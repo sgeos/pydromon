@@ -38,6 +38,8 @@ from dromon.model import ID_PATTERN
 from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, SandboxError, merge, parse_sandbox
 from dromon.settings import SettingsConfig, SettingsError, parse_settings
+from dromon.agents import OFF as AGENTS_OFF
+from dromon.agents import AgentError, AgentPolicy, parse_policy
 from dromon.teacher import TeacherConfig, TeacherError, parse_teacher
 
 CONFIG_FILE_NAME: Final = "dromon.toml"
@@ -54,6 +56,7 @@ TOP_KEYS: Final = frozenset(
         "sandbox",
         "settings",
         "teacher",
+        "agents",
         "profiles",
         "lines",
     }
@@ -134,6 +137,8 @@ class ProjectConfig:
     """The project's engine settings, merged under every line's own."""
     teacher: TeacherConfig | None = None
     """The project's local teacher model, if it declares one."""
+    agents: AgentPolicy = AGENTS_OFF
+    """Which external agents may connect, and with what access. Off by default."""
     lines: dict[str, LineDefinition] = field(default_factory=dict[str, LineDefinition])
 
 
@@ -243,6 +248,12 @@ class _Reader:
                 teacher = parse_teacher(top["teacher"])
             except TeacherError as error:
                 raise self.fail("teacher", str(error)) from error
+        agents = AGENTS_OFF
+        if "agents" in top:
+            try:
+                agents = parse_policy(top["agents"])
+            except AgentError as error:
+                raise self.fail("agents", str(error)) from error
         profiles = self.profiles(top.get("profiles", {}))
         lines_table = top.get("lines", {})
         if not isinstance(lines_table, dict):
@@ -258,6 +269,7 @@ class _Reader:
             sandbox=sandbox,
             settings=settings,
             teacher=teacher,
+            agents=agents,
             lines=lines,
         )
 

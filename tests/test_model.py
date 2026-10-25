@@ -6,6 +6,7 @@ from typing import get_args
 import pytest
 
 from dromon.model import (
+    AgentAddress,
     LINE_TRANSITIONS,
     MAX_CHOICE_BYTES,
     MAX_CHOICES,
@@ -75,8 +76,9 @@ def test_the_scenario_uses_every_kind_of_party_and_message(
 ) -> None:
     sent = [e for e in scenario if isinstance(e, MessageSent)]
     assert {m.kind for m in sent} == set(MessageKind)
-    assert {type(m.sender) for m in sent} == {LineAddress, OperatorAddress}
-    assert {type(m.recipient) for m in sent} == {LineAddress, OperatorAddress}
+    parties = {LineAddress, OperatorAddress, AgentAddress}
+    assert {type(m.sender) for m in sent} == parties
+    assert {type(m.recipient) for m in sent} == parties
     assert (
         len({m.recipient for m in sent if isinstance(m.recipient, OperatorAddress)}) > 1
     )

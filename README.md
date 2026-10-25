@@ -33,7 +33,9 @@ configured per project and per line as
 rules, hooks and environment as
 [`docs/protocol/SETTINGS.md`](docs/protocol/SETTINGS.md) specifies. A project's local
 teacher model, served by Ollama, is brought up with `dromon teacher up`, as
-[`docs/protocol/TEACHER.md`](docs/protocol/TEACHER.md) specifies. The first milestone is
+[`docs/protocol/TEACHER.md`](docs/protocol/TEACHER.md) specifies. Agents outside the
+daemon, such as another Claude Code session, reach it and its lines over MCP through
+`dromon mcp`, as [`docs/protocol/AGENTS.md`](docs/protocol/AGENTS.md) specifies. The first milestone is
 [`docs/roadmap/V0_1_0.md`](docs/roadmap/V0_1_0.md) and the planned system is
 [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md). What Dromon needs from
 the Keleusma Python bindings is in

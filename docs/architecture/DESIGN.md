@@ -448,6 +448,14 @@ of the data model. The specification is [`../protocol/EVENT_LOG.md`](../protocol
   honour the same documents.
 - Messages from other session lines, harnesses and machines are untrusted data. Only the
   operator, through a client, holds operator authority.
+- External agents reach the daemon over MCP. **Decided 2026-10-25, by the operator's
+  direction.** Another harness, such as a Claude Code session, starts `dromon mcp` as an
+  MCP server and becomes the party `&name` with its own mailbox. The project file sets
+  whether an agent socket exists, the access of an anonymous connection and a ceiling,
+  from off to every connection trusted as an operator, and registered agents carry
+  tokens stored as digests, as [`../protocol/AGENTS.md`](../protocol/AGENTS.md)
+  specifies. An agent's messages carry no operator authority unless its level is
+  `operator`.
 
 ## Keleusma
 
@@ -495,4 +503,6 @@ before any trace capture, and record the source model and licence of every trace
 5. Teacher-model scope and licensing. A local teacher served by Ollama is decided.
    Training on traces from hosted models remains open.
 6. Whether Dromon retires the interline store, or keeps it for sessions Dromon does not
-   drive. Moved here from the handoff on 2026-10-25.
+   drive. Moved here from the handoff on 2026-10-25. Since the same day, a session
+   Dromon does not drive can reach Dromon's lines as an external agent, which removes
+   one reason to keep a separate store.

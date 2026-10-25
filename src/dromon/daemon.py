@@ -36,12 +36,22 @@ import fcntl
 import os
 import signal
 import sys
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final, cast
+from typing import Any, Final, cast
+
+from claude_agent_sdk import SdkMcpTool
 
 from dromon import __version__, exits
+from dromon.agents import (
+    OFF as AGENTS_OFF,
+    AgentError,
+    AgentPolicy,
+    Gateway,
+    new_token,
+    token_digest,
+)
 from dromon import codex
 from dromon.teacher import Teacher, TeacherError
 from dromon.driver import ENGINE_OF, DriverError, Strategy
@@ -58,12 +68,17 @@ from dromon.lineconfig import (
 from dromon.projectconfig import ConfigFileError, ProjectConfig, config_path, load
 from dromon.sandbox import effective, merge
 from dromon.model import (
+    AgentAccess,
+    AgentAddress,
+    AgentRegistered,
+    AgentRevoked,
     EventRejected,
     InvalidField,
     LineAddress,
     Message,
     OperatorAddress,
     QuestionStatus,
+    State,
     parse_address,
 )
 from dromon.paths import PathError, ProjectPaths, ensure_private_dir, project_paths
@@ -130,6 +145,26 @@ class Daemon:
     started_at: str
     scheduler: Scheduler
     stop_requested: asyncio.Event = field(default_factory=asyncio.Event)
+    agents: AgentPolicy = AGENTS_OFF
+    """Who may connect to the agent socket, and with what access."""
+
+    # The gateway's view of the daemon.
+
+    @property
+    def state(self) -> State:
+        return self.log.state
+
+    def append(self, event: AgentRegistered) -> None:
+        self.log.append(event)
+
+    def mail_tools(self, owner: AgentAddress) -> list[SdkMcpTool[Any]]:
+        return [
+            self.scheduler.send_tool(owner),
+            self.scheduler.list_mail_tool(owner),
+            self.scheduler.read_mail_tool(owner),
+            self.scheduler.acknowledge_mail_tool(owner),
+            self.scheduler.list_sent_tool(owner),
+        ]
 
     def respond(self, line: bytes) -> Response:
         """Answer one request line. Never raises for anything a client can send."""
@@ -142,6 +177,58 @@ class Daemon:
                 error_code=error.code,
                 error_message=str(error),
             )
+        return self.execute(request)
+
+    async def respond_agent(self, line: bytes) -> Response:
+        """Answer one line on the agent socket, which serves only agent operations.
+        Never raises for anything an agent can send."""
+        try:
+            request = decode_request(line)
+        except ProtocolError as error:
+            return Response(
+                request_id_of(line),
+                ok=False,
+                error_code=error.code,
+                error_message=str(error),
+            )
+        if request.operation is Operation.PING:
+            return Response(request.request_id, ok=True, result={})
+        if request.operation not in (Operation.AGENT_TOOLS, Operation.AGENT_CALL):
+            return Response(
+                request.request_id,
+                ok=False,
+                error_code=ErrorCode.UNKNOWN_OPERATION,
+                error_message="the agent socket serves only agent_tools and agent_call",
+            )
+        gateway = Gateway(self.agents, self)
+        args = request.args
+        try:
+            access = gateway.authenticate(args.get("agent"), args.get("token"))
+        except (AgentError, InvalidField, EventRejected) as error:
+            return Response(
+                request.request_id,
+                ok=False,
+                error_code=ErrorCode.REJECTED,
+                error_message=str(error),
+            )
+        agent_id = cast(str, args["agent"])
+        if request.operation is Operation.AGENT_TOOLS:
+            return Response(
+                request.request_id,
+                ok=True,
+                result={
+                    "agent": str(AgentAddress(agent_id)),
+                    "access": access.value,
+                    "tools": cast(object, gateway.tools(access)),
+                },
+            )
+        result = await gateway.call(
+            agent_id, access, args.get("tool"), args.get("arguments", {})
+        )
+        return Response(request.request_id, ok=True, result=_bounded(result))
+
+    def execute(self, request: Request) -> Response:
+        """Answer one decoded request with operator authority."""
         match request.operation:
             case Operation.PING:
                 return Response(request.request_id, ok=True, result={})
@@ -150,6 +237,13 @@ class Daemon:
             case Operation.STOP:
                 self.stop_requested.set()
                 return Response(request.request_id, ok=True, result={"stopping": True})
+            case Operation.AGENT_TOOLS | Operation.AGENT_CALL:
+                return Response(
+                    request.request_id,
+                    ok=False,
+                    error_code=ErrorCode.UNKNOWN_OPERATION,
+                    error_message=f"{request.operation} is served on the agent socket",
+                )
             case (
                 Operation.CREATE_LINE
                 | Operation.CONFIGURE_LINE
@@ -162,6 +256,9 @@ class Daemon:
                 | Operation.SENT
                 | Operation.RELEASE
                 | Operation.LINE_VIEW
+                | Operation.AGENT_ADD
+                | Operation.AGENT_REVOKE
+                | Operation.AGENT_LIST
             ):
                 return self._command(request)
 
@@ -189,6 +286,14 @@ class Daemon:
                     result = self._release(request.args)
                 case Operation.LINE_VIEW:
                     result = self._line_view(request.args)
+                case Operation.AGENT_ADD:
+                    result = self._agent_add(request.args)
+                case Operation.AGENT_REVOKE:
+                    (agent_id,) = _text_args(request.args, ("agent",))
+                    self.log.append(AgentRevoked(agent_id))
+                    result: dict[str, object] = {"agent": str(AgentAddress(agent_id))}
+                case Operation.AGENT_LIST:
+                    result = self._agent_list(request.args)
                 case _:
                     result = self._send(request.args)
         except ProtocolError as error:
@@ -356,6 +461,48 @@ class Daemon:
             "open_questions": questions[-VIEW_LIMIT:],
         }
 
+    def _agent_add(self, args: dict[str, object]) -> dict[str, object]:
+        """Register an agent, or replace its access and token, and return the token.
+        The token is returned once and only its digest is stored."""
+        agent_id, access_text = _text_args(args, ("agent", "access"))
+        try:
+            access = AgentAccess(access_text)
+        except ValueError as error:
+            raise InvalidField(f"unknown access {access_text!r}") from error
+        token = new_token()
+        self.log.append(AgentRegistered(agent_id, access, token_digest(token)))
+        effective = (
+            access
+            if access.rank <= self.agents.max_access.rank
+            else (self.agents.max_access)
+        )
+        return {
+            "agent": str(AgentAddress(agent_id)),
+            "access": access.value,
+            "effective_access": effective.value,
+            "token": token,
+            "listening": self.agents.listen,
+        }
+
+    def _agent_list(self, args: dict[str, object]) -> dict[str, object]:
+        _text_args(args, ())
+        return {
+            "policy": {
+                "listen": self.agents.listen,
+                "anonymous": self.agents.anonymous.value,
+                "max_access": self.agents.max_access.value,
+            },
+            "agents": [
+                {
+                    "agent": str(AgentAddress(agent_id)),
+                    "access": agent.access.value,
+                    "token": bool(agent.token_sha256),
+                    "revoked": agent.revoked,
+                }
+                for agent_id, agent in sorted(self.log.state.agents.items())
+            ],
+        }
+
     def _release(self, args: dict[str, object]) -> dict[str, object]:
         (line_id,) = _text_args(args, ("line_id",))
         self.scheduler.release(line_id)
@@ -450,7 +597,32 @@ class Daemon:
             },
             "tick": self.scheduler.tick,
             "lines": self.scheduler.line_summaries(),
+            "agents": {
+                "listen": self.agents.listen,
+                "anonymous": self.agents.anonymous.value,
+                "max_access": self.agents.max_access.value,
+                "registered": sum(
+                    1 for agent in state.agents.values() if not agent.revoked
+                ),
+            },
         }
+
+
+MAX_AGENT_TEXT: Final = 48 * 1024
+"""The most text one agent result carries, so it fits one protocol line."""
+
+
+def _bounded(result: dict[str, object]) -> dict[str, object]:
+    """``result`` with each text item cut to ``MAX_AGENT_TEXT`` characters, noting the
+    cut, since a message body may be larger than a protocol line."""
+    content = cast(list[dict[str, object]], result.get("content", []))
+    bounded: list[dict[str, object]] = []
+    for item in content:
+        text = item.get("text")
+        if isinstance(text, str) and len(text) > MAX_AGENT_TEXT:
+            item = {**item, "text": text[:MAX_AGENT_TEXT] + "\n[truncated by Dromon]"}
+        bounded.append(item)
+    return {**result, "content": cast(object, bounded)}
 
 
 def _question_summary(message_id: str, message: Message) -> dict[str, object]:
@@ -491,8 +663,14 @@ async def _write(writer: asyncio.StreamWriter, response: Response) -> None:
     await writer.drain()
 
 
+type Responder = Callable[[bytes], Awaitable[Response]]
+
+
 async def _connection(
-    daemon: Daemon, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    daemon: Daemon,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    responder: Responder,
 ) -> None:
     """Serve requests on one connection until EOF, timeout, error or stop."""
     try:
@@ -527,7 +705,7 @@ async def _connection(
                     ),
                 )
                 break
-            await _write(writer, daemon.respond(line))
+            await _write(writer, await responder(line))
     except (ConnectionError, BrokenPipeError):
         pass
     finally:
@@ -543,19 +721,47 @@ async def serve(daemon: Daemon) -> None:
         loop.add_signal_handler(signum, daemon.stop_requested.set)
     writers: set[asyncio.StreamWriter] = set()
 
-    async def accept(
-        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
-        writers.add(writer)
-        try:
-            await _connection(daemon, reader, writer)
-        finally:
-            writers.discard(writer)
+    async def operator_responder(line: bytes) -> Response:
+        return daemon.respond(line)
+
+    def accepting(
+        responder: Responder,
+    ) -> Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]:
+        async def accept(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            writers.add(writer)
+            try:
+                await _connection(daemon, reader, writer, responder)
+            finally:
+                writers.discard(writer)
+
+        return accept
 
     socket_path = daemon.paths.socket
     server = await asyncio.start_unix_server(
-        accept, path=str(socket_path), limit=MAX_LINE_BYTES
+        accepting(operator_responder), path=str(socket_path), limit=MAX_LINE_BYTES
     )
+    servers = [server]
+    if daemon.agents.listen:
+        # A separate socket, so that nothing an agent sends reaches the operator
+        # dispatch, and so that turning agents off leaves nothing to connect to.
+        agent_path = daemon.paths.agent_socket
+        with contextlib.suppress(FileNotFoundError):
+            agent_path.unlink()
+        servers.append(
+            await asyncio.start_unix_server(
+                accepting(daemon.respond_agent),
+                path=str(agent_path),
+                limit=MAX_LINE_BYTES,
+            )
+        )
+        agent_path.chmod(0o600)
+        print(
+            f"dromond: agents may connect on {agent_path}, anonymous"
+            f" {daemon.agents.anonymous}, at most {daemon.agents.max_access}",
+            file=sys.stderr,
+        )
     daemon.scheduler.recover()
     scheduling = asyncio.create_task(daemon.scheduler.run(daemon.stop_requested))
     try:
@@ -566,11 +772,15 @@ async def serve(daemon: Daemon) -> None:
     finally:
         daemon.stop_requested.set()
         await scheduling
-        server.close()
+        for listening in servers:
+            listening.close()
         for writer in list(writers):
             writer.close()
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(server.wait_closed(), SHUTDOWN_TIMEOUT_SECONDS)
+        for listening in servers:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    listening.wait_closed(), SHUTDOWN_TIMEOUT_SECONDS
+                )
         for signum in (signal.SIGTERM, signal.SIGINT):
             loop.remove_signal_handler(signum)
 
@@ -755,7 +965,7 @@ def run(
             apply_project(scheduler, log, config)
             teacher = start_teacher(config, paths)
             try:
-                daemon = Daemon(paths, log, utc_now(), scheduler)
+                daemon = Daemon(paths, log, utc_now(), scheduler, agents=config.agents)
                 asyncio.run(serve(daemon))
             finally:
                 if teacher is not None:
@@ -770,8 +980,9 @@ def run(
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
     finally:
-        with contextlib.suppress(FileNotFoundError):
-            paths.socket.unlink()
+        for stale in (paths.socket, paths.agent_socket):
+            with contextlib.suppress(FileNotFoundError):
+                stale.unlink()
         os.close(lock)
     print("dromond: stopped", file=sys.stderr)
     return exits.OK

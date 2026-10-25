@@ -38,6 +38,13 @@ class Operation(StrEnum):
     SENT = "sent"
     RELEASE = "release"
     LINE_VIEW = "line_view"
+    AGENT_ADD = "agent_add"
+    AGENT_REVOKE = "agent_revoke"
+    AGENT_LIST = "agent_list"
+    AGENT_TOOLS = "agent_tools"
+    """Served only on the agent socket."""
+    AGENT_CALL = "agent_call"
+    """Served only on the agent socket."""
 
 
 class ErrorCode(StrEnum):

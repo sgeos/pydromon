@@ -19,6 +19,9 @@ from typing import Final, NoReturn, assert_never
 
 from dromon.model import (
     Address,
+    AgentAccess,
+    AgentRegistered,
+    AgentRevoked,
     Event,
     InvalidField,
     LineConfigured,
@@ -55,6 +58,8 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "line_held": ("line_id", "question_id"),
     "line_released": ("line_id",),
     "operator_registered": ("operator_id",),
+    "agent_registered": ("agent_id", "access", "token_sha256"),
+    "agent_revoked": ("agent_id",),
     "message_sent": (
         "message_id",
         "sender",
@@ -158,6 +163,14 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
             }
         case OperatorRegistered():
             return "operator_registered", {"operator_id": event.operator_id}
+        case AgentRegistered():
+            return "agent_registered", {
+                "agent_id": event.agent_id,
+                "access": event.access.value,
+                "token_sha256": event.token_sha256,
+            }
+        case AgentRevoked():
+            return "agent_revoked", {"agent_id": event.agent_id}
         case MessageSent():
             return "message_sent", {
                 "message_id": event.message_id,
@@ -213,6 +226,14 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
             return LineSession(_str(data, "line_id"), _str(data, "engine_session"))
         case "operator_registered":
             return OperatorRegistered(_str(data, "operator_id"))
+        case "agent_registered":
+            return AgentRegistered(
+                _str(data, "agent_id"),
+                _member(data, "access", AgentAccess),
+                _str(data, "token_sha256"),
+            )
+        case "agent_revoked":
+            return AgentRevoked(_str(data, "agent_id"))
         case "message_sent":
             return MessageSent(
                 _str(data, "message_id"),
@@ -279,7 +300,7 @@ def _address(data: dict[str, object], name: str) -> Address:
     return parse_address(_str(data, name))
 
 
-def _member[T: (LineState, MessageKind)](
+def _member[T: (LineState, MessageKind, AgentAccess)](
     data: dict[str, object], name: str, kind: type[T]
 ) -> T:
     value = _str(data, name)

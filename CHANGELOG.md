@@ -43,6 +43,13 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- External agents, specified by `docs/protocol/AGENTS.md`. Another harness starts
+  `dromon mcp --agent NAME` as an MCP server and reaches the daemon as the party
+  `&name`, with its own mailbox, through a separate agent socket. The project file's
+  `[agents]` table sets `listen`, off by default, `anonymous` and `max_access`, over the
+  levels `none`, `observe`, `message`, `manage` and `operator`. `dromon agent add`,
+  `list` and `revoke` register agents, whose tokens are stored only as digests. The
+  event log gains `agent_registered` and `agent_revoked`.
 - A project's local teacher model, specified by `docs/protocol/TEACHER.md`. The project
   file's `[teacher]` table names an Ollama model on the loopback interface, and
   `dromon teacher up`, `status` and `down` start a server when none answers, load the

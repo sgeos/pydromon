@@ -25,7 +25,10 @@ state by replaying the same log.
 | Identifier | 1 to 64 ASCII characters from `a` to `z`, `0` to `9`, `.`, `_` and `-`, starting with a letter or digit. Compared bytewise |
 | Line address | A line's identifier, such as `alpha` |
 | Operator address | `@` followed by an operator's identifier, such as `@ana`. `@` never appears in an identifier, so the two kinds of address cannot collide |
-| Address | A line address or an operator address |
+| Agent address | `&` followed by an external agent's identifier, such as `&claude-main`. `&` never appears in an identifier |
+| Address | A line address, an operator address or an agent address |
+| Agent access | `none`, `observe`, `message`, `manage` or `operator`, each including the levels before it |
+| Token digest | 64 lowercase hexadecimal characters, the SHA-256 of a token, or empty for an agent admitted without one |
 | Text | A Unicode string with a valid UTF-8 encoding of at most 1,048,576 bytes. Lone surrogates are invalid |
 | Choice | Text of at most 1,024 bytes |
 | Choices | At most 16 distinct choices, in order |
@@ -44,6 +47,9 @@ exist. A project with five people and thirty lines has five operators, each addr
 separately. An operator question is a message of kind `question` from a line to one
 operator, and its answer is that operator's reply. Questions therefore travel by the
 same path as every other message, and the question lifecycle is tracked on the message.
+An external agent is a party too, with its own mailbox, as
+[`AGENTS.md`](AGENTS.md) specifies. It may send and receive notes but not ask
+questions, and a revoked agent neither sends nor receives.
 
 ## Events
 
@@ -58,6 +64,8 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `line_held` | `line_id`, `question_id` | The line exists and is not held, and the question is open and from the line. The daemon wakes the line no more until it is released |
 | `line_released` | `line_id` | The line is held |
 | `operator_registered` | `operator_id` | The operator does not exist |
+| `agent_registered` | `agent_id`, `access`, `token_sha256` | Always. Registers the agent, or replaces its access and digest and restores it if revoked. A token itself is never stored |
+| `agent_revoked` | `agent_id` | The agent exists and is not revoked |
 | `message_sent` | `message_id`, `sender` and `recipient` addresses, `kind`, `body` text, `choices`, `reply_to` message identifier or `null` | See the message rules below |
 | `message_read` | `message_id` | The message was delivered and not yet read. Its recipient opened it, which obliges nothing |
 | `message_acknowledged` | `message_id` | The message was delivered and not yet acknowledged. Its recipient marked it dealt with without a reply. Its sender sees the acknowledgement as distinct from a reply. A question stays open |
@@ -102,7 +110,7 @@ An event is stored as one JSON object.
 {"data":{"engine":"claude-opus-5-5","line_id":"alpha","strategy":"subscription"},"kind":"line_created","v":1}
 ```
 
-Addresses are written as their text forms, such as `"beta"` and `"@ana"`.
+Addresses are written as their text forms, such as `"beta"`, `"@ana"` and `"&claude"`.
 
 - `v` is the format version, the integer `1`.
 - `kind` is the event kind and `data` holds exactly its fields.

@@ -5,10 +5,12 @@ directly. It is rebuilt by applying events in order, so the event list is the
 specification of the data model. ``docs/protocol/EVENT_LOG.md`` is normative and this
 module follows it.
 
-Parties. Session lines and operators are both addresses. An operator question is a
-message from a line to an operator, and the answer is the operator's reply, so questions
-travel by the same path as every other message. There may be any number of operators,
-each addressed separately.
+Parties. Session lines, operators and external agents are all addresses. An operator
+question is a message from a line to an operator, and the answer is the operator's
+reply, so questions travel by the same path as every other message. There may be any
+number of operators, each addressed separately. An external agent is a harness outside
+the daemon, such as another Claude Code session, registered with an access level and a
+token hash, and its messages are untrusted data like a line's.
 
 Trust. The model checks that each event is well formed and applicable to the current
 state. It does not authenticate anyone. Attribution, such as which operator sent a
@@ -29,6 +31,12 @@ ID_PATTERN: Final = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 OPERATOR_PREFIX: Final = "@"
 """Marks an operator address. It never appears in an identifier, so a line address and
 an operator address cannot be confused even when their identifiers are equal."""
+
+AGENT_PREFIX: Final = "&"
+"""Marks an external agent's address, distinct from both other kinds."""
+
+TOKEN_HASH: Final = re.compile(r"[0-9a-f]{64}")
+"""A SHA-256 digest in lowercase hexadecimal, the only form a token is stored in."""
 
 MAX_TEXT_BYTES: Final = 1024 * 1024
 """Upper bound on the UTF-8 size of a message body."""
@@ -123,19 +131,32 @@ class OperatorAddress:
         return OPERATOR_PREFIX + self.operator_id
 
 
-type Address = LineAddress | OperatorAddress
+@dataclass(frozen=True, slots=True)
+class AgentAddress:
+    agent_id: str
+
+    def __post_init__(self) -> None:
+        check_id("agent_id", self.agent_id)
+
+    def __str__(self) -> str:
+        return AGENT_PREFIX + self.agent_id
+
+
+type Address = LineAddress | OperatorAddress | AgentAddress
 
 
 def parse_address(text: str) -> Address:
-    """Return the address written as ``text``, either ``line`` or ``@operator``."""
+    """Return the address written as ``text``: ``line``, ``@operator`` or ``&agent``."""
     if text.startswith(OPERATOR_PREFIX):
         return OperatorAddress(text.removeprefix(OPERATOR_PREFIX))
+    if text.startswith(AGENT_PREFIX):
+        return AgentAddress(text.removeprefix(AGENT_PREFIX))
     return LineAddress(text)
 
 
 def check_address(name: str, value: object) -> None:
     """Raise ``InvalidField`` unless ``value`` is an address."""
-    if not isinstance(value, LineAddress | OperatorAddress):
+    if not isinstance(value, LineAddress | OperatorAddress | AgentAddress):
         raise InvalidField(f"{name} is not an address: {value!r}")
 
 
@@ -163,6 +184,29 @@ LINE_TRANSITIONS: Final[frozenset[tuple[LineState, LineState]]] = frozenset(
 class MessageKind(StrEnum):
     NOTE = "note"
     QUESTION = "question"
+
+
+class AgentAccess(StrEnum):
+    """What an external agent may do. Each level includes every level before it."""
+
+    NONE = "none"
+    OBSERVE = "observe"
+    MESSAGE = "message"
+    MANAGE = "manage"
+    OPERATOR = "operator"
+
+    @property
+    def rank(self) -> int:
+        return ACCESS_ORDER.index(self)
+
+
+ACCESS_ORDER: Final = (
+    AgentAccess.NONE,
+    AgentAccess.OBSERVE,
+    AgentAccess.MESSAGE,
+    AgentAccess.MANAGE,
+    AgentAccess.OPERATOR,
+)
 
 
 class QuestionStatus(StrEnum):
@@ -262,6 +306,33 @@ class OperatorRegistered:
 
     def __post_init__(self) -> None:
         check_id("operator_id", self.operator_id)
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRegistered:
+    """An external agent, with its access and the SHA-256 of its token, or with an
+    empty hash for an agent admitted without a token. Registering an agent again
+    replaces its access and hash, and restores it if it was revoked."""
+
+    agent_id: str
+    access: AgentAccess
+    token_sha256: str
+
+    def __post_init__(self) -> None:
+        check_id("agent_id", self.agent_id)
+        check_member("access", self.access, AgentAccess)
+        if self.token_sha256 and TOKEN_HASH.fullmatch(self.token_sha256) is None:
+            raise InvalidField("token_sha256 is not a SHA-256 hex digest")
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRevoked:
+    """The agent may no longer connect, send or receive."""
+
+    agent_id: str
+
+    def __post_init__(self) -> None:
+        check_id("agent_id", self.agent_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,6 +441,8 @@ type Event = (
     | LineHeld
     | LineReleased
     | OperatorRegistered
+    | AgentRegistered
+    | AgentRevoked
     | MessageSent
     | MessageDelivered
     | MessageRead
@@ -396,6 +469,14 @@ class Line:
     """The engine session the line's next turn resumes, if one was recorded."""
     held_by: str | None = None
     """The question whose answer releases the line, while the line is held."""
+
+
+@dataclass(frozen=True, slots=True)
+class Agent:
+    access: AgentAccess
+    token_sha256: str
+    """Empty for an agent admitted without a token."""
+    revoked: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -434,11 +515,16 @@ class State:
     operators: set[str] = field(default_factory=set[str])
     messages: dict[str, Message] = field(default_factory=dict[str, Message])
     wakes: dict[str, Wake] = field(default_factory=dict[str, Wake])
+    agents: dict[str, Agent] = field(default_factory=dict[str, Agent])
 
     def copy(self) -> "State":
         """Return an independent snapshot. The records are frozen, so maps suffice."""
         return State(
-            dict(self.lines), set(self.operators), dict(self.messages), dict(self.wakes)
+            dict(self.lines),
+            set(self.operators),
+            dict(self.messages),
+            dict(self.wakes),
+            dict(self.agents),
         )
 
     def open_questions(self, operator_id: str) -> list[str]:
@@ -477,6 +563,12 @@ class State:
             case OperatorRegistered():
                 if event.operator_id in self.operators:
                     raise EventRejected(f"operator {event.operator_id} exists")
+            case AgentRegistered():
+                pass
+            case AgentRevoked():
+                agent = self.agents.get(event.agent_id)
+                if agent is None or agent.revoked:
+                    raise EventRejected(f"no agent {event.agent_id} to revoke")
             case MessageSent():
                 self._check_message_sent(event)
             case MessageDelivered():
@@ -532,6 +624,11 @@ class State:
                 )
             case OperatorRegistered():
                 self.operators.add(event.operator_id)
+            case AgentRegistered():
+                self.agents[event.agent_id] = Agent(event.access, event.token_sha256)
+            case AgentRevoked():
+                agent = self.agents[event.agent_id]
+                self.agents[event.agent_id] = replace(agent, revoked=True)
             case MessageSent():
                 self._apply_message_sent(event)
             case MessageDelivered():
@@ -582,6 +679,10 @@ class State:
             case OperatorAddress():
                 if address.operator_id not in self.operators:
                     raise EventRejected(f"no operator {address.operator_id}")
+            case AgentAddress():
+                agent = self.agents.get(address.agent_id)
+                if agent is None or agent.revoked:
+                    raise EventRejected(f"no agent {address.agent_id}")
             case _:
                 assert_never(address)
 
