@@ -55,6 +55,8 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `sent` | Arguments `operator`, and optionally `unanswered_only`, `offset` and `limit`. Returns `total` and `messages`, the operator's sent mail with `message_id`, `recipient`, `kind`, `delivered`, `read` and `outcome` |
 | `read` | Arguments `operator` and `message_id`. Returns the message with its `body` and `choices`, and marks it read the first time |
 | `line_view` | Arguments `line_id`, and optionally `limit`, at most 50. Returns `line`, the line's status entry, `tick`, `total`, the count of messages involving the line, `messages`, the newest of them oldest first, each with a body preview of at most 600 characters and `truncated`, kept within a 40,000 byte budget, and `open_questions`, the line's open questions. What an attached client polls |
+| `line_activity` | Arguments `line_id`, and optionally `after`, a revision, default 0. Returns `line_id`, `seq`, the daemon's newest revision, `entries`, the line's activity entries changed after `after`, oldest first, the newest kept within a 40,000 byte budget, and `complete`, false when older changed entries were left out. Each entry has `entry_id`, `seq`, `kind` and `text`, as the activity section below specifies. What an attached client polls to follow a turn |
+| `interrupt` | Argument `line_id`. Cancels the line's turn in flight. Returns `line_id` and `interrupted`, false when no turn was in flight. Refused for an unknown line |
 | `release` | Argument `line_id`. Releases a line held at a conversation limit and resets its counts |
 | `agent_add` | Arguments `agent` and `access`. Registers an external agent, or replaces its access and token. Returns `agent`, `access`, `effective_access` under the policy's ceiling, `token`, shown only here, and `listening` |
 | `agent_revoke` | Argument `agent`. Revokes it |
@@ -114,7 +116,7 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromon read MESSAGE` | Sends `read` and prints the message | 0, 4, or 1 |
 | `dromon ack MESSAGE` | Sends `acknowledge` | 0, 4, or 1 |
 | `dromon sent` | Sends `sent`, with `--operator`, `--unanswered`, `--offset N` and `--limit N`, and prints each message's fate | 0, 4, or 1 |
-| `dromon attach LINE` | Opens a curses client attached to the line, or a Tk window with `--gui`, speaking for `--operator` and refreshing every `--poll-seconds`, default 1. Text sends a message, and `/answer`, `/ack`, `/release`, `/help` and `/quit` are commands. Any number may attach at once | 0 |
+| `dromon attach LINE` | Opens an interactive client attached to the line, in the terminal or in a Tk window with `--gui`, speaking for `--operator` and refreshing every `--poll-seconds`, default 1, and four times as often while the line runs a turn. Text sends a message. The commands, keys and panes are those of the attached client section below. Any number may attach at once | 0, or 2 on a poll interval that is not positive |
 | `dromon release LINE` | Sends `release` | 0, 4, or 1 |
 | `dromon answer QUESTION BODY` | Sends `answer`, with `--operator`, default the login name | 0, 4, or 1 |
 | `dromon probe` | Runs one short turn without the daemon on the engine of `--model`, and reports the driver, the engine, the credential and the capabilities the engine reports | 0 or 1 |
@@ -136,6 +138,80 @@ file whose permissions, hooks, `env`, attribution and sandbox are taken, and
 
 Status 2 is a usage error and status 3 marks a subcommand not yet implemented.
 
+## Line activity
+
+The daemon keeps, in memory and per line, a bounded tail of what the line's engine does
+during its turns, so that an attached client can show a turn as it runs. The tail is
+not part of the event log, is not persisted, and is lost when the daemon stops.
+
+| Kind | Text |
+|---|---|
+| `turn_started` | The prompt the line received, which holds every message delivered into the turn |
+| `text` | Text the engine wrote |
+| `thinking` | Empty. The engine reasoned, and reasoning is not shown |
+| `tool` | The name of the tool the engine called |
+| `turn_ended` | How the turn ended. The engine's result subtype, such as `success`, with the reason when its driver interrupted it, `failed:` and the error, `interrupted by an operator`, or `cancelled` at shutdown |
+
+Each entry has an `entry_id`, which never changes, and a `seq`, the daemon-wide revision
+at which it last changed. Only a line's newest entry changes, when an engine that
+streams its text sends another chunk, or reasons again, so a client that asks for
+entries after the highest `seq` it holds and replaces entries by `entry_id` stays exact.
+A `seq` lower than one the client holds means the daemon restarted, and the client
+starts again from 0. A line keeps at most 256 entries and an entry at most 4,000
+characters, the rest replaced by ` [truncated]`.
+
+The Claude Code and Codex adapters report each text message whole, and Codex reports
+it only once it completes. The Grok adapter reports chunks as they stream.
+
+An interrupt cancels the turn's task, which closes the engine's session or subprocess
+wherever it is. Mail the turn had received stays delivered. The engine session resumes
+from what the engine itself recorded, which may include part of the cancelled turn. An
+interrupted turn produces no turn report, so it counts toward no limit.
+
+## The attached client
+
+The terminal and the window run one client core and differ only in how they read keys
+and paint rows. The layout, from the top, is the transcript of the chosen pane, a card
+for the line's open questions, a status bar, the input, and suggestions or a hint.
+
+| Pane | Shows |
+|---|---|
+| Activity, the default | The line's activity entries, with fenced code and headings marked, and a spinner while a turn runs |
+| Mail | The line's recent messages, as `line_view` returns them |
+
+| Command | Effect |
+|---|---|
+| Plain text | Sends a message to the line |
+| `/answer QUESTION TEXT` | Answers one of the line's questions |
+| `/ack MESSAGE` | Acknowledges a message the line sent the operator |
+| `/release` | Releases the line from a hold |
+| `/interrupt` | Sends `interrupt`, as Escape does while a turn runs |
+| `/line LINE`, `/lines` | Attaches to another line, or lists the daemon's lines to pick one |
+| `/activity`, `/mail` | Chooses the pane |
+| `/help`, `/?` | Lists commands and keys |
+| `/quit`, `/exit` | Detaches |
+
+| Key | Effect |
+|---|---|
+| Enter | Sends the input, or takes the highlighted suggestion and sends it when it is complete |
+| Shift or Alt with Enter, Control-J in the window, Escape then Enter in the terminal, or a trailing backslash | Breaks the input into rows |
+| Tab, Shift-Tab | Completes a command, a line, a question, a message or an offered choice, or moves through the suggestions |
+| Up, Down | Moves between input rows, or walks the input history of up to 200 entries |
+| Control-A, Control-E, Control-B, Control-F | Moves to the start or end of the row, or by a character |
+| Control-U, Control-K, Control-W | Cuts before or after the cursor, or the word before it |
+| PageUp, PageDown, the mouse wheel in the window | Scrolls the transcript. A reader scrolled back keeps their place as rows arrive |
+| Escape | Closes a panel or the suggestions, or interrupts a running turn |
+| Control-O | Switches between the activity and mail panes |
+| Control-N, Control-P | Attaches to the next or previous line |
+| Control-L | Refreshes now |
+| Control-C | Clears the input, or detaches on a second press within two seconds |
+| Control-D | Detaches when the input is empty |
+| `?` on an empty input | Opens the help panel |
+
+The client rings the platform's bell once when a question arrives while it is attached.
+It replaces every control character in what it shows, except the line break, so that no
+message body or engine output can drive the terminal.
+
 ## Trust
 
 Whoever can connect runs as the operator's user, so a request carries operator authority
@@ -153,6 +229,6 @@ authorized by agent and access level.
 
 ## Not yet specified
 
-- Updates pushed to attached clients, which now poll.
+- Updates pushed to attached clients, which now poll, faster while a turn runs.
 - Authentication of a client beyond the directory's permissions.
 - Notifications pushed from the daemon to an attached client.

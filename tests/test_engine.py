@@ -30,6 +30,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
+from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon.driver import Credential, Driver, Strategy, driver_resource
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, McpServer, ToolPolicy
 from dromon.engine import (
@@ -132,12 +133,14 @@ def line(
     session: Scripted,
     driver: Driver | None = None,
     environment: Mapping[str, str] | None = None,
+    observe: Observer = ignore,
 ) -> ClaudeCodeLine:
     return ClaudeCodeLine(
         driver or Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
         Path("/work"),
         environment=environment or {},
         session_factory=session.factory,
+        observe=observe,
     )
 
 
@@ -168,6 +171,26 @@ def test_a_plain_turn_reports_text_capabilities_and_session() -> None:
     assert report.interrupted_for is None
     assert session.interrupts == 0
     assert target.driver.state == (0, 1, 1)
+
+
+def test_the_turn_is_reported_to_the_observer_as_it_runs() -> None:
+    session = Scripted(
+        [
+            init(),
+            say(ThinkingBlock("", ""), TextBlock("rea"), TextBlock("dy")),
+            say(ToolUseBlock("t1", "mcp__dromon__send", {})),
+            result(),
+        ]
+    )
+    log = ActivityLog()
+    run(line(session, observe=log.observer("alpha")))
+    # Whole text blocks are not chunks, so each stays its own entry.
+    assert [(entry.kind, entry.text) for entry in log.after("alpha", 0)] == [
+        (ActivityKind.THINKING, ""),
+        (ActivityKind.TEXT, "rea"),
+        (ActivityKind.TEXT, "dy"),
+        (ActivityKind.TOOL, "mcp__dromon__send"),
+    ]
 
 
 def test_options_follow_the_driver_and_isolate_the_line() -> None:

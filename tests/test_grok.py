@@ -15,6 +15,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
+from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon.agents import AgentError, LineTokens
 from dromon.daemon import Daemon
 from dromon.driver import Credential, Driver, Strategy
@@ -214,6 +215,7 @@ def line(
     driver: Driver | None = None,
     session_id: str | None = None,
     environment: Mapping[str, str] | None = None,
+    observe: Observer = ignore,
 ) -> GrokLine:
     workspace, home, state = project
 
@@ -238,6 +240,7 @@ def line(
         environment={} if environment is None else environment,
         home=home,
         connection_factory=connect,
+        observe=observe,
     )
 
 
@@ -508,6 +511,34 @@ def test_permission_requests_follow_the_lines_tools(
     }
     assert picked == {"p1": "no", "p2": "yes", "p3": "yes", "p4": "no"}
     assert answers["x"]["error"]["code"] == -32601
+
+
+def test_the_turn_is_reported_to_the_observer_as_it_streams(
+    project: tuple[Path, Path, Path],
+) -> None:
+    thought = note(
+        {
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": "hmm"},
+        }
+    )
+    server = FakeGrok(
+        [
+            thought,
+            thought,
+            chunk("hello "),
+            chunk("there"),
+            tool_call("other", "dromon__send_message"),
+        ]
+    )
+    log = ActivityLog()
+    run(line(server, project, observe=log.observer("alpha")))
+    # Streamed chunks extend one entry, and reasoning is shown only as a mark.
+    assert [(entry.kind, entry.text) for entry in log.after("alpha", 0)] == [
+        (ActivityKind.THINKING, ""),
+        (ActivityKind.TEXT, "hello there"),
+        (ActivityKind.TOOL, "dromon__send_message"),
+    ]
 
 
 def test_tool_calls_are_counted_and_others_cancel_the_turn(

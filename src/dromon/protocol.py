@@ -38,6 +38,8 @@ class Operation(StrEnum):
     SENT = "sent"
     RELEASE = "release"
     LINE_VIEW = "line_view"
+    LINE_ACTIVITY = "line_activity"
+    INTERRUPT = "interrupt"
     AGENT_ADD = "agent_add"
     AGENT_REVOKE = "agent_revoke"
     AGENT_LIST = "agent_list"

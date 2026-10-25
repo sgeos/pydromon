@@ -87,6 +87,7 @@ from claude_agent_sdk import (
 
 from claude_agent_sdk.types import SystemPromptPreset
 
+from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
 from dromon.lineconfig import DEFAULT_CONFIG, ConfigError, LineConfig
 from dromon.sandbox import blocks_unsandboxed
@@ -331,6 +332,7 @@ class ClaudeCodeLine:
         settings: Mapping[str, object] | None = None,
         environment: Mapping[str, str] | None = None,
         session_factory: SessionFactory = _sdk_session,
+        observe: Observer = ignore,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -346,6 +348,7 @@ class ClaudeCodeLine:
         self.settings = None if settings is None else dict(settings)
         self._environment = os.environ if environment is None else environment
         self._session_factory = session_factory
+        self._observe = observe
 
     @property
     def own_tools(self) -> frozenset[str]:
@@ -438,11 +441,14 @@ class ClaudeCodeLine:
             for block in message.content:
                 if isinstance(block, TextBlock):
                     turn.text.append(block.text)
+                    self._observe(ActivityKind.TEXT, block.text)
                     event = Event("text", "", len(block.text))
                 elif isinstance(block, ToolUseBlock):
                     turn.tool_uses.append(block.name)
+                    self._observe(ActivityKind.TOOL, block.name)
                     event = Event("tool_use", block.name)
                 elif isinstance(block, ThinkingBlock):
+                    self._observe(ActivityKind.THINKING, "")
                     event = Event("thinking")
                 else:
                     continue

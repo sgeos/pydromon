@@ -47,6 +47,20 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- The attached clients are rebuilt on a shared core in `dromon.ui`, near parity with
+  Claude Code, Codex and Grok Build. The core is a pure state machine with no input or
+  output, the runtime performs its effects through a `Daemon` port, and the curses and
+  Tk platforms only translate keys and paint frames. The clients follow a turn as it
+  runs in an activity pane, with a mail pane on Control-O, a status bar, a card for
+  open questions, a multi-row input with readline keys and history, slash commands
+  with Tab completion of commands, lines, questions, messages and offered choices, a
+  help panel on `?`, a line list and line switching, scrollback that keeps a reader's
+  place, Escape to interrupt a turn, a double Control-C to detach, and a bell for a new
+  question. `dromon.attach`, `dromon.tui` and `dromon.gui` are removed.
+- The daemon keeps a bounded, in-memory activity tail per line, fed by each engine
+  adapter, and serves it through the new `line_activity` operation. The new
+  `interrupt` operation cancels a line's turn in flight.
+
 - Sync with `sgeos/project-template`. `scripts/check.sh` is the local gate that CI now
   runs, with the hygiene checks, `uv sync --locked`, Ruff, pyright, pytest with its
   arguments and shellcheck. Adds `.gitattributes`, `SECURITY.md`, `CONTRIBUTING.md`, a

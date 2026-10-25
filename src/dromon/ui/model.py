@@ -1,0 +1,186 @@
+"""The client's state, and the events and effects that pass between it and a runtime.
+
+Everything here is immutable data. ``dromon.ui.update`` computes the next model, and
+``dromon.ui.render`` draws one.
+"""
+
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Final
+
+from dromon.ui.commands import DaemonCommand, Pane, Suggestion
+from dromon.ui.data import ActivityPage, Entry, LineSummary, View
+from dromon.ui.editor import Editor, History
+from dromon.ui.keys import Key
+
+MAX_ENTRIES: Final = 1024
+"""Activity entries a client keeps for its line, the oldest dropped first."""
+QUIT_WINDOW_SECONDS: Final = 2.0
+"""How long a first Control-C waits for a second one to detach."""
+RUNNING_POLL_DIVISOR: Final = 4
+"""How much faster a client polls while its line runs a turn, to follow it closely."""
+MIN_POLL_SECONDS: Final = 0.1
+
+
+class Overlay(StrEnum):
+    NONE = "none"
+    HELP = "help"
+    LINES = "lines"
+
+
+@dataclass(frozen=True, slots=True)
+class Model:
+    line_id: str
+    operator: str
+    poll_seconds: float
+    width: int = 80
+    height: int = 24
+    view: View | None = None
+    activity: tuple[Entry, ...] = ()
+    """The line's activity entries, ordered by ``entry_id``."""
+    activity_seq: int = 0
+    """The highest revision fetched, which the next fetch asks after."""
+    activity_gap: bool = False
+    """Whether entries older than those held were left out."""
+    lines: tuple[LineSummary, ...] = ()
+    editor: Editor = field(default_factory=Editor)
+    history: History = field(default_factory=History)
+    suggestions: tuple[Suggestion, ...] = ()
+    selected: int = 0
+    """The highlighted suggestion."""
+    pane: Pane = Pane.ACTIVITY
+    overlay: Overlay = Overlay.NONE
+    picked: int = 0
+    """The highlighted line in the line list."""
+    scroll: int = 0
+    """Transcript rows hidden below the bottom of the view."""
+    notice: str = ""
+    alarm: bool = False
+    """Whether the notice reports a failure."""
+    now: float = 0.0
+    polled_at: float | None = None
+    quit_armed_at: float | None = None
+    known_questions: frozenset[str] | None = None
+    """Questions already seen, or ``None`` before the first view, so that only a
+    question that arrives while attached rings the bell."""
+    finished: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.line_id:
+            raise ValueError("a client attaches to a line")
+        if not self.poll_seconds > 0:
+            raise ValueError("poll_seconds must be positive")
+
+    @property
+    def running(self) -> bool:
+        return self.view is not None and self.view.line.running
+
+    @property
+    def poll_interval(self) -> float:
+        if self.running:
+            return max(self.poll_seconds / RUNNING_POLL_DIVISOR, MIN_POLL_SECONDS)
+        return self.poll_seconds
+
+
+# Events, which a runtime feeds to ``update``.
+
+
+@dataclass(frozen=True, slots=True)
+class Tick:
+    now: float
+
+
+@dataclass(frozen=True, slots=True)
+class Resized:
+    width: int
+    height: int
+
+
+@dataclass(frozen=True, slots=True)
+class Pressed:
+    key: Key
+
+
+@dataclass(frozen=True, slots=True)
+class Wheel:
+    rows: int
+    """Rows to scroll, back toward older rows when positive."""
+
+
+@dataclass(frozen=True, slots=True)
+class ViewLoaded:
+    line_id: str
+    view: View
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityLoaded:
+    line_id: str
+    page: ActivityPage
+
+
+@dataclass(frozen=True, slots=True)
+class LinesLoaded:
+    lines: tuple[LineSummary, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Done:
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class Failed:
+    text: str
+
+
+type Event = (
+    Tick
+    | Resized
+    | Pressed
+    | Wheel
+    | ViewLoaded
+    | ActivityLoaded
+    | LinesLoaded
+    | Done
+    | Failed
+)
+
+
+# Effects, which ``update`` asks a runtime to perform.
+
+
+@dataclass(frozen=True, slots=True)
+class FetchView:
+    line_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class FetchActivity:
+    line_id: str
+    after: int
+
+
+@dataclass(frozen=True, slots=True)
+class FetchLines:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class Request:
+    command: DaemonCommand
+    line_id: str
+    operator: str
+
+
+@dataclass(frozen=True, slots=True)
+class Bell:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class Exit:
+    pass
+
+
+type Effect = FetchView | FetchActivity | FetchLines | Request | Bell | Exit

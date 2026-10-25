@@ -393,16 +393,24 @@ def _sent(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 
 
 def _attach(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
-    from dromon.attach import Attachment
+    """Wire a platform, the shared runtime and the daemon's socket together."""
+    from dromon.ui.link import SocketDaemon
 
-    attachment = Attachment(paths, arguments.line_id, arguments.operator)
+    if not arguments.poll_seconds > 0:
+        print("dromon attach: --poll-seconds must be positive", file=sys.stderr)
+        return exits.USAGE
+    daemon = SocketDaemon(paths)
     if arguments.gui:
-        from dromon import gui
+        from dromon.ui import window
 
-        return gui.run(attachment, round(arguments.poll_seconds * 1000))
-    from dromon import tui
+        return window.run(
+            daemon, arguments.line_id, arguments.operator, arguments.poll_seconds
+        )
+    from dromon.ui import terminal
 
-    return tui.run(attachment, arguments.poll_seconds)
+    return terminal.run(
+        daemon, arguments.line_id, arguments.operator, arguments.poll_seconds
+    )
 
 
 def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:

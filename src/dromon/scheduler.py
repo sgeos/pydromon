@@ -50,12 +50,13 @@ import secrets
 import time
 import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, Protocol, cast
 
 from claude_agent_sdk import SdkMcpTool
 
+from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon.driver import MODELS, Driver, DriverError, Strategy
 from dromon import codex, grok
 from dromon.agents import LineTokens
@@ -225,6 +226,8 @@ class LineSpec:
     config: LineConfig = DEFAULT_CONFIG
     session_id: str | None = None
     """The engine session to resume, kept when a configuration change rebuilds it."""
+    observe: Observer = field(default=ignore, compare=False)
+    """Where the engine reports what it does during a turn, for attached clients."""
 
 
 type EngineFactory = Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], LineEngine]
@@ -265,6 +268,7 @@ def engine_factory(
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
                 protected=protected,
+                observe=spec.observe,
             )
         if driver.settings.engine == grok.ENGINE_NAME:
             if project_sandbox is not None or project_settings is not None:
@@ -288,6 +292,7 @@ def engine_factory(
                 protected=protected,
                 bridge=bridge,
                 line_token=token,
+                observe=spec.observe,
             )
         merged = merge([project_sandbox, spec.config.sandbox])
         return ClaudeCodeLine(
@@ -301,6 +306,7 @@ def engine_factory(
                 engine_settings.merge([project_settings, spec.config.settings]),
                 protected,
             ),
+            observe=spec.observe,
         )
 
     return build
@@ -396,6 +402,10 @@ class Scheduler:
         self._failed: set[str] = set()
         self._tick_seconds = tick_seconds
         self._running: dict[str, asyncio.Task[None]] = {}
+        self.activity = ActivityLog()
+        self._interrupted: set[str] = set()
+        """Lines whose turn an operator cancelled, until the turn task ends."""
+        """What each line's engine is doing, for attached clients. Not persisted."""
         self._sent: list[str] = []
         """Messages sent during the current tick, moved to the post office after it."""
         self._post_office: set[str] = {
@@ -1018,26 +1028,54 @@ class Scheduler:
 
     async def _turn(self, line_id: str, prompt: str, from_operator: bool) -> None:
         report: TurnReport | None = None
+        ending = "cancelled"
+        self.activity.record(line_id, ActivityKind.TURN_STARTED, prompt)
         try:
             report = await self.engine_for(line_id).run_turn(prompt)
             self.turn_reports.append((line_id, report))
             recorded = self._log.state.lines[line_id].engine_session
             if report.session_id and report.session_id != recorded:
                 self._log.append(LineSession(line_id, report.session_id))
+            ending = report.subtype
+            if report.interrupted_for is not None:
+                ending += f", interrupted by its driver: {report.interrupted_for}"
         except asyncio.CancelledError:
+            if line_id in self._interrupted:
+                ending = "interrupted by an operator"
             raise
         except Exception as error:  # noqa: BLE001
             # The boundary between the scheduler and an engine. Any engine failure
             # ends only this turn, and is reported rather than crashing the daemon.
             self._failed.add(line_id)
+            ending = f"failed: {error}"
             print(f"dromond: line {line_id} turn failed: {error}", file=sys.stderr)
         finally:
+            self._interrupted.discard(line_id)
+            self.activity.record(line_id, ActivityKind.TURN_ENDED, ending)
             if self._log.state.lines[line_id].state is LineState.RUNNING:
                 self._log.append(LineStateChanged(line_id, LineState.IDLE))
             self._running.pop(line_id, None)
             self._last_turn_end[line_id] = self._clock()
             self._work.set()
         self._apply_limits(line_id, from_operator, report)
+
+    def interrupt(self, line_id: str) -> bool:
+        """Cancel ``line_id``'s turn in flight, and say whether there was one.
+
+        The turn task is cancelled, so the engine's session or subprocess is closed
+        wherever it is. Mail the turn had already received stays delivered, and the
+        engine session resumes from what the engine itself recorded, which may include
+        part of the cancelled turn. An interrupted turn does not count toward the
+        line's limits, because it produced no report.
+        """
+        if line_id not in self._log.state.lines:
+            raise EventRejected(f"no line {line_id}")
+        task = self._running.get(line_id)
+        if task is None or task.done():
+            return False
+        self._interrupted.add(line_id)
+        task.cancel()
+        return True
 
     def engine_for(self, line_id: str) -> LineEngine:
         """The line's engine, built on first use and kept for the session's life."""
@@ -1053,6 +1091,7 @@ class Scheduler:
                 Strategy(line.strategy),
                 config,
                 line.engine_session,
+                self.activity.observer(line_id),
             )
             engine = self._engine_factory(
                 spec,
