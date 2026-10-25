@@ -37,13 +37,17 @@ one `EventLog` per project, as its single writer.
 
 ## Open
 
-- **With the operator, by task 4.** Which loop drives Claude Opus 5.5, the Claude Agent
-  SDK as proposed in the design, or Dromon's own loop calling the model directly.
+- **With the operator, by task 4.** The operator prefers Dromon's own loop if it can run
+  on a subscription. Anthropic's terms, read on 2026-10-25 and quoted in the design, allow
+  subscription sign-in only for the unmodified Claude Code binary, so the own loop needs
+  an API key. The choice is the Claude Code binary on the subscription first, the own
+  loop on an API key first, or both.
 - **Worst-case time unit.** Keleusma's README states pipelined cycles, and the
   `pykeleusma` line reports unitless nominal cost units for `wcet_per_iteration`.
   Recorded in the integration document and not needed before the batched loop.
 - **Event log debt.** `read_entries` loads the whole log into memory. There is no
-  compaction or schema migration yet. Events for configuration, turns and conversation
+  compaction or schema migration yet, and by the operator's decision such standard
+  features land with the task that first needs them. Events for configuration, turns and conversation
   limits arrive with tasks 7 and 9. All are listed in the specification.
 - **Interline and Dromon overlap.** Once layer 1 messaging works, decide whether
   Dromon retires interline or keeps it for sessions Dromon does not drive.

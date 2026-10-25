@@ -13,6 +13,10 @@ All notable changes are recorded here. The format follows
 - `CLAUDE.md` states that dates in tracked files are in Coordinated Universal Time.
 - The design records two operator decisions. The protocol specification is drafted in
   this repository, and the first adapter targets Claude Opus 5.5.
+- The design records what Anthropic's terms allow for subscription sign-in, the open
+  choice of the first adapter that follows from it, and that standard harness features
+  such as compaction land with the task that first needs them.
+- `docs/process/HANDOFF.md` names the interline line `pydromon` as this line's mailbox.
 - Roadmap task 1 is done. The seed was checked against Appendix B and nothing conflicts.
 
 ### Added

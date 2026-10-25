@@ -37,4 +37,9 @@ access was tested with two connections in one process, not with two processes.
 store, after reading its protocol and client. The inbox was empty. Checks are manual,
 since no hooks are installed. Details are in `HANDOFF.md`.
 
+**Engine and features, a later prompt on the same day.** The operator's preferred own
+loop cannot run on a subscription under Anthropic's published terms, so the choice of
+first adapter returns to the operator, as recorded in the design. Standard features such
+as compaction land with the task that first needs them.
+
 **Next.** Task 3, the daemon skeleton.
