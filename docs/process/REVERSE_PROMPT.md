@@ -40,3 +40,28 @@ and the three live tests passing on Haiku 5.5. Ruff and pyright strict clean. A 
 started on a real project file created its declared line.
 
 **Next.** Task 10, continuous integration.
+
+## 2026-10-25, task 10, continuous integration
+
+**Blocked.** The workflow is written and committed on `ci/github-actions`, but GitHub
+refused the push. Fact, from the push error, the GitHub command-line token has the
+scopes `repo`, `gist`, `read:org` and `admin:public_key` and lacks `workflow`, which
+GitHub requires for any change under `.github/workflows`. Granting it needs the
+operator, through `gh auth refresh -h github.com -s workflow`. This line stopped there.
+
+- **Review.** Codex pins actions to commit hashes and checks out without persisting
+  credentials, and runs formatting and lint on Linux, macOS and Windows. goose adds
+  OpenSSF Scorecard and Dependabot. Aider tests five Python versions on Ubuntu with
+  tag-pinned actions. pykeleusma, this family's model, pins hashes, reads only and
+  tests Python 3.12 and 3.15 on Linux and macOS.
+- **Workflow.** Ruff, Pyright and pytest with warnings as errors, socket tests included,
+  on Ubuntu and macOS for Python 3.12 and 3.15. A read-only token, no secrets, pinned
+  actions, cancelled superseded runs and a 30-minute timeout. Live tests do not run,
+  because they need the operator's subscription.
+- **Dependabot** proposes action updates weekly, after a seven-day cooldown. Python
+  dependencies stay pinned by hand.
+- **Decision open to review.** The pins are the releases pykeleusma already runs rather
+  than releases three days old, by the cooldown's reasoning.
+
+**Verification.** actionlint reports the workflow clean. The workflow has not run, so
+whether the jobs pass on GitHub's runners is unverified. The local gate passes.

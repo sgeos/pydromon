@@ -62,12 +62,13 @@ Many stream processors on one thread, each resumed at most once per tick.
 - **Needs.** The verified worst-case time and memory, readable from Python for each VM.
   The scheduler uses them to budget a tick. This is now `pykeleusma` task 5b, as
   `vm.wcet_per_iteration` and `vm.arena_capacity`.
-- **Open.** The unit of the time figure. Keleusma's README states worst-case execution
-  time in pipelined cycles. The `pykeleusma` line reports that `wcet_per_iteration` is in
-  unitless nominal cost units, which need a calibrated cost model to become cycles or
-  seconds. Both statements are reported here and neither was checked by this line. A
-  tick budget can compare figures from different processors without settling the unit,
-  but it cannot be set in wall-clock time until the unit is settled.
+- **Reported.** The unit of the time figure. The `pykeleusma` line reported on
+  2026-10-25, as a correction from the operator, that Keleusma 0.2.2 counts time in
+  nominal cycles, the pipelined-cycle costs of its nominal cost model. They are not the
+  cycles of any particular processor and not seconds, and no calibrated cost model
+  ships, so converting the figure to time is the host's task. This line has not checked
+  the claim against the Keleusma book. A tick budget cannot be set in wall-clock time
+  until a calibration exists.
 - **Caveat.** Neither figure covers Python, the binding's conversions or the host's own
   work. The model call in particular stays outside every bound.
 
@@ -144,8 +145,8 @@ as a deficiency and requests shared data support. The reply
 `shared=` buffer to `call`, `resume` and `stream`, and corrects the request's premise
 about private data, which this line then confirmed.
 
-**Fact.** One decision of each packaged driver has a worst-case time of 81 nominal cost
-units, measured on 2026-10-25 for driver interface 2.
+**Fact.** One decision of each packaged driver has a worst-case time of 81 nominal
+cycles, measured on 2026-10-25 for driver interface 2.
 
 ## Questions for the pykeleusma line, with its answers
 
@@ -157,7 +158,7 @@ against Keleusma 0.2.3 and were not reproduced by this line.
    memory? **Yes, with no limit beyond memory.** A probe of 1,000 VMs resumed in turn
    on one thread completed every step. Each VM must stay on its creating thread.
 2. Can the verified worst-case figures be exposed to Python, and in which units?
-   **Yes**, as task 5b. Memory is in bytes and time is in nominal cost units, as
+   **Yes**, as task 5b. Memory is in bytes and time is in nominal cycles, as
    discussed under use 3.
 3. Does Keleusma 0.2.2 accept the tagged-tuple encoding, and if not, what shape does it
    prefer? **Mostly**, with the constraints listed under events and actions.
