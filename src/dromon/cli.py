@@ -544,7 +544,7 @@ def _teacher(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     try:
         if action == "up":
             print(f"dromon teacher: loading {config.teacher.model}")
-            found = teacher.up()
+            found = teacher.up(force=arguments.force)
         elif action == "down":
             found = teacher.down()
         else:
@@ -779,6 +779,11 @@ def build_parser() -> argparse.ArgumentParser:
                 nargs="?",
                 default="status",
                 help="default %(default)s",
+            )
+            command.add_argument(
+                "--force",
+                action="store_true",
+                help="load the model even when too little memory is available",
             )
         if name == "questions":
             command.add_argument(

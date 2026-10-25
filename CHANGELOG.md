@@ -43,6 +43,10 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- `dromon teacher up` checks available memory before loading a model, on macOS from
+  `kern.memorystatus_level` and on Linux from `MemAvailable`, and refuses below the
+  model's size plus `memory_headroom_gb`, 4 by default, unless given `--force`. `status`
+  reports available memory.
 - External agents, specified by `docs/protocol/AGENTS.md`. Another harness starts
   `dromon mcp --agent NAME` as an MCP server and reaches the daemon as the party
   `&name`, with its own mailbox, through a separate agent socket. The project file's

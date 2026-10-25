@@ -13,6 +13,13 @@ is the operator's decision. The model is then loaded with the declared context, 
 request that omits it inherits the server's default, which a project measured at eight
 times what its prompts needed.
 
+Memory. A teacher can need most of a host's memory, and a project recorded its host
+crashing when memory ran out. Before loading, ``up`` compares the memory the operating
+system reports as available, on macOS ``kern.memorystatus_level`` of the physical memory
+and on Linux ``MemAvailable``, with the model's size plus ``memory_headroom_gb``, and
+refuses unless forced. Free pages alone understate what the system can reclaim, so
+they are not used. Where neither source exists the check is skipped and said to be.
+
 Releasing it. ``down`` unloads the model, and stops the server only if Dromon started
 it, so a server the operator runs, such as the desktop application's, is never stopped.
 
@@ -63,11 +70,14 @@ class TeacherConfig:
     """How long Ollama keeps the model resident after its last request."""
     autostart: bool = False
     """Whether ``dromond`` brings the teacher up when it starts."""
+    memory_headroom_gb: float = 4.0
+    """Memory that must stay available beyond the model's size when it loads."""
 
 
 TEACHER_KEYS: Final = frozenset(
-    {"model", "endpoint", "context", "keep_alive", "autostart"}
+    {"model", "endpoint", "context", "keep_alive", "autostart", "memory_headroom_gb"}
 )
+MAX_HEADROOM_GB: Final = 1024.0
 
 
 def parse_teacher(value: object) -> TeacherConfig:
@@ -103,7 +113,56 @@ def parse_teacher(value: object) -> TeacherConfig:
     autostart = table.get("autostart", False)
     if type(autostart) is not bool:
         raise TeacherError("teacher.autostart must be a boolean")
-    return TeacherConfig(model, cast(str, endpoint), context, keep_alive, autostart)
+    headroom = table.get("memory_headroom_gb", 4.0)
+    if (
+        type(headroom) not in (int, float)
+        or not 0 <= cast(float, headroom) <= MAX_HEADROOM_GB
+    ):
+        raise TeacherError(
+            f"teacher.memory_headroom_gb must be a number in [0, {MAX_HEADROOM_GB:.0f}]"
+        )
+    return TeacherConfig(
+        model,
+        cast(str, endpoint),
+        context,
+        keep_alive,
+        autostart,
+        float(cast(float, headroom)),
+    )
+
+
+def available_memory() -> int | None:
+    """Bytes the operating system reports as available to a new process, or ``None``
+    where it reports nothing Dromon reads."""
+    meminfo = Path("/proc/meminfo")
+    if meminfo.exists():
+        for line in meminfo.read_text(encoding="ascii").splitlines():
+            if line.startswith("MemAvailable:"):
+                fields = line.split()
+                if len(fields) >= 2 and fields[1].isdigit():
+                    return int(fields[1]) * 1024
+        return None
+    try:
+        completed = subprocess.run(  # noqa: S603
+            ["/usr/sbin/sysctl", "-n", "kern.memorystatus_level", "hw.memsize"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except OSError:
+        return None
+    values = completed.stdout.split()
+    if (
+        completed.returncode != 0
+        or len(values) != 2
+        or not all(value.isdigit() for value in values)
+    ):
+        return None
+    percent, total = int(values[0]), int(values[1])
+    if not 0 <= percent <= 100:
+        return None
+    return total * percent // 100
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +175,8 @@ class TeacherStatus:
     context: int
     """The context Ollama reports for the loaded model, or 0 when it reports none."""
     started_by_dromon: bool
+    available_bytes: int | None = None
+    """Memory the operating system reports as available, or ``None`` if unknown."""
 
     def summary(self) -> str:
         if not self.reachable:
@@ -137,6 +198,8 @@ class TeacherStatus:
             if self.started_by_dromon
             else "server not started by Dromon"
         )
+        if self.available_bytes is not None:
+            parts.append(f"{self.available_bytes / 1e9:.1f} GB available")
         return ", ".join(parts)
 
 
@@ -203,6 +266,7 @@ class Teacher:
         sleep: Callable[[float], None] = time.sleep,
         command_of: Callable[[int], str | None] = _command_name,
         kill: Callable[[int, int], None] = os.kill,
+        memory: Callable[[], int | None] = available_memory,
     ) -> None:
         self.config = config
         self.runtime_dir = runtime_dir
@@ -213,6 +277,7 @@ class Teacher:
         self._sleep = sleep
         self._command_of = command_of
         self._kill = kill
+        self._memory = memory
 
     def _get(self, path: str) -> dict[str, object]:
         answer = self._transport("GET", self.config.endpoint + path, None, 5.0)
@@ -255,8 +320,9 @@ class Teacher:
         pid = self._recorded_pid()
         started = pid is not None and self._alive(pid)
         version = self._version()
+        available = self._memory()
         if version is None:
-            return TeacherStatus(False, "", False, False, 0, 0, started)
+            return TeacherStatus(False, "", False, False, 0, 0, started, available)
         try:
             pulled = self._ours(self._names("/api/tags")) is not None
             loaded = self._ours(self._names("/api/ps"))
@@ -274,6 +340,7 @@ class Teacher:
             size if type(size) is int else 0,
             context if type(context) is int else 0,
             started,
+            available,
         )
 
     def _serve(self) -> None:
@@ -302,27 +369,30 @@ class Teacher:
             f"ollama serve did not answer within {SERVER_WAIT_SECONDS:.0f}s"
         )
 
-    def up(self) -> TeacherStatus:
+    def up(self, *, force: bool = False) -> TeacherStatus:
         """Bring the teacher up and return its status. Raises ``TeacherError``, after
-        stopping a server this call started, so a failed attempt leaves none behind."""
+        stopping a server this call started, so a failed attempt leaves none behind.
+        ``force`` skips the memory check."""
         started = False
         if self._version() is None:
             self._serve()
             started = True
         try:
-            return self._load()
+            return self._load(force)
         except TeacherError:
             if started:
                 self._stop_server()
             raise
 
-    def _load(self) -> TeacherStatus:
+    def _load(self, force: bool) -> TeacherStatus:
         current = self.status()
         if not current.pulled:
             raise TeacherError(
                 f"the model {self.config.model} is not pulled. Pull it with"
                 f" `ollama pull {self.config.model}`, which downloads it"
             )
+        if not current.loaded and not force:
+            self._check_memory(current.available_bytes)
         body: dict[str, object] = {
             "model": self.config.model,
             "prompt": "",
@@ -345,6 +415,25 @@ class Teacher:
         if not loaded.loaded:
             raise TeacherError(f"the teacher reports {self.config.model} as not loaded")
         return loaded
+
+    def _check_memory(self, available: int | None) -> None:
+        """Refuse to load when available memory is below the model's size plus the
+        headroom. An unknown amount is not a refusal, and ``status`` shows it as
+        absent."""
+        if available is None:
+            return
+        entry = self._ours(self._names("/api/tags")) or {}
+        size = entry.get("size", 0)
+        needed = (size if type(size) is int else 0) + int(
+            self.config.memory_headroom_gb * 1e9
+        )
+        if available < needed:
+            raise TeacherError(
+                f"only {available / 1e9:.1f} GB of memory is available, and"
+                f" {self.config.model} needs {needed / 1e9:.1f} GB with"
+                f" {self.config.memory_headroom_gb:g} GB of headroom. Free memory, or"
+                " pass --force to load it anyway"
+            )
 
     def down(self) -> TeacherStatus:
         """Unload the model, and stop the server if Dromon started it."""

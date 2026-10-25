@@ -19,6 +19,8 @@ from dromon.teacher import (
 )
 
 MODEL = "qwen3:30b-a3b-instruct-2507-q4_K_M"
+MODEL_BYTES = 18_556_699_186
+PLENTY = 30_000_000_000
 
 
 class FakeOllama:
@@ -47,7 +49,8 @@ class FakeOllama:
         if path.endswith("/api/version"):
             return {"version": "0.40.10"}
         if path.endswith("/api/tags"):
-            return {"models": [{"name": MODEL, "model": MODEL}] if self.pulled else []}
+            entry = {"name": MODEL, "model": MODEL, "size": MODEL_BYTES}
+            return {"models": [entry] if self.pulled else []}
         if path.endswith("/api/ps"):
             return {"models": [self.loaded] if self.loaded else []}
         if path.endswith("/api/generate"):
@@ -88,7 +91,9 @@ class FakeOllama:
         self.running = False
 
 
-def teacher(fake: FakeOllama, runtime: Path, **table: object) -> Teacher:
+def teacher(
+    fake: FakeOllama, runtime: Path, *, memory: int | None = PLENTY, **table: object
+) -> Teacher:
     config = parse_teacher({"model": MODEL, **table})
     ticks = iter(range(100_000))
     return Teacher(
@@ -101,6 +106,7 @@ def teacher(fake: FakeOllama, runtime: Path, **table: object) -> Teacher:
         sleep=lambda seconds: None,
         command_of=fake.command_of,
         kill=fake.kill,
+        memory=lambda: memory,
     )
 
 
@@ -255,6 +261,58 @@ def test_status_reports_an_unreachable_server(tmp_path: Path) -> None:
     found = teacher(FakeOllama(running=False), tmp_path).status()
     assert not found.reachable
     assert found.summary() == "server not reachable"
+
+
+# Memory.
+
+
+def test_up_refuses_without_room_for_the_model_and_its_headroom(
+    tmp_path: Path,
+) -> None:
+    short = MODEL_BYTES + 3_000_000_000
+    fake = FakeOllama()
+    with pytest.raises(TeacherError, match="only 21.6 GB of memory is available"):
+        teacher(fake, tmp_path, memory=short).up()
+    assert fake.loaded is None
+    assert teacher(fake, tmp_path, memory=short, memory_headroom_gb=2).up().loaded
+
+
+def test_force_loads_anyway_and_a_loaded_model_needs_no_room(tmp_path: Path) -> None:
+    fake = FakeOllama()
+    assert teacher(fake, tmp_path, memory=1).up(force=True).loaded
+    assert teacher(fake, tmp_path, memory=1).up().loaded
+
+
+def test_unknown_memory_does_not_refuse(tmp_path: Path) -> None:
+    found = teacher(FakeOllama(), tmp_path, memory=None).up()
+    assert found.loaded and found.available_bytes is None
+    assert "available" not in found.summary()
+
+
+def test_a_refused_load_stops_a_server_it_started(tmp_path: Path) -> None:
+    fake = FakeOllama(running=False)
+    with pytest.raises(TeacherError, match="Free memory, or pass --force"):
+        teacher(fake, tmp_path, memory=1).up()
+    assert fake.signals == [(4242, 15)]
+
+
+def test_status_reports_available_memory(tmp_path: Path) -> None:
+    found = teacher(FakeOllama(), tmp_path).status()
+    assert found.available_bytes == PLENTY
+    assert found.summary().endswith("30.0 GB available")
+
+
+@pytest.mark.parametrize("value", [-1, 2000, True, "4"])
+def test_a_bad_headroom_is_refused(value: object) -> None:
+    with pytest.raises(TeacherError, match="memory_headroom_gb must be"):
+        parse_teacher({"model": MODEL, "memory_headroom_gb": value})
+
+
+def test_this_host_reports_its_available_memory() -> None:
+    from dromon.teacher import available_memory
+
+    found = available_memory()
+    assert found is None or found > 0
 
 
 # The daemon and the client.
