@@ -9,7 +9,7 @@ completed, moved or abandoned.
 
 ## State on 2026-10-25
 
-- **Tasks 1 to 9 done.**
+- **Tasks 1 to 10 done. Milestone 0.1.0 is complete.**
   - `model.py`, `codec.py` and `eventlog.py` hold the data model as nine event kinds in
     an append-only SQLite log. Operators are parties addressed as `@name`.
   - `relay.py` forwards operator messages. Replies will come through inbound adapters
@@ -52,15 +52,16 @@ completed, moved or abandoned.
 - **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310, and
   `pykeleusma` from its repository at `19d4558`, which needs a Rust toolchain to build.
 - **Published.** The public GitHub repository `sgeos/pydromon`, licensed 0BSD, on an
-  HTTPS remote that uses the GitHub command-line tool as its credential helper. No
-  continuous integration is configured.
+  HTTPS remote that uses the GitHub command-line tool as its credential helper.
+  `.github/workflows/ci.yml` runs Ruff, Pyright and pytest on Ubuntu and macOS for
+  Python 3.12 and 3.15. Live tests run only locally.
 - **Commands.** Every planned subcommand is implemented.
 - **pykeleusma.** Its tasks 2, 3 and 10 are done. Python cannot yet drive a script,
   because `call` and `resume` are its open task 5. Dromon's 0.1.0 does not depend on it.
 
 ## Next step
 
-Task 10 of [`../roadmap/V0_1_0.md`](../roadmap/V0_1_0.md), continuous integration.
+Milestone 0.1.0 is complete. The next milestone awaits the operator's direction.
 
 ## Open
 
@@ -70,9 +71,8 @@ Task 10 of [`../roadmap/V0_1_0.md`](../roadmap/V0_1_0.md), continuous integratio
   reason to move appears. Adopting task 11 means repinning `pykeleusma`.
 - **Subscription usage.** Anthropic's terms assume ordinary, individual use of Pro and
   Max plans. Many lines running continuously may exceed that.
-- **Event log debt.** `read_entries` loads the whole log into memory. There is no
-  compaction or schema migration yet, and by the operator's decision such standard
-  features land with the task that first needs them. Conversation-limit counts reset
+- **Event log debt.** `read_entries` loads the whole log into memory, with no
+  compaction or schema migration yet. Conversation-limit counts reset
   on restart.
 - **Operator relays.** The operator requires a response path through inbound adapters
   registered with the daemon and configured per channel, with the design deferred. Its
@@ -81,11 +81,9 @@ Task 10 of [`../roadmap/V0_1_0.md`](../roadmap/V0_1_0.md), continuous integratio
 - **Line configuration debt.** MCP credentials in `env` and `headers` are stored in the
   event log, which is owner-only. References to secrets held elsewhere are not yet
   specified.
-- **Daemon debt.** No peer credential check on connections, no relay forwarding passes
-  yet, and the event log's SQLite calls run on the event loop thread. Driver state
-  lives only in memory, while engine sessions are recorded. Notes to an operator are delivered when `dromon mail` lists them or a
-  relay forwards them. All are recorded
-  in `CLIENT.md` or the module documentation.
+- **Daemon debt.** No peer credential check on connections, no relay forwarding, and
+  SQLite calls on the event loop thread. Driver state lives only in memory. All are
+  recorded in `CLIENT.md` or the module documentation.
 - **Operator direction, recorded in the design.** Configuration may grow as large as a
   project needs. The client protocol later needs pushed updates and remote clients.
 - **Project file debt.** No user or managed layer, and no references to secrets held

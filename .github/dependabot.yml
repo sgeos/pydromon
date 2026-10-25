@@ -1,0 +1,12 @@
+# Proposes updates to the pinned actions. Each proposal is a pull request that CI
+# checks and the operator reviews. The cooldown keeps a release out until it has had
+# a week to be noticed if it is bad. Python dependencies are pinned exactly by
+# decision, so they are updated by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

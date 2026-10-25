@@ -43,6 +43,10 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Continuous integration, roadmap task 10. `.github/workflows/ci.yml` runs Ruff,
+  Pyright and pytest, socket tests included, on Linux and macOS for Python 3.12 and
+  3.15. Actions are pinned to commit hashes, the token is read-only, checkout keeps no
+  credentials, and Dependabot proposes action updates after a seven-day cooldown.
 - Per-project configuration in `.dromon/dromon.toml`, specified by
   `docs/protocol/PROJECT_CONFIG.md`. It declares lines through reusable profiles, with
   per-line limits and wake policy, and is validated strictly with located errors.

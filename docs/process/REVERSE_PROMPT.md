@@ -40,3 +40,29 @@ and the three live tests passing on Haiku 5.5. Ruff and pyright strict clean. A 
 started on a real project file created its declared line.
 
 **Next.** Task 10, continuous integration.
+
+## 2026-10-25, task 10, continuous integration
+
+**Done.** The push was first blocked because the GitHub token lacked the `workflow`
+scope. The operator granted it in session, and the work landed as pull request #19.
+
+- **Review.** Codex pins actions to commit hashes and checks out without persisting
+  credentials, and runs formatting and lint on Linux, macOS and Windows. goose adds
+  OpenSSF Scorecard and Dependabot. Aider tests five Python versions on Ubuntu with
+  tag-pinned actions. pykeleusma, this family's model, pins hashes, reads only and
+  tests Python 3.12 and 3.15 on Linux and macOS.
+- **Workflow.** Ruff, Pyright and pytest with warnings as errors, socket tests included,
+  on Ubuntu and macOS for Python 3.12 and 3.15. A read-only token, no secrets, pinned
+  actions, cancelled superseded runs and a 30-minute timeout. Live tests do not run,
+  because they need the operator's subscription.
+- **Dependabot** proposes action updates weekly, after a seven-day cooldown. Python
+  dependencies stay pinned by hand.
+- **Caught on the first run.** Pull request #18 had merged a test file with a trailing
+  blank line, added by a scripted edit after the local format check. It is fixed here.
+- **Decision open to review.** The pins are the releases pykeleusma already runs rather
+  than releases three days old, by the cooldown's reasoning.
+
+**Verification.** All four jobs pass, each with 574 tests passed and the 3 live tests
+deselected. actionlint reports the workflow clean.
+
+**Next.** Milestone 0.1.0 is complete. The next milestone awaits the operator.
