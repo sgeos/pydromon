@@ -17,14 +17,14 @@ user and project settings, such as an ``apiKeyHelper``, out of the line. Managed
 settings still apply. Dromon never reads, stores or forwards the sign-in token, which
 stays in Claude Code's keychain entry, as Anthropic's terms require.
 
-Tool isolation. A line sees only the tools it is given. ``tools`` lists the built-in
-tools, empty by default. ``mcp_tools`` are in-process tools served by Dromon, such as
-``send_message``. ``strict_mcp_config=True`` keeps every other MCP server out, which
-matters because a claude.ai login otherwise brings the account's connectors, such as
-mail and file sharing, into the session. No tool is approved in advance. Every call
-reaches the line's permission gate, which allows exactly the given tools and denies
-everything else, and a turn whose engine reports any tool beyond the given ones is
-interrupted and refused.
+Tool isolation. A line's tools come from its ``LineConfig``: the built-in tools it
+lists, the MCP servers it names, and Dromon's own in-process tools such as
+``send_message``. ``strict_mcp_config=True`` keeps every other MCP server out unless
+the configuration sets ``inherit_account_mcp``, which matters because a claude.ai login
+otherwise brings the account's connectors, such as mail and file sharing, into the
+session. No tool is approved in advance. Every call reaches the line's permission gate,
+which applies the configuration's policy, and a turn whose engine offers a built-in
+tool or an MCP server the configuration does not name is interrupted and refused.
 
 Failure modes. A refusal by the policy or the driver raises ``EngineRefused`` after the
 turn is interrupted. A driver failure raises ``DriverError``. Engine and transport
@@ -44,6 +44,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     McpSdkServerConfig,
+    McpServerConfig,
     Message,
     PermissionResultAllow,
     PermissionResultDeny,
@@ -58,6 +59,7 @@ from claude_agent_sdk import (
 )
 
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
+from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
 
 MCP_SERVER_NAME: Final = "dromon"
 """The name of the in-process MCP server that serves a line's Dromon tools."""
@@ -206,20 +208,28 @@ type PermissionGate = Callable[
 ]
 
 
-def permission_gate(allowed: frozenset[str]) -> PermissionGate:
-    """A gate that allows exactly ``allowed`` and denies every other tool call."""
+def permission_gate(config: LineConfig, own_tools: frozenset[str]) -> PermissionGate:
+    """A gate that applies ``config``'s policy and denies every other tool call."""
 
     async def gate(
         tool_name: str, tool_input: dict[str, Any], context: ToolPermissionContext
     ) -> PermissionResultAllow | PermissionResultDeny:
         del tool_input, context
-        if tool_name in allowed:
+        if config.allows(tool_name, own_tools):
             return PermissionResultAllow()
         return PermissionResultDeny(
             message=f"{tool_name} is not available to this line"
         )
 
     return gate
+
+
+def mcp_server_of(tool_name: str) -> str | None:
+    """The server an MCP tool name belongs to, or ``None`` for a built-in tool."""
+    if not tool_name.startswith("mcp__"):
+        return None
+    server, separator, _ = tool_name.removeprefix("mcp__").partition("__")
+    return server if separator else None
 
 
 def mcp_tool_name(tool: SdkMcpTool[object]) -> str:
@@ -230,9 +240,9 @@ def mcp_tool_name(tool: SdkMcpTool[object]) -> str:
 class ClaudeCodeLine:
     """One session line on the Claude Code engine, with its driver.
 
-    ``tools`` lists the built-in tools the line may use, and ``mcp_tools`` the
-    in-process tools Dromon serves it. Both are empty by default, so a line does
-    nothing but converse until its tools are configured deliberately.
+    ``config`` gives the line's built-in tools, MCP servers and tool policy, and
+    ``mcp_tools`` the in-process tools Dromon serves it. Both are empty by default, so
+    a line does nothing but converse until its tools are configured deliberately.
     """
 
     def __init__(
@@ -240,7 +250,7 @@ class ClaudeCodeLine:
         driver: Driver,
         cwd: Path,
         *,
-        tools: Sequence[str] = (),
+        config: LineConfig = DEFAULT_CONFIG,
         mcp_tools: Sequence[SdkMcpTool[object]] = (),
         session_id: str | None = None,
         environment: Mapping[str, str] | None = None,
@@ -248,33 +258,35 @@ class ClaudeCodeLine:
     ) -> None:
         self.driver = driver
         self.cwd = cwd
-        self.tools = tuple(tools)
+        self.config = config
         self.mcp_tools = tuple(mcp_tools)
         self.session_id = session_id
         self._environment = os.environ if environment is None else environment
         self._session_factory = session_factory
 
     @property
-    def expected_tools(self) -> frozenset[str]:
-        """Every tool name the engine may report for this line."""
-        return frozenset(self.tools) | {mcp_tool_name(tool) for tool in self.mcp_tools}
+    def own_tools(self) -> frozenset[str]:
+        """The names of Dromon's in-process tools for this line."""
+        return frozenset(mcp_tool_name(tool) for tool in self.mcp_tools)
 
     def options(self) -> ClaudeAgentOptions:
         settings = self.driver.settings
         effort = settings.effort
         if effort not in ("low", "medium", "high", "xhigh", "max"):
             raise EngineRefused(f"the driver names an unknown effort {effort!r}")
-        servers: dict[str, McpSdkServerConfig] = {}
+        servers: dict[str, McpSdkServerConfig | dict[str, object]] = {
+            name: server.sdk_config() for name, server in self.config.mcp_servers
+        }
         if self.mcp_tools:
             servers[MCP_SERVER_NAME] = create_sdk_mcp_server(
                 MCP_SERVER_NAME, tools=list(self.mcp_tools)
             )
         return ClaudeAgentOptions(
             model=settings.model,
-            tools=list(self.tools),
-            mcp_servers=dict(servers),
-            strict_mcp_config=True,
-            can_use_tool=permission_gate(self.expected_tools),
+            tools=list(self.config.builtin_tools),
+            mcp_servers=cast(dict[str, McpServerConfig], servers),
+            strict_mcp_config=not self.config.inherit_account_mcp,
+            can_use_tool=permission_gate(self.config, self.own_tools),
             setting_sources=[],
             max_turns=settings.max_turns,
             effort=effort,
@@ -346,9 +358,20 @@ class ClaudeCodeLine:
         if turn.refusal is not None:
             await session.interrupt()
 
+    def _offered_as_configured(self, tool_name: str) -> bool:
+        """Whether the engine may offer ``tool_name`` under this configuration."""
+        server = mcp_server_of(tool_name)
+        if server is None:
+            return tool_name in self.config.builtin_tools
+        if server == MCP_SERVER_NAME:
+            return tool_name in self.own_tools
+        return server in self.config.server_names() or self.config.inherit_account_mcp
+
     def _refusal(self, capabilities: Capabilities, turn: _Turn) -> str | None:
         """Why the driver or the policy refuses this engine, or ``None`` to proceed."""
-        unexpected = sorted(set(capabilities.tools) - self.expected_tools)
+        unexpected = sorted(
+            name for name in capabilities.tools if not self._offered_as_configured(name)
+        )
         if unexpected:
             return "the engine offers tools the line was not given: " + ", ".join(
                 unexpected

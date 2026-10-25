@@ -21,11 +21,15 @@ completed, moved or abandoned.
     Opus 5.5 and Haiku 5.5, each with a subscription, an API and a flexible strategy
     baked in, by the operator's decision. `dromon probe` reports capabilities and
     defaults to Haiku 5.5, the least expensive model, which tests also use.
-  - `scheduler.py` wakes idle lines when messages arrive and delivers pending messages
-    in one turn. Lines send through an in-process `send_message` tool, operators
-    through `dromon create` and `dromon send`. Lines are isolated from a claude.ai
-    login's connectors by `strict_mcp_config` and an allow-only permission gate.
-  - `docs/protocol/` holds `EVENT_LOG.md`, `CLIENT.md`, `RELAY.md` and `DRIVER.md`.
+  - `scheduler.py` runs ticks, by the operator's decision. A message sent in one tick is
+    received no sooner than the next, and messages never interrupt a turn. Lines send
+    through an in-process `send_message` tool, operators through `dromon send`.
+  - `lineconfig.py` gives each line its built-in tools, arbitrary MCP servers and an
+    allow-all or allowlist policy, by the operator's decision, stored as
+    `line_configured`. The default is no tools beyond Dromon's own, with strict MCP
+    configuration, so a claude.ai login's connectors stay out.
+  - `docs/protocol/` holds `EVENT_LOG.md`, `CLIENT.md`, `RELAY.md`, `DRIVER.md` and
+    `LINE_CONFIG.md`.
 - **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310, and
   `pykeleusma` from its repository at `19d4558`, which needs a Rust toolchain to build.
 - **Published.** The public GitHub repository `sgeos/pydromon`, licensed 0BSD, on an
@@ -41,14 +45,17 @@ completed, moved or abandoned.
 ## Next step
 
 Task 6 of [`../roadmap/V0_1_0.md`](../roadmap/V0_1_0.md), operator questions. Add an
-`ask_operator` tool beside `send_message` that sends a question to an operator, wire
-`dromon questions` and `dromon answer`, let an answer wake the asking line, and confirm
-an open question survives a daemon restart.
+`ask_operator` tool beside `send_message` that sends a question to an operator, keep the
+queue in the daemon, wire `dromon questions` and `dromon answer`, let an answer wake the
+asking line in the next tick, and confirm an open question survives a restart. The
+operator wants the client to grow a graphical interface, or a launcher for one, with
+many attached to different lines at once, which roadmap task 8 now states.
 
 ## Open
 
-- **pykeleusma shared data.** Accepted by the `pykeleusma` line as its task 11, with a
-  `shared=` buffer on `call`, `resume` and `stream`. Private data persists once
+- **pykeleusma shared data.** Accepted by the `pykeleusma` line as its task 11. Its
+  later notice `pykeleusma-20261025-shared-data-update` says the VM now owns a zeroed
+  block that persists across calls, with an optional `shared=` buffer synced in and out. Private data persists once
   assigned, as confirmed here. Drivers keep host-carried state, by choice, until a
   reason to move appears. Adopting task 11 means repinning `pykeleusma`.
 - **Subscription usage.** Anthropic's terms say Pro and Max limits assume ordinary,
@@ -68,6 +75,9 @@ an open question survives a daemon restart.
   line asks by default belongs to per-project configuration.
 - **Interline and Dromon overlap.** Once layer 1 messaging works, decide whether
   Dromon retires interline or keeps it for sessions Dromon does not drive.
+- **Line configuration debt.** MCP credentials in `env` and `headers` are stored in the
+  event log, which is owner-only. References to secrets held elsewhere are not yet
+  specified.
 - **Daemon debt.** No peer credential check on connections, no relay forwarding passes
   yet, and the event log's SQLite calls run on the event loop thread. A line's engine
   session and driver state live only in memory, so a restarted daemon starts each line
@@ -92,7 +102,7 @@ its keychain token on 2026-10-24.
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 388 tests pass, 11 of them need sockets
+uv sync && uv run pytest    # 433 tests pass, 11 of them need sockets
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 

@@ -8,6 +8,7 @@ other subcommands are placeholders that report they are not implemented and exit
 import argparse
 import asyncio
 import getpass
+import json
 import re
 import sys
 from collections.abc import Callable, Sequence
@@ -28,6 +29,7 @@ PROBE_PROMPT: Final = "Reply with the single word: ready"
 SUBCOMMANDS: Final[dict[str, str]] = {
     "start": "start the daemon for this project",
     "create": "create a session line",
+    "configure": "replace a session line's tools, MCP servers and tool policy",
     "stop": "stop the daemon",
     "status": "show the daemon and its session lines",
     "attach": "open the interactive client",
@@ -68,7 +70,7 @@ def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         return exits.FAILURE
     result = response.result
     print(f"running, pid {result.get('pid')}, since {result.get('started_at')}")
-    print(f"project {result.get('project')}")
+    print(f"project {result.get('project')}, tick {result.get('tick')}")
     print(
         f"daemon {result.get('daemon_version')},"
         f" protocol {result.get('protocol_version')}"
@@ -167,17 +169,60 @@ def _request(
     return exits.OK
 
 
+def _config_document(arguments: argparse.Namespace) -> dict[str, object] | None:
+    """The configuration the tool options describe, or ``None`` if none was given.
+
+    An ``--mcp-config`` file is read here, by the operator's client, and its contents
+    travel to the daemon, which stores them in the event log, credentials included.
+    """
+    tools: list[str] = arguments.tool or []
+    allowed: list[str] = arguments.allow_tool or []
+    mcp_file: Path | None = arguments.mcp_config
+    allow_all: bool = arguments.allow_all_tools
+    inherit: bool = arguments.inherit_account_mcp
+    if not (tools or allowed or mcp_file or allow_all or inherit):
+        return None
+    document: dict[str, object] = {
+        "builtin_tools": tools,
+        "allowed_tools": allowed,
+        "tool_policy": "allow_all" if allow_all else "allowlist",
+        "inherit_account_mcp": inherit,
+    }
+    if mcp_file is not None:
+        document["mcp_servers"] = json.loads(mcp_file.read_text(encoding="utf-8"))
+    return document
+
+
 def _create(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
-    return _request(
-        paths,
-        "create",
-        Operation.CREATE_LINE,
-        {
-            "line_id": arguments.line_id,
-            "model": arguments.model,
-            "strategy": arguments.strategy,
-        },
-    )
+    args: dict[str, object] = {
+        "line_id": arguments.line_id,
+        "model": arguments.model,
+        "strategy": arguments.strategy,
+    }
+    try:
+        config = _config_document(arguments)
+    except (OSError, ValueError) as error:
+        print(
+            f"dromon create: cannot read the MCP configuration: {error}",
+            file=sys.stderr,
+        )
+        return exits.FAILURE
+    if config is not None:
+        args["config"] = config
+    return _request(paths, "create", Operation.CREATE_LINE, args)
+
+
+def _configure(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    try:
+        config = _config_document(arguments) or {}
+    except (OSError, ValueError) as error:
+        print(
+            f"dromon configure: cannot read the MCP configuration: {error}",
+            file=sys.stderr,
+        )
+        return exits.FAILURE
+    args: dict[str, object] = {"line_id": arguments.line_id, "config": config}
+    return _request(paths, "configure", Operation.CONFIGURE_LINE, args)
 
 
 def _send(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
@@ -197,6 +242,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "stop": _stop,
     "probe": _probe,
     "create": _create,
+    "configure": _configure,
     "send": _send,
 }
 
@@ -210,6 +256,33 @@ def _add_driver_options(command: argparse.ArgumentParser) -> None:
         choices=[strategy.value for strategy in Strategy],
         default=Strategy.SUBSCRIPTION.value,
         help="the driver's credential strategy, default %(default)s",
+    )
+
+
+def _add_tool_options(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
+        "--tool", action="append", help="a built-in tool such as Read, repeatable"
+    )
+    command.add_argument(
+        "--mcp-config",
+        type=Path,
+        default=None,
+        help="a JSON file of MCP servers, in the mcpServers shape",
+    )
+    command.add_argument(
+        "--allow-tool",
+        action="append",
+        help="an allowed tool name or mcp__server__*, repeatable",
+    )
+    command.add_argument(
+        "--allow-all-tools",
+        action="store_true",
+        help="allow every tool the engine offers, instead of an allowlist",
+    )
+    command.add_argument(
+        "--inherit-account-mcp",
+        action="store_true",
+        help="also load the account's MCP servers and claude.ai connectors",
     )
 
 
@@ -232,8 +305,9 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     for name, help_text in SUBCOMMANDS.items():
         command = commands.add_parser(name, help=help_text, description=help_text)
-        if name == "create":
-            command.add_argument("line_id", help="the new line's identifier")
+        if name in ("create", "configure"):
+            command.add_argument("line_id", help="the line's identifier")
+            _add_tool_options(command)
         if name in ("create", "probe"):
             _add_driver_options(command)
         if name == "send":

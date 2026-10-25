@@ -28,6 +28,7 @@ class Operation(StrEnum):
     STATUS = "status"
     STOP = "stop"
     CREATE_LINE = "create_line"
+    CONFIGURE_LINE = "configure_line"
     SEND = "send"
 
 

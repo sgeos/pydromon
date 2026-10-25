@@ -21,6 +21,7 @@ from dromon.model import (
     Address,
     Event,
     InvalidField,
+    LineConfigured,
     LineCreated,
     LineState,
     LineStateChanged,
@@ -44,6 +45,7 @@ body and choices whose every character needs a six-byte escape, stays under it."
 KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "line_created": ("line_id", "engine", "strategy"),
     "line_state_changed": ("line_id", "state"),
+    "line_configured": ("line_id", "config"),
     "operator_registered": ("operator_id",),
     "message_sent": (
         "message_id",
@@ -131,6 +133,8 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "line_id": event.line_id,
                 "state": event.state.value,
             }
+        case LineConfigured():
+            return "line_configured", {"line_id": event.line_id, "config": event.config}
         case OperatorRegistered():
             return "operator_registered", {"operator_id": event.operator_id}
         case MessageSent():
@@ -175,6 +179,8 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
             return LineStateChanged(
                 _str(data, "line_id"), _member(data, "state", LineState)
             )
+        case "line_configured":
+            return LineConfigured(_str(data, "line_id"), _str(data, "config"))
         case "operator_registered":
             return OperatorRegistered(_str(data, "operator_id"))
         case "message_sent":

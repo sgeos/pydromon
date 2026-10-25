@@ -15,6 +15,7 @@ from claude_agent_sdk import SdkMcpTool
 from dromon.driver import DriverError, Strategy
 from dromon.engine import TurnReport
 from dromon.eventlog import EventLog, read_entries
+from dromon.lineconfig import LineConfig, ToolPolicy, encode_config
 from dromon.model import (
     LineAddress,
     LineState,
@@ -39,7 +40,11 @@ type Turn = list[dict[str, Any]]
 class Scripted:
     """A line engine that makes scripted tool calls and records its prompts."""
 
-    def __init__(self, tool: SdkMcpTool[Any], turns: list[Turn]) -> None:
+    def __init__(
+        self, tool: SdkMcpTool[Any], turns: list[Turn], spec: LineSpec | None = None
+    ) -> None:
+        self.spec = spec
+        self.session_id: str | None = spec.session_id if spec is not None else None
         self.tool = tool
         self.turns = turns
         self.prompts: list[str] = []
@@ -54,6 +59,7 @@ class Scripted:
         if self.fail:
             raise RuntimeError("the engine broke")
         calls = self.turns.pop(0) if self.turns else []
+        self.session_id = "session-" + str(len(self.prompts))
         for args in calls:
             self.results.append(await self.tool.handler(args))
         return TurnReport("success", 1, "ok", (), None, None, "s", None, None)
@@ -85,7 +91,7 @@ class World:
             self.scheduler.create_line(line_id, HAIKU, Strategy.SUBSCRIPTION)
 
     def build(self, spec: LineSpec, tool: SdkMcpTool[Any]) -> Scripted:
-        engine = Scripted(tool, self.scripts[spec.line_id])
+        engine = Scripted(tool, self.scripts[spec.line_id], spec)
         self.engines[spec.line_id] = engine
         return engine
 
@@ -390,3 +396,71 @@ def test_two_live_lines_exchange_a_message(tmp_path: Path) -> None:
         assert any(m.recipient == LineAddress("beta") for m in sent)
         assert wakes and all(w.issued for w in wakes)
         assert all(line.state is LineState.IDLE for line in log.state.lines.values())
+
+
+def test_a_message_sent_in_a_tick_reaches_an_idle_line_only_in_the_next(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world(
+        {
+            "alpha": [[{"to": "beta", "body": "ping"}], []],
+            "beta": [[{"to": "alpha", "body": "pong"}]],
+        }
+    )
+    run(target, send(target, "alpha", "start"))
+    events = target.events()
+    alpha_idle = events.index(LineStateChanged("alpha", LineState.IDLE))
+    beta_wake = next(
+        i
+        for i, e in enumerate(events)
+        if isinstance(e, WakeRequested) and e.line_id == "beta"
+    )
+    ping = next(
+        i
+        for i, e in enumerate(events)
+        if isinstance(e, MessageSent) and e.body == "ping"
+    )
+    # beta was idle when ping arrived, yet woke only after alpha's tick ended.
+    assert ping < alpha_idle < beta_wake
+    assert target.scheduler.tick == 3
+
+
+def test_each_line_takes_at_most_one_turn_per_tick(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[], []], "beta": [[], []]})
+
+    async def act() -> None:
+        target.scheduler.send(ANA, LineAddress("alpha"), "one")
+        target.scheduler.send(ANA, LineAddress("beta"), "two")
+
+    run(target, act)
+    assert target.scheduler.tick == 1
+    assert len(target.engines["alpha"].prompts) == 1
+    assert len(target.engines["beta"].prompts) == 1
+
+
+def test_a_configuration_reaches_the_engine_and_a_change_keeps_the_session(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": [[], []]})
+    first = LineConfig(builtin_tools=("Read",))
+    target.scheduler.configure_line("alpha", first)
+    run(target, send(target, "alpha", "one"))
+    assert target.engines["alpha"].spec is not None
+    assert target.engines["alpha"].spec.config == first
+    session = target.engines["alpha"].session_id
+    second = LineConfig(tool_policy=ToolPolicy.ALLOW_ALL)
+    target.scheduler.configure_line("alpha", second)
+    run(target, send(target, "alpha", "two"))
+    rebuilt = target.engines["alpha"].spec
+    assert rebuilt is not None
+    assert (rebuilt.config, rebuilt.session_id) == (second, session)
+    assert target.log.state.lines["alpha"].config == encode_config(second)
+
+
+def test_a_line_created_with_a_configuration_records_it(make_world: MakeWorld) -> None:
+    target = make_world({})
+    config = LineConfig(builtin_tools=("Read",))
+    target.scheduler.create_line("gamma", HAIKU, Strategy.SUBSCRIPTION, config)
+    assert target.log.state.lines["gamma"].config == encode_config(config)
+    target.scheduler.create_line("delta", HAIKU, Strategy.SUBSCRIPTION)
+    assert target.log.state.lines["delta"].config is None

@@ -102,6 +102,11 @@ offers the account's connectors, such as mail sending and file sharing, even wit
 `strict_mcp_config=True`, a permission gate that allows only the line's own tools, and a
 check that the engine reports no tool beyond them.
 
+**Decided 2026-10-25 by the operator.** Arbitrary MCP servers can be exposed to a line,
+under an allow-all or a whitelist model, with the settings held per line. This is
+[`../protocol/LINE_CONFIG.md`](../protocol/LINE_CONFIG.md), stored in the event log as
+`line_configured`. The default remains no tools beyond Dromon's own.
+
 **Decided 2026-10-25 by the operator.** Drivers are concrete. Subscription use, API use
 and flexible use are separate drivers that bake their strategy in, rather than one
 driver choosing behaviour from parameters. Claude Haiku 5.5, the least expensive
@@ -130,16 +135,23 @@ without being rewritten. Each layer adds only its routing and its delivery guara
 
 **Decided.** The harness issues wakes.
 
-**Implemented 2026-10-25, roadmap task 5.** If the recipient is idle and not blocked,
-the daemon wakes it at once and delivers every undelivered message in one turn. If the
-recipient is busy, the message waits until the turn ends, and the daemon wakes it again.
-Lines send through an in-process `send_message` tool whose sender the daemon fixes, and
-operators through `dromon send`. A per-line turn cap stops a runaway exchange until the
-conversation limits of task 7. Live, two Haiku 5.5 lines exchanged ping and pong, each
-woken by the other's message.
+**Decided 2026-10-25 by the operator.** Delivery is tick based, and messages are not
+interrupts. A message sent in one turn is received no sooner than the next. Mid-turn
+injection is therefore not used.
 
-**Proposed.** Mid-turn injection where the engine supports it, and a wake policy in
-per-project configuration, for example immediate, batched, or only at turn boundaries.
+**Implemented 2026-10-25, roadmap task 5.** At the start of a tick the scheduler takes a
+snapshot of every undelivered message whose recipient is idle, unblocked and under its
+turn cap. Each such line takes one turn with its messages from the snapshot, and the
+turns of a tick run concurrently. A message sent during a tick waits for the next tick,
+even when its recipient is idle throughout. Lines send through an in-process
+`send_message` tool whose sender the daemon fixes, and operators through `dromon send`.
+A per-line turn cap stops a runaway exchange until the conversation limits of task 7.
+
+**Inference.** The tick is the unit a batched update loop of Keleusma stream processors
+schedules, so the Keleusma version can keep these semantics exactly.
+
+**Proposed.** A wake policy in per-project configuration, for example every tick or
+every few ticks.
 
 ## Operator questions
 
@@ -172,6 +184,12 @@ as the general adapter. See [`../protocol/EVENT_LOG.md`](../protocol/EVENT_LOG.m
 - Which operator a line asks by default is per-project configuration.
 - Clients show each operator their own queue. `dromon questions` lists it and
   `dromon answer` replies from the command line.
+
+**Decided 2026-10-25 by the operator.** The daemon maintains the `ask_operator` queue.
+Interacting with it is a `dromon` client concern in the immediate term. A command-line
+client alone is not enough. The client wants a graphical interface, or a way to launch
+one, so that the operator can start the daemon and then attach a dozen interfaces to
+different session lines in different terminals at once.
 - **Decided 2026-10-25, design deferred.** Every relay adapter supports a response path,
   so an operator can reply through the channel that carried the question. The required
   properties are in [`../protocol/RELAY.md`](../protocol/RELAY.md), chief among them
@@ -270,5 +288,5 @@ before any trace capture, and record the source model and licence of every trace
 2. The engine for the first adapter. Decided 2026-10-25, Claude Opus 5.5 on Claude Code
    through the Agent SDK, on the subscription, with a Keleusma driver.
 3. The contents of `.dromon/dromon.toml`.
-4. Mid-turn injection, which depends on each engine.
+4. Mid-turn injection. Decided 2026-10-25, not used, because delivery is tick based.
 5. Teacher-model scope and licensing.
