@@ -12,27 +12,28 @@ completed, moved or abandoned.
 - **Tasks 1 to 10 done. Milestone 0.1.0 is complete.**
   - `model.py`, `codec.py` and `eventlog.py` hold the data model as nine event kinds in
     an append-only SQLite log. Operators are parties addressed as `@name`.
-  - `relay.py` forwards operator messages. Inbound replies are deferred.
-  - `daemon.py`, `client.py`, `protocol.py`, `paths.py` and `exits.py` are the daemon
-    skeleton behind `dromon start`, `status` and `stop`.
+  - `relay.py` forwards operator messages, and inbound replies are deferred.
+    `daemon.py`, `client.py`, `protocol.py`, `paths.py` and `exits.py` are the daemon.
   - `engine.py` runs turns on Claude Code through the Agent SDK. `driver.py` hosts
     Keleusma drivers through `pykeleusma`. Concrete drivers in `drivers/` cover Opus
     5.5, Haiku 5.5 and GPT-6-Luna, each in a subscription, API and flexible strategy,
-    by the operator's decision. Luna's name the `codex` engine, which has no adapter,
-    so no line can run them. `dromon probe` reports capabilities and
-    defaults to Haiku 5.5, the least expensive model, which tests also use.
+    by the operator's decision. Each names its engine, `claude-code` or `codex`.
+  - `codex.py` runs GPT-6-Luna lines through `codex app-server` on the operator's
+    ChatGPT plan, isolated from the user's MCP servers and connectors, with Dromon's
+    tools as dynamic tools. `scheduler.engine_factory` picks the adapter. `dromon
+    probe` runs one turn, by default on Haiku 5.5, the least expensive model.
   - `scheduler.py` is a game loop, by the operator's decision. Each tick updates every
     line once and skips a busy one, turns span ticks, and mail sent in a tick is
     delivered at its end. Lines send with `send_message`, operators `dromon send`.
   - Operator questions. `ask_operator` queues a question, `dromon questions` and
-    `dromon answer` work it, and the answer wakes the line. `line_session` records each line's engine session, so lines survive a
-    restart with their conversations.
+    `dromon answer` work it, and the answer wakes the line. `line_session` keeps each
+    line's engine session across a restart.
   - `mailbox.py` gives every party a mailbox with read and answered state. Wake
     prompts list headers. Lines use `list_mail`, `read_mail` and `list_sent`, and
     operators `dromon mail`, `read` and `sent`. Nobody is obliged to answer, and a
     recipient may acknowledge without replying.
   - `limits.py` holds a line after 12 turns without operator mail or $2 of estimated
-    cost and asks an operator. A reply or `dromon release` resumes it.
+    cost. A reply or `dromon release` resumes it.
   - `attach.py`, `tui.py` and `gui.py` are `dromon attach`.
   - `lineconfig.py` gives each line its built-in tools, arbitrary MCP servers and an
     allow-all or allowlist policy, by the operator's decision, stored as
@@ -42,16 +43,16 @@ completed, moved or abandoned.
     wake policy, strict keys and located errors. `dromond` applies it at start, flags
     override it, and `dromon config` validates it.
   - `sandbox.py` runs a line's shell commands in Claude Code's sandbox, by the
-    operator's direction, configured per project and per line in Claude Code's key
-    names. It fails closed, refuses unsandboxed retries, and protects `.dromon` and the
-    runtime directory.
+    operator's direction, per project and per line in Claude Code's key names. It
+    fails closed, refuses unsandboxed retries, and protects `.dromon` and the runtime
+    directory.
   - `settings.py` gives each line Claude Code permission rules, command hooks, `env`
     and `attribution`, layered like the sandbox and passed through `--settings`, by
     the operator's direction to match the settings in use in three harnesses. `ask`
     rules deny. A line's `effort` replaces its driver's. MCP servers may refer to
     `${NAME}` in the daemon's environment.
   - `docs/protocol/` holds `EVENT_LOG.md`, `CLIENT.md`, `RELAY.md`, `DRIVER.md`,
-    `LINE_CONFIG.md`, `PROJECT_CONFIG.md`, `SANDBOX.md` and `SETTINGS.md`.
+    `LINE_CONFIG.md`, `PROJECT_CONFIG.md`, `SANDBOX.md`, `SETTINGS.md`, `CODEX.md`.
 - **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310, and
   `pykeleusma` from its repository at `19d4558`, which needs a Rust toolchain to build.
 - **Published.** The public GitHub repository `sgeos/pydromon`, licensed 0BSD, on an
@@ -91,9 +92,8 @@ Milestone 0.1.0 is complete. The next milestone awaits the operator's direction.
   or language servers, no MCP OAuth, and Linux not verified live. The merge of `Read`
   and `Edit` rules into the sandbox is untested. Listed in `SANDBOX.md` and
   `SETTINGS.md`.
-- **Codex adapter.** Owed before a Luna line runs: credential detection, OpenAI and
-  xAI variables in the reserved lists, and isolation from account MCP servers. See the
-  Codex and Grok Build review in `DESIGN.md`.
+- **Codex lines.** No MCP servers, file edits, sandbox or settings documents, cost or
+  turn limit, and the app-server is experimental. Listed in `CODEX.md`.
 - **In the design.** Teacher-model scope and the Rust repository's eventual name.
 
 ## Environment
@@ -109,7 +109,7 @@ and a manual daemon run need a command outside it. The rest run inside it with
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 745 tests pass, plus 6 live tests deselected
+uv sync && uv run pytest    # 779 tests pass, plus 8 live tests deselected
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 

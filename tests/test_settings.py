@@ -25,7 +25,7 @@ from dromon.lineconfig import (
     references,
 )
 from dromon.projectconfig import ConfigFileError, parse
-from dromon.scheduler import LineSpec, claude_code_engine
+from dromon.scheduler import LineSpec, engine_factory
 from dromon.settings import (
     SettingsConfig,
     SettingsError,
@@ -466,7 +466,7 @@ def test_the_engine_expands_references_from_its_environment() -> None:
 def test_the_factory_merges_project_settings_under_each_line() -> None:
     project = settings({"permissions": {"deny": ["Bash(curl *)"]}, "env": {"A": "p"}})
     own = settings({"permissions": {"ask": ["Bash(git push *)"]}, "env": {"A": "l"}})
-    build = claude_code_engine(str(ROOT), project_settings=project, protected=PROTECTED)
+    build = engine_factory(str(ROOT), project_settings=project, protected=PROTECTED)
     spec = LineSpec(
         "alpha", "claude-haiku-5-5", Strategy.SUBSCRIPTION, LineConfig(settings=own)
     )

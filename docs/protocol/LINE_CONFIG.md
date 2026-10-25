@@ -75,6 +75,12 @@ out of the event log.
   and a turn is refused when the engine offers a built-in tool not in `builtin_tools`
   or a tool of a server not in `mcp_servers`.
 
+## Engines
+
+A line on the Codex engine accepts only the configurations
+[`CODEX.md`](CODEX.md) lists, and any other is refused when the line is created or
+configured.
+
 ## Storage
 
 The daemon validates a configuration, then appends `line_configured` with its canonical

@@ -25,7 +25,9 @@ curses client attached to one line, or a Tk window with `--gui`, and any number 
 attached at once. A project declares its lines, limits and wake policy in
 `.dromon/dromon.toml`, as
 [`docs/protocol/PROJECT_CONFIG.md`](docs/protocol/PROJECT_CONFIG.md) specifies, and
-`dromon config` validates it. A line's shell commands can run in Claude Code's sandbox,
+`dromon config` validates it. Lines run on Claude Code or, for OpenAI models such as GPT-6-Luna, on Codex, as
+[`docs/protocol/CODEX.md`](docs/protocol/CODEX.md) specifies. A line's shell commands
+can run in Claude Code's sandbox,
 configured per project and per line as
 [`docs/protocol/SANDBOX.md`](docs/protocol/SANDBOX.md) specifies, and its permission
 rules, hooks and environment as
@@ -63,8 +65,10 @@ all three stages. See [`docs/decisions/NAMING_AND_PORTS.md`](docs/decisions/NAMI
 ## Development
 
 The build needs a Rust toolchain, because `pykeleusma` is built from its repository at a
-pinned commit. Running a line needs a Claude subscription signed in to Claude Code, and
-no `ANTHROPIC_API_KEY` in the environment.
+pinned commit. Running a Claude line needs a Claude subscription signed in to Claude
+Code, and no `ANTHROPIC_API_KEY` in the environment. Running a GPT-6-Luna line needs
+Codex signed in to a ChatGPT plan, and Dromon starts Codex without any OpenAI API key
+in its environment.
 
 ```sh
 uv sync

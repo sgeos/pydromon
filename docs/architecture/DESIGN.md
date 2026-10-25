@@ -61,7 +61,7 @@ checked.
 | Grok Build | Agent Client Protocol | Its local user guide describes it as native to that protocol |
 | Cursor Agent | Agent Client Protocol through `agent acp` | Reported in July 2026 research by the operator's sessions. Not rechecked |
 | Claude Code | Claude Agent SDK | Implemented 2026-10-25 with Agent SDK 0.2.174 and Claude Code 2.1.310, on the subscription |
-| Codex | Codex SDK or its app-server | Vendor interfaces. Not tested here. Drivers for GPT-6-Luna packaged 2026-10-25, with no adapter yet |
+| Codex | Its app-server | Implemented 2026-10-25 with Codex 0.164.0 and GPT-6-Luna, on the ChatGPT plan |
 | Dromon's own loop | Direct model calls | Needed where full control of each step is required |
 
 **Decided 2026-10-25.** The first adapter targets the model Claude Opus 5.5. The operator
@@ -87,6 +87,9 @@ while the Agent SDK overview points developers to API keys.
 **Decided 2026-10-25 by the operator.** The operator's only credential is the
 subscription, so lines run on Claude Code through the Agent SDK, driven from outside by
 Dromon. The per-model drivers are written in Keleusma and run through `pykeleusma`.
+**Later the same day,** the operator directed that OpenAI models run on Dromon. Codex on
+the operator's machine is signed in to a ChatGPT plan, which Codex lines use, as the
+Codex section below records.
 
 **Implemented 2026-10-25, roadmap task 4.** `dromon.engine` runs each turn through
 `ClaudeSDKClient` with no user or project settings and no tools unless configured. It
@@ -167,9 +170,19 @@ day. xAI's consumer terms refused the request, so nothing here rests on them.
 
 **Implemented 2026-10-25, on the operator's direction.** Drivers for GPT-6-Luna on
 Codex are packaged in all three strategies, under driver interface 3, which adds the
-engine each driver is written for. A line can be created only on a model whose engine
-has an adapter, so these drivers are tested but no line runs them until a Codex adapter
-exists.
+engine each driver is written for.
+
+**Implemented 2026-10-25, on the operator's direction to run OpenAI models.**
+`dromon.codex` runs a line through `codex app-server`, as
+[`../protocol/CODEX.md`](../protocol/CODEX.md) specifies. The items owed above are met
+as follows. The account Codex reports is the credential handed to the driver. A
+subscription line's Codex starts without API variables, and the reserved variables name
+OpenAI, Codex and xAI prefixes. Every MCP server Codex lists is disabled by name, and
+connector features are disabled, then verified. Dromon's tools reach the model as
+dynamic tools. The app-server was chosen over `codex exec`, which OpenAI recommends for
+automation, because only the app-server lets Dromon serve its own tools in process and
+see each item as it starts. **Porting hazard.** The app-server and dynamic tools are
+experimental.
 
 ## Communication
 

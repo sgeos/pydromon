@@ -42,7 +42,8 @@ from pathlib import Path
 from typing import Final, cast
 
 from dromon import __version__, exits
-from dromon.driver import DriverError, Strategy
+from dromon import codex
+from dromon.driver import ENGINE_OF, DriverError, Strategy
 from dromon.eventlog import EventLog, LogError, utc_now
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.mailbox import MAX_PAGE, listing, outcome, replied_ids, sent, summary
@@ -82,7 +83,7 @@ from dromon.scheduler import (
     DEFAULT_TICK_SECONDS,
     MAX_TICK_SECONDS,
     Scheduler,
-    claude_code_engine,
+    engine_factory,
 )
 
 VIEW_LIMIT: Final = 50
@@ -603,6 +604,25 @@ def check_sandboxes(config: ProjectConfig, paths: ProjectPaths) -> None:
         effective(merge([config.sandbox, line.config.sandbox]), paths.root, protected)
 
 
+def check_engines(config: ProjectConfig) -> None:
+    """Refuse a project file that gives a Codex line a sandbox or settings through the
+    project's own tables, which the line's engine cannot honour. Raises ``ValueError``.
+    A line's own tables are checked when the line is created or configured."""
+    if config.sandbox is None and config.settings is None:
+        return
+    codex_lines = sorted(
+        line_id
+        for line_id, line in config.lines.items()
+        if ENGINE_OF[line.model] == codex.ENGINE_NAME
+    )
+    if codex_lines:
+        raise ValueError(
+            "the project's sandbox or settings would apply to the Codex lines "
+            + ", ".join(codex_lines)
+            + ", which run in Codex's own sandbox and take neither"
+        )
+
+
 def resolve(config: ProjectConfig, overrides: Overrides) -> tuple[Limits, str, float]:
     """The project-wide limits, default operator and tick cadence to run with."""
     base = config.limits
@@ -684,6 +704,7 @@ def run(
         file = config_path(paths.state_dir)
         config = load(file) if file.exists() else ProjectConfig()
         check_sandboxes(config, paths)
+        check_engines(config)
         limits, operator, tick = resolve(config, given)
         lock = acquire_lock(paths.lock)
     except AlreadyRunning as error:
@@ -696,7 +717,7 @@ def run(
         with EventLog(paths.event_log) as log:
             scheduler = Scheduler(
                 log,
-                claude_code_engine(
+                engine_factory(
                     str(paths.root),
                     project_sandbox=config.sandbox,
                     project_settings=config.settings,

@@ -4,33 +4,37 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-25, Codex and Grok Build review, and GPT-6-Luna drivers
+## 2026-10-25, OpenAI models on Dromon through Codex
 
-**Done.** On the operator's direction to record whether the Claude Code driver
-conclusions hold for Codex and Grok Build, and to write drivers for GPT-6-Luna.
+**Done.** On the operator's direction to get OpenAI models running on Dromon and to test
+with GPT-6-Luna.
 
-- `DESIGN.md` records the review, with vendor sources. The main difference is that
-  OpenAI documents ChatGPT plan usage for open-source and locally hosted apps, so
-  Dromon's own loop could run OpenAI models on a plan, at the cost of holding tokens.
-  xAI's documents invite automation, but its consumer terms could not be read.
-- Driver interface 3 adds the engine a driver is written for. Drivers for GPT-6-Luna
-  on Codex are packaged in the subscription, API and flexible strategies. Their effort
-  and context window come from Codex's local model catalogue, fetched on 2026-10-25.
-- A line can be created only on a model whose engine has an adapter, and the Claude
-  Code adapter refuses a driver for another engine, so no line can run the Luna
-  drivers on the wrong engine.
+- `dromon.codex` runs a line through `codex app-server` over standard input and output,
+  as `docs/protocol/CODEX.md` specifies. Lines can be created on `gpt-6-luna`, the
+  scheduler picks the adapter by the driver's engine, and `dromon probe --model
+  gpt-6-luna` runs on Codex.
+- **Facts, observed on 2026-10-25.** Codex reported a ChatGPT account on the Pro plan.
+  Without Dromon's overrides, a GPT-6-Luna thread connected to the operator's mail,
+  calendar, document, chat and task MCP servers. With them every server reported
+  disabled. The operator's environment sets `OPENAI_API_KEY`, which a subscription
+  line's Codex is now started without.
+- Dromon's tools reach the model as Codex dynamic tools. A resumed thread keeps them.
 
 **Decisions made by this line, open to the operator's review.**
 
-- Luna's subscription driver uses the catalogue's default effort, medium, and its
-  metered drivers use low. Turn and tool budgets match Haiku 5.5's, the other
-  inexpensive model.
-- Whether Dromon's own loop should use OpenAI's ChatGPT plan program, and so hold
-  tokens, is left to the operator.
+- The app-server rather than `codex exec`, which OpenAI recommends for automation,
+  because only the app-server lets Dromon serve its tools in process and see each item
+  as it starts. Both the app-server and its dynamic tools are experimental.
+- Codex lines run in Codex's read-only sandbox, never ask for approval, and take only
+  `Bash`. File edits wait for a way to protect `.dromon` from Codex's writable sandbox.
+- A subscription line's Codex is started without OpenAI API variables rather than
+  refused, because Dromon starts the process, and the reported account is still checked.
 
-**Not done.** There is no Codex adapter, so the Luna drivers have not run against
-Codex. The reserved variable lists do not yet name OpenAI's or xAI's credentials.
+**Not done.** MCP servers on Codex lines, cost reporting, the driver's turn limit and a
+Grok Build adapter.
 
-**Verification.** All tests pass outside the sandbox with warnings treated as errors.
-Ruff and pyright strict clean. The wheel includes the three new driver files. No live
-test was run, since nothing in this change reaches an engine.
+**Verification.** 779 tests passing outside the sandbox with warnings treated as errors,
+and all 8 live tests passing. The Codex ones showed that a GPT-6-Luna line resumes its
+thread with its tools, recalling a word from its first turn in its second, and that a
+GPT-6-Luna line messages a Claude Haiku 5.5 line in one scheduler. Ruff and pyright
+strict clean. Linux was not exercised live.

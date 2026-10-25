@@ -83,8 +83,8 @@ names, so that one can be copied from `.claude/settings.json`.
 - **Hooks.** Only `command` hooks are accepted, with `type`, `command` and an optional
   `timeout` in seconds in [1, 86400]. A hook runs outside the sandbox.
 - **Reserved variables.** `env` may not set a variable that selects or holds the
-  engine's credential or provider. These are every name that starts with `ANTHROPIC_`
-  or `CLAUDE_CODE_USE_`, and `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR` and
+  engine's credential or provider. These are every name that starts with `ANTHROPIC_`,
+  `CLAUDE_CODE_USE_`, `OPENAI_`, `CODEX_` or `XAI_`, and `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR` and
   `AWS_BEARER_TOKEN_BEDROCK`. Claude Code applies `env` to itself, and usage billed per
   token must never start silently.
 - **Strict keys.** Any other key, `permissions.defaultMode` included, is an error.

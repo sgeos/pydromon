@@ -43,10 +43,18 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- OpenAI models run on Dromon through Codex, specified by `docs/protocol/CODEX.md`.
+  `dromon.codex` drives `codex app-server`, maps the reported account to the driver's
+  credential, disables every MCP server and connector feature Codex would load, and
+  serves Dromon's tools as dynamic tools. Lines can be created on `gpt-6-luna`, and
+  `dromon probe --model gpt-6-luna` runs on Codex. Codex lines take only `Bash`, no MCP
+  servers and no sandbox or settings documents.
+- The reserved variables of engine settings add the `OPENAI_`, `CODEX_` and `XAI_`
+  prefixes.
 - Drivers for GPT-6-Luna on Codex in all three strategies, with settings from Codex's
   model catalogue. Driver interface 3 adds the `engine` each driver is written for. A
-  line can be created only on a model whose engine has an adapter, so no line runs these
-  drivers until a Codex adapter exists, and the Claude Code adapter refuses them.
+  line can be created only on a model whose engine has an adapter, and each adapter
+  refuses a driver written for another engine.
 - `docs/architecture/DESIGN.md` records whether the Claude Code conclusions on
   subscriptions, tokens, billing and account tools hold for Codex and Grok Build.
 - Engine settings at parity with the settings actually used on the operator's machine

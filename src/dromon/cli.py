@@ -19,9 +19,10 @@ from dromon import __version__, exits
 from dromon.client import DaemonFailed, DaemonNotRunning, call, is_running, start, stop
 from dromon.paths import PathError, ProjectPaths, project_paths
 from dromon.driver import MODELS, Driver, DriverError, Strategy
-from dromon.engine import ClaudeCodeLine, EngineRefused
+from dromon.engine import EngineRefused
 from dromon.lineconfig import EFFORTS
 from dromon.protocol import Operation, ProtocolError
+from dromon.scheduler import LineSpec, engine_factory
 from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, merge, sandbox_from_settings
 from dromon.settings import SettingsConfig, split_settings_file
@@ -120,7 +121,7 @@ def _probe(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         model: str = arguments.model
         strategy = Strategy(arguments.strategy)
         driver = Driver.for_model(model, strategy)
-        line = ClaudeCodeLine(driver, paths.root)
+        line = engine_factory(str(paths.root))(LineSpec("probe", model, strategy), [])
         report = asyncio.run(line.run_turn(PROBE_PROMPT))
     except (DriverError, EngineRefused) as error:
         print(f"dromon probe: {error}", file=sys.stderr)
@@ -135,6 +136,7 @@ def _probe(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         f" tool budget {settings.tool_budget},"
         f" context window {settings.context_window}"
     )
+    print(f"engine {settings.engine}, credential {report.credential}")
     found = report.capabilities
     if found is not None:
         print(

@@ -112,7 +112,7 @@ def test_luna_runs_on_codex_with_the_catalogues_default_effort_and_window() -> N
 
 def test_only_models_on_an_adapted_engine_can_carry_a_line() -> None:
     assert set(MODELS) == {m for m, e in ENGINE_OF.items() if e in ADAPTED_ENGINES}
-    assert LUNA in ENGINE_OF and LUNA not in MODELS
+    assert LUNA in MODELS
     assert set(ENGINE_OF.values()) <= set(ENGINES)
     assert set(ENGINES) >= ADAPTED_ENGINES
 

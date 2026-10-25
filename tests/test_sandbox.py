@@ -35,7 +35,7 @@ from dromon.sandbox import (
     parse_sandbox,
     sandbox_from_settings,
 )
-from dromon.scheduler import LineSpec, claude_code_engine
+from dromon.scheduler import LineSpec, engine_factory
 
 ROOT = Path("/work/project")
 STATE = ROOT / ".dromon"
@@ -379,7 +379,7 @@ def test_a_line_configuration_carries_its_sandbox_through_the_log() -> None:
 def test_the_factory_merges_the_project_sandbox_under_each_line() -> None:
     project = sandbox({"enabled": True, "network": {"allowedDomains": ["pypi.org"]}})
     own = sandbox({"network": {"allowedDomains": ["github.com"]}})
-    build = claude_code_engine(str(ROOT), project_sandbox=project, protected=PROTECTED)
+    build = engine_factory(str(ROOT), project_sandbox=project, protected=PROTECTED)
     spec = LineSpec(
         "alpha",
         "claude-haiku-5-5",

@@ -86,7 +86,13 @@ specifier, so Dromon checks only its shape."""
 
 VARIABLE_PATTERN: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 
-RESERVED_PREFIXES: Final = ("ANTHROPIC_", "CLAUDE_CODE_USE_")
+RESERVED_PREFIXES: Final = (
+    "ANTHROPIC_",
+    "CLAUDE_CODE_USE_",
+    "OPENAI_",
+    "CODEX_",
+    "XAI_",
+)
 RESERVED_VARIABLES: Final = frozenset(
     {
         "CLAUDE_CODE_OAUTH_TOKEN",

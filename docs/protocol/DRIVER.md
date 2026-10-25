@@ -50,8 +50,8 @@ ChatGPT plan the subscription strategy means Codex's own sign-in.
 Each driver names the engine it is written for, `claude-code` or `codex`. A model has
 packaged drivers once they are written, but a line can be created on it only when
 Dromon has an adapter for its engine, and an adapter refuses a driver written for
-another engine. On 2026-10-25 only `claude-code` has an adapter, so the GPT-6-Luna
-drivers are tested and no line runs them.
+another engine. Both engines have adapters, as of 2026-10-25 for `codex`, which
+[`CODEX.md`](CODEX.md) specifies.
 A file is named for its model and strategy, and the host refuses a file whose declared
 model or strategy differs from its name.
 
@@ -135,8 +135,9 @@ At most 32 settings are read.
 
 ## Credentials in the host
 
-For the Codex engine this mapping is not yet specified, and it is owed with the
-adapter. For Claude Code, the host maps Claude Code's reported `apiKeySource` to a credential. `none` is a
+For Codex, the host maps the account Codex reports, `chatgpt` to a subscription and
+`apiKey` to API usage, as [`CODEX.md`](CODEX.md) specifies. For Claude Code, the host
+maps Claude Code's reported `apiKeySource` to a credential. `none` is a
 subscription, and `ANTHROPIC_API_KEY`, `apiKeyHelper` and `/login managed key` are API
 usage. Any other value is refused without consulting the driver. Before a turn the host
 refuses every cloud provider, whose source would also read `none`, and for a
