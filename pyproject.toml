@@ -1,0 +1,51 @@
+[build-system]
+requires = ["uv_build>=0.9.5,<0.10"]
+build-backend = "uv_build"
+
+[project]
+# The distribution follows the py-prefix convention of pykeleusma. The import
+# package is plain `dromon`. The bare name `dromon` is reserved for the lasting
+# Keleusma implementation, which is not a Python package, so nothing collides.
+name = "pydromon"
+version = "0.0.0"
+description = "Python prototype of Dromon, a multi-agent harness daemon"
+readme = "README.md"
+license = "0BSD"
+license-files = ["LICENSE"]
+authors = [{ name = "Brendan Sechter", email = "sgeos@hotmail.com" }]
+requires-python = ">=3.12"
+dependencies = []
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development",
+]
+
+[project.scripts]
+# The command names are shared by every implementation of Dromon, so scripts and
+# habits carry across the Python, Rust and Keleusma versions.
+dromond = "dromon.daemon:main"
+dromon = "dromon.cli:main"
+
+[dependency-groups]
+dev = ["pytest==9.1.1", "ruff==0.17.2", "pyright==1.1.414"]
+
+[tool.uv.build-backend]
+module-name = "dromon"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "S", "ANN", "RET", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# Assertions are how pytest states expectations.
+"tests/*" = ["S101"]
+
+[tool.pyright]
+include = ["src", "tests"]
+typeCheckingMode = "strict"

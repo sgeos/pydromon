@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Claude Code agent runtime state, such as session lock files. Local to each
+# contributor's session and not project content.
+.claude/
+
+# Project-local scratch directory, committed through a .gitkeep marker with its
+# contents ignored. Use `tmp/` for transient files such as commit messages, draft
+# text, scratch scripts and probe outputs. The pattern matches the Keleusma and
+# pykeleusma repositories.
+/tmp/*
+!/tmp/.gitkeep
+
+# Local, never-committed material such as credentials, API keys and
+# environment-specific notes. Ignored whole, as in the Keleusma repository.
+/secret/
