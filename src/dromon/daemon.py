@@ -43,7 +43,7 @@ from typing import Final, cast
 from dromon import __version__, exits
 from dromon.driver import DriverError, Strategy
 from dromon.eventlog import EventLog, LogError, utc_now
-from dromon.mailbox import MAX_PAGE, answered_ids, listing, summary
+from dromon.mailbox import MAX_PAGE, listing, outcome, replied_ids, sent, summary
 from dromon.lineconfig import (
     DEFAULT_CONFIG,
     ConfigError,
@@ -142,6 +142,8 @@ class Daemon:
                 | Operation.ANSWER
                 | Operation.MAIL
                 | Operation.READ
+                | Operation.ACKNOWLEDGE
+                | Operation.SENT
             ):
                 return self._command(request)
 
@@ -161,6 +163,10 @@ class Daemon:
                     result = self._mail(request.args)
                 case Operation.READ:
                     result = self._read(request.args)
+                case Operation.ACKNOWLEDGE:
+                    result = self._acknowledge(request.args)
+                case Operation.SENT:
+                    result = self._sent(request.args)
                 case _:
                     result = self._send(request.args)
         except ProtocolError as error:
@@ -246,7 +252,7 @@ class Daemon:
             )
         except ValueError as error:
             raise InvalidField(str(error)) from error
-        answered = answered_ids(self.log.state, owner)
+        replied = replied_ids(self.log.state, owner)
         counts = summary(self.log.state, owner, 0)
         return {
             "total": total,
@@ -259,9 +265,56 @@ class Daemon:
                     "kind": message.kind.value,
                     "reply_to": message.reply_to,
                     "read": message.read,
-                    "answered": message_id in answered,
+                    "outcome": outcome(message_id, message, replied),
                 }
                 for message_id, message in page
+            ],
+        }
+
+    def _acknowledge(self, args: dict[str, object]) -> dict[str, object]:
+        operator, message_id = _text_args(args, ("operator", "message_id"))
+        self.scheduler.acknowledge(OperatorAddress(operator), message_id)
+        return {"message_id": message_id}
+
+    def _sent(self, args: dict[str, object]) -> dict[str, object]:
+        """A page of the mail an operator has sent, with each message's fate."""
+        allowed = {"operator", "unanswered_only", "offset", "limit"}
+        if "operator" not in args or not set(args) <= allowed:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST, f"sent takes {sorted(allowed)}, with operator"
+            )
+        (operator_text,) = _text_args({"operator": args["operator"]}, ("operator",))
+        unanswered_only = args.get("unanswered_only", False)
+        offset = args.get("offset", 0)
+        limit = args.get("limit", MAX_PAGE)
+        if type(unanswered_only) is not bool:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST, "unanswered_only is not a boolean"
+            )
+        if type(offset) is not int or type(limit) is not int:
+            raise ProtocolError(ErrorCode.BAD_REQUEST, "offset and limit are integers")
+        try:
+            page, total = sent(
+                self.log.state,
+                OperatorAddress(operator_text),
+                unanswered_only=unanswered_only,
+                offset=offset,
+                limit=limit,
+            )
+        except ValueError as error:
+            raise InvalidField(str(error)) from error
+        return {
+            "total": total,
+            "messages": [
+                {
+                    "message_id": status.message_id,
+                    "recipient": status.recipient,
+                    "kind": status.kind,
+                    "delivered": status.delivered,
+                    "read": status.read,
+                    "outcome": status.outcome,
+                }
+                for status in page
             ],
         }
 

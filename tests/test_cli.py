@@ -25,6 +25,8 @@ def test_the_lifecycle_subcommands_are_implemented() -> None:
         "answer",
         "mail",
         "read",
+        "ack",
+        "sent",
     }
     assert set(cli.IMPLEMENTED) <= set(cli.SUBCOMMANDS)
 

@@ -17,6 +17,7 @@ from dromon.model import (
     LineCreated,
     LineState,
     LineStateChanged,
+    MessageAcknowledged,
     MessageDelivered,
     MessageRead,
     MessageKind,
@@ -456,6 +457,23 @@ REJECTIONS: list[tuple[str, list[Event], Event, str]] = [
         "was read",
     ),
     ("reading an unknown message", parties(), MessageRead("m"), "no message"),
+    (
+        "acknowledging an undelivered message",
+        [*parties(), MessageSent("m", ALPHA, BETA, NOTE, "")],
+        MessageAcknowledged("m"),
+        "was not delivered",
+    ),
+    (
+        "acknowledging twice",
+        [
+            *parties(),
+            MessageSent("m", ALPHA, BETA, NOTE, ""),
+            MessageDelivered("m"),
+            MessageAcknowledged("m"),
+        ],
+        MessageAcknowledged("m"),
+        "was acknowledged",
+    ),
     (
         "withdrawal of a note",
         [*parties(), MessageSent("m", ALPHA, BETA, NOTE, "")],

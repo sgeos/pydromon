@@ -195,6 +195,16 @@ summary sentence and lists the new mail's headers, without bodies, and the line'
 use `dromon mail` and `dromon read`. Nothing marks mail as needing an answer, and the
 prompt does not ask for one.
 
+**Decided 2026-10-25 by the operator.** A message can be acknowledged, which marks it
+answered without sending a reply. Senders see which messages were acknowledged as
+opposed to replied to, because they may be expecting a reply.
+
+**Implemented 2026-10-25.** `message_acknowledged` records an acknowledgement. Lines use
+`acknowledge_mail` and see their sent mail's fate with `list_sent`, and operators use
+`dromon ack` and `dromon sent`. Each sent message reads as waiting, delivered or read,
+and as replied, acknowledged or unanswered. Acknowledging a question does not close it,
+so a sender can tell that its question was seen but not yet answered.
+
 **Decided 2026-10-25 by the operator.** There is no such thing as a blocking question.
 After asking, a line may end its turn or keep working. That is up to the line-agent.
 

@@ -397,7 +397,7 @@ def test_mail_lists_an_operators_mailbox_and_delivers_it(paths: ProjectPaths) ->
     assert (result["total"], result["unread"], result["unanswered"]) == (3, 3, 2)
     entries = cast(list[dict[str, object]], result["messages"])
     assert [e["message_id"] for e in entries] == ids
-    assert entries[0]["answered"] is True and entries[1]["answered"] is False
+    assert (entries[0]["outcome"], entries[1]["outcome"]) == ("replied", "unanswered")
     assert "body" not in entries[0]
 
 
@@ -437,6 +437,40 @@ def test_a_bad_mail_request_is_refused(
     ids = seed_mail(paths)
     if args.get("message_id") == "FIRST":
         args = {**args, "message_id": ids[0]}
+    response = request(paths, op, args)
+    assert (response.ok, response.error_code) == (False, code)
+
+
+def test_an_operator_acknowledges_and_lines_see_it_in_their_sent_mail(
+    paths: ProjectPaths,
+) -> None:
+    ids = seed_mail(paths)
+    assert request(paths, "acknowledge", {"operator": "ana", "message_id": ids[1]}).ok
+    mail = request(paths, "mail", {"operator": "ana"})
+    assert mail.result is not None
+    entries = cast(list[dict[str, object]], mail.result["messages"])
+    assert [e["outcome"] for e in entries] == ["replied", "acknowledged", "unanswered"]
+    assert mail.result["unanswered"] == 1
+    sent = request(paths, "sent", {"operator": "ana"})
+    assert sent.result is not None
+    (reply,) = cast(list[dict[str, object]], sent.result["messages"])
+    assert (reply["recipient"], reply["outcome"]) == ("alpha", "unanswered")
+
+
+@pytest.mark.parametrize(
+    ("op", "args", "code"),
+    [
+        ("acknowledge", {"operator": "ana", "message_id": "m-x"}, ErrorCode.REJECTED),
+        ("acknowledge", {"operator": "ana"}, ErrorCode.BAD_REQUEST),
+        ("sent", {}, ErrorCode.BAD_REQUEST),
+        ("sent", {"operator": "ana", "unanswered_only": 1}, ErrorCode.BAD_REQUEST),
+        ("sent", {"operator": "ana", "limit": 0}, ErrorCode.REJECTED),
+    ],
+)
+def test_a_bad_acknowledge_or_sent_request_is_refused(
+    paths: ProjectPaths, op: str, args: dict[str, object], code: ErrorCode
+) -> None:
+    seed_mail(paths)
     response = request(paths, op, args)
     assert (response.ok, response.error_code) == (False, code)
 
@@ -678,9 +712,16 @@ def test_an_operator_looks_through_mail_from_the_command_line(
         assert cli.main([*base, "mail", "--operator", "ana", "--unread"]) == exits.OK
         listed = capsys.readouterr().out
         assert listed.startswith("3 matching, 3 unread, 2 unanswered")
-        assert f"{ids[0]} from alpha, note, unread, answered" in listed
+        assert f"{ids[0]} from alpha, note, unread, replied" in listed
         assert cli.main([*base, "read", ids[2], "--operator", "ana"]) == exits.OK
         assert capsys.readouterr().out.rstrip().endswith("note 2")
+        assert cli.main([*base, "ack", ids[2], "--operator", "ana"]) == exits.OK
+        assert cli.main([*base, "mail", "--operator", "ana"]) == exits.OK
+        assert (
+            f"{ids[2]} from alpha, note, read, acknowledged" in capsys.readouterr().out
+        )
+        assert cli.main([*base, "sent", "--operator", "ana"]) == exits.OK
+        assert "to alpha, note, waiting, unanswered" in capsys.readouterr().out
     finally:
         client.stop(paths)
         reap(pid)

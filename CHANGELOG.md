@@ -43,6 +43,10 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Acknowledgements and sent mail. `message_acknowledged` marks a message answered
+  without a reply. Senders see each sent message as replied, acknowledged or
+  unanswered, through the `list_sent` tool for lines and `dromon sent` for operators,
+  and recipients acknowledge with `acknowledge_mail` or `dromon ack`.
 - Mailboxes. Every party has one, with read state recorded by a new `message_read`
   event. A line's wake prompt opens with "X new message(s). Y unread. Z unanswered."
   and lists the new mail's headers, and `list_mail` and `read_mail` tools page through

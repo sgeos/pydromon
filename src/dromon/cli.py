@@ -38,6 +38,8 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "answer": "answer an operator question",
     "mail": "look through an operator's mailbox",
     "read": "open a message in an operator's mailbox",
+    "ack": "acknowledge a message without replying",
+    "sent": "show what became of the mail an operator sent",
     "probe": "run one short turn on the engine and report its capabilities",
 }
 """Planned subcommands and their one-line help, in display order."""
@@ -295,9 +297,44 @@ def _mail(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         if entry.get("reply_to") is not None:
             parts.append(f"replying to {entry.get('reply_to')}")
         parts.append("read" if entry.get("read") is True else "unread")
-        if entry.get("answered") is True:
-            parts.append("answered")
+        if entry.get("outcome") != "unanswered":
+            parts.append(str(entry.get("outcome")))
         print(", ".join(parts))
+    return exits.OK
+
+
+def _ack(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    args: dict[str, object] = {
+        "operator": arguments.operator,
+        "message_id": arguments.message_id,
+    }
+    return _request(paths, "ack", Operation.ACKNOWLEDGE, args)
+
+
+def _sent(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    args: dict[str, object] = {
+        "operator": arguments.operator,
+        "unanswered_only": arguments.unanswered,
+        "offset": arguments.offset,
+        "limit": arguments.limit,
+    }
+    response = _call(paths, "sent", Operation.SENT, args)
+    if isinstance(response, int):
+        return response
+    entries = cast(list[dict[str, object]], response.get("messages", []))
+    print(f"{response.get('total')} sent")
+    for entry in entries:
+        delivery = (
+            "read"
+            if entry.get("read") is True
+            else "delivered"
+            if entry.get("delivered") is True
+            else "waiting"
+        )
+        print(
+            f"{entry.get('message_id')} to {entry.get('recipient')},"
+            f" {entry.get('kind')}, {delivery}, {entry.get('outcome')}"
+        )
     return exits.OK
 
 
@@ -359,6 +396,8 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "answer": _answer,
     "mail": _mail,
     "read": _read,
+    "ack": _ack,
+    "sent": _sent,
 }
 
 
@@ -442,7 +481,7 @@ def build_parser() -> argparse.ArgumentParser:
                 default=default_operator(),
                 help="the operator answering, default %(default)s",
             )
-        if name in ("mail", "read"):
+        if name in ("mail", "read", "ack", "sent"):
             command.add_argument(
                 "--operator",
                 default=default_operator(),
@@ -459,8 +498,18 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument(
                 "--limit", type=int, default=20, help="at most this many, default 20"
             )
-        if name == "read":
-            command.add_argument("message_id", help="the message to open")
+        if name in ("read", "ack"):
+            command.add_argument("message_id", help="the message")
+        if name == "sent":
+            command.add_argument(
+                "--unanswered", action="store_true", help="only mail awaiting an answer"
+            )
+            command.add_argument(
+                "--offset", type=int, default=0, help="messages to skip"
+            )
+            command.add_argument(
+                "--limit", type=int, default=20, help="at most this many, default 20"
+            )
         if name == "send":
             command.add_argument("recipient", help="a line, or an operator as @name")
             command.add_argument("body", help="the message text")

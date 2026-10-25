@@ -59,4 +59,10 @@ message(s). Y unread. Z unanswered." and lists headers without bodies. Lines use
 tests pass with real Haiku lines reading their instructions through `read_mail`. 484
 tests pass.
 
+**Acknowledgements, a later prompt on the same day.** On the operator's direction, a
+recipient can acknowledge a message, which marks it answered without a reply, and a
+sender sees each sent message as replied, acknowledged or unanswered. Lines use
+`acknowledge_mail` and `list_sent`, operators `dromon ack` and `dromon sent`.
+Acknowledging a question leaves it open. 502 tests and all three live tests pass.
+
 **Next.** Task 7, conversation control, then task 8, the attachable client.

@@ -27,6 +27,7 @@ from dromon.model import (
     LineState,
     LineStateChanged,
     MessageDelivered,
+    MessageAcknowledged,
     MessageKind,
     MessageRead,
     MessageSent,
@@ -61,6 +62,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     ),
     "message_delivered": ("message_id",),
     "message_read": ("message_id",),
+    "message_acknowledged": ("message_id",),
     "wake_requested": ("wake_id", "line_id", "message_id"),
     "wake_issued": ("wake_id",),
     "question_withdrawn": ("message_id",),
@@ -159,6 +161,8 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
             return "message_delivered", {"message_id": event.message_id}
         case MessageRead():
             return "message_read", {"message_id": event.message_id}
+        case MessageAcknowledged():
+            return "message_acknowledged", {"message_id": event.message_id}
         case WakeRequested():
             return "wake_requested", {
                 "wake_id": event.wake_id,
@@ -208,6 +212,8 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
             return MessageDelivered(_str(data, "message_id"))
         case "message_read":
             return MessageRead(_str(data, "message_id"))
+        case "message_acknowledged":
+            return MessageAcknowledged(_str(data, "message_id"))
         case "wake_requested":
             return WakeRequested(
                 _str(data, "wake_id"), _str(data, "line_id"), _str(data, "message_id")

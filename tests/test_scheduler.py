@@ -33,7 +33,7 @@ from dromon.model import (
     WakeIssued,
     WakeRequested,
 )
-from dromon.mailbox import MailSummary
+from dromon.mailbox import MailSummary, summary
 from dromon.scheduler import LineSpec, Scheduler, compose_prompt
 
 HAIKU = "claude-haiku-5-5"
@@ -896,3 +896,84 @@ def test_doing_nothing_with_mail_is_valid(make_world: MakeWorld) -> None:
     second = target.engines["alpha"].prompts[1]
     # The first message was neither read nor answered, and nothing forced either.
     assert second.startswith("1 new message. 2 unread. 2 unanswered.")
+
+
+# Acknowledgements and sent mail.
+
+
+def test_an_acknowledgement_answers_without_a_reply_and_the_sender_sees_it(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": [[]], "beta": [[]]}, hold_wakes=True)
+    alpha, beta = LineAddress("alpha"), LineAddress("beta")
+    acked = target.scheduler.send(alpha, beta, "fyi")
+    replied = target.scheduler.send(alpha, beta, "a question")
+    waiting = target.scheduler.send(alpha, beta, "another")
+    for message_id in (acked, replied, waiting):
+        target.log.append(MessageDelivered(message_id))
+    result = asyncio.run(
+        call_tool(target.scheduler.acknowledge_mail_tool("beta"), {"message_id": acked})
+    )
+    assert tool_text(result) == f"acknowledged {acked}"
+    target.scheduler.send(beta, alpha, "the answer", reply_to=replied)
+    sent_text = tool_text(
+        asyncio.run(call_tool(target.scheduler.list_sent_tool("alpha"), {}))
+    )
+    assert sent_text.splitlines() == [
+        "3 of 3 sent messages, from 0.",
+        f"{acked} to beta, note, delivered, acknowledged",
+        f"{replied} to beta, note, delivered, replied",
+        f"{waiting} to beta, note, delivered, unanswered",
+    ]
+    only = tool_text(
+        asyncio.run(
+            call_tool(
+                target.scheduler.list_sent_tool("alpha"), {"unanswered_only": True}
+            )
+        )
+    )
+    assert only.splitlines()[1:] == [f"{waiting} to beta, note, delivered, unanswered"]
+    counts = summary(target.log.state, beta, 0)
+    assert counts.unanswered == 1
+
+
+def test_acknowledging_does_not_close_a_question(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[ask_call(question="?", to="@ana")]]})
+    run(target, send(target, "alpha", "start"))
+    (question_id,) = questions_for(target)
+    target.scheduler.acknowledge(ANA, question_id)
+    assert target.log.state.messages[question_id].acknowledged
+    assert questions_for(target) == [question_id]
+
+
+@pytest.mark.parametrize(
+    ("tool", "args", "reason"),
+    [
+        ("acknowledge_mail", {"message_id": "m-missing"}, "no message m-missing"),
+        ("acknowledge_mail", {"message_id": 1}, "message_id must be text"),
+        ("acknowledge_mail", {"message_id": "x", "why": "y"}, "unexpected argument"),
+        ("list_sent", {"limit": 0}, "limit"),
+        ("list_sent", {"unanswered_only": "yes"}, "unanswered_only"),
+    ],
+)
+def test_a_bad_acknowledgement_or_sent_call_returns_an_error(
+    make_world: MakeWorld, tool: str, args: dict[str, Any], reason: str
+) -> None:
+    target = make_world({"alpha": []}, hold_wakes=True)
+    builders = {
+        "acknowledge_mail": target.scheduler.acknowledge_mail_tool,
+        "list_sent": target.scheduler.list_sent_tool,
+    }
+    result = asyncio.run(call_tool(builders[tool]("alpha"), args))
+    assert result["is_error"] is True
+    assert reason in tool_text(result)
+
+
+def test_a_line_cannot_acknowledge_another_mailbox(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]], "beta": []})
+    run(target, send(target, "alpha", "private"))
+    (message_id,) = [
+        i for i, m in target.log.state.messages.items() if m.body == "private"
+    ]
+    with pytest.raises(EventRejected, match="no message"):
+        target.scheduler.acknowledge(LineAddress("beta"), message_id)

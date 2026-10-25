@@ -32,7 +32,9 @@ completed, moved or abandoned.
   - `mailbox.py` gives every party a mailbox with read and answered state. A wake
     prompt opens with "X new message(s). Y unread. Z unanswered." and lists headers,
     and lines page and open mail with `list_mail` and `read_mail`, operators with
-    `dromon mail` and `dromon read`. Nobody is obliged to answer.
+    `dromon mail` and `dromon read`. Nobody is obliged to answer. A recipient may
+    acknowledge a message without replying, and senders see replied, acknowledged or
+    unanswered through `list_sent` or `dromon sent`.
   - `lineconfig.py` gives each line its built-in tools, arbitrary MCP servers and an
     allow-all or allowlist policy, by the operator's decision, stored as
     `line_configured`. The default is no tools beyond Dromon's own, with strict MCP
@@ -113,7 +115,7 @@ its keychain token on 2026-10-24.
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 484 tests pass, 13 of them need sockets
+uv sync && uv run pytest    # 502 tests pass, 13 of them need sockets
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 

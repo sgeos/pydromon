@@ -278,6 +278,21 @@ class MessageDelivered:
 
 
 @dataclass(frozen=True, slots=True)
+class MessageAcknowledged:
+    """The recipient marked the message dealt with, without sending a reply.
+
+    The sender sees the difference between an acknowledgement and a reply, because a
+    sender may still be expecting a reply. A question stays open until it is answered
+    or withdrawn, whether or not it is acknowledged.
+    """
+
+    message_id: str
+
+    def __post_init__(self) -> None:
+        check_id("message_id", self.message_id)
+
+
+@dataclass(frozen=True, slots=True)
 class MessageRead:
     """The recipient opened the message. Reading never obliges an answer."""
 
@@ -334,6 +349,7 @@ type Event = (
     | MessageSent
     | MessageDelivered
     | MessageRead
+    | MessageAcknowledged
     | WakeRequested
     | WakeIssued
     | QuestionWithdrawn
@@ -366,6 +382,7 @@ class Message:
     reply_to: str | None
     delivered: bool = False
     read: bool = False
+    acknowledged: bool = False
     status: QuestionStatus | None = None
     """The question's lifecycle, or ``None`` for a note."""
     answered_by: str | None = None
@@ -428,6 +445,12 @@ class State:
             case MessageDelivered():
                 if self._message(event.message_id).delivered:
                     raise EventRejected(f"message {event.message_id} was delivered")
+            case MessageAcknowledged():
+                message = self._message(event.message_id)
+                if not message.delivered:
+                    raise EventRejected(f"message {event.message_id} was not delivered")
+                if message.acknowledged:
+                    raise EventRejected(f"message {event.message_id} was acknowledged")
             case MessageRead():
                 message = self._message(event.message_id)
                 if not message.delivered:
@@ -474,6 +497,9 @@ class State:
             case MessageRead():
                 message = self.messages[event.message_id]
                 self.messages[event.message_id] = replace(message, read=True)
+            case MessageAcknowledged():
+                message = self.messages[event.message_id]
+                self.messages[event.message_id] = replace(message, acknowledged=True)
             case WakeRequested():
                 self.wakes[event.wake_id] = Wake(
                     event.line_id, event.message_id, issued=False
