@@ -7,6 +7,8 @@ other subcommands are placeholders that report they are not implemented and exit
 
 import argparse
 import asyncio
+import getpass
+import re
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -25,10 +27,11 @@ PROBE_PROMPT: Final = "Reply with the single word: ready"
 
 SUBCOMMANDS: Final[dict[str, str]] = {
     "start": "start the daemon for this project",
+    "create": "create a session line",
     "stop": "stop the daemon",
     "status": "show the daemon and its session lines",
     "attach": "open the interactive client",
-    "send": "send a message to a session line",
+    "send": "send a message to a session line or an operator",
     "questions": "list open operator questions",
     "answer": "answer an operator question",
     "probe": "run one short turn on the engine and report its capabilities",
@@ -135,12 +138,79 @@ def _probe(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK if report.subtype == "success" else exits.FAILURE
 
 
+def default_operator() -> str:
+    """The operator identifier for this user, from the login name when it is valid."""
+    try:
+        name = getpass.getuser().lower()
+    except OSError:
+        return "operator"
+    cleaned = re.sub(r"[^a-z0-9._-]", "-", name).strip("-._")[:64]
+    return cleaned or "operator"
+
+
+def _request(
+    paths: ProjectPaths, command: str, operation: Operation, args: dict[str, object]
+) -> int:
+    try:
+        response = call(paths.socket, operation, args=args)
+    except DaemonNotRunning:
+        print(f"dromon {command}: not running for {paths.root}", file=sys.stderr)
+        return exits.NOT_RUNNING
+    except (ProtocolError, TimeoutError, OSError) as error:
+        print(f"dromon {command}: {error}", file=sys.stderr)
+        return exits.FAILURE
+    if not response.ok or response.result is None:
+        print(f"dromon {command}: {response.error_message}", file=sys.stderr)
+        return exits.FAILURE
+    for key, value in sorted(response.result.items()):
+        print(f"{key} {value}")
+    return exits.OK
+
+
+def _create(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    return _request(
+        paths,
+        "create",
+        Operation.CREATE_LINE,
+        {
+            "line_id": arguments.line_id,
+            "model": arguments.model,
+            "strategy": arguments.strategy,
+        },
+    )
+
+
+def _send(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    args: dict[str, object] = {
+        "recipient": arguments.recipient,
+        "body": arguments.body,
+        "operator": arguments.operator,
+    }
+    if arguments.reply_to is not None:
+        args["reply_to"] = arguments.reply_to
+    return _request(paths, "send", Operation.SEND, args)
+
+
 IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]] = {
     "start": _start,
     "status": _status,
     "stop": _stop,
     "probe": _probe,
+    "create": _create,
+    "send": _send,
 }
+
+
+def _add_driver_options(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
+        "--model", choices=MODELS, default=PROBE_MODEL, help="default %(default)s"
+    )
+    command.add_argument(
+        "--strategy",
+        choices=[strategy.value for strategy in Strategy],
+        default=Strategy.SUBSCRIPTION.value,
+        help="the driver's credential strategy, default %(default)s",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -162,18 +232,20 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     for name, help_text in SUBCOMMANDS.items():
         command = commands.add_parser(name, help=help_text, description=help_text)
-        if name == "probe":
+        if name == "create":
+            command.add_argument("line_id", help="the new line's identifier")
+        if name in ("create", "probe"):
+            _add_driver_options(command)
+        if name == "send":
+            command.add_argument("recipient", help="a line, or an operator as @name")
+            command.add_argument("body", help="the message text")
             command.add_argument(
-                "--model",
-                choices=MODELS,
-                default=PROBE_MODEL,
-                help="default %(default)s",
+                "--operator",
+                default=default_operator(),
+                help="the operator sending it, default %(default)s",
             )
             command.add_argument(
-                "--strategy",
-                choices=[strategy.value for strategy in Strategy],
-                default=Strategy.SUBSCRIPTION.value,
-                help="the driver's credential strategy, default %(default)s",
+                "--reply-to", default=None, help="the message answered"
             )
     return parser
 

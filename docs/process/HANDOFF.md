@@ -9,7 +9,7 @@ completed, moved or abandoned.
 
 ## State on 2026-10-25
 
-- **Tasks 1 to 4 done.**
+- **Tasks 1 to 5 done.**
   - `model.py`, `codec.py` and `eventlog.py` hold the data model as nine event kinds in
     an append-only SQLite log. Operators are parties addressed as `@name`.
   - `relay.py` forwards operator messages. Replies will come through inbound adapters
@@ -21,6 +21,10 @@ completed, moved or abandoned.
     Opus 5.5 and Haiku 5.5, each with a subscription, an API and a flexible strategy
     baked in, by the operator's decision. `dromon probe` reports capabilities and
     defaults to Haiku 5.5, the least expensive model, which tests also use.
+  - `scheduler.py` wakes idle lines when messages arrive and delivers pending messages
+    in one turn. Lines send through an in-process `send_message` tool, operators
+    through `dromon create` and `dromon send`. Lines are isolated from a claude.ai
+    login's connectors by `strict_mcp_config` and an allow-only permission gate.
   - `docs/protocol/` holds `EVENT_LOG.md`, `CLIENT.md`, `RELAY.md` and `DRIVER.md`.
 - **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310, and
   `pykeleusma` from its repository at `19d4558`, which needs a Rust toolchain to build.
@@ -28,7 +32,7 @@ completed, moved or abandoned.
   HTTPS remote that uses the GitHub command-line tool as its credential helper. No
   continuous integration is configured.
 - **Commands.** `attach`, `send`, `questions` and `answer` are placeholders that exit with
-  status 3. Lines are not yet run by the daemon or recorded in the event log.
+  status 3.
 - **pykeleusma.** Its tasks 2, 3 and 10 are done. Python cannot yet drive a script,
   because `call` and `resume` are its open task 5. Dromon's 0.1.0 does not depend on it.
 - **Sibling repositories.** `~/projects/keleusma/dromon` and `~/projects/rust/dromon-rs`
@@ -36,10 +40,10 @@ completed, moved or abandoned.
 
 ## Next step
 
-Task 5 of [`../roadmap/V0_1_0.md`](../roadmap/V0_1_0.md), layer 1 messaging and wakes.
-The daemon creates lines in the event log, runs their turns through `ClaudeCodeLine`,
-stores each line's engine session and driver state, and wakes an idle line when a
-message arrives. Driver events for messages and answers are added to `DRIVER.md`.
+Task 6 of [`../roadmap/V0_1_0.md`](../roadmap/V0_1_0.md), operator questions. Add an
+`ask_operator` tool beside `send_message` that sends a question to an operator, wire
+`dromon questions` and `dromon answer`, let an answer wake the asking line, and confirm
+an open question survives a daemon restart.
 
 ## Open
 
@@ -66,7 +70,9 @@ message arrives. Driver events for messages and answers are added to `DRIVER.md`
 - **Interline and Dromon overlap.** Once layer 1 messaging works, decide whether
   Dromon retires interline or keeps it for sessions Dromon does not drive.
 - **Daemon debt.** No peer credential check on connections, no relay forwarding passes
-  yet, and the event log's SQLite calls run on the event loop thread. All are recorded
+  yet, and the event log's SQLite calls run on the event loop thread. A line's engine
+  session and driver state live only in memory, so a restarted daemon starts each line
+  on a fresh Claude Code session. The per-line turn cap stands in for task 7. All are recorded
   in `CLIENT.md` or the module documentation.
 - **Recorded in the design.** Teacher-model scope, the contents of `.dromon/dromon.toml`,
   and the Rust repository's eventual name.
@@ -87,7 +93,7 @@ its keychain token on 2026-10-24.
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 342 tests pass, 10 of them need sockets
+uv sync && uv run pytest    # 388 tests pass, 11 of them need sockets
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 

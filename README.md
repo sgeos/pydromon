@@ -15,8 +15,10 @@ append-only SQLite event log are implemented and specified in
 and `dromon stop` manage a per-project `dromond` over a private Unix domain socket, as
 specified in [`docs/protocol/CLIENT.md`](docs/protocol/CLIENT.md). `dromon probe` runs one
 short turn of Claude Opus 5.5 on Claude Code, on the operator's Claude subscription,
-through a Keleusma driver, and reports the engine's capabilities. The other subcommands
-report that they are not implemented. The first milestone is
+through a Keleusma driver, and reports the engine's capabilities. `dromon create` and
+`dromon send` create lines and message them, and the daemon wakes an idle line when a
+message arrives. Lines message each other through a `send_message` tool. The other
+subcommands report that they are not implemented. The first milestone is
 [`docs/roadmap/V0_1_0.md`](docs/roadmap/V0_1_0.md) and the planned system is
 [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md). What Dromon needs from
 the Keleusma Python bindings is in

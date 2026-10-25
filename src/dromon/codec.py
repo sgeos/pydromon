@@ -42,7 +42,7 @@ MAX_PAYLOAD_BYTES: Final = 8 * 1024 * 1024
 body and choices whose every character needs a six-byte escape, stays under it."""
 
 KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
-    "line_created": ("line_id", "engine"),
+    "line_created": ("line_id", "engine", "strategy"),
     "line_state_changed": ("line_id", "state"),
     "operator_registered": ("operator_id",),
     "message_sent": (
@@ -121,7 +121,11 @@ def decode(payload: str) -> Event:
 def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
     match event:
         case LineCreated():
-            return "line_created", {"line_id": event.line_id, "engine": event.engine}
+            return "line_created", {
+                "line_id": event.line_id,
+                "engine": event.engine,
+                "strategy": event.strategy,
+            }
         case LineStateChanged():
             return "line_state_changed", {
                 "line_id": event.line_id,
@@ -164,7 +168,9 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
 def _from_wire(kind: str, data: dict[str, object]) -> Event:
     match kind:
         case "line_created":
-            return LineCreated(_str(data, "line_id"), _str(data, "engine"))
+            return LineCreated(
+                _str(data, "line_id"), _str(data, "engine"), _str(data, "strategy")
+            )
         case "line_state_changed":
             return LineStateChanged(
                 _str(data, "line_id"), _member(data, "state", LineState)

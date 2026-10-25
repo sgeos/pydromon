@@ -65,10 +65,10 @@ def test_encoding_is_canonical(scenario: tuple[Event, ...]) -> None:
 
 def test_an_encoding_is_pinned_so_ports_can_compare_bytes() -> None:
     expected = (
-        '{"data":{"engine":"claude-opus-5-5","line_id":"alpha"},'
-        '"kind":"line_created","v":1}'
+        '{"data":{"engine":"claude-opus-5-5","line_id":"alpha",'
+        '"strategy":"subscription"},"kind":"line_created","v":1}'
     )
-    assert encode(LineCreated("alpha", "claude-opus-5-5")) == expected
+    assert encode(LineCreated("alpha", "claude-opus-5-5", "subscription")) == expected
 
 
 def test_string_escapes_are_pinned_so_ports_can_compare_bytes() -> None:
@@ -119,7 +119,7 @@ def test_the_largest_valid_event_fits_the_payload_bound() -> None:
     assert decode(encode(event)) == event
 
 
-VALID_DATA = {"line_id": "alpha", "engine": "e"}
+VALID_DATA = {"line_id": "alpha", "engine": "e", "strategy": "subscription"}
 
 
 def message(**overrides: object) -> str:

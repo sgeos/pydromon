@@ -51,7 +51,7 @@ Each event has a kind and fields, all required. An optional value is written as 
 
 | Kind | Fields | Applies when |
 |---|---|---|
-| `line_created` | `line_id`, `engine` identifiers | The line does not exist. The new line is idle |
+| `line_created` | `line_id`, `engine` and `strategy` identifiers | The line does not exist. The new line is idle. The engine names the model, and the strategy names the driver's credential strategy |
 | `line_state_changed` | `line_id`, `state` | The line exists, the change is in the transition table, and a change to `running` is refused while the line is blocked |
 | `operator_registered` | `operator_id` | The operator does not exist |
 | `message_sent` | `message_id`, `sender` and `recipient` addresses, `kind`, `body` text, `choices`, `blocking` boolean, `reply_to` message identifier or `null` | See the message rules below |
@@ -92,7 +92,7 @@ operator is never forced into an option that does not fit.
 An event is stored as one JSON object.
 
 ```json
-{"data":{"engine":"claude-opus-5-5","line_id":"alpha"},"kind":"line_created","v":1}
+{"data":{"engine":"claude-opus-5-5","line_id":"alpha","strategy":"subscription"},"kind":"line_created","v":1}
 ```
 
 Addresses are written as their text forms, such as `"beta"` and `"@ana"`.

@@ -13,7 +13,14 @@ PLACEHOLDERS = [name for name in cli.SUBCOMMANDS if name not in cli.IMPLEMENTED]
 
 
 def test_the_lifecycle_subcommands_are_implemented() -> None:
-    assert set(cli.IMPLEMENTED) == {"start", "status", "stop", "probe"}
+    assert set(cli.IMPLEMENTED) == {
+        "start",
+        "status",
+        "stop",
+        "probe",
+        "create",
+        "send",
+    }
     assert set(cli.IMPLEMENTED) <= set(cli.SUBCOMMANDS)
 
 
@@ -107,3 +114,22 @@ def test_probe_refuses_an_api_key_without_starting_the_engine(
     runtime = ["--runtime-dir", str(short_runtime)]
     assert cli.main(["--project", str(tmp_path), *runtime, "probe"]) == exits.FAILURE
     assert "ANTHROPIC_API_KEY" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("login", "expected"),
+    [("ana", "ana"), ("Ana.B", "ana.b"), ("j doe", "j-doe"), ("--", "operator")],
+)
+def test_the_default_operator_is_a_valid_identifier(
+    monkeypatch: pytest.MonkeyPatch, login: str, expected: str
+) -> None:
+    monkeypatch.setattr(cli.getpass, "getuser", lambda: login)
+    assert cli.default_operator() == expected
+
+
+def test_send_without_a_daemon_reports_not_running(
+    tmp_path: Path, short_runtime: Path
+) -> None:
+    runtime = ["--runtime-dir", str(short_runtime)]
+    argv = ["--project", str(tmp_path), *runtime, "send", "alpha", "hi"]
+    assert cli.main(argv) == exits.NOT_RUNNING

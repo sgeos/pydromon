@@ -36,8 +36,8 @@ QUESTION = MessageKind.QUESTION
 # as sender and recipient, with two operators. The coverage tests check that it really
 # does, so a new event kind cannot be left out of it silently.
 SCENARIO: tuple[Event, ...] = (
-    LineCreated("alpha", ENGINE),
-    LineCreated("beta", ENGINE),
+    LineCreated("alpha", ENGINE, "subscription"),
+    LineCreated("beta", ENGINE, "subscription"),
     OperatorRegistered("ana"),
     OperatorRegistered("ben"),
     MessageSent("m1", ALPHA, BETA, NOTE, "hello"),

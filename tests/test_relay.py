@@ -34,7 +34,7 @@ CLEO = OperatorAddress("cleo")
 QUESTION = MessageKind.QUESTION
 
 SETUP: tuple[Event, ...] = (
-    LineCreated("alpha", "claude-opus-5-5"),
+    LineCreated("alpha", "claude-opus-5-5", "subscription"),
     OperatorRegistered("ana"),
     OperatorRegistered("ben"),
     OperatorRegistered("cleo"),

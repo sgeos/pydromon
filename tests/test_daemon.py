@@ -14,7 +14,11 @@ from pathlib import Path
 import pytest
 
 from dromon import client, exits
-from dromon.daemon import Daemon, acquire_lock, AlreadyRunning
+from typing import Any, cast
+
+from claude_agent_sdk import SdkMcpTool
+
+from dromon.daemon import AlreadyRunning, Daemon, acquire_lock
 from dromon.eventlog import EventLog
 from dromon.model import (
     LineAddress,
@@ -32,6 +36,9 @@ from dromon.protocol import (
     Response,
     decode_response,
 )
+from dromon.scheduler import LineEngine, LineSpec, Scheduler
+
+HAIKU = "claude-haiku-5-5"
 
 
 @pytest.fixture
@@ -45,7 +52,7 @@ def paths(tmp_path: Path, short_runtime: Path) -> ProjectPaths:
 def handle(paths: ProjectPaths, line: bytes) -> tuple[Response, bool]:
     paths.state_dir.mkdir(mode=0o700, exist_ok=True)
     with EventLog(paths.event_log) as log:
-        log.append(LineCreated("alpha", "claude-opus-5-5"))
+        log.append(LineCreated("alpha", "claude-opus-5-5", "subscription"))
         log.append(OperatorRegistered("ana"))
         log.append(
             MessageSent(
@@ -56,9 +63,25 @@ def handle(paths: ProjectPaths, line: bytes) -> tuple[Response, bool]:
                 "?",
             )
         )
-        daemon = Daemon(paths, log, "2026-10-25T00:00:00Z")
+        daemon = Daemon(paths, log, "2026-10-25T00:00:00Z", held_scheduler(log))
         response = daemon.respond(line)
         return response, daemon.stop_requested.is_set()
+
+
+def no_engine(spec: LineSpec, tool: SdkMcpTool[Any]) -> LineEngine:
+    raise AssertionError(f"no engine may start in this test, but {spec.line_id} did")
+
+
+def held_scheduler(log: EventLog) -> Scheduler:
+    return Scheduler(log, no_engine, hold_wakes=True)
+
+
+def request(paths: ProjectPaths, op: str, args: dict[str, object]) -> Response:
+    paths.state_dir.mkdir(mode=0o700, exist_ok=True)
+    with EventLog(paths.event_log) as log:
+        daemon = Daemon(paths, log, "2026-10-25T00:00:00Z", held_scheduler(log))
+        line = (json.dumps({"id": "r", "op": op, "v": 1, "args": args}) + "\n").encode()
+        return daemon.respond(line)
 
 
 def test_ping_answers_with_an_empty_result(paths: ProjectPaths) -> None:
@@ -113,7 +136,7 @@ def test_start_refuses_an_unsafe_runtime_directory(paths: ProjectPaths) -> None:
     paths.runtime_dir.mkdir(mode=0o700)
     paths.runtime_dir.chmod(0o755)
     with pytest.raises(PathError, match="Restrict it to 700"):
-        client.start(paths)
+        client.start(paths, HOLD)
     assert not paths.daemon_output.exists()
 
 
@@ -123,12 +146,116 @@ def test_a_client_finds_no_daemon_without_a_socket(paths: ProjectPaths) -> None:
     assert not client.is_running(paths)
 
 
-# The real daemon, started detached and driven over its socket.
+# Creating lines and sending messages through the protocol.
+
+
+def test_create_line_records_the_line(paths: ProjectPaths) -> None:
+    response = request(
+        paths, "create_line", {"line_id": "beta", "model": HAIKU, "strategy": "api"}
+    )
+    assert response.ok and response.result == {"line_id": "beta"}
+    with EventLog(paths.event_log) as log:
+        line = log.state.lines["beta"]
+    assert (line.engine, line.strategy) == (HAIKU, "api")
+
+
+@pytest.mark.parametrize(
+    ("args", "code", "reason"),
+    [
+        ({"line_id": "beta", "model": HAIKU}, ErrorCode.BAD_REQUEST, "arguments"),
+        (
+            {"line_id": "beta", "model": HAIKU, "strategy": 1},
+            ErrorCode.BAD_REQUEST,
+            "not a string",
+        ),
+        (
+            {"line_id": "beta", "model": HAIKU, "strategy": "metered"},
+            ErrorCode.REJECTED,
+            "unknown strategy",
+        ),
+        (
+            {"line_id": "beta", "model": "claude-sonnet-5-5", "strategy": "api"},
+            ErrorCode.REJECTED,
+            "no driver",
+        ),
+        (
+            {"line_id": "Bad", "model": HAIKU, "strategy": "api"},
+            ErrorCode.REJECTED,
+            "identifier",
+        ),
+        (
+            {"line_id": "alpha", "model": HAIKU, "strategy": "api"},
+            ErrorCode.REJECTED,
+            "exists",
+        ),
+    ],
+)
+def test_a_bad_create_line_is_refused(
+    paths: ProjectPaths, args: dict[str, object], code: ErrorCode, reason: str
+) -> None:
+    if args.get("line_id") == "alpha":
+        request(
+            paths,
+            "create_line",
+            {"line_id": "alpha", "model": HAIKU, "strategy": "api"},
+        )
+    response = request(paths, "create_line", args)
+    assert (response.ok, response.error_code) == (False, code)
+    assert reason in (response.error_message or "")
+
+
+def test_send_records_a_message_from_the_operator(paths: ProjectPaths) -> None:
+    request(
+        paths, "create_line", {"line_id": "alpha", "model": HAIKU, "strategy": "api"}
+    )
+    response = request(
+        paths, "send", {"recipient": "alpha", "body": "hello", "operator": "ana"}
+    )
+    assert response.ok and response.result is not None
+    message_id = response.result["message_id"]
+    with EventLog(paths.event_log) as log:
+        message = log.state.messages[str(message_id)]
+        assert "ana" in log.state.operators
+    assert (str(message.sender), str(message.recipient), message.body) == (
+        "@ana",
+        "alpha",
+        "hello",
+    )
+    assert not message.delivered
+
+
+@pytest.mark.parametrize(
+    ("args", "code"),
+    [
+        ({"recipient": "alpha", "body": "x"}, ErrorCode.BAD_REQUEST),
+        ({"recipient": "nobody", "body": "x", "operator": "ana"}, ErrorCode.REJECTED),
+        ({"recipient": "alpha", "body": "x", "operator": "Ana!"}, ErrorCode.REJECTED),
+        (
+            {"recipient": "alpha", "body": "x", "operator": "ana", "reply_to": "m-x"},
+            ErrorCode.REJECTED,
+        ),
+        ({"recipient": "alpha", "body": 3, "operator": "ana"}, ErrorCode.BAD_REQUEST),
+    ],
+)
+def test_a_bad_send_is_refused(
+    paths: ProjectPaths, args: dict[str, object], code: ErrorCode
+) -> None:
+    request(
+        paths, "create_line", {"line_id": "alpha", "model": HAIKU, "strategy": "api"}
+    )
+    response = request(paths, "send", args)
+    assert (response.ok, response.error_code) == (False, code)
+
+
+# The real daemon, started detached and driven over its socket. Wakes are held, so no
+# engine ever starts and no test touches the subscription.
+
+HOLD = ["--hold-wakes"]
 
 
 @pytest.fixture
 def running(paths: ProjectPaths) -> Iterator[tuple[ProjectPaths, int]]:
-    pid = client.start(paths)
+    pid = client.start(paths, HOLD)
     yield paths, pid
     if client.is_running(paths):
         client.stop(paths)
@@ -260,7 +387,7 @@ def test_a_stale_socket_file_is_replaced(paths: ProjectPaths) -> None:
     stale.close()
     assert paths.socket.exists()
     assert not client.is_running(paths)
-    pid = client.start(paths)
+    pid = client.start(paths, HOLD)
     try:
         assert client.is_running(paths)
     finally:
@@ -272,8 +399,8 @@ def test_a_stale_socket_file_is_replaced(paths: ProjectPaths) -> None:
 def test_the_daemon_reports_events_already_in_the_log(paths: ProjectPaths) -> None:
     paths.state_dir.mkdir(mode=0o700)
     with EventLog(paths.event_log) as log:
-        log.append(LineCreated("alpha", "claude-opus-5-5"))
-    pid = client.start(paths)
+        log.append(LineCreated("alpha", "claude-opus-5-5", "subscription"))
+    pid = client.start(paths, HOLD)
     try:
         status = client.call(paths.socket, Operation.STATUS)
         assert status.result is not None
@@ -287,3 +414,26 @@ def test_the_daemon_reports_events_already_in_the_log(paths: ProjectPaths) -> No
 def test_stop_when_nothing_runs_reports_not_running(paths: ProjectPaths) -> None:
     with pytest.raises(client.DaemonNotRunning):
         client.stop(paths)
+
+
+@pytest.mark.socket
+def test_lines_and_messages_through_the_command_line(
+    running: tuple[ProjectPaths, int], capsys: pytest.CaptureFixture[str]
+) -> None:
+    from dromon import cli
+
+    paths, _ = running
+    base = ["--project", str(paths.root), "--runtime-dir", str(paths.runtime_dir)]
+    assert cli.main([*base, "create", "alpha"]) == exits.OK
+    assert cli.main([*base, "create", "beta", "--strategy", "flexible"]) == exits.OK
+    assert cli.main([*base, "send", "alpha", "hello", "--operator", "ana"]) == exits.OK
+    assert cli.main([*base, "send", "nobody", "hello"]) == exits.FAILURE
+    capsys.readouterr()
+    status = client.call(paths.socket, Operation.STATUS)
+    assert status.result is not None
+    summaries = cast(list[dict[str, object]], status.result["lines"])
+    by_id = {str(summary["line_id"]): summary for summary in summaries}
+    assert by_id["alpha"]["pending"] == 1
+    assert by_id["alpha"]["state"] == "idle"
+    assert by_id["beta"]["strategy"] == "flexible"
+    assert by_id["beta"]["pending"] == 0

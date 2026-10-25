@@ -178,12 +178,16 @@ class QuestionStatus(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class LineCreated:
+    """A new line, with the engine model and the driver strategy it runs on."""
+
     line_id: str
     engine: str
+    strategy: str
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
         check_id("engine", self.engine)
+        check_id("strategy", self.strategy)
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,6 +303,7 @@ type Event = (
 @dataclass(frozen=True, slots=True)
 class Line:
     engine: str
+    strategy: str
     state: LineState
 
 
@@ -396,7 +401,9 @@ class State:
         self.check(event)
         match event:
             case LineCreated():
-                self.lines[event.line_id] = Line(event.engine, LineState.IDLE)
+                self.lines[event.line_id] = Line(
+                    event.engine, event.strategy, LineState.IDLE
+                )
             case LineStateChanged():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, state=event.state)

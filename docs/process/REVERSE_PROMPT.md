@@ -4,38 +4,37 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-25, concrete drivers and the testing model
+## 2026-10-25, task 5, layer 1 messaging and wakes
 
-**Done.**
+**Done.** Tasks 1 to 4 were already complete. Task 5 is complete.
 
-- **Testing model.** Claude Haiku 5.5, the least expensive model, runs on the
-  subscription through Claude Code, confirmed live. `dromon probe` and the live test now
-  use it by default.
-- **Concrete drivers.** On the operator's decision, subscription use, API use and
-  flexible use are separate drivers that bake their strategy in. Six driver files cover
-  Opus 5.5 and Haiku 5.5. A subscription driver refuses API usage, an API driver refuses
-  a subscription, and a flexible driver accepts either with API-safe settings. Driver
-  interface 2 adds a `credential` event, a `strategy` setting and a credential code in
-  the state.
-- **Engine.** It maps `apiKeySource` to a credential and lets the driver decide. It
-  refuses cloud providers for every driver, and API variables for subscription drivers,
-  before starting. A live `dromon probe --strategy api` was refused as intended.
-- **pykeleusma.** Its reply was read and acknowledged. Request
-  `pydromon-20261025-data-segment-request` reports the data segment gap as a deficiency
-  and asks for shared data support.
+- `dromon.scheduler` runs in the daemon. A message to an idle, unblocked line wakes it,
+  records the wake, marks it running, delivers every pending message in one turn, and
+  returns it to idle. A message to a running line waits for the next turn. Lines run
+  concurrently, and a per-line turn cap stops runaway exchanges.
+- Lines send through an in-process `send_message` tool whose sender the daemon fixes.
+  Operators use `dromon create` and `dromon send`, through the new `create_line` and
+  `send` operations, with a `rejected` error code for requests that do not apply.
+- **Live evidence.** In a real daemon, an operator message woke `alpha`, which sent
+  `ping` to `beta`. The idle `beta` was woken, replied `pong` with `reply_to`, and woke
+  `alpha` again. Both ended idle. A live test repeats this.
+
+**Security finding.** With a claude.ai login, a line saw the account's connectors, among
+them mail sending, file sharing and calendar deletion, despite `setting_sources=[]` and
+no built-in tools. Task 4's lines had the same exposure, though nothing was approved for
+them. Lines now run with `strict_mcp_config=True`, a permission gate that allows only the
+line's own tools, and a refusal of any turn whose engine reports another tool.
 
 **Decisions made by this line, open to the operator's review.**
 
-- The flexible drivers use the API settings, because a flexible line may be billed per
-  token. The settings in each driver are a first judgement, listed in `DRIVER.md`.
-- The six files were generated once from a throwaway script that is not committed, and
-  each is now maintained as its own concrete driver.
+- The turn cap defaults to 10 per line per daemon lifetime.
+- `line_created` gained a `strategy` field, a change to the draft format.
+- `--hold-wakes` lets the socket tests run a real daemon without touching the engine.
 
-**Verification.** `uv sync`, 342 tests passing with warnings treated as errors outside
-the sandbox, and the live test passing on Haiku 5.5 with `DROMON_LIVE_TESTS=1`. Ruff and
-pyright strict clean. The wheel contains all six drivers.
+**Verification.** `uv sync`, 388 tests passing with warnings treated as errors outside
+the sandbox, and both live tests passing on Haiku 5.5. Ruff and pyright strict clean.
 
-**Not verified.** Any API credential, since the operator has none. The API and flexible
-paths are tested against scripted sessions only.
+**Not verified.** Restart recovery against a real engine mid-turn, and two lines on
+different models. Engine sessions are not persisted across daemon restarts.
 
-**Next.** Task 5, layer 1 messaging and wakes.
+**Next.** Task 6, operator questions.

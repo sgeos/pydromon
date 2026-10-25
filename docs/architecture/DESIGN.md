@@ -96,6 +96,12 @@ message becomes an event for the line's driver, whose actions the adapter perfor
 `dromon probe` runs one short turn and reports the engine's capabilities. The driver
 interface is [`../protocol/DRIVER.md`](../protocol/DRIVER.md).
 
+**Fact, observed live on 2026-10-25.** With a claude.ai login, a Claude Code session
+offers the account's connectors, such as mail sending and file sharing, even with
+`setting_sources=[]` and no built-in tools. Lines therefore run with
+`strict_mcp_config=True`, a permission gate that allows only the line's own tools, and a
+check that the engine reports no tool beyond them.
+
 **Decided 2026-10-25 by the operator.** Drivers are concrete. Subscription use, API use
 and flexible use are separate drivers that bake their strategy in, rather than one
 driver choosing behaviour from parameters. Claude Haiku 5.5, the least expensive
@@ -124,10 +130,16 @@ without being rewritten. Each layer adds only its routing and its delivery guara
 
 **Decided.** The harness issues wakes.
 
-**Proposed.** If the recipient is idle, the daemon starts a turn with the message. If the
-recipient is busy, the message waits until the turn ends, or is injected mid-turn where
-the engine supports it. The wake policy is per-project configuration, for example
-immediate, batched, or only at turn boundaries.
+**Implemented 2026-10-25, roadmap task 5.** If the recipient is idle and not blocked,
+the daemon wakes it at once and delivers every undelivered message in one turn. If the
+recipient is busy, the message waits until the turn ends, and the daemon wakes it again.
+Lines send through an in-process `send_message` tool whose sender the daemon fixes, and
+operators through `dromon send`. A per-line turn cap stops a runaway exchange until the
+conversation limits of task 7. Live, two Haiku 5.5 lines exchanged ping and pong, each
+woken by the other's message.
+
+**Proposed.** Mid-turn injection where the engine supports it, and a wake policy in
+per-project configuration, for example immediate, batched, or only at turn boundaries.
 
 ## Operator questions
 

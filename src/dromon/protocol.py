@@ -11,9 +11,9 @@ overrides, so a port can match it exactly.
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Final, NoReturn
+from typing import Final, NoReturn, cast
 
 PROTOCOL_VERSION: Final = 1
 
@@ -27,6 +27,8 @@ class Operation(StrEnum):
     PING = "ping"
     STATUS = "status"
     STOP = "stop"
+    CREATE_LINE = "create_line"
+    SEND = "send"
 
 
 class ErrorCode(StrEnum):
@@ -34,6 +36,8 @@ class ErrorCode(StrEnum):
     UNSUPPORTED_VERSION = "unsupported_version"
     UNKNOWN_OPERATION = "unknown_operation"
     TOO_LONG = "too_long"
+    REJECTED = "rejected"
+    """The request is well formed but does not apply, such as a message to no line."""
     INTERNAL = "internal"
 
 
@@ -49,6 +53,8 @@ class ProtocolError(ValueError):
 class Request:
     request_id: str
     operation: Operation
+    args: dict[str, object] = field(default_factory=dict[str, object])
+    """Operation arguments. Each operation checks its own, strictly."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,9 +132,14 @@ def _request_id(document: dict[str, object]) -> str:
 
 
 def encode_request(request: Request) -> bytes:
-    return _dumps(
-        {"id": request.request_id, "op": request.operation.value, "v": PROTOCOL_VERSION}
-    )
+    document: dict[str, object] = {
+        "id": request.request_id,
+        "op": request.operation.value,
+        "v": PROTOCOL_VERSION,
+    }
+    if request.args:
+        document["args"] = request.args
+    return _dumps(document)
 
 
 def decode_request(line: bytes) -> Request:
@@ -136,15 +147,19 @@ def decode_request(line: bytes) -> Request:
     document = _loads(line)
     _version(document)
     request_id = _request_id(document)
-    if set(document) != {"id", "op", "v"}:
+    if set(document) not in ({"id", "op", "v"}, {"args", "id", "op", "v"}):
         raise ProtocolError(
             ErrorCode.BAD_REQUEST, f"the request has keys {sorted(document)}"
         )
+    raw_args = document.get("args", {})
+    if not isinstance(raw_args, dict):
+        raise ProtocolError(ErrorCode.BAD_REQUEST, "args is not an object")
+    args = cast(dict[str, object], raw_args)
     operation = document["op"]
     if not isinstance(operation, str):
         raise ProtocolError(ErrorCode.BAD_REQUEST, "op is not a string")
     try:
-        return Request(request_id, Operation(operation))
+        return Request(request_id, Operation(operation), args)
     except ValueError as error:
         raise ProtocolError(
             ErrorCode.UNKNOWN_OPERATION, f"unknown operation {operation!r}"
