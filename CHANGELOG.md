@@ -7,6 +7,8 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- Driver documentation no longer claims that Keleusma resets private data. It persists
+  once assigned, as the `pykeleusma` line pointed out and this line confirmed.
 - `line_created` gains a `strategy` field naming the line's driver strategy.
 - The build backend requirement moves to `uv_build` 0.13, matching the installed uv.
 - `docs/protocol/RELAY.md` requires every relay adapter to support a response path and

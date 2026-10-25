@@ -8,9 +8,8 @@
 //
 // The host sends one event per cycle together with the driver's state, and receives
 // one action together with the next state. The host stores the state between cycles,
-// because Keleusma 0.2.2 resets private data and pykeleusma cannot drive shared data,
-// and the state persists naturally in Dromon's event log. Every cycle yields exactly
-// once, so its cost is bounded.
+// so that Dromon's event log can record it and a restarted daemon can resume it. Every
+// cycle yields exactly once, so its cost is bounded.
 //
 // Event:  (tag, text, number)
 // State:  (tool uses in the current turn, turns completed, credential code)

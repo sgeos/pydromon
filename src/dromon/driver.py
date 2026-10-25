@@ -8,8 +8,8 @@ inside the bounded path and the driver's worst-case time covers its whole decisi
 Driver interface 2. The entry point is
 ``loop main(input: (Event, State)) -> (Action, State)``, where an event and an action
 are ``(Text, Text, Word)`` and the state is ``(Word, Word, Word)``. The host owns the
-state between cycles, because Keleusma 0.2.2 resets private data and ``pykeleusma``
-cannot drive shared data. Each event is one cycle. The host resumes with the event and
+state between cycles, so the event log can record it and a restarted line can resume
+it. Each event is one cycle. The host resumes with the event and
 receives the action, then resumes once more to complete the cycle, which Keleusma
 reports as a reset.
 
