@@ -7,6 +7,9 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- The scheduler is tick based. A message sent in one turn is received no sooner than
+  the next tick, even by an idle line, and messages never interrupt a turn. `status`
+  reports the tick.
 - Driver documentation no longer claims that Keleusma resets private data. It persists
   once assigned, as the `pykeleusma` line pointed out and this line confirmed.
 - `line_created` gains a `strategy` field naming the line's driver strategy.
@@ -33,6 +36,10 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Per-line tool configuration, `dromon.lineconfig` and `docs/protocol/LINE_CONFIG.md`.
+  A line may be given built-in tools and arbitrary MCP servers under an allow-all or an
+  allowlist policy, stored as a new `line_configured` event. `dromon create` takes tool
+  options, and `dromon configure` and the `configure_line` operation change them.
 - Layer 1 messaging and wakes, roadmap task 5. `dromon.scheduler` wakes an idle line
   when a message arrives, delivers its pending messages in one turn, and wakes it again
   after a busy turn. Lines send through an in-process `send_message` tool, and operators

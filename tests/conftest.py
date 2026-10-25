@@ -7,9 +7,11 @@ from pathlib import Path
 
 import pytest
 
+from dromon.lineconfig import LineConfig, encode_config
 from dromon.model import (
     Event,
     LineAddress,
+    LineConfigured,
     LineCreated,
     LineState,
     LineStateChanged,
@@ -38,6 +40,12 @@ QUESTION = MessageKind.QUESTION
 SCENARIO: tuple[Event, ...] = (
     LineCreated("alpha", ENGINE, "subscription"),
     LineCreated("beta", ENGINE, "subscription"),
+    LineConfigured(
+        "beta",
+        encode_config(
+            LineConfig(builtin_tools=("Read",), allowed_tools=("mcp__docs__*",))
+        ),
+    ),
     OperatorRegistered("ana"),
     OperatorRegistered("ben"),
     MessageSent("m1", ALPHA, BETA, NOTE, "hello"),

@@ -47,12 +47,14 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `ping` | An empty object |
 | `status` | `daemon_version`, `protocol_version`, `pid`, `project`, `started_at`, and `event_log` with `last_seq`, `lines`, `operators` and `open_questions` |
 | `stop` | `{"stopping": true}`, after which the daemon closes its connections, removes its socket and exits |
-| `create_line` | Arguments `line_id`, `model` and `strategy`. Result `{"line_id": ...}`. Refused when no packaged driver serves the model and strategy |
+| `create_line` | Arguments `line_id`, `model`, `strategy`, and optionally `config`, an object of [`LINE_CONFIG.md`](LINE_CONFIG.md). Result `{"line_id": ...}`. Refused when no packaged driver serves the model and strategy |
+| `configure_line` | Arguments `line_id` and `config`. Replaces the line's configuration from its next turn |
 | `send` | Arguments `recipient`, a line or `@operator`, `body`, `operator`, and optionally `reply_to`. Registers the operator if new and records a note from them. Result `{"message_id": ...}` |
 
-`status` also returns `lines`, one entry per line with `line_id`, `engine`, `strategy`,
-`state`, `pending`, the count of undelivered messages, and `turns`, the turns run in
-this daemon's lifetime.
+`status` also returns `tick`, the ticks run in this daemon's lifetime, and `lines`, one
+entry per line with `line_id`, `engine`, `strategy`, `state`, `pending`, the count of
+undelivered messages, `turns`, the turns run in this daemon's lifetime, and
+`tool_policy`.
 
 ## Responses
 
@@ -91,10 +93,15 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromon start` | Starts a detached `dromond` in a new session and waits up to 10 seconds for it to answer `ping`. Succeeds without action when a daemon already answers | 0, or 1 on failure |
 | `dromon status` | Prints the `status` result | 0, 4 when no daemon answers, or 1 |
 | `dromon stop` | Sends `stop` and waits up to 10 seconds for the socket to disappear | 0, 4 when no daemon answers, or 1 |
-| `dromon create LINE` | Sends `create_line`, with `--model`, default `claude-haiku-5-5`, and `--strategy`, default `subscription` | 0, 4, or 1 |
+| `dromon create LINE` | Sends `create_line`, with `--model`, default `claude-haiku-5-5`, `--strategy`, default `subscription`, and the tool options below | 0, 4, or 1 |
+| `dromon configure LINE` | Sends `configure_line` with the tool options below. No option means the default configuration | 0, 4, or 1 |
 | `dromon send RECIPIENT BODY` | Sends `send`, with `--operator`, default the login name, and `--reply-to` | 0, 4, or 1 |
 | `dromon probe` | Runs one short turn without the daemon and reports the engine's capabilities | 0 or 1 |
 | `dromond` | Runs the daemon in the foreground. `--max-turns-per-line N` caps the turns run for each line, default 10, and `--hold-wakes` records messages without waking any line | 0, 1 on failure, 2 on a bad cap, or 5 when another daemon holds the lock |
+
+The tool options are `--tool NAME`, repeatable, `--mcp-config FILE`, a JSON file of MCP
+servers that the client reads, `--allow-tool NAME`, repeatable, `--allow-all-tools` and
+`--inherit-account-mcp`.
 
 Status 2 is a usage error and status 3 marks a subcommand not yet implemented.
 

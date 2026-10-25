@@ -4,41 +4,38 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-25, task 5, layer 1 messaging and wakes
+## 2026-10-25, ticks, per-line tools and the client direction
 
-**Done.** Tasks 1 to 4 were already complete. Task 5 is complete.
+**Done, on the operator's three directions.**
 
-- `dromon.scheduler` runs in the daemon. A message to an idle, unblocked line wakes it,
-  records the wake, marks it running, delivers every pending message in one turn, and
-  returns it to idle. A message to a running line waits for the next turn. Lines run
-  concurrently, and a per-line turn cap stops runaway exchanges.
-- Lines send through an in-process `send_message` tool whose sender the daemon fixes.
-  Operators use `dromon create` and `dromon send`, through the new `create_line` and
-  `send` operations, with a `rejected` error code for requests that do not apply.
-- **Live evidence.** In a real daemon, an operator message woke `alpha`, which sent
-  `ping` to `beta`. The idle `beta` was woken, replied `pong` with `reply_to`, and woke
-  `alpha` again. Both ended idle. A live test repeats this.
-
-**Security finding.** With a claude.ai login, a line saw the account's connectors, among
-them mail sending, file sharing and calendar deletion, despite `setting_sources=[]` and
-no built-in tools. Task 4's lines had the same exposure, though nothing was approved for
-them. Lines now run with `strict_mcp_config=True`, a permission gate that allows only the
-line's own tools, and a refusal of any turn whose engine reports another tool.
+- **Ticks.** The scheduler advances in ticks. At the start of a tick it takes a snapshot
+  of every undelivered message for an idle, unblocked line under its cap, and each such
+  line takes one turn. A message sent during a tick waits for the next tick, even when
+  its recipient is idle throughout, and messages never interrupt a turn. The live
+  ping-pong of task 5 now takes three ticks. `status` reports the tick.
+- **Per-line tools.** `docs/protocol/LINE_CONFIG.md` and `dromon.lineconfig` give each
+  line built-in tools, arbitrary MCP servers over stdio, HTTP or SSE, and an
+  `allowlist` or `allow_all` policy, plus an opt-in to inherit the account's MCP
+  servers. Configurations are stored as `line_configured`, set by `dromon create` or
+  `dromon configure`, and apply from the line's next turn on the same engine session.
+  A live Haiku line configured with only `Read` read a file and answered correctly.
+- **Client.** The daemon keeps the `ask_operator` queue, and the client is to grow a
+  graphical interface, or a launcher for one, attachable per line in many terminals at
+  once. This is recorded in the design and in roadmap task 8, not built yet.
 
 **Decisions made by this line, open to the operator's review.**
 
-- The turn cap defaults to 10 per line per daemon lifetime.
-- `line_created` gained a `strategy` field, a change to the draft format.
-- `--hold-wakes` lets the socket tests run a real daemon without touching the engine.
+- Listed built-in tools are allowed under the allowlist without being repeated in
+  `allowed_tools`, because listing them is already a grant.
+- An HTTP or SSE server must use `https`, or `http` on the local host.
+- A turn is refused when the engine offers a server the configuration does not name,
+  unless the account's servers are inherited.
 
-**Verification.** `uv sync`, 388 tests passing with warnings treated as errors outside
-the sandbox, and both live tests passing on Haiku 5.5. Ruff and pyright strict clean.
+**Verification.** `uv sync`, 433 tests passing with warnings treated as errors outside
+the sandbox. Ruff and pyright strict clean. A live turn exercised a configured built-in
+tool.
 
-**Not verified.** Restart recovery against a real engine mid-turn, and two lines on
-different models. Engine sessions are not persisted across daemon restarts.
-
-**Correction, after the merge.** The `pykeleusma` line accepted shared data support as
-its task 11 and pointed out that private data persists once assigned. A check here
-confirmed it, and the drivers and documents no longer say otherwise.
+**Not verified.** A real external MCP server, and `allow_all` or inheritance against the
+real engine. MCP credentials are stored in the event log.
 
 **Next.** Task 6, operator questions.

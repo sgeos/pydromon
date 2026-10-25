@@ -31,6 +31,7 @@ from claude_agent_sdk import (
 )
 
 from dromon.driver import Credential, Driver, Strategy, driver_resource
+from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, McpServer, ToolPolicy
 from dromon.engine import (
     API_ENVIRONMENT,
     KEY_SOURCES,
@@ -339,7 +340,7 @@ def test_a_line_with_dromon_tools_serves_and_allows_exactly_them() -> None:
     run(target)
     options = session.options[0]
     assert options.allowed_tools == []
-    assert target.expected_tools == {"mcp__dromon__echo"}
+    assert target.own_tools == {"mcp__dromon__echo"}
     assert isinstance(options.mcp_servers, dict)
     assert set(options.mcp_servers) == {MCP_SERVER_NAME}
 
@@ -358,9 +359,75 @@ def test_an_engine_offering_unexpected_tools_is_refused() -> None:
 
 
 def test_the_gate_allows_exactly_the_given_tools() -> None:
-    gate = permission_gate(frozenset({"mcp__dromon__echo"}))
+    gate = permission_gate(DEFAULT_CONFIG, frozenset({"mcp__dromon__echo"}))
     allowed = asyncio.run(gate("mcp__dromon__echo", {}, CONTEXT))
     denied = asyncio.run(gate("Bash", {"command": "ls"}, CONTEXT))
     assert isinstance(allowed, PermissionResultAllow)
     assert isinstance(denied, PermissionResultDeny)
     assert "Bash is not available" in denied.message
+
+
+# Per-line configuration.
+
+GITHUB = McpServer("stdio", command="gh-mcp")
+
+
+def configured(config: LineConfig, session: Scripted) -> ClaudeCodeLine:
+    return ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        Path("/work"),
+        config=config,
+        environment={},
+        session_factory=session.factory,
+    )
+
+
+def test_configured_servers_and_built_in_tools_reach_the_engine() -> None:
+    config = LineConfig(builtin_tools=("Read",), mcp_servers=(("github", GITHUB),))
+    session = Scripted([init(tools=["Read", "mcp__github__create_issue"]), result()])
+    run(configured(config, session))
+    options = session.options[0]
+    assert options.tools == ["Read"]
+    assert options.mcp_servers == {"github": {"type": "stdio", "command": "gh-mcp"}}
+    assert options.strict_mcp_config is True
+
+
+def test_inheriting_the_account_turns_off_strict_mcp_and_accepts_its_tools() -> None:
+    config = LineConfig(inherit_account_mcp=True)
+    session = Scripted([init(tools=["mcp__claude_ai_Gmail__send_message"]), result()])
+    run(configured(config, session))
+    assert session.options[0].strict_mcp_config is False
+
+
+@pytest.mark.parametrize(
+    ("offered", "expected"),
+    [
+        ("Bash", "Bash"),
+        ("mcp__other__tool", "mcp__other__tool"),
+        ("mcp__dromon__unknown", "mcp__dromon__unknown"),
+    ],
+)
+def test_an_engine_offering_more_than_the_configuration_is_refused(
+    offered: str, expected: str
+) -> None:
+    config = LineConfig(builtin_tools=("Read",), mcp_servers=(("github", GITHUB),))
+    session = Scripted([init(tools=["Read", offered]), result()])
+    with pytest.raises(EngineRefused, match=expected):
+        run(configured(config, session))
+
+
+def test_the_gate_applies_the_line_policy() -> None:
+    allowlist = permission_gate(
+        LineConfig(allowed_tools=("mcp__github__*",)), frozenset()
+    )
+    allow_all = permission_gate(
+        LineConfig(tool_policy=ToolPolicy.ALLOW_ALL), frozenset()
+    )
+    assert isinstance(
+        asyncio.run(allowlist("mcp__github__create_issue", {}, CONTEXT)),
+        PermissionResultAllow,
+    )
+    assert isinstance(asyncio.run(allowlist("Bash", {}, CONTEXT)), PermissionResultDeny)
+    assert isinstance(
+        asyncio.run(allow_all("Bash", {}, CONTEXT)), PermissionResultAllow
+    )

@@ -38,11 +38,17 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
 
 from dromon import __version__, exits
 from dromon.driver import DriverError, Strategy
 from dromon.eventlog import EventLog, LogError, utc_now
+from dromon.lineconfig import (
+    DEFAULT_CONFIG,
+    ConfigError,
+    LineConfig,
+    config_from_document,
+)
 from dromon.model import (
     EventRejected,
     InvalidField,
@@ -120,16 +126,19 @@ class Daemon:
             case Operation.STOP:
                 self.stop_requested.set()
                 return Response(request.request_id, ok=True, result={"stopping": True})
-            case Operation.CREATE_LINE | Operation.SEND:
+            case Operation.CREATE_LINE | Operation.CONFIGURE_LINE | Operation.SEND:
                 return self._command(request)
 
     def _command(self, request: Request) -> Response:
         """Run a request that changes state, turning each refusal into an error."""
         try:
-            if request.operation is Operation.CREATE_LINE:
-                result = self._create_line(request.args)
-            else:
-                result = self._send(request.args)
+            match request.operation:
+                case Operation.CREATE_LINE:
+                    result = self._create_line(request.args)
+                case Operation.CONFIGURE_LINE:
+                    result = self._configure_line(request.args)
+                case _:
+                    result = self._send(request.args)
         except ProtocolError as error:
             return Response(
                 request.request_id,
@@ -137,7 +146,7 @@ class Daemon:
                 error_code=error.code,
                 error_message=str(error),
             )
-        except (InvalidField, EventRejected, DriverError) as error:
+        except (InvalidField, EventRejected, DriverError, ConfigError) as error:
             return Response(
                 request.request_id,
                 False,
@@ -147,12 +156,24 @@ class Daemon:
         return Response(request.request_id, True, result=result)
 
     def _create_line(self, args: dict[str, object]) -> dict[str, object]:
-        line_id, model, strategy = _text_args(args, ("line_id", "model", "strategy"))
+        texts = {key: value for key, value in args.items() if key != "config"}
+        line_id, model, strategy = _text_args(texts, ("line_id", "model", "strategy"))
         try:
             chosen = Strategy(strategy)
         except ValueError as error:
             raise DriverError(f"unknown strategy {strategy!r}") from error
-        self.scheduler.create_line(line_id, model, chosen)
+        config = _config_arg(args) if "config" in args else DEFAULT_CONFIG
+        self.scheduler.create_line(line_id, model, chosen, config)
+        return {"line_id": line_id}
+
+    def _configure_line(self, args: dict[str, object]) -> dict[str, object]:
+        texts = {key: value for key, value in args.items() if key != "config"}
+        (line_id,) = _text_args(texts, ("line_id",))
+        if "config" not in args:
+            raise ProtocolError(ErrorCode.BAD_REQUEST, "configure_line needs a config")
+        if line_id not in self.log.state.lines:
+            raise EventRejected(f"no line {line_id}")
+        self.scheduler.configure_line(line_id, _config_arg(args))
         return {"line_id": line_id}
 
     def _send(self, args: dict[str, object]) -> dict[str, object]:
@@ -183,8 +204,16 @@ class Daemon:
                 "operators": len(state.operators),
                 "open_questions": open_questions,
             },
+            "tick": self.scheduler.tick,
             "lines": self.scheduler.line_summaries(),
         }
+
+
+def _config_arg(args: dict[str, object]) -> LineConfig:
+    value = args["config"]
+    if not isinstance(value, dict):
+        raise ProtocolError(ErrorCode.BAD_REQUEST, "config is not an object")
+    return config_from_document(cast(dict[str, object], value))
 
 
 def _text_args(args: dict[str, object], names: tuple[str, ...]) -> tuple[str, ...]:

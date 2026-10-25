@@ -33,6 +33,9 @@ an operator address cannot be confused even when their identifiers are equal."""
 MAX_TEXT_BYTES: Final = 1024 * 1024
 """Upper bound on the UTF-8 size of a message body."""
 
+MAX_CONFIG_BYTES: Final = 256 * 1024
+"""Upper bound on the UTF-8 size of a line's stored tool configuration."""
+
 MAX_CHOICES: Final = 16
 MAX_CHOICE_BYTES: Final = 1024
 
@@ -201,6 +204,22 @@ class LineStateChanged:
 
 
 @dataclass(frozen=True, slots=True)
+class LineConfigured:
+    """A line's tool configuration, as the canonical JSON of ``dromon.lineconfig``.
+
+    The model checks only that it is bounded text. The daemon validates its meaning
+    before appending, and decodes it again when it builds the line's engine.
+    """
+
+    line_id: str
+    config: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_text("config", self.config, MAX_CONFIG_BYTES)
+
+
+@dataclass(frozen=True, slots=True)
 class OperatorRegistered:
     operator_id: str
 
@@ -286,6 +305,7 @@ class QuestionSuperseded:
 type Event = (
     LineCreated
     | LineStateChanged
+    | LineConfigured
     | OperatorRegistered
     | MessageSent
     | MessageDelivered
@@ -305,6 +325,8 @@ class Line:
     engine: str
     strategy: str
     state: LineState
+    config: str | None = None
+    """The latest ``line_configured`` text, or ``None`` for the default."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,6 +399,8 @@ class State:
                     raise EventRejected(f"line {event.line_id} exists")
             case LineStateChanged():
                 self._check_line_state(event)
+            case LineConfigured():
+                self._line(event.line_id)
             case OperatorRegistered():
                 if event.operator_id in self.operators:
                     raise EventRejected(f"operator {event.operator_id} exists")
@@ -407,6 +431,9 @@ class State:
             case LineStateChanged():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, state=event.state)
+            case LineConfigured():
+                line = self.lines[event.line_id]
+                self.lines[event.line_id] = replace(line, config=event.config)
             case OperatorRegistered():
                 self.operators.add(event.operator_id)
             case MessageSent():

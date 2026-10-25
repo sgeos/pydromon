@@ -19,6 +19,7 @@ def test_the_lifecycle_subcommands_are_implemented() -> None:
         "stop",
         "probe",
         "create",
+        "configure",
         "send",
     }
     assert set(cli.IMPLEMENTED) <= set(cli.SUBCOMMANDS)
@@ -133,3 +134,53 @@ def test_send_without_a_daemon_reports_not_running(
     runtime = ["--runtime-dir", str(short_runtime)]
     argv = ["--project", str(tmp_path), *runtime, "send", "alpha", "hi"]
     assert cli.main(argv) == exits.NOT_RUNNING
+
+
+def test_tool_options_build_a_configuration(tmp_path: Path) -> None:
+    servers = tmp_path / "mcp.json"
+    servers.write_text(
+        '{"mcpServers": {"fs": {"command": "fs-mcp"}}}', encoding="utf-8"
+    )
+    parser = cli.build_parser()
+    arguments = parser.parse_args(
+        [
+            "configure",
+            "alpha",
+            "--tool",
+            "Read",
+            "--mcp-config",
+            str(servers),
+            "--allow-tool",
+            "mcp__fs__*",
+        ]
+    )
+    document = cli._config_document(arguments)  # pyright: ignore[reportPrivateUsage]
+    assert document == {
+        "builtin_tools": ["Read"],
+        "allowed_tools": ["mcp__fs__*"],
+        "tool_policy": "allowlist",
+        "inherit_account_mcp": False,
+        "mcp_servers": {"mcpServers": {"fs": {"command": "fs-mcp"}}},
+    }
+
+
+def test_no_tool_options_mean_no_configuration() -> None:
+    arguments = cli.build_parser().parse_args(["create", "alpha"])
+    assert cli._config_document(arguments) is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_an_unreadable_mcp_file_fails_before_contacting_the_daemon(
+    tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    runtime = ["--runtime-dir", str(short_runtime)]
+    argv = [
+        "--project",
+        str(tmp_path),
+        *runtime,
+        "create",
+        "alpha",
+        "--mcp-config",
+        "/nope",
+    ]
+    assert cli.main(argv) == exits.FAILURE
+    assert "cannot read the MCP configuration" in capsys.readouterr().err

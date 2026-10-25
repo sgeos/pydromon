@@ -1,12 +1,17 @@
-"""Layer 1 messaging and wakes: the daemon's scheduler for its session lines.
+"""Layer 1 messaging and wakes: the daemon's tick-based scheduler for its lines.
 
-Every message is a ``message_sent`` event in the log. When a message arrives for an
-idle line that is not blocked, the scheduler wakes it. It records the wake, marks the
-line running, delivers every undelivered message for the line into one turn, runs the
-turn on the line's engine, and marks the line idle again. A message for a running line
-waits until that turn ends, and the scheduler then wakes the line again. Lines send
-messages from inside a turn through the ``send_message`` tool, and operators through
-the client.
+Every message is a ``message_sent`` event in the log. The scheduler advances in ticks.
+At the start of a tick it takes a snapshot of every undelivered message whose recipient
+line is idle, unblocked and under its turn cap. Each such line is woken: the wake is
+recorded, the line is marked running, its messages from the snapshot are delivered
+into one turn, the turn runs, and the line is marked idle. The turns of one tick run
+concurrently, and the tick ends when all of them have.
+
+Messages are not interrupts. A message sent during a tick is delivered no sooner than
+the next tick, even when its recipient is idle throughout. Send this turn, received
+next turn. A message sent between ticks is delivered in the next tick, which starts as
+soon as there is work. Lines send messages from inside a turn through the
+``send_message`` tool, and operators through the client.
 
 Safety. Two lines can wake each other without end, so each line has a cap on the turns
 the scheduler runs for it in one daemon lifetime. A line at its cap keeps its messages
@@ -17,13 +22,16 @@ sender, and only a message from an operator address carries operator authority, 
 the daemon attributes, never the text. Tool arguments from a line are checked like any
 other untrusted input.
 
-Concurrency. Everything runs on the daemon's event loop. Turns of different lines run
-as concurrent tasks, and every log append happens on the loop thread, so appends never
-interleave. Only one turn per line runs at a time.
+Concurrency. Everything runs on the daemon's event loop. The turns of one tick run as
+concurrent tasks, and every log append happens on the loop thread, so appends never
+interleave. A line takes at most one turn per tick.
 
 Failure modes. An engine failure ends the turn, returns the line to idle and is written
 to standard error. A failed line is not woken again until a new message arrives for
 it, so a broken engine cannot spin.
+
+Porting note. The tick is the unit a batched update loop of Keleusma stream processors
+schedules, so the Keleusma version can keep these semantics exactly.
 """
 
 import asyncio
@@ -39,11 +47,13 @@ from claude_agent_sdk import SdkMcpTool
 from dromon.driver import Driver, Strategy
 from dromon.engine import ClaudeCodeLine, TurnReport
 from dromon.eventlog import EventLog
+from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, decode_config, encode_config
 from dromon.model import (
     Address,
     EventRejected,
     InvalidField,
     LineAddress,
+    LineConfigured,
     LineCreated,
     LineState,
     LineStateChanged,
@@ -82,6 +92,8 @@ type SendHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
 class LineEngine(Protocol):
+    session_id: str | None
+
     async def run_turn(self, prompt: str) -> TurnReport: ...
 
 
@@ -90,6 +102,9 @@ class LineSpec:
     line_id: str
     model: str
     strategy: Strategy
+    config: LineConfig = DEFAULT_CONFIG
+    session_id: str | None = None
+    """The engine session to resume, kept when a configuration change rebuilds it."""
 
 
 type EngineFactory = Callable[[LineSpec, SdkMcpTool[Any]], LineEngine]
@@ -100,7 +115,13 @@ def claude_code_engine(cwd: str) -> EngineFactory:
 
     def build(spec: LineSpec, send_tool: SdkMcpTool[Any]) -> LineEngine:
         driver = Driver.for_model(spec.model, spec.strategy)
-        return ClaudeCodeLine(driver, Path(cwd), mcp_tools=[send_tool])
+        return ClaudeCodeLine(
+            driver,
+            Path(cwd),
+            config=spec.config,
+            mcp_tools=[send_tool],
+            session_id=spec.session_id,
+        )
 
     return build
 
@@ -148,10 +169,13 @@ class Scheduler:
         self._max_turns = max_turns_per_line
         self._hold = hold_wakes
         self._engines: dict[str, LineEngine] = {}
+        self._sessions: dict[str, str | None] = {}
         self._turns: dict[str, int] = {}
         self._failed: set[str] = set()
-        self._running: dict[str, asyncio.Task[None]] = {}
+        self._ticking = False
         self._work = asyncio.Event()
+        self.tick = 0
+        """The number of ticks run in this daemon's lifetime."""
         self.turn_reports: list[tuple[str, TurnReport]] = []
 
     # Commands from the client and from lines.
@@ -163,10 +187,29 @@ class Scheduler:
                 self._log.append(LineStateChanged(line_id, LineState.IDLE))
         self._work.set()
 
-    def create_line(self, line_id: str, model: str, strategy: Strategy) -> None:
+    def create_line(
+        self,
+        line_id: str,
+        model: str,
+        strategy: Strategy,
+        config: LineConfig = DEFAULT_CONFIG,
+    ) -> None:
         """Create a line after checking that a driver exists for it."""
         Driver.for_model(model, strategy)
         self._log.append(LineCreated(line_id, model, strategy.value))
+        if config != DEFAULT_CONFIG:
+            self.configure_line(line_id, config)
+
+    def configure_line(self, line_id: str, config: LineConfig) -> None:
+        """Replace a line's tool configuration. It applies from the line's next turn.
+
+        The engine is rebuilt with the new configuration, and resumes the same engine
+        session, so the line keeps its conversation.
+        """
+        self._log.append(LineConfigured(line_id, encode_config(config)))
+        previous = self._engines.pop(line_id, None)
+        if previous is not None:
+            self._sessions[line_id] = previous.session_id
 
     def ensure_operator(self, operator_id: str) -> None:
         if operator_id not in self._log.state.operators:
@@ -179,7 +222,7 @@ class Scheduler:
         body: str,
         reply_to: str | None = None,
     ) -> str:
-        """Record a note from ``sender`` and wake the recipient if it can be woken."""
+        """Record a note from ``sender``. It is delivered in a later tick."""
         message_id = new_id("m")
         self._log.append(
             MessageSent(
@@ -213,7 +256,7 @@ class Scheduler:
             name=SEND_TOOL_NAME,
             description=(
                 "Send a message to another Dromon session line or to an operator."
-                " The recipient is woken to read it."
+                " The recipient reads it in its next turn, never in this one."
             ),
             input_schema=SEND_TOOL_SCHEMA,
             handler=handler,
@@ -230,97 +273,117 @@ class Scheduler:
             if message.recipient == address and not message.delivered
         ]
 
-    def _wakeable(self) -> list[str]:
+    def _snapshot(self) -> dict[str, list[tuple[str, Message]]]:
+        """The messages each wakeable line receives in the next tick."""
         state = self._log.state
-        ready: list[str] = []
+        ready: dict[str, list[tuple[str, Message]]] = {}
         for line_id, line in sorted(state.lines.items()):
             if (
                 line.state is LineState.IDLE
-                and line_id not in self._running
                 and line_id not in self._failed
                 and self._turns.get(line_id, 0) < self._max_turns
                 and not state.is_blocked(line_id)
-                and self.pending(line_id)
             ):
-                ready.append(line_id)
+                messages = self.pending(line_id)
+                if messages:
+                    ready[line_id] = messages
         return ready
 
     async def run(self, stop: asyncio.Event) -> None:
-        """Wake lines as messages arrive, until ``stop`` is set."""
+        """Run ticks while there is work, until ``stop`` is set."""
         stopping = asyncio.create_task(stop.wait())
         try:
             while not stop.is_set():
-                if not self._hold:
-                    for line_id in self._wakeable():
-                        task = asyncio.create_task(self._turn(line_id))
-                        self._running[line_id] = task
+                ready = {} if self._hold else self._snapshot()
+                if ready:
+                    await self._tick(ready, stopping)
+                    continue
+                self._work.clear()
                 worker = asyncio.create_task(self._work.wait())
                 await asyncio.wait(
                     {worker, stopping}, return_when=asyncio.FIRST_COMPLETED
                 )
                 worker.cancel()
-                self._work.clear()
         finally:
             stopping.cancel()
-            for task in list(self._running.values()):
-                task.cancel()
-            if self._running:
-                await asyncio.gather(*self._running.values(), return_exceptions=True)
+
+    async def _tick(
+        self, ready: dict[str, list[tuple[str, Message]]], stopping: asyncio.Task[bool]
+    ) -> None:
+        """Run one turn for each line in ``ready``, concurrently, then end the tick."""
+        self.tick += 1
+        self._ticking = True
+        turns = [
+            asyncio.create_task(self._turn(line_id, messages))
+            for line_id, messages in ready.items()
+        ]
+        try:
+            finished = asyncio.gather(*turns)
+            await asyncio.wait(
+                {finished, stopping}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not finished.done():
+                for turn in turns:
+                    turn.cancel()
+                await asyncio.gather(*turns, return_exceptions=True)
+        finally:
+            self._ticking = False
 
     async def idle(self) -> None:
-        """Wait until no turn runs and no line can be woken. For tests and shutdown."""
-        # Bounded by the turn caps: each pass either runs at least one turn or ends.
+        """Wait until no tick runs and none would start. For tests and shutdown."""
+        # Bounded by the turn caps: each tick runs at least one turn or none starts.
         while True:
-            if self._running:
-                await asyncio.gather(*self._running.values(), return_exceptions=True)
-                continue
             await asyncio.sleep(0)
-            if not self._running and (self._hold or not self._wakeable()):
-                return
+            if not self._ticking and (self._hold or not self._snapshot()):
+                await asyncio.sleep(0)
+                if not self._ticking and (self._hold or not self._snapshot()):
+                    return
 
-    async def _turn(self, line_id: str) -> None:
+    async def _turn(self, line_id: str, messages: list[tuple[str, Message]]) -> None:
+        wake_id = new_id("w")
+        self._log.append(WakeRequested(wake_id, line_id, messages[0][0]))
+        self._log.append(WakeIssued(wake_id))
+        self._log.append(LineStateChanged(line_id, LineState.RUNNING))
+        for message_id, _ in messages:
+            self._log.append(MessageDelivered(message_id))
+        self._turns[line_id] = self._turns.get(line_id, 0) + 1
         try:
-            messages = self.pending(line_id)
-            if not messages:
-                return
-            wake_id = new_id("w")
-            self._log.append(WakeRequested(wake_id, line_id, messages[0][0]))
-            self._log.append(WakeIssued(wake_id))
-            self._log.append(LineStateChanged(line_id, LineState.RUNNING))
-            for message_id, _ in messages:
-                self._log.append(MessageDelivered(message_id))
-            self._turns[line_id] = self._turns.get(line_id, 0) + 1
-            try:
-                report = await self.engine_for(line_id).run_turn(
-                    compose_prompt(line_id, messages)
-                )
-                self.turn_reports.append((line_id, report))
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:  # noqa: BLE001
-                # The boundary between the scheduler and an engine. Any engine failure
-                # ends only this turn, and is reported rather than crashing the daemon.
-                self._failed.add(line_id)
-                print(f"dromond: line {line_id} turn failed: {error}", file=sys.stderr)
-            finally:
-                if self._log.state.lines[line_id].state is LineState.RUNNING:
-                    self._log.append(LineStateChanged(line_id, LineState.IDLE))
-            if self._turns[line_id] >= self._max_turns and self.pending(line_id):
-                print(
-                    f"dromond: line {line_id} reached its cap of {self._max_turns}"
-                    " turns, and its messages wait",
-                    file=sys.stderr,
-                )
+            report = await self.engine_for(line_id).run_turn(
+                compose_prompt(line_id, messages)
+            )
+            self.turn_reports.append((line_id, report))
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001
+            # The boundary between the scheduler and an engine. Any engine failure
+            # ends only this turn, and is reported rather than crashing the daemon.
+            self._failed.add(line_id)
+            print(f"dromond: line {line_id} turn failed: {error}", file=sys.stderr)
         finally:
-            self._running.pop(line_id, None)
-            self._work.set()
+            if self._log.state.lines[line_id].state is LineState.RUNNING:
+                self._log.append(LineStateChanged(line_id, LineState.IDLE))
+        if self._turns[line_id] >= self._max_turns and self.pending(line_id):
+            print(
+                f"dromond: line {line_id} reached its cap of {self._max_turns}"
+                " turns, and its messages wait",
+                file=sys.stderr,
+            )
 
     def engine_for(self, line_id: str) -> LineEngine:
         """The line's engine, built on first use and kept for the session's life."""
         engine = self._engines.get(line_id)
         if engine is None:
             line = self._log.state.lines[line_id]
-            spec = LineSpec(line_id, line.engine, Strategy(line.strategy))
+            config = (
+                DEFAULT_CONFIG if line.config is None else decode_config(line.config)
+            )
+            spec = LineSpec(
+                line_id,
+                line.engine,
+                Strategy(line.strategy),
+                config,
+                self._sessions.get(line_id),
+            )
             engine = self._engine_factory(spec, self.send_tool(line_id))
             self._engines[line_id] = engine
         return engine
@@ -335,6 +398,11 @@ class Scheduler:
                 "state": line.state.value,
                 "pending": len(self.pending(line_id)),
                 "turns": self._turns.get(line_id, 0),
+                "tool_policy": (
+                    DEFAULT_CONFIG
+                    if line.config is None
+                    else decode_config(line.config)
+                ).tool_policy.value,
             }
             for line_id, line in sorted(state.lines.items())
         ]

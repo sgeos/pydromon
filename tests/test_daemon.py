@@ -247,6 +247,65 @@ def test_a_bad_send_is_refused(
     assert (response.ok, response.error_code) == (False, code)
 
 
+def test_create_line_accepts_a_configuration(paths: ProjectPaths) -> None:
+    config = {"builtin_tools": ["Read"], "allowed_tools": ["mcp__docs__*"]}
+    args: dict[str, object] = {
+        "line_id": "beta",
+        "model": HAIKU,
+        "strategy": "api",
+        "config": config,
+    }
+    assert request(paths, "create_line", args).ok
+    with EventLog(paths.event_log) as log:
+        stored = log.state.lines["beta"].config
+    assert stored is not None and '"builtin_tools":["Read"]' in stored
+
+
+def test_configure_line_replaces_the_configuration(paths: ProjectPaths) -> None:
+    request(
+        paths, "create_line", {"line_id": "alpha", "model": HAIKU, "strategy": "api"}
+    )
+    config = {"tool_policy": "allow_all"}
+    response = request(paths, "configure_line", {"line_id": "alpha", "config": config})
+    assert response.ok
+    with EventLog(paths.event_log) as log:
+        stored = log.state.lines["alpha"].config
+    assert stored is not None and '"tool_policy":"allow_all"' in stored
+
+
+@pytest.mark.parametrize(
+    ("op", "args", "code"),
+    [
+        ("configure_line", {"line_id": "alpha"}, ErrorCode.BAD_REQUEST),
+        ("configure_line", {"line_id": "nobody", "config": {}}, ErrorCode.REJECTED),
+        ("configure_line", {"line_id": "alpha", "config": []}, ErrorCode.BAD_REQUEST),
+        (
+            "configure_line",
+            {"line_id": "alpha", "config": {"tool_policy": "trust_me"}},
+            ErrorCode.REJECTED,
+        ),
+        (
+            "create_line",
+            {
+                "line_id": "beta",
+                "model": HAIKU,
+                "strategy": "api",
+                "config": {"mcp_servers": {"dromon": {"command": "x"}}},
+            },
+            ErrorCode.REJECTED,
+        ),
+    ],
+)
+def test_a_bad_configuration_is_refused(
+    paths: ProjectPaths, op: str, args: dict[str, object], code: ErrorCode
+) -> None:
+    request(
+        paths, "create_line", {"line_id": "alpha", "model": HAIKU, "strategy": "api"}
+    )
+    response = request(paths, op, args)
+    assert (response.ok, response.error_code) == (False, code)
+
+
 # The real daemon, started detached and driven over its socket. Wakes are held, so no
 # engine ever starts and no test touches the subscription.
 
