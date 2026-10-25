@@ -57,7 +57,19 @@ from typing import Any, Final, Protocol, cast
 from claude_agent_sdk import SdkMcpTool
 
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
-from dromon.driver import MODELS, Driver, DriverError, Strategy
+from dromon.overrides import (
+    OverrideError,
+    Scope,
+    Value,
+    apply_config,
+    apply_limits,
+    changed,
+    check,
+    spec_of,
+)
+from dromon.overrides import decode as decode_override
+from dromon.overrides import encode as encode_override
+from dromon.driver import ENGINE_OF, MODELS, Driver, DriverError, Strategy
 from dromon import codex, grok
 from dromon.agents import LineTokens
 from dromon.codex import CodexLine
@@ -92,8 +104,10 @@ from dromon.model import (
     LineConfigured,
     LineCreated,
     LineHeld,
+    LineOverridden,
     LineReleased,
     LineSession,
+    LineSessionCleared,
     LineState,
     LineStateChanged,
     Message,
@@ -403,6 +417,7 @@ class Scheduler:
         self._tick_seconds = tick_seconds
         self._running: dict[str, asyncio.Task[None]] = {}
         self.activity = ActivityLog()
+        self._reported: set[tuple[str, str]] = set()
         self._interrupted: set[str] = set()
         """Lines whose turn an operator cancelled, until the turn task ends."""
         """What each line's engine is doing, for attached clients. Not persisted."""
@@ -855,11 +870,134 @@ class Scheduler:
         else:
             self._line_wake[line_id] = wake_every_ticks
 
+    def line_policy(self, line_id: str) -> tuple[bool, bool]:
+        """Whether the project file gives the line limits, and a wake policy, of its
+        own."""
+        return line_id in self._line_limits, line_id in self._line_wake
+
     def limits_for(self, line_id: str) -> Limits:
-        return self._line_limits.get(line_id, self.limits)
+        """The line's own limits or the project's, under the line's overrides."""
+        base = self._line_limits.get(line_id, self.limits)
+        overrides = self.line_overrides(line_id)
+        try:
+            return apply_limits(base, overrides)
+        except ValueError as error:
+            self._skipped(line_id, str(error))
+            return base
+
+    def wake_every_for(self, line_id: str) -> int:
+        """The line's wake policy, under the line's override."""
+        every = self.line_overrides(line_id).get("wake.every_ticks")
+        if type(every) is int and 1 <= every <= MAX_WAKE_EVERY_TICKS:
+            return every
+        return self._line_wake.get(line_id, self.wake_every_ticks)
+
+    def baseline_config(self, line_id: str) -> LineConfig:
+        """The line's configuration before its overrides, from the project file, its
+        creation or ``dromon configure``."""
+        line = self._log.state.lines[line_id]
+        return DEFAULT_CONFIG if line.config is None else decode_config(line.config)
+
+    def line_overrides(self, line_id: str) -> dict[str, Value]:
+        """The settings an operator changed for the line, without those that no
+        longer apply."""
+        document, skipped = decode_override(
+            Scope.LINE, self._log.state.lines[line_id].overrides
+        )
+        for reason in skipped:
+            self._skipped(line_id, reason)
+        return document
+
+    def model_of(self, line_id: str) -> str:
+        """The model the line runs, which an override may change within its engine."""
+        line = self._log.state.lines[line_id]
+        model = self.line_overrides(line_id).get("model")
+        return model if isinstance(model, str) else line.engine
+
+    def effective_config(self, line_id: str) -> LineConfig:
+        """The line's configuration with its overrides applied."""
+        baseline = self.baseline_config(line_id)
+        try:
+            return apply_config(baseline, self.line_overrides(line_id))
+        except ConfigError as error:
+            self._skipped(line_id, str(error))
+            return baseline
+
+    def model_choices(self, line_id: str) -> tuple[str, ...]:
+        """The models the line may switch to, those on its engine. Every packaged
+        model has a driver for every strategy."""
+        engine = ENGINE_OF[self._log.state.lines[line_id].engine]
+        return tuple(model for model in MODELS if ENGINE_OF[model] == engine)
+
+    def override_line(self, line_id: str, key: str, value: object | None) -> None:
+        """Set one of a line's settings, or return it to the layers below when
+        ``value`` is ``None``. It applies from the line's next turn.
+
+        Raises ``OverrideError``, ``ConfigError``, ``DriverError`` or ``ValueError``
+        for a value that does not apply, leaving the line as it was.
+        """
+        line = self._log.state.lines.get(line_id)
+        if line is None:
+            raise EventRejected(f"no line {line_id}")
+        spec = spec_of(Scope.LINE, key)
+        checked = None if value is None else check(spec, value)
+        document = changed(self.line_overrides(line_id), key, checked)
+        model = document.get("model", line.engine)
+        if not isinstance(model, str) or model not in self.model_choices(line_id):
+            raise OverrideError(
+                f"{model} does not run on this line's engine with its strategy."
+                f" Choose one of {', '.join(self.model_choices(line_id))},"
+                " or create a new line"
+            )
+        config = apply_config(self.baseline_config(line_id), document)
+        _check_engine_supports(Driver.for_model(model, Strategy(line.strategy)), config)
+        apply_limits(self._line_limits.get(line_id, self.limits), document)
+        every = document.get("wake.every_ticks", 1)
+        if type(every) is not int or not 1 <= every <= MAX_WAKE_EVERY_TICKS:
+            raise OverrideError(
+                f"wake.every_ticks must be in [1, {MAX_WAKE_EVERY_TICKS}]"
+            )
+        self._log.append(LineOverridden(line_id, encode_override(document)))
+        self._engines.pop(line_id, None)
+
+    def _skipped(self, line_id: str, reason: str) -> None:
+        """Report, once, a stored override that no longer applies. It is skipped,
+        because a setting a later version stopped accepting must not stop the line."""
+        if (line_id, reason) in self._reported:
+            return
+        self._reported.add((line_id, reason))
+        print(
+            f"dromond: line {line_id}: an override is skipped: {reason}",
+            file=sys.stderr,
+        )
+
+    def clear_session(self, line_id: str) -> None:
+        """Start the line's next turn in a new engine session, as Claude Code's
+        ``/clear`` and Codex's ``/new`` do. Refused while a turn runs."""
+        line = self._log.state.lines.get(line_id)
+        if line is None:
+            raise EventRejected(f"no line {line_id}")
+        if line_id in self._running:
+            raise EventRejected(f"line {line_id} is in a turn. Interrupt it first")
+        self._log.append(LineSessionCleared(line_id))
+        self._engines.pop(line_id, None)
+
+    def set_project(
+        self, limits: Limits, operator: str, tick_seconds: float, wake_every_ticks: int
+    ) -> None:
+        """Replace the project-wide values, as a reload or a project override does."""
+        if not 1 <= wake_every_ticks <= MAX_WAKE_EVERY_TICKS:
+            raise ValueError(f"wake_every_ticks must be in [1, {MAX_WAKE_EVERY_TICKS}]")
+        if not 0 <= tick_seconds <= MAX_TICK_SECONDS:
+            raise ValueError(f"tick_seconds must be in [0, {MAX_TICK_SECONDS}]")
+        self.limits = limits
+        self._default_operator = OperatorAddress(operator)
+        self._tick_seconds = tick_seconds
+        self.wake_every_ticks = wake_every_ticks
+        self._work.set()
 
     def _can_start(self, line_id: str) -> bool:
-        every = self._line_wake.get(line_id, self.wake_every_ticks)
+        every = self.wake_every_for(line_id)
         return (
             self._eligible(line_id)
             and not self._cooling(line_id)
@@ -1082,14 +1220,11 @@ class Scheduler:
         engine = self._engines.get(line_id)
         if engine is None:
             line = self._log.state.lines[line_id]
-            config = (
-                DEFAULT_CONFIG if line.config is None else decode_config(line.config)
-            )
             spec = LineSpec(
                 line_id,
-                line.engine,
+                self.model_of(line_id),
                 Strategy(line.strategy),
-                config,
+                self.effective_config(line_id),
                 line.engine_session,
                 self.activity.observer(line_id),
             )
@@ -1112,7 +1247,7 @@ class Scheduler:
         return [
             {
                 "line_id": line_id,
-                "engine": line.engine,
+                "engine": self.model_of(line_id),
                 "strategy": line.strategy,
                 "state": line.state.value,
                 "pending": len(self.pending(line_id)),
@@ -1121,11 +1256,7 @@ class Scheduler:
                 # A decimal string, because the client protocol carries no floats.
                 "cost_estimate_usd": f"{self._cost.get(line_id, 0.0):.4f}",
                 "held_by": line.held_by,
-                "tool_policy": (
-                    DEFAULT_CONFIG
-                    if line.config is None
-                    else decode_config(line.config)
-                ).tool_policy.value,
+                "tool_policy": self.effective_config(line_id).tool_policy.value,
             }
             for line_id, line in sorted(state.lines.items())
         ]

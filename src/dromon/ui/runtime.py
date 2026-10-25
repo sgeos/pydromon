@@ -15,19 +15,23 @@ never reached in practice, and reaching it drops the rest rather than looping.
 """
 
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Final, Protocol
 
 from dromon.protocol import Operation, Response
 from dromon.ui.commands import (
     Acknowledge,
     Answer,
+    ClearSession,
+    CreateLine,
     DaemonCommand,
     Interrupt,
     Release,
+    ReloadProject,
     Say,
+    SetSetting,
 )
-from dromon.ui.data import activity_of, lines_of, view_of
+from dromon.ui.data import activity_of, lines_of, settings_of, shown, view_of
 from dromon.ui.keys import Key
 from dromon.ui.model import (
     ActivityLoaded,
@@ -39,12 +43,14 @@ from dromon.ui.model import (
     Failed,
     FetchActivity,
     FetchLines,
+    FetchSettings,
     FetchView,
     LinesLoaded,
     Model,
     Pressed,
     Request,
     Resized,
+    SettingsLoaded,
     Tick,
     ViewLoaded,
     Wheel,
@@ -87,6 +93,40 @@ def request_of(
             return Operation.RELEASE, {"line_id": line_id}, f"released {line_id}"
         case Interrupt():
             return Operation.INTERRUPT, {"line_id": line_id}, f"interrupted {line_id}"
+        case SetSetting(project, key, value):
+            args = {"scope": "project" if project else "line", "key": key}
+            if not project:
+                args["line_id"] = line_id
+            if value is not None:
+                args["value"] = list(value) if isinstance(value, tuple) else value
+            return Operation.SET_SETTING, args, f"set {key}"
+        case ClearSession():
+            done = f"{line_id} starts its next turn in a new session"
+            return Operation.CLEAR_SESSION, {"line_id": line_id}, done
+        case CreateLine(new_line, model, strategy):
+            args = {"line_id": new_line, "model": model, "strategy": strategy}
+            done = f"created {new_line}. /line {new_line} attaches to it"
+            return Operation.CREATE_LINE, args, done
+        case ReloadProject():
+            return Operation.RELOAD_PROJECT, {}, "reloaded the project file"
+
+
+def notice_of(
+    command: DaemonCommand, line_id: str, done: str, result: Mapping[str, object]
+) -> str:
+    """The notice for a request that succeeded, from what the daemon answered."""
+    if isinstance(command, Interrupt) and result.get("interrupted") is False:
+        return f"{line_id} has no turn in flight"
+    if isinstance(command, SetSetting):
+        key = ("project." if command.project else "") + command.key
+        value = shown(result.get("value"))
+        source = str(result.get("source") or "")
+        if result.get("shadowed") is True:
+            return f"{key} is recorded, but the {source} value {value} applies"
+        if command.value is None:
+            return f"{key} returns to {value} from the {source}"
+        return f"{key} is now {value}, from the next turn"
+    return done
 
 
 class Runtime:
@@ -165,12 +205,12 @@ class Runtime:
                 response = self._ask(operation, args)
                 if isinstance(response, Failed):
                     return response
-                if (
-                    operation is Operation.INTERRUPT
-                    and response.get("interrupted") is False
-                ):
-                    return Done(f"{line_id} has no turn in flight")
-                return Done(done)
+                return Done(notice_of(command, line_id, done, response))
+            case FetchSettings(line_id):
+                response = self._ask(Operation.SETTINGS, {"line_id": line_id})
+                if isinstance(response, Failed):
+                    return response
+                return SettingsLoaded(line_id, settings_of(response))
             case Bell():
                 self._bell()
                 return None

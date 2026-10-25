@@ -372,6 +372,39 @@ time, because only Grok's adapter receives streamed chunks.
 and whose `update` is a total function, and from there onto a Keleusma stream
 processor. The platforms map onto Ratatui with Crossterm and onto a native toolkit.
 
+**Decided 2026-10-25 by the operator, as direction.** The daemon and client pair is
+taken to near parity with Claude Code, Codex and Grok Build, with settings for session
+lines and for projects, keeping the core, platform and entry point layering.
+
+**Implemented 2026-10-25.** Settings have two scopes, the project and a line, and
+each value has layers, as [`../protocol/CLIENT.md`](../protocol/CLIENT.md) specifies.
+
+- **The project file stays the shared layer.** What an operator changes from a client
+  is an override, recorded in the event log as `line_overridden` or
+  `project_overridden`, and layered over the file, as Claude Code layers its local
+  settings over its shared project settings. The daemon never writes the file. The
+  alternative, a daemon that rewrites a committed, reviewed TOML file, would lose its
+  comments and blur who changed what.
+- **The command line wins**, as Claude Code's does, and a value it shadows is
+  reported as such rather than silently ignored.
+- **Layering in code.** `dromon.overrides` and `dromon.configview` are pure, and hold
+  the keys, their kinds, validation and the layers. The scheduler and the daemon apply
+  them. The client core reads typed text by the kinds the daemon reports, so it holds
+  no list of settings and learns of a new one without a release.
+- **What a client cannot change.** A line's strategy, because it decides per-token
+  billing, and the long documents, MCP servers, sandbox, engine settings, the teacher
+  and the agent policy, which belong in a reviewed file. MCP servers are shown by name
+  only, so that no credential in their environment reaches a client.
+- **Also added.** `/clear` starts a line's next turn in a new engine session, as
+  Claude Code's `/clear` and Codex's `/new` do. `/create` makes a line from the
+  client. `/reload` applies the project file without a restart, and refuses a change
+  that only a restart can apply, applying nothing.
+
+**Inference, not verified live.** Switching a Claude Code line's model resumes its
+engine session on the new model, as Claude Code's own `/model` does. Codex is given
+the new model when its thread is started or resumed, which the scripted tests cover
+but no live turn has exercised.
+
 **Inference.** The client protocol of [`../protocol/CLIENT.md`](../protocol/CLIENT.md) is
 then the game's network protocol. It needs pushed updates for attached clients, and
 clients on other machines once communication layer 3 exists, so both belong in its

@@ -10,7 +10,7 @@ completed, moved or abandoned.
 ## State on 2026-10-25
 
 - **Tasks 1 to 10 done. Milestone 0.1.0 is complete.**
-  - `model.py`, `codec.py` and `eventlog.py` hold the data model as nine event kinds in
+  - `model.py`, `codec.py` and `eventlog.py` hold the data model as event kinds in
     an append-only SQLite log. Operators are parties addressed as `@name`.
   - `relay.py` forwards operator messages, and inbound replies are deferred.
     `daemon.py`, `client.py`, `protocol.py`, `paths.py` and `exits.py` are the daemon.
@@ -39,13 +39,12 @@ completed, moved or abandoned.
   - `ui/` is `dromon attach`, near parity with three harnesses, by the operator's
     direction: a pure client core, a shared runtime, and curses and Tk platforms.
     `activity.py` holds each line's live activity, served by `line_activity`.
-  - `lineconfig.py` gives each line its built-in tools, arbitrary MCP servers and an
-    allow-all or allowlist policy, by the operator's decision, stored as
-    `line_configured`. The default is no tools beyond Dromon's own, with strict MCP
-    configuration, so a claude.ai login's connectors stay out.
+  - `overrides.py` and `configview.py` give lines and the project settings a client
+    changes, as event-log overrides over the project file, with `/config`.
+  - `lineconfig.py` gives each line built-in tools, MCP servers and a tool policy,
+    stored as `line_configured`. By default a line has only Dromon's own tools.
   - `projectconfig.py` reads `.dromon/dromon.toml`, with profiles, per-line limits and
-    wake policy, strict keys and located errors. `dromond` applies it at start, flags
-    override it, and `dromon config` validates it.
+    wake policy, strict keys and located errors. `dromon config` validates it.
   - `sandbox.py` runs a line's shell commands in Claude Code's sandbox, by the
     operator's direction, per project and per line in Claude Code's key names. It
     fails closed, refuses unsandboxed retries, and protects `.dromon` and the runtime
@@ -99,7 +98,8 @@ editable install that runs the working tree. Its project file is
 - **Codex lines.** No MCP servers, commits, sandbox or settings documents, cost or turn
   limit, and refused calls escape the tool budget. See `CODEX.md`.
 - **Clients.** Polling stands in for pushed updates. No token meter or permission
-  prompts. The Tk window is checked only withdrawn. Agents lack `interrupt`.
+  prompts. The Tk window is checked only withdrawn. Agents lack `interrupt` and
+  settings. A model switch is not verified live.
 - **In the design.** Hosted teacher traces, the Rust repository's name, and remote
   clients.
 
@@ -114,7 +114,7 @@ need a command outside it. The rest run inside it with `-m "not socket and not l
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-./scripts/check.sh          # 1062 tests pass, plus 10 live tests deselected
+./scripts/check.sh          # 1169 tests pass, plus 10 live tests deselected
 ```
 
 Report any check not run, and any commit after the one that last rewrote this file.

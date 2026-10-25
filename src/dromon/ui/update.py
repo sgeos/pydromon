@@ -19,21 +19,30 @@ from dromon.ui.commands import (
     Acknowledge,
     Answer,
     Choices,
+    ClearSession,
     Command,
+    CreateLine,
+    DaemonCommand,
     Help,
     Interrupt,
     Invalid,
     Pane,
     Quit,
+    ReloadProject,
     Release,
     Say,
+    Set,
     ShowLines,
     ShowPane,
+    ShowSettings,
     Switch,
     parse_input,
     suggest,
 )
 from dromon.ui.data import View
+from dromon.ui.settings import command_key, prefill, values_for
+from dromon.ui.settings import request_of as settings_request
+from dromon.ui.settings import rows as setting_rows
 from dromon.ui.keys import Char, Key, Named
 from dromon.ui.model import (
     MAX_ENTRIES,
@@ -47,6 +56,7 @@ from dromon.ui.model import (
     Failed,
     FetchActivity,
     FetchLines,
+    FetchSettings,
     FetchView,
     LinesLoaded,
     Model,
@@ -54,6 +64,7 @@ from dromon.ui.model import (
     Pressed,
     Request,
     Resized,
+    SettingsLoaded,
     Tick,
     ViewLoaded,
     Wheel,
@@ -111,8 +122,18 @@ def update(model: Model, event: Event) -> Result:
         case LinesLoaded(lines):
             picked = min(model.picked, max(len(lines) - 1, 0))
             return replace(model, lines=lines, picked=picked), NO_EFFECTS
+        case SettingsLoaded(line_id, settings):
+            if line_id != model.line_id:
+                return model, NO_EFFECTS
+            count = len(setting_rows(settings))
+            row = min(model.setting_row, max(count - 1, 0))
+            return replace(model, settings=settings, setting_row=row), NO_EFFECTS
         case Done(text):
-            return _poll(replace(model, notice=text, alarm=False))
+            polled, effects = _poll(replace(model, notice=text, alarm=False))
+            # Any request may change a setting, so the settings are fetched again.
+            if model.settings is not None:
+                effects = (*effects, FetchSettings(model.line_id))
+            return polled, effects
         case Failed(text):
             return replace(model, notice=text, alarm=True), NO_EFFECTS
 
@@ -130,11 +151,16 @@ def _tick(model: Model, now: float) -> Result:
 
 
 def _poll(model: Model) -> Result:
-    return replace(model, polled_at=model.now), (
+    """The polls due now. Settings are fetched only until they first arrive, because
+    they change only through requests, after which ``Done`` fetches them again."""
+    effects: tuple[Effect, ...] = (
         FetchView(model.line_id),
         FetchActivity(model.line_id, model.activity_seq),
         FetchLines(),
     )
+    if model.settings is None:
+        effects = (*effects, FetchSettings(model.line_id))
+    return replace(model, polled_at=model.now), effects
 
 
 def _bells(before: Model, view: View) -> tuple[Effect, ...]:
@@ -167,17 +193,41 @@ def _scrolled(model: Model, rows: int) -> Model:
 def _choices(model: Model) -> Choices:
     view = model.view
     lines = tuple((line.line_id, f"{line.state}, {line.model}") for line in model.lines)
-    if view is None:
-        return Choices(lines=lines)
-    return Choices(
-        lines=lines,
-        questions=tuple((q.question_id, q.text) for q in view.questions),
-        answers=tuple((q.question_id, q.choices) for q in view.questions),
-        messages=tuple(
+    values: list[tuple[str, str, tuple[str, ...]]] = []
+    settings_pool: tuple[tuple[str, str], ...] = ()
+    line_models: tuple[tuple[str, str], ...] = ()
+    efforts: tuple[tuple[str, str], ...] = ()
+    models: tuple[tuple[str, str], ...] = ()
+    settings = model.settings
+    if settings is not None:
+        editable = [(p, e) for p, e in setting_rows(settings) if e.editable]
+        settings_pool = tuple((command_key(p, e), e.summary) for p, e in editable)
+        values.extend(("/set", command_key(p, e), values_for(e)) for p, e in editable)
+        for entry in settings.line:
+            if entry.key == "model":
+                line_models = tuple((choice, "") for choice in entry.choices)
+            if entry.key == "effort":
+                efforts = tuple((choice, "") for choice in entry.choices)
+        models = tuple((name, "") for name in settings.models)
+    questions: tuple[tuple[str, str], ...] = ()
+    messages: tuple[tuple[str, str], ...] = ()
+    if view is not None:
+        questions = tuple((q.question_id, q.text) for q in view.questions)
+        values.extend(("/answer", q.question_id, q.choices) for q in view.questions)
+        messages = tuple(
             (m.message_id, m.body)
             for m in view.mail
             if m.sender == view.line.line_id and m.recipient.startswith("@")
-        ),
+        )
+    return Choices(
+        lines=lines,
+        questions=questions,
+        messages=messages,
+        settings=settings_pool,
+        line_models=line_models,
+        models=models,
+        efforts=efforts,
+        values=tuple(values),
     )
 
 
@@ -217,6 +267,8 @@ def _pressed(model: Model, key: Key) -> Result:
             return model, NO_EFFECTS
         case Overlay.LINES:
             return _picking(model, key)
+        case Overlay.SETTINGS:
+            return _setting(model, key)
         case Overlay.NONE:
             pass
     if model.suggestions:
@@ -343,8 +395,40 @@ def _enter(model: Model) -> Result:
 
 def _command(model: Model, command: Command) -> Result:
     match command:
-        case Say() | Answer() | Acknowledge() | Release() | Interrupt():
+        case (
+            Say()
+            | Answer()
+            | Acknowledge()
+            | Release()
+            | Interrupt()
+            | ClearSession()
+            | CreateLine()
+            | ReloadProject()
+        ):
             return _run(model, command)
+        case Set():
+            checked = settings_request(model.settings, command)
+            if isinstance(checked, str):
+                effects: tuple[Effect, ...] = ()
+                if model.settings is None:
+                    effects = (FetchSettings(model.line_id),)
+                return replace(model, notice=checked, alarm=True), effects
+            return _run(model, checked)
+        case ShowSettings(focus):
+            row = model.setting_row
+            if model.settings is not None and focus is not None:
+                row = next(
+                    (
+                        index
+                        for index, (project, entry) in enumerate(
+                            setting_rows(model.settings)
+                        )
+                        if not project and entry.key == focus
+                    ),
+                    row,
+                )
+            opened = replace(model, overlay=Overlay.SETTINGS, setting_row=row)
+            return opened, (FetchSettings(model.line_id),)
         case Switch(line_id):
             return _switch(model, line_id)
         case ShowLines():
@@ -367,9 +451,7 @@ def _command(model: Model, command: Command) -> Result:
             return replace(model, notice=reason, alarm=True), NO_EFFECTS
 
 
-def _run(
-    model: Model, command: Say | Answer | Acknowledge | Release | Interrupt
-) -> Result:
+def _run(model: Model, command: DaemonCommand) -> Result:
     request = Request(command, model.line_id, model.operator)
     return replace(model, notice="sending", alarm=False), (request,)
 
@@ -405,6 +487,42 @@ def _cycle(model: Model, step: int) -> Result:
     index = ids.index(model.line_id) if model.line_id in ids else -step
     target = ids[(index + step) % len(ids)]
     return _switch(model, target)
+
+
+def _setting(model: Model, key: Key) -> Result:
+    """The keys of the settings panel. Enter on a row a client may change fills the
+    input with the ``/set`` that edits it, as Claude Code's ``/config`` edits in
+    place, and the panel closes so the operator can type."""
+    found = setting_rows(model.settings) if model.settings is not None else []
+    count = len(found)
+    match key:
+        case Named.UP | Named.CTRL_P | Named.BACK_TAB:
+            return replace(model, setting_row=max(model.setting_row - 1, 0)), NO_EFFECTS
+        case Named.DOWN | Named.CTRL_N | Named.TAB:
+            row = min(model.setting_row + 1, max(count - 1, 0))
+            return replace(model, setting_row=row), NO_EFFECTS
+        case Named.PAGE_UP:
+            row = max(model.setting_row - render.page(model), 0)
+            return replace(model, setting_row=row), NO_EFFECTS
+        case Named.PAGE_DOWN:
+            row = min(model.setting_row + render.page(model), max(count - 1, 0))
+            return replace(model, setting_row=row), NO_EFFECTS
+        case Named.ENTER:
+            if not count:
+                return replace(model, overlay=Overlay.NONE), NO_EFFECTS
+            project, entry = found[model.setting_row]
+            if not entry.editable:
+                notice = f"{entry.key} cannot be changed from a client. {entry.summary}"
+                return replace(model, notice=notice, alarm=False), NO_EFFECTS
+            text = prefill(project, entry)
+            closed = replace(model, overlay=Overlay.NONE)
+            return _edited(closed, edit.Editor(text, len(text))), NO_EFFECTS
+        case Named.ESCAPE | Named.CTRL_C:
+            return replace(model, overlay=Overlay.NONE), NO_EFFECTS
+        case _:
+            if key == Char("q"):
+                return replace(model, overlay=Overlay.NONE), NO_EFFECTS
+            return model, NO_EFFECTS
 
 
 def _picking(model: Model, key: Key) -> Result:

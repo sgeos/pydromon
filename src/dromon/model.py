@@ -279,6 +279,43 @@ class LineSession:
 
 
 @dataclass(frozen=True, slots=True)
+class LineSessionCleared:
+    """A line's next turn starts a new engine session, as an operator asked.
+
+    The engine keeps the old session. Dromon only stops resuming it.
+    """
+
+    line_id: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+
+
+@dataclass(frozen=True, slots=True)
+class LineOverridden:
+    """The settings an operator changed for a line from a client, as the canonical
+    JSON of ``dromon.overrides``, replacing the line's earlier overrides whole."""
+
+    line_id: str
+    overrides: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_text("overrides", self.overrides, MAX_CONFIG_BYTES)
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectOverridden:
+    """The settings an operator changed for the whole project from a client,
+    replacing the earlier project overrides whole."""
+
+    overrides: str
+
+    def __post_init__(self) -> None:
+        check_text("overrides", self.overrides, MAX_CONFIG_BYTES)
+
+
+@dataclass(frozen=True, slots=True)
 class LineHeld:
     """The daemon stopped waking a line until an operator answers ``question_id``."""
 
@@ -438,6 +475,9 @@ type Event = (
     | LineStateChanged
     | LineConfigured
     | LineSession
+    | LineSessionCleared
+    | LineOverridden
+    | ProjectOverridden
     | LineHeld
     | LineReleased
     | OperatorRegistered
@@ -469,6 +509,8 @@ class Line:
     """The engine session the line's next turn resumes, if one was recorded."""
     held_by: str | None = None
     """The question whose answer releases the line, while the line is held."""
+    overrides: str | None = None
+    """The latest ``line_overridden`` text, or ``None`` when nothing was overridden."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -516,6 +558,8 @@ class State:
     messages: dict[str, Message] = field(default_factory=dict[str, Message])
     wakes: dict[str, Wake] = field(default_factory=dict[str, Wake])
     agents: dict[str, Agent] = field(default_factory=dict[str, Agent])
+    project_overrides: str | None = None
+    """The latest ``project_overridden`` text, or ``None``."""
 
     def copy(self) -> "State":
         """Return an independent snapshot. The records are frozen, so maps suffice."""
@@ -525,6 +569,7 @@ class State:
             dict(self.messages),
             dict(self.wakes),
             dict(self.agents),
+            self.project_overrides,
         )
 
     def open_questions(self, operator_id: str) -> list[str]:
@@ -547,8 +592,15 @@ class State:
                     raise EventRejected(f"line {event.line_id} exists")
             case LineStateChanged():
                 self._check_line_state(event)
-            case LineConfigured() | LineSession():
+            case (
+                LineConfigured()
+                | LineSession()
+                | LineSessionCleared()
+                | LineOverridden()
+            ):
                 self._line(event.line_id)
+            case ProjectOverridden():
+                pass
             case LineHeld():
                 if self._line(event.line_id).held_by is not None:
                     raise EventRejected(f"line {event.line_id} is held")
@@ -622,6 +674,14 @@ class State:
                 self.lines[event.line_id] = replace(
                     line, engine_session=event.engine_session
                 )
+            case LineSessionCleared():
+                line = self.lines[event.line_id]
+                self.lines[event.line_id] = replace(line, engine_session=None)
+            case LineOverridden():
+                line = self.lines[event.line_id]
+                self.lines[event.line_id] = replace(line, overrides=event.overrides)
+            case ProjectOverridden():
+                self.project_overrides = event.overrides
             case OperatorRegistered():
                 self.operators.add(event.operator_id)
             case AgentRegistered():

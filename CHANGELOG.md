@@ -47,6 +47,18 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Settings for lines and for the project can be shown and changed from a client, as
+  overrides layered over the project file and recorded in the event log as the new
+  `line_overridden` and `project_overridden` events. The attached client gains
+  `/config`, a settings panel with each value's layer, `/model`, `/effort`, `/set`
+  and `/unset` with completion of keys and values, `/clear` for a new engine session,
+  `/create` for a new line and `/reload` for the project file. The daemon gains the
+  `settings`, `set_setting`, `clear_session` and `reload_project` operations and the
+  `line_session_cleared` event, and the command line gains `dromon settings`,
+  `dromon set` and `dromon reload`. A line may switch models within its engine. The
+  command line of `dromond` still wins over a project override, which is reported as
+  shadowed.
+
 - The attached clients are rebuilt on a shared core in `dromon.ui`, near parity with
   Claude Code, Codex and Grok Build. The core is a pure state machine with no input or
   output, the runtime performs its effects through a `Daemon` port, and the curses and

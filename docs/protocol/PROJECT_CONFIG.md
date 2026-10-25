@@ -87,15 +87,25 @@ every_ticks = 5
   not merged, so the tools of a line can be read in one place. The `sandbox` and
   `settings` tables are the exception, and merge as their documents specify, so that no
   layer drops another's deny entries.
-- **Precedence.** A `dromond` flag overrides the file, and the file overrides the
-  built-in defaults. User and managed layers are not yet specified.
+- **Precedence.** A `dromond` flag overrides an operator's project override, which
+  overrides the file, and the file overrides the built-in defaults. A line override
+  overrides the line's configuration from the file. Overrides are set from a client
+  and recorded in the event log, as the settings section of
+  [`CLIENT.md`](CLIENT.md) specifies, and the daemon never writes this file. User and
+  managed layers are not yet specified.
 - **Located errors.** Every error names the file. A syntax error carries its line and
   column. Any other error carries the dotted key path and the line of its table or key
   when it can be found. The daemon refuses to start on an invalid file.
 - **Application.** At start, a declared line that does not exist is created, and one
   whose tools differ is reconfigured. A line's model and strategy are fixed at
   creation, so a file that changes either is refused and the daemon does not start.
-  Lines created through the client and absent from the file are left as they are.
+  A client may still switch a line's model within its engine, as an override. Lines
+  created through the client and absent from the file are left as they are.
+- **Reload.** `reload_project` applies the file again without a restart, with the same
+  rules, after checking all of it, so a refused reload applies nothing. It refuses a
+  change to the sandbox, the engine settings, the teacher or the external agent policy,
+  which apply only at start. A line the file no longer declares returns to the
+  project's limits and wake policy.
 - **Codex and Grok lines.** A project file whose own `[sandbox]` or `[settings]` table
   would reach a Codex or Grok line is refused at start, since such a line runs in its
   engine's own sandbox.

@@ -18,9 +18,11 @@ from dromon.driver import DriverError, Strategy
 from dromon.engine import TurnReport
 from dromon.eventlog import EventLog, read_entries
 from dromon.lineconfig import ConfigError, LineConfig, ToolPolicy, encode_config
+from dromon.overrides import OverrideError
 from dromon.model import (
     EventRejected,
     LineAddress,
+    LineOverridden,
     LineReleased,
     LineSession,
     LineState,
@@ -1220,3 +1222,127 @@ def test_an_operator_interrupts_a_turn_in_flight(make_world: MakeWorld) -> None:
     )
     with pytest.raises(EventRejected, match="no line"):
         target.scheduler.interrupt("nobody")
+
+
+# Settings an operator changes from a client.
+
+
+def test_a_line_override_reaches_its_next_engine(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    first = target.engine("alpha")
+    target.scheduler.override_line("alpha", "effort", "high")
+    target.scheduler.override_line("alpha", "builtin_tools", ["Read"])
+    rebuilt = target.engine("alpha")
+    assert rebuilt is not first and rebuilt.spec is not None
+    assert rebuilt.spec.config.effort == "high"
+    assert rebuilt.spec.config.builtin_tools == ("Read",)
+    assert target.scheduler.baseline_config("alpha") == LineConfig()
+    target.scheduler.override_line("alpha", "effort", None)
+    assert target.scheduler.effective_config("alpha").effort is None
+    assert target.scheduler.line_overrides("alpha") == {"builtin_tools": ("Read",)}
+
+
+def test_a_line_switches_models_only_within_its_engine(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    assert target.scheduler.model_choices("alpha") == (
+        "claude-opus-5-5",
+        "claude-haiku-5-5",
+    )
+    target.scheduler.override_line("alpha", "model", "claude-opus-5-5")
+    assert target.scheduler.model_of("alpha") == "claude-opus-5-5"
+    spec = target.engine("alpha").spec
+    assert spec is not None and spec.model == "claude-opus-5-5"
+    (summary,) = target.scheduler.line_summaries()
+    assert summary["engine"] == "claude-opus-5-5"
+    with pytest.raises(OverrideError, match="create a new line"):
+        target.scheduler.override_line("alpha", "model", "gpt-6-luna")
+    assert target.scheduler.model_of("alpha") == "claude-opus-5-5"
+
+
+def test_limit_and_wake_overrides_sit_over_the_project(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    scheduler = target.scheduler
+    scheduler.override_line("alpha", "limits.max_cost_usd", "9")
+    scheduler.override_line("alpha", "wake.every_ticks", 4)
+    assert scheduler.limits_for("alpha").max_cost_usd == 9.0
+    assert scheduler.limits_for("alpha").max_autonomous_turns == (
+        DEFAULT_LIMITS.max_autonomous_turns
+    )
+    assert scheduler.wake_every_for("alpha") == 4
+    with pytest.raises(OverrideError, match="every_ticks"):
+        scheduler.override_line("alpha", "wake.every_ticks", 0)
+    with pytest.raises(ValueError, match="max_cost_usd"):
+        scheduler.override_line("alpha", "limits.max_cost_usd", "0")
+    assert scheduler.limits_for("alpha").max_cost_usd == 9.0
+
+
+def test_refused_overrides_change_nothing(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    scheduler = target.scheduler
+    before = len(target.events())
+    for key, value in (
+        ("effort", "extreme"),
+        ("colour", "red"),
+        ("builtin_tools", ["x y"]),
+    ):
+        with pytest.raises((OverrideError, ConfigError)):
+            scheduler.override_line("alpha", key, value)
+    with pytest.raises(EventRejected, match="no line"):
+        scheduler.override_line("nobody", "effort", "low")
+    assert len(target.events()) == before
+
+
+def test_a_stored_override_that_no_longer_applies_is_skipped(
+    make_world: MakeWorld, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = make_world({"alpha": [[]]})
+    target.log.append(LineOverridden("alpha", '{"effort":"extreme","colour":1}'))
+    assert target.scheduler.effective_config("alpha") == LineConfig()
+    target.scheduler.line_summaries()
+    target.scheduler.line_summaries()
+    reported = capsys.readouterr().err
+    assert reported.count("colour") == 1 and "an override is skipped" in reported
+
+
+def test_clearing_a_session_starts_the_next_turn_fresh(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[], []]})
+    run(target, send(target, "alpha", "first"))
+    assert target.log.state.lines["alpha"].engine_session == "session-1"
+    target.scheduler.clear_session("alpha")
+    assert target.log.state.lines["alpha"].engine_session is None
+    spec = target.engine("alpha").spec
+    assert spec is not None and spec.session_id is None
+    with pytest.raises(EventRejected, match="no line"):
+        target.scheduler.clear_session("nobody")
+
+
+def test_a_session_is_not_cleared_mid_turn(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    engine = target.engine("alpha")
+    gate = asyncio.Event()
+    engine.gate = gate
+    refused: list[str] = []
+
+    async def act() -> None:
+        target.scheduler.send(ANA, LineAddress("alpha"), "work")
+        while not engine.prompts:
+            await asyncio.sleep(0)
+        with pytest.raises(EventRejected, match="Interrupt it first") as caught:
+            target.scheduler.clear_session("alpha")
+        refused.append(str(caught.value))
+        gate.set()
+
+    run(target, act)
+    assert refused
+
+
+def test_project_values_change_while_running(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    scheduler = target.scheduler
+    scheduler.set_project(Limits(3, 1.0, 0.0), "ben", 0.5, 2)
+    assert scheduler.limits_for("alpha") == Limits(3, 1.0, 0.0)
+    assert scheduler.wake_every_for("alpha") == 2
+    with pytest.raises(ValueError, match="wake_every_ticks"):
+        scheduler.set_project(DEFAULT_LIMITS, "ben", 0.5, 0)
+    with pytest.raises(ValueError, match="tick_seconds"):
+        scheduler.set_project(DEFAULT_LIMITS, "ben", 99.0, 1)

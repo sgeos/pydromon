@@ -39,7 +39,16 @@ VIEW: dict[str, object] = {
     ],
 }
 
-CORE = ("keys", "editor", "commands", "data", "model", "render", "update")
+CORE = (
+    "keys",
+    "editor",
+    "commands",
+    "data",
+    "model",
+    "settings",
+    "render",
+    "update",
+)
 CORE_DEPENDENCIES = {f"dromon.ui.{name}" for name in CORE} | {"dromon.activity"}
 FORBIDDEN = frozenset(
     {"curses", "tkinter", "socket", "select", "selectors", "asyncio", "os"}
@@ -131,6 +140,7 @@ def test_a_tick_polls_and_loads_the_results() -> None:
         Operation.LINE_VIEW,
         Operation.LINE_ACTIVITY,
         Operation.STATUS,
+        Operation.SETTINGS,
     ]
     assert daemon.calls[1][1] == {"line_id": "alpha", "after": 0}
     model = client.model
@@ -138,7 +148,7 @@ def test_a_tick_polls_and_loads_the_results() -> None:
     assert [entry.text for entry in model.activity] == ["hello"]
     assert [line.line_id for line in model.lines] == ["alpha"]
     client.tick(0.5)
-    assert len(daemon.calls) == 3
+    assert len(daemon.calls) == 4
 
 
 @pytest.mark.parametrize(
@@ -182,14 +192,15 @@ def test_typed_text_is_sent_and_the_client_refreshes() -> None:
     for character in "hi":
         client.press(Char(character))
     client.press(Named.ENTER)
-    assert daemon.calls[3] == (
+    assert daemon.calls[4] == (
         Operation.SEND,
         {"recipient": "alpha", "body": "hi", "operator": "ana"},
     )
-    assert daemon.operations()[4:] == [
+    assert daemon.operations()[5:] == [
         Operation.LINE_VIEW,
         Operation.LINE_ACTIVITY,
         Operation.STATUS,
+        Operation.SETTINGS,
     ]
     assert client.model.notice == "sent to alpha"
 

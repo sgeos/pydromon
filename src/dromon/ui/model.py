@@ -9,7 +9,7 @@ from enum import StrEnum
 from typing import Final
 
 from dromon.ui.commands import DaemonCommand, Pane, Suggestion
-from dromon.ui.data import ActivityPage, Entry, LineSummary, View
+from dromon.ui.data import ActivityPage, Entry, LineSummary, Settings, View
 from dromon.ui.editor import Editor, History
 from dromon.ui.keys import Key
 
@@ -26,6 +26,7 @@ class Overlay(StrEnum):
     NONE = "none"
     HELP = "help"
     LINES = "lines"
+    SETTINGS = "settings"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +53,11 @@ class Model:
     overlay: Overlay = Overlay.NONE
     picked: int = 0
     """The highlighted line in the line list."""
+    settings: Settings | None = None
+    """The line's and the project's settings, fetched on attach and after changes."""
+    setting_row: int = 0
+    """The highlighted row of the settings panel, over the line's rows and then the
+    project's."""
     scroll: int = 0
     """Transcript rows hidden below the bottom of the view."""
     notice: str = ""
@@ -120,6 +126,12 @@ class ActivityLoaded:
 
 
 @dataclass(frozen=True, slots=True)
+class SettingsLoaded:
+    line_id: str
+    settings: Settings
+
+
+@dataclass(frozen=True, slots=True)
 class LinesLoaded:
     lines: tuple[LineSummary, ...]
 
@@ -142,6 +154,7 @@ type Event = (
     | ViewLoaded
     | ActivityLoaded
     | LinesLoaded
+    | SettingsLoaded
     | Done
     | Failed
 )
@@ -167,6 +180,11 @@ class FetchLines:
 
 
 @dataclass(frozen=True, slots=True)
+class FetchSettings:
+    line_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class Request:
     command: DaemonCommand
     line_id: str
@@ -183,4 +201,6 @@ class Exit:
     pass
 
 
-type Effect = FetchView | FetchActivity | FetchLines | Request | Bell | Exit
+type Effect = (
+    FetchView | FetchActivity | FetchLines | FetchSettings | Request | Bell | Exit
+)
