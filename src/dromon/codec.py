@@ -23,6 +23,8 @@ from dromon.model import (
     InvalidField,
     LineConfigured,
     LineCreated,
+    LineHeld,
+    LineReleased,
     LineSession,
     LineState,
     LineStateChanged,
@@ -50,6 +52,8 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "line_state_changed": ("line_id", "state"),
     "line_configured": ("line_id", "config"),
     "line_session": ("line_id", "engine_session"),
+    "line_held": ("line_id", "question_id"),
+    "line_released": ("line_id",),
     "operator_registered": ("operator_id",),
     "message_sent": (
         "message_id",
@@ -140,6 +144,13 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
             }
         case LineConfigured():
             return "line_configured", {"line_id": event.line_id, "config": event.config}
+        case LineHeld():
+            return "line_held", {
+                "line_id": event.line_id,
+                "question_id": event.question_id,
+            }
+        case LineReleased():
+            return "line_released", {"line_id": event.line_id}
         case LineSession():
             return "line_session", {
                 "line_id": event.line_id,
@@ -194,6 +205,10 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
             )
         case "line_configured":
             return LineConfigured(_str(data, "line_id"), _str(data, "config"))
+        case "line_held":
+            return LineHeld(_str(data, "line_id"), _str(data, "question_id"))
+        case "line_released":
+            return LineReleased(_str(data, "line_id"))
         case "line_session":
             return LineSession(_str(data, "line_id"), _str(data, "engine_session"))
         case "operator_registered":

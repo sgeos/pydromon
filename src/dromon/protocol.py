@@ -36,6 +36,7 @@ class Operation(StrEnum):
     READ = "read"
     ACKNOWLEDGE = "acknowledge"
     SENT = "sent"
+    RELEASE = "release"
 
 
 class ErrorCode(StrEnum):

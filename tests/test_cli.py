@@ -27,6 +27,7 @@ def test_the_lifecycle_subcommands_are_implemented() -> None:
         "read",
         "ack",
         "sent",
+        "release",
     }
     assert set(cli.IMPLEMENTED) <= set(cli.SUBCOMMANDS)
 

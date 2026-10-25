@@ -20,6 +20,7 @@ from dromon.lineconfig import LineConfig, ToolPolicy, encode_config
 from dromon.model import (
     EventRejected,
     LineAddress,
+    LineReleased,
     LineSession,
     LineState,
     LineStateChanged,
@@ -33,6 +34,7 @@ from dromon.model import (
     WakeIssued,
     WakeRequested,
 )
+from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.mailbox import MailSummary, summary
 from dromon.scheduler import LineSpec, Scheduler, compose_prompt
 
@@ -60,6 +62,7 @@ class Scripted:
         self.results: list[dict[str, Any]] = []
         self.gate: asyncio.Event | None = None
         self.fail = False
+        self.cost: float | None = None
 
     async def run_turn(self, prompt: str) -> TurnReport:
         self.prompts.append(prompt)
@@ -79,7 +82,7 @@ class Scripted:
             self.results.append(await tool.handler(args))
         assert self.session_id is not None
         return TurnReport(
-            "success", 1, "ok", (), None, None, self.session_id, None, None
+            "success", 1, "ok", (), None, None, self.session_id, None, self.cost
         )
 
 
@@ -91,8 +94,9 @@ class World:
         path: Path,
         scripts: dict[str, list[Turn]],
         *,
-        max_turns_per_line: int = 10,
+        limits: Limits = DEFAULT_LIMITS,
         hold_wakes: bool = False,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.path = path
         self.log = EventLog(path)
@@ -101,9 +105,10 @@ class World:
         self.scheduler = Scheduler(
             self.log,
             self.build,
-            max_turns_per_line=max_turns_per_line,
+            limits=limits,
             hold_wakes=hold_wakes,
             tick_seconds=0,
+            clock=clock or (lambda: 0.0),
         )
         self.scheduler.ensure_operator("ana")
         for line_id in scripts:
@@ -141,14 +146,16 @@ def make_world(tmp_path: Path) -> Iterator[MakeWorld]:
     def make(
         scripts: dict[str, list[Turn]],
         *,
-        max_turns_per_line: int = 10,
+        limits: Limits = DEFAULT_LIMITS,
         hold_wakes: bool = False,
+        clock: Callable[[], float] | None = None,
     ) -> World:
         target = World(
             tmp_path / f"events-{len(built)}.sqlite",
             scripts,
-            max_turns_per_line=max_turns_per_line,
+            limits=limits,
             hold_wakes=hold_wakes,
+            clock=clock,
         )
         built.append(target)
         return target
@@ -284,14 +291,106 @@ def test_held_wakes_record_messages_but_run_nothing(make_world: MakeWorld) -> No
     assert len(target.scheduler.pending("alpha")) == 1
 
 
-def test_a_runaway_exchange_stops_at_the_turn_cap(make_world: MakeWorld) -> None:
+def test_a_runaway_exchange_is_held_and_raises_an_operator_question(
+    make_world: MakeWorld,
+) -> None:
     forever = [[{"to": "beta", "body": "again"}] for _ in range(50)]
     back = [[{"to": "alpha", "body": "again"}] for _ in range(50)]
-    target = make_world({"alpha": forever, "beta": back}, max_turns_per_line=3)
+    target = make_world(
+        {"alpha": forever, "beta": back}, limits=Limits(max_autonomous_turns=3)
+    )
     run(target, send(target, "alpha", "go"))
-    assert len(target.engines["alpha"].prompts) == 3
-    assert len(target.engines["beta"].prompts) == 3
-    assert target.scheduler.pending("alpha")
+    state = target.log.state
+    held = {line_id: line.held_by for line_id, line in state.lines.items()}
+    assert held["alpha"] is not None and held["beta"] is not None
+    # alpha's question goes to @ana, who messaged it, and beta's to the default
+    # operator, because no operator ever messaged beta.
+    asked = {"alpha": ANA, "beta": OperatorAddress("operator")}
+    for line_id, question_id in held.items():
+        assert question_id is not None
+        question = state.messages[question_id]
+        assert (question.sender, question.recipient) == (
+            LineAddress(line_id),
+            asked[line_id],
+        )
+        assert "3 turns in a row without mail from an operator" in question.body
+        assert question.choices == ("resume",)
+    # The exchange stopped long before the scripts ran out.
+    assert len(target.engines["alpha"].prompts) <= 4
+    assert len(target.engines["beta"].prompts) <= 4
+
+
+def test_answering_a_hold_question_releases_the_line(make_world: MakeWorld) -> None:
+    forever = [[{"to": "beta", "body": "again"}] for _ in range(50)]
+    back = [[{"to": "alpha", "body": "again"}] for _ in range(50)]
+    target = make_world(
+        {"alpha": forever, "beta": back}, limits=Limits(max_autonomous_turns=2)
+    )
+    run(target, send(target, "alpha", "go"))
+    question_id = target.log.state.lines["beta"].held_by
+    assert question_id is not None
+    before = len(target.engines["beta"].prompts)
+
+    async def act() -> None:
+        target.scheduler.answer(OperatorAddress("operator"), question_id, "resume")
+
+    run(target, act)
+    assert len(target.engines["beta"].prompts) > before
+    assert any(
+        isinstance(e, LineReleased) and e.line_id == "beta" for e in target.events()
+    )
+
+
+def test_release_resumes_a_held_line(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[] for _ in range(10)]})
+    target.scheduler.hold("alpha", "was held by a test")
+    run(target, send(target, "alpha", "waiting"))
+    assert target.engines == {}
+    target.scheduler.release("alpha")
+    run(target, send(target, "alpha", "more"))
+    assert target.log.state.lines["alpha"].held_by is None
+    assert target.engines["alpha"].prompts
+    with pytest.raises(EventRejected, match="not held"):
+        target.scheduler.release("alpha")
+
+
+def test_a_cost_budget_holds_a_line(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[], [], []]}, limits=Limits(max_cost_usd=0.015))
+    target.engine("alpha").cost = 0.01
+    run(target, send(target, "alpha", "one"))
+    assert target.log.state.lines["alpha"].held_by is None
+    run(target, send(target, "alpha", "two"))
+    question_id = target.log.state.lines["alpha"].held_by
+    assert question_id is not None
+    assert "over the budget of $0.01" in target.log.state.messages[question_id].body
+
+
+def test_a_cooldown_delays_the_next_turn(make_world: MakeWorld) -> None:
+    now = [100.0]
+    target = make_world(
+        {"alpha": [[], []]}, limits=Limits(cooldown_seconds=30), clock=lambda: now[0]
+    )
+    run(target, send(target, "alpha", "one"))
+    assert len(target.engines["alpha"].prompts) == 1
+
+    async def act() -> None:
+        target.scheduler.send(ANA, LineAddress("alpha"), "two")
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert len(target.engines["alpha"].prompts) == 1
+        now[0] += 31
+
+    run(target, act)
+    assert len(target.engines["alpha"].prompts) == 2
+
+
+def test_a_hold_asks_the_default_operator_when_none_messaged(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": []}, hold_wakes=True)
+    question_id = target.scheduler.hold("alpha", "was held by a test")
+    recipient = target.log.state.messages[question_id].recipient
+    assert recipient == OperatorAddress("operator")
 
 
 def test_an_engine_failure_returns_the_line_to_idle_and_is_not_retried(
@@ -382,9 +481,18 @@ def test_the_wake_prompt_summarizes_and_lists_headers_without_bodies() -> None:
     assert MailSummary(2, 2, 0).sentence() == "2 new messages. 2 unread. 0 unanswered."
 
 
-def test_the_turn_cap_must_be_positive(make_world: MakeWorld) -> None:
-    with pytest.raises(ValueError, match="at least 1"):
-        make_world({}, max_turns_per_line=0)
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"max_autonomous_turns": 0},
+        {"max_cost_usd": 0.0},
+        {"cooldown_seconds": -1.0},
+        {"cooldown_seconds": 100_000.0},
+    ],
+)
+def test_limits_are_bounded(bad: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        Limits(**bad)
 
 
 @pytest.mark.live
@@ -398,7 +506,9 @@ def test_two_live_lines_exchange_a_message(tmp_path: Path) -> None:
 
     with EventLog(tmp_path / "events.sqlite") as log:
         scheduler = Scheduler(
-            log, claude_code_engine(str(tmp_path)), max_turns_per_line=2
+            log,
+            claude_code_engine(str(tmp_path)),
+            limits=Limits(max_autonomous_turns=2),
         )
         scheduler.ensure_operator("ana")
         scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
@@ -697,7 +807,9 @@ def test_a_live_line_asks_and_is_woken_by_the_answer(tmp_path: Path) -> None:
 
     with EventLog(tmp_path / "events.sqlite") as log:
         scheduler = Scheduler(
-            log, claude_code_engine(str(tmp_path)), max_turns_per_line=2
+            log,
+            claude_code_engine(str(tmp_path)),
+            limits=Limits(max_autonomous_turns=2),
         )
         scheduler.ensure_operator("ana")
         scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)

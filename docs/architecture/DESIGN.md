@@ -260,6 +260,22 @@ protocol specification.
 per-conversation turn limits, cost budgets and cooldowns, and turns a long exchange into
 an operator question rather than letting it run.
 
+**Decided 2026-10-25 by the operator.** Pick sensible limits, to be tuned later.
+
+**Implemented 2026-10-25, roadmap task 7.** `dromon.limits` counts, for each line, its
+turns in a row without mail from an operator, by default at most 12, and the estimated
+cost of its turns since its last release, by default at most $2. An optional cooldown
+sets the least time between a line's turns. A line past either limit is held with
+`line_held`: it takes no turns and its mail waits, and the daemon asks, on the line's
+behalf, the operator who last messaged it, or else the daemon's default operator,
+whether to resume it. Any reply to that question, or `dromon release`, releases the line
+with `line_released` and resets its counts. A runaway ping-pong between two lines is
+held within the limit, and both lines raise questions.
+
+**Inference.** Counting turns without operator mail, rather than turns per pair of
+lines, catches a runaway among any number of lines, and a single operator message
+resets it, which matches the intent of an operator supervising the work.
+
 ## Stream processors and scheduling
 
 **Decided.** In the Keleusma version, each model has its own per-turn or per-sub-turn

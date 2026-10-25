@@ -43,6 +43,7 @@ from typing import Final, cast
 from dromon import __version__, exits
 from dromon.driver import DriverError, Strategy
 from dromon.eventlog import EventLog, LogError, utc_now
+from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.mailbox import MAX_PAGE, listing, outcome, replied_ids, sent, summary
 from dromon.lineconfig import (
     DEFAULT_CONFIG,
@@ -72,7 +73,7 @@ from dromon.protocol import (
     request_id_of,
 )
 from dromon.scheduler import (
-    DEFAULT_MAX_TURNS_PER_LINE,
+    DEFAULT_OPERATOR,
     DEFAULT_TICK_SECONDS,
     MAX_TICK_SECONDS,
     Scheduler,
@@ -144,6 +145,7 @@ class Daemon:
                 | Operation.READ
                 | Operation.ACKNOWLEDGE
                 | Operation.SENT
+                | Operation.RELEASE
             ):
                 return self._command(request)
 
@@ -167,6 +169,8 @@ class Daemon:
                     result = self._acknowledge(request.args)
                 case Operation.SENT:
                     result = self._sent(request.args)
+                case Operation.RELEASE:
+                    result = self._release(request.args)
                 case _:
                     result = self._send(request.args)
         except ProtocolError as error:
@@ -270,6 +274,11 @@ class Daemon:
                 for message_id, message in page
             ],
         }
+
+    def _release(self, args: dict[str, object]) -> dict[str, object]:
+        (line_id,) = _text_args(args, ("line_id",))
+        self.scheduler.release(line_id)
+        return {"line_id": line_id}
 
     def _acknowledge(self, args: dict[str, object]) -> dict[str, object]:
         operator, message_id = _text_args(args, ("operator", "message_id"))
@@ -488,7 +497,8 @@ async def serve(daemon: Daemon) -> None:
 def run(
     paths: ProjectPaths,
     *,
-    max_turns_per_line: int = DEFAULT_MAX_TURNS_PER_LINE,
+    limits: Limits = DEFAULT_LIMITS,
+    default_operator: str = DEFAULT_OPERATOR,
     hold_wakes: bool = False,
     tick_seconds: float = DEFAULT_TICK_SECONDS,
 ) -> int:
@@ -509,7 +519,8 @@ def run(
             scheduler = Scheduler(
                 log,
                 claude_code_engine(str(paths.root)),
-                max_turns_per_line=max_turns_per_line,
+                limits=limits,
+                default_operator=default_operator,
                 hold_wakes=hold_wakes,
                 tick_seconds=tick_seconds,
             )
@@ -543,10 +554,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="directory for the socket and lock, default .dromon/run",
     )
     parser.add_argument(
-        "--max-turns-per-line",
+        "--max-autonomous-turns",
         type=int,
-        default=DEFAULT_MAX_TURNS_PER_LINE,
-        help="turns run for each line in one daemon lifetime, default %(default)s",
+        default=DEFAULT_LIMITS.max_autonomous_turns,
+        help="turns a line may take without operator mail before it is held,"
+        " default %(default)s",
+    )
+    parser.add_argument(
+        "--max-cost-usd",
+        type=float,
+        default=DEFAULT_LIMITS.max_cost_usd,
+        help="estimated cost a line may run up before it is held, default %(default)s",
+    )
+    parser.add_argument(
+        "--cooldown-seconds",
+        type=float,
+        default=DEFAULT_LIMITS.cooldown_seconds,
+        help="the least time between a line's turns, default %(default)s",
+    )
+    parser.add_argument(
+        "--operator",
+        default=DEFAULT_OPERATOR,
+        help="who is asked about a held line no operator has messaged,"
+        " default %(default)s",
     )
     parser.add_argument(
         "--hold-wakes",
@@ -572,9 +602,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     except PathError as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
-    max_turns: int = arguments.max_turns_per_line
-    if max_turns < 1:
-        print("dromond: --max-turns-per-line must be at least 1", file=sys.stderr)
+    try:
+        limits = Limits(
+            max_autonomous_turns=arguments.max_autonomous_turns,
+            max_cost_usd=arguments.max_cost_usd,
+            cooldown_seconds=arguments.cooldown_seconds,
+        )
+        default_operator = OperatorAddress(arguments.operator).operator_id
+    except (ValueError, InvalidField) as error:
+        print(f"dromond: {error}", file=sys.stderr)
         return exits.USAGE
     hold: bool = arguments.hold_wakes
     tick: float = arguments.tick_seconds
@@ -584,7 +620,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return exits.USAGE
-    return run(paths, max_turns_per_line=max_turns, hold_wakes=hold, tick_seconds=tick)
+    return run(
+        paths,
+        limits=limits,
+        default_operator=default_operator,
+        hold_wakes=hold,
+        tick_seconds=tick,
+    )
 
 
 if __name__ == "__main__":

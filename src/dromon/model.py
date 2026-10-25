@@ -235,6 +235,28 @@ class LineSession:
 
 
 @dataclass(frozen=True, slots=True)
+class LineHeld:
+    """The daemon stopped waking a line until an operator answers ``question_id``."""
+
+    line_id: str
+    question_id: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_id("question_id", self.question_id)
+
+
+@dataclass(frozen=True, slots=True)
+class LineReleased:
+    """A held line may be woken again."""
+
+    line_id: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+
+
+@dataclass(frozen=True, slots=True)
 class OperatorRegistered:
     operator_id: str
 
@@ -345,6 +367,8 @@ type Event = (
     | LineStateChanged
     | LineConfigured
     | LineSession
+    | LineHeld
+    | LineReleased
     | OperatorRegistered
     | MessageSent
     | MessageDelivered
@@ -370,6 +394,8 @@ class Line:
     """The latest ``line_configured`` text, or ``None`` for the default."""
     engine_session: str | None = None
     """The engine session the line's next turn resumes, if one was recorded."""
+    held_by: str | None = None
+    """The question whose answer releases the line, while the line is held."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -437,6 +463,17 @@ class State:
                 self._check_line_state(event)
             case LineConfigured() | LineSession():
                 self._line(event.line_id)
+            case LineHeld():
+                if self._line(event.line_id).held_by is not None:
+                    raise EventRejected(f"line {event.line_id} is held")
+                question = self._open_question(event.question_id)
+                if question.sender != LineAddress(event.line_id):
+                    raise EventRejected(
+                        f"question {event.question_id} is not from line {event.line_id}"
+                    )
+            case LineReleased():
+                if self._line(event.line_id).held_by is None:
+                    raise EventRejected(f"line {event.line_id} is not held")
             case OperatorRegistered():
                 if event.operator_id in self.operators:
                     raise EventRejected(f"operator {event.operator_id} exists")
@@ -482,6 +519,12 @@ class State:
             case LineConfigured():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, config=event.config)
+            case LineHeld():
+                line = self.lines[event.line_id]
+                self.lines[event.line_id] = replace(line, held_by=event.question_id)
+            case LineReleased():
+                line = self.lines[event.line_id]
+                self.lines[event.line_id] = replace(line, held_by=None)
             case LineSession():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(

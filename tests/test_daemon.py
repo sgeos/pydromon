@@ -475,6 +475,25 @@ def test_a_bad_acknowledge_or_sent_request_is_refused(
     assert (response.ok, response.error_code) == (False, code)
 
 
+def test_release_resumes_a_held_line_and_status_shows_holds(
+    paths: ProjectPaths,
+) -> None:
+    paths.state_dir.mkdir(mode=0o700, exist_ok=True)
+    with EventLog(paths.event_log) as log:
+        scheduler = held_scheduler(log)
+        scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+        question_id = scheduler.hold("alpha", "was held by a test")
+    status = request(paths, "status", {})
+    assert status.result is not None
+    (line,) = cast(list[dict[str, object]], status.result["lines"])
+    assert line["held_by"] == question_id
+    assert request(paths, "release", {"line_id": "alpha"}).ok
+    again = request(paths, "release", {"line_id": "alpha"})
+    assert (again.ok, again.error_code) == (False, ErrorCode.REJECTED)
+    unknown = request(paths, "release", {"line_id": "nobody"})
+    assert (unknown.ok, unknown.error_code) == (False, ErrorCode.REJECTED)
+
+
 # The real daemon, started detached and driven over its socket. Wakes are held, so no
 # engine ever starts and no test touches the subscription.
 
