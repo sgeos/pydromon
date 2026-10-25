@@ -36,6 +36,9 @@ MAX_TEXT_BYTES: Final = 1024 * 1024
 MAX_CONFIG_BYTES: Final = 256 * 1024
 """Upper bound on the UTF-8 size of a line's stored tool configuration."""
 
+MAX_SESSION_BYTES: Final = 256
+"""Upper bound on an engine's session identifier."""
+
 MAX_CHOICES: Final = 16
 MAX_CHOICE_BYTES: Final = 1024
 
@@ -220,6 +223,24 @@ class LineConfigured:
 
 
 @dataclass(frozen=True, slots=True)
+class LineSession:
+    """The engine session a line's next turn resumes, recorded after each turn.
+
+    It lets a restarted daemon continue a line's conversation, so an answer reaches a
+    line that still remembers its question.
+    """
+
+    line_id: str
+    engine_session: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_text("engine_session", self.engine_session, MAX_SESSION_BYTES)
+        if not self.engine_session:
+            raise InvalidField("engine_session is empty")
+
+
+@dataclass(frozen=True, slots=True)
 class OperatorRegistered:
     operator_id: str
 
@@ -306,6 +327,7 @@ type Event = (
     LineCreated
     | LineStateChanged
     | LineConfigured
+    | LineSession
     | OperatorRegistered
     | MessageSent
     | MessageDelivered
@@ -327,6 +349,8 @@ class Line:
     state: LineState
     config: str | None = None
     """The latest ``line_configured`` text, or ``None`` for the default."""
+    engine_session: str | None = None
+    """The engine session the line's next turn resumes, if one was recorded."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,7 +423,7 @@ class State:
                     raise EventRejected(f"line {event.line_id} exists")
             case LineStateChanged():
                 self._check_line_state(event)
-            case LineConfigured():
+            case LineConfigured() | LineSession():
                 self._line(event.line_id)
             case OperatorRegistered():
                 if event.operator_id in self.operators:
@@ -434,6 +458,11 @@ class State:
             case LineConfigured():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, config=event.config)
+            case LineSession():
+                line = self.lines[event.line_id]
+                self.lines[event.line_id] = replace(
+                    line, engine_session=event.engine_session
+                )
             case OperatorRegistered():
                 self.operators.add(event.operator_id)
             case MessageSent():

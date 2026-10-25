@@ -5,7 +5,7 @@ line sends travels the same path as one sent by a model.
 """
 
 import asyncio
-from collections.abc import Callable, Coroutine, Iterator
+from collections.abc import Callable, Coroutine, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +17,9 @@ from dromon.engine import TurnReport
 from dromon.eventlog import EventLog, read_entries
 from dromon.lineconfig import LineConfig, ToolPolicy, encode_config
 from dromon.model import (
+    EventRejected,
     LineAddress,
+    LineSession,
     LineState,
     LineStateChanged,
     Message,
@@ -25,6 +27,7 @@ from dromon.model import (
     MessageKind,
     MessageSent,
     OperatorAddress,
+    QuestionStatus,
     WakeIssued,
     WakeRequested,
 )
@@ -41,11 +44,14 @@ class Scripted:
     """A line engine that makes scripted tool calls and records its prompts."""
 
     def __init__(
-        self, tool: SdkMcpTool[Any], turns: list[Turn], spec: LineSpec | None = None
+        self,
+        tools: Sequence[SdkMcpTool[Any]],
+        turns: list[Turn],
+        spec: LineSpec | None = None,
     ) -> None:
         self.spec = spec
         self.session_id: str | None = spec.session_id if spec is not None else None
-        self.tool = tool
+        self.tools = {tool.name: tool for tool in tools}
         self.turns = turns
         self.prompts: list[str] = []
         self.results: list[dict[str, Any]] = []
@@ -59,10 +65,19 @@ class Scripted:
         if self.fail:
             raise RuntimeError("the engine broke")
         calls = self.turns.pop(0) if self.turns else []
-        self.session_id = "session-" + str(len(self.prompts))
-        for args in calls:
-            self.results.append(await self.tool.handler(args))
-        return TurnReport("success", 1, "ok", (), None, None, "s", None, None)
+        # Like a real engine, a new session gets an identifier and a resumed one
+        # keeps it.
+        if self.session_id is None:
+            self.session_id = "session-1"
+        for call in calls:
+            # A call names its tool with the key "tool", and sends by default.
+            args = {key: value for key, value in call.items() if key != "tool"}
+            tool = self.tools[str(call.get("tool", "send_message"))]
+            self.results.append(await tool.handler(args))
+        assert self.session_id is not None
+        return TurnReport(
+            "success", 1, "ok", (), None, None, self.session_id, None, None
+        )
 
 
 class World:
@@ -90,10 +105,14 @@ class World:
         for line_id in scripts:
             self.scheduler.create_line(line_id, HAIKU, Strategy.SUBSCRIPTION)
 
-    def build(self, spec: LineSpec, tool: SdkMcpTool[Any]) -> Scripted:
-        engine = Scripted(tool, self.scripts[spec.line_id], spec)
+    def build(self, spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> Scripted:
+        engine = Scripted(tools, self.scripts[spec.line_id], spec)
         self.engines[spec.line_id] = engine
         return engine
+
+    @staticmethod
+    def build_nothing(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> Scripted:
+        raise AssertionError(f"no engine may start, but {spec.line_id} did")
 
     def engine(self, line_id: str) -> Scripted:
         """The line's engine, built now if the scheduler has not built it yet."""
@@ -174,12 +193,13 @@ def test_a_message_wakes_an_idle_line_and_is_delivered(make_world: MakeWorld) ->
     message_id = next(e.message_id for e in events if isinstance(e, MessageSent))
     wake = wakes_for(target, "alpha")
     assert [w.message_id for w in wake] == [message_id]
-    tail = events[-5:]
+    tail = events[-6:]
     assert isinstance(tail[0], WakeRequested)
     assert tail[1] == WakeIssued(wake[0].wake_id)
     assert tail[2] == LineStateChanged("alpha", LineState.RUNNING)
     assert tail[3] == MessageDelivered(message_id)
-    assert tail[4] == LineStateChanged("alpha", LineState.IDLE)
+    assert tail[4] == LineSession("alpha", "session-1")
+    assert tail[5] == LineStateChanged("alpha", LineState.IDLE)
     prompt = target.engines["alpha"].prompts[0]
     assert f"Message {message_id} from @ana:\nhello" in prompt
 
@@ -448,6 +468,8 @@ def test_a_configuration_reaches_the_engine_and_a_change_keeps_the_session(
     assert target.engines["alpha"].spec is not None
     assert target.engines["alpha"].spec.config == first
     session = target.engines["alpha"].session_id
+    assert session is not None
+    assert target.log.state.lines["alpha"].engine_session == session
     second = LineConfig(tool_policy=ToolPolicy.ALLOW_ALL)
     target.scheduler.configure_line("alpha", second)
     run(target, send(target, "alpha", "two"))
@@ -464,3 +486,217 @@ def test_a_line_created_with_a_configuration_records_it(make_world: MakeWorld) -
     assert target.log.state.lines["gamma"].config == encode_config(config)
     target.scheduler.create_line("delta", HAIKU, Strategy.SUBSCRIPTION)
     assert target.log.state.lines["delta"].config is None
+
+
+# Operator questions.
+
+BEN = OperatorAddress("ben")
+
+
+def ask_call(**args: object) -> dict[str, Any]:
+    return {"tool": "ask_operator", **args}
+
+
+def questions_for(target: World, operator: OperatorAddress | None = ANA) -> list[str]:
+    return [question_id for question_id, _ in target.scheduler.questions(operator)]
+
+
+def test_a_line_asks_and_the_question_waits_in_its_operators_queue(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world(
+        {"alpha": [[ask_call(question="Proceed?", to="@ana", choices=["yes", "no"])]]}
+    )
+    target.scheduler.ensure_operator("ben")
+    run(target, send(target, "alpha", "start"))
+    asked = questions_for(target)
+    assert len(asked) == 1
+    question = target.log.state.messages[asked[0]]
+    assert (question.sender, question.recipient) == (LineAddress("alpha"), ANA)
+    assert (question.body, question.choices, question.blocking) == (
+        "Proceed?",
+        ("yes", "no"),
+        False,
+    )
+    assert questions_for(target, BEN) == []
+    assert questions_for(target, None) == asked
+    assert target.log.state.messages[asked[0]].delivered
+
+
+def test_without_to_a_question_goes_to_the_operator_who_last_messaged(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": [[ask_call(question="Which one?")]]})
+    target.scheduler.ensure_operator("ben")
+
+    async def act() -> None:
+        target.scheduler.send(ANA, LineAddress("alpha"), "first")
+        target.scheduler.send(BEN, LineAddress("alpha"), "second")
+
+    run(target, act)
+    assert questions_for(target, BEN) and not questions_for(target, ANA)
+
+
+@pytest.mark.parametrize(
+    ("args", "reason"),
+    [
+        ({"question": "?", "to": "alpha"}, "not an operator address"),
+        ({"question": "?", "to": "@nobody"}, "no operator nobody"),
+        ({"question": "?"}, "no operator has messaged this line"),
+        ({"question": 3, "to": "@ana"}, "question must be text"),
+        ({"question": "?", "to": "@ana", "choices": "yes"}, "choices must be a list"),
+        ({"question": "?", "to": "@ana", "blocking": "yes"}, "blocking must be"),
+        ({"question": "?", "to": "@ana", "choices": ["a", "a"]}, "repeat"),
+    ],
+)
+def test_a_bad_question_returns_an_error_and_asks_nothing(
+    make_world: MakeWorld, args: dict[str, Any], reason: str
+) -> None:
+    target = make_world({"alpha": []}, hold_wakes=True)
+    result = asyncio.run(call_tool(target.scheduler.ask_tool("alpha"), args))
+    assert result["is_error"] is True
+    assert reason in result["content"][0]["text"]
+    assert questions_for(target, None) == []
+
+
+def test_an_answer_wakes_the_line_in_a_later_tick(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[ask_call(question="Proceed?", to="@ana")], []]})
+    run(target, send(target, "alpha", "start"))
+    (question_id,) = questions_for(target)
+
+    async def act() -> None:
+        target.scheduler.answer(ANA, question_id, "yes")
+
+    run(target, act)
+    prompts = target.engines["alpha"].prompts
+    assert len(prompts) == 2
+    assert f"from @ana, replying to {question_id}:\nyes" in prompts[1]
+    question = target.log.state.messages[question_id]
+    assert question.status is QuestionStatus.ANSWERED
+    assert questions_for(target) == []
+
+
+def test_a_blocking_question_pauses_its_line_until_answered(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world(
+        {"alpha": [[ask_call(question="Wait?", to="@ana", blocking=True)], []]}
+    )
+    run(target, send(target, "alpha", "start"))
+    (question_id,) = questions_for(target)
+    run(target, send(target, "alpha", "meanwhile"))
+    assert len(target.engines["alpha"].prompts) == 1
+    assert target.log.state.is_blocked("alpha")
+
+    async def act() -> None:
+        target.scheduler.answer(ANA, question_id, "go")
+
+    run(target, act)
+    prompts = target.engines["alpha"].prompts
+    assert len(prompts) == 2
+    assert "meanwhile" in prompts[1] and "go" in prompts[1]
+
+
+def test_only_the_asked_operator_may_answer_and_only_once(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": [[ask_call(question="?", to="@ana")]]})
+    target.scheduler.ensure_operator("ben")
+    run(target, send(target, "alpha", "start"))
+    (question_id,) = questions_for(target)
+    with pytest.raises(EventRejected, match="must go from @ana"):
+        target.scheduler.answer(BEN, question_id, "no")
+    target.scheduler.answer(ANA, question_id, "yes")
+    with pytest.raises(EventRejected, match="is answered"):
+        target.scheduler.answer(ANA, question_id, "again")
+    with pytest.raises(EventRejected, match="no question"):
+        target.scheduler.answer(ANA, "q-missing", "x")
+
+
+def test_an_open_question_survives_a_restart(tmp_path: Path) -> None:
+    path = tmp_path / "events.sqlite"
+    with EventLog(path) as log:
+        first = Scheduler(log, World.build_nothing)
+        first.ensure_operator("ana")
+        first.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+        question_id = first.ask("alpha", ANA, "Still there?", blocking=True)
+    with EventLog(path) as log:
+        restarted = Scheduler(log, World.build_nothing)
+        assert [i for i, _ in restarted.questions(ANA)] == [question_id]
+        assert log.state.is_blocked("alpha")
+
+
+def test_a_restarted_scheduler_resumes_each_lines_engine_session(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": [[], []]})
+    run(target, send(target, "alpha", "one"))
+    session = target.log.state.lines["alpha"].engine_session
+    assert session is not None
+    target.engines.clear()
+    target.scheduler = Scheduler(target.log, target.build)
+    run(target, send(target, "alpha", "two"))
+    rebuilt = target.engines["alpha"].spec
+    assert rebuilt is not None and rebuilt.session_id == session
+
+
+def test_an_unchanged_session_is_not_recorded_again(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[], []]})
+    run(target, send(target, "alpha", "one"))
+    run(target, send(target, "alpha", "two"))
+    recorded = [e for e in target.events() if isinstance(e, LineSession)]
+    assert [e.engine_session for e in recorded] == ["session-1"]
+
+
+def test_a_changed_session_is_recorded(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[], []]})
+    engine = target.engine("alpha")
+    run(target, send(target, "alpha", "one"))
+    engine.session_id = "session-2"
+    run(target, send(target, "alpha", "two"))
+    recorded = [e for e in target.events() if isinstance(e, LineSession)]
+    assert [e.engine_session for e in recorded] == ["session-1", "session-2"]
+
+
+@pytest.mark.live
+def test_a_live_line_asks_and_is_woken_by_the_answer(tmp_path: Path) -> None:
+    """Roadmap task 6 on the real engine, on the operator's subscription."""
+    import os
+
+    if os.environ.get("DROMON_LIVE_TESTS") != "1":
+        pytest.skip("set DROMON_LIVE_TESTS=1 to call the engine on the subscription")
+    from dromon.scheduler import claude_code_engine
+
+    with EventLog(tmp_path / "events.sqlite") as log:
+        scheduler = Scheduler(
+            log, claude_code_engine(str(tmp_path)), max_turns_per_line=2
+        )
+        scheduler.ensure_operator("ana")
+        scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+
+        async def settle_once(act: Callable[[], object]) -> None:
+            stop = asyncio.Event()
+            loop = asyncio.create_task(scheduler.run(stop))
+            act()
+            await asyncio.sleep(0)
+            await scheduler.idle()
+            stop.set()
+            await loop
+
+        asyncio.run(
+            settle_once(
+                lambda: scheduler.send(
+                    ANA,
+                    LineAddress("alpha"),
+                    "Call the ask_operator tool once, to @ana, asking: Proceed?, with"
+                    " blocking true. Send nothing else.",
+                )
+            )
+        )
+        asked = scheduler.questions(ANA)
+        assert len(asked) == 1 and asked[0][1].blocking
+        question_id = asked[0][0]
+        asyncio.run(settle_once(lambda: scheduler.answer(ANA, question_id, "yes")))
+        assert log.state.messages[question_id].status is QuestionStatus.ANSWERED
+        assert len(scheduler.turn_reports) == 2
+        assert not log.state.is_blocked("alpha")

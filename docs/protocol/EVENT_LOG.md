@@ -54,6 +54,7 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `line_created` | `line_id`, `engine` and `strategy` identifiers | The line does not exist. The new line is idle. The engine names the model, and the strategy names the driver's credential strategy |
 | `line_state_changed` | `line_id`, `state` | The line exists, the change is in the transition table, and a change to `running` is refused while the line is blocked |
 | `line_configured` | `line_id`, `config` text of at most 262,144 bytes | The line exists. The text is the canonical JSON of [`LINE_CONFIG.md`](LINE_CONFIG.md), validated by the daemon before it appends, and replaces any earlier configuration |
+| `line_session` | `line_id`, `engine_session` text of 1 to 256 bytes | The line exists. Records the engine session the line's next turn resumes, so a restarted daemon continues the line's conversation |
 | `operator_registered` | `operator_id` | The operator does not exist |
 | `message_sent` | `message_id`, `sender` and `recipient` addresses, `kind`, `body` text, `choices`, `blocking` boolean, `reply_to` message identifier or `null` | See the message rules below |
 | `message_delivered` | `message_id` | The message exists and was not delivered. For a line, delivery is into a turn. For an operator, delivery is acceptance by the operator's relay or display in a client |

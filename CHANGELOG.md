@@ -36,6 +36,12 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Operator questions, roadmap task 6. Lines ask through an in-process `ask_operator`
+  tool. The daemon keeps the queue, `dromon questions` lists it, `dromon answer`
+  replies, and the answer wakes the asking line in a later tick. New `questions` and
+  `answer` operations.
+- A `line_session` event records each line's engine session, so a restarted daemon
+  resumes every line's conversation.
 - Per-line tool configuration, `dromon.lineconfig` and `docs/protocol/LINE_CONFIG.md`.
   A line may be given built-in tools and arbitrary MCP servers under an allow-all or an
   allowlist policy, stored as a new `line_configured` event. `dromon create` takes tool

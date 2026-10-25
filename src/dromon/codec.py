@@ -23,6 +23,7 @@ from dromon.model import (
     InvalidField,
     LineConfigured,
     LineCreated,
+    LineSession,
     LineState,
     LineStateChanged,
     MessageDelivered,
@@ -46,6 +47,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "line_created": ("line_id", "engine", "strategy"),
     "line_state_changed": ("line_id", "state"),
     "line_configured": ("line_id", "config"),
+    "line_session": ("line_id", "engine_session"),
     "operator_registered": ("operator_id",),
     "message_sent": (
         "message_id",
@@ -135,6 +137,11 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
             }
         case LineConfigured():
             return "line_configured", {"line_id": event.line_id, "config": event.config}
+        case LineSession():
+            return "line_session", {
+                "line_id": event.line_id,
+                "engine_session": event.engine_session,
+            }
         case OperatorRegistered():
             return "operator_registered", {"operator_id": event.operator_id}
         case MessageSent():
@@ -181,6 +188,8 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
             )
         case "line_configured":
             return LineConfigured(_str(data, "line_id"), _str(data, "config"))
+        case "line_session":
+            return LineSession(_str(data, "line_id"), _str(data, "engine_session"))
         case "operator_registered":
             return OperatorRegistered(_str(data, "operator_id"))
         case "message_sent":

@@ -8,7 +8,7 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -19,6 +19,7 @@ from typing import Any, cast
 from claude_agent_sdk import SdkMcpTool
 
 from dromon.daemon import AlreadyRunning, Daemon, acquire_lock
+from dromon.driver import Strategy
 from dromon.eventlog import EventLog
 from dromon.model import (
     LineAddress,
@@ -27,6 +28,7 @@ from dromon.model import (
     MessageSent,
     OperatorAddress,
     OperatorRegistered,
+    QuestionStatus,
 )
 from dromon.paths import PathError, ProjectPaths, project_paths
 from dromon.protocol import (
@@ -68,7 +70,7 @@ def handle(paths: ProjectPaths, line: bytes) -> tuple[Response, bool]:
         return response, daemon.stop_requested.is_set()
 
 
-def no_engine(spec: LineSpec, tool: SdkMcpTool[Any]) -> LineEngine:
+def no_engine(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> LineEngine:
     raise AssertionError(f"no engine may start in this test, but {spec.line_id} did")
 
 
@@ -306,6 +308,75 @@ def test_a_bad_configuration_is_refused(
     assert (response.ok, response.error_code) == (False, code)
 
 
+def seed_question(paths: ProjectPaths, *, blocking: bool = False) -> str:
+    """A log holding line alpha and one open question from it to @ana."""
+    paths.state_dir.mkdir(mode=0o700, exist_ok=True)
+    with EventLog(paths.event_log) as log:
+        scheduler = held_scheduler(log)
+        scheduler.ensure_operator("ana")
+        if "alpha" not in log.state.lines:
+            scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+        return scheduler.ask(
+            "alpha",
+            OperatorAddress("ana"),
+            "Proceed?",
+            ("yes", "no"),
+            blocking=blocking,
+        )
+
+
+def test_questions_lists_open_questions_for_an_operator(paths: ProjectPaths) -> None:
+    question_id = seed_question(paths)
+    mine = request(paths, "questions", {"operator": "ana"})
+    theirs = request(paths, "questions", {"operator": "ben"})
+    every = request(paths, "questions", {})
+    assert mine.result == {
+        "questions": [
+            {
+                "question_id": question_id,
+                "line": "alpha",
+                "operator": "@ana",
+                "text": "Proceed?",
+                "choices": ["yes", "no"],
+                "blocking": False,
+            }
+        ]
+    }
+    assert theirs.result == {"questions": []}
+    assert every.result == mine.result
+
+
+def test_answer_records_the_operators_reply(paths: ProjectPaths) -> None:
+    question_id = seed_question(paths)
+    response = request(
+        paths, "answer", {"question_id": question_id, "body": "yes", "operator": "ana"}
+    )
+    assert response.ok
+    with EventLog(paths.event_log) as log:
+        assert log.state.messages[question_id].status is QuestionStatus.ANSWERED
+    assert request(paths, "questions", {"operator": "ana"}).result == {"questions": []}
+
+
+@pytest.mark.parametrize(
+    ("args", "code"),
+    [
+        ({"question_id": "q-x", "body": "y", "operator": "ana"}, ErrorCode.REJECTED),
+        ({"question_id": "Q", "body": "y", "operator": "ben"}, ErrorCode.REJECTED),
+        ({"question_id": "q-x", "body": "y"}, ErrorCode.BAD_REQUEST),
+    ],
+)
+def test_a_bad_answer_is_refused(
+    paths: ProjectPaths, args: dict[str, object], code: ErrorCode
+) -> None:
+    question_id = seed_question(paths)
+    if args.get("question_id") == "Q":
+        args = {**args, "question_id": question_id}
+    response = request(paths, "answer", args)
+    assert (response.ok, response.error_code) == (False, code)
+    with EventLog(paths.event_log) as log:
+        assert "ben" not in log.state.operators
+
+
 # The real daemon, started detached and driven over its socket. Wakes are held, so no
 # engine ever starts and no test touches the subscription.
 
@@ -496,3 +567,35 @@ def test_lines_and_messages_through_the_command_line(
     assert by_id["alpha"]["state"] == "idle"
     assert by_id["beta"]["strategy"] == "flexible"
     assert by_id["beta"]["pending"] == 0
+
+
+@pytest.mark.socket
+def test_an_open_question_survives_a_daemon_restart_and_is_answered(
+    paths: ProjectPaths, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from dromon import cli
+
+    question_id = seed_question(paths, blocking=True)
+    base = ["--project", str(paths.root), "--runtime-dir", str(paths.runtime_dir)]
+    pid = client.start(paths, HOLD)
+    try:
+        assert cli.main([*base, "questions", "--operator", "ana"]) == exits.OK
+        listed = capsys.readouterr().out
+        assert f"{question_id} from alpha to @ana, blocking" in listed
+        assert "choices: yes | no" in listed
+    finally:
+        client.stop(paths)
+        reap(pid)
+    pid = client.start(paths, HOLD)
+    try:
+        assert cli.main([*base, "questions", "--operator", "ana"]) == exits.OK
+        assert question_id in capsys.readouterr().out
+        assert cli.main([*base, "answer", question_id, "yes", "--operator", "ana"]) == 0
+        assert cli.main([*base, "questions", "--all"]) == exits.OK
+        assert "no open questions" in capsys.readouterr().out
+    finally:
+        client.stop(paths)
+        reap(pid)
+    with EventLog(paths.event_log) as log:
+        assert log.state.messages[question_id].status is QuestionStatus.ANSWERED
+        assert not log.state.is_blocked("alpha")

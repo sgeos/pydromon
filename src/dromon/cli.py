@@ -13,7 +13,7 @@ import re
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
 
 from dromon import __version__, exits
 from dromon.client import DaemonFailed, DaemonNotRunning, call, is_running, start, stop
@@ -236,6 +236,49 @@ def _send(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return _request(paths, "send", Operation.SEND, args)
 
 
+def _questions(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    args: dict[str, object] = {} if arguments.all else {"operator": arguments.operator}
+    try:
+        response = call(paths.socket, Operation.QUESTIONS, args=args)
+    except DaemonNotRunning:
+        print(f"dromon questions: not running for {paths.root}", file=sys.stderr)
+        return exits.NOT_RUNNING
+    except (ProtocolError, TimeoutError, OSError) as error:
+        print(f"dromon questions: {error}", file=sys.stderr)
+        return exits.FAILURE
+    if not response.ok or response.result is None:
+        print(f"dromon questions: {response.error_message}", file=sys.stderr)
+        return exits.FAILURE
+    found = response.result.get("questions")
+    entries = cast(list[dict[str, object]], found) if isinstance(found, list) else []
+    if not entries:
+        print("no open questions")
+    for entry in entries:
+        blocking = ", blocking" if entry.get("blocking") is True else ""
+        print(
+            f"{entry.get('question_id')} from {entry.get('line')}"
+            f" to {entry.get('operator')}{blocking}"
+        )
+        for text_line in str(entry.get("text", "")).splitlines() or [""]:
+            print(f"    {text_line}")
+        choices = entry.get("choices")
+        if isinstance(choices, list) and choices:
+            print(
+                "    choices: "
+                + " | ".join(str(c) for c in cast(list[object], choices))
+            )
+    return exits.OK
+
+
+def _answer(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    args: dict[str, object] = {
+        "question_id": arguments.question_id,
+        "body": arguments.body,
+        "operator": arguments.operator,
+    }
+    return _request(paths, "answer", Operation.ANSWER, args)
+
+
 IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]] = {
     "start": _start,
     "status": _status,
@@ -244,6 +287,8 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "create": _create,
     "configure": _configure,
     "send": _send,
+    "questions": _questions,
+    "answer": _answer,
 }
 
 
@@ -310,6 +355,23 @@ def build_parser() -> argparse.ArgumentParser:
             _add_tool_options(command)
         if name in ("create", "probe"):
             _add_driver_options(command)
+        if name == "questions":
+            command.add_argument(
+                "--operator",
+                default=default_operator(),
+                help="whose questions to list, default %(default)s",
+            )
+            command.add_argument(
+                "--all", action="store_true", help="list every operator's questions"
+            )
+        if name == "answer":
+            command.add_argument("question_id", help="the question answered")
+            command.add_argument("body", help="the answer")
+            command.add_argument(
+                "--operator",
+                default=default_operator(),
+                help="the operator answering, default %(default)s",
+            )
         if name == "send":
             command.add_argument("recipient", help="a line, or an operator as @name")
             command.add_argument("body", help="the message text")

@@ -49,6 +49,8 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `stop` | `{"stopping": true}`, after which the daemon closes its connections, removes its socket and exits |
 | `create_line` | Arguments `line_id`, `model`, `strategy`, and optionally `config`, an object of [`LINE_CONFIG.md`](LINE_CONFIG.md). Result `{"line_id": ...}`. Refused when no packaged driver serves the model and strategy |
 | `configure_line` | Arguments `line_id` and `config`. Replaces the line's configuration from its next turn |
+| `questions` | Optionally `operator`. Result `{"questions": [...]}`, the open questions for that operator, or for all when omitted, oldest first, each with `question_id`, `line`, `operator`, `text`, `choices` and `blocking`. Listing marks each question delivered, because the client has shown it |
+| `answer` | Arguments `question_id`, `body` and `operator`. Records the operator's reply, which must come from the operator the question was asked of. Result `{"message_id": ...}`. The answer wakes the asking line in a later tick |
 | `send` | Arguments `recipient`, a line or `@operator`, `body`, `operator`, and optionally `reply_to`. Registers the operator if new and records a note from them. Result `{"message_id": ...}` |
 
 `status` also returns `tick`, the ticks run in this daemon's lifetime, and `lines`, one
@@ -96,6 +98,8 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromon create LINE` | Sends `create_line`, with `--model`, default `claude-haiku-5-5`, `--strategy`, default `subscription`, and the tool options below | 0, 4, or 1 |
 | `dromon configure LINE` | Sends `configure_line` with the tool options below. No option means the default configuration | 0, 4, or 1 |
 | `dromon send RECIPIENT BODY` | Sends `send`, with `--operator`, default the login name, and `--reply-to` | 0, 4, or 1 |
+| `dromon questions` | Sends `questions` for `--operator`, default the login name, or for every operator with `--all`, and prints each question with its choices | 0, 4, or 1 |
+| `dromon answer QUESTION BODY` | Sends `answer`, with `--operator`, default the login name | 0, 4, or 1 |
 | `dromon probe` | Runs one short turn without the daemon and reports the engine's capabilities | 0 or 1 |
 | `dromond` | Runs the daemon in the foreground. `--max-turns-per-line N` caps the turns run for each line, default 10, and `--hold-wakes` records messages without waking any line | 0, 1 on failure, 2 on a bad cap, or 5 when another daemon holds the lock |
 
@@ -120,6 +124,6 @@ not yet implemented, because its interface differs between macOS and Linux.
 
 ## Not yet specified
 
-- Listing and answering questions, and attaching an interactive client.
+- Attaching an interactive client, and the graphical interface roadmap task 8 calls for.
 - Authentication of a client beyond the directory's permissions.
 - Notifications pushed from the daemon to an attached client.

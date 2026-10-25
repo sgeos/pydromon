@@ -21,6 +21,8 @@ def test_the_lifecycle_subcommands_are_implemented() -> None:
         "create",
         "configure",
         "send",
+        "questions",
+        "answer",
     }
     assert set(cli.IMPLEMENTED) <= set(cli.SUBCOMMANDS)
 

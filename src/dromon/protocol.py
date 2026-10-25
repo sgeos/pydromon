@@ -30,6 +30,8 @@ class Operation(StrEnum):
     CREATE_LINE = "create_line"
     CONFIGURE_LINE = "configure_line"
     SEND = "send"
+    QUESTIONS = "questions"
+    ANSWER = "answer"
 
 
 class ErrorCode(StrEnum):
