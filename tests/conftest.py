@@ -12,6 +12,7 @@ from dromon.model import (
     Event,
     LineAddress,
     LineConfigured,
+    LineSession,
     LineCreated,
     LineState,
     LineStateChanged,
@@ -46,6 +47,7 @@ SCENARIO: tuple[Event, ...] = (
             LineConfig(builtin_tools=("Read",), allowed_tools=("mcp__docs__*",))
         ),
     ),
+    LineSession("beta", "0b9f2c6e-session"),
     OperatorRegistered("ana"),
     OperatorRegistered("ben"),
     MessageSent("m1", ALPHA, BETA, NOTE, "hello"),

@@ -176,11 +176,18 @@ question pauses only its own line. Forwarding goes through relays, with a comman
 as the general adapter. See [`../protocol/EVENT_LOG.md`](../protocol/EVENT_LOG.md) and
 [`../protocol/RELAY.md`](../protocol/RELAY.md).
 
-**Proposed.**
+**Implemented 2026-10-25, roadmap task 6.** `ask_operator` is an in-process tool beside
+`send_message`. It records a question to one operator, by default the operator who last
+messaged the line, and returns at once, so no tool call waits on a person. The daemon
+keeps the queue in the event log. `dromon questions` lists an operator's open questions
+and `dromon answer` replies. The answer is a reply message that wakes the asking line in
+a later tick and closes the question, which unblocks the line. Each line's engine
+session is recorded as `line_session`, so after a restart the answer reaches a line that
+still remembers its question. Live, a Haiku line asked a blocking question, the daemon
+restarted, the question was listed and answered, and the line woke and recalled a
+codeword it had been given before the restart.
 
-- `ask_operator` is served by the daemon over MCP, or as an in-process tool of the
-  Agent SDK, so that any engine can call it. It records the question and returns at
-  once, and the line ends its turn, so no tool call waits on a person.
+**Proposed.**
 - Which operator a line asks by default is per-project configuration.
 - Clients show each operator their own queue. `dromon questions` lists it and
   `dromon answer` replies from the command line.

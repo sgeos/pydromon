@@ -4,38 +4,36 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-25, ticks, per-line tools and the client direction
+## 2026-10-25, task 6, operator questions
 
-**Done, on the operator's three directions.**
+**Done.** Tasks 1 to 5 were already complete, and pull request #11, ticks and per-line
+tools, was merged first. Task 6 is complete.
 
-- **Ticks.** The scheduler advances in ticks. At the start of a tick it takes a snapshot
-  of every undelivered message for an idle, unblocked line under its cap, and each such
-  line takes one turn. A message sent during a tick waits for the next tick, even when
-  its recipient is idle throughout, and messages never interrupt a turn. The live
-  ping-pong of task 5 now takes three ticks. `status` reports the tick.
-- **Per-line tools.** `docs/protocol/LINE_CONFIG.md` and `dromon.lineconfig` give each
-  line built-in tools, arbitrary MCP servers over stdio, HTTP or SSE, and an
-  `allowlist` or `allow_all` policy, plus an opt-in to inherit the account's MCP
-  servers. Configurations are stored as `line_configured`, set by `dromon create` or
-  `dromon configure`, and apply from the line's next turn on the same engine session.
-  A live Haiku line configured with only `Read` read a file and answered correctly.
-- **Client.** The daemon keeps the `ask_operator` queue, and the client is to grow a
-  graphical interface, or a launcher for one, attachable per line in many terminals at
-  once. This is recorded in the design and in roadmap task 8, not built yet.
+- Lines ask through an in-process `ask_operator` tool, with optional choices and an
+  optional block. A question goes to the named operator, or by default to the operator
+  who last messaged the line.
+- The daemon keeps the queue in the event log. `dromon questions` lists an operator's
+  open questions, or all with `--all`, and marks them delivered. `dromon answer` replies,
+  only the asked operator may answer, and only once.
+- An answer is a reply message, so it wakes the line in a later tick, closes the
+  question and unblocks the line.
+- **Found live and fixed.** After a restart, the first live run's line had forgotten
+  its question, because engine sessions lived only in memory. A `line_session` event now
+  records each line's session, and the rebuilt engine resumes it. In the second live
+  run, the line answered with a codeword it was given before the restart.
 
 **Decisions made by this line, open to the operator's review.**
 
-- Listed built-in tools are allowed under the allowlist without being repeated in
-  `allowed_tools`, because listing them is already a grant.
-- An HTTP or SSE server must use `https`, or `http` on the local host.
-- A turn is refused when the engine offers a server the configuration does not name,
-  unless the account's servers are inherited.
+- Listing questions marks them delivered, since the client has shown them.
+- A question without `to` goes to the operator who last messaged the line, and fails
+  with a clear message when none has.
 
-**Verification.** `uv sync`, 433 tests passing with warnings treated as errors outside
-the sandbox. Ruff and pyright strict clean. A live turn exercised a configured built-in
-tool.
+**Verification.** `uv sync`, 455 tests passing with warnings treated as errors outside
+the sandbox, and all three live tests passing on Haiku 5.5. Ruff and pyright strict
+clean. The full flow, from asking through a daemon restart to the answer waking the line,
+ran live through the command line.
 
-**Not verified.** A real external MCP server, and `allow_all` or inheritance against the
-real engine. MCP credentials are stored in the event log.
+**Not verified.** Driver state is not persisted, so a driver's counters restart with
+the daemon. Notes a line sends to an operator are recorded but shown by no client yet.
 
-**Next.** Task 6, operator questions.
+**Next.** Task 7, conversation control, then task 8, the attachable client.

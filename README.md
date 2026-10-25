@@ -17,8 +17,9 @@ specified in [`docs/protocol/CLIENT.md`](docs/protocol/CLIENT.md). `dromon probe
 short turn of Claude Opus 5.5 on Claude Code, on the operator's Claude subscription,
 through a Keleusma driver, and reports the engine's capabilities. `dromon create` and
 `dromon send` create lines and message them, and the daemon wakes an idle line when a
-message arrives. Lines message each other through a `send_message` tool. The other
-subcommands report that they are not implemented. The first milestone is
+message arrives. Lines message each other through a `send_message` tool. Lines ask operators
+questions through an `ask_operator` tool, and `dromon questions` and `dromon answer`
+work the queue. `dromon attach` reports that it is not implemented. The first milestone is
 [`docs/roadmap/V0_1_0.md`](docs/roadmap/V0_1_0.md) and the planned system is
 [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md). What Dromon needs from
 the Keleusma Python bindings is in

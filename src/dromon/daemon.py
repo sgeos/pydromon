@@ -52,6 +52,7 @@ from dromon.lineconfig import (
 from dromon.model import (
     EventRejected,
     InvalidField,
+    Message,
     OperatorAddress,
     QuestionStatus,
     parse_address,
@@ -126,7 +127,13 @@ class Daemon:
             case Operation.STOP:
                 self.stop_requested.set()
                 return Response(request.request_id, ok=True, result={"stopping": True})
-            case Operation.CREATE_LINE | Operation.CONFIGURE_LINE | Operation.SEND:
+            case (
+                Operation.CREATE_LINE
+                | Operation.CONFIGURE_LINE
+                | Operation.SEND
+                | Operation.QUESTIONS
+                | Operation.ANSWER
+            ):
                 return self._command(request)
 
     def _command(self, request: Request) -> Response:
@@ -137,6 +144,10 @@ class Daemon:
                     result = self._create_line(request.args)
                 case Operation.CONFIGURE_LINE:
                     result = self._configure_line(request.args)
+                case Operation.QUESTIONS:
+                    result = self._questions(request.args)
+                case Operation.ANSWER:
+                    result = self._answer(request.args)
                 case _:
                     result = self._send(request.args)
         except ProtocolError as error:
@@ -176,6 +187,21 @@ class Daemon:
         self.scheduler.configure_line(line_id, _config_arg(args))
         return {"line_id": line_id}
 
+    def _questions(self, args: dict[str, object]) -> dict[str, object]:
+        """Open questions for ``operator``, or for every operator when it is omitted."""
+        names = ("operator",) if "operator" in args else ()
+        values = _text_args(args, names)
+        operator = OperatorAddress(values[0]) if values else None
+        found = self.scheduler.questions(operator)
+        return {"questions": [_question_summary(i, m) for i, m in found]}
+
+    def _answer(self, args: dict[str, object]) -> dict[str, object]:
+        question_id, body, operator = _text_args(
+            args, ("question_id", "body", "operator")
+        )
+        message_id = self.scheduler.answer(OperatorAddress(operator), question_id, body)
+        return {"message_id": message_id}
+
     def _send(self, args: dict[str, object]) -> dict[str, object]:
         optional = ("reply_to",) if "reply_to" in args else ()
         values = _text_args(args, ("recipient", "body", "operator", *optional))
@@ -207,6 +233,17 @@ class Daemon:
             "tick": self.scheduler.tick,
             "lines": self.scheduler.line_summaries(),
         }
+
+
+def _question_summary(message_id: str, message: Message) -> dict[str, object]:
+    return {
+        "question_id": message_id,
+        "line": str(message.sender),
+        "operator": str(message.recipient),
+        "text": message.body,
+        "choices": list(message.choices),
+        "blocking": message.blocking,
+    }
 
 
 def _config_arg(args: dict[str, object]) -> LineConfig:

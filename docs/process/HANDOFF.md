@@ -9,7 +9,7 @@ completed, moved or abandoned.
 
 ## State on 2026-10-25
 
-- **Tasks 1 to 5 done.**
+- **Tasks 1 to 6 done.**
   - `model.py`, `codec.py` and `eventlog.py` hold the data model as nine event kinds in
     an append-only SQLite log. Operators are parties addressed as `@name`.
   - `relay.py` forwards operator messages. Replies will come through inbound adapters
@@ -24,6 +24,10 @@ completed, moved or abandoned.
   - `scheduler.py` runs ticks, by the operator's decision. A message sent in one tick is
     received no sooner than the next, and messages never interrupt a turn. Lines send
     through an in-process `send_message` tool, operators through `dromon send`.
+  - Operator questions. `ask_operator` records a question in the daemon's queue,
+    `dromon questions` and `dromon answer` work it, and the answer wakes the line in a
+    later tick. `line_session` records each line's engine session, so lines survive a
+    restart with their conversations.
   - `lineconfig.py` gives each line its built-in tools, arbitrary MCP servers and an
     allow-all or allowlist policy, by the operator's decision, stored as
     `line_configured`. The default is no tools beyond Dromon's own, with strict MCP
@@ -44,12 +48,9 @@ completed, moved or abandoned.
 
 ## Next step
 
-Task 6 of [`../roadmap/V0_1_0.md`](../roadmap/V0_1_0.md), operator questions. Add an
-`ask_operator` tool beside `send_message` that sends a question to an operator, keep the
-queue in the daemon, wire `dromon questions` and `dromon answer`, let an answer wake the
-asking line in the next tick, and confirm an open question survives a restart. The
-operator wants the client to grow a graphical interface, or a launcher for one, with
-many attached to different lines at once, which roadmap task 8 now states.
+Task 7 of [`../roadmap/V0_1_0.md`](../roadmap/V0_1_0.md), conversation control, which
+replaces the per-line turn cap with turn limits, budgets and cooldowns that raise an
+operator question. Task 8, the attachable client the operator asked for, follows.
 
 ## Open
 
@@ -79,9 +80,10 @@ many attached to different lines at once, which roadmap task 8 now states.
   event log, which is owner-only. References to secrets held elsewhere are not yet
   specified.
 - **Daemon debt.** No peer credential check on connections, no relay forwarding passes
-  yet, and the event log's SQLite calls run on the event loop thread. A line's engine
-  session and driver state live only in memory, so a restarted daemon starts each line
-  on a fresh Claude Code session. The per-line turn cap stands in for task 7. All are recorded
+  yet, and the event log's SQLite calls run on the event loop thread. Driver state
+  lives only in memory, while engine sessions are recorded. The per-line turn cap stands
+  in for task 7. A note a line sends to an operator waits undelivered until a relay or
+  client shows it. All are recorded
   in `CLIENT.md` or the module documentation.
 - **Recorded in the design.** Teacher-model scope, the contents of `.dromon/dromon.toml`,
   and the Rust repository's eventual name.
@@ -102,7 +104,7 @@ its keychain token on 2026-10-24.
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 433 tests pass, 11 of them need sockets
+uv sync && uv run pytest    # 455 tests pass, 12 of them need sockets
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 
