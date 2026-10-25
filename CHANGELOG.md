@@ -5,6 +5,14 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `docs/architecture/KELEUSMA_INTEGRATION.md` records the `pykeleusma` line's answers to
+  the four questions, the binding's current task status, and the tagged-tuple
+  constraints it reported. One-element tuples in the examples became two-element ones.
+- `CLAUDE.md` states that dates in tracked files are in Coordinated Universal Time.
+- Roadmap task 1 is done. The seed was checked against Appendix B and nothing conflicts.
+
 ### Added
 
 - `docs/architecture/KELEUSMA_INTEGRATION.md`, what Dromon needs from `pykeleusma`,

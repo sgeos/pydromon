@@ -116,3 +116,7 @@ Prose is polite, professional and academic. No contractions. No em-dashes or en-
 and no colons, semicolons or parentheticals in prose, with front matter, tables, code and
 equations exempt. Spell out acronyms on first use. Distinguish facts, inferences and
 hypotheses, and state uncertainty explicitly.
+
+Dates in tracked files are calendar dates in Coordinated Universal Time, written as
+`YYYY-MM-DD`. The seed followed this, so its dates can run one day ahead of the local
+timestamps in commits made in the evening, Pacific time.

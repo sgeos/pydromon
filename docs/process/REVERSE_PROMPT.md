@@ -4,17 +4,31 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-25, the seed
+## 2026-10-25, housekeeping and the Appendix B check
 
-**Done.** The repository was cut and seeded by the operator's admin session. The layout
-follows `pykeleusma` and the Keleusma repository: `CLAUDE.md`, `AGENTS.md`, a changelog,
-and `docs/` with architecture, decisions, roadmap and process sections. The content comes
-from a design conversation with the operator and is recorded in
-[`../architecture/DESIGN.md`](../architecture/DESIGN.md), where each point is marked
-decided, proposed or open.
+**Done.**
 
-**Not done.** The seeding session could not read Appendix B. See `HANDOFF.md`.
+- **Appendix B.** Read in full. Every tracked file, every diff in history and every
+  commit message was searched for its subject matter and read by hand. Nothing conflicts.
+  Every keyword hit was an ordinary use, such as an adapter that probes an engine. The
+  Keleusma properties the documents rely on are already in Keleusma's public README.
+- **Dates.** The seed's dates are correct in Coordinated Universal Time. Its commits were
+  made after 00:00 UTC on 2026-10-25, while their local Pacific timestamps read
+  2026-10-24. `CLAUDE.md` now states the convention. No date was changed.
+- **Integration document.** Updated from the `pykeleusma` repository, read without
+  changes, at its commit `03d2309`. The four questions now carry that line's answers,
+  the mapping shows its tasks 2 and 3 done and the new task 5b, and the examples no
+  longer use one-element tuples, which Keleusma rejects.
+- **Repository.** Local `main` matched `origin/main`. A stale tracking reference to the
+  merged branch `docs/keleusma-integration` was pruned, since the remote branch was
+  already deleted. The lock file is current.
 
-**Verification.** See the seed commit message for the commands run and their results.
+**Not verified.** The `pykeleusma` line's answers were taken from its report and were
+not reproduced here. The disagreement on the worst-case time unit is recorded, not
+resolved.
 
-**Next.** Task 1, the Appendix B check, then task 2, the data model and event log.
+**Verification.** `uv sync`, 18 tests passing, ruff check and format clean, and pyright
+strict with 0 errors and 0 warnings.
+
+**Next.** Task 2, the data model and event log. Of the operator decisions in `HANDOFF.md`,
+the home of the protocol specification is needed by task 3, and the engine by task 4.
