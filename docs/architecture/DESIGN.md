@@ -360,7 +360,13 @@ of the data model. The specification is [`../protocol/EVENT_LOG.md`](../protocol
 - The daemon runs outside every session line's sandbox, so it can act as a credential
   broker under policy, for example pushing to git on a line's request. That also makes it
   a high-value target. Every brokered action needs an explicit per-project allowance.
-- Each session line keeps its own sandbox profile.
+- Each session line keeps its own sandbox profile. **Decided 2026-10-25, by the
+  operator's direction to reach parity with Claude Code.** A line's shell commands run
+  in Claude Code's own sandbox, configured per project and per line in Claude Code's
+  vocabulary, with unattended defaults and with Dromon's state and runtime directories
+  protected, as [`../protocol/SANDBOX.md`](../protocol/SANDBOX.md) specifies. **Porting
+  hazard.** The Rust port inherits the dependency on Claude Code's sandbox runtime for
+  the Claude Code engine, and another engine needs a sandbox of its own.
 - Messages from other session lines, harnesses and machines are untrusted data. Only the
   operator, through a client, holds operator authority.
 
@@ -392,3 +398,5 @@ before any trace capture, and record the source model and licence of every trace
 3. The contents of `.dromon/dromon.toml`.
 4. Mid-turn injection. Decided 2026-10-25, not used, because delivery is tick based.
 5. Teacher-model scope and licensing.
+6. Whether Dromon retires the interline store, or keeps it for sessions Dromon does not
+   drive. Moved here from the handoff on 2026-10-25.

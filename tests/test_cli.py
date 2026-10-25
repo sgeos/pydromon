@@ -171,4 +171,4 @@ def test_an_unreadable_mcp_file_fails_before_contacting_the_daemon(
         "/nope",
     ]
     assert cli.main(argv) == exits.FAILURE
-    assert "cannot read the MCP configuration" in capsys.readouterr().err
+    assert "cannot read the line configuration" in capsys.readouterr().err

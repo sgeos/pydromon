@@ -25,7 +25,9 @@ curses client attached to one line, or a Tk window with `--gui`, and any number 
 attached at once. A project declares its lines, limits and wake policy in
 `.dromon/dromon.toml`, as
 [`docs/protocol/PROJECT_CONFIG.md`](docs/protocol/PROJECT_CONFIG.md) specifies, and
-`dromon config` validates it. The first milestone is
+`dromon config` validates it. A line's shell commands can run in Claude Code's sandbox,
+configured per project and per line as
+[`docs/protocol/SANDBOX.md`](docs/protocol/SANDBOX.md) specifies. The first milestone is
 [`docs/roadmap/V0_1_0.md`](docs/roadmap/V0_1_0.md) and the planned system is
 [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md). What Dromon needs from
 the Keleusma Python bindings is in

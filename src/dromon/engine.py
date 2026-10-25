@@ -26,6 +26,12 @@ session. No tool is approved in advance. Every call reaches the line's permissio
 which applies the configuration's policy, and a turn whose engine offers a built-in
 tool or an MCP server the configuration does not name is interrupted and refused.
 
+Sandbox. ``sandbox`` is the line's effective sandbox settings, already merged and
+resolved by ``dromon.sandbox.effective``, and Claude Code enforces them on shell
+commands. With ``setting_sources=[]`` a line has no sandbox but the one given here and
+any managed policy. The gate also refuses a shell call that asks to run outside an
+enabled sandbox that does not allow it, in case the engine forwards one.
+
 Failure modes. A refusal by the policy or the driver raises ``EngineRefused`` after the
 turn is interrupted. A driver failure raises ``DriverError``. Engine and transport
 failures from the SDK propagate unchanged.
@@ -53,6 +59,7 @@ from claude_agent_sdk import (
     SystemMessage,
     TextBlock,
     ThinkingBlock,
+    SandboxSettings,
     ToolPermissionContext,
     ToolUseBlock,
     create_sdk_mcp_server,
@@ -60,6 +67,7 @@ from claude_agent_sdk import (
 
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
+from dromon.sandbox import blocks_unsandboxed
 
 MCP_SERVER_NAME: Final = "dromon"
 """The name of the in-process MCP server that serves a line's Dromon tools."""
@@ -208,13 +216,22 @@ type PermissionGate = Callable[
 ]
 
 
-def permission_gate(config: LineConfig, own_tools: frozenset[str]) -> PermissionGate:
-    """A gate that applies ``config``'s policy and denies every other tool call."""
+def permission_gate(
+    config: LineConfig,
+    own_tools: frozenset[str],
+    sandbox: Mapping[str, object] | None = None,
+) -> PermissionGate:
+    """A gate that applies ``config``'s policy and denies every other tool call,
+    and every shell call that would leave the ``sandbox`` without its leave."""
 
     async def gate(
         tool_name: str, tool_input: dict[str, Any], context: ToolPermissionContext
     ) -> PermissionResultAllow | PermissionResultDeny:
-        del tool_input, context
+        del context
+        if blocks_unsandboxed(sandbox, tool_name, tool_input):
+            return PermissionResultDeny(
+                message="this line's sandbox does not allow unsandboxed commands"
+            )
         if config.allows(tool_name, own_tools):
             return PermissionResultAllow()
         return PermissionResultDeny(
@@ -253,6 +270,7 @@ class ClaudeCodeLine:
         config: LineConfig = DEFAULT_CONFIG,
         mcp_tools: Sequence[SdkMcpTool[object]] = (),
         session_id: str | None = None,
+        sandbox: Mapping[str, object] | None = None,
         environment: Mapping[str, str] | None = None,
         session_factory: SessionFactory = _sdk_session,
     ) -> None:
@@ -261,6 +279,7 @@ class ClaudeCodeLine:
         self.config = config
         self.mcp_tools = tuple(mcp_tools)
         self.session_id = session_id
+        self.sandbox = None if sandbox is None else dict(sandbox)
         self._environment = os.environ if environment is None else environment
         self._session_factory = session_factory
 
@@ -286,12 +305,13 @@ class ClaudeCodeLine:
             tools=list(self.config.builtin_tools),
             mcp_servers=cast(dict[str, McpServerConfig], servers),
             strict_mcp_config=not self.config.inherit_account_mcp,
-            can_use_tool=permission_gate(self.config, self.own_tools),
+            can_use_tool=permission_gate(self.config, self.own_tools, self.sandbox),
             setting_sources=[],
             max_turns=settings.max_turns,
             effort=effort,
             cwd=str(self.cwd),
             resume=self.session_id,
+            sandbox=cast(SandboxSettings, self.sandbox),
         )
 
     async def run_turn(self, prompt: str) -> TurnReport:

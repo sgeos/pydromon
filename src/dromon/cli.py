@@ -21,6 +21,7 @@ from dromon.paths import PathError, ProjectPaths, project_paths
 from dromon.driver import MODELS, Driver, DriverError, Strategy
 from dromon.engine import ClaudeCodeLine, EngineRefused
 from dromon.protocol import Operation, ProtocolError
+from dromon.sandbox import SandboxConfig, merge, sandbox_from_settings
 
 PROBE_MODEL: Final = "claude-haiku-5-5"
 """The least expensive subscription model, used for probes and tests by default."""
@@ -180,13 +181,16 @@ def _config_document(arguments: argparse.Namespace) -> dict[str, object] | None:
 
     An ``--mcp-config`` file is read here, by the operator's client, and its contents
     travel to the daemon, which stores them in the event log, credentials included.
+    A ``--sandbox-config`` file holds a Claude Code sandbox object, or a settings file
+    whose ``sandbox`` key is taken. It is validated here with operator authority.
     """
     tools: list[str] = arguments.tool or []
     allowed: list[str] = arguments.allow_tool or []
     mcp_file: Path | None = arguments.mcp_config
+    sandbox_file: Path | None = arguments.sandbox_config
     allow_all: bool = arguments.allow_all_tools
     inherit: bool = arguments.inherit_account_mcp
-    if not (tools or allowed or mcp_file or allow_all or inherit):
+    if not (tools or allowed or mcp_file or allow_all or inherit or sandbox_file):
         return None
     document: dict[str, object] = {
         "builtin_tools": tools,
@@ -196,6 +200,9 @@ def _config_document(arguments: argparse.Namespace) -> dict[str, object] | None:
     }
     if mcp_file is not None:
         document["mcp_servers"] = json.loads(mcp_file.read_text(encoding="utf-8"))
+    if sandbox_file is not None:
+        loaded: object = json.loads(sandbox_file.read_text(encoding="utf-8"))
+        document["sandbox"] = sandbox_from_settings(loaded).document()
     return document
 
 
@@ -209,7 +216,7 @@ def _create(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         config = _config_document(arguments)
     except (OSError, ValueError) as error:
         print(
-            f"dromon create: cannot read the MCP configuration: {error}",
+            f"dromon create: cannot read the line configuration: {error}",
             file=sys.stderr,
         )
         return exits.FAILURE
@@ -223,7 +230,7 @@ def _configure(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         config = _config_document(arguments) or {}
     except (OSError, ValueError) as error:
         print(
-            f"dromon configure: cannot read the MCP configuration: {error}",
+            f"dromon configure: cannot read the line configuration: {error}",
             file=sys.stderr,
         )
         return exits.FAILURE
@@ -374,14 +381,22 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         f" ${limits.max_cost_usd} estimated cost, {limits.cooldown_seconds}s cooldown"
     )
     print(f"wake every {config.wake_every_ticks} ticks")
+    print(f"project: {_sandbox_summary(config.sandbox)}")
     for line_id, line in sorted(config.lines.items()):
         tools = ", ".join(line.config.builtin_tools) or "no built-in tools"
         servers = ", ".join(line.config.server_names()) or "no MCP servers"
         print(
             f"line {line_id}: {line.model} {line.strategy},"
-            f" {line.config.tool_policy}, {tools}, {servers}"
+            f" {line.config.tool_policy}, {tools}, {servers},"
+            f" {_sandbox_summary(merge([config.sandbox, line.config.sandbox]))}"
         )
     return exits.OK
+
+
+def _sandbox_summary(sandbox: SandboxConfig | None) -> str:
+    if sandbox is None:
+        return "no sandbox settings"
+    return "sandboxed" if sandbox.enabled else "not sandboxed"
 
 
 def _release(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
@@ -476,6 +491,12 @@ def _add_tool_options(command: argparse.ArgumentParser) -> None:
         type=Path,
         default=None,
         help="a JSON file of MCP servers, in the mcpServers shape",
+    )
+    command.add_argument(
+        "--sandbox-config",
+        type=Path,
+        default=None,
+        help="a JSON file of Claude Code sandbox settings for the line's commands",
     )
     command.add_argument(
         "--allow-tool",

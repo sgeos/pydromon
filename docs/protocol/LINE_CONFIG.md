@@ -37,6 +37,7 @@ keys, duplicate keys and numbers are refused.
 | `tool_policy` | `allowlist` or `allow_all` | `allowlist` |
 | `allowed_tools` | Exact tool names, or `mcp__server__*` for every tool of one server | none |
 | `inherit_account_mcp` | Also load the MCP servers of the operator's user settings and claude.ai account | `false` |
+| `sandbox` | The line's own sandbox document, as [`SANDBOX.md`](SANDBOX.md) specifies, before the project's is merged in. Omitted from the stored JSON when unset | none |
 
 A server name is an identifier and may not be `dromon`, which Dromon's own tools use. A
 `stdio` server has `command` and optionally `args` and `env`. An `http` or `sse` server

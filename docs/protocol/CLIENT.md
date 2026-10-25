@@ -119,8 +119,10 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromond` | Runs the daemon in the foreground, after applying `.dromon/dromon.toml`. Each flag overrides the file. `--max-autonomous-turns N`, default 12, `--max-cost-usd X`, default 2, and `--cooldown-seconds S`, default 0, set the conversation limits, `--operator NAME`, default `operator`, names who hears about a held line no operator has messaged, `--hold-wakes` records messages without waking any line, and `--tick-seconds S` sets the time between ticks while work is in flight, default 1, at most 60 | 0, 1 on failure, 2 on a bad cap or cadence, or 5 when another daemon holds the lock |
 
 The tool options are `--tool NAME`, repeatable, `--mcp-config FILE`, a JSON file of MCP
-servers that the client reads, `--allow-tool NAME`, repeatable, `--allow-all-tools` and
-`--inherit-account-mcp`.
+servers that the client reads, `--allow-tool NAME`, repeatable, `--allow-all-tools`,
+`--inherit-account-mcp`, and `--sandbox-config FILE`, a JSON file holding a Claude Code
+sandbox object or a settings file whose `sandbox` key is taken, as
+[`SANDBOX.md`](SANDBOX.md) specifies.
 
 Status 2 is a usage error and status 3 marks a subcommand not yet implemented.
 
