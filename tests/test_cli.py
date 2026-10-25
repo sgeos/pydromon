@@ -1,4 +1,4 @@
-"""Behaviour of the seed's placeholder commands, including their error paths."""
+"""Behaviour of the dromon and dromond commands, including their error paths."""
 
 from collections.abc import Callable, Sequence
 
@@ -9,35 +9,16 @@ from pathlib import Path
 from dromon import __version__, cli, daemon, exits
 
 
-PLACEHOLDERS = [name for name in cli.SUBCOMMANDS if name not in cli.IMPLEMENTED]
+def test_every_planned_subcommand_is_implemented() -> None:
+    assert set(cli.IMPLEMENTED) == set(cli.SUBCOMMANDS)
 
 
-def test_the_lifecycle_subcommands_are_implemented() -> None:
-    assert set(cli.IMPLEMENTED) == {
-        "start",
-        "status",
-        "stop",
-        "probe",
-        "create",
-        "configure",
-        "send",
-        "questions",
-        "answer",
-        "mail",
-        "read",
-        "ack",
-        "sent",
-        "release",
-    }
-    assert set(cli.IMPLEMENTED) <= set(cli.SUBCOMMANDS)
-
-
-@pytest.mark.parametrize("command", PLACEHOLDERS)
-def test_each_unimplemented_subcommand_reports_not_implemented(
-    command: str, capsys: pytest.CaptureFixture[str]
+def test_a_subcommand_without_a_handler_reports_not_implemented(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert cli.main([command]) == exits.NOT_IMPLEMENTED
-    assert f"dromon {command}: not implemented" in capsys.readouterr().err
+    monkeypatch.delitem(cli.IMPLEMENTED, "status")
+    assert cli.main(["status"]) == exits.NOT_IMPLEMENTED
+    assert "dromon status: not implemented" in capsys.readouterr().err
 
 
 def test_dromon_without_a_subcommand_is_a_usage_error() -> None:

@@ -30,6 +30,7 @@ every target of the Rust and Keleusma ports except Windows, which is not support
 
 import argparse
 import asyncio
+import json
 import contextlib
 import fcntl
 import os
@@ -54,6 +55,7 @@ from dromon.lineconfig import (
 from dromon.model import (
     EventRejected,
     InvalidField,
+    LineAddress,
     Message,
     OperatorAddress,
     QuestionStatus,
@@ -79,6 +81,14 @@ from dromon.scheduler import (
     Scheduler,
     claude_code_engine,
 )
+
+VIEW_LIMIT: Final = 50
+"""The most messages one ``line_view`` returns."""
+
+VIEW_PREVIEW_CHARACTERS: Final = 600
+
+VIEW_BUDGET_BYTES: Final = 40_000
+"""Room for messages in a ``line_view`` response, below the 64 KiB line limit."""
 
 IDLE_TIMEOUT_SECONDS: Final = 30.0
 """A connection that sends nothing for this long is closed."""
@@ -146,6 +156,7 @@ class Daemon:
                 | Operation.ACKNOWLEDGE
                 | Operation.SENT
                 | Operation.RELEASE
+                | Operation.LINE_VIEW
             ):
                 return self._command(request)
 
@@ -171,6 +182,8 @@ class Daemon:
                     result = self._sent(request.args)
                 case Operation.RELEASE:
                     result = self._release(request.args)
+                case Operation.LINE_VIEW:
+                    result = self._line_view(request.args)
                 case _:
                     result = self._send(request.args)
         except ProtocolError as error:
@@ -273,6 +286,69 @@ class Daemon:
                 }
                 for message_id, message in page
             ],
+        }
+
+    def _line_view(self, args: dict[str, object]) -> dict[str, object]:
+        """What an attached client shows: the line, its recent mail and questions.
+
+        Bodies are previews, and the newest messages are kept within a byte budget,
+        so the response always fits one protocol line however large the mail is.
+        """
+        allowed = {"line_id", "limit"}
+        if "line_id" not in args or not set(args) <= allowed:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST, f"line_view takes {sorted(allowed)}"
+            )
+        (line_id,) = _text_args({"line_id": args["line_id"]}, ("line_id",))
+        limit = args.get("limit", VIEW_LIMIT)
+        if type(limit) is not int or not 1 <= limit <= VIEW_LIMIT:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST, f"limit must be in [1, {VIEW_LIMIT}]"
+            )
+        state = self.log.state
+        if line_id not in state.lines:
+            raise EventRejected(f"no line {line_id}")
+        address = LineAddress(line_id)
+        involved = [
+            (message_id, message)
+            for message_id, message in state.messages.items()
+            if address in (message.sender, message.recipient)
+        ]
+        summaries = {
+            str(entry["line_id"]): entry for entry in self.scheduler.line_summaries()
+        }
+        messages: list[dict[str, object]] = []
+        budget = VIEW_BUDGET_BYTES
+        for message_id, message in reversed(involved[-limit:]):
+            preview = message.body[:VIEW_PREVIEW_CHARACTERS]
+            entry: dict[str, object] = {
+                "message_id": message_id,
+                "sender": str(message.sender),
+                "recipient": str(message.recipient),
+                "kind": message.kind.value,
+                "reply_to": message.reply_to,
+                "status": None if message.status is None else message.status.value,
+                "delivered": message.delivered,
+                "read": message.read,
+                "body": preview,
+                "truncated": len(preview) < len(message.body),
+            }
+            budget -= len(json.dumps(entry, ensure_ascii=False).encode("utf-8"))
+            if budget < 0:
+                break
+            messages.append(entry)
+        messages.reverse()
+        questions = [
+            _question_summary(message_id, message)
+            for message_id, message in involved
+            if message.status is QuestionStatus.OPEN and message.sender == address
+        ]
+        return {
+            "line": dict(summaries[line_id]),
+            "tick": self.scheduler.tick,
+            "messages": messages,
+            "total": len(involved),
+            "open_questions": questions[-VIEW_LIMIT:],
         }
 
     def _release(self, args: dict[str, object]) -> dict[str, object]:

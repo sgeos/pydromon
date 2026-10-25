@@ -236,6 +236,24 @@ harnesses such as Claude Code and Codex, which unify the two in one program. The
 operator's comparison is a multiplayer online game, whose clients attach to a shared
 server, against a single-player game that is client and world at once.
 
+**Decided 2026-10-25 by the operator.** The terminal client is probably curses, chosen
+after looking at what Claude Code, Codex and Grok Build use.
+
+**Fact, from secondary sources read on 2026-10-25 and not checked against the official
+repositories.** Claude Code renders its terminal interface with a heavily customized
+Ink, the React renderer for terminals, on Node.js. Codex's interactive mode is the
+`codex-tui` Rust crate, built on Ratatui and Crossterm. Grok Build is Rust, with its
+interface in an `xai-grok-pager` crate whose underlying library the sources do not
+name. All three are full-screen terminal programs rather than separate graphical
+applications.
+
+**Implemented 2026-10-25, roadmap task 8.** `dromon attach LINE` opens a curses client,
+the standard library's counterpart to Ratatui and Crossterm and so a direct map onto
+the Rust port, and `dromon attach LINE --gui` opens a Tk window, which also ships with
+Python. Both are thin shells over `dromon.attach`, which polls the new `line_view`
+operation and turns typed input into operator commands. Every client is an independent
+connection, so any number may attach to any lines at once.
+
 **Inference.** The client protocol of [`../protocol/CLIENT.md`](../protocol/CLIENT.md) is
 then the game's network protocol. It needs pushed updates for attached clients, and
 clients on other machines once communication layer 3 exists, so both belong in its

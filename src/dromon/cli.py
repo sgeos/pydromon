@@ -32,7 +32,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "configure": "replace a session line's tools, MCP servers and tool policy",
     "stop": "stop the daemon",
     "status": "show the daemon and its session lines",
-    "attach": "open the interactive client",
+    "attach": "open an interactive client attached to one line",
     "send": "send a message to a session line or an operator",
     "questions": "list open operator questions",
     "answer": "answer an operator question",
@@ -339,6 +339,19 @@ def _sent(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
+def _attach(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    from dromon.attach import Attachment
+
+    attachment = Attachment(paths, arguments.line_id, arguments.operator)
+    if arguments.gui:
+        from dromon import gui
+
+        return gui.run(attachment, round(arguments.poll_seconds * 1000))
+    from dromon import tui
+
+    return tui.run(attachment, arguments.poll_seconds)
+
+
 def _release(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     args: dict[str, object] = {"line_id": arguments.line_id}
     return _request(paths, "release", Operation.RELEASE, args)
@@ -405,6 +418,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "ack": _ack,
     "sent": _sent,
     "release": _release,
+    "attach": _attach,
 }
 
 
@@ -468,6 +482,22 @@ def build_parser() -> argparse.ArgumentParser:
         command = commands.add_parser(name, help=help_text, description=help_text)
         if name == "release":
             command.add_argument("line_id", help="the held line")
+        if name == "attach":
+            command.add_argument("line_id", help="the line to attach to")
+            command.add_argument(
+                "--operator",
+                default=default_operator(),
+                help="who the client speaks for, default %(default)s",
+            )
+            command.add_argument(
+                "--gui", action="store_true", help="open a graphical window instead"
+            )
+            command.add_argument(
+                "--poll-seconds",
+                type=float,
+                default=1.0,
+                help="how often to refresh, default %(default)s",
+            )
         if name in ("create", "configure"):
             command.add_argument("line_id", help="the line's identifier")
             _add_tool_options(command)
