@@ -36,4 +36,12 @@ ran live through the command line.
 **Not verified.** Driver state is not persisted, so a driver's counters restart with
 the daemon. Notes a line sends to an operator are recorded but shown by no client yet.
 
+**Game loop, a later prompt on the same day.** On the operator's feedback, the
+scheduler became a game loop. Each tick updates every line once and skips a busy one,
+which counts as its update, turns run across ticks without blocking the loop, and mail
+moves from a sent queue to the post office at the end of each tick. The operator's
+direction on large per-line and per-project configuration, and on a client split from
+the daemon like a multiplayer game, is recorded in the design. 458 tests and all three
+live tests pass.
+
 **Next.** Task 7, conversation control, then task 8, the attachable client.

@@ -70,7 +70,13 @@ from dromon.protocol import (
     encode_response,
     request_id_of,
 )
-from dromon.scheduler import DEFAULT_MAX_TURNS_PER_LINE, Scheduler, claude_code_engine
+from dromon.scheduler import (
+    DEFAULT_MAX_TURNS_PER_LINE,
+    DEFAULT_TICK_SECONDS,
+    MAX_TICK_SECONDS,
+    Scheduler,
+    claude_code_engine,
+)
 
 IDLE_TIMEOUT_SECONDS: Final = 30.0
 """A connection that sends nothing for this long is closed."""
@@ -363,6 +369,7 @@ def run(
     *,
     max_turns_per_line: int = DEFAULT_MAX_TURNS_PER_LINE,
     hold_wakes: bool = False,
+    tick_seconds: float = DEFAULT_TICK_SECONDS,
 ) -> int:
     """Run the daemon for ``paths`` in the foreground and return its exit status."""
     os.umask(0o077)
@@ -383,6 +390,7 @@ def run(
                 claude_code_engine(str(paths.root)),
                 max_turns_per_line=max_turns_per_line,
                 hold_wakes=hold_wakes,
+                tick_seconds=tick_seconds,
             )
             daemon = Daemon(paths, log, utc_now(), scheduler)
             asyncio.run(serve(daemon))
@@ -424,6 +432,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="record messages but wake no line, for maintenance and tests",
     )
+    parser.add_argument(
+        "--tick-seconds",
+        type=float,
+        default=DEFAULT_TICK_SECONDS,
+        help="the time between ticks while work is in flight, default %(default)s",
+    )
     return parser
 
 
@@ -442,7 +456,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("dromond: --max-turns-per-line must be at least 1", file=sys.stderr)
         return exits.USAGE
     hold: bool = arguments.hold_wakes
-    return run(paths, max_turns_per_line=max_turns, hold_wakes=hold)
+    tick: float = arguments.tick_seconds
+    if not 0 <= tick <= MAX_TICK_SECONDS:
+        print(
+            f"dromond: --tick-seconds must be in [0, {MAX_TICK_SECONDS}]",
+            file=sys.stderr,
+        )
+        return exits.USAGE
+    return run(paths, max_turns_per_line=max_turns, hold_wakes=hold, tick_seconds=tick)
 
 
 if __name__ == "__main__":

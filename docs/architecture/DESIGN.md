@@ -139,11 +139,18 @@ without being rewritten. Each layer adds only its routing and its delivery guara
 interrupts. A message sent in one turn is received no sooner than the next. Mid-turn
 injection is therefore not used.
 
-**Implemented 2026-10-25, roadmap task 5.** At the start of a tick the scheduler takes a
-snapshot of every undelivered message whose recipient is idle, unblocked and under its
-turn cap. Each such line takes one turn with its messages from the snapshot, and the
-turns of a tick run concurrently. A message sent during a tick waits for the next tick,
-even when its recipient is idle throughout. Lines send through an in-process
+**Decided 2026-10-25 by the operator, refining the above.** The scheduler is a game
+loop. Every tick iterates over all lines and updates each once. Messages sent during a
+tick are collected in a sent queue, and at the end of the tick they move to the post
+office, which makes them valid for delivery from the next tick on. A busy line is
+skipped, and that counts as its update for the tick.
+
+**Implemented 2026-10-25.** Each tick visits the lines in a fixed order. An idle,
+unblocked line under its cap with post office mail starts a turn, which runs as a task
+without the tick waiting for it, so a turn may span many ticks and a slow line never
+holds the others back. Ticks follow every `--tick-seconds`, one second by default,
+while anything is in flight, and the loop rests when nothing is. After a restart every
+undelivered message starts in the post office. Lines send through an in-process
 `send_message` tool whose sender the daemon fixes, and operators through `dromon send`.
 A per-line turn cap stops a runaway exchange until the conversation limits of task 7.
 
@@ -197,6 +204,17 @@ Interacting with it is a `dromon` client concern in the immediate term. A comman
 client alone is not enough. The client wants a graphical interface, or a way to launch
 one, so that the operator can start the daemon and then attach a dozen interfaces to
 different session lines in different terminals at once.
+
+**Decided 2026-10-25 by the operator, as direction.** The front end and the back end are
+split. The graphical client is the front end and the daemon is the back end, unlike
+harnesses such as Claude Code and Codex, which unify the two in one program. The
+operator's comparison is a multiplayer online game, whose clients attach to a shared
+server, against a single-player game that is client and world at once.
+
+**Inference.** The client protocol of [`../protocol/CLIENT.md`](../protocol/CLIENT.md) is
+then the game's network protocol. It needs pushed updates for attached clients, and
+clients on other machines once communication layer 3 exists, so both belong in its
+later versions.
 - **Decided 2026-10-25, design deferred.** Every relay adapter supports a response path,
   so an operator can reply through the channel that carried the question. The required
   properties are in [`../protocol/RELAY.md`](../protocol/RELAY.md), chief among them
@@ -244,6 +262,14 @@ known worst-case tick, which most harnesses cannot guarantee.
 ## Configuration
 
 **Decided.** Per-project configuration is non-trivial.
+
+**Decided 2026-10-25 by the operator, as direction.** Dromon's configuration for a
+multi-agent project may grow as large and as detailed as the project needs, with
+Kubernetes as a loose point of comparison. Everything about a session line is
+configurable per line, and per project when one harness serves several projects.
+Building that machinery is expected to take sustained work. The per-line tool
+configuration of [`../protocol/LINE_CONFIG.md`](../protocol/LINE_CONFIG.md) is its first
+piece.
 
 **Proposed.** It lives in `.dromon/dromon.toml` in the project, and its format is versioned
 with the protocol so it survives each port. **Open.** Its contents, which will at least

@@ -21,8 +21,9 @@ completed, moved or abandoned.
     Opus 5.5 and Haiku 5.5, each with a subscription, an API and a flexible strategy
     baked in, by the operator's decision. `dromon probe` reports capabilities and
     defaults to Haiku 5.5, the least expensive model, which tests also use.
-  - `scheduler.py` runs ticks, by the operator's decision. A message sent in one tick is
-    received no sooner than the next, and messages never interrupt a turn. Lines send
+  - `scheduler.py` is a game loop, by the operator's decision. Each tick updates every
+    line once and skips a busy one, turns run across ticks without blocking, and mail
+    moves from the sent queue to the post office at the end of each tick. Lines send
     through an in-process `send_message` tool, operators through `dromon send`.
   - Operator questions. `ask_operator` records a question in the daemon's queue,
     `dromon questions` and `dromon answer` work it, and the answer wakes the line in a
@@ -85,6 +86,10 @@ operator question. Task 8, the attachable client the operator asked for, follows
   in for task 7. A note a line sends to an operator waits undelivered until a relay or
   client shows it. All are recorded
   in `CLIENT.md` or the module documentation.
+- **Operator direction, recorded in the design.** Configuration may grow as large as a
+  multi-agent project needs, per line and per project, in the spirit of Kubernetes. The
+  graphical client and the daemon are split like a multiplayer game's client and
+  server, so the client protocol later needs pushed updates and remote clients.
 - **Recorded in the design.** Teacher-model scope, the contents of `.dromon/dromon.toml`,
   and the Rust repository's eventual name.
 
@@ -104,7 +109,7 @@ its keychain token on 2026-10-24.
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 455 tests pass, 12 of them need sockets
+uv sync && uv run pytest    # 458 tests pass, 12 of them need sockets
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 
