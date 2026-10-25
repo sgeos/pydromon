@@ -18,39 +18,48 @@ import json
 from typing import Final, NoReturn, assert_never
 
 from dromon.model import (
+    Address,
     Event,
     InvalidField,
     LineCreated,
     LineState,
     LineStateChanged,
     MessageDelivered,
+    MessageKind,
     MessageSent,
-    QuestionAnswered,
-    QuestionAsked,
+    OperatorRegistered,
     QuestionSuperseded,
     QuestionWithdrawn,
-    WakeCause,
     WakeIssued,
     WakeRequested,
+    parse_address,
 )
 
 FORMAT_VERSION: Final = 1
 
 MAX_PAYLOAD_BYTES: Final = 8 * 1024 * 1024
-"""Upper bound on an encoded event. The largest valid event, a question with maximal
-text and choices whose every character needs a six-byte escape, stays under it."""
+"""Upper bound on an encoded event. The largest valid event, a question with a maximal
+body and choices whose every character needs a six-byte escape, stays under it."""
 
 KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "line_created": ("line_id", "engine"),
     "line_state_changed": ("line_id", "state"),
-    "message_sent": ("message_id", "sender", "recipient", "body"),
+    "operator_registered": ("operator_id",),
+    "message_sent": (
+        "message_id",
+        "sender",
+        "recipient",
+        "kind",
+        "body",
+        "choices",
+        "blocking",
+        "reply_to",
+    ),
     "message_delivered": ("message_id",),
-    "wake_requested": ("wake_id", "line_id", "cause", "cause_id"),
+    "wake_requested": ("wake_id", "line_id", "message_id"),
     "wake_issued": ("wake_id",),
-    "question_asked": ("question_id", "line_id", "text", "choices", "blocking"),
-    "question_answered": ("question_id", "answer"),
-    "question_withdrawn": ("question_id",),
-    "question_superseded": ("question_id", "superseded_by"),
+    "question_withdrawn": ("message_id",),
+    "question_superseded": ("message_id", "superseded_by"),
 }
 """The wire name of each event kind and its fields, in declaration order."""
 
@@ -118,12 +127,18 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "line_id": event.line_id,
                 "state": event.state.value,
             }
+        case OperatorRegistered():
+            return "operator_registered", {"operator_id": event.operator_id}
         case MessageSent():
             return "message_sent", {
                 "message_id": event.message_id,
-                "sender": event.sender,
-                "recipient": event.recipient,
+                "sender": str(event.sender),
+                "recipient": str(event.recipient),
+                "kind": event.kind.value,
                 "body": event.body,
+                "choices": list(event.choices),
+                "blocking": event.blocking,
+                "reply_to": event.reply_to,
             }
         case MessageDelivered():
             return "message_delivered", {"message_id": event.message_id}
@@ -131,29 +146,15 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
             return "wake_requested", {
                 "wake_id": event.wake_id,
                 "line_id": event.line_id,
-                "cause": event.cause.value,
-                "cause_id": event.cause_id,
+                "message_id": event.message_id,
             }
         case WakeIssued():
             return "wake_issued", {"wake_id": event.wake_id}
-        case QuestionAsked():
-            return "question_asked", {
-                "question_id": event.question_id,
-                "line_id": event.line_id,
-                "text": event.text,
-                "choices": list(event.choices),
-                "blocking": event.blocking,
-            }
-        case QuestionAnswered():
-            return "question_answered", {
-                "question_id": event.question_id,
-                "answer": event.answer,
-            }
         case QuestionWithdrawn():
-            return "question_withdrawn", {"question_id": event.question_id}
+            return "question_withdrawn", {"message_id": event.message_id}
         case QuestionSuperseded():
             return "question_superseded", {
-                "question_id": event.question_id,
+                "message_id": event.message_id,
                 "superseded_by": event.superseded_by,
             }
         case _:
@@ -168,39 +169,32 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
             return LineStateChanged(
                 _str(data, "line_id"), _member(data, "state", LineState)
             )
+        case "operator_registered":
+            return OperatorRegistered(_str(data, "operator_id"))
         case "message_sent":
             return MessageSent(
                 _str(data, "message_id"),
-                _str(data, "sender"),
-                _str(data, "recipient"),
+                _address(data, "sender"),
+                _address(data, "recipient"),
+                _member(data, "kind", MessageKind),
                 _str(data, "body"),
+                _choices(data),
+                _bool(data, "blocking"),
+                _optional_str(data, "reply_to"),
             )
         case "message_delivered":
             return MessageDelivered(_str(data, "message_id"))
         case "wake_requested":
             return WakeRequested(
-                _str(data, "wake_id"),
-                _str(data, "line_id"),
-                _member(data, "cause", WakeCause),
-                _str(data, "cause_id"),
+                _str(data, "wake_id"), _str(data, "line_id"), _str(data, "message_id")
             )
         case "wake_issued":
             return WakeIssued(_str(data, "wake_id"))
-        case "question_asked":
-            return QuestionAsked(
-                _str(data, "question_id"),
-                _str(data, "line_id"),
-                _str(data, "text"),
-                _choices(data),
-                _bool(data, "blocking"),
-            )
-        case "question_answered":
-            return QuestionAnswered(_str(data, "question_id"), _str(data, "answer"))
         case "question_withdrawn":
-            return QuestionWithdrawn(_str(data, "question_id"))
+            return QuestionWithdrawn(_str(data, "message_id"))
         case "question_superseded":
             return QuestionSuperseded(
-                _str(data, "question_id"), _str(data, "superseded_by")
+                _str(data, "message_id"), _str(data, "superseded_by")
             )
         case _:
             raise DecodeError(f"unknown event kind {kind!r}")
@@ -227,6 +221,19 @@ def _str(data: dict[str, object], name: str) -> str:
     return value
 
 
+def _optional_str(data: dict[str, object], name: str) -> str | None:
+    value = data[name]
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise DecodeError(f"{name} is not a string or null")
+    return value
+
+
+def _address(data: dict[str, object], name: str) -> Address:
+    return parse_address(_str(data, name))
+
+
 def _bool(data: dict[str, object], name: str) -> bool:
     value = data[name]
     if type(value) is not bool:
@@ -234,7 +241,7 @@ def _bool(data: dict[str, object], name: str) -> bool:
     return value
 
 
-def _member[T: (LineState, WakeCause)](
+def _member[T: (LineState, MessageKind)](
     data: dict[str, object], name: str, kind: type[T]
 ) -> T:
     value = _str(data, name)

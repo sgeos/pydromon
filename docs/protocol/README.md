@@ -8,3 +8,4 @@ repository, as recorded in [`../decisions/NAMING_AND_PORTS.md`](../decisions/NAM
 Documents here describe behaviour and formats, never Python details.
 
 - [`EVENT_LOG.md`](EVENT_LOG.md), the data model as events, their JSON encoding and their SQLite storage. Draft, version 1.
+- [`RELAY.md`](RELAY.md), forwarding messages to operators through adapters for channels such as email or chat. Draft, version 1.

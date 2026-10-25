@@ -26,7 +26,8 @@ the operator as a first-class feature.
 | Daemon | `dromond`, the process that owns the session lines, the event log and the client socket |
 | Client | A curses or graphical program, or the `dromon` command, that connects to the daemon |
 | Wake | Starting a session line's next turn because something arrived for it |
-| Operator question | A question a session line raises for the human operator, tracked until it is answered or withdrawn |
+| Operator | A person with authority over a project's lines, addressed as `@name`. A project may have several |
+| Operator question | A question a session line sends to one operator, tracked until it is answered, withdrawn or superseded |
 | Stream processor | In the Keleusma version, the per-model program that handles one turn or sub-turn step |
 
 ## Process model
@@ -114,17 +115,34 @@ immediate, batched, or only at turn boundaries.
 **Decided.** The harness tracks questions for the operator as a first-class feature, so
 that questions are no longer lost in responses and tracking files.
 
+**Decided 2026-10-25 by the operator.**
+
+- `ask_operator` sends a message to an operator's mailbox, and the operator replies as
+  another session line would. The reply reaches the asking line as an ordinary message
+  and wakes it.
+- The operator is not a singleton. A project may have several people and many session
+  lines, and every operator is addressed separately.
+- Questions can be forwarded to channels such as email or Slack through a general
+  interface that adapters implement for each use case.
+
+**Implemented 2026-10-25.** Operators are parties with addresses such as `@ana`. A
+question is a message of kind question from a line to one operator, and the answer is
+that operator's reply, which must reverse the question's route. The lifecycle states
+open, answered, withdrawn and superseded are tracked on the message, and a blocking
+question pauses only its own line. Forwarding goes through relays, with a command relay
+as the general adapter. See [`../protocol/EVENT_LOG.md`](../protocol/EVENT_LOG.md) and
+[`../protocol/RELAY.md`](../protocol/RELAY.md).
+
 **Proposed.**
 
-- Each session line has an `ask_operator` tool, served by the daemon over MCP so that any
-  engine can call it.
-- A question records the asking line, the text, optional choices, links to context, and
-  whether it blocks that line. A blocking question pauses only its own line.
-- A question moves through the states open, answered, withdrawn and superseded. Questions
-  are stored durably and survive a restart.
-- An answer is delivered to the asking line as a wake.
-- Clients show one queue for all session lines. `dromon questions` lists it and
-  `dromon answer` answers from the command line.
+- `ask_operator` is served by the daemon over MCP, or as an in-process tool of the
+  Agent SDK, so that any engine can call it. It records the question and returns at
+  once, and the line ends its turn, so no tool call waits on a person.
+- Which operator a line asks by default is per-project configuration.
+- Clients show each operator their own queue. `dromon questions` lists it and
+  `dromon answer` replies from the command line.
+- Inbound adapters, such as a reply by email, authenticate the operator before a reply
+  is attributed to them.
 
 ## Standard harness features
 

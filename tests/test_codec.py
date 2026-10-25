@@ -18,10 +18,15 @@ from dromon.model import (
     MAX_CHOICES,
     MAX_TEXT_BYTES,
     Event,
+    LineAddress,
     LineCreated,
-    QuestionAnswered,
-    QuestionAsked,
+    MessageKind,
+    MessageSent,
+    OperatorAddress,
 )
+
+ANA = OperatorAddress("ana")
+BETA = LineAddress("beta")
 
 
 def wire(kind: object, data: object, version: object = FORMAT_VERSION) -> str:
@@ -74,31 +79,64 @@ def test_string_escapes_are_pinned_so_ports_can_compare_bytes() -> None:
         r"\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f"
         '\\"\\\\/\x7f '
     )
-    event = QuestionAnswered("q", text)
-    expected = f'{{"data":{{"answer":"{escaped}","question_id":"q"}},'
+    event = MessageSent("a", ANA, BETA, MessageKind.NOTE, text, reply_to="q")
+    expected = f'{{"data":{{"blocking":false,"body":"{escaped}",'
     assert encode(event).startswith(expected)
     assert decode(encode(event)) == event
 
 
+def test_a_message_payload_uses_address_text_and_null_for_no_reply() -> None:
+    event = MessageSent("q", BETA, ANA, MessageKind.QUESTION, "?", ("a",), True)
+    data = json.loads(encode(event))["data"]
+    assert (data["sender"], data["recipient"], data["reply_to"]) == (
+        "beta",
+        "@ana",
+        None,
+    )
+    assert decode(message()) == MessageSent(
+        "q", BETA, ANA, MessageKind.QUESTION, "?", (), True
+    )
+
+
 def test_non_ascii_text_is_not_escaped() -> None:
-    event = QuestionAsked("q", "a", "✓", (), blocking=False)
+    event = MessageSent("q", BETA, ANA, MessageKind.QUESTION, "✓")
     assert "✓" in encode(event)
 
 
 def test_the_largest_valid_event_fits_the_payload_bound() -> None:
     # Control characters need a six-byte escape, the worst case for JSON expansion.
     worst = "\x01"
-    event = QuestionAsked(
+    event = MessageSent(
         "q" * 64,
-        "a" * 64,
+        LineAddress("b" * 64),
+        OperatorAddress("o" * 64),
+        MessageKind.QUESTION,
         worst * MAX_TEXT_BYTES,
         tuple(f"{n:02}" + worst * (MAX_CHOICE_BYTES - 2) for n in range(MAX_CHOICES)),
         blocking=True,
+        reply_to="r" * 64,
     )
     assert decode(encode(event)) == event
 
 
 VALID_DATA = {"line_id": "alpha", "engine": "e"}
+
+
+def message(**overrides: object) -> str:
+    """A message_sent payload that is valid except for ``overrides``."""
+    data: dict[str, object] = {
+        "message_id": "q",
+        "sender": "beta",
+        "recipient": "@ana",
+        "kind": "question",
+        "body": "?",
+        "choices": [],
+        "blocking": True,
+        "reply_to": None,
+    }
+    data.update(overrides)
+    return wire("message_sent", data)
+
 
 MALFORMED: list[tuple[str, str, str]] = [
     ("not JSON", "{", "not valid JSON"),
@@ -140,53 +178,15 @@ MALFORMED: list[tuple[str, str, str]] = [
         wire("line_state_changed", {"line_id": "a", "state": "paused"}),
         "no value",
     ),
-    (
-        "an integer for a boolean",
-        wire(
-            "question_asked",
-            {
-                "question_id": "q",
-                "line_id": "a",
-                "text": "?",
-                "choices": [],
-                "blocking": 1,
-            },
-        ),
-        "boolean",
-    ),
-    (
-        "choices that are not an array",
-        wire(
-            "question_asked",
-            {
-                "question_id": "q",
-                "line_id": "a",
-                "text": "?",
-                "choices": "yes",
-                "blocking": True,
-            },
-        ),
-        "not an array",
-    ),
-    (
-        "a choice that is not text",
-        wire(
-            "question_asked",
-            {
-                "question_id": "q",
-                "line_id": "a",
-                "text": "?",
-                "choices": [1],
-                "blocking": True,
-            },
-        ),
-        "not a string",
-    ),
-    (
-        "a lone surrogate escape",
-        wire("question_answered", {"question_id": "q", "answer": "\ud800"}),
-        "Unicode",
-    ),
+    ("an integer for a boolean", message(blocking=1), "boolean"),
+    ("choices that are not an array", message(choices="yes"), "not an array"),
+    ("a choice that is not text", message(choices=[1]), "not a string"),
+    ("a lone surrogate escape", message(body="\ud800"), "Unicode"),
+    ("an unknown message kind", message(kind="memo"), "no value"),
+    ("a reply reference that is a number", message(reply_to=3), "string or null"),
+    ("a malformed operator address", message(recipient="@"), "identifier"),
+    ("an address with two prefixes", message(recipient="@@ana"), "identifier"),
+    ("an address that is not text", message(sender=["beta"]), "not a string"),
     ("deep nesting", "[" * 100_000 + "]" * 100_000, "nests too deeply|not an object"),
 ]
 

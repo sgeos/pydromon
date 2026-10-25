@@ -4,42 +4,40 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-25, task 2, the data model and event log
+## 2026-10-25, operators as addressable parties
 
-**Done.** Session lines, messages, wakes and operator questions are typed records built
-by ten event kinds, stored in an append-only SQLite log, and a replay rebuilds the same
-state. The specification is `docs/protocol/EVENT_LOG.md`.
+**Done.** On the operator's instruction, operator questions became messages, and the
+operator stopped being a singleton.
+
+- Every operator is a party with an address such as `@ana`, registered by an
+  `operator_registered` event. Any number may exist, each addressed separately.
+- A question is a `message_sent` of kind question from a line to one operator. The
+  answer is that operator's reply, and the route rule refuses an answer from any other
+  operator or to any other line. The question lifecycle is tracked on the message.
+- Relays forward operator messages to channels such as email or Slack through one
+  general interface. The command relay runs a configured command with the notice as JSON
+  on standard input, with no shell. Delivery is recorded only after a relay accepts, so
+  delivery is at least once.
+- The specification is revised in `docs/protocol/EVENT_LOG.md`, and
+  `docs/protocol/RELAY.md` is new. The draft format version stays 1, since nothing yet
+  depends on it, and the specification now says a draft may change without a new
+  version until it is marked stable.
 
 **Decisions made by this line, open to the operator's review.**
 
-- **State is never stored.** It is rebuilt from events, so the event list is the data
-  model, as the design proposed.
-- **Identifiers are never reused.** This makes a resent event harmless, which the design
-  requires of messages.
-- **A blocking question pauses its own line only.** It refuses that line's next turn and
-  wakes and affects nothing else.
-- **Answers are free text** even when a question offers choices.
-- **The log does not authenticate.** The daemon attributes each event before appending.
-  File permissions are the security boundary, and new logs are owner-only.
-- **The encoding is canonical JSON**, pinned byte for byte in tests, so the Rust and
-  Keleusma ports can be checked against the same bytes.
+- Only a line asks a question, and only an operator receives one. Lines message each
+  other with notes.
+- Questions are superseded only by a later question from the same line, which may go to
+  a different operator.
+- Relays are outbound only. A reply from a channel is not attributed to an operator
+  until an inbound adapter authenticates it, so replies come from clients for now.
 
-**Verification.** `uv sync`, 145 tests passing with warnings treated as errors, ruff
-check and format clean, and pyright strict with 0 errors and 0 warnings. The tests cover
-every event kind through one scenario, every rejection, every malformed-payload class,
-replay equality, append-only triggers, a second writer and three forms of corruption.
+**Verification.** `uv sync`, 188 tests passing with warnings treated as errors, ruff
+check and format clean, and pyright strict with 0 errors and 0 warnings. The relay tests
+run the command relay as a real subprocess, including a timeout, a failed start, a
+nonzero exit and an attempt to inject shell syntax through the message body.
 
-**Not verified.** Only Python 3.12.12 with SQLite 3.50.4 on macOS was tested. Concurrent
-access was tested with two connections in one process, not with two processes.
-
-**Mailbox, a later prompt on the same day.** On the operator's approval of the
-`pykeleusma` line's proposal, this line registered as `pydromon` in the shared interline
-store, after reading its protocol and client. The inbox was empty. Checks are manual,
-since no hooks are installed. Details are in `HANDOFF.md`.
-
-**Engine and features, a later prompt on the same day.** The operator's preferred own
-loop cannot run on a subscription under Anthropic's published terms, so the choice of
-first adapter returns to the operator, as recorded in the design. Standard features such
-as compaction land with the task that first needs them.
+**Not verified.** Only Python 3.12.12 with SQLite 3.50.4 on macOS was tested. No real
+email or chat channel was exercised.
 
 **Next.** Task 3, the daemon skeleton.

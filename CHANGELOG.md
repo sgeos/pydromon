@@ -7,6 +7,12 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- Operators are no longer a singleton. Each operator is a party with an address such as
+  `@ana`, registered by a new `operator_registered` event. An operator question is a
+  `message_sent` of kind question from a line to one operator, and the answer is that
+  operator's reply, which must reverse the question's route. `question_asked`,
+  `question_answered` and the wake cause field are removed, and messages gain `kind`,
+  `choices`, `blocking` and `reply_to`. The draft format version stays 1.
 - `docs/architecture/KELEUSMA_INTEGRATION.md` records the `pykeleusma` line's answers to
   the four questions, the binding's current task status, and the tagged-tuple
   constraints it reported. One-element tuples in the examples became two-element ones.
@@ -21,6 +27,9 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- `dromon.relay` and `docs/protocol/RELAY.md`, forwarding of operator messages through
+  relays, a general adapter interface for channels such as email or chat, with a
+  command relay that hands each notice to a configured command as JSON.
 - The data model and event log, roadmap task 2. `dromon.model` defines session lines,
   messages, wakes and operator questions as ten event kinds with explicit transition
   checks. `dromon.codec` encodes them as canonical JSON and decodes untrusted payloads
