@@ -13,7 +13,9 @@ The distribution is `pydromon` and the import package is `dromon`. The commands 
 append-only SQLite event log are implemented and specified in
 [`docs/protocol/EVENT_LOG.md`](docs/protocol/EVENT_LOG.md). `dromon start`, `dromon status`
 and `dromon stop` manage a per-project `dromond` over a private Unix domain socket, as
-specified in [`docs/protocol/CLIENT.md`](docs/protocol/CLIENT.md). The other subcommands
+specified in [`docs/protocol/CLIENT.md`](docs/protocol/CLIENT.md). `dromon probe` runs one
+short turn of Claude Opus 5.5 on Claude Code, on the operator's Claude subscription,
+through a Keleusma driver, and reports the engine's capabilities. The other subcommands
 report that they are not implemented. The first milestone is
 [`docs/roadmap/V0_1_0.md`](docs/roadmap/V0_1_0.md) and the planned system is
 [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md). What Dromon needs from
@@ -46,6 +48,10 @@ The command names, the per-project configuration and the protocol stay the same 
 all three stages. See [`docs/decisions/NAMING_AND_PORTS.md`](docs/decisions/NAMING_AND_PORTS.md).
 
 ## Development
+
+The build needs a Rust toolchain, because `pykeleusma` is built from its repository at a
+pinned commit. Running a line needs a Claude subscription signed in to Claude Code, and
+no `ANTHROPIC_API_KEY` in the environment.
 
 ```sh
 uv sync

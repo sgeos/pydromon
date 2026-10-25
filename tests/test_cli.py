@@ -13,7 +13,7 @@ PLACEHOLDERS = [name for name in cli.SUBCOMMANDS if name not in cli.IMPLEMENTED]
 
 
 def test_the_lifecycle_subcommands_are_implemented() -> None:
-    assert set(cli.IMPLEMENTED) == {"start", "status", "stop"}
+    assert set(cli.IMPLEMENTED) == {"start", "status", "stop", "probe"}
     assert set(cli.IMPLEMENTED) <= set(cli.SUBCOMMANDS)
 
 
@@ -95,3 +95,15 @@ def test_dromond_rejects_an_unknown_option() -> None:
     with pytest.raises(SystemExit) as raised:
         daemon.main(["--no-such-option"])
     assert raised.value.code == 2
+
+
+def test_probe_refuses_an_api_key_without_starting_the_engine(
+    tmp_path: Path,
+    short_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "not-a-real-key")
+    runtime = ["--runtime-dir", str(short_runtime)]
+    assert cli.main(["--project", str(tmp_path), *runtime, "probe"]) == exits.FAILURE
+    assert "ANTHROPIC_API_KEY" in capsys.readouterr().err

@@ -1,0 +1,241 @@
+"""The packaged Keleusma drivers run through pykeleusma, and the host's checks."""
+
+from importlib import resources
+
+import pytest
+
+from dromon.driver import (
+    INITIAL_STATE,
+    INTERFACE_VERSION,
+    MAX_SETTINGS,
+    MODELS,
+    ActionTag,
+    Driver,
+    DriverError,
+    Event,
+    Strategy,
+    driver_resource,
+)
+
+OPUS = "claude-opus-5-5"
+HAIKU = "claude-haiku-5-5"
+EVERY_DRIVER = [(model, strategy) for model in MODELS for strategy in Strategy]
+
+
+def packaged_source(
+    model: str = OPUS, strategy: Strategy = Strategy.SUBSCRIPTION
+) -> str:
+    path = resources.files("dromon.drivers").joinpath(driver_resource(model, strategy))
+    return path.read_text(encoding="utf-8")
+
+
+def with_budget(budget: int) -> Driver:
+    source = packaged_source().replace(
+        "fn tool_budget() -> Word { 40 }", f"fn tool_budget() -> Word {{ {budget} }}"
+    )
+    assert f"{{ {budget} }}" in source
+    return Driver(source)
+
+
+@pytest.mark.parametrize(("model", "strategy"), EVERY_DRIVER)
+def test_every_packaged_driver_declares_its_own_model_and_strategy(
+    model: str, strategy: Strategy
+) -> None:
+    driver = Driver.for_model(model, strategy)
+    assert (driver.settings.model, driver.settings.strategy) == (model, strategy)
+    assert driver.settings.max_turns >= 1
+    assert driver.wcet_per_iteration > 0
+    assert driver.state == INITIAL_STATE
+
+
+ACCEPTS = {
+    Strategy.SUBSCRIPTION: {"subscription"},
+    Strategy.API: {"api"},
+    Strategy.FLEXIBLE: {"subscription", "api"},
+}
+
+
+@pytest.mark.parametrize(("model", "strategy"), EVERY_DRIVER)
+@pytest.mark.parametrize("credential", ["subscription", "api", "bedrock", ""])
+def test_each_strategy_accepts_exactly_its_credentials(
+    model: str, strategy: Strategy, credential: str
+) -> None:
+    driver = Driver.for_model(model, strategy)
+    verdict = driver.step(Event("credential", credential))
+    if credential in ACCEPTS[strategy]:
+        code = {"subscription": 1, "api": 2}[credential]
+        assert (verdict.tag, verdict.text, verdict.number) == (
+            ActionTag.ACCEPT,
+            credential,
+            code,
+        )
+        assert driver.state[2] == code
+    else:
+        assert (verdict.tag, verdict.text) == (ActionTag.REFUSE, strategy.value)
+        assert driver.state == INITIAL_STATE
+
+
+@pytest.mark.parametrize("model", MODELS)
+def test_metered_strategies_run_shorter_than_the_subscription(model: str) -> None:
+    subscription = Driver.for_model(model, Strategy.SUBSCRIPTION).settings
+    for metered in (Strategy.API, Strategy.FLEXIBLE):
+        settings = Driver.for_model(model, metered).settings
+        assert settings.max_turns <= subscription.max_turns
+        assert settings.tool_budget <= subscription.tool_budget
+    assert (
+        Driver.for_model(model, Strategy.API).settings.max_turns
+        < subscription.max_turns
+    )
+
+
+def test_haiku_is_the_low_effort_testing_model() -> None:
+    for strategy in Strategy:
+        assert Driver.for_model(HAIKU, strategy).settings.effort == "low"
+    assert Driver.for_model(OPUS, Strategy.SUBSCRIPTION).settings.effort == "high"
+
+
+@pytest.mark.parametrize(("model", "strategy"), EVERY_DRIVER)
+def test_each_driver_accepts_its_model_and_refuses_another(
+    model: str, strategy: Strategy
+) -> None:
+    driver = Driver.for_model(model, strategy)
+    other = HAIKU if model == OPUS else OPUS
+    assert driver.step(Event("init", model)).tag is ActionTag.ACCEPT
+    refused = driver.step(Event("init", other))
+    assert (refused.tag, refused.text) == (ActionTag.REFUSE, model)
+
+
+def test_tool_uses_are_counted_and_the_budget_interrupts() -> None:
+    driver = with_budget(2)
+    driver.step(Event("turn_start"))
+    first = driver.step(Event("tool_use", "Read"))
+    second = driver.step(Event("tool_use", "Bash"))
+    third = driver.step(Event("tool_use", "Edit"))
+    assert (first.tag, first.text, first.number) == (ActionTag.CONTINUE, "Read", 1)
+    assert second.tag is ActionTag.CONTINUE
+    assert (third.tag, third.text, third.number) == (
+        ActionTag.INTERRUPT,
+        "tool_budget",
+        3,
+    )
+
+
+def test_a_new_turn_resets_the_tool_count_and_a_result_counts_the_turn() -> None:
+    driver = with_budget(1)
+    driver.step(Event("credential", "subscription"))
+    driver.step(Event("turn_start"))
+    driver.step(Event("tool_use", "Read"))
+    end = driver.step(Event("result", "success", 3))
+    assert (end.tag, end.text, end.number) == (ActionTag.END_TURN, "success", 3)
+    assert driver.state == (1, 1, 1)
+    driver.step(Event("turn_start"))
+    assert driver.state == (0, 1, 1)
+    assert driver.step(Event("tool_use", "Read")).tag is ActionTag.CONTINUE
+
+
+def test_state_carries_across_a_restart() -> None:
+    first = with_budget(1)
+    first.step(Event("turn_start"))
+    first.step(Event("tool_use", "Read"))
+    restarted = Driver(packaged_source().replace("{ 40 }", "{ 1 }"), state=first.state)
+    assert restarted.step(Event("tool_use", "Bash")).tag is ActionTag.INTERRUPT
+
+
+def test_an_unknown_event_continues_and_changes_nothing() -> None:
+    driver = Driver.for_model(OPUS)
+    before = driver.state
+    action = driver.step(Event("something_new", "x", 9))
+    assert action.tag is ActionTag.CONTINUE
+    assert driver.state == before
+
+
+def test_many_decisions_run_on_one_driver() -> None:
+    driver = Driver.for_model(HAIKU)
+    for turn in range(200):
+        driver.step(Event("turn_start"))
+        driver.step(Event("text", "", 5))
+        driver.step(Event("result", "success", 1))
+        assert driver.state == (0, turn + 1, 0)
+
+
+def test_an_unknown_model_has_no_driver() -> None:
+    with pytest.raises(DriverError, match="no driver"):
+        Driver.for_model("claude-sonnet-5-5")
+
+
+# The host's checks on a defective driver.
+
+STEP = "((Text, Text, Word), (Word, Word, Word))"
+
+
+def driver_source(settings: str, action: str = '("continue", "", 0)') -> str:
+    return (
+        "fn setting(index: Word) -> (Text, Text, Word) { match index { "
+        + settings
+        + ' _ => ("end", "", 0), } }\n'
+        f"loop main(input: {STEP}) -> {STEP} {{ "
+        "let event = input.0; let state = input.1; "
+        'let step = if event.0 == "settings" { (setting(event.2), state) } '
+        f"else {{ ({action}, state) }}; "
+        'let _ = yield step; (("idle", "", 0), state) }'
+    )
+
+
+GOOD_SETTINGS = (
+    f'0 => ("interface", "", {INTERFACE_VERSION}), 1 => ("model", "m", 0), '
+    '6 => ("strategy", "flexible", 0), '
+    '2 => ("effort", "high", 0), 3 => ("max_turns", "", 2), '
+    '4 => ("tool_budget", "", 1), 5 => ("context_window", "", 10),'
+)
+
+
+def test_a_minimal_valid_driver_loads() -> None:
+    assert Driver(driver_source(GOOD_SETTINGS)).settings.model == "m"
+
+
+@pytest.mark.parametrize(
+    ("source", "reason"),
+    [
+        ("loop main(", "does not compile"),
+        ("fn main() -> Word { 1 }", "not a loop main"),
+        (driver_source(GOOD_SETTINGS.replace('1 => ("model", "m", 0), ', "")), "omits"),
+        (
+            driver_source(
+                GOOD_SETTINGS.replace(f'"", {INTERFACE_VERSION})', '"", 99)')
+            ),
+            "interface 99",
+        ),
+        (
+            driver_source(
+                GOOD_SETTINGS.replace('("max_turns", "", 2)', '("max_turns", "", 0)')
+            ),
+            "invalid settings",
+        ),
+        (
+            driver_source(GOOD_SETTINGS + ' 7 => ("model", "n", 0),'),
+            "repeats the setting",
+        ),
+        (
+            driver_source(GOOD_SETTINGS.replace('"flexible"', '"metered"')),
+            "unknown strategy 'metered'",
+        ),
+    ],
+)
+def test_a_defective_driver_is_refused_at_load(source: str, reason: str) -> None:
+    with pytest.raises(DriverError, match=reason):
+        Driver(source)
+
+
+def test_a_driver_with_endless_settings_is_refused() -> None:
+    endless = driver_source("").replace(
+        '_ => ("end", "", 0)', '_ => ("model", "m", index)'
+    )
+    with pytest.raises(DriverError, match="repeats|more than"):
+        Driver(endless)
+    assert MAX_SETTINGS > 6
+
+
+def test_an_unknown_action_is_refused() -> None:
+    driver = Driver(driver_source(GOOD_SETTINGS, '("launch", "", 0)'))
+    with pytest.raises(DriverError, match="unknown action 'launch'"):
+        driver.step(Event("turn_start"))

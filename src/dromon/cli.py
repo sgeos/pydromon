@@ -6,6 +6,7 @@ other subcommands are placeholders that report they are not implemented and exit
 """
 
 import argparse
+import asyncio
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -14,7 +15,13 @@ from typing import Final
 from dromon import __version__, exits
 from dromon.client import DaemonFailed, DaemonNotRunning, call, is_running, start, stop
 from dromon.paths import PathError, ProjectPaths, project_paths
+from dromon.driver import MODELS, Driver, DriverError, Strategy
+from dromon.engine import ClaudeCodeLine, EngineRefused
 from dromon.protocol import Operation, ProtocolError
+
+PROBE_MODEL: Final = "claude-haiku-5-5"
+"""The least expensive subscription model, used for probes and tests by default."""
+PROBE_PROMPT: Final = "Reply with the single word: ready"
 
 SUBCOMMANDS: Final[dict[str, str]] = {
     "start": "start the daemon for this project",
@@ -24,11 +31,13 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "send": "send a message to a session line",
     "questions": "list open operator questions",
     "answer": "answer an operator question",
+    "probe": "run one short turn on the engine and report its capabilities",
 }
 """Planned subcommands and their one-line help, in display order."""
 
 
-def _start(paths: ProjectPaths) -> int:
+def _start(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    del arguments
     if is_running(paths):
         print(f"dromon start: already running for {paths.root}")
         return exits.OK
@@ -41,7 +50,8 @@ def _start(paths: ProjectPaths) -> int:
     return exits.OK
 
 
-def _status(paths: ProjectPaths) -> int:
+def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    del arguments
     try:
         response = call(paths.socket, Operation.STATUS)
     except DaemonNotRunning:
@@ -71,7 +81,8 @@ def _status(paths: ProjectPaths) -> int:
     return exits.OK
 
 
-def _stop(paths: ProjectPaths) -> int:
+def _stop(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    del arguments
     try:
         stop(paths)
     except DaemonNotRunning:
@@ -84,10 +95,51 @@ def _stop(paths: ProjectPaths) -> int:
     return exits.OK
 
 
-IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths], int]]] = {
+def _probe(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Run one short turn with no tools and report what the engine says.
+
+    The driver's strategy decides which credential is acceptable, so the default
+    subscription driver can never start usage billed per token.
+    """
+    try:
+        model: str = arguments.model
+        strategy = Strategy(arguments.strategy)
+        driver = Driver.for_model(model, strategy)
+        line = ClaudeCodeLine(driver, paths.root)
+        report = asyncio.run(line.run_turn(PROBE_PROMPT))
+    except (DriverError, EngineRefused) as error:
+        print(f"dromon probe: {error}", file=sys.stderr)
+        return exits.FAILURE
+    settings = driver.settings
+    print(
+        f"driver {settings.model} {settings.strategy},"
+        f" wcet {driver.wcet_per_iteration} per decision"
+    )
+    print(
+        f"settings effort {settings.effort}, max turns {settings.max_turns},"
+        f" tool budget {settings.tool_budget},"
+        f" context window {settings.context_window}"
+    )
+    found = report.capabilities
+    if found is not None:
+        print(
+            f"engine Claude Code {found.claude_code_version},"
+            f" Agent SDK {found.sdk_version}, model {found.model}"
+        )
+        print(
+            f"credential {report.credential} from {found.api_key_source!r},"
+            f" tools {len(found.tools)}, permission mode {found.permission_mode}"
+        )
+        print("capabilities " + ", ".join(found.capabilities))
+    print(f"turn {report.subtype} in {report.num_turns}, reply {report.text!r}")
+    return exits.OK if report.subtype == "success" else exits.FAILURE
+
+
+IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]] = {
     "start": _start,
     "status": _status,
     "stop": _stop,
+    "probe": _probe,
 }
 
 
@@ -109,7 +161,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     for name, help_text in SUBCOMMANDS.items():
-        commands.add_parser(name, help=help_text, description=help_text)
+        command = commands.add_parser(name, help=help_text, description=help_text)
+        if name == "probe":
+            command.add_argument(
+                "--model",
+                choices=MODELS,
+                default=PROBE_MODEL,
+                help="default %(default)s",
+            )
+            command.add_argument(
+                "--strategy",
+                choices=[strategy.value for strategy in Strategy],
+                default=Strategy.SUBSCRIPTION.value,
+                help="the driver's credential strategy, default %(default)s",
+            )
     return parser
 
 
@@ -128,7 +193,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except PathError as error:
         print(f"dromon {command}: {error}", file=sys.stderr)
         return exits.FAILURE
-    return handler(paths)
+    return handler(paths, arguments)
 
 
 if __name__ == "__main__":

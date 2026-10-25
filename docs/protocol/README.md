@@ -9,4 +9,5 @@ Documents here describe behaviour and formats, never Python details.
 
 - [`EVENT_LOG.md`](EVENT_LOG.md), the data model as events, their JSON encoding and their SQLite storage. Draft, version 1.
 - [`CLIENT.md`](CLIENT.md), the requests between `dromon` and `dromond` over the project's Unix domain socket, with the command exit statuses. Draft, version 1.
+- [`DRIVER.md`](DRIVER.md), the interface between a per-model Keleusma driver and its host. Draft, interface 1.
 - [`RELAY.md`](RELAY.md), forwarding messages to operators through adapters for channels such as email or chat. Draft, version 1.

@@ -4,39 +4,38 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-25, task 3, the daemon skeleton
+## 2026-10-25, concrete drivers and the testing model
 
-**Done.** Tasks 1 and 2 were already complete. Task 3 is complete.
+**Done.**
 
-- `dromond` serves one project on a Unix domain socket in a runtime directory that must
-  be owned by the user with mode 0700. It holds the event log as its single writer and
-  admits one instance through an exclusive lock.
-- `dromon start` spawns a detached daemon in its own session and waits for it to answer.
-  `dromon status` reports the daemon and event log counts, and `dromon stop` stops it and
-  waits for the socket to go. Exit statuses are distinct and listed in `CLIENT.md`.
-- The protocol is versioned, line-delimited canonical JSON with a 64 KiB line limit,
-  strict decoding, a per-connection idle timeout and error codes, specified in
-  `docs/protocol/CLIENT.md`.
-- The operator's decision that replies arrive through inbound adapters plugged into a
-  daemon registry and configured per channel is recorded in `RELAY.md`, with the design
-  deferred.
-- Pull request #6, the response path requirement, was merged first.
+- **Testing model.** Claude Haiku 5.5, the least expensive model, runs on the
+  subscription through Claude Code, confirmed live. `dromon probe` and the live test now
+  use it by default.
+- **Concrete drivers.** On the operator's decision, subscription use, API use and
+  flexible use are separate drivers that bake their strategy in. Six driver files cover
+  Opus 5.5 and Haiku 5.5. A subscription driver refuses API usage, an API driver refuses
+  a subscription, and a flexible driver accepts either with API-safe settings. Driver
+  interface 2 adds a `credential` event, a `strategy` setting and a credential code in
+  the state.
+- **Engine.** It maps `apiKeySource` to a credential and lets the driver decide. It
+  refuses cloud providers for every driver, and API variables for subscription drivers,
+  before starting. A live `dromon probe --strategy api` was refused as intended.
+- **pykeleusma.** Its reply was read and acknowledged. Request
+  `pydromon-20261025-data-segment-request` reports the data segment gap as a deficiency
+  and asks for shared data support.
 
 **Decisions made by this line, open to the operator's review.**
 
-- `dromon start` succeeds without action when a daemon already answers, while `status`
-  and `stop` exit with status 4 when none does.
-- The runtime directory defaults to `.dromon/run` in the project and moves with
-  `DROMON_RUNTIME_DIR`, because socket paths are limited to 103 bytes.
-- Access control rests on the directory's mode. A peer credential check is deferred.
+- The flexible drivers use the API settings, because a flexible line may be billed per
+  token. The settings in each driver are a first judgement, listed in `DRIVER.md`.
+- The six files were generated once from a throwaway script that is not committed, and
+  each is now maintained as its own concrete driver.
 
-**Verification.** `uv sync`, 245 tests passing with warnings treated as errors outside
-the sandbox, including 10 socket tests that start real daemons, and 235 passing inside
-it with `-m "not socket"`. Ruff check and format clean, and pyright strict with 0 errors
-and 0 warnings. A manual run of start, a second start, status, stop and status behaved as
-specified, and no daemon process was left after the suite.
+**Verification.** `uv sync`, 342 tests passing with warnings treated as errors outside
+the sandbox, and the live test passing on Haiku 5.5 with `DROMON_LIVE_TESTS=1`. Ruff and
+pyright strict clean. The wheel contains all six drivers.
 
-**Not verified.** Only macOS with Python 3.12.12 was tested. Linux behaviour of the lock,
-`posix_spawn` with `setsid` and the socket limit is inferred from documentation.
+**Not verified.** Any API credential, since the operator has none. The API and flexible
+paths are tested against scripted sessions only.
 
-**Next.** Task 4, which needs the operator's choice of loop for Claude Opus 5.5.
+**Next.** Task 5, layer 1 messaging and wakes.

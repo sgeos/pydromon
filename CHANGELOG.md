@@ -7,6 +7,7 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- The build backend requirement moves to `uv_build` 0.13, matching the installed uv.
 - `docs/protocol/RELAY.md` requires every relay adapter to support a response path and
   states the properties its deferred design must have.
 - Operators are no longer a singleton. Each operator is a party with an address such as
@@ -29,6 +30,15 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- The first engine adapter, roadmap task 4. `dromon.engine` runs a session line's turns
+  on Claude Code through the Agent SDK, on the operator's Claude subscription only, and
+  refuses any other credential. `dromon.driver` hosts per-model Keleusma drivers through
+  `pykeleusma`. Six concrete drivers cover Claude Opus 5.5 and Claude Haiku 5.5, each
+  with a subscription, an API and a flexible strategy baked in. `dromon probe` reports
+  the engine's capabilities and defaults to Haiku 5.5, the least expensive model.
+  `docs/protocol/DRIVER.md` specifies driver interface 2.
+- Dependencies `claude-agent-sdk` and `pykeleusma`, the latter pinned to commit
+  `19d4558` of its repository.
 - The daemon skeleton, roadmap task 3. `dromond` serves one project on a Unix domain
   socket in a private runtime directory, holds the event log as its single writer and
   admits one instance through a lock. `dromon start`, `dromon status` and `dromon stop`
