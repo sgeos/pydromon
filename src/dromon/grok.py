@@ -49,6 +49,7 @@ from typing import Any, Final, Protocol, cast
 
 from claude_agent_sdk import SdkMcpTool
 
+from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
 from dromon.engine import EngineRefused, TurnReport, read_instructions
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
@@ -390,6 +391,7 @@ class GrokLine:
         environment: Mapping[str, str] | None = None,
         home: Path | None = None,
         connection_factory: ConnectionFactory = _grok_agent,
+        observe: Observer = ignore,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -409,6 +411,7 @@ class GrokLine:
         self._environment = os.environ if environment is None else environment
         self._home = Path.home() if home is None else home
         self._connect = connection_factory
+        self._observe = observe
         self._next_id = 0
         self._connection: Connection | None = None
         self.session_id_in_use: str | None = None
@@ -547,8 +550,10 @@ class GrokLine:
             content = cast(dict[str, Any], update.get("content") or {})
             text = str(content.get("text") or "")
             turn.text.append(text)
+            self._observe(ActivityKind.TEXT, text, chunk=True)
             await self._act(Event("text", "", len(text)), turn)
         elif kind == "agent_thought_chunk":
+            self._observe(ActivityKind.THINKING, "")
             await self._act(Event("thinking"), turn)
         elif kind == "tool_call":
             if str(update.get("kind")) in QUIET_KINDS:
@@ -560,6 +565,7 @@ class GrokLine:
                 )
                 return
             turn.tool_uses.append(name)
+            self._observe(ActivityKind.TOOL, name)
             await self._act(Event("tool_use", name), turn)
 
     async def _act(self, event: Event, turn: _Turn) -> None:

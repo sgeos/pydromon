@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
+from dromon.activity import ActivityKind
 from dromon.driver import DriverError, Strategy
 from dromon.engine import TurnReport
 from dromon.eventlog import EventLog, read_entries
@@ -174,6 +175,10 @@ async def settle(target: World, act: Callable[[], Coroutine[Any, Any, None]]) ->
     await target.scheduler.idle()
     stop.set()
     await loop
+
+
+def activity_of(scheduler: Scheduler, line_id: str) -> list[tuple[ActivityKind, str]]:
+    return [(entry.kind, entry.text) for entry in scheduler.activity.after(line_id, 0)]
 
 
 def run(target: World, act: Callable[[], Coroutine[Any, Any, None]]) -> None:
@@ -597,6 +602,13 @@ def test_a_live_luna_line_messages_a_haiku_line(tmp_path: Path) -> None:
         assert "alpha" in reports, "the Luna line did not complete a turn"
         assert any(m.recipient == LineAddress("beta") for m in sent)
         assert any(line_id == "beta" for line_id, _ in scheduler.turn_reports)
+        # Both real adapters report their turns to the activity tail.
+        luna = [kind for kind, _ in activity_of(scheduler, "alpha")]
+        haiku = [kind for kind, _ in activity_of(scheduler, "beta")]
+        assert ActivityKind.TOOL in luna and luna[-1] is ActivityKind.TURN_ENDED
+        assert luna[0] is ActivityKind.TURN_STARTED
+        assert haiku[0] is ActivityKind.TURN_STARTED
+        assert ActivityKind.TEXT in haiku or ActivityKind.TOOL in haiku
         assert all(line.state is LineState.IDLE for line in log.state.lines.values())
 
 
@@ -1151,3 +1163,60 @@ def test_a_line_cannot_acknowledge_another_mailbox(make_world: MakeWorld) -> Non
     ]
     with pytest.raises(EventRejected, match="no message"):
         target.scheduler.acknowledge(LineAddress("beta"), message_id)
+
+
+# Activity and interrupts, for attached clients.
+
+
+def activity(target: World, line_id: str) -> list[tuple[ActivityKind, str]]:
+    return activity_of(target.scheduler, line_id)
+
+
+def test_each_turn_is_bracketed_in_the_line_activity(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    run(target, send(target, "alpha", "hello"))
+    recorded = activity(target, "alpha")
+    assert [kind for kind, _ in recorded] == [
+        ActivityKind.TURN_STARTED,
+        ActivityKind.TURN_ENDED,
+    ]
+    assert recorded[0][1] == target.engines["alpha"].prompts[0]
+    assert recorded[1][1] == "success"
+
+
+def test_a_failed_turn_says_why_in_the_activity(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    target.engine("alpha").fail = True
+    run(target, send(target, "alpha", "hello"))
+    assert activity(target, "alpha")[-1] == (
+        ActivityKind.TURN_ENDED,
+        "failed: the engine broke",
+    )
+
+
+def test_an_operator_interrupts_a_turn_in_flight(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    engine = target.engine("alpha")
+    engine.gate = asyncio.Event()
+    outcomes: list[bool] = []
+
+    async def act() -> None:
+        assert target.scheduler.interrupt("alpha") is False
+        target.scheduler.send(ANA, LineAddress("alpha"), "long work")
+        while not engine.prompts:
+            await asyncio.sleep(0)
+        outcomes.append(target.scheduler.interrupt("alpha"))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        outcomes.append(target.scheduler.interrupt("alpha"))
+
+    run(target, act)
+    assert outcomes == [True, False]
+    assert target.log.state.lines["alpha"].state is LineState.IDLE
+    assert target.scheduler.turn_reports == []
+    assert activity(target, "alpha")[-1] == (
+        ActivityKind.TURN_ENDED,
+        "interrupted by an operator",
+    )
+    with pytest.raises(EventRejected, match="no line"):
+        target.scheduler.interrupt("nobody")

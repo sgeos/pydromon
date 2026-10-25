@@ -339,6 +339,8 @@ class Daemon:
                 | Operation.SENT
                 | Operation.RELEASE
                 | Operation.LINE_VIEW
+                | Operation.LINE_ACTIVITY
+                | Operation.INTERRUPT
                 | Operation.AGENT_ADD
                 | Operation.AGENT_REVOKE
                 | Operation.AGENT_LIST
@@ -369,6 +371,12 @@ class Daemon:
                     result = self._release(request.args)
                 case Operation.LINE_VIEW:
                     result = self._line_view(request.args)
+                case Operation.LINE_ACTIVITY:
+                    result = self._line_activity(request.args)
+                case Operation.INTERRUPT:
+                    (line_id,) = _text_args(request.args, ("line_id",))
+                    interrupted = self.scheduler.interrupt(line_id)
+                    result = {"line_id": line_id, "interrupted": interrupted}
                 case Operation.AGENT_ADD:
                     result = self._agent_add(request.args)
                 case Operation.AGENT_REVOKE:
@@ -542,6 +550,44 @@ class Daemon:
             "messages": messages,
             "total": len(involved),
             "open_questions": questions[-VIEW_LIMIT:],
+        }
+
+    def _line_activity(self, args: dict[str, object]) -> dict[str, object]:
+        """The entries of a line's activity changed after revision ``after``.
+
+        The newest entries are kept within a byte budget, so the response fits one
+        protocol line. ``complete`` is false when older changed entries were left
+        out, which a client shows rather than fetching them, because they may be
+        large and are already past.
+        """
+        allowed = {"line_id", "after"}
+        if "line_id" not in args or not set(args) <= allowed:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST, f"line_activity takes {sorted(allowed)}"
+            )
+        (line_id,) = _text_args({"line_id": args["line_id"]}, ("line_id",))
+        after = args.get("after", 0)
+        if type(after) is not int or after < 0:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST, "after is a non-negative integer"
+            )
+        if line_id not in self.log.state.lines:
+            raise EventRejected(f"no line {line_id}")
+        changed = self.scheduler.activity.after(line_id, after)
+        kept: list[dict[str, object]] = []
+        budget = VIEW_BUDGET_BYTES
+        for entry in reversed(changed):
+            document = entry.to_json()
+            budget -= len(json.dumps(document, ensure_ascii=False).encode("utf-8"))
+            if budget < 0:
+                break
+            kept.append(document)
+        kept.reverse()
+        return {
+            "line_id": line_id,
+            "seq": self.scheduler.activity.seq,
+            "entries": kept,
+            "complete": len(kept) == len(changed),
         }
 
     def _agent_add(self, args: dict[str, object]) -> dict[str, object]:

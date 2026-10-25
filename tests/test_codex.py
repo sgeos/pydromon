@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
+from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon.codex import (
     DISABLED_FEATURES,
     CodexLine,
@@ -170,6 +171,7 @@ def line(
     config: LineConfig | None = None,
     environment: Mapping[str, str] | None = None,
     session_id: str | None = None,
+    observe: Observer = ignore,
 ) -> CodexLine:
     @asynccontextmanager
     async def connect(
@@ -189,6 +191,7 @@ def line(
         environment={} if environment is None else environment,
         connection_factory=connect,
         server_lister=lambda env: ["gmail", "slack"],
+        observe=observe,
     )
 
 
@@ -293,6 +296,26 @@ def test_dromons_tools_are_served_and_counted() -> None:
         },
     }
     assert second["result"]["success"] is False
+
+
+def test_the_turn_is_reported_to_the_observer_as_it_runs() -> None:
+    server = FakeServer(
+        [
+            item("reasoning"),
+            item("dynamicToolCall", tool="record"),
+            message("first"),
+            message("second"),
+            completed(),
+        ]
+    )
+    log = ActivityLog()
+    run(line(server, observe=log.observer("alpha")))
+    assert [(entry.kind, entry.text) for entry in log.after("alpha", 0)] == [
+        (ActivityKind.THINKING, ""),
+        (ActivityKind.TOOL, "record"),
+        (ActivityKind.TEXT, "first"),
+        (ActivityKind.TEXT, "second"),
+    ]
 
 
 def test_approvals_are_declined_and_other_requests_refused() -> None:

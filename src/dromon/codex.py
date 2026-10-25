@@ -59,6 +59,7 @@ from typing import Any, Final, Protocol, cast
 from claude_agent_sdk import SdkMcpTool
 
 from dromon import __version__
+from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
 from dromon.engine import EngineRefused, TurnReport, read_instructions
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
@@ -364,6 +365,7 @@ class CodexLine:
         environment: Mapping[str, str] | None = None,
         connection_factory: ConnectionFactory = _app_server,
         server_lister: ServerLister = list_servers,
+        observe: Observer = ignore,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -379,6 +381,7 @@ class CodexLine:
         self._environment = os.environ if environment is None else environment
         self._connect = connection_factory
         self._list_servers = server_lister
+        self._observe = observe
         self._next_id = 0
         self._thread_id = ""
         self._connection: Connection | None = None
@@ -516,6 +519,7 @@ class CodexLine:
             if item.get("type") == "agentMessage":
                 text = str(item.get("text") or "")
                 turn.text.append(text)
+                self._observe(ActivityKind.TEXT, text)
                 await self._act(Event("text", "", len(text)), turn)
         elif method == "model/rerouted":
             model = str(params.get("toModel") or "")
@@ -535,6 +539,7 @@ class CodexLine:
         kind = str(item.get("type") or "")
         if kind in QUIET_ITEMS:
             if kind == "reasoning":
+                self._observe(ActivityKind.THINKING, "")
                 await self._act(Event("thinking"), turn)
             return
         if kind == "dynamicToolCall" and str(item.get("tool")) in self.mcp_tools:
@@ -549,6 +554,7 @@ class CodexLine:
             )
             return
         turn.tool_uses.append(name)
+        self._observe(ActivityKind.TOOL, name)
         await self._act(Event("tool_use", name), turn)
 
     async def _act(self, event: Event, turn: _Turn) -> None:

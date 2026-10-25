@@ -329,9 +329,48 @@ applications.
 **Implemented 2026-10-25, roadmap task 8.** `dromon attach LINE` opens a curses client,
 the standard library's counterpart to Ratatui and Crossterm and so a direct map onto
 the Rust port, and `dromon attach LINE --gui` opens a Tk window, which also ships with
-Python. Both are thin shells over `dromon.attach`, which polls the new `line_view`
-operation and turns typed input into operator commands. Every client is an independent
+Python. Both were thin shells over `dromon.attach`, since replaced as recorded below,
+which polled the new `line_view` operation and turned typed input into commands. Every client is an independent
 connection, so any number may attach to any lines at once.
+
+**Decided 2026-10-25 by the operator, as direction.** The terminal and graphical clients
+are taken near parity with Claude Code, Codex and Grok Build, on a shared core, in the
+shape of the operator's Rust projects. Those have a `no_std` core, a platform layer
+that implements the core's traits, and an entry point that wires the two together.
+
+**Implemented 2026-10-25.** The clients live in `dromon.ui`, in three layers.
+
+- **The core**, the counterpart of the `no_std` crate. Its modules perform no input or
+  output, and a test checks their imports. It is an Elm-style state machine. `update`
+  takes the model and an event, a key, a tick, a size or a daemon result, and returns
+  the next model and the effects to perform, a fetch, a request, a bell or an exit.
+  `frame` draws a model as rows of styled text with a cursor. The input editor, the
+  history, the commands with their completion, polling, scrolling, the panes, the
+  line list and the help panel are all here, and are tested without a terminal.
+- **The ports and the shared runtime.** The `Daemon` port is one `call` method. The
+  runtime owns the model, performs effects through the port, and feeds results back
+  as events within a fixed bound of steps. Both platforms use the same runtime.
+- **The platforms.** `terminal` translates curses keys and paints frames with curses
+  attributes, and `window` does the same with Tk events and text tags, adding the
+  mouse wheel. Neither holds client behaviour of its own. The entry point in
+  `dromon.cli` wires a platform, the runtime and the socket adapter together.
+
+For a turn to be followed as it runs, the daemon gained a bounded, in-memory activity
+tail per line, fed by an observer that each engine adapter calls, and two operations,
+`line_activity` and `interrupt`, as [`../protocol/CLIENT.md`](../protocol/CLIENT.md)
+specifies. A client polls four times as often while its line runs a turn, which
+stands in for pushed updates.
+
+**Not at parity, recorded as limitations.** The clients show no token or context
+meter, because the engines report none to Dromon, offer no permission prompts,
+because Dromon decides tool use by policy rather than by asking, render Markdown only
+to the extent of fenced code and headings, and assume each character fills one column.
+Codex text appears only when a message completes, and Claude Code text a message at a
+time, because only Grok's adapter receives streamed chunks.
+
+**Porting note.** The core maps onto a Rust crate whose events and effects are `enum`s
+and whose `update` is a total function, and from there onto a Keleusma stream
+processor. The platforms map onto Ratatui with Crossterm and onto a native toolkit.
 
 **Inference.** The client protocol of [`../protocol/CLIENT.md`](../protocol/CLIENT.md) is
 then the game's network protocol. It needs pushed updates for attached clients, and

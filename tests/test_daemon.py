@@ -18,6 +18,7 @@ from typing import Any, cast
 
 from claude_agent_sdk import SdkMcpTool
 
+from dromon.activity import ActivityKind
 from dromon.daemon import AlreadyRunning, Daemon, acquire_lock
 from dromon.driver import Strategy
 from dromon.eventlog import EventLog
@@ -551,6 +552,79 @@ def test_a_bad_line_view_is_refused(
     assert (response.ok, response.error_code) == (False, code)
 
 
+def activity_request(
+    paths: ProjectPaths, args: dict[str, object], texts: Sequence[str] = ()
+) -> Response:
+    """A ``line_activity`` request to a daemon whose line ``alpha`` said ``texts``."""
+    seed_question(paths)
+    with EventLog(paths.event_log) as log:
+        scheduler = held_scheduler(log)
+        for text in texts:
+            scheduler.activity.record("alpha", ActivityKind.TEXT, text)
+        daemon = Daemon(paths, log, "2026-10-25T00:00:00Z", scheduler)
+        request_line = {"id": "r", "op": "line_activity", "v": 1, "args": args}
+        return daemon.respond((json.dumps(request_line) + "\n").encode())
+
+
+def test_line_activity_returns_what_changed_after_a_revision(
+    paths: ProjectPaths,
+) -> None:
+    response = activity_request(paths, {"line_id": "alpha"}, ["one", "two"])
+    assert response.ok and response.result is not None
+    assert response.result["seq"] == 2 and response.result["complete"] is True
+    entries = cast(list[dict[str, object]], response.result["entries"])
+    assert [(e["entry_id"], e["kind"], e["text"]) for e in entries] == [
+        (1, "text", "one"),
+        (2, "text", "two"),
+    ]
+    later = activity_request(paths, {"line_id": "alpha", "after": 1}, ["one", "two"])
+    assert later.result is not None
+    assert [
+        e["text"] for e in cast(list[dict[str, object]], later.result["entries"])
+    ] == ["two"]
+
+
+def test_line_activity_keeps_the_newest_entries_within_the_budget(
+    paths: ProjectPaths,
+) -> None:
+    # Three bytes a character, so the byte budget binds well before the tail's end.
+    texts = ["\u65e5" * 3000] * 40
+    response = activity_request(paths, {"line_id": "alpha"}, texts)
+    assert response.ok and response.result is not None
+    entries = cast(list[dict[str, object]], response.result["entries"])
+    assert 0 < len(entries) < 40 and response.result["complete"] is False
+    assert entries[-1]["entry_id"] == 40
+    assert len(encode_response(response)) < MAX_LINE_BYTES
+
+
+@pytest.mark.parametrize(
+    ("args", "code"),
+    [
+        ({}, ErrorCode.BAD_REQUEST),
+        ({"line_id": "alpha", "after": -1}, ErrorCode.BAD_REQUEST),
+        ({"line_id": "alpha", "after": "1"}, ErrorCode.BAD_REQUEST),
+        ({"line_id": "alpha", "after": True}, ErrorCode.BAD_REQUEST),
+        ({"line_id": "alpha", "extra": 1}, ErrorCode.BAD_REQUEST),
+        ({"line_id": "nobody"}, ErrorCode.REJECTED),
+    ],
+)
+def test_a_bad_line_activity_request_is_refused(
+    paths: ProjectPaths, args: dict[str, object], code: ErrorCode
+) -> None:
+    response = activity_request(paths, args)
+    assert (response.ok, response.error_code) == (False, code)
+
+
+def test_interrupt_reports_whether_a_turn_was_in_flight(paths: ProjectPaths) -> None:
+    seed_question(paths)
+    response = request(paths, "interrupt", {"line_id": "alpha"})
+    assert response.ok and response.result == {"line_id": "alpha", "interrupted": False}
+    unknown = request(paths, "interrupt", {"line_id": "nobody"})
+    assert (unknown.ok, unknown.error_code) == (False, ErrorCode.REJECTED)
+    bad = request(paths, "interrupt", {})
+    assert (bad.ok, bad.error_code) == (False, ErrorCode.BAD_REQUEST)
+
+
 # The real daemon, started detached and driven over its socket. Wakes are held, so no
 # engine ever starts and no test touches the subscription.
 
@@ -805,21 +879,29 @@ def test_an_operator_looks_through_mail_from_the_command_line(
 
 @pytest.mark.socket
 def test_several_clients_attach_to_lines_at_once(paths: ProjectPaths) -> None:
-    from dromon.attach import Attachment, Say
+    from dromon.ui.keys import Char, Named
+    from dromon.ui.link import SocketDaemon
+    from dromon.ui.runtime import Runtime
 
     seed_question(paths)
     pid = client.start(paths, HOLD)
     try:
-        first = Attachment(paths, "alpha", "ana")
-        second = Attachment(paths, "alpha", "ben")
-        assert first.execute(Say("from the first window")) == "sent"
-        assert second.execute(Say("from the second window")) == "sent"
+        first = Runtime(SocketDaemon(paths), "alpha", "ana", 1000.0)
+        second = Runtime(SocketDaemon(paths), "alpha", "ben", 1000.0)
+        for attached, text in ((first, "from the first"), (second, "from the second")):
+            for character in text:
+                attached.press(Char(character))
+            attached.press(Named.ENTER)
+            assert attached.model.notice == "sent to alpha"
+        first.press(Named.CTRL_L)
+        second.press(Named.CTRL_L)
         for attached in (first, second):
-            view = attached.fetch()
-            bodies = [
-                m["body"] for m in cast(list[dict[str, object]], view["messages"])
-            ]
-            assert bodies[-2:] == ["from the first window", "from the second window"]
+            view = attached.model.view
+            assert view is not None and view.line.line_id == "alpha"
+            bodies = [mail.body for mail in view.mail]
+            assert bodies[-2:] == ["from the first", "from the second"]
+            assert attached.model.lines and attached.model.activity == ()
+            assert not attached.model.alarm, attached.model.notice
     finally:
         client.stop(paths)
         reap(pid)
