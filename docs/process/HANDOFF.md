@@ -19,8 +19,8 @@ completed, moved or abandoned.
     5.5, Haiku 5.5 and GPT-6-Luna, each in a subscription, API and flexible strategy,
     by the operator's decision. Each names its engine, `claude-code` or `codex`.
   - `codex.py` runs GPT-6-Luna lines through `codex app-server` on the operator's
-    ChatGPT plan, isolated from the user's MCP servers and connectors, with Dromon's
-    tools as dynamic tools. `scheduler.engine_factory` picks the adapter. `dromon
+    ChatGPT plan, isolated from the user's MCP servers, under a Codex permission
+    profile denying Dromon's state, with Dromon's tools as dynamic tools. `scheduler.engine_factory` picks the adapter. `dromon
     probe` runs one turn, by default on Haiku 5.5, the least expensive model.
   - `teacher.py` brings a project's local Ollama teacher up and down. Lines take
     `claude_code_prompt` and `instructions`, so they can follow a `CLAUDE.md`.
@@ -63,8 +63,7 @@ completed, moved or abandoned.
 - **Published.** Public `sgeos/pydromon`, 0BSD, over HTTPS with the GitHub CLI as
   credential helper. CI runs Ruff, Pyright and pytest on Ubuntu and macOS for Python
   3.12 and 3.15. Live tests run only locally.
-- **pykeleusma.** Python cannot yet drive a script, its open task 5. Dromon's 0.1.0
-  does not depend on it.
+- **pykeleusma.** Cannot yet drive a script, its task 5. Dromon does not need it.
 
 ## Next step
 
@@ -95,8 +94,8 @@ editable install that runs the working tree. Its project file is
   or language servers, no MCP OAuth, and Linux not verified live. The merge of `Read`
   and `Edit` rules into the sandbox is untested. Listed in `SANDBOX.md` and
   `SETTINGS.md`.
-- **Codex lines.** No MCP servers, file edits, sandbox or settings documents, cost or
-  turn limit, and the app-server is experimental. Listed in `CODEX.md`.
+- **Codex lines.** No MCP servers, commits, sandbox or settings documents, cost or turn
+  limit, and refused calls escape the tool budget. See `CODEX.md`.
 - **In the design.** Hosted teacher traces, the Rust repository's name, and pushed
   updates and remote clients for the client protocol.
 
@@ -113,7 +112,7 @@ and a manual daemon run need a command outside it. The rest run inside it with
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 875 tests pass, plus 9 live tests deselected
+uv sync && uv run pytest    # 879 tests pass, plus 10 live tests deselected
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 

@@ -260,6 +260,7 @@ def engine_factory(
                 config=spec.config,
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
+                protected=protected,
             )
         merged = merge([project_sandbox, spec.config.sandbox])
         return ClaudeCodeLine(

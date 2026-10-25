@@ -473,7 +473,9 @@ def test_a_codex_line_refuses_a_configuration_its_engine_cannot_run(
 ) -> None:
     target = make_world({})
     unsupported = LineConfig(builtin_tools=("Read",))
-    with pytest.raises(ConfigError, match="only the built-in tool Bash"):
+    with pytest.raises(
+        ConfigError, match="only the built-in tools Bash, Edit and Write"
+    ):
         target.scheduler.create_line(
             "gamma", "gpt-6-luna", Strategy.SUBSCRIPTION, unsupported
         )

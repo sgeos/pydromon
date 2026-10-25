@@ -182,7 +182,9 @@ connector features are disabled, then verified. Dromon's tools reach the model a
 dynamic tools. The app-server was chosen over `codex exec`, which OpenAI recommends for
 automation, because only the app-server lets Dromon serve its own tools in process and
 see each item as it starts. **Porting hazard.** The app-server and dynamic tools are
-experimental.
+experimental. **Later the same day,** Codex lines gained write access under a Dromon
+permission profile that denies Dromon's state and runtime directories and keeps `.git`
+read-only, as `CODEX.md` records.
 
 ## Communication
 

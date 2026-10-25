@@ -43,6 +43,11 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Codex lines can write files. Every Codex thread runs under `dromon-line`, a Codex
+  permission profile that makes the workspace writable for a line given `Edit` or
+  `Write`, keeps `.git` read-only, and denies Dromon's state and runtime directories to
+  reads and writes. It replaces Codex's read-only sandbox, which let a Codex line read
+  the event log. The thread must report the profile as active.
 - `dromon teacher up` checks available memory before loading a model, on macOS from
   `kern.memorystatus_level` and on Linux from `MemAvailable`, and refuses below the
   model's size plus `memory_headroom_gb`, 4 by default, unless given `--force`. `status`

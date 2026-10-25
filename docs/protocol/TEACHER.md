@@ -70,7 +70,7 @@ start if that fails, and releases it when it stops.
 
 A line reaches the teacher through its own tools, such as a project script run from
 Bash. A Claude Code line's sandbox must let the shell connect to the endpoint. A Codex
-line runs in Codex's read-only sandbox without network access, so it cannot.
+line runs without network access, so it cannot.
 
 **Fact, verified on 2026-10-25 on macOS with Ollama 0.40.10.** `dromon teacher up`
 loaded `qwen3:30b-a3b-instruct-2507-q4_K_M` in 17.7 seconds, and Ollama reported 18.9 GB

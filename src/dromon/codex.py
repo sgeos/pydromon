@@ -17,17 +17,25 @@ provider, and a model provider other than OpenAI, are always refused.
 Isolation. Codex loads the operator's user configuration, which on the operator's
 machine declares mail, document and calendar MCP servers and approval by a reviewer
 model. Every MCP server Codex lists is disabled by name, connector and agent features
-are disabled, approvals are never asked, the shell runs only for a line given ``Bash``,
-and the thread runs in Codex's read-only sandbox without network access. After the
-thread starts, every MCP server must report itself disabled and no app may be listed,
-or the turn is refused. During the turn, an item of a kind the line was not given
+are disabled, approvals are never asked, and the shell runs only for a line given
+``Bash``. After the thread starts, every MCP server must report itself disabled, no app
+may be listed, and the thread must report Dromon's permission profile as active, or
+the turn is refused. During the turn, an item of a kind the line was not given
 interrupts it. Dromon's own tools, such as ``send_message``, reach the model as Codex
 dynamic tools, which Codex calls back through the same connection.
 
+Filesystem. Each thread runs under ``dromon-line``, a Codex permission profile Dromon
+defines on the command line. It extends Codex's ``:workspace`` profile, makes the
+workspace writable only for a line given ``Edit`` or ``Write``, keeps ``.git`` readable
+but not writable, and denies reading and writing Dromon's state and runtime
+directories, with network access off. Codex's own read-only sandbox would let a line
+read the event log, and its writable sandbox would let a line write it, so neither is
+used. A deny is enforced by the operating system and a narrower deny wins over a wider
+write, which ``docs/protocol/CODEX.md`` records as verified.
+
 Limits of the adapter. Codex lines take no MCP servers, no sandbox or settings
-documents and no built-in tools but ``Bash``, and their configurations are refused
-otherwise. The read-only sandbox is required because Codex's writable sandbox would let
-a line write Dromon's state directory. Codex reports no cost, and has no turn limit, so
+documents and no built-in tools but ``Bash``, ``Edit`` and ``Write``, and their
+configurations are refused otherwise. Codex reports no cost, and has no turn limit, so
 the driver's tool budget is the bound. Dynamic tools are an experimental part of the
 protocol, and the app-server is documented as experimental.
 
@@ -94,8 +102,14 @@ DISABLED_FEATURES: Final = (
 SHELL_FEATURES: Final = ("shell_tool", "unified_exec")
 """The features behind Codex's shell, enabled only for a line given ``Bash``."""
 
-SUPPORTED_BUILTINS: Final = frozenset({"Bash"})
+SUPPORTED_BUILTINS: Final = frozenset({"Bash", "Edit", "Write"})
 """Built-in tool names a Codex line may be given, in Dromon's vocabulary."""
+
+WRITE_TOOLS: Final = frozenset({"Edit", "Write"})
+"""Tools that make the workspace writable, through Codex's file changes."""
+
+PROFILE_NAME: Final = "dromon-line"
+"""The Codex permission profile every Dromon thread runs under."""
 
 QUIET_ITEMS: Final = frozenset(
     {"userMessage", "agentMessage", "reasoning", "plan", "contextCompaction"}
@@ -113,8 +127,9 @@ def unsupported(config: LineConfig) -> str | None:
     """Why a Codex line cannot run ``config``, or ``None`` if it can."""
     extra = sorted(set(config.builtin_tools) - SUPPORTED_BUILTINS)
     if extra:
-        return "Codex lines support only the built-in tool Bash, not " + ", ".join(
-            extra
+        return (
+            "Codex lines support only the built-in tools Bash, Edit and Write, not "
+            + (", ".join(extra))
         )
     if config.mcp_servers or config.inherit_account_mcp:
         return "Codex lines do not yet support MCP servers"
@@ -122,8 +137,8 @@ def unsupported(config: LineConfig) -> str | None:
         return "Codex lines run on Codex's own instructions, not Claude Code's prompt"
     if config.sandbox is not None or config.settings is not None:
         return (
-            "Codex lines run in Codex's own read-only sandbox, and take no sandbox"
-            " or settings document"
+            "Codex lines run under Dromon's Codex permission profile, and take no"
+            " sandbox or settings document"
         )
     return None
 
@@ -146,9 +161,38 @@ def engine_environment(
     return {k: v for k, v in environment.items() if k not in API_ENVIRONMENT}
 
 
-def server_arguments(servers: Sequence[str], config: LineConfig) -> list[str]:
+def _toml_string(text: str) -> str:
+    """``text`` as a TOML basic string. JSON's escapes are a subset of TOML's."""
+    if any(ord(character) < 0x20 for character in text):
+        raise EngineRefused(f"the path {text!r} holds a control character")
+    return json.dumps(text)
+
+
+def permission_profile(config: LineConfig, protected: Sequence[Path]) -> str:
+    """The ``dromon-line`` profile for ``config``, as an inline TOML table.
+
+    The workspace is writable only with a write tool, ``.git`` is readable but not
+    writable, and each ``protected`` directory that exists is denied, as its real path,
+    since Codex enforces the path the operating system sees.
+    """
+    workspace = "write" if WRITE_TOOLS & set(config.builtin_tools) else "read"
+    entries = [
+        f'":workspace_roots"={{"."="{workspace}", ".git"="read"}}',
+        *(
+            f'{_toml_string(os.path.realpath(directory))}="deny"'
+            for directory in protected
+            if os.path.exists(directory)
+        ),
+    ]
+    return f'{{extends=":workspace", filesystem={{{", ".join(entries)}}}}}'
+
+
+def server_arguments(
+    servers: Sequence[str], config: LineConfig, protected: Sequence[Path] = ()
+) -> list[str]:
     """The ``codex app-server`` arguments that isolate a line configured as ``config``
-    from the operator's ``servers`` and from every tool it was not given."""
+    from the operator's ``servers``, from every tool it was not given, and from the
+    ``protected`` directories."""
     arguments = ["app-server"]
     for name in sorted(set(servers)):
         # Codex's -c parser takes bare dotted keys only, and rejects a quoted one.
@@ -164,6 +208,12 @@ def server_arguments(servers: Sequence[str], config: LineConfig) -> list[str]:
     for feature in SHELL_FEATURES:
         arguments += [f"--{shell}", feature]
     arguments += ["-c", 'web_search="disabled"']
+    # A bare key, since Codex's -c parser rejects a quoted one, with the profile's
+    # quoted keys inside the inline table value.
+    arguments += [
+        "-c",
+        f"permissions.{PROFILE_NAME}={permission_profile(config, protected)}",
+    ]
     return arguments
 
 
@@ -310,6 +360,7 @@ class CodexLine:
         config: LineConfig = DEFAULT_CONFIG,
         mcp_tools: Sequence[SdkMcpTool[Any]] = (),
         session_id: str | None = None,
+        protected: Sequence[Path] = (),
         environment: Mapping[str, str] | None = None,
         connection_factory: ConnectionFactory = _app_server,
         server_lister: ServerLister = list_servers,
@@ -324,6 +375,7 @@ class CodexLine:
         self.config = config
         self.mcp_tools = {tool.name: tool for tool in mcp_tools}
         self.session_id = session_id
+        self.protected = tuple(protected)
         self._environment = os.environ if environment is None else environment
         self._connect = connection_factory
         self._list_servers = server_lister
@@ -339,7 +391,9 @@ class CodexLine:
         reason = unsupported(self.config)
         if reason is not None:
             raise EngineRefused(reason)
-        arguments = server_arguments(self._list_servers(environment), self.config)
+        arguments = server_arguments(
+            self._list_servers(environment), self.config, self.protected
+        )
         turn = _Turn()
         async with self._connect(arguments, self.cwd, environment) as connection:
             self._connection = connection
@@ -487,6 +541,8 @@ class CodexLine:
             name = str(item.get("tool"))
         elif kind == "commandExecution" and "Bash" in self.config.builtin_tools:
             name = "Bash"
+        elif kind == "fileChange" and WRITE_TOOLS & set(self.config.builtin_tools):
+            name = "Edit"
         else:
             await self._interrupt(
                 turn, f"the engine used a tool the line was not given: {kind}"
@@ -547,7 +603,7 @@ class CodexLine:
         settings: dict[str, object] = {
             "model": self.driver.settings.model,
             "cwd": str(self.cwd),
-            "sandbox": "read-only",
+            "permissions": PROFILE_NAME,
             "approvalPolicy": "never",
             "approvalsReviewer": "user",
         }
@@ -571,6 +627,16 @@ class CodexLine:
         provider = result.get("modelProvider")
         if provider != "openai":
             turn.refusal = f"the engine reports the model provider {provider!r}"
+            return thread_id
+        active = result.get("activePermissionProfile")
+        active_id = (
+            cast(dict[str, Any], active).get("id") if isinstance(active, dict) else None
+        )
+        if active_id != PROFILE_NAME:
+            turn.refusal = (
+                f"the engine runs the permission profile {active_id!r},"
+                f" not {PROFILE_NAME}"
+            )
             return thread_id
         model = str(result.get("model") or "")
         verdict = self.driver.step(Event("init", model))
