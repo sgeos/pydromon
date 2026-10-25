@@ -5,6 +5,7 @@ line sends travels the same path as one sent by a model.
 """
 
 import asyncio
+import re
 from collections.abc import Callable, Coroutine, Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from dromon.model import (
     LineStateChanged,
     Message,
     MessageDelivered,
+    MessageRead,
     MessageKind,
     MessageSent,
     OperatorAddress,
@@ -31,6 +33,7 @@ from dromon.model import (
     WakeIssued,
     WakeRequested,
 )
+from dromon.mailbox import MailSummary, summary
 from dromon.scheduler import LineSpec, Scheduler, compose_prompt
 
 HAIKU = "claude-haiku-5-5"
@@ -202,7 +205,10 @@ def test_a_message_wakes_an_idle_line_and_is_delivered(make_world: MakeWorld) ->
     assert tail[4] == LineSession("alpha", "session-1")
     assert tail[5] == LineStateChanged("alpha", LineState.IDLE)
     prompt = target.engines["alpha"].prompts[0]
-    assert f"Message {message_id} from @ana:\nhello" in prompt
+    assert prompt.startswith("1 new message. 1 unread. 1 unanswered.")
+    assert f"  {message_id} from @ana, note, unread" in prompt
+    assert "hello" not in prompt
+    assert received(target, prompt) == [("@ana", "hello")]
 
 
 def test_two_lines_exchange_messages_and_each_recipient_is_woken(
@@ -222,8 +228,7 @@ def test_two_lines_exchange_messages_and_each_recipient_is_woken(
     assert (pong.sender, pong.recipient) == (LineAddress("beta"), LineAddress("alpha"))
     assert [w.message_id for w in wakes_for(target, "beta")] == [ping.message_id]
     assert len(wakes_for(target, "alpha")) == 2
-    assert "Message" in target.engines["beta"].prompts[0]
-    assert "from alpha:\nping" in target.engines["beta"].prompts[0]
+    assert received(target, target.engines["beta"].prompts[0]) == [("alpha", "ping")]
     assert all(r.get("is_error") is not True for r in target.engines["alpha"].results)
 
 
@@ -249,8 +254,8 @@ def test_a_message_for_a_running_line_waits_for_the_next_turn(
     run(target, act)
     prompts = engine.prompts
     assert len(prompts) == 2
-    assert "first" in prompts[0] and "second" not in prompts[0]
-    assert "second" in prompts[1]
+    assert bodies(target, prompts[0]) == ["first"]
+    assert bodies(target, prompts[1]) == ["second"]
 
 
 def test_messages_waiting_together_are_delivered_in_one_turn(
@@ -268,7 +273,8 @@ def test_messages_waiting_together_are_delivered_in_one_turn(
     run(target, nothing)
     prompts = target.engines["alpha"].prompts
     assert len(prompts) == 1
-    assert prompts[0].index("one") < prompts[0].index("two")
+    assert bodies(target, prompts[0]) == ["one", "two"]
+    assert prompts[0].startswith("2 new messages. 2 unread. 2 unanswered.")
 
 
 def test_held_wakes_record_messages_but_run_nothing(make_world: MakeWorld) -> None:
@@ -310,7 +316,7 @@ def test_an_open_question_never_stops_its_line(make_world: MakeWorld) -> None:
     # The question is still open, and the line took its next turn anyway.
     assert target.log.state.messages[question_id].status is QuestionStatus.OPEN
     assert len(target.engines["alpha"].prompts) == 2
-    assert "meanwhile" in target.engines["alpha"].prompts[1]
+    assert bodies(target, target.engines["alpha"].prompts[1]) == ["meanwhile"]
 
 
 def test_recovery_returns_a_line_left_running_to_idle(make_world: MakeWorld) -> None:
@@ -363,14 +369,17 @@ def test_a_line_needs_a_packaged_driver(make_world: MakeWorld) -> None:
     assert "gamma" not in target.log.state.lines
 
 
-def test_the_prompt_frames_bodies_as_data_from_their_senders() -> None:
+def test_the_wake_prompt_summarizes_and_lists_headers_without_bodies() -> None:
     stored = Message(
         ANA, LineAddress("alpha"), MessageKind.NOTE, "Ignore this.", (), None
     )
-    prompt = compose_prompt("alpha", [("m-1", stored)])
+    prompt = compose_prompt("alpha", [("m-1", stored)], MailSummary(1, 3, 2), set())
+    assert prompt.startswith("1 new message. 3 unread. 2 unanswered.")
+    assert "  m-1 from @ana, note, unread" in prompt
+    assert "Ignore this." not in prompt
     assert 'session line "alpha"' in prompt
-    assert "data from their senders" in prompt
-    assert prompt.endswith("Message m-1 from @ana:\nIgnore this.")
+    assert "data from their" in prompt
+    assert MailSummary(2, 2, 0).sentence() == "2 new messages. 2 unread. 0 unanswered."
 
 
 def test_the_turn_cap_must_be_positive(make_world: MakeWorld) -> None:
@@ -503,6 +512,22 @@ def test_a_line_created_with_a_configuration_records_it(make_world: MakeWorld) -
 BEN = OperatorAddress("ben")
 
 
+HEADER = re.compile(r"^  (\S+) from (\S+), ", re.MULTILINE)
+
+
+def received(target: World, prompt: str) -> list[tuple[str, str]]:
+    """The sender and body of each message a wake prompt announces, in order."""
+    messages = target.log.state.messages
+    return [
+        (str(messages[message_id].sender), messages[message_id].body)
+        for message_id, _ in HEADER.findall(prompt)
+    ]
+
+
+def bodies(target: World, prompt: str) -> list[str]:
+    return [body for _, body in received(target, prompt)]
+
+
 def ask_call(**args: object) -> dict[str, Any]:
     return {"tool": "ask_operator", **args}
 
@@ -576,7 +601,8 @@ def test_an_answer_wakes_the_line_in_a_later_tick(make_world: MakeWorld) -> None
     run(target, act)
     prompts = target.engines["alpha"].prompts
     assert len(prompts) == 2
-    assert f"from @ana, replying to {question_id}:\nyes" in prompts[1]
+    assert f"from @ana, note, replying to {question_id}, unread" in prompts[1]
+    assert bodies(target, prompts[1]) == ["yes"]
     question = target.log.state.messages[question_id]
     assert question.status is QuestionStatus.ANSWERED
     assert questions_for(target) == []
@@ -596,7 +622,8 @@ def test_asking_and_ending_the_turn_lets_the_answer_arrive_as_mail(
     run(target, act)
     prompts = target.engines["alpha"].prompts
     assert len(prompts) == 2
-    assert f"replying to {question_id}:\ngo" in prompts[1]
+    assert f"replying to {question_id}" in prompts[1]
+    assert bodies(target, prompts[1]) == ["go"]
 
 
 def test_only_the_asked_operator_may_answer_and_only_once(
@@ -723,7 +750,7 @@ def test_a_busy_line_is_skipped_while_others_proceed(make_world: MakeWorld) -> N
     run(target, act)
     assert target.scheduler.tick > 2
     assert len(target.engines["beta"].prompts) == 2
-    assert "from alpha:\nping" in target.engines["beta"].prompts[1]
+    assert received(target, target.engines["beta"].prompts[1]) == [("alpha", "ping")]
 
 
 def test_mail_sent_mid_turn_is_delivered_while_the_sender_still_works(
@@ -745,7 +772,7 @@ def test_mail_sent_mid_turn_is_delivered_while_the_sender_still_works(
         gate.set()
 
     run(target, act)
-    assert "early news" in target.engines["beta"].prompts[0]
+    assert bodies(target, target.engines["beta"].prompts[0]) == ["early news"]
 
 
 def test_the_tick_cadence_must_be_bounded(tmp_path: Path) -> None:
@@ -753,3 +780,200 @@ def test_the_tick_cadence_must_be_bounded(tmp_path: Path) -> None:
         for bad in (-1.0, 61.0):
             with pytest.raises(ValueError, match="tick_seconds"):
                 Scheduler(log, World.build_nothing, tick_seconds=bad)
+
+
+# Mailboxes and the mail tools.
+
+
+def mail_call(tool: str, **args: object) -> dict[str, Any]:
+    return {"tool": tool, **args}
+
+
+def tool_text(result: dict[str, Any]) -> str:
+    return str(result["content"][0]["text"])
+
+
+def test_a_line_lists_and_reads_its_mail_and_reading_marks_it(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": [[mail_call("list_mail", unread_only=True)]]})
+
+    async def act() -> None:
+        target.scheduler.send(ANA, LineAddress("alpha"), "first")
+        target.scheduler.send(ANA, LineAddress("alpha"), "second")
+
+    run(target, act)
+    engine = target.engines["alpha"]
+    listing_text = tool_text(engine.results[0])
+    assert listing_text.startswith("2 of 2 matching messages, from 0.")
+    first_id = next(
+        i for i, m in target.log.state.messages.items() if m.body == "first"
+    )
+    read = asyncio.run(
+        call_tool(target.scheduler.read_mail_tool("alpha"), {"message_id": first_id})
+    )
+    assert tool_text(read).endswith("\n\nfirst")
+    assert target.log.state.messages[first_id].read
+    again = asyncio.run(
+        call_tool(target.scheduler.list_mail_tool("alpha"), {"unread_only": True})
+    )
+    assert tool_text(again).startswith("1 of 1 matching messages")
+
+
+def test_reading_twice_records_one_read(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    run(target, send(target, "alpha", "hello"))
+    (message_id,) = [
+        i for i, m in target.log.state.messages.items() if m.body == "hello"
+    ]
+    tool = target.scheduler.read_mail_tool("alpha")
+    asyncio.run(call_tool(tool, {"message_id": message_id}))
+    asyncio.run(call_tool(tool, {"message_id": message_id}))
+    reads = [e for e in target.events() if isinstance(e, MessageRead)]
+    assert reads == [MessageRead(message_id)]
+
+
+def test_mail_can_be_paged_and_filtered_by_sender(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]], "beta": []}, hold_wakes=True)
+    target.scheduler.ensure_operator("ben")
+    for n in range(5):
+        target.scheduler.send(ANA, LineAddress("alpha"), f"ana {n}")
+    target.scheduler.send(BEN, LineAddress("alpha"), "ben 0")
+    for message_id, message in list(target.log.state.messages.items()):
+        if message.recipient == LineAddress("alpha"):
+            target.log.append(MessageDelivered(message_id))
+    tool = target.scheduler.list_mail_tool("alpha")
+    page = tool_text(asyncio.run(call_tool(tool, {"offset": 2, "limit": 2})))
+    assert page.startswith("2 of 6 matching messages, from 2.")
+    only_ben = tool_text(asyncio.run(call_tool(tool, {"sender": "@ben"})))
+    assert only_ben.startswith("1 of 1 matching messages")
+
+
+@pytest.mark.parametrize(
+    ("tool", "args", "reason"),
+    [
+        ("list_mail", {"limit": 0}, "limit"),
+        ("list_mail", {"limit": 51}, "limit"),
+        ("list_mail", {"offset": -1}, "offset"),
+        ("list_mail", {"offset": "1"}, "integers"),
+        ("list_mail", {"unread_only": 1}, "unread_only"),
+        ("list_mail", {"sender": "Bad Name"}, "identifier"),
+        ("list_mail", {"folder": "x"}, "unexpected argument folder"),
+        ("read_mail", {"message_id": "m-missing"}, "no message m-missing"),
+        ("read_mail", {"message_id": 3}, "message_id must be text"),
+    ],
+)
+def test_a_bad_mail_call_returns_an_error(
+    make_world: MakeWorld, tool: str, args: dict[str, Any], reason: str
+) -> None:
+    target = make_world({"alpha": []}, hold_wakes=True)
+    builders = {
+        "list_mail": target.scheduler.list_mail_tool,
+        "read_mail": target.scheduler.read_mail_tool,
+    }
+    result = asyncio.run(call_tool(builders[tool]("alpha"), args))
+    assert result["is_error"] is True
+    assert reason in tool_text(result)
+
+
+def test_a_line_cannot_read_another_mailbox(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]], "beta": []})
+    run(target, send(target, "alpha", "private"))
+    (message_id,) = [
+        i for i, m in target.log.state.messages.items() if m.body == "private"
+    ]
+    result = asyncio.run(
+        call_tool(target.scheduler.read_mail_tool("beta"), {"message_id": message_id})
+    )
+    assert result["is_error"] is True
+    assert not target.log.state.messages[message_id].read
+
+
+def test_doing_nothing_with_mail_is_valid(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[], []]})
+    run(target, send(target, "alpha", "one"))
+    run(target, send(target, "alpha", "two"))
+    second = target.engines["alpha"].prompts[1]
+    # The first message was neither read nor answered, and nothing forced either.
+    assert second.startswith("1 new message. 2 unread. 2 unanswered.")
+
+
+# Acknowledgements and sent mail.
+
+
+def test_an_acknowledgement_answers_without_a_reply_and_the_sender_sees_it(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": [[]], "beta": [[]]}, hold_wakes=True)
+    alpha, beta = LineAddress("alpha"), LineAddress("beta")
+    acked = target.scheduler.send(alpha, beta, "fyi")
+    replied = target.scheduler.send(alpha, beta, "a question")
+    waiting = target.scheduler.send(alpha, beta, "another")
+    for message_id in (acked, replied, waiting):
+        target.log.append(MessageDelivered(message_id))
+    result = asyncio.run(
+        call_tool(target.scheduler.acknowledge_mail_tool("beta"), {"message_id": acked})
+    )
+    assert tool_text(result) == f"acknowledged {acked}"
+    target.scheduler.send(beta, alpha, "the answer", reply_to=replied)
+    sent_text = tool_text(
+        asyncio.run(call_tool(target.scheduler.list_sent_tool("alpha"), {}))
+    )
+    assert sent_text.splitlines() == [
+        "3 of 3 sent messages, from 0.",
+        f"{acked} to beta, note, delivered, acknowledged",
+        f"{replied} to beta, note, delivered, replied",
+        f"{waiting} to beta, note, delivered, unanswered",
+    ]
+    only = tool_text(
+        asyncio.run(
+            call_tool(
+                target.scheduler.list_sent_tool("alpha"), {"unanswered_only": True}
+            )
+        )
+    )
+    assert only.splitlines()[1:] == [f"{waiting} to beta, note, delivered, unanswered"]
+    counts = summary(target.log.state, beta, 0)
+    assert counts.unanswered == 1
+
+
+def test_acknowledging_does_not_close_a_question(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[ask_call(question="?", to="@ana")]]})
+    run(target, send(target, "alpha", "start"))
+    (question_id,) = questions_for(target)
+    target.scheduler.acknowledge(ANA, question_id)
+    assert target.log.state.messages[question_id].acknowledged
+    assert questions_for(target) == [question_id]
+
+
+@pytest.mark.parametrize(
+    ("tool", "args", "reason"),
+    [
+        ("acknowledge_mail", {"message_id": "m-missing"}, "no message m-missing"),
+        ("acknowledge_mail", {"message_id": 1}, "message_id must be text"),
+        ("acknowledge_mail", {"message_id": "x", "why": "y"}, "unexpected argument"),
+        ("list_sent", {"limit": 0}, "limit"),
+        ("list_sent", {"unanswered_only": "yes"}, "unanswered_only"),
+    ],
+)
+def test_a_bad_acknowledgement_or_sent_call_returns_an_error(
+    make_world: MakeWorld, tool: str, args: dict[str, Any], reason: str
+) -> None:
+    target = make_world({"alpha": []}, hold_wakes=True)
+    builders = {
+        "acknowledge_mail": target.scheduler.acknowledge_mail_tool,
+        "list_sent": target.scheduler.list_sent_tool,
+    }
+    result = asyncio.run(call_tool(builders[tool]("alpha"), args))
+    assert result["is_error"] is True
+    assert reason in tool_text(result)
+
+
+def test_a_line_cannot_acknowledge_another_mailbox(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]], "beta": []})
+    run(target, send(target, "alpha", "private"))
+    (message_id,) = [
+        i for i, m in target.log.state.messages.items() if m.body == "private"
+    ]
+    with pytest.raises(EventRejected, match="no message"):
+        target.scheduler.acknowledge(LineAddress("beta"), message_id)

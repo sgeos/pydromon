@@ -182,6 +182,29 @@ open, answered, withdrawn and superseded are tracked on the message. Forwarding 
 as the general adapter. See [`../protocol/EVENT_LOG.md`](../protocol/EVENT_LOG.md) and
 [`../protocol/RELAY.md`](../protocol/RELAY.md).
 
+**Decided 2026-10-25 by the operator.** Nobody is compelled to answer mail or questions.
+Deferring is always an option, and doing nothing is valid. A human or an agent with a
+hundred messages needs tools to look through them. The wake message reads along the
+lines of "X new message(s). Y unread. Z unanswered."
+
+**Implemented 2026-10-25.** Every party has a mailbox of the messages delivered to it.
+A message is unread until its recipient opens it, recorded as `message_read`, and
+unanswered until the recipient replies to it. A line's wake prompt opens with that
+summary sentence and lists the new mail's headers, without bodies, and the line's
+`list_mail` and `read_mail` tools page through its mailbox and open messages. Operators
+use `dromon mail` and `dromon read`. Nothing marks mail as needing an answer, and the
+prompt does not ask for one.
+
+**Decided 2026-10-25 by the operator.** A message can be acknowledged, which marks it
+answered without sending a reply. Senders see which messages were acknowledged as
+opposed to replied to, because they may be expecting a reply.
+
+**Implemented 2026-10-25.** `message_acknowledged` records an acknowledgement. Lines use
+`acknowledge_mail` and see their sent mail's fate with `list_sent`, and operators use
+`dromon ack` and `dromon sent`. Each sent message reads as waiting, delivered or read,
+and as replied, acknowledged or unanswered. Acknowledging a question does not close it,
+so a sender can tell that its question was seen but not yet answered.
+
 **Decided 2026-10-25 by the operator.** There is no such thing as a blocking question.
 After asking, a line may end its turn or keep working. That is up to the line-agent.
 

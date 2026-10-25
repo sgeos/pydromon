@@ -32,6 +32,10 @@ class Operation(StrEnum):
     SEND = "send"
     QUESTIONS = "questions"
     ANSWER = "answer"
+    MAIL = "mail"
+    READ = "read"
+    ACKNOWLEDGE = "acknowledge"
+    SENT = "sent"
 
 
 class ErrorCode(StrEnum):
