@@ -7,6 +7,9 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- The scheduler is a game loop. Each tick updates every line once and skips a busy one,
+  turns run without the tick waiting for them, and mail sent during a tick moves from
+  the sent queue to the post office at its end. `dromond` gains `--tick-seconds`.
 - The scheduler is tick based. A message sent in one turn is received no sooner than
   the next tick, even by an idle line, and messages never interrupt a turn. `status`
   reports the tick.

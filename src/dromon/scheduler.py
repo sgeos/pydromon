@@ -1,17 +1,22 @@
-"""Layer 1 messaging and wakes: the daemon's tick-based scheduler for its lines.
+"""Layer 1 messaging and wakes: the daemon's game loop for its session lines.
 
-Every message is a ``message_sent`` event in the log. The scheduler advances in ticks.
-At the start of a tick it takes a snapshot of every undelivered message whose recipient
-line is idle, unblocked and under its turn cap. Each such line is woken: the wake is
-recorded, the line is marked running, its messages from the snapshot are delivered
-into one turn, the turn runs, and the line is marked idle. The turns of one tick run
-concurrently, and the tick ends when all of them have.
+The scheduler runs a loop of ticks, like a game loop that updates every object once per
+frame. Each tick visits every line in a fixed order. A line that is busy with a turn is
+skipped, and that counts as its update for the tick. An idle line that is not blocked,
+not failed and under its turn cap, and that has mail in the post office, starts a turn:
+the wake is recorded, the line is marked running, its mail is delivered into the turn,
+and the turn then runs on its engine without the tick waiting for it. A turn may span
+many ticks.
 
-Messages are not interrupts. A message sent during a tick is delivered no sooner than
-the next tick, even when its recipient is idle throughout. Send this turn, received
-next turn. A message sent between ticks is delivered in the next tick, which starts as
-soon as there is work. Lines send messages from inside a turn through the
-``send_message`` tool, and operators through the client.
+Mail. Every message is a ``message_sent`` event in the log. A message sent during a
+tick, by a line in a turn or by an operator, goes to the sent queue. At the end of each
+tick the sent queue moves to the post office, and only post office mail is delivered,
+so a message is received no sooner than the next tick. Messages are not interrupts.
+After a restart, every undelivered message in the log was sent in an earlier tick, so
+it starts in the post office.
+
+Cadence. While anything is in flight, ticks follow one another every ``tick_seconds``.
+When nothing is, the loop rests until a message arrives.
 
 Safety. Two lines can wake each other without end, so each line has a cap on the turns
 the scheduler runs for it in one daemon lifetime. A line at its cap keeps its messages
@@ -22,9 +27,9 @@ sender, and only a message from an operator address carries operator authority, 
 the daemon attributes, never the text. Tool arguments from a line are checked like any
 other untrusted input.
 
-Concurrency. Everything runs on the daemon's event loop. The turns of one tick run as
-concurrent tasks, and every log append happens on the loop thread, so appends never
-interleave. A line takes at most one turn per tick.
+Concurrency. Everything runs on the daemon's event loop. Turns run as concurrent tasks,
+and every log append happens on the loop thread, so appends never interleave. A line has
+at most one turn in flight, and a tick starts at most one turn per line.
 
 Failure modes. An engine failure ends the turn, returns the line to idle and is written
 to standard error. A failed line is not woken again until a new message arrives for
@@ -35,6 +40,7 @@ schedules, so the Keleusma version can keep these semantics exactly.
 """
 
 import asyncio
+import contextlib
 import secrets
 import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -71,6 +77,9 @@ from dromon.model import (
 )
 
 DEFAULT_MAX_TURNS_PER_LINE: Final = 10
+
+DEFAULT_TICK_SECONDS: Final = 1.0
+MAX_TICK_SECONDS: Final = 60.0
 
 SEND_TOOL_NAME: Final = "send_message"
 
@@ -197,9 +206,12 @@ class Scheduler:
         *,
         max_turns_per_line: int = DEFAULT_MAX_TURNS_PER_LINE,
         hold_wakes: bool = False,
+        tick_seconds: float = DEFAULT_TICK_SECONDS,
     ) -> None:
         if max_turns_per_line < 1:
             raise ValueError("max_turns_per_line must be at least 1")
+        if not 0 <= tick_seconds <= MAX_TICK_SECONDS:
+            raise ValueError(f"tick_seconds must be in [0, {MAX_TICK_SECONDS}]")
         self._log = log
         self._engine_factory = engine_factory
         self._max_turns = max_turns_per_line
@@ -207,7 +219,16 @@ class Scheduler:
         self._engines: dict[str, LineEngine] = {}
         self._turns: dict[str, int] = {}
         self._failed: set[str] = set()
-        self._ticking = False
+        self._tick_seconds = tick_seconds
+        self._running: dict[str, asyncio.Task[None]] = {}
+        self._sent: list[str] = []
+        """Messages sent during the current tick, moved to the post office after it."""
+        self._post_office: set[str] = {
+            message_id
+            for message_id, message in log.state.messages.items()
+            if not message.delivered
+        }
+        """Messages deliverable from the next tick on."""
         self._work = asyncio.Event()
         self.tick = 0
         """The number of ticks run in this daemon's lifetime."""
@@ -262,6 +283,7 @@ class Scheduler:
                 message_id, sender, recipient, MessageKind.NOTE, body, reply_to=reply_to
             )
         )
+        self._sent.append(message_id)
         if isinstance(recipient, LineAddress):
             self._failed.discard(recipient.line_id)
         self._work.set()
@@ -425,80 +447,98 @@ class Scheduler:
             if message.recipient == address and not message.delivered
         ]
 
-    def _snapshot(self) -> dict[str, list[tuple[str, Message]]]:
-        """The messages each wakeable line receives in the next tick."""
+    def deliverable(self, line_id: str) -> list[tuple[str, Message]]:
+        """The post office mail for ``line_id``, in the order sent."""
+        return [
+            (message_id, message)
+            for message_id, message in self.pending(line_id)
+            if message_id in self._post_office
+        ]
+
+    def _can_start(self, line_id: str) -> bool:
         state = self._log.state
-        ready: dict[str, list[tuple[str, Message]]] = {}
-        for line_id, line in sorted(state.lines.items()):
-            if (
-                line.state is LineState.IDLE
-                and line_id not in self._failed
-                and self._turns.get(line_id, 0) < self._max_turns
-                and not state.is_blocked(line_id)
-            ):
-                messages = self.pending(line_id)
-                if messages:
-                    ready[line_id] = messages
-        return ready
+        return (
+            not self._hold
+            and line_id not in self._running
+            and state.lines[line_id].state is LineState.IDLE
+            and line_id not in self._failed
+            and self._turns.get(line_id, 0) < self._max_turns
+            and not state.is_blocked(line_id)
+        )
+
+    def _work_waiting(self) -> bool:
+        """Whether the next tick has anything to do or move."""
+        if self._running or self._sent:
+            return True
+        return any(
+            self._can_start(line_id) and self.deliverable(line_id)
+            for line_id in self._log.state.lines
+        )
+
+    def step(self) -> None:
+        """Run one tick: update every line once, then move the sent queue to the post
+        office. Turns the tick starts run on after it, as tasks."""
+        self.tick += 1
+        for line_id in sorted(self._log.state.lines):
+            if not self._can_start(line_id):
+                continue
+            messages = self.deliverable(line_id)
+            if not messages:
+                continue
+            self._begin_turn(line_id, messages)
+        self._post_office.update(self._sent)
+        self._sent.clear()
 
     async def run(self, stop: asyncio.Event) -> None:
         """Run ticks while there is work, until ``stop`` is set."""
-        stopping = asyncio.create_task(stop.wait())
         try:
             while not stop.is_set():
-                ready = {} if self._hold else self._snapshot()
-                if ready:
-                    await self._tick(ready, stopping)
+                if self._work_waiting():
+                    self.step()
+                    if self._tick_seconds:
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(stop.wait(), self._tick_seconds)
+                    else:
+                        await asyncio.sleep(0)
                     continue
                 self._work.clear()
                 worker = asyncio.create_task(self._work.wait())
+                stopping = asyncio.create_task(stop.wait())
                 await asyncio.wait(
                     {worker, stopping}, return_when=asyncio.FIRST_COMPLETED
                 )
                 worker.cancel()
+                stopping.cancel()
         finally:
-            stopping.cancel()
-
-    async def _tick(
-        self, ready: dict[str, list[tuple[str, Message]]], stopping: asyncio.Task[bool]
-    ) -> None:
-        """Run one turn for each line in ``ready``, concurrently, then end the tick."""
-        self.tick += 1
-        self._ticking = True
-        turns = [
-            asyncio.create_task(self._turn(line_id, messages))
-            for line_id, messages in ready.items()
-        ]
-        try:
-            finished = asyncio.gather(*turns)
-            await asyncio.wait(
-                {finished, stopping}, return_when=asyncio.FIRST_COMPLETED
-            )
-            if not finished.done():
-                for turn in turns:
-                    turn.cancel()
-                await asyncio.gather(*turns, return_exceptions=True)
-        finally:
-            self._ticking = False
+            for turn in list(self._running.values()):
+                turn.cancel()
+            if self._running:
+                await asyncio.gather(*self._running.values(), return_exceptions=True)
 
     async def idle(self) -> None:
-        """Wait until no tick runs and none would start. For tests and shutdown."""
-        # Bounded by the turn caps: each tick runs at least one turn or none starts.
+        """Wait until nothing is in flight and no tick would start a turn. For tests."""
+        # Bounded by the turn caps: each pass ends a turn, moves mail, or returns.
         while True:
             await asyncio.sleep(0)
-            if not self._ticking and (self._hold or not self._snapshot()):
+            if not self._work_waiting():
                 await asyncio.sleep(0)
-                if not self._ticking and (self._hold or not self._snapshot()):
+                if not self._work_waiting():
                     return
 
-    async def _turn(self, line_id: str, messages: list[tuple[str, Message]]) -> None:
+    def _begin_turn(self, line_id: str, messages: list[tuple[str, Message]]) -> None:
+        """Wake ``line_id`` and deliver its mail now, then run the turn as a task."""
         wake_id = new_id("w")
         self._log.append(WakeRequested(wake_id, line_id, messages[0][0]))
         self._log.append(WakeIssued(wake_id))
         self._log.append(LineStateChanged(line_id, LineState.RUNNING))
         for message_id, _ in messages:
             self._log.append(MessageDelivered(message_id))
+            self._post_office.discard(message_id)
         self._turns[line_id] = self._turns.get(line_id, 0) + 1
+        task = asyncio.get_running_loop().create_task(self._turn(line_id, messages))
+        self._running[line_id] = task
+
+    async def _turn(self, line_id: str, messages: list[tuple[str, Message]]) -> None:
         try:
             report = await self.engine_for(line_id).run_turn(
                 compose_prompt(line_id, messages)
@@ -517,6 +557,8 @@ class Scheduler:
         finally:
             if self._log.state.lines[line_id].state is LineState.RUNNING:
                 self._log.append(LineStateChanged(line_id, LineState.IDLE))
+            self._running.pop(line_id, None)
+            self._work.set()
         if self._turns[line_id] >= self._max_turns and self.pending(line_id):
             print(
                 f"dromond: line {line_id} reached its cap of {self._max_turns}"

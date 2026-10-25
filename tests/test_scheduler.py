@@ -100,6 +100,7 @@ class World:
             self.build,
             max_turns_per_line=max_turns_per_line,
             hold_wakes=hold_wakes,
+            tick_seconds=0,
         )
         self.scheduler.ensure_operator("ana")
         for line_id in scripts:
@@ -259,7 +260,7 @@ def test_messages_waiting_together_are_delivered_in_one_turn(
     target.scheduler.send(ANA, LineAddress("alpha"), "one")
     target.scheduler.send(ANA, LineAddress("alpha"), "two")
     assert len(target.scheduler.pending("alpha")) == 2
-    target.scheduler = Scheduler(target.log, target.build)
+    target.scheduler = Scheduler(target.log, target.build, tick_seconds=0)
 
     async def nothing() -> None:
         return None
@@ -440,9 +441,9 @@ def test_a_message_sent_in_a_tick_reaches_an_idle_line_only_in_the_next(
         for i, e in enumerate(events)
         if isinstance(e, MessageSent) and e.body == "ping"
     )
-    # beta was idle when ping arrived, yet woke only after alpha's tick ended.
-    assert ping < alpha_idle < beta_wake
-    assert target.scheduler.tick == 3
+    # beta was idle when ping arrived, yet woke only in a later tick.
+    assert ping < beta_wake
+    assert alpha_idle < beta_wake
 
 
 def test_each_line_takes_at_most_one_turn_per_tick(make_world: MakeWorld) -> None:
@@ -453,9 +454,18 @@ def test_each_line_takes_at_most_one_turn_per_tick(make_world: MakeWorld) -> Non
         target.scheduler.send(ANA, LineAddress("beta"), "two")
 
     run(target, act)
-    assert target.scheduler.tick == 1
     assert len(target.engines["alpha"].prompts) == 1
     assert len(target.engines["beta"].prompts) == 1
+    events = target.events()
+    starts = [i for i, e in enumerate(events) if isinstance(e, WakeRequested)]
+    # Both lines started in one tick, one after the other in the line order.
+    first, second = (events[i] for i in starts)
+    assert isinstance(first, WakeRequested) and isinstance(second, WakeRequested)
+    assert (first.line_id, second.line_id) == ("alpha", "beta")
+    between = events[starts[0] : starts[1]]
+    assert not any(
+        isinstance(e, LineStateChanged) and e.state is LineState.IDLE for e in between
+    )
 
 
 def test_a_configuration_reaches_the_engine_and_a_change_keeps_the_session(
@@ -593,8 +603,11 @@ def test_a_blocking_question_pauses_its_line_until_answered(
 
     run(target, act)
     prompts = target.engines["alpha"].prompts
-    assert len(prompts) == 2
-    assert "meanwhile" in prompts[1] and "go" in prompts[1]
+    # The answer unblocks the line at once, so the waiting message goes first, and the
+    # answer itself arrives a tick later, as all mail does.
+    assert len(prompts) == 3
+    assert "meanwhile" in prompts[1] and "go" not in prompts[1]
+    assert f"replying to {question_id}:\ngo" in prompts[2]
 
 
 def test_only_the_asked_operator_may_answer_and_only_once(
@@ -616,12 +629,12 @@ def test_only_the_asked_operator_may_answer_and_only_once(
 def test_an_open_question_survives_a_restart(tmp_path: Path) -> None:
     path = tmp_path / "events.sqlite"
     with EventLog(path) as log:
-        first = Scheduler(log, World.build_nothing)
+        first = Scheduler(log, World.build_nothing, tick_seconds=0)
         first.ensure_operator("ana")
         first.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
         question_id = first.ask("alpha", ANA, "Still there?", blocking=True)
     with EventLog(path) as log:
-        restarted = Scheduler(log, World.build_nothing)
+        restarted = Scheduler(log, World.build_nothing, tick_seconds=0)
         assert [i for i, _ in restarted.questions(ANA)] == [question_id]
         assert log.state.is_blocked("alpha")
 
@@ -634,7 +647,7 @@ def test_a_restarted_scheduler_resumes_each_lines_engine_session(
     session = target.log.state.lines["alpha"].engine_session
     assert session is not None
     target.engines.clear()
-    target.scheduler = Scheduler(target.log, target.build)
+    target.scheduler = Scheduler(target.log, target.build, tick_seconds=0)
     run(target, send(target, "alpha", "two"))
     rebuilt = target.engines["alpha"].spec
     assert rebuilt is not None and rebuilt.session_id == session
@@ -700,3 +713,56 @@ def test_a_live_line_asks_and_is_woken_by_the_answer(tmp_path: Path) -> None:
         assert log.state.messages[question_id].status is QuestionStatus.ANSWERED
         assert len(scheduler.turn_reports) == 2
         assert not log.state.is_blocked("alpha")
+
+
+def test_a_busy_line_is_skipped_while_others_proceed(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[{"to": "beta", "body": "ping"}]], "beta": [[], []]})
+    alpha = target.engine("alpha")
+    gate = asyncio.Event()
+    alpha.gate = gate
+
+    async def act() -> None:
+        target.scheduler.send(ANA, LineAddress("alpha"), "slow work")
+        target.scheduler.send(ANA, LineAddress("beta"), "quick work")
+        while len(target.engine("beta").prompts) < 1:
+            await asyncio.sleep(0)
+        for _ in range(50):
+            await asyncio.sleep(0)
+        # alpha is still in its turn, yet ticks went on and beta finished its turn.
+        assert target.log.state.lines["alpha"].state is LineState.RUNNING
+        assert target.log.state.lines["beta"].state is LineState.IDLE
+        gate.set()
+
+    run(target, act)
+    assert target.scheduler.tick > 2
+    assert len(target.engines["beta"].prompts) == 2
+    assert "from alpha:\nping" in target.engines["beta"].prompts[1]
+
+
+def test_mail_sent_mid_turn_is_delivered_while_the_sender_still_works(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": [[]], "beta": [[]]})
+    alpha = target.engine("alpha")
+    gate = asyncio.Event()
+    alpha.gate = gate
+
+    async def act() -> None:
+        target.scheduler.send(ANA, LineAddress("alpha"), "start")
+        while not alpha.prompts:
+            await asyncio.sleep(0)
+        target.scheduler.send(LineAddress("alpha"), LineAddress("beta"), "early news")
+        while not target.engine("beta").prompts:
+            await asyncio.sleep(0)
+        assert target.log.state.lines["alpha"].state is LineState.RUNNING
+        gate.set()
+
+    run(target, act)
+    assert "early news" in target.engines["beta"].prompts[0]
+
+
+def test_the_tick_cadence_must_be_bounded(tmp_path: Path) -> None:
+    with EventLog(tmp_path / "events.sqlite") as log:
+        for bad in (-1.0, 61.0):
+            with pytest.raises(ValueError, match="tick_seconds"):
+                Scheduler(log, World.build_nothing, tick_seconds=bad)

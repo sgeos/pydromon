@@ -101,7 +101,7 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromon questions` | Sends `questions` for `--operator`, default the login name, or for every operator with `--all`, and prints each question with its choices | 0, 4, or 1 |
 | `dromon answer QUESTION BODY` | Sends `answer`, with `--operator`, default the login name | 0, 4, or 1 |
 | `dromon probe` | Runs one short turn without the daemon and reports the engine's capabilities | 0 or 1 |
-| `dromond` | Runs the daemon in the foreground. `--max-turns-per-line N` caps the turns run for each line, default 10, and `--hold-wakes` records messages without waking any line | 0, 1 on failure, 2 on a bad cap, or 5 when another daemon holds the lock |
+| `dromond` | Runs the daemon in the foreground. `--max-turns-per-line N` caps the turns run for each line, default 10, and `--hold-wakes` records messages without waking any line, and `--tick-seconds S` sets the time between ticks while work is in flight, default 1, at most 60 | 0, 1 on failure, 2 on a bad cap or cadence, or 5 when another daemon holds the lock |
 
 The tool options are `--tool NAME`, repeatable, `--mcp-config FILE`, a JSON file of MCP
 servers that the client reads, `--allow-tool NAME`, repeatable, `--allow-all-tools` and
