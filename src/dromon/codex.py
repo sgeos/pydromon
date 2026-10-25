@@ -52,7 +52,7 @@ from claude_agent_sdk import SdkMcpTool
 
 from dromon import __version__
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
-from dromon.engine import EngineRefused, TurnReport
+from dromon.engine import EngineRefused, TurnReport, read_instructions
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
 
 ENGINE_NAME: Final = "codex"
@@ -118,6 +118,8 @@ def unsupported(config: LineConfig) -> str | None:
         )
     if config.mcp_servers or config.inherit_account_mcp:
         return "Codex lines do not yet support MCP servers"
+    if config.claude_code_prompt:
+        return "Codex lines run on Codex's own instructions, not Claude Code's prompt"
     if config.sandbox is not None or config.settings is not None:
         return (
             "Codex lines run in Codex's own read-only sandbox, and take no sandbox"
@@ -549,6 +551,9 @@ class CodexLine:
             "approvalPolicy": "never",
             "approvalsReviewer": "user",
         }
+        instructions = read_instructions(self.config.instructions, self.cwd)
+        if instructions:
+            settings["developerInstructions"] = instructions
         if self.session_id is None:
             settings["dynamicTools"] = [
                 dynamic_tool(t) for t in self.mcp_tools.values()

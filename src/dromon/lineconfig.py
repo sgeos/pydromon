@@ -10,6 +10,12 @@ the operator's user settings and claude.ai account, which are otherwise excluded
 ``settings`` its own engine settings, as ``dromon.settings`` defines them, and
 ``effort`` replaces the reasoning effort its driver declares.
 
+Instructions. ``claude_code_prompt`` runs a Claude Code line on Claude Code's own system
+prompt instead of an empty one, and ``instructions`` names files, such as a project's
+``CLAUDE.md``, whose text is appended to the system prompt at the start of each turn. A
+relative path is resolved against the project root, and ``~`` against the home
+directory. Only the paths are stored.
+
 References. Any text of an MCP server may hold ``${NAME}`` or ``${NAME:-default}``,
 which the engine replaces with the daemon's environment at the start of each turn, as
 Claude Code expands its ``.mcp.json``. Only the reference is stored, so a token can stay
@@ -52,6 +58,8 @@ TOOL_PATTERN: Final = re.compile(
 )
 MAX_ENTRIES: Final = 256
 MAX_TEXT: Final = 4096
+
+MAX_INSTRUCTION_FILES: Final = 16
 
 EFFORTS: Final = ("low", "medium", "high", "xhigh", "max")
 """The reasoning efforts Claude Code accepts."""
@@ -162,6 +170,10 @@ class LineConfig:
     """The line's own engine settings, before the project's are merged in."""
     effort: str | None = None
     """The reasoning effort, or ``None`` for the one the driver declares."""
+    claude_code_prompt: bool = False
+    """Whether a Claude Code line runs on Claude Code's own system prompt."""
+    instructions: tuple[str, ...] = ()
+    """Files whose text is appended to the system prompt, in order."""
 
     def allows(self, tool_name: str, own_tools: frozenset[str]) -> bool:
         """Whether the policy allows ``tool_name``. Dromon's own tools always pass."""
@@ -204,6 +216,10 @@ def encode_config(config: LineConfig) -> str:
         document["settings"] = config.settings.document()
     if config.effort is not None:
         document["effort"] = config.effort
+    if config.claude_code_prompt:
+        document["claude_code_prompt"] = True
+    if config.instructions:
+        document["instructions"] = list(config.instructions)
     return json.dumps(
         document,
         ensure_ascii=False,
@@ -329,6 +345,8 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         "sandbox",
         "settings",
         "effort",
+        "claude_code_prompt",
+        "instructions",
     }
     unknown = set(document) - allowed
     if unknown:
@@ -367,6 +385,14 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
     effort = document.get("effort")
     if effort is not None and effort not in EFFORTS:
         _fail(f"effort must be one of {list(EFFORTS)}, found {effort!r}")
+    prompt = document.get("claude_code_prompt", False)
+    if type(prompt) is not bool:
+        _fail("claude_code_prompt must be a boolean")
+    instructions = _texts(document.get("instructions", []), "instructions")
+    if len(instructions) > MAX_INSTRUCTION_FILES:
+        _fail(f"instructions names more than {MAX_INSTRUCTION_FILES} files")
+    if len(set(instructions)) != len(instructions):
+        _fail("instructions names a file twice")
     return LineConfig(
         builtin_tools=tuple(sorted(set(builtin))),
         mcp_servers=parse_servers(document.get("mcp_servers", {})),
@@ -376,6 +402,8 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         sandbox=sandbox,
         settings=settings,
         effort=cast(str | None, effort),
+        claude_code_prompt=prompt,
+        instructions=instructions,
     )
 
 
