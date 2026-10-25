@@ -64,11 +64,14 @@ it stopped.
 The credential code is 0 before the engine reports a credential, 1 for a subscription
 and 2 for API usage.
 
-**Fact, relayed by the `pykeleusma` line on 2026-10-25.** Keleusma 0.2.2 initializes
-each `private data` field to unit at every reset, and `pykeleusma` 0.1.0 does not
-support shared `data` blocks. Keeping the state in the host works around both. It
-also lets the event log record driver state, which a data segment inside the VM would
-hide. A later interface may move the state into a data segment if that proves better.
+The state lives in the host so that the event log can record it and a restarted line
+can resume it, which a data segment inside the VM would hide.
+
+**Fact, executed on 2026-10-25.** A `private data` field starts as unit and, once
+assigned, persists across cycles. An earlier statement here that it resets at every
+cycle was wrong, and came from a test that read a field before assigning it. The
+`pykeleusma` line has accepted shared data support as its task 11, which lends a host
+buffer to the module's `data` block. A later interface may use either.
 
 ## Events
 

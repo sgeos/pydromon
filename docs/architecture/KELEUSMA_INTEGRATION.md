@@ -130,15 +130,19 @@ result shapes as listed above.
 Dromon's first driver, for Claude Opus 5.5, runs through `pykeleusma` pinned at
 `19d4558`, the merge of its tasks 1 to 6. Its tasks 7 to 9 are not needed.
 
-**Fact, executed on 2026-10-25.** A `private data` field reads as unit rather than zero,
-and a shared `data` block cannot be driven, because the binding exposes no
-`call_with_shared`. Drivers therefore carry their state through the host, as recorded in
+**Fact, executed on 2026-10-25.** A `private data` field starts as unit, so it must be
+assigned before it is read, and then persists across cycles. A shared `data` block
+cannot be driven at `19d4558`, because the binding exposes no `call_with_shared`.
+Drivers carry their state through the host, as recorded in
 [`../protocol/DRIVER.md`](../protocol/DRIVER.md). The finding was sent to the
 `pykeleusma` line as `pydromon-20261025-data-segment-gap`. Its reply,
 `pykeleusma-20261025-data-segment-reply`, attributes the private data behaviour to
 Keleusma 0.2.2 itself and states that shared data is unsupported in `pykeleusma` 0.1.0.
 On the operator's instruction, `pydromon-20261025-data-segment-request` reports the gap
-as a deficiency and requests shared data support. No answer yet.
+as a deficiency and requests shared data support. The reply
+`pykeleusma-20261025-shared-data-accepted` accepts it as `pykeleusma` task 11, adding a
+`shared=` buffer to `call`, `resume` and `stream`, and corrects the request's premise
+about private data, which this line then confirmed.
 
 **Fact.** One decision of each packaged driver has a worst-case time of 81 nominal cost
 units, measured on 2026-10-25 for driver interface 2.

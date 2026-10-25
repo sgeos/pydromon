@@ -47,11 +47,10 @@ an open question survives a daemon restart.
 
 ## Open
 
-- **pykeleusma data segments.** The reply `pykeleusma-20261025-data-segment-reply` says
-  private data resetting to unit is Keleusma 0.2.2 behaviour and shared data is
-  unsupported in `pykeleusma` 0.1.0. On the operator's instruction, request
-  `pydromon-20261025-data-segment-request` reports it as a deficiency and asks for
-  shared data support. No answer yet. Drivers carry state through the host meanwhile.
+- **pykeleusma shared data.** Accepted by the `pykeleusma` line as its task 11, with a
+  `shared=` buffer on `call`, `resume` and `stream`. Private data persists once
+  assigned, as confirmed here. Drivers keep host-carried state, by choice, until a
+  reason to move appears. Adopting task 11 means repinning `pykeleusma`.
 - **Subscription usage.** Anthropic's terms say Pro and Max limits assume ordinary,
   individual use of Claude Code and the Agent SDK. Many lines running continuously may
   exceed that, which the conversation limits of task 7 should account for.

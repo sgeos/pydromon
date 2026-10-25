@@ -37,4 +37,8 @@ the sandbox, and both live tests passing on Haiku 5.5. Ruff and pyright strict c
 **Not verified.** Restart recovery against a real engine mid-turn, and two lines on
 different models. Engine sessions are not persisted across daemon restarts.
 
+**Correction, after the merge.** The `pykeleusma` line accepted shared data support as
+its task 11 and pointed out that private data persists once assigned. A check here
+confirmed it, and the drivers and documents no longer say otherwise.
+
 **Next.** Task 6, operator questions.
