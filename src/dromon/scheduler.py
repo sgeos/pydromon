@@ -56,7 +56,7 @@ from typing import Any, Final, Protocol, cast
 
 from claude_agent_sdk import SdkMcpTool
 
-from dromon.driver import Driver, Strategy
+from dromon.driver import MODELS, Driver, DriverError, Strategy
 from dromon.engine import ClaudeCodeLine, TurnReport
 from dromon.eventlog import EventLog
 from dromon.limits import DEFAULT_LIMITS, Limits
@@ -359,8 +359,14 @@ class Scheduler:
         strategy: Strategy,
         config: LineConfig = DEFAULT_CONFIG,
     ) -> None:
-        """Create a line after checking that a driver exists for it."""
-        Driver.for_model(model, strategy)
+        """Create a line after checking that a driver exists for it and that Dromon
+        has an adapter for the driver's engine."""
+        driver = Driver.for_model(model, strategy)
+        if model not in MODELS:
+            raise DriverError(
+                f"{model} runs on the {driver.settings.engine} engine, for which Dromon"
+                " has no adapter yet"
+            )
         self._log.append(LineCreated(line_id, model, strategy.value))
         if config != DEFAULT_CONFIG:
             self.configure_line(line_id, config)

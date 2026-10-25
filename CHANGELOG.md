@@ -43,6 +43,12 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Drivers for GPT-6-Luna on Codex in all three strategies, with settings from Codex's
+  model catalogue. Driver interface 3 adds the `engine` each driver is written for. A
+  line can be created only on a model whose engine has an adapter, so no line runs these
+  drivers until a Codex adapter exists, and the Claude Code adapter refuses them.
+- `docs/architecture/DESIGN.md` records whether the Claude Code conclusions on
+  subscriptions, tokens, billing and account tools hold for Codex and Grok Build.
 - Engine settings at parity with the settings actually used on the operator's machine
   in Claude Code, Codex and Grok Build, specified by `docs/protocol/SETTINGS.md` with
   the review behind them. Permission rules, command hooks, `env` and `attribution`, in

@@ -468,6 +468,13 @@ def test_a_line_needs_a_packaged_driver(make_world: MakeWorld) -> None:
     assert "gamma" not in target.log.state.lines
 
 
+def test_a_line_needs_an_adapter_for_its_drivers_engine(make_world: MakeWorld) -> None:
+    target = make_world({})
+    with pytest.raises(DriverError, match="codex engine, for which Dromon has no"):
+        target.scheduler.create_line("gamma", "gpt-6-luna", Strategy.SUBSCRIPTION)
+    assert "gamma" not in target.log.state.lines
+
+
 def test_the_wake_prompt_summarizes_and_lists_headers_without_bodies() -> None:
     stored = Message(
         ANA, LineAddress("alpha"), MessageKind.NOTE, "Ignore this.", (), None

@@ -83,6 +83,9 @@ from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
 from dromon.lineconfig import DEFAULT_CONFIG, ConfigError, LineConfig
 from dromon.sandbox import blocks_unsandboxed
 
+ENGINE_NAME: Final = "claude-code"
+"""The engine this adapter runs, as drivers name it."""
+
 MCP_SERVER_NAME: Final = "dromon"
 """The name of the in-process MCP server that serves a line's Dromon tools."""
 
@@ -289,6 +292,11 @@ class ClaudeCodeLine:
         environment: Mapping[str, str] | None = None,
         session_factory: SessionFactory = _sdk_session,
     ) -> None:
+        if driver.settings.engine != ENGINE_NAME:
+            raise EngineRefused(
+                f"the driver for {driver.settings.model} is written for the"
+                f" {driver.settings.engine} engine, not {ENGINE_NAME}"
+            )
         self.driver = driver
         self.cwd = cwd
         self.config = config

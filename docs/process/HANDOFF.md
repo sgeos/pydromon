@@ -16,9 +16,10 @@ completed, moved or abandoned.
   - `daemon.py`, `client.py`, `protocol.py`, `paths.py` and `exits.py` are the daemon
     skeleton behind `dromon start`, `status` and `stop`.
   - `engine.py` runs turns on Claude Code through the Agent SDK. `driver.py` hosts
-    Keleusma drivers through `pykeleusma`. Six concrete drivers in `drivers/` cover
-    Opus 5.5 and Haiku 5.5, each with a subscription, an API and a flexible strategy
-    baked in, by the operator's decision. `dromon probe` reports capabilities and
+    Keleusma drivers through `pykeleusma`. Concrete drivers in `drivers/` cover Opus
+    5.5, Haiku 5.5 and GPT-6-Luna, each in a subscription, API and flexible strategy,
+    by the operator's decision. Luna's name the `codex` engine, which has no adapter,
+    so no line can run them. `dromon probe` reports capabilities and
     defaults to Haiku 5.5, the least expensive model, which tests also use.
   - `scheduler.py` is a game loop, by the operator's decision. Each tick updates every
     line once and skips a busy one, turns span ticks, and mail sent in a tick is
@@ -57,7 +58,6 @@ completed, moved or abandoned.
   HTTPS remote that uses the GitHub command-line tool as its credential helper.
   `.github/workflows/ci.yml` runs Ruff, Pyright and pytest on Ubuntu and macOS for
   Python 3.12 and 3.15. Live tests run only locally.
-- **Commands.** All planned subcommands exist.
 - **pykeleusma.** Its tasks 2, 3 and 10 are done. Python cannot yet drive a script,
   because `call` and `resume` are its open task 5. Dromon's 0.1.0 does not depend on it.
 
@@ -67,10 +67,10 @@ Milestone 0.1.0 is complete. The next milestone awaits the operator's direction.
 
 ## Open
 
-- **pykeleusma shared data.** Accepted by the `pykeleusma` line as its task 11. Its
-  later notice `pykeleusma-20261025-shared-data-update` says the VM now owns a zeroed
-  block that persists across calls. Private data persists once assigned. Drivers keep host-carried state, by choice, until a
-  reason to move appears. Adopting task 11 means repinning `pykeleusma`.
+- **pykeleusma shared data.** Its task 11. Notice
+  `pykeleusma-20261025-shared-data-update` says the VM now owns a zeroed block that
+  persists across calls. Drivers keep host-carried state, by choice, until a reason to
+  move appears. Adopting it means repinning `pykeleusma`.
 - **Subscription usage.** Anthropic's terms assume ordinary, individual use of Pro and
   Max plans. Many lines running continuously may exceed that.
 - **Event log debt.** `read_entries` loads the whole log into memory, with no
@@ -91,24 +91,25 @@ Milestone 0.1.0 is complete. The next milestone awaits the operator's direction.
   or language servers, no MCP OAuth, and Linux not verified live. The merge of `Read`
   and `Edit` rules into the sandbox is untested. Listed in `SANDBOX.md` and
   `SETTINGS.md`.
+- **Codex adapter.** Owed before a Luna line runs: credential detection, OpenAI and
+  xAI variables in the reserved lists, and isolation from account MCP servers. See the
+  Codex and Grok Build review in `DESIGN.md`.
 - **In the design.** Teacher-model scope and the Rust repository's eventual name.
 
 ## Environment
 
-On 2026-10-25, inside Claude Code's sandbox, `uv sync`, the gates, `git fetch`, `git
-push` and `gh` ran without escalation. The sandbox denies binding a Unix domain socket,
-so the tests marked `socket` and any manual daemon run need a command outside the
-sandbox. The rest run inside it with `-m "not socket and not live"`. Claude Code keeps
-its login in the macOS Keychain, so `dromon probe` and the live test also run outside
-the sandbox. The sandbox denies writes to `.git/config`, so `git push -u` cannot record
-an upstream.
+On 2026-10-25, inside Claude Code's sandbox, `uv sync`, the gates, `git push` and `gh`
+ran without escalation. The sandbox denies binding a Unix domain socket, the macOS
+Keychain and writes to `.git/config`, so the `socket` and `live` tests, `dromon probe`
+and a manual daemon run need a command outside it. The rest run inside it with
+`-m "not socket and not live"`.
 
 ## Validity
 
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 720 tests pass, plus 6 live tests deselected
+uv sync && uv run pytest    # 745 tests pass, plus 6 live tests deselected
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 
