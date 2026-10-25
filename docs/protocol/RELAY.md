@@ -41,7 +41,6 @@ A notice is one JSON object, encoded canonically as in [`EVENT_LOG.md`](EVENT_LO
 | `kind` | `note` or `question` |
 | `body` | The message text |
 | `choices` | The question's choices, possibly empty |
-| `blocking` | Whether the asking line waits for the answer |
 | `reply_to` | The message this one replies to, or `null` |
 
 ## Command relay

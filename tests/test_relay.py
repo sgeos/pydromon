@@ -38,7 +38,7 @@ SETUP: tuple[Event, ...] = (
     OperatorRegistered("ana"),
     OperatorRegistered("ben"),
     OperatorRegistered("cleo"),
-    MessageSent("q1", ALPHA, ANA, QUESTION, "For Ana?", ("yes", "no"), blocking=True),
+    MessageSent("q1", ALPHA, ANA, QUESTION, "For Ana?", ("yes", "no")),
     MessageSent("q2", ALPHA, BEN, QUESTION, "For Ben?"),
     MessageSent("q3", ALPHA, CLEO, QUESTION, "For Cleo?"),
     MessageSent("n1", ANA, ALPHA, MessageKind.NOTE, "not for an operator"),
@@ -75,7 +75,6 @@ def test_only_undelivered_operator_messages_are_pending(log: EventLog) -> None:
         "ana",
         ("yes", "no"),
     )
-    assert first.blocking
 
 
 def test_each_operator_is_routed_to_their_own_relay(log: EventLog) -> None:
@@ -119,7 +118,7 @@ def test_a_defect_in_a_relay_propagates(log: EventLog) -> None:
 
 
 def test_the_notice_encoding_is_canonical_and_versioned() -> None:
-    notice = Notice("q", "alpha", "ana", QUESTION, "✓", ("a",), True, None)
+    notice = Notice("q", "alpha", "ana", QUESTION, "✓", ("a",), None)
     text = encode_notice(notice)
     document = json.loads(text)
     assert document["v"] == NOTICE_VERSION
@@ -153,7 +152,7 @@ def test_a_nonzero_exit_is_a_relay_error_with_detail() -> None:
     relay = CommandRelay(
         [sys.executable, "-I", "-c", "import sys; sys.exit('no route')"]
     )
-    notice = Notice("q", "alpha", "ana", QUESTION, "?", (), False, None)
+    notice = Notice("q", "alpha", "ana", QUESTION, "?", (), None)
     with pytest.raises(RelayError, match="status 1: no route"):
         relay.forward(notice)
 
@@ -162,14 +161,14 @@ def test_a_slow_command_times_out() -> None:
     relay = CommandRelay(
         [sys.executable, "-I", "-c", "import time; time.sleep(5)"], timeout_seconds=0.2
     )
-    notice = Notice("q", "alpha", "ana", QUESTION, "?", (), False, None)
+    notice = Notice("q", "alpha", "ana", QUESTION, "?", (), None)
     with pytest.raises(RelayError, match="timed out"):
         relay.forward(notice)
 
 
 def test_a_missing_command_is_a_relay_error(tmp_path: Path) -> None:
     relay = CommandRelay([str(tmp_path / "no-such-command")])
-    notice = Notice("q", "alpha", "ana", QUESTION, "?", (), False, None)
+    notice = Notice("q", "alpha", "ana", QUESTION, "?", (), None)
     with pytest.raises(RelayError, match="could not start"):
         relay.forward(notice)
 
@@ -179,7 +178,7 @@ def test_notice_text_cannot_change_what_runs(tmp_path: Path) -> None:
     marker = tmp_path / "injected"
     relay = CommandRelay([sys.executable, "-I", "-c", ECHO_TO_FILE, str(out)])
     body = f"; touch {marker} $(touch {marker}) `touch {marker}`"
-    relay.forward(Notice("q", "alpha", "ana", QUESTION, body, (), False, None))
+    relay.forward(Notice("q", "alpha", "ana", QUESTION, body, (), None))
     assert json.loads(out.read_text(encoding="utf-8"))["body"] == body
     assert not marker.exists()
 

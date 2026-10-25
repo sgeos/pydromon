@@ -79,12 +79,6 @@ def check_text(name: str, value: object, limit: int = MAX_TEXT_BYTES) -> None:
         raise InvalidField(f"{name} is {size} bytes, over the limit of {limit}")
 
 
-def check_bool(name: str, value: object) -> None:
-    """Raise ``InvalidField`` unless ``value`` is a boolean and not an integer."""
-    if type(value) is not bool:
-        raise InvalidField(f"{name} is not a boolean: {value!r}")
-
-
 def check_member(name: str, value: object, kind: type[StrEnum]) -> None:
     """Raise ``InvalidField`` unless ``value`` is a member of ``kind``."""
     if not isinstance(value, kind):
@@ -259,7 +253,6 @@ class MessageSent:
     kind: MessageKind
     body: str
     choices: tuple[str, ...] = ()
-    blocking: bool = False
     reply_to: str | None = None
 
     def __post_init__(self) -> None:
@@ -269,10 +262,9 @@ class MessageSent:
         check_member("kind", self.kind, MessageKind)
         check_text("body", self.body)
         check_choices(self.choices)
-        check_bool("blocking", self.blocking)
         check_optional_id("reply_to", self.reply_to)
-        if self.kind is MessageKind.NOTE and (self.choices or self.blocking):
-            raise InvalidField("only a question has choices or blocks")
+        if self.kind is MessageKind.NOTE and self.choices:
+            raise InvalidField("only a question has choices")
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,7 +352,6 @@ class Message:
     kind: MessageKind
     body: str
     choices: tuple[str, ...]
-    blocking: bool
     reply_to: str | None
     delivered: bool = False
     status: QuestionStatus | None = None
@@ -393,14 +384,6 @@ class State:
         """Return an independent snapshot. The records are frozen, so maps suffice."""
         return State(
             dict(self.lines), set(self.operators), dict(self.messages), dict(self.wakes)
-        )
-
-    def is_blocked(self, line_id: str) -> bool:
-        """Whether ``line_id`` has an open blocking question, which pauses only it."""
-        asker = LineAddress(line_id)
-        return any(
-            m.sender == asker and m.blocking and m.status is QuestionStatus.OPEN
-            for m in self.messages.values()
         )
 
     def open_questions(self, operator_id: str) -> list[str]:
@@ -534,8 +517,6 @@ class State:
             raise EventRejected(
                 f"line {event.line_id} cannot go from {line.state} to {event.state}"
             )
-        if event.state is LineState.RUNNING and self.is_blocked(event.line_id):
-            raise EventRejected(f"line {event.line_id} is blocked on a question")
 
     def _check_message_sent(self, event: MessageSent) -> None:
         if event.message_id in self.messages:
@@ -585,8 +566,6 @@ class State:
         line = self._line(wake.line_id)
         if line.state is not LineState.IDLE:
             raise EventRejected(f"line {wake.line_id} is {line.state}, not idle")
-        if self.is_blocked(wake.line_id):
-            raise EventRejected(f"line {wake.line_id} is blocked on a question")
 
     def _check_superseded(self, event: QuestionSuperseded) -> None:
         old = self._open_question(event.message_id)
@@ -609,7 +588,6 @@ class State:
             event.kind,
             event.body,
             event.choices,
-            event.blocking,
             event.reply_to,
             status=status,
         )

@@ -80,22 +80,20 @@ def test_string_escapes_are_pinned_so_ports_can_compare_bytes() -> None:
         '\\"\\\\/\x7f '
     )
     event = MessageSent("a", ANA, BETA, MessageKind.NOTE, text, reply_to="q")
-    expected = f'{{"data":{{"blocking":false,"body":"{escaped}",'
+    expected = f'{{"data":{{"body":"{escaped}",'
     assert encode(event).startswith(expected)
     assert decode(encode(event)) == event
 
 
 def test_a_message_payload_uses_address_text_and_null_for_no_reply() -> None:
-    event = MessageSent("q", BETA, ANA, MessageKind.QUESTION, "?", ("a",), True)
+    event = MessageSent("q", BETA, ANA, MessageKind.QUESTION, "?", ("a",))
     data = json.loads(encode(event))["data"]
     assert (data["sender"], data["recipient"], data["reply_to"]) == (
         "beta",
         "@ana",
         None,
     )
-    assert decode(message()) == MessageSent(
-        "q", BETA, ANA, MessageKind.QUESTION, "?", (), True
-    )
+    assert decode(message()) == MessageSent("q", BETA, ANA, MessageKind.QUESTION, "?")
 
 
 def test_non_ascii_text_is_not_escaped() -> None:
@@ -113,7 +111,6 @@ def test_the_largest_valid_event_fits_the_payload_bound() -> None:
         MessageKind.QUESTION,
         worst * MAX_TEXT_BYTES,
         tuple(f"{n:02}" + worst * (MAX_CHOICE_BYTES - 2) for n in range(MAX_CHOICES)),
-        blocking=True,
         reply_to="r" * 64,
     )
     assert decode(encode(event)) == event
@@ -131,7 +128,6 @@ def message(**overrides: object) -> str:
         "kind": "question",
         "body": "?",
         "choices": [],
-        "blocking": True,
         "reply_to": None,
     }
     data.update(overrides)
@@ -178,7 +174,6 @@ MALFORMED: list[tuple[str, str, str]] = [
         wire("line_state_changed", {"line_id": "a", "state": "paused"}),
         "no value",
     ),
-    ("an integer for a boolean", message(blocking=1), "boolean"),
     ("choices that are not an array", message(choices="yes"), "not an array"),
     ("a choice that is not text", message(choices=[1]), "not a string"),
     ("a lone surrogate escape", message(body="\ud800"), "Unicode"),

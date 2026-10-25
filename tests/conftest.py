@@ -55,10 +55,8 @@ SCENARIO: tuple[Event, ...] = (
     WakeIssued("w1"),
     LineStateChanged("beta", LineState.RUNNING),
     MessageDelivered("m1"),
-    MessageSent("q1", BETA, ANA, QUESTION, "Proceed?", ("yes", "no"), blocking=True),
-    MessageSent(
-        "q2", BETA, ANA, QUESTION, "Proceed now?", ("yes", "no"), blocking=True
-    ),
+    MessageSent("q1", BETA, ANA, QUESTION, "Proceed?", ("yes", "no")),
+    MessageSent("q2", BETA, ANA, QUESTION, "Proceed now?", ("yes", "no")),
     QuestionSuperseded("q1", "q2"),
     LineStateChanged("beta", LineState.IDLE),
     MessageDelivered("q2"),

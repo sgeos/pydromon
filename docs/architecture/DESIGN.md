@@ -146,7 +146,7 @@ office, which makes them valid for delivery from the next tick on. A busy line i
 skipped, and that counts as its update for the tick.
 
 **Implemented 2026-10-25.** Each tick visits the lines in a fixed order. An idle,
-unblocked line under its cap with post office mail starts a turn, which runs as a task
+line under its cap with post office mail starts a turn, which runs as a task
 without the tick waiting for it, so a turn may span many ticks and a slow line never
 holds the others back. Ticks follow every `--tick-seconds`, one second by default,
 while anything is in flight, and the loop rests when nothing is. After a restart every
@@ -178,19 +178,21 @@ that questions are no longer lost in responses and tracking files.
 **Implemented 2026-10-25.** Operators are parties with addresses such as `@ana`. A
 question is a message of kind question from a line to one operator, and the answer is
 that operator's reply, which must reverse the question's route. The lifecycle states
-open, answered, withdrawn and superseded are tracked on the message, and a blocking
-question pauses only its own line. Forwarding goes through relays, with a command relay
+open, answered, withdrawn and superseded are tracked on the message. Forwarding goes through relays, with a command relay
 as the general adapter. See [`../protocol/EVENT_LOG.md`](../protocol/EVENT_LOG.md) and
 [`../protocol/RELAY.md`](../protocol/RELAY.md).
+
+**Decided 2026-10-25 by the operator.** There is no such thing as a blocking question.
+After asking, a line may end its turn or keep working. That is up to the line-agent.
 
 **Implemented 2026-10-25, roadmap task 6.** `ask_operator` is an in-process tool beside
 `send_message`. It records a question to one operator, by default the operator who last
 messaged the line, and returns at once, so no tool call waits on a person. The daemon
 keeps the queue in the event log. `dromon questions` lists an operator's open questions
 and `dromon answer` replies. The answer is a reply message that wakes the asking line in
-a later tick and closes the question, which unblocks the line. Each line's engine
+a later tick and closes the question. Each line's engine
 session is recorded as `line_session`, so after a restart the answer reaches a line that
-still remembers its question. Live, a Haiku line asked a blocking question, the daemon
+still remembers its question. Live, a Haiku line asked a question, the daemon
 restarted, the question was listed and answered, and the line woke and recalled a
 codeword it had been given before the restart.
 

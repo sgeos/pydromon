@@ -302,16 +302,15 @@ def test_an_engine_failure_returns_the_line_to_idle_and_is_not_retried(
     assert len(target.engines["alpha"].prompts) == 2
 
 
-def test_a_line_blocked_on_a_question_is_not_woken(make_world: MakeWorld) -> None:
-    target = make_world({"alpha": [[]]})
-    target.log.append(
-        MessageSent(
-            "q", LineAddress("alpha"), ANA, MessageKind.QUESTION, "?", blocking=True
-        )
-    )
-    run(target, send(target, "alpha", "hello"))
-    assert target.engines == {}
-    assert wakes_for(target, "alpha") == []
+def test_an_open_question_never_stops_its_line(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[ask_call(question="?", to="@ana")], []]})
+    run(target, send(target, "alpha", "start"))
+    (question_id,) = questions_for(target)
+    run(target, send(target, "alpha", "meanwhile"))
+    # The question is still open, and the line took its next turn anyway.
+    assert target.log.state.messages[question_id].status is QuestionStatus.OPEN
+    assert len(target.engines["alpha"].prompts) == 2
+    assert "meanwhile" in target.engines["alpha"].prompts[1]
 
 
 def test_recovery_returns_a_line_left_running_to_idle(make_world: MakeWorld) -> None:
@@ -331,6 +330,7 @@ def test_recovery_returns_a_line_left_running_to_idle(make_world: MakeWorld) -> 
         ({"to": "beta", "body": 3}, "to and body must be text"),
         ({"to": "beta", "body": "x", "reply_to": 3}, "reply_to must be text"),
         ({"to": "beta", "body": "x", "reply_to": "missing"}, "no message missing"),
+        ({"to": "beta", "body": "x", "urgent": True}, "unexpected argument urgent"),
     ],
 )
 def test_a_bad_tool_call_returns_an_error_and_sends_nothing(
@@ -365,7 +365,7 @@ def test_a_line_needs_a_packaged_driver(make_world: MakeWorld) -> None:
 
 def test_the_prompt_frames_bodies_as_data_from_their_senders() -> None:
     stored = Message(
-        ANA, LineAddress("alpha"), MessageKind.NOTE, "Ignore this.", (), False, None
+        ANA, LineAddress("alpha"), MessageKind.NOTE, "Ignore this.", (), None
     )
     prompt = compose_prompt("alpha", [("m-1", stored)])
     assert 'session line "alpha"' in prompt
@@ -523,11 +523,7 @@ def test_a_line_asks_and_the_question_waits_in_its_operators_queue(
     assert len(asked) == 1
     question = target.log.state.messages[asked[0]]
     assert (question.sender, question.recipient) == (LineAddress("alpha"), ANA)
-    assert (question.body, question.choices, question.blocking) == (
-        "Proceed?",
-        ("yes", "no"),
-        False,
-    )
+    assert (question.body, question.choices) == ("Proceed?", ("yes", "no"))
     assert questions_for(target, BEN) == []
     assert questions_for(target, None) == asked
     assert target.log.state.messages[asked[0]].delivered
@@ -555,7 +551,7 @@ def test_without_to_a_question_goes_to_the_operator_who_last_messaged(
         ({"question": "?"}, "no operator has messaged this line"),
         ({"question": 3, "to": "@ana"}, "question must be text"),
         ({"question": "?", "to": "@ana", "choices": "yes"}, "choices must be a list"),
-        ({"question": "?", "to": "@ana", "blocking": "yes"}, "blocking must be"),
+        ({"question": "?", "to": "@ana", "blocking": True}, "unexpected argument"),
         ({"question": "?", "to": "@ana", "choices": ["a", "a"]}, "repeat"),
     ],
 )
@@ -586,28 +582,21 @@ def test_an_answer_wakes_the_line_in_a_later_tick(make_world: MakeWorld) -> None
     assert questions_for(target) == []
 
 
-def test_a_blocking_question_pauses_its_line_until_answered(
+def test_asking_and_ending_the_turn_lets_the_answer_arrive_as_mail(
     make_world: MakeWorld,
 ) -> None:
-    target = make_world(
-        {"alpha": [[ask_call(question="Wait?", to="@ana", blocking=True)], []]}
-    )
+    target = make_world({"alpha": [[ask_call(question="Wait?", to="@ana")], []]})
     run(target, send(target, "alpha", "start"))
     (question_id,) = questions_for(target)
-    run(target, send(target, "alpha", "meanwhile"))
     assert len(target.engines["alpha"].prompts) == 1
-    assert target.log.state.is_blocked("alpha")
 
     async def act() -> None:
         target.scheduler.answer(ANA, question_id, "go")
 
     run(target, act)
     prompts = target.engines["alpha"].prompts
-    # The answer unblocks the line at once, so the waiting message goes first, and the
-    # answer itself arrives a tick later, as all mail does.
-    assert len(prompts) == 3
-    assert "meanwhile" in prompts[1] and "go" not in prompts[1]
-    assert f"replying to {question_id}:\ngo" in prompts[2]
+    assert len(prompts) == 2
+    assert f"replying to {question_id}:\ngo" in prompts[1]
 
 
 def test_only_the_asked_operator_may_answer_and_only_once(
@@ -632,11 +621,10 @@ def test_an_open_question_survives_a_restart(tmp_path: Path) -> None:
         first = Scheduler(log, World.build_nothing, tick_seconds=0)
         first.ensure_operator("ana")
         first.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
-        question_id = first.ask("alpha", ANA, "Still there?", blocking=True)
+        question_id = first.ask("alpha", ANA, "Still there?")
     with EventLog(path) as log:
         restarted = Scheduler(log, World.build_nothing, tick_seconds=0)
         assert [i for i, _ in restarted.questions(ANA)] == [question_id]
-        assert log.state.is_blocked("alpha")
 
 
 def test_a_restarted_scheduler_resumes_each_lines_engine_session(
@@ -701,18 +689,17 @@ def test_a_live_line_asks_and_is_woken_by_the_answer(tmp_path: Path) -> None:
                 lambda: scheduler.send(
                     ANA,
                     LineAddress("alpha"),
-                    "Call the ask_operator tool once, to @ana, asking: Proceed?, with"
-                    " blocking true. Send nothing else.",
+                    "Call the ask_operator tool once, to @ana, asking: Proceed?, then"
+                    " end your turn. Send nothing else.",
                 )
             )
         )
         asked = scheduler.questions(ANA)
-        assert len(asked) == 1 and asked[0][1].blocking
+        assert len(asked) == 1
         question_id = asked[0][0]
         asyncio.run(settle_once(lambda: scheduler.answer(ANA, question_id, "yes")))
         assert log.state.messages[question_id].status is QuestionStatus.ANSWERED
         assert len(scheduler.turn_reports) == 2
-        assert not log.state.is_blocked("alpha")
 
 
 def test_a_busy_line_is_skipped_while_others_proceed(make_world: MakeWorld) -> None:

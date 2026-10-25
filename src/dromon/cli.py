@@ -254,10 +254,9 @@ def _questions(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     if not entries:
         print("no open questions")
     for entry in entries:
-        blocking = ", blocking" if entry.get("blocking") is True else ""
         print(
             f"{entry.get('question_id')} from {entry.get('line')}"
-            f" to {entry.get('operator')}{blocking}"
+            f" to {entry.get('operator')}"
         )
         for text_line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"    {text_line}")

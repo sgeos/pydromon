@@ -79,7 +79,7 @@ within that by encoding events and actions as tagged tuples.
 | Value | Encoding |
 |---|---|
 | An event | A tuple whose first element is a tag string, such as `("tokens", text)`, `("tool_result", call_id, text)` or `("turn_end", "")` |
-| An action | A tuple with a tag string, such as `("send", line_id, text)`, `("wake", line_id)`, `("ask", question_text, blocking)` or `("end_turn", "")` |
+| An action | A tuple with a tag string, such as `("send", line_id, text)`, `("wake", line_id)`, `("ask", operator, question_text)` or `("end_turn", "")` |
 | Several actions in one step | An array of action tuples of one shared type |
 
 **Constraints reported by the `pykeleusma` line** against Keleusma 0.2.2.

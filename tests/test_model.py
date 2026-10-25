@@ -56,10 +56,8 @@ def parties() -> list[Event]:
     ]
 
 
-def ask(
-    message_id: str = "q", line: LineAddress = BETA, *, blocking: bool = True
-) -> MessageSent:
-    return MessageSent(message_id, line, ANA, QUESTION, "?", blocking=blocking)
+def ask(message_id: str = "q", line: LineAddress = BETA) -> MessageSent:
+    return MessageSent(message_id, line, ANA, QUESTION, "?")
 
 
 # The scenario.
@@ -187,16 +185,9 @@ def test_text_must_be_a_string() -> None:
         MessageSent("m", ALPHA, BETA, NOTE, b"hi")  # pyright: ignore[reportArgumentType]
 
 
-def test_blocking_must_be_a_boolean_not_an_integer() -> None:
-    with pytest.raises(InvalidField, match="boolean"):
-        MessageSent("q", BETA, ANA, QUESTION, "?", blocking=1)  # pyright: ignore[reportArgumentType]
-
-
-def test_only_a_question_has_choices_or_blocks() -> None:
+def test_only_a_question_has_choices() -> None:
     with pytest.raises(InvalidField, match="only a question"):
         MessageSent("m", ALPHA, BETA, NOTE, "", choices=("a",))
-    with pytest.raises(InvalidField, match="only a question"):
-        MessageSent("m", ALPHA, BETA, NOTE, "", blocking=True)
 
 
 def test_choices_are_bounded_in_count_and_size_and_distinct() -> None:
@@ -267,31 +258,26 @@ def test_no_transition_keeps_the_same_state() -> None:
     assert all(old is not new for old, new in LINE_TRANSITIONS)
 
 
-def test_a_blocked_line_cannot_start_a_turn() -> None:
-    state = build(*parties(), ask())
-    assert state.is_blocked("beta")
-    with pytest.raises(EventRejected, match="blocked"):
-        state.apply(LineStateChanged("beta", LineState.RUNNING))
+def test_an_open_question_never_stops_its_line() -> None:
+    state = build(
+        *parties(),
+        ask(),
+        MessageSent("m", ALPHA, BETA, NOTE, "meanwhile"),
+        WakeRequested("w", "beta", "m"),
+        WakeIssued("w"),
+        LineStateChanged("beta", LineState.RUNNING),
+    )
+    assert state.messages["q"].status is QuestionStatus.OPEN
+    assert state.lines["beta"].state is LineState.RUNNING
 
 
-def test_a_non_blocking_question_does_not_block() -> None:
-    state = build(*parties(), ask(blocking=False))
-    assert not state.is_blocked("beta")
-    state.apply(LineStateChanged("beta", LineState.RUNNING))
-
-
-def test_an_answer_unblocks_the_line_and_can_wake_it() -> None:
+def test_an_answer_can_wake_the_asking_line() -> None:
     state = build(
         *parties(), ask(), MessageSent("a", ANA, BETA, NOTE, "ok", reply_to="q")
     )
-    assert not state.is_blocked("beta")
     state.apply(WakeRequested("w", "beta", "a"))
     state.apply(WakeIssued("w"))
-
-
-def test_a_question_to_one_operator_does_not_block_another_line() -> None:
-    state = build(*parties(), ask())
-    assert not state.is_blocked("alpha")
+    assert state.messages["q"].status is QuestionStatus.ANSWERED
 
 
 # Rejections. Each case is a valid history followed by one event that must not apply.
@@ -450,17 +436,6 @@ REJECTIONS: list[tuple[str, list[Event], Event, str]] = [
         ],
         WakeIssued("w"),
         "not idle",
-    ),
-    (
-        "wake issued to a blocked line",
-        [
-            *parties(),
-            MessageSent("m", ALPHA, BETA, NOTE, ""),
-            WakeRequested("w", "beta", "m"),
-            ask(),
-        ],
-        WakeIssued("w"),
-        "blocked",
     ),
     (
         "withdrawal of a note",

@@ -50,7 +50,6 @@ class Notice:
     kind: MessageKind
     body: str
     choices: tuple[str, ...]
-    blocking: bool
     reply_to: str | None
 
 
@@ -94,7 +93,6 @@ def pending_notices(state: State) -> list[Notice]:
                 message.kind,
                 message.body,
                 message.choices,
-                message.blocking,
                 message.reply_to,
             )
         )
@@ -128,7 +126,6 @@ def forward_pending(log: EventLog, routes: Mapping[str, Relay]) -> ForwardReport
 def encode_notice(notice: Notice) -> str:
     """Return ``notice`` as canonical JSON, the input every command relay receives."""
     document = {
-        "blocking": notice.blocking,
         "body": notice.body,
         "choices": list(notice.choices),
         "kind": notice.kind.value,
