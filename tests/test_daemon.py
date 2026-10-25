@@ -37,6 +37,7 @@ from dromon.protocol import (
     Operation,
     Response,
     decode_response,
+    encode_response,
 )
 from dromon.scheduler import LineEngine, LineSpec, Scheduler
 
@@ -494,6 +495,62 @@ def test_release_resumes_a_held_line_and_status_shows_holds(
     assert (unknown.ok, unknown.error_code) == (False, ErrorCode.REJECTED)
 
 
+def test_line_view_shows_the_line_its_mail_and_its_questions(
+    paths: ProjectPaths,
+) -> None:
+    seed_question(paths)
+    with EventLog(paths.event_log) as log:
+        scheduler = held_scheduler(log)
+        scheduler.send(OperatorAddress("ana"), LineAddress("alpha"), "hello")
+    response = request(paths, "line_view", {"line_id": "alpha"})
+    assert response.ok and response.result is not None
+    result = response.result
+    line = cast(dict[str, object], result["line"])
+    assert (line["line_id"], line["state"]) == ("alpha", "idle")
+    messages = cast(list[dict[str, object]], result["messages"])
+    assert [m["kind"] for m in messages] == ["question", "note"]
+    assert messages[1]["body"] == "hello" and messages[1]["truncated"] is False
+    questions = cast(list[dict[str, object]], result["open_questions"])
+    assert [q["text"] for q in questions] == ["Proceed?"]
+
+
+def test_line_view_previews_and_budgets_large_mail(paths: ProjectPaths) -> None:
+    seed_question(paths)
+    with EventLog(paths.event_log) as log:
+        scheduler = held_scheduler(log)
+        for _ in range(50):
+            # Three bytes a character, so the byte budget binds before the count.
+            scheduler.send(
+                OperatorAddress("ana"), LineAddress("alpha"), "\u65e5" * 5000
+            )
+    response = request(paths, "line_view", {"line_id": "alpha"})
+    assert response.ok and response.result is not None
+    messages = cast(list[dict[str, object]], response.result["messages"])
+    assert messages and all(m["truncated"] is True for m in messages)
+    assert len(messages) < 50
+    assert response.result["total"] == 51
+    encoded = encode_response(response)
+    assert len(encoded) < MAX_LINE_BYTES
+
+
+@pytest.mark.parametrize(
+    ("args", "code"),
+    [
+        ({}, ErrorCode.BAD_REQUEST),
+        ({"line_id": "alpha", "limit": 0}, ErrorCode.BAD_REQUEST),
+        ({"line_id": "alpha", "limit": 51}, ErrorCode.BAD_REQUEST),
+        ({"line_id": "alpha", "extra": 1}, ErrorCode.BAD_REQUEST),
+        ({"line_id": "nobody"}, ErrorCode.REJECTED),
+    ],
+)
+def test_a_bad_line_view_is_refused(
+    paths: ProjectPaths, args: dict[str, object], code: ErrorCode
+) -> None:
+    seed_question(paths)
+    response = request(paths, "line_view", args)
+    assert (response.ok, response.error_code) == (False, code)
+
+
 # The real daemon, started detached and driven over its socket. Wakes are held, so no
 # engine ever starts and no test touches the subscription.
 
@@ -741,6 +798,28 @@ def test_an_operator_looks_through_mail_from_the_command_line(
         )
         assert cli.main([*base, "sent", "--operator", "ana"]) == exits.OK
         assert "to alpha, note, waiting, unanswered" in capsys.readouterr().out
+    finally:
+        client.stop(paths)
+        reap(pid)
+
+
+@pytest.mark.socket
+def test_several_clients_attach_to_lines_at_once(paths: ProjectPaths) -> None:
+    from dromon.attach import Attachment, Say
+
+    seed_question(paths)
+    pid = client.start(paths, HOLD)
+    try:
+        first = Attachment(paths, "alpha", "ana")
+        second = Attachment(paths, "alpha", "ben")
+        assert first.execute(Say("from the first window")) == "sent"
+        assert second.execute(Say("from the second window")) == "sent"
+        for attached in (first, second):
+            view = attached.fetch()
+            bodies = [
+                m["body"] for m in cast(list[dict[str, object]], view["messages"])
+            ]
+            assert bodies[-2:] == ["from the first window", "from the second window"]
     finally:
         client.stop(paths)
         reap(pid)

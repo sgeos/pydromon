@@ -9,7 +9,7 @@ completed, moved or abandoned.
 
 ## State on 2026-10-25
 
-- **Tasks 1 to 7 done.**
+- **Tasks 1 to 8 done.**
   - `model.py`, `codec.py` and `eventlog.py` hold the data model as nine event kinds in
     an append-only SQLite log. Operators are parties addressed as `@name`.
   - `relay.py` forwards operator messages. Replies will come through inbound adapters
@@ -38,6 +38,8 @@ completed, moved or abandoned.
   - `limits.py` holds a line after 12 turns without operator mail or $2 of estimated
     cost and asks an operator whether to resume it. A reply or `dromon release`
     resumes it.
+  - `attach.py`, `tui.py` and `gui.py` are the interactive client. `dromon attach
+    LINE` opens curses, `--gui` a Tk window, and any number may attach at once.
   - `lineconfig.py` gives each line its built-in tools, arbitrary MCP servers and an
     allow-all or allowlist policy, by the operator's decision, stored as
     `line_configured`. The default is no tools beyond Dromon's own, with strict MCP
@@ -49,8 +51,7 @@ completed, moved or abandoned.
 - **Published.** The public GitHub repository `sgeos/pydromon`, licensed 0BSD, on an
   HTTPS remote that uses the GitHub command-line tool as its credential helper. No
   continuous integration is configured.
-- **Commands.** `attach`, `send`, `questions` and `answer` are placeholders that exit with
-  status 3.
+- **Commands.** Every planned subcommand is implemented.
 - **pykeleusma.** Its tasks 2, 3 and 10 are done. Python cannot yet drive a script,
   because `call` and `resume` are its open task 5. Dromon's 0.1.0 does not depend on it.
 - **Sibling repositories.** `~/projects/keleusma/dromon` and `~/projects/rust/dromon-rs`
@@ -58,8 +59,8 @@ completed, moved or abandoned.
 
 ## Next step
 
-Task 8 of [`../roadmap/V0_1_0.md`](../roadmap/V0_1_0.md), the interactive client, then
-task 9, per-project configuration, and task 10, continuous integration.
+Task 9 of [`../roadmap/V0_1_0.md`](../roadmap/V0_1_0.md), per-project configuration,
+then task 10, continuous integration.
 
 ## Open
 
@@ -116,7 +117,7 @@ its keychain token on 2026-10-24.
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 512 tests pass, 13 of them need sockets
+uv sync && uv run pytest    # 547 tests pass, 14 of them need sockets
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 

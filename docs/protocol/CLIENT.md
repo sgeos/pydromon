@@ -54,6 +54,7 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `acknowledge` | Arguments `operator` and `message_id`. Marks a message in the operator's mailbox dealt with, without a reply |
 | `sent` | Arguments `operator`, and optionally `unanswered_only`, `offset` and `limit`. Returns `total` and `messages`, the operator's sent mail with `message_id`, `recipient`, `kind`, `delivered`, `read` and `outcome` |
 | `read` | Arguments `operator` and `message_id`. Returns the message with its `body` and `choices`, and marks it read the first time |
+| `line_view` | Arguments `line_id`, and optionally `limit`, at most 50. Returns `line`, the line's status entry, `tick`, `total`, the count of messages involving the line, `messages`, the newest of them oldest first, each with a body preview of at most 600 characters and `truncated`, kept within a 40,000 byte budget, and `open_questions`, the line's open questions. What an attached client polls |
 | `release` | Argument `line_id`. Releases a line held at a conversation limit and resets its counts |
 | `answer` | Arguments `question_id`, `body` and `operator`. Records the operator's reply, which must come from the operator the question was asked of. Result `{"message_id": ...}`. The answer wakes the asking line in a later tick |
 | `send` | Arguments `recipient`, a line or `@operator`, `body`, `operator`, and optionally `reply_to`. Registers the operator if new and records a note from them. Result `{"message_id": ...}` |
@@ -110,6 +111,7 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromon read MESSAGE` | Sends `read` and prints the message | 0, 4, or 1 |
 | `dromon ack MESSAGE` | Sends `acknowledge` | 0, 4, or 1 |
 | `dromon sent` | Sends `sent`, with `--operator`, `--unanswered`, `--offset N` and `--limit N`, and prints each message's fate | 0, 4, or 1 |
+| `dromon attach LINE` | Opens a curses client attached to the line, or a Tk window with `--gui`, speaking for `--operator` and refreshing every `--poll-seconds`, default 1. Text sends a message, and `/answer`, `/ack`, `/release`, `/help` and `/quit` are commands. Any number may attach at once | 0 |
 | `dromon release LINE` | Sends `release` | 0, 4, or 1 |
 | `dromon answer QUESTION BODY` | Sends `answer`, with `--operator`, default the login name | 0, 4, or 1 |
 | `dromon probe` | Runs one short turn without the daemon and reports the engine's capabilities | 0 or 1 |
@@ -136,6 +138,6 @@ not yet implemented, because its interface differs between macOS and Linux.
 
 ## Not yet specified
 
-- Attaching an interactive client, and the graphical interface roadmap task 8 calls for.
+- Updates pushed to attached clients, which now poll.
 - Authentication of a client beyond the directory's permissions.
 - Notifications pushed from the daemon to an attached client.

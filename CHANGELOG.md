@@ -43,6 +43,11 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- The interactive client, roadmap task 8. `dromon attach LINE` opens a curses client
+  attached to one line, and `--gui` opens a Tk window instead. Both poll the new
+  `line_view` operation through `dromon.attach` and accept typed messages and the
+  `/answer`, `/ack`, `/release`, `/help` and `/quit` commands. Any number of clients
+  may attach at once.
 - Conversation control, roadmap task 7. `dromon.limits` holds a line after 12 turns in
   a row without operator mail or $2 of estimated cost, with an optional cooldown, and
   asks an operator whether to resume it. New `line_held` and `line_released` events,
