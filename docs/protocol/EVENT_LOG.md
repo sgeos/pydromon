@@ -55,6 +55,8 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `line_state_changed` | `line_id`, `state` | The line exists and the change is in the transition table |
 | `line_configured` | `line_id`, `config` text of at most 262,144 bytes | The line exists. The text is the canonical JSON of [`LINE_CONFIG.md`](LINE_CONFIG.md), validated by the daemon before it appends, and replaces any earlier configuration |
 | `line_session` | `line_id`, `engine_session` text of 1 to 256 bytes | The line exists. Records the engine session the line's next turn resumes, so a restarted daemon continues the line's conversation |
+| `line_held` | `line_id`, `question_id` | The line exists and is not held, and the question is open and from the line. The daemon wakes the line no more until it is released |
+| `line_released` | `line_id` | The line is held |
 | `operator_registered` | `operator_id` | The operator does not exist |
 | `message_sent` | `message_id`, `sender` and `recipient` addresses, `kind`, `body` text, `choices`, `reply_to` message identifier or `null` | See the message rules below |
 | `message_read` | `message_id` | The message was delivered and not yet read. Its recipient opened it, which obliges nothing |

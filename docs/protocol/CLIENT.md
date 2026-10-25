@@ -54,13 +54,16 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `acknowledge` | Arguments `operator` and `message_id`. Marks a message in the operator's mailbox dealt with, without a reply |
 | `sent` | Arguments `operator`, and optionally `unanswered_only`, `offset` and `limit`. Returns `total` and `messages`, the operator's sent mail with `message_id`, `recipient`, `kind`, `delivered`, `read` and `outcome` |
 | `read` | Arguments `operator` and `message_id`. Returns the message with its `body` and `choices`, and marks it read the first time |
+| `release` | Argument `line_id`. Releases a line held at a conversation limit and resets its counts |
 | `answer` | Arguments `question_id`, `body` and `operator`. Records the operator's reply, which must come from the operator the question was asked of. Result `{"message_id": ...}`. The answer wakes the asking line in a later tick |
 | `send` | Arguments `recipient`, a line or `@operator`, `body`, `operator`, and optionally `reply_to`. Registers the operator if new and records a note from them. Result `{"message_id": ...}` |
 
 `status` also returns `tick`, the ticks run in this daemon's lifetime, and `lines`, one
 entry per line with `line_id`, `engine`, `strategy`, `state`, `pending`, the count of
-undelivered messages, `turns`, the turns run in this daemon's lifetime, and
-`tool_policy`.
+undelivered messages, `turns`, the turns run in this daemon's lifetime,
+`tool_policy`, `autonomous_turns`, the turns in a row without operator mail,
+`cost_estimate_usd`, a decimal string, and `held_by`, the question holding the line or
+`null`.
 
 ## Responses
 
@@ -107,9 +110,10 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromon read MESSAGE` | Sends `read` and prints the message | 0, 4, or 1 |
 | `dromon ack MESSAGE` | Sends `acknowledge` | 0, 4, or 1 |
 | `dromon sent` | Sends `sent`, with `--operator`, `--unanswered`, `--offset N` and `--limit N`, and prints each message's fate | 0, 4, or 1 |
+| `dromon release LINE` | Sends `release` | 0, 4, or 1 |
 | `dromon answer QUESTION BODY` | Sends `answer`, with `--operator`, default the login name | 0, 4, or 1 |
 | `dromon probe` | Runs one short turn without the daemon and reports the engine's capabilities | 0 or 1 |
-| `dromond` | Runs the daemon in the foreground. `--max-turns-per-line N` caps the turns run for each line, default 10, and `--hold-wakes` records messages without waking any line, and `--tick-seconds S` sets the time between ticks while work is in flight, default 1, at most 60 | 0, 1 on failure, 2 on a bad cap or cadence, or 5 when another daemon holds the lock |
+| `dromond` | Runs the daemon in the foreground. `--max-autonomous-turns N`, default 12, `--max-cost-usd X`, default 2, and `--cooldown-seconds S`, default 0, set the conversation limits, `--operator NAME`, default `operator`, names who hears about a held line no operator has messaged, `--hold-wakes` records messages without waking any line, and `--tick-seconds S` sets the time between ticks while work is in flight, default 1, at most 60 | 0, 1 on failure, 2 on a bad cap or cadence, or 5 when another daemon holds the lock |
 
 The tool options are `--tool NAME`, repeatable, `--mcp-config FILE`, a JSON file of MCP
 servers that the client reads, `--allow-tool NAME`, repeatable, `--allow-all-tools` and

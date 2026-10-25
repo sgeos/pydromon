@@ -43,6 +43,12 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Conversation control, roadmap task 7. `dromon.limits` holds a line after 12 turns in
+  a row without operator mail or $2 of estimated cost, with an optional cooldown, and
+  asks an operator whether to resume it. New `line_held` and `line_released` events,
+  the `release` operation and `dromon release`. `dromond` gains
+  `--max-autonomous-turns`, `--max-cost-usd`, `--cooldown-seconds` and `--operator`,
+  replacing `--max-turns-per-line`.
 - Acknowledgements and sent mail. `message_acknowledged` marks a message answered
   without a reply. Senders see each sent message as replied, acknowledged or
   unanswered, through the `list_sent` tool for lines and `dromon sent` for operators,

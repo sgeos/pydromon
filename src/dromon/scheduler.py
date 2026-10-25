@@ -21,9 +21,11 @@ it starts in the post office.
 Cadence. While anything is in flight, ticks follow one another every ``tick_seconds``.
 When nothing is, the loop rests until a message arrives.
 
-Safety. Two lines can wake each other without end, so each line has a cap on the turns
-the scheduler runs for it in one daemon lifetime. A line at its cap keeps its messages
-pending until the daemon restarts. Conversation limits proper are roadmap task 7.
+Safety. Two lines can wake each other without end, and a line can run up cost without
+anyone watching. ``dromon.limits`` sets how many turns a line may take in a row without
+mail from an operator, and how much estimated cost it may run up. A line past either is
+held, its mail waits, and the daemon asks an operator whether to resume it. A reply
+releases it.
 
 Trust. Message bodies are untrusted text. The prompt presents each one as data from its
 sender, and only a message from an operator address carries operator authority, which
@@ -45,6 +47,7 @@ schedules, so the Keleusma version can keep these semantics exactly.
 import asyncio
 import contextlib
 import secrets
+import time
 import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -56,6 +59,7 @@ from claude_agent_sdk import SdkMcpTool
 from dromon.driver import Driver, Strategy
 from dromon.engine import ClaudeCodeLine, TurnReport
 from dromon.eventlog import EventLog
+from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.mailbox import (
     MAX_PAGE,
     MailSummary,
@@ -73,6 +77,8 @@ from dromon.model import (
     LineAddress,
     LineConfigured,
     LineCreated,
+    LineHeld,
+    LineReleased,
     LineSession,
     LineState,
     LineStateChanged,
@@ -90,7 +96,8 @@ from dromon.model import (
     parse_address,
 )
 
-DEFAULT_MAX_TURNS_PER_LINE: Final = 10
+DEFAULT_OPERATOR: Final = "operator"
+"""Who hears about a held line that no operator has messaged."""
 
 DEFAULT_TICK_SECONDS: Final = 1.0
 MAX_TICK_SECONDS: Final = 60.0
@@ -269,20 +276,27 @@ class Scheduler:
         log: EventLog,
         engine_factory: EngineFactory,
         *,
-        max_turns_per_line: int = DEFAULT_MAX_TURNS_PER_LINE,
+        limits: Limits = DEFAULT_LIMITS,
+        default_operator: str = DEFAULT_OPERATOR,
         hold_wakes: bool = False,
         tick_seconds: float = DEFAULT_TICK_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if max_turns_per_line < 1:
-            raise ValueError("max_turns_per_line must be at least 1")
         if not 0 <= tick_seconds <= MAX_TICK_SECONDS:
             raise ValueError(f"tick_seconds must be in [0, {MAX_TICK_SECONDS}]")
         self._log = log
         self._engine_factory = engine_factory
-        self._max_turns = max_turns_per_line
+        self.limits = limits
+        self._default_operator = OperatorAddress(default_operator)
+        self._clock = clock
         self._hold = hold_wakes
         self._engines: dict[str, LineEngine] = {}
         self._turns: dict[str, int] = {}
+        self._autonomous: dict[str, int] = {}
+        """Turns each line took in a row without mail from an operator."""
+        self._cost: dict[str, float] = {}
+        """Estimated cost of each line's turns since its last release."""
+        self._last_turn_end: dict[str, float] = {}
         self._failed: set[str] = set()
         self._tick_seconds = tick_seconds
         self._running: dict[str, asyncio.Task[None]] = {}
@@ -349,6 +363,10 @@ class Scheduler:
             )
         )
         self._sent.append(message_id)
+        if reply_to is not None and isinstance(recipient, LineAddress):
+            line = self._log.state.lines.get(recipient.line_id)
+            if line is not None and line.held_by == reply_to:
+                self.release(recipient.line_id)
         if isinstance(recipient, LineAddress):
             self._failed.discard(recipient.line_id)
         self._work.set()
@@ -702,23 +720,91 @@ class Scheduler:
         ]
 
     def _can_start(self, line_id: str) -> bool:
-        state = self._log.state
+        return self._eligible(line_id) and not self._cooling(line_id)
+
+    def _eligible(self, line_id: str) -> bool:
+        """Whether a line could start a turn, apart from its cooldown."""
+        line = self._log.state.lines[line_id]
         return (
             not self._hold
             and line_id not in self._running
-            and state.lines[line_id].state is LineState.IDLE
+            and line.state is LineState.IDLE
+            and line.held_by is None
             and line_id not in self._failed
-            and self._turns.get(line_id, 0) < self._max_turns
         )
 
+    def _cooling(self, line_id: str) -> bool:
+        ended = self._last_turn_end.get(line_id)
+        if ended is None:
+            return False
+        return self._clock() - ended < self.limits.cooldown_seconds
+
     def _work_waiting(self) -> bool:
-        """Whether the next tick has anything to do or move."""
+        """Whether the next tick has anything to do or move.
+
+        A line in its cooldown with mail waiting keeps the loop ticking, so its turn
+        starts when the cooldown ends rather than when the next message arrives.
+        """
         if self._running or self._sent:
             return True
         return any(
-            self._can_start(line_id) and self.deliverable(line_id)
+            self._eligible(line_id) and self.deliverable(line_id)
             for line_id in self._log.state.lines
         )
+
+    # Conversation limits.
+
+    def hold(self, line_id: str, reason: str) -> str:
+        """Hold ``line_id`` and ask an operator whether to resume it."""
+        operator = self.last_operator(line_id) or self._default_operator
+        self.ensure_operator(operator.operator_id)
+        question_id = self.ask(
+            line_id,
+            operator,
+            f"Dromon held line {line_id}, which {reason}. Its mail waits. Reply to"
+            " this question to resume it, or leave it held.",
+            ("resume",),
+        )
+        self._log.append(LineHeld(line_id, question_id))
+        print(
+            f"dromond: line {line_id} held, asking {operator}: {reason}",
+            file=sys.stderr,
+        )
+        return question_id
+
+    def release(self, line_id: str) -> None:
+        """Release a held line and reset its counts. It wakes in a later tick."""
+        if line_id not in self._log.state.lines:
+            raise EventRejected(f"no line {line_id}")
+        self._log.append(LineReleased(line_id))
+        self._autonomous.pop(line_id, None)
+        self._cost.pop(line_id, None)
+        self._failed.discard(line_id)
+        self._work.set()
+
+    def _apply_limits(
+        self, line_id: str, from_operator: bool, report: TurnReport | None
+    ) -> None:
+        """Count a finished turn and hold the line if it passed a limit."""
+        turns = 0 if from_operator else self._autonomous.get(line_id, 0) + 1
+        self._autonomous[line_id] = turns
+        if report is not None and report.cost_estimate_usd is not None:
+            self._cost[line_id] = (
+                self._cost.get(line_id, 0.0) + report.cost_estimate_usd
+            )
+        cost = self._cost.get(line_id, 0.0)
+        limits = self.limits
+        reason: str | None = None
+        if turns >= limits.max_autonomous_turns:
+            reason = f"took {turns} turns in a row without mail from an operator"
+        elif cost > limits.max_cost_usd:
+            reason = (
+                f"has an estimated cost of ${cost:.2f} since its last release, over"
+                f" the budget of ${limits.max_cost_usd:.2f}"
+            )
+        line = self._log.state.lines[line_id]
+        if reason is not None and line.held_by is None:
+            self.hold(line_id, reason)
 
     def step(self) -> None:
         """Run one tick: update every line once, then move the sent queue to the post
@@ -787,10 +873,16 @@ class Scheduler:
             summary(self._log.state, address, len(messages)),
             replied_ids(self._log.state, address),
         )
-        task = asyncio.get_running_loop().create_task(self._turn(line_id, prompt))
+        from_operator = any(
+            isinstance(message.sender, OperatorAddress) for _, message in messages
+        )
+        task = asyncio.get_running_loop().create_task(
+            self._turn(line_id, prompt, from_operator)
+        )
         self._running[line_id] = task
 
-    async def _turn(self, line_id: str, prompt: str) -> None:
+    async def _turn(self, line_id: str, prompt: str, from_operator: bool) -> None:
+        report: TurnReport | None = None
         try:
             report = await self.engine_for(line_id).run_turn(prompt)
             self.turn_reports.append((line_id, report))
@@ -808,13 +900,9 @@ class Scheduler:
             if self._log.state.lines[line_id].state is LineState.RUNNING:
                 self._log.append(LineStateChanged(line_id, LineState.IDLE))
             self._running.pop(line_id, None)
+            self._last_turn_end[line_id] = self._clock()
             self._work.set()
-        if self._turns[line_id] >= self._max_turns and self.pending(line_id):
-            print(
-                f"dromond: line {line_id} reached its cap of {self._max_turns}"
-                " turns, and its messages wait",
-                file=sys.stderr,
-            )
+        self._apply_limits(line_id, from_operator, report)
 
     def engine_for(self, line_id: str) -> LineEngine:
         """The line's engine, built on first use and kept for the session's life."""
@@ -855,6 +943,10 @@ class Scheduler:
                 "state": line.state.value,
                 "pending": len(self.pending(line_id)),
                 "turns": self._turns.get(line_id, 0),
+                "autonomous_turns": self._autonomous.get(line_id, 0),
+                # A decimal string, because the client protocol carries no floats.
+                "cost_estimate_usd": f"{self._cost.get(line_id, 0.0):.4f}",
+                "held_by": line.held_by,
                 "tool_policy": (
                     DEFAULT_CONFIG
                     if line.config is None

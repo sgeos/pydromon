@@ -9,7 +9,7 @@ completed, moved or abandoned.
 
 ## State on 2026-10-25
 
-- **Tasks 1 to 6 done.**
+- **Tasks 1 to 7 done.**
   - `model.py`, `codec.py` and `eventlog.py` hold the data model as nine event kinds in
     an append-only SQLite log. Operators are parties addressed as `@name`.
   - `relay.py` forwards operator messages. Replies will come through inbound adapters
@@ -35,6 +35,9 @@ completed, moved or abandoned.
     `dromon mail` and `dromon read`. Nobody is obliged to answer. A recipient may
     acknowledge a message without replying, and senders see replied, acknowledged or
     unanswered through `list_sent` or `dromon sent`.
+  - `limits.py` holds a line after 12 turns without operator mail or $2 of estimated
+    cost and asks an operator whether to resume it. A reply or `dromon release`
+    resumes it.
   - `lineconfig.py` gives each line its built-in tools, arbitrary MCP servers and an
     allow-all or allowlist policy, by the operator's decision, stored as
     `line_configured`. The default is no tools beyond Dromon's own, with strict MCP
@@ -55,9 +58,8 @@ completed, moved or abandoned.
 
 ## Next step
 
-Task 7 of [`../roadmap/V0_1_0.md`](../roadmap/V0_1_0.md), conversation control, which
-replaces the per-line turn cap with turn limits, budgets and cooldowns that raise an
-operator question. Task 8, the attachable client the operator asked for, follows.
+Task 8 of [`../roadmap/V0_1_0.md`](../roadmap/V0_1_0.md), the interactive client, then
+task 9, per-project configuration, and task 10, continuous integration.
 
 ## Open
 
@@ -88,8 +90,7 @@ operator question. Task 8, the attachable client the operator asked for, follows
   specified.
 - **Daemon debt.** No peer credential check on connections, no relay forwarding passes
   yet, and the event log's SQLite calls run on the event loop thread. Driver state
-  lives only in memory, while engine sessions are recorded. The per-line turn cap stands
-  in for task 7. Notes to an operator are delivered when `dromon mail` lists them or a
+  lives only in memory, while engine sessions are recorded. Notes to an operator are delivered when `dromon mail` lists them or a
   relay forwards them. All are recorded
   in `CLIENT.md` or the module documentation.
 - **Operator direction, recorded in the design.** Configuration may grow as large as a
@@ -115,7 +116,7 @@ its keychain token on 2026-10-24.
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 502 tests pass, 13 of them need sockets
+uv sync && uv run pytest    # 512 tests pass, 13 of them need sockets
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 

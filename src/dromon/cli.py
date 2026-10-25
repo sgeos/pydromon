@@ -40,6 +40,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "read": "open a message in an operator's mailbox",
     "ack": "acknowledge a message without replying",
     "sent": "show what became of the mail an operator sent",
+    "release": "resume a line the daemon held at a conversation limit",
     "probe": "run one short turn on the engine and report its capabilities",
 }
 """Planned subcommands and their one-line help, in display order."""
@@ -338,6 +339,11 @@ def _sent(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
+def _release(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    args: dict[str, object] = {"line_id": arguments.line_id}
+    return _request(paths, "release", Operation.RELEASE, args)
+
+
 def _read(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     args: dict[str, object] = {
         "operator": arguments.operator,
@@ -398,6 +404,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "read": _read,
     "ack": _ack,
     "sent": _sent,
+    "release": _release,
 }
 
 
@@ -459,6 +466,8 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     for name, help_text in SUBCOMMANDS.items():
         command = commands.add_parser(name, help=help_text, description=help_text)
+        if name == "release":
+            command.add_argument("line_id", help="the held line")
         if name in ("create", "configure"):
             command.add_argument("line_id", help="the line's identifier")
             _add_tool_options(command)
