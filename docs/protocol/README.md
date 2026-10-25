@@ -14,6 +14,7 @@ Documents here describe behaviour and formats, never Python details.
 - [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md), the `.dromon/dromon.toml` file that declares a project's lines, limits and wake policy. Draft, version 1.
 - [`AGENTS.md`](AGENTS.md), external agents that reach the daemon and its lines over MCP, with access from off to full trust. Draft, part of version 1.
 - [`TEACHER.md`](TEACHER.md), a project's local teacher model served by Ollama, and how Dromon brings it up and releases it. Draft, part of version 1.
+- [`GROK.md`](GROK.md), how a line runs on Grok Build over the Agent Client Protocol, with its sandbox profiles and line bridge. Draft, not verified against a live turn.
 - [`CODEX.md`](CODEX.md), how a line runs on Codex through its app-server, with its isolation, credentials and the configurations a Codex line may have. Draft.
 - [`SETTINGS.md`](SETTINGS.md), a line's engine settings, permission rules, hooks, environment and attribution, with the review of the settings in use that motivated them. Draft, part of version 1.
 - [`SANDBOX.md`](SANDBOX.md), the Claude Code sandbox document of a line and a project, its layers, unattended defaults and protected directories. Draft, part of version 1.

@@ -24,7 +24,7 @@ closed, because the rest of the line cannot be skipped safely.
 | Path | Default | Purpose |
 |---|---|---|
 | State directory | `<project>/.dromon` | Holds `events.sqlite`, the event log |
-| Runtime directory | `<project>/.dromon/run`, or `DROMON_RUNTIME_DIR` | Holds `dromond.sock`, `dromond.lock`, `dromond.log`, and `agents.sock` when the project lets external agents in, as [`AGENTS.md`](AGENTS.md) specifies |
+| Runtime directory | `<project>/.dromon/run`, or `DROMON_RUNTIME_DIR` | Holds `dromond.sock`, `dromond.lock`, `dromond.log`, `lines.sock` for engines that reach their line's tools over MCP, as [`GROK.md`](GROK.md) specifies, and `agents.sock` when the project lets external agents in, as [`AGENTS.md`](AGENTS.md) specifies |
 
 A socket path is at most 103 bytes, the smaller of the macOS and Linux limits. A
 project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
@@ -119,7 +119,7 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromon answer QUESTION BODY` | Sends `answer`, with `--operator`, default the login name | 0, 4, or 1 |
 | `dromon probe` | Runs one short turn without the daemon on the engine of `--model`, and reports the driver, the engine, the credential and the capabilities the engine reports | 0 or 1 |
 | `dromon agent add NAME --access LEVEL`, `dromon agent list`, `dromon agent revoke NAME` | Sends `agent_add`, `agent_list` or `agent_revoke`. `add` prints the token once with an MCP configuration for the agent | 0, 2, 4, or 1 |
-| `dromon mcp --agent NAME` | Serves one external agent over MCP on standard input and output, reading its token from `DROMON_AGENT_TOKEN`, as [`AGENTS.md`](AGENTS.md) specifies | 0, or 1 on an oversized message |
+| `dromon mcp --agent NAME` or `--line LINE` | Serves one external agent over MCP on standard input and output, reading its token from `DROMON_AGENT_TOKEN`, as [`AGENTS.md`](AGENTS.md) specifies, or one line's own tools to its engine through `lines.sock`, reading the line's token from `DROMON_LINE_TOKEN` | 0, or 1 on an oversized message |
 | `dromon teacher [up\|status\|down]` | Brings the project's teacher up, reports it, or releases it, without the daemon, as [`TEACHER.md`](TEACHER.md) specifies. The default is `status`. `--force` loads the model when too little memory is available | 0, or 1 on failure or when the project declares no teacher |
 | `dromon config` | Validates `.dromon/dromon.toml` without a daemon, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, and prints its limits, wake policy and lines | 0, or 1 on an invalid file |
 | `dromond` | Runs the daemon in the foreground, after applying `.dromon/dromon.toml`. Each flag overrides the file. `--max-autonomous-turns N`, default 12, `--max-cost-usd X`, default 2, and `--cooldown-seconds S`, default 0, set the conversation limits, `--operator NAME`, default `operator`, names who hears about a held line no operator has messaged, `--hold-wakes` records messages without waking any line, and `--tick-seconds S` sets the time between ticks while work is in flight, default 1, at most 60 | 0, 1 on failure, 2 on a bad cap or cadence, or 5 when another daemon holds the lock |

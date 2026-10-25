@@ -89,9 +89,9 @@ paths are stored. On Codex the text becomes the thread's developer instructions,
 
 ## Engines
 
-A line on the Codex engine accepts only the configurations
-[`CODEX.md`](CODEX.md) lists, and any other is refused when the line is created or
-configured.
+A line on the Codex or Grok Build engine accepts only the configurations
+[`CODEX.md`](CODEX.md) or [`GROK.md`](GROK.md) lists, and any other is refused when the
+line is created or configured.
 
 ## Storage
 

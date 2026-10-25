@@ -58,7 +58,7 @@ checked.
 
 | Engine | Interface | Evidence on 2026-10-25 |
 |---|---|---|
-| Grok Build | Agent Client Protocol | Its local user guide describes it as native to that protocol |
+| Grok Build | Agent Client Protocol | Implemented 2026-10-25 for Grok 4.7 from Grok Build 1.0.70's documentation, not verified against a live turn |
 | Cursor Agent | Agent Client Protocol through `agent acp` | Reported in July 2026 research by the operator's sessions. Not rechecked |
 | Claude Code | Claude Agent SDK | Implemented 2026-10-25 with Agent SDK 0.2.174 and Claude Code 2.1.310, on the subscription |
 | Codex | Its app-server | Implemented 2026-10-25 with Codex 0.164.0 and GPT-6-Luna, on the ChatGPT plan |
@@ -185,6 +185,14 @@ see each item as it starts. **Porting hazard.** The app-server and dynamic tools
 experimental. **Later the same day,** Codex lines gained write access under a Dromon
 permission profile that denies Dromon's state and runtime directories and keeps `.git`
 read-only, as `CODEX.md` records.
+
+**Implemented 2026-10-25, on the operator's direction for nominal Grok support while
+Grok usage was exhausted.** `dromon.grok` runs a line through `grok agent stdio` over the
+Agent Client Protocol, as [`../protocol/GROK.md`](../protocol/GROK.md) specifies. Grok's
+custom sandbox profiles live only in its own files, so the operator defines Dromon's two
+profiles and Dromon checks them before each turn. ACP has no client-hosted tools, so
+Dromon's tools reach a Grok line through `dromon mcp --line` and a per-line token on a
+line socket. Every behaviour that could not be confirmed refuses the turn.
 
 ## Communication
 

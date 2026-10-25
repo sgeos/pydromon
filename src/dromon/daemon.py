@@ -49,10 +49,11 @@ from dromon.agents import (
     AgentError,
     AgentPolicy,
     Gateway,
+    LineTokens,
     new_token,
     token_digest,
 )
-from dromon import codex
+from dromon import codex, grok
 from dromon.teacher import Teacher, TeacherError
 from dromon.driver import ENGINE_OF, DriverError, Strategy
 from dromon.eventlog import EventLog, LogError, utc_now
@@ -147,6 +148,8 @@ class Daemon:
     stop_requested: asyncio.Event = field(default_factory=asyncio.Event)
     agents: AgentPolicy = AGENTS_OFF
     """Who may connect to the agent socket, and with what access."""
+    line_tokens: LineTokens = field(default_factory=LineTokens)
+    """The tokens of lines whose engines reach their tools over the line socket."""
 
     # The gateway's view of the daemon.
 
@@ -178,6 +181,86 @@ class Daemon:
                 error_message=str(error),
             )
         return self.execute(request)
+
+    def line_tools(self, line_id: str) -> list[SdkMcpTool[Any]]:
+        """A line's own tools, the same ones an in-process engine receives."""
+        return [
+            self.scheduler.send_tool(line_id),
+            self.scheduler.ask_tool(line_id),
+            self.scheduler.list_mail_tool(line_id),
+            self.scheduler.read_mail_tool(line_id),
+            self.scheduler.acknowledge_mail_tool(line_id),
+            self.scheduler.list_sent_tool(line_id),
+        ]
+
+    async def respond_line(self, line: bytes) -> Response:
+        """Answer one line on the line socket, for an engine reaching its line's own
+        tools. Only the token the daemon issued for that line is accepted."""
+        try:
+            request = decode_request(line)
+        except ProtocolError as error:
+            return Response(
+                request_id_of(line),
+                ok=False,
+                error_code=error.code,
+                error_message=str(error),
+            )
+        if request.operation is Operation.PING:
+            return Response(request.request_id, ok=True, result={})
+        if request.operation not in (Operation.AGENT_TOOLS, Operation.AGENT_CALL):
+            return Response(
+                request.request_id,
+                ok=False,
+                error_code=ErrorCode.UNKNOWN_OPERATION,
+                error_message="the line socket serves only agent_tools and agent_call",
+            )
+        args = request.args
+        try:
+            line_id = self.line_tokens.check(args.get("line"), args.get("token"))
+        except AgentError as error:
+            return Response(
+                request.request_id,
+                ok=False,
+                error_code=ErrorCode.REJECTED,
+                error_message=str(error),
+            )
+        if line_id not in self.log.state.lines:
+            return Response(
+                request.request_id,
+                ok=False,
+                error_code=ErrorCode.REJECTED,
+                error_message=f"no line {line_id}",
+            )
+        tools = self.line_tools(line_id)
+        if request.operation is Operation.AGENT_TOOLS:
+            listed: list[dict[str, object]] = [
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "inputSchema": tool.input_schema,
+                }
+                for tool in tools
+            ]
+            return Response(
+                request.request_id,
+                ok=True,
+                result={"line": line_id, "tools": cast(object, listed)},
+            )
+        name = args.get("tool")
+        arguments = args.get("arguments", {})
+        tool = next((t for t in tools if t.name == name), None)
+        if tool is None or not isinstance(arguments, dict):
+            result: dict[str, object] = {
+                "content": [{"type": "text", "text": f"no tool {name}"}],
+                "is_error": True,
+            }
+        else:
+            found = await tool.handler(cast(dict[str, Any], arguments))
+            result = {
+                "content": found.get("content", []),
+                "is_error": bool(found.get("is_error", False)),
+            }
+        return Response(request.request_id, ok=True, result=_bounded(result))
 
     async def respond_agent(self, line: bytes) -> Response:
         """Answer one line on the agent socket, which serves only agent operations.
@@ -742,7 +825,18 @@ async def serve(daemon: Daemon) -> None:
     server = await asyncio.start_unix_server(
         accepting(operator_responder), path=str(socket_path), limit=MAX_LINE_BYTES
     )
-    servers = [server]
+    # The line socket serves only lines whose engine was issued a token, so it is
+    # always open, and it never accepts an agent or operator request.
+    line_path = daemon.paths.line_socket
+    with contextlib.suppress(FileNotFoundError):
+        line_path.unlink()
+    servers = [
+        server,
+        await asyncio.start_unix_server(
+            accepting(daemon.respond_line), path=str(line_path), limit=MAX_LINE_BYTES
+        ),
+    ]
+    line_path.chmod(0o600)
     if daemon.agents.listen:
         # A separate socket, so that nothing an agent sends reaches the operator
         # dispatch, and so that turning agents off leaves nothing to connect to.
@@ -821,16 +915,16 @@ def check_engines(config: ProjectConfig) -> None:
     A line's own tables are checked when the line is created or configured."""
     if config.sandbox is None and config.settings is None:
         return
-    codex_lines = sorted(
+    outside = sorted(
         line_id
         for line_id, line in config.lines.items()
-        if ENGINE_OF[line.model] == codex.ENGINE_NAME
+        if ENGINE_OF[line.model] in (codex.ENGINE_NAME, grok.ENGINE_NAME)
     )
-    if codex_lines:
+    if outside:
         raise ValueError(
-            "the project's sandbox or settings would apply to the Codex lines "
-            + ", ".join(codex_lines)
-            + ", which run in Codex's own sandbox and take neither"
+            "the project's sandbox or settings would apply to the lines "
+            + ", ".join(outside)
+            + ", which run on Codex or Grok in their own sandboxes and take neither"
         )
 
 
@@ -946,6 +1040,7 @@ def run(
     except (PathError, ConfigFileError, ValueError, InvalidField) as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
+    line_tokens = LineTokens()
     try:
         with EventLog(paths.event_log) as log:
             scheduler = Scheduler(
@@ -955,6 +1050,8 @@ def run(
                     project_sandbox=config.sandbox,
                     project_settings=config.settings,
                     protected=protected_dirs(paths),
+                    line_tokens=line_tokens,
+                    line_socket=paths.line_socket,
                 ),
                 limits=limits,
                 default_operator=operator,
@@ -965,7 +1062,14 @@ def run(
             apply_project(scheduler, log, config)
             teacher = start_teacher(config, paths)
             try:
-                daemon = Daemon(paths, log, utc_now(), scheduler, agents=config.agents)
+                daemon = Daemon(
+                    paths,
+                    log,
+                    utc_now(),
+                    scheduler,
+                    agents=config.agents,
+                    line_tokens=line_tokens,
+                )
                 asyncio.run(serve(daemon))
             finally:
                 if teacher is not None:
@@ -980,7 +1084,7 @@ def run(
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
     finally:
-        for stale in (paths.socket, paths.agent_socket):
+        for stale in (paths.socket, paths.agent_socket, paths.line_socket):
             with contextlib.suppress(FileNotFoundError):
                 stale.unlink()
         os.close(lock)

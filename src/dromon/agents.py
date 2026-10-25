@@ -57,6 +57,8 @@ from dromon.protocol import Operation, Request, Response
 
 TOKEN_BYTES: Final = 32
 TOKEN_ENV: Final = "DROMON_AGENT_TOKEN"  # noqa: S105, the variable's name
+LINE_TOKEN_ENV: Final = "DROMON_LINE_TOKEN"  # noqa: S105, the variable's name
+"""The variable through which ``dromon mcp --line`` receives a line's token."""
 """The variable through which ``dromon mcp`` receives an agent's token."""
 
 
@@ -125,6 +127,29 @@ def token_digest(token: str) -> str:
 
 def _capped(access: AgentAccess, ceiling: AgentAccess) -> AgentAccess:
     return access if access.rank <= ceiling.rank else ceiling
+
+
+class LineTokens:
+    """Tokens through which an engine that cannot host Dromon's tools in process,
+    such as Grok Build, reaches them over ``dromon mcp --line``. Each line has one token
+    for the daemon's life, held only in memory, so a restart invalidates them all."""
+
+    def __init__(self) -> None:
+        self._tokens: dict[str, str] = {}
+
+    def issue(self, line_id: str) -> str:
+        if ID_PATTERN.fullmatch(line_id) is None:
+            raise AgentError(f"line {line_id!r} is not an identifier")
+        return self._tokens.setdefault(line_id, new_token())
+
+    def check(self, line_id: object, token: object) -> str:
+        """The line ``token`` belongs to, or ``AgentError``."""
+        if not isinstance(line_id, str) or not isinstance(token, str):
+            raise AgentError("line and token must be text")
+        issued = self._tokens.get(line_id)
+        if issued is None or not hmac.compare_digest(issued, token):
+            raise AgentError(f"line {line_id} needs its token")
+        return line_id
 
 
 # Tools.

@@ -39,6 +39,9 @@ subscription draws on a plan's limits while API usage is charged for every token
 | `gpt_6_luna_subscription.kel` | GPT-6-Luna on Codex | subscription | medium | 4 | 20 |
 | `gpt_6_luna_api.kel` | GPT-6-Luna on Codex | api | low | 2 | 10 |
 | `gpt_6_luna_flexible.kel` | GPT-6-Luna on Codex | flexible | low | 2 | 10 |
+| `grok_4_7_subscription.kel` | Grok 4.7 on Grok Build | subscription | high | 8 | 40 |
+| `grok_4_7_api.kel` | Grok 4.7 on Grok Build | api | medium | 4 | 20 |
+| `grok_4_7_flexible.kel` | Grok 4.7 on Grok Build | flexible | medium | 4 | 20 |
 
 Claude Haiku 5.5 is the least expensive model and is the default for probes and tests.
 GPT-6-Luna's settings follow Codex's model catalogue as fetched on 2026-10-25, which
@@ -47,11 +50,13 @@ ChatGPT plan the subscription strategy means Codex's own sign-in.
 
 ## Engines
 
-Each driver names the engine it is written for, `claude-code` or `codex`. A model has
+Each driver names the engine it is written for, `claude-code`, `codex` or
+`grok-build`. A file is named for its model with `-` and `.` written as `_`. A model has
 packaged drivers once they are written, but a line can be created on it only when
 Dromon has an adapter for its engine, and an adapter refuses a driver written for
-another engine. Both engines have adapters, as of 2026-10-25 for `codex`, which
-[`CODEX.md`](CODEX.md) specifies.
+another engine. All three engines have adapters, as of 2026-10-25 for `codex`, which
+[`CODEX.md`](CODEX.md) specifies, and for `grok-build`, which
+[`GROK.md`](GROK.md) specifies and which is not yet verified against a live turn.
 A file is named for its model and strategy, and the host refuses a file whose declared
 model or strategy differs from its name.
 
@@ -125,7 +130,7 @@ At most 32 settings are read.
 | Name | Value | Required |
 |---|---|---|
 | `interface` | Number `3` | Yes |
-| `engine` | Text, `claude-code` or `codex` | Yes |
+| `engine` | Text, `claude-code`, `codex` or `grok-build` | Yes |
 | `strategy` | Text, `subscription`, `api` or `flexible` | Yes |
 | `model` | Text, the model identifier | Yes |
 | `effort` | Text, one of `low`, `medium`, `high`, `xhigh` and `max` | Yes |

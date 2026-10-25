@@ -641,8 +641,11 @@ def test_no_agent_socket_exists_unless_the_project_listens(
     try:
         assert paths.socket.exists()
         assert not paths.agent_socket.exists()
+        # The line socket is always open, private, and serves only issued line tokens.
+        assert stat.S_IMODE(paths.line_socket.stat().st_mode) == 0o600
     finally:
         stop_daemon(paths, pid)
+    assert not paths.line_socket.exists()
 
 
 @pytest.mark.socket
