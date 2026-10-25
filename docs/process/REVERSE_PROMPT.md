@@ -32,4 +32,14 @@ replay equality, append-only triggers, a second writer and three forms of corrup
 **Not verified.** Only Python 3.12.12 with SQLite 3.50.4 on macOS was tested. Concurrent
 access was tested with two connections in one process, not with two processes.
 
+**Mailbox, a later prompt on the same day.** On the operator's approval of the
+`pykeleusma` line's proposal, this line registered as `pydromon` in the shared interline
+store, after reading its protocol and client. The inbox was empty. Checks are manual,
+since no hooks are installed. Details are in `HANDOFF.md`.
+
+**Engine and features, a later prompt on the same day.** The operator's preferred own
+loop cannot run on a subscription under Anthropic's published terms, so the choice of
+first adapter returns to the operator, as recorded in the design. Standard features such
+as compaction land with the task that first needs them.
+
 **Next.** Task 3, the daemon skeleton.

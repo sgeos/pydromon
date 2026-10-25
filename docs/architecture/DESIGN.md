@@ -60,16 +60,29 @@ checked.
 | Codex | Codex SDK or its app-server | Vendor interfaces. Not tested here |
 | Dromon's own loop | Direct model calls | Needed where full control of each step is required |
 
-**Decided 2026-10-25.** The first adapter targets the model Claude Opus 5.5. **Open.**
-Which loop drives it, either Claude Code through the Claude Agent SDK or Dromon's own
-loop calling the model directly. **Proposed.** The Claude Agent SDK, which follows the
-principle above of running each model in its vendor's harness and may work with a
-subscription login, subject to the hypothesis below. Each adapter should probe the engine's
-capabilities at startup, because support varies by engine version.
+**Decided 2026-10-25.** The first adapter targets the model Claude Opus 5.5. The operator
+prefers Dromon's own loop calling the model directly, on the condition that it can run on
+a Claude subscription as well as on separately billed application programming interface
+usage.
 
-**Hypothesis.** Subscription logins usually work only through the vendor's own harness,
-while Dromon's own loop would need paid application programming interface keys. This
-affects cost and should be checked per vendor.
+**Fact, read on 2026-10-25** in Anthropic's Claude Code "Legal and compliance" page and
+the Agent SDK overview. Subscription sign-in is "intended exclusively" for subscribers'
+"ordinary use of Claude Code and other native Anthropic applications". Developers,
+including those using the Agent SDK, "should use API key authentication", and "may not
+collect, store, or intermediate Claude.ai credentials or session tokens". Signing in to
+the unmodified Claude Code binary with one's own subscription is permitted.
+
+**Inference.** Dromon's own loop calling the Messages API can run only on an API key with
+usage billing, so the operator's condition is not met for it. A subscription can drive a
+line only through the unmodified Claude Code binary, through its headless mode or the
+Agent SDK, with Dromon never reading or storing the sign-in token. Whether the Agent SDK
+itself may run on a personal subscription is not stated plainly. The same page says Pro
+and Max limits "assume ordinary, individual usage of Claude Code and the Agent SDK",
+while the Agent SDK overview points developers to API keys. **Open with the operator.**
+Which adapter comes first given this, as recorded in the handoff.
+
+Each adapter should probe the engine's capabilities at startup, because support varies by
+engine version.
 
 ## Communication
 
@@ -112,6 +125,13 @@ that questions are no longer lost in responses and tracking files.
 - An answer is delivered to the asking line as a wake.
 - Clients show one queue for all session lines. `dromon questions` lists it and
   `dromon answer` answers from the command line.
+
+## Standard harness features
+
+**Decided 2026-10-25.** Standard features of an agent harness, such as compaction of long
+conversations, are added as the work reaches them rather than designed up front. Each
+lands with the roadmap task that first needs it, together with its events in the
+protocol specification.
 
 ## Conversation control
 
@@ -195,7 +215,8 @@ before any trace capture, and record the source model and licence of every trace
 1. The home of the protocol specification. Decided 2026-10-25, drafted here and ported
    later.
 2. The engine for the first adapter. The model Claude Opus 5.5 was decided on
-   2026-10-25. The loop that drives it is open.
+   2026-10-25. The loop that drives it is open, because a subscription can drive only
+   the Claude Code binary and Dromon's own loop needs an API key.
 3. The contents of `.dromon/dromon.toml`.
 4. Mid-turn injection, which depends on each engine.
 5. Teacher-model scope and licensing.
