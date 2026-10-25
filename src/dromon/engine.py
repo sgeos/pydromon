@@ -5,15 +5,17 @@ Dromon drives the engine from outside. Each turn starts a Claude Code process th
 message the engine emits to the line's Keleusma driver as an event, and performs the
 driver's actions, such as interrupting a turn that exceeds the tool budget.
 
-Credential policy. The operator's only credential is a Claude subscription, and usage
-billed per token must never start silently. ``check_subscription_environment`` refuses
-to start when the environment selects an API key, a cloud provider or an API profile,
-each of which Claude Code would prefer over the subscription. The engine's own init
-report is then checked, and a turn whose ``apiKeySource`` is anything but ``"none"`` is
-interrupted and refused. ``setting_sources=[]`` keeps user and project settings, such
-as an ``apiKeyHelper``, out of the line. Managed policy settings still apply. Dromon
-never reads, stores or forwards the sign-in token, which stays in Claude Code's keychain
-entry, as Anthropic's terms require.
+Credential policy. Each driver fixes a strategy, subscription only, API only or
+flexible, and decides at run time whether the credential the engine reports is
+acceptable. Usage billed per token must never start silently, so before a turn
+``check_environment`` refuses any cloud provider, whose ``apiKeySource`` would read
+``"none"`` like a subscription, and for a subscription driver also refuses every
+variable that would make Claude Code prefer an API credential. The engine's init
+report is then mapped to a credential and handed to the driver, and a turn whose
+credential is unrecognized or refused is interrupted. ``setting_sources=[]`` keeps
+user and project settings, such as an ``apiKeyHelper``, out of the line. Managed policy
+settings still apply. Dromon never reads, stores or forwards the sign-in token, which
+stays in Claude Code's keychain entry, as Anthropic's terms require.
 
 Failure modes. A refusal by the policy or the driver raises ``EngineRefused`` after the
 turn is interrupted. A driver failure raises ``DriverError``. Engine and transport
@@ -40,23 +42,34 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from dromon.driver import ActionTag, Driver, Event
+from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
 
-SUBSCRIPTION_KEY_SOURCE: Final = "none"
-"""The ``apiKeySource`` Claude Code reports for a claude.ai login."""
+KEY_SOURCES: Final[dict[str, Credential]] = {
+    "none": Credential.SUBSCRIPTION,
+    "ANTHROPIC_API_KEY": Credential.API,
+    "apiKeyHelper": Credential.API,
+    "/login managed key": Credential.API,
+}
+"""Each ``apiKeySource`` Claude Code reports, as a credential. ``"none"`` means a
+claude.ai login only because ``check_environment`` has excluded cloud providers."""
 
-NON_SUBSCRIPTION_ENVIRONMENT: Final = (
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_PROFILE",
+PROVIDER_ENVIRONMENT: Final = (
     "ANTHROPIC_FEDERATION_RULE_ID",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
 )
-"""Variables that make Claude Code use a credential other than the subscription, or a
-provider whose ``apiKeySource`` would also read ``"none"``."""
+"""Variables selecting a provider Dromon does not model. Always refused."""
+
+API_ENVIRONMENT: Final = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_PROFILE",
+)
+"""Variables that make Claude Code prefer an API credential over the subscription."""
+
+NON_SUBSCRIPTION_ENVIRONMENT: Final = API_ENVIRONMENT + PROVIDER_ENVIRONMENT
 
 
 class EngineRefused(Exception):
@@ -86,15 +99,25 @@ def _sdk_session(
     )
 
 
-def check_subscription_environment(environment: Mapping[str, str]) -> None:
-    """Raise ``EngineRefused`` if ``environment`` selects another credential."""
-    present = [name for name in NON_SUBSCRIPTION_ENVIRONMENT if environment.get(name)]
+def check_environment(environment: Mapping[str, str], strategy: Strategy) -> None:
+    """Raise ``EngineRefused`` if ``environment`` conflicts with ``strategy``."""
+    refused = (
+        NON_SUBSCRIPTION_ENVIRONMENT
+        if strategy is Strategy.SUBSCRIPTION
+        else PROVIDER_ENVIRONMENT
+    )
+    present = [name for name in refused if environment.get(name)]
     if present:
         raise EngineRefused(
-            "the environment selects a credential other than the Claude subscription: "
+            f"the environment conflicts with the {strategy} driver: "
             + ", ".join(present)
-            + ". Unset these variables to run on the subscription."
+            + ". Unset these variables or choose another driver."
         )
+
+
+def credential_of(api_key_source: str) -> Credential | None:
+    """The credential behind a reported ``apiKeySource``, or ``None`` if unknown."""
+    return KEY_SOURCES.get(api_key_source)
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +140,7 @@ class TurnReport:
     text: str
     tool_uses: tuple[str, ...]
     interrupted_for: str | None
+    credential: Credential | None
     session_id: str
     capabilities: Capabilities | None
     cost_estimate_usd: float | None
@@ -155,6 +179,7 @@ class _Turn:
     interrupted_for: str | None = None
     refusal: str | None = None
     capabilities: Capabilities | None = None
+    credential: Credential | None = None
 
 
 class ClaudeCodeLine:
@@ -199,7 +224,7 @@ class ClaudeCodeLine:
 
     async def run_turn(self, prompt: str) -> TurnReport:
         """Run one turn for ``prompt`` and return what happened."""
-        check_subscription_environment(self._environment)
+        check_environment(self._environment, self.driver.settings.strategy)
         options = self.options()
         self.driver.step(Event("turn_start"))
         turn = _Turn()
@@ -225,6 +250,7 @@ class ClaudeCodeLine:
             text="".join(turn.text),
             tool_uses=tuple(turn.tool_uses),
             interrupted_for=turn.interrupted_for,
+            credential=turn.credential,
             session_id=result.session_id,
             capabilities=turn.capabilities,
             cost_estimate_usd=result.total_cost_usd,
@@ -256,17 +282,26 @@ class ClaudeCodeLine:
     async def _check_init(
         self, session: AgentSession, capabilities: Capabilities, turn: _Turn
     ) -> None:
-        if capabilities.api_key_source != SUBSCRIPTION_KEY_SOURCE:
-            turn.refusal = (
-                f"the engine uses the credential {capabilities.api_key_source!r},"
-                " not the Claude subscription"
-            )
-        else:
-            action = self.driver.step(Event("init", capabilities.model))
-            if action.tag is ActionTag.REFUSE:
-                turn.refusal = (
-                    f"the driver for {action.text} refuses the engine model"
-                    f" {capabilities.model!r}"
-                )
+        turn.refusal = self._refusal(capabilities, turn)
         if turn.refusal is not None:
             await session.interrupt()
+
+    def _refusal(self, capabilities: Capabilities, turn: _Turn) -> str | None:
+        """Why the driver or the policy refuses this engine, or ``None`` to proceed."""
+        credential = credential_of(capabilities.api_key_source)
+        if credential is None:
+            return (
+                f"the engine reports an unrecognized credential source"
+                f" {capabilities.api_key_source!r}"
+            )
+        turn.credential = credential
+        verdict = self.driver.step(Event("credential", credential.value))
+        if verdict.tag is ActionTag.REFUSE:
+            return f"the {verdict.text} driver refuses the {credential} credential"
+        verdict = self.driver.step(Event("init", capabilities.model))
+        if verdict.tag is ActionTag.REFUSE:
+            return (
+                f"the driver for {verdict.text} refuses the engine model"
+                f" {capabilities.model!r}"
+            )
+        return None

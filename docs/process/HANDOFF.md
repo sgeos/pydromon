@@ -16,9 +16,11 @@ completed, moved or abandoned.
     in a daemon registry, with the design deferred.
   - `daemon.py`, `client.py`, `protocol.py`, `paths.py` and `exits.py` are the daemon
     skeleton behind `dromon start`, `status` and `stop`.
-  - `engine.py` runs turns on Claude Code through the Agent SDK, on the subscription
-    only. `driver.py` hosts Keleusma drivers through `pykeleusma`, and
-    `drivers/claude_opus_5_5.kel` is the first. `dromon probe` reports capabilities.
+  - `engine.py` runs turns on Claude Code through the Agent SDK. `driver.py` hosts
+    Keleusma drivers through `pykeleusma`. Six concrete drivers in `drivers/` cover
+    Opus 5.5 and Haiku 5.5, each with a subscription, an API and a flexible strategy
+    baked in, by the operator's decision. `dromon probe` reports capabilities and
+    defaults to Haiku 5.5, the least expensive model, which tests also use.
   - `docs/protocol/` holds `EVENT_LOG.md`, `CLIENT.md`, `RELAY.md` and `DRIVER.md`.
 - **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310, and
   `pykeleusma` from its repository at `19d4558`, which needs a Rust toolchain to build.
@@ -41,9 +43,11 @@ message arrives. Driver events for messages and answers are added to `DRIVER.md`
 
 ## Open
 
-- **pykeleusma data segments.** Notice `pydromon-20261025-data-segment-gap` reports that
-  private data reads as unit and shared data cannot be driven. Drivers carry state
-  through the host meanwhile. No reply yet.
+- **pykeleusma data segments.** The reply `pykeleusma-20261025-data-segment-reply` says
+  private data resetting to unit is Keleusma 0.2.2 behaviour and shared data is
+  unsupported in `pykeleusma` 0.1.0. On the operator's instruction, request
+  `pydromon-20261025-data-segment-request` reports it as a deficiency and asks for
+  shared data support. No answer yet. Drivers carry state through the host meanwhile.
 - **Subscription usage.** Anthropic's terms say Pro and Max limits assume ordinary,
   individual use of Claude Code and the Agent SDK. Many lines running continuously may
   exceed that, which the conversation limits of task 7 should account for.
@@ -83,7 +87,7 @@ its keychain token on 2026-10-24.
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 282 tests pass, 10 of them need sockets
+uv sync && uv run pytest    # 342 tests pass, 10 of them need sockets
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 

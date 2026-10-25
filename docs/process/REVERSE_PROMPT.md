@@ -4,42 +4,38 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-25, task 4, the first engine adapter
+## 2026-10-25, concrete drivers and the testing model
 
-**Done.** On the operator's decisions, lines run on the subscription through Claude Code
-and the Agent SDK, and drivers are written in Keleusma.
+**Done.**
 
-- `dromon.engine.ClaudeCodeLine` runs one turn per call through `ClaudeSDKClient`, with
-  no user or project settings, no tools unless configured, and the engine session
-  resumed on the next turn. It refuses an environment selecting an API key, API profile
-  or cloud provider before starting, and interrupts and refuses a turn whose engine
-  reports any `apiKeySource` other than `"none"`.
-- `src/dromon/drivers/claude_opus_5_5.kel` is the Opus 5.5 driver. It declares its
-  settings, accepts only its model, counts tool uses and interrupts past a budget of
-  40, and has a verified worst case of 84 nominal cost units per decision.
-- `dromon probe` ran live on the subscription and reported Claude Code 2.1.310, Agent
-  SDK 0.2.174, model `claude-opus-5-5`, credential `none`, and a successful turn.
-- `docs/protocol/DRIVER.md` specifies driver interface 1.
-
-**Finding.** `pykeleusma` at `19d4558` cannot use Keleusma data segments. Drivers carry
-their state through the host instead, which also lets the event log record it. The
-`pykeleusma` line has the report as `pydromon-20261025-data-segment-gap`.
+- **Testing model.** Claude Haiku 5.5, the least expensive model, runs on the
+  subscription through Claude Code, confirmed live. `dromon probe` and the live test now
+  use it by default.
+- **Concrete drivers.** On the operator's decision, subscription use, API use and
+  flexible use are separate drivers that bake their strategy in. Six driver files cover
+  Opus 5.5 and Haiku 5.5. A subscription driver refuses API usage, an API driver refuses
+  a subscription, and a flexible driver accepts either with API-safe settings. Driver
+  interface 2 adds a `credential` event, a `strategy` setting and a credential code in
+  the state.
+- **Engine.** It maps `apiKeySource` to a credential and lets the driver decide. It
+  refuses cloud providers for every driver, and API variables for subscription drivers,
+  before starting. A live `dromon probe --strategy api` was refused as intended.
+- **pykeleusma.** Its reply was read and acknowledged. Request
+  `pydromon-20261025-data-segment-request` reports the data segment gap as a deficiency
+  and asks for shared data support.
 
 **Decisions made by this line, open to the operator's review.**
 
-- Each turn starts a fresh Claude Code process and resumes the engine session by its
-  identifier, so a line survives a daemon restart.
-- The probe uses no tools, so it cannot change any file.
-- The Agent SDK is pinned exactly, because it bundles the engine itself.
-- The live test needs both `-m live` and `DROMON_LIVE_TESTS=1`, because a later `-m`
-  replaces the configured deselection.
+- The flexible drivers use the API settings, because a flexible line may be billed per
+  token. The settings in each driver are a first judgement, listed in `DRIVER.md`.
+- The six files were generated once from a throwaway script that is not committed, and
+  each is now maintained as its own concrete driver.
 
-**Verification.** `uv sync`, 282 tests passing with warnings treated as errors outside
-the sandbox, 272 passing inside it with `-m "not socket and not live"`, and the live
-test passing once with `DROMON_LIVE_TESTS=1`. Ruff and pyright strict clean. The wheel
-contains the driver source.
+**Verification.** `uv sync`, 342 tests passing with warnings treated as errors outside
+the sandbox, and the live test passing on Haiku 5.5 with `DROMON_LIVE_TESTS=1`. Ruff and
+pyright strict clean. The wheel contains all six drivers.
 
-**Not verified.** Mid-turn message injection, a turn with tools, and the interrupt path
-against the real engine. The interrupt path is tested only against a scripted session.
+**Not verified.** Any API credential, since the operator has none. The API and flexible
+paths are tested against scripted sessions only.
 
 **Next.** Task 5, layer 1 messaging and wakes.

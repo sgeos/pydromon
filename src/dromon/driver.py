@@ -5,12 +5,19 @@ and its reaction to each engine event, such as interrupting a turn that exceeds 
 tool budget. The host performs every action a driver yields, so no Python callable runs
 inside the bounded path and the driver's worst-case time covers its whole decision.
 
-Driver interface 1. The entry point is
+Driver interface 2. The entry point is
 ``loop main(input: (Event, State)) -> (Action, State)``, where an event and an action
-are ``(Text, Text, Word)`` and the state is ``(Word, Word)``. The host owns the state
-between cycles, because ``pykeleusma`` does not yet support data segments. Each event
-is one cycle. The host resumes with the event and receives the action, then resumes
-once more to complete the cycle, which Keleusma reports as a reset.
+are ``(Text, Text, Word)`` and the state is ``(Word, Word, Word)``. The host owns the
+state between cycles, because Keleusma 0.2.2 resets private data and ``pykeleusma``
+cannot drive shared data. Each event is one cycle. The host resumes with the event and
+receives the action, then resumes once more to complete the cycle, which Keleusma
+reports as a reset.
+
+Strategies. Each driver is concrete, with one model and one credential strategy fixed
+in its code: subscription only, API only, or flexible. A subscription draws on a plan's
+limits while API usage is charged per token, so the strategies differ in what they
+accept and how they run the model. The engine reports the credential actually in use
+with a ``credential`` event, and the driver accepts or refuses it.
 
 Trust. Drivers ship with Dromon and are trusted code, but every yielded action is still
 checked, so a driver defect surfaces as ``DriverError`` and never as a silent misstep.
@@ -23,22 +30,44 @@ from typing import Final, cast
 
 import keleusma
 
-INTERFACE_VERSION: Final = 1
+INTERFACE_VERSION: Final = 2
 MAX_SETTINGS: Final = 32
 """Upper bound on the settings a driver may declare, so reading them terminates."""
 
-DRIVERS: Final[dict[str, str]] = {"claude-opus-5-5": "claude_opus_5_5"}
-"""The driver resource for each supported model."""
+MODELS: Final = ("claude-opus-5-5", "claude-haiku-5-5")
+"""Models with a packaged driver for every strategy."""
 
 type Triple = tuple[str, str, int]
-type DriverState = tuple[int, int]
+type DriverState = tuple[int, int, int]
 
-_IDLE: Final[tuple[Triple, DriverState]] = (("idle", "", 0), (0, 0))
+INITIAL_STATE: Final[DriverState] = (0, 0, 0)
+
+_IDLE: Final[tuple[Triple, DriverState]] = (("idle", "", 0), INITIAL_STATE)
 """The value that completes a cycle. The driver ignores it."""
 
 
 class DriverError(Exception):
     """A driver could not be loaded, failed at run time, or yielded an invalid value."""
+
+
+class Credential(StrEnum):
+    """How the engine is actually paid for in a turn."""
+
+    SUBSCRIPTION = "subscription"
+    API = "api"
+
+
+class Strategy(StrEnum):
+    """Which credentials a driver accepts, fixed in the driver's code."""
+
+    SUBSCRIPTION = "subscription"
+    API = "api"
+    FLEXIBLE = "flexible"
+
+
+def driver_resource(model: str, strategy: Strategy) -> str:
+    """The packaged file name of the driver for ``model`` and ``strategy``."""
+    return f"{model.replace('-', '_')}_{strategy.value}.kel"
 
 
 class ActionTag(StrEnum):
@@ -65,6 +94,7 @@ class Action:
 
 @dataclass(frozen=True, slots=True)
 class DriverSettings:
+    strategy: Strategy
     model: str
     effort: str
     max_turns: int
@@ -90,16 +120,16 @@ def _triple(value: object, what: str) -> Triple:
 
 
 def _state(value: object) -> DriverState:
-    first, second = _items(value, 2, "state")
-    if type(first) is not int or type(second) is not int:
+    first, second, third = _items(value, 3, "state")
+    if type(first) is not int or type(second) is not int or type(third) is not int:
         raise DriverError(f"the driver yielded a malformed state: {value!r}")
-    return first, second
+    return first, second, third
 
 
 class Driver:
     """One running driver. Not thread-safe, and each session line owns its own."""
 
-    def __init__(self, source: str, *, state: DriverState = (0, 0)) -> None:
+    def __init__(self, source: str, *, state: DriverState = INITIAL_STATE) -> None:
         try:
             self._vm = keleusma.VM(keleusma.compile(source))
         except (keleusma.SourceError, keleusma.VerifyError) as error:
@@ -113,17 +143,27 @@ class Driver:
         self.settings = self._read_settings()
 
     @classmethod
-    def for_model(cls, model: str, *, state: DriverState = (0, 0)) -> "Driver":
-        """Load the packaged driver for ``model``."""
-        name = DRIVERS.get(model)
-        if name is None:
+    def for_model(
+        cls,
+        model: str,
+        strategy: Strategy = Strategy.SUBSCRIPTION,
+        *,
+        state: DriverState = INITIAL_STATE,
+    ) -> "Driver":
+        """Load the packaged driver for ``model`` and ``strategy``."""
+        if model not in MODELS:
             raise DriverError(f"no driver for model {model!r}")
-        source = (
-            resources.files("dromon.drivers")
-            .joinpath(f"{name}.kel")
-            .read_text(encoding="utf-8")
+        resource = resources.files("dromon.drivers").joinpath(
+            driver_resource(model, strategy)
         )
-        return cls(source, state=state)
+        driver = cls(resource.read_text(encoding="utf-8"), state=state)
+        found = driver.settings
+        if (found.model, found.strategy) != (model, strategy):
+            raise DriverError(
+                f"the packaged driver for {model} {strategy} declares"
+                f" {found.model} {found.strategy}"
+            )
+        return driver
 
     @property
     def state(self) -> DriverState:
@@ -179,6 +219,7 @@ class Driver:
             raise DriverError(f"the driver declares more than {MAX_SETTINGS} settings")
         required = {
             "interface",
+            "strategy",
             "model",
             "effort",
             "max_turns",
@@ -193,7 +234,15 @@ class Driver:
             raise DriverError(
                 f"the driver implements interface {interface}, not {INTERFACE_VERSION}"
             )
+        declared = found["strategy"][1]
+        try:
+            strategy = Strategy(declared)
+        except ValueError as error:
+            raise DriverError(
+                f"the driver declares an unknown strategy {declared!r}"
+            ) from error
         settings = DriverSettings(
+            strategy=strategy,
             model=found["model"][1],
             effort=found["effort"][1],
             max_turns=found["max_turns"][2],

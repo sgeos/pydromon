@@ -25,17 +25,22 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from dromon.driver import Driver
+from dromon.driver import Credential, Driver, Strategy, driver_resource
 from dromon.engine import (
+    API_ENVIRONMENT,
+    KEY_SOURCES,
     NON_SUBSCRIPTION_ENVIRONMENT,
+    PROVIDER_ENVIRONMENT,
     AgentSession,
     ClaudeCodeLine,
     EngineRefused,
     TurnReport,
-    check_subscription_environment,
+    check_environment,
+    credential_of,
 )
 
-MODEL = "claude-opus-5-5"
+MODEL = "claude-haiku-5-5"
+"""Tests use the least expensive model, as the operator directs."""
 
 
 def init(model: str = MODEL, source: str = "none") -> SystemMessage:
@@ -109,7 +114,7 @@ def line(
     environment: Mapping[str, str] | None = None,
 ) -> ClaudeCodeLine:
     return ClaudeCodeLine(
-        driver or Driver.for_model(MODEL),
+        driver or Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
         Path("/work"),
         environment=environment or {},
         session_factory=session.factory,
@@ -142,7 +147,7 @@ def test_a_plain_turn_reports_text_capabilities_and_session() -> None:
     assert report.capabilities.claude_code_version == "2.1.310"
     assert report.interrupted_for is None
     assert session.interrupts == 0
-    assert target.driver.state == (0, 1)
+    assert target.driver.state == (0, 1, 1)
 
 
 def test_options_follow_the_driver_and_isolate_the_line() -> None:
@@ -170,12 +175,13 @@ def test_the_next_turn_resumes_the_engine_session() -> None:
 
 
 def test_the_driver_budget_interrupts_a_turn_once() -> None:
-    text = resources.files("dromon.drivers").joinpath("claude_opus_5_5.kel").read_text()
-    driver = Driver(
-        text.replace(
-            "fn tool_budget() -> Word { 40 }", "fn tool_budget() -> Word { 1 }"
-        )
+    resource = driver_resource(MODEL, Strategy.SUBSCRIPTION)
+    text = resources.files("dromon.drivers").joinpath(resource).read_text()
+    budgeted = text.replace(
+        "fn tool_budget() -> Word { 20 }", "fn tool_budget() -> Word { 1 }"
     )
+    assert budgeted != text
+    driver = Driver(budgeted)
     session = Scripted(
         [
             init(),
@@ -191,7 +197,7 @@ def test_the_driver_budget_interrupts_a_turn_once() -> None:
 
 
 @pytest.mark.parametrize("variable", NON_SUBSCRIPTION_ENVIRONMENT)
-def test_a_non_subscription_environment_is_refused_before_starting(
+def test_a_subscription_driver_refuses_any_other_credential_before_starting(
     variable: str,
 ) -> None:
     session = Scripted([init(), result()])
@@ -201,18 +207,64 @@ def test_a_non_subscription_environment_is_refused_before_starting(
     assert session.options == []
 
 
+@pytest.mark.parametrize("strategy", [Strategy.API, Strategy.FLEXIBLE])
+@pytest.mark.parametrize("variable", PROVIDER_ENVIRONMENT)
+def test_every_driver_refuses_a_cloud_provider_before_starting(
+    strategy: Strategy, variable: str
+) -> None:
+    with pytest.raises(EngineRefused, match=variable):
+        check_environment({variable: "1"}, strategy)
+
+
+@pytest.mark.parametrize("strategy", [Strategy.API, Strategy.FLEXIBLE])
+@pytest.mark.parametrize("variable", API_ENVIRONMENT)
+def test_metered_drivers_allow_an_api_credential_in_the_environment(
+    strategy: Strategy, variable: str
+) -> None:
+    check_environment({variable: "1"}, strategy)
+
+
 def test_an_empty_variable_does_not_count() -> None:
-    check_subscription_environment({"ANTHROPIC_API_KEY": ""})
+    check_environment({"ANTHROPIC_API_KEY": ""}, Strategy.SUBSCRIPTION)
 
 
-@pytest.mark.parametrize(
-    "source", ["ANTHROPIC_API_KEY", "apiKeyHelper", "/login managed key", ""]
-)
-def test_an_engine_using_another_credential_is_interrupted_and_refused(
-    source: str,
+def test_every_known_key_source_maps_to_a_credential() -> None:
+    assert credential_of("none") is Credential.SUBSCRIPTION
+    assert {credential_of(source) for source in KEY_SOURCES} == set(Credential)
+    assert credential_of("something new") is None
+
+
+CREDENTIAL_CASES: list[tuple[Strategy, str, bool]] = [
+    (Strategy.SUBSCRIPTION, "none", True),
+    (Strategy.SUBSCRIPTION, "ANTHROPIC_API_KEY", False),
+    (Strategy.SUBSCRIPTION, "apiKeyHelper", False),
+    (Strategy.SUBSCRIPTION, "/login managed key", False),
+    (Strategy.API, "none", False),
+    (Strategy.API, "ANTHROPIC_API_KEY", True),
+    (Strategy.FLEXIBLE, "none", True),
+    (Strategy.FLEXIBLE, "apiKeyHelper", True),
+]
+
+
+@pytest.mark.parametrize(("strategy", "source", "accepted"), CREDENTIAL_CASES)
+def test_the_driver_decides_on_the_credential_the_engine_reports(
+    strategy: Strategy, source: str, accepted: bool
 ) -> None:
     session = Scripted([init(source=source), say(TextBlock("x")), result()])
-    with pytest.raises(EngineRefused, match="not the Claude subscription"):
+    target = line(session, Driver.for_model(MODEL, strategy))
+    expected = credential_of(source)
+    if accepted:
+        assert run(target).credential is expected
+        assert session.interrupts == 0
+    else:
+        with pytest.raises(EngineRefused, match=f"the {strategy} driver refuses"):
+            run(target)
+        assert session.interrupts == 1
+
+
+def test_an_unrecognized_credential_source_is_refused() -> None:
+    session = Scripted([init(source=""), result()])
+    with pytest.raises(EngineRefused, match="unrecognized credential source"):
         run(line(session))
     assert session.interrupts == 1
 
@@ -235,9 +287,9 @@ def test_a_turn_without_a_result_is_refused() -> None:
 def test_a_live_turn_on_the_subscription() -> None:
     if os.environ.get("DROMON_LIVE_TESTS") != "1":
         pytest.skip("set DROMON_LIVE_TESTS=1 to call the engine on the subscription")
-    target = ClaudeCodeLine(Driver.for_model(MODEL), Path.cwd())
+    target = ClaudeCodeLine(Driver.for_model(MODEL, Strategy.SUBSCRIPTION), Path.cwd())
     report = asyncio.run(target.run_turn("Reply with the single word: ready"))
     assert report.subtype == "success"
     assert report.capabilities is not None
-    assert report.capabilities.api_key_source == "none"
+    assert report.credential is Credential.SUBSCRIPTION
     assert report.capabilities.model == MODEL

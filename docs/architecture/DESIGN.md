@@ -96,6 +96,11 @@ message becomes an event for the line's driver, whose actions the adapter perfor
 `dromon probe` runs one short turn and reports the engine's capabilities. The driver
 interface is [`../protocol/DRIVER.md`](../protocol/DRIVER.md).
 
+**Decided 2026-10-25 by the operator.** Drivers are concrete. Subscription use, API use
+and flexible use are separate drivers that bake their strategy in, rather than one
+driver choosing behaviour from parameters. Claude Haiku 5.5, the least expensive
+subscription model, is used for testing.
+
 Each adapter should probe the engine's capabilities at startup, because support varies by
 engine version.
 
