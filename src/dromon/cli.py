@@ -36,6 +36,8 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "send": "send a message to a session line or an operator",
     "questions": "list open operator questions",
     "answer": "answer an operator question",
+    "mail": "look through an operator's mailbox",
+    "read": "open a message in an operator's mailbox",
     "probe": "run one short turn on the engine and report its capabilities",
 }
 """Planned subcommands and their one-line help, in display order."""
@@ -269,6 +271,73 @@ def _questions(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
+def _mail(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    args: dict[str, object] = {
+        "operator": arguments.operator,
+        "unread_only": arguments.unread,
+        "offset": arguments.offset,
+        "limit": arguments.limit,
+    }
+    if arguments.sender is not None:
+        args["sender"] = arguments.sender
+    response = _call(paths, "mail", Operation.MAIL, args)
+    if isinstance(response, int):
+        return response
+    result = response
+    entries = cast(list[dict[str, object]], result.get("messages", []))
+    print(
+        f"{result.get('total')} matching, {result.get('unread')} unread,"
+        f" {result.get('unanswered')} unanswered"
+    )
+    for entry in entries:
+        parts = [f"{entry.get('message_id')} from {entry.get('sender')}"]
+        parts.append(str(entry.get("kind")))
+        if entry.get("reply_to") is not None:
+            parts.append(f"replying to {entry.get('reply_to')}")
+        parts.append("read" if entry.get("read") is True else "unread")
+        if entry.get("answered") is True:
+            parts.append("answered")
+        print(", ".join(parts))
+    return exits.OK
+
+
+def _read(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    args: dict[str, object] = {
+        "operator": arguments.operator,
+        "message_id": arguments.message_id,
+    }
+    response = _call(paths, "read", Operation.READ, args)
+    if isinstance(response, int):
+        return response
+    reply = response.get("reply_to")
+    suffix = f", replying to {reply}" if reply is not None else ""
+    print(f"{response.get('message_id')} from {response.get('sender')}{suffix}")
+    choices = response.get("choices")
+    if isinstance(choices, list) and choices:
+        print("choices: " + " | ".join(str(c) for c in cast(list[object], choices)))
+    print()
+    print(response.get("body"))
+    return exits.OK
+
+
+def _call(
+    paths: ProjectPaths, command: str, operation: Operation, args: dict[str, object]
+) -> dict[str, object] | int:
+    """The result of one request, or the exit status that reports its failure."""
+    try:
+        response = call(paths.socket, operation, args=args)
+    except DaemonNotRunning:
+        print(f"dromon {command}: not running for {paths.root}", file=sys.stderr)
+        return exits.NOT_RUNNING
+    except (ProtocolError, TimeoutError, OSError) as error:
+        print(f"dromon {command}: {error}", file=sys.stderr)
+        return exits.FAILURE
+    if not response.ok or response.result is None:
+        print(f"dromon {command}: {response.error_message}", file=sys.stderr)
+        return exits.FAILURE
+    return response.result
+
+
 def _answer(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     args: dict[str, object] = {
         "question_id": arguments.question_id,
@@ -288,6 +357,8 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "send": _send,
     "questions": _questions,
     "answer": _answer,
+    "mail": _mail,
+    "read": _read,
 }
 
 
@@ -371,6 +442,25 @@ def build_parser() -> argparse.ArgumentParser:
                 default=default_operator(),
                 help="the operator answering, default %(default)s",
             )
+        if name in ("mail", "read"):
+            command.add_argument(
+                "--operator",
+                default=default_operator(),
+                help="whose mailbox, default %(default)s",
+            )
+        if name == "mail":
+            command.add_argument("--unread", action="store_true", help="unread only")
+            command.add_argument(
+                "--from", dest="sender", default=None, help="one sender"
+            )
+            command.add_argument(
+                "--offset", type=int, default=0, help="matches to skip"
+            )
+            command.add_argument(
+                "--limit", type=int, default=20, help="at most this many, default 20"
+            )
+        if name == "read":
+            command.add_argument("message_id", help="the message to open")
         if name == "send":
             command.add_argument("recipient", help="a line, or an operator as @name")
             command.add_argument("body", help="the message text")

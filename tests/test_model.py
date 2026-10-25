@@ -18,6 +18,7 @@ from dromon.model import (
     LineState,
     LineStateChanged,
     MessageDelivered,
+    MessageRead,
     MessageKind,
     MessageSent,
     OperatorAddress,
@@ -437,6 +438,24 @@ REJECTIONS: list[tuple[str, list[Event], Event, str]] = [
         WakeIssued("w"),
         "not idle",
     ),
+    (
+        "reading an undelivered message",
+        [*parties(), MessageSent("m", ALPHA, BETA, NOTE, "")],
+        MessageRead("m"),
+        "was not delivered",
+    ),
+    (
+        "reading twice",
+        [
+            *parties(),
+            MessageSent("m", ALPHA, BETA, NOTE, ""),
+            MessageDelivered("m"),
+            MessageRead("m"),
+        ],
+        MessageRead("m"),
+        "was read",
+    ),
+    ("reading an unknown message", parties(), MessageRead("m"), "no message"),
     (
         "withdrawal of a note",
         [*parties(), MessageSent("m", ALPHA, BETA, NOTE, "")],

@@ -51,4 +51,12 @@ receives the answer as mail in a later turn. An open question never stops its li
 being woken. Dromon's own tools now reject
 arguments outside their schema.
 
+**Mailboxes, a later prompt on the same day.** On the operator's direction that nobody
+is compelled to answer and that a hundred messages need tools, every party now has a
+mailbox with read state, recorded by `message_read`. A wake prompt opens with "X new
+message(s). Y unread. Z unanswered." and lists headers without bodies. Lines use
+`list_mail` and `read_mail`, operators `dromon mail` and `dromon read`. All three live
+tests pass with real Haiku lines reading their instructions through `read_mail`. 484
+tests pass.
+
 **Next.** Task 7, conversation control, then task 8, the attachable client.

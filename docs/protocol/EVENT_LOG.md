@@ -57,6 +57,7 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `line_session` | `line_id`, `engine_session` text of 1 to 256 bytes | The line exists. Records the engine session the line's next turn resumes, so a restarted daemon continues the line's conversation |
 | `operator_registered` | `operator_id` | The operator does not exist |
 | `message_sent` | `message_id`, `sender` and `recipient` addresses, `kind`, `body` text, `choices`, `reply_to` message identifier or `null` | See the message rules below |
+| `message_read` | `message_id` | The message was delivered and not yet read. Its recipient opened it, which obliges nothing |
 | `message_delivered` | `message_id` | The message exists and was not delivered. For a line, delivery is into a turn. For an operator, delivery is acceptance by the operator's relay or display in a client |
 | `wake_requested` | `wake_id`, `line_id`, `message_id` | The wake does not exist, the line exists and is not stopped, and the message exists with the line as its recipient |
 | `wake_issued` | `wake_id` | The wake exists and was not issued, and its line is idle |

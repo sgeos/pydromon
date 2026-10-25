@@ -29,6 +29,10 @@ completed, moved or abandoned.
     `dromon questions` and `dromon answer` work it, and the answer wakes the line in a
     later tick. `line_session` records each line's engine session, so lines survive a
     restart with their conversations.
+  - `mailbox.py` gives every party a mailbox with read and answered state. A wake
+    prompt opens with "X new message(s). Y unread. Z unanswered." and lists headers,
+    and lines page and open mail with `list_mail` and `read_mail`, operators with
+    `dromon mail` and `dromon read`. Nobody is obliged to answer.
   - `lineconfig.py` gives each line its built-in tools, arbitrary MCP servers and an
     allow-all or allowlist policy, by the operator's decision, stored as
     `line_configured`. The default is no tools beyond Dromon's own, with strict MCP
@@ -83,8 +87,8 @@ operator question. Task 8, the attachable client the operator asked for, follows
 - **Daemon debt.** No peer credential check on connections, no relay forwarding passes
   yet, and the event log's SQLite calls run on the event loop thread. Driver state
   lives only in memory, while engine sessions are recorded. The per-line turn cap stands
-  in for task 7. A note a line sends to an operator waits undelivered until a relay or
-  client shows it. All are recorded
+  in for task 7. Notes to an operator are delivered when `dromon mail` lists them or a
+  relay forwards them. All are recorded
   in `CLIENT.md` or the module documentation.
 - **Operator direction, recorded in the design.** Configuration may grow as large as a
   multi-agent project needs, per line and per project, in the spirit of Kubernetes. The
@@ -109,7 +113,7 @@ its keychain token on 2026-10-24.
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 458 tests pass, 12 of them need sockets
+uv sync && uv run pytest    # 484 tests pass, 13 of them need sockets
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 

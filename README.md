@@ -19,7 +19,9 @@ through a Keleusma driver, and reports the engine's capabilities. `dromon create
 `dromon send` create lines and message them, and the daemon wakes an idle line when a
 message arrives. Lines message each other through a `send_message` tool. Lines ask operators
 questions through an `ask_operator` tool, and `dromon questions` and `dromon answer`
-work the queue. `dromon attach` reports that it is not implemented. The first milestone is
+work the queue. Every party has a mailbox, which lines search with `list_mail` and
+`read_mail` and operators with `dromon mail` and `dromon read`. `dromon attach` reports
+that it is not implemented. The first milestone is
 [`docs/roadmap/V0_1_0.md`](docs/roadmap/V0_1_0.md) and the planned system is
 [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md). What Dromon needs from
 the Keleusma Python bindings is in

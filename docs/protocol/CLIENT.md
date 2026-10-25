@@ -50,6 +50,8 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `create_line` | Arguments `line_id`, `model`, `strategy`, and optionally `config`, an object of [`LINE_CONFIG.md`](LINE_CONFIG.md). Result `{"line_id": ...}`. Refused when no packaged driver serves the model and strategy |
 | `configure_line` | Arguments `line_id` and `config`. Replaces the line's configuration from its next turn |
 | `questions` | Optionally `operator`. Result `{"questions": [...]}`, the open questions for that operator, or for all when omitted, oldest first, each with `question_id`, `line`, `operator`, `text` and `choices`. Listing marks each question delivered, because the client has shown it |
+| `mail` | Arguments `operator`, and optionally `unread_only`, `sender`, `offset` and `limit`, at most 50. Delivers the operator's undelivered mail, then returns `total`, `unread`, `unanswered` and `messages`, a page of headers with `message_id`, `sender`, `kind`, `reply_to`, `read` and `answered`, oldest first |
+| `read` | Arguments `operator` and `message_id`. Returns the message with its `body` and `choices`, and marks it read the first time |
 | `answer` | Arguments `question_id`, `body` and `operator`. Records the operator's reply, which must come from the operator the question was asked of. Result `{"message_id": ...}`. The answer wakes the asking line in a later tick |
 | `send` | Arguments `recipient`, a line or `@operator`, `body`, `operator`, and optionally `reply_to`. Registers the operator if new and records a note from them. Result `{"message_id": ...}` |
 
@@ -99,6 +101,8 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromon configure LINE` | Sends `configure_line` with the tool options below. No option means the default configuration | 0, 4, or 1 |
 | `dromon send RECIPIENT BODY` | Sends `send`, with `--operator`, default the login name, and `--reply-to` | 0, 4, or 1 |
 | `dromon questions` | Sends `questions` for `--operator`, default the login name, or for every operator with `--all`, and prints each question with its choices | 0, 4, or 1 |
+| `dromon mail` | Sends `mail`, with `--operator`, `--unread`, `--from ADDRESS`, `--offset N` and `--limit N`, default 20 | 0, 4, or 1 |
+| `dromon read MESSAGE` | Sends `read` and prints the message | 0, 4, or 1 |
 | `dromon answer QUESTION BODY` | Sends `answer`, with `--operator`, default the login name | 0, 4, or 1 |
 | `dromon probe` | Runs one short turn without the daemon and reports the engine's capabilities | 0 or 1 |
 | `dromond` | Runs the daemon in the foreground. `--max-turns-per-line N` caps the turns run for each line, default 10, and `--hold-wakes` records messages without waking any line, and `--tick-seconds S` sets the time between ticks while work is in flight, default 1, at most 60 | 0, 1 on failure, 2 on a bad cap or cadence, or 5 when another daemon holds the lock |

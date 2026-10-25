@@ -43,6 +43,11 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Mailboxes. Every party has one, with read state recorded by a new `message_read`
+  event. A line's wake prompt opens with "X new message(s). Y unread. Z unanswered."
+  and lists the new mail's headers, and `list_mail` and `read_mail` tools page through
+  the mailbox and open messages. Operators use `dromon mail` and `dromon read`, through
+  new `mail` and `read` operations. Nobody is obliged to answer anything.
 - Operator questions, roadmap task 6. Lines ask through an in-process `ask_operator`
   tool. The daemon keeps the queue, `dromon questions` lists it, `dromon answer`
   replies, and the answer wakes the asking line in a later tick. New `questions` and

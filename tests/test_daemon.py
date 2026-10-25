@@ -375,6 +375,72 @@ def test_a_bad_answer_is_refused(
         assert "ben" not in log.state.operators
 
 
+def seed_mail(paths: ProjectPaths) -> list[str]:
+    """Line alpha with three notes to @ana, one of them a reply from her."""
+    paths.state_dir.mkdir(mode=0o700, exist_ok=True)
+    with EventLog(paths.event_log) as log:
+        scheduler = held_scheduler(log)
+        scheduler.ensure_operator("ana")
+        scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+        alpha, ana = LineAddress("alpha"), OperatorAddress("ana")
+        ids = [scheduler.send(alpha, ana, f"note {n}") for n in range(3)]
+        scheduler.collect(ana)
+        scheduler.send(ana, alpha, "thanks", reply_to=ids[0])
+        return ids
+
+
+def test_mail_lists_an_operators_mailbox_and_delivers_it(paths: ProjectPaths) -> None:
+    ids = seed_mail(paths)
+    response = request(paths, "mail", {"operator": "ana"})
+    assert response.ok and response.result is not None
+    result = response.result
+    assert (result["total"], result["unread"], result["unanswered"]) == (3, 3, 2)
+    entries = cast(list[dict[str, object]], result["messages"])
+    assert [e["message_id"] for e in entries] == ids
+    assert entries[0]["answered"] is True and entries[1]["answered"] is False
+    assert "body" not in entries[0]
+
+
+def test_mail_pages_and_filters(paths: ProjectPaths) -> None:
+    ids = seed_mail(paths)
+    page = request(paths, "mail", {"operator": "ana", "offset": 1, "limit": 1})
+    assert page.result is not None
+    entries = cast(list[dict[str, object]], page.result["messages"])
+    assert [e["message_id"] for e in entries] == [ids[1]]
+    nobody = request(paths, "mail", {"operator": "ana", "sender": "@ben"})
+    assert nobody.result is not None and nobody.result["total"] == 0
+
+
+def test_read_returns_the_body_and_marks_it_read(paths: ProjectPaths) -> None:
+    ids = seed_mail(paths)
+    response = request(paths, "read", {"operator": "ana", "message_id": ids[1]})
+    assert response.result is not None and response.result["body"] == "note 1"
+    after = request(paths, "mail", {"operator": "ana", "unread_only": True})
+    assert after.result is not None and after.result["total"] == 2
+
+
+@pytest.mark.parametrize(
+    ("op", "args", "code"),
+    [
+        ("mail", {}, ErrorCode.BAD_REQUEST),
+        ("mail", {"operator": "ana", "folder": "x"}, ErrorCode.BAD_REQUEST),
+        ("mail", {"operator": "ana", "limit": "5"}, ErrorCode.BAD_REQUEST),
+        ("mail", {"operator": "ana", "limit": 500}, ErrorCode.REJECTED),
+        ("mail", {"operator": "ana", "unread_only": 1}, ErrorCode.BAD_REQUEST),
+        ("read", {"operator": "ana", "message_id": "m-x"}, ErrorCode.REJECTED),
+        ("read", {"operator": "ben", "message_id": "FIRST"}, ErrorCode.REJECTED),
+    ],
+)
+def test_a_bad_mail_request_is_refused(
+    paths: ProjectPaths, op: str, args: dict[str, object], code: ErrorCode
+) -> None:
+    ids = seed_mail(paths)
+    if args.get("message_id") == "FIRST":
+        args = {**args, "message_id": ids[0]}
+    response = request(paths, op, args)
+    assert (response.ok, response.error_code) == (False, code)
+
+
 # The real daemon, started detached and driven over its socket. Wakes are held, so no
 # engine ever starts and no test touches the subscription.
 
@@ -596,3 +662,25 @@ def test_an_open_question_survives_a_daemon_restart_and_is_answered(
         reap(pid)
     with EventLog(paths.event_log) as log:
         assert log.state.messages[question_id].status is QuestionStatus.ANSWERED
+
+
+@pytest.mark.socket
+def test_an_operator_looks_through_mail_from_the_command_line(
+    paths: ProjectPaths, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from dromon import cli
+
+    ids = seed_mail(paths)
+    base = ["--project", str(paths.root), "--runtime-dir", str(paths.runtime_dir)]
+    pid = client.start(paths, HOLD)
+    try:
+        capsys.readouterr()
+        assert cli.main([*base, "mail", "--operator", "ana", "--unread"]) == exits.OK
+        listed = capsys.readouterr().out
+        assert listed.startswith("3 matching, 3 unread, 2 unanswered")
+        assert f"{ids[0]} from alpha, note, unread, answered" in listed
+        assert cli.main([*base, "read", ids[2], "--operator", "ana"]) == exits.OK
+        assert capsys.readouterr().out.rstrip().endswith("note 2")
+    finally:
+        client.stop(paths)
+        reap(pid)

@@ -269,7 +269,17 @@ class MessageSent:
 
 @dataclass(frozen=True, slots=True)
 class MessageDelivered:
-    """The message reached its recipient, a line's turn or an operator's channel."""
+    """The message reached its recipient's mailbox, by a turn, a relay or a client."""
+
+    message_id: str
+
+    def __post_init__(self) -> None:
+        check_id("message_id", self.message_id)
+
+
+@dataclass(frozen=True, slots=True)
+class MessageRead:
+    """The recipient opened the message. Reading never obliges an answer."""
 
     message_id: str
 
@@ -323,6 +333,7 @@ type Event = (
     | OperatorRegistered
     | MessageSent
     | MessageDelivered
+    | MessageRead
     | WakeRequested
     | WakeIssued
     | QuestionWithdrawn
@@ -354,6 +365,7 @@ class Message:
     choices: tuple[str, ...]
     reply_to: str | None
     delivered: bool = False
+    read: bool = False
     status: QuestionStatus | None = None
     """The question's lifecycle, or ``None`` for a note."""
     answered_by: str | None = None
@@ -416,6 +428,12 @@ class State:
             case MessageDelivered():
                 if self._message(event.message_id).delivered:
                     raise EventRejected(f"message {event.message_id} was delivered")
+            case MessageRead():
+                message = self._message(event.message_id)
+                if not message.delivered:
+                    raise EventRejected(f"message {event.message_id} was not delivered")
+                if message.read:
+                    raise EventRejected(f"message {event.message_id} was read")
             case WakeRequested():
                 self._check_wake_requested(event)
             case WakeIssued():
@@ -453,6 +471,9 @@ class State:
             case MessageDelivered():
                 message = self.messages[event.message_id]
                 self.messages[event.message_id] = replace(message, delivered=True)
+            case MessageRead():
+                message = self.messages[event.message_id]
+                self.messages[event.message_id] = replace(message, read=True)
             case WakeRequested():
                 self.wakes[event.wake_id] = Wake(
                     event.line_id, event.message_id, issued=False
