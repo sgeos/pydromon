@@ -141,8 +141,10 @@ as the general adapter. See [`../protocol/EVENT_LOG.md`](../protocol/EVENT_LOG.m
 - Which operator a line asks by default is per-project configuration.
 - Clients show each operator their own queue. `dromon questions` lists it and
   `dromon answer` replies from the command line.
-- Inbound adapters, such as a reply by email, authenticate the operator before a reply
-  is attributed to them.
+- **Decided 2026-10-25, design deferred.** Every relay adapter supports a response path,
+  so an operator can reply through the channel that carried the question. The required
+  properties are in [`../protocol/RELAY.md`](../protocol/RELAY.md), chief among them
+  that a reply is attributed to an operator only after the channel authenticates them.
 
 ## Standard harness features
 

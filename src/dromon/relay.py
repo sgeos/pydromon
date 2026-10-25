@@ -17,9 +17,10 @@ Trust boundaries.
 - Routes and relay configuration are operator configuration, trusted like the daemon's
   own settings. ``CommandRelay`` runs only the argument list it is configured with and
   never passes text through a shell.
-- Relays are outbound only. A reply arriving through a channel, such as an email
-  response, is not attributable to an operator until an inbound adapter authenticates
-  it. Inbound adapters are not yet specified.
+- Relays are outbound only for now. Every adapter must eventually support a response
+  path, so an operator can reply through the same channel. A reply is attributable to
+  an operator only after that path authenticates them. ``docs/protocol/RELAY.md``
+  states the required properties, and their design is technical debt.
 """
 
 import json

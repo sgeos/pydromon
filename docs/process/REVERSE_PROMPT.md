@@ -40,4 +40,9 @@ nonzero exit and an attempt to inject shell syntax through the message body.
 **Not verified.** Only Python 3.12.12 with SQLite 3.50.4 on macOS was tested. No real
 email or chat channel was exercised.
 
+**Response path, a later prompt on the same day.** The operator requires every relay
+adapter to support a response path and accepts solving it later. `RELAY.md` now states
+the required properties, which are correlation, authentication, a route check, no double
+answers and an untrusted body, and leaves the design open.
+
 **Next.** Task 3, the daemon skeleton.
