@@ -1,4 +1,4 @@
-// Dromon driver for Claude Haiku 5.5 run through Claude Code, driver interface 2.
+// Dromon driver for Claude Haiku 5.5 run through Claude Code, driver interface 3.
 //
 // Strategy: API only. The line runs on API usage billed per token. The driver refuses a
 // subscription, so a line meant to be metered is never silently moved onto a plan, and
@@ -27,13 +27,14 @@ fn tool_budget() -> Word { 10 }
 // Settings read by index before the first turn. The list ends with the tag "end".
 fn setting(index: Word) -> (Text, Text, Word) {
     match index {
-        0 => ("interface", "", 2),
+        0 => ("interface", "", 3),
         1 => ("strategy", strategy(), 0),
         2 => ("model", model(), 0),
         3 => ("effort", "low", 0),
         4 => ("max_turns", "", 2),
         5 => ("tool_budget", "", tool_budget()),
         6 => ("context_window", "", 1000000),
+        7 => ("engine", "claude-code", 0),
         _ => ("end", "", 0),
     }
 }

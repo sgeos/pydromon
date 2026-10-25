@@ -7,6 +7,9 @@ import pytest
 from dromon.driver import (
     INITIAL_STATE,
     INTERFACE_VERSION,
+    ADAPTED_ENGINES,
+    ENGINE_OF,
+    ENGINES,
     MAX_SETTINGS,
     MODELS,
     ActionTag,
@@ -19,7 +22,8 @@ from dromon.driver import (
 
 OPUS = "claude-opus-5-5"
 HAIKU = "claude-haiku-5-5"
-EVERY_DRIVER = [(model, strategy) for model in MODELS for strategy in Strategy]
+LUNA = "gpt-6-luna"
+EVERY_DRIVER = [(model, strategy) for model in ENGINE_OF for strategy in Strategy]
 
 
 def packaged_source(
@@ -43,6 +47,7 @@ def test_every_packaged_driver_declares_its_own_model_and_strategy(
 ) -> None:
     driver = Driver.for_model(model, strategy)
     assert (driver.settings.model, driver.settings.strategy) == (model, strategy)
+    assert driver.settings.engine == ENGINE_OF[model]
     assert driver.settings.max_turns >= 1
     assert driver.wcet_per_iteration > 0
     assert driver.state == INITIAL_STATE
@@ -75,7 +80,7 @@ def test_each_strategy_accepts_exactly_its_credentials(
         assert driver.state == INITIAL_STATE
 
 
-@pytest.mark.parametrize("model", MODELS)
+@pytest.mark.parametrize("model", ENGINE_OF)
 def test_metered_strategies_run_shorter_than_the_subscription(model: str) -> None:
     subscription = Driver.for_model(model, Strategy.SUBSCRIPTION).settings
     for metered in (Strategy.API, Strategy.FLEXIBLE):
@@ -92,6 +97,24 @@ def test_haiku_is_the_low_effort_testing_model() -> None:
     for strategy in Strategy:
         assert Driver.for_model(HAIKU, strategy).settings.effort == "low"
     assert Driver.for_model(OPUS, Strategy.SUBSCRIPTION).settings.effort == "high"
+
+
+def test_luna_runs_on_codex_with_the_catalogues_default_effort_and_window() -> None:
+    # Codex's model catalogue, fetched on 2026-10-25, gives GPT-6-Luna a default
+    # effort of medium and a context window of 272,000 tokens.
+    subscription = Driver.for_model(LUNA, Strategy.SUBSCRIPTION).settings
+    assert (subscription.engine, subscription.effort) == ("codex", "medium")
+    for strategy in Strategy:
+        assert Driver.for_model(LUNA, strategy).settings.context_window == 272000
+    for metered in (Strategy.API, Strategy.FLEXIBLE):
+        assert Driver.for_model(LUNA, metered).settings.effort == "low"
+
+
+def test_only_models_on_an_adapted_engine_can_carry_a_line() -> None:
+    assert set(MODELS) == {m for m, e in ENGINE_OF.items() if e in ADAPTED_ENGINES}
+    assert LUNA in ENGINE_OF and LUNA not in MODELS
+    assert set(ENGINE_OF.values()) <= set(ENGINES)
+    assert set(ENGINES) >= ADAPTED_ENGINES
 
 
 @pytest.mark.parametrize(("model", "strategy"), EVERY_DRIVER)
@@ -183,6 +206,7 @@ def driver_source(settings: str, action: str = '("continue", "", 0)') -> str:
 
 GOOD_SETTINGS = (
     f'0 => ("interface", "", {INTERFACE_VERSION}), 1 => ("model", "m", 0), '
+    '7 => ("engine", "codex", 0), '
     '6 => ("strategy", "flexible", 0), '
     '2 => ("effort", "high", 0), 3 => ("max_turns", "", 2), '
     '4 => ("tool_budget", "", 1), 5 => ("context_window", "", 10),'
@@ -212,12 +236,20 @@ def test_a_minimal_valid_driver_loads() -> None:
             "invalid settings",
         ),
         (
-            driver_source(GOOD_SETTINGS + ' 7 => ("model", "n", 0),'),
+            driver_source(GOOD_SETTINGS + ' 8 => ("model", "n", 0),'),
             "repeats the setting",
         ),
         (
             driver_source(GOOD_SETTINGS.replace('"flexible"', '"metered"')),
             "unknown strategy 'metered'",
+        ),
+        (
+            driver_source(GOOD_SETTINGS.replace('"codex"', '"gemini-cli"')),
+            "unknown engine 'gemini-cli'",
+        ),
+        (
+            driver_source(GOOD_SETTINGS.replace('7 => ("engine", "codex", 0), ', "")),
+            "omits the settings \\['engine'\\]",
         ),
     ],
 )

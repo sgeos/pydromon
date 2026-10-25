@@ -61,7 +61,7 @@ checked.
 | Grok Build | Agent Client Protocol | Its local user guide describes it as native to that protocol |
 | Cursor Agent | Agent Client Protocol through `agent acp` | Reported in July 2026 research by the operator's sessions. Not rechecked |
 | Claude Code | Claude Agent SDK | Implemented 2026-10-25 with Agent SDK 0.2.174 and Claude Code 2.1.310, on the subscription |
-| Codex | Codex SDK or its app-server | Vendor interfaces. Not tested here |
+| Codex | Codex SDK or its app-server | Vendor interfaces. Not tested here. Drivers for GPT-6-Luna packaged 2026-10-25, with no adapter yet |
 | Dromon's own loop | Direct model calls | Needed where full control of each step is required |
 
 **Decided 2026-10-25.** The first adapter targets the model Claude Opus 5.5. The operator
@@ -114,6 +114,62 @@ subscription model, is used for testing.
 
 Each adapter should probe the engine's capabilities at startup, because support varies by
 engine version.
+
+### Codex and Grok Build against the Claude Code conclusions
+
+**Reviewed 2026-10-25 at the operator's request**, which asked whether the conclusions
+above for Claude Code hold for Codex and Grok Build. Vendor documents were read on that
+day. xAI's consumer terms refused the request, so nothing here rests on them.
+
+| Conclusion for Claude Code | Codex | Grok Build |
+|---|---|---|
+| Dromon's own loop cannot use the subscription | Does not hold, see below | Unknown |
+| Dromon never reads, stores or forwards the sign-in token | Holds when Dromon drives the Codex binary | Holds, as the conservative default |
+| Unattended subscription use is unclear | Similar, API keys are the recommended default | Documents invite automation |
+| Per-token billing must never start silently | Holds, with OpenAI's variables | Holds, with xAI's variables |
+| Account tools must be kept out of a line | Holds, without an equivalent isolation switch | Holds, without an equivalent isolation switch |
+
+- **Fact.** OpenAI's Sign in with ChatGPT documents ChatGPT plan usage "for open-source
+  and locally hosted apps", which may request "permission to use the user's ChatGPT
+  plan for eligible Responses API requests". The host app then holds and renews the
+  OAuth tokens itself. Source <https://developers.openai.com/siwc/token-sharing-open-source>
+  and <https://developers.openai.com/siwc/token-sharing-open-source/codex-app-server>.
+- **Inference.** Dromon is open source and runs locally, so its own loop could run
+  OpenAI models on a ChatGPT plan, which Anthropic's terms rule out for Claude. Doing so
+  would make Dromon hold tokens, the reverse of the Claude rule, and needs the
+  operator's decision. The program and the app-server it pairs with are described as
+  preview and "experimental".
+- **Fact.** OpenAI's Codex authentication page says "API keys are still the recommended
+  default for automation", and its app-server page says to use the Codex SDK for jobs
+  and CI. Codex keeps its login in `~/.codex/auth.json` or the system credential store,
+  and says to "treat ~/.codex/auth.json like a password". Source
+  <https://learn.chatgpt.com/docs/auth> and <https://learn.chatgpt.com/docs/app-server>.
+- **Fact.** xAI's Grok Build overview calls headless use "ideal for scripts,
+  automations, or integration into other apps" and names the Agent Client Protocol for
+  use "in other apps". xAI's own posts endorse subscription sign-in inside OpenCode and
+  Kilo Code. No xAI program for other apps to use the subscription was found. Source
+  <https://docs.x.ai/build/overview> and <https://x.ai/news/grok-opencode>.
+- **Fact.** On the operator's machine, the user configurations of both Codex and Grok
+  Build declare mail, document and calendar MCP servers.
+- **Inference.** A line on either engine started on the operator's configuration would
+  inherit those servers. A separate configuration directory would also leave the login
+  behind, and copying the login would breach the token rule, so isolating a line is an
+  open design problem for both. Codex's `-c` overrides may disable servers by name.
+- **Owed before a Codex or Grok line runs.** The environment check and the reserved
+  variables of `SETTINGS.md` name only Anthropic's credentials, and must add at least
+  `OPENAI_API_KEY` and `XAI_API_KEY`, and each adapter needs a way to read the
+  credential the engine actually used, as `apiKeySource` does for Claude Code. A
+  third-party report, not verified, says a Codex session on a ChatGPT plan may fall back
+  to a smaller model at a limit, which the driver's model check exists to catch.
+- **Concrete drivers carry over.** Each model and credential strategy keeps its own
+  driver. Dromon's own loop on OpenAI's program would add a credential the current
+  strategies do not name.
+
+**Implemented 2026-10-25, on the operator's direction.** Drivers for GPT-6-Luna on
+Codex are packaged in all three strategies, under driver interface 3, which adds the
+engine each driver is written for. A line can be created only on a model whose engine
+has an adapter, so these drivers are tested but no line runs them until a Codex adapter
+exists.
 
 ## Communication
 

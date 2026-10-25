@@ -2,8 +2,9 @@
 
 > **Navigation**: [Protocol](./README.md) | [Documentation Root](../README.md)
 
-**Status.** Draft, driver interface 2, written on 2026-10-25 for roadmap task 4 and
-revised the same day to separate credential strategies. Normative. `dromon.driver`
+**Status.** Draft, driver interface 3, written on 2026-10-25 for roadmap task 4 and
+revised the same day to separate credential strategies and, in interface 3, to name
+each driver's engine. Normative. `dromon.driver`
 hosts drivers through `pykeleusma`, and the packaged drivers are in
 `src/dromon/drivers/`.
 
@@ -23,7 +24,7 @@ subscription draws on a plan's limits while API usage is charged for every token
 
 | Strategy | Accepts | Settings |
 |---|---|---|
-| `subscription` | A Claude subscription only | Tuned for the plan's limits |
+| `subscription` | A subscription only, a Claude plan or a ChatGPT plan | Tuned for the plan's limits |
 | `api` | API usage billed per token only | Shorter turns and smaller budgets, since every token is charged |
 | `flexible` | Either | The API-safe settings, because the line may be charged per token |
 
@@ -35,8 +36,22 @@ subscription draws on a plan's limits while API usage is charged for every token
 | `claude_haiku_5_5_subscription.kel` | Claude Haiku 5.5 | subscription | low | 4 | 20 |
 | `claude_haiku_5_5_api.kel` | Claude Haiku 5.5 | api | low | 2 | 10 |
 | `claude_haiku_5_5_flexible.kel` | Claude Haiku 5.5 | flexible | low | 2 | 10 |
+| `gpt_6_luna_subscription.kel` | GPT-6-Luna on Codex | subscription | medium | 4 | 20 |
+| `gpt_6_luna_api.kel` | GPT-6-Luna on Codex | api | low | 2 | 10 |
+| `gpt_6_luna_flexible.kel` | GPT-6-Luna on Codex | flexible | low | 2 | 10 |
 
 Claude Haiku 5.5 is the least expensive model and is the default for probes and tests.
+GPT-6-Luna's settings follow Codex's model catalogue as fetched on 2026-10-25, which
+gives it a default effort of medium and a context window of 272,000 tokens, and for a
+ChatGPT plan the subscription strategy means Codex's own sign-in.
+
+## Engines
+
+Each driver names the engine it is written for, `claude-code` or `codex`. A model has
+packaged drivers once they are written, but a line can be created on it only when
+Dromon has an adapter for its engine, and an adapter refuses a driver written for
+another engine. On 2026-10-25 only `claude-code` has an adapter, so the GPT-6-Luna
+drivers are tested and no line runs them.
 A file is named for its model and strategy, and the host refuses a file whose declared
 model or strategy differs from its name.
 
@@ -109,7 +124,8 @@ At most 32 settings are read.
 
 | Name | Value | Required |
 |---|---|---|
-| `interface` | Number `2` | Yes |
+| `interface` | Number `3` | Yes |
+| `engine` | Text, `claude-code` or `codex` | Yes |
 | `strategy` | Text, `subscription`, `api` or `flexible` | Yes |
 | `model` | Text, the model identifier | Yes |
 | `effort` | Text, one of `low`, `medium`, `high`, `xhigh` and `max` | Yes |
@@ -119,7 +135,8 @@ At most 32 settings are read.
 
 ## Credentials in the host
 
-The host maps Claude Code's reported `apiKeySource` to a credential. `none` is a
+For the Codex engine this mapping is not yet specified, and it is owed with the
+adapter. For Claude Code, the host maps Claude Code's reported `apiKeySource` to a credential. `none` is a
 subscription, and `ANTHROPIC_API_KEY`, `apiKeyHelper` and `/login managed key` are API
 usage. Any other value is refused without consulting the driver. Before a turn the host
 refuses every cloud provider, whose source would also read `none`, and for a

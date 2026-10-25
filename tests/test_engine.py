@@ -186,6 +186,12 @@ def test_options_follow_the_driver_and_isolate_the_line() -> None:
     assert options.cwd == "/work"
 
 
+def test_the_claude_code_adapter_refuses_a_driver_for_another_engine() -> None:
+    codex = Driver.for_model("gpt-6-luna", Strategy.SUBSCRIPTION)
+    with pytest.raises(EngineRefused, match="written for the codex engine"):
+        ClaudeCodeLine(codex, Path("/work"))
+
+
 def test_the_next_turn_resumes_the_engine_session() -> None:
     session = Scripted([init(), result()])
     target = line(session)

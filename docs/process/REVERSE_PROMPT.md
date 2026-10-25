@@ -4,40 +4,33 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-25, configuration parity with the settings in use
+## 2026-10-25, Codex and Grok Build review, and GPT-6-Luna drivers
 
-**Done.** On the operator's direction to review the settings actually used on this
-machine with Claude Code, Codex and Grok Build, and to reach functional parity for them,
-configurable per line and per project.
+**Done.** On the operator's direction to record whether the Claude Code driver
+conclusions hold for Codex and Grok Build, and to write drivers for GPT-6-Luna.
 
-- **Fact.** The user and project configuration of the three harnesses was read with
-  credential values redacted and credential files left unread. The settings found, by
-  key, and how Dromon provides each, are tabled in `docs/protocol/SETTINGS.md`. Paths,
-  project names and values are not recorded in tracked files.
-- New engine settings, in Claude Code's key names, cover permission rules, command
-  hooks, `env` and `attribution`. They layer per project, profile and line, or come from
-  `--settings-config FILE`, a Claude Code settings file, and reach Claude Code through
-  its `--settings` flag.
-- A line's `effort` replaces its driver's, matching Codex's reasoning effort setting.
-- MCP servers may refer to the daemon's environment as `${NAME}`, matching Codex's
-  bearer token variable, so a token can stay out of the event log.
+- `DESIGN.md` records the review, with vendor sources. The main difference is that
+  OpenAI documents ChatGPT plan usage for open-source and locally hosted apps, so
+  Dromon's own loop could run OpenAI models on a plan, at the cost of holding tokens.
+  xAI's documents invite automation, but its consumer terms could not be read.
+- Driver interface 3 adds the engine a driver is written for. Drivers for GPT-6-Luna
+  on Codex are packaged in the subscription, API and flexible strategies. Their effort
+  and context window come from Codex's local model catalogue, fetched on 2026-10-25.
+- A line can be created only on a model whose engine has an adapter, and the Claude
+  Code adapter refuses a driver for another engine, so no line can run the Luna
+  drivers on the wrong engine.
 
 **Decisions made by this line, open to the operator's review.**
 
-- `ask` rules deny, because a question never pauses a line. Grok Build's `ask` rules
-  therefore refuse rather than prompt.
-- Every line's built-in file tools are denied `.dromon` and the runtime directory,
-  whether or not its sandbox is enabled.
-- `env` may not set credential or provider variables, and MCP references may not name
-  them.
-- Hooks are accepted from the committed project file, on the reasoning that it can
-  already declare stdio MCP servers, which run commands too.
+- Luna's subscription driver uses the catalogue's default effort, medium, and its
+  metered drivers use low. Turn and tool budgets match Haiku 5.5's, the other
+  inexpensive model.
+- Whether Dromon's own loop should use OpenAI's ChatGPT plan program, and so hold
+  tokens, is left to the operator.
 
-**Not at parity.** Claude Code's `auto` mode and Codex's automatic reviewer, plugins and
-language servers, and MCP OAuth. Each is explained in `SETTINGS.md`.
+**Not done.** There is no Codex adapter, so the Luna drivers have not run against
+Codex. The reserved variable lists do not yet name OpenAI's or xAI's credentials.
 
-**Verification.** 720 tests passing outside the sandbox with warnings treated as errors,
-and all 6 live tests passing on Haiku 5.5. The two new live tests showed that a hook
-runs with the line's `env` and reaches the model, and that an `ask` rule refuses a Bash
-call while an unmatched one runs. Ruff and pyright strict clean. Linux was not exercised
-live.
+**Verification.** All tests pass outside the sandbox with warnings treated as errors.
+Ruff and pyright strict clean. The wheel includes the three new driver files. No live
+test was run, since nothing in this change reaches an engine.
