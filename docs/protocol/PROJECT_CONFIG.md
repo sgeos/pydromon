@@ -67,7 +67,7 @@ every_ticks = 5
 | `profiles.NAME` | table | none | A reusable line template with every line key but `profile` |
 | `lines.ID` | table | none | A line, named by a line identifier |
 | `lines.ID.profile` | profile name | none | The profile the line starts from |
-| `lines.ID.model` | model | required | `claude-opus-5-5` or `claude-haiku-5-5` |
+| `lines.ID.model` | model | required | `claude-opus-5-5`, `claude-haiku-5-5` or `gpt-6-luna`, the last on Codex as [`CODEX.md`](CODEX.md) specifies |
 | `lines.ID.strategy` | strategy | `subscription` | `subscription`, `api` or `flexible` |
 | `lines.ID.limits` | table | the file's | Limits for this line, each key defaulting to the file's |
 | `lines.ID.wake` | table | the file's | The wake policy for this line |
@@ -94,6 +94,8 @@ every_ticks = 5
   whose tools differ is reconfigured. A line's model and strategy are fixed at
   creation, so a file that changes either is refused and the daemon does not start.
   Lines created through the client and absent from the file are left as they are.
+- **Codex lines.** A project file whose own `[sandbox]` or `[settings]` table would
+  reach a Codex line is refused at start, since such a line runs in Codex's sandbox.
 - **Restart.** The policies of limits and wake live in the daemon and are re-read on
   every start. The lines and their configurations are events in the log.
 

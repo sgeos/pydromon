@@ -16,7 +16,7 @@ from claude_agent_sdk import SdkMcpTool
 from dromon.driver import DriverError, Strategy
 from dromon.engine import TurnReport
 from dromon.eventlog import EventLog, read_entries
-from dromon.lineconfig import LineConfig, ToolPolicy, encode_config
+from dromon.lineconfig import ConfigError, LineConfig, ToolPolicy, encode_config
 from dromon.model import (
     EventRejected,
     LineAddress,
@@ -468,11 +468,20 @@ def test_a_line_needs_a_packaged_driver(make_world: MakeWorld) -> None:
     assert "gamma" not in target.log.state.lines
 
 
-def test_a_line_needs_an_adapter_for_its_drivers_engine(make_world: MakeWorld) -> None:
+def test_a_codex_line_refuses_a_configuration_its_engine_cannot_run(
+    make_world: MakeWorld,
+) -> None:
     target = make_world({})
-    with pytest.raises(DriverError, match="codex engine, for which Dromon has no"):
-        target.scheduler.create_line("gamma", "gpt-6-luna", Strategy.SUBSCRIPTION)
+    unsupported = LineConfig(builtin_tools=("Read",))
+    with pytest.raises(ConfigError, match="only the built-in tool Bash"):
+        target.scheduler.create_line(
+            "gamma", "gpt-6-luna", Strategy.SUBSCRIPTION, unsupported
+        )
     assert "gamma" not in target.log.state.lines
+    target.scheduler.create_line("gamma", "gpt-6-luna", Strategy.SUBSCRIPTION)
+    with pytest.raises(ConfigError, match="do not yet support MCP servers"):
+        target.scheduler.configure_line("gamma", LineConfig(inherit_account_mcp=True))
+    target.scheduler.configure_line("gamma", LineConfig(builtin_tools=("Bash",)))
 
 
 def test_the_wake_prompt_summarizes_and_lists_headers_without_bodies() -> None:
@@ -509,12 +518,12 @@ def test_two_live_lines_exchange_a_message(tmp_path: Path) -> None:
 
     if os.environ.get("DROMON_LIVE_TESTS") != "1":
         pytest.skip("set DROMON_LIVE_TESTS=1 to call the engine on the subscription")
-    from dromon.scheduler import claude_code_engine
+    from dromon.scheduler import engine_factory
 
     with EventLog(tmp_path / "events.sqlite") as log:
         scheduler = Scheduler(
             log,
-            claude_code_engine(str(tmp_path)),
+            engine_factory(str(tmp_path)),
             limits=Limits(max_autonomous_turns=2),
         )
         scheduler.ensure_operator("ana")
@@ -542,6 +551,50 @@ def test_two_live_lines_exchange_a_message(tmp_path: Path) -> None:
         wakes = [w for w in log.state.wakes.values() if w.line_id == "beta"]
         assert any(m.recipient == LineAddress("beta") for m in sent)
         assert wakes and all(w.issued for w in wakes)
+        assert all(line.state is LineState.IDLE for line in log.state.lines.values())
+
+
+@pytest.mark.live
+def test_a_live_luna_line_messages_a_haiku_line(tmp_path: Path) -> None:
+    """Two engines in one scheduler, on the operator's ChatGPT plan and subscription."""
+    import os
+
+    if os.environ.get("DROMON_LIVE_TESTS") != "1":
+        pytest.skip("set DROMON_LIVE_TESTS=1 to call the engine on the subscription")
+    from dromon.scheduler import engine_factory
+
+    with EventLog(tmp_path / "events.sqlite") as log:
+        scheduler = Scheduler(
+            log,
+            engine_factory(str(tmp_path.resolve())),
+            limits=Limits(max_autonomous_turns=2),
+        )
+        scheduler.ensure_operator("ana")
+        scheduler.create_line("alpha", "gpt-6-luna", Strategy.SUBSCRIPTION)
+        scheduler.create_line("beta", HAIKU, Strategy.SUBSCRIPTION)
+
+        async def exchange() -> None:
+            stop = asyncio.Event()
+            loop = asyncio.create_task(scheduler.run(stop))
+            scheduler.send(
+                ANA,
+                LineAddress("alpha"),
+                "Use the send_message tool exactly once to send the word ping to the"
+                " line beta. Do not send anything else.",
+            )
+            await asyncio.sleep(0)
+            await scheduler.idle()
+            stop.set()
+            await loop
+
+        asyncio.run(exchange())
+        reports = dict(scheduler.turn_reports)
+        sent = [
+            m for m in log.state.messages.values() if m.sender == LineAddress("alpha")
+        ]
+        assert "alpha" in reports, "the Luna line did not complete a turn"
+        assert any(m.recipient == LineAddress("beta") for m in sent)
+        assert any(line_id == "beta" for line_id, _ in scheduler.turn_reports)
         assert all(line.state is LineState.IDLE for line in log.state.lines.values())
 
 
@@ -810,12 +863,12 @@ def test_a_live_line_asks_and_is_woken_by_the_answer(tmp_path: Path) -> None:
 
     if os.environ.get("DROMON_LIVE_TESTS") != "1":
         pytest.skip("set DROMON_LIVE_TESTS=1 to call the engine on the subscription")
-    from dromon.scheduler import claude_code_engine
+    from dromon.scheduler import engine_factory
 
     with EventLog(tmp_path / "events.sqlite") as log:
         scheduler = Scheduler(
             log,
-            claude_code_engine(str(tmp_path)),
+            engine_factory(str(tmp_path)),
             limits=Limits(max_autonomous_turns=2),
         )
         scheduler.ensure_operator("ana")

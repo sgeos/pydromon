@@ -57,7 +57,9 @@ from typing import Any, Final, Protocol, cast
 from claude_agent_sdk import SdkMcpTool
 
 from dromon.driver import MODELS, Driver, DriverError, Strategy
-from dromon.engine import ClaudeCodeLine, TurnReport
+from dromon import codex
+from dromon.codex import CodexLine
+from dromon.engine import ClaudeCodeLine, EngineRefused, TurnReport
 from dromon.eventlog import EventLog
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon import settings as engine_settings
@@ -72,7 +74,13 @@ from dromon.mailbox import (
     sent,
     summary,
 )
-from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, decode_config, encode_config
+from dromon.lineconfig import (
+    DEFAULT_CONFIG,
+    ConfigError,
+    LineConfig,
+    decode_config,
+    encode_config,
+)
 from dromon.model import (
     Address,
     EventRejected,
@@ -220,7 +228,7 @@ type EngineFactory = Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], LineEngine]
 """Builds a line's engine, given the line and Dromon's own tools for it."""
 
 
-def claude_code_engine(
+def engine_factory(
     cwd: str,
     *,
     project_sandbox: SandboxConfig | None = None,
@@ -239,6 +247,19 @@ def claude_code_engine(
 
     def build(spec: LineSpec, own_tools: Sequence[SdkMcpTool[Any]]) -> LineEngine:
         driver = Driver.for_model(spec.model, spec.strategy)
+        if driver.settings.engine == codex.ENGINE_NAME:
+            if project_sandbox is not None or project_settings is not None:
+                raise EngineRefused(
+                    "Codex lines take no sandbox or settings, and the project file"
+                    " sets one for every line"
+                )
+            return CodexLine(
+                driver,
+                Path(cwd),
+                config=spec.config,
+                mcp_tools=list(own_tools),
+                session_id=spec.session_id,
+            )
         merged = merge([project_sandbox, spec.config.sandbox])
         return ClaudeCodeLine(
             driver,
@@ -254,6 +275,14 @@ def claude_code_engine(
         )
 
     return build
+
+
+def _check_engine_supports(driver: Driver, config: LineConfig) -> None:
+    """Raise ``ConfigError`` if the driver's engine cannot run ``config``."""
+    if driver.settings.engine == codex.ENGINE_NAME:
+        reason = codex.unsupported(config)
+        if reason is not None:
+            raise ConfigError(reason)
 
 
 def new_id(prefix: str) -> str:
@@ -367,6 +396,7 @@ class Scheduler:
                 f"{model} runs on the {driver.settings.engine} engine, for which Dromon"
                 " has no adapter yet"
             )
+        _check_engine_supports(driver, config)
         self._log.append(LineCreated(line_id, model, strategy.value))
         if config != DEFAULT_CONFIG:
             self.configure_line(line_id, config)
@@ -377,6 +407,10 @@ class Scheduler:
         The engine is rebuilt with the new configuration, and resumes the same engine
         session, so the line keeps its conversation.
         """
+        line = self._log.state.lines.get(line_id)
+        if line is not None:
+            driver = Driver.for_model(line.engine, Strategy(line.strategy))
+            _check_engine_supports(driver, config)
         self._log.append(LineConfigured(line_id, encode_config(config)))
         self._engines.pop(line_id, None)
 

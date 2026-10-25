@@ -1,0 +1,545 @@
+"""The Codex engine adapter, driven by a scripted app-server instead of Codex.
+
+The tests marked ``live`` reach the real engine on the operator's ChatGPT plan, so
+they need both the ``live`` marker selected and ``DROMON_LIVE_TESTS=1``.
+"""
+
+import asyncio
+import os
+from collections import deque
+from collections.abc import AsyncGenerator, Mapping, Sequence
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+import pytest
+from claude_agent_sdk import SdkMcpTool
+
+from dromon.codex import (
+    DISABLED_FEATURES,
+    CodexLine,
+    Connection,
+    engine_environment,
+    server_arguments,
+    tool_output,
+    unsupported,
+)
+from dromon.daemon import check_engines
+from dromon.driver import Credential, Driver, Strategy
+from dromon.engine import EngineRefused, TurnReport
+from dromon.lineconfig import LineConfig
+from dromon.projectconfig import parse
+from dromon.sandbox import parse_sandbox
+from dromon.scheduler import LineSpec, engine_factory
+from dromon.settings import parse_settings, reserved_variable
+
+LUNA = "gpt-6-luna"
+CWD = Path("/work")
+
+
+def luna(strategy: Strategy = Strategy.SUBSCRIPTION) -> Driver:
+    return Driver.for_model(LUNA, strategy)
+
+
+calls: list[dict[str, Any]] = []
+
+
+async def _record(args: dict[str, Any]) -> dict[str, Any]:
+    calls.append(args)
+    return {"content": [{"type": "text", "text": f"recorded {args.get('word')}"}]}
+
+
+RECORD: SdkMcpTool[Any] = SdkMcpTool(
+    name="record",
+    description="Record a word.",
+    input_schema={"type": "object", "properties": {"word": {"type": "string"}}},
+    handler=_record,
+)
+
+
+def notice(method: str, **params: object) -> dict[str, Any]:
+    return {"method": method, "params": params}
+
+
+def item(kind: str, **fields: object) -> dict[str, Any]:
+    return notice("item/started", item={"type": kind, "id": "i", **fields})
+
+
+def message(text: str) -> dict[str, Any]:
+    return notice(
+        "item/completed", item={"type": "agentMessage", "id": "m", "text": text}
+    )
+
+
+def completed(status: str = "completed") -> dict[str, Any]:
+    return notice("turn/completed", threadId="th", turn={"id": "t1", "status": status})
+
+
+class FakeServer:
+    """A scripted app-server: answers requests by method and plays the turn's
+    messages after ``turn/start``."""
+
+    def __init__(
+        self,
+        turn: Sequence[dict[str, Any]] = (message("done"), completed()),
+        *,
+        account: object = {"type": "chatgpt", "planType": "pro", "email": None},
+        model: str = LUNA,
+        provider: str = "openai",
+        servers: Sequence[tuple[str, str, int]] = (("gmail", "disabled", 0),),
+        apps: Sequence[object] = (),
+        failing: str | None = None,
+    ) -> None:
+        self.turn = list(turn)
+        self.account = account
+        self.model = model
+        self.provider = provider
+        self.servers = servers
+        self.apps = list(apps)
+        self.failing = failing
+        self.sent: list[dict[str, Any]] = []
+        self.queue: deque[dict[str, Any]] = deque()
+        self.arguments: list[str] = []
+        self.environment: dict[str, str] = {}
+
+    def methods(self) -> list[str]:
+        return [m["method"] for m in self.sent if "method" in m]
+
+    def params(self, method: str) -> dict[str, Any]:
+        return next(m["params"] for m in self.sent if m.get("method") == method)
+
+    def answers(self) -> list[dict[str, Any]]:
+        return [m for m in self.sent if "method" not in m]
+
+    async def send(self, message: Mapping[str, object]) -> None:
+        sent = dict(message)
+        self.sent.append(sent)
+        method = sent.get("method")
+        if not isinstance(method, str) or "id" not in sent:
+            return
+        if method == self.failing:
+            self.queue.append(
+                {"id": sent["id"], "error": {"code": -1, "message": "no"}}
+            )
+            return
+        result = self.result(method)
+        self.queue.append({"id": sent["id"], "result": result})
+        if method == "turn/start":
+            self.queue.append(notice("turn/started", turn={"id": "t1"}))
+            self.queue.extend(self.turn)
+        if method == "turn/interrupt":
+            self.queue.append(completed("interrupted"))
+
+    def result(self, method: str) -> dict[str, Any]:
+        if method == "account/read":
+            return {"account": self.account, "requiresOpenaiAuth": True}
+        if method in ("thread/start", "thread/resume"):
+            return {
+                "thread": {"id": "th"},
+                "model": self.model,
+                "modelProvider": self.provider,
+            }
+        if method == "mcpServerStatus/list":
+            return {
+                "data": [
+                    {
+                        "name": n,
+                        "runtimeStatus": s,
+                        "tools": {str(i): {} for i in range(t)},
+                    }
+                    for n, s, t in self.servers
+                ]
+            }
+        if method == "app/list":
+            return {"data": self.apps}
+        if method == "turn/start":
+            return {"turn": {"id": "t1", "status": "inProgress"}}
+        return {}
+
+    async def receive(self) -> dict[str, Any] | None:
+        await asyncio.sleep(0)
+        return self.queue.popleft() if self.queue else None
+
+
+def line(
+    server: FakeServer,
+    *,
+    driver: Driver | None = None,
+    config: LineConfig | None = None,
+    environment: Mapping[str, str] | None = None,
+    session_id: str | None = None,
+) -> CodexLine:
+    @asynccontextmanager
+    async def connect(
+        arguments: list[str], cwd: Path, env: Mapping[str, str]
+    ) -> AsyncGenerator[Connection]:
+        del cwd
+        server.arguments = arguments
+        server.environment = dict(env)
+        yield server
+
+    return CodexLine(
+        driver or luna(),
+        CWD,
+        config=config or LineConfig(),
+        mcp_tools=[RECORD],
+        session_id=session_id,
+        environment={} if environment is None else environment,
+        connection_factory=connect,
+        server_lister=lambda env: ["gmail", "slack"],
+    )
+
+
+def run(target: CodexLine, prompt: str = "hello") -> TurnReport:
+    return asyncio.run(target.run_turn(prompt))
+
+
+# A plain turn.
+
+
+def test_a_plain_turn_reports_text_credential_and_thread() -> None:
+    server = FakeServer()
+    target = line(server)
+    report = run(target)
+    assert (report.subtype, report.text, report.session_id) == ("success", "done", "th")
+    assert report.credential is Credential.SUBSCRIPTION
+    assert report.cost_estimate_usd is None
+    assert target.session_id == "th"
+    assert server.methods()[:3] == ["initialize", "initialized", "account/read"]
+    assert server.params("initialize")["capabilities"] == {"experimentalApi": True}
+
+
+def test_the_thread_is_isolated_and_offers_only_dromons_tools() -> None:
+    server = FakeServer()
+    run(line(server))
+    start = server.params("thread/start")
+    assert start["model"] == LUNA
+    assert (start["sandbox"], start["approvalPolicy"], start["approvalsReviewer"]) == (
+        "read-only",
+        "never",
+        "user",
+    )
+    assert [t["name"] for t in start["dynamicTools"]] == ["record"]
+    assert start["dynamicTools"][0]["inputSchema"] == RECORD.input_schema
+    turn = server.params("turn/start")
+    assert turn["effort"] == luna().settings.effort
+    assert turn["input"] == [{"type": "text", "text": "hello"}]
+
+
+def test_the_arguments_disable_every_server_feature_and_the_shell() -> None:
+    arguments = server_arguments(["slack", "gmail", "gmail"], LineConfig())
+    assert arguments[0] == "app-server"
+    assert arguments.count("mcp_servers.gmail.enabled=false") == 1
+    assert "mcp_servers.slack.enabled=false" in arguments
+    with pytest.raises(EngineRefused, match="cannot be disabled"):
+        server_arguments(["mail.example"], LineConfig())
+    for feature in (*DISABLED_FEATURES, "shell_tool", "unified_exec"):
+        assert arguments[arguments.index(feature) - 1] == "--disable"
+    assert 'web_search="disabled"' in arguments
+    shell = server_arguments([], LineConfig(builtin_tools=("Bash",)))
+    assert shell[shell.index("shell_tool") - 1] == "--enable"
+    assert shell[shell.index("unified_exec") - 1] == "--enable"
+
+
+def test_a_line_effort_replaces_the_drivers() -> None:
+    server = FakeServer()
+    run(line(server, config=LineConfig(effort="max")))
+    assert server.params("turn/start")["effort"] == "max"
+
+
+def test_the_next_turn_resumes_the_thread() -> None:
+    server = FakeServer()
+    run(line(server, session_id="th"))
+    resume = server.params("thread/resume")
+    assert resume["threadId"] == "th"
+    assert "dynamicTools" not in resume
+    assert "thread/start" not in server.methods()
+
+
+# Requests from the engine.
+
+
+def test_dromons_tools_are_served_and_counted() -> None:
+    calls.clear()
+    server = FakeServer(
+        [
+            item("dynamicToolCall", tool="record"),
+            {
+                "id": "s1",
+                "method": "item/tool/call",
+                "params": {"tool": "record", "arguments": {"word": "heron"}},
+            },
+            {
+                "id": "s2",
+                "method": "item/tool/call",
+                "params": {"tool": "missing", "arguments": {}},
+            },
+            message("ok"),
+            completed(),
+        ]
+    )
+    report = run(line(server))
+    assert calls == [{"word": "heron"}]
+    assert report.tool_uses == ("record",)
+    first, second = server.answers()[:2]
+    assert first == {
+        "id": "s1",
+        "result": {
+            "success": True,
+            "contentItems": [{"type": "inputText", "text": "recorded heron"}],
+        },
+    }
+    assert second["result"]["success"] is False
+
+
+def test_approvals_are_declined_and_other_requests_refused() -> None:
+    server = FakeServer(
+        [
+            {
+                "id": "a1",
+                "method": "item/commandExecution/requestApproval",
+                "params": {},
+            },
+            {"id": "a2", "method": "item/fileChange/requestApproval", "params": {}},
+            {"id": "a3", "method": "item/tool/requestUserInput", "params": {}},
+            completed(),
+        ]
+    )
+    run(line(server))
+    answers = {a["id"]: a for a in server.answers()}
+    assert answers["a1"]["result"] == {"decision": "decline"}
+    assert answers["a2"]["result"] == {"decision": "decline"}
+    assert answers["a3"]["error"]["code"] == -32601
+
+
+def test_tool_output_maps_text_and_errors() -> None:
+    assert tool_output(
+        {"content": [{"type": "text", "text": "x"}, {"type": "image"}]}
+    ) == {
+        "success": True,
+        "contentItems": [{"type": "inputText", "text": "x"}],
+    }
+    assert tool_output({"content": [], "is_error": True})["success"] is False
+
+
+# Credentials, models and isolation.
+
+
+def test_a_subscription_driver_refuses_an_api_key_before_any_thread() -> None:
+    server = FakeServer(account={"type": "apiKey"})
+    with pytest.raises(EngineRefused, match="subscription driver refuses the api"):
+        run(line(server))
+    assert "thread/start" not in server.methods()
+
+
+def test_an_api_driver_accepts_an_api_key() -> None:
+    report = run(
+        line(FakeServer(account={"type": "apiKey"}), driver=luna(Strategy.API))
+    )
+    assert report.credential is Credential.API
+
+
+@pytest.mark.parametrize("account", [None, {"type": "amazonBedrock"}, "chatgpt"])
+def test_an_unrecognized_account_is_refused(account: object) -> None:
+    with pytest.raises(EngineRefused, match="unrecognized account"):
+        run(line(FakeServer(account=account)))
+
+
+@pytest.mark.parametrize(
+    ("server", "reason"),
+    [
+        (FakeServer(model="gpt-6-astra"), "refuses the engine model 'gpt-6-astra'"),
+        (FakeServer(provider="azure"), "model provider 'azure'"),
+        (
+            FakeServer(servers=[("gmail", "connected", 23)]),
+            "MCP servers the line was not given: gmail",
+        ),
+        (
+            FakeServer(servers=[("gmail", "disabled", 1)]),
+            "MCP servers the line was not given",
+        ),
+        (
+            FakeServer(servers=[("gmail", "notStarted", 0)]),
+            "MCP servers the line was not given",
+        ),
+        (FakeServer(apps=[{"id": "drive"}]), "offers apps"),
+    ],
+)
+def test_an_engine_that_breaks_isolation_is_refused_before_the_turn(
+    server: FakeServer, reason: str
+) -> None:
+    with pytest.raises(EngineRefused, match=reason):
+        run(line(server))
+    assert "turn/start" not in server.methods()
+
+
+def test_a_tool_the_line_was_not_given_interrupts_and_refuses_the_turn() -> None:
+    server = FakeServer([item("mcpToolCall", server="gmail", tool="send")])
+    with pytest.raises(EngineRefused, match="not given: mcpToolCall"):
+        run(line(server))
+    assert server.params("turn/interrupt") == {"threadId": "th", "turnId": "t1"}
+
+
+def test_the_shell_counts_as_bash_only_for_a_line_given_bash() -> None:
+    with pytest.raises(EngineRefused, match="not given: commandExecution"):
+        run(line(FakeServer([item("commandExecution", command="ls")])))
+    server = FakeServer([item("commandExecution", command="ls"), completed()])
+    report = run(line(server, config=LineConfig(builtin_tools=("Bash",))))
+    assert report.tool_uses == ("Bash",)
+
+
+def test_a_reroute_to_another_model_interrupts_and_refuses_the_turn() -> None:
+    server = FakeServer(
+        [notice("model/rerouted", fromModel=LUNA, toModel="gpt-6-mini")]
+    )
+    with pytest.raises(
+        EngineRefused, match="rerouted the turn to the model 'gpt-6-mini'"
+    ):
+        run(line(server))
+    assert "turn/interrupt" in server.methods()
+
+
+def test_the_driver_budget_interrupts_a_turn_once() -> None:
+    budget = luna().settings.tool_budget
+    server = FakeServer([item("dynamicToolCall", tool="record")] * (budget + 3))
+    report = run(line(server))
+    assert report.interrupted_for == "tool_budget"
+    assert report.subtype == "interrupted"
+    assert server.methods().count("turn/interrupt") == 1
+
+
+def test_a_closed_connection_or_failed_request_refuses_the_turn() -> None:
+    with pytest.raises(EngineRefused, match="closed its connection"):
+        run(line(FakeServer([message("partial")])))
+    with pytest.raises(EngineRefused, match="refused a request: thread/start"):
+        run(line(FakeServer(failing="thread/start")))
+
+
+# Environment and configuration.
+
+
+KEYS = {"OPENAI_API_KEY": "k", "CODEX_API_KEY": "k", "CODEX_ACCESS_TOKEN": "k"}
+
+
+def test_a_subscription_lines_codex_never_sees_an_api_key() -> None:
+    environment = {**KEYS, "PATH": "/bin"}
+    assert engine_environment(environment, Strategy.SUBSCRIPTION) == {"PATH": "/bin"}
+    for metered in (Strategy.API, Strategy.FLEXIBLE):
+        assert engine_environment(environment, metered) == environment
+    server = FakeServer()
+    run(line(server, environment=environment))
+    assert server.environment == {"PATH": "/bin"}
+
+
+def test_a_redirected_provider_is_always_refused() -> None:
+    for strategy in Strategy:
+        with pytest.raises(EngineRefused, match="OPENAI_BASE_URL"):
+            engine_environment({"OPENAI_BASE_URL": "https://x"}, strategy)
+    server = FakeServer()
+    with pytest.raises(EngineRefused, match="OPENAI_BASE_URL"):
+        run(line(server, environment={"OPENAI_BASE_URL": "https://x"}))
+    assert server.sent == []
+
+
+@pytest.mark.parametrize(
+    ("config", "reason"),
+    [
+        (
+            LineConfig(builtin_tools=("Read", "Bash")),
+            "only the built-in tool Bash, not Read",
+        ),
+        (LineConfig(inherit_account_mcp=True), "do not yet support MCP servers"),
+        (
+            LineConfig(sandbox=parse_sandbox({"enabled": True}, operator=True)),
+            "own read-only sandbox",
+        ),
+        (
+            LineConfig(settings=parse_settings({"env": {"A": "1"}})),
+            "own read-only sandbox",
+        ),
+    ],
+)
+def test_a_configuration_codex_cannot_run_is_refused(
+    config: LineConfig, reason: str
+) -> None:
+    assert reason in (unsupported(config) or "")
+    with pytest.raises(EngineRefused, match=reason):
+        run(line(FakeServer(), config=config))
+    assert unsupported(LineConfig(builtin_tools=("Bash",))) is None
+
+
+def test_openai_codex_and_xai_variables_are_reserved() -> None:
+    for name in (
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "CODEX_API_KEY",
+        "CODEX_HOME",
+        "XAI_API_KEY",
+    ):
+        assert reserved_variable(name)
+
+
+def test_the_codex_adapter_refuses_a_driver_for_another_engine() -> None:
+    claude = Driver.for_model("claude-haiku-5-5", Strategy.SUBSCRIPTION)
+    with pytest.raises(EngineRefused, match="written for the claude-code engine"):
+        CodexLine(claude, CWD)
+
+
+def test_the_factory_builds_each_line_on_its_drivers_engine() -> None:
+    build = engine_factory(str(CWD))
+    engine = build(LineSpec("alpha", LUNA, Strategy.SUBSCRIPTION), [RECORD])
+    assert isinstance(engine, CodexLine)
+    assert list(engine.mcp_tools) == ["record"]
+    sandboxed = engine_factory(
+        str(CWD), project_sandbox=parse_sandbox({"enabled": True}, operator=False)
+    )
+    with pytest.raises(EngineRefused, match="project file sets one"):
+        sandboxed(LineSpec("alpha", LUNA, Strategy.SUBSCRIPTION), [])
+
+
+def test_the_daemon_refuses_project_tables_that_would_reach_a_codex_line() -> None:
+    check_engines(parse("version = 1\n[lines.a]\nmodel = 'gpt-6-luna'\n"))
+    check_engines(
+        parse(
+            "version = 1\n[sandbox]\nenabled = true\n"
+            "[lines.a]\nmodel = 'claude-haiku-5-5'\n"
+        )
+    )
+    with pytest.raises(ValueError, match="Codex lines a"):
+        check_engines(
+            parse(
+                "version = 1\n[settings.env]\nA = '1'\n"
+                "[lines.a]\nmodel = 'gpt-6-luna'\n"
+            )
+        )
+
+
+# Real turns, on the operator's ChatGPT plan.
+
+
+def _live() -> None:
+    if os.environ.get("DROMON_LIVE_TESTS") != "1":
+        pytest.skip("set DROMON_LIVE_TESTS=1 to call the engine on the subscription")
+
+
+@pytest.mark.live
+def test_a_live_luna_line_keeps_its_thread_and_tools_across_turns(
+    tmp_path: Path,
+) -> None:
+    _live()
+    calls.clear()
+    target = CodexLine(luna(), tmp_path.resolve(), mcp_tools=[RECORD])
+    first = asyncio.run(
+        target.run_turn("Remember the word heron. Use no tool. Reply with the word ok.")
+    )
+    assert first.credential is Credential.SUBSCRIPTION
+    assert first.subtype == "success"
+    second = asyncio.run(
+        target.run_turn(
+            "Call the record tool once, with the word you were asked to remember."
+            " Then reply with the word done."
+        )
+    )
+    assert second.session_id == first.session_id, "the second turn did not resume"
+    assert second.tool_uses == ("record",)
+    assert calls == [{"word": "heron"}]

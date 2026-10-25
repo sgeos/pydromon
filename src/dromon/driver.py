@@ -49,8 +49,8 @@ ENGINE_OF: Final[dict[str, str]] = {
 ENGINES: Final = ("claude-code", "codex")
 """The engines a driver may name."""
 
-ADAPTED_ENGINES: Final = frozenset({"claude-code"})
-"""The engines Dromon has an adapter for. A Codex adapter is not yet written."""
+ADAPTED_ENGINES: Final = frozenset({"claude-code", "codex"})
+"""The engines Dromon has an adapter for."""
 
 MODELS: Final = tuple(
     model for model, engine in ENGINE_OF.items() if engine in ADAPTED_ENGINES
