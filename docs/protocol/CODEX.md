@@ -27,17 +27,18 @@ from the engine before reading on. The process is stopped when the turn ends.
    usage. Any other type is refused. The driver accepts or refuses the credential
    before any thread exists.
 3. `thread/start` for a new line, or `thread/resume` with the stored thread
-   identifier, with the driver's model, the project root as `cwd`, `sandbox` set to
-   `read-only`, `approvalPolicy` set to `never` and `approvalsReviewer` set to `user`. A
-   new thread also receives Dromon's own tools as `dynamicTools`.
-4. The response's `modelProvider` must be `openai`, and its `model` is handed to the
-   driver, which refuses any model but its own.
+   identifier, with the driver's model, the project root as `cwd`, `permissions` set to
+   `dromon-line`, `approvalPolicy` set to `never` and `approvalsReviewer` set to `user`.
+   A new thread also receives Dromon's own tools as `dynamicTools`.
+4. The response's `modelProvider` must be `openai`, its `activePermissionProfile` must
+   be `dromon-line`, and its `model` is handed to the driver, which refuses any model
+   but its own.
 5. `mcpServerStatus/list` for the thread must report every server as `disabled` with
    no tools, and `app/list` must list nothing.
 6. `turn/start` with the wake prompt as text and the line's effort, or the driver's.
 7. Notifications become driver events until `turn/completed`. A started
-   `dynamicToolCall` of one of Dromon's tools, or a `commandExecution` for a line given
-   `Bash`, is tool use. A `reasoning` item is thinking, and a completed `agentMessage`
+   `dynamicToolCall` of one of Dromon's tools, a `commandExecution` for a line given
+   `Bash`, or a `fileChange` for a line given `Edit` or `Write`, is tool use. A `reasoning` item is thinking, and a completed `agentMessage`
    is text. Any other tool item, and a `model/rerouted` to a model the driver refuses,
    interrupts the turn with `turn/interrupt` and refuses it.
 8. `item/tool/call` requests run Dromon's tool and answer with `success` and text
@@ -65,6 +66,49 @@ servers, one of them with 47 tools. With them every server reported `disabled`, 
 `config/read` reported web search and the disabled features as off. A
 `-c mcp_servers={}` override did not remove any server.
 
+## Permission profile
+
+Every thread runs under `dromon-line`, a Codex permission profile that Dromon defines
+on the app-server's command line as one inline TOML value, because Codex's `-c` parser
+takes only bare keys and the profile's own keys need quoting. Codex's built-in
+read-only sandbox would let a line read the event log and its stored credentials, and
+its writable sandbox would let a line write them, so neither is used.
+
+```toml
+[permissions.dromon-line]
+extends = ":workspace"
+
+[permissions.dromon-line.filesystem]
+":workspace_roots" = { "." = "write", ".git" = "read" }
+"/real/path/of/project/.dromon" = "deny"
+"/real/path/of/runtime" = "deny"
+```
+
+- The workspace is `write` for a line given `Edit` or `Write`, and `read` otherwise.
+- `.git` is always `read`, so a Codex line never commits. Codex documents that a
+  profile extending `:workspace` keeps `.git` read-only, and a reported issue says it
+  does not, so Dromon states it.
+- Each protected directory that exists, the state directory and the runtime
+  directory, is denied as its real path.
+- Network access is off, as `:workspace` leaves it, so a Codex line cannot reach a
+  local teacher.
+- Codex's `:workspace` also leaves `$TMPDIR` and `/tmp` writable.
+
+**Facts, verified on 2026-10-25 with Codex 0.164.0 on macOS.** Under the profile through
+`codex sandbox -P`, a write in the workspace succeeded. Reading or writing `.dromon`,
+writing `.git`, writing the home directory and reaching the network failed with
+`Operation not permitted` or no connection. So did renaming `.dromon` or `.git` away,
+replacing `.dromon` with another directory, a symbolic or hard link into it, and
+changing its mode. An absolute deny on a runtime directory outside the workspace
+refused reads and writes there. Through Dromon, a GPT-6-Luna line given `Edit` wrote a
+file in the workspace, Codex rejected its edits to `.dromon` and `.git` with "patch
+rejected: writing outside of the project", its shell read of `.dromon` failed, and in
+the epagoge project the line ran the project's full gate, which passed.
+
+**Fact, observed the same day.** Codex emits no item for an edit it rejects or for that
+shell read, so Dromon's driver cannot count a call that Codex refuses before running
+it.
+
 ## Credentials
 
 Codex keeps its own login, and Dromon never reads, stores or forwards it. For a
@@ -78,7 +122,7 @@ driver. **Fact, observed on 2026-10-25.** The operator's environment sets
 
 | Configuration | On a Codex line |
 |---|---|
-| `builtin_tools` | Only `Bash`, which enables Codex's shell inside its read-only sandbox |
+| `builtin_tools` | `Bash`, which enables Codex's shell, and `Edit` or `Write`, which make the workspace writable for Codex's file changes and its shell |
 | `mcp_servers`, `inherit_account_mcp` | Refused, not yet supported |
 | `sandbox`, `settings` | Refused, including the project's own tables, which `dromond` checks at start |
 | `tool_policy`, `allowed_tools` | Accepted, with no effect beyond Dromon's own tools |
@@ -87,8 +131,7 @@ driver. **Fact, observed on 2026-10-25.** The operator's environment sets
 | `claude_code_prompt` | Refused, since Codex uses its own instructions |
 
 A configuration a Codex line cannot run is refused when the line is created or
-configured. The read-only sandbox is required because Codex's writable sandbox would let
-a line write Dromon's state directory.
+configured.
 
 ## Verification
 
@@ -101,7 +144,9 @@ turn. `dromon probe --model gpt-6-luna` reported the subscription credential.
 
 ## Not at parity with Claude Code lines
 
-- No MCP servers, no file editing, and no sandbox or settings documents.
+- No MCP servers, no sandbox or settings documents, and no way to commit, since `.git`
+  is always read-only.
+- A call Codex refuses before running it is invisible to the driver's tool budget.
 - Codex reports no cost, so cost limits do not count a Codex line's turns, and the
   driver's `max_turns` is not enforced. The tool budget still interrupts a turn.
 - The app-server and dynamic tools are experimental, so a Codex update may break the

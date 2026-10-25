@@ -94,6 +94,7 @@ class FakeServer:
         self.account = account
         self.model = model
         self.provider = provider
+        self.profile: object = {"id": "dromon-line", "extends": ":workspace"}
         self.servers = servers
         self.apps = list(apps)
         self.failing = failing
@@ -138,6 +139,7 @@ class FakeServer:
                 "thread": {"id": "th"},
                 "model": self.model,
                 "modelProvider": self.provider,
+                "activePermissionProfile": self.profile,
             }
         if method == "mcpServerStatus/list":
             return {
@@ -214,11 +216,12 @@ def test_the_thread_is_isolated_and_offers_only_dromons_tools() -> None:
     run(line(server))
     start = server.params("thread/start")
     assert start["model"] == LUNA
-    assert (start["sandbox"], start["approvalPolicy"], start["approvalsReviewer"]) == (
-        "read-only",
-        "never",
-        "user",
-    )
+    assert "sandbox" not in start
+    assert (
+        start["permissions"],
+        start["approvalPolicy"],
+        start["approvalsReviewer"],
+    ) == ("dromon-line", "never", "user")
     assert [t["name"] for t in start["dynamicTools"]] == ["record"]
     assert start["dynamicTools"][0]["inputSchema"] == RECORD.input_schema
     turn = server.params("turn/start")
@@ -446,16 +449,16 @@ def test_a_redirected_provider_is_always_refused() -> None:
     [
         (
             LineConfig(builtin_tools=("Read", "Bash")),
-            "only the built-in tool Bash, not Read",
+            "only the built-in tools Bash, Edit and Write, not Read",
         ),
         (LineConfig(inherit_account_mcp=True), "do not yet support MCP servers"),
         (
             LineConfig(sandbox=parse_sandbox({"enabled": True}, operator=True)),
-            "own read-only sandbox",
+            "Dromon's Codex permission profile",
         ),
         (
             LineConfig(settings=parse_settings({"env": {"A": "1"}})),
-            "own read-only sandbox",
+            "Dromon's Codex permission profile",
         ),
     ],
 )
@@ -533,6 +536,72 @@ def test_a_codex_line_gets_its_instructions_as_developer_instructions(
     assert reason is not None and "Codex's own instructions" in reason
 
 
+# The permission profile.
+
+
+def profile_of(arguments: list[str]) -> str:
+    entry = next(a for a in arguments if a.startswith("permissions.dromon-line="))
+    return entry.removeprefix("permissions.dromon-line=")
+
+
+def test_the_profile_writes_only_with_a_write_tool_and_never_git(
+    tmp_path: Path,
+) -> None:
+    import tomllib
+
+    def parsed(config: LineConfig) -> dict[str, Any]:
+        text = profile_of(server_arguments([], config, (tmp_path,)))
+        return tomllib.loads(f"profile = {text}")["profile"]
+
+    reader = parsed(LineConfig(builtin_tools=("Bash",)))
+    assert reader["extends"] == ":workspace"
+    assert reader["filesystem"][":workspace_roots"] == {".": "read", ".git": "read"}
+    for tools in (("Edit",), ("Write",), ("Bash", "Edit")):
+        writer = parsed(LineConfig(builtin_tools=tools))
+        assert writer["filesystem"][":workspace_roots"] == {
+            ".": "write",
+            ".git": "read",
+        }
+
+
+def test_the_profile_denies_each_protected_directory_that_exists(
+    tmp_path: Path,
+) -> None:
+    import os
+    import tomllib
+
+    state = tmp_path / "project" / ".dromon"
+    state.mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(state)
+    missing = tmp_path / "missing"
+    text = profile_of(server_arguments([], LineConfig(), (link, missing)))
+    filesystem = tomllib.loads(f"profile = {text}")["profile"]["filesystem"]
+    assert filesystem[os.path.realpath(state)] == "deny"
+    assert str(link) not in filesystem and str(missing) not in filesystem
+    odd = tmp_path / "bad\nname"
+    odd.mkdir()
+    with pytest.raises(EngineRefused, match="control character"):
+        server_arguments([], LineConfig(), (odd,))
+
+
+def test_a_thread_without_dromons_profile_is_refused() -> None:
+    for profile in (None, {"id": ":workspace"}, "dromon-line"):
+        server = FakeServer()
+        server.profile = profile
+        with pytest.raises(EngineRefused, match="permission profile"):
+            run(line(server))
+        assert "turn/start" not in server.methods()
+
+
+def test_a_file_change_is_tool_use_only_for_a_line_given_a_write_tool() -> None:
+    with pytest.raises(EngineRefused, match="not given: fileChange"):
+        run(line(FakeServer([item("fileChange")])))
+    server = FakeServer([item("fileChange"), completed()])
+    report = run(line(server, config=LineConfig(builtin_tools=("Edit",))))
+    assert report.tool_uses == ("Edit",)
+
+
 # Real turns, on the operator's ChatGPT plan.
 
 
@@ -562,3 +631,37 @@ def test_a_live_luna_line_keeps_its_thread_and_tools_across_turns(
     assert second.session_id == first.session_id, "the second turn did not resume"
     assert second.tool_uses == ("record",)
     assert calls == [{"word": "heron"}]
+
+
+@pytest.mark.live
+def test_a_live_luna_line_writes_the_workspace_but_not_protected_paths(
+    tmp_path: Path,
+) -> None:
+    _live()
+    project = tmp_path.resolve()
+    state = project / ".dromon"
+    state.mkdir()
+    (state / "dromon.toml").write_text("secret = true\n")
+    (project / ".git").mkdir()
+    (project / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    target = CodexLine(
+        luna(),
+        project,
+        config=LineConfig(builtin_tools=("Bash", "Edit")),
+        protected=(state,),
+    )
+    prompt = (
+        "Do these four steps in order, each once, and do not retry a step that fails."
+        " 1. With your file editing tool, create notes.txt containing hello."
+        " 2. With your file editing tool, create .dromon/probe.txt containing x."
+        " 3. With your file editing tool, create .git/probe.txt containing x."
+        " 4. With the shell, run: cat .dromon/dromon.toml"
+        " Then reply with one line per step saying whether it succeeded."
+    )
+    report = asyncio.run(target.run_turn(prompt))
+    assert report.subtype == "success"
+    assert (project / "notes.txt").read_text().strip() == "hello"
+    assert not (state / "probe.txt").exists(), "the line wrote Dromon's state"
+    assert not (project / ".git" / "probe.txt").exists(), "the line wrote .git"
+    assert "secret = true" not in report.text, "the line read Dromon's state"
+    assert "Edit" in report.tool_uses
