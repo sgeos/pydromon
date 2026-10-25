@@ -59,12 +59,42 @@ service or write to a file.
   channel as data and never as commands or markup beyond what the channel displays.
 - Routes and relay commands are operator configuration and are trusted like the
   daemon's own settings.
-- Relays are outbound. A reply that arrives through a channel becomes a `message_sent`
-  from an operator only after an inbound adapter authenticates its sender. Inbound
-  adapters are not yet specified, and until they are, replies come from clients.
+- A reply that arrives through a channel becomes a `message_sent` from an operator only
+  after the response path authenticates its sender, as required below. Until the
+  response path exists, replies come from clients.
+
+## Response path
+
+**Required, decided by the operator on 2026-10-25, design deferred.** Every relay
+adapter supports a response path, so that an operator can reply through the channel that
+carried the notice, such as answering an email or a chat message, and the reply arrives
+as that operator's `message_sent` with `reply_to` set to the notice's message. Until the
+response path is designed, replies come from clients.
+
+Whatever design is chosen must provide these properties.
+
+1. **Correlation.** A response names the notice it answers. The notice's `message_id`
+   is the correlation key, and it must survive the channel, for example in a reply
+   header, a thread or a token in the text.
+2. **Authentication.** The adapter establishes which operator sent the response by a
+   means the channel actually guarantees, such as a verified sender or a signed
+   request. A response that cannot be attributed is refused, never guessed. The
+   claimed identity is untrusted until verified, as with every inbound message.
+3. **Route check.** The attributed operator must be the notice's recipient. The event
+   log's reply rule enforces this, so a correctly attributed response from another
+   person is refused.
+4. **No double answers.** A channel that redelivers a response must not produce a
+   second reply. The event log refuses a second answer to a question, and an adapter
+   records the channel's own response identifier to recognize a redelivered note.
+5. **Untrusted body.** The response text is untrusted data and is stored as text only.
+
+**Open.** Whether the response path belongs to the `Relay` interface itself, such as a
+method the daemon polls, or to a separate inbound adapter paired with each relay. Also
+open is how the command relay expresses it, for example a second configured command
+that the daemon polls, or a local endpoint that a channel's webhook calls.
 
 ## Not yet specified
 
-- Inbound adapters and how each authenticates an operator.
+- The design of the response path, whose required properties are stated above.
 - Several relays for one operator, such as a chat service with email as a fallback.
 - Retry timing and backoff between forwarding passes.

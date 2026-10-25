@@ -54,8 +54,9 @@ The operator chose reading 1 for the Agent SDK. Dromon drives it from outside, a
   compaction or schema migration yet, and by the operator's decision such standard
   features land with the task that first needs them. Events for configuration, turns and conversation
   limits arrive with tasks 7 and 9. All are listed in the specification.
-- **Operator relays.** Inbound adapters that authenticate a reply from a channel, more
-  than one relay per operator, and retry timing are not yet specified. Which operator a
+- **Operator relays.** The operator requires every relay adapter to support a response
+  path, with the design deferred. Its required properties are in `RELAY.md`. More than
+  one relay per operator and retry timing are not yet specified. Which operator a
   line asks by default belongs to per-project configuration.
 - **Interline and Dromon overlap.** Once layer 1 messaging works, decide whether
   Dromon retires interline or keeps it for sessions Dromon does not drive.

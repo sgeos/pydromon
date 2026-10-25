@@ -7,6 +7,8 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- `docs/protocol/RELAY.md` requires every relay adapter to support a response path and
+  states the properties its deferred design must have.
 - Operators are no longer a singleton. Each operator is a party with an address such as
   `@ana`, registered by a new `operator_registered` event. An operator question is a
   `message_sent` of kind question from a line to one operator, and the answer is that
