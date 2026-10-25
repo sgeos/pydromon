@@ -29,6 +29,13 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- The daemon skeleton, roadmap task 3. `dromond` serves one project on a Unix domain
+  socket in a private runtime directory, holds the event log as its single writer and
+  admits one instance through a lock. `dromon start`, `dromon status` and `dromon stop`
+  manage it, with distinct exit statuses in `dromon.exits`. `docs/protocol/CLIENT.md`
+  specifies the versioned line-delimited JSON protocol.
+- The decision that replies arrive through inbound adapters plugged into a registry in
+  the daemon and configured per channel, recorded in `docs/protocol/RELAY.md`.
 - `dromon.relay` and `docs/protocol/RELAY.md`, forwarding of operator messages through
   relays, a general adapter interface for channels such as email or chat, with a
   command relay that hands each notice to a configured command as JSON.

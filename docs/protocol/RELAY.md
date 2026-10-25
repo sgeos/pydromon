@@ -88,10 +88,16 @@ Whatever design is chosen must provide these properties.
    records the channel's own response identifier to recognize a redelivered note.
 5. **Untrusted body.** The response text is untrusted data and is stored as text only.
 
-**Open.** Whether the response path belongs to the `Relay` interface itself, such as a
-method the daemon polls, or to a separate inbound adapter paired with each relay. Also
-open is how the command relay expresses it, for example a second configured command
-that the daemon polls, or a local endpoint that a channel's webhook calls.
+**Decided by the operator on 2026-10-25.** The response path is a separate kind of
+adapter. The daemon holds an inbound adapter registry, and inbound adapters plug into
+it and are configured individually, as relays are for the outbound path. A project in
+which some operators reply by Slack and others by email registers two inbound adapters,
+each configured for its channel. The daemon turns what an adapter authenticates into an
+operator's reply, subject to the properties above.
+
+**Open.** The inbound adapter interface, how adapters deliver to the daemon, for
+example a command the daemon polls or a local endpoint that a channel's webhook calls,
+and the configuration format for both registries.
 
 ## Not yet specified
 

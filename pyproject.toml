@@ -35,6 +35,9 @@ module-name = "dromon"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Socket tests bind Unix domain sockets, which Claude Code's sandbox denies. They run by
+# default. Deselect them with -m "not socket" only to run the rest inside a sandbox.
+markers = ["socket: binds a Unix domain socket"]
 
 [tool.ruff]
 line-length = 88

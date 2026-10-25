@@ -11,8 +11,10 @@ The distribution is `pydromon` and the import package is `dromon`. The commands 
 
 **Early prototype.** The repository was cut on 2026-10-25. The data model and its
 append-only SQLite event log are implemented and specified in
-[`docs/protocol/EVENT_LOG.md`](docs/protocol/EVENT_LOG.md). No daemon runs yet, and every
-subcommand reports that it is not implemented. The first milestone is
+[`docs/protocol/EVENT_LOG.md`](docs/protocol/EVENT_LOG.md). `dromon start`, `dromon status`
+and `dromon stop` manage a per-project `dromond` over a private Unix domain socket, as
+specified in [`docs/protocol/CLIENT.md`](docs/protocol/CLIENT.md). The other subcommands
+report that they are not implemented. The first milestone is
 [`docs/roadmap/V0_1_0.md`](docs/roadmap/V0_1_0.md) and the planned system is
 [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md). What Dromon needs from
 the Keleusma Python bindings is in

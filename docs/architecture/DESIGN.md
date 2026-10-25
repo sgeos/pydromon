@@ -37,10 +37,13 @@ operator can also use sessions held inside the daemon. The client command is `dr
 whose subcommands cover starting and stopping the daemon, status, attaching an
 interactive client, sending messages and handling operator questions.
 
-**Proposed.** Clients reach the daemon through a Unix domain socket readable only by the
-operator's user account, with no network listener by default. The client protocol is
-versioned independently of any implementation, so a client written against one version
-keeps working after a port.
+**Implemented 2026-10-25, roadmap task 3.** Clients reach the daemon through a Unix
+domain socket in a runtime directory readable only by the operator's user account, with
+no network listener. One daemon serves one project. See
+[`../protocol/CLIENT.md`](../protocol/CLIENT.md).
+
+**Proposed.** The client protocol is versioned independently of any implementation, so
+a client written against one version keeps working after a port.
 
 **Decided 2026-10-25.** The protocol specification is drafted in this repository and its
 mature parts are later ported to the lasting `dromon` repository. See
@@ -145,6 +148,8 @@ as the general adapter. See [`../protocol/EVENT_LOG.md`](../protocol/EVENT_LOG.m
   so an operator can reply through the channel that carried the question. The required
   properties are in [`../protocol/RELAY.md`](../protocol/RELAY.md), chief among them
   that a reply is attributed to an operator only after the channel authenticates them.
+  Replies arrive through inbound adapters registered with the daemon and configured per
+  channel, so replying by Slack and by email needs two registered adapters.
 
 ## Standard harness features
 

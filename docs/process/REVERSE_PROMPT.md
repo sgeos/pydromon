@@ -4,45 +4,39 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-25, operators as addressable parties
+## 2026-10-25, task 3, the daemon skeleton
 
-**Done.** On the operator's instruction, operator questions became messages, and the
-operator stopped being a singleton.
+**Done.** Tasks 1 and 2 were already complete. Task 3 is complete.
 
-- Every operator is a party with an address such as `@ana`, registered by an
-  `operator_registered` event. Any number may exist, each addressed separately.
-- A question is a `message_sent` of kind question from a line to one operator. The
-  answer is that operator's reply, and the route rule refuses an answer from any other
-  operator or to any other line. The question lifecycle is tracked on the message.
-- Relays forward operator messages to channels such as email or Slack through one
-  general interface. The command relay runs a configured command with the notice as JSON
-  on standard input, with no shell. Delivery is recorded only after a relay accepts, so
-  delivery is at least once.
-- The specification is revised in `docs/protocol/EVENT_LOG.md`, and
-  `docs/protocol/RELAY.md` is new. The draft format version stays 1, since nothing yet
-  depends on it, and the specification now says a draft may change without a new
-  version until it is marked stable.
+- `dromond` serves one project on a Unix domain socket in a runtime directory that must
+  be owned by the user with mode 0700. It holds the event log as its single writer and
+  admits one instance through an exclusive lock.
+- `dromon start` spawns a detached daemon in its own session and waits for it to answer.
+  `dromon status` reports the daemon and event log counts, and `dromon stop` stops it and
+  waits for the socket to go. Exit statuses are distinct and listed in `CLIENT.md`.
+- The protocol is versioned, line-delimited canonical JSON with a 64 KiB line limit,
+  strict decoding, a per-connection idle timeout and error codes, specified in
+  `docs/protocol/CLIENT.md`.
+- The operator's decision that replies arrive through inbound adapters plugged into a
+  daemon registry and configured per channel is recorded in `RELAY.md`, with the design
+  deferred.
+- Pull request #6, the response path requirement, was merged first.
 
 **Decisions made by this line, open to the operator's review.**
 
-- Only a line asks a question, and only an operator receives one. Lines message each
-  other with notes.
-- Questions are superseded only by a later question from the same line, which may go to
-  a different operator.
-- Relays are outbound only. A reply from a channel is not attributed to an operator
-  until an inbound adapter authenticates it, so replies come from clients for now.
+- `dromon start` succeeds without action when a daemon already answers, while `status`
+  and `stop` exit with status 4 when none does.
+- The runtime directory defaults to `.dromon/run` in the project and moves with
+  `DROMON_RUNTIME_DIR`, because socket paths are limited to 103 bytes.
+- Access control rests on the directory's mode. A peer credential check is deferred.
 
-**Verification.** `uv sync`, 188 tests passing with warnings treated as errors, ruff
-check and format clean, and pyright strict with 0 errors and 0 warnings. The relay tests
-run the command relay as a real subprocess, including a timeout, a failed start, a
-nonzero exit and an attempt to inject shell syntax through the message body.
+**Verification.** `uv sync`, 245 tests passing with warnings treated as errors outside
+the sandbox, including 10 socket tests that start real daemons, and 235 passing inside
+it with `-m "not socket"`. Ruff check and format clean, and pyright strict with 0 errors
+and 0 warnings. A manual run of start, a second start, status, stop and status behaved as
+specified, and no daemon process was left after the suite.
 
-**Not verified.** Only Python 3.12.12 with SQLite 3.50.4 on macOS was tested. No real
-email or chat channel was exercised.
+**Not verified.** Only macOS with Python 3.12.12 was tested. Linux behaviour of the lock,
+`posix_spawn` with `setsid` and the socket limit is inferred from documentation.
 
-**Response path, a later prompt on the same day.** The operator requires every relay
-adapter to support a response path and accepts solving it later. `RELAY.md` now states
-the required properties, which are correlation, authentication, a route check, no double
-answers and an untrusted body, and leaves the design open.
-
-**Next.** Task 3, the daemon skeleton.
+**Next.** Task 4, which needs the operator's choice of loop for Claude Opus 5.5.

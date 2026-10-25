@@ -22,6 +22,10 @@ dist/
 /tmp/*
 !/tmp/.gitkeep
 
+# Per-project Dromon state, the event log and the daemon's runtime files, which hold
+# messages and answers and are never committed.
+/.dromon/
+
 # Local, never-committed material such as credentials, API keys and
 # environment-specific notes. Ignored whole, as in the Keleusma repository.
 /secret/
