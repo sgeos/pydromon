@@ -43,6 +43,18 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Engine settings at parity with the settings actually used on the operator's machine
+  in Claude Code, Codex and Grok Build, specified by `docs/protocol/SETTINGS.md` with
+  the review behind them. Permission rules, command hooks, `env` and `attribution`, in
+  Claude Code's key names, may be set in `[settings]` for the project, per profile and
+  per line, or with `dromon create` or `dromon configure --settings-config FILE`, and
+  reach Claude Code through its `--settings` flag. Layers merge as Claude Code's scopes
+  do. An `ask` rule denies, `env` may not change the engine's credential or provider,
+  and every line's file tools are denied Dromon's state and runtime directories.
+- A line's `effort`, in the line configuration, the project file and `--effort`,
+  replaces its driver's reasoning effort.
+- MCP servers may refer to the daemon's environment as `${NAME}` or `${NAME:-default}`.
+  Only the reference is stored, and the engine expands it at the start of each turn.
 - Sandboxing at parity with Claude Code, specified by `docs/protocol/SANDBOX.md`. A
   Claude Code sandbox document, in Claude Code's key names, may be set for the whole
   project in `[sandbox]`, for a profile or line in `.dromon/dromon.toml`, or for one

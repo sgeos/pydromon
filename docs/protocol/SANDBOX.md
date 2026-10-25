@@ -109,9 +109,12 @@ succeeded and the one that wrote in the home directory was refused.
 **Not at parity.**
 
 - Claude Code merges `Read` and `Edit` permission rules into the sandbox and lets
-  `WebFetch` rules pre-allow domains. Dromon has no path or domain rules for built-in
-  tools, so these do not apply. As in Claude Code, `denyRead` does not restrict the
-  built-in Read tool and `allowedDomains` does not restrict WebFetch.
+  `WebFetch` rules pre-allow domains. Since 2026-10-25 a line's permission rules reach
+  Claude Code, as [`SETTINGS.md`](SETTINGS.md) specifies, so this is expected to apply,
+  but it is an inference that has not been tested. As in Claude Code, `denyRead` does
+  not restrict the built-in Read tool and `allowedDomains` does not restrict WebFetch.
+  Dromon's own deny rules keep the built-in file tools out of its protected
+  directories.
 - There is no user or managed layer, so nothing can make the sandbox mandatory against
   the operator's own configuration.
 - The keys refused above, including credential masking, are missing.

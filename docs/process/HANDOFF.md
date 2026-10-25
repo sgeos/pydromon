@@ -21,23 +21,18 @@ completed, moved or abandoned.
     baked in, by the operator's decision. `dromon probe` reports capabilities and
     defaults to Haiku 5.5, the least expensive model, which tests also use.
   - `scheduler.py` is a game loop, by the operator's decision. Each tick updates every
-    line once and skips a busy one, turns run across ticks without blocking, and mail
-    moves from the sent queue to the post office at the end of each tick. Lines send
-    through an in-process `send_message` tool, operators through `dromon send`.
-  - Operator questions. `ask_operator` records a question in the daemon's queue,
-    `dromon questions` and `dromon answer` work it, and the answer wakes the line in a
-    later tick. `line_session` records each line's engine session, so lines survive a
+    line once and skips a busy one, turns span ticks, and mail sent in a tick is
+    delivered at its end. Lines send with `send_message`, operators `dromon send`.
+  - Operator questions. `ask_operator` queues a question, `dromon questions` and
+    `dromon answer` work it, and the answer wakes the line. `line_session` records each line's engine session, so lines survive a
     restart with their conversations.
-  - `mailbox.py` gives every party a mailbox with read and answered state. A wake
-    prompt opens with "X new message(s). Y unread. Z unanswered." and lists headers,
-    and lines page and open mail with `list_mail` and `read_mail`, operators with
-    `dromon mail` and `dromon read`. Nobody is obliged to answer. A recipient may
-    acknowledge a message without replying, and senders see replied, acknowledged or
-    unanswered through `list_sent` or `dromon sent`.
+  - `mailbox.py` gives every party a mailbox with read and answered state. Wake
+    prompts list headers. Lines use `list_mail`, `read_mail` and `list_sent`, and
+    operators `dromon mail`, `read` and `sent`. Nobody is obliged to answer, and a
+    recipient may acknowledge without replying.
   - `limits.py` holds a line after 12 turns without operator mail or $2 of estimated
-    cost and asks an operator whether to resume it. A reply or `dromon release`
-    resumes it.
-  - `attach.py`, `tui.py` and `gui.py` are the interactive client, `dromon attach`.
+    cost and asks an operator. A reply or `dromon release` resumes it.
+  - `attach.py`, `tui.py` and `gui.py` are `dromon attach`.
   - `lineconfig.py` gives each line its built-in tools, arbitrary MCP servers and an
     allow-all or allowlist policy, by the operator's decision, stored as
     `line_configured`. The default is no tools beyond Dromon's own, with strict MCP
@@ -49,15 +44,20 @@ completed, moved or abandoned.
     operator's direction, configured per project and per line in Claude Code's key
     names. It fails closed, refuses unsandboxed retries, and protects `.dromon` and the
     runtime directory.
+  - `settings.py` gives each line Claude Code permission rules, command hooks, `env`
+    and `attribution`, layered like the sandbox and passed through `--settings`, by
+    the operator's direction to match the settings in use in three harnesses. `ask`
+    rules deny. A line's `effort` replaces its driver's. MCP servers may refer to
+    `${NAME}` in the daemon's environment.
   - `docs/protocol/` holds `EVENT_LOG.md`, `CLIENT.md`, `RELAY.md`, `DRIVER.md`,
-    `LINE_CONFIG.md`, `PROJECT_CONFIG.md` and `SANDBOX.md`.
+    `LINE_CONFIG.md`, `PROJECT_CONFIG.md`, `SANDBOX.md` and `SETTINGS.md`.
 - **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310, and
   `pykeleusma` from its repository at `19d4558`, which needs a Rust toolchain to build.
 - **Published.** The public GitHub repository `sgeos/pydromon`, licensed 0BSD, on an
   HTTPS remote that uses the GitHub command-line tool as its credential helper.
   `.github/workflows/ci.yml` runs Ruff, Pyright and pytest on Ubuntu and macOS for
   Python 3.12 and 3.15. Live tests run only locally.
-- **Commands.** Every planned subcommand is implemented.
+- **Commands.** All planned subcommands exist.
 - **pykeleusma.** Its tasks 2, 3 and 10 are done. Python cannot yet drive a script,
   because `call` and `resume` are its open task 5. Dromon's 0.1.0 does not depend on it.
 
@@ -79,20 +79,19 @@ Milestone 0.1.0 is complete. The next milestone awaits the operator's direction.
 - **Operator relays.** The operator requires a response path through inbound adapters
   registered with the daemon and configured per channel, with the design deferred. Its
   required properties are in `RELAY.md`.
-- **Line configuration debt.** MCP credentials in `env` and `headers` are stored in the
-  event log, which is owner-only. References to secrets held elsewhere are not yet
-  specified.
+- **Secrets.** Literal MCP credentials and `env` values are stored in the owner-only
+  event log. Environment references exist, but not file or keychain references.
 - **Daemon debt.** No peer credential check on connections, no relay forwarding, and
   SQLite calls on the event loop thread. Driver state lives only in memory. All are
   recorded in `CLIENT.md` or the module documentation.
 - **Operator direction, recorded in the design.** Configuration may grow as large as a
   project needs. The client protocol later needs pushed updates and remote clients.
-- **Project file debt.** No user or managed layer, and no references to secrets held
-  outside the file. Recorded in `PROJECT_CONFIG.md`.
-- **Sandbox gaps.** No `Read`, `Edit` or `WebFetch` rules, no credential masking, and
-  Linux not verified live. Listed in `SANDBOX.md`.
-- **Recorded in the design.** Teacher-model scope and the Rust repository's eventual
-  name.
+- **Project file debt.** No user or managed layer. Recorded in `PROJECT_CONFIG.md`.
+- **Parity gaps.** No credential masking, no automatic approval reviewer, no plugins
+  or language servers, no MCP OAuth, and Linux not verified live. The merge of `Read`
+  and `Edit` rules into the sandbox is untested. Listed in `SANDBOX.md` and
+  `SETTINGS.md`.
+- **In the design.** Teacher-model scope and the Rust repository's eventual name.
 
 ## Environment
 
@@ -109,7 +108,7 @@ an upstream.
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 639 tests pass, plus 4 live tests deselected
+uv sync && uv run pytest    # 720 tests pass, plus 6 live tests deselected
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 

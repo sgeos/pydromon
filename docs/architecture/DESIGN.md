@@ -367,6 +367,16 @@ of the data model. The specification is [`../protocol/EVENT_LOG.md`](../protocol
   protected, as [`../protocol/SANDBOX.md`](../protocol/SANDBOX.md) specifies. **Porting
   hazard.** The Rust port inherits the dependency on Claude Code's sandbox runtime for
   the Claude Code engine, and another engine needs a sandbox of its own.
+- Each session line carries engine settings. **Decided 2026-10-25, by the operator's
+  direction to reach parity with the settings actually used in Claude Code, Codex and
+  Grok Build.** Permission rules, command hooks, environment variables and attribution
+  use Claude Code's vocabulary, layer per project, profile and line, and reach Claude
+  Code through its settings flag, as [`../protocol/SETTINGS.md`](../protocol/SETTINGS.md)
+  specifies. An `ask` rule denies, since nothing pauses a line, and every line's file
+  tools are denied Dromon's state and runtime directories. MCP servers may refer to
+  secrets in the daemon's environment. **Porting hazard.** Claude Code parses the rules
+  and runs the hooks, so another engine needs its own rule matcher and hook runner to
+  honour the same documents.
 - Messages from other session lines, harnesses and machines are untrusted data. Only the
   operator, through a client, holds operator authority.
 

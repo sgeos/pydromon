@@ -71,16 +71,20 @@ every_ticks = 5
 | `lines.ID.strategy` | strategy | `subscription` | `subscription`, `api` or `flexible` |
 | `lines.ID.limits` | table | the file's | Limits for this line, each key defaulting to the file's |
 | `lines.ID.wake` | table | the file's | The wake policy for this line |
-| tool keys | as in `LINE_CONFIG.md` | as there | `builtin_tools`, `mcp_servers`, `tool_policy`, `allowed_tools`, `inherit_account_mcp` |
+| tool keys | as in `LINE_CONFIG.md` | as there | `builtin_tools`, `mcp_servers`, `tool_policy`, `allowed_tools`, `inherit_account_mcp`, `effort` |
 | `sandbox` | table | none | The project's sandbox, merged under every line's, as [`SANDBOX.md`](SANDBOX.md) specifies |
 | `profiles.NAME.sandbox`, `lines.ID.sandbox` | table | none | A profile's or a line's sandbox. These merge rather than replace |
+| `settings` | table | none | The project's engine settings, merged under every line's, as [`SETTINGS.md`](SETTINGS.md) specifies |
+| `profiles.NAME.settings`, `lines.ID.settings` | table | none | A profile's or a line's engine settings. These merge rather than replace |
 
 ## Rules
 
 - **Strict keys.** A key that the table above does not name is an error, so a misspelt
   key is reported rather than ignored.
 - **Profiles.** A line's own key replaces the profile's key whole. Lists and tables are
-  not merged, so the tools of a line can be read in one place.
+  not merged, so the tools of a line can be read in one place. The `sandbox` and
+  `settings` tables are the exception, and merge as their documents specify, so that no
+  layer drops another's deny entries.
 - **Precedence.** A `dromond` flag overrides the file, and the file overrides the
   built-in defaults. User and managed layers are not yet specified.
 - **Located errors.** Every error names the file. A syntax error carries its line and
@@ -96,10 +100,11 @@ every_ticks = 5
 ## Trust
 
 The file is operator configuration, committed with the project. It can grant a line
-tools, MCP servers and the credentials in their `env` and `headers`, which are then
-stored in the event log as `LINE_CONFIG.md` describes. It deserves the review any such
-file does, and a project that holds secrets should keep them out of the committed file.
-References to secrets held elsewhere are not yet specified.
+tools, MCP servers, hooks and the credentials in their `env` and `headers`, which are
+then stored in the event log as `LINE_CONFIG.md` describes. Like a stdio MCP server, a
+hook runs a command with the daemon's privileges. The file deserves the review any such
+file does. A project that holds secrets should keep them out of the committed file, and
+its MCP servers can refer to them in the daemon's environment as `${NAME}`.
 
 ## Comparison with other harnesses
 

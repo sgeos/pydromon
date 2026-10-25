@@ -120,9 +120,11 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 
 The tool options are `--tool NAME`, repeatable, `--mcp-config FILE`, a JSON file of MCP
 servers that the client reads, `--allow-tool NAME`, repeatable, `--allow-all-tools`,
-`--inherit-account-mcp`, and `--sandbox-config FILE`, a JSON file holding a Claude Code
+`--inherit-account-mcp`, `--sandbox-config FILE`, a JSON file holding a Claude Code
 sandbox object or a settings file whose `sandbox` key is taken, as
-[`SANDBOX.md`](SANDBOX.md) specifies.
+[`SANDBOX.md`](SANDBOX.md) specifies, `--settings-config FILE`, a Claude Code settings
+file whose permissions, hooks, `env`, attribution and sandbox are taken, and
+`--effort LEVEL`, both as [`SETTINGS.md`](SETTINGS.md) specifies.
 
 Status 2 is a usage error and status 3 marks a subcommand not yet implemented.
 

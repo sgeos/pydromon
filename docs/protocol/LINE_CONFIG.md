@@ -38,6 +38,8 @@ keys, duplicate keys and numbers are refused.
 | `allowed_tools` | Exact tool names, or `mcp__server__*` for every tool of one server | none |
 | `inherit_account_mcp` | Also load the MCP servers of the operator's user settings and claude.ai account | `false` |
 | `sandbox` | The line's own sandbox document, as [`SANDBOX.md`](SANDBOX.md) specifies, before the project's is merged in. Omitted from the stored JSON when unset | none |
+| `settings` | The line's own engine settings, as [`SETTINGS.md`](SETTINGS.md) specifies, before the project's are merged in. Omitted when unset | none |
+| `effort` | `low`, `medium`, `high`, `xhigh` or `max`, replacing the driver's effort. Omitted when unset | the driver's |
 
 A server name is an identifier and may not be `dromon`, which Dromon's own tools use. A
 `stdio` server has `command` and optionally `args` and `env`. An `http` or `sse` server
@@ -45,12 +47,30 @@ has `url` and optionally `headers`. A URL must use `https`, or `http` on `127.0.
 `localhost`. At most 256 entries are accepted in any list or mapping, and each text is
 at most 4,096 characters.
 
+## Variable references
+
+Any text of an MCP server, its command, arguments, `env` values, url and header values,
+may hold `${NAME}`, or `${NAME:-default}` for a default used when `NAME` is unset, as
+Claude Code's `.mcp.json` does. The configuration stores the reference, and the engine
+replaces it from the daemon's environment at the start of each turn, so a token can stay
+out of the event log.
+
+- A `${` that does not begin a well-formed reference is refused when the configuration
+  is accepted. So is a reference to a variable `SETTINGS.md` reserves for the engine's
+  credential, because an MCP server could otherwise carry that credential elsewhere.
+- A url is checked against the transport rule when it is accepted, unless it starts with
+  a reference, and again after expansion at every turn.
+- A turn whose server refers to an unset variable without a default, or whose expanded
+  url breaks the transport rule, is refused before the engine starts.
+
 ## Policy
 
 - `allowlist` allows the listed built-in tools, Dromon's own tools such as
   `send_message`, and every tool matching `allowed_tools`, and denies everything else.
 - `allow_all` allows every tool the engine offers.
-- No tool is approved in advance. Every call reaches the line's permission gate.
+- Dromon approves no tool in advance, and every call the engine would ask about
+  reaches the line's permission gate. A line's own `allow` rules and hooks may approve
+  calls before the gate, as [`SETTINGS.md`](SETTINGS.md) specifies.
 - Unless `inherit_account_mcp` is set, the engine runs with strict MCP configuration,
   and a turn is refused when the engine offers a built-in tool not in `builtin_tools`
   or a tool of a server not in `mcp_servers`.
@@ -64,12 +84,11 @@ whole and applies from the line's next turn, which resumes the same engine sessi
 ## Trust
 
 A configuration is operator authority and arrives only through the client. Server
-`env` and `headers` may hold credentials. They are stored in the event log, whose file
-is readable by its owner only. `allow_all` and `inherit_account_mcp` hand a line every
+`env` and `headers` may hold credentials. Literal values are stored in the event log,
+whose file is readable by its owner only, and references are stored as written. `allow_all` and `inherit_account_mcp` hand a line every
 tool they bring, including a claude.ai account's mail and file connectors, and suit
 only lines the operator trusts with them.
 
 ## Not yet specified
 
-- References to secrets held outside the event log, such as environment variables.
-- Per-project defaults, which arrive with per-project configuration in roadmap task 9.
+- References to secrets held in files or a keychain rather than the environment.

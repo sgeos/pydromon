@@ -12,5 +12,6 @@ Documents here describe behaviour and formats, never Python details.
 - [`DRIVER.md`](DRIVER.md), the interface between a per-model Keleusma driver and its host. Draft, interface 1.
 - [`LINE_CONFIG.md`](LINE_CONFIG.md), a session line's built-in tools, MCP servers and allow-all or allowlist tool policy. Draft, version 1.
 - [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md), the `.dromon/dromon.toml` file that declares a project's lines, limits and wake policy. Draft, version 1.
+- [`SETTINGS.md`](SETTINGS.md), a line's engine settings, permission rules, hooks, environment and attribution, with the review of the settings in use that motivated them. Draft, part of version 1.
 - [`SANDBOX.md`](SANDBOX.md), the Claude Code sandbox document of a line and a project, its layers, unattended defaults and protected directories. Draft, part of version 1.
 - [`RELAY.md`](RELAY.md), forwarding messages to operators through adapters for channels such as email or chat. Draft, version 1.

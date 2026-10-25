@@ -20,8 +20,11 @@ from dromon.client import DaemonFailed, DaemonNotRunning, call, is_running, star
 from dromon.paths import PathError, ProjectPaths, project_paths
 from dromon.driver import MODELS, Driver, DriverError, Strategy
 from dromon.engine import ClaudeCodeLine, EngineRefused
+from dromon.lineconfig import EFFORTS
 from dromon.protocol import Operation, ProtocolError
+from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, merge, sandbox_from_settings
+from dromon.settings import SettingsConfig, split_settings_file
 
 PROBE_MODEL: Final = "claude-haiku-5-5"
 """The least expensive subscription model, used for probes and tests by default."""
@@ -182,15 +185,20 @@ def _config_document(arguments: argparse.Namespace) -> dict[str, object] | None:
     An ``--mcp-config`` file is read here, by the operator's client, and its contents
     travel to the daemon, which stores them in the event log, credentials included.
     A ``--sandbox-config`` file holds a Claude Code sandbox object, or a settings file
-    whose ``sandbox`` key is taken. It is validated here with operator authority.
+    whose ``sandbox`` key is taken. It is validated here with operator authority. A
+    ``--settings-config`` file is a Claude Code settings file whose supported keys are
+    taken, its ``sandbox`` key included, and any other key is an error.
     """
     tools: list[str] = arguments.tool or []
     allowed: list[str] = arguments.allow_tool or []
     mcp_file: Path | None = arguments.mcp_config
     sandbox_file: Path | None = arguments.sandbox_config
+    settings_file: Path | None = arguments.settings_config
+    effort: str | None = arguments.effort
     allow_all: bool = arguments.allow_all_tools
     inherit: bool = arguments.inherit_account_mcp
-    if not (tools or allowed or mcp_file or allow_all or inherit or sandbox_file):
+    given = (tools, allowed, mcp_file, allow_all, inherit, sandbox_file, settings_file)
+    if not any(given) and effort is None:
         return None
     document: dict[str, object] = {
         "builtin_tools": tools,
@@ -203,6 +211,19 @@ def _config_document(arguments: argparse.Namespace) -> dict[str, object] | None:
     if sandbox_file is not None:
         loaded: object = json.loads(sandbox_file.read_text(encoding="utf-8"))
         document["sandbox"] = sandbox_from_settings(loaded).document()
+    if settings_file is not None:
+        loaded = json.loads(settings_file.read_text(encoding="utf-8"))
+        settings, sandbox = split_settings_file(loaded)
+        if settings is not None:
+            document["settings"] = settings.document()
+        if sandbox is not None:
+            if "sandbox" in document:
+                raise ValueError(
+                    "the settings file has a sandbox, and so does --sandbox-config"
+                )
+            document["sandbox"] = sandbox_from_settings(sandbox).document()
+    if effort is not None:
+        document["effort"] = effort
     return document
 
 
@@ -381,16 +402,26 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         f" ${limits.max_cost_usd} estimated cost, {limits.cooldown_seconds}s cooldown"
     )
     print(f"wake every {config.wake_every_ticks} ticks")
-    print(f"project: {_sandbox_summary(config.sandbox)}")
+    print(
+        f"project: {_sandbox_summary(config.sandbox)},"
+        f" {_settings_summary(config.settings)}"
+    )
     for line_id, line in sorted(config.lines.items()):
+        line_settings = engine_settings.merge([config.settings, line.config.settings])
         tools = ", ".join(line.config.builtin_tools) or "no built-in tools"
         servers = ", ".join(line.config.server_names()) or "no MCP servers"
         print(
             f"line {line_id}: {line.model} {line.strategy},"
             f" {line.config.tool_policy}, {tools}, {servers},"
-            f" {_sandbox_summary(merge([config.sandbox, line.config.sandbox]))}"
+            f" {_sandbox_summary(merge([config.sandbox, line.config.sandbox]))},"
+            f" {_settings_summary(line_settings)}"
+            + (f", effort {line.config.effort}" if line.config.effort else "")
         )
     return exits.OK
+
+
+def _settings_summary(settings: SettingsConfig | None) -> str:
+    return "no engine settings" if settings is None else settings.summary()
 
 
 def _sandbox_summary(sandbox: SandboxConfig | None) -> str:
@@ -497,6 +528,18 @@ def _add_tool_options(command: argparse.ArgumentParser) -> None:
         type=Path,
         default=None,
         help="a JSON file of Claude Code sandbox settings for the line's commands",
+    )
+    command.add_argument(
+        "--settings-config",
+        type=Path,
+        default=None,
+        help="a Claude Code settings file of permissions, hooks, env and attribution",
+    )
+    command.add_argument(
+        "--effort",
+        choices=EFFORTS,
+        default=None,
+        help="the reasoning effort, instead of the one the driver declares",
     )
     command.add_argument(
         "--allow-tool",
