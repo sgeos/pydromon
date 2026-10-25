@@ -3,10 +3,12 @@
 > **Navigation**: [Architecture](./README.md) | [Documentation Root](../README.md)
 
 What the Dromon prototype needs from `pykeleusma`, written so that the `pykeleusma` line
-can choose what to build and in what order. The mapping to `pykeleusma` tasks was made
-on 2026-10-25 against its `docs/roadmap/V0_1_0.md` and
-`docs/architecture/BINDING_DESIGN.md` at commit `ae0b68e`. Those files are authoritative
-for the binding. This document states needs, not binding design.
+can choose what to build and in what order. The mapping to `pykeleusma` tasks was first
+made on 2026-10-25 against its `docs/roadmap/V0_1_0.md` and
+`docs/architecture/BINDING_DESIGN.md` at commit `ae0b68e`. It was revised the same day
+against commit `03d2309`, after the `pykeleusma` line answered the four questions below
+and the operator approved its roadmap changes for Dromon. The `pykeleusma` files are
+authoritative for the binding. This document states needs, not binding design.
 
 ## Why Dromon uses Keleusma
 
@@ -55,12 +57,19 @@ the host to perform.
 
 Many stream processors on one thread, each resumed at most once per tick.
 
-- **Needs.** Several VMs owned by one thread. `BINDING_DESIGN.md` says a VM belongs to the
-  thread that creates it and tests several worker threads, each with its own VM. Dromon
-  needs the converse case confirmed, many VMs created and resumed on one thread.
-- **Needs, not in the binding's plan.** The verified worst-case execution time, in
-  pipelined cycles, and the worst-case memory in bytes, readable from Python for each
-  module or VM. The scheduler uses them to budget a tick.
+- **Needs.** Several VMs owned by one thread. The `pykeleusma` line confirmed this with a
+  probe and made it part of its task 5. Each VM must stay on the thread that created it.
+- **Needs.** The verified worst-case time and memory, readable from Python for each VM.
+  The scheduler uses them to budget a tick. This is now `pykeleusma` task 5b, as
+  `vm.wcet_per_iteration` and `vm.arena_capacity`.
+- **Open.** The unit of the time figure. Keleusma's README states worst-case execution
+  time in pipelined cycles. The `pykeleusma` line reports that `wcet_per_iteration` is in
+  unitless nominal cost units, which need a calibrated cost model to become cycles or
+  seconds. Both statements are reported here and neither was checked by this line. A
+  tick budget can compare figures from different processors without settling the unit,
+  but it cannot be set in wall-clock time until the unit is settled.
+- **Caveat.** Neither figure covers Python, the binding's conversions or the host's own
+  work. The model call in particular stays outside every bound.
 
 ## Events and actions without structs
 
@@ -69,25 +78,38 @@ within that by encoding events and actions as tagged tuples.
 
 | Value | Encoding |
 |---|---|
-| An event | A tuple whose first element is a tag string, such as `("tokens", text)`, `("tool_result", call_id, text)` or `("turn_end",)` |
-| An action | A tuple with a tag string, such as `("send", line_id, text)`, `("wake", line_id)`, `("ask", question_text, blocking)` or `("end_turn",)` |
-| Several actions in one step | A tuple or array of action tuples |
+| An event | A tuple whose first element is a tag string, such as `("tokens", text)`, `("tool_result", call_id, text)` or `("turn_end", "")` |
+| An action | A tuple with a tag string, such as `("send", line_id, text)`, `("wake", line_id)`, `("ask", question_text, blocking)` or `("end_turn", "")` |
+| Several actions in one step | An array of action tuples of one shared type |
 
-**Open for the binding line.** Whether Keleusma 0.2.2 accepts this shape well. A
-heterogeneous array may not type-check, in which case a fixed-arity tuple per step, or one
-yield per action, is the fallback.
+**Constraints reported by the `pykeleusma` line** against Keleusma 0.2.2.
+
+- A tuple has at least two elements, so a tag with no payload carries an empty string.
+- Every yield of one processor shares one declared type. Actions of different shapes
+  therefore need a fixed-arity tuple with padding fields, such as `(Text, Text, Text)`.
+  The examples in the table are shapes to be padded, not final types.
+- A processor can compare a host string with a literal tag and yield it back. Any other
+  text work, such as searching tokens, needs a host native. Text inspection therefore
+  stays on the Python side, which keeps the design free of natives.
+- A yield of the wrong type passed both the compiler and the verifier in the probe and
+  was caught only on decoding. Dromon must therefore treat a decoding error as a
+  processor fault and must not assume that verification proves the yield type.
+
+Keleusma enums compile and would suit actions better than tagged tuples. The binding
+converts them only after its 0.1.0.
 
 ## Requirements mapped to pykeleusma tasks
 
 | Priority | Need | pykeleusma 0.1.0 task | Status on 2026-10-25 |
 |---|---|---|---|
-| 1 | `keleusma.compile(source)` with located errors, so a bad policy file reports a line and column | Task 2 | Open |
-| 1 | `keleusma.VM(module)` that rejects an unverifiable module with a clear message | Task 3 | Open |
-| 1 | Conversion of `None`, `bool`, `int`, `float`, `str`, `tuple` and `list` | Task 4 | Open |
+| 1 | `keleusma.compile(source)` with located errors, so a bad policy file reports a line and column | Task 2 | Done 2026-10-25 |
+| 1 | `keleusma.VM(module)` that rejects an unverifiable module with a clear message, with an arena that survives `Reset` | Task 3 | Done 2026-10-25 |
+| 1 | Conversion of `None`, `bool`, `int`, `float`, `str`, `tuple` and `list`, decoded by declared type | Task 4 | Open |
 | 1 | `vm.call` and `vm.resume` with the yielded, finished and reset states | Task 5 | Open |
 | 2 | `vm.stream` as a generator, for tests and simple drivers | Task 6 | Open |
-| 2 | Many VMs on one thread, confirmed by a test | Not listed | Asked here |
-| 2 | Worst-case time and memory figures readable from Python | Not listed | Asked here |
+| 2 | Many VMs on one thread, confirmed by a test | Task 5 | Confirmed by probe. Test open |
+| 2 | Worst-case time and memory figures readable from Python | Task 5b | `arena_capacity` exposed. Units and `wcet_per_iteration` open |
+| 2 | A batched update loop in Dromon's event and action shape | Task 8 | Open |
 | 3 | Hot swap, so the daemon can reload a policy or processor without restarting a line | The binding's later list | Not needed for a first prototype |
 | 3 | Structs and enums | After 0.1.0 | Tagged tuples suffice until then |
 | Not needed | Python natives, precompiled bytecode, signed modules, shared buffers | Task 7 and the later list | Dromon's recommended design avoids them |
@@ -103,12 +125,20 @@ the Keleusma processor will have, so the switch replaces the class body and noth
 around it. Policy functions start as plain Python functions with the same argument and
 result shapes as listed above.
 
-## Questions for the pykeleusma line
+## Questions for the pykeleusma line, with its answers
+
+The answers are the `pykeleusma` line's report of 2026-10-25, from reading the
+Keleusma 0.2.2 crate and from a probe on macOS for arm64. They were not tested
+against Keleusma 0.2.3 and were not reproduced by this line.
 
 1. Can several VMs be created and resumed on one thread, and is there a limit beyond
-   memory?
+   memory? **Yes, with no limit beyond memory.** A probe of 1,000 VMs resumed in turn
+   on one thread completed every step. Each VM must stay on its creating thread.
 2. Can the verified worst-case figures be exposed to Python, and in which units?
+   **Yes**, as task 5b. Memory is in bytes and time is in nominal cost units, as
+   discussed under use 3.
 3. Does Keleusma 0.2.2 accept the tagged-tuple encoding, and if not, what shape does it
-   prefer?
+   prefer? **Mostly**, with the constraints listed under events and actions.
 4. Does a yielded tuple stay valid after the next `resume`, given that the binding
-   converts composites eagerly because they live in the VM's arena?
+   converts composites eagerly because they live in the VM's arena? **Yes.** The binding
+   returns owned Python objects, and only the VM's internal copy becomes invalid.

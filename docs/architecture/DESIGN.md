@@ -41,6 +41,10 @@ operator's user account, with no network listener by default. The client protoco
 versioned independently of any implementation, so a client written against one version
 keeps working after a port.
 
+**Decided 2026-10-25.** The protocol specification is drafted in this repository and its
+mature parts are later ported to the lasting `dromon` repository. See
+[`../decisions/NAMING_AND_PORTS.md`](../decisions/NAMING_AND_PORTS.md).
+
 ## Session lines and engines
 
 **Proposed.** Coordinate existing harnesses rather than replace them, so that each model
@@ -56,7 +60,11 @@ checked.
 | Codex | Codex SDK or its app-server | Vendor interfaces. Not tested here |
 | Dromon's own loop | Direct model calls | Needed where full control of each step is required |
 
-**Open.** Which engine the first adapter targets. Each adapter should probe the engine's
+**Decided 2026-10-25.** The first adapter targets the model Claude Opus 5.5. **Open.**
+Which loop drives it, either Claude Code through the Claude Agent SDK or Dromon's own
+loop calling the model directly. **Proposed.** The Claude Agent SDK, which follows the
+principle above of running each model in its vendor's harness and may work with a
+subscription login, subject to the hypothesis below. Each adapter should probe the engine's
 capabilities at startup, because support varies by engine version.
 
 **Hypothesis.** Subscription logins usually work only through the vendor's own harness,
@@ -183,9 +191,10 @@ before any trace capture, and record the source model and licence of every trace
 
 ## Open questions
 
-1. The home of the protocol specification. The `dromon` repository was created empty to
-   hold it, and drafting could also start here and move later.
-2. The engine for the first adapter.
+1. The home of the protocol specification. Decided 2026-10-25, drafted here and ported
+   later.
+2. The engine for the first adapter. The model Claude Opus 5.5 was decided on
+   2026-10-25. The loop that drives it is open.
 3. The contents of `.dromon/dromon.toml`.
 4. Mid-turn injection, which depends on each engine.
 5. Teacher-model scope and licensing.
