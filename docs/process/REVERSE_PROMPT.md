@@ -43,11 +43,8 @@ started on a real project file created its declared line.
 
 ## 2026-10-25, task 10, continuous integration
 
-**Blocked.** The workflow is written and committed on `ci/github-actions`, but GitHub
-refused the push. Fact, from the push error, the GitHub command-line token has the
-scopes `repo`, `gist`, `read:org` and `admin:public_key` and lacks `workflow`, which
-GitHub requires for any change under `.github/workflows`. Granting it needs the
-operator, through `gh auth refresh -h github.com -s workflow`. This line stopped there.
+**Done.** The push was first blocked because the GitHub token lacked the `workflow`
+scope. The operator granted it in session, and the work landed as pull request #19.
 
 - **Review.** Codex pins actions to commit hashes and checks out without persisting
   credentials, and runs formatting and lint on Linux, macOS and Windows. goose adds
@@ -60,8 +57,12 @@ operator, through `gh auth refresh -h github.com -s workflow`. This line stopped
   because they need the operator's subscription.
 - **Dependabot** proposes action updates weekly, after a seven-day cooldown. Python
   dependencies stay pinned by hand.
+- **Caught on the first run.** Pull request #18 had merged a test file with a trailing
+  blank line, added by a scripted edit after the local format check. It is fixed here.
 - **Decision open to review.** The pins are the releases pykeleusma already runs rather
   than releases three days old, by the cooldown's reasoning.
 
-**Verification.** actionlint reports the workflow clean. The workflow has not run, so
-whether the jobs pass on GitHub's runners is unverified. The local gate passes.
+**Verification.** All four jobs pass, each with 574 tests passed and the 3 live tests
+deselected. actionlint reports the workflow clean.
+
+**Next.** Milestone 0.1.0 is complete. The next milestone awaits the operator.

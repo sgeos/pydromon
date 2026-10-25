@@ -9,7 +9,7 @@ completed, moved or abandoned.
 
 ## State on 2026-10-25
 
-- **Tasks 1 to 9 done.**
+- **Tasks 1 to 10 done. Milestone 0.1.0 is complete.**
   - `model.py`, `codec.py` and `eventlog.py` hold the data model as nine event kinds in
     an append-only SQLite log. Operators are parties addressed as `@name`.
   - `relay.py` forwards operator messages. Replies will come through inbound adapters
@@ -53,17 +53,15 @@ completed, moved or abandoned.
   `pykeleusma` from its repository at `19d4558`, which needs a Rust toolchain to build.
 - **Published.** The public GitHub repository `sgeos/pydromon`, licensed 0BSD, on an
   HTTPS remote that uses the GitHub command-line tool as its credential helper.
-  `.github/workflows/ci.yml` is written on `ci/github-actions` and has not yet run.
+  `.github/workflows/ci.yml` runs Ruff, Pyright and pytest on Ubuntu and macOS for
+  Python 3.12 and 3.15. Live tests run only locally.
 - **Commands.** Every planned subcommand is implemented.
 - **pykeleusma.** Its tasks 2, 3 and 10 are done. Python cannot yet drive a script,
   because `call` and `resume` are its open task 5. Dromon's 0.1.0 does not depend on it.
 
 ## Next step
 
-Task 10 of [`../roadmap/V0_1_0.md`](../roadmap/V0_1_0.md) is blocked on a push. The
-GitHub token lacks the `workflow` scope, so GitHub refuses the workflow file. Once the
-operator runs `gh auth refresh -h github.com -s workflow`, push `ci/github-actions`,
-open its pull request, confirm all four jobs pass, mark task 10 done and merge.
+Milestone 0.1.0 is complete. The next milestone awaits the operator's direction.
 
 ## Open
 
