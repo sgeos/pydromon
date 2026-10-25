@@ -4,38 +4,40 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-25, write access for Codex lines
+## 2026-10-25, nominal Grok support
 
-**Done.** On the operator's direction to investigate Codex permission profiles for write
-access and build it, as `docs/protocol/CODEX.md` specifies.
+**Done, not verified live.** On the operator's direction to add nominal Grok support,
+with Grok usage exhausted so that it cannot be tested yet, as `docs/protocol/GROK.md`
+specifies.
 
-- **Facts, from Codex 0.164.0's schema and documentation.** A `[permissions.NAME]`
-  profile can extend `:workspace`, scope entries to `:workspace_roots` or to absolute
-  paths, and give each `read`, `write` or `deny`. A narrower deny wins over a wider
-  write. A thread selects a profile with `permissions`, which replaces `sandbox`.
-- Every Codex thread now runs under `dromon-line`, defined on the app-server's command
-  line. The workspace is writable for a line given `Edit` or `Write`, `.git` is always
-  read-only, and the state and runtime directories are denied to reads and writes. The
-  thread must report the profile as active, and a `fileChange` counts as tool use.
-- **Facts, verified on 2026-10-25.** Under the profile, `codex sandbox -P` refused
-  reading, writing, renaming, replacing, linking and changing the mode of `.dromon`,
-  and writing `.git`, while the workspace was writable. A GPT-6-Luna line wrote a file,
-  had its edits to `.dromon` and `.git` rejected, and ran epagoge's full gate, which
-  passed. Epagoge's tree stayed clean.
-- **Fact, a fix found on the way.** Codex's read-only sandbox, used until now, let a
-  Codex line read `.dromon`, including the event log. Every Codex line now has it
-  denied.
+- Drivers for Grok 4.7 on a new `grok-build` engine, in the three strategies, with the
+  context and efforts from Grok's model cache.
+- `dromon.grok` drives `grok agent --no-leader stdio` over the Agent Client Protocol.
+  Its design rests on Grok Build 1.0.70's bundled guide and on one `initialize`
+  handshake, which runs no model. No session was created and no prompt was sent.
+- **Fact.** Grok's custom sandbox profiles live only in `sandbox.toml` files, which the
+  injectable overlay cannot set. Dromon therefore requires the operator to define
+  `dromon-reader` and `dromon-writer`, checks before each turn that they deny Dromon's
+  directories and that a writer keeps `.git` read-only, and selects one with
+  `GROK_SANDBOX`. A missing or unsafe profile refuses the turn with the table to add.
+- **Fact.** The operator's Grok configuration sets always-approve and declares mail and
+  document MCP servers. Dromon asks for Grok's ask mode, refuses a session that does
+  not report one, answers every permission request, and cancels a turn that uses a tool
+  the line was not given.
+- Dromon's tools reach a Grok line through `dromon mcp --line`, on a new `lines.sock`,
+  with a per-line token the daemon holds in memory.
 
 **Decisions made by this line, open to the operator's review.**
 
-- `.git` is read-only for every Codex line, so Codex lines never commit, matching
-  epagoge's rule and Dromon's caution.
-- The profile is fixed. A line cannot widen it, and the sandbox and settings
-  documents of Claude Code lines stay refused on Codex lines.
-- Epagoge's local `luna` line now has `Bash` and `Edit`.
+- Dromon does not write either `sandbox.toml`. The operator adds the profiles.
+- The API strategy is refused, because Grok prefers a cached sign-in over a key and
+  Dromon cannot yet confirm which it used.
+- Every unconfirmed behaviour refuses the turn. The first live run may therefore fail
+  closed on a field shape and need an adjustment, and `GROK.md` lists what to check.
 
-**Not done, fact.** Codex emits no item for a call it refuses before running, so the
-driver's tool budget cannot count refused calls.
+**Not done.** No live verification of any Grok turn. On macOS Grok cannot block a
+command's network access.
 
-**Verification.** 879 tests passing outside the sandbox with warnings treated as errors,
-and all 10 live tests passing. Ruff and pyright strict clean.
+**Verification.** 931 tests passing outside the sandbox with warnings treated as errors,
+including 33 for the Grok adapter against a scripted server. Ruff and pyright strict
+clean. The live tests were not rerun, since nothing they cover changed.

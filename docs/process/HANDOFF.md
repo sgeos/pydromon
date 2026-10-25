@@ -15,13 +15,13 @@ completed, moved or abandoned.
   - `relay.py` forwards operator messages, and inbound replies are deferred.
     `daemon.py`, `client.py`, `protocol.py`, `paths.py` and `exits.py` are the daemon.
   - `engine.py` runs turns on Claude Code through the Agent SDK. `driver.py` hosts
-    Keleusma drivers through `pykeleusma`. Concrete drivers in `drivers/` cover Opus
-    5.5, Haiku 5.5 and GPT-6-Luna, each in a subscription, API and flexible strategy,
-    by the operator's decision. Each names its engine, `claude-code` or `codex`.
-  - `codex.py` runs GPT-6-Luna lines through `codex app-server` on the operator's
-    ChatGPT plan, isolated from the user's MCP servers, under a Codex permission
-    profile denying Dromon's state, with Dromon's tools as dynamic tools. `scheduler.engine_factory` picks the adapter. `dromon
-    probe` runs one turn, by default on Haiku 5.5, the least expensive model.
+    Keleusma drivers through `pykeleusma`. Drivers cover Opus 5.5, Haiku 5.5,
+    GPT-6-Luna and Grok 4.7, each in three strategies, and name their engine.
+    `scheduler.engine_factory` picks the adapter. `dromon probe` runs one turn.
+  - `codex.py` runs GPT-6-Luna through `codex app-server` on the ChatGPT plan,
+    isolated from the user's MCP servers, under a profile denying Dromon's state.
+  - `grok.py` runs Grok 4.7 over ACP, unverified live: operator-defined sandbox
+    profiles Dromon checks, and tools via `dromon mcp --line` on `lines.sock`.
   - `teacher.py` brings a project's local Ollama teacher up and down. Lines take
     `claude_code_prompt` and `instructions`, so they can follow a `CLAUDE.md`.
   - `agents.py` and `mcp.py` let outside harnesses reach the daemon over MCP as `&name`
@@ -32,10 +32,8 @@ completed, moved or abandoned.
   - Operator questions. `ask_operator` queues a question, `dromon questions` and
     `dromon answer` work it, and the answer wakes the line. `line_session` keeps each
     line's engine session across a restart.
-  - `mailbox.py` gives every party a mailbox with read and answered state. Wake
-    prompts list headers. Lines use `list_mail`, `read_mail` and `list_sent`, and
-    operators `dromon mail`, `read` and `sent`. Nobody is obliged to answer, and a
-    recipient may acknowledge without replying.
+  - `mailbox.py` gives every party a mailbox with read and answered state. Nobody is
+    obliged to answer, and a recipient may acknowledge without replying.
   - `limits.py` holds a line after 12 turns without operator mail or $2 of estimated
     cost. A reply or `dromon release` resumes it.
   - `attach.py`, `tui.py` and `gui.py` are `dromon attach`.
@@ -94,6 +92,7 @@ editable install that runs the working tree. Its project file is
   or language servers, no MCP OAuth, and Linux not verified live. The merge of `Read`
   and `Edit` rules into the sandbox is untested. Listed in `SANDBOX.md` and
   `SETTINGS.md`.
+- **Grok lines.** Never run live. `GROK.md` lists what to verify first.
 - **Codex lines.** No MCP servers, commits, sandbox or settings documents, cost or turn
   limit, and refused calls escape the tool budget. See `CODEX.md`.
 - **In the design.** Hosted teacher traces, the Rust repository's name, and pushed
@@ -112,7 +111,7 @@ and a manual daemon run need a command outside it. The rest run inside it with
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 879 tests pass, plus 10 live tests deselected
+uv sync && uv run pytest    # 931 tests pass, plus 10 live tests deselected
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 

@@ -508,7 +508,7 @@ def test_the_daemon_refuses_project_tables_that_would_reach_a_codex_line() -> No
             "[lines.a]\nmodel = 'claude-haiku-5-5'\n"
         )
     )
-    with pytest.raises(ValueError, match="Codex lines a"):
+    with pytest.raises(ValueError, match="the lines a, which run on Codex or Grok"):
         check_engines(
             parse(
                 "version = 1\n[settings.env]\nA = '1'\n"

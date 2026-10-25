@@ -21,7 +21,7 @@ from dromon.client import DaemonFailed, DaemonNotRunning, call, is_running, star
 from dromon.paths import PathError, ProjectPaths, project_paths
 from dromon.driver import MODELS, Driver, DriverError, Strategy
 from dromon.engine import EngineRefused
-from dromon.agents import TOKEN_ENV
+from dromon.agents import LINE_TOKEN_ENV, TOKEN_ENV
 from dromon.lineconfig import EFFORTS
 from dromon.model import AgentAccess
 from dromon.protocol import Operation, ProtocolError
@@ -520,9 +520,19 @@ def _mcp(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     """Serve one external agent over MCP on standard input and output."""
     from dromon.mcp import Bridge, serve
 
-    agent: str = arguments.agent
-    token = os.environ.get(TOKEN_ENV) or None
-    return serve(Bridge(paths.agent_socket, agent, token), sys.stdin, sys.stdout)
+    line: str | None = arguments.line
+    if line is not None:
+        bridge = Bridge(
+            paths.line_socket,
+            line,
+            os.environ.get(LINE_TOKEN_ENV) or None,
+            party="line",
+        )
+    else:
+        bridge = Bridge(
+            paths.agent_socket, arguments.agent, os.environ.get(TOKEN_ENV) or None
+        )
+    return serve(bridge, sys.stdin, sys.stdout)
 
 
 def _teacher(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
@@ -767,10 +777,15 @@ def build_parser() -> argparse.ArgumentParser:
                 help="what the agent may do, for add, default %(default)s",
             )
         if name == "mcp":
-            command.add_argument(
+            party = command.add_mutually_exclusive_group(required=True)
+            party.add_argument(
                 "--agent",
-                required=True,
                 help="the agent's name. Its token is read from DROMON_AGENT_TOKEN",
+            )
+            party.add_argument(
+                "--line",
+                help="the line whose own tools to serve, for its engine. Its token is"
+                " read from DROMON_LINE_TOKEN",
             )
         if name == "teacher":
             command.add_argument(

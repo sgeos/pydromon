@@ -57,8 +57,10 @@ from typing import Any, Final, Protocol, cast
 from claude_agent_sdk import SdkMcpTool
 
 from dromon.driver import MODELS, Driver, DriverError, Strategy
-from dromon import codex
+from dromon import codex, grok
+from dromon.agents import LineTokens
 from dromon.codex import CodexLine
+from dromon.grok import GrokLine
 from dromon.engine import ClaudeCodeLine, EngineRefused, TurnReport
 from dromon.eventlog import EventLog
 from dromon.limits import DEFAULT_LIMITS, Limits
@@ -235,6 +237,8 @@ def engine_factory(
     project_sandbox: SandboxConfig | None = None,
     project_settings: SettingsConfig | None = None,
     protected: Sequence[Path] = (),
+    line_tokens: LineTokens | None = None,
+    line_socket: Path | None = None,
 ) -> EngineFactory:
     """The production factory: each line on Claude Code with its packaged driver.
 
@@ -262,6 +266,29 @@ def engine_factory(
                 session_id=spec.session_id,
                 protected=protected,
             )
+        if driver.settings.engine == grok.ENGINE_NAME:
+            if project_sandbox is not None or project_settings is not None:
+                raise EngineRefused(
+                    "Grok lines take no sandbox or settings, and the project file"
+                    " sets one for every line"
+                )
+            bridge: list[str] = []
+            token: str | None = None
+            if line_tokens is not None and line_socket is not None:
+                token = line_tokens.issue(spec.line_id)
+                bridge = grok.bridge_command(
+                    Path(cwd), line_socket.parent, spec.line_id
+                )
+            return GrokLine(
+                driver,
+                Path(cwd),
+                config=spec.config,
+                mcp_tools=list(own_tools),
+                session_id=spec.session_id,
+                protected=protected,
+                bridge=bridge,
+                line_token=token,
+            )
         merged = merge([project_sandbox, spec.config.sandbox])
         return ClaudeCodeLine(
             driver,
@@ -286,8 +313,10 @@ def _party(owner: str | Address) -> Address:
 
 def _check_engine_supports(driver: Driver, config: LineConfig) -> None:
     """Raise ``ConfigError`` if the driver's engine cannot run ``config``."""
-    if driver.settings.engine == codex.ENGINE_NAME:
-        reason = codex.unsupported(config)
+    checks = {codex.ENGINE_NAME: codex.unsupported, grok.ENGINE_NAME: grok.unsupported}
+    check = checks.get(driver.settings.engine)
+    if check is not None:
+        reason = check(config)
         if reason is not None:
             raise ConfigError(reason)
 

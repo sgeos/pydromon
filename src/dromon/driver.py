@@ -43,13 +43,14 @@ ENGINE_OF: Final[dict[str, str]] = {
     "claude-opus-5-5": "claude-code",
     "claude-haiku-5-5": "claude-code",
     "gpt-6-luna": "codex",
+    "grok-4.7": "grok-build",
 }
 """Each model with a packaged driver for every strategy, and the engine it runs on."""
 
-ENGINES: Final = ("claude-code", "codex")
+ENGINES: Final = ("claude-code", "codex", "grok-build")
 """The engines a driver may name."""
 
-ADAPTED_ENGINES: Final = frozenset({"claude-code", "codex"})
+ADAPTED_ENGINES: Final = frozenset({"claude-code", "codex", "grok-build"})
 """The engines Dromon has an adapter for."""
 
 MODELS: Final = tuple(
@@ -87,7 +88,7 @@ class Strategy(StrEnum):
 
 def driver_resource(model: str, strategy: Strategy) -> str:
     """The packaged file name of the driver for ``model`` and ``strategy``."""
-    return f"{model.replace('-', '_')}_{strategy.value}.kel"
+    return f"{model.replace('-', '_').replace('.', '_')}_{strategy.value}.kel"
 
 
 class ActionTag(StrEnum):

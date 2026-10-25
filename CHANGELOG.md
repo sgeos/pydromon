@@ -43,6 +43,13 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Nominal Grok support, not verified against a live turn, specified by
+  `docs/protocol/GROK.md`. Drivers for Grok 4.7 on the new `grok-build` engine, and
+  `dromon.grok`, which drives `grok agent stdio` over the Agent Client Protocol. A Grok
+  line runs under an operator-defined `dromon-reader` or `dromon-writer` sandbox profile
+  that Dromon checks, must report Grok's ask mode, has every permission request
+  answered by Dromon, and reaches Dromon's tools through `dromon mcp --line` and the new
+  `lines.sock`, with a per-line token the daemon holds in memory.
 - Codex lines can write files. Every Codex thread runs under `dromon-line`, a Codex
   permission profile that makes the workspace writable for a line given `Edit` or
   `Write`, keeps `.git` read-only, and denies Dromon's state and runtime directories to
