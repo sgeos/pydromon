@@ -16,10 +16,12 @@ Design notes from the settings of other harnesses, reviewed on 2026-10-25.
   and column for a syntax error, or the key path and the line of its table otherwise.
 - Precedence is command line flags over this file over built-in defaults. User and
   managed layers are not yet specified. A line's own keys replace its profile's whole,
-  rather than merging lists, so a line's tools are always readable in one place.
+  rather than merging lists, so a line's tools are always readable in one place. The
+  ``sandbox`` and ``settings`` tables merge instead, so no layer drops a deny entry.
 
 Trust. The file is operator configuration, committed with the project. It can grant a
-line tools, MCP servers and credentials, so it deserves the review any such file does.
+line tools, MCP servers, hooks and credentials, so it deserves the review any such file
+does. MCP servers may refer to secrets in the daemon's environment instead.
 """
 
 import re
@@ -33,7 +35,9 @@ from dromon.driver import MODELS, Strategy
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.lineconfig import ConfigError, LineConfig, config_from_document
 from dromon.model import ID_PATTERN
+from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, SandboxError, merge, parse_sandbox
+from dromon.settings import SettingsConfig, SettingsError, parse_settings
 
 CONFIG_FILE_NAME: Final = "dromon.toml"
 FILE_VERSION: Final = 1
@@ -41,7 +45,7 @@ MAX_WAKE_EVERY: Final = 3600
 MAX_FILE_BYTES: Final = 4 * 1024 * 1024
 
 TOP_KEYS: Final = frozenset(
-    {"version", "daemon", "limits", "wake", "sandbox", "profiles", "lines"}
+    {"version", "daemon", "limits", "wake", "sandbox", "settings", "profiles", "lines"}
 )
 DAEMON_KEYS: Final = frozenset({"operator", "tick_seconds"})
 LIMIT_KEYS: Final = frozenset(
@@ -55,10 +59,15 @@ TOOL_KEYS: Final = frozenset(
         "tool_policy",
         "allowed_tools",
         "inherit_account_mcp",
+        "effort",
     }
 )
+LAYERED_KEYS: Final = frozenset({"sandbox", "settings"})
+"""Keys whose profile and line tables merge as Claude Code's scopes do."""
 LINE_KEYS: Final = (
-    frozenset({"profile", "model", "strategy", "limits", "wake", "sandbox"}) | TOOL_KEYS
+    frozenset({"profile", "model", "strategy", "limits", "wake"})
+    | TOOL_KEYS
+    | LAYERED_KEYS
 )
 PROFILE_KEYS: Final = LINE_KEYS - {"profile"}
 
@@ -108,6 +117,8 @@ class ProjectConfig:
     wake_every_ticks: int = 1
     sandbox: SandboxConfig | None = None
     """The project's sandbox, merged under every line's own."""
+    settings: SettingsConfig | None = None
+    """The project's engine settings, merged under every line's own."""
     lines: dict[str, LineDefinition] = field(default_factory=dict[str, LineDefinition])
 
 
@@ -210,6 +221,7 @@ class _Reader:
         limits = self.limits(top.get("limits", {}), "limits", DEFAULT_LIMITS)
         wake = self.wake(top.get("wake", {}), "wake", 1)
         sandbox = self.sandbox(top.get("sandbox"), "sandbox")
+        settings = self.settings(top.get("settings"), "settings")
         profiles = self.profiles(top.get("profiles", {}))
         lines_table = top.get("lines", {})
         if not isinstance(lines_table, dict):
@@ -223,6 +235,7 @@ class _Reader:
             limits=limits,
             wake_every_ticks=wake,
             sandbox=sandbox,
+            settings=settings,
             lines=lines,
         )
 
@@ -262,6 +275,18 @@ class _Reader:
                 self.path, str(error), key=key, line=self.line_of(where)
             ) from error
 
+    def settings(self, value: object, key: str) -> SettingsConfig | None:
+        """An engine settings table from the file."""
+        if value is None:
+            return None
+        try:
+            return parse_settings(value)
+        except SettingsError as error:
+            where = f"{key}.{error.key}" if error.key else key
+            raise ConfigFileError(
+                self.path, str(error), key=key, line=self.line_of(where)
+            ) from error
+
     def profiles(self, value: object) -> dict[str, dict[str, object]]:
         if not isinstance(value, dict):
             raise self.fail("profiles", "must be a table")
@@ -286,6 +311,7 @@ class _Reader:
         own = self.table(value, key, LINE_KEYS)
         merged: dict[str, object] = {}
         profile_sandbox: SandboxConfig | None = None
+        profile_settings: SettingsConfig | None = None
         profile_name = own.get("profile")
         if profile_name is not None:
             if not isinstance(profile_name, str) or profile_name not in profiles:
@@ -294,6 +320,10 @@ class _Reader:
             profile_sandbox = self.sandbox(
                 profiles[profile_name].get("sandbox"),
                 f"profiles.{profile_name}.sandbox",
+            )
+            profile_settings = self.settings(
+                profiles[profile_name].get("settings"),
+                f"profiles.{profile_name}.settings",
             )
         merged.update({k: v for k, v in own.items() if k != "profile"})
         model = merged.get("model")
@@ -312,10 +342,15 @@ class _Reader:
             config = config_from_document(tools)
         except ConfigError as error:
             raise self.fail(key, str(error)) from error
-        # Unlike the tool keys, sandbox tables merge as Claude Code's scopes do, so a
-        # line cannot drop a deny entry its profile adds.
+        # Unlike the tool keys, sandbox and settings tables merge as Claude Code's
+        # scopes do, so a line cannot drop a deny entry its profile adds.
         own_sandbox = self.sandbox(own.get("sandbox"), f"{key}.sandbox")
-        config = replace(config, sandbox=merge([profile_sandbox, own_sandbox]))
+        own_settings = self.settings(own.get("settings"), f"{key}.settings")
+        config = replace(
+            config,
+            sandbox=merge([profile_sandbox, own_sandbox]),
+            settings=engine_settings.merge([profile_settings, own_settings]),
+        )
         return LineDefinition(
             line_id=line_id,
             model=cast(str, model),

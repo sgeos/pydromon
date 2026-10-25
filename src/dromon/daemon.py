@@ -699,6 +699,7 @@ def run(
                 claude_code_engine(
                     str(paths.root),
                     project_sandbox=config.sandbox,
+                    project_settings=config.settings,
                     protected=protected_dirs(paths),
                 ),
                 limits=limits,

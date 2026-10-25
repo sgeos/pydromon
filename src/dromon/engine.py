@@ -22,9 +22,11 @@ lists, the MCP servers it names, and Dromon's own in-process tools such as
 ``send_message``. ``strict_mcp_config=True`` keeps every other MCP server out unless
 the configuration sets ``inherit_account_mcp``, which matters because a claude.ai login
 otherwise brings the account's connectors, such as mail and file sharing, into the
-session. No tool is approved in advance. Every call reaches the line's permission gate,
-which applies the configuration's policy, and a turn whose engine offers a built-in
-tool or an MCP server the configuration does not name is interrupted and refused.
+session. Dromon approves no tool in advance. A call that the engine would ask about
+reaches the line's permission gate, which applies the configuration's policy, and a
+turn whose engine offers a built-in tool or an MCP server the configuration does not
+name is interrupted and refused. The line's own settings may approve calls in advance,
+as described under Settings below.
 
 Sandbox. ``sandbox`` is the line's effective sandbox settings, already merged and
 resolved by ``dromon.sandbox.effective``, and Claude Code enforces them on shell
@@ -32,12 +34,24 @@ commands. With ``setting_sources=[]`` a line has no sandbox but the one given he
 any managed policy. The gate also refuses a shell call that asks to run outside an
 enabled sandbox that does not allow it, in case the engine forwards one.
 
+Settings. ``settings`` is the line's effective engine settings, already merged and
+resolved by ``dromon.settings.effective``: permission rules, hooks, ``env`` and
+``attribution``. They reach Claude Code through ``--settings``, which the SDK also uses
+for the sandbox, and Claude Code applies them itself. A deny rule refuses a call before
+the gate sees it, and an allow rule approves one without the gate, within the tools
+the configuration offers. Fact, verified on 2026-10-25 with Claude Haiku 5.5: with
+``setting_sources=[]`` a deny rule refused a Bash call, and a ``UserPromptSubmit`` hook
+ran, saw a variable from ``env``, and its output reached the model. MCP server
+references such as ``${TOKEN}`` are replaced from the daemon's environment here, at the
+start of each turn, so the stored configuration holds only the reference.
+
 Failure modes. A refusal by the policy or the driver raises ``EngineRefused`` after the
 turn is interrupted. A driver failure raises ``DriverError``. Engine and transport
 failures from the SDK propagate unchanged.
 """
 
 import importlib.metadata
+import json
 import os
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
@@ -66,7 +80,7 @@ from claude_agent_sdk import (
 )
 
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
-from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
+from dromon.lineconfig import DEFAULT_CONFIG, ConfigError, LineConfig
 from dromon.sandbox import blocks_unsandboxed
 
 MCP_SERVER_NAME: Final = "dromon"
@@ -271,6 +285,7 @@ class ClaudeCodeLine:
         mcp_tools: Sequence[SdkMcpTool[object]] = (),
         session_id: str | None = None,
         sandbox: Mapping[str, object] | None = None,
+        settings: Mapping[str, object] | None = None,
         environment: Mapping[str, str] | None = None,
         session_factory: SessionFactory = _sdk_session,
     ) -> None:
@@ -280,6 +295,7 @@ class ClaudeCodeLine:
         self.mcp_tools = tuple(mcp_tools)
         self.session_id = session_id
         self.sandbox = None if sandbox is None else dict(sandbox)
+        self.settings = None if settings is None else dict(settings)
         self._environment = os.environ if environment is None else environment
         self._session_factory = session_factory
 
@@ -290,12 +306,17 @@ class ClaudeCodeLine:
 
     def options(self) -> ClaudeAgentOptions:
         settings = self.driver.settings
-        effort = settings.effort
+        effort = self.config.effort or settings.effort
         if effort not in ("low", "medium", "high", "xhigh", "max"):
             raise EngineRefused(f"the driver names an unknown effort {effort!r}")
-        servers: dict[str, McpSdkServerConfig | dict[str, object]] = {
-            name: server.sdk_config() for name, server in self.config.mcp_servers
-        }
+        servers: dict[str, McpSdkServerConfig | dict[str, object]] = {}
+        for name, server in self.config.mcp_servers:
+            try:
+                servers[name] = server.sdk_config(self._environment)
+            except ConfigError as error:
+                raise EngineRefused(
+                    f"the MCP server {name} cannot start: {error}"
+                ) from error
         if self.mcp_tools:
             servers[MCP_SERVER_NAME] = create_sdk_mcp_server(
                 MCP_SERVER_NAME, tools=list(self.mcp_tools)
@@ -312,6 +333,7 @@ class ClaudeCodeLine:
             cwd=str(self.cwd),
             resume=self.session_id,
             sandbox=cast(SandboxSettings, self.sandbox),
+            settings=None if self.settings is None else json.dumps(self.settings),
         )
 
     async def run_turn(self, prompt: str) -> TurnReport:
