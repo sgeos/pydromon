@@ -6,6 +6,7 @@ import signal
 import socket
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
 
@@ -39,6 +40,7 @@ def call(
     socket_path: Path,
     operation: Operation,
     timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
+    args: dict[str, object] | None = None,
 ) -> Response:
     """Send one request and return the daemon's response.
 
@@ -46,7 +48,7 @@ def call(
     is malformed or answers another request, and ``TimeoutError`` when the daemon is
     too slow.
     """
-    request = Request(secrets.token_hex(8), operation)
+    request = Request(secrets.token_hex(8), operation, dict(args or {}))
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(timeout_seconds)
         try:
@@ -85,7 +87,7 @@ def is_running(paths: ProjectPaths) -> bool:
         return False
 
 
-def start(paths: ProjectPaths) -> int:
+def start(paths: ProjectPaths, daemon_args: Sequence[str] = ()) -> int:
     """Start a detached daemon for ``paths`` and return its process id.
 
     The daemon runs in a new session with no terminal, so it survives the client. Its
@@ -104,6 +106,7 @@ def start(paths: ProjectPaths) -> int:
         str(paths.root),
         "--runtime-dir",
         str(paths.runtime_dir),
+        *daemon_args,
     ]
     try:
         # posix_spawn leaves no subprocess object behind, which a detached daemon

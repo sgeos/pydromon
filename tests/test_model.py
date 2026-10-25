@@ -49,8 +49,8 @@ def build(*events: Event) -> State:
 
 def parties() -> list[Event]:
     return [
-        LineCreated("alpha", ENGINE),
-        LineCreated("beta", ENGINE),
+        LineCreated("alpha", ENGINE, "subscription"),
+        LineCreated("beta", ENGINE, "subscription"),
         OperatorRegistered("ana"),
         OperatorRegistered("ben"),
     ]
@@ -108,7 +108,7 @@ def test_applying_the_same_events_twice_gives_equal_states(
 def test_a_copy_is_independent(scenario: tuple[Event, ...]) -> None:
     state = build(*scenario)
     snapshot = state.copy()
-    state.apply(LineCreated("gamma", ENGINE))
+    state.apply(LineCreated("gamma", ENGINE, "subscription"))
     state.apply(OperatorRegistered("cleo"))
     assert "gamma" not in snapshot.lines
     assert "cleo" not in snapshot.operators
@@ -151,12 +151,12 @@ def test_operators_are_addressed_separately() -> None:
 )
 def test_an_invalid_identifier_is_refused(value: object) -> None:
     with pytest.raises(InvalidField, match="line_id"):
-        LineCreated(value, ENGINE)  # pyright: ignore[reportArgumentType]
+        LineCreated(value, ENGINE, "subscription")  # pyright: ignore[reportArgumentType]
 
 
 @pytest.mark.parametrize("value", ["a", "0", "a" * 64, "claude-opus-5.5_x"])
 def test_a_valid_identifier_is_accepted(value: str) -> None:
-    assert LineCreated(value, ENGINE).line_id == value
+    assert LineCreated(value, ENGINE, "subscription").line_id == value
 
 
 def test_an_address_field_must_hold_an_address() -> None:
@@ -232,10 +232,10 @@ def test_an_invalid_reply_reference_is_refused() -> None:
 
 
 def test_every_event_is_immutable() -> None:
-    event = LineCreated("alpha", ENGINE)
+    event = LineCreated("alpha", ENGINE, "subscription")
     with pytest.raises(AttributeError):
         event.line_id = "beta"  # pyright: ignore[reportAttributeAccessIssue]
-    assert [f.name for f in fields(event)] == ["line_id", "engine"]
+    assert [f.name for f in fields(event)] == ["line_id", "engine", "strategy"]
 
 
 # Line state transitions.
@@ -244,7 +244,7 @@ def test_every_event_is_immutable() -> None:
 @pytest.mark.parametrize("old", list(LineState))
 @pytest.mark.parametrize("new", list(LineState))
 def test_line_transitions_follow_the_table(old: LineState, new: LineState) -> None:
-    state = build(LineCreated("a", ENGINE))
+    state = build(LineCreated("a", ENGINE, "subscription"))
     # Reach ``old`` by the shortest permitted path from idle.
     paths = {
         LineState.IDLE: [],
@@ -297,7 +297,12 @@ def test_a_question_to_one_operator_does_not_block_another_line() -> None:
 # Rejections. Each case is a valid history followed by one event that must not apply.
 
 REJECTIONS: list[tuple[str, list[Event], Event, str]] = [
-    ("duplicate line", parties(), LineCreated("alpha", ENGINE), "exists"),
+    (
+        "duplicate line",
+        parties(),
+        LineCreated("alpha", ENGINE, "subscription"),
+        "exists",
+    ),
     ("duplicate operator", parties(), OperatorRegistered("ana"), "exists"),
     ("unknown line state", [], LineStateChanged("x", LineState.RUNNING), "no line"),
     (

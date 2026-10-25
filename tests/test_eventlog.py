@@ -86,7 +86,7 @@ def test_a_reopened_log_accepts_further_events(
 ) -> None:
     write(path, scenario)
     with EventLog(path) as log:
-        entry = log.append(LineCreated("gamma", ENGINE))
+        entry = log.append(LineCreated("gamma", ENGINE, "subscription"))
     assert entry.seq == len(scenario) + 1
     assert "gamma" in replay(path).lines
 
@@ -124,13 +124,13 @@ def test_the_state_property_is_a_snapshot(path: Path) -> None:
     with EventLog(path) as log:
         snapshot = log.state
         snapshot.lines.clear()
-        log.append(LineCreated("alpha", ENGINE))
+        log.append(LineCreated("alpha", ENGINE, "subscription"))
         assert "alpha" not in snapshot.lines
         assert "alpha" in log.state.lines
 
 
 def test_a_new_log_is_private_to_its_owner(path: Path) -> None:
-    write(path, (LineCreated("alpha", ENGINE),))
+    write(path, (LineCreated("alpha", ENGINE, "subscription"),))
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
@@ -151,9 +151,9 @@ def test_utc_now_is_iso_8601_in_utc() -> None:
 
 def test_a_rejected_event_is_not_stored(path: Path) -> None:
     with EventLog(path) as log:
-        log.append(LineCreated("alpha", ENGINE))
+        log.append(LineCreated("alpha", ENGINE, "subscription"))
         with pytest.raises(EventRejected):
-            log.append(LineCreated("alpha", ENGINE))
+            log.append(LineCreated("alpha", ENGINE, "subscription"))
         with pytest.raises(EventRejected):
             log.append(LineStateChanged("alpha", LineState.IDLE))
         assert log.last_seq == 1
@@ -163,19 +163,21 @@ def test_a_rejected_event_is_not_stored(path: Path) -> None:
 def test_an_empty_timestamp_is_refused_and_nothing_is_stored(path: Path) -> None:
     with EventLog(path, clock=lambda: "") as log:
         with pytest.raises(LogError, match="timestamp"):
-            log.append(LineCreated("alpha", ENGINE))
+            log.append(LineCreated("alpha", ENGINE, "subscription"))
         assert log.state == State()
     assert read_entries(path) == []
 
 
 def test_a_second_writer_is_detected(path: Path) -> None:
     with EventLog(path) as first, EventLog(path) as second:
-        first.append(LineCreated("alpha", ENGINE))
+        first.append(LineCreated("alpha", ENGINE, "subscription"))
         with pytest.raises(LogConflict, match="at 1"):
-            second.append(LineCreated("beta", ENGINE))
+            second.append(LineCreated("beta", ENGINE, "subscription"))
         assert second.state == State()
         assert second.last_seq == 0
-    assert [e.event for e in read_entries(path)] == [LineCreated("alpha", ENGINE)]
+    assert [e.event for e in read_entries(path)] == [
+        LineCreated("alpha", ENGINE, "subscription")
+    ]
 
 
 # The log is append-only.
@@ -256,14 +258,14 @@ def test_a_payload_that_does_not_decode_is_corruption(
 
 
 def test_an_event_that_does_not_apply_is_corruption(path: Path) -> None:
-    write(path, (LineCreated("alpha", ENGINE),))
-    insert(path, encode(LineCreated("alpha", ENGINE)))
+    write(path, (LineCreated("alpha", ENGINE, "subscription"),))
+    insert(path, encode(LineCreated("alpha", ENGINE, "subscription")))
     with pytest.raises(LogCorrupt, match="event 2 does not apply"):
         replay(path)
 
 
 def test_a_gap_in_the_sequence_is_corruption(path: Path) -> None:
-    write(path, (LineCreated("alpha", ENGINE),))
-    insert(path, encode(LineCreated("beta", ENGINE)), seq=5)
+    write(path, (LineCreated("alpha", ENGINE, "subscription"),))
+    insert(path, encode(LineCreated("beta", ENGINE, "subscription")), seq=5)
     with pytest.raises(LogCorrupt, match="skips from 1 to 5"):
         replay(path)

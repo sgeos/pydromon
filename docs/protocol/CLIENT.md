@@ -40,12 +40,19 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `v` | The protocol version, the integer `1` |
 | `id` | 1 to 64 characters from `A` to `Z`, `a` to `z`, `0` to `9`, `.`, `_` and `-`, chosen by the client and echoed in the response |
 | `op` | The operation |
+| `args` | Optional. An object of the operation's arguments, each of which is checked exactly |
 
 | Operation | Result |
 |---|---|
 | `ping` | An empty object |
 | `status` | `daemon_version`, `protocol_version`, `pid`, `project`, `started_at`, and `event_log` with `last_seq`, `lines`, `operators` and `open_questions` |
 | `stop` | `{"stopping": true}`, after which the daemon closes its connections, removes its socket and exits |
+| `create_line` | Arguments `line_id`, `model` and `strategy`. Result `{"line_id": ...}`. Refused when no packaged driver serves the model and strategy |
+| `send` | Arguments `recipient`, a line or `@operator`, `body`, `operator`, and optionally `reply_to`. Registers the operator if new and records a note from them. Result `{"message_id": ...}` |
+
+`status` also returns `lines`, one entry per line with `line_id`, `engine`, `strategy`,
+`state`, `pending`, the count of undelivered messages, and `turns`, the turns run in
+this daemon's lifetime.
 
 ## Responses
 
@@ -64,6 +71,7 @@ request's `id` could not be read.
 | `unsupported_version` | The request's `v` is missing or not `1` |
 | `unknown_operation` | The `op` is not one listed above |
 | `too_long` | The line exceeds the limit |
+| `rejected` | The request is well formed but does not apply, such as a message to no line |
 | `internal` | The daemon failed while handling a valid request |
 
 Both sides decode with the strictness of the event codec. Duplicate keys, numbers other
@@ -83,11 +91,18 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromon start` | Starts a detached `dromond` in a new session and waits up to 10 seconds for it to answer `ping`. Succeeds without action when a daemon already answers | 0, or 1 on failure |
 | `dromon status` | Prints the `status` result | 0, 4 when no daemon answers, or 1 |
 | `dromon stop` | Sends `stop` and waits up to 10 seconds for the socket to disappear | 0, 4 when no daemon answers, or 1 |
-| `dromond` | Runs the daemon in the foreground | 0, 1 on failure, or 5 when another daemon holds the lock |
+| `dromon create LINE` | Sends `create_line`, with `--model`, default `claude-haiku-5-5`, and `--strategy`, default `subscription` | 0, 4, or 1 |
+| `dromon send RECIPIENT BODY` | Sends `send`, with `--operator`, default the login name, and `--reply-to` | 0, 4, or 1 |
+| `dromon probe` | Runs one short turn without the daemon and reports the engine's capabilities | 0 or 1 |
+| `dromond` | Runs the daemon in the foreground. `--max-turns-per-line N` caps the turns run for each line, default 10, and `--hold-wakes` records messages without waking any line | 0, 1 on failure, 2 on a bad cap, or 5 when another daemon holds the lock |
 
 Status 2 is a usage error and status 3 marks a subcommand not yet implemented.
 
 ## Trust
+
+Whoever can connect runs as the operator's user, so a request carries operator authority
+and names, in `send`, the operator it speaks for. Lines never use the socket. They send
+through their `send_message` tool, and the daemon fixes each tool's sender to its line.
 
 The socket's access control is the runtime directory, which must be owned by the
 current user with mode 0700. The daemon refuses to start otherwise and never changes an
@@ -98,7 +113,6 @@ not yet implemented, because its interface differs between macOS and Linux.
 
 ## Not yet specified
 
-- Operations beyond the lifecycle, such as sending messages, listing and answering
-  questions, and attaching an interactive client.
+- Listing and answering questions, and attaching an interactive client.
 - Authentication of a client beyond the directory's permissions.
 - Notifications pushed from the daemon to an attached client.

@@ -16,7 +16,7 @@ distribution is `pydromon`, the import package is `dromon`, and the commands are
 **Status.** Seeded on 2026-10-25 by the operator's admin session, which only cut the
 repository. The data model, event log, operator relays and the daemon skeleton with
 `start`, `status` and `stop`, and the Claude Code engine adapter with its Keleusma driver
-for Claude Opus 5.5 are implemented. The other subcommands are placeholders. A session line carries development forward. The first milestone is [`docs/roadmap/V0_1_0.md`](docs/roadmap/V0_1_0.md)
+for Claude Opus 5.5 and Haiku 5.5, and layer 1 messaging with wakes are implemented. The other subcommands are placeholders. A session line carries development forward. The first milestone is [`docs/roadmap/V0_1_0.md`](docs/roadmap/V0_1_0.md)
 and the design is [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md). The
 normative protocol, drafted here and ported later, is in [`docs/protocol/`](docs/protocol/README.md).
 

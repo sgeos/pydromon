@@ -7,6 +7,7 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- `line_created` gains a `strategy` field naming the line's driver strategy.
 - The build backend requirement moves to `uv_build` 0.13, matching the installed uv.
 - `docs/protocol/RELAY.md` requires every relay adapter to support a response path and
   states the properties its deferred design must have.
@@ -30,6 +31,14 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Layer 1 messaging and wakes, roadmap task 5. `dromon.scheduler` wakes an idle line
+  when a message arrives, delivers its pending messages in one turn, and wakes it again
+  after a busy turn. Lines send through an in-process `send_message` tool, and operators
+  through the new `dromon create` and `dromon send` commands and the `create_line` and
+  `send` operations. `dromond` gains `--max-turns-per-line` and `--hold-wakes`.
+- Tool isolation for lines. `strict_mcp_config` keeps a claude.ai login's connectors
+  out of every line, a permission gate allows only the line's own tools, and a turn
+  whose engine offers any other tool is refused.
 - The first engine adapter, roadmap task 4. `dromon.engine` runs a session line's turns
   on Claude Code through the Agent SDK, on the operator's Claude subscription only, and
   refuses any other credential. `dromon.driver` hosts per-model Keleusma drivers through

@@ -17,8 +17,12 @@ Lifecycle and failure modes.
   cannot hold the daemon or exhaust its memory.
 
 Concurrency. Everything runs on one asyncio event loop thread, including the event log's
-blocking SQLite calls, which are short. Engine work will need its own threads or
-processes later, and must then reach the log through this loop.
+blocking SQLite calls, which are short, and the scheduler's turns, which wait on their
+engine processes without blocking the loop.
+
+Authority. Whoever can connect to the socket runs as the operator's user, so a request
+carries operator authority and names the operator it speaks for. Messages from lines
+arrive through their ``send_message`` tool and never through the socket.
 
 Porting note. ``fcntl.flock`` and Unix domain sockets are POSIX facilities, available on
 every target of the Rust and Keleusma ports except Windows, which is not supported.
@@ -37,8 +41,15 @@ from pathlib import Path
 from typing import Final
 
 from dromon import __version__, exits
+from dromon.driver import DriverError, Strategy
 from dromon.eventlog import EventLog, LogError, utc_now
-from dromon.model import QuestionStatus
+from dromon.model import (
+    EventRejected,
+    InvalidField,
+    OperatorAddress,
+    QuestionStatus,
+    parse_address,
+)
 from dromon.paths import PathError, ProjectPaths, ensure_private_dir, project_paths
 from dromon.protocol import (
     MAX_LINE_BYTES,
@@ -46,11 +57,13 @@ from dromon.protocol import (
     ErrorCode,
     Operation,
     ProtocolError,
+    Request,
     Response,
     decode_request,
     encode_response,
     request_id_of,
 )
+from dromon.scheduler import DEFAULT_MAX_TURNS_PER_LINE, Scheduler, claude_code_engine
 
 IDLE_TIMEOUT_SECONDS: Final = 30.0
 """A connection that sends nothing for this long is closed."""
@@ -85,6 +98,7 @@ class Daemon:
     paths: ProjectPaths
     log: EventLog
     started_at: str
+    scheduler: Scheduler
     stop_requested: asyncio.Event = field(default_factory=asyncio.Event)
 
     def respond(self, line: bytes) -> Response:
@@ -106,6 +120,51 @@ class Daemon:
             case Operation.STOP:
                 self.stop_requested.set()
                 return Response(request.request_id, ok=True, result={"stopping": True})
+            case Operation.CREATE_LINE | Operation.SEND:
+                return self._command(request)
+
+    def _command(self, request: Request) -> Response:
+        """Run a request that changes state, turning each refusal into an error."""
+        try:
+            if request.operation is Operation.CREATE_LINE:
+                result = self._create_line(request.args)
+            else:
+                result = self._send(request.args)
+        except ProtocolError as error:
+            return Response(
+                request.request_id,
+                False,
+                error_code=error.code,
+                error_message=str(error),
+            )
+        except (InvalidField, EventRejected, DriverError) as error:
+            return Response(
+                request.request_id,
+                False,
+                error_code=ErrorCode.REJECTED,
+                error_message=str(error),
+            )
+        return Response(request.request_id, True, result=result)
+
+    def _create_line(self, args: dict[str, object]) -> dict[str, object]:
+        line_id, model, strategy = _text_args(args, ("line_id", "model", "strategy"))
+        try:
+            chosen = Strategy(strategy)
+        except ValueError as error:
+            raise DriverError(f"unknown strategy {strategy!r}") from error
+        self.scheduler.create_line(line_id, model, chosen)
+        return {"line_id": line_id}
+
+    def _send(self, args: dict[str, object]) -> dict[str, object]:
+        optional = ("reply_to",) if "reply_to" in args else ()
+        values = _text_args(args, ("recipient", "body", "operator", *optional))
+        recipient, body, operator = values[:3]
+        reply_to = values[3] if optional else None
+        self.scheduler.ensure_operator(OperatorAddress(operator).operator_id)
+        message_id = self.scheduler.send(
+            OperatorAddress(operator), parse_address(recipient), body, reply_to
+        )
+        return {"message_id": message_id}
 
     def status(self) -> dict[str, object]:
         state = self.log.state
@@ -124,7 +183,24 @@ class Daemon:
                 "operators": len(state.operators),
                 "open_questions": open_questions,
             },
+            "lines": self.scheduler.line_summaries(),
         }
+
+
+def _text_args(args: dict[str, object], names: tuple[str, ...]) -> tuple[str, ...]:
+    """Return exactly the named text arguments, or raise ``ProtocolError``."""
+    if set(args) != set(names):
+        raise ProtocolError(
+            ErrorCode.BAD_REQUEST,
+            f"the arguments are {sorted(args)}, expected {sorted(names)}",
+        )
+    values: list[str] = []
+    for name in names:
+        value = args[name]
+        if not isinstance(value, str):
+            raise ProtocolError(ErrorCode.BAD_REQUEST, f"{name} is not a string")
+        values.append(value)
+    return tuple(values)
 
 
 async def _write(writer: asyncio.StreamWriter, response: Response) -> None:
@@ -197,12 +273,16 @@ async def serve(daemon: Daemon) -> None:
     server = await asyncio.start_unix_server(
         accept, path=str(socket_path), limit=MAX_LINE_BYTES
     )
+    daemon.scheduler.recover()
+    scheduling = asyncio.create_task(daemon.scheduler.run(daemon.stop_requested))
     try:
         # The umask already gives 0600, and this states it rather than relying on it.
         socket_path.chmod(0o600)
         print(f"dromond: serving {daemon.paths.root} on {socket_path}", file=sys.stderr)
         await daemon.stop_requested.wait()
     finally:
+        daemon.stop_requested.set()
+        await scheduling
         server.close()
         for writer in list(writers):
             writer.close()
@@ -212,7 +292,12 @@ async def serve(daemon: Daemon) -> None:
             loop.remove_signal_handler(signum)
 
 
-def run(paths: ProjectPaths) -> int:
+def run(
+    paths: ProjectPaths,
+    *,
+    max_turns_per_line: int = DEFAULT_MAX_TURNS_PER_LINE,
+    hold_wakes: bool = False,
+) -> int:
     """Run the daemon for ``paths`` in the foreground and return its exit status."""
     os.umask(0o077)
     try:
@@ -227,7 +312,13 @@ def run(paths: ProjectPaths) -> int:
         return exits.FAILURE
     try:
         with EventLog(paths.event_log) as log:
-            daemon = Daemon(paths, log, utc_now())
+            scheduler = Scheduler(
+                log,
+                claude_code_engine(str(paths.root)),
+                max_turns_per_line=max_turns_per_line,
+                hold_wakes=hold_wakes,
+            )
+            daemon = Daemon(paths, log, utc_now(), scheduler)
             asyncio.run(serve(daemon))
     except LogError as error:
         print(f"dromond: {error}", file=sys.stderr)
@@ -256,6 +347,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="directory for the socket and lock, default .dromon/run",
     )
+    parser.add_argument(
+        "--max-turns-per-line",
+        type=int,
+        default=DEFAULT_MAX_TURNS_PER_LINE,
+        help="turns run for each line in one daemon lifetime, default %(default)s",
+    )
+    parser.add_argument(
+        "--hold-wakes",
+        action="store_true",
+        help="record messages but wake no line, for maintenance and tests",
+    )
     return parser
 
 
@@ -269,7 +371,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     except PathError as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
-    return run(paths)
+    max_turns: int = arguments.max_turns_per_line
+    if max_turns < 1:
+        print("dromond: --max-turns-per-line must be at least 1", file=sys.stderr)
+        return exits.USAGE
+    hold: bool = arguments.hold_wakes
+    return run(paths, max_turns_per_line=max_turns, hold_wakes=hold)
 
 
 if __name__ == "__main__":

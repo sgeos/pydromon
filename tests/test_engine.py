@@ -12,12 +12,17 @@ from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from importlib import resources
 from pathlib import Path
+from typing import Any
 
 import pytest
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     Message,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    SdkMcpTool,
+    ToolPermissionContext,
     ResultMessage,
     SystemMessage,
     TextBlock,
@@ -29,6 +34,7 @@ from dromon.driver import Credential, Driver, Strategy, driver_resource
 from dromon.engine import (
     API_ENVIRONMENT,
     KEY_SOURCES,
+    MCP_SERVER_NAME,
     NON_SUBSCRIPTION_ENVIRONMENT,
     PROVIDER_ENVIRONMENT,
     AgentSession,
@@ -37,20 +43,33 @@ from dromon.engine import (
     TurnReport,
     check_environment,
     credential_of,
+    permission_gate,
 )
 
 MODEL = "claude-haiku-5-5"
 """Tests use the least expensive model, as the operator directs."""
 
 
-def init(model: str = MODEL, source: str = "none") -> SystemMessage:
+async def _echo(args: dict[str, Any]) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": str(args)}]}
+
+
+ECHO: SdkMcpTool[Any] = SdkMcpTool(
+    name="echo", description="Echo.", input_schema={"type": "object"}, handler=_echo
+)
+CONTEXT = ToolPermissionContext()
+
+
+def init(
+    model: str = MODEL, source: str = "none", tools: list[str] | None = None
+) -> SystemMessage:
     return SystemMessage(
         subtype="init",
         data={
             "model": model,
             "apiKeySource": source,
             "claude_code_version": "2.1.310",
-            "tools": [],
+            "tools": tools or [],
             "permissionMode": "default",
             "capabilities": ["interrupt_receipt_v1"],
         },
@@ -293,3 +312,55 @@ def test_a_live_turn_on_the_subscription() -> None:
     assert report.capabilities is not None
     assert report.credential is Credential.SUBSCRIPTION
     assert report.capabilities.model == MODEL
+
+
+# Tool isolation.
+
+
+def test_every_line_is_isolated_from_other_mcp_servers_and_prompts() -> None:
+    session = Scripted([init(), result()])
+    run(line(session))
+    options = session.options[0]
+    assert options.strict_mcp_config is True
+    assert options.mcp_servers == {}
+    assert options.allowed_tools == []
+    assert options.can_use_tool is not None
+
+
+def test_a_line_with_dromon_tools_serves_and_allows_exactly_them() -> None:
+    session = Scripted([init(tools=["mcp__dromon__echo"]), result()])
+    target = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        Path("/work"),
+        mcp_tools=[ECHO],
+        environment={},
+        session_factory=session.factory,
+    )
+    run(target)
+    options = session.options[0]
+    assert options.allowed_tools == []
+    assert target.expected_tools == {"mcp__dromon__echo"}
+    assert isinstance(options.mcp_servers, dict)
+    assert set(options.mcp_servers) == {MCP_SERVER_NAME}
+
+
+def test_an_engine_offering_unexpected_tools_is_refused() -> None:
+    session = Scripted(
+        [
+            init(tools=["mcp__claude_ai_Gmail__send_message"]),
+            say(TextBlock("x")),
+            result(),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="mcp__claude_ai_Gmail__send_message"):
+        run(line(session))
+    assert session.interrupts == 1
+
+
+def test_the_gate_allows_exactly_the_given_tools() -> None:
+    gate = permission_gate(frozenset({"mcp__dromon__echo"}))
+    allowed = asyncio.run(gate("mcp__dromon__echo", {}, CONTEXT))
+    denied = asyncio.run(gate("Bash", {"command": "ls"}, CONTEXT))
+    assert isinstance(allowed, PermissionResultAllow)
+    assert isinstance(denied, PermissionResultDeny)
+    assert "Bash is not available" in denied.message

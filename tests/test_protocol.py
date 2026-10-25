@@ -138,3 +138,15 @@ def test_an_oversized_response_cannot_be_encoded() -> None:
     with pytest.raises(ProtocolError) as raised:
         encode_response(Response("r", True, result={"x": "y" * MAX_LINE_BYTES}))
     assert raised.value.code is ErrorCode.TOO_LONG
+
+
+def test_arguments_round_trip_and_are_omitted_when_empty() -> None:
+    request = Request("r", Operation.SEND, {"recipient": "alpha", "body": "hi"})
+    assert decode_request(encode_request(request)) == request
+    assert b"args" not in encode_request(Request("r", Operation.PING))
+
+
+def test_arguments_must_be_an_object() -> None:
+    with pytest.raises(ProtocolError) as raised:
+        decode_request(line({"id": "r", "op": "send", "v": 1, "args": []}))
+    assert raised.value.code is ErrorCode.BAD_REQUEST
