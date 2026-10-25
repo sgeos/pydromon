@@ -7,6 +7,8 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- `docs/architecture/KELEUSMA_INTEGRATION.md`, what Dromon needs from `pykeleusma`,
+  mapped to that binding's tasks, for the `pykeleusma` line.
 - The repository seed. The `pydromon` distribution with the import package `dromon`, the
   placeholder commands `dromond` and `dromon` with seven planned subcommands, smoke and
   command tests, the design, the naming and port decision, the 0.1.0 milestone and the
