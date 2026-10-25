@@ -9,17 +9,20 @@ completed, moved or abandoned.
 
 ## State on 2026-10-25
 
-- **Tasks 1 and 2 done.** Task 2 added the data model and event log.
-  - `src/dromon/model.py` defines ten event kinds over session lines, messages, wakes
-    and operator questions, with one explicit check per event. A rejected event changes
-    nothing.
-  - `src/dromon/codec.py` encodes events as canonical JSON and decodes untrusted payloads
-    strictly.
-  - `src/dromon/eventlog.py` stores them in an append-only SQLite log. Opening a log
-    replays it, appends are checked first, a second writer is detected, corruption is
-    reported by sequence number, and new files are owner-only.
-  - [`../protocol/EVENT_LOG.md`](../protocol/EVENT_LOG.md) is the normative
-    specification and the first protocol document.
+- **Tasks 1 and 2 done, and the data model revised.** The event log holds session lines,
+  operators, messages and wakes.
+  - `src/dromon/model.py` defines nine event kinds with one explicit check each.
+    Operators are parties addressed as `@name`, any number of them. A question is a
+    message from a line to one operator, and its answer is that operator's reply, which
+    must reverse the route.
+  - `src/dromon/codec.py` encodes events as canonical JSON and decodes untrusted
+    payloads strictly.
+  - `src/dromon/eventlog.py` stores them in an append-only SQLite log that replays to
+    the same state.
+  - `src/dromon/relay.py` forwards operator messages through relays. A command relay is
+    the general adapter for channels such as email or Slack.
+  - [`../protocol/EVENT_LOG.md`](../protocol/EVENT_LOG.md) and
+    [`../protocol/RELAY.md`](../protocol/RELAY.md) are normative drafts.
 - **Published.** The public GitHub repository `sgeos/pydromon`, licensed 0BSD, on an
   HTTPS remote that uses the GitHub command-line tool as its credential helper. No
   continuous integration is configured.
@@ -33,7 +36,9 @@ completed, moved or abandoned.
 
 Task 3 of [`../roadmap/V0_1_0.md`](../roadmap/V0_1_0.md), the daemon skeleton, with its
 versioned request format specified under `docs/protocol/` first. `dromond` should own
-one `EventLog` per project, as its single writer.
+one `EventLog` per project, as its single writer, and run forwarding passes for relays.
+The operator chose reading 1 for the Agent SDK. Dromon drives it from outside, and
+`ask_operator` sends a message to an operator and returns at once.
 
 ## Open
 
@@ -49,6 +54,9 @@ one `EventLog` per project, as its single writer.
   compaction or schema migration yet, and by the operator's decision such standard
   features land with the task that first needs them. Events for configuration, turns and conversation
   limits arrive with tasks 7 and 9. All are listed in the specification.
+- **Operator relays.** Inbound adapters that authenticate a reply from a channel, more
+  than one relay per operator, and retry timing are not yet specified. Which operator a
+  line asks by default belongs to per-project configuration.
 - **Interline and Dromon overlap.** Once layer 1 messaging works, decide whether
   Dromon retires interline or keeps it for sessions Dromon does not drive.
 - **Recorded in the design.** Teacher-model scope, the contents of `.dromon/dromon.toml`,
@@ -66,7 +74,7 @@ sandbox the GitHub command-line tool could not read its keychain token on 2026-1
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 145 tests pass
+uv sync && uv run pytest    # 188 tests pass
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 

@@ -10,27 +10,34 @@ from dromon.model import (
     MAX_CHOICE_BYTES,
     MAX_CHOICES,
     MAX_TEXT_BYTES,
-    OPERATOR,
     Event,
     EventRejected,
     InvalidField,
+    LineAddress,
     LineCreated,
     LineState,
     LineStateChanged,
     MessageDelivered,
+    MessageKind,
     MessageSent,
-    QuestionAnswered,
-    QuestionAsked,
+    OperatorAddress,
+    OperatorRegistered,
     QuestionStatus,
     QuestionSuperseded,
     QuestionWithdrawn,
     State,
-    WakeCause,
     WakeIssued,
     WakeRequested,
+    parse_address,
 )
 
 ENGINE = "claude-opus-5-5"
+ALPHA = LineAddress("alpha")
+BETA = LineAddress("beta")
+ANA = OperatorAddress("ana")
+BEN = OperatorAddress("ben")
+NOTE = MessageKind.NOTE
+QUESTION = MessageKind.QUESTION
 
 
 def build(*events: Event) -> State:
@@ -40,8 +47,19 @@ def build(*events: Event) -> State:
     return state
 
 
-def two_lines() -> list[Event]:
-    return [LineCreated("alpha", ENGINE), LineCreated("beta", ENGINE)]
+def parties() -> list[Event]:
+    return [
+        LineCreated("alpha", ENGINE),
+        LineCreated("beta", ENGINE),
+        OperatorRegistered("ana"),
+        OperatorRegistered("ben"),
+    ]
+
+
+def ask(
+    message_id: str = "q", line: LineAddress = BETA, *, blocking: bool = True
+) -> MessageSent:
+    return MessageSent(message_id, line, ANA, QUESTION, "?", blocking=blocking)
 
 
 # The scenario.
@@ -52,23 +70,33 @@ def test_the_scenario_uses_every_event_kind(scenario: tuple[Event, ...]) -> None
     assert {type(event) for event in scenario} == every_kind
 
 
-def test_the_scenario_uses_every_wake_cause(scenario: tuple[Event, ...]) -> None:
-    causes = {e.cause for e in scenario if isinstance(e, WakeRequested)}
-    assert causes == set(WakeCause)
+def test_the_scenario_uses_every_kind_of_party_and_message(
+    scenario: tuple[Event, ...],
+) -> None:
+    sent = [e for e in scenario if isinstance(e, MessageSent)]
+    assert {m.kind for m in sent} == set(MessageKind)
+    assert {type(m.sender) for m in sent} == {LineAddress, OperatorAddress}
+    assert {type(m.recipient) for m in sent} == {LineAddress, OperatorAddress}
+    assert (
+        len({m.recipient for m in sent if isinstance(m.recipient, OperatorAddress)}) > 1
+    )
 
 
 def test_the_scenario_builds_the_expected_state(scenario: tuple[Event, ...]) -> None:
     state = build(*scenario)
     assert state.lines["alpha"].state is LineState.STOPPED
     assert state.lines["beta"].state is LineState.IDLE
+    assert state.operators == {"ana", "ben"}
     assert state.messages["m1"].delivered
-    assert not state.messages["m2"].delivered
+    assert state.messages["m1"].status is None
     assert all(wake.issued for wake in state.wakes.values())
-    assert state.questions["q1"].status is QuestionStatus.SUPERSEDED
-    assert state.questions["q1"].superseded_by == "q2"
-    assert state.questions["q2"].status is QuestionStatus.ANSWERED
-    assert state.questions["q2"].answer == "yes"
-    assert state.questions["q3"].status is QuestionStatus.WITHDRAWN
+    assert state.messages["q1"].status is QuestionStatus.SUPERSEDED
+    assert state.messages["q1"].superseded_by == "q2"
+    assert state.messages["q2"].status is QuestionStatus.ANSWERED
+    assert state.messages["q2"].answered_by == "a2"
+    assert state.messages["q3"].status is QuestionStatus.WITHDRAWN
+    assert state.messages["m3"].reply_to == "m2"
+    assert state.open_questions("ana") == []
 
 
 def test_applying_the_same_events_twice_gives_equal_states(
@@ -81,8 +109,37 @@ def test_a_copy_is_independent(scenario: tuple[Event, ...]) -> None:
     state = build(*scenario)
     snapshot = state.copy()
     state.apply(LineCreated("gamma", ENGINE))
+    state.apply(OperatorRegistered("cleo"))
     assert "gamma" not in snapshot.lines
+    assert "cleo" not in snapshot.operators
     assert snapshot != state
+
+
+# Addresses.
+
+
+@pytest.mark.parametrize("address", [ALPHA, ANA, LineAddress("a.b-c_d")])
+def test_an_address_round_trips_through_its_text(
+    address: LineAddress | OperatorAddress,
+) -> None:
+    assert parse_address(str(address)) == address
+
+
+def test_a_line_and_an_operator_with_one_identifier_are_different_addresses() -> None:
+    assert LineAddress("ana") != OperatorAddress("ana")
+    assert str(LineAddress("ana")) != str(OperatorAddress("ana"))
+
+
+@pytest.mark.parametrize("text", ["", "@", "@@ana", "@Ana", "Alpha", "a b"])
+def test_malformed_address_text_is_refused(text: str) -> None:
+    with pytest.raises(InvalidField):
+        parse_address(text)
+
+
+def test_operators_are_addressed_separately() -> None:
+    state = build(*parties(), ask("q1"), MessageSent("q2", ALPHA, BEN, QUESTION, "?"))
+    assert state.open_questions("ana") == ["q1"]
+    assert state.open_questions("ben") == ["q2"]
 
 
 # Field validation.
@@ -90,7 +147,7 @@ def test_a_copy_is_independent(scenario: tuple[Event, ...]) -> None:
 
 @pytest.mark.parametrize(
     "value",
-    ["", "Alpha", "-alpha", "a b", "a/b", "a" * 65, "été", OPERATOR, 7],
+    ["", "Alpha", "-alpha", "a b", "a/b", "a" * 65, "été", "@ana", 7],
 )
 def test_an_invalid_identifier_is_refused(value: object) -> None:
     with pytest.raises(InvalidField, match="line_id"):
@@ -102,64 +159,76 @@ def test_a_valid_identifier_is_accepted(value: str) -> None:
     assert LineCreated(value, ENGINE).line_id == value
 
 
-def test_the_operator_may_send_but_is_not_an_identifier() -> None:
-    assert MessageSent("m", OPERATOR, "alpha", "hi").sender == OPERATOR
-    with pytest.raises(InvalidField):
-        MessageSent("m", "alpha", OPERATOR, "hi")
+def test_an_address_field_must_hold_an_address() -> None:
+    with pytest.raises(InvalidField, match="sender is not an address"):
+        MessageSent("m", "alpha", BETA, NOTE, "")  # pyright: ignore[reportArgumentType]
 
 
 def test_text_at_the_limit_is_accepted_and_one_byte_more_is_refused() -> None:
-    MessageSent("m", "alpha", "beta", "x" * MAX_TEXT_BYTES)
+    MessageSent("m", ALPHA, BETA, NOTE, "x" * MAX_TEXT_BYTES)
     with pytest.raises(InvalidField, match="over the limit"):
-        MessageSent("m", "alpha", "beta", "x" * (MAX_TEXT_BYTES + 1))
+        MessageSent("m", ALPHA, BETA, NOTE, "x" * (MAX_TEXT_BYTES + 1))
 
 
 def test_the_text_limit_counts_utf8_bytes_not_characters() -> None:
     snake = "\U0001f40d"
     assert len(snake.encode("utf-8")) == 4
     with pytest.raises(InvalidField, match="over the limit"):
-        MessageSent("m", "alpha", "beta", snake * (MAX_TEXT_BYTES // 4 + 1))
+        MessageSent("m", ALPHA, BETA, NOTE, snake * (MAX_TEXT_BYTES // 4 + 1))
 
 
 def test_a_lone_surrogate_is_refused() -> None:
     with pytest.raises(InvalidField, match="Unicode"):
-        MessageSent("m", "alpha", "beta", "\ud800")
+        MessageSent("m", ALPHA, BETA, NOTE, "\ud800")
 
 
 def test_text_must_be_a_string() -> None:
     with pytest.raises(InvalidField, match="not text"):
-        MessageSent("m", "alpha", "beta", b"hi")  # pyright: ignore[reportArgumentType]
+        MessageSent("m", ALPHA, BETA, NOTE, b"hi")  # pyright: ignore[reportArgumentType]
 
 
 def test_blocking_must_be_a_boolean_not_an_integer() -> None:
     with pytest.raises(InvalidField, match="boolean"):
-        QuestionAsked("q", "alpha", "?", (), 1)  # pyright: ignore[reportArgumentType]
+        MessageSent("q", BETA, ANA, QUESTION, "?", blocking=1)  # pyright: ignore[reportArgumentType]
+
+
+def test_only_a_question_has_choices_or_blocks() -> None:
+    with pytest.raises(InvalidField, match="only a question"):
+        MessageSent("m", ALPHA, BETA, NOTE, "", choices=("a",))
+    with pytest.raises(InvalidField, match="only a question"):
+        MessageSent("m", ALPHA, BETA, NOTE, "", blocking=True)
 
 
 def test_choices_are_bounded_in_count_and_size_and_distinct() -> None:
-    QuestionAsked("q", "a", "?", tuple(str(n) for n in range(MAX_CHOICES)), True)
+    def question(choices: tuple[str, ...]) -> MessageSent:
+        return MessageSent("q", BETA, ANA, QUESTION, "?", choices)
+
+    question(tuple(str(n) for n in range(MAX_CHOICES)))
     with pytest.raises(InvalidField, match="entries"):
-        QuestionAsked(
-            "q", "a", "?", tuple(str(n) for n in range(MAX_CHOICES + 1)), True
-        )
+        question(tuple(str(n) for n in range(MAX_CHOICES + 1)))
     with pytest.raises(InvalidField, match="over the limit"):
-        QuestionAsked("q", "a", "?", ("x" * (MAX_CHOICE_BYTES + 1),), True)
+        question(("x" * (MAX_CHOICE_BYTES + 1),))
     with pytest.raises(InvalidField, match="repeat"):
-        QuestionAsked("q", "a", "?", ("yes", "yes"), True)
+        question(("yes", "yes"))
 
 
 def test_choices_must_be_a_tuple_of_text() -> None:
     with pytest.raises(InvalidField, match="tuple"):
-        QuestionAsked("q", "a", "?", ["yes"], True)  # pyright: ignore[reportArgumentType]
+        MessageSent("q", BETA, ANA, QUESTION, "?", ["yes"])  # pyright: ignore[reportArgumentType]
     with pytest.raises(InvalidField, match="not text"):
-        QuestionAsked("q", "a", "?", (1,), True)  # pyright: ignore[reportArgumentType]
+        MessageSent("q", BETA, ANA, QUESTION, "?", (1,))  # pyright: ignore[reportArgumentType]
 
 
 def test_enumerated_fields_must_be_members() -> None:
     with pytest.raises(InvalidField, match="LineState"):
         LineStateChanged("a", "idle")  # pyright: ignore[reportArgumentType]
-    with pytest.raises(InvalidField, match="WakeCause"):
-        WakeRequested("w", "a", "message", "m")  # pyright: ignore[reportArgumentType]
+    with pytest.raises(InvalidField, match="MessageKind"):
+        MessageSent("m", ALPHA, BETA, "note", "")  # pyright: ignore[reportArgumentType]
+
+
+def test_an_invalid_reply_reference_is_refused() -> None:
+    with pytest.raises(InvalidField, match="reply_to"):
+        MessageSent("m", ALPHA, BETA, NOTE, "", reply_to="Bad Id")
 
 
 def test_every_event_is_immutable() -> None:
@@ -199,104 +268,168 @@ def test_no_transition_keeps_the_same_state() -> None:
 
 
 def test_a_blocked_line_cannot_start_a_turn() -> None:
-    state = build(
-        LineCreated("a", ENGINE), QuestionAsked("q", "a", "?", (), blocking=True)
-    )
-    assert state.is_blocked("a")
+    state = build(*parties(), ask())
+    assert state.is_blocked("beta")
     with pytest.raises(EventRejected, match="blocked"):
-        state.apply(LineStateChanged("a", LineState.RUNNING))
+        state.apply(LineStateChanged("beta", LineState.RUNNING))
 
 
 def test_a_non_blocking_question_does_not_block() -> None:
+    state = build(*parties(), ask(blocking=False))
+    assert not state.is_blocked("beta")
+    state.apply(LineStateChanged("beta", LineState.RUNNING))
+
+
+def test_an_answer_unblocks_the_line_and_can_wake_it() -> None:
     state = build(
-        LineCreated("a", ENGINE), QuestionAsked("q", "a", "?", (), blocking=False)
+        *parties(), ask(), MessageSent("a", ANA, BETA, NOTE, "ok", reply_to="q")
     )
-    assert not state.is_blocked("a")
-    state.apply(LineStateChanged("a", LineState.RUNNING))
+    assert not state.is_blocked("beta")
+    state.apply(WakeRequested("w", "beta", "a"))
+    state.apply(WakeIssued("w"))
+
+
+def test_a_question_to_one_operator_does_not_block_another_line() -> None:
+    state = build(*parties(), ask())
+    assert not state.is_blocked("alpha")
 
 
 # Rejections. Each case is a valid history followed by one event that must not apply.
 
 REJECTIONS: list[tuple[str, list[Event], Event, str]] = [
-    ("duplicate line", two_lines(), LineCreated("alpha", ENGINE), "exists"),
+    ("duplicate line", parties(), LineCreated("alpha", ENGINE), "exists"),
+    ("duplicate operator", parties(), OperatorRegistered("ana"), "exists"),
     ("unknown line state", [], LineStateChanged("x", LineState.RUNNING), "no line"),
     (
         "duplicate message",
-        [*two_lines(), MessageSent("m", "alpha", "beta", "")],
-        MessageSent("m", "alpha", "beta", ""),
+        [*parties(), MessageSent("m", ALPHA, BETA, NOTE, "")],
+        MessageSent("m", ALPHA, BETA, NOTE, ""),
         "exists",
     ),
-    ("unknown recipient", two_lines(), MessageSent("m", "alpha", "x", ""), "no line"),
-    ("unknown sender", two_lines(), MessageSent("m", "x", "beta", ""), "no line"),
-    ("self message", two_lines(), MessageSent("m", "alpha", "alpha", ""), "itself"),
-    ("unknown delivery", two_lines(), MessageDelivered("m"), "no message"),
+    (
+        "unknown line recipient",
+        parties(),
+        MessageSent("m", ALPHA, LineAddress("x"), NOTE, ""),
+        "no line",
+    ),
+    (
+        "unknown operator recipient",
+        parties(),
+        MessageSent("m", ALPHA, OperatorAddress("x"), NOTE, ""),
+        "no operator",
+    ),
+    (
+        "unknown sender",
+        parties(),
+        MessageSent("m", LineAddress("x"), BETA, NOTE, ""),
+        "no line",
+    ),
+    ("self message", parties(), MessageSent("m", ALPHA, ALPHA, NOTE, ""), "itself"),
+    (
+        "question from an operator",
+        parties(),
+        MessageSent("q", ANA, BETA, QUESTION, "?"),
+        "only a line",
+    ),
+    (
+        "question to a line",
+        parties(),
+        MessageSent("q", ALPHA, BETA, QUESTION, "?"),
+        "addressed to an operator",
+    ),
+    (
+        "question from a stopped line",
+        [*parties(), LineStateChanged("beta", LineState.STOPPED)],
+        ask(),
+        "stopped",
+    ),
+    (
+        "reply to an unknown message",
+        parties(),
+        MessageSent("a", ANA, BETA, NOTE, "", reply_to="q"),
+        "no message",
+    ),
+    (
+        "answer from another operator",
+        [*parties(), ask()],
+        MessageSent("a", BEN, BETA, NOTE, "", reply_to="q"),
+        "must go from @ana to beta",
+    ),
+    (
+        "answer to another line",
+        [*parties(), ask()],
+        MessageSent("a", ANA, ALPHA, NOTE, "", reply_to="q"),
+        "must go from @ana to beta",
+    ),
+    (
+        "second answer",
+        [*parties(), ask(), MessageSent("a", ANA, BETA, NOTE, "", reply_to="q")],
+        MessageSent("b", ANA, BETA, NOTE, "", reply_to="q"),
+        "is answered",
+    ),
+    (
+        "answer to a withdrawn question",
+        [*parties(), ask(), QuestionWithdrawn("q")],
+        MessageSent("a", ANA, BETA, NOTE, "", reply_to="q"),
+        "is withdrawn",
+    ),
+    (
+        "unknown delivery",
+        parties(),
+        MessageDelivered("m"),
+        "no message",
+    ),
     (
         "second delivery",
-        [*two_lines(), MessageSent("m", "alpha", "beta", ""), MessageDelivered("m")],
+        [*parties(), MessageSent("m", ALPHA, BETA, NOTE, ""), MessageDelivered("m")],
         MessageDelivered("m"),
         "was delivered",
     ),
     (
         "duplicate wake",
         [
-            *two_lines(),
-            MessageSent("m", "alpha", "beta", ""),
-            WakeRequested("w", "beta", WakeCause.MESSAGE, "m"),
+            *parties(),
+            MessageSent("m", ALPHA, BETA, NOTE, ""),
+            WakeRequested("w", "beta", "m"),
         ],
-        WakeRequested("w", "beta", WakeCause.MESSAGE, "m"),
+        WakeRequested("w", "beta", "m"),
         "exists",
     ),
     (
         "wake for a stopped line",
         [
-            *two_lines(),
-            MessageSent("m", "alpha", "beta", ""),
+            *parties(),
+            MessageSent("m", ALPHA, BETA, NOTE, ""),
             LineStateChanged("beta", LineState.STOPPED),
         ],
-        WakeRequested("w", "beta", WakeCause.MESSAGE, "m"),
+        WakeRequested("w", "beta", "m"),
         "stopped",
     ),
     (
         "wake for another line's message",
-        [*two_lines(), MessageSent("m", "alpha", "beta", "")],
-        WakeRequested("w", "alpha", WakeCause.MESSAGE, "m"),
+        [*parties(), MessageSent("m", ALPHA, BETA, NOTE, "")],
+        WakeRequested("w", "alpha", "m"),
+        "not for line",
+    ),
+    (
+        "wake for a message to an operator",
+        [*parties(), ask()],
+        WakeRequested("w", "beta", "q"),
         "not for line",
     ),
     (
         "wake for an unknown message",
-        two_lines(),
-        WakeRequested("w", "beta", WakeCause.MESSAGE, "m"),
+        parties(),
+        WakeRequested("w", "beta", "m"),
         "no message",
     ),
-    (
-        "wake for an unknown question",
-        two_lines(),
-        WakeRequested("w", "beta", WakeCause.ANSWER, "q"),
-        "no question",
-    ),
-    (
-        "wake for an unanswered question",
-        [*two_lines(), QuestionAsked("q", "beta", "?", (), True)],
-        WakeRequested("w", "beta", WakeCause.ANSWER, "q"),
-        "not answered",
-    ),
-    (
-        "wake for another line's answer",
-        [
-            *two_lines(),
-            QuestionAsked("q", "beta", "?", (), True),
-            QuestionAnswered("q", "ok"),
-        ],
-        WakeRequested("w", "alpha", WakeCause.ANSWER, "q"),
-        "not from line",
-    ),
-    ("unknown wake issued", two_lines(), WakeIssued("w"), "no wake"),
+    ("unknown wake issued", parties(), WakeIssued("w"), "no wake"),
     (
         "wake issued twice",
         [
-            *two_lines(),
-            MessageSent("m", "alpha", "beta", ""),
-            WakeRequested("w", "beta", WakeCause.MESSAGE, "m"),
+            *parties(),
+            MessageSent("m", ALPHA, BETA, NOTE, ""),
+            WakeRequested("w", "beta", "m"),
             WakeIssued("w"),
         ],
         WakeIssued("w"),
@@ -305,9 +438,9 @@ REJECTIONS: list[tuple[str, list[Event], Event, str]] = [
     (
         "wake issued to a running line",
         [
-            *two_lines(),
-            MessageSent("m", "alpha", "beta", ""),
-            WakeRequested("w", "beta", WakeCause.MESSAGE, "m"),
+            *parties(),
+            MessageSent("m", ALPHA, BETA, NOTE, ""),
+            WakeRequested("w", "beta", "m"),
             LineStateChanged("beta", LineState.RUNNING),
         ],
         WakeIssued("w"),
@@ -316,77 +449,42 @@ REJECTIONS: list[tuple[str, list[Event], Event, str]] = [
     (
         "wake issued to a blocked line",
         [
-            *two_lines(),
-            MessageSent("m", "alpha", "beta", ""),
-            WakeRequested("w", "beta", WakeCause.MESSAGE, "m"),
-            QuestionAsked("q", "beta", "?", (), True),
+            *parties(),
+            MessageSent("m", ALPHA, BETA, NOTE, ""),
+            WakeRequested("w", "beta", "m"),
+            ask(),
         ],
         WakeIssued("w"),
         "blocked",
     ),
     (
-        "duplicate question",
-        [*two_lines(), QuestionAsked("q", "beta", "?", (), True)],
-        QuestionAsked("q", "beta", "?", (), True),
-        "exists",
-    ),
-    (
-        "question from a stopped line",
-        [*two_lines(), LineStateChanged("beta", LineState.STOPPED)],
-        QuestionAsked("q", "beta", "?", (), True),
-        "stopped",
-    ),
-    ("answer to an unknown question", [], QuestionAnswered("q", "ok"), "no question"),
-    (
-        "second answer",
-        [
-            *two_lines(),
-            QuestionAsked("q", "beta", "?", (), True),
-            QuestionAnswered("q", "ok"),
-        ],
-        QuestionAnswered("q", "again"),
-        "is answered",
+        "withdrawal of a note",
+        [*parties(), MessageSent("m", ALPHA, BETA, NOTE, "")],
+        QuestionWithdrawn("m"),
+        "not a question",
     ),
     (
         "withdrawal of an answered question",
-        [
-            *two_lines(),
-            QuestionAsked("q", "beta", "?", (), True),
-            QuestionAnswered("q", "ok"),
-        ],
+        [*parties(), ask(), MessageSent("a", ANA, BETA, NOTE, "", reply_to="q")],
         QuestionWithdrawn("q"),
         "is answered",
     ),
-    (
-        "self supersession",
-        [*two_lines(), QuestionAsked("q", "beta", "?", (), True)],
-        QuestionSuperseded("q", "q"),
-        "itself",
-    ),
+    ("self supersession", [*parties(), ask()], QuestionSuperseded("q", "q"), "itself"),
     (
         "supersession by an unknown question",
-        [*two_lines(), QuestionAsked("q", "beta", "?", (), True)],
+        [*parties(), ask()],
         QuestionSuperseded("q", "r"),
-        "no question",
+        "no message",
     ),
     (
         "supersession by a closed question",
-        [
-            *two_lines(),
-            QuestionAsked("q", "beta", "?", (), True),
-            QuestionAsked("r", "beta", "?", (), True),
-            QuestionWithdrawn("r"),
-        ],
+        [*parties(), ask(), ask("r"), QuestionWithdrawn("r")],
         QuestionSuperseded("q", "r"),
         "is withdrawn",
     ),
     (
         "supersession across lines",
-        [
-            *two_lines(),
-            QuestionAsked("q", "beta", "?", (), True),
-            QuestionAsked("r", "alpha", "?", (), True),
-        ],
+        [*parties(), ask(), ask("r", ALPHA)],
         QuestionSuperseded("q", "r"),
         "another line",
     ),
@@ -406,6 +504,14 @@ def test_an_inapplicable_event_is_rejected_and_changes_nothing(
     with pytest.raises(EventRejected, match=reason):
         state.apply(event)
     assert state == before
+
+
+def test_a_reply_to_a_note_reverses_its_route() -> None:
+    state = build(*parties(), MessageSent("m", ALPHA, BETA, NOTE, ""))
+    with pytest.raises(EventRejected, match="must go from beta to alpha"):
+        state.apply(MessageSent("r", ANA, ALPHA, NOTE, "", reply_to="m"))
+    state.apply(MessageSent("r", BETA, ALPHA, NOTE, "", reply_to="m"))
+    assert state.messages["m"].status is None
 
 
 def test_check_never_mutates(scenario: tuple[Event, ...]) -> None:

@@ -5,10 +5,14 @@ directly. It is rebuilt by applying events in order, so the event list is the
 specification of the data model. ``docs/protocol/EVENT_LOG.md`` is normative and this
 module follows it.
 
+Parties. Session lines and operators are both addresses. An operator question is a
+message from a line to an operator, and the answer is the operator's reply, so questions
+travel by the same path as every other message. There may be any number of operators,
+each addressed separately.
+
 Trust. The model checks that each event is well formed and applicable to the current
-state. It does not authenticate anyone. Attribution, such as which line sent a message
-or that an answer came from the operator, is the daemon's responsibility before it
-appends an event.
+state. It does not authenticate anyone. Attribution, such as which operator sent a
+reply, is the daemon's responsibility before it appends an event.
 
 Porting note. Events are frozen plain records, the state is maps of frozen records, and
 each event has one explicit check, so each maps onto a Rust enum and a ``match``.
@@ -22,11 +26,12 @@ from typing import Final, assert_never
 ID_PATTERN: Final = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 """Identifiers and engine names. ASCII only, so every port compares them bytewise."""
 
-OPERATOR: Final = "@operator"
-"""The sender of a message from the operator. ``@`` never appears in an identifier."""
+OPERATOR_PREFIX: Final = "@"
+"""Marks an operator address. It never appears in an identifier, so a line address and
+an operator address cannot be confused even when their identifiers are equal."""
 
 MAX_TEXT_BYTES: Final = 1024 * 1024
-"""Upper bound on the UTF-8 size of a message body, question text or answer."""
+"""Upper bound on the UTF-8 size of a message body."""
 
 MAX_CHOICES: Final = 16
 MAX_CHOICE_BYTES: Final = 1024
@@ -44,6 +49,12 @@ def check_id(name: str, value: object) -> None:
     """Raise ``InvalidField`` unless ``value`` is a valid identifier."""
     if not isinstance(value, str) or ID_PATTERN.fullmatch(value) is None:
         raise InvalidField(f"{name} is not a valid identifier: {value!r}")
+
+
+def check_optional_id(name: str, value: object) -> None:
+    """Raise ``InvalidField`` unless ``value`` is ``None`` or a valid identifier."""
+    if value is not None:
+        check_id(name, value)
 
 
 def check_text(name: str, value: object, limit: int = MAX_TEXT_BYTES) -> None:
@@ -68,12 +79,6 @@ def check_bool(name: str, value: object) -> None:
         raise InvalidField(f"{name} is not a boolean: {value!r}")
 
 
-def check_sender(value: object) -> None:
-    """Raise ``InvalidField`` unless ``value`` is ``OPERATOR`` or an identifier."""
-    if value != OPERATOR:
-        check_id("sender", value)
-
-
 def check_member(name: str, value: object, kind: type[StrEnum]) -> None:
     """Raise ``InvalidField`` unless ``value`` is a member of ``kind``."""
     if not isinstance(value, kind):
@@ -91,6 +96,50 @@ def check_choices(value: object) -> None:
         check_text("choice", choice, MAX_CHOICE_BYTES)
     if len(set(choices)) != len(choices):
         raise InvalidField("choices repeat an entry")
+
+
+# Addresses.
+
+
+@dataclass(frozen=True, slots=True)
+class LineAddress:
+    line_id: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+
+    def __str__(self) -> str:
+        return self.line_id
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorAddress:
+    operator_id: str
+
+    def __post_init__(self) -> None:
+        check_id("operator_id", self.operator_id)
+
+    def __str__(self) -> str:
+        return OPERATOR_PREFIX + self.operator_id
+
+
+type Address = LineAddress | OperatorAddress
+
+
+def parse_address(text: str) -> Address:
+    """Return the address written as ``text``, either ``line`` or ``@operator``."""
+    if text.startswith(OPERATOR_PREFIX):
+        return OperatorAddress(text.removeprefix(OPERATOR_PREFIX))
+    return LineAddress(text)
+
+
+def check_address(name: str, value: object) -> None:
+    """Raise ``InvalidField`` unless ``value`` is an address."""
+    if not isinstance(value, LineAddress | OperatorAddress):
+        raise InvalidField(f"{name} is not an address: {value!r}")
+
+
+# Enumerations.
 
 
 class LineState(StrEnum):
@@ -111,9 +160,9 @@ LINE_TRANSITIONS: Final[frozenset[tuple[LineState, LineState]]] = frozenset(
 """Every permitted change of a line's state. A change to the same state is not one."""
 
 
-class WakeCause(StrEnum):
-    MESSAGE = "message"
-    ANSWER = "answer"
+class MessageKind(StrEnum):
+    NOTE = "note"
+    QUESTION = "question"
 
 
 class QuestionStatus(StrEnum):
@@ -148,21 +197,44 @@ class LineStateChanged:
 
 
 @dataclass(frozen=True, slots=True)
+class OperatorRegistered:
+    operator_id: str
+
+    def __post_init__(self) -> None:
+        check_id("operator_id", self.operator_id)
+
+
+@dataclass(frozen=True, slots=True)
 class MessageSent:
+    """A message between any two parties. A question is a message of kind question
+    from a line to an operator, and a reply names the message it answers."""
+
     message_id: str
-    sender: str
-    recipient: str
+    sender: Address
+    recipient: Address
+    kind: MessageKind
     body: str
+    choices: tuple[str, ...] = ()
+    blocking: bool = False
+    reply_to: str | None = None
 
     def __post_init__(self) -> None:
         check_id("message_id", self.message_id)
-        check_sender(self.sender)
-        check_id("recipient", self.recipient)
+        check_address("sender", self.sender)
+        check_address("recipient", self.recipient)
+        check_member("kind", self.kind, MessageKind)
         check_text("body", self.body)
+        check_choices(self.choices)
+        check_bool("blocking", self.blocking)
+        check_optional_id("reply_to", self.reply_to)
+        if self.kind is MessageKind.NOTE and (self.choices or self.blocking):
+            raise InvalidField("only a question has choices or blocks")
 
 
 @dataclass(frozen=True, slots=True)
 class MessageDelivered:
+    """The message reached its recipient, a line's turn or an operator's channel."""
+
     message_id: str
 
     def __post_init__(self) -> None:
@@ -173,14 +245,12 @@ class MessageDelivered:
 class WakeRequested:
     wake_id: str
     line_id: str
-    cause: WakeCause
-    cause_id: str
+    message_id: str
 
     def __post_init__(self) -> None:
         check_id("wake_id", self.wake_id)
         check_id("line_id", self.line_id)
-        check_member("cause", self.cause, WakeCause)
-        check_id("cause_id", self.cause_id)
+        check_id("message_id", self.message_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,58 +262,31 @@ class WakeIssued:
 
 
 @dataclass(frozen=True, slots=True)
-class QuestionAsked:
-    question_id: str
-    line_id: str
-    text: str
-    choices: tuple[str, ...]
-    blocking: bool
-
-    def __post_init__(self) -> None:
-        check_id("question_id", self.question_id)
-        check_id("line_id", self.line_id)
-        check_text("text", self.text)
-        check_choices(self.choices)
-        check_bool("blocking", self.blocking)
-
-
-@dataclass(frozen=True, slots=True)
-class QuestionAnswered:
-    question_id: str
-    answer: str
-
-    def __post_init__(self) -> None:
-        check_id("question_id", self.question_id)
-        check_text("answer", self.answer)
-
-
-@dataclass(frozen=True, slots=True)
 class QuestionWithdrawn:
-    question_id: str
+    message_id: str
 
     def __post_init__(self) -> None:
-        check_id("question_id", self.question_id)
+        check_id("message_id", self.message_id)
 
 
 @dataclass(frozen=True, slots=True)
 class QuestionSuperseded:
-    question_id: str
+    message_id: str
     superseded_by: str
 
     def __post_init__(self) -> None:
-        check_id("question_id", self.question_id)
+        check_id("message_id", self.message_id)
         check_id("superseded_by", self.superseded_by)
 
 
 type Event = (
     LineCreated
     | LineStateChanged
+    | OperatorRegistered
     | MessageSent
     | MessageDelivered
     | WakeRequested
     | WakeIssued
-    | QuestionAsked
-    | QuestionAnswered
     | QuestionWithdrawn
     | QuestionSuperseded
 )
@@ -261,29 +304,25 @@ class Line:
 
 @dataclass(frozen=True, slots=True)
 class Message:
-    sender: str
-    recipient: str
+    sender: Address
+    recipient: Address
+    kind: MessageKind
     body: str
-    delivered: bool
+    choices: tuple[str, ...]
+    blocking: bool
+    reply_to: str | None
+    delivered: bool = False
+    status: QuestionStatus | None = None
+    """The question's lifecycle, or ``None`` for a note."""
+    answered_by: str | None = None
+    superseded_by: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class Wake:
     line_id: str
-    cause: WakeCause
-    cause_id: str
+    message_id: str
     issued: bool
-
-
-@dataclass(frozen=True, slots=True)
-class Question:
-    line_id: str
-    text: str
-    choices: tuple[str, ...]
-    blocking: bool
-    status: QuestionStatus
-    answer: str | None = None
-    superseded_by: str | None = None
 
 
 @dataclass(slots=True)
@@ -295,25 +334,32 @@ class State:
     """
 
     lines: dict[str, Line] = field(default_factory=dict[str, Line])
+    operators: set[str] = field(default_factory=set[str])
     messages: dict[str, Message] = field(default_factory=dict[str, Message])
     wakes: dict[str, Wake] = field(default_factory=dict[str, Wake])
-    questions: dict[str, Question] = field(default_factory=dict[str, Question])
 
     def copy(self) -> "State":
         """Return an independent snapshot. The records are frozen, so maps suffice."""
         return State(
-            dict(self.lines),
-            dict(self.messages),
-            dict(self.wakes),
-            dict(self.questions),
+            dict(self.lines), set(self.operators), dict(self.messages), dict(self.wakes)
         )
 
     def is_blocked(self, line_id: str) -> bool:
         """Whether ``line_id`` has an open blocking question, which pauses only it."""
+        asker = LineAddress(line_id)
         return any(
-            q.line_id == line_id and q.blocking and q.status is QuestionStatus.OPEN
-            for q in self.questions.values()
+            m.sender == asker and m.blocking and m.status is QuestionStatus.OPEN
+            for m in self.messages.values()
         )
+
+    def open_questions(self, operator_id: str) -> list[str]:
+        """The open questions addressed to ``operator_id``, in the order asked."""
+        operator = OperatorAddress(operator_id)
+        return [
+            message_id
+            for message_id, m in self.messages.items()
+            if m.recipient == operator and m.status is QuestionStatus.OPEN
+        ]
 
     def check(self, event: Event) -> None:
         """Raise ``EventRejected`` unless ``event`` applies to this state.
@@ -322,23 +368,24 @@ class State:
         """
         match event:
             case LineCreated():
-                self._check_new_line(event)
+                if event.line_id in self.lines:
+                    raise EventRejected(f"line {event.line_id} exists")
             case LineStateChanged():
                 self._check_line_state(event)
+            case OperatorRegistered():
+                if event.operator_id in self.operators:
+                    raise EventRejected(f"operator {event.operator_id} exists")
             case MessageSent():
                 self._check_message_sent(event)
             case MessageDelivered():
-                message = self._message(event.message_id)
-                if message.delivered:
+                if self._message(event.message_id).delivered:
                     raise EventRejected(f"message {event.message_id} was delivered")
             case WakeRequested():
                 self._check_wake_requested(event)
             case WakeIssued():
                 self._check_wake_issued(event)
-            case QuestionAsked():
-                self._check_question_asked(event)
-            case QuestionAnswered() | QuestionWithdrawn():
-                self._open_question(event.question_id)
+            case QuestionWithdrawn():
+                self._open_question(event.message_id)
             case QuestionSuperseded():
                 self._check_superseded(event)
             case _:
@@ -353,37 +400,25 @@ class State:
             case LineStateChanged():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, state=event.state)
+            case OperatorRegistered():
+                self.operators.add(event.operator_id)
             case MessageSent():
-                self.messages[event.message_id] = Message(
-                    event.sender, event.recipient, event.body, delivered=False
-                )
+                self._apply_message_sent(event)
             case MessageDelivered():
                 message = self.messages[event.message_id]
                 self.messages[event.message_id] = replace(message, delivered=True)
             case WakeRequested():
                 self.wakes[event.wake_id] = Wake(
-                    event.line_id, event.cause, event.cause_id, issued=False
+                    event.line_id, event.message_id, issued=False
                 )
             case WakeIssued():
                 wake = self.wakes[event.wake_id]
                 self.wakes[event.wake_id] = replace(wake, issued=True)
-            case QuestionAsked():
-                self.questions[event.question_id] = Question(
-                    event.line_id,
-                    event.text,
-                    event.choices,
-                    event.blocking,
-                    QuestionStatus.OPEN,
-                )
-            case QuestionAnswered():
-                self._close(
-                    event.question_id, QuestionStatus.ANSWERED, answer=event.answer
-                )
             case QuestionWithdrawn():
-                self._close(event.question_id, QuestionStatus.WITHDRAWN)
+                self._close(event.message_id, QuestionStatus.WITHDRAWN)
             case QuestionSuperseded():
                 self._close(
-                    event.question_id,
+                    event.message_id,
                     QuestionStatus.SUPERSEDED,
                     superseded_by=event.superseded_by,
                 )
@@ -404,25 +439,31 @@ class State:
             raise EventRejected(f"line {line_id} is stopped")
         return line
 
+    def _require_party(self, address: Address) -> None:
+        match address:
+            case LineAddress():
+                self._line(address.line_id)
+            case OperatorAddress():
+                if address.operator_id not in self.operators:
+                    raise EventRejected(f"no operator {address.operator_id}")
+            case _:
+                assert_never(address)
+
     def _message(self, message_id: str) -> Message:
         message = self.messages.get(message_id)
         if message is None:
             raise EventRejected(f"no message {message_id}")
         return message
 
-    def _open_question(self, question_id: str) -> Question:
-        question = self.questions.get(question_id)
-        if question is None:
-            raise EventRejected(f"no question {question_id}")
-        if question.status is not QuestionStatus.OPEN:
-            raise EventRejected(f"question {question_id} is {question.status}")
-        return question
+    def _open_question(self, message_id: str) -> Message:
+        message = self._message(message_id)
+        if message.kind is not MessageKind.QUESTION:
+            raise EventRejected(f"message {message_id} is not a question")
+        if message.status is not QuestionStatus.OPEN:
+            raise EventRejected(f"question {message_id} is {message.status}")
+        return message
 
     # Per-event checks.
-
-    def _check_new_line(self, event: LineCreated) -> None:
-        if event.line_id in self.lines:
-            raise EventRejected(f"line {event.line_id} exists")
 
     def _check_line_state(self, event: LineStateChanged) -> None:
         line = self._line(event.line_id)
@@ -436,35 +477,41 @@ class State:
     def _check_message_sent(self, event: MessageSent) -> None:
         if event.message_id in self.messages:
             raise EventRejected(f"message {event.message_id} exists")
-        self._line(event.recipient)
-        if event.sender != OPERATOR:
-            self._line(event.sender)
+        self._require_party(event.sender)
+        self._require_party(event.recipient)
         if event.sender == event.recipient:
-            raise EventRejected(f"line {event.sender} cannot message itself")
+            raise EventRejected(f"{event.sender} cannot message itself")
+        if event.kind is MessageKind.QUESTION:
+            if not isinstance(event.sender, LineAddress):
+                raise EventRejected("only a line asks a question")
+            if not isinstance(event.recipient, OperatorAddress):
+                raise EventRejected("a question is addressed to an operator")
+            self._live_line(event.sender.line_id)
+        if event.reply_to is not None:
+            self._check_reply(event, event.reply_to)
+
+    def _check_reply(self, event: MessageSent, reply_to: str) -> None:
+        parent = self._message(reply_to)
+        if (parent.sender, parent.recipient) != (event.recipient, event.sender):
+            raise EventRejected(
+                f"a reply to {reply_to} must go from {parent.recipient}"
+                f" to {parent.sender}"
+            )
+        if parent.kind is MessageKind.QUESTION:
+            if parent.status is not QuestionStatus.OPEN:
+                raise EventRejected(f"question {reply_to} is {parent.status}")
+            if event.kind is MessageKind.QUESTION:
+                raise EventRejected(f"an answer to {reply_to} cannot be a question")
 
     def _check_wake_requested(self, event: WakeRequested) -> None:
         if event.wake_id in self.wakes:
             raise EventRejected(f"wake {event.wake_id} exists")
         self._live_line(event.line_id)
-        match event.cause:
-            case WakeCause.MESSAGE:
-                message = self._message(event.cause_id)
-                if message.recipient != event.line_id:
-                    raise EventRejected(
-                        f"message {event.cause_id} is not for line {event.line_id}"
-                    )
-            case WakeCause.ANSWER:
-                question = self.questions.get(event.cause_id)
-                if question is None:
-                    raise EventRejected(f"no question {event.cause_id}")
-                if question.line_id != event.line_id:
-                    raise EventRejected(
-                        f"question {event.cause_id} is not from line {event.line_id}"
-                    )
-                if question.status is not QuestionStatus.ANSWERED:
-                    raise EventRejected(f"question {event.cause_id} is not answered")
-            case _:
-                assert_never(event.cause)
+        message = self._message(event.message_id)
+        if message.recipient != LineAddress(event.line_id):
+            raise EventRejected(
+                f"message {event.message_id} is not for line {event.line_id}"
+            )
 
     def _check_wake_issued(self, event: WakeIssued) -> None:
         wake = self.wakes.get(event.wake_id)
@@ -478,31 +525,46 @@ class State:
         if self.is_blocked(wake.line_id):
             raise EventRejected(f"line {wake.line_id} is blocked on a question")
 
-    def _check_question_asked(self, event: QuestionAsked) -> None:
-        if event.question_id in self.questions:
-            raise EventRejected(f"question {event.question_id} exists")
-        self._live_line(event.line_id)
-
     def _check_superseded(self, event: QuestionSuperseded) -> None:
-        old = self._open_question(event.question_id)
-        if event.superseded_by == event.question_id:
-            raise EventRejected(f"question {event.question_id} cannot supersede itself")
+        old = self._open_question(event.message_id)
+        if event.superseded_by == event.message_id:
+            raise EventRejected(f"question {event.message_id} cannot supersede itself")
         new = self._open_question(event.superseded_by)
-        if new.line_id != old.line_id:
+        if new.sender != old.sender:
             raise EventRejected(
                 f"question {event.superseded_by} is from another line than"
-                f" {event.question_id}"
+                f" {event.message_id}"
             )
+
+    # Mutations.
+
+    def _apply_message_sent(self, event: MessageSent) -> None:
+        status = QuestionStatus.OPEN if event.kind is MessageKind.QUESTION else None
+        self.messages[event.message_id] = Message(
+            event.sender,
+            event.recipient,
+            event.kind,
+            event.body,
+            event.choices,
+            event.blocking,
+            event.reply_to,
+            status=status,
+        )
+        if event.reply_to is not None:
+            parent = self.messages[event.reply_to]
+            if parent.status is QuestionStatus.OPEN:
+                self.messages[event.reply_to] = replace(
+                    parent, status=QuestionStatus.ANSWERED, answered_by=event.message_id
+                )
 
     def _close(
         self,
-        question_id: str,
+        message_id: str,
         status: QuestionStatus,
         *,
-        answer: str | None = None,
         superseded_by: str | None = None,
     ) -> None:
-        question = self.questions[question_id]
-        self.questions[question_id] = replace(
-            question, status=status, answer=answer, superseded_by=superseded_by
+        question = self.messages[message_id]
+        self.messages[message_id] = replace(
+            question, status=status, superseded_by=superseded_by
         )
