@@ -100,6 +100,7 @@ DEFAULT_OPERATOR: Final = "operator"
 """Who hears about a held line that no operator has messaged."""
 
 DEFAULT_TICK_SECONDS: Final = 1.0
+MAX_WAKE_EVERY_TICKS: Final = 3600
 MAX_TICK_SECONDS: Final = 60.0
 
 SEND_TOOL_NAME: Final = "send_message"
@@ -281,12 +282,18 @@ class Scheduler:
         hold_wakes: bool = False,
         tick_seconds: float = DEFAULT_TICK_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        wake_every_ticks: int = 1,
     ) -> None:
+        if not 1 <= wake_every_ticks <= MAX_WAKE_EVERY_TICKS:
+            raise ValueError(f"wake_every_ticks must be in [1, {MAX_WAKE_EVERY_TICKS}]")
         if not 0 <= tick_seconds <= MAX_TICK_SECONDS:
             raise ValueError(f"tick_seconds must be in [0, {MAX_TICK_SECONDS}]")
         self._log = log
         self._engine_factory = engine_factory
         self.limits = limits
+        self.wake_every_ticks = wake_every_ticks
+        self._line_limits: dict[str, Limits] = {}
+        self._line_wake: dict[str, int] = {}
         self._default_operator = OperatorAddress(default_operator)
         self._clock = clock
         self._hold = hold_wakes
@@ -719,8 +726,31 @@ class Scheduler:
             if message_id in self._post_office
         ]
 
+    def set_line_policy(
+        self, line_id: str, limits: Limits | None, wake_every_ticks: int | None
+    ) -> None:
+        """Give a line its own limits or wake policy, or return it to the project's."""
+        if limits is None:
+            self._line_limits.pop(line_id, None)
+        else:
+            self._line_limits[line_id] = limits
+        if wake_every_ticks is None:
+            self._line_wake.pop(line_id, None)
+        elif not 1 <= wake_every_ticks <= MAX_WAKE_EVERY_TICKS:
+            raise ValueError(f"wake_every_ticks must be in [1, {MAX_WAKE_EVERY_TICKS}]")
+        else:
+            self._line_wake[line_id] = wake_every_ticks
+
+    def limits_for(self, line_id: str) -> Limits:
+        return self._line_limits.get(line_id, self.limits)
+
     def _can_start(self, line_id: str) -> bool:
-        return self._eligible(line_id) and not self._cooling(line_id)
+        every = self._line_wake.get(line_id, self.wake_every_ticks)
+        return (
+            self._eligible(line_id)
+            and not self._cooling(line_id)
+            and self.tick % every == 0
+        )
 
     def _eligible(self, line_id: str) -> bool:
         """Whether a line could start a turn, apart from its cooldown."""
@@ -737,13 +767,14 @@ class Scheduler:
         ended = self._last_turn_end.get(line_id)
         if ended is None:
             return False
-        return self._clock() - ended < self.limits.cooldown_seconds
+        return self._clock() - ended < self.limits_for(line_id).cooldown_seconds
 
     def _work_waiting(self) -> bool:
         """Whether the next tick has anything to do or move.
 
-        A line in its cooldown with mail waiting keeps the loop ticking, so its turn
-        starts when the cooldown ends rather than when the next message arrives.
+        A line in its cooldown, or waiting for its wake tick, with mail waiting keeps
+        the loop ticking, so its turn starts on time rather than when more mail
+        arrives.
         """
         if self._running or self._sent:
             return True
@@ -793,7 +824,7 @@ class Scheduler:
                 self._cost.get(line_id, 0.0) + report.cost_estimate_usd
             )
         cost = self._cost.get(line_id, 0.0)
-        limits = self.limits
+        limits = self.limits_for(line_id)
         reason: str | None = None
         if turns >= limits.max_autonomous_turns:
             reason = f"took {turns} turns in a row without mail from an operator"
