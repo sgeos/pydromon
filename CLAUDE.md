@@ -14,9 +14,10 @@ distribution is `pydromon`, the import package is `dromon`, and the commands are
 `dromond` and `dromon` with subcommands.
 
 **Status.** Seeded on 2026-10-25 by the operator's admin session, which only cut the
-repository. Nothing beyond placeholder commands is implemented. A new session line picks
-up development. The first milestone is [`docs/roadmap/V0_1_0.md`](docs/roadmap/V0_1_0.md)
-and the design is [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md).
+repository. The data model and event log are implemented, and every command is still a
+placeholder. A session line carries development forward. The first milestone is [`docs/roadmap/V0_1_0.md`](docs/roadmap/V0_1_0.md)
+and the design is [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md). The
+normative protocol, drafted here and ported later, is in [`docs/protocol/`](docs/protocol/README.md).
 
 **The port plan.** This Python prototype will be retired after a Rust port, which will in
 turn be retired in favour of a Keleusma implementation. Write the prototype so that its

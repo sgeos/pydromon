@@ -17,6 +17,14 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- The data model and event log, roadmap task 2. `dromon.model` defines session lines,
+  messages, wakes and operator questions as ten event kinds with explicit transition
+  checks. `dromon.codec` encodes them as canonical JSON and decodes untrusted payloads
+  strictly. `dromon.eventlog` stores them in an append-only SQLite log that replays to
+  the same state, detects a second writer, reports corruption by sequence number and
+  creates new logs readable by their owner only.
+- `docs/protocol/EVENT_LOG.md`, the normative specification of the above, the first
+  document of the protocol specification.
 - `docs/architecture/KELEUSMA_INTEGRATION.md`, what Dromon needs from `pykeleusma`,
   mapped to that binding's tasks, for the `pykeleusma` line.
 - The repository seed. The `pydromon` distribution with the import package `dromon`, the

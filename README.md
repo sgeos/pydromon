@@ -9,9 +9,10 @@ The distribution is `pydromon` and the import package is `dromon`. The commands 
 
 ## Status
 
-**Seed only.** The repository was cut on 2026-10-25. The package installs, both commands
-parse their arguments, and every subcommand reports that it is not implemented. No
-daemon, session line, message or question exists yet. The first milestone is
+**Early prototype.** The repository was cut on 2026-10-25. The data model and its
+append-only SQLite event log are implemented and specified in
+[`docs/protocol/EVENT_LOG.md`](docs/protocol/EVENT_LOG.md). No daemon runs yet, and every
+subcommand reports that it is not implemented. The first milestone is
 [`docs/roadmap/V0_1_0.md`](docs/roadmap/V0_1_0.md) and the planned system is
 [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md). What Dromon needs from
 the Keleusma Python bindings is in
