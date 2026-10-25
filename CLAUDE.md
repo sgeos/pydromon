@@ -66,13 +66,12 @@ commits to the assistant that actually contributed, with
 `Co-Authored-By: Codex <noreply@openai.com>` for Codex, and the equivalent line for any
 other assistant.
 
-The remote is `https://github.com/sgeos/pydromon`, a private repository. Its git
+The remote is `https://github.com/sgeos/pydromon`, a public repository. Its git
 configuration uses the GitHub command-line tool as the credential helper, because SSH
 keys are unreachable from inside agent sandboxes.
 
 **Irreversible or outward-facing actions need the operator's confirmation in session.**
-That includes pushing to the remote, changing the repository's visibility, publishing
-to PyPI and force-pushing.
+That includes pushing to the remote, publishing to PyPI and force-pushing.
 
 ## Common Commands
 

@@ -12,9 +12,11 @@ completed, moved or abandoned.
 - **Seeded.** The operator's admin session cut this repository and wrote the seed from a
   design conversation with the operator. It did no further development. A new session
   line picks up from here.
-- **Published.** The private GitHub repository `sgeos/pydromon`, licensed 0BSD, on an
-  HTTPS remote that uses the GitHub command-line tool as its credential helper. No
-  continuous integration is configured.
+- **Published.** The public GitHub repository `sgeos/pydromon`, licensed 0BSD, on an
+  HTTPS remote that uses the GitHub command-line tool as its credential helper. The
+  operator made it public on 2026-10-25. No continuous integration is configured.
+- **For the pykeleusma line.** [`../architecture/KELEUSMA_INTEGRATION.md`](../architecture/KELEUSMA_INTEGRATION.md)
+  states what Dromon needs from the binding, mapped to its tasks, with four questions.
 - **Code.** The placeholder commands `dromond` and `dromon`. Every subcommand reports that
   it is not implemented and exits with status 3.
 - **Sibling repositories.** `~/projects/keleusma/dromon` and `~/projects/rust/dromon-rs`
@@ -29,8 +31,9 @@ task 2, the data model and event log.
 
 - **Appendix B.** The seeding session was not permitted to read Appendix B, so the seed
   was written from the conversation and from Keleusma's public README only. The receiving
-  line reads it and checks every tracked file against it before further work, and before
-  the repository's visibility is ever changed.
+  line reads it and checks every tracked file against it before further work. The
+  repository is already public, so anything found must be corrected promptly, and the
+  operator decides whether history needs rewriting.
 - **With the operator.** Where the protocol specification is drafted, here or in the empty
   `dromon` repository. Which engine the first adapter targets. Which mailbox this line
   uses, since none is assigned.

@@ -13,7 +13,9 @@ The distribution is `pydromon` and the import package is `dromon`. The commands 
 parse their arguments, and every subcommand reports that it is not implemented. No
 daemon, session line, message or question exists yet. The first milestone is
 [`docs/roadmap/V0_1_0.md`](docs/roadmap/V0_1_0.md) and the planned system is
-[`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md).
+[`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md). What Dromon needs from
+the Keleusma Python bindings is in
+[`docs/architecture/KELEUSMA_INTEGRATION.md`](docs/architecture/KELEUSMA_INTEGRATION.md).
 
 ## Why Dromon
 

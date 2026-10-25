@@ -169,7 +169,8 @@ Keleusma, entirely or almost entirely.
 
 **Proposed.** Keleusma's bounded execution suits the harness's policy layer, such as
 message routing, wake policy and permission checks, where a hook must never hang. Use it
-there once `pykeleusma` can run scripts, which it could not on 2026-10-24.
+there once `pykeleusma` can run scripts, which it could not on 2026-10-24. The needs,
+mapped to the binding's tasks, are in [`KELEUSMA_INTEGRATION.md`](KELEUSMA_INTEGRATION.md).
 
 ## Teacher models
 
