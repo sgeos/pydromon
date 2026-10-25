@@ -9,24 +9,23 @@ completed, moved or abandoned.
 
 ## State on 2026-10-25
 
-- **Tasks 1 and 2 done, and the data model revised.** The event log holds session lines,
-  operators, messages and wakes.
-  - `src/dromon/model.py` defines nine event kinds with one explicit check each.
-    Operators are parties addressed as `@name`, any number of them. A question is a
-    message from a line to one operator, and its answer is that operator's reply, which
-    must reverse the route.
-  - `src/dromon/codec.py` encodes events as canonical JSON and decodes untrusted
-    payloads strictly.
-  - `src/dromon/eventlog.py` stores them in an append-only SQLite log that replays to
-    the same state.
-  - `src/dromon/relay.py` forwards operator messages through relays. A command relay is
-    the general adapter for channels such as email or Slack.
-  - [`../protocol/EVENT_LOG.md`](../protocol/EVENT_LOG.md) and
-    [`../protocol/RELAY.md`](../protocol/RELAY.md) are normative drafts.
+- **Tasks 1, 2 and 3 done.**
+  - `src/dromon/model.py`, `codec.py` and `eventlog.py` hold the data model as nine
+    event kinds in an append-only SQLite log. Operators are parties addressed as
+    `@name`, any number of them, and a question is a message to one operator.
+  - `src/dromon/relay.py` forwards operator messages through relays. Replies will arrive
+    through inbound adapters plugged into a registry in the daemon, by the operator's
+    decision, with the design deferred.
+  - `src/dromon/daemon.py`, `client.py`, `protocol.py`, `paths.py` and `exits.py` make
+    up the daemon skeleton. `dromon start`, `status` and `stop` manage a per-project
+    `dromond` on a Unix domain socket in a 0700 runtime directory, one instance per
+    project through a lock.
+  - `docs/protocol/` holds `EVENT_LOG.md`, `RELAY.md` and `CLIENT.md`, all drafts.
 - **Published.** The public GitHub repository `sgeos/pydromon`, licensed 0BSD, on an
   HTTPS remote that uses the GitHub command-line tool as its credential helper. No
   continuous integration is configured.
-- **Commands.** `dromond` and `dromon` are still placeholders that exit with status 3.
+- **Commands.** `attach`, `send`, `questions` and `answer` are placeholders that exit with
+  status 3.
 - **pykeleusma.** Its tasks 2, 3 and 10 are done. Python cannot yet drive a script,
   because `call` and `resume` are its open task 5. Dromon's 0.1.0 does not depend on it.
 - **Sibling repositories.** `~/projects/keleusma/dromon` and `~/projects/rust/dromon-rs`
@@ -34,11 +33,10 @@ completed, moved or abandoned.
 
 ## Next step
 
-Task 3 of [`../roadmap/V0_1_0.md`](../roadmap/V0_1_0.md), the daemon skeleton, with its
-versioned request format specified under `docs/protocol/` first. `dromond` should own
-one `EventLog` per project, as its single writer, and run forwarding passes for relays.
-The operator chose reading 1 for the Agent SDK. Dromon drives it from outside, and
-`ask_operator` sends a message to an operator and returns at once.
+Task 4 of [`../roadmap/V0_1_0.md`](../roadmap/V0_1_0.md), the first engine adapter. It
+needs the operator's choice of loop first, and the design proposes a throwaway probe of
+the Agent SDK before the adapter is fixed. The operator chose to drive the Agent SDK from
+outside, with `ask_operator` sending a message to an operator and returning at once.
 
 ## Open
 
@@ -54,28 +52,35 @@ The operator chose reading 1 for the Agent SDK. Dromon drives it from outside, a
   compaction or schema migration yet, and by the operator's decision such standard
   features land with the task that first needs them. Events for configuration, turns and conversation
   limits arrive with tasks 7 and 9. All are listed in the specification.
-- **Operator relays.** The operator requires every relay adapter to support a response
-  path, with the design deferred. Its required properties are in `RELAY.md`. More than
+- **Operator relays.** The operator requires a response path through inbound adapters
+  registered with the daemon and configured per channel, with the design deferred. Its
+  required properties are in `RELAY.md`. More than
   one relay per operator and retry timing are not yet specified. Which operator a
   line asks by default belongs to per-project configuration.
 - **Interline and Dromon overlap.** Once layer 1 messaging works, decide whether
   Dromon retires interline or keeps it for sessions Dromon does not drive.
+- **Daemon debt.** No peer credential check on connections, no relay forwarding passes
+  yet, and the event log's SQLite calls run on the event loop thread. All are recorded
+  in `CLIENT.md` or the module documentation.
 - **Recorded in the design.** Teacher-model scope, the contents of `.dromon/dromon.toml`,
   and the Rust repository's eventual name.
 
 ## Environment
 
 On 2026-10-25, inside Claude Code's sandbox, `uv sync`, the gates, `git fetch`, `git
-push` and `gh` all ran without escalation. The sandbox denies writes to `.git/config`, so
-`git push -u` cannot record an upstream, which nothing depends on. Inside Grok Build's
-sandbox the GitHub command-line tool could not read its keychain token on 2026-10-24.
+push` and `gh` ran without escalation. The sandbox denies binding a Unix domain socket
+with "Operation not permitted", so the 10 tests marked `socket` and any manual daemon run
+need a command outside the sandbox, and `uv run pytest -m "not socket"` runs the rest
+inside it. The sandbox also denies writes to `.git/config`, so `git push -u` cannot
+record an upstream. Inside Grok Build's sandbox the GitHub command-line tool could not
+read its keychain token on 2026-10-24.
 
 ## Validity
 
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 188 tests pass
+uv sync && uv run pytest    # 245 tests pass, 10 of them need sockets
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 

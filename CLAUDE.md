@@ -14,8 +14,8 @@ distribution is `pydromon`, the import package is `dromon`, and the commands are
 `dromond` and `dromon` with subcommands.
 
 **Status.** Seeded on 2026-10-25 by the operator's admin session, which only cut the
-repository. The data model and event log are implemented, and every command is still a
-placeholder. A session line carries development forward. The first milestone is [`docs/roadmap/V0_1_0.md`](docs/roadmap/V0_1_0.md)
+repository. The data model, event log, operator relays and the daemon skeleton with
+`start`, `status` and `stop` are implemented. The other subcommands are placeholders. A session line carries development forward. The first milestone is [`docs/roadmap/V0_1_0.md`](docs/roadmap/V0_1_0.md)
 and the design is [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md). The
 normative protocol, drafted here and ported later, is in [`docs/protocol/`](docs/protocol/README.md).
 
@@ -78,7 +78,8 @@ That includes pushing to the remote, publishing to PyPI and force-pushing.
 
 ```sh
 uv sync                                        # install the package and dev tools
-uv run pytest                                  # tests
+uv run pytest                                  # tests, socket tests need no sandbox
+uv run pytest -m "not socket"                  # the rest, inside a sandbox
 uv run ruff check . && uv run ruff format --check .
 uv run pyright                                 # strict type checks
 uv run dromon --help                           # the client and its subcommands

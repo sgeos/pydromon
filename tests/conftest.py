@@ -1,4 +1,9 @@
-"""Fixtures shared by the data model, codec, event log and relay tests."""
+"""Fixtures shared across the test suite."""
+
+import shutil
+import tempfile
+from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
@@ -61,3 +66,14 @@ SCENARIO: tuple[Event, ...] = (
 @pytest.fixture
 def scenario() -> tuple[Event, ...]:
     return SCENARIO
+
+
+@pytest.fixture
+def short_runtime() -> Iterator[Path]:
+    """A runtime directory path that does not exist yet, short enough for a socket.
+
+    Pytest's own temporary paths can exceed the Unix socket path limit.
+    """
+    parent = Path(tempfile.mkdtemp(prefix="dr"))
+    yield parent / "run"
+    shutil.rmtree(parent, ignore_errors=True)
