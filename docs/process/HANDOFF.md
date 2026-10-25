@@ -22,6 +22,8 @@ completed, moved or abandoned.
     ChatGPT plan, isolated from the user's MCP servers and connectors, with Dromon's
     tools as dynamic tools. `scheduler.engine_factory` picks the adapter. `dromon
     probe` runs one turn, by default on Haiku 5.5, the least expensive model.
+  - `teacher.py` brings a project's local Ollama teacher up and down. Lines take
+    `claude_code_prompt` and `instructions`, so they can follow a `CLAUDE.md`.
   - `scheduler.py` is a game loop, by the operator's decision. Each tick updates every
     line once and skips a busy one, turns span ticks, and mail sent in a tick is
     delivered at its end. Lines send with `send_message`, operators `dromon send`.
@@ -59,12 +61,14 @@ completed, moved or abandoned.
   HTTPS remote that uses the GitHub command-line tool as its credential helper.
   `.github/workflows/ci.yml` runs Ruff, Pyright and pytest on Ubuntu and macOS for
   Python 3.12 and 3.15. Live tests run only locally.
-- **pykeleusma.** Its tasks 2, 3 and 10 are done. Python cannot yet drive a script,
-  because `call` and `resume` are its open task 5. Dromon's 0.1.0 does not depend on it.
+- **pykeleusma.** Python cannot yet drive a script, its open task 5. Dromon's 0.1.0
+  does not depend on it.
 
 ## Next step
 
-Milestone 0.1.0 is complete. The next milestone awaits the operator's direction.
+Dromon can be dogfooded in epagoge. Its project file is
+`~/projects/python/epagoge/.dromon/dromon.toml`, local and excluded from git there, and
+`dromon teacher up` loads the teacher first. The next milestone awaits the operator.
 
 ## Open
 
@@ -72,21 +76,17 @@ Milestone 0.1.0 is complete. The next milestone awaits the operator's direction.
   `pykeleusma-20261025-shared-data-update` says the VM now owns a zeroed block that
   persists across calls. Drivers keep host-carried state, by choice, until a reason to
   move appears. Adopting it means repinning `pykeleusma`.
-- **Subscription usage.** Anthropic's terms assume ordinary, individual use of Pro and
-  Max plans. Many lines running continuously may exceed that.
+- **Subscription usage.** Plan terms assume ordinary, individual use. Many lines
+  running continuously may exceed that.
 - **Event log debt.** `read_entries` loads the whole log into memory, with no
-  compaction or schema migration yet. Conversation-limit counts reset
-  on restart.
-- **Operator relays.** The operator requires a response path through inbound adapters
-  registered with the daemon and configured per channel, with the design deferred. Its
+  compaction or migration. Conversation-limit counts reset on restart.
+- **Operator relays.** Inbound adapters, required by the operator, are deferred. Their
   required properties are in `RELAY.md`.
 - **Secrets.** Literal MCP credentials and `env` values are stored in the owner-only
   event log. Environment references exist, but not file or keychain references.
 - **Daemon debt.** No peer credential check on connections, no relay forwarding, and
   SQLite calls on the event loop thread. Driver state lives only in memory. All are
   recorded in `CLIENT.md` or the module documentation.
-- **Operator direction, recorded in the design.** Configuration may grow as large as a
-  project needs. The client protocol later needs pushed updates and remote clients.
 - **Project file debt.** No user or managed layer. Recorded in `PROJECT_CONFIG.md`.
 - **Parity gaps.** No credential masking, no automatic approval reviewer, no plugins
   or language servers, no MCP OAuth, and Linux not verified live. The merge of `Read`
@@ -94,7 +94,8 @@ Milestone 0.1.0 is complete. The next milestone awaits the operator's direction.
   `SETTINGS.md`.
 - **Codex lines.** No MCP servers, file edits, sandbox or settings documents, cost or
   turn limit, and the app-server is experimental. Listed in `CODEX.md`.
-- **In the design.** Teacher-model scope and the Rust repository's eventual name.
+- **In the design.** Hosted teacher traces, the Rust repository's name, and pushed
+  updates and remote clients for the client protocol.
 
 ## Environment
 
@@ -109,7 +110,7 @@ and a manual daemon run need a command outside it. The rest run inside it with
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 779 tests pass, plus 8 live tests deselected
+uv sync && uv run pytest    # 819 tests pass, plus 8 live tests deselected
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 

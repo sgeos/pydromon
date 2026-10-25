@@ -43,6 +43,15 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- A project's local teacher model, specified by `docs/protocol/TEACHER.md`. The project
+  file's `[teacher]` table names an Ollama model on the loopback interface, and
+  `dromon teacher up`, `status` and `down` start a server when none answers, load the
+  model with the declared context, and release it, stopping only a server Dromon
+  started. Dromon never pulls a model. With `autostart`, `dromond` brings it up.
+- Lines take `claude_code_prompt`, to run on Claude Code's own system prompt instead of
+  an empty one, and `instructions`, files such as `CLAUDE.md` appended to the system
+  prompt at each turn, or given to Codex as developer instructions. `dromon create` and
+  `configure` gain `--claude-code-prompt` and `--instructions`.
 - OpenAI models run on Dromon through Codex, specified by `docs/protocol/CODEX.md`.
   `dromon.codex` drives `codex app-server`, maps the reported account to the driver's
   credential, disables every MCP server and connector feature Codex would load, and

@@ -45,6 +45,12 @@ ran, saw a variable from ``env``, and its output reached the model. MCP server
 references such as ``${TOKEN}`` are replaced from the daemon's environment here, at the
 start of each turn, so the stored configuration holds only the reference.
 
+Instructions. With ``claude_code_prompt`` a line runs on Claude Code's own system
+prompt, and otherwise on an empty one, which the SDK passes when no prompt is given.
+The text of the configuration's ``instructions`` files is appended at each turn, so a
+project's ``CLAUDE.md`` reaches a line although ``setting_sources=[]`` keeps Claude Code
+from loading it. A missing or oversized file refuses the turn.
+
 Failure modes. A refusal by the policy or the driver raises ``EngineRefused`` after the
 turn is interrupted. A driver failure raises ``DriverError``. Engine and transport
 failures from the SDK propagate unchanged.
@@ -78,6 +84,8 @@ from claude_agent_sdk import (
     ToolUseBlock,
     create_sdk_mcp_server,
 )
+
+from claude_agent_sdk.types import SystemPromptPreset
 
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
 from dromon.lineconfig import DEFAULT_CONFIG, ConfigError, LineConfig
@@ -119,6 +127,38 @@ NON_SUBSCRIPTION_ENVIRONMENT: Final = API_ENVIRONMENT + PROVIDER_ENVIRONMENT
 
 class EngineRefused(Exception):
     """The credential policy or the driver refused to run the turn."""
+
+
+MAX_INSTRUCTION_BYTES: Final = 256 * 1024
+"""The largest instruction file a line reads, so a stray file cannot flood a turn."""
+
+
+def read_instructions(paths: Sequence[str], root: Path) -> str:
+    """The text of the instruction files ``paths``, each under a heading naming it,
+    with relative paths resolved against ``root``. Raises ``EngineRefused`` for a file
+    that cannot be read, is not UTF-8, or exceeds ``MAX_INSTRUCTION_BYTES``."""
+    sections: list[str] = []
+    for path in paths:
+        file = Path(path).expanduser()
+        if not file.is_absolute():
+            file = root / file
+        try:
+            with file.open("rb") as handle:
+                raw = handle.read(MAX_INSTRUCTION_BYTES + 1)
+        except OSError as error:
+            raise EngineRefused(
+                f"cannot read the instructions {path}: {error}"
+            ) from error
+        if len(raw) > MAX_INSTRUCTION_BYTES:
+            raise EngineRefused(
+                f"the instructions {path} exceed {MAX_INSTRUCTION_BYTES} bytes"
+            )
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise EngineRefused(f"the instructions {path} are not UTF-8") from error
+        sections.append(f"Contents of {path}:\n\n{text.strip()}")
+    return "\n\n".join(sections)
 
 
 class AgentSession(Protocol):
@@ -342,7 +382,17 @@ class ClaudeCodeLine:
             resume=self.session_id,
             sandbox=cast(SandboxSettings, self.sandbox),
             settings=None if self.settings is None else json.dumps(self.settings),
+            system_prompt=self._system_prompt(),
         )
+
+    def _system_prompt(self) -> str | SystemPromptPreset | None:
+        appended = read_instructions(self.config.instructions, self.cwd)
+        if self.config.claude_code_prompt:
+            preset: SystemPromptPreset = {"type": "preset", "preset": "claude_code"}
+            if appended:
+                preset["append"] = appended
+            return preset
+        return appended or None
 
     async def run_turn(self, prompt: str) -> TurnReport:
         """Run one turn for ``prompt`` and return what happened."""

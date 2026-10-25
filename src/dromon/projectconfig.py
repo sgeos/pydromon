@@ -38,6 +38,7 @@ from dromon.model import ID_PATTERN
 from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, SandboxError, merge, parse_sandbox
 from dromon.settings import SettingsConfig, SettingsError, parse_settings
+from dromon.teacher import TeacherConfig, TeacherError, parse_teacher
 
 CONFIG_FILE_NAME: Final = "dromon.toml"
 FILE_VERSION: Final = 1
@@ -45,7 +46,17 @@ MAX_WAKE_EVERY: Final = 3600
 MAX_FILE_BYTES: Final = 4 * 1024 * 1024
 
 TOP_KEYS: Final = frozenset(
-    {"version", "daemon", "limits", "wake", "sandbox", "settings", "profiles", "lines"}
+    {
+        "version",
+        "daemon",
+        "limits",
+        "wake",
+        "sandbox",
+        "settings",
+        "teacher",
+        "profiles",
+        "lines",
+    }
 )
 DAEMON_KEYS: Final = frozenset({"operator", "tick_seconds"})
 LIMIT_KEYS: Final = frozenset(
@@ -60,6 +71,8 @@ TOOL_KEYS: Final = frozenset(
         "allowed_tools",
         "inherit_account_mcp",
         "effort",
+        "claude_code_prompt",
+        "instructions",
     }
 )
 LAYERED_KEYS: Final = frozenset({"sandbox", "settings"})
@@ -119,6 +132,8 @@ class ProjectConfig:
     """The project's sandbox, merged under every line's own."""
     settings: SettingsConfig | None = None
     """The project's engine settings, merged under every line's own."""
+    teacher: TeacherConfig | None = None
+    """The project's local teacher model, if it declares one."""
     lines: dict[str, LineDefinition] = field(default_factory=dict[str, LineDefinition])
 
 
@@ -222,6 +237,12 @@ class _Reader:
         wake = self.wake(top.get("wake", {}), "wake", 1)
         sandbox = self.sandbox(top.get("sandbox"), "sandbox")
         settings = self.settings(top.get("settings"), "settings")
+        teacher: TeacherConfig | None = None
+        if "teacher" in top:
+            try:
+                teacher = parse_teacher(top["teacher"])
+            except TeacherError as error:
+                raise self.fail("teacher", str(error)) from error
         profiles = self.profiles(top.get("profiles", {}))
         lines_table = top.get("lines", {})
         if not isinstance(lines_table, dict):
@@ -236,6 +257,7 @@ class _Reader:
             wake_every_ticks=wake,
             sandbox=sandbox,
             settings=settings,
+            teacher=teacher,
             lines=lines,
         )
 

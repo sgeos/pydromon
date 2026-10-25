@@ -463,7 +463,23 @@ mapped to the binding's tasks, are in [`KELEUSMA_INTEGRATION.md`](KELEUSMA_INTEG
 
 **Open.** Before the operator clarified that Dromon is its own project, they mentioned
 supporting teacher models that help train new language models. Its place in Dromon's
-scope is not settled. **Unverified, from the seeding session's memory.** Several model
+scope is not settled.
+
+**Decided 2026-10-25, by the operator's direction to dogfood Dromon in the epagoge
+project.** Dromon can spin up a project's local teacher, a model the project's own
+generators call through Ollama on the loopback interface, as
+[`../protocol/TEACHER.md`](../protocol/TEACHER.md) specifies. A teacher is a served model,
+not a session line. Lines reach it through the project's tools, and Dromon only loads
+and releases it. Lines also gained `claude_code_prompt` and `instructions`, because a
+Claude Code line had an empty system prompt and read no `CLAUDE.md`, so it could not
+follow a project's own rules.
+
+**Fact, observed on 2026-10-25 in epagoge.** With the teacher loaded by `dromon
+teacher up` and `dromond` running there, a Claude Haiku 5.5 line in Claude Code's
+sandbox queried the teacher over loopback and answered a question from the project's
+`CLAUDE.md`, and a GPT-6-Luna line answered one from its instructions. Both replied to
+the operator by `send_message`. Dromon's state there is excluded from git through the
+repository's local exclude file, so the project's own checks never see it. **Unverified, from the seeding session's memory.** Several model
 vendors' terms forbid using their outputs to train competing models, and subscription
 plans tend to be stricter than paid interface use. Check each vendor's current terms
 before any trace capture, and record the source model and licence of every trace.
@@ -476,6 +492,7 @@ before any trace capture, and record the source model and licence of every trace
    through the Agent SDK, on the subscription, with a Keleusma driver.
 3. The contents of `.dromon/dromon.toml`.
 4. Mid-turn injection. Decided 2026-10-25, not used, because delivery is tick based.
-5. Teacher-model scope and licensing.
+5. Teacher-model scope and licensing. A local teacher served by Ollama is decided.
+   Training on traces from hosted models remains open.
 6. Whether Dromon retires the interline store, or keeps it for sessions Dromon does not
    drive. Moved here from the handoff on 2026-10-25.

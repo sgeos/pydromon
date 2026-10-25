@@ -4,37 +4,42 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-25, OpenAI models on Dromon through Codex
+## 2026-10-25, dogfooding in epagoge with its local teacher
 
-**Done.** On the operator's direction to get OpenAI models running on Dromon and to test
-with GPT-6-Luna.
+**Done.** On the operator's direction to review the epagoge project and bring Dromon to
+the point where it can nominally be dogfooded there, with the ability to spin up the
+local teacher model.
 
-- `dromon.codex` runs a line through `codex app-server` over standard input and output,
-  as `docs/protocol/CODEX.md` specifies. Lines can be created on `gpt-6-luna`, the
-  scheduler picks the adapter by the driver's engine, and `dromon probe --model
-  gpt-6-luna` runs on Codex.
-- **Facts, observed on 2026-10-25.** Codex reported a ChatGPT account on the Pro plan.
-  Without Dromon's overrides, a GPT-6-Luna thread connected to the operator's mail,
-  calendar, document, chat and task MCP servers. With them every server reported
-  disabled. The operator's environment sets `OPENAI_API_KEY`, which a subscription
-  line's Codex is now started without.
-- Dromon's tools reach the model as Codex dynamic tools. A resumed thread keeps them.
+- **Review, facts.** Epagoge's generators all call a local teacher,
+  `qwen3:30b-a3b-instruct-2507-q4_K_M`, served by Ollama on `127.0.0.1:11434`, at a
+  declared context of 4096. Its `CLAUDE.md` carries obligations every agent must
+  follow, including a disclosure discipline whose scan reads untracked files. Ollama
+  0.40.10 was already serving through the desktop application, with the model pulled.
+- **Gap, fact.** A Dromon Claude Code line ran with an empty system prompt and read no
+  `CLAUDE.md`, so it could not follow a project's rules. Lines now take
+  `claude_code_prompt` and `instructions`.
+- `dromon teacher up`, `status` and `down` bring the teacher up and release it, as
+  `docs/protocol/TEACHER.md` specifies. Dromon never pulls a model and stops only a
+  server it started.
+- Epagoge has a local `.dromon/dromon.toml` with a `worker` on Opus 5.5, a `reviewer`
+  on Haiku 5.5 and a `luna` line on GPT-6-Luna, and `.dromon/` was added to its
+  `.git/info/exclude`. No tracked file of epagoge changed, and its tree stayed clean.
+- **Verified live in epagoge.** With the teacher loaded and `dromond` running, the
+  `reviewer` line queried the teacher from its sandboxed shell and answered from
+  `CLAUDE.md`, the `luna` line answered from its instructions, and both replied to the
+  operator by mail. The daemon was then stopped and the teacher released.
 
 **Decisions made by this line, open to the operator's review.**
 
-- The app-server rather than `codex exec`, which OpenAI recommends for automation,
-  because only the app-server lets Dromon serve its tools in process and see each item
-  as it starts. Both the app-server and its dynamic tools are experimental.
-- Codex lines run in Codex's read-only sandbox, never ask for approval, and take only
-  `Bash`. File edits wait for a way to protect `.dromon` from Codex's writable sandbox.
-- A subscription line's Codex is started without OpenAI API variables rather than
-  refused, because Dromon starts the process, and the reported account is still checked.
+- The teacher is not autostarted in epagoge's file, because loading it takes about
+  19 GB on a 32 GB host. Free memory fell to 14 percent while it was loaded.
+- Epagoge lines may not commit or push, as an `ask` rule that denies, since that
+  project leaves both to the operator.
+- The Claude lines read the operator's global `~/.claude/CLAUDE.md` as well as the
+  project's, as Claude Code itself would.
 
-**Not done.** MCP servers on Codex lines, cost reporting, the driver's turn limit and a
-Grok Build adapter.
+**Not done.** No generator was run, and the epagoge gate was not run by a line. Whether
+loopback needs `allowLocalBinding` is untested. A Codex line cannot reach the teacher.
 
-**Verification.** 779 tests passing outside the sandbox with warnings treated as errors,
-and all 8 live tests passing. The Codex ones showed that a GPT-6-Luna line resumes its
-thread with its tools, recalling a word from its first turn in its second, and that a
-GPT-6-Luna line messages a Claude Haiku 5.5 line in one scheduler. Ruff and pyright
-strict clean. Linux was not exercised live.
+**Verification.** 819 tests passing outside the sandbox with warnings treated as errors,
+and all 8 live tests passing. Ruff and pyright strict clean.

@@ -83,6 +83,8 @@ driver. **Fact, observed on 2026-10-25.** The operator's environment sets
 | `sandbox`, `settings` | Refused, including the project's own tables, which `dromond` checks at start |
 | `tool_policy`, `allowed_tools` | Accepted, with no effect beyond Dromon's own tools |
 | `effort` | Passed with each turn |
+| `instructions` | Their text becomes the thread's developer instructions |
+| `claude_code_prompt` | Refused, since Codex uses its own instructions |
 
 A configuration a Codex line cannot run is refused when the line is created or
 configured. The read-only sandbox is required because Codex's writable sandbox would let

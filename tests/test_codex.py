@@ -514,6 +514,25 @@ def test_the_daemon_refuses_project_tables_that_would_reach_a_codex_line() -> No
         )
 
 
+def test_a_codex_line_gets_its_instructions_as_developer_instructions(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path
+    (root / "CLAUDE.md").write_text("Follow the project rules.\n")
+    server = FakeServer()
+    target = line(server, config=LineConfig(instructions=("CLAUDE.md",)))
+    target.cwd = root
+    asyncio.run(target.run_turn("hello"))
+    assert server.params("thread/start")["developerInstructions"] == (
+        "Contents of CLAUDE.md:\n\nFollow the project rules."
+    )
+    plain = FakeServer()
+    asyncio.run(line(plain).run_turn("hello"))
+    assert "developerInstructions" not in plain.params("thread/start")
+    reason = unsupported(LineConfig(claude_code_prompt=True))
+    assert reason is not None and "Codex's own instructions" in reason
+
+
 # Real turns, on the operator's ChatGPT plan.
 
 

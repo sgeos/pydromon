@@ -40,6 +40,8 @@ keys, duplicate keys and numbers are refused.
 | `sandbox` | The line's own sandbox document, as [`SANDBOX.md`](SANDBOX.md) specifies, before the project's is merged in. Omitted from the stored JSON when unset | none |
 | `settings` | The line's own engine settings, as [`SETTINGS.md`](SETTINGS.md) specifies, before the project's are merged in. Omitted when unset | none |
 | `effort` | `low`, `medium`, `high`, `xhigh` or `max`, replacing the driver's effort. Omitted when unset | the driver's |
+| `claude_code_prompt` | Run a Claude Code line on Claude Code's own system prompt rather than an empty one. Omitted when false | `false` |
+| `instructions` | At most 16 distinct files, such as `CLAUDE.md`, whose text is appended to the system prompt at each turn. A relative path is resolved against the project root and `~` against the home directory. Omitted when empty | none |
 
 A server name is an identifier and may not be `dromon`, which Dromon's own tools use. A
 `stdio` server has `command` and optionally `args` and `env`. An `http` or `sse` server
@@ -74,6 +76,16 @@ out of the event log.
 - Unless `inherit_account_mcp` is set, the engine runs with strict MCP configuration,
   and a turn is refused when the engine offers a built-in tool not in `builtin_tools`
   or a tool of a server not in `mcp_servers`.
+
+## Instructions
+
+Dromon starts Claude Code with no settings sources, so Claude Code reads no
+`CLAUDE.md` by itself, and without `claude_code_prompt` the SDK passes an empty system
+prompt. **Fact, read on 2026-10-25** in the SDK's command construction. The files named
+in `instructions` are read at the start of each turn, each under a heading naming it,
+and a file that is missing, larger than 256 KiB or not UTF-8 refuses the turn. Only the
+paths are stored. On Codex the text becomes the thread's developer instructions, and
+`claude_code_prompt` is refused, since Codex uses its own.
 
 ## Engines
 

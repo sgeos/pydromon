@@ -43,6 +43,7 @@ from typing import Final, cast
 
 from dromon import __version__, exits
 from dromon import codex
+from dromon.teacher import Teacher, TeacherError
 from dromon.driver import ENGINE_OF, DriverError, Strategy
 from dromon.eventlog import EventLog, LogError, utc_now
 from dromon.limits import DEFAULT_LIMITS, Limits
@@ -623,6 +624,28 @@ def check_engines(config: ProjectConfig) -> None:
         )
 
 
+def start_teacher(config: ProjectConfig, paths: ProjectPaths) -> Teacher | None:
+    """Bring the project's teacher up when its table sets ``autostart``, before any
+    line runs, and return it so the daemon can release it at exit. Raises
+    ``TeacherError``."""
+    if config.teacher is None or not config.teacher.autostart:
+        return None
+    teacher = Teacher(config.teacher, paths.runtime_dir)
+    print(f"dromond: loading the teacher {config.teacher.model}", file=sys.stderr)
+    found = teacher.up()
+    print(f"dromond: teacher {found.summary()}", file=sys.stderr)
+    return teacher
+
+
+def release_teacher(teacher: Teacher) -> None:
+    """Release a teacher the daemon brought up. A failure is reported, not raised,
+    because the daemon is already stopping."""
+    try:
+        teacher.down()
+    except TeacherError as error:
+        print(f"dromond: could not release the teacher: {error}", file=sys.stderr)
+
+
 def resolve(config: ProjectConfig, overrides: Overrides) -> tuple[Limits, str, float]:
     """The project-wide limits, default operator and tick cadence to run with."""
     base = config.limits
@@ -730,9 +753,20 @@ def run(
                 wake_every_ticks=config.wake_every_ticks,
             )
             apply_project(scheduler, log, config)
-            daemon = Daemon(paths, log, utc_now(), scheduler)
-            asyncio.run(serve(daemon))
-    except (LogError, ProjectMismatch, DriverError, EventRejected) as error:
+            teacher = start_teacher(config, paths)
+            try:
+                daemon = Daemon(paths, log, utc_now(), scheduler)
+                asyncio.run(serve(daemon))
+            finally:
+                if teacher is not None:
+                    release_teacher(teacher)
+    except (
+        LogError,
+        ProjectMismatch,
+        DriverError,
+        EventRejected,
+        TeacherError,
+    ) as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
     finally:

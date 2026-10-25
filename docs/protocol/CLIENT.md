@@ -115,6 +115,7 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromon release LINE` | Sends `release` | 0, 4, or 1 |
 | `dromon answer QUESTION BODY` | Sends `answer`, with `--operator`, default the login name | 0, 4, or 1 |
 | `dromon probe` | Runs one short turn without the daemon on the engine of `--model`, and reports the driver, the engine, the credential and the capabilities the engine reports | 0 or 1 |
+| `dromon teacher [up\|status\|down]` | Brings the project's teacher up, reports it, or releases it, without the daemon, as [`TEACHER.md`](TEACHER.md) specifies. The default is `status` | 0, or 1 on failure or when the project declares no teacher |
 | `dromon config` | Validates `.dromon/dromon.toml` without a daemon, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, and prints its limits, wake policy and lines | 0, or 1 on an invalid file |
 | `dromond` | Runs the daemon in the foreground, after applying `.dromon/dromon.toml`. Each flag overrides the file. `--max-autonomous-turns N`, default 12, `--max-cost-usd X`, default 2, and `--cooldown-seconds S`, default 0, set the conversation limits, `--operator NAME`, default `operator`, names who hears about a held line no operator has messaged, `--hold-wakes` records messages without waking any line, and `--tick-seconds S` sets the time between ticks while work is in flight, default 1, at most 60 | 0, 1 on failure, 2 on a bad cap or cadence, or 5 when another daemon holds the lock |
 
@@ -124,7 +125,9 @@ servers that the client reads, `--allow-tool NAME`, repeatable, `--allow-all-too
 sandbox object or a settings file whose `sandbox` key is taken, as
 [`SANDBOX.md`](SANDBOX.md) specifies, `--settings-config FILE`, a Claude Code settings
 file whose permissions, hooks, `env`, attribution and sandbox are taken, and
-`--effort LEVEL`, both as [`SETTINGS.md`](SETTINGS.md) specifies.
+`--effort LEVEL`, both as [`SETTINGS.md`](SETTINGS.md) specifies, and
+`--instructions FILE`, repeatable, and `--claude-code-prompt`, as
+[`LINE_CONFIG.md`](LINE_CONFIG.md) specifies.
 
 Status 2 is a usage error and status 3 marks a subcommand not yet implemented.
 

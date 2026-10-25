@@ -48,6 +48,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "release": "resume a line the daemon held at a conversation limit",
     "config": "check the project file and show what it declares",
     "probe": "run one short turn on the engine and report its capabilities",
+    "teacher": "bring the project's local teacher model up, report it, or release it",
 }
 """Planned subcommands and their one-line help, in display order."""
 
@@ -199,7 +200,19 @@ def _config_document(arguments: argparse.Namespace) -> dict[str, object] | None:
     effort: str | None = arguments.effort
     allow_all: bool = arguments.allow_all_tools
     inherit: bool = arguments.inherit_account_mcp
-    given = (tools, allowed, mcp_file, allow_all, inherit, sandbox_file, settings_file)
+    instructions: list[str] = arguments.instructions or []
+    prompt: bool = arguments.claude_code_prompt
+    given = (
+        tools,
+        allowed,
+        mcp_file,
+        allow_all,
+        inherit,
+        sandbox_file,
+        settings_file,
+        instructions,
+        prompt,
+    )
     if not any(given) and effort is None:
         return None
     document: dict[str, object] = {
@@ -226,6 +239,10 @@ def _config_document(arguments: argparse.Namespace) -> dict[str, object] | None:
             document["sandbox"] = sandbox_from_settings(sandbox).document()
     if effort is not None:
         document["effort"] = effort
+    if instructions:
+        document["instructions"] = instructions
+    if prompt:
+        document["claude_code_prompt"] = True
     return document
 
 
@@ -408,6 +425,14 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         f"project: {_sandbox_summary(config.sandbox)},"
         f" {_settings_summary(config.settings)}"
     )
+    if config.teacher is not None:
+        teacher = config.teacher
+        print(
+            f"teacher: {teacher.model} at {teacher.endpoint},"
+            f" context {teacher.context},"
+            f" keep alive {teacher.keep_alive},"
+            + (" autostart" if teacher.autostart else " started with dromon teacher up")
+        )
     for line_id, line in sorted(config.lines.items()):
         line_settings = engine_settings.merge([config.settings, line.config.settings])
         tools = ", ".join(line.config.builtin_tools) or "no built-in tools"
@@ -420,6 +445,42 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             + (f", effort {line.config.effort}" if line.config.effort else "")
         )
     return exits.OK
+
+
+def _teacher(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Bring the project's teacher up, report it, or release it, without a daemon."""
+    from dromon.projectconfig import ConfigFileError, config_path, load
+    from dromon.teacher import Teacher, TeacherError
+
+    file = config_path(paths.state_dir)
+    try:
+        config = load(file) if file.exists() else None
+    except ConfigFileError as error:
+        print(f"dromon teacher: {error}", file=sys.stderr)
+        return exits.FAILURE
+    if config is None or config.teacher is None:
+        print(f"dromon teacher: {file} declares no [teacher]", file=sys.stderr)
+        return exits.FAILURE
+    teacher = Teacher(config.teacher, paths.runtime_dir)
+    action: str = arguments.action
+    try:
+        if action == "up":
+            print(f"dromon teacher: loading {config.teacher.model}")
+            found = teacher.up()
+        elif action == "down":
+            found = teacher.down()
+        else:
+            found = teacher.status()
+    except TeacherError as error:
+        print(f"dromon teacher: {error}", file=sys.stderr)
+        return exits.FAILURE
+    print(
+        f"teacher {config.teacher.model} at {config.teacher.endpoint}:"
+        f" {found.summary()}"
+    )
+    if action == "status":
+        return exits.OK
+    return exits.OK if found.loaded == (action == "up") else exits.FAILURE
 
 
 def _settings_summary(settings: SettingsConfig | None) -> str:
@@ -500,6 +561,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "release": _release,
     "attach": _attach,
     "config": _config,
+    "teacher": _teacher,
 }
 
 
@@ -536,6 +598,17 @@ def _add_tool_options(command: argparse.ArgumentParser) -> None:
         type=Path,
         default=None,
         help="a Claude Code settings file of permissions, hooks, env and attribution",
+    )
+    command.add_argument(
+        "--instructions",
+        action="append",
+        help="a file appended to the system prompt, relative to the project root,"
+        " repeatable",
+    )
+    command.add_argument(
+        "--claude-code-prompt",
+        action="store_true",
+        help="run on Claude Code's own system prompt instead of an empty one",
     )
     command.add_argument(
         "--effort",
@@ -602,6 +675,14 @@ def build_parser() -> argparse.ArgumentParser:
             _add_tool_options(command)
         if name in ("create", "probe"):
             _add_driver_options(command)
+        if name == "teacher":
+            command.add_argument(
+                "action",
+                choices=["up", "status", "down"],
+                nargs="?",
+                default="status",
+                help="default %(default)s",
+            )
         if name == "questions":
             command.add_argument(
                 "--operator",
