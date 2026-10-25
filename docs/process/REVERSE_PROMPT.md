@@ -30,5 +30,8 @@ resolved.
 **Verification.** `uv sync`, 18 tests passing, ruff check and format clean, and pyright
 strict with 0 errors and 0 warnings.
 
-**Next.** Task 2, the data model and event log. Of the operator decisions in `HANDOFF.md`,
-the home of the protocol specification is needed by task 3, and the engine by task 4.
+**Operator decisions recorded.** The protocol specification is drafted here and ported
+later. The first adapter targets Claude Opus 5.5, and the loop that drives it stays open
+until task 4. The mailbox is chosen when needed.
+
+**Next.** Task 2, the data model and event log.

@@ -18,7 +18,14 @@ Dromon is written three times.
 |---|---|---|
 | Python | `sgeos/pydromon` | `~/projects/python/pydromon` |
 | Rust | `dromon-rs`, no remote yet | `~/projects/rust/dromon-rs` |
-| Keleusma and the specification | `dromon`, no remote yet | `~/projects/keleusma/dromon` |
+| Keleusma | `dromon`, no remote yet | `~/projects/keleusma/dromon` |
+
+**Decided 2026-10-25 by the operator.** The protocol specification is drafted in this
+repository, because the Python version is the rapid prototype where the protocol is
+first exercised. Material that has matured is ported to the lasting repository when the
+time comes, and this repository is then deprecated with the rest of the prototype. The
+specification is written to stand apart from the Python code, so that the port moves
+documents and not implementation details.
 
 The paths follow the operator's layout of one folder per language. All three repositories
 were created on 2026-10-25. The other two hold no files yet.

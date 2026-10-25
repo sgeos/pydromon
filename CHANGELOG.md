@@ -11,6 +11,8 @@ All notable changes are recorded here. The format follows
   the four questions, the binding's current task status, and the tagged-tuple
   constraints it reported. One-element tuples in the examples became two-element ones.
 - `CLAUDE.md` states that dates in tracked files are in Coordinated Universal Time.
+- The design records two operator decisions. The protocol specification is drafted in
+  this repository, and the first adapter targets Claude Opus 5.5.
 - Roadmap task 1 is done. The seed was checked against Appendix B and nothing conflicts.
 
 ### Added
