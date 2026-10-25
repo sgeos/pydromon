@@ -1,0 +1,43 @@
+# pydromon
+
+> The Python prototype of Dromon, a multi-agent harness that runs several AI agent
+> session lines at once inside one daemon, lets them message and wake each other, and
+> tracks the questions they raise for the human operator. Lines run on Claude Code,
+> on Codex for OpenAI models, and nominally on Grok Build.
+
+The distribution is `pydromon`, the import package is `dromon`, and the commands are
+`dromond`, the daemon, and `dromon`, the client. The specification under
+`docs/protocol/` is normative and will be carried unchanged to a Rust port and then to
+Keleusma, so prefer it to the Python source when the two seem to differ, and report the
+difference.
+
+When generating code for this project, read the agent onboarding files first, then the
+specification, then confirm details against the source.
+
+## Start Here
+
+- [AGENTS.md](https://github.com/sgeos/pydromon/blob/main/AGENTS.md): Assistant onboarding for any model.
+- [CLAUDE.md](https://github.com/sgeos/pydromon/blob/main/CLAUDE.md): Authoritative project context, conventions and per-session protocol.
+- [README](https://github.com/sgeos/pydromon/blob/main/README.md): Overview, status and setup.
+- [CONTRIBUTING](https://github.com/sgeos/pydromon/blob/main/CONTRIBUTING.md): The gate and the test markers.
+
+## Specification
+
+- [Protocol index](https://github.com/sgeos/pydromon/blob/main/docs/protocol/README.md): Every normative document.
+- [Event log](https://github.com/sgeos/pydromon/blob/main/docs/protocol/EVENT_LOG.md): The data model as events.
+- [Client](https://github.com/sgeos/pydromon/blob/main/docs/protocol/CLIENT.md): The client protocol and commands.
+- [Drivers](https://github.com/sgeos/pydromon/blob/main/docs/protocol/DRIVER.md): Per-model Keleusma drivers.
+- [Line configuration](https://github.com/sgeos/pydromon/blob/main/docs/protocol/LINE_CONFIG.md): Tools, MCP servers and policy.
+- [Project file](https://github.com/sgeos/pydromon/blob/main/docs/protocol/PROJECT_CONFIG.md): `.dromon/dromon.toml`.
+- [External agents](https://github.com/sgeos/pydromon/blob/main/docs/protocol/AGENTS.md): Reaching the daemon over MCP.
+
+## Engines
+
+- [Codex](https://github.com/sgeos/pydromon/blob/main/docs/protocol/CODEX.md): OpenAI models through `codex app-server`.
+- [Grok Build](https://github.com/sgeos/pydromon/blob/main/docs/protocol/GROK.md): Grok over the Agent Client Protocol, not yet verified live.
+- [Sandbox](https://github.com/sgeos/pydromon/blob/main/docs/protocol/SANDBOX.md) and [Settings](https://github.com/sgeos/pydromon/blob/main/docs/protocol/SETTINGS.md): Claude Code lines.
+
+## Design and Process
+
+- [Design](https://github.com/sgeos/pydromon/blob/main/docs/architecture/DESIGN.md): The planned system and its decisions.
+- [Handoff](https://github.com/sgeos/pydromon/blob/main/docs/process/HANDOFF.md): What a resuming session reads first.

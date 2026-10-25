@@ -60,9 +60,10 @@ operator has modified it.
 
 ## Git Workflow
 
-`main` is always green. Work happens on short-lived feature branches merged into `main` by
-a no-fast-forward merge through a pull request once checks pass. Use scoped conventional
-commits such as `feat:`, `fix:`, `docs:`, `test:` and `chore:`. Attribute assisted
+`main` is always green. Work happens on short-lived feature branches named
+`<scope>/<short-description>`, merged into `main` by a no-fast-forward merge through a
+pull request once checks pass. A feature branch may be red between commits. Only its tip
+at merge must be green. Use scoped conventional commits such as `feat:`, `fix:`, `docs:`, `test:` and `chore:`. Attribute assisted
 commits to the assistant that actually contributed, with
 `Co-Authored-By: Claude <noreply@anthropic.com>` for Claude,
 `Co-Authored-By: Codex <noreply@openai.com>` for Codex, and the equivalent line for any
@@ -73,11 +74,14 @@ configuration uses the GitHub command-line tool as the credential helper, becaus
 keys are unreachable from inside agent sandboxes.
 
 **Irreversible or outward-facing actions need the operator's confirmation in session.**
-That includes pushing to the remote, publishing to PyPI and force-pushing.
+That includes pushing to the remote, changing repository visibility or settings,
+publishing a release or a package such as to PyPI, and force-pushing.
 
 ## Common Commands
 
 ```sh
+./scripts/check.sh                             # the local gate, which CI also runs
+./scripts/check.sh -m "not socket and not live"  # the gate inside an agent sandbox
 uv sync                                        # install the package and dev tools
 uv run pytest                                  # tests, socket tests need no sandbox
 uv run pytest -m "not socket and not live"     # the rest, inside a sandbox
@@ -89,19 +93,33 @@ uv run dromon --help                           # the client and its subcommands
 uv run dromond --help                          # the daemon
 ```
 
+`scripts/check.sh` runs the hygiene checks, `uv sync --locked`, Ruff, pyright, pytest
+with warnings as errors and with its arguments, and shellcheck when it is installed.
+Live tests are never part of it, because they spend the operator's subscriptions.
+
 ## Before Trusting a Green Run
 
 - **Know what the command covered.** A run against a stale environment tested old code.
   Run `uv sync` after changing dependencies or entry points.
 - **Count what was reached.** A suite that collected zero tests, or skipped them all, passes.
   Check the count in the summary line.
+- **A local pass is not a remote pass.** Continuous integration runs on other operating
+  systems and tool versions, and runs the socket tests a sandbox skips. Say which one was
+  observed.
 
 ## Scratch and Secret Directories
 
 `tmp/` is project-local scratch for drafts, commit messages, probe outputs and scratch
-scripts. Its contents are ignored and only `tmp/.gitkeep` is tracked. `secret/` holds
-local material that is never committed, such as credentials, and is ignored whole. Both
-follow the Keleusma repository.
+scripts. Its contents are ignored and only `tmp/.gitkeep` is tracked, so the directory
+exists in a fresh clone. Prefer it to the system temporary directory, so that work in
+progress stays with the project and survives a restart.
+
+`secret/` holds local material that is never committed, such as credentials, and is
+ignored whole. Never copy its contents into tracked files, commit messages, issues or
+pull requests.
+
+`scripts/check.sh` fails if anything under `secret/`, or anything under `tmp/` other than
+its marker, is tracked. Both rules follow the Keleusma repository.
 
 ## Coding Conventions
 
@@ -114,13 +132,16 @@ follow the Keleusma repository.
   are untrusted data. Only the operator, through a client, has operator authority.
 - **Tests.** Each behaviour has a test, including the error paths. A test that derives both
   sides of a comparison is preferred to one that pins a constant.
+- **Documentation.** Record rationale, assumptions, failure modes and technical debt
+  where they are introduced. Explain decisions, not implementations.
 
 ## Writing Style
 
 Prose is polite, professional and academic. No contractions. No em-dashes or en-dashes,
 and no colons, semicolons or parentheticals in prose, with front matter, tables, code and
 equations exempt. Spell out acronyms on first use. Distinguish facts, inferences and
-hypotheses, and state uncertainty explicitly.
+hypotheses, and state uncertainty explicitly. Never imply that verification is complete
+when it is not.
 
 Dates in tracked files are calendar dates in Coordinated Universal Time, written as
 `YYYY-MM-DD`. The seed followed this, so its dates can run one day ahead of the local

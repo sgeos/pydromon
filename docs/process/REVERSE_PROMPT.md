@@ -4,40 +4,38 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-25, nominal Grok support
+## 2026-10-25, sync with sgeos/project-template
 
-**Done, not verified live.** On the operator's direction to add nominal Grok support,
-with Grok usage exhausted so that it cannot be tested yet, as `docs/protocol/GROK.md`
-specifies.
+**Done.** On the admin session's request, relayed and approved by the operator, and with
+the operator's additions of README badges and a review of the Keleusma and angelssword
+repositories.
 
-- Drivers for Grok 4.7 on a new `grok-build` engine, in the three strategies, with the
-  context and efforts from Grok's model cache.
-- `dromon.grok` drives `grok agent --no-leader stdio` over the Agent Client Protocol.
-  Its design rests on Grok Build 1.0.70's bundled guide and on one `initialize`
-  handshake, which runs no model. No session was created and no prompt was sent.
-- **Fact.** Grok's custom sandbox profiles live only in `sandbox.toml` files, which the
-  injectable overlay cannot set. Dromon therefore requires the operator to define
-  `dromon-reader` and `dromon-writer`, checks before each turn that they deny Dromon's
-  directories and that a writer keeps `.git` read-only, and selects one with
-  `GROK_SANDBOX`. A missing or unsafe profile refuses the turn with the table to add.
-- **Fact.** The operator's Grok configuration sets always-approve and declares mail and
-  document MCP servers. Dromon asks for Grok's ask mode, refuses a session that does
-  not report one, answers every permission request, and cancels a turn that uses a tool
-  the line was not given.
-- Dromon's tools reach a Grok line through `dromon mcp --line`, on a new `lines.sock`,
-  with a per-line token the daemon holds in memory.
+- **Adopted as is.** `.gitattributes` and `.github/rulesets/main.json`. Every tracked
+  file was already LF, so nothing was renormalised.
+- **Adapted.** `SECURITY.md`, with pydromon's sockets, sandboxes, credential policy and
+  isolation as its scope. `CONTRIBUTING.md`, with `uv`, the gate and the `socket` and
+  `live` markers. The pull request template.
+- **`scripts/check.sh`.** The template's hygiene checks, then `uv sync --locked`, Ruff,
+  pyright, pytest with warnings as errors and its arguments, and shellcheck when
+  installed. CI runs it with `UV_PYTHON` set, after a Linux shellcheck step that
+  requires the tool.
+- **CI.** The concurrency group is the ref for a pull request and the run identifier
+  otherwise, and the matrix runs at most two jobs at once.
+- **From Keleusma and angelssword.** Issue templates for bugs and features, `llms.txt`,
+  README badges, and repository topics.
+- **Settings, applied on the operator's approval and read back.** Merge commits only,
+  branches deleted on merge, no wiki or projects, secret scanning and push protection,
+  vulnerability alerts, the `main` ruleset, and topics.
 
-**Decisions made by this line, open to the operator's review.**
+**Declined, with reasons recorded in the proposal.** `paths-ignore`, because the merge
+procedure waits on checks. `CITATION.cff`, for a prototype to be retired. A dependency
+advisory job, pending a supply-chain decision on fetching a scanner at CI time.
 
-- Dromon does not write either `sandbox.toml`. The operator adds the profiles.
-- The API strategy is refused, because Grok prefers a cached sign-in over a key and
-  Dromon cannot yet confirm which it used.
-- Every unconfirmed behaviour refuses the turn. The first live run may therefore fail
-  closed on a field shape and need an adjustment, and `GROK.md` lists what to check.
+**Reported for the template, not edited.** Opt-in sandbox and credential test markers,
+issue templates and `llms.txt`, a shellcheck step that fails when the tool is absent, a
+pinned language-setup example with `timeout-minutes`, topics in its settings step, and an
+optional disclosure screen against a term list under `secret/`.
 
-**Not done.** No live verification of any Grok turn. On macOS Grok cannot block a
-command's network access.
-
-**Verification.** 931 tests passing outside the sandbox with warnings treated as errors,
-including 33 for the Grok adapter against a scripted server. Ruff and pyright strict
-clean. The live tests were not rerun, since nothing they cover changed.
+**Verification.** `./scripts/check.sh -m "not socket and not live"` passed inside the
+sandbox, and the full gate outside it. CI on the pull request runs the new workflow for
+the first time.

@@ -5,7 +5,7 @@ Guidance for AI coding assistants other than Claude Code, such as Codex or Grok 
 ## Authoritative source
 
 The project context, conventions and per-session protocol live in
-[`CLAUDE.md`](./CLAUDE.md). Despite the name, its content is agent-agnostic. Read it before
+[`CLAUDE.md`](./CLAUDE.md). Despite the name, its content is agent agnostic. Read it before
 making any non-trivial change.
 
 ## Reading order
@@ -25,6 +25,9 @@ making any non-trivial change.
   "Appendix B".
 - **Do not edit Keleusma or pykeleusma.** They are separate repositories.
 - **Commit once per prompt,** and attribute the assistant that actually contributed.
-- **Ask before outward-facing actions,** such as pushing, changing visibility or publishing.
+- **Ask before outward-facing actions,** such as pushing, changing visibility or
+  settings, or publishing.
 - **Scratch directories.** Use `tmp/` for transient files. Its contents are ignored. Never
-  commit anything under `secret/`.
+  commit anything under `secret/`, and never copy its contents into tracked files.
+- **Run `./scripts/check.sh` before committing,** or its sandbox form
+  `./scripts/check.sh -m "not socket and not live"` inside an agent sandbox.
