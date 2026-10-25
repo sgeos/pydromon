@@ -6,6 +6,7 @@ other subcommands are placeholders that report they are not implemented and exit
 """
 
 import argparse
+import asyncio
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -14,7 +15,12 @@ from typing import Final
 from dromon import __version__, exits
 from dromon.client import DaemonFailed, DaemonNotRunning, call, is_running, start, stop
 from dromon.paths import PathError, ProjectPaths, project_paths
+from dromon.driver import Driver, DriverError
+from dromon.engine import ClaudeCodeLine, EngineRefused
 from dromon.protocol import Operation, ProtocolError
+
+PROBE_MODEL: Final = "claude-opus-5-5"
+PROBE_PROMPT: Final = "Reply with the single word: ready"
 
 SUBCOMMANDS: Final[dict[str, str]] = {
     "start": "start the daemon for this project",
@@ -24,6 +30,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "send": "send a message to a session line",
     "questions": "list open operator questions",
     "answer": "answer an operator question",
+    "probe": "run one short turn on the engine and report its capabilities",
 }
 """Planned subcommands and their one-line help, in display order."""
 
@@ -84,10 +91,45 @@ def _stop(paths: ProjectPaths) -> int:
     return exits.OK
 
 
+def _probe(paths: ProjectPaths) -> int:
+    """Run one turn with no tools on the subscription and report what the engine says.
+
+    It uses a small amount of the operator's plan, and never a per-token credential.
+    """
+    try:
+        driver = Driver.for_model(PROBE_MODEL)
+        line = ClaudeCodeLine(driver, paths.root)
+        report = asyncio.run(line.run_turn(PROBE_PROMPT))
+    except (DriverError, EngineRefused) as error:
+        print(f"dromon probe: {error}", file=sys.stderr)
+        return exits.FAILURE
+    settings = driver.settings
+    print(f"driver {PROBE_MODEL}, wcet {driver.wcet_per_iteration} per decision")
+    print(
+        f"settings effort {settings.effort}, max turns {settings.max_turns},"
+        f" tool budget {settings.tool_budget},"
+        f" context window {settings.context_window}"
+    )
+    found = report.capabilities
+    if found is not None:
+        print(
+            f"engine Claude Code {found.claude_code_version},"
+            f" Agent SDK {found.sdk_version}, model {found.model}"
+        )
+        print(
+            f"credential {found.api_key_source} (subscription),"
+            f" tools {len(found.tools)}, permission mode {found.permission_mode}"
+        )
+        print("capabilities " + ", ".join(found.capabilities))
+    print(f"turn {report.subtype} in {report.num_turns}, reply {report.text!r}")
+    return exits.OK if report.subtype == "success" else exits.FAILURE
+
+
 IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths], int]]] = {
     "start": _start,
     "status": _status,
     "stop": _stop,
+    "probe": _probe,
 }
 
 

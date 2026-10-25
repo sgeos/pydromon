@@ -9,23 +9,24 @@ completed, moved or abandoned.
 
 ## State on 2026-10-25
 
-- **Tasks 1, 2 and 3 done.**
-  - `src/dromon/model.py`, `codec.py` and `eventlog.py` hold the data model as nine
-    event kinds in an append-only SQLite log. Operators are parties addressed as
-    `@name`, any number of them, and a question is a message to one operator.
-  - `src/dromon/relay.py` forwards operator messages through relays. Replies will arrive
-    through inbound adapters plugged into a registry in the daemon, by the operator's
-    decision, with the design deferred.
-  - `src/dromon/daemon.py`, `client.py`, `protocol.py`, `paths.py` and `exits.py` make
-    up the daemon skeleton. `dromon start`, `status` and `stop` manage a per-project
-    `dromond` on a Unix domain socket in a 0700 runtime directory, one instance per
-    project through a lock.
-  - `docs/protocol/` holds `EVENT_LOG.md`, `RELAY.md` and `CLIENT.md`, all drafts.
+- **Tasks 1 to 4 done.**
+  - `model.py`, `codec.py` and `eventlog.py` hold the data model as nine event kinds in
+    an append-only SQLite log. Operators are parties addressed as `@name`.
+  - `relay.py` forwards operator messages. Replies will come through inbound adapters
+    in a daemon registry, with the design deferred.
+  - `daemon.py`, `client.py`, `protocol.py`, `paths.py` and `exits.py` are the daemon
+    skeleton behind `dromon start`, `status` and `stop`.
+  - `engine.py` runs turns on Claude Code through the Agent SDK, on the subscription
+    only. `driver.py` hosts Keleusma drivers through `pykeleusma`, and
+    `drivers/claude_opus_5_5.kel` is the first. `dromon probe` reports capabilities.
+  - `docs/protocol/` holds `EVENT_LOG.md`, `CLIENT.md`, `RELAY.md` and `DRIVER.md`.
+- **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310, and
+  `pykeleusma` from its repository at `19d4558`, which needs a Rust toolchain to build.
 - **Published.** The public GitHub repository `sgeos/pydromon`, licensed 0BSD, on an
   HTTPS remote that uses the GitHub command-line tool as its credential helper. No
   continuous integration is configured.
 - **Commands.** `attach`, `send`, `questions` and `answer` are placeholders that exit with
-  status 3.
+  status 3. Lines are not yet run by the daemon or recorded in the event log.
 - **pykeleusma.** Its tasks 2, 3 and 10 are done. Python cannot yet drive a script,
   because `call` and `resume` are its open task 5. Dromon's 0.1.0 does not depend on it.
 - **Sibling repositories.** `~/projects/keleusma/dromon` and `~/projects/rust/dromon-rs`
@@ -33,18 +34,19 @@ completed, moved or abandoned.
 
 ## Next step
 
-Task 4 of [`../roadmap/V0_1_0.md`](../roadmap/V0_1_0.md), the first engine adapter. It
-needs the operator's choice of loop first, and the design proposes a throwaway probe of
-the Agent SDK before the adapter is fixed. The operator chose to drive the Agent SDK from
-outside, with `ask_operator` sending a message to an operator and returning at once.
+Task 5 of [`../roadmap/V0_1_0.md`](../roadmap/V0_1_0.md), layer 1 messaging and wakes.
+The daemon creates lines in the event log, runs their turns through `ClaudeCodeLine`,
+stores each line's engine session and driver state, and wakes an idle line when a
+message arrives. Driver events for messages and answers are added to `DRIVER.md`.
 
 ## Open
 
-- **With the operator, by task 4.** The operator prefers Dromon's own loop if it can run
-  on a subscription. Anthropic's terms, read on 2026-10-25 and quoted in the design, allow
-  subscription sign-in only for the unmodified Claude Code binary, so the own loop needs
-  an API key. The choice is the Claude Code binary on the subscription first, the own
-  loop on an API key first, or both.
+- **pykeleusma data segments.** Notice `pydromon-20261025-data-segment-gap` reports that
+  private data reads as unit and shared data cannot be driven. Drivers carry state
+  through the host meanwhile. No reply yet.
+- **Subscription usage.** Anthropic's terms say Pro and Max limits assume ordinary,
+  individual use of Claude Code and the Agent SDK. Many lines running continuously may
+  exceed that, which the conversation limits of task 7 should account for.
 - **Worst-case time unit.** Keleusma's README states pipelined cycles, and the
   `pykeleusma` line reports unitless nominal cost units for `wcet_per_iteration`.
   Recorded in the integration document and not needed before the batched loop.
@@ -68,19 +70,20 @@ outside, with `ask_operator` sending a message to an operator and returning at o
 ## Environment
 
 On 2026-10-25, inside Claude Code's sandbox, `uv sync`, the gates, `git fetch`, `git
-push` and `gh` ran without escalation. The sandbox denies binding a Unix domain socket
-with "Operation not permitted", so the 10 tests marked `socket` and any manual daemon run
-need a command outside the sandbox, and `uv run pytest -m "not socket"` runs the rest
-inside it. The sandbox also denies writes to `.git/config`, so `git push -u` cannot
-record an upstream. Inside Grok Build's sandbox the GitHub command-line tool could not
-read its keychain token on 2026-10-24.
+push` and `gh` ran without escalation. The sandbox denies binding a Unix domain socket,
+so the 10 tests marked `socket` and any manual daemon run need a command outside the
+sandbox. The rest run inside it with `-m "not socket and not live"`. Claude Code keeps
+its login in the macOS Keychain, so `dromon probe` and the live test also run outside
+the sandbox. The sandbox denies writes to `.git/config`, so `git push -u` cannot record
+an upstream. Inside Grok Build's sandbox the GitHub command-line tool could not read
+its keychain token on 2026-10-24.
 
 ## Validity
 
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 245 tests pass, 10 of them need sockets
+uv sync && uv run pytest    # 282 tests pass, 10 of them need sockets
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 

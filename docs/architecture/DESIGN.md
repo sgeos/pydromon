@@ -60,7 +60,7 @@ checked.
 |---|---|---|
 | Grok Build | Agent Client Protocol | Its local user guide describes it as native to that protocol |
 | Cursor Agent | Agent Client Protocol through `agent acp` | Reported in July 2026 research by the operator's sessions. Not rechecked |
-| Claude Code | Claude Agent SDK | Vendor SDK. Not tested from Python here |
+| Claude Code | Claude Agent SDK | Implemented 2026-10-25 with Agent SDK 0.2.174 and Claude Code 2.1.310, on the subscription |
 | Codex | Codex SDK or its app-server | Vendor interfaces. Not tested here |
 | Dromon's own loop | Direct model calls | Needed where full control of each step is required |
 
@@ -82,8 +82,19 @@ line only through the unmodified Claude Code binary, through its headless mode o
 Agent SDK, with Dromon never reading or storing the sign-in token. Whether the Agent SDK
 itself may run on a personal subscription is not stated plainly. The same page says Pro
 and Max limits "assume ordinary, individual usage of Claude Code and the Agent SDK",
-while the Agent SDK overview points developers to API keys. **Open with the operator.**
-Which adapter comes first given this, as recorded in the handoff.
+while the Agent SDK overview points developers to API keys.
+
+**Decided 2026-10-25 by the operator.** The operator's only credential is the
+subscription, so lines run on Claude Code through the Agent SDK, driven from outside by
+Dromon. The per-model drivers are written in Keleusma and run through `pykeleusma`.
+
+**Implemented 2026-10-25, roadmap task 4.** `dromon.engine` runs each turn through
+`ClaudeSDKClient` with no user or project settings and no tools unless configured. It
+refuses an environment that selects an API key, an API profile or a cloud provider, and
+refuses a turn whose engine reports any `apiKeySource` other than `"none"`. Each engine
+message becomes an event for the line's driver, whose actions the adapter performs.
+`dromon probe` runs one short turn and reports the engine's capabilities. The driver
+interface is [`../protocol/DRIVER.md`](../protocol/DRIVER.md).
 
 Each adapter should probe the engine's capabilities at startup, because support varies by
 engine version.
@@ -239,9 +250,8 @@ before any trace capture, and record the source model and licence of every trace
 
 1. The home of the protocol specification. Decided 2026-10-25, drafted here and ported
    later.
-2. The engine for the first adapter. The model Claude Opus 5.5 was decided on
-   2026-10-25. The loop that drives it is open, because a subscription can drive only
-   the Claude Code binary and Dromon's own loop needs an API key.
+2. The engine for the first adapter. Decided 2026-10-25, Claude Opus 5.5 on Claude Code
+   through the Agent SDK, on the subscription, with a Keleusma driver.
 3. The contents of `.dromon/dromon.toml`.
 4. Mid-turn injection, which depends on each engine.
 5. Teacher-model scope and licensing.

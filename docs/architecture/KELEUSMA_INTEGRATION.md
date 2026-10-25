@@ -125,6 +125,20 @@ the Keleusma processor will have, so the switch replaces the class body and noth
 around it. Policy functions start as plain Python functions with the same argument and
 result shapes as listed above.
 
+## First use, 2026-10-25
+
+Dromon's first driver, for Claude Opus 5.5, runs through `pykeleusma` pinned at
+`19d4558`, the merge of its tasks 1 to 6. Its tasks 7 to 9 are not needed.
+
+**Fact, executed on 2026-10-25.** A `private data` field reads as unit rather than zero,
+and a shared `data` block cannot be driven, because the binding exposes no
+`call_with_shared`. Drivers therefore carry their state through the host, as recorded in
+[`../protocol/DRIVER.md`](../protocol/DRIVER.md). The finding was sent to the
+`pykeleusma` line as `pydromon-20261025-data-segment-gap`.
+
+**Fact.** One decision of the Opus 5.5 driver has a worst-case time of 84 nominal cost
+units in an arena of 5,960 bytes.
+
 ## Questions for the pykeleusma line, with its answers
 
 The answers are the `pykeleusma` line's report of 2026-10-25, from reading the

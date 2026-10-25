@@ -4,39 +4,42 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-25, task 3, the daemon skeleton
+## 2026-10-25, task 4, the first engine adapter
 
-**Done.** Tasks 1 and 2 were already complete. Task 3 is complete.
+**Done.** On the operator's decisions, lines run on the subscription through Claude Code
+and the Agent SDK, and drivers are written in Keleusma.
 
-- `dromond` serves one project on a Unix domain socket in a runtime directory that must
-  be owned by the user with mode 0700. It holds the event log as its single writer and
-  admits one instance through an exclusive lock.
-- `dromon start` spawns a detached daemon in its own session and waits for it to answer.
-  `dromon status` reports the daemon and event log counts, and `dromon stop` stops it and
-  waits for the socket to go. Exit statuses are distinct and listed in `CLIENT.md`.
-- The protocol is versioned, line-delimited canonical JSON with a 64 KiB line limit,
-  strict decoding, a per-connection idle timeout and error codes, specified in
-  `docs/protocol/CLIENT.md`.
-- The operator's decision that replies arrive through inbound adapters plugged into a
-  daemon registry and configured per channel is recorded in `RELAY.md`, with the design
-  deferred.
-- Pull request #6, the response path requirement, was merged first.
+- `dromon.engine.ClaudeCodeLine` runs one turn per call through `ClaudeSDKClient`, with
+  no user or project settings, no tools unless configured, and the engine session
+  resumed on the next turn. It refuses an environment selecting an API key, API profile
+  or cloud provider before starting, and interrupts and refuses a turn whose engine
+  reports any `apiKeySource` other than `"none"`.
+- `src/dromon/drivers/claude_opus_5_5.kel` is the Opus 5.5 driver. It declares its
+  settings, accepts only its model, counts tool uses and interrupts past a budget of
+  40, and has a verified worst case of 84 nominal cost units per decision.
+- `dromon probe` ran live on the subscription and reported Claude Code 2.1.310, Agent
+  SDK 0.2.174, model `claude-opus-5-5`, credential `none`, and a successful turn.
+- `docs/protocol/DRIVER.md` specifies driver interface 1.
+
+**Finding.** `pykeleusma` at `19d4558` cannot use Keleusma data segments. Drivers carry
+their state through the host instead, which also lets the event log record it. The
+`pykeleusma` line has the report as `pydromon-20261025-data-segment-gap`.
 
 **Decisions made by this line, open to the operator's review.**
 
-- `dromon start` succeeds without action when a daemon already answers, while `status`
-  and `stop` exit with status 4 when none does.
-- The runtime directory defaults to `.dromon/run` in the project and moves with
-  `DROMON_RUNTIME_DIR`, because socket paths are limited to 103 bytes.
-- Access control rests on the directory's mode. A peer credential check is deferred.
+- Each turn starts a fresh Claude Code process and resumes the engine session by its
+  identifier, so a line survives a daemon restart.
+- The probe uses no tools, so it cannot change any file.
+- The Agent SDK is pinned exactly, because it bundles the engine itself.
+- The live test needs both `-m live` and `DROMON_LIVE_TESTS=1`, because a later `-m`
+  replaces the configured deselection.
 
-**Verification.** `uv sync`, 245 tests passing with warnings treated as errors outside
-the sandbox, including 10 socket tests that start real daemons, and 235 passing inside
-it with `-m "not socket"`. Ruff check and format clean, and pyright strict with 0 errors
-and 0 warnings. A manual run of start, a second start, status, stop and status behaved as
-specified, and no daemon process was left after the suite.
+**Verification.** `uv sync`, 282 tests passing with warnings treated as errors outside
+the sandbox, 272 passing inside it with `-m "not socket and not live"`, and the live
+test passing once with `DROMON_LIVE_TESTS=1`. Ruff and pyright strict clean. The wheel
+contains the driver source.
 
-**Not verified.** Only macOS with Python 3.12.12 was tested. Linux behaviour of the lock,
-`posix_spawn` with `setsid` and the socket limit is inferred from documentation.
+**Not verified.** Mid-turn message injection, a turn with tools, and the interrupt path
+against the real engine. The interrupt path is tested only against a scripted session.
 
-**Next.** Task 4, which needs the operator's choice of loop for Claude Opus 5.5.
+**Next.** Task 5, layer 1 messaging and wakes.

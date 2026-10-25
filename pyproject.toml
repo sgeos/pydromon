@@ -1,5 +1,5 @@
 [build-system]
-requires = ["uv_build>=0.9.5,<0.10"]
+requires = ["uv_build>=0.13.5,<0.14"]
 build-backend = "uv_build"
 
 [project]
@@ -14,7 +14,13 @@ license = "0BSD"
 license-files = ["LICENSE"]
 authors = [{ name = "Brendan Sechter", email = "sgeos@hotmail.com" }]
 requires-python = ">=3.12"
-dependencies = []
+# Both are pinned exactly. The Agent SDK bundles the Claude Code binary, so its version
+# fixes the engine's behaviour. pykeleusma is not on PyPI and builds from its
+# repository at a reviewed commit, which needs a Rust toolchain.
+dependencies = [
+    "claude-agent-sdk==0.2.174",
+    "pykeleusma",
+]
 classifiers = [
     "Development Status :: 1 - Planning",
     "Programming Language :: Python :: 3",
@@ -33,11 +39,20 @@ dev = ["pytest==9.1.1", "ruff==0.17.2", "pyright==1.1.414"]
 [tool.uv.build-backend]
 module-name = "dromon"
 
+[tool.uv.sources]
+pykeleusma = { git = "https://github.com/sgeos/pykeleusma", rev = "19d4558ad6d4afa66e496c1fdef75cca98a249e3" }
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Socket tests bind Unix domain sockets, which Claude Code's sandbox denies. They run by
 # default. Deselect them with -m "not socket" only to run the rest inside a sandbox.
-markers = ["socket: binds a Unix domain socket"]
+# Live tests use the operator's Claude subscription. They run only when selected with
+# -m live and enabled with DROMON_LIVE_TESTS=1, since a later -m replaces addopts.
+markers = [
+    "socket: binds a Unix domain socket",
+    "live: calls the real engine on the operator's subscription",
+]
+addopts = "-m 'not live'"
 
 [tool.ruff]
 line-length = 88
