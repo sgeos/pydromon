@@ -24,7 +24,7 @@ closed, because the rest of the line cannot be skipped safely.
 | Path | Default | Purpose |
 |---|---|---|
 | State directory | `<project>/.dromon` | Holds `events.sqlite`, the event log |
-| Runtime directory | `<project>/.dromon/run`, or `DROMON_RUNTIME_DIR` | Holds `dromond.sock`, `dromond.lock` and `dromond.log` |
+| Runtime directory | `<project>/.dromon/run`, or `DROMON_RUNTIME_DIR` | Holds `dromond.sock`, `dromond.lock`, `dromond.log`, and `agents.sock` when the project lets external agents in, as [`AGENTS.md`](AGENTS.md) specifies |
 
 A socket path is at most 103 bytes, the smaller of the macOS and Linux limits. A
 project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
@@ -56,6 +56,9 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `read` | Arguments `operator` and `message_id`. Returns the message with its `body` and `choices`, and marks it read the first time |
 | `line_view` | Arguments `line_id`, and optionally `limit`, at most 50. Returns `line`, the line's status entry, `tick`, `total`, the count of messages involving the line, `messages`, the newest of them oldest first, each with a body preview of at most 600 characters and `truncated`, kept within a 40,000 byte budget, and `open_questions`, the line's open questions. What an attached client polls |
 | `release` | Argument `line_id`. Releases a line held at a conversation limit and resets its counts |
+| `agent_add` | Arguments `agent` and `access`. Registers an external agent, or replaces its access and token. Returns `agent`, `access`, `effective_access` under the policy's ceiling, `token`, shown only here, and `listening` |
+| `agent_revoke` | Argument `agent`. Revokes it |
+| `agent_list` | No arguments. Returns `policy`, with `listen`, `anonymous` and `max_access`, and `agents`, each with `agent`, `access`, `token` and `revoked` |
 | `answer` | Arguments `question_id`, `body` and `operator`. Records the operator's reply, which must come from the operator the question was asked of. Result `{"message_id": ...}`. The answer wakes the asking line in a later tick |
 | `send` | Arguments `recipient`, a line or `@operator`, `body`, `operator`, and optionally `reply_to`. Registers the operator if new and records a note from them. Result `{"message_id": ...}` |
 
@@ -115,6 +118,8 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromon release LINE` | Sends `release` | 0, 4, or 1 |
 | `dromon answer QUESTION BODY` | Sends `answer`, with `--operator`, default the login name | 0, 4, or 1 |
 | `dromon probe` | Runs one short turn without the daemon on the engine of `--model`, and reports the driver, the engine, the credential and the capabilities the engine reports | 0 or 1 |
+| `dromon agent add NAME --access LEVEL`, `dromon agent list`, `dromon agent revoke NAME` | Sends `agent_add`, `agent_list` or `agent_revoke`. `add` prints the token once with an MCP configuration for the agent | 0, 2, 4, or 1 |
+| `dromon mcp --agent NAME` | Serves one external agent over MCP on standard input and output, reading its token from `DROMON_AGENT_TOKEN`, as [`AGENTS.md`](AGENTS.md) specifies | 0, or 1 on an oversized message |
 | `dromon teacher [up\|status\|down]` | Brings the project's teacher up, reports it, or releases it, without the daemon, as [`TEACHER.md`](TEACHER.md) specifies. The default is `status` | 0, or 1 on failure or when the project declares no teacher |
 | `dromon config` | Validates `.dromon/dromon.toml` without a daemon, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, and prints its limits, wake policy and lines | 0, or 1 on an invalid file |
 | `dromond` | Runs the daemon in the foreground, after applying `.dromon/dromon.toml`. Each flag overrides the file. `--max-autonomous-turns N`, default 12, `--max-cost-usd X`, default 2, and `--cooldown-seconds S`, default 0, set the conversation limits, `--operator NAME`, default `operator`, names who hears about a held line no operator has messaged, `--hold-wakes` records messages without waking any line, and `--tick-seconds S` sets the time between ticks while work is in flight, default 1, at most 60 | 0, 1 on failure, 2 on a bad cap or cadence, or 5 when another daemon holds the lock |
@@ -142,7 +147,9 @@ current user with mode 0700. The daemon refuses to start otherwise and never cha
 existing directory's mode. The socket and the event log are created with mode 0600. Any
 process running as the same user can connect, so the protocol treats every request as
 untrusted input and checks it strictly. A peer credential check on each connection is
-not yet implemented, because its interface differs between macOS and Linux.
+not yet implemented, because its interface differs between macOS and Linux. External
+agents never use this socket. They reach the separate agent socket, whose requests are
+authorized by agent and access level.
 
 ## Not yet specified
 

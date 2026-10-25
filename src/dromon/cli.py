@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import getpass
 import json
+import os
 import re
 import sys
 from collections.abc import Callable, Sequence
@@ -20,7 +21,9 @@ from dromon.client import DaemonFailed, DaemonNotRunning, call, is_running, star
 from dromon.paths import PathError, ProjectPaths, project_paths
 from dromon.driver import MODELS, Driver, DriverError, Strategy
 from dromon.engine import EngineRefused
+from dromon.agents import TOKEN_ENV
 from dromon.lineconfig import EFFORTS
+from dromon.model import AgentAccess
 from dromon.protocol import Operation, ProtocolError
 from dromon.scheduler import LineSpec, engine_factory
 from dromon import settings as engine_settings
@@ -49,6 +52,8 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "config": "check the project file and show what it declares",
     "probe": "run one short turn on the engine and report its capabilities",
     "teacher": "bring the project's local teacher model up, report it, or release it",
+    "agent": "register, list or revoke the external agents that may connect",
+    "mcp": "serve an external agent over MCP on standard input and output",
 }
 """Planned subcommands and their one-line help, in display order."""
 
@@ -447,6 +452,79 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
+def _agent(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Register, list or revoke external agents, through the daemon."""
+    action: str = arguments.action
+    name: str | None = arguments.name
+    if action != "list" and name is None:
+        print(f"dromon agent {action}: name the agent", file=sys.stderr)
+        return exits.USAGE
+    if action == "list":
+        operation, args = Operation.AGENT_LIST, {}
+    elif action == "add":
+        operation = Operation.AGENT_ADD
+        args = {"agent": name, "access": arguments.access}
+    else:
+        operation, args = Operation.AGENT_REVOKE, {"agent": name}
+    try:
+        response = call(paths.socket, operation, args=cast(dict[str, object], args))
+    except DaemonNotRunning:
+        print(f"dromon agent: no daemon is running for {paths.root}", file=sys.stderr)
+        return exits.NOT_RUNNING
+    except (ProtocolError, TimeoutError, OSError) as error:
+        print(f"dromon agent: {error}", file=sys.stderr)
+        return exits.FAILURE
+    if not response.ok or response.result is None:
+        print(f"dromon agent: {response.error_message}", file=sys.stderr)
+        return exits.FAILURE
+    result = response.result
+    if action == "list":
+        policy = cast(dict[str, object], result["policy"])
+        listening = "listening" if policy["listen"] else "not listening"
+        print(
+            f"agents {listening}, anonymous {policy['anonymous']},"
+            f" at most {policy['max_access']}"
+        )
+        for entry in cast(list[dict[str, object]], result["agents"]):
+            how = "token" if entry["token"] else "anonymous"
+            revoked = ", revoked" if entry["revoked"] else ""
+            print(f"{entry['agent']} {entry['access']}, {how}{revoked}")
+        return exits.OK
+    if action == "revoke":
+        print(f"revoked {result['agent']}")
+        return exits.OK
+    print(
+        f"registered {result['agent']} with {result['access']} access,"
+        f" effective {result['effective_access']}"
+    )
+    if not result["listening"]:
+        print("the project file does not set [agents] listen, so it cannot connect yet")
+    print(f"token {result['token']}")
+    print("The token is shown once. An MCP configuration for the agent:")
+    server = {
+        "command": _dromon_command(),
+        "args": ["--project", str(paths.root), "mcp", "--agent", name],
+        "env": {TOKEN_ENV: result["token"]},
+    }
+    print(json.dumps({"mcpServers": {"dromon": server}}, indent=2))
+    return exits.OK
+
+
+def _dromon_command() -> str:
+    """The path of this ``dromon``, so an MCP configuration starts the same one."""
+    launched = Path(sys.argv[0])
+    return str(launched.resolve()) if launched.is_file() else "dromon"
+
+
+def _mcp(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Serve one external agent over MCP on standard input and output."""
+    from dromon.mcp import Bridge, serve
+
+    agent: str = arguments.agent
+    token = os.environ.get(TOKEN_ENV) or None
+    return serve(Bridge(paths.agent_socket, agent, token), sys.stdin, sys.stdout)
+
+
 def _teacher(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     """Bring the project's teacher up, report it, or release it, without a daemon."""
     from dromon.projectconfig import ConfigFileError, config_path, load
@@ -562,6 +640,8 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "attach": _attach,
     "config": _config,
     "teacher": _teacher,
+    "agent": _agent,
+    "mcp": _mcp,
 }
 
 
@@ -675,6 +755,23 @@ def build_parser() -> argparse.ArgumentParser:
             _add_tool_options(command)
         if name in ("create", "probe"):
             _add_driver_options(command)
+        if name == "agent":
+            command.add_argument("action", choices=["add", "list", "revoke"])
+            command.add_argument(
+                "name", nargs="?", help="the agent, for add and revoke"
+            )
+            command.add_argument(
+                "--access",
+                choices=[level.value for level in AgentAccess],
+                default=AgentAccess.MESSAGE.value,
+                help="what the agent may do, for add, default %(default)s",
+            )
+        if name == "mcp":
+            command.add_argument(
+                "--agent",
+                required=True,
+                help="the agent's name. Its token is read from DROMON_AGENT_TOKEN",
+            )
         if name == "teacher":
             command.add_argument(
                 "action",

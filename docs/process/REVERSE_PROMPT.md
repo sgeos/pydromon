@@ -4,42 +4,38 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-25, dogfooding in epagoge with its local teacher
+## 2026-10-25, external agents over MCP
 
-**Done.** On the operator's direction to review the epagoge project and bring Dromon to
-the point where it can nominally be dogfooded there, with the ability to spin up the
-local teacher model.
+**Done.** On the operator's direction to let agents outside the daemon, such as another
+Claude Code session, communicate with the daemon and its lines through MCP, configurable
+from off to full trust with graded permissions between, as `docs/protocol/AGENTS.md`
+specifies.
 
-- **Review, facts.** Epagoge's generators all call a local teacher,
-  `qwen3:30b-a3b-instruct-2507-q4_K_M`, served by Ollama on `127.0.0.1:11434`, at a
-  declared context of 4096. Its `CLAUDE.md` carries obligations every agent must
-  follow, including a disclosure discipline whose scan reads untracked files. Ollama
-  0.40.10 was already serving through the desktop application, with the model pulled.
-- **Gap, fact.** A Dromon Claude Code line ran with an empty system prompt and read no
-  `CLAUDE.md`, so it could not follow a project's rules. Lines now take
-  `claude_code_prompt` and `instructions`.
-- `dromon teacher up`, `status` and `down` bring the teacher up and release it, as
-  `docs/protocol/TEACHER.md` specifies. Dromon never pulls a model and stops only a
-  server it started.
-- Epagoge has a local `.dromon/dromon.toml` with a `worker` on Opus 5.5, a `reviewer`
-  on Haiku 5.5 and a `luna` line on GPT-6-Luna, and `.dromon/` was added to its
-  `.git/info/exclude`. No tracked file of epagoge changed, and its tree stayed clean.
-- **Verified live in epagoge.** With the teacher loaded and `dromond` running, the
-  `reviewer` line queried the teacher from its sandboxed shell and answered from
-  `CLAUDE.md`, the `luna` line answered from its instructions, and both replied to the
-  operator by mail. The daemon was then stopped and the teacher released.
+- An external agent is the party `&name`, with its own mailbox. Its messages are
+  untrusted data, and a line's wake prompt now says that a sender beginning with `&`
+  has no operator authority.
+- The levels are `none`, `observe`, `message`, `manage` and `operator`, each including
+  the ones before it. The `[agents]` table sets `listen`, off by default, `anonymous`
+  and `max_access`.
+- `dromon agent add`, `list` and `revoke` register agents through the operator socket.
+  A token is printed once and stored only as its SHA-256 digest.
+- `dromon mcp --agent NAME` is a stdio MCP server that forwards to a separate agent
+  socket, which exists only when `listen` is set and serves only agent operations.
+- **Fact, observed live on 2026-10-25.** A Claude Code session given `dromon mcp` sent a
+  line a request to reply. The line read it and acknowledged it without replying. When
+  the operator directed it, the line replied to the agent.
 
 **Decisions made by this line, open to the operator's review.**
 
-- The teacher is not autostarted in epagoge's file, because loading it takes about
-  19 GB on a 32 GB host. Free memory fell to 14 percent while it was loaded.
-- Epagoge lines may not commit or push, as an `ask` rule that denies, since that
-  project leaves both to the operator.
-- The Claude lines read the operator's global `~/.claude/CLAUDE.md` as well as the
-  project's, as Claude Code itself would.
+- An `operator` answer is recorded as the reply of the operator the question was asked
+  of, with the agent named only in the daemon's output, not in the event log.
+- An anonymous agent allowed to message is recorded as a party the first time, under
+  the name it gives, which a later registration with a token can claim.
+- The MCP server is written by hand rather than with an MCP library, so the Rust port
+  can reproduce it, and it speaks three MCP protocol versions.
 
-**Not done.** No generator was run, and the epagoge gate was not run by a line. Whether
-loopback needs `allowLocalBinding` is untested. A Codex line cannot reach the teacher.
+**Not done.** Pushed notifications to agents, agents from other machines, and a
+per-agent list of lines it may message. The peer credential check is still missing.
 
-**Verification.** 819 tests passing outside the sandbox with warnings treated as errors,
-and all 8 live tests passing. Ruff and pyright strict clean.
+**Verification.** 865 tests passing outside the sandbox with warnings treated as errors,
+and all 9 live tests passing. Ruff and pyright strict clean.

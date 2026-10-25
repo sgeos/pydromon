@@ -9,6 +9,10 @@ import pytest
 
 from dromon.lineconfig import LineConfig, encode_config
 from dromon.model import (
+    AgentAccess,
+    AgentAddress,
+    AgentRegistered,
+    AgentRevoked,
     Event,
     LineAddress,
     LineConfigured,
@@ -36,10 +40,11 @@ ALPHA = LineAddress("alpha")
 BETA = LineAddress("beta")
 ANA = OperatorAddress("ana")
 BEN = OperatorAddress("ben")
+PROBE = AgentAddress("probe")
 NOTE = MessageKind.NOTE
 QUESTION = MessageKind.QUESTION
 
-# A valid history that uses every event kind, both message kinds and both address kinds
+# A valid history that uses every event kind, both message kinds and every address kind
 # as sender and recipient, with two operators. The coverage tests check that it really
 # does, so a new event kind cannot be left out of it silently.
 SCENARIO: tuple[Event, ...] = (
@@ -77,6 +82,11 @@ SCENARIO: tuple[Event, ...] = (
     QuestionWithdrawn("q3"),
     MessageSent("m2", BEN, ALPHA, NOTE, "from an operator"),
     MessageSent("m3", ALPHA, BEN, NOTE, "thank you", reply_to="m2"),
+    AgentRegistered("probe", AgentAccess.MESSAGE, "0" * 64),
+    MessageSent("m4", PROBE, BETA, NOTE, "from an agent"),
+    MessageSent("m5", BETA, PROBE, NOTE, "to an agent", reply_to="m4"),
+    AgentRegistered("guest", AgentAccess.OBSERVE, ""),
+    AgentRevoked("guest"),
     LineStateChanged("alpha", LineState.STOPPED),
 )
 
