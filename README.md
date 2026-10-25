@@ -1,5 +1,13 @@
 # pydromon
 
+[![CI](https://github.com/sgeos/pydromon/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sgeos/pydromon/actions/workflows/ci.yml)
+[![License: 0BSD](https://img.shields.io/badge/license-0BSD-blue.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Checked with pyright](https://microsoft.github.io/pyright/img/pyright_badge.svg)](https://microsoft.github.io/pyright/)
+[![Status: prototype](https://img.shields.io/badge/status-prototype-orange)](docs/process/HANDOFF.md)
+
 The Python prototype of **Dromon**, a harness that runs several AI agent session lines at
 once inside one daemon, lets them message and wake each other, and tracks the questions
 they raise for the human operator as a first-class feature.
@@ -77,10 +85,12 @@ in its environment.
 
 ```sh
 uv sync
-uv run pytest
-uv run ruff check . && uv run ruff format --check .
-uv run pyright
+./scripts/check.sh                                # the gate, which CI also runs
+./scripts/check.sh -m "not socket and not live"   # the same, inside an agent sandbox
 ```
+
+[`CONTRIBUTING.md`](CONTRIBUTING.md) describes the gate and the test markers, and
+[`SECURITY.md`](SECURITY.md) how to report a vulnerability.
 
 ## License
 

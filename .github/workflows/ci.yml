@@ -1,13 +1,18 @@
 # Continuous integration, roadmap task 10.
 #
-# Each job runs the local gate that CLAUDE.md lists, so a green run here means what a
+# Each job runs the local gate, scripts/check.sh, so a green run here means what a
 # green run on a developer machine means. Live tests are not run, because they need
-# the operator's Claude subscription, and no credential of any kind is given to CI.
+# the operator's subscriptions, and no credential of any kind is given to CI.
 #
 # Supply chain. Actions are pinned to full commit hashes with the release tag in a
 # comment, so a moved or compromised tag cannot change what runs. The pins are
 # releases already in use by the pykeleusma repository, and Dependabot proposes
 # newer ones after a cooldown. The workflow only reads the repository.
+#
+# Account load. GitHub-hosted runners share one concurrent-job limit across the whole
+# sgeos account, and macOS runners a smaller one, so the matrix runs two jobs at a
+# time. paths-ignore is not used, because a pull request with no checks would stall the
+# merge procedure, which waits on them.
 
 name: CI
 
@@ -20,8 +25,13 @@ on:
 permissions:
   contents: read
 
+# Supersede an in-flight run when a pull request is pushed again, and leave branch runs
+# alone. The group is the ref for a pull request and the unique run identifier
+# otherwise, so that a second merge to main cannot cancel the first merge's run and
+# leave a commit on main with no result of its own. This follows the Keleusma
+# repository's reasoning in its own ci.yml, by way of sgeos/project-template.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -31,6 +41,7 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         os: [ubuntu-latest, macos-latest]
         # 3.12 is requires-python in pyproject.toml, and 3.15 the newest release.
@@ -56,18 +67,17 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Install the package and tools
-        run: uv sync --locked --python "${{ steps.python.outputs.python-path }}"
-
-      - name: Ruff
+      # Required here rather than skipped, since a step that passed without the tool
+      # would read as coverage while checking nothing.
+      - name: Shell scripts
+        if: runner.os == 'Linux'
         run: |
-          uv run --no-sync ruff check .
-          uv run --no-sync ruff format --check .
+          command -v shellcheck >/dev/null || { echo "shellcheck is not on this runner, so this step would check nothing"; exit 1; }
+          shellcheck scripts/*.sh
 
-      - name: Pyright
-        run: uv run --no-sync pyright
-
-      # Socket tests run here, since runners allow Unix domain sockets. Warnings are
-      # errors, as in the local gate.
-      - name: Tests
-        run: uv run --no-sync pytest -W error
+      # Socket tests run here, since runners allow Unix domain sockets. UV_PYTHON makes
+      # the gate's locked sync install for this job's interpreter.
+      - name: The local gate
+        env:
+          UV_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: ./scripts/check.sh

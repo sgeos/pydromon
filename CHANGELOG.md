@@ -7,6 +7,10 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- CI groups concurrent runs by the pull request's ref and otherwise by run, as the
+  Keleusma repository does, so a second merge to `main` no longer cancels the first
+  merge's run. The test matrix runs at most two jobs at once, and Linux jobs require
+  shellcheck on `scripts/`.
 - Questions no longer block. The `blocking` field leaves `message_sent`, notices and the
   `ask_operator` tool. After asking, a line ends its turn or keeps working, as it
   decides, and the answer arrives as mail.
@@ -43,6 +47,13 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Sync with `sgeos/project-template`. `scripts/check.sh` is the local gate that CI now
+  runs, with the hygiene checks, `uv sync --locked`, Ruff, pyright, pytest with its
+  arguments and shellcheck. Adds `.gitattributes`, `SECURITY.md`, `CONTRIBUTING.md`, a
+  pull request template, `.github/rulesets/main.json`, issue templates from the
+  Keleusma and angelssword repositories, `llms.txt`, and README badges. `.gitignore`
+  and `.editorconfig` take the template's entries, and CLAUDE.md and AGENTS.md its
+  wording on branches, local and remote passes, scratch and verification.
 - Nominal Grok support, not verified against a live turn, specified by
   `docs/protocol/GROK.md`. Drivers for Grok 4.7 on the new `grok-build` engine, and
   `dromon.grok`, which drives `grok agent stdio` over the Agent Client Protocol. A Grok

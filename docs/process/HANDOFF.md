@@ -59,8 +59,10 @@ completed, moved or abandoned.
 - **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310, and
   `pykeleusma` from its repository at `19d4558`, which needs a Rust toolchain to build.
 - **Published.** Public `sgeos/pydromon`, 0BSD, over HTTPS with the GitHub CLI as
-  credential helper. CI runs Ruff, Pyright and pytest on Ubuntu and macOS for Python
-  3.12 and 3.15. Live tests run only locally.
+  credential helper, synced with `sgeos/project-template`. CI runs `scripts/check.sh`
+  on Ubuntu and macOS for Python 3.12 and 3.15. Settings, applied 2026-10-25: merge
+  commits only, branches deleted on merge, secret scanning, push protection,
+  vulnerability alerts, and the `main` ruleset against deletion and force-push.
 - **pykeleusma.** Cannot yet drive a script, its task 5. Dromon does not need it.
 
 ## Next step
@@ -111,8 +113,7 @@ and a manual daemon run need a command outside it. The rest run inside it with
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 931 tests pass, plus 10 live tests deselected
-uv run ruff check . && uv run ruff format --check . && uv run pyright
+./scripts/check.sh          # 931 tests pass, plus 10 live tests deselected
 ```
 
 Report any check not run, and any commit after the one that last rewrote this file.
