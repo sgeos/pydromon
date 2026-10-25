@@ -4,54 +4,39 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-25, task 7, conversation control
+## 2026-10-25, task 9, per-project configuration
 
-**Done.** Tasks 1 to 6 were already complete. Task 7 is complete, on the operator's
-direction to pick sensible limits to be tuned later.
+**Done.** On the operator's direction that configuration may grow as large as a
+multi-agent project needs, after a review of the settings of Claude Code, Codex and
+Grok Build.
 
-- `dromon.limits` counts each line's turns in a row without operator mail, at most 12
-  by default, and its estimated cost since release, at most $2. An optional cooldown,
-  off by default, spaces a line's turns.
-- A line past a limit is held with `line_held`, takes no turns, and keeps its mail. The
-  daemon asks, on the line's behalf, the operator who last messaged it, or the default
-  operator named by `dromond --operator`, whether to resume it.
-- Any reply to that question, or `dromon release`, releases the line and resets its
-  counts. Holds survive a restart, while the counts do not.
-- The temporary per-line turn cap is gone.
+- **Survey.** Claude Code layers JSON settings and merges lists across layers. Codex and
+  Grok Build use TOML in a user file and a project file, with requirements files for
+  organizations, and Codex adds profiles. The sources are cited in
+  `docs/protocol/PROJECT_CONFIG.md`.
+- `.dromon/dromon.toml`, file version 1, declares the default operator, the tick
+  cadence, the conversation limits, the wake policy, reusable profiles, and each line's
+  model, strategy, tools, limits and wake policy.
+- Unknown keys are errors. Every error names the file and, where it can be found, the
+  line, and a syntax error also names its column. `dromond` refuses to start on an
+  invalid file, and `dromon config` validates the file without a daemon.
+- At start the daemon creates missing lines and reconfigures lines whose tools changed.
+  It refuses a file that changes an existing line's model or strategy.
+- `dromond` flags now override the file rather than always applying their defaults.
 
 **Decisions made by this line, open to the operator's review.**
 
-- The defaults, 12 autonomous turns and $2 of estimated cost, are a first guess.
-- Counting turns without operator mail, rather than per pair of lines, catches a
-  runaway among any number of lines.
-- The cost is the SDK's estimate, which on a subscription is not a charge.
-- A hold question offers the choice resume, but any reply releases the line.
+- A line's own key replaces its profile's key whole, unlike Claude Code's merged lists,
+  so that a line's grant reads in one place.
+- The wake policy is a tick divisor. A line may start a turn only on ticks divisible by
+  its `every_ticks`, and mail waits until then.
+- Lines created through the client and absent from the file are left alone rather than
+  removed.
 
-**Verification.** `uv sync`, 512 tests passing with warnings treated as errors outside
-the sandbox, and all three live tests passing on Haiku 5.5. Ruff and pyright strict
-clean. A scripted runaway between two lines was held within the limit with a question
-from each.
+**Not done.** User and managed layers, and references to secrets held outside the file.
 
-## 2026-10-25, task 8, the interactive client
+**Verification.** 574 tests passing outside the sandbox with warnings treated as errors,
+and the three live tests passing on Haiku 5.5. Ruff and pyright strict clean. A daemon
+started on a real project file created its declared line.
 
-**Done.** On the operator's direction to look at what Claude Code, Codex and Grok Build
-use, then pick something sensible.
-
-- **Survey.** Claude Code uses a customized Ink on Node.js, Codex a Ratatui and
-  Crossterm interface in Rust, and Grok Build its own Rust pager crate. All three are
-  full-screen terminal programs. The sources were secondary and are cited in the design.
-- **Choice.** Curses, from the standard library, which maps onto Ratatui and Crossterm
-  in the Rust port, and Tk for the launchable window, also from the standard library.
-- `dromon attach LINE` opens curses, and `--gui` opens Tk. Both are thin shells over
-  `dromon.attach`, which polls the new `line_view` operation and turns typed input into
-  messages and the `/answer`, `/ack`, `/release`, `/help` and `/quit` commands.
-- Every client is an independent connection, so any number may attach at once, as a
-  socket test with two clients shows.
-
-**Verification.** 547 tests passing outside the sandbox, with nothing skipped. The real
-curses client ran under a pseudo-terminal against a held daemon, drew the view, sent a
-typed message and quit with status 0. The Tk window was not opened, to avoid a window
-on the operator's screen overnight, and is covered only by an import test and the
-shared logic it calls.
-
-**Next.** Task 9, per-project configuration.
+**Next.** Task 10, continuous integration.

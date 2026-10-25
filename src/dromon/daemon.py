@@ -51,7 +51,9 @@ from dromon.lineconfig import (
     ConfigError,
     LineConfig,
     config_from_document,
+    decode_config,
 )
+from dromon.projectconfig import ConfigFileError, ProjectConfig, config_path, load
 from dromon.model import (
     EventRejected,
     InvalidField,
@@ -570,24 +572,107 @@ async def serve(daemon: Daemon) -> None:
             loop.remove_signal_handler(signum)
 
 
+@dataclass(frozen=True, slots=True)
+class Overrides:
+    """Settings given on the command line, which take precedence over the file."""
+
+    operator: str | None = None
+    tick_seconds: float | None = None
+    max_autonomous_turns: int | None = None
+    max_cost_usd: float | None = None
+    cooldown_seconds: float | None = None
+
+
+class ProjectMismatch(Exception):
+    """The project file and the event log disagree on something that cannot change."""
+
+
+def resolve(config: ProjectConfig, overrides: Overrides) -> tuple[Limits, str, float]:
+    """The project-wide limits, default operator and tick cadence to run with."""
+    base = config.limits
+    limits = Limits(
+        overrides.max_autonomous_turns
+        if overrides.max_autonomous_turns is not None
+        else base.max_autonomous_turns,
+        overrides.max_cost_usd
+        if overrides.max_cost_usd is not None
+        else base.max_cost_usd,
+        overrides.cooldown_seconds
+        if overrides.cooldown_seconds is not None
+        else base.cooldown_seconds,
+    )
+    operator = overrides.operator or config.operator or DEFAULT_OPERATOR
+    tick = overrides.tick_seconds
+    if tick is None:
+        tick = (
+            config.tick_seconds
+            if config.tick_seconds is not None
+            else DEFAULT_TICK_SECONDS
+        )
+    return limits, OperatorAddress(operator).operator_id, tick
+
+
+def apply_project(scheduler: Scheduler, log: EventLog, config: ProjectConfig) -> None:
+    """Bring the log's lines into line with the file's definitions.
+
+    A declared line that does not exist is created. One whose tools changed is
+    reconfigured. A line's model and strategy are fixed when it is created, so a file
+    that changes either is refused rather than silently ignored. Lines created through
+    the client and absent from the file are left as they are.
+    """
+    for line_id, definition in sorted(config.lines.items()):
+        existing = log.state.lines.get(line_id)
+        if existing is None:
+            scheduler.create_line(
+                line_id, definition.model, definition.strategy, definition.config
+            )
+        else:
+            if (existing.engine, existing.strategy) != (
+                definition.model,
+                definition.strategy.value,
+            ):
+                raise ProjectMismatch(
+                    f"line {line_id} runs {existing.engine} with the"
+                    f" {existing.strategy} strategy, but the project file says"
+                    f" {definition.model} with"
+                    f" {definition.strategy}. Create a new line instead."
+                )
+            stored = (
+                DEFAULT_CONFIG
+                if existing.config is None
+                else decode_config(existing.config)
+            )
+            if stored != definition.config:
+                scheduler.configure_line(line_id, definition.config)
+        scheduler.set_line_policy(
+            line_id, definition.limits, definition.wake_every_ticks
+        )
+
+
 def run(
     paths: ProjectPaths,
     *,
-    limits: Limits = DEFAULT_LIMITS,
-    default_operator: str = DEFAULT_OPERATOR,
+    overrides: Overrides | None = None,
     hold_wakes: bool = False,
-    tick_seconds: float = DEFAULT_TICK_SECONDS,
 ) -> int:
-    """Run the daemon for ``paths`` in the foreground and return its exit status."""
+    """Run the daemon for ``paths`` in the foreground and return its exit status.
+
+    The project file ``.dromon/dromon.toml``, when present, supplies lines, limits and
+    the wake policy. ``overrides`` from the command line take precedence over it.
+    """
     os.umask(0o077)
+    given = overrides or Overrides()
     try:
         ensure_private_dir(paths.state_dir)
         ensure_private_dir(paths.runtime_dir)
+        file = config_path(paths.state_dir)
+        config = load(file) if file.exists() else ProjectConfig()
+        limits, operator, tick = resolve(config, given)
         lock = acquire_lock(paths.lock)
     except AlreadyRunning as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.ALREADY_RUNNING
-    except PathError as error:
+    except (PathError, ConfigFileError, ValueError, InvalidField) as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
     try:
@@ -596,13 +681,15 @@ def run(
                 log,
                 claude_code_engine(str(paths.root)),
                 limits=limits,
-                default_operator=default_operator,
+                default_operator=operator,
                 hold_wakes=hold_wakes,
-                tick_seconds=tick_seconds,
+                tick_seconds=tick,
+                wake_every_ticks=config.wake_every_ticks,
             )
+            apply_project(scheduler, log, config)
             daemon = Daemon(paths, log, utc_now(), scheduler)
             asyncio.run(serve(daemon))
-    except LogError as error:
+    except (LogError, ProjectMismatch, DriverError, EventRejected) as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
     finally:
@@ -632,27 +719,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-autonomous-turns",
         type=int,
-        default=DEFAULT_LIMITS.max_autonomous_turns,
+        default=None,
         help="turns a line may take without operator mail before it is held,"
-        " default %(default)s",
+        f" default from the project file, else {DEFAULT_LIMITS.max_autonomous_turns}",
     )
     parser.add_argument(
         "--max-cost-usd",
         type=float,
-        default=DEFAULT_LIMITS.max_cost_usd,
-        help="estimated cost a line may run up before it is held, default %(default)s",
+        default=None,
+        help="estimated cost a line may run up before it is held, default from the"
+        f" project file, else {DEFAULT_LIMITS.max_cost_usd}",
     )
     parser.add_argument(
         "--cooldown-seconds",
         type=float,
-        default=DEFAULT_LIMITS.cooldown_seconds,
-        help="the least time between a line's turns, default %(default)s",
+        default=None,
+        help="the least time between a line's turns, default from the project file,"
+        f" else {DEFAULT_LIMITS.cooldown_seconds}",
     )
     parser.add_argument(
         "--operator",
-        default=DEFAULT_OPERATOR,
-        help="who is asked about a held line no operator has messaged,"
-        " default %(default)s",
+        default=None,
+        help="who is asked about a held line no operator has messaged, default from"
+        f" the project file, else {DEFAULT_OPERATOR}",
     )
     parser.add_argument(
         "--hold-wakes",
@@ -662,8 +751,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tick-seconds",
         type=float,
-        default=DEFAULT_TICK_SECONDS,
-        help="the time between ticks while work is in flight, default %(default)s",
+        default=None,
+        help="the time between ticks while work is in flight, default from the"
+        f" project file, else {DEFAULT_TICK_SECONDS}",
     )
     return parser
 
@@ -678,31 +768,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     except PathError as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
-    try:
-        limits = Limits(
-            max_autonomous_turns=arguments.max_autonomous_turns,
-            max_cost_usd=arguments.max_cost_usd,
-            cooldown_seconds=arguments.cooldown_seconds,
-        )
-        default_operator = OperatorAddress(arguments.operator).operator_id
-    except (ValueError, InvalidField) as error:
-        print(f"dromond: {error}", file=sys.stderr)
-        return exits.USAGE
-    hold: bool = arguments.hold_wakes
-    tick: float = arguments.tick_seconds
-    if not 0 <= tick <= MAX_TICK_SECONDS:
+    tick: float | None = arguments.tick_seconds
+    if tick is not None and not 0 <= tick <= MAX_TICK_SECONDS:
         print(
             f"dromond: --tick-seconds must be in [0, {MAX_TICK_SECONDS}]",
             file=sys.stderr,
         )
         return exits.USAGE
-    return run(
-        paths,
-        limits=limits,
-        default_operator=default_operator,
-        hold_wakes=hold,
+    overrides = Overrides(
+        operator=arguments.operator,
         tick_seconds=tick,
+        max_autonomous_turns=arguments.max_autonomous_turns,
+        max_cost_usd=arguments.max_cost_usd,
+        cooldown_seconds=arguments.cooldown_seconds,
     )
+    try:
+        resolve(ProjectConfig(), overrides)
+    except (ValueError, InvalidField) as error:
+        print(f"dromond: {error}", file=sys.stderr)
+        return exits.USAGE
+    hold: bool = arguments.hold_wakes
+    return run(paths, overrides=overrides, hold_wakes=hold)
 
 
 if __name__ == "__main__":

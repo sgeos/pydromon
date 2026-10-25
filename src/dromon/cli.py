@@ -41,6 +41,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "ack": "acknowledge a message without replying",
     "sent": "show what became of the mail an operator sent",
     "release": "resume a line the daemon held at a conversation limit",
+    "config": "check the project file and show what it declares",
     "probe": "run one short turn on the engine and report its capabilities",
 }
 """Planned subcommands and their one-line help, in display order."""
@@ -352,6 +353,37 @@ def _attach(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return tui.run(attachment, arguments.poll_seconds)
 
 
+def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Validate ``.dromon/dromon.toml`` without a daemon and summarize it."""
+    del arguments
+    from dromon.projectconfig import ConfigFileError, config_path, load
+
+    file = config_path(paths.state_dir)
+    if not file.exists():
+        print(f"no project file at {file}. Built-in defaults apply.")
+        return exits.OK
+    try:
+        config = load(file)
+    except ConfigFileError as error:
+        print(f"dromon config: {error}", file=sys.stderr)
+        return exits.FAILURE
+    limits = config.limits
+    print(f"{file} is valid")
+    print(
+        f"limits: {limits.max_autonomous_turns} autonomous turns,"
+        f" ${limits.max_cost_usd} estimated cost, {limits.cooldown_seconds}s cooldown"
+    )
+    print(f"wake every {config.wake_every_ticks} ticks")
+    for line_id, line in sorted(config.lines.items()):
+        tools = ", ".join(line.config.builtin_tools) or "no built-in tools"
+        servers = ", ".join(line.config.server_names()) or "no MCP servers"
+        print(
+            f"line {line_id}: {line.model} {line.strategy},"
+            f" {line.config.tool_policy}, {tools}, {servers}"
+        )
+    return exits.OK
+
+
 def _release(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     args: dict[str, object] = {"line_id": arguments.line_id}
     return _request(paths, "release", Operation.RELEASE, args)
@@ -419,6 +451,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "sent": _sent,
     "release": _release,
     "attach": _attach,
+    "config": _config,
 }
 
 

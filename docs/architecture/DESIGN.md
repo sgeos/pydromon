@@ -330,10 +330,20 @@ Building that machinery is expected to take sustained work. The per-line tool
 configuration of [`../protocol/LINE_CONFIG.md`](../protocol/LINE_CONFIG.md) is its first
 piece.
 
-**Proposed.** It lives in `.dromon/dromon.toml` in the project, and its format is versioned
-with the protocol so it survives each port. **Open.** Its contents, which will at least
-cover the session lines, their engines, wake policy, conversation limits and credentials
-policy.
+**Decided 2026-10-25, task 9.** It lives in `.dromon/dromon.toml`, specified by
+[`../protocol/PROJECT_CONFIG.md`](../protocol/PROJECT_CONFIG.md) as file version 1. It
+declares the default operator, the tick cadence, the conversation limits, the wake
+policy, reusable line profiles, and each line's engine, strategy, tools, limits and wake
+policy. Unknown keys are errors, and every error is located in the file. Flags override
+the file, and the file overrides the defaults.
+
+**Fact.** The format follows a review of Claude Code, Codex and Grok Build settings on
+2026-10-25, recorded in the specification with its sources. **Open.** User and managed
+layers, credentials policy and references to secrets held outside the file.
+
+**Porting hazard.** The prototype reads TOML with Python's `tomllib` and locates syntax
+errors by parsing its message text. The Rust port should use a parser that reports
+spans, such as the `toml` crate, and keep the same messages.
 
 ## Persistence
 

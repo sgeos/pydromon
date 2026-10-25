@@ -43,6 +43,11 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Per-project configuration in `.dromon/dromon.toml`, specified by
+  `docs/protocol/PROJECT_CONFIG.md`. It declares lines through reusable profiles, with
+  per-line limits and wake policy, and is validated strictly with located errors.
+  `dromond` applies it at start, and its flags now override the file. `dromon config`
+  validates it without a daemon.
 - The interactive client, roadmap task 8. `dromon attach LINE` opens a curses client
   attached to one line, and `--gui` opens a Tk window instead. Both poll the new
   `line_view` operation through `dromon.attach` and accept typed messages and the
