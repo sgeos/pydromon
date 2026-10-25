@@ -331,4 +331,3 @@ def test_config_without_a_file_reports_the_defaults(
     argv = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime), "config"]
     assert cli.main(argv) == exits.OK
     assert "Built-in defaults apply" in capsys.readouterr().out
-
