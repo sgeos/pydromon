@@ -31,6 +31,7 @@ autostart = false
 | `context` | Tokens to load the model with, in [512, 1048576] | 4096 |
 | `keep_alive` | `-1`, `0`, or a number followed by `s`, `m` or `h`, as Ollama reads it | `30m` |
 | `autostart` | Whether `dromond` brings the teacher up when it starts | `false` |
+| `memory_headroom_gb` | Gigabytes that must stay available beyond the model's size when it loads, in [0, 1024] | 4 |
 
 Any other key is an error. The endpoint is restricted to the loopback interface, so a
 project file cannot point the teacher at another host.
@@ -45,13 +46,18 @@ project's teacher without a daemon.
    process identifier in `teacher.pid` in the runtime directory, writes its output to
    `teacher.log` there, and waits up to 60 seconds for it to answer. The model must
    appear in `GET /api/tags`, and Dromon never pulls it, because a pull downloads many
-   gigabytes and is the operator's decision. Dromon then loads the model with
+   gigabytes and is the operator's decision. Unless the model is already loaded or
+   `--force` is given, Dromon refuses to load it when the memory the operating system
+   reports as available is less than the model's size in `GET /api/tags` plus
+   `memory_headroom_gb`. Available memory is `kern.memorystatus_level` percent of the
+   physical memory on macOS and `MemAvailable` on Linux, and where neither exists the
+   check is skipped. Dromon then loads the model with
    `POST /api/generate`, an empty prompt, `keep_alive` and `options.num_ctx` set to the
    context, and checks that `GET /api/ps` lists it. A failure stops a server this call
    started, so a failed attempt leaves nothing running.
 2. **Status.** Whether the server answers, its version, whether the model is pulled
-   and loaded, its resident size and context as `GET /api/ps` reports them, and
-   whether Dromon started the server.
+   and loaded, its resident size and context as `GET /api/ps` reports them, whether
+   Dromon started the server, and the memory available.
 3. **Down.** A loaded model is unloaded with `keep_alive` set to 0. The server is
    stopped only if Dromon started it, and only after the recorded process is confirmed
    to be `ollama`, since a stale identifier can be reused by another process. A server
@@ -76,6 +82,11 @@ whose sandbox was enabled with `network.allowLocalBinding` reached the loaded te
 with `curl` on `127.0.0.1:11434`. **Not tested.** Whether the connection needs
 `allowLocalBinding`.
 
+**Fact, observed on 2026-10-25 on macOS.** With the model unloaded, `vm_stat` showed
+about 1.6 GB of free pages and 12.8 GB inactive, while `kern.memorystatus_level`
+reported 82 percent, about 28 GB, available. Free pages alone would have refused a load
+that the earlier measurement shows the host can take, which is why they are not used.
+
 ## Trust
 
 The model's answers are untrusted text. Dromon only loads and unloads the model and
@@ -83,8 +94,5 @@ never reads its output, and a project's own tools validate what they take from i
 
 ## Not yet specified
 
-- A memory check before loading. A teacher this size can exhaust a host's memory, which
-  a project has recorded as the condition its host crashed under, and Dromon reports
-  the resident size rather than refusing a load.
 - Teachers served by anything but Ollama.
 - A tool through which a line asks the daemon to bring the teacher up.

@@ -487,7 +487,13 @@ teacher up` and `dromond` running there, a Claude Haiku 5.5 line in Claude Code'
 sandbox queried the teacher over loopback and answered a question from the project's
 `CLAUDE.md`, and a GPT-6-Luna line answered one from its instructions. Both replied to
 the operator by `send_message`. Dromon's state there is excluded from git through the
-repository's local exclude file, so the project's own checks never see it. **Unverified, from the seeding session's memory.** Several model
+repository's local exclude file, so the project's own checks never see it.
+
+**Fact, observed later on 2026-10-25 in epagoge, after its line reviewed the setup.** The
+project's full gate passed from a sandboxed Claude Haiku 5.5 line, with 678 tests and a
+clean disclosure scan. With the sandbox denying writes to `.git`, the same line could not
+write there, so no spelling of a commit succeeds from its shell. `dromon teacher up` now
+refuses to load a model that would leave less than its headroom of available memory. **Unverified, from the seeding session's memory.** Several model
 vendors' terms forbid using their outputs to train competing models, and subscription
 plans tend to be stricter than paid interface use. Check each vendor's current terms
 before any trace capture, and record the source model and licence of every trace.

@@ -144,6 +144,18 @@ an `ask` rule refused a Bash call while an unmatched Bash call ran, and a
 `UserPromptSubmit` hook ran, saw a variable set in `env`, and its output reached the
 model.
 
+## Rules are guards, the sandbox is the barrier
+
+Claude Code matches a Bash rule against the command as written, so `ask` or `deny` on
+`Bash(git commit *)` refuses `git commit` with an explanation but not every spelling,
+such as `git -C . commit`. **Inference, from the rule syntax, not tested by this line.**
+To keep a line from committing, also deny writes to the repository's `.git` in its
+sandbox and `Edit` there in its rules. **Fact, verified on 2026-10-25 in epagoge.** With
+`filesystem.denyWrite` naming `.git`, a sandboxed Claude Haiku 5.5 line's
+`python3 -c "open('.git/...', 'w')"` failed with `Operation not permitted`, and its
+`touch .git/...` was refused by the permission layer before it ran, while the project's
+full gate still passed from the same line.
+
 ## Trust
 
 A hook runs a command with the daemon's privileges and outside the sandbox, and can

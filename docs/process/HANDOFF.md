@@ -68,9 +68,10 @@ completed, moved or abandoned.
 
 ## Next step
 
-Dromon can be dogfooded in epagoge. Its project file is
-`~/projects/python/epagoge/.dromon/dromon.toml`, local and excluded from git there, and
-`dromon teacher up` loads the teacher first. The next milestone awaits the operator.
+Dromon can be dogfooded in epagoge from a clean, merged `main`, since `.venv` is an
+editable install that runs the working tree. Its project file is
+`~/projects/python/epagoge/.dromon/dromon.toml`, local and git-excluded, with
+`.dromon/LINES.md` as the lines' extra rules. `dromon teacher up` loads the teacher.
 
 ## Open
 
@@ -80,16 +81,16 @@ Dromon can be dogfooded in epagoge. Its project file is
   move appears. Adopting it means repinning `pykeleusma`.
 - **Subscription usage.** Plan terms assume ordinary, individual use. Many lines
   running continuously may exceed that.
-- **Event log debt.** `read_entries` loads the whole log into memory, with no
-  compaction or migration. Conversation-limit counts reset on restart.
-- **Operator relays.** Inbound adapters, required by the operator, are deferred. Their
-  required properties are in `RELAY.md`.
-- **Secrets.** Literal MCP credentials and `env` values are stored in the owner-only
-  event log. Environment references exist, but not file or keychain references.
+- **Event log.** `read_entries` loads the whole log, with no compaction or migration.
+  Limit counts reset on restart.
+- **Operator relays.** Inbound adapters are deferred, with their properties in
+  `RELAY.md`.
+- **Secrets.** Literal MCP credentials and `env` values sit in the owner-only event log.
+  Environment references exist, file and keychain ones do not.
 - **Daemon debt.** No peer credential check on connections, no relay forwarding, and
   SQLite calls on the event loop thread. Driver state lives only in memory. All are
   recorded in `CLIENT.md` or the module documentation.
-- **Project file debt.** No user or managed layer. Recorded in `PROJECT_CONFIG.md`.
+- **Project file.** No user or managed layer, per `PROJECT_CONFIG.md`.
 - **Parity gaps.** No credential masking, no automatic approval reviewer, no plugins
   or language servers, no MCP OAuth, and Linux not verified live. The merge of `Read`
   and `Edit` rules into the sandbox is untested. Listed in `SANDBOX.md` and
@@ -112,7 +113,7 @@ and a manual daemon run need a command outside it. The rest run inside it with
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 865 tests pass, plus 9 live tests deselected
+uv sync && uv run pytest    # 875 tests pass, plus 9 live tests deselected
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 
