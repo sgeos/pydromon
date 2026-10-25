@@ -60,6 +60,7 @@ from dromon.driver import Driver, Strategy
 from dromon.engine import ClaudeCodeLine, TurnReport
 from dromon.eventlog import EventLog
 from dromon.limits import DEFAULT_LIMITS, Limits
+from dromon.sandbox import SandboxConfig, effective, merge
 from dromon.mailbox import (
     MAX_PAGE,
     MailSummary,
@@ -217,17 +218,30 @@ type EngineFactory = Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], LineEngine]
 """Builds a line's engine, given the line and Dromon's own tools for it."""
 
 
-def claude_code_engine(cwd: str) -> EngineFactory:
-    """The production factory: each line on Claude Code with its packaged driver."""
+def claude_code_engine(
+    cwd: str,
+    *,
+    project_sandbox: SandboxConfig | None = None,
+    protected: Sequence[Path] = (),
+) -> EngineFactory:
+    """The production factory: each line on Claude Code with its packaged driver.
+
+    Each line's sandbox is the project's document merged with its own, with relative
+    paths resolved against ``cwd`` and the ``protected`` directories denied. A
+    document that cannot be made safe raises ``SandboxError``, which ends the turn
+    before any command runs.
+    """
 
     def build(spec: LineSpec, own_tools: Sequence[SdkMcpTool[Any]]) -> LineEngine:
         driver = Driver.for_model(spec.model, spec.strategy)
+        merged = merge([project_sandbox, spec.config.sandbox])
         return ClaudeCodeLine(
             driver,
             Path(cwd),
             config=spec.config,
             mcp_tools=list(own_tools),
             session_id=spec.session_id,
+            sandbox=effective(merged, Path(cwd), protected),
         )
 
     return build

@@ -43,6 +43,14 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Sandboxing at parity with Claude Code, specified by `docs/protocol/SANDBOX.md`. A
+  Claude Code sandbox document, in Claude Code's key names, may be set for the whole
+  project in `[sandbox]`, for a profile or line in `.dromon/dromon.toml`, or for one
+  line with `dromon create` or `dromon configure --sandbox-config FILE`. Layers merge as
+  Claude Code's settings scopes do. An enabled sandbox fails closed, refuses
+  unsandboxed retries and hosts outside the allowlist, and always denies Dromon's state
+  and runtime directories. Keys that remove a boundary need the client's operator
+  authority. `dromon config` reports each line's sandbox.
 - Continuous integration, roadmap task 10. `.github/workflows/ci.yml` runs Ruff,
   Pyright and pytest, socket tests included, on Linux and macOS for Python 3.12 and
   3.15. Actions are pinned to commit hashes, the token is read-only, checkout keeps no

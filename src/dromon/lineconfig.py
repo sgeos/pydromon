@@ -1,4 +1,4 @@
-"""Per-line tool configuration: built-in tools, MCP servers and the tool policy.
+"""Per-line configuration: built-in tools, MCP servers, tool policy and sandbox.
 
 A line's configuration names the built-in Claude Code tools it gets, the MCP servers it
 connects to, and which tool calls are allowed. ``allowlist`` allows the given built-in
@@ -6,6 +6,7 @@ tools, Dromon's own tools, and every name or ``mcp__server__*`` pattern listed i
 ``allowed_tools``, and denies everything else. ``allow_all`` allows every tool the
 engine offers. ``inherit_account_mcp`` lets Claude Code also load the MCP servers of
 the operator's user settings and claude.ai account, which are otherwise excluded.
+``sandbox`` is the line's own sandbox document, as ``dromon.sandbox`` defines it.
 
 The configuration is stored in the event log as canonical JSON, so it survives a
 restart and every change is on record. ``docs/protocol/LINE_CONFIG.md`` is normative.
@@ -25,6 +26,7 @@ from enum import StrEnum
 from typing import Final, NoReturn, cast
 
 from dromon.model import ID_PATTERN
+from dromon.sandbox import SandboxConfig, SandboxError, parse_sandbox
 
 CONFIG_VERSION: Final = 1
 
@@ -81,6 +83,8 @@ class LineConfig:
     tool_policy: ToolPolicy = ToolPolicy.ALLOWLIST
     allowed_tools: tuple[str, ...] = field(default=())
     inherit_account_mcp: bool = False
+    sandbox: SandboxConfig | None = None
+    """The line's own sandbox document, before the project's is merged in."""
 
     def allows(self, tool_name: str, own_tools: frozenset[str]) -> bool:
         """Whether the policy allows ``tool_name``. Dromon's own tools always pass."""
@@ -105,7 +109,7 @@ DEFAULT_CONFIG: Final = LineConfig()
 
 def encode_config(config: LineConfig) -> str:
     """The canonical JSON of ``config``, as stored in the event log."""
-    document = {
+    document: dict[str, object] = {
         "v": CONFIG_VERSION,
         "builtin_tools": list(config.builtin_tools),
         "mcp_servers": {
@@ -115,6 +119,10 @@ def encode_config(config: LineConfig) -> str:
         "allowed_tools": list(config.allowed_tools),
         "inherit_account_mcp": config.inherit_account_mcp,
     }
+    if config.sandbox is not None:
+        # Omitted when unset, so configurations stored before sandboxing keep
+        # their text.
+        document["sandbox"] = config.sandbox.document()
     return json.dumps(
         document,
         ensure_ascii=False,
@@ -222,6 +230,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         "tool_policy",
         "allowed_tools",
         "inherit_account_mcp",
+        "sandbox",
     }
     unknown = set(document) - allowed
     if unknown:
@@ -245,12 +254,19 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
     inherit = document.get("inherit_account_mcp", False)
     if type(inherit) is not bool:
         _fail("inherit_account_mcp must be a boolean")
+    sandbox: SandboxConfig | None = None
+    if "sandbox" in document:
+        try:
+            sandbox = parse_sandbox(document["sandbox"], operator=True)
+        except SandboxError as error:
+            _fail(str(error))
     return LineConfig(
         builtin_tools=tuple(sorted(set(builtin))),
         mcp_servers=parse_servers(document.get("mcp_servers", {})),
         tool_policy=policy,
         allowed_tools=tuple(sorted(set(patterns))),
         inherit_account_mcp=inherit,
+        sandbox=sandbox,
     )
 
 

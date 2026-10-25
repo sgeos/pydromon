@@ -54,6 +54,7 @@ from dromon.lineconfig import (
     decode_config,
 )
 from dromon.projectconfig import ConfigFileError, ProjectConfig, config_path, load
+from dromon.sandbox import effective, merge
 from dromon.model import (
     EventRejected,
     InvalidField,
@@ -587,6 +588,21 @@ class ProjectMismatch(Exception):
     """The project file and the event log disagree on something that cannot change."""
 
 
+def protected_dirs(paths: ProjectPaths) -> tuple[Path, ...]:
+    """The directories every enabled sandbox denies, which hold the event log, the
+    project file and the daemon's socket."""
+    return (paths.state_dir.resolve(), paths.runtime_dir.resolve())
+
+
+def check_sandboxes(config: ProjectConfig, paths: ProjectPaths) -> None:
+    """Refuse a project file whose sandboxes cannot be made safe, before anything
+    starts, rather than at each line's first turn. Raises ``SandboxError``."""
+    protected = protected_dirs(paths)
+    effective(config.sandbox, paths.root, protected)
+    for line in config.lines.values():
+        effective(merge([config.sandbox, line.config.sandbox]), paths.root, protected)
+
+
 def resolve(config: ProjectConfig, overrides: Overrides) -> tuple[Limits, str, float]:
     """The project-wide limits, default operator and tick cadence to run with."""
     base = config.limits
@@ -667,6 +683,7 @@ def run(
         ensure_private_dir(paths.runtime_dir)
         file = config_path(paths.state_dir)
         config = load(file) if file.exists() else ProjectConfig()
+        check_sandboxes(config, paths)
         limits, operator, tick = resolve(config, given)
         lock = acquire_lock(paths.lock)
     except AlreadyRunning as error:
@@ -679,7 +696,11 @@ def run(
         with EventLog(paths.event_log) as log:
             scheduler = Scheduler(
                 log,
-                claude_code_engine(str(paths.root)),
+                claude_code_engine(
+                    str(paths.root),
+                    project_sandbox=config.sandbox,
+                    protected=protected_dirs(paths),
+                ),
                 limits=limits,
                 default_operator=operator,
                 hold_wakes=hold_wakes,

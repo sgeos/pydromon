@@ -25,7 +25,7 @@ line tools, MCP servers and credentials, so it deserves the review any such file
 import re
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Final, cast
 
@@ -33,6 +33,7 @@ from dromon.driver import MODELS, Strategy
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.lineconfig import ConfigError, LineConfig, config_from_document
 from dromon.model import ID_PATTERN
+from dromon.sandbox import SandboxConfig, SandboxError, merge, parse_sandbox
 
 CONFIG_FILE_NAME: Final = "dromon.toml"
 FILE_VERSION: Final = 1
@@ -40,7 +41,7 @@ MAX_WAKE_EVERY: Final = 3600
 MAX_FILE_BYTES: Final = 4 * 1024 * 1024
 
 TOP_KEYS: Final = frozenset(
-    {"version", "daemon", "limits", "wake", "profiles", "lines"}
+    {"version", "daemon", "limits", "wake", "sandbox", "profiles", "lines"}
 )
 DAEMON_KEYS: Final = frozenset({"operator", "tick_seconds"})
 LIMIT_KEYS: Final = frozenset(
@@ -57,7 +58,7 @@ TOOL_KEYS: Final = frozenset(
     }
 )
 LINE_KEYS: Final = (
-    frozenset({"profile", "model", "strategy", "limits", "wake"}) | TOOL_KEYS
+    frozenset({"profile", "model", "strategy", "limits", "wake", "sandbox"}) | TOOL_KEYS
 )
 PROFILE_KEYS: Final = LINE_KEYS - {"profile"}
 
@@ -105,6 +106,8 @@ class ProjectConfig:
     tick_seconds: float | None = None
     limits: Limits = DEFAULT_LIMITS
     wake_every_ticks: int = 1
+    sandbox: SandboxConfig | None = None
+    """The project's sandbox, merged under every line's own."""
     lines: dict[str, LineDefinition] = field(default_factory=dict[str, LineDefinition])
 
 
@@ -206,6 +209,7 @@ class _Reader:
                 raise self.fail("daemon.tick_seconds", "must be a number in [0, 60]")
         limits = self.limits(top.get("limits", {}), "limits", DEFAULT_LIMITS)
         wake = self.wake(top.get("wake", {}), "wake", 1)
+        sandbox = self.sandbox(top.get("sandbox"), "sandbox")
         profiles = self.profiles(top.get("profiles", {}))
         lines_table = top.get("lines", {})
         if not isinstance(lines_table, dict):
@@ -218,6 +222,7 @@ class _Reader:
             tick_seconds=tick,
             limits=limits,
             wake_every_ticks=wake,
+            sandbox=sandbox,
             lines=lines,
         )
 
@@ -245,6 +250,18 @@ class _Reader:
             )
         return every
 
+    def sandbox(self, value: object, key: str) -> SandboxConfig | None:
+        """A sandbox table from the file, which lacks operator authority."""
+        if value is None:
+            return None
+        try:
+            return parse_sandbox(value, operator=False)
+        except SandboxError as error:
+            where = f"{key}.{error.key}" if error.key else key
+            raise ConfigFileError(
+                self.path, str(error), key=key, line=self.line_of(where)
+            ) from error
+
     def profiles(self, value: object) -> dict[str, dict[str, object]]:
         if not isinstance(value, dict):
             raise self.fail("profiles", "must be a table")
@@ -268,11 +285,16 @@ class _Reader:
             raise self.fail(key, "is not a valid line identifier")
         own = self.table(value, key, LINE_KEYS)
         merged: dict[str, object] = {}
+        profile_sandbox: SandboxConfig | None = None
         profile_name = own.get("profile")
         if profile_name is not None:
             if not isinstance(profile_name, str) or profile_name not in profiles:
                 raise self.fail(f"{key}.profile", f"names no profile: {profile_name!r}")
             merged.update(profiles[profile_name])
+            profile_sandbox = self.sandbox(
+                profiles[profile_name].get("sandbox"),
+                f"profiles.{profile_name}.sandbox",
+            )
         merged.update({k: v for k, v in own.items() if k != "profile"})
         model = merged.get("model")
         if model not in MODELS:
@@ -290,6 +312,10 @@ class _Reader:
             config = config_from_document(tools)
         except ConfigError as error:
             raise self.fail(key, str(error)) from error
+        # Unlike the tool keys, sandbox tables merge as Claude Code's scopes do, so a
+        # line cannot drop a deny entry its profile adds.
+        own_sandbox = self.sandbox(own.get("sandbox"), f"{key}.sandbox")
+        config = replace(config, sandbox=merge([profile_sandbox, own_sandbox]))
         return LineDefinition(
             line_id=line_id,
             model=cast(str, model),

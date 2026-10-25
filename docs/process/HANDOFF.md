@@ -12,8 +12,7 @@ completed, moved or abandoned.
 - **Tasks 1 to 10 done. Milestone 0.1.0 is complete.**
   - `model.py`, `codec.py` and `eventlog.py` hold the data model as nine event kinds in
     an append-only SQLite log. Operators are parties addressed as `@name`.
-  - `relay.py` forwards operator messages. Replies will come through inbound adapters
-    in a daemon registry, with the design deferred.
+  - `relay.py` forwards operator messages. Inbound replies are deferred.
   - `daemon.py`, `client.py`, `protocol.py`, `paths.py` and `exits.py` are the daemon
     skeleton behind `dromon start`, `status` and `stop`.
   - `engine.py` runs turns on Claude Code through the Agent SDK. `driver.py` hosts
@@ -38,8 +37,7 @@ completed, moved or abandoned.
   - `limits.py` holds a line after 12 turns without operator mail or $2 of estimated
     cost and asks an operator whether to resume it. A reply or `dromon release`
     resumes it.
-  - `attach.py`, `tui.py` and `gui.py` are the interactive client. `dromon attach
-    LINE` opens curses, `--gui` a Tk window, and any number may attach at once.
+  - `attach.py`, `tui.py` and `gui.py` are the interactive client, `dromon attach`.
   - `lineconfig.py` gives each line its built-in tools, arbitrary MCP servers and an
     allow-all or allowlist policy, by the operator's decision, stored as
     `line_configured`. The default is no tools beyond Dromon's own, with strict MCP
@@ -47,8 +45,12 @@ completed, moved or abandoned.
   - `projectconfig.py` reads `.dromon/dromon.toml`, with profiles, per-line limits and
     wake policy, strict keys and located errors. `dromond` applies it at start, flags
     override it, and `dromon config` validates it.
+  - `sandbox.py` runs a line's shell commands in Claude Code's sandbox, by the
+    operator's direction, configured per project and per line in Claude Code's key
+    names. It fails closed, refuses unsandboxed retries, and protects `.dromon` and the
+    runtime directory.
   - `docs/protocol/` holds `EVENT_LOG.md`, `CLIENT.md`, `RELAY.md`, `DRIVER.md`,
-    `LINE_CONFIG.md` and `PROJECT_CONFIG.md`.
+    `LINE_CONFIG.md`, `PROJECT_CONFIG.md` and `SANDBOX.md`.
 - **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310, and
   `pykeleusma` from its repository at `19d4558`, which needs a Rust toolchain to build.
 - **Published.** The public GitHub repository `sgeos/pydromon`, licensed 0BSD, on an
@@ -77,7 +79,6 @@ Milestone 0.1.0 is complete. The next milestone awaits the operator's direction.
 - **Operator relays.** The operator requires a response path through inbound adapters
   registered with the daemon and configured per channel, with the design deferred. Its
   required properties are in `RELAY.md`.
-- **Interline and Dromon overlap.** Whether Dromon retires interline is undecided.
 - **Line configuration debt.** MCP credentials in `env` and `headers` are stored in the
   event log, which is owner-only. References to secrets held elsewhere are not yet
   specified.
@@ -88,6 +89,8 @@ Milestone 0.1.0 is complete. The next milestone awaits the operator's direction.
   project needs. The client protocol later needs pushed updates and remote clients.
 - **Project file debt.** No user or managed layer, and no references to secrets held
   outside the file. Recorded in `PROJECT_CONFIG.md`.
+- **Sandbox gaps.** No `Read`, `Edit` or `WebFetch` rules, no credential masking, and
+  Linux not verified live. Listed in `SANDBOX.md`.
 - **Recorded in the design.** Teacher-model scope and the Rust repository's eventual
   name.
 
@@ -106,7 +109,7 @@ an upstream.
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-uv sync && uv run pytest    # 574 tests pass, plus 3 live tests deselected
+uv sync && uv run pytest    # 639 tests pass, plus 4 live tests deselected
 uv run ruff check . && uv run ruff format --check . && uv run pyright
 ```
 
