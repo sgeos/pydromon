@@ -4,34 +4,32 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-25, housekeeping and the Appendix B check
+## 2026-10-25, task 2, the data model and event log
 
-**Done.**
+**Done.** Session lines, messages, wakes and operator questions are typed records built
+by ten event kinds, stored in an append-only SQLite log, and a replay rebuilds the same
+state. The specification is `docs/protocol/EVENT_LOG.md`.
 
-- **Appendix B.** Read in full. Every tracked file, every diff in history and every
-  commit message was searched for its subject matter and read by hand. Nothing conflicts.
-  Every keyword hit was an ordinary use, such as an adapter that probes an engine. The
-  Keleusma properties the documents rely on are already in Keleusma's public README.
-- **Dates.** The seed's dates are correct in Coordinated Universal Time. Its commits were
-  made after 00:00 UTC on 2026-10-25, while their local Pacific timestamps read
-  2026-10-24. `CLAUDE.md` now states the convention. No date was changed.
-- **Integration document.** Updated from the `pykeleusma` repository, read without
-  changes, at its commit `03d2309`. The four questions now carry that line's answers,
-  the mapping shows its tasks 2 and 3 done and the new task 5b, and the examples no
-  longer use one-element tuples, which Keleusma rejects.
-- **Repository.** Local `main` matched `origin/main`. A stale tracking reference to the
-  merged branch `docs/keleusma-integration` was pruned, since the remote branch was
-  already deleted. The lock file is current.
+**Decisions made by this line, open to the operator's review.**
 
-**Not verified.** The `pykeleusma` line's answers were taken from its report and were
-not reproduced here. The disagreement on the worst-case time unit is recorded, not
-resolved.
+- **State is never stored.** It is rebuilt from events, so the event list is the data
+  model, as the design proposed.
+- **Identifiers are never reused.** This makes a resent event harmless, which the design
+  requires of messages.
+- **A blocking question pauses its own line only.** It refuses that line's next turn and
+  wakes and affects nothing else.
+- **Answers are free text** even when a question offers choices.
+- **The log does not authenticate.** The daemon attributes each event before appending.
+  File permissions are the security boundary, and new logs are owner-only.
+- **The encoding is canonical JSON**, pinned byte for byte in tests, so the Rust and
+  Keleusma ports can be checked against the same bytes.
 
-**Verification.** `uv sync`, 18 tests passing, ruff check and format clean, and pyright
-strict with 0 errors and 0 warnings.
+**Verification.** `uv sync`, 145 tests passing with warnings treated as errors, ruff
+check and format clean, and pyright strict with 0 errors and 0 warnings. The tests cover
+every event kind through one scenario, every rejection, every malformed-payload class,
+replay equality, append-only triggers, a second writer and three forms of corruption.
 
-**Operator decisions recorded.** The protocol specification is drafted here and ported
-later. The first adapter targets Claude Opus 5.5, and the loop that drives it stays open
-until task 4. The mailbox is chosen when needed.
+**Not verified.** Only Python 3.12.12 with SQLite 3.50.4 on macOS was tested. Concurrent
+access was tested with two connections in one process, not with two processes.
 
-**Next.** Task 2, the data model and event log.
+**Next.** Task 3, the daemon skeleton.

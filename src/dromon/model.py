@@ -1,0 +1,508 @@
+"""The Dromon data model, as events and the state they build.
+
+Every change to the daemon's durable state is one event. State is never written
+directly. It is rebuilt by applying events in order, so the event list is the
+specification of the data model. ``docs/protocol/EVENT_LOG.md`` is normative and this
+module follows it.
+
+Trust. The model checks that each event is well formed and applicable to the current
+state. It does not authenticate anyone. Attribution, such as which line sent a message
+or that an answer came from the operator, is the daemon's responsibility before it
+appends an event.
+
+Porting note. Events are frozen plain records, the state is maps of frozen records, and
+each event has one explicit check, so each maps onto a Rust enum and a ``match``.
+"""
+
+import re
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
+from typing import Final, assert_never
+
+ID_PATTERN: Final = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+"""Identifiers and engine names. ASCII only, so every port compares them bytewise."""
+
+OPERATOR: Final = "@operator"
+"""The sender of a message from the operator. ``@`` never appears in an identifier."""
+
+MAX_TEXT_BYTES: Final = 1024 * 1024
+"""Upper bound on the UTF-8 size of a message body, question text or answer."""
+
+MAX_CHOICES: Final = 16
+MAX_CHOICE_BYTES: Final = 1024
+
+
+class InvalidField(ValueError):
+    """A record field is outside the data model, such as a malformed identifier."""
+
+
+class EventRejected(ValueError):
+    """A well-formed event does not apply to the current state."""
+
+
+def check_id(name: str, value: object) -> None:
+    """Raise ``InvalidField`` unless ``value`` is a valid identifier."""
+    if not isinstance(value, str) or ID_PATTERN.fullmatch(value) is None:
+        raise InvalidField(f"{name} is not a valid identifier: {value!r}")
+
+
+def check_text(name: str, value: object, limit: int = MAX_TEXT_BYTES) -> None:
+    """Raise ``InvalidField`` unless ``value`` is encodable text within ``limit`` bytes.
+
+    Lone surrogates are rejected because they have no UTF-8 encoding, and a port reading
+    the log as UTF-8 could not represent them.
+    """
+    if not isinstance(value, str):
+        raise InvalidField(f"{name} is not text: {value!r}")
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise InvalidField(f"{name} is not valid Unicode text") from error
+    if size > limit:
+        raise InvalidField(f"{name} is {size} bytes, over the limit of {limit}")
+
+
+def check_bool(name: str, value: object) -> None:
+    """Raise ``InvalidField`` unless ``value`` is a boolean and not an integer."""
+    if type(value) is not bool:
+        raise InvalidField(f"{name} is not a boolean: {value!r}")
+
+
+def check_sender(value: object) -> None:
+    """Raise ``InvalidField`` unless ``value`` is ``OPERATOR`` or an identifier."""
+    if value != OPERATOR:
+        check_id("sender", value)
+
+
+def check_member(name: str, value: object, kind: type[StrEnum]) -> None:
+    """Raise ``InvalidField`` unless ``value`` is a member of ``kind``."""
+    if not isinstance(value, kind):
+        raise InvalidField(f"{name} is not a {kind.__name__}: {value!r}")
+
+
+def check_choices(value: object) -> None:
+    """Raise ``InvalidField`` unless ``value`` holds distinct, bounded choices."""
+    if not isinstance(value, tuple):
+        raise InvalidField(f"choices is not a tuple: {value!r}")
+    choices: tuple[object, ...] = value  # pyright: ignore[reportUnknownVariableType]
+    if len(choices) > MAX_CHOICES:
+        raise InvalidField(f"choices has more than {MAX_CHOICES} entries")
+    for choice in choices:
+        check_text("choice", choice, MAX_CHOICE_BYTES)
+    if len(set(choices)) != len(choices):
+        raise InvalidField("choices repeat an entry")
+
+
+class LineState(StrEnum):
+    IDLE = "idle"
+    RUNNING = "running"
+    STOPPED = "stopped"
+
+
+LINE_TRANSITIONS: Final[frozenset[tuple[LineState, LineState]]] = frozenset(
+    {
+        (LineState.IDLE, LineState.RUNNING),
+        (LineState.RUNNING, LineState.IDLE),
+        (LineState.IDLE, LineState.STOPPED),
+        (LineState.RUNNING, LineState.STOPPED),
+        (LineState.STOPPED, LineState.IDLE),
+    }
+)
+"""Every permitted change of a line's state. A change to the same state is not one."""
+
+
+class WakeCause(StrEnum):
+    MESSAGE = "message"
+    ANSWER = "answer"
+
+
+class QuestionStatus(StrEnum):
+    OPEN = "open"
+    ANSWERED = "answered"
+    WITHDRAWN = "withdrawn"
+    SUPERSEDED = "superseded"
+
+
+# Events. Each validates its own fields on construction, so an event that exists is
+# well formed, whether it was built in code or decoded from the log.
+
+
+@dataclass(frozen=True, slots=True)
+class LineCreated:
+    line_id: str
+    engine: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_id("engine", self.engine)
+
+
+@dataclass(frozen=True, slots=True)
+class LineStateChanged:
+    line_id: str
+    state: LineState
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_member("state", self.state, LineState)
+
+
+@dataclass(frozen=True, slots=True)
+class MessageSent:
+    message_id: str
+    sender: str
+    recipient: str
+    body: str
+
+    def __post_init__(self) -> None:
+        check_id("message_id", self.message_id)
+        check_sender(self.sender)
+        check_id("recipient", self.recipient)
+        check_text("body", self.body)
+
+
+@dataclass(frozen=True, slots=True)
+class MessageDelivered:
+    message_id: str
+
+    def __post_init__(self) -> None:
+        check_id("message_id", self.message_id)
+
+
+@dataclass(frozen=True, slots=True)
+class WakeRequested:
+    wake_id: str
+    line_id: str
+    cause: WakeCause
+    cause_id: str
+
+    def __post_init__(self) -> None:
+        check_id("wake_id", self.wake_id)
+        check_id("line_id", self.line_id)
+        check_member("cause", self.cause, WakeCause)
+        check_id("cause_id", self.cause_id)
+
+
+@dataclass(frozen=True, slots=True)
+class WakeIssued:
+    wake_id: str
+
+    def __post_init__(self) -> None:
+        check_id("wake_id", self.wake_id)
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionAsked:
+    question_id: str
+    line_id: str
+    text: str
+    choices: tuple[str, ...]
+    blocking: bool
+
+    def __post_init__(self) -> None:
+        check_id("question_id", self.question_id)
+        check_id("line_id", self.line_id)
+        check_text("text", self.text)
+        check_choices(self.choices)
+        check_bool("blocking", self.blocking)
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionAnswered:
+    question_id: str
+    answer: str
+
+    def __post_init__(self) -> None:
+        check_id("question_id", self.question_id)
+        check_text("answer", self.answer)
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionWithdrawn:
+    question_id: str
+
+    def __post_init__(self) -> None:
+        check_id("question_id", self.question_id)
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionSuperseded:
+    question_id: str
+    superseded_by: str
+
+    def __post_init__(self) -> None:
+        check_id("question_id", self.question_id)
+        check_id("superseded_by", self.superseded_by)
+
+
+type Event = (
+    LineCreated
+    | LineStateChanged
+    | MessageSent
+    | MessageDelivered
+    | WakeRequested
+    | WakeIssued
+    | QuestionAsked
+    | QuestionAnswered
+    | QuestionWithdrawn
+    | QuestionSuperseded
+)
+
+
+# State records. They are frozen and replaced whole on change, so a shallow copy of the
+# state maps is an independent snapshot.
+
+
+@dataclass(frozen=True, slots=True)
+class Line:
+    engine: str
+    state: LineState
+
+
+@dataclass(frozen=True, slots=True)
+class Message:
+    sender: str
+    recipient: str
+    body: str
+    delivered: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Wake:
+    line_id: str
+    cause: WakeCause
+    cause_id: str
+    issued: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Question:
+    line_id: str
+    text: str
+    choices: tuple[str, ...]
+    blocking: bool
+    status: QuestionStatus
+    answer: str | None = None
+    superseded_by: str | None = None
+
+
+@dataclass(slots=True)
+class State:
+    """Everything the event log records, keyed by identifier.
+
+    Identifiers are never reused within their kind, even after a line stops or a
+    question closes, so a resent event is rejected rather than applied twice.
+    """
+
+    lines: dict[str, Line] = field(default_factory=dict[str, Line])
+    messages: dict[str, Message] = field(default_factory=dict[str, Message])
+    wakes: dict[str, Wake] = field(default_factory=dict[str, Wake])
+    questions: dict[str, Question] = field(default_factory=dict[str, Question])
+
+    def copy(self) -> "State":
+        """Return an independent snapshot. The records are frozen, so maps suffice."""
+        return State(
+            dict(self.lines),
+            dict(self.messages),
+            dict(self.wakes),
+            dict(self.questions),
+        )
+
+    def is_blocked(self, line_id: str) -> bool:
+        """Whether ``line_id`` has an open blocking question, which pauses only it."""
+        return any(
+            q.line_id == line_id and q.blocking and q.status is QuestionStatus.OPEN
+            for q in self.questions.values()
+        )
+
+    def check(self, event: Event) -> None:
+        """Raise ``EventRejected`` unless ``event`` applies to this state.
+
+        Never mutates, so a caller can check, persist and only then apply.
+        """
+        match event:
+            case LineCreated():
+                self._check_new_line(event)
+            case LineStateChanged():
+                self._check_line_state(event)
+            case MessageSent():
+                self._check_message_sent(event)
+            case MessageDelivered():
+                message = self._message(event.message_id)
+                if message.delivered:
+                    raise EventRejected(f"message {event.message_id} was delivered")
+            case WakeRequested():
+                self._check_wake_requested(event)
+            case WakeIssued():
+                self._check_wake_issued(event)
+            case QuestionAsked():
+                self._check_question_asked(event)
+            case QuestionAnswered() | QuestionWithdrawn():
+                self._open_question(event.question_id)
+            case QuestionSuperseded():
+                self._check_superseded(event)
+            case _:
+                assert_never(event)
+
+    def apply(self, event: Event) -> None:
+        """Check ``event``, then apply it. A rejection leaves the state unchanged."""
+        self.check(event)
+        match event:
+            case LineCreated():
+                self.lines[event.line_id] = Line(event.engine, LineState.IDLE)
+            case LineStateChanged():
+                line = self.lines[event.line_id]
+                self.lines[event.line_id] = replace(line, state=event.state)
+            case MessageSent():
+                self.messages[event.message_id] = Message(
+                    event.sender, event.recipient, event.body, delivered=False
+                )
+            case MessageDelivered():
+                message = self.messages[event.message_id]
+                self.messages[event.message_id] = replace(message, delivered=True)
+            case WakeRequested():
+                self.wakes[event.wake_id] = Wake(
+                    event.line_id, event.cause, event.cause_id, issued=False
+                )
+            case WakeIssued():
+                wake = self.wakes[event.wake_id]
+                self.wakes[event.wake_id] = replace(wake, issued=True)
+            case QuestionAsked():
+                self.questions[event.question_id] = Question(
+                    event.line_id,
+                    event.text,
+                    event.choices,
+                    event.blocking,
+                    QuestionStatus.OPEN,
+                )
+            case QuestionAnswered():
+                self._close(
+                    event.question_id, QuestionStatus.ANSWERED, answer=event.answer
+                )
+            case QuestionWithdrawn():
+                self._close(event.question_id, QuestionStatus.WITHDRAWN)
+            case QuestionSuperseded():
+                self._close(
+                    event.question_id,
+                    QuestionStatus.SUPERSEDED,
+                    superseded_by=event.superseded_by,
+                )
+            case _:
+                assert_never(event)
+
+    # Lookups that turn a missing identifier into a rejection.
+
+    def _line(self, line_id: str) -> Line:
+        line = self.lines.get(line_id)
+        if line is None:
+            raise EventRejected(f"no line {line_id}")
+        return line
+
+    def _live_line(self, line_id: str) -> Line:
+        line = self._line(line_id)
+        if line.state is LineState.STOPPED:
+            raise EventRejected(f"line {line_id} is stopped")
+        return line
+
+    def _message(self, message_id: str) -> Message:
+        message = self.messages.get(message_id)
+        if message is None:
+            raise EventRejected(f"no message {message_id}")
+        return message
+
+    def _open_question(self, question_id: str) -> Question:
+        question = self.questions.get(question_id)
+        if question is None:
+            raise EventRejected(f"no question {question_id}")
+        if question.status is not QuestionStatus.OPEN:
+            raise EventRejected(f"question {question_id} is {question.status}")
+        return question
+
+    # Per-event checks.
+
+    def _check_new_line(self, event: LineCreated) -> None:
+        if event.line_id in self.lines:
+            raise EventRejected(f"line {event.line_id} exists")
+
+    def _check_line_state(self, event: LineStateChanged) -> None:
+        line = self._line(event.line_id)
+        if (line.state, event.state) not in LINE_TRANSITIONS:
+            raise EventRejected(
+                f"line {event.line_id} cannot go from {line.state} to {event.state}"
+            )
+        if event.state is LineState.RUNNING and self.is_blocked(event.line_id):
+            raise EventRejected(f"line {event.line_id} is blocked on a question")
+
+    def _check_message_sent(self, event: MessageSent) -> None:
+        if event.message_id in self.messages:
+            raise EventRejected(f"message {event.message_id} exists")
+        self._line(event.recipient)
+        if event.sender != OPERATOR:
+            self._line(event.sender)
+        if event.sender == event.recipient:
+            raise EventRejected(f"line {event.sender} cannot message itself")
+
+    def _check_wake_requested(self, event: WakeRequested) -> None:
+        if event.wake_id in self.wakes:
+            raise EventRejected(f"wake {event.wake_id} exists")
+        self._live_line(event.line_id)
+        match event.cause:
+            case WakeCause.MESSAGE:
+                message = self._message(event.cause_id)
+                if message.recipient != event.line_id:
+                    raise EventRejected(
+                        f"message {event.cause_id} is not for line {event.line_id}"
+                    )
+            case WakeCause.ANSWER:
+                question = self.questions.get(event.cause_id)
+                if question is None:
+                    raise EventRejected(f"no question {event.cause_id}")
+                if question.line_id != event.line_id:
+                    raise EventRejected(
+                        f"question {event.cause_id} is not from line {event.line_id}"
+                    )
+                if question.status is not QuestionStatus.ANSWERED:
+                    raise EventRejected(f"question {event.cause_id} is not answered")
+            case _:
+                assert_never(event.cause)
+
+    def _check_wake_issued(self, event: WakeIssued) -> None:
+        wake = self.wakes.get(event.wake_id)
+        if wake is None:
+            raise EventRejected(f"no wake {event.wake_id}")
+        if wake.issued:
+            raise EventRejected(f"wake {event.wake_id} was issued")
+        line = self._line(wake.line_id)
+        if line.state is not LineState.IDLE:
+            raise EventRejected(f"line {wake.line_id} is {line.state}, not idle")
+        if self.is_blocked(wake.line_id):
+            raise EventRejected(f"line {wake.line_id} is blocked on a question")
+
+    def _check_question_asked(self, event: QuestionAsked) -> None:
+        if event.question_id in self.questions:
+            raise EventRejected(f"question {event.question_id} exists")
+        self._live_line(event.line_id)
+
+    def _check_superseded(self, event: QuestionSuperseded) -> None:
+        old = self._open_question(event.question_id)
+        if event.superseded_by == event.question_id:
+            raise EventRejected(f"question {event.question_id} cannot supersede itself")
+        new = self._open_question(event.superseded_by)
+        if new.line_id != old.line_id:
+            raise EventRejected(
+                f"question {event.superseded_by} is from another line than"
+                f" {event.question_id}"
+            )
+
+    def _close(
+        self,
+        question_id: str,
+        status: QuestionStatus,
+        *,
+        answer: str | None = None,
+        superseded_by: str | None = None,
+    ) -> None:
+        question = self.questions[question_id]
+        self.questions[question_id] = replace(
+            question, status=status, answer=answer, superseded_by=superseded_by
+        )

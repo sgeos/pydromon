@@ -154,9 +154,10 @@ policy.
 
 ## Persistence
 
-**Proposed.** An append-only event log in SQLite holds messages, wakes, questions and line
-state. It makes recovery after a crash and replay in a newly attached client
-straightforward, and the event list doubles as the specification of the data model.
+**Implemented 2026-10-25, roadmap task 2.** An append-only event log in SQLite holds
+messages, wakes, questions and line state. It makes recovery after a crash and replay in
+a newly attached client straightforward, and the event list doubles as the specification
+of the data model. The specification is [`../protocol/EVENT_LOG.md`](../protocol/EVENT_LOG.md).
 
 ## Security and trust
 
