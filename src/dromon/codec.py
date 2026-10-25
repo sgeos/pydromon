@@ -56,7 +56,6 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "kind",
         "body",
         "choices",
-        "blocking",
         "reply_to",
     ),
     "message_delivered": ("message_id",),
@@ -152,7 +151,6 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "kind": event.kind.value,
                 "body": event.body,
                 "choices": list(event.choices),
-                "blocking": event.blocking,
                 "reply_to": event.reply_to,
             }
         case MessageDelivered():
@@ -200,7 +198,6 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _member(data, "kind", MessageKind),
                 _str(data, "body"),
                 _choices(data),
-                _bool(data, "blocking"),
                 _optional_str(data, "reply_to"),
             )
         case "message_delivered":
@@ -253,13 +250,6 @@ def _optional_str(data: dict[str, object], name: str) -> str | None:
 
 def _address(data: dict[str, object], name: str) -> Address:
     return parse_address(_str(data, name))
-
-
-def _bool(data: dict[str, object], name: str) -> bool:
-    value = data[name]
-    if type(value) is not bool:
-        raise DecodeError(f"{name} is not a boolean")
-    return value
 
 
 def _member[T: (LineState, MessageKind)](

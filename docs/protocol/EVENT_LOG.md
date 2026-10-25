@@ -52,21 +52,21 @@ Each event has a kind and fields, all required. An optional value is written as 
 | Kind | Fields | Applies when |
 |---|---|---|
 | `line_created` | `line_id`, `engine` and `strategy` identifiers | The line does not exist. The new line is idle. The engine names the model, and the strategy names the driver's credential strategy |
-| `line_state_changed` | `line_id`, `state` | The line exists, the change is in the transition table, and a change to `running` is refused while the line is blocked |
+| `line_state_changed` | `line_id`, `state` | The line exists and the change is in the transition table |
 | `line_configured` | `line_id`, `config` text of at most 262,144 bytes | The line exists. The text is the canonical JSON of [`LINE_CONFIG.md`](LINE_CONFIG.md), validated by the daemon before it appends, and replaces any earlier configuration |
 | `line_session` | `line_id`, `engine_session` text of 1 to 256 bytes | The line exists. Records the engine session the line's next turn resumes, so a restarted daemon continues the line's conversation |
 | `operator_registered` | `operator_id` | The operator does not exist |
-| `message_sent` | `message_id`, `sender` and `recipient` addresses, `kind`, `body` text, `choices`, `blocking` boolean, `reply_to` message identifier or `null` | See the message rules below |
+| `message_sent` | `message_id`, `sender` and `recipient` addresses, `kind`, `body` text, `choices`, `reply_to` message identifier or `null` | See the message rules below |
 | `message_delivered` | `message_id` | The message exists and was not delivered. For a line, delivery is into a turn. For an operator, delivery is acceptance by the operator's relay or display in a client |
 | `wake_requested` | `wake_id`, `line_id`, `message_id` | The wake does not exist, the line exists and is not stopped, and the message exists with the line as its recipient |
-| `wake_issued` | `wake_id` | The wake exists and was not issued, and its line is idle and not blocked |
+| `wake_issued` | `wake_id` | The wake exists and was not issued, and its line is idle |
 | `question_withdrawn` | `message_id` | The message is a question and is open |
 | `question_superseded` | `message_id`, `superseded_by` | Both messages are open questions, they differ, and they come from the same line |
 
 **Message rules.** A `message_sent` applies when every one of these holds.
 
 1. The message does not exist, and the sender and recipient both exist and differ.
-2. A note has no choices and does not block.
+2. A note has no choices.
 3. A question comes from a line that is not stopped and goes to an operator. A new
    question is open.
 4. A reply, which has a `reply_to`, names an existing message and reverses its route.
@@ -80,9 +80,10 @@ Each event has a kind and fields, all required. An optional value is written as 
 `running` to `stopped`, and `stopped` to `idle`. No other change is permitted, including
 a change to the same state.
 
-**Blocking.** A line is blocked while it has sent an open question with `blocking` true.
-A blocked line cannot start a turn or be woken, and nothing else is affected. An answer
-closes the question, so the reply that unblocks a line can also wake it.
+**No blocking.** **Decided by the operator on 2026-10-25.** Nothing blocks a line. After
+asking a question, a line may end its turn or keep working, as the line-agent decides,
+and the answer arrives as mail in a later turn, like any reply. An open question never
+stops its line from being woken.
 
 **Answers.** An answer is free text even when the question offers choices, so the
 operator is never forced into an option that does not fit.

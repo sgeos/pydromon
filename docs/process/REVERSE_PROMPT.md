@@ -9,14 +9,14 @@ A state file, overwritten whole after each task.
 **Done.** Tasks 1 to 5 were already complete, and pull request #11, ticks and per-line
 tools, was merged first. Task 6 is complete.
 
-- Lines ask through an in-process `ask_operator` tool, with optional choices and an
-  optional block. A question goes to the named operator, or by default to the operator
-  who last messaged the line.
+- Lines ask through an in-process `ask_operator` tool, with optional choices. A
+  question goes to the named operator, or by default to the operator who last messaged
+  the line.
 - The daemon keeps the queue in the event log. `dromon questions` lists an operator's
   open questions, or all with `--all`, and marks them delivered. `dromon answer` replies,
   only the asked operator may answer, and only once.
-- An answer is a reply message, so it wakes the line in a later tick, closes the
-  question and unblocks the line.
+- An answer is a reply message, so it wakes the line in a later tick and closes the
+  question.
 - **Found live and fixed.** After a restart, the first live run's line had forgotten
   its question, because engine sessions lived only in memory. A `line_session` event now
   records each line's session, and the rebuilt engine resumes it. In the second live
@@ -43,5 +43,12 @@ moves from a sent queue to the post office at the end of each tick. The operator
 direction on large per-line and per-project configuration, and on a client split from
 the daemon like a multiplayer game, is recorded in the design. 458 tests and all three
 live tests pass.
+
+**No blocking questions, a later prompt on the same day.** On the operator's
+decision, the `blocking` field and every blocked-line rule are gone. A line asks with
+`ask_operator`, then ends its turn or keeps working as the line-agent decides, and
+receives the answer as mail in a later turn. An open question never stops its line from
+being woken. Dromon's own tools now reject
+arguments outside their schema.
 
 **Next.** Task 7, conversation control, then task 8, the attachable client.

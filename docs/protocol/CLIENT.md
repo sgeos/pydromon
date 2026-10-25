@@ -49,7 +49,7 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `stop` | `{"stopping": true}`, after which the daemon closes its connections, removes its socket and exits |
 | `create_line` | Arguments `line_id`, `model`, `strategy`, and optionally `config`, an object of [`LINE_CONFIG.md`](LINE_CONFIG.md). Result `{"line_id": ...}`. Refused when no packaged driver serves the model and strategy |
 | `configure_line` | Arguments `line_id` and `config`. Replaces the line's configuration from its next turn |
-| `questions` | Optionally `operator`. Result `{"questions": [...]}`, the open questions for that operator, or for all when omitted, oldest first, each with `question_id`, `line`, `operator`, `text`, `choices` and `blocking`. Listing marks each question delivered, because the client has shown it |
+| `questions` | Optionally `operator`. Result `{"questions": [...]}`, the open questions for that operator, or for all when omitted, oldest first, each with `question_id`, `line`, `operator`, `text` and `choices`. Listing marks each question delivered, because the client has shown it |
 | `answer` | Arguments `question_id`, `body` and `operator`. Records the operator's reply, which must come from the operator the question was asked of. Result `{"message_id": ...}`. The answer wakes the asking line in a later tick |
 | `send` | Arguments `recipient`, a line or `@operator`, `body`, `operator`, and optionally `reply_to`. Registers the operator if new and records a note from them. Result `{"message_id": ...}` |
 

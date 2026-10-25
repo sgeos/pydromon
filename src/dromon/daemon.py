@@ -248,7 +248,6 @@ def _question_summary(message_id: str, message: Message) -> dict[str, object]:
         "operator": str(message.recipient),
         "text": message.body,
         "choices": list(message.choices),
-        "blocking": message.blocking,
     }
 
 

@@ -308,7 +308,7 @@ def test_a_bad_configuration_is_refused(
     assert (response.ok, response.error_code) == (False, code)
 
 
-def seed_question(paths: ProjectPaths, *, blocking: bool = False) -> str:
+def seed_question(paths: ProjectPaths) -> str:
     """A log holding line alpha and one open question from it to @ana."""
     paths.state_dir.mkdir(mode=0o700, exist_ok=True)
     with EventLog(paths.event_log) as log:
@@ -321,7 +321,6 @@ def seed_question(paths: ProjectPaths, *, blocking: bool = False) -> str:
             OperatorAddress("ana"),
             "Proceed?",
             ("yes", "no"),
-            blocking=blocking,
         )
 
 
@@ -338,7 +337,6 @@ def test_questions_lists_open_questions_for_an_operator(paths: ProjectPaths) -> 
                 "operator": "@ana",
                 "text": "Proceed?",
                 "choices": ["yes", "no"],
-                "blocking": False,
             }
         ]
     }
@@ -575,13 +573,13 @@ def test_an_open_question_survives_a_daemon_restart_and_is_answered(
 ) -> None:
     from dromon import cli
 
-    question_id = seed_question(paths, blocking=True)
+    question_id = seed_question(paths)
     base = ["--project", str(paths.root), "--runtime-dir", str(paths.runtime_dir)]
     pid = client.start(paths, HOLD)
     try:
         assert cli.main([*base, "questions", "--operator", "ana"]) == exits.OK
         listed = capsys.readouterr().out
-        assert f"{question_id} from alpha to @ana, blocking" in listed
+        assert f"{question_id} from alpha to @ana" in listed
         assert "choices: yes | no" in listed
     finally:
         client.stop(paths)
@@ -598,4 +596,3 @@ def test_an_open_question_survives_a_daemon_restart_and_is_answered(
         reap(pid)
     with EventLog(paths.event_log) as log:
         assert log.state.messages[question_id].status is QuestionStatus.ANSWERED
-        assert not log.state.is_blocked("alpha")

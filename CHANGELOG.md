@@ -7,6 +7,10 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- Questions no longer block. The `blocking` field leaves `message_sent`, notices and the
+  `ask_operator` tool. After asking, a line ends its turn or keeps working, as it
+  decides, and the answer arrives as mail.
+  Dromon's tools now reject arguments outside their schema.
 - The scheduler is a game loop. Each tick updates every line once and skips a busy one,
   turns run without the tick waiting for them, and mail sent during a tick moves from
   the sent queue to the post office at its end. `dromond` gains `--tick-seconds`.

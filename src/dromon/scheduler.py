@@ -2,11 +2,14 @@
 
 The scheduler runs a loop of ticks, like a game loop that updates every object once per
 frame. Each tick visits every line in a fixed order. A line that is busy with a turn is
-skipped, and that counts as its update for the tick. An idle line that is not blocked,
-not failed and under its turn cap, and that has mail in the post office, starts a turn:
-the wake is recorded, the line is marked running, its mail is delivered into the turn,
-and the turn then runs on its engine without the tick waiting for it. A turn may span
-many ticks.
+skipped, and that counts as its update for the tick. An idle line that is not failed,
+is under its turn cap and has mail in the post office starts a turn: the wake is
+recorded, the line is marked running, its mail is delivered into the turn, and the turn
+then runs on its engine without the tick waiting for it. A turn may span many ticks.
+
+Questions. Nothing blocks a line. A line asks with ``ask_operator`` and then ends its
+turn or keeps working, as the line-agent decides, and the answer arrives as mail in a
+later turn.
 
 Mail. Every message is a ``message_sent`` event in the log. A message sent during a
 tick, by a line in a turn or by an operator, goes to the sent queue. At the end of each
@@ -117,10 +120,6 @@ ASK_TOOL_SCHEMA: Final[dict[str, object]] = {
             "type": "array",
             "items": {"type": "string"},
             "description": "Suggested answers, if any. The operator may answer freely",
-        },
-        "blocking": {
-            "type": "boolean",
-            "description": "True to pause this line until the operator answers",
         },
     },
     "required": ["question"],
@@ -294,6 +293,9 @@ class Scheduler:
         sender = LineAddress(line_id)
 
         async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, SEND_TOOL_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
             to: object = args.get("to")
             body: object = args.get("body")
             reply_to: object = args.get("reply_to")
@@ -323,10 +325,12 @@ class Scheduler:
         operator: OperatorAddress,
         question: str,
         choices: tuple[str, ...] = (),
-        *,
-        blocking: bool = False,
     ) -> str:
-        """Record a question from ``line_id`` to ``operator`` in the queue."""
+        """Record a question from ``line_id`` to ``operator`` in the queue.
+
+        A question never pauses its line. The line may end its turn or keep working, as
+        it decides, and the answer reaches it as mail in a later turn, like any reply.
+        """
         message_id = new_id("q")
         self._log.append(
             MessageSent(
@@ -336,7 +340,6 @@ class Scheduler:
                 MessageKind.QUESTION,
                 question,
                 choices,
-                blocking,
             )
         )
         return message_id
@@ -377,10 +380,12 @@ class Scheduler:
         """The ``ask_operator`` tool for ``line_id``, whose asker it fixes."""
 
         async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, ASK_TOOL_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
             question: object = args.get("question")
             to: object = args.get("to")
             choices: object = args.get("choices", [])
-            blocking: object = args.get("blocking", False)
             if not isinstance(question, str):
                 return _tool_error("question must be text")
             if to is not None and not isinstance(to, str):
@@ -389,8 +394,6 @@ class Scheduler:
                 isinstance(choice, str) for choice in cast(list[object], choices)
             ):
                 return _tool_error("choices must be a list of text")
-            if type(blocking) is not bool:
-                return _tool_error("blocking must be true or false")
             try:
                 operator = self._operator_for(line_id, to)
                 message_id = self.ask(
@@ -398,7 +401,6 @@ class Scheduler:
                     operator,
                     question,
                     tuple(cast(list[str], choices)),
-                    blocking=blocking,
                 )
             except (InvalidField, EventRejected) as error:
                 return _tool_error(str(error))
@@ -406,8 +408,9 @@ class Scheduler:
                 "content": [
                     {
                         "type": "text",
-                        "text": f"asked {operator} as {message_id}. The answer arrives"
-                        " as a message in a later turn.",
+                        "text": f"asked {operator} as {message_id}. The answer"
+                        " arrives as a message in a later turn. You may end your"
+                        " turn or keep working meanwhile.",
                     }
                 ]
             }
@@ -417,7 +420,8 @@ class Scheduler:
             description=(
                 "Ask a Dromon operator a question. The question waits in the"
                 " operator's queue, and the answer arrives as a message in a later"
-                " turn. Set blocking to pause this line until the answer comes."
+                " turn. Asking never pauses you. End your turn or keep working, as"
+                " the work requires."
             ),
             input_schema=ASK_TOOL_SCHEMA,
             handler=handler,
@@ -463,7 +467,6 @@ class Scheduler:
             and state.lines[line_id].state is LineState.IDLE
             and line_id not in self._failed
             and self._turns.get(line_id, 0) < self._max_turns
-            and not state.is_blocked(line_id)
         )
 
     def _work_waiting(self) -> bool:
@@ -605,6 +608,15 @@ class Scheduler:
             }
             for line_id, line in sorted(state.lines.items())
         ]
+
+
+def _unexpected(args: dict[str, Any], schema: dict[str, object]) -> str | None:
+    """An error naming arguments outside ``schema``, which tool input may not carry."""
+    properties = cast(dict[str, object], schema["properties"])
+    extra = sorted(set(args) - set(properties))
+    if extra:
+        return "unexpected argument " + ", ".join(extra)
+    return None
 
 
 def _tool_error(text: str) -> dict[str, Any]:
