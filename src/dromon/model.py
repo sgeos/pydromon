@@ -22,6 +22,7 @@ each event has one explicit check, so each maps onto a Rust enum and a ``match``
 
 import re
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Final, assert_never
 
@@ -49,6 +50,25 @@ MAX_SESSION_BYTES: Final = 256
 
 MAX_CHOICES: Final = 16
 MAX_CHOICE_BYTES: Final = 1024
+
+MAX_WAKE_NOTE_BYTES: Final = 2000
+"""Upper bound on the UTF-8 size of a scheduled wake's note."""
+
+DUE_FORMAT: Final = "%Y-%m-%dT%H:%M:%SZ"
+"""A scheduled wake's due time, Coordinated Universal Time to the second, such as
+``2026-10-26T09:30:00Z``. One fixed form, so every port compares it the same way."""
+
+WITHHELD_WAKE_NOTE: Final = (
+    "Your scheduled wake fell due. Its note was withheld, because it contains a term"
+    " from the project's disclosure list."
+)
+"""The body a scheduled wake fires with in place of a note that the project's
+disclosure list, read again since the wake was scheduled, now covers. Fixed, so it
+never reveals the term."""
+
+DUE_PATTERN: Final = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
+)
 
 
 class InvalidField(ValueError):
@@ -85,6 +105,26 @@ def check_text(name: str, value: object, limit: int = MAX_TEXT_BYTES) -> None:
         raise InvalidField(f"{name} is not valid Unicode text") from error
     if size > limit:
         raise InvalidField(f"{name} is {size} bytes, over the limit of {limit}")
+
+
+def parse_due(value: str) -> datetime:
+    """The instant a due time names, or ``InvalidField`` unless it is a valid time in
+    exactly the ``DUE_FORMAT`` form."""
+    if DUE_PATTERN.fullmatch(value) is None:
+        raise InvalidField(
+            f"due is not a time of the form YYYY-MM-DDTHH:MM:SSZ: {value!r}"
+        )
+    try:
+        return datetime.strptime(value, DUE_FORMAT).replace(tzinfo=UTC)
+    except ValueError as error:
+        raise InvalidField(f"due is not a valid time: {value!r}") from error
+
+
+def format_due(instant: datetime) -> str:
+    """``instant``, which must be aware, as a due time."""
+    if instant.tzinfo is None:
+        raise InvalidField("a due time needs an aware instant")
+    return instant.astimezone(UTC).strftime(DUE_FORMAT)
 
 
 def check_member(name: str, value: object, kind: type[StrEnum]) -> None:
@@ -453,6 +493,30 @@ class WakeIssued:
 
 
 @dataclass(frozen=True, slots=True)
+class WakeScheduled:
+    """A line's one scheduled wake, replacing any earlier one it had.
+
+    When ``due`` has passed, the daemon records ``note`` as a ``message_sent`` from the
+    line to itself, under the ``message_id`` reserved here, which wakes the line as any
+    mail does, or records ``WITHHELD_WAKE_NOTE`` instead when the note now discloses a
+    listed term. Recording that one message is the whole of firing, so a crash either
+    leaves the wake pending or fired, never both.
+    """
+
+    line_id: str
+    message_id: str
+    due: str
+    note: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_id("message_id", self.message_id)
+        check_text("due", self.due, len("YYYY-MM-DDTHH:MM:SSZ"))
+        parse_due(self.due)
+        check_text("note", self.note, MAX_WAKE_NOTE_BYTES)
+
+
+@dataclass(frozen=True, slots=True)
 class QuestionWithdrawn:
     message_id: str
 
@@ -489,6 +553,7 @@ type Event = (
     | MessageAcknowledged
     | WakeRequested
     | WakeIssued
+    | WakeScheduled
     | QuestionWithdrawn
     | QuestionSuperseded
 )
@@ -545,6 +610,15 @@ class Wake:
     issued: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ScheduledWake:
+    """A line's pending scheduled wake, until its note is recorded."""
+
+    message_id: str
+    due: str
+    note: str
+
+
 @dataclass(slots=True)
 class State:
     """Everything the event log records, keyed by identifier.
@@ -560,6 +634,10 @@ class State:
     agents: dict[str, Agent] = field(default_factory=dict[str, Agent])
     project_overrides: str | None = None
     """The latest ``project_overridden`` text, or ``None``."""
+    scheduled: dict[str, ScheduledWake] = field(
+        default_factory=dict[str, ScheduledWake]
+    )
+    """Each line's pending scheduled wake, keyed by line. At most one per line."""
 
     def copy(self) -> "State":
         """Return an independent snapshot. The records are frozen, so maps suffice."""
@@ -570,6 +648,7 @@ class State:
             dict(self.wakes),
             dict(self.agents),
             self.project_overrides,
+            dict(self.scheduled),
         )
 
     def open_questions(self, operator_id: str) -> list[str]:
@@ -642,6 +721,8 @@ class State:
                 self._check_wake_requested(event)
             case WakeIssued():
                 self._check_wake_issued(event)
+            case WakeScheduled():
+                self._check_wake_scheduled(event)
             case QuestionWithdrawn():
                 self._open_question(event.message_id)
             case QuestionSuperseded():
@@ -707,6 +788,10 @@ class State:
             case WakeIssued():
                 wake = self.wakes[event.wake_id]
                 self.wakes[event.wake_id] = replace(wake, issued=True)
+            case WakeScheduled():
+                self.scheduled[event.line_id] = ScheduledWake(
+                    event.message_id, event.due, event.note
+                )
             case QuestionWithdrawn():
                 self._close(event.message_id, QuestionStatus.WITHDRAWN)
             case QuestionSuperseded():
@@ -769,13 +854,41 @@ class State:
                 f"line {event.line_id} cannot go from {line.state} to {event.state}"
             )
 
+    def _reserver(self, message_id: str) -> str | None:
+        """The line whose pending scheduled wake reserves ``message_id``, if any."""
+        for line_id, pending in self.scheduled.items():
+            if pending.message_id == message_id:
+                return line_id
+        return None
+
+    def _is_firing(self, event: MessageSent) -> bool:
+        """Whether ``event`` is the note of its sender's pending scheduled wake, the
+        only message a party may send itself."""
+        if not isinstance(event.sender, LineAddress) or event.sender != event.recipient:
+            return False
+        pending = self.scheduled.get(event.sender.line_id)
+        return (
+            pending is not None
+            and pending.message_id == event.message_id
+            and event.kind is MessageKind.NOTE
+            and event.body in (pending.note, WITHHELD_WAKE_NOTE)
+            and event.reply_to is None
+        )
+
     def _check_message_sent(self, event: MessageSent) -> None:
         if event.message_id in self.messages:
             raise EventRejected(f"message {event.message_id} exists")
         self._require_party(event.sender)
         self._require_party(event.recipient)
-        if event.sender == event.recipient:
+        firing = self._is_firing(event)
+        if event.sender == event.recipient and not firing:
             raise EventRejected(f"{event.sender} cannot message itself")
+        reserver = self._reserver(event.message_id)
+        if reserver is not None and not firing:
+            raise EventRejected(
+                f"message {event.message_id} is reserved by line {reserver}'s"
+                " scheduled wake"
+            )
         if event.kind is MessageKind.QUESTION:
             if not isinstance(event.sender, LineAddress):
                 raise EventRejected("only a line asks a question")
@@ -818,6 +931,17 @@ class State:
         if line.state is not LineState.IDLE:
             raise EventRejected(f"line {wake.line_id} is {line.state}, not idle")
 
+    def _check_wake_scheduled(self, event: WakeScheduled) -> None:
+        self._line(event.line_id)
+        if event.message_id in self.messages:
+            raise EventRejected(f"message {event.message_id} exists")
+        reserver = self._reserver(event.message_id)
+        if reserver is not None and reserver != event.line_id:
+            raise EventRejected(
+                f"message {event.message_id} is reserved by line {reserver}'s"
+                " scheduled wake"
+            )
+
     def _check_superseded(self, event: QuestionSuperseded) -> None:
         old = self._open_question(event.message_id)
         if event.superseded_by == event.message_id:
@@ -832,6 +956,8 @@ class State:
     # Mutations.
 
     def _apply_message_sent(self, event: MessageSent) -> None:
+        if self._is_firing(event) and isinstance(event.sender, LineAddress):
+            del self.scheduled[event.sender.line_id]
         status = QuestionStatus.OPEN if event.kind is MessageKind.QUESTION else None
         self.messages[event.message_id] = Message(
             event.sender,

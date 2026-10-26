@@ -61,7 +61,9 @@ TOP_KEYS: Final = frozenset(
         "lines",
     }
 )
-DAEMON_KEYS: Final = frozenset({"operator", "tick_seconds"})
+DAEMON_KEYS: Final = frozenset(
+    {"operator", "tick_seconds", "require_sandbox", "disclosure_terms"}
+)
 LIMIT_KEYS: Final = frozenset(
     {"max_autonomous_turns", "max_cost_usd", "cooldown_seconds"}
 )
@@ -144,6 +146,11 @@ class ProjectConfig:
     """The project's local teacher model, if it declares one."""
     agents: AgentPolicy = AGENTS_OFF
     """Which external agents may connect, and with what access. Off by default."""
+    require_sandbox: bool = False
+    """Whether every Claude Code line must run with its merged sandbox enabled."""
+    disclosure_terms: str | None = None
+    """The project's disclosure list, a path relative to the project root, or
+    ``None``. Only the path is held here. The daemon reads the terms."""
     lines: dict[str, LineDefinition] = field(default_factory=dict[str, LineDefinition])
 
 
@@ -243,6 +250,14 @@ class _Reader:
             tick = float(raw_tick)
             if not 0 <= tick <= 60:
                 raise self.fail("daemon.tick_seconds", "must be a number in [0, 60]")
+        require_sandbox = daemon.get("require_sandbox", False)
+        if type(require_sandbox) is not bool:
+            raise self.fail("daemon.require_sandbox", "must be a boolean")
+        terms = daemon.get("disclosure_terms")
+        if terms is not None and (
+            not isinstance(terms, str) or not terms or "\x00" in terms
+        ):
+            raise self.fail("daemon.disclosure_terms", "must be a path to a file")
         limits = self.limits(top.get("limits", {}), "limits", DEFAULT_LIMITS)
         wake = self.wake(top.get("wake", {}), "wake", 1)
         sandbox = self.sandbox(top.get("sandbox"), "sandbox")
@@ -275,6 +290,8 @@ class _Reader:
             settings=settings,
             teacher=teacher,
             agents=agents,
+            require_sandbox=require_sandbox,
+            disclosure_terms=terms,
             lines=lines,
         )
 

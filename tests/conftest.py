@@ -36,6 +36,7 @@ from dromon.model import (
     QuestionWithdrawn,
     WakeIssued,
     WakeRequested,
+    WakeScheduled,
 )
 
 ENGINE = "claude-opus-5-5"
@@ -94,6 +95,9 @@ SCENARIO: tuple[Event, ...] = (
     MessageSent("m5", BETA, PROBE, NOTE, "to an agent", reply_to="m4"),
     AgentRegistered("guest", AgentAccess.OBSERVE, ""),
     AgentRevoked("guest"),
+    WakeScheduled("beta", "s1", "2026-10-26T09:30:00Z", "read the gate's log"),
+    WakeScheduled("beta", "s2", "2026-10-26T10:00:00Z", "read it again"),
+    MessageSent("s2", BETA, BETA, NOTE, "read it again"),
     LineStateChanged("alpha", LineState.STOPPED),
 )
 

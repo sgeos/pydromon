@@ -54,6 +54,8 @@ from dromon.agents import (
     token_digest,
 )
 from dromon import codex, grok
+from dromon.disclosure import DisclosureError, load_terms
+from dromon.engine import ENGINE_NAME as CLAUDE_CODE_ENGINE
 from dromon.teacher import Teacher, TeacherError
 from dromon.driver import ENGINE_OF, MODELS, DriverError, Strategy
 from dromon.eventlog import EventLog, LogError, utc_now
@@ -67,7 +69,7 @@ from dromon.lineconfig import (
     decode_config,
 )
 from dromon.projectconfig import ConfigFileError, ProjectConfig, config_path, load
-from dromon.sandbox import SandboxError, effective, merge
+from dromon.sandbox import SandboxConfig, SandboxError, effective, merge
 from dromon.workdir import git_write_guards, resolve_workdir
 from dromon.configview import (
     OVERRIDE,
@@ -238,6 +240,9 @@ class Daemon:
     def append(self, event: AgentRegistered) -> None:
         self.log.append(event)
 
+    def discloses(self, *texts: str) -> bool:
+        return self.scheduler.discloses(*texts)
+
     def mail_tools(self, owner: AgentAddress) -> list[SdkMcpTool[Any]]:
         return [
             self.scheduler.send_tool(owner),
@@ -262,14 +267,7 @@ class Daemon:
 
     def line_tools(self, line_id: str) -> list[SdkMcpTool[Any]]:
         """A line's own tools, the same ones an in-process engine receives."""
-        return [
-            self.scheduler.send_tool(line_id),
-            self.scheduler.ask_tool(line_id),
-            self.scheduler.list_mail_tool(line_id),
-            self.scheduler.read_mail_tool(line_id),
-            self.scheduler.acknowledge_mail_tool(line_id),
-            self.scheduler.list_sent_tool(line_id),
-        ]
+        return self.scheduler.own_tools(line_id)
 
     async def respond_line(self, line: bytes) -> Response:
         """Answer one line on the line socket, for an engine reaching its line's own
@@ -495,6 +493,7 @@ class Daemon:
             ConfigFileError,
             ProjectMismatch,
             SandboxError,
+            DisclosureError,
         ) as error:
             return Response(
                 request.request_id,
@@ -518,6 +517,7 @@ class Daemon:
             raise DriverError(f"unknown strategy {strategy!r}") from error
         config = _config_arg(args) if "config" in args else DEFAULT_CONFIG
         self._check_workdir(config)
+        check_sandbox_required(self.project, line_id, model, config)
         self.scheduler.create_line(line_id, model, chosen, config, session)
         return {"line_id": line_id}
 
@@ -530,6 +530,9 @@ class Daemon:
             raise EventRejected(f"no line {line_id}")
         config = _config_arg(args)
         self._check_workdir(config)
+        check_sandbox_required(
+            self.project, line_id, self.scheduler.model_of(line_id), config
+        )
         self.scheduler.configure_line(line_id, config)
         return {"line_id": line_id}
 
@@ -805,10 +808,13 @@ class Daemon:
         except (ValueError, InvalidField) as error:
             raise OverrideError(str(error)) from error
         check_project(self.log, config)
+        terms = project_terms(config, self.paths)
+        check_lines_sandboxed(config, self.log, self.scheduler)
         for line_id in sorted(set(self.project.lines) - set(config.lines)):
             if line_id in self.log.state.lines:
                 self.scheduler.set_line_policy(line_id, None, None)
         apply_project(self.scheduler, self.log, config)
+        self.scheduler.set_disclosure_terms(terms)
         self.project = config
         self.project_file_present = present
         self.apply_project_values()
@@ -1184,6 +1190,46 @@ def check_sandboxes(config: ProjectConfig, paths: ProjectPaths) -> None:
         effective(merged, workdir, protected, guarded)
 
 
+def check_sandbox_required(
+    project: ProjectConfig, line_id: str, model: str, config: LineConfig
+) -> None:
+    """Refuse a Claude Code line whose merged sandbox is not enabled, when the
+    project requires one. Codex and Grok lines run under their own permission
+    profiles and satisfy the requirement. Raises ``SandboxError``."""
+    if not project.require_sandbox or ENGINE_OF.get(model) != CLAUDE_CODE_ENGINE:
+        return
+    merged: SandboxConfig | None = merge([project.sandbox, config.sandbox])
+    if merged is None or not merged.enabled:
+        raise SandboxError(
+            f"line {line_id} would run on Claude Code without an enabled sandbox,"
+            " which the project's daemon.require_sandbox requires"
+        )
+
+
+def check_lines_sandboxed(
+    config: ProjectConfig, log: EventLog, scheduler: Scheduler
+) -> None:
+    """Refuse a project that requires sandboxes while a line it declares, or a line
+    created through a client, would run without one. Raises ``SandboxError``."""
+    for line_id, definition in sorted(config.lines.items()):
+        check_sandbox_required(config, line_id, definition.model, definition.config)
+    for line_id in sorted(set(log.state.lines) - set(config.lines)):
+        check_sandbox_required(
+            config,
+            line_id,
+            scheduler.model_of(line_id),
+            scheduler.effective_config(line_id),
+        )
+
+
+def project_terms(config: ProjectConfig, paths: ProjectPaths) -> tuple[str, ...]:
+    """The project's disclosure terms, or none when it names no list. Raises
+    ``DisclosureError`` for a list that cannot be read, naming the file only."""
+    if config.disclosure_terms is None:
+        return ()
+    return load_terms(paths.root / config.disclosure_terms)
+
+
 def check_engines(config: ProjectConfig) -> None:
     """Refuse a project file that gives a Codex line a sandbox or settings through the
     project's own tables, which the line's engine cannot honour. Raises ``ValueError``.
@@ -1322,6 +1368,7 @@ def run(
         config = load(file) if file.exists() else ProjectConfig()
         check_sandboxes(config, paths)
         check_engines(config)
+        terms = project_terms(config, paths)
         limits, operator, tick = resolve(config, given)
         lock = acquire_lock(paths.lock)
     except AlreadyRunning as error:
@@ -1349,6 +1396,8 @@ def run(
                 tick_seconds=tick,
                 wake_every_ticks=config.wake_every_ticks,
             )
+            scheduler.set_disclosure_terms(terms)
+            check_lines_sandboxed(config, log, scheduler)
             apply_project(scheduler, log, config)
             teacher = start_teacher(config, paths)
             try:
@@ -1374,6 +1423,7 @@ def run(
         DriverError,
         EventRejected,
         TeacherError,
+        SandboxError,
     ) as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE

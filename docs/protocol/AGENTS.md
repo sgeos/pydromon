@@ -33,7 +33,12 @@ and `agent_revoked`, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies.
 
 Each level includes every level before it. The mail tools are the same tools a line
 has, with the same schemas and results, fixed to the agent's address, and an agent's
-mail is delivered when it lists it. `manage` can grant a line shell access and
+mail is delivered when it lists it. An agent's `send_message` is held to the project's
+disclosure list, and its `create_line` and `configure_line` to the project's sandbox
+requirement, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. It has no
+`wake_after`, which only lines have. An anonymous agent whose chosen name contains a
+listed term is refused on connection, and an agent registered with `agent_add` is
+exempt, since the operator named it. `manage` can grant a line shell access and
 credentials through its configuration, so it is close to operator trust. An
 `operator` answer is recorded as the reply of the operator the question was asked of,
 and the daemon's output names the agent that gave it.
