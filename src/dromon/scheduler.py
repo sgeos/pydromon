@@ -73,11 +73,16 @@ schedules, so the Keleusma version can keep these semantics exactly.
 """
 
 import asyncio
+import hashlib
+import errno
+import os
+import json
 import contextlib
 import secrets
 import time
 import sys
 from datetime import UTC, datetime, timedelta
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -105,12 +110,27 @@ from dromon import codex, grok
 from dromon.agents import LineTokens
 from dromon.codex import CodexLine
 from dromon.grok import GrokLine
-from dromon.engine import ClaudeCodeLine, EngineRefused, TurnReport, resolve_plugin
+from dromon import __version__
+from dromon.engine import (
+    ClaudeCodeLine,
+    EngineRefused,
+    TurnReport,
+    composed_instructions,
+    resolve_plugin,
+)
 from dromon.eventlog import EventLog
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, effective, merge
 from dromon.settings import SettingsConfig
+from dromon.processes import (
+    ProcessRefused,
+    ProcessTable,
+    UNIDENTIFIABLE,
+    SystemProcesses,
+    line_processes,
+    stop_line_process,
+)
 from dromon.workdir import git_write_guards, resolve_workdir
 from dromon.mailbox import (
     MAX_PAGE,
@@ -262,6 +282,57 @@ WAKE_TOOL_SCHEMA: Final[dict[str, object]] = {
     "additionalProperties": False,
 }
 
+REPEAT_WINDOW: Final = timedelta(minutes=15)
+"""How recent an identical message must be for a new one to be marked a repeat."""
+
+MAX_SCRATCH_BYTES: Final = 256 * 1024
+SCRATCH_DIRECTORY: Final = "tmp"
+
+LINE_STATUS_TOOL_NAME: Final = "line_status"
+WRITE_SCRATCH_TOOL_NAME: Final = "write_scratch"
+READ_INSTRUCTIONS_TOOL_NAME: Final = "read_instructions"
+
+NO_ARGUMENTS_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
+
+WRITE_SCRATCH_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "path": {
+            "type": "string",
+            "description": "A path relative to tmp/ in your working directory",
+        },
+        "text": {"type": "string", "description": "The file's whole new content"},
+    },
+    "required": ["path", "text"],
+    "additionalProperties": False,
+}
+
+
+LIST_PROCESSES_TOOL_NAME: Final = "list_processes"
+STOP_PROCESS_TOOL_NAME: Final = "stop_process"
+
+STOP_PROCESS_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "pid": {"type": "integer", "description": "One of your processes"},
+        "force": {
+            "type": "boolean",
+            "description": "Send SIGKILL instead of SIGTERM. Default false",
+        },
+    },
+    "required": ["pid"],
+    "additionalProperties": False,
+}
+
+
+class LineToolRefused(ValueError):
+    """A line tool cannot do what the line asked."""
+
+
 MAX_REST_SECONDS: Final = 60.0
 """The longest the loop rests while a scheduled wake is pending, so that a change of
 the wall clock delays a wake by at most this much."""
@@ -340,6 +411,8 @@ class LineSpec:
     """The engine session to resume, kept when a configuration change rebuilds it."""
     observe: Observer = field(default=ignore, compare=False)
     """Where the engine reports what it does during a turn, for attached clients."""
+    mark: str | None = None
+    """The process mark the line's engine and everything it starts inherit."""
 
 
 type EngineFactory = Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], LineEngine]
@@ -386,6 +459,7 @@ def engine_factory(
                 session_id=spec.session_id,
                 protected=protected,
                 observe=spec.observe,
+                mark=spec.mark,
             )
         if driver.settings.engine == grok.ENGINE_NAME:
             if project_sandbox is not None or project_settings is not None:
@@ -410,6 +484,7 @@ def engine_factory(
                 bridge=bridge,
                 line_token=token,
                 observe=spec.observe,
+                mark=spec.mark,
             )
         merged = merge([project_sandbox, spec.config.sandbox])
         enabled = merged is not None and merged.enabled
@@ -432,6 +507,7 @@ def engine_factory(
                 write_protected,
             ),
             observe=spec.observe,
+            mark=spec.mark,
         )
 
     return build
@@ -462,18 +538,27 @@ def compose_prompt(
     new: list[tuple[str, Message]],
     counts: MailSummary,
     answered: set[str],
+    *,
+    budget: str | None = None,
+    notes: Mapping[str, str] | None = None,
 ) -> str:
-    """The text that wakes ``line_id``: its mail summary and the new mail's headers.
+    """The text that wakes ``line_id``: its budget, its mail summary and the new mail's
+    headers, each followed by any note about it, such as that it repeats an earlier
+    message.
 
     Bodies stay in the mailbox, where ``read_mail`` opens them, so a large delivery
     does not flood the turn. The framing says bodies are data from their senders,
     because a body is untrusted text that may contain anything, including text posing
     as instructions.
     """
-    parts = [counts.sentence(), "", "New:"]
-    parts.extend(
-        f"  {header(message_id, message, answered)}" for message_id, message in new
-    )
+    noted = notes or {}
+    parts = [budget] if budget else []
+    parts.extend([counts.sentence(), "", "New:"])
+    for message_id, message in new:
+        line = f"  {header(message_id, message, answered)}"
+        if message_id in noted:
+            line += f", {noted[message_id]}"
+        parts.append(line)
     parts.append("")
     parts.append(
         f'You are the Dromon session line "{line_id}". list_mail looks through your'
@@ -504,6 +589,11 @@ class Scheduler:
         clock: Callable[[], float] = time.monotonic,
         wake_every_ticks: int = 1,
         wall_clock: Callable[[], datetime] = utc_clock,
+        root: Path | None = None,
+        protected: Sequence[Path] = (),
+        daemon_commit: str | None = None,
+        processes: ProcessTable | None = None,
+        processes_identifiable: bool = True,
     ) -> None:
         if not 1 <= wake_every_ticks <= MAX_WAKE_EVERY_TICKS:
             raise ValueError(f"wake_every_ticks must be in [1, {MAX_WAKE_EVERY_TICKS}]")
@@ -512,6 +602,28 @@ class Scheduler:
         self._log = log
         self._engine_factory = engine_factory
         self._wall_clock = wall_clock
+        self._root = root
+        """The project root, against which a line's working directory resolves, or
+        ``None`` where the scheduler runs without a project, as in some tests."""
+        self._protected = tuple(protected)
+        self._daemon_commit = daemon_commit
+        """The commit the daemon's own checkout had at start, if it runs from one."""
+        self._processes: ProcessTable = processes or SystemProcesses()
+        self._processes_identifiable = processes_identifiable
+        """Whether the daemon's start-time self-test could read another process's
+        environment. Where it could not, the process tools explain instead."""
+        self._mark_tokens: dict[str, str] = {}
+        """A random token per line, issued on first use in this daemon run, so that a
+        line, which sees only its own mark, cannot derive another line's."""
+        self._recent: dict[tuple[str, str, str], deque[tuple[datetime, str]]] = {}
+        """Messages sent within ``REPEAT_WINDOW``, by sender, recipient and body
+        digest, for marking repeats. In memory, so a message sent before a restart is
+        never marked."""
+        self._recent_order: deque[tuple[datetime, tuple[str, str, str], str]] = deque()
+        """The same messages in the order sent, so expired ones are pruned in turn."""
+        self._repeats: dict[str, str] = {}
+        """Each undelivered message to a line that repeats an earlier one, and that
+        earlier message, until the repeat is delivered."""
         self._disclosure: tuple[str, ...] = ()
         """The project's disclosure terms, case folded. Never logged or returned."""
         self._lease_names: frozenset[str] = frozenset()
@@ -645,11 +757,14 @@ class Scheduler:
     ) -> str:
         """Record a note from ``sender``. It is delivered in a later tick."""
         message_id = new_id("m")
+        sent_at = self._wall_clock()
         self._log.append(
             MessageSent(
                 message_id, sender, recipient, MessageKind.NOTE, body, reply_to=reply_to
             )
         )
+        if isinstance(recipient, LineAddress):
+            self._remember(message_id, sender, recipient, body, sent_at)
         self._sent.append(message_id)
         if reply_to is not None and isinstance(recipient, LineAddress):
             line = self._log.state.lines.get(recipient.line_id)
@@ -1040,6 +1155,341 @@ class Scheduler:
         """The ``release_lease`` tool for ``line_id``."""
         return self._lease_tool(line_id, acquire=False)
 
+    # What a line sees of itself and of the daemon.
+
+    def _budget_line(self, line_id: str) -> str:
+        """The line that opens every turn's prompt, so that a line sees how close a
+        hold is."""
+        limits = self.limits_for(line_id)
+        used = self._autonomous.get(line_id, 0)
+        cost = self._cost.get(line_id, 0.0)
+        return (
+            f"Autonomous turns used: {used} of {limits.max_autonomous_turns}."
+            f" Estimated cost since your last release: ${cost:.2f} of"
+            f" ${limits.max_cost_usd:.2f}. A line past either is held."
+        )
+
+    def _remember(
+        self,
+        message_id: str,
+        sender: Address,
+        recipient: Address,
+        body: str,
+        sent_at: datetime,
+    ) -> None:
+        """Note a message to a line for repeat marking, after pruning every remembered
+        message older than ``REPEAT_WINDOW``, so memory stays bounded by the messages
+        of the last 15 minutes."""
+        cutoff = sent_at - REPEAT_WINDOW
+        while self._recent_order and self._recent_order[0][0] < cutoff:
+            _, old_key, old_id = self._recent_order.popleft()
+            queue = self._recent.get(old_key)
+            if queue and queue[0][1] == old_id:
+                queue.popleft()
+            if queue is not None and not queue:
+                del self._recent[old_key]
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        key = (str(sender), str(recipient), digest)
+        queue = self._recent.setdefault(key, deque())
+        if queue and sent_at - queue[-1][0] <= REPEAT_WINDOW:
+            self._repeats[message_id] = queue[-1][1]
+        queue.append((sent_at, message_id))
+        self._recent_order.append((sent_at, key, message_id))
+
+    def _notes(self, messages: list[tuple[str, Message]]) -> dict[str, str]:
+        """Notes for a delivery's headers: a repeat names the message it repeats, and
+        a scheduled wake's note says when it was due and when it is delivered."""
+        notes: dict[str, str] = {}
+        delivered = format_due(self._wall_clock())
+        fired = self._log.state.fired_dues
+        for message_id, _ in messages:
+            parts: list[str] = []
+            repeated = self._repeats.pop(message_id, None)
+            if repeated is not None:
+                parts.append(f"a repeat of {repeated}")
+            if message_id in fired:
+                parts.append(
+                    f"your scheduled wake, due {fired[message_id]}, delivered"
+                    f" {delivered}"
+                )
+            if parts:
+                notes[message_id] = ", ".join(parts)
+        return notes
+
+    def _workdir_of(self, line_id: str) -> Path:
+        """The line's working directory, resolved and checked, or
+        ``LineToolRefused``."""
+        if self._root is None:
+            raise LineToolRefused("this daemon does not know its project root")
+        try:
+            return resolve_workdir(
+                self.effective_config(line_id).workdir, self._root, self._protected
+            )
+        except ConfigError as error:
+            raise LineToolRefused(str(error)) from error
+
+    def line_status(self, line_id: str) -> dict[str, object]:
+        """What ``line_id`` may know of itself, its daemon and the other lines. It
+        holds no configuration document and no message body."""
+        state = self._log.state
+        line = state.lines[line_id]
+        limits = self.limits_for(line_id)
+        config = self.effective_config(line_id)
+        try:
+            workdir: str | None = str(self._workdir_of(line_id))
+        except LineToolRefused:
+            workdir = None
+        pending = state.scheduled.get(line_id)
+        others: list[dict[str, object]] = [
+            {
+                "line_id": other_id,
+                "state": other.state.value,
+                "held": other.held_by is not None,
+                "leases": [str(lease["name"]) for lease in self.leases_of(other_id)],
+            }
+            for other_id, other in sorted(state.lines.items())
+            if other_id != line_id
+        ]
+        return {
+            "line_id": line_id,
+            "state": line.state.value,
+            "held_by": line.held_by,
+            "autonomous_turns": {
+                "used": self._autonomous.get(line_id, 0),
+                "allowed": limits.max_autonomous_turns,
+            },
+            "cost_usd": {
+                "estimate": f"{self._cost.get(line_id, 0.0):.4f}",
+                "limit": f"{limits.max_cost_usd:.2f}",
+            },
+            "leases": self.leases_of(line_id),
+            "scheduled_wake": _scheduled_summary(pending),
+            "unread": summary(state, LineAddress(line_id), 0).unread,
+            "pending": len(self.pending(line_id)),
+            "model": self.model_of(line_id),
+            "strategy": line.strategy,
+            "workdir": config.workdir,
+            "workdir_path": workdir,
+            "engine_session": line.engine_session,
+            "daemon": {"version": __version__, "commit": self._daemon_commit},
+            "processes": {
+                "identifiable": self._processes_identifiable,
+                "note": None if self._processes_identifiable else UNIDENTIFIABLE,
+            },
+            "other_lines": others,
+        }
+
+    def write_scratch(self, line_id: str, path: str, text: str) -> str:
+        """Write ``text`` to ``path`` under ``tmp/`` in the line's working directory,
+        creating directories, and return the path written, relative to the working
+        directory. Refused for an absolute path, ``..``, a path that resolves outside
+        ``tmp/``, a target that is a symbolic link or a directory, text over
+        ``MAX_SCRATCH_BYTES``, and text the disclosure list covers."""
+        if not path or "\x00" in path or path.startswith(("/", "~")):
+            raise LineToolRefused("path must be a relative path under tmp/")
+        parts = Path(path).parts
+        if ".." in parts or not parts:
+            raise LineToolRefused("path may not contain ..")
+        data = text.encode("utf-8")
+        if len(data) > MAX_SCRATCH_BYTES:
+            raise LineToolRefused(f"text is over {MAX_SCRATCH_BYTES} bytes")
+        if self.discloses(text, path):
+            raise LineToolRefused(disclosure.REFUSAL)
+        workdir = self._workdir_of(line_id)
+        # Every component is opened relative to its parent's descriptor without
+        # following links, so no link swapped in at any level can redirect the
+        # write, however the race falls.
+        try:
+            parent = os.open(workdir, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError as error:
+            raise LineToolRefused(
+                f"cannot open the working directory: {error.strerror}"
+            ) from error
+        try:
+            names = [SCRATCH_DIRECTORY, *parts[:-1]]
+            for index, name in enumerate(names):
+                entered = _enter(parent, name, path, scratch_root=index == 0)
+                os.close(parent)
+                parent = entered
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+            try:
+                descriptor = os.open(parts[-1], flags, 0o644, dir_fd=parent)
+            except OSError as error:
+                if error.errno == errno.ELOOP:
+                    raise LineToolRefused(
+                        f"{path} is a symbolic link, which is not overwritten"
+                    ) from error
+                if error.errno == errno.EISDIR:
+                    raise LineToolRefused(f"{path} is a directory") from error
+                raise LineToolRefused(
+                    f"cannot write {path}: {error.strerror}"
+                ) from error
+        finally:
+            os.close(parent)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+        return f"{SCRATCH_DIRECTORY}/{Path(*parts)}"
+
+    def line_instructions(self, line_id: str) -> str:
+        """The instructions ``line_id``'s next turn receives, as its engine adapter
+        composes them. Raises ``LineToolRefused``."""
+        config = self.effective_config(line_id)
+        engine = ENGINE_OF[self.model_of(line_id)]
+        workdir = self._workdir_of(line_id)
+        try:
+            text = composed_instructions(engine, config, workdir)
+        except EngineRefused as error:
+            raise LineToolRefused(str(error)) from error
+        if not text:
+            text = "This line's next turn receives no instructions from Dromon."
+        if config.project_settings:
+            text += (
+                "\n\nThe engine also loads the project's own CLAUDE.md files, which"
+                " Dromon does not compose and which are not shown here."
+            )
+        return text
+
+    def line_mark(self, line_id: str) -> str:
+        """The value of ``DROMON_LINE_MARK`` for ``line_id``'s processes in this run,
+        with a token that is this line's alone."""
+        token = self._mark_tokens.get(line_id)
+        if token is None:
+            token = self._mark_tokens.setdefault(line_id, secrets.token_hex(16))
+        return f"{line_id}.{token}"
+
+    def list_processes_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``list_processes`` tool for ``line_id``, which sees only its own."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, NO_ARGUMENTS_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            if not self._processes_identifiable:
+                return _tool_error(UNIDENTIFIABLE)
+            mark = self.line_mark(line_id)
+            try:
+                # Listing runs ps and reads environments, so it leaves the event
+                # loop free for the other lines meanwhile.
+                found = await asyncio.to_thread(
+                    line_processes, self._processes, mark, os.getpid()
+                )
+            except ProcessRefused as error:
+                return _tool_error(str(error))
+            return _tool_text(json.dumps(found, indent=2))
+
+        return SdkMcpTool(
+            name=LIST_PROCESSES_TOOL_NAME,
+            description=(
+                "List the processes you started that still run, including those"
+                " started in the background or with nohup in an earlier turn, with"
+                " pid, elapsed time and command. Only your own are shown."
+            ),
+            input_schema=NO_ARGUMENTS_SCHEMA,
+            handler=handler,
+        )
+
+    def stop_process_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``stop_process`` tool for ``line_id``, which stops only its own."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, STOP_PROCESS_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            pid: object = args.get("pid")
+            force: object = args.get("force", False)
+            if type(pid) is not int:
+                return _tool_error("pid must be a whole number")
+            if type(force) is not bool:
+                return _tool_error("force must be true or false")
+            if not self._processes_identifiable:
+                return _tool_error(UNIDENTIFIABLE)
+            mark = self.line_mark(line_id)
+            try:
+                done = await asyncio.to_thread(
+                    stop_line_process, self._processes, mark, os.getpid(), pid, force
+                )
+            except ProcessRefused as error:
+                return _tool_error(str(error))
+            return _tool_text(done)
+
+        return SdkMcpTool(
+            name=STOP_PROCESS_TOOL_NAME,
+            description=(
+                "Stop one of your own processes by pid, with SIGTERM, or SIGKILL when"
+                " force is true. Any other process is refused."
+            ),
+            input_schema=STOP_PROCESS_SCHEMA,
+            handler=handler,
+        )
+
+    def _view_tool(
+        self, name: str, description: str, view: Callable[[], str]
+    ) -> SdkMcpTool[Any]:
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, NO_ARGUMENTS_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            try:
+                return _tool_text(view())
+            except LineToolRefused as error:
+                return _tool_error(str(error))
+
+        return SdkMcpTool(
+            name=name,
+            description=description,
+            input_schema=NO_ARGUMENTS_SCHEMA,
+            handler=handler,
+        )
+
+    def line_status_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``line_status`` tool for ``line_id``."""
+        return self._view_tool(
+            LINE_STATUS_TOOL_NAME,
+            "Show your own state: your hold, autonomous turns and estimated cost with"
+            " their limits, leases, scheduled wake, unread mail, model, working"
+            " directory and engine session, the daemon's version and commit, and the"
+            " other lines' state, read only.",
+            lambda: json.dumps(self.line_status(line_id), indent=2, sort_keys=True),
+        )
+
+    def read_instructions_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``read_instructions`` tool for ``line_id``."""
+        return self._view_tool(
+            READ_INSTRUCTIONS_TOOL_NAME,
+            "Show the instructions your next turn receives, as Dromon composes them"
+            " from your configuration.",
+            lambda: self.line_instructions(line_id),
+        )
+
+    def write_scratch_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``write_scratch`` tool for ``line_id``, which writes only under its own
+        working directory's ``tmp/``."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, WRITE_SCRATCH_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            path: object = args.get("path")
+            text: object = args.get("text")
+            if not isinstance(path, str) or not isinstance(text, str):
+                return _tool_error("path and text must be text")
+            try:
+                written = self.write_scratch(line_id, path, text)
+            except LineToolRefused as error:
+                return _tool_error(str(error))
+            return _tool_text(f"wrote {written} in your working directory")
+
+        return SdkMcpTool(
+            name=WRITE_SCRATCH_TOOL_NAME,
+            description=(
+                "Write a scratch or report file under tmp/ in your working directory,"
+                " replacing it whole, without needing a file-writing tool. The path is"
+                " relative to tmp/, and the text is at most 256 KiB."
+            ),
+            input_schema=WRITE_SCRATCH_SCHEMA,
+            handler=handler,
+        )
+
     def own_tools(self, line_id: str) -> list[SdkMcpTool[Any]]:
         """A line's own Dromon tools, whose sender each fixes to the line."""
         return [
@@ -1048,6 +1498,11 @@ class Scheduler:
             self.wake_tool(line_id),
             self.acquire_lease_tool(line_id),
             self.release_lease_tool(line_id),
+            self.line_status_tool(line_id),
+            self.read_instructions_tool(line_id),
+            self.write_scratch_tool(line_id),
+            self.list_processes_tool(line_id),
+            self.stop_process_tool(line_id),
             self.list_mail_tool(line_id),
             self.read_mail_tool(line_id),
             self.acknowledge_mail_tool(line_id),
@@ -1611,6 +2066,8 @@ class Scheduler:
             messages,
             summary(self._log.state, address, len(messages)),
             replied_ids(self._log.state, address),
+            budget=self._budget_line(line_id),
+            notes=self._notes(messages),
         )
         from_operator = any(
             isinstance(message.sender, OperatorAddress) for _, message in messages
@@ -1685,6 +2142,7 @@ class Scheduler:
                 self.effective_config(line_id),
                 line.engine_session,
                 self.activity.observer(line_id),
+                self.line_mark(line_id),
             )
             engine = self._engine_factory(spec, self.own_tools(line_id))
             self._engines[line_id] = engine
@@ -1719,6 +2177,30 @@ def _unexpected(args: dict[str, Any], schema: dict[str, object]) -> str | None:
     if extra:
         return "unexpected argument " + ", ".join(extra)
     return None
+
+
+def _enter(parent: int, name: str, path: str, *, scratch_root: bool) -> int:
+    """Create the directory ``name`` under the open directory ``parent`` if it is
+    missing, and return a new descriptor for it, opened without following a link. The
+    caller keeps ``parent`` and closes it. Raises ``LineToolRefused`` for a link, a file
+    in the way, or any other failure."""
+    try:
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(name, 0o755, dir_fd=parent)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        return os.open(name, flags, dir_fd=parent)
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR) and scratch_root:
+            raise LineToolRefused(
+                "tmp/ in the working directory is a link elsewhere or not a directory"
+            ) from error
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise LineToolRefused(
+                f"{path} resolves outside tmp/ through a link, or crosses a file"
+            ) from error
+        raise LineToolRefused(
+            f"cannot create a directory for {path}: {error.strerror}"
+        ) from error
 
 
 def _scheduled_summary(pending: ScheduledWake | None) -> dict[str, object] | None:

@@ -95,6 +95,119 @@ argument outside a tool's schema is refused.
 | `list_mail`, `read_mail`, `acknowledge_mail` | Page through, open and acknowledge the line's mailbox |
 | `list_sent` | Lists what became of the line's sent mail |
 | `acquire_lease`, `release_lease` | Take and give up a lease the project declares, as below |
+| `line_status` | Shows the line's own state, its daemon and the other lines, read only, as below |
+| `read_instructions` | Shows the instructions the line's next turn receives, as below |
+| `write_scratch` | Writes a file under `tmp/` in the line's working directory, as below |
+| `list_processes`, `stop_process` | List and stop the processes the line started, as below |
+
+**Decided by the operator on 2026-10-26**, from the lines' own reports, for what follows
+in this section.
+
+**`line_status`.** No arguments. It returns JSON for the calling line: its `state`, the
+question holding it as `held_by`, its `autonomous_turns` used and allowed, its estimated
+`cost_usd` since its last release and its limit, its `leases` with their ends, its
+`scheduled_wake`, its `unread` mail and `pending` deliveries, its `model` and
+`strategy`, its `workdir` as configured and as `workdir_path` resolved, and its
+`engine_session`. It adds the daemon's `version` and `commit`, and for every other line
+its `line_id`, `state`, whether it is `held`, and the names of its `leases`. It holds no
+configuration document and no message body. The commit is read once when `dromond`
+starts, from the `HEAD` of the checkout its own code runs from, following loose refs,
+`packed-refs` and a linked worktree's pointers without running git, and is `null` when
+the daemon does not run from a checkout or the commit cannot be read.
+
+**`read_instructions`.** No arguments. It returns the instructions the line's next turn
+receives as its engine adapter composes them from `instructions`: the system prompt
+text of a Claude Code line, marked as following Claude Code's own prompt when
+`claude_code_prompt` is set, and the developer instructions of a Codex line or the
+rules of a Grok line. Files the engine loads itself, such as a project's `CLAUDE.md`
+under `project_settings`, are named but not shown. An unreadable instruction file is
+reported as the turn would refuse it.
+
+**`write_scratch`.** Arguments `path`, relative to `tmp/` in the line's working
+directory, and `text`, at most 262,144 bytes of UTF-8, which replaces the file whole.
+The daemon writes the file, so a line without `Write` can keep its own notes and
+reports. It creates `tmp/` and the directories under it. It refuses an absolute path,
+a path starting with `~`, any `..`, a target that is a symbolic link, which is never
+overwritten, and a target that is a directory. The daemon walks the path from the
+working directory one component at a time, creating each missing directory and opening
+it relative to its parent's open descriptor without following a link, and creates the
+file the same way. So a `tmp/` or a directory under it that is a link, or that a racing
+process swaps for a link at any moment, refuses the write instead of redirecting it,
+as does a file in a directory's place. Text or a path that the project's disclosure
+list covers is refused, and nothing is written.
+
+**Processes.** **Decided by the operator on 2026-10-26.** Claude Code, Codex and Grok
+Build each scope their own process controls to the agent's own session, and these
+tools do the same for a line.
+
+- **Mark.** `DROMON_LINE_MARK` holds the line's identifier and a random token issued
+  for that line once per daemon run, such as `alpha.` followed by 32 hexadecimal
+  digits. Each line's token is its own and held only in the daemon, so a line, which
+  sees only its own mark, cannot present another line's. Every command a line runs
+  carries it, including one started with `nohup` that outlives its turn. A restart
+  issues new tokens, so a process from an earlier run is no longer the line's. `DROMON_LINE_MARK` is a reserved variable that a settings document's `env`
+  may not set, as [`SETTINGS.md`](SETTINGS.md) specifies.
+- **How each engine passes it on.** Codex receives it only for the commands it runs,
+  through its `shell_environment_policy.set`, as [`CODEX.md`](CODEX.md) specifies, so
+  Codex's own processes never carry it. **Fact, observed live on 2026-10-26.** Put in
+  the app-server's environment instead, the mark was filtered from a Codex line's shell
+  commands and carried by Codex's own helper processes, so this was changed. Claude
+  Code and Grok Build receive it in their environment, and the engine, a direct child
+  of the daemon, is left out of the listing. **Inference, not tested live.** What the
+  engine starts carries the mark too: on Claude Code a line's configured stdio MCP
+  servers and short-lived search processes, and on Grok the Dromon bridge that serves
+  the line's own tools. These are the line's own session, and stopping one affects
+  only that line.
+- **`list_processes`.** No arguments. It returns, as JSON, every process of the
+  daemon's user whose environment holds exactly the calling line's mark, with `pid`,
+  `elapsed` as `ps` reports it, and `command` cut to 200 characters. The daemon and the
+  engines it started directly are left out.
+- **`stop_process`.** Arguments `pid` and optionally `force`, a boolean. It sends
+  `SIGTERM`, or `SIGKILL` with `force`, only to a process of the daemon's user that is
+  neither the daemon nor an engine it started and whose environment holds the line's
+  mark, read again at the moment of stopping. Every other pid is refused, as are a pid
+  of 1 or less, a process that has already ended and one that cannot be signalled.
+- **Failing closed.** A process whose environment cannot be read is not the line's.
+  Reading another process's environment is specific to each operating system, through
+  `ps -E` on macOS and `/proc/PID/environ` on Linux, a porting hazard that
+  `dromon.processes` keeps in one function. On macOS the environment arrives on one line
+  after the command's arguments, so an argument written exactly as the assignment also
+  counts, which a line can only arrange for a process it started itself.
+- **Self-test.** When `dromond` starts, it starts a short child with a known variable and
+  checks that both readers, the listing's and the stop's, see it within about a second,
+  then stops the child. Where they do not, `list_processes` and `stop_process` refuse
+  with a fixed explanation that the platform does not let the daemon identify a line's
+  processes, rather than returning an empty listing, and `line_status` reports
+  `processes` as not identifiable with the same note.
+- **Fact, observed live on 2026-10-26 on macOS, Darwin 27.** Neither `ps -wwE` nor
+  `sysctl` with `KERN_PROCARGS2` returned any environment for another process, even an
+  ordinary one of the same user, and a line's `nohup` process was reparented to
+  `launchd` and led its own process group. So `list_processes` returned an empty
+  listing and `stop_process` refused on a Claude Code line and on a Codex line. On such
+  a platform the mark cannot identify a line's processes, and the self-test above
+  makes the tools say so. The Linux path through `/proc` is unaffected. Keeping a
+  line's engine session alive between turns, so that the engines' own background task
+  tools can be used, is recorded as a round 2 item in `docs/process/DOGFOOD.md`.
+- **Limits.** A pid reused by another process between the check and the signal is the
+  race every signal by pid has, narrowed by checking immediately before. External
+  agents have neither tool.
+
+## The wake prompt
+
+Each turn's prompt opens with one line giving the line's autonomous turns used of
+those allowed and its estimated cost since its last release of its limit, so the line
+sees how close a hold is without calling `line_status`. The mail summary and the
+headers of the newly delivered mail follow, and bodies stay in the mailbox.
+
+- **Repeats.** A message whose sender, recipient and body match a message sent at most
+  15 minutes before it is still delivered, and its header ends with
+  `a repeat of` and the earlier message's identifier. The daemon remembers messages to
+  lines by sender, recipient and a digest of the body, and forgets each once it is more
+  than 15 minutes old, so the memory stays bounded and the check takes constant time.
+  The memory does not survive a restart, so a message sent before one is never marked.
+- **Scheduled wakes.** A fired wake's header says it is the line's scheduled wake and
+  gives the time it was due and the time it is delivered. The due time is kept in the
+  state the event log builds, so it survives a restart.
 
 **Leases.** **Decided by the operator on 2026-10-26.** A project declares named leases
 in its `[leases]` table, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, so its

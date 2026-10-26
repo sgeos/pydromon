@@ -98,13 +98,15 @@ RESERVED_VARIABLES: Final = frozenset(
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CLAUDE_CONFIG_DIR",
         "AWS_BEARER_TOKEN_BEDROCK",
+        "DROMON_LINE_MARK",
     }
 )
 
 
 def reserved_variable(name: str) -> bool:
     """Whether a line may not set or reference ``name``, because it selects or holds
-    the engine's credential or provider."""
+    the engine's credential or provider, or is the mark Dromon gives a line's
+    processes."""
     return name in RESERVED_VARIABLES or name.startswith(RESERVED_PREFIXES)
 
 

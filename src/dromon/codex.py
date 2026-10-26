@@ -45,8 +45,12 @@ server request before reading on.
 """
 
 import asyncio
+import stat
+import contextlib
+import hashlib
 import json
 import os
+import tempfile
 import re
 import shutil
 import subprocess
@@ -62,6 +66,7 @@ from dromon import __version__
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
 from dromon.engine import EngineRefused, TurnReport, read_instructions
+from dromon.processes import MARK_VARIABLE
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
 
 ENGINE_NAME: Final = "codex"
@@ -161,9 +166,46 @@ def engine_environment(
             + ", ".join(present)
             + ". Unset these variables."
         )
-    if strategy is not Strategy.SUBSCRIPTION:
-        return dict(environment)
-    return {k: v for k, v in environment.items() if k not in API_ENVIRONMENT}
+    chosen = (
+        dict(environment)
+        if strategy is not Strategy.SUBSCRIPTION
+        else {k: v for k, v in environment.items() if k not in API_ENVIRONMENT}
+    )
+    if "XDG_CACHE_HOME" not in chosen:
+        chosen["XDG_CACHE_HOME"] = ensure_cache_home(default_cache_home())
+    return chosen
+
+
+def default_cache_home() -> str:
+    """A cache directory under the system temporary directory, one per user, which
+    Codex's workspace profile leaves writable, for tools that honour
+    ``XDG_CACHE_HOME``. A cold cache still needs the network, which a Codex line
+    lacks."""
+    return os.path.join(tempfile.gettempdir(), f"dromon-cache-{os.getuid()}")
+
+
+def ensure_cache_home(path: str) -> str:
+    """Create the default cache directory with mode 0700 if it is missing, and return
+    it. Raises ``EngineRefused`` for one that is a link, not a directory, not owned by
+    the daemon's user, or writable by its group or others, since on a shared temporary
+    directory another user could have made it first and planted cache entries."""
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(path, 0o700)
+    try:
+        found = os.lstat(path)
+    except OSError as error:
+        raise EngineRefused(
+            f"cannot use the cache directory {path}: {error}"
+        ) from error
+    if not stat.S_ISDIR(found.st_mode):
+        raise EngineRefused(f"the cache directory {path} is not a directory")
+    if found.st_uid != os.getuid():
+        raise EngineRefused(f"the cache directory {path} belongs to another user")
+    if found.st_mode & 0o022:
+        raise EngineRefused(
+            f"the cache directory {path} is writable by its group or others"
+        )
+    return path
 
 
 def _toml_string(text: str) -> str:
@@ -192,13 +234,50 @@ def permission_profile(config: LineConfig, protected: Sequence[Path]) -> str:
     return f'{{extends=":workspace", filesystem={{{", ".join(entries)}}}}}'
 
 
+SESSION_SEPARATOR: Final = ":"
+"""Joins a Codex thread identifier and the fingerprint of the tools it started with,
+in the engine session Dromon stores. A thread identifier holds no colon."""
+
+TOOLS_CHANGED_NOTE: Final = (
+    "Dromon's tools for this line changed since your Codex thread started, and a"
+    " resumed thread keeps the tools it started with, so this turn starts a new thread."
+    " The earlier thread's context is not available in it. Your mailbox, files and"
+    " reports are unchanged."
+)
+
+
+def split_session(session: str | None) -> tuple[str | None, str | None]:
+    """The thread to resume and its tools' fingerprint, from a stored session. A
+    session without a fingerprint, as stored before fingerprints existed or adopted
+    from elsewhere, has none, so its tools count as changed."""
+    if session is None:
+        return None, None
+    thread, separator, fingerprint = session.rpartition(SESSION_SEPARATOR)
+    if not separator:
+        return session, None
+    return thread, fingerprint
+
+
 def server_arguments(
-    servers: Sequence[str], config: LineConfig, protected: Sequence[Path] = ()
+    servers: Sequence[str],
+    config: LineConfig,
+    protected: Sequence[Path] = (),
+    mark: str | None = None,
 ) -> list[str]:
     """The ``codex app-server`` arguments that isolate a line configured as ``config``
     from the operator's ``servers``, from every tool it was not given, and from the
-    ``protected`` directories."""
+    ``protected`` directories, and that give the line's shell commands its process
+    ``mark``.
+
+    The mark goes through Codex's ``shell_environment_policy.set``, which applies to
+    the commands Codex runs and not to Codex's own processes, so the app-server and its
+    helpers never carry it and a line cannot list or stop them."""
     arguments = ["app-server"]
+    if mark is not None:
+        arguments += [
+            "-c",
+            f"shell_environment_policy.set.{MARK_VARIABLE}={_toml_string(mark)}",
+        ]
     for name in sorted(set(servers)):
         # Codex's -c parser takes bare dotted keys only, and rejects a quoted one.
         if BARE_KEY.fullmatch(name) is None:
@@ -352,6 +431,8 @@ class _Turn:
     refusal: str | None = None
     turn_id: str | None = None
     status: str = ""
+    tools_changed: bool = False
+    """Whether this turn started a new thread because Dromon's tools changed."""
 
 
 class CodexLine:
@@ -370,6 +451,7 @@ class CodexLine:
         connection_factory: ConnectionFactory = _app_server,
         server_lister: ServerLister = list_servers,
         observe: Observer = ignore,
+        mark: str | None = None,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -386,6 +468,8 @@ class CodexLine:
         self._connect = connection_factory
         self._list_servers = server_lister
         self._observe = observe
+        self.mark = mark
+        """The process mark every process of this line inherits, if issued."""
         self._next_id = 0
         self._thread_id = ""
         self._connection: Connection | None = None
@@ -399,7 +483,7 @@ class CodexLine:
         if reason is not None:
             raise EngineRefused(reason)
         arguments = server_arguments(
-            self._list_servers(environment), self.config, self.protected
+            self._list_servers(environment), self.config, self.protected, self.mark
         )
         turn = _Turn()
         async with self._connect(arguments, self.cwd, environment) as connection:
@@ -417,7 +501,8 @@ class CodexLine:
                 self._connection = None
         if turn.refusal is not None:
             raise EngineRefused(turn.refusal)
-        self.session_id = thread_id
+        session = f"{thread_id}{SESSION_SEPARATOR}{self.tools_fingerprint()}"
+        self.session_id = session
         subtype = "success" if turn.status == "completed" else turn.status
         self.driver.step(Event("result", subtype, 1))
         return TurnReport(
@@ -427,7 +512,7 @@ class CodexLine:
             tool_uses=tuple(turn.tool_uses),
             interrupted_for=turn.interrupted_for,
             credential=credential,
-            session_id=thread_id,
+            session_id=session,
             capabilities=None,
             cost_estimate_usd=None,
         )
@@ -620,14 +705,20 @@ class CodexLine:
         instructions = read_instructions(self.config.instructions, self.cwd)
         if instructions:
             settings["developerInstructions"] = instructions
-        if self.session_id is None:
+        resumable, fingerprint = split_session(self.session_id)
+        if resumable is not None and fingerprint != self.tools_fingerprint():
+            # thread/resume takes no dynamicTools in this Codex, so a thread keeps the
+            # tools it was started with, and changed tools need a new thread.
+            turn.tools_changed = True
+            resumable = None
+        if resumable is None:
             settings["dynamicTools"] = [
                 dynamic_tool(t) for t in self.mcp_tools.values()
             ]
             result = await self._call("thread/start", settings, turn)
         else:
             result = await self._call(
-                "thread/resume", {**settings, "threadId": self.session_id}, turn
+                "thread/resume", {**settings, "threadId": resumable}, turn
             )
         thread = cast(dict[str, Any], result.get("thread") or {})
         thread_id = str(thread.get("id") or "")
@@ -675,7 +766,15 @@ class CodexLine:
         if apps.get("data"):
             turn.refusal = "the engine offers apps the line was not given"
 
+    def tools_fingerprint(self) -> str:
+        """A short digest of the names of Dromon's tools for this line, stored with
+        the thread so a resumed thread can be checked against today's tools."""
+        names = "\n".join(sorted(self.mcp_tools))
+        return hashlib.sha256(names.encode("utf-8")).hexdigest()[:16]
+
     async def _run(self, thread_id: str, prompt: str, turn: _Turn) -> None:
+        if turn.tools_changed:
+            prompt = f"{TOOLS_CHANGED_NOTE}\n\n{prompt}"
         self.driver.step(Event("turn_start"))
         started = await self._call(
             "turn/start",

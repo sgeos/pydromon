@@ -67,6 +67,37 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Lines gain `list_processes` and `stop_process`. Every command a line runs carries
+  `DROMON_LINE_MARK`, the line's identifier and a random token of its own issued per
+  daemon run, including commands that outlive a turn, so no line can present another
+  line's mark. Both tools run off the event loop, and on macOS one `ps` call reads every
+  environment. At start the daemon tests whether it can read a child's environment at
+  all, and where it cannot, as on macOS from Darwin 27 on, both tools and
+  `line_status` say that this platform does not let it identify a line's processes. A line sees and
+  signals only processes of the daemon's user that carry its own mark, never the
+  daemon or an engine, and the mark is read again when stopping. An unreadable
+  environment counts as not the line's. On Codex the mark reaches only the commands it
+  runs, through `shell_environment_policy.set`, so Codex's own processes are never
+  listed. `DOGFOOD.md` records three requirements that stay in the engine for now.
+- A Codex line's stored session now carries a fingerprint of its Dromon tools. A thread
+  started with other tools is not resumed, since `thread/resume` takes no
+  `dynamicTools`, and the new thread's first turn tells the line so.
+- Lines gain `line_status`, which shows the line's hold, autonomous turns and cost with
+  their limits, leases, scheduled wake, unread mail, model, working directory, engine
+  session, the daemon's version and the commit it runs from, read from `HEAD` without
+  running git, and the other lines' state, read only. Every turn's prompt now opens
+  with the autonomous turns and cost against their limits.
+- Lines gain `read_instructions`, which shows the instructions their next turn
+  receives as the engine adapter composes them, and `write_scratch`, which writes a
+  file under `tmp/` in the line's working directory without a file tool, walking each
+  component by descriptor without following links so no swapped link can redirect it,
+  and refusing text or a path the disclosure list covers.
+- A message that repeats one with the same sender, recipient and body from the last
+  15 minutes is marked as a repeat in the turn prompt, and a fired wake's header says
+  when it was due and when it is delivered. The state keeps fired wakes' due times.
+- Codex lines start with `XDG_CACHE_HOME` under the system temporary directory unless
+  the operator sets it, so uv and other tools have a writable cache. The directory is
+  created with mode 0700 and refused when another user owns it or others can write it.
 - `plugins`, a line key, lists local plugin directories a Claude Code line loads
   through the Agent SDK's `plugins` option, so no user setting source opens. Only
   operator authority sets it. At every turn each plugin must pass allowlists of its

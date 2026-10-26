@@ -71,7 +71,8 @@ from dromon.lineconfig import (
 )
 from dromon.projectconfig import ConfigFileError, ProjectConfig, config_path, load
 from dromon.sandbox import SandboxConfig, SandboxError, effective, merge
-from dromon.workdir import git_write_guards, resolve_workdir
+from dromon.processes import environment_reading_works
+from dromon.workdir import git_write_guards, read_head_commit, resolve_workdir
 from dromon.configview import (
     OVERRIDE,
     LineFacts,
@@ -1444,6 +1445,10 @@ def run(
                 hold_wakes=hold_wakes,
                 tick_seconds=tick,
                 wake_every_ticks=config.wake_every_ticks,
+                root=paths.root,
+                protected=protected_dirs(paths),
+                daemon_commit=read_head_commit(Path(__file__).parent),
+                processes_identifiable=environment_reading_works(),
             )
             scheduler.set_disclosure_terms(terms)
             scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)

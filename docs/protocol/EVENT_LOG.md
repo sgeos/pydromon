@@ -120,6 +120,8 @@ pending wake. That is the only message a party may send itself.
   `Your scheduled wake fell due. Its note was withheld, because it contains a term from the project's disclosure list.`
   The line is still woken, the note goes no further, and the fixed text reveals no
   term. The model admits exactly these two bodies.
+- **After firing.** The state keeps each fired wake's due time under its note's
+  identifier, so a later turn can say when the wake was due, also after a restart.
 - **Due time.** The model checks only the form. The daemon compares the due time with
   its wall clock in Coordinated Universal Time.
 
