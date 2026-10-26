@@ -81,9 +81,16 @@ from dromon import __version__
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
 from dromon.engine import (
+    COMPACTION_REQUESTED,
     DIED_NOTE,
+    CompactionRequest,
+    MAX_CALLS,
     BackgroundEnd,
+    add_usage,
+    compaction_note,
+    ignore_compaction,
     ignore_end,
+    no_context_line,
     INTERRUPT_TIMEOUT_SECONDS,
     KEEP_POLL_SECONDS,
     EngineRefused,
@@ -178,6 +185,52 @@ MAX_OWN_COMMANDS: Final = 1024
 
 REQUEST_TIMEOUT_SECONDS: Final = 30.0
 
+TOKEN_USAGE_UPDATED: Final = "thread/tokenUsage/updated"  # noqa: S105
+COMPACT_START: Final = "thread/compact/start"
+THREAD_COMPACTED: Final = "thread/compacted"
+COMPACTION_ITEM: Final = "contextCompaction"
+"""The app-server's token usage notice, compaction request, compaction notice and
+compaction item. **Facts, observed live on Codex 0.164.0 on 2026-10-26.** A token
+usage notice carries ``threadId``, ``turnId`` and ``tokenUsage``, whose ``total``
+and ``last`` give ``totalTokens``, ``inputTokens``, ``cachedInputTokens``,
+``cacheWriteInputTokens``, ``outputTokens`` and ``reasoningOutputTokens``, with
+``modelContextWindow`` beside them. ``totalTokens`` was ``inputTokens`` plus
+``outputTokens``, so the input count includes ``cachedInputTokens``.
+``thread/compact/start`` answers at once, and the engine then starts a turn of its
+own, whose ``contextCompaction`` item starts and completes before that turn
+completes. That build never sent ``thread/compacted``, whose name its binary
+holds, as read with ``strings`` and not by running it, so
+the item's completion is the compaction's report, and the notice is still accepted
+from another build. The
+compaction left ``total`` unchanged and gave a ``last`` of ``totalTokens`` alone,
+larger than the context before it, with every other count zero, which is not an
+engine call and is not read as one. The next call's input was about the context
+before. **Inference, not observed.** The thread was too short to shrink.
+**Inference.** ``last.totalTokens`` of a
+real call is the context the next call re-reads. No cost in money is reported
+anywhere, which matches a plan that charges none per call."""
+
+COMPACT_TIMEOUT_SECONDS: Final = 600.0
+"""How long a compaction may take before the turn is refused. It is waited for until
+its turn completes, as observed, or until a compaction is reported outside any turn,
+which a build that sent only the notice might do."""
+
+CODEX_USAGE_KEYS: Final = {
+    "totalTokens": "total_tokens",
+    "inputTokens": "input_tokens",
+    "cachedInputTokens": "cached_input_tokens",
+    "cacheWriteInputTokens": "cache_write_input_tokens",
+    "outputTokens": "output_tokens",
+    "reasoningOutputTokens": "reasoning_output_tokens",
+}
+
+CODEX_USAGE_NOTE: Final = (
+    "the engine's tokens for this turn, the difference of the thread's running totals,"
+    " and per call. Its input_tokens include its cached_input_tokens, since its"
+    " total_tokens were observed to be its input_tokens and output_tokens alone. A"
+    " compaction adds nothing to the running totals. It reports no cost"
+)
+
 CODEX_SELF_STARTED_NOTE: Final = (
     "Dromon note: between your turns the engine began a turn by itself. Only Dromon"
     " starts turns, so it was interrupted, and its tool calls were refused."
@@ -200,8 +253,6 @@ def unsupported(config: LineConfig) -> str | None:
         return "Codex lines do not load Claude Code's project settings"
     if config.plugins:
         return "Codex lines do not load Claude Code plugins"
-    if config.allow_compact:
-        return "Codex lines cannot compact their session through Dromon"
     if config.sandbox is not None or config.settings is not None:
         return (
             "Codex lines run under Dromon's Codex permission profile, and take no"
@@ -493,6 +544,18 @@ class _RpcError(Exception):
     pass
 
 
+def breakdown(value: object) -> dict[str, int]:
+    """A token usage breakdown's whole-number counts, under Dromon's names."""
+    if not isinstance(value, dict):
+        return {}
+    fields_ = cast(dict[str, object], value)
+    return {
+        name: count
+        for raw, name in CODEX_USAGE_KEYS.items()
+        if type(count := fields_.get(raw)) is int and count >= 0
+    }
+
+
 @dataclass(slots=True)
 class _Turn:
     text: list[str] = field(default_factory=list[str])
@@ -503,6 +566,13 @@ class _Turn:
     status: str = ""
     tools_changed: bool = False
     """Whether this turn started a new thread because Dromon's tools changed."""
+    calls: list[dict[str, int]] = field(default_factory=list[dict[str, int]])
+    """Each engine call's tokens, the latest ``MAX_CALLS``."""
+    first_total: dict[str, int] | None = None
+    """The thread's running totals before the turn's first call."""
+    last_total: dict[str, int] | None = None
+    compacted: bool = False
+    """Whether the engine reported a compaction of the thread during the turn."""
 
 
 class _Routed:
@@ -614,6 +684,18 @@ class _Kept:
     the line never depends on the engine's scoping by thread."""
 
 
+def turn_usage(turn: _Turn) -> dict[str, int] | None:
+    """A turn's tokens, the difference of the thread's running totals across it, or
+    ``None`` when the engine reported no call in it. A compaction's notice moves no
+    total and is no call, so its tokens are unknown rather than measured zeros."""
+    if not turn.calls or turn.last_total is None or turn.first_total is None:
+        return None
+    first = turn.first_total
+    return {
+        key: max(0, value - first.get(key, 0)) for key, value in turn.last_total.items()
+    }
+
+
 class CodexLine:
     """One session line on the Codex engine, with its driver."""
 
@@ -634,6 +716,9 @@ class CodexLine:
         clock: Callable[[], float] = time.monotonic,
         poll_seconds: float = KEEP_POLL_SECONDS,
         task_ended: Callable[[BackgroundEnd], object] = ignore_end,
+        compacted: Callable[
+            [Mapping[str, int | str | None]], object
+        ] = ignore_compaction,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -663,10 +748,77 @@ class CodexLine:
         self._retired = False
         self._in_turn = False
         self._background: set[asyncio.Task[None]] = set()
+        self._compacted = compacted
+        self._request: CompactionRequest | None = None
+        """The compaction the next turn begins with, if any, which each turn takes
+        as it starts, as on a Claude Code line."""
+        self._context: int | None = None
+        """The context the last engine call's usage gave, kept on this engine."""
+
+    def request_compaction(
+        self,
+        reason: str = COMPACTION_REQUESTED,
+        context_line: Callable[[], str | None] = no_context_line,
+    ) -> None:
+        """Compact the line's thread at the start of its next turn, as a Claude Code
+        line's ``request_compaction`` does."""
+        self._request = CompactionRequest(reason, context_line)
+
+    async def _compact_thread(
+        self, thread_id: str, turn: _Turn, request: CompactionRequest
+    ) -> tuple[str, tuple[dict[str, int | str | None], _Turn]]:
+        """Compact the thread before the turn's prompt, after every check of the turn
+        has passed, and return the note the prompt opens with and what was reported.
+        The compaction's own messages go to a turn of their own, so its turn
+        notices cannot end or name the line's turn, and its refusal ends the line's.
+        It is waited for until the engine reports the compaction and any turn it
+        started has completed, or until its turn completes without one, at most
+        ``COMPACT_TIMEOUT_SECONDS``."""
+        before = self._context
+        work = _Turn()
+
+        async def wait() -> None:
+            await self._call(COMPACT_START, {"threadId": thread_id}, work)
+            # Bounded by the timeout below.
+            while not work.status and not (work.compacted and work.turn_id is None):
+                await self._dispatch(await self._receive(), work)
+
+        try:
+            await asyncio.wait_for(wait(), COMPACT_TIMEOUT_SECONDS)
+        except TimeoutError as error:
+            raise EngineRefused(
+                f"the engine did not finish compacting within {COMPACT_TIMEOUT_SECONDS}"
+                " seconds"
+            ) from error
+        if work.refusal is not None and turn.refusal is None:
+            turn.refusal = work.refusal
+        after = work.calls[-1].get("total_tokens") if work.calls else None
+        compaction: dict[str, int | str | None] = {
+            "trigger": "manual" if work.compacted else None,
+            "before_tokens": before if work.compacted else None,
+            "after_tokens": after if work.compacted else None,
+        }
+        if work.compacted:
+            self._context = after
+            try:
+                self._compacted(dict(compaction))
+            except Exception as error:  # noqa: BLE001
+                print(
+                    f"dromond: a compaction could not be recorded: {error}",
+                    file=sys.stderr,
+                )
+        try:
+            context_line = request.context_line()
+        except Exception as error:  # noqa: BLE001
+            print(f"dromond: the context line failed: {error}", file=sys.stderr)
+            context_line = None
+        note = compaction_note(compaction, request.reason, context_line)
+        return note, (compaction, work)
 
     async def run_turn(self, prompt: str) -> TurnReport:
         """Run one turn for ``prompt`` and return what happened. A check that
         refuses the turn also closes a kept connection."""
+        request, self._request = self._request, None
         try:
             environment = engine_environment(
                 self._environment, self.driver.settings.strategy
@@ -682,8 +834,11 @@ class CodexLine:
             await self.close()
             raise
         if self.config.keep_session:
-            return await self._kept_turn(prompt, arguments, environment, instructions)
+            return await self._kept_turn(
+                prompt, arguments, environment, instructions, request
+            )
         turn = _Turn()
+        compaction: tuple[dict[str, int | str | None], _Turn] | None = None
         async with self._connect(arguments, self.cwd, environment) as connection:
             self._connection = connection
             try:
@@ -691,6 +846,11 @@ class CodexLine:
                 thread_id = await self._open_thread(turn)
                 if turn.refusal is None:
                     await self._check_isolation(thread_id, turn)
+                if turn.refusal is None and request is not None:
+                    note, compaction = await self._compact_thread(
+                        thread_id, turn, request
+                    )
+                    prompt = f"{note}\n\n{prompt}"
                 if turn.refusal is None:
                     await self._run(thread_id, prompt, turn)
             except _RpcError as error:
@@ -699,10 +859,14 @@ class CodexLine:
                 self._connection = None
         if turn.refusal is not None:
             raise EngineRefused(turn.refusal)
-        return self._report(turn, credential, thread_id)
+        return self._report(turn, credential, thread_id, compaction)
 
     def _report(
-        self, turn: _Turn, credential: Credential, thread_id: str
+        self,
+        turn: _Turn,
+        credential: Credential,
+        thread_id: str,
+        compaction: tuple[dict[str, int | str | None], _Turn] | None = None,
     ) -> TurnReport:
         session = f"{thread_id}{SESSION_SEPARATOR}{self.tools_fingerprint()}"
         self.session_id = session
@@ -718,6 +882,15 @@ class CodexLine:
             session_id=session,
             capabilities=None,
             cost_estimate_usd=None,
+            usage=add_usage(
+                None if compaction is None else turn_usage(compaction[1]),
+                turn_usage(turn),
+            ),
+            calls=tuple(dict(call) for call in turn.calls),
+            context_tokens=self._context,
+            compaction=None if compaction is None else compaction[0],
+            compaction_usage=None if compaction is None else turn_usage(compaction[1]),
+            usage_note=CODEX_USAGE_NOTE,
         )
 
     # The protocol.
@@ -813,6 +986,8 @@ class CodexLine:
             )
         elif method == "item/completed":
             item = cast(dict[str, Any], params.get("item") or {})
+            if item.get("type") == COMPACTION_ITEM and self._this_thread(params):
+                turn.compacted = True
             if item.get("type") == "agentMessage":
                 text = str(item.get("text") or "")
                 turn.text.append(text)
@@ -831,6 +1006,42 @@ class CodexLine:
         elif method == "turn/completed":
             completed = cast(dict[str, Any], params.get("turn") or {})
             turn.status = str(completed.get("status") or "")
+        elif method == TOKEN_USAGE_UPDATED:
+            self._usage_seen(params, turn)
+        elif method == THREAD_COMPACTED and self._this_thread(params):
+            turn.compacted = True
+
+    def _this_thread(self, params: Mapping[str, Any]) -> bool:
+        """Whether a notice is about the line's own thread, or names none."""
+        thread = params.get("threadId")
+        return thread is None or thread == self._thread_id
+
+    def _usage_seen(self, params: Mapping[str, Any], turn: _Turn) -> None:
+        """Note one engine call's tokens, the thread's running totals and the context
+        the next call re-reads, from a token usage notice."""
+        if not self._this_thread(params):
+            return
+        usage = params.get("tokenUsage")
+        if not isinstance(usage, dict):
+            return
+        fields_ = cast(dict[str, object], usage)
+        last = breakdown(fields_.get("last"))
+        total = breakdown(fields_.get("total"))
+        if not any(count for key, count in last.items() if key != "total_tokens"):
+            # A compaction's notice gives a total alone, which no call made.
+            last = {}
+        if last:
+            turn.calls.append(last)
+            del turn.calls[:-MAX_CALLS]
+            context = last.get("total_tokens")
+            self._context = context if context else self._context
+        if total:
+            if turn.first_total is None:
+                turn.first_total = {
+                    key: max(0, value - last.get(key, 0))
+                    for key, value in total.items()
+                }
+            turn.last_total = total
 
     async def _item_started(self, item: dict[str, Any], turn: _Turn) -> None:
         kind = str(item.get("type") or "")
@@ -998,8 +1209,11 @@ class CodexLine:
             },
             turn,
         )
-        turn.turn_id = turn.turn_id or cast(
-            str | None, cast(dict[str, Any], started.get("turn") or {}).get("id")
+        # The response names the line's own turn, so it is preferred to a turn
+        # notice, which could be another turn's, such as a compaction's.
+        turn.turn_id = (
+            cast(str | None, cast(dict[str, Any], started.get("turn") or {}).get("id"))
+            or turn.turn_id
         )
         while not turn.status:
             await self._dispatch(await self._receive(), turn)
@@ -1426,6 +1640,7 @@ class CodexLine:
         arguments: list[str],
         environment: Mapping[str, str],
         instructions: str,
+        request: CompactionRequest | None = None,
     ) -> TurnReport:
         """A turn on the kept app-server, opened anew when there is none, when it
         ended, or when what it was started with changed. On a reused connection every
@@ -1447,6 +1662,7 @@ class CodexLine:
             prompt = "\n\n".join([*self._notes, prompt])
             self._notes.clear()
         turn = _Turn()
+        compaction: tuple[dict[str, int | str | None], _Turn] | None = None
         kept.routed.active = True
         self._connection = kept.routed
         self._in_turn = True
@@ -1458,6 +1674,9 @@ class CodexLine:
             thread_id = await self._open_thread(turn)
             if turn.refusal is None:
                 await self._check_isolation(thread_id, turn)
+            if turn.refusal is None and request is not None:
+                note, compaction = await self._compact_thread(thread_id, turn, request)
+                prompt = f"{note}\n\n{prompt}"
             if turn.refusal is None:
                 await self._run(thread_id, prompt, turn)
         except asyncio.CancelledError:
@@ -1492,7 +1711,7 @@ class CodexLine:
         # applies.
         with contextlib.suppress(EngineRefused):
             await self.list_background()
-        return self._report(turn, credential, thread_id)
+        return self._report(turn, credential, thread_id, compaction)
 
     async def _interrupt_kept(self, kept: _Kept, turn_id: str) -> None:
         """After an operator's interrupt, interrupt the engine's turn, and close the

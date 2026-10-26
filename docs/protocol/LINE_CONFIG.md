@@ -48,7 +48,8 @@ keys, duplicate keys and numbers are refused.
 | `keep_session` | Keep a Claude Code or Codex line's engine connected between turns, as the kept sessions section below specifies. Refused on Grok lines. Omitted when false | `false` |
 | `keep_session_idle_seconds` | Seconds a kept connection waits for the next turn before it closes, a whole number from 60 to 86,400. Omitted at its default | `1800` |
 | `context_warn_tokens` | The estimated context, in tokens, past which the line's prompt warns, a whole number from 1,000 to 10,000,000, as the context section below specifies. Omitted at its default | `150000` |
-| `allow_compact` | Give a Claude Code line `compact_session`, to compact its own session. Refused on Codex and Grok lines. Omitted when false | `false` |
+| `allow_compact` | Give a Claude Code or Codex line `compact_session`, to compact its own session. Refused on Grok lines. Omitted when false | `false` |
+| `auto_compact_tokens` | The context estimate at or past which a turn begins by compacting the session, a whole number from 1,000 to 10,000,000, as the context section below specifies. Needs `allow_compact`. Set by an operator. Omitted when unset | unset |
 | `keep_session_max_seconds` | Seconds after the last turn a kept connection may stay open while the engine reports background tasks running, a whole number from 60 to 86,400 and not less than `keep_session_idle_seconds`. Omitted at its default | `14400` |
 
 A server name is an identifier and may not be `dromon`, which Dromon's own tools use. A
@@ -323,13 +324,19 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
   Each of `recent_turns` lists its `calls`, the latest 50, each with its fresh, cached
   and written input tokens and output tokens and whether a subagent made it, and a
   `calls_note` saying that the engine reports cost per turn and model only, not per
-  call, or that the engine reports no per-call usage, as Codex does.
+  call, or that the engine reports no per-call usage. Codex lines list their calls
+  from round 6, as below.
 - **The context estimate.** `line_status` gives `context`, with `estimated_tokens`, the
   last main-loop call's fresh, cached and cache-written input and its output, which the
   next call re-reads, `warn_at`, whether the line has `compact_session`, whether a
   compaction is pending, and the `last_compaction`, with its `trigger`, `manual` or
   `auto`, its `before_tokens` and `after_tokens`, and the time `at` which Dromon
-  recorded it. All are kept in memory. **Fixed after the live probe of 2026-10-26.** A
+  recorded it. Its `cause` is `compact_session` or `auto_compact_tokens` for a
+  compaction Dromon asked for, which the engine reports as `manual`, or `engine` for
+  one the engine made by itself. The live probe of round 6 showed an automatic
+  compaction reported as `manual`, which is why the cause is given apart from the
+  trigger. While the estimate is unknown after a compaction whose size was not
+  reported, its `note` says so. All are kept in memory. **Fixed after the live probe of 2026-10-26.** A
   compaction, asked for or automatic, is recorded the moment the engine reports it,
   so a status read later in the same turn shows it, and the estimate then becomes the
   size it left, or unknown when the engine did not report that size. At the turn's end
@@ -341,8 +348,8 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
   it, and that `compact_session` compacts it, or that an operator can enable it. The
   default of 150,000 leaves room before an engine's automatic compaction near a
   200,000 token window, and past it a turn of a few calls re-reads a million tokens.
-- **`compact_session`.** No arguments. Only a Claude Code line whose configuration sets
-  `allow_compact` has it, and it is refused if the setting is withdrawn. It marks the
+- **`compact_session`.** No arguments before round 6. Only a Claude Code line, and
+  from round 6 a Codex line, whose configuration sets `allow_compact` has it, and it is refused if the setting is withdrawn. It marks the
   line's own next turn to begin with a compaction. **Fact, read from the bundled Claude
   Code 2.1.310.** `compact` is a built-in command that runs outside an interactive
   session unless `DISABLE_COMPACT` is set, and the engine reports it with a
@@ -358,6 +365,64 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
   reports its init only with its reply to a prompt, so normally the compaction's own
   reply carries it, and the init check then refuses and interrupts the compaction as
   it would an ordinary prompt, which is no weaker than a turn without a compaction.
+- **Round 6, decided by the operator on 2026-10-26** from the round 5 reports.
+  - **Its own wake.** `compact_session` takes an optional `seconds`, from 60 to
+    86,400, by default 60, and schedules a wake through the `wake_after` machinery,
+    so the compaction does not wait for unrelated mail. A wake already pending stays,
+    and none is added. A bad `seconds` is refused with nothing asked or scheduled. The
+    event log has no event that cancels a wake, so a compaction an earlier turn
+    consumed leaves the wake to fire, which costs one short turn. **Review, F4.** The
+    request is held in memory, so a daemon restart loses it while the wake survives.
+    The wake's note says so, since the wake's turn cannot tell a lost request from a
+    consumed one, and a line without a compaction note may ask again.
+  - **The warning after the compaction.** A turn that begins with a compaction leaves
+    the context warning out of its first line. The compaction's note ends with the
+    warning as it stands once the compaction is recorded, so a compacted line is not
+    told to compact again, and a compaction that leaves a large context still warns.
+    An engine that cannot compact gets the warning at the head of its prompt instead.
+  - **Automatic compaction.** With `auto_compact_tokens` set, which needs
+    `allow_compact`, a turn whose estimate is at or past it begins with a compaction,
+    whose note says that it was automatic and why. A request the line made takes
+    precedence. No automatic compaction follows one that left the context at or past
+    the threshold, or whose size after the engine did not report, as on Codex, until
+    a context below the threshold is reported, because compacting again would not
+    bring it below and would cost every turn. The warning shows meanwhile, and
+    `line_status` gives `auto_compact_held`. **Review, F2 and F3.** A request belongs
+    to the turn it was made for, which takes it as it starts, so a turn refused before
+    its compaction point leaves nothing for a later turn. A Codex compaction in which
+    no call was seen reports its usage as unknown, not as zeros.
+  - **Its own cost.** Each of `recent_turns` has a `kind`, `turn` for a Dromon turn,
+    and `compaction`, the compaction it began with, with its trigger, sizes, its own
+    `cost_usd` and `usage`, which the turn's own include, or `null`. A Claude Code
+    result that ends a turn outside Dromon's own is measured when it arrives, so the
+    cost mark moves past it, and becomes an entry of its own, of kind `self_started`
+    for a turn the engine began by itself or `interrupted` for a turn an operator
+    interrupted. Its cost counts toward the budget, and a line past it is held, but it
+    is not an autonomous turn. Before round 6 such a result was discarded, which lost
+    its cost where the engine reports per-turn usage.
+  - **Codex lines.** **Facts, observed live on Codex 0.164.0 on 2026-10-26.** The
+    app-server notifies `thread/tokenUsage/updated` with `threadId`, `turnId` and
+    `tokenUsage`, which has `total`, `last` and `modelContextWindow`, each breakdown
+    giving `totalTokens`, `inputTokens`, `cachedInputTokens`, `cacheWriteInputTokens`,
+    `outputTokens` and `reasoningOutputTokens`. `totalTokens` was `inputTokens` plus
+    `outputTokens`, so the input includes the cached part. `thread/compact/start`
+    answers at once, and the engine then starts a turn of its own, in which a
+    `contextCompaction` item starts and completes before the turn completes. The
+    `thread/compacted` notice, whose name the binary holds, as read with `strings`
+    and not by running it, was never sent, so the item's
+    completion is read as the compaction, and the notice is still accepted. The
+    compaction left the running totals unchanged and gave a usage notice whose `last`
+    held a total alone, larger than the context before it, with every other count
+    zero. That notice is not read as an engine call. No cost in money is reported
+    anywhere. **Inference.** The context is `last.totalTokens` of a real call, as the
+    engine's own gauge uses it. So a Codex line lists each call's tokens, estimates its
+    context, reports the turn's tokens as the difference of the running totals, and
+    may have `compact_session` and `auto_compact_tokens`. Its compaction is sent after
+    every check of the turn, with its messages read as a turn of their own, whose tool
+    use refuses the line's turn, and is waited for until that turn completes, at most
+    600 seconds. The size before is Dromon's last estimate. The size after is not
+    reported, and the estimate is unknown until the line's next call reports one. Its
+    cost stays unknown.
 
 ## Kept sessions
 
@@ -439,7 +504,11 @@ ends with each turn, and the next turn resumes the session in a new one.
   says that the engine began a turn, which Dromon interrupted, and no separate note is
   added. A turn the engine begins with no end waiting keeps its own note. The note
   gives the exit code when the engine's summary gives one, as in `completed (exit code
-  0)`, the only place its messages give it. It quotes the first lines of the task's
+  0)`, the only place its messages give it. **Round 6.** The exit code is a sentence of
+  its own, `Its exit code was 1.`, or `The engine reported no exit code for it.` It is
+  read only from the end of the summary, which also matches the form `failed with exit
+  code 1` observed live in round 5, since the quoted description before it is the
+  line's own text. It quotes the first lines of the task's
   output, at most 20 lines and 2,048 bytes, as a JSON string said to be data the task
   wrote, says when the output is empty, and withholds it when the disclosure list
   covers it. The output file is the line's to write, so it is read only as a file

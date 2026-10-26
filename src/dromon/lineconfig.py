@@ -220,8 +220,11 @@ class LineConfig:
     context_warn_tokens: int = DEFAULT_CONTEXT_WARN_TOKENS
     """The context size past which the line's prompt warns."""
     allow_compact: bool = False
-    """Whether a Claude Code line has ``compact_session``, to compact its own
-    session."""
+    """Whether a Claude Code or Codex line has ``compact_session``, to compact its
+    own session."""
+    auto_compact_tokens: int | None = None
+    """The context estimate at or past which a turn of a line with ``allow_compact``
+    begins by compacting the session, or ``None`` for never. Set by an operator."""
 
     def allows(self, tool_name: str, own_tools: frozenset[str]) -> bool:
         """Whether the policy allows ``tool_name``. Dromon's own tools always pass."""
@@ -284,6 +287,8 @@ def encode_config(config: LineConfig) -> str:
         document["context_warn_tokens"] = config.context_warn_tokens
     if config.allow_compact:
         document["allow_compact"] = True
+    if config.auto_compact_tokens is not None:
+        document["auto_compact_tokens"] = config.auto_compact_tokens
     return json.dumps(
         document,
         ensure_ascii=False,
@@ -441,6 +446,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         "keep_session_max_seconds",
         "context_warn_tokens",
         "allow_compact",
+        "auto_compact_tokens",
     }
     unknown = set(document) - allowed
     if unknown:
@@ -522,6 +528,18 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
     compact = document.get("allow_compact", False)
     if type(compact) is not bool:
         _fail("allow_compact must be a boolean")
+    auto = document.get("auto_compact_tokens")
+    if auto is not None and (
+        type(auto) is not int
+        or not MIN_CONTEXT_WARN_TOKENS <= auto <= MAX_CONTEXT_WARN_TOKENS
+    ):
+        _fail(
+            f"auto_compact_tokens must be a whole number from {MIN_CONTEXT_WARN_TOKENS}"
+            f" to {MAX_CONTEXT_WARN_TOKENS}"
+        )
+    if auto is not None and not compact:
+        # An automatic compaction is a compaction the line could not have asked for.
+        _fail("auto_compact_tokens needs allow_compact")
     return LineConfig(
         builtin_tools=tuple(sorted(set(builtin))),
         mcp_servers=parse_servers(document.get("mcp_servers", {})),
@@ -541,6 +559,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         keep_session_max_seconds=ceiling,
         context_warn_tokens=warn,
         allow_compact=compact,
+        auto_compact_tokens=auto,
     )
 
 

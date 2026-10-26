@@ -600,10 +600,13 @@ SELF_START_GRACE_SECONDS: Final = 2.0
 so that one note reports both. The engine begins that turn at once, in the
 observed case."""
 
-EXIT_CODE: Final = re.compile(r"\(exit code (-?\d{1,5})\)")
-"""The exit code in the engine's summary of a finished shell task, such as
-``completed (exit code 0)``. **Fact, observed live on 2026-10-26.** The summary is the
-only place the engine's messages give it."""
+EXIT_CODE: Final = re.compile(r"\bexit code (-?\d{1,5})\)?\.?\s*$")
+"""The exit code at the end of the engine's summary of a finished shell task.
+**Facts, observed live on 2026-10-26.** The summary is the only place the engine's
+messages give it, as ``completed (exit code 0)`` in one case and as ``Background
+command "..." failed with exit code 1`` in round 5, which the earlier pattern missed.
+Only the end of the summary is read, since the quoted description before it is the
+line's own text and could carry a phrase of the same form."""
 
 
 USAGE_KEYS: Final = (
@@ -691,20 +694,47 @@ def compaction_of(metadata: object) -> dict[str, int | str | None]:
     return found
 
 
-def compaction_note(compaction: Mapping[str, int | str | None]) -> str:
-    """The note a turn that began with a compaction opens with."""
+COMPACTION_REQUESTED: Final = "at your request"
+"""Why a turn began with a compaction, when the line asked for it."""
+
+
+def no_context_line() -> str | None:
+    """The default for an engine whose compaction nobody describes afterwards."""
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class CompactionRequest:
+    """A compaction asked of an engine for its next turn: why, for its note, and the
+    context warning as it will stand after it."""
+
+    reason: str = COMPACTION_REQUESTED
+    context_line: Callable[[], str | None] = no_context_line
+
+
+def compaction_note(
+    compaction: Mapping[str, int | str | None],
+    reason: str = COMPACTION_REQUESTED,
+    context_line: str | None = None,
+) -> str:
+    """The note a turn that began with a compaction opens with, for ``reason``, and
+    then ``context_line``, the prompt's context warning computed after the
+    compaction, where there still is one."""
     before, after = compaction.get("before_tokens"), compaction.get("after_tokens")
     if before is None and after is None:
-        return (
-            "Dromon note: your session's compaction was asked for at the start of this"
-            " turn, but the engine reported no compaction, so it may not have happened."
+        note = (
+            "Dromon note: your session was to be compacted at the start of this turn"
+            f" {reason}, but the engine reported no compaction, so it may not have"
+            " happened."
         )
-    shown_before = "not reported" if before is None else f"{before} tokens"
-    shown_after = "not reported" if after is None else f"{after} tokens"
-    return (
-        "Dromon note: your session was compacted at your request at the start of this"
-        f" turn. Context before: {shown_before}. After: {shown_after}."
-    )
+    else:
+        shown_before = "not reported" if before is None else f"{before} tokens"
+        shown_after = "not reported" if after is None else f"{after} tokens"
+        note = (
+            f"Dromon note: your session was compacted at the start of this turn"
+            f" {reason}. Context before: {shown_before}. After: {shown_after}."
+        )
+    return note if context_line is None else f"{note} {context_line}"
 
 
 def add_costs(first: float | None, second: float | None) -> float | None:
@@ -814,6 +844,25 @@ def ignore_compaction(compaction: Mapping[str, int | str | None]) -> None:
     del compaction
 
 
+SELF_STARTED_KIND: Final = "self_started"
+"""A turn the engine began by itself between Dromon's turns, which Dromon
+interrupted."""
+
+INTERRUPTED_KIND: Final = "interrupted"
+"""A Dromon turn that was cancelled, whose result arrived after it."""
+
+type SpentBetween = Callable[[str, float | None, Mapping[str, int] | None], object]
+"""Where an engine reports what a turn outside Dromon's own cost: its kind, its cost
+and its tokens, where the engine reports them."""
+
+
+def ignore_spent(
+    kind: str, cost: float | None, usage: Mapping[str, int] | None
+) -> None:
+    """The default for an engine whose costs between turns nobody follows."""
+    del kind, cost, usage
+
+
 def ignore_end(end: BackgroundEnd) -> None:
     """The default for an engine whose task ends nobody follows."""
     del end
@@ -880,6 +929,9 @@ class _Connection:
     draining: bool = False
     """Whether the pump discards messages until a result, the tail of a turn that
     was cancelled or that the engine began by itself."""
+    drained: str = SELF_STARTED_KIND
+    """Which of the two the pump is draining, ``SELF_STARTED_KIND`` or
+    ``INTERRUPTED_KIND``, so the result it ends with is reported as that kind."""
 
 
 def check_environment(environment: Mapping[str, str], strategy: Strategy) -> None:
@@ -946,6 +998,14 @@ class TurnReport:
     compaction: Mapping[str, int | str | None] | None = None
     """The trigger and the context before and after the turn's latest compaction,
     as the engine reported them, or ``None`` when there was none."""
+    compaction_cost_usd: float | None = None
+    """The cost of the compaction the turn began with, included in
+    ``cost_estimate_usd``, or ``None`` when there was none or no cost was reported."""
+    compaction_usage: Mapping[str, int] | None = None
+    """The tokens of the compaction the turn began with, included in ``usage``."""
+    usage_note: str | None = None
+    """What the engine's ``usage`` and ``calls`` mean, where an engine's differ from
+    Claude Code's, or ``None`` for Claude Code's."""
 
 
 def _strings(value: object) -> tuple[str, ...]:
@@ -1287,6 +1347,7 @@ class ClaudeCodeLine:
         compacted: Callable[
             [Mapping[str, int | str | None]], object
         ] = ignore_compaction,
+        spent_between: SpentBetween = ignore_spent,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -1310,8 +1371,12 @@ class ClaudeCodeLine:
         self._compacted = compacted
         """Called the moment the engine reports a compaction of the session."""
         self.cost_mark = cost_mark
-        self._compact = False
-        """Whether the next turn begins by compacting the session."""
+        self._request: CompactionRequest | None = None
+        """The compaction the next turn begins with, if any. Each turn takes it as
+        it starts, so a turn refused before its compaction point does not leave it
+        to a later turn."""
+        self._spent_between = spent_between
+        """Called with the cost of a result that ends a turn outside Dromon's own."""
         self._usage: dict[str, int] | None = None
         self._source: str | None = None
         """What the last measured turn's cost and usage came from."""
@@ -1413,6 +1478,7 @@ class ClaudeCodeLine:
         """Run one turn for ``prompt`` and return what happened. A check that
         refuses the turn also closes a kept connection, whose engine may already have
         loaded what the check refused."""
+        request, self._request = self._request, None
         try:
             check_environment(self._environment, self.driver.settings.strategy)
             options = self.options()
@@ -1420,7 +1486,7 @@ class ClaudeCodeLine:
             await self.close()
             raise
         if self.config.keep_session:
-            return await self._kept_turn(prompt, options)
+            return await self._kept_turn(prompt, options, request)
         self.driver.step(Event("turn_start"))
         turn = _Turn()
         result: ResultMessage | None = None
@@ -1428,10 +1494,10 @@ class ClaudeCodeLine:
         try:
             async with AsyncExitStack() as stack:
                 session = await self._enter(stack, self._session_factory, options)
-                if self._compact and self._compaction_allowed(turn):
+                if request is not None and self._compaction_allowed(turn):
                     await session.query(COMPACT_COMMAND)
                     note = await self._run_compaction(
-                        session, turn, aiter(session.receive_response())
+                        session, turn, aiter(session.receive_response()), request
                     )
                     prompt = f"{note}\n\n{prompt}"
                 if turn.refusal is not None:
@@ -1473,31 +1539,35 @@ class ClaudeCodeLine:
         )
         return await stack.enter_async_context(factory(options))
 
-    def request_compaction(self) -> None:
-        """Compact the line's own session at the start of its next turn."""
-        self._compact = True
+    def request_compaction(
+        self,
+        reason: str = COMPACTION_REQUESTED,
+        context_line: Callable[[], str | None] = no_context_line,
+    ) -> None:
+        """Compact the line's own session at the start of its next turn, whose note
+        gives ``reason`` and then what ``context_line`` returns once the compaction
+        has been recorded."""
+        self._request = CompactionRequest(reason, context_line)
 
-    def _compaction_allowed(self, turn: _Turn) -> bool:
+    @staticmethod
+    def _compaction_allowed(turn: _Turn) -> bool:
         """Whether the turn may begin with its compaction: not when an init seen
-        before it was refused, in which case no ``/compact`` is sent and the request
-        is spent. The engine reports its init only with its reply to a prompt, so
-        normally the compaction's own reply carries it, and the init check then
-        refuses and interrupts the compaction as it would an ordinary prompt, which
-        is no weaker than a turn without one."""
-        if turn.refusal is None:
-            return True
-        self._compact = False
-        return False
+        before it was refused, in which case no ``/compact`` is sent, and the
+        request, which the turn took as it started, is spent. The engine reports its
+        init only with its reply to a prompt, so normally the compaction's own reply
+        carries it, and the init check then refuses and interrupts the compaction as
+        it would an ordinary prompt, which is no weaker than a turn without one."""
+        return turn.refusal is None
 
     async def _run_compaction(
         self,
         session: AgentSession | KeptSession,
         turn: _Turn,
         messages: AsyncIterator[Message | None],
+        request: CompactionRequest,
     ) -> str:
         """Read the messages of a ``/compact`` sent at the start of the turn, through
         the turn's own checks, and return the note the turn's prompt opens with."""
-        self._compact = False
         result: ResultMessage | None = None
         # Bounded by the engine's result for the command, or the end of its stream.
         async for message in messages:
@@ -1512,7 +1582,12 @@ class ClaudeCodeLine:
             turn.compaction_usage = self._usage
         if turn.compaction is None:
             turn.compaction = compaction_of(None)
-        return compaction_note(turn.compaction)
+        try:
+            context_line = request.context_line()
+        except Exception as error:  # noqa: BLE001
+            print(f"dromond: the context line failed: {error}", file=sys.stderr)
+            context_line = None
+        return compaction_note(turn.compaction, request.reason, context_line)
 
     def _compaction_seen(self, turn: _Turn, metadata: object) -> None:
         """Note a compaction, asked for or automatic, the moment the engine reports
@@ -1580,6 +1655,8 @@ class ClaudeCodeLine:
             calls=tuple(dict(call) for call in turn.calls.values()),
             context_tokens=self._context_after(turn),
             compaction=turn.compaction,
+            compaction_cost_usd=turn.compaction_cost,
+            compaction_usage=turn.compaction_usage,
         )
 
     async def _handle(
@@ -1858,10 +1935,14 @@ class ClaudeCodeLine:
                 if connection.draining:
                     if isinstance(message, ResultMessage):
                         connection.draining = False
+                        self._spent_alone(message, connection.drained)
                     continue
                 if not begins_turn(message):
                     continue
                 connection.draining = not isinstance(message, ResultMessage)
+                connection.drained = SELF_STARTED_KIND
+                if isinstance(message, ResultMessage):
+                    self._spent_alone(message, SELF_STARTED_KIND)
                 if connection.pending:
                     # The turn is the engine's answer to those ends, so their notes
                     # say so, and no separate note is added.
@@ -1878,6 +1959,16 @@ class ClaudeCodeLine:
             connection.alive = False
             if connection.inbox is not None:
                 connection.inbox.put_nowait(None)
+
+    def _spent_alone(self, result: ResultMessage, kind: str) -> None:
+        """Report the cost of a result that ends a turn outside Dromon's own, so it
+        counts toward the line's budget and is shown on its own, and move the cost
+        mark past it."""
+        cost = self._measure(result)
+        try:
+            self._spent_between(kind, cost, self._usage)
+        except Exception as error:  # noqa: BLE001
+            print(f"dromond: a cost could not be recorded: {error}", file=sys.stderr)
 
     def _track(self, connection: _Connection, message: Message) -> None:
         """Follow the connection's background tasks: the command each tool call
@@ -1998,7 +2089,12 @@ class ClaudeCodeLine:
 
         self._spawn(settle())
 
-    async def _kept_turn(self, prompt: str, options: ClaudeAgentOptions) -> TurnReport:
+    async def _kept_turn(
+        self,
+        prompt: str,
+        options: ClaudeAgentOptions,
+        request: CompactionRequest | None = None,
+    ) -> TurnReport:
         """Run a turn on the kept connection, opening one when there is none or when
         the one there no longer matches. Every check of a fresh turn has run by now
         in ``options``. On a reused connection the engine is asked to report its init
@@ -2030,10 +2126,10 @@ class ClaudeCodeLine:
         try:
             if reused:
                 await connection.session.set_permission_mode(connection.permission_mode)
-            if self._compact and self._compaction_allowed(turn):
+            if request is not None and self._compaction_allowed(turn):
                 await connection.session.query(COMPACT_COMMAND)
                 note = await self._run_compaction(
-                    connection.session, turn, _drain(inbox)
+                    connection.session, turn, _drain(inbox), request
                 )
                 prompt = f"{note}\n\n{prompt}"
                 # The pump let go of the inbox at the compaction's result.
@@ -2061,6 +2157,7 @@ class ClaudeCodeLine:
             if result is None and connection.alive:
                 connection.inbox = None
                 connection.draining = True
+                connection.drained = INTERRUPTED_KIND
                 self._settle(connection)
             raise
         except Exception:
