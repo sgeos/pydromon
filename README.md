@@ -82,11 +82,11 @@ all three stages. See [`docs/decisions/NAMING_AND_PORTS.md`](docs/decisions/NAMI
 
 ## Development
 
-The build needs a Rust toolchain, because `pykeleusma` is built from its repository at a
-pinned commit. Running a Claude line needs a Claude subscription signed in to Claude
-Code, and no `ANTHROPIC_API_KEY` in the environment. Running a GPT-6-Luna line needs
-Codex signed in to a ChatGPT plan, and Dromon starts Codex without any OpenAI API key
-in its environment.
+`pykeleusma` installs from its published wheels for Python 3.12 or later on Linux, macOS
+and Windows, so no Rust toolchain is needed there. Running a Claude line needs a Claude
+subscription signed in to Claude Code, and no `ANTHROPIC_API_KEY` in the environment.
+Running a GPT-6-Luna line needs Codex signed in to a ChatGPT plan, and Dromon starts
+Codex without any OpenAI API key in its environment.
 
 ```sh
 uv sync

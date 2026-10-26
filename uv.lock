@@ -541,7 +541,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "claude-agent-sdk", specifier = "==0.2.174" },
-    { name = "pykeleusma", git = "https://github.com/sgeos/pykeleusma?rev=19d4558ad6d4afa66e496c1fdef75cca98a249e3" },
+    { name = "pykeleusma", specifier = "==0.2.2.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -576,8 +576,35 @@ crypto = [
 
 [[package]]
 name = "pykeleusma"
-version = "0.0.0"
-source = { git = "https://github.com/sgeos/pykeleusma?rev=19d4558ad6d4afa66e496c1fdef75cca98a249e3#19d4558ad6d4afa66e496c1fdef75cca98a249e3" }
+version = "0.2.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/5f/90/193c0d53ffee4dcab7b262949b89fafed5d460bdc7aeb34bf3ba2933a845/pykeleusma-0.2.2.0.tar.gz", hash = "sha256:46ec22f6b922bcd06739e5d840985b7f1adf877ab52c6f2eadc166ad0d1f2e22", size = 230612, upload-time = "2026-10-26T21:14:54.675Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9d/63/5841beed2e52889ae65960ca0612244bc99309d464384980b9df04756d0e/pykeleusma-0.2.2.0-cp312-abi3-macosx_10_12_x86_64.whl", hash = "sha256:3fecdd6494e6016f2bbadc15d2a6d35e8aff52bfb10dd86f5539e599f8385c1c", size = 1653178, upload-time = "2026-10-26T21:14:19.59Z" },
+    { url = "https://files.pythonhosted.org/packages/f2/0e/b15d5ccd8c2112624d61d47b8d850dad369d235a96ff4362bc8ed6b8f12c/pykeleusma-0.2.2.0-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:13e9dedb0f3e7a207005833acebb5251ddd9f26b999356bfb674924da6f0cdc7", size = 1553856, upload-time = "2026-10-26T21:14:21.236Z" },
+    { url = "https://files.pythonhosted.org/packages/40/76/024b7b1d17b207ee082eb8c28ab48faef589baf6be117045dc5c134cfc44/pykeleusma-0.2.2.0-cp312-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:759db1140676806d18431c88d1f1228c02e4038403e67b2bc6efb554965773ff", size = 1665019, upload-time = "2026-10-26T21:14:22.584Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/ca/9cd2e40aacd97ad3c224fed624f5fe0f5ce39d088c2603b098ad88dfdc52/pykeleusma-0.2.2.0-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:43c4a6323172193a181dd6a7cb18461faae18fb72aca3424e74366a1622414b6", size = 1725247, upload-time = "2026-10-26T21:14:24.013Z" },
+    { url = "https://files.pythonhosted.org/packages/82/61/8579ee55b7c1998823574a5278df5b2100ccf36dccb5711de76b1782e1c5/pykeleusma-0.2.2.0-cp312-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:24ea0d145a692c6737cd307dae5822dd41457b9991ba5996b3cdd9d80020ffdd", size = 1843195, upload-time = "2026-10-26T21:14:25.558Z" },
+    { url = "https://files.pythonhosted.org/packages/bd/c9/cb558d51df2196b41308bf4d59719f0b4e4d8c1bc1ec2550ec087078842a/pykeleusma-0.2.2.0-cp312-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:b1bdf1383a4891de613023d2696f9f8f395af3ef08bd087d6644ce64a7e2dad3", size = 1963901, upload-time = "2026-10-26T21:14:26.997Z" },
+    { url = "https://files.pythonhosted.org/packages/db/3f/0d060ca674437672b256a5b01846e97ead3cee9b21a8e17a68055efce408/pykeleusma-0.2.2.0-cp312-abi3-win_amd64.whl", hash = "sha256:ab6d428115f080914bf56c9372fe39ca59757466de3691f835ef46b1772ec038", size = 1572875, upload-time = "2026-10-26T21:14:28.453Z" },
+    { url = "https://files.pythonhosted.org/packages/50/bc/5741c88f3f346d4aa58333bf92ecaf17d4e70c55b3d70575b43891f18411/pykeleusma-0.2.2.0-cp312-abi3-win_arm64.whl", hash = "sha256:e30b08abedb9fa3e801de08a562dd4b3c907cb221612790148801aa46ecd490f", size = 1455965, upload-time = "2026-10-26T21:14:29.776Z" },
+    { url = "https://files.pythonhosted.org/packages/88/72/9f276bdfb824fbe27d8055a88c78f2a7e6e4d43ae54ad652449203b0880e/pykeleusma-0.2.2.0-cp314-cp314t-macosx_10_12_x86_64.whl", hash = "sha256:7bb398d3954bf923de2b5b04febe27a43b0ebe09036eff0ebe25a3f936b5d2b0", size = 1652523, upload-time = "2026-10-26T21:14:31.16Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/09/a61c9d8fa4ecd802592bdead335e0266a23eaa676b23b192af1392a167bf/pykeleusma-0.2.2.0-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:dc6fb50191ed34a0f69e671d586ade8c11470e8e6dc230a4e02d9ce1b001fdd6", size = 1552326, upload-time = "2026-10-26T21:14:32.624Z" },
+    { url = "https://files.pythonhosted.org/packages/8d/12/73755612c30a64249cb133fefa00a9e2f3855091e49ac290c9fcafa31f85/pykeleusma-0.2.2.0-cp314-cp314t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:d816da1604bb042c8a259ebd875149cdd18a84c8b7d267cac535a556aff31f7a", size = 1662590, upload-time = "2026-10-26T21:14:34.089Z" },
+    { url = "https://files.pythonhosted.org/packages/33/fb/9a6482dea2107ccca2fbd7af9d9507e71610a0ca56e71ce8bc2a66c26977/pykeleusma-0.2.2.0-cp314-cp314t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:4e235f99506809db967549905b154f143af5efaed3ae5996969800e78bd9c24e", size = 1723026, upload-time = "2026-10-26T21:14:35.55Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/87/849b756b48462df26152feeb12ea0d5b27b560b96853c65076bfb901266d/pykeleusma-0.2.2.0-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:83aebda3c9868eb8e8a76de445717c9acdd40d343a1eecdda09c7294f503d160", size = 1839841, upload-time = "2026-10-26T21:14:36.841Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/75/5bcd840473536ee0aceadd1213f395bae22924ea20213e6380eef2ccc456/pykeleusma-0.2.2.0-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:3cbedc362ab55934afe6b923d208ea1b971a038e5901d19fad46879397f104ca", size = 1960281, upload-time = "2026-10-26T21:14:38.234Z" },
+    { url = "https://files.pythonhosted.org/packages/ee/fe/80bf09c90a597f8dbad2d52c6a8c7afc06e7d78f1d4e8d9ce2055f552cb7/pykeleusma-0.2.2.0-cp314-cp314t-win_amd64.whl", hash = "sha256:ad76bb0248808c89339b03975b21207b73dc4a4de4857dae0fa707f364e4fe2b", size = 1570192, upload-time = "2026-10-26T21:14:39.542Z" },
+    { url = "https://files.pythonhosted.org/packages/ae/b2/e53729511d72c0fcbcdd25b9bdb105ccd9a63644c4123697037346398f13/pykeleusma-0.2.2.0-cp314-cp314t-win_arm64.whl", hash = "sha256:1ba898539f01c72d12ff95dfb6c8040ff50b88d6f51354633d275bb7dfe607c6", size = 1454729, upload-time = "2026-10-26T21:14:40.863Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/03/f90e1d35823f1d39ed236b3265d511a6c1df7c90b77c17270c67a2b9c696/pykeleusma-0.2.2.0-cp315-cp315t-macosx_10_12_x86_64.whl", hash = "sha256:d7cb55cfd34a7ac461f07493888683f3165f8f016c09b9a0c49fbb2da84d7bb3", size = 1652912, upload-time = "2026-10-26T21:14:42.211Z" },
+    { url = "https://files.pythonhosted.org/packages/d7/4d/f7fea0769cdc3e40fa828a3b3d6563e12b216c746283c051ff927c39e8fb/pykeleusma-0.2.2.0-cp315-cp315t-macosx_11_0_arm64.whl", hash = "sha256:8bb856df28dd698d15ffbfc7b86a7ab9bfbf088e13957c6dc908c53f56163ac9", size = 1553498, upload-time = "2026-10-26T21:14:43.654Z" },
+    { url = "https://files.pythonhosted.org/packages/da/9a/6cab9bd6cd51d3c247f14375ba482d39bec6e7dcdd307e4c0e3a4f8c34dd/pykeleusma-0.2.2.0-cp315-cp315t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:3b8b5ad987605ce5f4b32633c9dddb8af29bf058a9de67bb9ed206b393c4ecc5", size = 1662577, upload-time = "2026-10-26T21:14:45.32Z" },
+    { url = "https://files.pythonhosted.org/packages/39/0b/1570bae004dc1cd5b305fb23d7132b07447daf674e944ac316fee88b6711/pykeleusma-0.2.2.0-cp315-cp315t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:19d31435ed120d637c165723bb4dcf76e406e6bca7394ae1534bbd170b2c52b0", size = 1722940, upload-time = "2026-10-26T21:14:46.636Z" },
+    { url = "https://files.pythonhosted.org/packages/0e/1b/4260f643e591a7d18b7ee4f4e97320be79fad0c1a6ce1c4f35967587f9a0/pykeleusma-0.2.2.0-cp315-cp315t-musllinux_1_2_aarch64.whl", hash = "sha256:c717258d43164579ba99fad3fa6a88d7405769f50a2b811c8b2329b609dfa9cc", size = 1840279, upload-time = "2026-10-26T21:14:48.375Z" },
+    { url = "https://files.pythonhosted.org/packages/08/db/4839045c1a7d6d19c6b19c9cebcc437a2162652c6a9ea4500199efff295c/pykeleusma-0.2.2.0-cp315-cp315t-musllinux_1_2_x86_64.whl", hash = "sha256:dc74df24b12e1700bdf5d593838d9e6f1a846da839aaf7a9eeaf10f09a09b9b8", size = 1960959, upload-time = "2026-10-26T21:14:49.938Z" },
+    { url = "https://files.pythonhosted.org/packages/dd/14/2eea9b7129c78e277e407964a7c68d7482e6c47b27876c6543ac526872da/pykeleusma-0.2.2.0-cp315-cp315t-win_amd64.whl", hash = "sha256:0353017321e1f4e838d0b3c62bc64e9e812a01356714743b9042d404d49d0f75", size = 1570290, upload-time = "2026-10-26T21:14:51.249Z" },
+    { url = "https://files.pythonhosted.org/packages/49/91/fb68f7fe51237d01bf3b8ad698ec3d7e1c8a5f8d12b9c30a706a7a93ba9a/pykeleusma-0.2.2.0-cp315-cp315t-win_arm64.whl", hash = "sha256:54136f42aec7d4a3d067867ade89c6456d39f9524e790ab1ce136e0e4f2d5354", size = 1454830, upload-time = "2026-10-26T21:14:52.687Z" },
+]
 
 [[package]]
 name = "pyright"
