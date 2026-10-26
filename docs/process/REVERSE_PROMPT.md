@@ -4,33 +4,36 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-26, the harness ready for Keleusma, and installed for kaizen
+## 2026-10-26, the session-line experience loop, rounds 1 to 7
 
-**Done.** On the operator's goal that pydromon be in order for its session to direct
-further development through Dromon, and that the harness reach a standard where
-Keleusma's four lines can run on it.
+**Done.** On the operator's goal that pydromon's dogfooded lines improve the
+session-line experience in an iterative loop of reports, research, changes and new
+reports, until every line is satisfied or what remains is unreasonable.
 
-- **Directed work.** pydromon's Opus `worker` line inspected Keleusma and built four
-  stages, which its Haiku `reviewer` line reviewed. The operator's session verified
-  each live and merged pull requests 35 to 40. The record is
-  `docs/architecture/KELEUSMA_DOGFOOD.md`.
-- **Verified live.** Working directories, git guards, scheduled wakes, leases,
-  `require_sandbox`, the disclosure guard, rebinding, project settings, plugins and a
-  Fable 5.1 probe. A read-only trial ran Keleusma's four lines in their worktrees, and
-  a writing trial ran kaizen in a private clone through lease, background build, wake,
-  commit and push.
-- **Installed, on the operator's decisions.** Keleusma's `.dromon/dromon.toml` for the
-  kaizen line, excluded from git and accepted by `dromon config`, and an untracked
-  `secret/disclosure-terms.txt`. The remote stays on SSH. No daemon was started.
-- **Reports.** The lines' harness reports are in `tmp/harness-report-*.md`, and the
-  trials' reports in `tmp/keleusma-trial-reports.txt`.
+- **Rounds.** Pull requests 42 to 49 carried rounds 1 to 7. Each round began from the
+  lines' reports, was built by the Opus `worker` line, reviewed by the Haiku `reviewer`
+  line, fixed by the worker, probed live by the operator's session in a scratch
+  project, and merged on green checks. A last change after round 7 makes a compaction's
+  `trigger` only what the engine reported.
+- **Outcome.** In round 7, `worker`, `reviewer` and `luna` each wrote
+  `VERDICT: SATISFIED`. The reports are in `tmp/reports/`.
+- **Verified live.** Kept sessions, cost differencing, task-end notes, context
+  estimates, `compact_session` with its own wake and that wake's withdrawal, automatic
+  compaction with its hold on Claude Code and on Codex, and Codex usage, which was
+  found to report a compaction as a `contextCompaction` item rather than the notice
+  its binary names.
 
-**Not done.** No real Keleusma line has written under Dromon yet, because kaizen's own
-live session was still running, and the operator starts the daemon once it ends.
+**Declined, with reasons given to the lines.** A daemon-run job runner, which would
+bypass the sandbox. Listing untracked processes, which Darwin 27 does not allow the
+daemon. A size after a Codex compaction, which Codex does not report, so Dromon gives
+an upper bound from the next call instead.
+
+**Inferences, not verified.** The reviewer accepted two of the operator's live results
+and the round 7 fixes without observing or re-reading them. A refused turn's request
+carry-over is covered by tests on both engines and was not forced live.
 
 **For the operator.**
 1. Start Keleusma's daemon for kaizen when its live session has ended, as
-   `KELEUSMA_DOGFOOD.md` shows, and decide when the other three lines join.
-2. Move the remote to HTTPS when the lines should push.
-3. The lines' top suggestions: let a line list and stop its own processes, and show a
-   line its own holds, limits and leases.
+   `KELEUSMA_DOGFOOD.md` shows.
+2. The lines' remaining wishes are wording and status refinements, listed in their
+   round 7 reports.

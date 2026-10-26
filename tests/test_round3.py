@@ -25,6 +25,7 @@ from dromon.paths import ProjectPaths, project_paths
 from dromon.projectconfig import ProjectConfig
 from dromon.protocol import Response
 from dromon import scheduler as scheduler_module
+from dromon.scheduler import trigger_note
 from dromon.scheduler import LineSpec, Scheduler
 
 HAIKU = "claude-haiku-5-5"
@@ -1129,6 +1130,7 @@ def test_a_compaction_shows_in_the_status_within_its_turn(world: World) -> None:
     assert during["estimated_tokens"] == 3_655
     assert during["last_compaction"] == {
         "trigger": "manual",
+        "trigger_note": trigger_note("manual"),
         "cause": "engine",
         "before_tokens": 30_074,
         "after_tokens": 3_655,

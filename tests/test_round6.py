@@ -1059,7 +1059,7 @@ def test_a_codex_line_compacts_its_thread_before_the_prompt() -> None:
     assert server.methods().count(COMPACT_START) == 1
     assert server.methods().index(COMPACT_START) < len(server.methods()) - 1
     expected = {
-        "trigger": "manual",
+        "trigger": None,
         "before_tokens": 8_000,
         "after_tokens": None,
         "after_estimate_tokens": None,
@@ -1093,7 +1093,7 @@ def test_a_codex_compaction_notice_is_still_accepted() -> None:
         ]
     )
     expected = {
-        "trigger": "manual",
+        "trigger": None,
         "before_tokens": 8_000,
         "after_tokens": 500,
         "after_estimate_tokens": None,
@@ -1315,3 +1315,35 @@ def test_f3_a_codex_turn_with_only_a_compaction_notice_has_unknown_usage() -> No
 
 def test_f4_the_wake_note_says_a_restart_loses_the_request() -> None:
     assert "restart" in COMPACT_WAKE_NOTE
+
+
+# The round 7 report of luna. The trigger is only what the engine reported.
+
+
+def test_a_codex_compaction_reports_no_trigger_and_says_why() -> None:
+    from dromon.scheduler import trigger_note
+
+    _, compactions, report = compacted_after_first_turn(OBSERVED_COMPACTION)
+    assert compactions[0]["trigger"] is None
+    assert report.compaction is not None and report.compaction["trigger"] is None
+    assert "reports no trigger" in trigger_note(None)
+    assert "cause says why" in trigger_note("manual")
+    assert "by itself" in trigger_note("auto")
+    assert "does not know" in trigger_note("other")
+
+
+def test_a_codex_compaction_without_an_earlier_estimate_is_still_reported() -> None:
+    server = Server([[said("two"), done()]], OBSERVED_COMPACTION)
+    target = codex_line(server)
+    target.request_compaction("at your request", lambda: None)
+    asyncio.run(target.run_turn("second"))
+    assert "reported no compaction" not in server.prompt()
+    assert "Context before: not reported. After: not reported." in server.prompt()
+
+
+def test_an_unreported_codex_compaction_is_still_said_plainly() -> None:
+    server = Server([[said("two"), done()]], [done("c1")])
+    target = codex_line(server)
+    target.request_compaction("at your request", lambda: None)
+    asyncio.run(target.run_turn("second"))
+    assert "reported no compaction" in server.prompt()

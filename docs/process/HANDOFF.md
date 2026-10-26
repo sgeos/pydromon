@@ -7,7 +7,7 @@ flight, why, what is owed and the next step, within a budget of 8 KB. History li
 git. A rewrite that drops an open item says in its commit message whether the item was
 completed, moved or abandoned.
 
-## State on 2026-10-25
+## State on 2026-10-26
 
 - **Tasks 1 to 10 done. Milestone 0.1.0 is complete.**
   - `model.py`, `codec.py` and `eventlog.py` hold the data model as event kinds in
@@ -67,11 +67,10 @@ completed, moved or abandoned.
 
 ## Next step
 
-pydromon develops itself with Dromon, per `docs/process/DOGFOOD.md`: lines `worker`,
-`reviewer` and `luna` in a local `.dromon/`, and the operator's session commits. The
-harness is ready for Keleusma, per `docs/architecture/KELEUSMA_DOGFOOD.md`, whose
-project file awaits the operator's decision to install it. The lines' harness reports
-are in `tmp/harness-report-*.md`.
+pydromon develops itself with Dromon, per `docs/process/DOGFOOD.md`, through lines
+`worker`, `reviewer` and `luna` in a local `.dromon/`. The session-line experience loop
+ended in round 7 with all three satisfied, per `REVERSE_PROMPT.md`. Keleusma awaits
+the operator, per `docs/architecture/KELEUSMA_DOGFOOD.md`.
 
 ## Open
 
@@ -112,7 +111,7 @@ need a command outside it. The rest run inside it with `-m "not socket and not l
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-./scripts/check.sh          # 1483 tests pass, plus 10 live tests deselected
+./scripts/check.sh          # 1865 tests pass, plus 10 live tests deselected
 ```
 
 Report any check not run, and any commit after the one that last rewrote this file.
