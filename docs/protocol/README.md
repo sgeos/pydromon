@@ -15,6 +15,9 @@ Documents here describe behaviour and formats, never Python details.
 - [`AGENTS.md`](AGENTS.md), external agents that reach the daemon and its lines over MCP, with access from off to full trust. Draft, part of version 1.
 - [`TEACHER.md`](TEACHER.md), a project's local teacher model served by Ollama, and how Dromon brings it up and releases it. Draft, part of version 1.
 - [`GROK.md`](GROK.md), how a line runs on Grok Build over the Agent Client Protocol, with its sandbox profiles and line bridge. Draft, not verified against a live turn.
+- [`PI.md`](PI.md), how a line runs on Pi in its RPC mode, with its dedicated agent directory, its extension and the configurations a Pi line refuses. Draft, not verified against a live turn.
+- [`CURSOR.md`](CURSOR.md), how a line would run on Cursor Agent in print mode, with the configuration Dromon writes for each turn. Draft, refused in a daemon, and run only by `dromon probe --accept-partial-isolation`.
+- [`ANTIGRAVITY.md`](ANTIGRAVITY.md), how a line would run on Antigravity's command-line tool, written from its documentation alone. Draft, refused in a daemon since Dromon's tools cannot reach it, and every probe turn refused on its unverified credential unless the operator confirms it by hand.
 - [`CODEX.md`](CODEX.md), how a line runs on Codex through its app-server, with its isolation, credentials and the configurations a Codex line may have. Draft.
 - [`SETTINGS.md`](SETTINGS.md), a line's engine settings, permission rules, hooks, environment and attribution, with the review of the settings in use that motivated them. Draft, part of version 1.
 - [`SANDBOX.md`](SANDBOX.md), the Claude Code sandbox document of a line and a project, its layers, unattended defaults and protected directories. Draft, part of version 1.

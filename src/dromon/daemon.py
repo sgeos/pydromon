@@ -53,12 +53,17 @@ from dromon.agents import (
     new_token,
     token_digest,
 )
-from dromon import codex, grok
 from dromon.disclosure import DisclosureError, load_terms
 from dromon.engine import ENGINE_NAME as CLAUDE_CODE_ENGINE
 from dromon.engine import EngineRefused, check_plugin, resolve_plugin
 from dromon.teacher import Teacher, TeacherError
-from dromon.driver import ENGINE_OF, MODELS, DriverError, Strategy
+from dromon.driver import (
+    DOCUMENTLESS_ENGINES,
+    ENGINE_OF,
+    MODELS,
+    DriverError,
+    Strategy,
+)
 from dromon.eventlog import EventLog, LogError, utc_now
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.mailbox import MAX_PAGE, listing, outcome, replied_ids, sent, summary
@@ -550,8 +555,9 @@ class Daemon:
     def _rebind_line(self, args: dict[str, object]) -> dict[str, object]:
         """Move a line to another model and strategy, as only an operator may.
 
-        Besides the scheduler's own checks, a line moving onto Codex or Grok is
-        refused while the project's own sandbox or settings would reach it, and a
+        Besides the scheduler's own checks, a line moving onto an engine other than
+        Claude Code is refused while the project's own sandbox or settings would
+        reach it, and a
         line moving onto Claude Code is refused when the project requires a sandbox
         it lacks, as at ``create_line``.
         """
@@ -564,10 +570,10 @@ class Daemon:
             raise EventRejected(f"no line {line_id}")
         engine = ENGINE_OF.get(model)
         own = self.project.sandbox is not None or self.project.settings is not None
-        if engine in (codex.ENGINE_NAME, grok.ENGINE_NAME) and own:
+        if engine in DOCUMENTLESS_ENGINES and own:
             raise ConfigError(
                 f"the project's sandbox or settings would apply to line {line_id},"
-                f" which on {model} runs in its engine's own sandbox and takes neither"
+                f" which on {model} runs on an engine that takes neither"
             )
         config = self.scheduler.effective_config(line_id)
         check_sandbox_required(self.project, line_id, model, config)
@@ -1271,7 +1277,9 @@ def check_sandbox_required(
 ) -> None:
     """Refuse a Claude Code line whose merged sandbox is not enabled, when the
     project requires one. Codex and Grok lines run under their own permission
-    profiles and satisfy the requirement. Raises ``SandboxError``."""
+    profiles, Pi lines take no built-in tool that could run a command or touch a
+    file, and Cursor and Antigravity lines are refused, so they satisfy the
+    requirement. Raises ``SandboxError``."""
     if not project.require_sandbox or ENGINE_OF.get(model) != CLAUDE_CODE_ENGINE:
         return
     merged: SandboxConfig | None = merge([project.sandbox, config.sandbox])
@@ -1315,13 +1323,13 @@ def check_engines(config: ProjectConfig) -> None:
     outside = sorted(
         line_id
         for line_id, line in config.lines.items()
-        if ENGINE_OF[line.model] in (codex.ENGINE_NAME, grok.ENGINE_NAME)
+        if ENGINE_OF[line.model] in DOCUMENTLESS_ENGINES
     )
     if outside:
         raise ValueError(
             "the project's sandbox or settings would apply to the lines "
             + ", ".join(outside)
-            + ", which run on Codex or Grok in their own sandboxes and take neither"
+            + ", which run on engines other than Claude Code and take neither"
         )
 
 

@@ -4,36 +4,33 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-26, the session-line experience loop, rounds 1 to 7
+## 2026-10-26, prospective engine adapters for Pi, Cursor Agent and Antigravity
 
-**Done.** On the operator's goal that pydromon's dogfooded lines improve the
-session-line experience in an iterative loop of reports, research, changes and new
-reports, until every line is satisfied or what remains is unreasonable.
+**Done.** On the operator's goal that the dogfooded lines build drivers for Claude
+Code, Codex, Cursor Agent, Antigravity and Pi, to the extent reasonable, so that each
+can be tested when resources allow.
 
-- **Rounds.** Pull requests 42 to 49 carried rounds 1 to 7. Each round began from the
-  lines' reports, was built by the Opus `worker` line, reviewed by the Haiku `reviewer`
-  line, fixed by the worker, probed live by the operator's session in a scratch
-  project, and merged on green checks. A last change after round 7 makes a compaction's
-  `trigger` only what the engine reported.
-- **Outcome.** In round 7, `worker`, `reviewer` and `luna` each wrote
-  `VERDICT: SATISFIED`. The reports are in `tmp/reports/`.
-- **Verified live.** Kept sessions, cost differencing, task-end notes, context
-  estimates, `compact_session` with its own wake and that wake's withdrawal, automatic
-  compaction with its hold on Claude Code and on Codex, and Codex usage, which was
-  found to report a compaction as a `contextCompaction` item rather than the notice
-  its binary names.
+- **Work.** The Opus `worker` line wrote `pi.py`, `cursor.py`, `antigravity.py`, the
+  shared `jsonlines.py`, nine Keleusma drivers and a protocol document for each engine.
+  The Haiku `reviewer` line reviewed each adapter, then re-reviewed every fix, and the
+  worker fixed what it found. Claude Code and Codex were already adapted and verified
+  live, and no gap was found in them.
+- **Basis.** Pi 1.4.0 and Cursor Agent 2026.10.01 are installed, and their help,
+  documentation and installed code were read, but no turn was run. Antigravity is not
+  installed, so its adapter rests on its published documentation alone, and its model
+  name is a guess.
+- **Operator decisions taken in session.** Cursor and Antigravity cannot be fully
+  isolated, so daemon lines on them are refused. `dromon probe` runs one turn behind
+  `--accept-partial-isolation`, and Antigravity also needs
+  `--accept-unverified-credential`, since its stream names no credential. Pi's Claude
+  plan sign-in is refused, because whether a plan may be drawn through a third-party
+  harness is not established.
 
-**Declined, with reasons given to the lines.** A daemon-run job runner, which would
-bypass the sandbox. Listing untracked processes, which Darwin 27 does not allow the
-daemon. A size after a Codex compaction, which Codex does not report, so Dromon gives
-an upper bound from the next call instead.
-
-**Inferences, not verified.** The reviewer accepted two of the operator's live results
-and the round 7 fixes without observing or re-reading them. A refused turn's request
-carry-over is covered by tests on both engines and was not forced live.
+**Not verified.** No adapter has run against its real tool. Each of `PI.md`,
+`CURSOR.md` and `ANTIGRAVITY.md` lists what to verify first.
 
 **For the operator.**
-1. Start Keleusma's daemon for kaizen when its live session has ended, as
-   `KELEUSMA_DOGFOOD.md` shows.
-2. The lines' remaining wishes are wording and status refinements, listed in their
-   round 7 reports.
+1. Before a live Pi test, confirm that the ChatGPT plan's terms allow its use through
+   Pi, then sign in once in Pi's dedicated agent directory, per `PI.md`.
+2. Run `dromon probe` with the flags only after working through the verify-first list.
+3. Start Keleusma's daemon for kaizen when its live session has ended.

@@ -959,3 +959,25 @@ def test_the_production_factory_wires_the_estimate_to_codex(tmp_path: Path) -> N
     assert isinstance(engine, CodexLine)
     engine._estimated(7)  # pyright: ignore[reportPrivateUsage]
     assert estimates == [7]
+
+
+def test_pi_review_f3_an_engines_own_estimate_is_carried(world: World) -> None:
+    """An engine that estimates the size its compaction left, as Pi does, has that
+    estimate and its note in last_compaction and as the context estimate."""
+    world.scheduler.session_compacted(
+        "alpha",
+        {
+            "trigger": "auto",
+            "before_tokens": 150000,
+            "after_tokens": None,
+            "after_estimate_tokens": 32000,
+            "after_estimate_note": "the engine's own estimate",
+        },
+    )
+    context = cast(dict[str, Any], world.status()["context"])
+    last = cast(dict[str, Any], context["last_compaction"])
+    assert last["after_tokens"] is None
+    assert last["after_estimate_tokens"] == 32000
+    assert last["after_estimate_note"] == "the engine's own estimate"
+    assert context["estimated_tokens"] == 32000
+    assert "engine's own estimate" in context["note"]

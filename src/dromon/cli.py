@@ -28,6 +28,7 @@ from dromon.client import (
 )
 from dromon.paths import PathError, ProjectPaths, project_paths
 from dromon.driver import MODELS, Driver, DriverError, Strategy
+from dromon import antigravity, cursor
 from dromon.engine import EngineRefused
 from dromon.agents import LINE_TOKEN_ENV, TOKEN_ENV
 from dromon.lineconfig import EFFORTS
@@ -132,6 +133,17 @@ def _stop(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
+PARTIAL_ISOLATION_ENGINES: Final = frozenset(
+    {cursor.ENGINE_NAME, antigravity.ENGINE_NAME}
+)
+"""Engines ``dromon probe --accept-partial-isolation`` lets run, by the operator's
+decision of 2026-10-26. A daemon refuses lines on either."""
+
+UNVERIFIED_CREDENTIAL_ENGINES: Final = frozenset({antigravity.ENGINE_NAME})
+"""Engines ``dromon probe --accept-unverified-credential`` lets run on the operator's
+confirmation of the credential by hand, by the operator's decision of 2026-10-26."""
+
+
 def _probe(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     """Run one short turn with no tools and report what the engine says.
 
@@ -142,7 +154,27 @@ def _probe(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         model: str = arguments.model
         strategy = Strategy(arguments.strategy)
         driver = Driver.for_model(model, strategy)
-        line = engine_factory(str(paths.root))(LineSpec("probe", model, strategy), [])
+        accept: bool = arguments.accept_partial_isolation
+        if accept and driver.settings.engine not in PARTIAL_ISOLATION_ENGINES:
+            raise EngineRefused(
+                "--accept-partial-isolation applies only to Cursor Agent and"
+                " Antigravity models"
+            )
+        unverified: bool = arguments.accept_unverified_credential
+        if unverified and driver.settings.engine not in UNVERIFIED_CREDENTIAL_ENGINES:
+            raise EngineRefused(
+                "--accept-unverified-credential applies only to Antigravity models"
+            )
+        if unverified and not accept:
+            raise EngineRefused(
+                "--accept-unverified-credential is accepted only together with"
+                " --accept-partial-isolation"
+            )
+        line = engine_factory(
+            str(paths.root),
+            accept_partial_isolation=accept,
+            accept_unverified_credential=unverified,
+        )(LineSpec("probe", model, strategy), [])
         report = asyncio.run(line.run_turn(PROBE_PROMPT))
     except (DriverError, EngineRefused) as error:
         print(f"dromon probe: {error}", file=sys.stderr)
@@ -926,6 +958,29 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if name in ("create", "probe"):
             _add_driver_options(command)
+        if name == "probe":
+            command.add_argument(
+                "--accept-partial-isolation",
+                action="store_true",
+                help="let a Cursor Agent or Antigravity model run this one turn,"
+                " with partial isolation. Cursor's built-in reads, writes, commands"
+                " and web fetches are denied before they run, but its subagents,"
+                " searches, image and screen tools are stopped only after they start."
+                " Antigravity's tools are all stopped only after they start. Either"
+                " way such a tool may act before the turn is refused. Neither this"
+                " flag nor --accept-unverified-credential changes the strategy, so"
+                " --strategy api still bills per token",
+            )
+            command.add_argument(
+                "--accept-unverified-credential",
+                action="store_true",
+                help="let an Antigravity model run this one turn although Dromon"
+                " cannot tell which credential agy uses, a sign-in to a plan or a key"
+                " billed per token. First confirm by hand that agy is signed in to a"
+                " plan and not billing per token, step 2 of the verify-first list in"
+                " docs/protocol/ANTIGRAVITY.md. Accepted only together with"
+                " --accept-partial-isolation. It does not change the strategy",
+            )
         if name == "agent":
             command.add_argument("action", choices=["add", "list", "revoke"])
             command.add_argument(

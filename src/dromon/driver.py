@@ -19,7 +19,7 @@ limits while API usage is charged per token, so the strategies differ in what th
 accept and how they run the model. The engine reports the credential actually in use
 with a ``credential`` event, and the driver accepts or refuses it.
 
-Engines. Each driver names the engine it is written for, ``claude-code`` or ``codex``.
+Engines. Each driver names the engine it is written for, one of ``ENGINES``.
 A model has a packaged driver once its drivers are written, but a line can be created
 on it only once Dromon has an adapter for its engine, so a driver can be written and
 tested ahead of its adapter without a line ever running it on the wrong engine.
@@ -45,14 +45,41 @@ ENGINE_OF: Final[dict[str, str]] = {
     "claude-fable-5-1": "claude-code",
     "gpt-6-luna": "codex",
     "grok-4.7": "grok-build",
+    "pi:openai/gpt-6-luna": "pi",
+    "cursor-agent:gpt-5.6-luna-medium": "cursor-agent",
+    "antigravity:gemini-3.1-pro": "antigravity",
 }
-"""Each model with a packaged driver for every strategy, and the engine it runs on."""
+"""Each model with a packaged driver for every strategy, and the engine it runs on.
 
-ENGINES: Final = ("claude-code", "codex", "grok-build")
+Naming. The first engines each run their own vendor's models, so a model is named by
+the vendor's identifier. Pi, Cursor Agent and Antigravity run other vendors' models,
+and Cursor Agent's ``claude-opus-5-5-high`` or Pi's ``openai/gpt-6-luna`` would read
+as, or come to collide with, the models above, which run on another engine with other
+credentials and costs. Their models are therefore named ``ENGINE:ID``, the engine and
+the harness's own identifier, so the engine can be read from the name and a name
+never stands for two engines. No harness identifier seen in their catalogues on
+2026-10-26 contains a colon, so the first colon divides the two parts."""
+
+ENGINES: Final = (
+    "claude-code",
+    "codex",
+    "grok-build",
+    "pi",
+    "cursor-agent",
+    "antigravity",
+)
 """The engines a driver may name."""
 
-ADAPTED_ENGINES: Final = frozenset({"claude-code", "codex", "grok-build"})
+ADAPTED_ENGINES: Final = frozenset(
+    {"claude-code", "codex", "grok-build", "pi", "cursor-agent", "antigravity"}
+)
 """The engines Dromon has an adapter for."""
+
+DOCUMENTLESS_ENGINES: Final = frozenset(
+    {"codex", "grok-build", "pi", "cursor-agent", "antigravity"}
+)
+"""Engines that take no sandbox or settings document, which only Claude Code honours,
+so a project's own sandbox or settings must not reach their lines."""
 
 MODELS: Final = tuple(
     model for model, engine in ENGINE_OF.items() if engine in ADAPTED_ENGINES
@@ -77,6 +104,9 @@ class Credential(StrEnum):
 
     SUBSCRIPTION = "subscription"
     API = "api"
+    UNVERIFIED = "unverified"
+    """An engine that names no credential source, so that Dromon cannot tell a plan
+    from a key. No packaged driver accepts it, so such a turn is refused."""
 
 
 class Strategy(StrEnum):
@@ -87,9 +117,31 @@ class Strategy(StrEnum):
     FLEXIBLE = "flexible"
 
 
+REPORTED_NAMES: Final[dict[str, str]] = {
+    "cursor-agent:gpt-5.6-luna-medium": "GPT-5.6 Luna 1M",
+}
+"""How an engine names a model in its ``init`` event, where that is not the harness
+identifier. Cursor Agent reports the model's display name, as its listing shows it."""
+
+
+def harness_id(model: str) -> str:
+    """The identifier a harness takes for ``model``, the part after the colon of an
+    engine-qualified name, or the name itself."""
+    _, colon, identifier = model.partition(":")
+    return identifier if colon else model
+
+
+def reported_model(model: str) -> str:
+    """The name the model's engine reports for it, which its drivers accept."""
+    return REPORTED_NAMES.get(model, harness_id(model))
+
+
 def driver_resource(model: str, strategy: Strategy) -> str:
-    """The packaged file name of the driver for ``model`` and ``strategy``."""
-    return f"{model.replace('-', '_').replace('.', '_')}_{strategy.value}.kel"
+    """The packaged file name of the driver for ``model`` and ``strategy``. The colon
+    and slash of an engine-qualified name become double underscores, which no vendor
+    identifier contains."""
+    stem = model.replace(":", "__").replace("/", "__")
+    return f"{stem.replace('-', '_').replace('.', '_')}_{strategy.value}.kel"
 
 
 class ActionTag(StrEnum):

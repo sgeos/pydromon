@@ -19,6 +19,7 @@ from dromon.driver import (
     Event,
     Strategy,
     driver_resource,
+    reported_model,
 )
 
 OPUS = "claude-opus-5-5"
@@ -131,7 +132,7 @@ def test_each_driver_accepts_its_model_and_refuses_another(
 ) -> None:
     driver = Driver.for_model(model, strategy)
     other = HAIKU if model == OPUS else OPUS
-    assert driver.step(Event("init", model)).tag is ActionTag.ACCEPT
+    assert driver.step(Event("init", reported_model(model))).tag is ActionTag.ACCEPT
     refused = driver.step(Event("init", other))
     assert (refused.tag, refused.text) == (ActionTag.REFUSE, model)
 

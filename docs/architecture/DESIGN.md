@@ -59,7 +59,9 @@ checked.
 | Engine | Interface | Evidence on 2026-10-25 |
 |---|---|---|
 | Grok Build | Agent Client Protocol | Implemented 2026-10-25 for Grok 4.7 from Grok Build 1.0.70's documentation, not verified against a live turn |
-| Cursor Agent | Agent Client Protocol through `agent acp` | Reported in July 2026 research by the operator's sessions. Not rechecked |
+| Pi | Its RPC mode, JSON lines over standard streams | Implemented 2026-10-26 for GPT-6-Luna from Pi 1.4.0's documentation and installed source, not verified against a live turn. Dromon's tools only, since Pi has no sandbox |
+| Antigravity | Print mode with `--output-format stream-json` | Implemented 2026-10-26 from the operator's summary of its documentation, not installed. Refused in a daemon, since no MCP configuration is documented, and every probe turn refused, since its stream names no credential, unless the operator confirms the sign-in by hand with `--accept-unverified-credential` |
+| Cursor Agent | Print mode with `--output-format stream-json` | Implemented 2026-10-26 from Cursor Agent 2026.10.01's help and installed code, whose help lists no `acp` command. Refused in a daemon, and run only by `dromon probe --accept-partial-isolation`, by the operator's decision |
 | Claude Code | Claude Agent SDK | Implemented 2026-10-25 with Agent SDK 0.2.174 and Claude Code 2.1.310, on the subscription |
 | Codex | Its app-server | Implemented 2026-10-25 with Codex 0.164.0 and GPT-6-Luna, on the ChatGPT plan |
 | Dromon's own loop | Direct model calls | Needed where full control of each step is required |

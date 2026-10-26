@@ -758,9 +758,12 @@ reach a line unless its configuration names them.
 
 ## Engines
 
-A line on the Codex or Grok Build engine accepts only the configurations
-[`CODEX.md`](CODEX.md) or [`GROK.md`](GROK.md) lists, and any other is refused when the
-line is created or configured.
+A line on the Codex, Grok Build, Pi or Cursor Agent engine accepts only the
+configurations [`CODEX.md`](CODEX.md), [`GROK.md`](GROK.md), [`PI.md`](PI.md) or
+[`CURSOR.md`](CURSOR.md) lists, and any other is refused when the line is created or
+configured. Pi lines take no built-in tool. Cursor and Antigravity lines are refused
+whatever their configuration, as [`CURSOR.md`](CURSOR.md) and
+[`ANTIGRAVITY.md`](ANTIGRAVITY.md) record.
 
 ## Storage
 

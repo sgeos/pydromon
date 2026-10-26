@@ -108,10 +108,13 @@ from dromon.overrides import decode as decode_override
 from dromon.overrides import encode as encode_override_document
 from dromon.overrides import encode as encode_override
 from dromon.driver import ENGINE_OF, MODELS, Driver, DriverError, Strategy
-from dromon import codex, grok
+from dromon import antigravity, codex, cursor, grok, pi
 from dromon.agents import LineTokens
 from dromon.codex import CodexLine
 from dromon.grok import GrokLine
+from dromon.antigravity import AntigravityLine
+from dromon.cursor import CursorLine
+from dromon.pi import PiLine
 from dromon import __version__
 from dromon.engine import ENGINE_NAME as ENGINE_NAME_CLAUDE
 from dromon.engine import (
@@ -395,6 +398,7 @@ DEFAULT_COMPACT_WAKE_SECONDS: Final = 60
 CONTEXT_FROM_CALL: Final = "call"
 CONTEXT_FROM_COMPACTION: Final = "compaction"
 CONTEXT_FROM_ESTIMATE: Final = "compaction_estimate"
+CONTEXT_FROM_ENGINE_ESTIMATE: Final = "engine_estimate"
 CONTEXT_NOTES: Final[dict[str, str]] = {
     CONTEXT_FROM_CALL: (
         "the last engine call's context, its input, cached and written tokens,"
@@ -408,6 +412,11 @@ CONTEXT_NOTES: Final[dict[str, str]] = {
         "the first engine call's input after the last compaction, whose size the"
         " engine did not report, an upper bound that includes that turn's prompt,"
         " until the turn's end gives its last engine call's context instead"
+    ),
+    CONTEXT_FROM_ENGINE_ESTIMATE: (
+        "the engine's own estimate of the size its last compaction left, not a"
+        " measured size, until the turn's end gives its last engine call's context"
+        " instead"
     ),
 }
 """Where a line's context estimate came from, and the note ``line_status`` gives
@@ -635,8 +644,17 @@ def engine_factory(
     protected: Sequence[Path] = (),
     line_tokens: LineTokens | None = None,
     line_socket: Path | None = None,
+    accept_partial_isolation: bool = False,
+    accept_unverified_credential: bool = False,
 ) -> EngineFactory:
     """The production factory: each line on its packaged driver's engine.
+
+    ``accept_partial_isolation`` lets a Cursor Agent or Antigravity engine run, which
+    only ``dromon probe`` passes, and only when the operator gives its flag. A daemon
+    never passes it, and refuses lines on either engine when they are created.
+    ``accept_unverified_credential`` lets an Antigravity driver be given the
+    subscription in place of the credential Dromon cannot see, which likewise only
+    ``dromon probe`` passes, and only together with ``accept_partial_isolation``.
 
     Each engine runs in the line's working directory, its ``workdir`` resolved
     against the project ``root``, or the root itself. A directory that is gone or
@@ -649,6 +667,14 @@ def engine_factory(
     project's merged with its own, with ``ask`` rules denied and the ``protected``
     directories denied to the built-in file tools.
     """
+
+    def _line_bridge(line_id: str) -> tuple[list[str], str | None]:
+        """The command that serves a line's Dromon tools over ``lines.sock``, and the
+        token the daemon issued for the line, or neither outside a daemon."""
+        if line_tokens is None or line_socket is None:
+            return [], None
+        token = line_tokens.issue(line_id)
+        return grok.bridge_command(Path(root), line_socket.parent, line_id), token
 
     def build(spec: LineSpec, own_tools: Sequence[SdkMcpTool[Any]]) -> LineEngine:
         driver = Driver.for_model(spec.model, spec.strategy)
@@ -678,13 +704,7 @@ def engine_factory(
                     "Grok lines take no sandbox or settings, and the project file"
                     " sets one for every line"
                 )
-            bridge: list[str] = []
-            token: str | None = None
-            if line_tokens is not None and line_socket is not None:
-                token = line_tokens.issue(spec.line_id)
-                bridge = grok.bridge_command(
-                    Path(root), line_socket.parent, spec.line_id
-                )
+            bridge, token = _line_bridge(spec.line_id)
             return GrokLine(
                 driver,
                 workdir,
@@ -696,6 +716,61 @@ def engine_factory(
                 line_token=token,
                 observe=spec.observe,
                 mark=spec.mark,
+            )
+        if driver.settings.engine == pi.ENGINE_NAME:
+            if project_sandbox is not None or project_settings is not None:
+                raise EngineRefused(
+                    "Pi lines take no sandbox or settings, and the project file sets"
+                    " one for every line"
+                )
+            bridge, token = _line_bridge(spec.line_id)
+            return PiLine(
+                driver,
+                workdir,
+                config=spec.config,
+                mcp_tools=list(own_tools),
+                session_id=spec.session_id,
+                bridge=bridge,
+                line_token=token,
+                observe=spec.observe,
+                mark=spec.mark,
+                compacted=spec.compacted,
+            )
+        if driver.settings.engine == cursor.ENGINE_NAME:
+            if project_sandbox is not None or project_settings is not None:
+                raise EngineRefused(
+                    "Cursor lines take no sandbox or settings, and the project file"
+                    " sets one for every line"
+                )
+            bridge, token = _line_bridge(spec.line_id)
+            return CursorLine(
+                driver,
+                workdir,
+                config=spec.config,
+                mcp_tools=list(own_tools),
+                session_id=spec.session_id,
+                bridge=bridge,
+                line_token=token,
+                observe=spec.observe,
+                mark=spec.mark,
+                partial_isolation=accept_partial_isolation,
+            )
+        if driver.settings.engine == antigravity.ENGINE_NAME:
+            if project_sandbox is not None or project_settings is not None:
+                raise EngineRefused(
+                    "Antigravity lines take no sandbox or settings, and the project"
+                    " file sets one for every line"
+                )
+            return AntigravityLine(
+                driver,
+                workdir,
+                config=spec.config,
+                mcp_tools=list(own_tools),
+                session_id=spec.session_id,
+                observe=spec.observe,
+                mark=spec.mark,
+                partial_isolation=accept_partial_isolation,
+                unverified_credential=accept_unverified_credential,
             )
         merged = merge([project_sandbox, spec.config.sandbox])
         enabled = merged is not None and merged.enabled
@@ -735,7 +810,13 @@ def _party(owner: str | Address) -> Address:
 
 def _check_engine_supports(driver: Driver, config: LineConfig) -> None:
     """Raise ``ConfigError`` if the driver's engine cannot run ``config``."""
-    checks = {codex.ENGINE_NAME: codex.unsupported, grok.ENGINE_NAME: grok.unsupported}
+    checks = {
+        codex.ENGINE_NAME: codex.unsupported,
+        grok.ENGINE_NAME: grok.unsupported,
+        pi.ENGINE_NAME: pi.unsupported,
+        cursor.ENGINE_NAME: cursor.line_refusal,
+        antigravity.ENGINE_NAME: antigravity.line_refusal,
+    }
     check = checks.get(driver.settings.engine)
     if check is not None:
         reason = check(config)
@@ -1518,8 +1599,9 @@ class Scheduler:
         ``trigger`` the engine reports as manual, and ``engine`` for one the engine
         made by itself. A ``compact_session`` compaction withdraws the wake that call
         scheduled, which has nothing left to do. The context estimate becomes the
-        size the compaction left, or unknown when the engine did not report it, until
-        the turn's own calls estimate it again.
+        size the compaction left, or the engine's own estimate of it with its
+        ``after_estimate_note``, as Pi gives, or unknown when the engine reported
+        neither, until the turn's own calls estimate it again.
 
         **Round 7 review, F2.** The compaction is recorded before the wake is
         withdrawn, and a withdrawal that fails is reported and leaves the wake to
@@ -1538,10 +1620,21 @@ class Scheduler:
         }
         self._last_compaction[line_id] = record
         after = compaction.get("after_tokens")
+        estimate = compaction.get("after_estimate_tokens")
         threshold = self.effective_config(line_id).auto_compact_tokens
         if isinstance(after, int):
             self._context_reported(line_id, after, CONTEXT_FROM_COMPACTION)
             if threshold is not None and after >= threshold:
+                self._auto_held.add(line_id)
+        elif type(estimate) is int and estimate > 0:
+            # An engine that estimates the size itself, as Pi does, gives it here.
+            note = compaction.get("after_estimate_note")
+            record["after_estimate_tokens"] = estimate
+            record["after_estimate_note"] = (
+                note if isinstance(note, str) else AFTER_ESTIMATE_NOTE
+            )
+            self._context_reported(line_id, estimate, CONTEXT_FROM_ENGINE_ESTIMATE)
+            if threshold is not None and estimate >= threshold:
                 self._auto_held.add(line_id)
         else:
             self._context.pop(line_id, None)

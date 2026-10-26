@@ -71,7 +71,7 @@ every_ticks = 5
 | `profiles.NAME` | table | none | A reusable line template with every line key but `profile` and `session` |
 | `lines.ID` | table | none | A line, named by a line identifier |
 | `lines.ID.profile` | profile name | none | The profile the line starts from |
-| `lines.ID.model` | model | required | `claude-opus-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`, `gpt-6-luna` on Codex as [`CODEX.md`](CODEX.md) specifies, or `grok-4.7` on Grok Build as [`GROK.md`](GROK.md) specifies |
+| `lines.ID.model` | model | required | `claude-opus-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`, `gpt-6-luna` on Codex as [`CODEX.md`](CODEX.md) specifies, `grok-4.7` on Grok Build as [`GROK.md`](GROK.md) specifies, `pi:openai/gpt-6-luna` on Pi as [`PI.md`](PI.md) specifies, `cursor-agent:gpt-5.6-luna-medium` on Cursor Agent as [`CURSOR.md`](CURSOR.md) specifies, or `antigravity:gemini-3.1-pro` on Antigravity as [`ANTIGRAVITY.md`](ANTIGRAVITY.md) specifies. A daemon refuses Cursor and Antigravity lines |
 | `lines.ID.strategy` | strategy | `subscription` | `subscription`, `api` or `flexible` |
 | `lines.ID.limits` | table | the file's | Limits for this line, each key defaulting to the file's |
 | `lines.ID.wake` | table | the file's | The wake policy for this line |
@@ -121,9 +121,9 @@ every_ticks = 5
   which apply only at start. A line the file no longer declares returns to the
   project's limits and wake policy. The leases table is applied again, and a held lease
   whose name the file no longer declares ends.
-- **Codex and Grok lines.** A project file whose own `[sandbox]` or `[settings]` table
-  would reach a Codex or Grok line is refused at start, since such a line runs in its
-  engine's own sandbox.
+- **Lines on other engines.** A project file whose own `[sandbox]` or `[settings]`
+  table would reach a line on any engine but Claude Code is refused at start, since
+  only Claude Code honours either document.
 - **Restart.** The policies of limits and wake live in the daemon and are re-read on
   every start. The lines and their configurations are events in the log.
 
@@ -138,7 +138,8 @@ start, over the lines the file declares and the lines created through a client, 
 `create_line`, at `configure_line`, and at reload, where it uses the reloaded file's
 value, so a reload may turn the requirement on or off. A refusal names the line and
 changes nothing. Codex and Grok lines run under their own permission profiles, as
-[`CODEX.md`](CODEX.md) and [`GROK.md`](GROK.md) specify, and satisfy it. **Why.** A
+[`CODEX.md`](CODEX.md) and [`GROK.md`](GROK.md) specify, and Pi lines take no built-in
+tool, as [`PI.md`](PI.md) specifies, so all three satisfy it. **Why.** A
 line without an enabled sandbox can reach the daemon's socket from its shell and act
 with operator authority, as [`SANDBOX.md`](SANDBOX.md) records.
 
