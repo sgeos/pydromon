@@ -30,18 +30,26 @@ subscription draws on a plan's limits while API usage is charged for every token
 
 | Driver file | Model | Strategy | Effort | Max turns | Tool budget |
 |---|---|---|---|---|---|
-| `claude_opus_5_5_subscription.kel` | Claude Opus 5.5 | subscription | high | 8 | 40 |
+| `claude_opus_5_5_subscription.kel` | Claude Opus 5.5 | subscription | high | 200 | 400 |
 | `claude_opus_5_5_api.kel` | Claude Opus 5.5 | api | medium | 4 | 20 |
 | `claude_opus_5_5_flexible.kel` | Claude Opus 5.5 | flexible | medium | 4 | 20 |
-| `claude_haiku_5_5_subscription.kel` | Claude Haiku 5.5 | subscription | low | 4 | 20 |
+| `claude_haiku_5_5_subscription.kel` | Claude Haiku 5.5 | subscription | low | 100 | 200 |
 | `claude_haiku_5_5_api.kel` | Claude Haiku 5.5 | api | low | 2 | 10 |
 | `claude_haiku_5_5_flexible.kel` | Claude Haiku 5.5 | flexible | low | 2 | 10 |
-| `gpt_6_luna_subscription.kel` | GPT-6-Luna on Codex | subscription | medium | 4 | 20 |
+| `gpt_6_luna_subscription.kel` | GPT-6-Luna on Codex | subscription | medium | 200 | 400 |
 | `gpt_6_luna_api.kel` | GPT-6-Luna on Codex | api | low | 2 | 10 |
 | `gpt_6_luna_flexible.kel` | GPT-6-Luna on Codex | flexible | low | 2 | 10 |
-| `grok_4_7_subscription.kel` | Grok 4.7 on Grok Build | subscription | high | 8 | 40 |
+| `grok_4_7_subscription.kel` | Grok 4.7 on Grok Build | subscription | high | 200 | 400 |
 | `grok_4_7_api.kel` | Grok 4.7 on Grok Build | api | medium | 4 | 20 |
 | `grok_4_7_flexible.kel` | Grok 4.7 on Grok Build | flexible | medium | 4 | 20 |
+
+**Decided 2026-10-26, for dogfooding.** The subscription drivers' turn limits and tool
+budgets are sized for a line that develops software, which reads, edits and runs a
+gate many times in one turn. The earlier values, 4 to 8 engine turns and 20 to 40 tool
+calls, ended such turns early. A subscription draws on a plan's limits rather than
+charging per token, and the per-line conversation limits, which a client can now set,
+remain the operator's bound on a line's work. Drivers that may bill per token keep
+their small budgets.
 
 Claude Haiku 5.5 is the least expensive model and is the default for probes and tests.
 GPT-6-Luna's settings follow Codex's model catalogue as fetched on 2026-10-25, which

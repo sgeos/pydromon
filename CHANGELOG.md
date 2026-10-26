@@ -7,6 +7,10 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- The subscription drivers allow a development turn: 200 engine turns and 400 tool
+  calls for Opus, GPT-6-Luna and Grok, and 100 and 200 for Haiku. The API and flexible
+  drivers keep their small budgets.
+
 - pydromon is set up to develop itself with Dromon, as `docs/process/DOGFOOD.md`
   records. pytest's collection now ignores `.dromon`, which a Codex line's profile
   denies outright, so a line can run the gate in the project it works on.

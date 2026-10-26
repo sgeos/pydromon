@@ -1,5 +1,6 @@
 """The packaged Keleusma drivers run through pykeleusma, and the host's checks."""
 
+import re
 from importlib import resources
 
 import pytest
@@ -33,12 +34,19 @@ def packaged_source(
     return path.read_text(encoding="utf-8")
 
 
-def with_budget(budget: int) -> Driver:
-    source = packaged_source().replace(
-        "fn tool_budget() -> Word { 40 }", f"fn tool_budget() -> Word {{ {budget} }}"
+def budget_source(budget: int) -> str:
+    """The packaged Opus driver with its tool budget replaced, whatever it was."""
+    source = re.sub(
+        r"fn tool_budget\(\) -> Word \{ \d+ \}",
+        f"fn tool_budget() -> Word {{ {budget} }}",
+        packaged_source(),
     )
-    assert f"{{ {budget} }}" in source
-    return Driver(source)
+    assert f"fn tool_budget() -> Word {{ {budget} }}" in source
+    return source
+
+
+def with_budget(budget: int) -> Driver:
+    return Driver(budget_source(budget))
 
 
 @pytest.mark.parametrize(("model", "strategy"), EVERY_DRIVER)
@@ -160,7 +168,7 @@ def test_state_carries_across_a_restart() -> None:
     first = with_budget(1)
     first.step(Event("turn_start"))
     first.step(Event("tool_use", "Read"))
-    restarted = Driver(packaged_source().replace("{ 40 }", "{ 1 }"), state=first.state)
+    restarted = Driver(budget_source(1), state=first.state)
     assert restarted.step(Event("tool_use", "Bash")).tag is ActionTag.INTERRUPT
 
 
@@ -271,3 +279,18 @@ def test_an_unknown_action_is_refused() -> None:
     driver = Driver(driver_source(GOOD_SETTINGS, '("launch", "", 0)'))
     with pytest.raises(DriverError, match="unknown action 'launch'"):
         driver.step(Event("turn_start"))
+
+
+DEVELOPMENT_TOOL_BUDGET = 100
+DEVELOPMENT_TURNS = 50
+
+
+@pytest.mark.parametrize("model", list(ENGINE_OF))
+def test_subscription_drivers_allow_a_development_turn(model: str) -> None:
+    # A line that develops software reads, edits and runs a gate many times in one
+    # turn, so a subscription driver's budgets are sized for that. The per-line cost
+    # and autonomous-turn limits are the operator's safety net. Drivers that may bill
+    # per token keep their small budgets, which the strategy tests above order.
+    settings = Driver.for_model(model, Strategy.SUBSCRIPTION).settings
+    assert settings.tool_budget >= DEVELOPMENT_TOOL_BUDGET
+    assert settings.max_turns >= DEVELOPMENT_TURNS

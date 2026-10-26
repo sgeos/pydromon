@@ -22,7 +22,7 @@ fn model() -> Text { "claude-haiku-5-5" }
 
 fn strategy() -> Text { "subscription" }
 
-fn tool_budget() -> Word { 20 }
+fn tool_budget() -> Word { 200 }
 
 // Settings read by index before the first turn. The list ends with the tag "end".
 fn setting(index: Word) -> (Text, Text, Word) {
@@ -31,7 +31,7 @@ fn setting(index: Word) -> (Text, Text, Word) {
         1 => ("strategy", strategy(), 0),
         2 => ("model", model(), 0),
         3 => ("effort", "low", 0),
-        4 => ("max_turns", "", 4),
+        4 => ("max_turns", "", 100),
         5 => ("tool_budget", "", tool_budget()),
         6 => ("context_window", "", 1000000),
         7 => ("engine", "claude-code", 0),
