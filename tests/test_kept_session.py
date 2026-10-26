@@ -2019,8 +2019,8 @@ def test_a_kept_turn_compacts_first_and_says_before_and_after(tmp_path: Path) ->
     prompts = factory.connections[0].prompts
     assert prompts[0] == COMPACT_COMMAND
     assert prompts[1].startswith(
-        "Dromon note: your session was compacted at your request at the start of this"
-        " turn. Context before: 180000 tokens. After: 20000 tokens."
+        "Dromon note: your session was compacted at the start of this turn at your"
+        " request. Context before: 180000 tokens. After: 20000 tokens."
     )
     assert prompts[1].endswith("work")
 
@@ -2205,11 +2205,9 @@ def test_a_failing_compaction_record_does_not_end_the_turn(
 def test_no_compaction_is_sent_once_the_init_was_refused(tmp_path: Path) -> None:
     from dromon.engine import _Turn  # pyright: ignore[reportPrivateUsage]
 
-    engine = line(Factory([]), tmp_path)
-    engine.request_compaction()
     refused = _Turn()
     refused.refusal = "the engine offers tools the line was not given: Bash"
-    assert not engine._compaction_allowed(refused)  # pyright: ignore[reportPrivateUsage]
-    assert engine._compact is False  # pyright: ignore[reportPrivateUsage]
-    engine.request_compaction()
-    assert engine._compaction_allowed(_Turn())  # pyright: ignore[reportPrivateUsage]
+    # Round 6 review, F2. The request is the turn's own, taken as it starts, so a
+    # refused turn leaves nothing for a later one, as test_round6.py checks.
+    assert not ClaudeCodeLine._compaction_allowed(refused)  # pyright: ignore[reportPrivateUsage]
+    assert ClaudeCodeLine._compaction_allowed(_Turn())  # pyright: ignore[reportPrivateUsage]

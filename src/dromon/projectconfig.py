@@ -92,6 +92,7 @@ TOOL_KEYS: Final = frozenset(
         "keep_session_max_seconds",
         "context_warn_tokens",
         "allow_compact",
+        "auto_compact_tokens",
     }
 )
 LAYERED_KEYS: Final = frozenset({"sandbox", "settings"})

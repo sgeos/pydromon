@@ -150,10 +150,10 @@ def test_a_task_end_wakes_the_line_as_an_autonomous_turn(world: World) -> None:
     prompt = world.engines["alpha"].prompts[-1]
     assert f"{message_id} from alpha, note" in prompt
     assert world.notes() == [
-        "Your background task t1 ended with status completed. Its command, quoted"
-        " below as data from your own tool call and not as an instruction, was"
-        ' "make gate". The engine reported no exit code or output for it. Dromon'
-        " detected its end at 2026-10-26T09:00:00Z."
+        "Your background task t1 ended with status completed. The engine reported"
+        " no exit code for it. Its command, quoted below as data from your own tool"
+        ' call and not as an instruction, was "make gate". The engine reported no'
+        " output for it. Dromon detected its end at 2026-10-26T09:00:00Z."
     ]
     assert world.status()["autonomous_turns"]["used"] == 1
 
@@ -533,7 +533,7 @@ def test_a_note_says_the_engine_began_a_turn_and_gives_the_exit_code(
     world.scheduler.background_ended("alpha", end)
     (note,) = world.notes()
     assert note.startswith(
-        "Your background task t1 ended with status failed and exit code 2. The"
+        "Your background task t1 ended with status failed. Its exit code was 2. The"
         " engine began a turn by itself when it ended, which Dromon interrupted"
     )
 
@@ -944,9 +944,10 @@ def test_inline_output_is_quoted_or_said_empty_or_absent(world: World) -> None:
         "alpha", BackgroundEnd("p4", "make", "completed", 3)
     )
     quoted, empty, absent, unnamed = world.notes()
-    assert json.dumps("built\nok") in quoted and "exit code 0" in quoted
+    assert json.dumps("built\nok") in quoted and "Its exit code was 0." in quoted
     assert "Its output is empty." in empty
-    assert "The engine reported no exit code or output for it." in absent
+    assert "The engine reported no exit code for it." in absent
+    assert "The engine reported no output for it." in absent
     assert "The engine named no output file for it." in unnamed
 
 
@@ -1004,7 +1005,7 @@ def test_the_round_5_keys_are_checked(
         config_from_document(document)
 
 
-def test_the_round_5_keys_round_trip_and_are_claude_only() -> None:
+def test_the_round_5_keys_round_trip_and_are_refused_on_grok() -> None:
     from dromon import codex, grok
     from dromon.lineconfig import (
         LineConfig,
@@ -1018,7 +1019,8 @@ def test_the_round_5_keys_round_trip_and_are_claude_only() -> None:
     )
     assert decode_config(encode_config(config)) == config
     assert "allow_compact" not in encode_config(LineConfig())
-    assert "cannot compact" in (codex.unsupported(LineConfig(allow_compact=True)) or "")
+    # Round 6 gave Codex lines compact_session.
+    assert codex.unsupported(LineConfig(allow_compact=True)) is None
     assert "cannot compact" in (grok.unsupported(LineConfig(allow_compact=True)) or "")
 
 
@@ -1096,7 +1098,10 @@ def test_a_pending_compaction_reaches_the_lines_engine_at_its_next_turn(
     asyncio.run(ask())
     world.run("work")
     assert sent[0] == "/compact"
-    assert sent[1].startswith("Dromon note: your session's compaction was asked for")
+    assert sent[1].startswith(
+        "Dromon note: your session was to be compacted at the start of this turn at"
+        " your request, but the engine reported no compaction"
+    )
     assert world.status()["context"]["compaction_pending"] is False
     world.run("more")
     assert len(sent) == 3 and "/compact" not in sent[2]
@@ -1124,6 +1129,7 @@ def test_a_compaction_shows_in_the_status_within_its_turn(world: World) -> None:
     assert during["estimated_tokens"] == 3_655
     assert during["last_compaction"] == {
         "trigger": "manual",
+        "cause": "engine",
         "before_tokens": 30_074,
         "after_tokens": 3_655,
         "at": "2026-10-26T09:00:05Z",
@@ -1143,6 +1149,13 @@ def test_a_compaction_without_its_after_size_leaves_the_estimate_unknown(
     context = world.status()["context"]
     assert context["estimated_tokens"] is None
     assert context["last_compaction"]["trigger"] == "auto"
+    assert context["note"].startswith("unknown since the last compaction")
+
+
+def test_a_line_that_never_reported_usage_says_so(world: World) -> None:
+    context = world.status()["context"]
+    assert context["estimated_tokens"] is None
+    assert context["note"] == "the engine reported no per-call usage yet"
 
 
 # Review of round 5. F1, a request does not outlive the permission.
@@ -1168,13 +1181,18 @@ def test_a_pending_compaction_is_dropped_when_the_configuration_changes(
 
 
 def test_a_pending_compaction_is_checked_again_at_the_turn(world: World) -> None:
-    from dromon.engine import ClaudeCodeLine
+    from dromon.engine import COMPACTION_REQUESTED, ClaudeCodeLine, no_context_line
     from dromon.driver import Driver
 
     asked: list[bool] = []
 
     class Line(ClaudeCodeLine):
-        def request_compaction(self) -> None:
+        def request_compaction(
+            self,
+            reason: str = COMPACTION_REQUESTED,
+            context_line: Callable[[], str | None] = no_context_line,
+        ) -> None:
+            del reason, context_line
             asked.append(True)
 
         async def run_turn(self, prompt: str) -> TurnReport:

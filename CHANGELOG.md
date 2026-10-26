@@ -85,6 +85,28 @@ All notable changes are recorded here. The format follows
   unanswered count leaves out replies to hold questions, and `list_mail` entries carry
   `repeat_of` and a fired wake's due and delivery times.
 
+- The round 6 review. Automatic compaction is held after a compaction whose size
+  after is unknown or still past the threshold, until a lower context is reported,
+  which `line_status` shows as `auto_compact_held`. A compaction request belongs to
+  the turn it was made for, on both engines. A Codex compaction with no call seen
+  reports its usage as unknown. The compaction wake's note says that a restart loses
+  the request.
+
+- Round 6 of the session-line experience. `compact_session` schedules its own wake, 60
+  seconds ahead by default, unless one is pending. A turn that begins with a
+  compaction gives the context warning after it, so a compacted line is not told to
+  compact again. A task note states its exit code as a sentence of its own or says
+  that none was reported, and reads the form `failed with exit code 1` too. The line
+  key `auto_compact_tokens` compacts a turn first once the estimate reaches it.
+  `recent_turns` shows a compaction's own cost and tokens, and the cost of a turn the
+  engine began by itself or an operator interrupted as an entry of its own that
+  counts toward the budget. Codex lines report each call's tokens, their context and
+  their turn's tokens, and may compact through `thread/compact/start`. A live probe
+  showed that Codex reports the compaction as a `contextCompaction` item and not by
+  the `thread/compacted` notice, so the item is read, and the compaction's own usage
+  notice is not counted as a call. `last_compaction` gains a `cause`, and every
+  `recent_turns` entry has a `compaction` field.
+
 - The round 5 review. A pending compaction is dropped on a configuration change and
   checked again against `allow_compact` when consumed, and none is sent after a
   refused init. A Codex completion counts only for the line's own item, in a turn
