@@ -30,7 +30,7 @@ live and merged pull requests 35 to 38.
 | The required user plugin | Done. `plugins` loads one plugin by path, under allowlists, verified live: a line saw `typesafe:typesafe-ai` and the plugin's files were not written |
 | One full gate at a time | Done. `[leases]`, verified in both trials |
 | Turn budgets for real work | Done. Subscription drivers allow 200 engine turns and 400 tool calls |
-| The proofs line's model | Fable 5.1 drivers packaged, not run live. The project file runs proofs on Opus, so dogfooding does not depend on them |
+| The proofs line's model | Fable 5.1 drivers, verified live by one probe turn on the subscription. The project file runs proofs on Opus |
 | Pushing over HTTPS and pull requests | Keleusma's configuration, for the operator |
 
 ## The trial
@@ -74,6 +74,24 @@ What the lines reported a real deployment needs, beyond the read-only trial's ru
 - **Live sessions.** A Dromon line and a live session in the same worktree share one
   tree. Stop the live session before the line starts, and adopt its session with
   `session` only after it has stopped.
+
+## Installation
+
+**Fact, 2026-10-26.** On the operator's decision, the project file below, cut to the
+kaizen line, is installed as Keleusma's `.dromon/dromon.toml`, with `.dromon/` in
+`.git/info/exclude`, and `dromon config` accepts it there. Keleusma's
+`secret/disclosure-terms.txt` exists, untracked. No daemon was started, because the
+kaizen line's own live session was still running, and the operator starts it once that
+session ends:
+
+```sh
+cd /PATH/TO/keleusma
+CLAUDE_CODE_STREAM_CLOSE_TIMEOUT=300000 uv run --project /PATH/TO/pydromon dromon start
+uv run --project /PATH/TO/pydromon dromon attach kaizen
+```
+
+The remote stays on SSH by the operator's decision, so the kaizen line can commit but
+not push. The other three lines join by adding their sections from the file below.
 
 ## The project file
 

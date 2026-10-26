@@ -96,9 +96,8 @@ are in `tmp/harness-report-*.md`.
   limit, and refused calls escape the tool budget. See `CODEX.md`.
 - **Clients.** Polling, no token meter, Tk checked only withdrawn. Agents lack
   `interrupt` and settings.
-- **Keleusma.** Installing its project file and its lines' authority await the
-  operator. Its remote needs HTTPS. Fable 5.1 never ran. A line cannot list or stop
-  its own processes or see its own limits.
+- **Keleusma.** Installed for kaizen, not started, until its live session ends. The
+  remote stays SSH, so no pushes. A line cannot list its own processes or limits.
 - **In the design.** Hosted teacher traces, the Rust repository's name, and remote
   clients.
 

@@ -4,49 +4,33 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-26, the harness brought to Keleusma, through the dogfooded harness
+## 2026-10-26, the harness ready for Keleusma, and installed for kaizen
 
 **Done.** On the operator's goal that pydromon be in order for its session to direct
-further development through Dromon, and that the harness be brought to a standard
-where Keleusma's four lines can run on it.
+further development through Dromon, and that the harness reach a standard where
+Keleusma's four lines can run on it.
 
-- **Directed work.** The Opus line `worker` inspected Keleusma read only and ranked the
-  gaps, then built three stages. The Haiku line `reviewer` reviewed each, and its
-  findings were fixed. The operator's session verified each stage live and merged pull
-  requests 35 to 38. The record is `docs/architecture/KELEUSMA_DOGFOOD.md`.
-- **Built.** Development-scale turn budgets, per-line working directories with session
-  adoption and a git hooks and config guard, `wake_after`, `require_sandbox`, a
-  disclosure guard, operator-only rebinding, allowlisted project settings, leases, and
-  Fable 5.1 drivers.
-- **Tried.** A scratch project ran Keleusma's four lines on Haiku in their real
-  worktrees, read only. Each identified its line and task, the lease was contended as
-  designed, and nothing in Keleusma was written.
-- **Validated.** A Keleusma project file passes `dromon config` against the real
-  worktrees, and is recorded with placeholder paths.
-- **Reports.** The three lines' harness reports are in `tmp/harness-report-*.md`, and
-  the trial's reports in `tmp/keleusma-trial-reports.txt`.
+- **Directed work.** pydromon's Opus `worker` line inspected Keleusma and built four
+  stages, which its Haiku `reviewer` line reviewed. The operator's session verified
+  each live and merged pull requests 35 to 40. The record is
+  `docs/architecture/KELEUSMA_DOGFOOD.md`.
+- **Verified live.** Working directories, git guards, scheduled wakes, leases,
+  `require_sandbox`, the disclosure guard, rebinding, project settings, plugins and a
+  Fable 5.1 probe. A read-only trial ran Keleusma's four lines in their worktrees, and
+  a writing trial ran kaizen in a private clone through lease, background build, wake,
+  commit and push.
+- **Installed, on the operator's decisions.** Keleusma's `.dromon/dromon.toml` for the
+  kaizen line, excluded from git and accepted by `dromon config`, and an untracked
+  `secret/disclosure-terms.txt`. The remote stays on SSH. No daemon was started.
+- **Reports.** The lines' harness reports are in `tmp/harness-report-*.md`, and the
+  trials' reports in `tmp/keleusma-trial-reports.txt`.
 
-**Corrections to the lines' reports.** The worker's holds were cost holds, not
-autonomous-turn holds. The reviewer's duplicate request was a deliberate resend after
-its first turn failed to start. Luna's intermittent collection failure was the
-`.dromon` defect, fixed by pytest's `--ignore`.
-
-**Verified live afterwards, 2026-10-26.** In a scratch project, `require_sandbox`
-refused an unsandboxed line, the disclosure guard refused a line's message without
-naming the term, a project skill loaded and a project hook refused its turn, a rebind
-from Haiku to Opus answered as Opus, and the `plugins` key loaded Keleusma's required
-skill. In a private clone of Keleusma, a writing kaizen line took the lease, built a
-crate in the background with two scheduled wakes, committed in its worktree, pushed to
-a local remote, and released the lease. Stage 4, the plugin opt-in, merged with its
-review findings fixed.
-
-**Not verified.** No live turn ran on Fable 5.1, which the project file does not use.
-The real Keleusma lines have not run as writing lines, because their live sessions work
-in the same worktrees, and installing the file is the operator's decision.
+**Not done.** No real Keleusma line has written under Dromon yet, because kaizen's own
+live session was still running, and the operator starts the daemon once it ends.
 
 **For the operator.**
-1. Whether to install the Keleusma project file, which stops the live sessions of
-   those lines, and whether those lines keep their authority to commit, push and merge.
-2. Keleusma's remote over HTTPS, and `secret/disclosure-terms.txt` there.
+1. Start Keleusma's daemon for kaizen when its live session has ended, as
+   `KELEUSMA_DOGFOOD.md` shows, and decide when the other three lines join.
+2. Move the remote to HTTPS when the lines should push.
 3. The lines' top suggestions: let a line list and stop its own processes, and show a
    line its own holds, limits and leases.
