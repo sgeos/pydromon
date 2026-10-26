@@ -49,6 +49,9 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "ack": "acknowledge a message without replying",
     "sent": "show what became of the mail an operator sent",
     "release": "resume a line the daemon held at a conversation limit",
+    "settings": "show the project's settings, and a line's, with where each comes from",
+    "set": "change a project or line setting, or return it to the layers below",
+    "reload": "read the project file again and apply its lines, limits and wake policy",
     "config": "check the project file and show what it declares",
     "probe": "run one short turn on the engine and report its capabilities",
     "teacher": "bring the project's local teacher model up, report it, or release it",
@@ -594,6 +597,73 @@ def _release(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return _request(paths, "release", Operation.RELEASE, args)
 
 
+def _settings(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    args: dict[str, object] = {}
+    if arguments.line_id is not None:
+        args["line_id"] = arguments.line_id
+    response = _call(paths, "settings", Operation.SETTINGS, args)
+    if isinstance(response, int):
+        return response
+    from dromon.ui.data import settings_of
+
+    found = settings_of(response)
+    sections = [("project.", "Project", found.project)]
+    if arguments.line_id is not None:
+        sections.insert(0, ("", f"Line {found.line_id}", found.line))
+    for prefix, title, entries in sections:
+        print(title)
+        for entry in entries:
+            source = f"  [{entry.source}]" if entry.source else "  [read only]"
+            print(f"  {prefix}{entry.key} = {entry.shown}{source}")
+    return exits.OK
+
+
+def _set(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Check the value against the daemon's settings, as the interactive client does,
+    then send it. A line key needs ``--line``, and a project key its prefix."""
+    from dromon.ui.commands import PROJECT_PREFIX, Set
+    from dromon.ui.data import settings_of
+    from dromon.ui.settings import request_of
+
+    project = arguments.key.startswith(PROJECT_PREFIX)
+    if not project and arguments.line_id is None:
+        print(
+            f"dromon set: {arguments.key} is a line setting and needs --line,"
+            f" or write {PROJECT_PREFIX}{arguments.key} for the project",
+            file=sys.stderr,
+        )
+        return exits.USAGE
+    if arguments.unset == bool(arguments.value):
+        print("dromon set: give a value or --unset, not both", file=sys.stderr)
+        return exits.USAGE
+    query: dict[str, object] = {}
+    if arguments.line_id is not None:
+        query["line_id"] = arguments.line_id
+    response = _call(paths, "set", Operation.SETTINGS, query)
+    if isinstance(response, int):
+        return response
+    text = None if arguments.unset else " ".join(arguments.value)
+    checked = request_of(settings_of(response), Set(arguments.key, text))
+    if isinstance(checked, str):
+        print(f"dromon set: {checked}", file=sys.stderr)
+        return exits.FAILURE
+    args: dict[str, object] = {
+        "scope": "project" if checked.project else "line",
+        "key": checked.key,
+    }
+    if not checked.project:
+        args["line_id"] = arguments.line_id
+    if checked.value is not None:
+        value = checked.value
+        args["value"] = list(value) if isinstance(value, tuple) else value
+    return _request(paths, "set", Operation.SET_SETTING, args)
+
+
+def _reload(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    del arguments
+    return _request(paths, "reload", Operation.RELOAD_PROJECT, {})
+
+
 def _read(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     args: dict[str, object] = {
         "operator": arguments.operator,
@@ -655,6 +725,9 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "ack": _ack,
     "sent": _sent,
     "release": _release,
+    "settings": _settings,
+    "set": _set,
+    "reload": _reload,
     "attach": _attach,
     "config": _config,
     "teacher": _teacher,
@@ -752,6 +825,26 @@ def build_parser() -> argparse.ArgumentParser:
         command = commands.add_parser(name, help=help_text, description=help_text)
         if name == "release":
             command.add_argument("line_id", help="the held line")
+        if name == "settings":
+            command.add_argument(
+                "line_id", nargs="?", help="the line whose settings to show as well"
+            )
+        if name == "set":
+            command.add_argument(
+                "key",
+                help="a line key, or a project key such as project.wake.every_ticks",
+            )
+            command.add_argument(
+                "value", nargs="*", help="the value, as the client takes it"
+            )
+            command.add_argument(
+                "--line", dest="line_id", help="the line, for a line key"
+            )
+            command.add_argument(
+                "--unset",
+                action="store_true",
+                help="return the key to the layers below",
+            )
         if name == "attach":
             command.add_argument("line_id", help="the line to attach to")
             command.add_argument(

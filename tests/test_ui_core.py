@@ -50,6 +50,7 @@ from dromon.ui.model import (
     Failed,
     FetchActivity,
     FetchLines,
+    FetchSettings,
     FetchView,
     LinesLoaded,
     Model,
@@ -221,7 +222,7 @@ def test_every_command_in_the_table_parses() -> None:
 CHOICES = Choices(
     lines=(("alpha", "idle"), ("beta", "running")),
     questions=(("q-1", "Resume?"),),
-    answers=(("q-1", ("yes", "no", "yes, later")),),
+    values=(("/answer", "q-1", ("yes", "no", "yes, later")),),
     messages=(("m-1", "a note"),),
 )
 
@@ -229,7 +230,7 @@ CHOICES = Choices(
 def test_command_names_complete_from_a_slash() -> None:
     names = [s.label for s in suggest("/", CHOICES)]
     assert len(names) == min(len(SPECS), MAX_SUGGESTIONS)
-    assert [s.text for s in suggest("/rel", CHOICES)] == ["/release"]
+    assert [s.text for s in suggest("/rele", CHOICES)] == ["/release"]
     assert [s.text for s in suggest("/ans", CHOICES)] == ["/answer "]
     assert suggest("hello", CHOICES) == ()
     assert suggest("/release\nmore", CHOICES) == ()
@@ -357,7 +358,12 @@ def running_view() -> View:
     return replace(view, line=replace(view.line, state="running"))
 
 
-POLL = [FetchView("alpha"), FetchActivity("alpha", 0), FetchLines()]
+POLL = [
+    FetchView("alpha"),
+    FetchActivity("alpha", 0),
+    FetchLines(),
+    FetchSettings("alpha"),
+]
 
 
 def test_the_first_tick_polls_and_later_ones_wait_for_the_interval() -> None:
@@ -433,7 +439,7 @@ def test_editing_keys_reach_the_editor() -> None:
 
 
 def test_a_slash_shows_suggestions_that_tab_and_enter_take() -> None:
-    model, _ = run(attached(), *keys("/re"))
+    model, _ = run(attached(), *keys("/rele"))
     assert [s.text for s in model.suggestions] == ["/release"]
     _, effects = run(model, Pressed(Named.ENTER))
     assert effects == [Request(Release(), "alpha", "ana")]
@@ -532,7 +538,12 @@ def test_switching_lines_resets_the_line_state_and_polls() -> None:
     model, effects = run(model, Pressed(Named.ENTER))
     assert model.line_id == "beta" and model.view is None and model.activity == ()
     assert model.pane is Pane.MAIL and model.lines == LINES and model.scroll == 0
-    assert effects == [FetchView("beta"), FetchActivity("beta", 0), FetchLines()]
+    assert effects == [
+        FetchView("beta"),
+        FetchActivity("beta", 0),
+        FetchLines(),
+        FetchSettings("beta"),
+    ]
 
 
 def test_switching_to_an_unknown_or_the_same_line_stays_put() -> None:

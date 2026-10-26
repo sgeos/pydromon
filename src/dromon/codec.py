@@ -28,7 +28,10 @@ from dromon.model import (
     LineCreated,
     LineHeld,
     LineReleased,
+    LineOverridden,
     LineSession,
+    LineSessionCleared,
+    ProjectOverridden,
     LineState,
     LineStateChanged,
     MessageDelivered,
@@ -55,6 +58,9 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "line_state_changed": ("line_id", "state"),
     "line_configured": ("line_id", "config"),
     "line_session": ("line_id", "engine_session"),
+    "line_session_cleared": ("line_id",),
+    "line_overridden": ("line_id", "overrides"),
+    "project_overridden": ("overrides",),
     "line_held": ("line_id", "question_id"),
     "line_released": ("line_id",),
     "operator_registered": ("operator_id",),
@@ -161,6 +167,15 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "line_id": event.line_id,
                 "engine_session": event.engine_session,
             }
+        case LineSessionCleared():
+            return "line_session_cleared", {"line_id": event.line_id}
+        case LineOverridden():
+            return "line_overridden", {
+                "line_id": event.line_id,
+                "overrides": event.overrides,
+            }
+        case ProjectOverridden():
+            return "project_overridden", {"overrides": event.overrides}
         case OperatorRegistered():
             return "operator_registered", {"operator_id": event.operator_id}
         case AgentRegistered():
@@ -224,6 +239,12 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
             return LineReleased(_str(data, "line_id"))
         case "line_session":
             return LineSession(_str(data, "line_id"), _str(data, "engine_session"))
+        case "line_session_cleared":
+            return LineSessionCleared(_str(data, "line_id"))
+        case "line_overridden":
+            return LineOverridden(_str(data, "line_id"), _str(data, "overrides"))
+        case "project_overridden":
+            return ProjectOverridden(_str(data, "overrides"))
         case "operator_registered":
             return OperatorRegistered(_str(data, "operator_id"))
         case "agent_registered":

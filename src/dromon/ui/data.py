@@ -123,13 +123,7 @@ def view_of(result: Mapping[str, object]) -> View:
             question_id=_text(entry, "question_id"),
             operator=_text(entry, "operator"),
             text=_text(entry, "text"),
-            choices=tuple(
-                choice
-                for choice in cast(list[object], entry.get("choices") or [])
-                if isinstance(choice, str)
-            )
-            if isinstance(entry.get("choices"), list)
-            else (),
+            choices=_strings(entry.get("choices")),
         )
         for entry in _items(result.get("open_questions"))
     )
@@ -169,4 +163,71 @@ def activity_of(result: Mapping[str, object]) -> ActivityPage:
     )
     return ActivityPage(
         _number(result, "seq"), entries, result.get("complete") is not False
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SettingEntry:
+    key: str
+    kind: str
+    """One of the kinds of ``dromon.overrides.Kind``, or ``info`` for one that a
+    client cannot change."""
+    summary: str
+    choices: tuple[str, ...]
+    shown: str
+    """The value as the client shows it."""
+    source: str
+    editable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Settings:
+    line_id: str
+    line: tuple[SettingEntry, ...]
+    project: tuple[SettingEntry, ...]
+    models: tuple[str, ...]
+    """Every model a line may be created on."""
+
+
+def shown(value: object) -> str:
+    """A setting's value as text: a list joined by commas, a boolean as on or off."""
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    if isinstance(value, list):
+        items = [str(item) for item in cast(list[object], value)]
+        return ", ".join(items) if items else "none"
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _settings(value: object) -> tuple[SettingEntry, ...]:
+    return tuple(
+        SettingEntry(
+            key=_text(entry, "key"),
+            kind=_text(entry, "kind"),
+            summary=_text(entry, "summary"),
+            choices=_strings(entry.get("choices")),
+            shown=shown(entry.get("value")),
+            source=_text(entry, "source"),
+            editable=entry.get("editable") is True,
+        )
+        for entry in _items(value)
+        if _text(entry, "key")
+    )
+
+
+def _strings(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(item for item in cast(list[object], value) if isinstance(item, str))
+
+
+def settings_of(result: Mapping[str, object]) -> Settings:
+    """A ``settings`` result."""
+    return Settings(
+        line_id=_text(result, "line_id"),
+        line=_settings(result.get("line")),
+        project=_settings(result.get("project")),
+        models=_strings(result.get("models")),
     )

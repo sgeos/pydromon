@@ -99,6 +99,9 @@ def test_the_scenario_builds_the_expected_state(scenario: tuple[Event, ...]) -> 
     assert state.messages["q3"].status is QuestionStatus.WITHDRAWN
     assert state.messages["m3"].reply_to == "m2"
     assert state.open_questions("ana") == []
+    assert state.lines["beta"].engine_session == "0b9f2c6e-session"
+    assert state.lines["alpha"].overrides == '{"effort":"low"}'
+    assert state.project_overrides == '{"limits.max_cost_usd":"5"}'
 
 
 def test_applying_the_same_events_twice_gives_equal_states(

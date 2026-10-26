@@ -36,7 +36,7 @@ import fcntl
 import os
 import signal
 import sys
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, cast
@@ -55,7 +55,7 @@ from dromon.agents import (
 )
 from dromon import codex, grok
 from dromon.teacher import Teacher, TeacherError
-from dromon.driver import ENGINE_OF, DriverError, Strategy
+from dromon.driver import ENGINE_OF, MODELS, DriverError, Strategy
 from dromon.eventlog import EventLog, LogError, utc_now
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.mailbox import MAX_PAGE, listing, outcome, replied_ids, sent, summary
@@ -67,8 +67,29 @@ from dromon.lineconfig import (
     decode_config,
 )
 from dromon.projectconfig import ConfigFileError, ProjectConfig, config_path, load
-from dromon.sandbox import effective, merge
+from dromon.sandbox import SandboxError, effective, merge
+from dromon.configview import (
+    OVERRIDE,
+    LineFacts,
+    Overrides,
+    line_entries,
+    project_entries,
+    project_layers,
+    project_values,
+)
+from dromon.overrides import (
+    Layer,
+    OverrideError,
+    Scope,
+    Value,
+    changed,
+    check,
+    spec_of,
+)
+from dromon.overrides import decode as decode_override
+from dromon.overrides import encode as encode_override
 from dromon.model import (
+    ProjectOverridden,
     AgentAccess,
     AgentAddress,
     AgentRegistered,
@@ -150,6 +171,62 @@ class Daemon:
     """Who may connect to the agent socket, and with what access."""
     line_tokens: LineTokens = field(default_factory=LineTokens)
     """The tokens of lines whose engines reach their tools over the line socket."""
+    project: ProjectConfig = field(default_factory=ProjectConfig)
+    """The project file as last loaded, at start or by ``reload_project``."""
+    command_line: Overrides = field(default_factory=Overrides)
+    project_file_present: bool = False
+
+    # Settings, at the project's scope and each line's.
+
+    def project_layers(
+        self, overrides: Mapping[str, Value] | None = None
+    ) -> list[Layer]:
+        """The project's layers, with the stored project overrides unless others
+        are given."""
+        if overrides is None:
+            overrides, skipped = decode_override(
+                Scope.PROJECT, self.log.state.project_overrides
+            )
+            for reason in skipped:
+                print(
+                    f"dromond: a project override is skipped: {reason}", file=sys.stderr
+                )
+        return project_layers(
+            self.project, self.command_line, overrides, self.project_file_present
+        )
+
+    def apply_project_values(self) -> None:
+        """Give the scheduler the project-wide values the layers resolve to. Stored
+        overrides that no longer resolve are skipped, so they cannot stop a start."""
+        try:
+            values = project_values(self.project_layers())
+        except (ValueError, InvalidField) as error:
+            print(
+                f"dromond: the project overrides are skipped: {error}", file=sys.stderr
+            )
+            values = project_values(self.project_layers({}))
+        self.scheduler.set_project(
+            values.limits, values.operator, values.tick_seconds, values.wake_every_ticks
+        )
+
+    def line_facts(self, line_id: str) -> LineFacts:
+        scheduler = self.scheduler
+        line = self.log.state.lines[line_id]
+        own_limits, own_wake = scheduler.line_policy(line_id)
+        return LineFacts(
+            line_id=line_id,
+            created_model=line.engine,
+            model=scheduler.model_of(line_id),
+            model_choices=scheduler.model_choices(line_id),
+            strategy=line.strategy,
+            session=line.engine_session,
+            config=scheduler.effective_config(line_id),
+            overrides=scheduler.line_overrides(line_id),
+            limits=scheduler.limits_for(line_id),
+            own_limits=own_limits,
+            wake_every_ticks=scheduler.wake_every_for(line_id),
+            own_wake=own_wake,
+        )
 
     # The gateway's view of the daemon.
 
@@ -341,6 +418,10 @@ class Daemon:
                 | Operation.LINE_VIEW
                 | Operation.LINE_ACTIVITY
                 | Operation.INTERRUPT
+                | Operation.SETTINGS
+                | Operation.SET_SETTING
+                | Operation.CLEAR_SESSION
+                | Operation.RELOAD_PROJECT
                 | Operation.AGENT_ADD
                 | Operation.AGENT_REVOKE
                 | Operation.AGENT_LIST
@@ -377,6 +458,16 @@ class Daemon:
                     (line_id,) = _text_args(request.args, ("line_id",))
                     interrupted = self.scheduler.interrupt(line_id)
                     result = {"line_id": line_id, "interrupted": interrupted}
+                case Operation.SETTINGS:
+                    result = self._settings(request.args)
+                case Operation.SET_SETTING:
+                    result = self._set_setting(request.args)
+                case Operation.CLEAR_SESSION:
+                    (line_id,) = _text_args(request.args, ("line_id",))
+                    self.scheduler.clear_session(line_id)
+                    result = {"line_id": line_id}
+                case Operation.RELOAD_PROJECT:
+                    result = self._reload_project(request.args)
                 case Operation.AGENT_ADD:
                     result = self._agent_add(request.args)
                 case Operation.AGENT_REVOKE:
@@ -394,7 +485,16 @@ class Daemon:
                 error_code=error.code,
                 error_message=str(error),
             )
-        except (InvalidField, EventRejected, DriverError, ConfigError) as error:
+        except (
+            InvalidField,
+            EventRejected,
+            DriverError,
+            ConfigError,
+            OverrideError,
+            ConfigFileError,
+            ProjectMismatch,
+            SandboxError,
+        ) as error:
             return Response(
                 request.request_id,
                 False,
@@ -590,6 +690,116 @@ class Daemon:
             "complete": len(kept) == len(changed),
         }
 
+    def _settings(self, args: dict[str, object]) -> dict[str, object]:
+        """The project's settings, and a line's when ``line_id`` is given, each with
+        the layer its value comes from."""
+        allowed = {"line_id"}
+        if not set(args) <= allowed:
+            raise ProtocolError(ErrorCode.BAD_REQUEST, "settings takes only line_id")
+        layers = self.project_layers()
+        file = str(config_path(self.paths.state_dir))
+        result: dict[str, object] = {
+            "project": project_entries(
+                layers, self.project, file, self.project_file_present
+            ),
+            "models": list(MODELS),
+        }
+        if "line_id" in args:
+            (line_id,) = _text_args(args, ("line_id",))
+            if line_id not in self.log.state.lines:
+                raise EventRejected(f"no line {line_id}")
+            result["line_id"] = line_id
+            result["line"] = line_entries(self.line_facts(line_id), layers)
+        return result
+
+    def _set_setting(self, args: dict[str, object]) -> dict[str, object]:
+        """Set one setting at the project's scope or a line's, or return it to the
+        layers below when ``value`` is omitted. Returns where the value now comes
+        from, which is not the override when the command line shadows it."""
+        scope_text = args.get("scope")
+        allowed = {"scope", "key", "value", "line_id"}
+        if not set(args) <= allowed or not isinstance(args.get("key"), str):
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST, f"set_setting takes {sorted(allowed)}, with key"
+            )
+        key = cast(str, args["key"])
+        value = args.get("value")
+        if scope_text == Scope.LINE.value:
+            (line_id,) = _text_args({"line_id": args.get("line_id")}, ("line_id",))
+            self.scheduler.override_line(line_id, key, value)
+            found = next(
+                e
+                for e in line_entries(self.line_facts(line_id), self.project_layers())
+                if e["key"] == key
+            )
+            landed = _landed(found, value is not None)
+            return {"scope": "line", "line_id": line_id, **landed}
+        if scope_text != Scope.PROJECT.value or "line_id" in args:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST, "scope is line, with line_id, or project"
+            )
+        spec = spec_of(Scope.PROJECT, key)
+        stored, _ = decode_override(Scope.PROJECT, self.log.state.project_overrides)
+        document = changed(stored, key, None if value is None else check(spec, value))
+        try:
+            project_values(self.project_layers(document))
+        except (ValueError, InvalidField) as error:
+            raise OverrideError(f"{key}: {error}") from error
+        self.log.append(ProjectOverridden(encode_override(document)))
+        self.apply_project_values()
+        found = next(
+            e
+            for e in project_entries(
+                self.project_layers(), self.project, "", self.project_file_present
+            )
+            if e["key"] == key
+        )
+        return {"scope": "project", **_landed(found, value is not None)}
+
+    def _reload_project(self, args: dict[str, object]) -> dict[str, object]:
+        """Read the project file again and apply its lines, limits and wake policy.
+
+        A change to the sandbox, the engine settings, the teacher or the external
+        agent policy is refused, because the running engine factory, teacher and
+        agent socket were built from them, and the daemon must restart to apply it.
+        A refused reload changes nothing.
+        """
+        if args:
+            raise ProtocolError(ErrorCode.BAD_REQUEST, "reload_project takes nothing")
+        file = config_path(self.paths.state_dir)
+        present = file.exists()
+        config = load(file) if present else ProjectConfig()
+        check_sandboxes(config, self.paths)
+        try:
+            check_engines(config)
+        except ValueError as error:
+            raise OverrideError(str(error)) from error
+        fixed = ("sandbox", "settings", "teacher", "agents")
+        moved = [
+            name
+            for name in fixed
+            if getattr(config, name) != getattr(self.project, name)
+        ]
+        if moved:
+            raise OverrideError(
+                "the project file changes "
+                + ", ".join(moved)
+                + ", which apply only when the daemon restarts"
+            )
+        try:
+            project_values(project_layers(config, self.command_line, {}, present))
+        except (ValueError, InvalidField) as error:
+            raise OverrideError(str(error)) from error
+        check_project(self.log, config)
+        for line_id in sorted(set(self.project.lines) - set(config.lines)):
+            if line_id in self.log.state.lines:
+                self.scheduler.set_line_policy(line_id, None, None)
+        apply_project(self.scheduler, self.log, config)
+        self.project = config
+        self.project_file_present = present
+        self.apply_project_values()
+        return {"file": str(file), "present": present, "lines": sorted(config.lines)}
+
     def _agent_add(self, args: dict[str, object]) -> dict[str, object]:
         """Register an agent, or replace its access and token, and return the token.
         The token is returned once and only its digest is stored."""
@@ -752,6 +962,17 @@ def _bounded(result: dict[str, object]) -> dict[str, object]:
             item = {**item, "text": text[:MAX_AGENT_TEXT] + "\n[truncated by Dromon]"}
         bounded.append(item)
     return {**result, "content": cast(object, bounded)}
+
+
+def _landed(found: Mapping[str, object], was_set: bool) -> dict[str, object]:
+    """The parts of a settings entry a ``set_setting`` result reports. A value that
+    was set but does not come from the override is shadowed by a higher layer."""
+    return {
+        "key": found["key"],
+        "value": found["value"],
+        "source": found["source"],
+        "shadowed": was_set and found["source"] != OVERRIDE,
+    }
 
 
 def _question_summary(message_id: str, message: Message) -> dict[str, object]:
@@ -925,17 +1146,6 @@ async def serve(daemon: Daemon) -> None:
             loop.remove_signal_handler(signum)
 
 
-@dataclass(frozen=True, slots=True)
-class Overrides:
-    """Settings given on the command line, which take precedence over the file."""
-
-    operator: str | None = None
-    tick_seconds: float | None = None
-    max_autonomous_turns: int | None = None
-    max_cost_usd: float | None = None
-    cooldown_seconds: float | None = None
-
-
 class ProjectMismatch(Exception):
     """The project file and the event log disagree on something that cannot change."""
 
@@ -1021,14 +1231,33 @@ def resolve(config: ProjectConfig, overrides: Overrides) -> tuple[Limits, str, f
     return limits, OperatorAddress(operator).operator_id, tick
 
 
+def check_project(log: EventLog, config: ProjectConfig) -> None:
+    """Raise ``ProjectMismatch`` if the file changes a line's model or strategy, which
+    are fixed when it is created, so that nothing is applied from such a file. A
+    client may still switch a line's model within its engine, as an override."""
+    for line_id, definition in sorted(config.lines.items()):
+        existing = log.state.lines.get(line_id)
+        if existing is not None and (existing.engine, existing.strategy) != (
+            definition.model,
+            definition.strategy.value,
+        ):
+            raise ProjectMismatch(
+                f"line {line_id} runs {existing.engine} with the"
+                f" {existing.strategy} strategy, but the project file says"
+                f" {definition.model} with"
+                f" {definition.strategy}. Create a new line instead."
+            )
+
+
 def apply_project(scheduler: Scheduler, log: EventLog, config: ProjectConfig) -> None:
     """Bring the log's lines into line with the file's definitions.
 
     A declared line that does not exist is created. One whose tools changed is
-    reconfigured. A line's model and strategy are fixed when it is created, so a file
-    that changes either is refused rather than silently ignored. Lines created through
-    the client and absent from the file are left as they are.
+    reconfigured, under any overrides an operator set from a client. A file that
+    changes a line's model or strategy is refused before anything is applied. Lines
+    created through the client and absent from the file are left as they are.
     """
+    check_project(log, config)
     for line_id, definition in sorted(config.lines.items()):
         existing = log.state.lines.get(line_id)
         if existing is None:
@@ -1036,16 +1265,6 @@ def apply_project(scheduler: Scheduler, log: EventLog, config: ProjectConfig) ->
                 line_id, definition.model, definition.strategy, definition.config
             )
         else:
-            if (existing.engine, existing.strategy) != (
-                definition.model,
-                definition.strategy.value,
-            ):
-                raise ProjectMismatch(
-                    f"line {line_id} runs {existing.engine} with the"
-                    f" {existing.strategy} strategy, but the project file says"
-                    f" {definition.model} with"
-                    f" {definition.strategy}. Create a new line instead."
-                )
             stored = (
                 DEFAULT_CONFIG
                 if existing.config is None
@@ -1115,7 +1334,11 @@ def run(
                     scheduler,
                     agents=config.agents,
                     line_tokens=line_tokens,
+                    project=config,
+                    command_line=given,
+                    project_file_present=file.exists(),
                 )
+                daemon.apply_project_values()
                 asyncio.run(serve(daemon))
             finally:
                 if teacher is not None:

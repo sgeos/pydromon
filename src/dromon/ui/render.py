@@ -242,6 +242,45 @@ def _help(width: int) -> list[Row]:
     return rows
 
 
+def _settings(model: Model, width: int) -> tuple[list[Row], int]:
+    """The settings panel, and the index of the highlighted row in it."""
+    rows: list[Row] = [
+        (
+            Span(
+                "Settings. Up and Down choose, Enter edits, Escape closes.",
+                Style.STRONG,
+            ),
+        )
+    ]
+    settings = model.settings
+    if settings is None:
+        rows.append((Span("waiting for the daemon", Style.DIM),))
+        return rows, 0
+    span = max(
+        (len(entry.key) for entry in (*settings.line, *settings.project)), default=8
+    )
+    span = min(span + 2, max(width // 3, 8))
+    selected = 0
+    index = 0
+    for project, title in ((False, f"Line {settings.line_id}"), (True, "Project")):
+        rows.append(())
+        rows.append((Span(title, Style.ACCENT),))
+        prefix = "project." if project else ""
+        for entry in settings.project if project else settings.line:
+            source = f"  [{entry.source}]" if entry.source else ""
+            text = clean(
+                f"  {(prefix + entry.key)[: span - 1].ljust(span)}{entry.shown}{source}"
+            )
+            if index == model.setting_row:
+                style = Style.SELECTED
+                selected = len(rows)
+            else:
+                style = Style.PLAIN if entry.editable else Style.DIM
+            rows.append((Span(text.replace("\n", " ")[:width], style),))
+            index += 1
+    return rows, selected
+
+
 def _lines(model: Model, width: int) -> list[Row]:
     rows: list[Row] = [
         (
@@ -390,6 +429,11 @@ def frame(model: Model) -> Frame:
             panel = _lines(model, width)
             start = max(model.picked + 2 - layout.area, 0)
             body = panel[:1] + panel[1 + start :][: max(layout.area - 1, 0)]
+        case Overlay.SETTINGS:
+            panel, selected = _settings(model, width)
+            # The title stays, and the rest scrolls to keep the highlighted row shown.
+            start = max(selected + 1 - layout.area + 1, 1)
+            body = panel[:1] + panel[start:][: max(layout.area - 1, 0)]
         case Overlay.NONE:
             rows = transcript(model)
             scroll = min(model.scroll, max(len(rows) - layout.area, 0))

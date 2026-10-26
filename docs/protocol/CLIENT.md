@@ -56,6 +56,10 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `read` | Arguments `operator` and `message_id`. Returns the message with its `body` and `choices`, and marks it read the first time |
 | `line_view` | Arguments `line_id`, and optionally `limit`, at most 50. Returns `line`, the line's status entry, `tick`, `total`, the count of messages involving the line, `messages`, the newest of them oldest first, each with a body preview of at most 600 characters and `truncated`, kept within a 40,000 byte budget, and `open_questions`, the line's open questions. What an attached client polls |
 | `line_activity` | Arguments `line_id`, and optionally `after`, a revision, default 0. Returns `line_id`, `seq`, the daemon's newest revision, `entries`, the line's activity entries changed after `after`, oldest first, the newest kept within a 40,000 byte budget, and `complete`, false when older changed entries were left out. Each entry has `entry_id`, `seq`, `kind` and `text`, as the activity section below specifies. What an attached client polls to follow a turn |
+| `settings` | Optionally `line_id`. Returns `project`, the project's settings, `models`, every model a line may be created on, and with `line_id` also `line_id` and `line`, the line's settings, each as the settings section below specifies |
+| `set_setting` | Arguments `scope`, `line` with `line_id` or `project` without it, `key`, and optionally `value`. Records the value as an override, or removes the key's override when `value` is omitted. Returns `scope`, `line_id` for a line, `key`, `value` and `source`, the value now in force and its layer, and `shadowed`, true when a value was set but a higher layer still decides. Refused, recording nothing, for an unknown key or a value its key or its meaning does not accept |
+| `clear_session` | Argument `line_id`. The line's next turn starts a new engine session. Refused while the line runs a turn |
+| `reload_project` | No arguments. Reads `.dromon/dromon.toml` again and applies its lines, limits, wake policy, operator and tick cadence. Returns `file`, `present` and `lines`, the lines it declares. Refused, applying nothing, for an invalid file, a file that changes a line's model or strategy, or one that changes the sandbox, the engine settings, the teacher or the external agent policy, which apply only when the daemon restarts |
 | `interrupt` | Argument `line_id`. Cancels the line's turn in flight. Returns `line_id` and `interrupted`, false when no turn was in flight. Refused for an unknown line |
 | `release` | Argument `line_id`. Releases a line held at a conversation limit and resets its counts |
 | `agent_add` | Arguments `agent` and `access`. Registers an external agent, or replaces its access and token. Returns `agent`, `access`, `effective_access` under the policy's ceiling, `token`, shown only here, and `listening` |
@@ -118,6 +122,9 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromon sent` | Sends `sent`, with `--operator`, `--unanswered`, `--offset N` and `--limit N`, and prints each message's fate | 0, 4, or 1 |
 | `dromon attach LINE` | Opens an interactive client attached to the line, in the terminal or in a Tk window with `--gui`, speaking for `--operator` and refreshing every `--poll-seconds`, default 1, and four times as often while the line runs a turn. Text sends a message. The commands, keys and panes are those of the attached client section below. Any number may attach at once | 0, or 2 on a poll interval that is not positive |
 | `dromon release LINE` | Sends `release` | 0, 4, or 1 |
+| `dromon settings [LINE]` | Sends `settings` and prints the project's settings, and the line's when given, each with its layer | 0, 4, or 1 |
+| `dromon set KEY [VALUE...]` | Checks the value against `settings` as the attached client does, then sends `set_setting`. A line key needs `--line LINE`, and a project key is written with the `project.` prefix. `--unset` removes the override instead | 0, 2, 4, or 1 |
+| `dromon reload` | Sends `reload_project` | 0, 4, or 1 |
 | `dromon answer QUESTION BODY` | Sends `answer`, with `--operator`, default the login name | 0, 4, or 1 |
 | `dromon probe` | Runs one short turn without the daemon on the engine of `--model`, and reports the driver, the engine, the credential and the capabilities the engine reports | 0 or 1 |
 | `dromon agent add NAME --access LEVEL`, `dromon agent list`, `dromon agent revoke NAME` | Sends `agent_add`, `agent_list` or `agent_revoke`. `add` prints the token once with an MCP configuration for the agent | 0, 2, 4, or 1 |
@@ -186,6 +193,13 @@ for the line's open questions, a status bar, the input, and suggestions or a hin
 | `/ack MESSAGE` | Acknowledges a message the line sent the operator |
 | `/release` | Releases the line from a hold |
 | `/interrupt` | Sends `interrupt`, as Escape does while a turn runs |
+| `/config` | Opens the settings panel, the line's settings and then the project's, each with its layer. Enter on a row fills the input with the `/set` that edits it |
+| `/model [MODEL]`, `/effort [LEVEL]` | Sets the line's model or reasoning effort, or without an argument opens the settings panel at that row |
+| `/set KEY VALUE` | Sets a line setting, or a project setting written as `project.KEY`. A list is written with commas or spaces, `none` for an empty one, and a boolean as `on` or `off` |
+| `/unset KEY` | Removes the override, so the layers below decide again |
+| `/clear` | Sends `clear_session` |
+| `/create LINE MODEL [STRATEGY]` | Sends `create_line`, with the subscription strategy by default |
+| `/reload` | Sends `reload_project` |
 | `/line LINE`, `/lines` | Attaches to another line, or lists the daemon's lines to pick one |
 | `/activity`, `/mail` | Chooses the pane |
 | `/help`, `/?` | Lists commands and keys |
@@ -211,6 +225,53 @@ for the line's open questions, a status bar, the input, and suggestions or a hin
 The client rings the platform's bell once when a question arrives while it is attached.
 It replaces every control character in what it shows, except the line break, so that no
 message body or engine output can drive the terminal.
+
+## Settings
+
+Settings have two scopes, the project and a line. Each value comes from a layer, and
+the first layer that gives a value decides it.
+
+| Scope | Layers, highest first |
+|---|---|
+| Project | The command line of `dromond`, the project override, `.dromon/dromon.toml`, the built-in default |
+| Line | The line override, the line's configuration from the project file, its creation or `configure_line`, and then, for limits and the wake policy, the line's own tables in the project file and the project's value |
+
+Overrides are what an operator sets from a client, recorded in the event log as
+`line_overridden` and `project_overridden`, so they survive a restart. The daemon never
+writes the project file, which stays the shared, reviewed layer. A reload or a restart
+applies the file under the overrides. The command line wins over a project override,
+as Claude Code's command line wins over its settings files, and `set_setting` reports
+such a value as shadowed.
+
+| Scope | Key | Kind |
+|---|---|---|
+| Line | `model` | A choice of the models on the line's engine. The engine session is resumed on the new model |
+| Line | `effort` | A choice of `low`, `medium`, `high`, `xhigh` and `max` |
+| Line | `builtin_tools`, `allowed_tools`, `instructions` | Lists, checked as in [`LINE_CONFIG.md`](LINE_CONFIG.md) |
+| Line | `tool_policy` | `allowlist` or `allow_all` |
+| Line | `inherit_account_mcp`, `claude_code_prompt` | Booleans |
+| Both | `limits.max_autonomous_turns`, `wake.every_ticks` | Whole numbers |
+| Both | `limits.max_cost_usd`, `limits.cooldown_seconds` | Decimal strings |
+| Project | `daemon.operator` | An operator identifier |
+| Project | `daemon.tick_seconds` | A decimal string |
+
+An override document is a JSON object from keys to values, written canonically with
+sorted keys. Each entry of a `settings` result has `key`, `kind`, one of `bool`, `int`,
+`decimal`, `text`, `choice`, `list` and `info`, `summary`, `choices`, `value`, `source`
+and `editable`. Entries of kind `info` cannot be changed from a client. They show a
+line's engine, strategy and engine session, its MCP servers by name only, whether a
+sandbox or engine settings document is set, and the project's file, declared lines,
+teacher and external agent policy.
+
+A client cannot change a line's strategy, because it decides whether usage is billed
+per token, and such usage never starts from a one-word command. It cannot change MCP
+servers, sandbox or engine settings documents, the teacher or the agent policy either,
+because they are long documents that belong in a reviewed file. A stored override
+that no longer applies, for example after an upgrade, is skipped and reported on
+standard error once, rather than stopping the line or the daemon.
+
+A change applies from the line's next turn, and a turn in flight keeps what it began
+with. Limits, the wake policy, the operator and the tick cadence apply at once.
 
 ## Trust
 

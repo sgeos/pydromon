@@ -61,6 +61,9 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `line_state_changed` | `line_id`, `state` | The line exists and the change is in the transition table |
 | `line_configured` | `line_id`, `config` text of at most 262,144 bytes | The line exists. The text is the canonical JSON of [`LINE_CONFIG.md`](LINE_CONFIG.md), validated by the daemon before it appends, and replaces any earlier configuration |
 | `line_session` | `line_id`, `engine_session` text of 1 to 256 bytes | The line exists. Records the engine session the line's next turn resumes, so a restarted daemon continues the line's conversation |
+| `line_session_cleared` | `line_id` | The line exists. Its next turn starts a new engine session, as an operator asked with `clear_session`. The engine keeps the old session |
+| `line_overridden` | `line_id`, `overrides` text of at most 262,144 bytes | The line exists. The text is the canonical JSON of the line's override document, as [`CLIENT.md`](CLIENT.md) specifies under settings, validated by the daemon before it appends, and replaces any earlier overrides of the line |
+| `project_overridden` | `overrides` text of at most 262,144 bytes | Always. The project's override document, replacing any earlier one |
 | `line_held` | `line_id`, `question_id` | The line exists and is not held, and the question is open and from the line. The daemon wakes the line no more until it is released |
 | `line_released` | `line_id` | The line is held |
 | `operator_registered` | `operator_id` | The operator does not exist |
@@ -168,7 +171,8 @@ with write access to the file, so the file's permissions are the security bounda
 
 ## Not yet specified
 
-- Events for configuration, conversation limits, turns and engine output.
+- Events for limit counts, turns and engine output. Settings an operator changes from a
+  client are recorded by `line_overridden` and `project_overridden`.
 - How a line chooses which operator to ask, which belongs to per-project configuration.
 - Retiring an operator or a line.
 - Compaction or snapshots for long logs.
