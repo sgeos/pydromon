@@ -658,6 +658,9 @@ class State:
         default_factory=dict[str, ScheduledWake]
     )
     """Each line's pending scheduled wake, keyed by line. At most one per line."""
+    fired_dues: dict[str, str] = field(default_factory=dict[str, str])
+    """The due time of each scheduled wake that has fired, keyed by its note's message
+    identifier, so a turn can say when the wake was due."""
 
     def copy(self) -> "State":
         """Return an independent snapshot. The records are frozen, so maps suffice."""
@@ -669,6 +672,7 @@ class State:
             dict(self.agents),
             self.project_overrides,
             dict(self.scheduled),
+            dict(self.fired_dues),
         )
 
     def open_questions(self, operator_id: str) -> list[str]:
@@ -993,7 +997,8 @@ class State:
 
     def _apply_message_sent(self, event: MessageSent) -> None:
         if self._is_firing(event) and isinstance(event.sender, LineAddress):
-            del self.scheduled[event.sender.line_id]
+            fired = self.scheduled.pop(event.sender.line_id)
+            self.fired_dues[event.message_id] = fired.due
         status = QuestionStatus.OPEN if event.kind is MessageKind.QUESTION else None
         self.messages[event.message_id] = Message(
             event.sender,

@@ -31,7 +31,9 @@ from the engine before reading on. The process is stopped when the turn ends.
    its `workdir` as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies or the project root,
    `permissions` set to
    `dromon-line`, `approvalPolicy` set to `never` and `approvalsReviewer` set to `user`.
-   A new thread also receives Dromon's own tools as `dynamicTools`.
+   A new thread also receives Dromon's own tools as `dynamicTools`. A thread is resumed
+   only when the tools it started with are today's, as the tools section below
+   specifies, and a new thread is started otherwise.
 4. The response's `modelProvider` must be `openai`, its `activePermissionProfile` must
    be `dromon-line`, and its `model` is handed to the driver, which refuses any model
    but its own.
@@ -46,6 +48,36 @@ from the engine before reading on. The process is stopped when the turn ends.
 8. `item/tool/call` requests run Dromon's tool and answer with `success` and text
    `contentItems`. Approval requests are declined, and any other request is answered
    with an error.
+
+## Tools across threads
+
+**Decided by the operator on 2026-10-26.** **Fact, observed live on 2026-10-26.** A
+resumed thread saw none of the tools Dromon added after it started.
+
+**Inference, read on 2026-10-26 in the embedded strings of the installed Codex 0.164.0
+binary, not tested live.** Codex gates its experimental request fields per method, and
+its list names `thread/start.dynamicTools` but no `dynamicTools` for `thread/resume`,
+whose own experimental fields are `history`, `path`, `runtimeWorkspaceRoots`,
+`permissions`, `initialTurnsPage`, `activePermissionProfile` and `multiAgentMode`. So a
+thread keeps the tools it was started with.
+
+Dromon therefore stores a Codex line's engine session as the thread identifier, a
+colon, and the first 16 hexadecimal digits of the SHA-256 of the sorted names of the
+line's Dromon tools. At each turn, a stored session whose fingerprint differs from
+today's tools, or that has none, as one stored before fingerprints existed or adopted
+from elsewhere, is not resumed. A new thread is started with today's tools, and the
+turn's text opens with a note telling the line that its earlier thread's context is
+not available and that its mailbox, files and reports are unchanged.
+
+## Process mark
+
+**Decided by the operator on 2026-10-26.** The app-server is started with
+`-c shell_environment_policy.set.DROMON_LINE_MARK="..."`, so the commands Codex runs
+carry the line's mark and Codex's own processes do not. **Fact, read on 2026-10-26** in
+the installed Codex 0.164.0 binary. Its help names `-c shell_environment_policy.inherit=all`
+as an example override, and its configuration errors name `shell_environment_policy.set`.
+That a `set` entry reaches every shell command is an inference from that, not yet
+observed live.
 
 ## Isolation
 
@@ -162,6 +194,16 @@ turn. `dromon probe --model gpt-6-luna` reported the subscription credential.
   rule. A common git directory under `$TMPDIR` or `/tmp` would be writable. So would one
   inside the workspace, when a line's `workdir` contains another checkout's git
   directory, since only the workspace's own `.git` is held read-only.
+- **A cache by default.** **Decided by the operator on 2026-10-26.** Codex starts with
+  `XDG_CACHE_HOME` set to `dromon-cache-` and the user's number under the system
+  temporary directory, which the profile leaves writable, unless the operator's
+  environment sets it. The daemon creates it with mode 0700, and refuses the turn when
+  it is a link, not a directory, owned by another user, or writable by its group or
+  others, since on a shared temporary directory another user could make it first and
+  plant cache entries. **Inference, not tested live.** Tools that honour it, uv among
+  them, then have a writable cache. A cold cache still needs the network to fill, and a
+  Codex line has none, so a tool that must download still fails until the cache holds
+  what it needs.
 - No extra writable paths. **Fact, observed on 2026-10-26 in pydromon.** uv could not
   write its cache in the home directory, so a Codex line runs the gate with
   `UV_CACHE_DIR` under `$TMPDIR` and `UV_OFFLINE=1`, which works while the environment

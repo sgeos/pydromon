@@ -106,6 +106,7 @@ from claude_agent_sdk.types import SystemPromptPreset
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
 from dromon.lineconfig import DEFAULT_CONFIG, ConfigError, LineConfig
+from dromon.processes import MARK_VARIABLE
 from dromon.sandbox import blocks_unsandboxed
 
 ENGINE_NAME: Final = "claude-code"
@@ -253,6 +254,26 @@ def read_instructions(paths: Sequence[str], root: Path) -> str:
             raise EngineRefused(f"the instructions {path} are not UTF-8") from error
         sections.append(f"Contents of {path}:\n\n{text.strip()}")
     return "\n\n".join(sections)
+
+
+CLAUDE_CODE_PROMPT_MARK: Final = "[Claude Code's own system prompt]"
+"""Stands for Claude Code's system prompt in a composed view, since Dromon never holds
+that prompt's text."""
+
+
+def composed_instructions(engine: str, config: LineConfig, cwd: Path) -> str:
+    """The instructions a line on ``engine`` with ``config`` receives at its next turn,
+    composed as its adapter composes them. The Claude Code adapter passes them as the
+    system prompt, after Claude Code's own when ``claude_code_prompt`` is set. The Codex
+    adapter passes them as developer instructions, and the Grok adapter as rules. Files
+    the engine itself loads, such as project ``CLAUDE.md`` files, are not part of it.
+    Raises ``EngineRefused`` as ``read_instructions`` does."""
+    text = read_instructions(config.instructions, cwd)
+    if engine == ENGINE_NAME and config.claude_code_prompt:
+        return (
+            f"{CLAUDE_CODE_PROMPT_MARK}\n\n{text}" if text else CLAUDE_CODE_PROMPT_MARK
+        )
+    return text
 
 
 class AgentSession(Protocol):
@@ -634,6 +655,7 @@ class ClaudeCodeLine:
         environment: Mapping[str, str] | None = None,
         session_factory: SessionFactory = _sdk_session,
         observe: Observer = ignore,
+        mark: str | None = None,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -650,6 +672,8 @@ class ClaudeCodeLine:
         self._environment = os.environ if environment is None else environment
         self._session_factory = session_factory
         self._observe = observe
+        self.mark = mark
+        """The process mark every process of this line inherits, if issued."""
 
     @property
     def own_tools(self) -> frozenset[str]:
@@ -702,6 +726,7 @@ class ClaudeCodeLine:
             resume=self.session_id,
             sandbox=cast(SandboxSettings, self.sandbox),
             settings=None if self.settings is None else json.dumps(self.settings),
+            env={} if self.mark is None else {MARK_VARIABLE: self.mark},
             system_prompt=self._system_prompt(),
         )
 

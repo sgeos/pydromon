@@ -642,6 +642,11 @@ def test_the_line_socket_serves_only_the_lines_own_tools(
             "wake_after",
             "acquire_lease",
             "release_lease",
+            "line_status",
+            "read_instructions",
+            "write_scratch",
+            "list_processes",
+            "stop_process",
             "list_mail",
             "read_mail",
             "acknowledge_mail",
@@ -677,3 +682,13 @@ def test_the_bridge_names_a_line_in_line_mode(short_runtime: Path) -> None:
     assert "session line alpha" in instructions
     listed = bridge.handle({"id": 2, "method": "tools/list"})
     assert listed is not None and "not running" in str(listed["error"])
+
+
+def test_a_grok_line_carries_its_process_mark(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok([chunk("hello")])
+    target = line(server, project)
+    target.mark = "alpha.token"
+    run(target)
+    assert server.environment["DROMON_LINE_MARK"] == "alpha.token"

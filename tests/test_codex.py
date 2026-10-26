@@ -20,6 +20,9 @@ from dromon.codex import (
     DISABLED_FEATURES,
     CodexLine,
     Connection,
+    TOOLS_CHANGED_NOTE,
+    default_cache_home,
+    split_session,
     engine_environment,
     server_arguments,
     tool_output,
@@ -206,10 +209,15 @@ def test_a_plain_turn_reports_text_credential_and_thread() -> None:
     server = FakeServer()
     target = line(server)
     report = run(target)
-    assert (report.subtype, report.text, report.session_id) == ("success", "done", "th")
+    session = f"th:{target.tools_fingerprint()}"
+    assert (report.subtype, report.text, report.session_id) == (
+        "success",
+        "done",
+        session,
+    )
     assert report.credential is Credential.SUBSCRIPTION
     assert report.cost_estimate_usd is None
-    assert target.session_id == "th"
+    assert target.session_id == session
     assert server.methods()[:3] == ["initialize", "initialized", "account/read"]
     assert server.params("initialize")["capabilities"] == {"experimentalApi": True}
 
@@ -255,11 +263,37 @@ def test_a_line_effort_replaces_the_drivers() -> None:
 
 def test_the_next_turn_resumes_the_thread() -> None:
     server = FakeServer()
-    run(line(server, session_id="th"))
+    fingerprint = line(FakeServer()).tools_fingerprint()
+    run(line(server, session_id=f"th:{fingerprint}"))
     resume = server.params("thread/resume")
     assert resume["threadId"] == "th"
     assert "dynamicTools" not in resume
     assert "thread/start" not in server.methods()
+    assert TOOLS_CHANGED_NOTE not in str(server.params("turn/start")["input"])
+
+
+@pytest.mark.parametrize("stored", ["th", "th:0000000000000000"])
+def test_a_thread_started_with_other_tools_is_replaced_and_the_line_told(
+    stored: str,
+) -> None:
+    server = FakeServer()
+    target = line(server, session_id=stored)
+    report = run(target)
+    assert "thread/resume" not in server.methods()
+    start = server.params("thread/start")
+    assert [t["name"] for t in start["dynamicTools"]] == ["record"]
+    text = server.params("turn/start")["input"][0]["text"]
+    assert text.startswith(TOOLS_CHANGED_NOTE)
+    assert report.session_id == f"th:{target.tools_fingerprint()}"
+
+
+def test_the_fingerprint_follows_the_tool_names_only() -> None:
+    assert split_session(None) == (None, None)
+    assert split_session("th") == ("th", None)
+    assert split_session("th:abc") == ("th", "abc")
+    first = line(FakeServer()).tools_fingerprint()
+    assert first == line(FakeServer()).tools_fingerprint()
+    assert len(first) == 16
 
 
 # Requests from the engine.
@@ -449,12 +483,14 @@ KEYS = {"OPENAI_API_KEY": "k", "CODEX_API_KEY": "k", "CODEX_ACCESS_TOKEN": "k"}
 
 def test_a_subscription_lines_codex_never_sees_an_api_key() -> None:
     environment = {**KEYS, "PATH": "/bin"}
-    assert engine_environment(environment, Strategy.SUBSCRIPTION) == {"PATH": "/bin"}
+    cache = {"XDG_CACHE_HOME": default_cache_home()}
+    expected = {"PATH": "/bin", **cache}
+    assert engine_environment(environment, Strategy.SUBSCRIPTION) == expected
     for metered in (Strategy.API, Strategy.FLEXIBLE):
-        assert engine_environment(environment, metered) == environment
+        assert engine_environment(environment, metered) == {**environment, **cache}
     server = FakeServer()
     run(line(server, environment=environment))
-    assert server.environment == {"PATH": "/bin"}
+    assert server.environment == expected
 
 
 def test_a_redirected_provider_is_always_refused() -> None:
@@ -688,3 +724,24 @@ def test_a_live_luna_line_writes_the_workspace_but_not_protected_paths(
     assert not (project / ".git" / "probe.txt").exists(), "the line wrote .git"
     assert "secret = true" not in report.text, "the line read Dromon's state"
     assert "Edit" in report.tool_uses
+
+
+def test_the_mark_reaches_codexs_shell_commands_and_not_codex_itself() -> None:
+    server = FakeServer()
+    target = line(server, environment={"PATH": "/bin"})
+    target.mark = "alpha.token"
+    run(target)
+    assert "DROMON_LINE_MARK" not in server.environment
+    pairs = list(zip(server.arguments, server.arguments[1:], strict=False))
+    assert (
+        "-c",
+        'shell_environment_policy.set.DROMON_LINE_MARK="alpha.token"',
+    ) in pairs
+    unmarked = FakeServer()
+    run(line(unmarked, environment={"PATH": "/bin"}))
+    assert not any("DROMON_LINE_MARK" in a for a in unmarked.arguments)
+    assert reserved_variable("DROMON_LINE_MARK")
+    assert server_arguments([], LineConfig(), (), "a.b")[1:3] == [
+        "-c",
+        'shell_environment_policy.set.DROMON_LINE_MARK="a.b"',
+    ]

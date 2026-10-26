@@ -52,6 +52,7 @@ from claude_agent_sdk import SdkMcpTool
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
 from dromon.engine import EngineRefused, TurnReport, read_instructions
+from dromon.processes import MARK_VARIABLE
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
 
 ENGINE_NAME: Final = "grok-build"
@@ -396,6 +397,7 @@ class GrokLine:
         home: Path | None = None,
         connection_factory: ConnectionFactory = _grok_agent,
         observe: Observer = ignore,
+        mark: str | None = None,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -416,6 +418,8 @@ class GrokLine:
         self._home = Path.home() if home is None else home
         self._connect = connection_factory
         self._observe = observe
+        self.mark = mark
+        """The process mark every process of this line inherits, if issued."""
         self._next_id = 0
         self._connection: Connection | None = None
         self.session_id_in_use: str | None = None
@@ -424,6 +428,8 @@ class GrokLine:
         """Run one turn for ``prompt`` and return what happened."""
         strategy = self.driver.settings.strategy
         environment = engine_environment(self._environment, strategy)
+        if self.mark is not None:
+            environment[MARK_VARIABLE] = self.mark
         reason = unsupported(self.config)
         if reason is not None:
             raise EngineRefused(reason)

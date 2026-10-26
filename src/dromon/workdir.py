@@ -31,6 +31,7 @@ search for ``.git`` walks a finite list of parents, so it terminates.
 """
 
 import os
+import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Final, NoReturn
@@ -106,14 +107,10 @@ def _against(text: str, base: Path) -> Path:
     return Path(os.path.realpath(path if path.is_absolute() else base / path))
 
 
-def git_write_guards(directory: Path) -> tuple[Path, ...]:
-    """The git files a sandboxed line working in ``directory`` must never write, as
-    real paths, or nothing when ``directory`` is not in a git checkout.
-
-    These are the common git directory's ``hooks`` and ``config``, and the worktree's
-    own ``config.worktree``. For a linked worktree, whose ``.git`` is a file, they also
-    include that file and the worktree's ``commondir``. Raises ``SandboxError`` for a
-    pointer file that cannot be followed."""
+def _git_dirs(directory: Path) -> tuple[Path, Path, Path, bool] | None:
+    """The git directory, the common git directory, the ``.git`` entry and whether it
+    is a linked worktree, for the checkout holding ``directory``, or ``None`` outside
+    any checkout. Raises ``SandboxError`` for a pointer file that cannot be followed."""
     real = Path(os.path.realpath(directory))
     for checkout in (real, *real.parents):
         dot = checkout / ".git"
@@ -130,8 +127,79 @@ def git_write_guards(directory: Path) -> tuple[Path, ...]:
         common = (
             _against(_pointer(commondir, ""), gitdir) if commondir.is_file() else gitdir
         )
-        guards = {common / "hooks", common / "config", gitdir / "config.worktree"}
-        if linked:
-            guards |= {dot, commondir}
-        return tuple(sorted(guards))
-    return ()
+        return gitdir, common, dot, linked
+    return None
+
+
+def git_write_guards(directory: Path) -> tuple[Path, ...]:
+    """The git files a sandboxed line working in ``directory`` must never write, as
+    real paths, or nothing when ``directory`` is not in a git checkout.
+
+    These are the common git directory's ``hooks`` and ``config``, and the worktree's
+    own ``config.worktree``. For a linked worktree, whose ``.git`` is a file, they also
+    include that file and the worktree's ``commondir``. Raises ``SandboxError`` for a
+    pointer file that cannot be followed."""
+    found = _git_dirs(directory)
+    if found is None:
+        return ()
+    gitdir, common, dot, linked = found
+    guards = {common / "hooks", common / "config", gitdir / "config.worktree"}
+    if linked:
+        guards |= {dot, gitdir / "commondir"}
+    return tuple(sorted(guards))
+
+
+OBJECT_NAME: Final = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+"""A commit's object name, SHA-1 or SHA-256, in lowercase hexadecimal."""
+
+REF_NAME: Final = re.compile(r"refs/[A-Za-z0-9._/-]{1,255}")
+
+
+def _small_text(file: Path) -> str | None:
+    try:
+        with file.open("rb") as handle:
+            raw = handle.read(MAX_POINTER_BYTES + 1)
+        if len(raw) > MAX_POINTER_BYTES:
+            return None
+        return raw.decode("utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def read_head_commit(directory: Path) -> str | None:
+    """The commit the checkout holding ``directory`` has checked out, read from its
+    ``HEAD``, its loose refs and ``packed-refs`` without running git, or ``None`` when
+    it is not in a checkout or the commit cannot be read. Never raises, because the
+    answer is informational. A ref name with ``..`` or outside ``refs/`` is not
+    followed."""
+    try:
+        found = _git_dirs(directory)
+    except SandboxError:
+        return None
+    if found is None:
+        return None
+    gitdir, common, _, _ = found
+    head = _small_text(gitdir / "HEAD")
+    if head is None:
+        return None
+    if OBJECT_NAME.fullmatch(head):
+        return head
+    if not head.startswith("ref:"):
+        return None
+    ref = head.removeprefix("ref:").strip()
+    if REF_NAME.fullmatch(ref) is None or ".." in ref:
+        return None
+    for base in (gitdir, common):
+        value = _small_text(base / ref)
+        if value is not None and OBJECT_NAME.fullmatch(value):
+            return value
+    try:
+        with (common / "packed-refs").open("rb") as handle:
+            packed = handle.read(1024 * 1024).decode("utf-8", "replace")
+    except OSError:
+        return None
+    for line in packed.splitlines():
+        name, _, value = line.partition(" ")
+        if value == ref and OBJECT_NAME.fullmatch(name):
+            return name
+    return None

@@ -219,7 +219,7 @@ def test_a_message_wakes_an_idle_line_and_is_delivered(make_world: MakeWorld) ->
     assert tail[4] == LineSession("alpha", "session-1")
     assert tail[5] == LineStateChanged("alpha", LineState.IDLE)
     prompt = target.engines["alpha"].prompts[0]
-    assert prompt.startswith("1 new message. 1 unread. 1 unanswered.")
+    assert prompt.splitlines()[1] == "1 new message. 1 unread. 1 unanswered."
     assert f"  {message_id} from @ana, note, unread" in prompt
     assert "hello" not in prompt
     assert received(target, prompt) == [("@ana", "hello")]
@@ -288,7 +288,7 @@ def test_messages_waiting_together_are_delivered_in_one_turn(
     prompts = target.engines["alpha"].prompts
     assert len(prompts) == 1
     assert bodies(target, prompts[0]) == ["one", "two"]
-    assert prompts[0].startswith("2 new messages. 2 unread. 2 unanswered.")
+    assert prompts[0].splitlines()[1] == "2 new messages. 2 unread. 2 unanswered."
 
 
 def test_held_wakes_record_messages_but_run_nothing(make_world: MakeWorld) -> None:
@@ -1083,7 +1083,7 @@ def test_doing_nothing_with_mail_is_valid(make_world: MakeWorld) -> None:
     run(target, send(target, "alpha", "two"))
     second = target.engines["alpha"].prompts[1]
     # The first message was neither read nor answered, and nothing forced either.
-    assert second.startswith("1 new message. 2 unread. 2 unanswered.")
+    assert second.splitlines()[1] == "1 new message. 2 unread. 2 unanswered."
 
 
 # Acknowledgements and sent mail.
