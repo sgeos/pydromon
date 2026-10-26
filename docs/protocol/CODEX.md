@@ -146,6 +146,12 @@ turn. `dromon probe --model gpt-6-luna` reported the subscription credential.
 
 - No MCP servers, no sandbox or settings documents, and no way to commit, since `.git`
   is always read-only.
+- No extra writable paths. **Fact, observed on 2026-10-26 in pydromon.** uv could not
+  write its cache in the home directory, so a Codex line runs the gate with
+  `UV_CACHE_DIR` under `$TMPDIR` and `UV_OFFLINE=1`, which works while the environment
+  already matches the lock. A tool that stats the state directory, as pytest's
+  collection did, fails with `Operation not permitted`, because the profile denies its
+  metadata too, so pydromon's pytest configuration ignores `.dromon`.
 - A call Codex refuses before running it is invisible to the driver's tool budget.
 - Codex reports no cost, so cost limits do not count a Codex line's turns, and the
   driver's `max_turns` is not enforced. The tool budget still interrupts a turn.

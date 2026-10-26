@@ -4,34 +4,29 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-25, second sync with sgeos/project-template
+## 2026-10-26, pydromon dogfoods itself
 
-**Done.** On the operator's request, with the code of conduct as the priority, a sync
-with the template at `f829df4`, a check of the GitHub repository, and an audit of the
-template.
+**Done.** On the operator's goal that the project be in order to dogfood its own
+development.
 
-- **Adopted.** `CODE_OF_CONDUCT.md` verbatim, linked from the README, `CONTRIBUTING.md`
-  and `llms.txt`. `.github/CODEOWNERS`, `.github/release.yml`, the issue template
-  `config.yml`, `docs/decisions/TEMPLATE.md`, `scripts/worktree.sh` and the opt-in
-  `scripts/hooks/pre-push`. The template's `.editorconfig`, `.gitattributes` and
-  narrower `.claude` ignore rules.
-- **Merged.** `scripts/check.sh` takes the template's hygiene section whole and keeps
-  pydromon's project checks and its argument pass-through to pytest. CI grants no
-  permissions by default, installs shellcheck on macOS where missing, and gains the
-  template's actionlint and zizmor job. zizmor reported no findings locally.
-- **Commit trailer.** Dropped on the operator's instruction in session, which confirmed
-  what the template states. `CLAUDE.md` and `AGENTS.md` say so.
-- **GitHub.** Settings read back as the template prescribes. The labels `breaking` and
-  `ignore-for-release`, which `release.yml` uses, were missing and were created.
-- **Local only.** `secret/disclosure-terms.txt` now holds the disclosure screen terms,
-  so the gate scans every tracked file. One term of the usual screen is left out,
-  because it matches a dependency name in `uv.lock`.
+- **Local setup.** `.dromon/dromon.toml` declares `worker` on Opus, `reviewer` on Haiku
+  and `luna` on GPT-6-Luna, and `.dromon/LINES.md` gives their rules. Lines never
+  commit, push or use `gh`, write only when given the task, run the sandbox form of the
+  gate, and never spend a subscription or start a daemon. `docs/process/DOGFOOD.md`
+  records both files with placeholders for the absolute paths.
+- **A defect found and fixed.** pytest's collection stats every entry of the root
+  directory, and a Codex line's profile denies even the metadata of `.dromon`, so a
+  Codex line could not run the gate here. pytest now ignores `.dromon`, and a test ties
+  the option to Dromon's state directory name. A Codex line also needs uv's cache under
+  `$TMPDIR`, which the rules give it.
 
-**Verification.** The full gate passed outside the sandbox with 1169 tests, and the
-sandbox form inside it. `scripts/worktree.sh` was tried inside the sandbox. Its default
-location fails, and a base under `tmp/` works, which `CLAUDE.md` now records.
+**Verification.** The daemon runs for this checkout. Through it, a Haiku line ran the
+hygiene gate, was refused a `.git` write and a commit, and opened Appendix B without
+reading it, and then passed the sandbox gate with 1153 tests. A GPT-6-Luna line passed
+the same gate with 1154 tests after the fix. The failure was reproduced and the fix
+checked with macOS's sandbox denying `.dromon`. The full gate passed locally with 1170
+tests. No Opus turn was run.
 
-**For the operator.** Dependabot pull request 20, a bump of `astral-sh/setup-uv` to
-10.3.0 with green checks, is still open for review. The new grouping may supersede it.
-A draft message to the admin session with the template findings is in
-`tmp/admin-message.md`, which is not tracked.
+**For the operator.** The daemon is left running, so lines can be attached with
+`uv run dromon attach worker`. It runs this working tree and picks up merged changes
+when restarted with `dromon stop` and `dromon start`.

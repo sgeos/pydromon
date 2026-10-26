@@ -7,6 +7,10 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- pydromon is set up to develop itself with Dromon, as `docs/process/DOGFOOD.md`
+  records. pytest's collection now ignores `.dromon`, which a Codex line's profile
+  denies outright, so a line can run the gate in the project it works on.
+
 - Synced with `sgeos/project-template` a second time. The repository gains
   `CODE_OF_CONDUCT.md`, linked from the README, `CONTRIBUTING.md` and `llms.txt`,
   `.github/CODEOWNERS`, `.github/release.yml`, an issue template `config.yml` that

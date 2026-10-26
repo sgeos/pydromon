@@ -67,10 +67,10 @@ completed, moved or abandoned.
 
 ## Next step
 
-Dromon can be dogfooded in epagoge from a clean, merged `main`, since `.venv` is an
-editable install that runs the working tree. Its project file is
-`~/projects/python/epagoge/.dromon/dromon.toml`, local and git-excluded, with
-`.dromon/LINES.md` as the lines' extra rules. `dromon teacher up` loads the teacher.
+pydromon develops itself with Dromon, as `docs/process/DOGFOOD.md` records. Its local
+`.dromon/` holds lines `worker` (Opus), `reviewer` (Haiku) and `luna` (GPT-6-Luna) and
+their rules. Lines never commit. The operator's session commits their work. epagoge
+has a similar local setup with its teacher.
 
 ## Open
 
@@ -114,7 +114,7 @@ need a command outside it. The rest run inside it with `-m "not socket and not l
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-./scripts/check.sh          # 1169 tests pass, plus 10 live tests deselected
+./scripts/check.sh          # 1170 tests pass, plus 10 live tests deselected
 ```
 
 Report any check not run, and any commit after the one that last rewrote this file.
