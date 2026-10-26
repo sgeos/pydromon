@@ -17,7 +17,15 @@ from pathlib import Path
 from typing import Final, cast
 
 from dromon import __version__, exits
-from dromon.client import DaemonFailed, DaemonNotRunning, call, is_running, start, stop
+from dromon.client import (
+    STARTUP_TIMEOUT_SECONDS,
+    DaemonFailed,
+    DaemonNotRunning,
+    call,
+    is_running,
+    start,
+    stop,
+)
 from dromon.paths import PathError, ProjectPaths, project_paths
 from dromon.driver import MODELS, Driver, DriverError, Strategy
 from dromon.engine import EngineRefused
@@ -63,13 +71,13 @@ SUBCOMMANDS: Final[dict[str, str]] = {
 
 
 def _start(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
-    del arguments
+    wait: float = arguments.wait
     if is_running(paths):
         print(f"dromon start: already running for {paths.root}")
         return exits.OK
     try:
-        pid = start(paths)
-    except (DaemonFailed, PathError) as error:
+        pid = start(paths, wait_seconds=wait)
+    except (DaemonFailed, PathError, ValueError) as error:
         print(f"dromon start: {error}", file=sys.stderr)
         return exits.FAILURE
     print(f"dromon start: started, pid {pid}")
@@ -862,6 +870,14 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if name == "release":
             command.add_argument("line_id", help="the held line")
+        if name == "start":
+            command.add_argument(
+                "--wait",
+                type=float,
+                default=STARTUP_TIMEOUT_SECONDS,
+                metavar="SECONDS",
+                help="how long to wait for the daemon to answer, default %(default)g",
+            )
         if name == "settings":
             command.add_argument(
                 "line_id", nargs="?", help="the line whose settings to show as well"

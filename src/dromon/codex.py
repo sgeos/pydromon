@@ -82,6 +82,8 @@ from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
 from dromon.engine import (
     DIED_NOTE,
+    BackgroundEnd,
+    ignore_end,
     INTERRUPT_TIMEOUT_SECONDS,
     KEEP_POLL_SECONDS,
     EngineRefused,
@@ -161,6 +163,14 @@ takes three parameters and termination two, whose names beyond ``threadId`` and
 ``processId`` are an inference. Not run, since a line may not start Codex."""
 
 MAX_TERMINALS: Final = 64
+
+TERMINAL_POLL_SECONDS: Final = 15.0
+"""How often, between turns, a kept connection lists the line's own terminals to
+notice one that ended. **Fact, read from the installed binary.** The app-server was
+not found to report a terminal's end, so it is polled. It is polled only while the
+line has a listed terminal, at most once in this many seconds."""
+
+MAX_POLL_FAILURES: Final = 3
 
 MAX_OWN_COMMANDS: Final = 1024
 """How many command identifiers a kept connection remembers as the line's own."""
@@ -464,6 +474,19 @@ def list_servers(environment: Mapping[str, str]) -> Sequence[str]:
     return names
 
 
+def identifier(value: object) -> str | None:
+    """An engine identifier as text, whether the engine sent text or a whole number,
+    or ``None`` for anything else. A listing and an item may differ in how they send
+    the same identifier, which round 3 matched only as text."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str) and value and len(value) <= 128:
+        return value
+    return None
+
+
 class _RpcError(Exception):
     pass
 
@@ -554,8 +577,22 @@ class _Kept:
     started: bool = False
     """Whether the connection has been initialized, which only its first turn does."""
     terminals: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
-    """The line's own background terminals in the last listing, for the status and
-    the ceiling."""
+    """The line's own background terminals in the last listing. The one source of
+    both ``list_background`` and the status, and of the ceiling."""
+    listed_at: float | None = None
+    """When ``terminals`` was listed, on the monotonic clock."""
+    engine_listed: int = 0
+    """How many terminals the engine listed in all, the line's or not, for
+    diagnosis."""
+    stopped: set[str] = field(default_factory=set[str])
+    """Terminals the line stopped with ``stop_background``, whose end needs no note."""
+    poll_failures: int = 0
+    """Consecutive failed listings between turns. Polling stops after
+    ``MAX_POLL_FAILURES`` until the next turn ends."""
+    commands: dict[str, str] = field(default_factory=dict[str, str])
+    """The command each of the line's own command executions ran, by its process
+    and item identifiers, so a terminal is named even when a listing gives no
+    command."""
     own: set[str] = field(default_factory=set[str])
     """The process and item identifiers of the commands the line's own turns ran on
     this connection, from the items the engine reported, bounded by
@@ -582,6 +619,7 @@ class CodexLine:
         mark: str | None = None,
         clock: Callable[[], float] = time.monotonic,
         poll_seconds: float = KEEP_POLL_SECONDS,
+        task_ended: Callable[[BackgroundEnd], object] = ignore_end,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -605,6 +643,7 @@ class CodexLine:
         self._connection: Connection | None = None
         self._clock = clock
         self._poll_seconds = poll_seconds
+        self._task_ended = task_ended
         self._kept: _Kept | None = None
         self._notes: list[str] = []
         self._retired = False
@@ -998,6 +1037,12 @@ class CodexLine:
                 {"task_id": str(t.get("process_id")), "command": str(t.get("command"))}
                 for t in terminals
             ],
+            "tasks_listed_seconds_ago": (
+                None
+                if kept is None or not alive or kept.listed_at is None
+                else round(self._clock() - kept.listed_at)
+            ),
+            "engine_listed": kept.engine_listed if kept is not None and alive else 0,
         }
 
     async def expire(self) -> bool:
@@ -1109,12 +1154,36 @@ class CodexLine:
             if kept is not self._kept:
                 return
             try:
-                await self.expire()
+                if await self.expire():
+                    return
+                await self._poll_terminals(kept)
             except Exception as error:  # noqa: BLE001
                 print(
                     f"dromond: the watch of a kept session failed and goes on: {error}",
                     file=sys.stderr,
                 )
+
+    async def _poll_terminals(self, kept: _Kept) -> None:
+        """Between turns, list the line's own terminals again when one was listed
+        and the last listing is ``TERMINAL_POLL_SECONDS`` old, so that an end wakes
+        the line. Bounded by that interval and by ``MAX_POLL_FAILURES``."""
+        if (
+            self._in_turn
+            or not kept.terminals
+            or kept.poll_failures >= MAX_POLL_FAILURES
+        ):
+            return
+        if (
+            kept.listed_at is not None
+            and self._clock() - kept.listed_at < TERMINAL_POLL_SECONDS
+        ):
+            return
+        try:
+            await self.list_background()
+        except EngineRefused:
+            kept.poll_failures += 1
+            return
+        kept.poll_failures = 0
 
     async def request(
         self, method: str, params: Mapping[str, object]
@@ -1150,12 +1219,16 @@ class CodexLine:
         kept = self._kept
         if kept is None or item.get("type") != "commandExecution":
             return
+        command = item.get("command")
         for key in ("processId", "id"):
-            value = item.get(key)
-            if isinstance(value, str) and value and len(value) <= 128:
+            value = identifier(item.get(key))
+            if value is not None:
                 if len(kept.own) >= MAX_OWN_COMMANDS:
                     kept.own.clear()
+                    kept.commands.clear()
                 kept.own.add(value)
+                if isinstance(command, str) and command:
+                    kept.commands[value] = command[:200]
 
     async def list_background(self) -> list[dict[str, object]]:
         """The background terminals of the line's own thread. Raises
@@ -1180,20 +1253,58 @@ class CodexLine:
                     for key in ("command", "commandLine", "cmd")
                     if isinstance(fields.get(key), str)
                 ),
-                "",
+                self._own_command(fields),
             )
             terminals.append(
                 {
-                    "process_id": str(fields.get("processId") or ""),
+                    "process_id": identifier(fields.get("processId")) or "",
                     "os_pid": fields.get("osPid")
                     if isinstance(fields.get("osPid"), int)
                     else None,
                     "command": str(command)[:200],
                 }
             )
-        if self._kept is not None:
-            self._kept.terminals = terminals
+        kept = self._kept
+        if kept is not None:
+            self._note_ends(kept, terminals)
+            kept.terminals = terminals
+            kept.listed_at = self._clock()
+            kept.engine_listed = min(len(listed), MAX_TERMINALS)
         return terminals
+
+    def _note_ends(self, kept: _Kept, terminals: list[dict[str, object]]) -> None:
+        """Report, between turns, each of the line's terminals that the last listing
+        held and this one does not, unless the line stopped it itself."""
+        now = {str(t["process_id"]) for t in terminals}
+        for gone in kept.terminals:
+            process_id = str(gone["process_id"])
+            if process_id in now:
+                continue
+            if process_id in kept.stopped:
+                kept.stopped.discard(process_id)
+                continue
+            if self._in_turn:
+                continue
+            try:
+                self._task_ended(
+                    BackgroundEnd(process_id, str(gone.get("command") or ""), "ended")
+                )
+            except Exception as error:  # noqa: BLE001
+                print(
+                    f"dromond: a background terminal's end could not be noted: {error}",
+                    file=sys.stderr,
+                )
+
+    def _own_command(self, fields: Mapping[str, object]) -> str:
+        """The command the line's own item gave for a listed terminal, or empty."""
+        kept = self._kept
+        if kept is None:
+            return ""
+        for key in ("processId", "itemId"):
+            name = identifier(fields.get(key))
+            if name is not None and name in kept.commands:
+                return kept.commands[name]
+        return ""
 
     def _is_own(self, fields: Mapping[str, object]) -> bool:
         """Whether a listed terminal was started by the line's own turn on this
@@ -1201,8 +1312,8 @@ class CodexLine:
         kept = self._kept
         if kept is None:
             return False
-        names = {fields.get("processId"), fields.get("itemId")}
-        return any(isinstance(name, str) and name in kept.own for name in names)
+        names = {identifier(fields.get("processId")), identifier(fields.get("itemId"))}
+        return any(name is not None and name in kept.own for name in names)
 
     async def stop_background(self, process_id: str) -> str:
         """Terminate one background terminal of the line's own thread, which must be
@@ -1212,6 +1323,8 @@ class CodexLine:
         listed = await self.list_background()
         if process_id not in {str(t["process_id"]) for t in listed}:
             raise EngineRefused(f"{process_id} is not one of your background terminals")
+        if self._kept is not None:
+            self._kept.stopped.add(process_id)
         await self.request(
             TERMINATE_TERMINAL, {"threadId": self._thread_id, "processId": process_id}
         )
@@ -1277,6 +1390,7 @@ class CodexLine:
             self._connection = None
             kept.routed.active = False
             kept.last_end = self._clock()
+            kept.poll_failures = 0
             while not kept.routed.queue.empty():
                 leftover = kept.routed.queue.get_nowait()
                 if leftover is not None:

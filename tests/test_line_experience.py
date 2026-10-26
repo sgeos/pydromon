@@ -163,7 +163,9 @@ def test_line_status_shows_the_line_its_daemon_and_the_others(world: World) -> N
     assert not error
     status = json.loads(text)
     assert status["line_id"] == "alpha" and status["held_by"] == question
-    assert status["autonomous_turns"] == {"used": 0, "allowed": 5}
+    turns = status["autonomous_turns"]
+    assert (turns["used"], turns["allowed"]) == (0, 5)
+    assert turns["current_turn_counts"] is None
     assert status["cost_usd"] == {"estimate": "0.2500", "limit": "3.00"}
     assert status["scheduled_wake"] == {"due": due, "message_id": message_id}
     assert status["unread"] == 1 and status["pending"] == 0
@@ -201,12 +203,17 @@ def test_every_prompt_opens_with_the_budget(world: World) -> None:
     first = world.turn("one")
     assert first.splitlines()[0] == (
         "Autonomous turns used: 0 of 5. Estimated cost since your last release:"
-        " $0.00 of $3.00. A line past either is held."
+        " $0.00 of $3.00. A line past either is held. An operator's mail started"
+        " this turn, so the count of autonomous turns starts again from 0 when it"
+        " ends."
     )
     assert first.splitlines()[1] == "1 new message. 1 unread. 1 unanswered."
     world.scheduler.send(LineAddress("beta"), LineAddress("alpha"), "from beta")
     second = world.turn(sender=LineAddress("beta"))
     assert second.startswith("Autonomous turns used: 0 of 5.")
+    assert second.splitlines()[0].endswith(
+        "This turn is autonomous, so the count becomes 1 when it ends."
+    )
     third = world.turn("again", sender=LineAddress("beta"))
     assert third.startswith(
         "Autonomous turns used: 1 of 5. Estimated cost since your last release:"

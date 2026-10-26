@@ -218,3 +218,22 @@ something the engine produces rather than the harness.
   turns are inferences from the installed binary.
 - **Long work** goes into a tracked background task, not `nohup`, as the lines' rules
   above now say.
+
+## Round 4
+
+**Decided by the operator on 2026-10-26**, from the lines' round 3 reports.
+
+- **The cost mark is logged**, with `line_cost_marked` after each turn, so a restart no
+  longer counts a session's restored history, which cost one line $97.60 for two
+  acknowledgements.
+- **One note per task end**, which also says when the engine began a turn on it, with
+  the exit code and the head of the output, quoted as data.
+- **A line's notes to itself** leave the unanswered count.
+- **Each recent turn** gives its tokens beside its cost, or says that the engine reports
+  none.
+- **The autonomous count** was right. The prompt now says how the turn in flight
+  counts, which a reviewer had misread.
+- **Codex terminals** have one source for both views, match numeric identifiers, and
+  wake the line when a terminal ends, by polling. **Not observed live.**
+- **`dromon start` waits 60 seconds** by default, and takes `--wait`.
+- **An engine start that times out** at its initialize request is tried once more.

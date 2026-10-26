@@ -94,7 +94,7 @@ import sys
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Final, Protocol, cast
 
@@ -126,6 +126,8 @@ from claude_agent_sdk import (
     create_sdk_mcp_server,
 )
 
+from claude_agent_sdk._internal.message_parser import parse_message
+from claude_agent_sdk._internal.transport import Transport
 from claude_agent_sdk.types import SystemPromptPreset
 
 from dromon.activity import ActivityKind, Observer, ignore
@@ -326,12 +328,79 @@ type SessionFactory = Callable[
 ]
 
 
+@dataclass
+class TurnResult(ResultMessage):
+    """A result with the engine's per-turn usage and cost by model, its
+    ``model_usage_since_last_result``, which the SDK's parser drops. **Fact, read
+    from the engine's own field description on 2026-10-26.** It states the calls the
+    process counted since its previous result, nothing is carried from one process to
+    another, and the engine marks it internal, so it may be absent."""
+
+    turn_model_usage: dict[str, Any] | None = None
+
+
+def with_turn_usage(message: Message, data: Mapping[str, Any]) -> Message:
+    """``message`` as the SDK parsed it from ``data``, as a ``TurnResult`` when it is
+    a result whose raw form carries the per-turn usage."""
+    if not isinstance(message, ResultMessage):
+        return message
+    raw = data.get("model_usage_since_last_result")
+    if not isinstance(raw, dict):
+        return message
+    values = {f.name: getattr(message, f.name) for f in fields(ResultMessage)}
+    return TurnResult(**values, turn_model_usage=cast(dict[str, Any], raw))
+
+
+class _SdkClient:
+    """``ClaudeSDKClient`` as both session protocols use it, reading each message
+    as the client does, through the SDK's own parser, but keeping the per-turn
+    usage of a result. Porting hazard: it reads the client's internal query, so an
+    SDK upgrade must check that ``_query.receive_messages`` still yields the raw
+    messages that ``ClaudeSDKClient.receive_messages`` parses."""
+
+    def __init__(
+        self, options: ClaudeAgentOptions, transport: Transport | None = None
+    ) -> None:
+        self._client = ClaudeSDKClient(options=options, transport=transport)
+
+    async def __aenter__(self) -> "_SdkClient":
+        # A failed connect has already disconnected, which ends the engine's
+        # process, as ClaudeSDKClient.connect does in Agent SDK 0.2.174.
+        await self._client.connect()
+        return self
+
+    async def __aexit__(self, *details: object) -> None:
+        await self._client.disconnect()
+
+    async def query(self, prompt: str) -> None:
+        await self._client.query(prompt)
+
+    async def interrupt(self) -> None:
+        await self._client.interrupt()
+
+    async def set_permission_mode(self, mode: PermissionMode) -> None:
+        await self._client.set_permission_mode(mode)
+
+    async def receive_messages(self) -> AsyncIterator[Message]:
+        query = self._client._query  # pyright: ignore[reportPrivateUsage]
+        if query is None:
+            raise EngineRefused("the engine is not connected")
+        async for data in cast(AsyncIterator[dict[str, Any]], query.receive_messages()):
+            message = parse_message(data)
+            if message is not None:
+                yield with_turn_usage(message, data)
+
+    async def receive_response(self) -> AsyncIterator[Message]:
+        async for message in self.receive_messages():
+            yield message
+            if isinstance(message, ResultMessage):
+                return
+
+
 def _sdk_session(
     options: ClaudeAgentOptions,
 ) -> AbstractAsyncContextManager[AgentSession]:
-    return cast(
-        AbstractAsyncContextManager[AgentSession], ClaudeSDKClient(options=options)
-    )
+    return _SdkClient(options)
 
 
 class KeptSession(Protocol):
@@ -356,9 +425,7 @@ type KeptSessionFactory = Callable[
 def _sdk_kept_session(
     options: ClaudeAgentOptions,
 ) -> AbstractAsyncContextManager[KeptSession]:
-    return cast(
-        AbstractAsyncContextManager[KeptSession], ClaudeSDKClient(options=options)
-    )
+    return _SdkClient(options)
 
 
 KEEP_POLL_SECONDS: Final = 5.0
@@ -516,12 +583,120 @@ class BackgroundEnd:
     command: str
     """The command its tool call ran, or the engine's description of the task."""
     status: str
+    exit_code: int | None = None
+    """The exit code the engine's summary gives, when it gives one."""
+    output_file: str | None = None
+    """The file the engine wrote the task's output to, as it named it."""
+    self_started: bool = False
+    """Whether the end also made the engine begin a turn by itself, which Dromon
+    interrupted, so one note can say both."""
+
+
+SELF_START_GRACE_SECONDS: Final = 2.0
+"""How long a task's end waits for the turn the engine may begin by itself on it,
+so that one note reports both. The engine begins that turn at once, in the
+observed case."""
+
+EXIT_CODE: Final = re.compile(r"\(exit code (-?\d{1,5})\)")
+"""The exit code in the engine's summary of a finished shell task, such as
+``completed (exit code 0)``. **Fact, observed live on 2026-10-26.** The summary is the
+only place the engine's messages give it."""
+
+
+USAGE_KEYS: Final = (
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
+"""The token counts a turn's report carries, as the engine's result names them.
+**Fact, read from the engine's own field description on 2026-10-26.** A result's
+``usage`` covers the main agent loop only and is per turn, while its cost covers
+subagents and helper calls too, so the tokens explain most, not all, of the cost."""
+
+
+PER_TURN_SOURCE: Final = "per_turn"
+"""The cost and tokens are the engine's own per-turn figures, by model, which cover
+its subagents and helper calls too."""
+
+DIFFERENCE_SOURCE: Final = "difference"
+"""The cost is the difference of running totals, and the tokens are the main loop's
+per-turn ``usage``, which leaves out subagents and helper calls."""
+
+MODEL_USAGE_KEYS: Final = {
+    "inputTokens": "input_tokens",
+    "outputTokens": "output_tokens",
+    "cacheCreationInputTokens": "cache_creation_input_tokens",
+    "cacheReadInputTokens": "cache_read_input_tokens",
+}
+
+
+def turn_usage_of(result: ResultMessage) -> tuple[float, dict[str, int]] | None:
+    """The turn's cost and tokens summed over the models of the engine's per-turn
+    usage, or ``None`` when the result does not carry it or any entry is malformed,
+    so that a malformed report falls back rather than undercounts."""
+    if not isinstance(result, TurnResult) or not result.turn_model_usage:
+        return None
+    cost = 0.0
+    tokens: dict[str, int] = {}
+    for entry in result.turn_model_usage.values():
+        if not isinstance(entry, dict):
+            return None
+        fields_ = cast(dict[str, object], entry)
+        spent = fields_.get("costUSD")
+        if isinstance(spent, bool) or not isinstance(spent, int | float):
+            return None
+        if not 0 <= spent < float("inf"):
+            return None
+        cost += spent
+        for raw, name in MODEL_USAGE_KEYS.items():
+            count = fields_.get(raw)
+            if type(count) is int and count >= 0:
+                tokens[name] = tokens.get(name, 0) + count
+    return cost, tokens
+
+
+def usage_of(usage: Mapping[str, Any] | None) -> dict[str, int] | None:
+    """The whole-number token counts of a result's ``usage``, or ``None``."""
+    if usage is None:
+        return None
+    found = {
+        key: value
+        for key in USAGE_KEYS
+        if type(value := usage.get(key)) is int and value >= 0
+    }
+    return found or None
+
+
+INITIALIZE_TIMEOUT: Final = "Control request timeout: initialize"
+"""What the SDK raises when the engine does not answer its initialize request in
+time. **Fact, read from Agent SDK 0.2.174 on 2026-10-26.** It is a plain
+``Exception`` with this text, raised from a ``TimeoutError``, so the text is the only
+way to tell it apart."""
+
+
+def initialize_timed_out(error: BaseException) -> bool:
+    """Whether ``error`` is the SDK's timeout of the engine's initialize request."""
+    return str(error) == INITIALIZE_TIMEOUT
+
+
+def end_details(message: Message) -> tuple[int | None, str | None]:
+    """The exit code and output file a task's end reports, where it reports them."""
+    if not isinstance(message, TaskNotificationMessage):
+        return None, None
+    found = EXIT_CODE.search(message.summary or "")
+    output = message.output_file or None
+    return (int(found.group(1)) if found else None), output
 
 
 def ignore_end(end: BackgroundEnd) -> None:
     """The default for an engine whose task ends nobody follows."""
     del end
 
+
+COST_TOLERANCE_USD: Final = 0.000001
+"""A recorded total is kept to the millionth of a dollar, so a total within this of
+the mark has not fallen."""
 
 type CostMark = tuple[str, float]
 """An engine session and the running cost total its last result reported."""
@@ -547,9 +722,9 @@ def turn_cost(total: float | None, session: str, mark: CostMark | None) -> float
     undercounted by the mark."""
     if total is None:
         return None
-    if mark is None or mark[0] != session or total < mark[1]:
+    if mark is None or mark[0] != session or total < mark[1] - COST_TOLERANCE_USD:
         return total
-    return total - mark[1]
+    return max(0.0, total - mark[1])
 
 
 @dataclass(slots=True)
@@ -572,6 +747,9 @@ class _Connection:
     start names. Bounded by ``MAX_TRACKED_COMMANDS``."""
     stopped: set[str] = field(default_factory=set[str])
     """Tasks the line stopped itself in a turn, whose end needs no note."""
+    pending: dict[str, BackgroundEnd] = field(default_factory=dict[str, BackgroundEnd])
+    """Ends between turns that wait, up to ``SELF_START_GRACE_SECONDS``, for a turn
+    the engine may begin by itself on them."""
     permission_mode: PermissionMode = "default"
     alive: bool = True
     draining: bool = False
@@ -629,6 +807,11 @@ class TurnReport:
     cost_mark: tuple[str, float] | None = None
     """The session and running total the engine reported, which the scheduler hands
     to a rebuilt engine. ``None`` for an engine whose costs are not running totals."""
+    usage: Mapping[str, int] | None = None
+    """The engine's token counts for the turn, where it reports them."""
+    cost_source: str | None = None
+    """What the cost and usage were taken from, ``PER_TURN_SOURCE`` or
+    ``DIFFERENCE_SOURCE``, or ``None`` when the engine reported no cost."""
 
 
 def _strings(value: object) -> tuple[str, ...]:
@@ -976,6 +1159,9 @@ class ClaudeCodeLine:
         self._kept_factory = kept_factory
         self._task_ended = task_ended
         self.cost_mark = cost_mark
+        self._usage: dict[str, int] | None = None
+        self._source: str | None = None
+        """What the last measured turn's cost and usage came from."""
         """The last session and running total, which the scheduler keeps across
         rebuilds of the engine, so a rebuilt engine does not count the session's
         earlier turns again."""
@@ -1087,7 +1273,8 @@ class ClaudeCodeLine:
         result: ResultMessage | None = None
         self._turn = turn
         try:
-            async with self._session_factory(options) as session:
+            async with AsyncExitStack() as stack:
+                session = await self._enter(stack, self._session_factory, options)
                 await session.query(prompt)
                 async for message in session.receive_response():
                     if isinstance(message, ResultMessage):
@@ -1104,12 +1291,42 @@ class ClaudeCodeLine:
             raise EngineRefused(turn.refusal)
         return self._report(result, turn, cost)
 
+    async def _enter[S](
+        self,
+        stack: AsyncExitStack,
+        factory: Callable[[ClaudeAgentOptions], AbstractAsyncContextManager[S]],
+        options: ClaudeAgentOptions,
+    ) -> S:
+        """Start the engine. A start that times out at its initialize request is
+        tried once more, and the activity log says so, since on a loaded host the
+        engine can miss the SDK's wait while still starting. Any other failure, and
+        a second timeout, end the turn as before."""
+        try:
+            return await stack.enter_async_context(factory(options))
+        except Exception as error:
+            if not initialize_timed_out(error):
+                raise
+        self._observe(
+            ActivityKind.NOTICE,
+            "the engine's start timed out at initialize, so Dromon starts it once more",
+        )
+        return await stack.enter_async_context(factory(options))
+
     def _measure(self, result: ResultMessage) -> float | None:
-        """The turn's own cost from its result, moving the cost mark on."""
+        """The turn's own cost from its result, moving the cost mark on. The
+        engine's per-turn usage is preferred where the result carries it, since it
+        needs no mark, and the difference of running totals is the fallback."""
         total = result.total_cost_usd
         cost = turn_cost(total, result.session_id, self.cost_mark)
         if total is not None:
             self.cost_mark = (result.session_id, total)
+        per_turn = turn_usage_of(result)
+        if per_turn is not None:
+            self._source = PER_TURN_SOURCE
+            self._usage = per_turn[1]
+            return per_turn[0]
+        self._source = None if cost is None else DIFFERENCE_SOURCE
+        self._usage = usage_of(result.usage)
         return cost
 
     def _report(
@@ -1134,6 +1351,8 @@ class ClaudeCodeLine:
             capabilities=turn.capabilities,
             cost_estimate_usd=cost,
             cost_mark=self.cost_mark,
+            usage=self._usage,
+            cost_source=self._source,
         )
 
     async def _handle(
@@ -1337,6 +1556,8 @@ class ClaudeCodeLine:
         if connection is None:
             return
         self._kept = None
+        if connection.pending:
+            self._flush(connection, self_started=False)
         if reason is not None:
             self._notes.append(closed_note(reason, len(connection.tasks)))
         current = asyncio.current_task()
@@ -1365,7 +1586,7 @@ class ClaudeCodeLine:
         files = self.loaded_files_digest()
         stack = AsyncExitStack()
         try:
-            session = await stack.enter_async_context(self._kept_factory(options))
+            session = await self._enter(stack, self._kept_factory, options)
         except BaseException:
             await stack.aclose()
             raise
@@ -1407,7 +1628,11 @@ class ClaudeCodeLine:
                 if not begins_turn(message):
                     continue
                 connection.draining = not isinstance(message, ResultMessage)
-                if SELF_STARTED_NOTE not in self._notes:
+                if connection.pending:
+                    # The turn is the engine's answer to those ends, so their notes
+                    # say so, and no separate note is added.
+                    self._flush(connection, self_started=True)
+                elif SELF_STARTED_NOTE not in self._notes:
                     self._notes.append(SELF_STARTED_NOTE)
                 if not await self._interrupt(connection):
                     return
@@ -1448,20 +1673,46 @@ class ClaudeCodeLine:
         ended = task_ended(message)
         if ended is None:
             return
+        exit_code, output = end_details(message)
+        waiting = connection.pending.get(ended)
+        if waiting is not None:
+            # A second report of the same end, such as the notice after the update,
+            # completes the first.
+            connection.pending[ended] = replace(
+                waiting,
+                exit_code=waiting.exit_code if exit_code is None else exit_code,
+                output_file=waiting.output_file or output,
+            )
+            return
         command = connection.tasks.pop(ended, None)
         between = connection.inbox is None
         asked = ended in connection.stopped
         connection.stopped.discard(ended)
         if command is None or not between or asked:
             return
-        try:
-            self._task_ended(BackgroundEnd(ended, command, task_status(message)))
-        except Exception as error:  # noqa: BLE001
-            # The scheduler's failure to note a task must not end the connection.
-            print(
-                f"dromond: a background task's end could not be noted: {error}",
-                file=sys.stderr,
-            )
+        connection.pending[ended] = BackgroundEnd(
+            ended, command, task_status(message), exit_code, output
+        )
+        self._spawn(self._flush_later(connection))
+
+    def _flush(self, connection: _Connection, self_started: bool) -> None:
+        """Report every waiting end, once each."""
+        waiting = list(connection.pending.values())
+        connection.pending.clear()
+        for end in waiting:
+            try:
+                self._task_ended(replace(end, self_started=self_started))
+            except Exception as error:  # noqa: BLE001
+                # The scheduler's failure to note a task must not end the connection.
+                print(
+                    f"dromond: a background task's end could not be noted: {error}",
+                    file=sys.stderr,
+                )
+
+    async def _flush_later(self, connection: _Connection) -> None:
+        await asyncio.sleep(SELF_START_GRACE_SECONDS)
+        if connection.pending:
+            self._flush(connection, self_started=False)
 
     async def _watch(self, connection: _Connection) -> None:
         """Close the kept connection when, between turns, a file its engine loaded

@@ -47,6 +47,7 @@ from dromon.model import (
     WakeRequested,
     WakeScheduled,
     TaskNoted,
+    LineCostMarked,
     parse_address,
 )
 
@@ -86,6 +87,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "wake_issued": ("wake_id",),
     "wake_scheduled": ("line_id", "message_id", "due", "note"),
     "task_noted": ("line_id", "message_id", "task_id", "status", "body"),
+    "line_cost_marked": ("line_id", "engine_session", "total_micro_usd"),
     "question_withdrawn": ("message_id",),
     "question_superseded": ("message_id", "superseded_by"),
 }
@@ -229,6 +231,12 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "due": event.due,
                 "note": event.note,
             }
+        case LineCostMarked():
+            return "line_cost_marked", {
+                "line_id": event.line_id,
+                "engine_session": event.engine_session,
+                "total_micro_usd": event.total_micro_usd,
+            }
         case TaskNoted():
             return "task_noted", {
                 "line_id": event.line_id,
@@ -315,6 +323,12 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "due"),
                 _str(data, "note"),
             )
+        case "line_cost_marked":
+            return LineCostMarked(
+                _str(data, "line_id"),
+                _str(data, "engine_session"),
+                _int(data, "total_micro_usd"),
+            )
         case "task_noted":
             return TaskNoted(
                 _str(data, "line_id"),
@@ -351,6 +365,13 @@ def _str(data: dict[str, object], name: str) -> str:
     value = data[name]
     if not isinstance(value, str):
         raise DecodeError(f"{name} is not a string")
+    return value
+
+
+def _int(data: dict[str, object], name: str) -> int:
+    value = data[name]
+    if type(value) is not int:
+        raise DecodeError(f"{name} is not a whole number")
     return value
 
 

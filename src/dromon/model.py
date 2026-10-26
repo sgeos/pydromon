@@ -318,6 +318,34 @@ class LineSession:
             raise InvalidField("engine_session is empty")
 
 
+MAX_COST_MICRO_USD: Final = 10**15
+"""The largest running cost total an event records, in millionths of a dollar."""
+
+
+@dataclass(frozen=True, slots=True)
+class LineCostMarked:
+    """The running cost total an engine reported for a line's session after its last
+    turn, in whole millionths of a dollar, since the log admits no fractions. It lets
+    a restarted daemon measure the next turn from there, because the engine restores
+    a resumed session's total. One is recorded after each turn whose engine reports a
+    total."""
+
+    line_id: str
+    engine_session: str
+    total_micro_usd: int
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_text("engine_session", self.engine_session, MAX_SESSION_BYTES)
+        if not self.engine_session:
+            raise InvalidField("engine_session is empty")
+        total = self.total_micro_usd
+        if type(total) is not int or not 0 <= total <= MAX_COST_MICRO_USD:
+            raise InvalidField(
+                f"total_micro_usd must be a whole number from 0 to {MAX_COST_MICRO_USD}"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class LineSessionCleared:
     """A line's next turn starts a new engine session, as an operator asked.
@@ -533,6 +561,9 @@ class WakeScheduled:
 
 
 MAX_TASK_STATUS_BYTES: Final = 32
+MAX_TASK_NOTE_BYTES: Final = 8192
+"""The largest task-end note, which fits a quoted command and the head of the task's
+output."""
 MAX_TASK_ID_BYTES: Final = 128
 
 
@@ -555,7 +586,7 @@ class TaskNoted:
         check_id("message_id", self.message_id)
         check_text("task_id", self.task_id, MAX_TASK_ID_BYTES)
         check_text("status", self.status, MAX_TASK_STATUS_BYTES)
-        check_text("body", self.body, MAX_WAKE_NOTE_BYTES)
+        check_text("body", self.body, MAX_TASK_NOTE_BYTES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -598,6 +629,7 @@ type Event = (
     | WakeIssued
     | WakeScheduled
     | TaskNoted
+    | LineCostMarked
     | QuestionWithdrawn
     | QuestionSuperseded
 )
@@ -623,6 +655,9 @@ class Line:
     rebound: bool = False
     """Whether ``line_rebound``, rather than ``line_created``, set the current
     binding."""
+    cost_mark: tuple[str, int] | None = None
+    """The session and running cost total, in millionths of a dollar, of the line's
+    latest ``line_cost_marked``."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -787,6 +822,8 @@ class State:
                 self._check_wake_scheduled(event)
             case TaskNoted():
                 self._check_task_noted(event)
+            case LineCostMarked():
+                self._line(event.line_id)
             case QuestionWithdrawn():
                 self._open_question(event.message_id)
             case QuestionSuperseded():
@@ -865,6 +902,11 @@ class State:
             case WakeScheduled():
                 self.scheduled[event.line_id] = ScheduledWake(
                     event.message_id, event.due, event.note
+                )
+            case LineCostMarked():
+                line = self.lines[event.line_id]
+                self.lines[event.line_id] = replace(
+                    line, cost_mark=(event.engine_session, event.total_micro_usd)
                 )
             case TaskNoted():
                 address = LineAddress(event.line_id)

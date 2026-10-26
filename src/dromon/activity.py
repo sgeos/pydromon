@@ -47,6 +47,8 @@ class ActivityKind(StrEnum):
     """The engine called a tool. The text is the tool's name."""
     TURN_ENDED = "turn_ended"
     """A turn ended. The text says how."""
+    NOTICE = "notice"
+    """Dromon's own remark on the turn, such as that it started the engine again."""
 
 
 @dataclass(frozen=True, slots=True)

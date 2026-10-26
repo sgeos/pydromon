@@ -85,6 +85,29 @@ All notable changes are recorded here. The format follows
   unanswered count leaves out replies to hold questions, and `list_mail` entries carry
   `repeat_of` and a fired wake's due and delivery times.
 
+- The round 4 review. A Claude Code turn's cost and tokens come from the engine's
+  own per-turn usage where its result carries it, kept through a session wrapper
+  that reuses the SDK's parser, with the difference of running totals as the
+  fallback, and `line_status` says which. The task output reader walks from a
+  directory descriptor without following links, and reads only `.output` files in a
+  `tasks` directory, in the working directory too. A test shows that the SDK's failed
+  connect ends the engine process before the start is retried. The undercount a
+  same-session restart can cause is recorded as a residual.
+
+- Round 4 of the session-line experience. The cost mark is recorded as
+  `line_cost_marked` after each turn that reports a new total, so a restart does not
+  count a session's restored history again. A task-end note folds in the turn the
+  engine began on the end, and gives the exit code and the first lines of the output,
+  read only from the line's working directory or the engine's task output and quoted
+  as data. A line's notes to itself leave the unanswered count. `line_status` gives
+  each recent turn's tokens and says when an engine reports no cost, and says whether
+  the turn in flight counts as autonomous, which the prompt now says too. Codex
+  background terminals have one source for the status and `list_background`, match
+  numeric identifiers, and wake the line when one ends, found by bounded polling.
+  `dromon start` waits up to 60 seconds, or `--wait` seconds. An engine start that
+  times out at its initialize request is tried once more, with a `notice` in the
+  activity log.
+
 - The round 3 review. A Claude Code turn's cost is the difference from the last total
   reported for the same engine session, kept across engine rebuilds, and the whole
   total when the session changes or the total falls. The engine restores a resumed

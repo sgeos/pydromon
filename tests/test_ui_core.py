@@ -696,7 +696,8 @@ def busy_model(width: int, height: int) -> Model:
         entry(2, ActivityKind.THINKING, ""),
         entry(3, ActivityKind.TEXT, "# Plan\n```\ncode\n```\n" + "word " * 80),
         entry(4, ActivityKind.TOOL, "mcp__dromon__send"),
-        entry(5, ActivityKind.TURN_ENDED, "failed: broke"),
+        entry(5, ActivityKind.NOTICE, "the engine's start timed out, so once more"),
+        entry(6, ActivityKind.TURN_ENDED, "failed: broke"),
     )
     return attached(
         width=width,
@@ -816,3 +817,9 @@ def test_transcript_is_the_chosen_pane() -> None:
         "m-1" in text_of(row) for row in transcript(replace(model, pane=Pane.MAIL))
     )
     assert "waiting" in text_of(transcript(attached(pane=Pane.MAIL))[0])
+
+
+def test_a_notice_is_drawn_as_dromons_note() -> None:
+    model = busy_model(80, 40)
+    shown = "\n".join(text_of(row) for row in frame(model).rows)
+    assert "note: the engine's start timed out, so once more" in shown

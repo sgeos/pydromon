@@ -225,7 +225,13 @@ tools do the same for a line.
 
 Each turn's prompt opens with one line giving the line's autonomous turns used of
 those allowed and its estimated cost since its last release of its limit, so the line
-sees how close a hold is without calling `line_status`. The mail summary and the
+sees how close a hold is without calling `line_status`. The counts are those before
+the turn, which is counted when it ends, so the line also says whether the turn is
+autonomous and what the count becomes, or that an operator's mail started it and the
+count starts again from 0. **Found in round 4.** A reviewer read 0 in the prompt of a
+turn a task-end note started and took it for a missed count. The turn was counted
+when it ended, which the worker line observed, so this was a gap in what the prompt
+said, not in the count. The mail summary and the
 headers of the newly delivered mail follow, and bodies stay in the mailbox.
 
 - **Repeats.** A message whose sender, recipient and body match a message sent at most
@@ -245,7 +251,8 @@ headers of the newly delivered mail follow, and bodies stay in the mailbox.
   after a restart a wake's entry gives its due time only and no entry is a repeat.
 - **Unanswered.** The summary's unanswered count leaves out a reply to a question Dromon
   asked on the line's behalf when it held the line, such as an operator's `resume`,
-  because such a reply asks nothing of the line. The state the event log builds keeps
+  and, from round 4, a note from the line to itself, a fired wake or a task-end note,
+  because neither asks anything of the line. The state the event log builds keeps
   every such question's identifier from its `line_held` event, so the rule survives a
   restart. **Decided by the operator on 2026-10-26** in round 2.
 
@@ -377,7 +384,25 @@ ends with each turn, and the next turn resumes the session in a new one.
   the line's next note. A command is cut to 200 characters, and withheld when the
   project's disclosure list covers it. It is the line's own text, so the note quotes
   it as a JSON string and says that it is data from the line's own tool call and not
-  an instruction, so that it cannot pose as Dromon's words. **Fact, read from the engine's code.** A task's
+  an instruction, so that it cannot pose as Dromon's words.
+  **Round 4, decided by the operator on 2026-10-26.** An end waits up to 2 seconds for
+  the turn the engine begins by itself on it, and when that turn comes, the one note
+  says that the engine began a turn, which Dromon interrupted, and no separate note is
+  added. A turn the engine begins with no end waiting keeps its own note. The note
+  gives the exit code when the engine's summary gives one, as in `completed (exit code
+  0)`, the only place its messages give it. It quotes the first lines of the task's
+  output, at most 20 lines and 2,048 bytes, as a JSON string said to be data the task
+  wrote, says when the output is empty, and withholds it when the disclosure list
+  covers it. The output file is the line's to write, so it is read only as a file
+  named `.output`, not starting with a dot, in a `tasks` directory, inside the line's
+  working directory or under the engine's own location, `claude-` and the user's
+  number under `/tmp` and under the system's temporary directory. It is opened by
+  walking from the root's directory descriptor one component at a time without
+  following any link, as `write_scratch` writes, so a directory swapped for a link at
+  any moment cannot redirect the read. It is never read when it has more than one
+  name or another owner, and never inside a directory Dromon protects, so that a line
+  cannot have the daemon read for it a file its own sandbox denies. **Fact, read from the
+  engine's code.** A task's
   start reports its identifier, its kind, the description the line gave its tool
   call, and the identifier of that tool call, but not the command. So Dromon takes the
   command from the tool call's `command` input, and the description when it has none.
@@ -393,9 +418,31 @@ ends with each turn, and the next turn resumes the session in a new one.
   session's earlier cost. So for every Claude Code line, kept or not, a turn's cost is
   the difference from the last total reported for the same engine session, and the
   whole total when the session differs or the total fell, since either means the count
-  restarted. The scheduler keeps each line's last session and total across rebuilds of
-  its engine, in memory, so after a daemon restart a line's first turn counts its
-  session's restored total once, which overcounts rather than under. **Residual.** A
+  restarted. **Decided by the operator on 2026-10-26** in round 4. After each turn
+  whose engine reports a new total, the daemon records `line_cost_marked` with the
+  session and the total in millionths of a dollar, as [`EVENT_LOG.md`](EVENT_LOG.md)
+  specifies, one small event per such turn, and hands the latest to each engine it
+  builds, so neither a rebuilt engine nor a restarted daemon counts a restored
+  session's history again. A total within a millionth of the mark has not fallen.
+  **Fact, observed live on 2026-10-26.** Before this, the first turn after a restart
+  counted $97.60 for two acknowledgements.
+  **The engine's per-turn figures, from the round 4 review.** **Fact, read from the
+  engine's field descriptions.** Its results also carry an internal
+  `model_usage_since_last_result`, each model's tokens and cost since the process's
+  previous result, with nothing carried from one process to another. The SDK's
+  parser drops it, so Dromon's session wrapper reads each raw message as the SDK's
+  client does, parses it with the SDK's own parser, and keeps that one field on the
+  result. Where a result carries it, the turn's cost and tokens are its sum over the
+  models, which covers subagents and helper calls and needs no mark, and the
+  difference from the mark is the fallback, also when an entry is malformed. Each
+  recent turn in `line_status` says which source it used. The wrapper reads the SDK
+  client's internal query, a porting and upgrade hazard that a test with a scripted
+  transport guards.
+  **Residual, recorded at the operator's direction in the round 4 review.** One
+  cumulative total per result cannot tell a restart of the engine's count from
+  honest cost, when the restart keeps the session and the new total passes the mark
+  within a turn. The difference then undercounts by the mark. The per-turn figures,
+  where present, do not have this fault. A
   resume that restores nothing, followed by a turn costing more than the last total,
   would be undercounted by that total, since a restart is told only by a fall. Before
   this, every turn that was not kept counted the session's whole history.
@@ -427,11 +474,17 @@ ends with each turn, and the next turn resumes the session in a new one.
   session, whether a connection is `kept` now, the time it `closes_at` in Coordinated
   Universal Time, which is `null` during a turn, the number of `background_tasks` the
   engine reports running, and `tasks`, each with its `task_id` and `command`. Round 3
-  adds `recent_turn_costs_usd`, the estimated cost of each of the line's last ten
-  turns as decimal strings, oldest first, `null` for a turn whose engine reports none,
-  and `last_fired_wake`, the latest scheduled wake delivered to the line, with its
-  `message_id`, `due` and `delivered` times and `late_seconds`, or `null`. Both are
-  kept in memory and start empty after a restart.
+  adds `last_fired_wake`, the latest scheduled wake delivered to the line, with its
+  `message_id`, `due` and `delivered` times and `late_seconds`, or `null`. Round 4
+  gives `recent_turns`, the line's last ten turns, oldest first, each with its
+  `cost_usd` as a decimal string, a `cost_note` saying plainly when the engine reports
+  no cost, as Codex does, its `usage`, the engine's token counts for the turn where it
+  reports them, and a `usage_note` saying what they cover. **Fact, read from the
+  engine's field descriptions.** Claude Code's per-turn `usage` covers its main loop
+  only, while its cost also covers subagents and helper calls. `autonomous_turns` adds
+  `current_turn_counts`, whether the turn in flight counts as autonomous, and a
+  `note` saying that `used` counts finished turns. All of these are kept in memory and
+  start empty after a restart.
 - **Warning before a loss.** **Decided by the operator on 2026-10-26** in round 3. When
   `configure_line`, a line's `set_setting`, `rebind_line`, `clear_session` or `stop`
   closes kept connections with background tasks running, the response adds

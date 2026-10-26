@@ -149,6 +149,8 @@ def _entry(entry: Entry, width: int) -> list[Row]:
         case ActivityKind.TURN_ENDED:
             style = Style.ERROR if entry.text.startswith("failed") else Style.DIM
             return _rows(wrap(entry.text, width, "  turn ended, ", "    "), style)
+        case ActivityKind.NOTICE:
+            return _rows(wrap(entry.text, width, "  note: ", "    "), Style.DIM)
 
 
 @functools.lru_cache(maxsize=4)
