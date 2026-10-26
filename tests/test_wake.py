@@ -411,6 +411,8 @@ def test_every_line_has_the_tool_and_status_shows_the_pending_wake(
         "send_message",
         "ask_operator",
         WAKE_TOOL_NAME,
+        "acquire_lease",
+        "release_lease",
         "list_mail",
         "read_mail",
         "acknowledge_mail",

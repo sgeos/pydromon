@@ -640,6 +640,8 @@ def test_the_line_socket_serves_only_the_lines_own_tools(
             "send_message",
             "ask_operator",
             "wake_after",
+            "acquire_lease",
+            "release_lease",
             "list_mail",
             "read_mail",
             "acknowledge_mail",

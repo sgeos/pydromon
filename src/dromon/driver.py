@@ -42,6 +42,7 @@ MAX_SETTINGS: Final = 32
 ENGINE_OF: Final[dict[str, str]] = {
     "claude-opus-5-5": "claude-code",
     "claude-haiku-5-5": "claude-code",
+    "claude-fable-5-1": "claude-code",
     "gpt-6-luna": "codex",
     "grok-4.7": "grok-build",
 }

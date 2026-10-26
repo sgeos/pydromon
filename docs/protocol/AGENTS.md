@@ -36,7 +36,8 @@ has, with the same schemas and results, fixed to the agent's address, and an age
 mail is delivered when it lists it. An agent's `send_message` is held to the project's
 disclosure list, and its `create_line` and `configure_line` to the project's sandbox
 requirement, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. It has no
-`wake_after`, which only lines have. An anonymous agent whose chosen name contains a
+`wake_after`, `acquire_lease` or `release_lease`, which only lines have, and no
+`rebind_line`, which only an operator has through a client. An anonymous agent whose chosen name contains a
 listed term is refused on connection, and an agent registered with `agent_add` is
 exempt, since the operator named it. `manage` can grant a line shell access and
 credentials through its configuration, so it is close to operator trust. An

@@ -94,7 +94,7 @@ def test_settings_report_each_value_with_its_layer(paths: ProjectPaths) -> None:
         )
         model = client.entry("line", "model")
         assert (model["value"], model["source"]) == (HAIKU, "created")
-        assert model["choices"] == ["claude-opus-5-5", HAIKU]
+        assert model["choices"] == ["claude-opus-5-5", HAIKU, "claude-fable-5-1"]
         effort = client.entry("line", "effort")
         assert effort["source"] == "driver" and effort["editable"] is True
         strategy = client.entry("line", "strategy")
@@ -297,7 +297,7 @@ def test_a_reload_that_needs_a_restart_or_is_invalid_changes_nothing(
         assert not broken.ok and "dromon.toml" in (broken.error_message or "")
         write_file(paths, '[lines.alpha]\nmodel = "claude-opus-5-5"\n')
         mismatch = client.ask("reload_project")
-        assert not mismatch.ok and "Create a new line" in (mismatch.error_message or "")
+        assert not mismatch.ok and "create a new line" in (mismatch.error_message or "")
         assert client.daemon.log.last_seq == before
         assert client.daemon.scheduler.limits_for("alpha").max_cost_usd == 4.0
         assert (

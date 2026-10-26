@@ -129,6 +129,7 @@ that line, held only in memory, and it serves only that line's own tools.
 
 ## Not at parity
 
-- No MCP servers of the line's own, and no sandbox or settings documents.
+- No MCP servers of the line's own, no sandbox or settings documents, and no
+  `project_settings`, which loads Claude Code's settings.
 - No network blocking for a Grok line's commands on macOS.
 - Grok reports no cost, and the driver's `max_turns` is not enforced.

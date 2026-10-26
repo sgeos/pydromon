@@ -21,6 +21,7 @@ from dromon.model import (
     LineOverridden,
     LineSession,
     LineSessionCleared,
+    LineRebound,
     LineCreated,
     LineState,
     LineStateChanged,
@@ -98,6 +99,7 @@ SCENARIO: tuple[Event, ...] = (
     WakeScheduled("beta", "s1", "2026-10-26T09:30:00Z", "read the gate's log"),
     WakeScheduled("beta", "s2", "2026-10-26T10:00:00Z", "read it again"),
     MessageSent("s2", BETA, BETA, NOTE, "read it again"),
+    LineRebound("alpha", "claude-haiku-5-5", "subscription"),
     LineStateChanged("alpha", LineState.STOPPED),
 )
 

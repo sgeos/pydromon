@@ -32,6 +32,18 @@ a crash leaves a wake either pending or fired, and a wake that fell due while th
 daemon was down fires at its first tick. The wall clock is injected, so tests control
 it, and it is distinct from the monotonic clock that measures cooldowns.
 
+Leases. A project may declare named leases, such as ``full-gate``, so that its lines
+take turns at a shared resource. ``acquire_lease`` succeeds only while no line holds
+the name, and otherwise reports the holder and when its lease ends, so one acquisition
+lasts at most one time to live, by the wall clock. ``release_lease`` gives it up. A
+lease ends when released, when its time to live passes, or when its holder's session is
+cleared or the holder is rebound. Leases live only in the daemon's memory, so a restart
+drops every one, which suits a resource a crashed daemon no longer uses.
+
+Rebinding. An operator may move a line to another model and strategy, keeping its
+identity, mailbox, configuration and overrides. ``line_rebound`` records it, the model
+override is dropped, the engine session is cleared and the engine rebuilt.
+
 Disclosure guard. When the project names a disclosure list, a message, question or
 wake note that a line or an external agent sends through these tools is refused, and
 nothing is recorded, if its text holds a listed term, as ``dromon.disclosure``
@@ -86,6 +98,7 @@ from dromon.overrides import (
     spec_of,
 )
 from dromon.overrides import decode as decode_override
+from dromon.overrides import encode as encode_override_document
 from dromon.overrides import encode as encode_override
 from dromon.driver import ENGINE_OF, MODELS, Driver, DriverError, Strategy
 from dromon import codex, grok
@@ -127,6 +140,7 @@ from dromon.model import (
     LineReleased,
     LineSession,
     LineSessionCleared,
+    LineRebound,
     LineState,
     LineStateChanged,
     Message,
@@ -197,6 +211,33 @@ ASK_TOOL_SCHEMA: Final[dict[str, object]] = {
     "required": ["question"],
     "additionalProperties": False,
 }
+
+ACQUIRE_LEASE_TOOL_NAME: Final = "acquire_lease"
+RELEASE_LEASE_TOOL_NAME: Final = "release_lease"
+
+LEASE_TOOL_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "description": "A lease the project declares"},
+    },
+    "required": ["name"],
+    "additionalProperties": False,
+}
+
+MIN_LEASE_TTL_SECONDS: Final = 60
+MAX_LEASE_TTL_SECONDS: Final = 86400
+DEFAULT_LEASE_TTL_SECONDS: Final = 10800
+
+
+class LeaseRefused(ValueError):
+    """A lease cannot be acquired or released as asked."""
+
+
+@dataclass(frozen=True, slots=True)
+class Lease:
+    holder: str
+    expires: datetime
+
 
 WAKE_TOOL_NAME: Final = "wake_after"
 
@@ -373,6 +414,9 @@ def engine_factory(
         merged = merge([project_sandbox, spec.config.sandbox])
         enabled = merged is not None and merged.enabled
         guarded = git_write_guards(workdir) if enabled else ()
+        # A line that loads project settings must not write the file it loads.
+        claude_dir = (workdir / ".claude",) if spec.config.project_settings else ()
+        guarded = (*guarded, *claude_dir)
         return ClaudeCodeLine(
             driver,
             workdir,
@@ -383,6 +427,7 @@ def engine_factory(
             settings=engine_settings.effective(
                 engine_settings.merge([project_settings, spec.config.settings]),
                 protected,
+                claude_dir,
             ),
             observe=spec.observe,
         )
@@ -467,6 +512,10 @@ class Scheduler:
         self._wall_clock = wall_clock
         self._disclosure: tuple[str, ...] = ()
         """The project's disclosure terms, case folded. Never logged or returned."""
+        self._lease_names: frozenset[str] = frozenset()
+        self._lease_ttl = DEFAULT_LEASE_TTL_SECONDS
+        self._leases: dict[str, Lease] = {}
+        """Held leases by name. In memory only, so a restart drops them."""
         self.limits = limits
         self.wake_every_ticks = wake_every_ticks
         self._line_limits: dict[str, Limits] = {}
@@ -568,6 +617,7 @@ class Scheduler:
         self._log.append(LineConfigured(line_id, encode_config(config)))
         if not creating and line is not None and previous != config.workdir:
             self._log.append(LineSessionCleared(line_id))
+            self._end_leases(line_id)
             if line_id in self._running:
                 self._moved.add(line_id)
         self._engines.pop(line_id, None)
@@ -864,12 +914,138 @@ class Scheduler:
             handler=handler,
         )
 
+    # Leases.
+
+    def set_leases(self, names: Sequence[str], ttl_seconds: int) -> None:
+        """Declare the project's leases, as the project file does at start and reload.
+        A held lease whose name is no longer declared ends."""
+        if (
+            type(ttl_seconds) is not int
+            or not MIN_LEASE_TTL_SECONDS <= ttl_seconds <= MAX_LEASE_TTL_SECONDS
+        ):
+            raise ValueError(
+                f"ttl_seconds must be a whole number from {MIN_LEASE_TTL_SECONDS}"
+                f" to {MAX_LEASE_TTL_SECONDS}"
+            )
+        self._lease_names = frozenset(names)
+        self._lease_ttl = ttl_seconds
+        for name in [n for n in self._leases if n not in self._lease_names]:
+            del self._leases[name]
+
+    def _live_lease(self, name: str) -> Lease | None:
+        """The lease held under ``name``, ending it first if its time has passed."""
+        lease = self._leases.get(name)
+        if lease is not None and lease.expires <= self._wall_clock():
+            del self._leases[name]
+            return None
+        return lease
+
+    def acquire_lease(self, line_id: str, name: str) -> str:
+        """Give ``line_id`` the lease ``name`` for the project's time to live, and
+        return when it expires. Raises ``LeaseRefused`` for an undeclared name, for a
+        lease another line holds, and for one the line holds already, so that one
+        acquisition lasts at most one time to live. The holder may acquire it again
+        once it has expired, by the wall clock."""
+        if name not in self._lease_names:
+            declared = ", ".join(sorted(self._lease_names)) or "none"
+            raise LeaseRefused(
+                f"the project declares no lease {name!r}. Declared leases: {declared}"
+            )
+        held = self._live_lease(name)
+        if held is not None and held.holder == line_id:
+            raise LeaseRefused(
+                f"you hold lease {name} already, until {format_due(held.expires)}."
+                " A lease is not renewed. Acquire it again once it has expired"
+            )
+        if held is not None:
+            raise LeaseRefused(
+                f"lease {name} is held by line {held.holder} until"
+                f" {format_due(held.expires)}"
+            )
+        now = self._wall_clock().astimezone(UTC)
+        start = now.replace(microsecond=0)
+        if start < now:
+            start += timedelta(seconds=1)
+        expires = start + timedelta(seconds=self._lease_ttl)
+        self._leases[name] = Lease(line_id, expires)
+        return format_due(expires)
+
+    def release_lease(self, line_id: str, name: str) -> None:
+        """End ``line_id``'s lease ``name``. Raises ``LeaseRefused`` unless it holds
+        it."""
+        held = self._live_lease(name)
+        if held is None or held.holder != line_id:
+            raise LeaseRefused(f"line {line_id} holds no lease {name!r}")
+        del self._leases[name]
+
+    def _end_leases(self, line_id: str) -> None:
+        for name in [n for n, lease in self._leases.items() if lease.holder == line_id]:
+            del self._leases[name]
+
+    def leases_of(self, line_id: str) -> list[dict[str, object]]:
+        """The leases ``line_id`` holds, by name, with when each expires."""
+        held: list[dict[str, object]] = []
+        for name in sorted(self._leases):
+            lease = self._live_lease(name)
+            if lease is not None and lease.holder == line_id:
+                held.append({"name": name, "expires": format_due(lease.expires)})
+        return held
+
+    def _lease_tool(self, line_id: str, acquire: bool) -> SdkMcpTool[Any]:
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, LEASE_TOOL_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            name: object = args.get("name")
+            if not isinstance(name, str):
+                return _tool_error("name must be text")
+            try:
+                if acquire:
+                    expires = self.acquire_lease(line_id, name)
+                    return _tool_text(
+                        f"you hold lease {name} until {expires}. Release it when"
+                        " you are done."
+                    )
+                self.release_lease(line_id, name)
+            except LeaseRefused as error:
+                return _tool_error(str(error))
+            return _tool_text(f"released lease {name}")
+
+        if acquire:
+            return SdkMcpTool(
+                name=ACQUIRE_LEASE_TOOL_NAME,
+                description=(
+                    "Acquire a lease the project declares, such as one for a shared"
+                    " machine resource, before using that resource. It succeeds only"
+                    " if no other line holds it, and otherwise says who does. It ends"
+                    " when you release it or when its time to live passes."
+                ),
+                input_schema=LEASE_TOOL_SCHEMA,
+                handler=handler,
+            )
+        return SdkMcpTool(
+            name=RELEASE_LEASE_TOOL_NAME,
+            description="Release a lease you hold, so another line may acquire it.",
+            input_schema=LEASE_TOOL_SCHEMA,
+            handler=handler,
+        )
+
+    def acquire_lease_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``acquire_lease`` tool for ``line_id``, whose holder it fixes."""
+        return self._lease_tool(line_id, acquire=True)
+
+    def release_lease_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``release_lease`` tool for ``line_id``."""
+        return self._lease_tool(line_id, acquire=False)
+
     def own_tools(self, line_id: str) -> list[SdkMcpTool[Any]]:
         """A line's own Dromon tools, whose sender each fixes to the line."""
         return [
             self.send_tool(line_id),
             self.ask_tool(line_id),
             self.wake_tool(line_id),
+            self.acquire_lease_tool(line_id),
+            self.release_lease_tool(line_id),
             self.list_mail_tool(line_id),
             self.read_mail_tool(line_id),
             self.acknowledge_mail_tool(line_id),
@@ -1213,6 +1389,46 @@ class Scheduler:
             raise EventRejected(f"line {line_id} is in a turn. Interrupt it first")
         self._log.append(LineSessionCleared(line_id))
         self._engines.pop(line_id, None)
+        self._end_leases(line_id)
+
+    def rebind_line(self, line_id: str, model: str, strategy: Strategy) -> None:
+        """Move ``line_id`` to ``model`` with ``strategy``, keeping its identity,
+        mailbox, configuration and overrides but its model override, which is
+        dropped. The next turn starts a new engine session on a rebuilt engine, and
+        the line's leases end.
+
+        Refused while the line runs a turn, for a model and strategy with no packaged
+        driver or adapter, for the binding the line already has, and for a
+        configuration the new engine cannot run. A refusal changes nothing.
+        """
+        line = self._log.state.lines.get(line_id)
+        if line is None:
+            raise EventRejected(f"no line {line_id}")
+        if line_id in self._running:
+            raise EventRejected(f"line {line_id} is in a turn. Interrupt it first")
+        driver = Driver.for_model(model, strategy)
+        if model not in MODELS:
+            raise DriverError(
+                f"{model} runs on the {driver.settings.engine} engine, for which Dromon"
+                " has no adapter yet"
+            )
+        if (line.engine, line.strategy) == (model, strategy.value):
+            raise EventRejected(
+                f"line {line_id} already runs {model} with the {strategy} strategy,"
+                " so the rebind would change nothing"
+            )
+        overrides = dict(self.line_overrides(line_id))
+        had_model = overrides.pop("model", None) is not None
+        baseline = self.baseline_config(line_id)
+        _check_engine_supports(driver, baseline)
+        _check_engine_supports(driver, apply_config(baseline, overrides))
+        if had_model:
+            self._log.append(
+                LineOverridden(line_id, encode_override_document(overrides))
+            )
+        self._log.append(LineRebound(line_id, model, strategy.value))
+        self._engines.pop(line_id, None)
+        self._end_leases(line_id)
 
     def set_project(
         self, limits: Limits, operator: str, tick_seconds: float, wake_every_ticks: int
@@ -1488,6 +1704,7 @@ class Scheduler:
                 "held_by": line.held_by,
                 "tool_policy": self.effective_config(line_id).tool_policy.value,
                 "scheduled_wake": _scheduled_summary(state.scheduled.get(line_id)),
+                "leases": self.leases_of(line_id),
             }
             for line_id, line in sorted(state.lines.items())
         ]

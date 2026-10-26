@@ -45,6 +45,19 @@ ran, saw a variable from ``env``, and its output reached the model. MCP server
 references such as ``${TOKEN}`` are replaced from the daemon's environment here, at the
 start of each turn, so the stored configuration holds only the reference.
 
+Project settings. With ``project_settings`` a line also loads Claude Code's
+``project`` setting source, which the SDK documents as ``.claude/settings.json`` under
+the working directory, and which it requires for ``CLAUDE.md`` files to load. Dromon's
+own settings still arrive through ``--settings``. The engine is still given only the
+configured tools, and the init check still refuses any other. A project file must not
+run code or grant anything, since an ``allow`` rule, for one, would approve a call
+without the permission gate. So at the start of every turn ``check_project_settings``
+admits only allowlisted settings keys, allowlisted ``.claude`` entries and skills with
+allowlisted front matter, and refuses the turn otherwise. A line with a shell tool
+needs an enabled sandbox, in which the factory denies writes to the working
+directory's ``.claude``, as its ``Edit`` rules do for the built-in editing tools, so the
+line cannot change what it loads.
+
 Instructions. With ``claude_code_prompt`` a line runs on Claude Code's own system
 prompt, and otherwise on an empty one, which the SDK passes when no prompt is given.
 The text of the configuration's ``instructions`` files is appended at each turn, so a
@@ -59,6 +72,7 @@ failures from the SDK propagate unchanged.
 import importlib.metadata
 import json
 import os
+import re
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
@@ -90,10 +104,43 @@ from claude_agent_sdk.types import SystemPromptPreset
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
 from dromon.lineconfig import DEFAULT_CONFIG, ConfigError, LineConfig
-from dromon.sandbox import blocks_unsandboxed
+from dromon.sandbox import SHELL_TOOLS, blocks_unsandboxed
 
 ENGINE_NAME: Final = "claude-code"
 """The engine this adapter runs, as drivers name it."""
+
+PROJECT_SETTINGS_FILE: Final = Path(".claude") / "settings.json"
+"""The project settings file Claude Code's ``project`` source reads, under the line's
+working directory."""
+
+MAX_PROJECT_SETTINGS_BYTES: Final = 1024 * 1024
+
+PROJECT_SETTINGS_KEYS: Final = frozenset(
+    {"$schema", "attribution", "includeCoAuthoredBy"}
+)
+"""The only keys a project settings file may set for a Dromon line. ``$schema`` names a
+schema for editors, and the other two only choose the attribution text written into
+commits and pull requests. None grants a permission, widens a sandbox, changes a
+credential, environment or model, or runs code. Every other key refuses the turn,
+including ``hooks``, ``mcpServers``, ``enableAllProjectMcpServers``,
+``enabledMcpjsonServers``, ``statusLine``, ``permissions``, ``sandbox``, ``env`` and the
+plugin keys. A line's hooks come from Dromon's own settings document instead."""
+
+CLAUDE_DIR_ENTRIES: Final = frozenset(
+    {"settings.json", "settings.local.json", "skills", "CLAUDE.md"}
+)
+"""The only entries a working directory's ``.claude`` may hold for such a line. The
+local settings file is a source Dromon never loads. Others, such as ``commands``,
+``agents``, ``hooks`` or ``output-styles``, can grant tools or run commands, so their
+presence refuses the turn."""
+
+SKILL_FRONTMATTER_KEYS: Final = frozenset({"name", "description", "license", "version"})
+"""The only front matter keys a project skill's ``SKILL.md`` may set. Others, such as
+``allowed-tools``, ``hooks`` or ``model``, grant a tool, run code or change the
+model."""
+
+MAX_SKILLS: Final = 256
+MAX_FRONTMATTER_LINES: Final = 256
 
 MCP_SERVER_NAME: Final = "dromon"
 """The name of the in-process MCP server that serves a line's Dromon tools."""
@@ -299,6 +346,100 @@ def permission_gate(
     return gate
 
 
+def _read_bounded(file: Path, what: str) -> bytes:
+    try:
+        with file.open("rb") as handle:
+            raw = handle.read(MAX_PROJECT_SETTINGS_BYTES + 1)
+    except OSError as error:
+        raise EngineRefused(f"cannot read the {what} {file}: {error}") from error
+    if len(raw) > MAX_PROJECT_SETTINGS_BYTES:
+        raise EngineRefused(f"the {what} {file} is too large")
+    return raw
+
+
+def _check_settings_file(file: Path) -> None:
+    raw = _read_bounded(file, "project settings")
+    try:
+        document: object = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise EngineRefused(f"the project settings {file} are not JSON") from error
+    if not isinstance(document, dict):
+        raise EngineRefused(f"the project settings {file} are not a JSON object")
+    found = sorted(set(cast(dict[str, object], document)) - PROJECT_SETTINGS_KEYS)
+    if found:
+        raise EngineRefused(
+            f"the project settings {file} set {', '.join(found)}, which a Dromon line"
+            f" may not take from them. Only {', '.join(sorted(PROJECT_SETTINGS_KEYS))}"
+            " are accepted, and a line's hooks belong in Dromon's settings document"
+        )
+
+
+FRONTMATTER_KEY: Final = re.compile(r"([A-Za-z0-9_-]+)\s*:")
+
+
+def _check_skill(file: Path) -> None:
+    """Refuse a skill whose front matter sets a key outside the allowlist. The front
+    matter is the block between a first line ``---`` and the next ``---``, and a key is
+    a line that starts with a name and a colon, as YAML writes a top-level key."""
+    lines = _read_bounded(file, "skill").decode("utf-8", "replace").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return
+    found: set[str] = set()
+    for line in lines[1 : 1 + MAX_FRONTMATTER_LINES]:
+        if line.strip() == "---":
+            break
+        key = FRONTMATTER_KEY.match(line)
+        if key is not None:
+            found.add(key.group(1))
+    else:
+        raise EngineRefused(f"the skill {file} has front matter that does not end")
+    extra = sorted(found - SKILL_FRONTMATTER_KEYS)
+    if extra:
+        raise EngineRefused(
+            f"the skill {file} sets {', '.join(extra)} in its front matter, which a"
+            " Dromon line may not take from a project"
+        )
+
+
+def check_project_settings(cwd: Path) -> None:
+    """Refuse the turn unless what Claude Code's project source would load under
+    ``cwd`` grants nothing and runs nothing: a settings file of allowlisted keys only,
+    a ``.claude`` of allowlisted entries only, and skills whose front matter sets only
+    allowlisted keys. A missing ``.claude`` is fine. Raises ``EngineRefused``, naming
+    the file and the key or entry, never a value."""
+    directory = cwd / ".claude"
+    if not os.path.lexists(directory):
+        return
+    if not directory.is_dir():
+        raise EngineRefused(f"{directory} is not a directory")
+    try:
+        entries = sorted(os.listdir(directory))
+    except OSError as error:
+        raise EngineRefused(f"cannot list {directory}: {error}") from error
+    extra = [name for name in entries if name not in CLAUDE_DIR_ENTRIES]
+    if extra:
+        raise EngineRefused(
+            f"{directory} holds {', '.join(extra)}, which a Dromon line loading"
+            " project settings may not take. Only"
+            f" {', '.join(sorted(CLAUDE_DIR_ENTRIES))} are accepted"
+        )
+    settings = cwd / PROJECT_SETTINGS_FILE
+    if os.path.lexists(settings):
+        _check_settings_file(settings)
+    skills = directory / "skills"
+    if not os.path.lexists(skills):
+        return
+    if not skills.is_dir():
+        raise EngineRefused(f"{skills} is not a directory")
+    names = sorted(os.listdir(skills))
+    if len(names) > MAX_SKILLS:
+        raise EngineRefused(f"{skills} holds more than {MAX_SKILLS} skills")
+    for name in names:
+        skill = skills / name / "SKILL.md"
+        if os.path.lexists(skill):
+            _check_skill(skill)
+
+
 def mcp_server_of(tool_name: str) -> str | None:
     """The server an MCP tool name belongs to, or ``None`` for a built-in tool."""
     if not tool_name.startswith("mcp__"):
@@ -372,13 +513,21 @@ class ClaudeCodeLine:
             servers[MCP_SERVER_NAME] = create_sdk_mcp_server(
                 MCP_SERVER_NAME, tools=list(self.mcp_tools)
             )
+        if self.config.project_settings:
+            sandboxed = self.sandbox is not None and self.sandbox.get("enabled") is True
+            if SHELL_TOOLS & set(self.config.builtin_tools) and not sandboxed:
+                raise EngineRefused(
+                    "a line that loads project settings and has a shell tool needs an"
+                    " enabled sandbox, so it cannot write the hooks it would load"
+                )
+            check_project_settings(self.cwd)
         return ClaudeAgentOptions(
             model=settings.model,
             tools=list(self.config.builtin_tools),
             mcp_servers=cast(dict[str, McpServerConfig], servers),
             strict_mcp_config=not self.config.inherit_account_mcp,
             can_use_tool=permission_gate(self.config, self.own_tools, self.sandbox),
-            setting_sources=[],
+            setting_sources=["project"] if self.config.project_settings else [],
             max_turns=settings.max_turns,
             effort=effort,
             cwd=str(self.cwd),

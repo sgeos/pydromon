@@ -369,28 +369,37 @@ def protected_rules(protected: Sequence[Path]) -> list[str]:
     is given as written and as its real path, since a rule matches the path a tool is
     handed and a symbolic link such as macOS's ``/tmp`` can stand in for either.
     """
+    return _rules(protected, ("Read", "Edit"))
+
+
+def _rules(directories: Sequence[Path], tools: Sequence[str]) -> list[str]:
     rules: set[str] = set()
-    for directory in protected:
+    for directory in directories:
         for path in {os.path.normpath(directory), os.path.realpath(directory)}:
             if not path.startswith("/"):
                 _fail(f"the protected directory {path!r} is not absolute")
-            for tool in ("Read", "Edit"):
+            for tool in tools:
                 rules.add(f"{tool}(/{path}/**)")
     return sorted(rules)
 
 
 def effective(
-    settings: SettingsConfig | None, protected: Sequence[Path]
+    settings: SettingsConfig | None,
+    protected: Sequence[Path],
+    write_protected: Sequence[Path] = (),
 ) -> dict[str, object] | None:
     """The settings to hand the engine for a line whose merged document is
-    ``settings``: ``ask`` rules become ``deny`` rules, and ``protected`` is denied to
-    the built-in file tools. ``None`` when there is nothing to hand over."""
+    ``settings``: ``ask`` rules become ``deny`` rules, ``protected`` is denied to the
+    built-in file tools, and ``write_protected``, such as a working directory's
+    ``.claude``, to the tools that write files. ``None`` when there is nothing to hand
+    over."""
     document = {} if settings is None else settings.document()
     permissions = cast(dict[str, list[str]], document.pop("permissions", {}))
     deny = {
         *permissions.get("deny", []),
         *permissions.get("ask", []),
         *protected_rules(protected),
+        *_rules(write_protected, ("Edit",)),
     }
     handed: dict[str, object] = {}
     if permissions.get("allow"):

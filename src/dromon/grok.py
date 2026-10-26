@@ -131,6 +131,8 @@ def unsupported(config: LineConfig) -> str | None:
         return "Grok lines do not yet support MCP servers"
     if config.claude_code_prompt:
         return "Grok lines run on Grok's own prompt, not Claude Code's"
+    if config.project_settings:
+        return "Grok lines do not load Claude Code's project settings"
     if config.sandbox is not None or config.settings is not None:
         return (
             "Grok lines run under a Grok sandbox profile, and take no sandbox or"

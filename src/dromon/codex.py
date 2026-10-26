@@ -136,6 +136,8 @@ def unsupported(config: LineConfig) -> str | None:
         return "Codex lines do not yet support MCP servers"
     if config.claude_code_prompt:
         return "Codex lines run on Codex's own instructions, not Claude Code's prompt"
+    if config.project_settings:
+        return "Codex lines do not load Claude Code's project settings"
     if config.sandbox is not None or config.settings is not None:
         return (
             "Codex lines run under Dromon's Codex permission profile, and take no"

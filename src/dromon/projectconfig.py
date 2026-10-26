@@ -57,6 +57,7 @@ TOP_KEYS: Final = frozenset(
         "settings",
         "teacher",
         "agents",
+        "leases",
         "profiles",
         "lines",
     }
@@ -68,6 +69,11 @@ LIMIT_KEYS: Final = frozenset(
     {"max_autonomous_turns", "max_cost_usd", "cooldown_seconds"}
 )
 WAKE_KEYS: Final = frozenset({"every_ticks"})
+LEASE_KEYS: Final = frozenset({"names", "ttl_seconds"})
+DEFAULT_LEASE_TTL: Final = 10800
+MIN_LEASE_TTL: Final = 60
+MAX_LEASE_TTL: Final = 86400
+MAX_LEASES: Final = 256
 TOOL_KEYS: Final = frozenset(
     {
         "builtin_tools",
@@ -79,6 +85,7 @@ TOOL_KEYS: Final = frozenset(
         "claude_code_prompt",
         "instructions",
         "workdir",
+        "project_settings",
     }
 )
 LAYERED_KEYS: Final = frozenset({"sandbox", "settings"})
@@ -151,6 +158,10 @@ class ProjectConfig:
     disclosure_terms: str | None = None
     """The project's disclosure list, a path relative to the project root, or
     ``None``. Only the path is held here. The daemon reads the terms."""
+    lease_names: tuple[str, ...] = ()
+    """The leases the project's lines may acquire, by name."""
+    lease_ttl_seconds: int = DEFAULT_LEASE_TTL
+    """How long an acquired lease lasts unless it is released first."""
     lines: dict[str, LineDefinition] = field(default_factory=dict[str, LineDefinition])
 
 
@@ -274,6 +285,7 @@ class _Reader:
                 agents = parse_policy(top["agents"])
             except AgentError as error:
                 raise self.fail("agents", str(error)) from error
+        lease_names, lease_ttl = self.leases(top.get("leases", {}))
         profiles = self.profiles(top.get("profiles", {}))
         lines_table = top.get("lines", {})
         if not isinstance(lines_table, dict):
@@ -292,6 +304,8 @@ class _Reader:
             agents=agents,
             require_sandbox=require_sandbox,
             disclosure_terms=terms,
+            lease_names=lease_names,
+            lease_ttl_seconds=lease_ttl,
             lines=lines,
         )
 
@@ -309,6 +323,27 @@ class _Reader:
             return Limits(turns, float(cast(float, cost)), float(cast(float, cooldown)))
         except ValueError as error:
             raise self.fail(key, str(error)) from error
+
+    def leases(self, value: object) -> tuple[tuple[str, ...], int]:
+        """The ``[leases]`` table, as its names and their time to live."""
+        document = self.table(value, "leases", LEASE_KEYS)
+        names = document.get("names", [])
+        if not isinstance(names, list) or len(cast(list[object], names)) > MAX_LEASES:
+            raise self.fail("leases.names", f"must be a list of at most {MAX_LEASES}")
+        found: list[str] = []
+        for name in cast(list[object], names):
+            if not isinstance(name, str) or ID_PATTERN.fullmatch(name) is None:
+                raise self.fail("leases.names", f"{name!r} is not an identifier")
+            if name in found:
+                raise self.fail("leases.names", f"names {name!r} twice")
+            found.append(name)
+        ttl = document.get("ttl_seconds", DEFAULT_LEASE_TTL)
+        if type(ttl) is not int or not MIN_LEASE_TTL <= ttl <= MAX_LEASE_TTL:
+            raise self.fail(
+                "leases.ttl_seconds",
+                f"must be a whole number from {MIN_LEASE_TTL} to {MAX_LEASE_TTL}",
+            )
+        return tuple(sorted(found)), ttl
 
     def wake(self, value: object, key: str, base: int) -> int:
         document = self.table(value, key, WAKE_KEYS)
