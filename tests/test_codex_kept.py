@@ -19,7 +19,7 @@ from dromon.codex import (
     Connection,
 )
 from dromon.driver import Driver, Strategy
-from dromon.engine import DIED_NOTE, EngineRefused, closed_note
+from dromon.engine import DIED_NOTE, BackgroundEnd, EngineRefused, closed_note
 from dromon.lineconfig import LineConfig
 
 LUNA = "gpt-6-luna"
@@ -142,6 +142,7 @@ class World:
         clock: Clock | None = None,
         poll: float = 3600.0,
         tools: list[SdkMcpTool[Any]] | None = None,
+        ends: list[BackgroundEnd] | None = None,
     ) -> CodexLine:
         @asynccontextmanager
         async def connect(
@@ -166,6 +167,7 @@ class World:
             server_lister=lambda env: [],
             clock=clock or Clock(),
             poll_seconds=poll,
+            task_ended=(ends if ends is not None else []).append,
         )
 
 
@@ -535,3 +537,160 @@ def test_writes_on_a_kept_connection_are_never_interleaved() -> None:
 
     asyncio.run(go())
     assert events == ["start 0", "end 0", "start 1", "end 1", "start 2", "end 2"]
+
+
+# Round 4. G, one lifecycle for the line's own terminals.
+
+
+def started_command(item_id: str, process_id: object, command: str) -> dict[str, Any]:
+    return {
+        "method": "item/started",
+        "params": {
+            "item": {
+                "type": "commandExecution",
+                "id": item_id,
+                "processId": process_id,
+                "command": command,
+            }
+        },
+    }
+
+
+def test_numeric_identifiers_match_and_both_views_agree(tmp_path: Path) -> None:
+    clock = Clock()
+    world = World([[started_command("i1", 59780, "sleep 120"), done()]])
+    world.terminals = [
+        {"itemId": "other", "processId": 59780, "osPid": 41},
+        {"itemId": "x", "processId": 11, "osPid": 42},
+    ]
+    engine = world.line(tmp_path, clock=clock)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        status = engine.kept_status()
+        assert status["tasks"] == [{"task_id": "59780", "command": "sleep 120"}]
+        assert (status["engine_listed"], status["tasks_listed_seconds_ago"]) == (2, 0)
+        listed = await engine.list_background()
+        assert listed == [{"process_id": "59780", "os_pid": 41, "command": "sleep 120"}]
+        assert engine.kept_status()["tasks"] == [
+            {"task_id": str(t["process_id"]), "command": t["command"]} for t in listed
+        ]
+        await engine.close()
+
+    asyncio.run(go())
+
+
+def kept_of(engine: CodexLine) -> Any:  # noqa: ANN401
+    return engine._kept  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_terminal_that_ends_between_turns_is_noted_once(tmp_path: Path) -> None:
+    clock = Clock()
+    ends: list[BackgroundEnd] = []
+    world = World([[started_command("i1", "p1", "sleep 120"), done()]])
+    world.terminals = [{"itemId": "i1", "processId": "p1", "osPid": 41}]
+    engine = world.line(tmp_path, clock=clock, ends=ends)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        kept = kept_of(engine)
+        world.terminals = []
+        # Not before the interval.
+        clock.now += 14
+        await engine._poll_terminals(kept)  # pyright: ignore[reportPrivateUsage]
+        assert ends == []
+        clock.now += 1
+        await engine._poll_terminals(kept)  # pyright: ignore[reportPrivateUsage]
+        assert ends == [BackgroundEnd("p1", "sleep 120", "ended")]
+        # Nothing is listed now, so nothing more is polled or noted.
+        clock.now += 60
+        await engine._poll_terminals(kept)  # pyright: ignore[reportPrivateUsage]
+        assert len(ends) == 1
+        await engine.close()
+
+    asyncio.run(go())
+    lists = [m for m in world.servers[0].sent if m.get("method") == LIST_TERMINALS]
+    assert len(lists) == 2
+
+
+def test_a_stopped_or_in_turn_end_is_not_noted(tmp_path: Path) -> None:
+    clock = Clock()
+    ends: list[BackgroundEnd] = []
+    world = World(
+        [
+            [
+                started_command("i1", "p1", "a"),
+                started_command("i2", "p2", "b"),
+                done(),
+            ],
+            [done()],
+        ]
+    )
+    world.terminals = [
+        {"itemId": "i1", "processId": "p1", "osPid": 41},
+        {"itemId": "i2", "processId": "p2", "osPid": 42},
+    ]
+    engine = world.line(tmp_path, clock=clock, ends=ends)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        await engine.stop_background("p1")
+        # A listing the line makes in its own turn shows it the end itself.
+        world.terminals = []
+        engine._in_turn = True  # pyright: ignore[reportPrivateUsage]
+        assert await engine.list_background() == []
+        engine._in_turn = False  # pyright: ignore[reportPrivateUsage]
+        clock.now += 30
+        await engine._poll_terminals(kept_of(engine))  # pyright: ignore[reportPrivateUsage]
+        await engine.close()
+
+    asyncio.run(go())
+    assert ends == []
+
+
+def test_an_end_found_after_a_turn_is_noted(tmp_path: Path) -> None:
+    # The engine does not tell the model that a terminal ended, so an end that the
+    # listing after a turn finds is noted once.
+    ends: list[BackgroundEnd] = []
+    world = World([[started_command("i1", "p1", "make"), done()], [done()]])
+    world.terminals = [{"itemId": "i1", "processId": "p1", "osPid": 41}]
+    engine = world.line(tmp_path, ends=ends)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        world.terminals = []
+        await engine.run_turn("second")
+        await engine.close()
+
+    asyncio.run(go())
+    assert ends == [BackgroundEnd("p1", "make", "ended")]
+
+
+def test_polling_stops_after_repeated_failures(tmp_path: Path) -> None:
+    clock = Clock()
+    world = World([[started_command("i1", "p1", "a"), done()]])
+    world.terminals = [{"itemId": "i1", "processId": "p1", "osPid": 41}]
+    engine = world.line(tmp_path, clock=clock)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        kept = kept_of(engine)
+        world.failing = {LIST_TERMINALS}
+        for _ in range(5):
+            clock.now += 20
+            await engine._poll_terminals(kept)  # pyright: ignore[reportPrivateUsage]
+        assert kept.poll_failures == 3
+        await engine.close()
+
+    asyncio.run(go())
+    lists = [m for m in world.servers[0].sent if m.get("method") == LIST_TERMINALS]
+    # One at the end of the turn, then three failures, then none.
+    assert len(lists) == 4
+
+
+def test_numbers_and_text_name_the_same_identifier() -> None:
+    from dromon.codex import identifier
+
+    assert identifier(59780) == identifier("59780") == "59780"
+    assert identifier(True) is None and identifier("") is None
+    assert identifier("x" * 129) is None and identifier(None) is None

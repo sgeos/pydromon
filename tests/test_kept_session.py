@@ -10,7 +10,7 @@ import json
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from claude_agent_sdk import (
@@ -1256,7 +1256,7 @@ def test_a_task_that_ends_between_turns_is_reported_once(tmp_path: Path) -> None
         await engine.close()
 
     asyncio.run(go())
-    assert ends == [BackgroundEnd("t1", "make gate", "completed")]
+    assert ends == [BackgroundEnd("t1", "make gate", "completed", None, "out.txt")]
 
 
 def test_a_task_without_a_known_command_is_named_by_its_description(
@@ -1439,3 +1439,486 @@ def test_a_line_without_keep_session_also_takes_the_difference(
     )
     costs = [asyncio.run(engine.run_turn(p)).cost_estimate_usd for p in "abc"]
     assert costs == [1.0, 0.5, 0.75]
+
+
+# Round 4. B, one note for a task end and the turn the engine began on it.
+
+
+def test_a_self_start_after_a_task_end_folds_into_its_note(tmp_path: Path) -> None:
+    factory = Factory(
+        [[bash("tu1", "sleep 90"), launched("t1", "tu1"), result()], [result()]]
+    )
+    ends: list[BackgroundEnd] = []
+    engine = background_line(factory, tmp_path, ends)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        connection = factory.connections[0]
+        connection.stream.put_nowait(notified("t1"))
+        connection.stream.put_nowait(say("re-invoked"))
+        await settle()
+        assert connection.interrupts == 1
+        connection.stream.put_nowait(result())
+        await settle()
+        await engine.run_turn("second")
+        await engine.close()
+
+    asyncio.run(go())
+    assert ends == [BackgroundEnd("t1", "sleep 90", "completed", None, "out.txt", True)]
+    # No separate note: the second prompt is the prompt alone.
+    assert factory.connections[0].prompts[1] == "second"
+
+
+def test_a_task_end_without_a_self_start_is_noted_after_the_grace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(engine_module, "SELF_START_GRACE_SECONDS", 0.01)
+    factory = Factory([[bash("tu1", "make gate"), launched("t1", "tu1"), result()]])
+    ends: list[BackgroundEnd] = []
+    engine = background_line(factory, tmp_path, ends)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        connection = factory.connections[0]
+        connection.stream.put_nowait(
+            TaskUpdatedMessage(
+                subtype="task_updated",
+                data={},
+                task_id="t1",
+                patch={"status": "completed"},
+            )
+        )
+        await settle()
+        # The notice that follows the update completes the waiting end.
+        connection.stream.put_nowait(
+            TaskNotificationMessage(
+                subtype="task_notification",
+                data={},
+                task_id="t1",
+                status="completed",
+                output_file="t1.output",
+                summary='Background command "x" completed (exit code 3)',
+                uuid="u",
+                session_id="session-1",
+            )
+        )
+        await settle()
+        assert ends == []
+        await asyncio.sleep(0.05)
+        await engine.close()
+
+    asyncio.run(go())
+    assert ends == [
+        BackgroundEnd("t1", "make gate", "completed", 3, "t1.output", False)
+    ]
+
+
+def test_a_self_start_without_a_task_end_keeps_its_own_note(tmp_path: Path) -> None:
+    factory = Factory([[result()], [result()]])
+    ends: list[BackgroundEnd] = []
+    engine = background_line(factory, tmp_path, ends)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        factory.connections[0].stream.put_nowait(say("by itself"))
+        factory.connections[0].stream.put_nowait(result())
+        await settle()
+        await engine.run_turn("second")
+        await engine.close()
+
+    asyncio.run(go())
+    assert ends == []
+    assert factory.connections[0].prompts[1].startswith(SELF_STARTED_NOTE)
+
+
+def test_end_details_read_the_exit_code_from_the_summary() -> None:
+    from dromon.engine import end_details
+
+    def notice(summary: str, output: str) -> TaskNotificationMessage:
+        return TaskNotificationMessage(
+            subtype="task_notification",
+            data={},
+            task_id="t",
+            status="failed",
+            output_file=output,
+            summary=summary,
+            uuid="u",
+            session_id="s",
+        )
+
+    assert end_details(notice("x failed (exit code -2)", "/o")) == (-2, "/o")
+    assert end_details(notice("x completed", "")) == (None, None)
+    assert end_details(say("x")) == (None, None)
+
+
+# E, the tokens behind a turn.
+
+
+def test_a_report_carries_the_turns_main_loop_tokens(tmp_path: Path) -> None:
+    from dromon.engine import usage_of
+
+    message = ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id="s",
+        total_cost_usd=0.5,
+        usage={
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 30,
+            "cache_creation_input_tokens": True,
+            "server_tool_use": {"web_search_requests": 0},
+        },
+    )
+    factory = Factory([[message]])
+    engine = line(factory, tmp_path)
+
+    async def go() -> None:
+        report = await engine.run_turn("one")
+        assert report.usage == {
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 30,
+        }
+        await engine.close()
+
+    asyncio.run(go())
+    assert usage_of(None) is None
+    assert usage_of({"input_tokens": -1}) is None
+
+
+# A, a mark recorded to the millionth still matches.
+
+
+def test_a_rounded_mark_does_not_read_as_a_restart() -> None:
+    assert turn_cost(0.1234565, "s", ("s", 0.123457)) == 0.0
+    assert turn_cost(0.2, "s", ("s", 0.123457)) == pytest.approx(0.076543)
+
+
+# I, one more start after an initialize timeout.
+
+
+def test_an_initialize_timeout_is_retried_once(tmp_path: Path) -> None:
+    from dromon.activity import ActivityKind
+    from dromon.engine import INITIALIZE_TIMEOUT
+
+    starts: list[int] = []
+    seen: list[tuple[ActivityKind, str]] = []
+
+    def watch(kind: ActivityKind, text: str, *, chunk: bool = False) -> None:
+        del chunk
+        seen.append((kind, text))
+
+    @asynccontextmanager
+    async def flaky(options: ClaudeAgentOptions) -> AsyncGenerator[AgentSession]:
+        del options
+        starts.append(1)
+        if len(starts) == 1:
+            raise Exception(INITIALIZE_TIMEOUT)  # noqa: TRY002
+        yield OneTurn("s", 0.5)
+
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        environment={},
+        session_factory=flaky,
+        observe=watch,
+    )
+    report = asyncio.run(engine.run_turn("a"))
+    assert report.cost_estimate_usd == 0.5 and len(starts) == 2
+    assert seen[0][0] is ActivityKind.NOTICE and "once more" in seen[0][1]
+
+
+def test_a_second_initialize_timeout_or_another_failure_ends_the_turn(
+    tmp_path: Path,
+) -> None:
+    from dromon.engine import INITIALIZE_TIMEOUT
+
+    failures = [Exception(INITIALIZE_TIMEOUT), Exception(INITIALIZE_TIMEOUT)]
+
+    @asynccontextmanager
+    async def timing_out(options: ClaudeAgentOptions) -> AsyncGenerator[AgentSession]:
+        del options
+        raise failures.pop()
+        yield OneTurn("s", 0.5)
+
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        environment={},
+        session_factory=timing_out,
+    )
+    with pytest.raises(Exception, match="Control request timeout"):
+        asyncio.run(engine.run_turn("a"))
+    assert failures == []
+    other = [RuntimeError("no engine"), Exception(INITIALIZE_TIMEOUT)]
+
+    @asynccontextmanager
+    async def broken(options: ClaudeAgentOptions) -> AsyncGenerator[AgentSession]:
+        del options
+        raise other.pop(0)
+        yield OneTurn("s", 0.5)
+
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        environment={},
+        session_factory=broken,
+    )
+    with pytest.raises(RuntimeError, match="no engine"):
+        asyncio.run(engine.run_turn("a"))
+    assert len(other) == 1
+
+
+def test_a_kept_connection_retries_an_initialize_timeout(tmp_path: Path) -> None:
+    from dromon.engine import INITIALIZE_TIMEOUT
+
+    factory = Factory([[result()]])
+    attempts: list[int] = []
+
+    def flaky(options: ClaudeAgentOptions) -> AbstractAsyncContextManager[KeptSession]:
+        attempts.append(1)
+        if len(attempts) == 1:
+
+            @asynccontextmanager
+            async def fail() -> AsyncGenerator[KeptSession]:
+                raise Exception(INITIALIZE_TIMEOUT)  # noqa: TRY002
+                yield cast(KeptSession, None)
+
+            return fail()
+        return factory(options)
+
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        config=KEPT,
+        environment={},
+        kept_factory=flaky,
+    )
+
+    async def go() -> None:
+        await engine.run_turn("one")
+        await engine.close()
+
+    asyncio.run(go())
+    assert len(attempts) == 2 and len(factory.connections) == 1
+
+
+# Review of round 4. F2, a failed start leaves no engine process behind.
+
+
+def test_a_failed_sdk_connect_closes_its_transport_before_raising() -> None:
+    """The retry after an initialize timeout relies on this: ClaudeSDKClient's
+    connect disconnects on any failure after the process starts, which closes the
+    transport and so ends the process, before it raises."""
+    from claude_agent_sdk import ClaudeSDKClient
+    from claude_agent_sdk._internal.transport import Transport
+
+    events: list[str] = []
+
+    class Failing(Transport):
+        async def connect(self) -> None:
+            events.append("connect")
+
+        async def write(self, data: str) -> None:
+            del data
+            events.append("write")
+            raise RuntimeError("the engine stopped answering")
+
+        def read_messages(self) -> AsyncIterator[dict[str, Any]]:
+            async def nothing() -> AsyncIterator[dict[str, Any]]:
+                await asyncio.Event().wait()
+                yield {}
+
+            return nothing()
+
+        async def close(self) -> None:
+            events.append("close")
+
+        def is_ready(self) -> bool:
+            return True
+
+        async def end_input(self) -> None:
+            events.append("end_input")
+
+    async def go() -> None:
+        client = ClaudeSDKClient(options=ClaudeAgentOptions(), transport=Failing())
+        with pytest.raises(Exception):  # noqa: B017, PT011
+            await client.connect()
+
+    asyncio.run(go())
+    assert events[0] == "connect" and "close" in events
+    assert events.index("close") > events.index("write")
+
+
+# The engine's per-turn usage, which the SDK's parser drops.
+
+
+def raw_result(per_turn: object) -> dict[str, Any]:
+    return {
+        "type": "result",
+        "subtype": "success",
+        "duration_ms": 1,
+        "duration_api_ms": 1,
+        "is_error": False,
+        "num_turns": 1,
+        "session_id": "s",
+        "total_cost_usd": 9.0,
+        "usage": {"input_tokens": 1, "output_tokens": 2},
+        "model_usage_since_last_result": per_turn,
+    }
+
+
+PER_TURN = {
+    "claude-opus-5-5": {
+        "inputTokens": 100,
+        "outputTokens": 50,
+        "cacheReadInputTokens": 1000,
+        "cacheCreationInputTokens": 10,
+        "costUSD": 0.25,
+    },
+    "claude-haiku-5-5": {"inputTokens": 5, "outputTokens": 5, "costUSD": 0.01},
+}
+
+
+def test_the_sdks_parse_keeps_the_per_turn_usage_through_the_wrapper() -> None:
+    from claude_agent_sdk._internal.message_parser import parse_message
+
+    from dromon.engine import TurnResult, turn_usage_of, with_turn_usage
+
+    data = raw_result(PER_TURN)
+    message = with_turn_usage(cast(Message, parse_message(data)), data)
+    assert isinstance(message, TurnResult)
+    assert message.total_cost_usd == 9.0 and message.session_id == "s"
+    found = turn_usage_of(message)
+    assert found is not None
+    cost, tokens = found
+    assert cost == pytest.approx(0.26)
+    assert tokens == {
+        "input_tokens": 105,
+        "output_tokens": 55,
+        "cache_read_input_tokens": 1000,
+        "cache_creation_input_tokens": 10,
+    }
+    plain = raw_result(None)
+    assert not isinstance(
+        with_turn_usage(cast(Message, parse_message(plain)), plain), TurnResult
+    )
+
+
+@pytest.mark.parametrize(
+    "per_turn",
+    [
+        {"m": {"costUSD": -1.0}},
+        {"m": {"costUSD": "0.1"}},
+        {"m": {"costUSD": True}},
+        {"m": {"costUSD": float("inf")}},
+        {"m": "not an entry"},
+        {},
+    ],
+)
+def test_a_malformed_per_turn_usage_falls_back(per_turn: dict[str, Any]) -> None:
+    from claude_agent_sdk._internal.message_parser import parse_message
+
+    from dromon.engine import turn_usage_of, with_turn_usage
+
+    data = raw_result(per_turn)
+    message = with_turn_usage(cast(Message, parse_message(data)), data)
+    assert turn_usage_of(cast(ResultMessage, message)) is None
+
+
+def test_a_turn_prefers_the_per_turn_cost_and_moves_the_mark(tmp_path: Path) -> None:
+    from claude_agent_sdk._internal.message_parser import parse_message
+
+    from dromon.engine import DIFFERENCE_SOURCE, PER_TURN_SOURCE, with_turn_usage
+
+    with_usage = raw_result(PER_TURN)
+    without = raw_result(None)
+    without["total_cost_usd"] = 9.5
+    factory = Factory(
+        [
+            [with_turn_usage(cast(Message, parse_message(with_usage)), with_usage)],
+            [cast(Message, parse_message(without))],
+        ]
+    )
+    engine = line(factory, tmp_path)
+
+    async def go() -> None:
+        first = await engine.run_turn("one")
+        assert first.cost_estimate_usd == pytest.approx(0.26)
+        assert first.cost_source == PER_TURN_SOURCE
+        assert first.usage is not None and first.usage["input_tokens"] == 105
+        second = await engine.run_turn("two")
+        # Without the per-turn figures, the difference from the mark is taken.
+        assert second.cost_estimate_usd == pytest.approx(0.5)
+        assert second.cost_source == DIFFERENCE_SOURCE
+        assert second.usage == {"input_tokens": 1, "output_tokens": 2}
+        await engine.close()
+
+    asyncio.run(go())
+
+
+def test_the_wrapper_reads_a_real_clients_messages_with_their_per_turn_usage() -> None:
+    """Drives ClaudeSDKClient through a scripted transport, so an SDK upgrade that
+    changes the internal query the wrapper reads fails here."""
+    import json as json_module
+
+    from claude_agent_sdk._internal.transport import Transport
+
+    from dromon.engine import TurnResult, _SdkClient  # pyright: ignore[reportPrivateUsage]
+
+    class Scripted(Transport):
+        def __init__(self) -> None:
+            self.out: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+            self.closed = False
+
+        async def connect(self) -> None:
+            pass
+
+        async def write(self, data: str) -> None:
+            message = json_module.loads(data)
+            if message.get("type") == "control_request":
+                self.out.put_nowait(
+                    {
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": message["request_id"],
+                            "response": {},
+                        },
+                    }
+                )
+            elif message.get("type") == "user":
+                self.out.put_nowait(raw_result(PER_TURN))
+
+        def read_messages(self) -> AsyncIterator[dict[str, Any]]:
+            async def messages() -> AsyncIterator[dict[str, Any]]:
+                while not self.closed:
+                    yield await self.out.get()
+
+            return messages()
+
+        async def close(self) -> None:
+            self.closed = True
+
+        def is_ready(self) -> bool:
+            return True
+
+        async def end_input(self) -> None:
+            pass
+
+    transport = Scripted()
+    received: list[Message] = []
+
+    async def go() -> None:
+        async with _SdkClient(ClaudeAgentOptions(), transport) as session:
+            await session.query("hello")
+            async for message in session.receive_response():
+                received.append(message)
+
+    asyncio.run(go())
+    assert len(received) == 1 and isinstance(received[0], TurnResult)
+    assert received[0].turn_model_usage == PER_TURN

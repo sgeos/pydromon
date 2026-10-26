@@ -23,7 +23,11 @@ from dromon.protocol import (
 )
 
 REQUEST_TIMEOUT_SECONDS: Final = 5.0
-STARTUP_TIMEOUT_SECONDS: Final = 10.0
+STARTUP_TIMEOUT_SECONDS: Final = 60.0
+"""How long ``start`` waits by default for the daemon to answer. **Fact, observed on
+2026-10-26.** On a loaded host the daemon was still starting after 10 seconds."""
+
+MAX_START_WAIT_SECONDS: Final = 600.0
 SHUTDOWN_TIMEOUT_SECONDS: Final = 10.0
 POLL_INTERVAL_SECONDS: Final = 0.05
 
@@ -87,13 +91,22 @@ def is_running(paths: ProjectPaths) -> bool:
         return False
 
 
-def start(paths: ProjectPaths, daemon_args: Sequence[str] = ()) -> int:
+def start(
+    paths: ProjectPaths,
+    daemon_args: Sequence[str] = (),
+    wait_seconds: float = STARTUP_TIMEOUT_SECONDS,
+) -> int:
     """Start a detached daemon for ``paths`` and return its process id.
 
     The daemon runs in a new session with no terminal, so it survives the client. Its
     output goes to ``dromond.log`` in the runtime directory. Raises ``DaemonFailed`` if
-    it exits or does not answer within the startup timeout.
+    it exits or does not answer within ``wait_seconds``, and ``ValueError`` for a wait
+    that is not above 0 and at most ``MAX_START_WAIT_SECONDS``.
     """
+    if not 0 < wait_seconds <= MAX_START_WAIT_SECONDS:
+        raise ValueError(
+            f"the wait must be above 0 and at most {MAX_START_WAIT_SECONDS:g} seconds"
+        )
     ensure_private_dir(paths.state_dir)
     ensure_private_dir(paths.runtime_dir)
     output = os.open(paths.daemon_output, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -125,7 +138,7 @@ def start(paths: ProjectPaths, daemon_args: Sequence[str] = ()) -> int:
     finally:
         os.close(null)
         os.close(output)
-    deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
+    deadline = time.monotonic() + wait_seconds
     while time.monotonic() < deadline:
         finished, status = os.waitpid(pid, os.WNOHANG)
         if finished:
@@ -138,8 +151,7 @@ def start(paths: ProjectPaths, daemon_args: Sequence[str] = ()) -> int:
         time.sleep(POLL_INTERVAL_SECONDS)
     os.kill(pid, signal.SIGTERM)
     raise DaemonFailed(
-        f"the daemon did not answer within {STARTUP_TIMEOUT_SECONDS}s."
-        f" See {paths.daemon_output}"
+        f"the daemon did not answer within {wait_seconds:g}s. See {paths.daemon_output}"
     )
 
 

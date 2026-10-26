@@ -113,7 +113,7 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 
 | Command | Behaviour | Exit status |
 |---|---|---|
-| `dromon start` | Starts a detached `dromond` in a new session and waits up to 10 seconds for it to answer `ping`. Succeeds without action when a daemon already answers | 0, or 1 on failure |
+| `dromon start` | Starts a detached `dromond` in a new session and waits for it to answer `ping`, up to 60 seconds or the `--wait` seconds given, above 0 and at most 600. On a loaded host the daemon was observed still starting after 10 seconds. Succeeds without action when a daemon already answers | 0, or 1 on failure |
 | `dromon status` | Prints the `status` result | 0, 4 when no daemon answers, or 1 |
 | `dromon stop` | Sends `stop` and waits up to 10 seconds for the socket to disappear | 0, 4 when no daemon answers, or 1 |
 | `dromon create LINE` | Sends `create_line`, with `--model`, default `claude-haiku-5-5`, `--strategy`, default `subscription`, `--session`, an engine session to continue, which must have been started in the line's working directory, and the tool options below | 0, 4, or 1 |
@@ -164,6 +164,7 @@ not part of the event log, is not persisted, and is lost when the daemon stops.
 | `thinking` | Empty. The engine reasoned, and reasoning is not shown |
 | `tool` | The name of the tool the engine called |
 | `turn_ended` | How the turn ended. The engine's result subtype, such as `success`, with the reason when its driver interrupted it, `failed:` and the error, `interrupted by an operator`, or `cancelled` at shutdown |
+| `notice` | Dromon's own remark on the turn, such as that the engine's start timed out at its initialize request and was tried once more. **Fact, read from Agent SDK 0.2.174 and tested.** The client's failed connect disconnects before it raises, which ends the first engine process before the second start |
 
 Each entry has an `entry_id`, which never changes, and a `seq`, the daemon-wide revision
 at which it last changed. Only a line's newest entry changes, when an engine that

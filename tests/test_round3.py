@@ -3,8 +3,9 @@ background tasks that end between turns, the new ``line_status`` fields, and the
 warning that an operator's action stops a kept session's tasks."""
 
 import asyncio
+import os
 import json
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,7 +18,7 @@ from dromon.configview import Overrides
 from dromon.daemon import Daemon
 from dromon.driver import Strategy
 from dromon.engine import BackgroundEnd, TurnReport
-from dromon.eventlog import EventLog
+from dromon.eventlog import EventLog, read_entries
 from dromon.limits import Limits
 from dromon.model import LineAddress, OperatorAddress
 from dromon.paths import ProjectPaths, project_paths
@@ -79,6 +80,7 @@ class Engine:
 
 class World:
     def __init__(self, path: Path, tasks: int = 0) -> None:
+        self.log_path = path
         self.log = EventLog(path)
         self.clock = Clock()
         self.ticks = Ticks()
@@ -213,11 +215,13 @@ def test_a_long_command_is_cut(world: World) -> None:
 
 
 def test_line_status_gives_the_cost_of_the_last_ten_turns(world: World) -> None:
-    assert world.status()["recent_turn_costs_usd"] == []
+    assert world.status()["recent_turns"] == []
     for index in range(12):
         world.run(f"turn {index}")
-    costs = world.status()["recent_turn_costs_usd"]
-    assert costs == ["0.1250"] * scheduler_module.RECENT_TURN_COSTS
+    turns = world.status()["recent_turns"]
+    assert len(turns) == scheduler_module.RECENT_TURN_COSTS
+    assert {turn["cost_usd"] for turn in turns} == {"0.1250"}
+    assert turns[0]["usage_note"] == "the engine reports no token usage"
 
 
 def test_line_status_gives_a_fired_wakes_lateness(world: World) -> None:
@@ -339,7 +343,7 @@ def test_task_noted_checks_its_fields() -> None:
     with pytest.raises(InvalidField):
         TaskNoted("alpha", "n-1", "t", "s" * 33, "x")
     with pytest.raises(InvalidField):
-        TaskNoted("alpha", "n-1", "t", "completed", "x" * 2001)
+        TaskNoted("alpha", "n-1", "t", "completed", "x" * 8193)
 
 
 def test_engine_text_is_cut_to_valid_bounded_utf8(world: World) -> None:
@@ -444,3 +448,356 @@ def test_a_command_posing_as_instructions_is_quoted(world: World) -> None:
     assert json.dumps(command) in note
     assert "\n" not in note
     assert "quoted below as data from your own tool call" in note
+
+
+# Round 4. A, the cost mark in the event log.
+
+
+class Marked(Engine):
+    """An engine that reports a running total for session ``s``."""
+
+    totals = iter([1.5, 1.5, 2.25])
+    """Shared, since the scheduler rebuilds the engine after each stop."""
+
+    async def run_turn(self, prompt: str) -> TurnReport:
+        self.prompts.append(prompt)
+        total = next(Marked.totals)
+        return TurnReport(
+            "success", 1, "ok", (), None, None, "s", None, 0.0, ("s", total)
+        )
+
+
+def test_each_turn_with_a_new_total_records_one_cost_mark(world: World) -> None:
+    from dromon.model import LineCostMarked
+
+    world.scheduler._engine_factory = factory_of(Marked)  # pyright: ignore[reportPrivateUsage]
+    world.run("one")
+    world.run("two")
+    world.run("three")
+    marks = [
+        entry.event
+        for entry in read_entries(world.log_path)
+        if isinstance(entry.event, LineCostMarked)
+    ]
+    # The second turn's total did not change, so it records nothing.
+    assert [(m.engine_session, m.total_micro_usd) for m in marks] == [
+        ("s", 1_500_000),
+        ("s", 2_250_000),
+    ]
+    assert world.log.state.lines["alpha"].cost_mark == ("s", 2_250_000)
+
+
+def test_a_restarted_daemon_hands_the_recorded_mark_to_the_engine(
+    tmp_path: Path,
+) -> None:
+    from dromon.model import LineCostMarked
+
+    path = tmp_path / "events.sqlite"
+    first = World(path)
+    first.log.append(LineCostMarked("alpha", "s", 97_601_800))
+    first.log.close()
+    second = World(path)
+    try:
+        specs: list[LineSpec] = []
+
+        def build(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> Engine:
+            del tools
+            specs.append(spec)
+            return Engine(spec)
+
+        second.scheduler._engine_factory = build  # pyright: ignore[reportPrivateUsage]
+        second.scheduler.engine_for("alpha")
+        assert specs[0].cost_mark == ("s", 97.6018)
+    finally:
+        second.log.close()
+
+
+def test_a_cost_mark_event_is_checked() -> None:
+    from dromon.model import InvalidField, LineCostMarked
+
+    for total in (-1, 10**15 + 1, 1.5, True):
+        with pytest.raises(InvalidField, match="total_micro_usd"):
+            LineCostMarked("alpha", "s", cast(int, total))
+    with pytest.raises(InvalidField, match="engine_session is empty"):
+        LineCostMarked("alpha", "", 1)
+
+
+# B and D, the task-end note.
+
+
+def test_a_note_says_the_engine_began_a_turn_and_gives_the_exit_code(
+    world: World,
+) -> None:
+    end = BackgroundEnd("t1", "make gate", "failed", 2, None, True)
+    world.scheduler.background_ended("alpha", end)
+    (note,) = world.notes()
+    assert note.startswith(
+        "Your background task t1 ended with status failed and exit code 2. The"
+        " engine began a turn by itself when it ended, which Dromon interrupted"
+    )
+
+
+@pytest.fixture
+def rooted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Generator[World]:
+    engine_root = tmp_path.resolve() / "engine-output"
+    engine_root.mkdir()
+    monkeypatch.setattr(scheduler_module, "engine_output_roots", lambda: [engine_root])
+    root = tmp_path.resolve() / "project"
+    (root / ".dromon").mkdir(parents=True)
+    target = World(tmp_path / "events.sqlite")
+    target.scheduler._root = root  # pyright: ignore[reportPrivateUsage]
+    target.scheduler._protected = (root / ".dromon",)  # pyright: ignore[reportPrivateUsage]
+    yield target
+    target.log.close()
+
+
+def output_note(world: World, path: Path) -> str:
+    end = BackgroundEnd(f"t{len(world.notes())}", "make", "completed", 0, str(path))
+    world.scheduler.background_ended("alpha", end)
+    return world.notes()[-1]
+
+
+def task_output(root: Path, name: str, text: str, folder: str = "tasks") -> Path:
+    directory = root / folder
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text(text)
+    return path
+
+
+def test_a_note_quotes_the_head_of_the_output(rooted: World) -> None:
+    root = cast(Path, rooted.scheduler._root)  # pyright: ignore[reportPrivateUsage]
+    output = task_output(root, "b1.output", "".join(f"line {n}\n" for n in range(40)))
+    note = output_note(rooted, output)
+    head = "\n".join(f"line {n}" for n in range(20))
+    assert json.dumps(head) in note and "line 20" not in note
+    assert "quoted as data your task wrote" in note
+    big = task_output(root, "b2.output", "y" * 5000)
+    assert json.dumps("y" * 2048) in output_note(rooted, big)
+    empty = task_output(root, "b3.output", "")
+    assert "Its output file is empty." in output_note(rooted, empty)
+
+
+def refused(world: World, path: Path) -> bool:
+    note = output_note(world, path)
+    return "private" not in note and "output" not in note.split(" was ")[-1]
+
+
+def test_an_output_the_line_may_not_read_is_not_quoted(
+    rooted: World, tmp_path: Path
+) -> None:
+    root = cast(Path, rooted.scheduler._root)  # pyright: ignore[reportPrivateUsage]
+    elsewhere = tmp_path / "elsewhere"
+    # Inside a protected directory.
+    assert refused(rooted, task_output(root / ".dromon", "a.output", "private"))
+    # Outside every root.
+    assert refused(rooted, task_output(elsewhere, "b.output", "private"))
+    # A final link.
+    target = task_output(elsewhere, "c.output", "private")
+    link = root / "tasks" / "link.output"
+    link.parent.mkdir(exist_ok=True)
+    link.symlink_to(target)
+    assert refused(rooted, link)
+    # A directory on the way that is a link.
+    (root / "swapped").symlink_to(elsewhere)
+    assert refused(rooted, root / "swapped" / "tasks" / "c.output")
+    # A file with a second name.
+    twice = task_output(root, "twice.output", "private")
+    os.link(twice, root / "tasks" / "twice-again.output")
+    assert refused(rooted, twice)
+    # A missing file.
+    assert refused(rooted, root / "tasks" / "missing.output")
+
+
+def test_only_task_output_names_are_read_in_the_workdir(rooted: World) -> None:
+    root = cast(Path, rooted.scheduler._root)  # pyright: ignore[reportPrivateUsage]
+    assert refused(rooted, task_output(root, "notes.txt", "private"))
+    assert refused(rooted, task_output(root, "x.output", "private", folder="logs"))
+    assert refused(rooted, task_output(root, ".output", "private"))
+    assert refused(rooted, root / "tasks" / ".." / "tasks" / "x.output")
+
+
+def test_a_directory_swapped_for_a_link_between_check_and_read_is_refused(
+    rooted: World, tmp_path: Path
+) -> None:
+    root = cast(Path, rooted.scheduler._root)  # pyright: ignore[reportPrivateUsage]
+    target = task_output(tmp_path / "elsewhere", "d.output", "private")
+    real = task_output(root, "d.output", "mine")
+    assert json.dumps("mine") in output_note(rooted, real)
+    # The tasks directory is replaced by a link to another, as a racing process
+    # could do at any moment. The walk does not follow it.
+    (root / "tasks").rename(root / "old-tasks")
+    (root / "tasks").symlink_to(target.parent)
+    assert refused(rooted, root / "tasks" / "d.output")
+
+
+def test_an_output_on_the_disclosure_list_is_withheld(rooted: World) -> None:
+    root = cast(Path, rooted.scheduler._root)  # pyright: ignore[reportPrivateUsage]
+    rooted.scheduler.set_disclosure_terms(["secret name"])
+    output = task_output(root, "s.output", "the Secret Name is here")
+    note = output_note(rooted, output)
+    assert "Its output is withheld" in note and "Secret" not in note
+
+
+# C, notes to oneself are not unanswered.
+
+
+def test_a_lines_notes_to_itself_are_not_counted_unanswered(world: World) -> None:
+    from dromon.mailbox import summary
+    from dromon.model import MessageDelivered
+
+    note = world.scheduler.background_ended("alpha", END)
+    request = world.scheduler.send(ANA, LineAddress("alpha"), "a request")
+    for message_id in (note, request):
+        world.log.append(MessageDelivered(cast(str, message_id)))
+    counts = summary(world.log.state, LineAddress("alpha"), 0)
+    assert (counts.unread, counts.unanswered) == (2, 1)
+
+
+# E, each recent turn explains its cost.
+
+
+class Using(Engine):
+    async def run_turn(self, prompt: str) -> TurnReport:
+        self.prompts.append(prompt)
+        return TurnReport(
+            "success",
+            1,
+            "ok",
+            (),
+            None,
+            None,
+            "s",
+            None,
+            0.25,
+            None,
+            {"input_tokens": 10, "output_tokens": 5},
+        )
+
+
+def test_a_recent_turn_gives_its_tokens(world: World) -> None:
+    world.scheduler._engine_factory = factory_of(Using)  # pyright: ignore[reportPrivateUsage]
+    world.run("one")
+    (turn,) = world.status()["recent_turns"]
+    assert turn["cost_usd"] == "0.2500" and turn["cost_note"] is None
+    assert turn["usage"] == {"input_tokens": 10, "output_tokens": 5}
+    assert "main loop" in turn["usage_note"]
+
+
+def test_a_recent_turn_says_when_the_engine_reports_no_cost(world: World) -> None:
+    from dromon.scheduler import _turn_entry  # pyright: ignore[reportPrivateUsage]
+
+    entry = _turn_entry(
+        TurnReport("success", 1, "ok", (), None, None, "th", None, None)
+    )
+    assert entry["cost_usd"] is None
+    assert entry["cost_note"] == "the engine reports no cost"
+    assert entry["usage_note"] == "the engine reports no token usage"
+
+
+# F, whether the turn in flight counts.
+
+
+def test_line_status_says_whether_the_turn_in_flight_counts(world: World) -> None:
+    seen: list[object] = []
+
+    class Looking(Engine):
+        async def run_turn(self, prompt: str) -> TurnReport:
+            seen.append(world.status()["autonomous_turns"]["current_turn_counts"])
+            return await super().run_turn(prompt)
+
+    world.scheduler._engine_factory = factory_of(Looking)  # pyright: ignore[reportPrivateUsage]
+    world.run("from an operator")
+    world.scheduler.background_ended("alpha", END)
+    world.run()
+    assert seen == [False, True]
+    assert world.status()["autonomous_turns"]["used"] == 1
+    assert world.status()["autonomous_turns"]["current_turn_counts"] is None
+
+
+def factory_of(
+    kind: type[Engine],
+) -> Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], Engine]:
+    def build(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> Engine:
+        del tools
+        return kind(spec)
+
+    return build
+
+
+def test_the_engines_location_yields_only_task_output(
+    rooted: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del monkeypatch
+    tasks = tmp_path.resolve() / "engine-output" / "project" / "session" / "tasks"
+    tasks.mkdir(parents=True)
+    output = tasks / "b1.output"
+    output.write_text("done\n")
+    assert json.dumps("done") in output_note(rooted, output)
+    other = tasks.parent / "notes.txt"
+    other.write_text("private")
+    assert "private" not in output_note(rooted, other)
+
+
+# H, how long start waits.
+
+
+def test_start_waits_sixty_seconds_by_default_and_takes_a_wait() -> None:
+    from dromon.cli import build_parser
+    from dromon.client import STARTUP_TIMEOUT_SECONDS
+
+    assert STARTUP_TIMEOUT_SECONDS == 60.0
+    assert build_parser().parse_args(["start"]).wait == 60.0
+    assert build_parser().parse_args(["start", "--wait", "120"]).wait == 120.0
+
+
+@pytest.mark.parametrize("wait", [0.0, -1.0, 601.0])
+def test_start_refuses_a_wait_out_of_bounds(paths: ProjectPaths, wait: float) -> None:
+    from dromon.client import start
+
+    with pytest.raises(ValueError, match="above 0 and at most 600"):
+        start(paths, wait_seconds=wait)
+
+
+def test_start_gives_up_after_its_wait(
+    paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dromon import client
+
+    now = [0.0]
+    killed: list[int] = []
+
+    def spawn(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        return 4242
+
+    def waitpid(pid: int, flags: int) -> tuple[int, int]:
+        del pid, flags
+        return 0, 0
+
+    def kill(pid: int, signal_number: int) -> None:
+        del signal_number
+        killed.append(pid)
+
+    def not_running(given: ProjectPaths) -> bool:
+        del given
+        return False
+
+    def tick() -> float:
+        now[0] += 10.0
+        return now[0]
+
+    def rest(seconds: float) -> None:
+        del seconds
+
+    monkeypatch.setattr(client.os, "posix_spawn", spawn)
+    monkeypatch.setattr(client.os, "waitpid", waitpid)
+    monkeypatch.setattr(client.os, "kill", kill)
+    monkeypatch.setattr(client, "is_running", not_running)
+    monkeypatch.setattr(client.time, "monotonic", tick)
+    monkeypatch.setattr(client.time, "sleep", rest)
+    with pytest.raises(client.DaemonFailed, match="within 30s"):
+        client.start(paths, wait_seconds=30.0)
+    assert killed == [4242]
+    # Three polls of ten seconds fit in a wait of thirty.
+    assert now[0] == 40.0

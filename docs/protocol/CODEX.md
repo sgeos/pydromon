@@ -260,6 +260,25 @@ turn. `dromon probe --model gpt-6-luna` reported the subscription credential.
     and is looked for as `command`, `commandLine` or `cmd`. The second takes a
     `process_id` of 1 to 128 characters, which must be in a fresh listing of the same
     thread, and terminates it. Both refuse when no Codex session is kept.
-  - **Not done.** Codex was not found to report a terminal's end as an event, so a
-    Codex line gets no note when one ends, and its count of terminals is refreshed by a
-    listing at the end of each turn.
+  - **One lifecycle.** **Decided by the operator on 2026-10-26** in round 4. The last
+    listing of the line's own terminals is the one source of both `list_background`
+    and the status's task list, which also gives how many seconds ago it was listed and
+    how many terminals the engine listed in all. A listing is made at the end of each
+    turn, by `list_background`, and between turns by polling. Identifiers are matched
+    as text whether the engine sends text or a whole number. Commands are named from
+    the line's own command execution items when a listing gives none.
+  - **Why the two views disagreed.** **Not established.** The luna line saw a task in
+    the status that `list_background` did not list. In round 3 the status showed the
+    listing taken at the end of the previous turn, while the tool listed afresh, so the
+    two were taken at different times. Round 3 also matched identifiers as text only,
+    and the task's identifier, 59780, looks like a number. Either could explain it, and
+    the raw listing was not kept to tell which. The status now gives the listing's age
+    and the engine's count, which will show the difference if it happens again.
+  - **A note when a terminal ends.** Codex was not found to report a terminal's end, so
+    while the line has a listed terminal, a kept connection lists its terminals again
+    between turns, at most once every 15 seconds, and stops after 3 failed listings
+    until the next turn ends. A terminal that a listing no longer holds, other than one
+    the line stopped with `stop_background` or saw end in a listing of its own turn,
+    wakes the line with the same task-end note, with the status `ended`, since the
+    listing gives no exit code. An end found by the listing after a turn is noted too,
+    since the engine does not tell the model that a terminal ended.
