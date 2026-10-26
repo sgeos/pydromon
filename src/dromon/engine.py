@@ -475,6 +475,21 @@ def begins_turn(message: Message) -> bool:
     )
 
 
+STOP_TOOLS: Final = frozenset({"TaskStop", "KillShell", "KillBash"})
+"""The engine's tool that stops a background task, under its name and its aliases."""
+
+
+def task_status(message: Message) -> str:
+    """The final status a task's end reports, such as ``completed``, ``failed``,
+    ``stopped`` or ``killed``, or ``ended`` when none is given."""
+    if isinstance(message, TaskNotificationMessage):
+        return str(message.status)
+    if isinstance(message, TaskUpdatedMessage):
+        status = message.status or message.patch.get("status")
+        return status if isinstance(status, str) else "ended"
+    return "ended"
+
+
 def task_ended(message: Message) -> str | None:
     """The background task ``message`` reports ended, or ``None``."""
     if isinstance(message, TaskNotificationMessage):
@@ -484,6 +499,57 @@ def task_ended(message: Message) -> str | None:
         if status in TERMINAL_TASK_STATUSES:
             return message.task_id
     return None
+
+
+MAX_TRACKED_COMMANDS: Final = 256
+"""How many tool calls' commands a kept connection remembers, to name the background
+task each starts, oldest forgotten first."""
+
+MAX_COMMAND_CHARACTERS: Final = 200
+
+
+@dataclass(frozen=True, slots=True)
+class BackgroundEnd:
+    """A background task the engine reported finished between turns."""
+
+    task_id: str
+    command: str
+    """The command its tool call ran, or the engine's description of the task."""
+    status: str
+
+
+def ignore_end(end: BackgroundEnd) -> None:
+    """The default for an engine whose task ends nobody follows."""
+    del end
+
+
+type CostMark = tuple[str, float]
+"""An engine session and the running cost total its last result reported."""
+
+
+def turn_cost(total: float | None, session: str, mark: CostMark | None) -> float | None:
+    """One turn's cost, from the running ``total`` its result reported for
+    ``session`` and the ``mark`` left by the turn before, or ``None`` when the engine
+    reported none.
+
+    **Facts.** On a kept connection the total covers every turn since the connection
+    opened, observed live on 2026-10-26. On resume the engine restores the session's
+    total from a cost-state entry it writes into the session's transcript, and starts
+    from zero when there is none, read from its bundled code on 2026-10-26 and
+    consistent with what was observed live. So without a kept connection, every turn's
+    total also covers the session's earlier turns.
+
+    The difference from the mark is taken only when the mark is for the same session
+    and the total has not fallen. A different session, or a fall, means the count
+    restarted, and then the whole total is taken, so a restart is never subtracted
+    from. **Residual.** A restart that the engine does not show, by a resume that
+    finds no cost-state entry, followed by a turn costing more than the mark, would be
+    undercounted by the mark."""
+    if total is None:
+        return None
+    if mark is None or mark[0] != session or total < mark[1]:
+        return total
+    return total - mark[1]
 
 
 @dataclass(slots=True)
@@ -499,7 +565,13 @@ class _Connection:
     pump: "asyncio.Task[None] | None" = None
     watch: "asyncio.Task[None] | None" = None
     inbox: "asyncio.Queue[Message | None] | None" = None
-    tasks: set[str] = field(default_factory=set[str])
+    tasks: dict[str, str] = field(default_factory=dict[str, str])
+    """Running background tasks, by identifier, with their commands."""
+    commands: dict[str, str] = field(default_factory=dict[str, str])
+    """The command of each recent tool call, by tool use identifier, which a task's
+    start names. Bounded by ``MAX_TRACKED_COMMANDS``."""
+    stopped: set[str] = field(default_factory=set[str])
+    """Tasks the line stopped itself in a turn, whose end needs no note."""
     permission_mode: PermissionMode = "default"
     alive: bool = True
     draining: bool = False
@@ -552,7 +624,11 @@ class TurnReport:
     session_id: str
     capabilities: Capabilities | None
     cost_estimate_usd: float | None
-    """The SDK's client-side estimate. On a subscription it is not a charge."""
+    """The SDK's client-side estimate for this turn alone. On a subscription it is
+    not a charge."""
+    cost_mark: tuple[str, float] | None = None
+    """The session and running total the engine reported, which the scheduler hands
+    to a rebuilt engine. ``None`` for an engine whose costs are not running totals."""
 
 
 def _strings(value: object) -> tuple[str, ...]:
@@ -877,6 +953,8 @@ class ClaudeCodeLine:
         mark: str | None = None,
         clock: Callable[[], float] = time.monotonic,
         poll_seconds: float = KEEP_POLL_SECONDS,
+        task_ended: Callable[[BackgroundEnd], object] = ignore_end,
+        cost_mark: CostMark | None = None,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -896,6 +974,13 @@ class ClaudeCodeLine:
         self.mark = mark
         """The process mark every process of this line inherits, if issued."""
         self._kept_factory = kept_factory
+        self._task_ended = task_ended
+        self.cost_mark = cost_mark
+        """The last session and running total, which the scheduler keeps across
+        rebuilds of the engine, so a rebuilt engine does not count the session's
+        earlier turns again."""
+        """Called for each background task that ends between turns, so the
+        scheduler can wake the line."""
         self._clock = clock
         self._poll_seconds = poll_seconds
         self._kept: _Connection | None = None
@@ -1014,11 +1099,27 @@ class ClaudeCodeLine:
                     await self._handle(session, message, turn)
         finally:
             self._turn = None
+        cost = None if result is None else self._measure(result)
         if turn.refusal is not None:
             raise EngineRefused(turn.refusal)
-        return self._report(result, turn)
+        return self._report(result, turn, cost)
 
-    def _report(self, result: ResultMessage | None, turn: _Turn) -> TurnReport:
+    def _measure(self, result: ResultMessage) -> float | None:
+        """The turn's own cost from its result, moving the cost mark on."""
+        total = result.total_cost_usd
+        cost = turn_cost(total, result.session_id, self.cost_mark)
+        if total is not None:
+            self.cost_mark = (result.session_id, total)
+        return cost
+
+    def _report(
+        self,
+        result: ResultMessage | None,
+        turn: _Turn,
+        cost: float | None,
+    ) -> TurnReport:
+        """The turn's report, with ``cost`` the turn's own, which ``_measure`` took
+        from the engine's running total."""
         if result is None:
             raise EngineRefused("the engine ended the turn without a result")
         self.session_id = result.session_id
@@ -1031,7 +1132,8 @@ class ClaudeCodeLine:
             credential=turn.credential,
             session_id=result.session_id,
             capabilities=turn.capabilities,
-            cost_estimate_usd=result.total_cost_usd,
+            cost_estimate_usd=cost,
+            cost_mark=self.cost_mark,
         )
 
     async def _handle(
@@ -1197,6 +1299,14 @@ class ClaudeCodeLine:
             "kept": alive,
             "seconds_to_close": self.seconds_to_close(),
             "background_tasks": len(connection.tasks) if connection and alive else 0,
+            "tasks": (
+                [
+                    {"task_id": task_id, "command": command}
+                    for task_id, command in sorted(connection.tasks.items())
+                ]
+                if connection and alive
+                else []
+            ),
         }
 
     async def expire(self) -> bool:
@@ -1283,11 +1393,7 @@ class ClaudeCodeLine:
         a turn the engine began by itself is interrupted and noted."""
         try:
             async for message in connection.session.receive_messages():
-                ended = task_ended(message)
-                if ended is not None:
-                    connection.tasks.discard(ended)
-                elif isinstance(message, TaskStartedMessage):
-                    connection.tasks.add(message.task_id)
+                self._track(connection, message)
                 inbox = connection.inbox
                 if inbox is not None:
                     inbox.put_nowait(message)
@@ -1313,6 +1419,49 @@ class ClaudeCodeLine:
             connection.alive = False
             if connection.inbox is not None:
                 connection.inbox.put_nowait(None)
+
+    def _track(self, connection: _Connection, message: Message) -> None:
+        """Follow the connection's background tasks: the command each tool call
+        runs, each task's start, a stop the line asked for, and each end, which
+        between turns is passed to ``task_ended`` once per task."""
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if not isinstance(block, ToolUseBlock):
+                    continue
+                command = block.input.get("command")
+                if isinstance(command, str):
+                    connection.commands[block.id] = command[:MAX_COMMAND_CHARACTERS]
+                    while len(connection.commands) > MAX_TRACKED_COMMANDS:
+                        del connection.commands[next(iter(connection.commands))]
+                stopped = block.input.get("task_id") or block.input.get("shell_id")
+                if block.name in STOP_TOOLS and isinstance(stopped, str):
+                    if len(connection.stopped) >= MAX_TRACKED_COMMANDS:
+                        connection.stopped.clear()
+                    connection.stopped.add(stopped)
+            return
+        if isinstance(message, TaskStartedMessage):
+            command = connection.commands.get(message.tool_use_id or "")
+            connection.tasks[message.task_id] = (
+                command or message.description[:MAX_COMMAND_CHARACTERS]
+            )
+            return
+        ended = task_ended(message)
+        if ended is None:
+            return
+        command = connection.tasks.pop(ended, None)
+        between = connection.inbox is None
+        asked = ended in connection.stopped
+        connection.stopped.discard(ended)
+        if command is None or not between or asked:
+            return
+        try:
+            self._task_ended(BackgroundEnd(ended, command, task_status(message)))
+        except Exception as error:  # noqa: BLE001
+            # The scheduler's failure to note a task must not end the connection.
+            print(
+                f"dromond: a background task's end could not be noted: {error}",
+                file=sys.stderr,
+            )
 
     async def _watch(self, connection: _Connection) -> None:
         """Close the kept connection when, between turns, a file its engine loaded
@@ -1431,7 +1580,8 @@ class ClaudeCodeLine:
             await self.close()
             self._notes.append(DIED_NOTE)
             raise EngineRefused("the engine's process ended during the turn")
+        cost = self._measure(result)
         if turn.refusal is not None:
             await self.close()
             raise EngineRefused(turn.refusal)
-        return self._report(result, turn)
+        return self._report(result, turn, cost)

@@ -79,13 +79,15 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `wake_requested` | `wake_id`, `line_id`, `message_id` | The wake does not exist, the line exists and is not stopped, and the message exists with the line as its recipient |
 | `wake_issued` | `wake_id` | The wake exists and was not issued, and its line is idle |
 | `wake_scheduled` | `line_id`, `message_id`, `due` due time, `note` wake note | The line exists, no message has the identifier, and no other line's pending scheduled wake reserves it. Becomes the line's one pending scheduled wake, replacing any earlier one, and reserves `message_id` for its note |
+| `task_noted` | `line_id`, `message_id`, `task_id` of at most 128 bytes, `status` of at most 32 bytes, `body` note of at most 2,000 bytes | The line exists, no message has the identifier, and no pending scheduled wake reserves it. Records a note from the line to itself, already sent, saying that a background task of its engine ended between turns. Only the daemon records it, from the engine's own report |
 | `question_withdrawn` | `message_id` | The message is a question and is open |
 | `question_superseded` | `message_id`, `superseded_by` | Both messages are open questions, they differ, and they come from the same line |
 
 **Message rules.** A `message_sent` applies when every one of these holds.
 
 1. The message does not exist, and the sender and recipient both exist and differ. The
-   one exception is the firing of a scheduled wake, below. A message whose identifier a
+   one exception is the firing of a scheduled wake, below. A `task_noted` event is the
+   other way a line receives a note from itself, and it is not a `message_sent`. A message whose identifier a
    pending scheduled wake reserves is refused unless it is that firing.
 2. A note has no choices.
 3. A question comes from a line that is not stopped and goes to an operator. A new

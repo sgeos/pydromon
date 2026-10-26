@@ -532,6 +532,32 @@ class WakeScheduled:
         check_text("note", self.note, MAX_WAKE_NOTE_BYTES)
 
 
+MAX_TASK_STATUS_BYTES: Final = 32
+MAX_TASK_ID_BYTES: Final = 128
+
+
+@dataclass(frozen=True, slots=True)
+class TaskNoted:
+    """A note from a line to itself saying that a background task of its engine
+    ended between turns, which wakes the line as any mail does. Only the daemon
+    records it, when the line's engine reports the end, and recording it is the
+    whole of sending, so it needs no separate ``message_sent``. A line cannot send
+    itself mail any other way but by a scheduled wake."""
+
+    line_id: str
+    message_id: str
+    task_id: str
+    status: str
+    body: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_id("message_id", self.message_id)
+        check_text("task_id", self.task_id, MAX_TASK_ID_BYTES)
+        check_text("status", self.status, MAX_TASK_STATUS_BYTES)
+        check_text("body", self.body, MAX_WAKE_NOTE_BYTES)
+
+
 @dataclass(frozen=True, slots=True)
 class QuestionWithdrawn:
     message_id: str
@@ -571,6 +597,7 @@ type Event = (
     | WakeRequested
     | WakeIssued
     | WakeScheduled
+    | TaskNoted
     | QuestionWithdrawn
     | QuestionSuperseded
 )
@@ -758,6 +785,8 @@ class State:
                 self._check_wake_issued(event)
             case WakeScheduled():
                 self._check_wake_scheduled(event)
+            case TaskNoted():
+                self._check_task_noted(event)
             case QuestionWithdrawn():
                 self._open_question(event.message_id)
             case QuestionSuperseded():
@@ -836,6 +865,11 @@ class State:
             case WakeScheduled():
                 self.scheduled[event.line_id] = ScheduledWake(
                     event.message_id, event.due, event.note
+                )
+            case TaskNoted():
+                address = LineAddress(event.line_id)
+                self.messages[event.message_id] = Message(
+                    address, address, MessageKind.NOTE, event.body, (), None
                 )
             case QuestionWithdrawn():
                 self._close(event.message_id, QuestionStatus.WITHDRAWN)
@@ -982,6 +1016,17 @@ class State:
             raise EventRejected(f"message {event.message_id} exists")
         reserver = self._reserver(event.message_id)
         if reserver is not None and reserver != event.line_id:
+            raise EventRejected(
+                f"message {event.message_id} is reserved by line {reserver}'s"
+                " scheduled wake"
+            )
+
+    def _check_task_noted(self, event: TaskNoted) -> None:
+        self._line(event.line_id)
+        if event.message_id in self.messages:
+            raise EventRejected(f"message {event.message_id} exists")
+        reserver = self._reserver(event.message_id)
+        if reserver is not None:
             raise EventRejected(
                 f"message {event.message_id} is reserved by line {reserver}'s"
                 " scheduled wake"

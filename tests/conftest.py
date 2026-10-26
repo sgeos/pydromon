@@ -38,6 +38,7 @@ from dromon.model import (
     WakeIssued,
     WakeRequested,
     WakeScheduled,
+    TaskNoted,
 )
 
 ENGINE = "claude-opus-5-5"
@@ -99,6 +100,7 @@ SCENARIO: tuple[Event, ...] = (
     WakeScheduled("beta", "s1", "2026-10-26T09:30:00Z", "read the gate's log"),
     WakeScheduled("beta", "s2", "2026-10-26T10:00:00Z", "read it again"),
     MessageSent("s2", BETA, BETA, NOTE, "read it again"),
+    TaskNoted("beta", "n1", "b8k2", "completed", "Your background task b8k2 ended."),
     LineRebound("alpha", "claude-haiku-5-5", "subscription"),
     LineStateChanged("alpha", LineState.STOPPED),
 )

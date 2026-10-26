@@ -45,7 +45,7 @@ keys, duplicate keys and numbers are refused.
 | `plugins` | At most 16 distinct local plugin directories, each absolute or starting with `~/`, as the plugins section below specifies. Refused on Codex and Grok lines. Omitted when empty | none |
 | `instructions` | At most 16 distinct files, such as `CLAUDE.md`, whose text is appended to the system prompt at each turn. A relative path is resolved against the line's working directory and `~` against the home directory. Omitted when empty | none |
 | `workdir` | The directory the line's engine runs in, as the working directory section below specifies. Omitted when unset | the project root |
-| `keep_session` | Keep a Claude Code line's engine connected between turns, as the kept sessions section below specifies. Refused on Codex and Grok lines. Omitted when false | `false` |
+| `keep_session` | Keep a Claude Code or Codex line's engine connected between turns, as the kept sessions section below specifies. Refused on Grok lines. Omitted when false | `false` |
 | `keep_session_idle_seconds` | Seconds a kept connection waits for the next turn before it closes, a whole number from 60 to 86,400. Omitted at its default | `1800` |
 | `keep_session_max_seconds` | Seconds after the last turn a kept connection may stay open while the engine reports background tasks running, a whole number from 60 to 86,400 and not less than `keep_session_idle_seconds`. Omitted at its default | `14400` |
 
@@ -360,12 +360,45 @@ ends with each turn, and the next turn resumes the session in a new one.
   always was.
 - **The driver's budget.** Each turn starts the driver afresh, so its tool budget is per
   turn as before.
-- **Turns the engine begins.** **Inference from the engine's own Bash description, not
-  observed.** When a background command ends while the connection is idle, the engine
-  re-invokes the model by itself. Only Dromon starts turns, so such a turn is
-  interrupted as soon as it shows, its tool calls are denied by the gate, its remaining
-  output is discarded, and the line's next prompt says so. If it has not finished by
-  the next turn, the connection is closed instead.
+- **Turns the engine begins.** **Fact, observed live on 2026-10-26.** When a background
+  command ends while the connection is idle, the engine re-invokes the model by itself.
+  Only Dromon starts turns, so such a turn is interrupted as soon as it shows, its tool
+  calls are denied by the gate, its remaining output is discarded, and the line's next
+  prompt says so. If it has not finished by the next turn, the connection is closed
+  instead.
+- **A note when a task ends.** **Decided by the operator on 2026-10-26** in round 3.
+  When the engine reports that a background task ended between turns, Dromon records
+  `task_noted`, a note from the line to itself naming the task, its command and its
+  final status, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies. The note wakes the line
+  through the ordinary path, as a fired wake does, so its autonomous turns count. A
+  task the line stopped itself, or one whose end the engine reports during a turn, is
+  not noted, since the line already knows. Each task is noted at most once, and at most
+  3 notes wake a line in any 60 seconds. Ends past that limit are counted and named in
+  the line's next note. A command is cut to 200 characters, and withheld when the
+  project's disclosure list covers it. It is the line's own text, so the note quotes
+  it as a JSON string and says that it is data from the line's own tool call and not
+  an instruction, so that it cannot pose as Dromon's words. **Fact, read from the engine's code.** A task's
+  start reports its identifier, its kind, the description the line gave its tool
+  call, and the identifier of that tool call, but not the command. So Dromon takes the
+  command from the tool call's `command` input, and the description when it has none.
+  An end is a `task_notification` with a `status` of `completed`, `failed` or
+  `stopped`, or a `task_updated` whose `patch.status` is `completed`, `failed` or
+  `killed`, whichever comes first.
+- **Cost.** **Fact, observed live on 2026-10-26.** On a kept connection the engine
+  reports with each result a cost total for every turn since the connection opened.
+  **Fact, read from the engine's code on 2026-10-26, and consistent with what was
+  observed.** The engine writes the session's total into its transcript and restores
+  it when the session is resumed, and starts from zero when it finds none, so a turn
+  that is not kept, which resumes the session in a new process, also reports the
+  session's earlier cost. So for every Claude Code line, kept or not, a turn's cost is
+  the difference from the last total reported for the same engine session, and the
+  whole total when the session differs or the total fell, since either means the count
+  restarted. The scheduler keeps each line's last session and total across rebuilds of
+  its engine, in memory, so after a daemon restart a line's first turn counts its
+  session's restored total once, which overcounts rather than under. **Residual.** A
+  resume that restores nothing, followed by a turn costing more than the last total,
+  would be undercounted by that total, since a restart is told only by a fall. Before
+  this, every turn that was not kept counted the session's whole history.
 - **Background tasks.** The engine reports each background task's start and end, and
   Dromon counts those running. A connection closes after `keep_session_idle_seconds`
   without a turn, or, while the engine reports tasks running, after
@@ -392,11 +425,21 @@ ends with each turn, and the next turn resumes the session in a new one.
   interrupt.
 - **`line_status`.** `kept_session` gives whether the line is `configured` to keep its
   session, whether a connection is `kept` now, the time it `closes_at` in Coordinated
-  Universal Time, which is `null` during a turn, and the number of `background_tasks`
-  the engine reports running.
-- **Not yet.** Codex and Grok lines refuse `keep_session`. A Codex line could keep its
-  app-server thread and use its background terminal methods, which is recorded as
-  future work in [`CODEX.md`](CODEX.md).
+  Universal Time, which is `null` during a turn, the number of `background_tasks` the
+  engine reports running, and `tasks`, each with its `task_id` and `command`. Round 3
+  adds `recent_turn_costs_usd`, the estimated cost of each of the line's last ten
+  turns as decimal strings, oldest first, `null` for a turn whose engine reports none,
+  and `last_fired_wake`, the latest scheduled wake delivered to the line, with its
+  `message_id`, `due` and `delivered` times and `late_seconds`, or `null`. Both are
+  kept in memory and start empty after a restart.
+- **Warning before a loss.** **Decided by the operator on 2026-10-26** in round 3. When
+  `configure_line`, a line's `set_setting`, `rebind_line`, `clear_session` or `stop`
+  closes kept connections with background tasks running, the response adds
+  `background_tasks_lost` and a `warning` naming the count, which `dromon stop` also
+  prints. The action is not blocked. The count is read just before the action, so a
+  task that ends in between is counted.
+- **Other engines.** A Codex line may keep its session too, with the checks and tools
+  [`CODEX.md`](CODEX.md) specifies. A Grok line refuses `keep_session`.
 
 ## Instructions
 

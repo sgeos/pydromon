@@ -143,8 +143,9 @@ def start(paths: ProjectPaths, daemon_args: Sequence[str] = ()) -> int:
     )
 
 
-def stop(paths: ProjectPaths) -> None:
-    """Ask the daemon to stop and wait until its socket is gone.
+def stop(paths: ProjectPaths) -> dict[str, object]:
+    """Ask the daemon to stop, wait until its socket is gone, and return its answer,
+    which says how many background tasks of kept engine sessions the stop ends.
 
     Raises ``DaemonNotRunning`` if no daemon answers and ``DaemonFailed`` if it does
     not finish within the shutdown timeout.
@@ -155,6 +156,6 @@ def stop(paths: ProjectPaths) -> None:
     deadline = time.monotonic() + SHUTDOWN_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         if not paths.socket.exists():
-            return
+            return dict(response.result or {})
         time.sleep(POLL_INTERVAL_SECONDS)
     raise DaemonFailed(f"the daemon did not stop within {SHUTDOWN_TIMEOUT_SECONDS}s")

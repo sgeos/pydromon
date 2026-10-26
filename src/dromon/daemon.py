@@ -397,8 +397,11 @@ class Daemon:
             case Operation.STATUS:
                 return Response(request.request_id, ok=True, result=self.status())
             case Operation.STOP:
+                lost = self.tasks_lost(sorted(self.log.state.lines))
                 self.stop_requested.set()
-                return Response(request.request_id, ok=True, result={"stopping": True})
+                return Response(
+                    request.request_id, ok=True, result={"stopping": True, **lost}
+                )
             case Operation.AGENT_TOOLS | Operation.AGENT_CALL:
                 return Response(
                     request.request_id,
@@ -467,8 +470,9 @@ class Daemon:
                     result = self._set_setting(request.args)
                 case Operation.CLEAR_SESSION:
                     (line_id,) = _text_args(request.args, ("line_id",))
+                    lost = self.tasks_lost([line_id])
                     self.scheduler.clear_session(line_id)
-                    result = {"line_id": line_id}
+                    result = {"line_id": line_id, **lost}
                 case Operation.REBIND_LINE:
                     result = self._rebind_line(request.args)
                 case Operation.RELOAD_PROJECT:
@@ -539,8 +543,9 @@ class Daemon:
         check_sandbox_required(
             self.project, line_id, self.scheduler.model_of(line_id), config
         )
+        lost = self.tasks_lost([line_id])
         self.scheduler.configure_line(line_id, config)
-        return {"line_id": line_id}
+        return {"line_id": line_id, **lost}
 
     def _rebind_line(self, args: dict[str, object]) -> dict[str, object]:
         """Move a line to another model and strategy, as only an operator may.
@@ -566,8 +571,31 @@ class Daemon:
             )
         config = self.scheduler.effective_config(line_id)
         check_sandbox_required(self.project, line_id, model, config)
+        lost = self.tasks_lost([line_id])
         self.scheduler.rebind_line(line_id, model, chosen)
-        return {"line_id": line_id, "model": model, "strategy": chosen.value}
+        return {
+            "line_id": line_id,
+            "model": model,
+            "strategy": chosen.value,
+            **lost,
+        }
+
+    def tasks_lost(self, line_ids: Sequence[str]) -> dict[str, object]:
+        """What a response says of the background tasks an action closes with the
+        lines' kept engine connections, nothing when there are none. The action is
+        not blocked, only reported.
+        Read before the action, and a task can end in between, so it is an upper
+        bound."""
+        lost = sum(self.scheduler.kept_tasks(line_id) for line_id in line_ids)
+        if not lost:
+            return {}
+        return {
+            "background_tasks_lost": lost,
+            "warning": (
+                f"{lost} background tasks were running in kept engine sessions and"
+                " are stopped with them"
+            ),
+        }
 
     def _check_workdir(self, config: LineConfig) -> None:
         """Refuse a working directory that does not exist or is not allowed, and a
@@ -778,6 +806,7 @@ class Daemon:
         value = args.get("value")
         if scope_text == Scope.LINE.value:
             (line_id,) = _text_args({"line_id": args.get("line_id")}, ("line_id",))
+            lost = self.tasks_lost([line_id])
             self.scheduler.override_line(line_id, key, value)
             found = next(
                 e
@@ -785,7 +814,7 @@ class Daemon:
                 if e["key"] == key
             )
             landed = _landed(found, value is not None)
-            return {"scope": "line", "line_id": line_id, **landed}
+            return {"scope": "line", "line_id": line_id, **landed, **lost}
         if scope_text != Scope.PROJECT.value or "line_id" in args:
             raise ProtocolError(
                 ErrorCode.BAD_REQUEST, "scope is line, with line_id, or project"

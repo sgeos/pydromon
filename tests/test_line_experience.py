@@ -179,6 +179,7 @@ def test_line_status_shows_the_line_its_daemon_and_the_others(world: World) -> N
         "kept": False,
         "closes_at": None,
         "background_tasks": 0,
+        "tasks": [],
     }
     assert status["leases"] == []
     assert status["other_lines"] == [
@@ -597,7 +598,15 @@ class KeptRecorder(Recorder):
         self.retired += 1
 
     def kept_status(self) -> dict[str, object]:
-        return {"kept": True, "seconds_to_close": 90.0, "background_tasks": 2}
+        return {
+            "kept": True,
+            "seconds_to_close": 90.0,
+            "background_tasks": 2,
+            "tasks": [
+                {"task_id": "t1", "command": "make gate"},
+                {"task_id": "t2", "command": "sleep 300"},
+            ],
+        }
 
 
 def kept_engine(world: World) -> KeptRecorder:
@@ -616,6 +625,10 @@ def test_line_status_reports_a_kept_session_and_its_deadline(world: World) -> No
         "kept": True,
         "closes_at": "2026-10-26T09:01:30Z",
         "background_tasks": 2,
+        "tasks": [
+            {"task_id": "t1", "command": "make gate"},
+            {"task_id": "t2", "command": "sleep 300"},
+        ],
     }
 
 

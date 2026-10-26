@@ -217,10 +217,49 @@ turn. `dromon probe --model gpt-6-luna` reported the subscription credential.
   adapter.
 - **Inference, not checked.** Codex loads its usual `AGENTS.md` instruction files,
   while a Claude Code line loads no settings sources and so no `CLAUDE.md`.
-- **No kept session.** A Codex line refuses `keep_session`, which keeps a Claude Code
-  line's engine connected between turns, as [`LINE_CONFIG.md`](LINE_CONFIG.md)
-  specifies. **Future work, recorded on 2026-10-26** in round 2. A Codex line could keep
-  its app-server and thread between turns and use the app-server's background terminal
-  methods for commands that outlive a turn. That needs the same per-turn checks a kept
-  Claude Code connection passes, and a way to tell the thread's tool list has not
-  changed, since resuming does not take dynamic tools.
+- **A kept session.** **Decided by the operator on 2026-10-26** in round 3, at the
+  request of a Codex line. A Codex line with `keep_session` keeps its app-server and
+  thread between turns, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies for kept
+  sessions. Every Codex line runs under the `dromon-line` permission profile, so the
+  rule that a kept line with a shell needs an enabled sandbox is met by construction.
+  - **Facts, read from the installed Codex 0.164.0 binary on 2026-10-26, not run.** The
+    app-server has `thread/backgroundTerminals/list`, `thread/backgroundTerminals/terminate`
+    and `thread/backgroundTerminals/clean`. A listed terminal has seven fields, of which
+    `itemId`, `processId`, `osPid`, `cpuPercent` and `rssKb` were read. The list takes
+    three parameters, termination two and cleaning one. Termination reports an invalid
+    background terminal process identifier as an error. Resuming a thread that is
+    already loaded logs that its overrides are ignored. The interactive client reports
+    background terminals still running between turns, with commands to view and stop
+    them.
+  - **Inferences, for the live probe.** The parameters are `threadId` for the list and
+    `threadId` with `processId` for termination. A terminal outlives the turn that
+    started it while the app-server runs. Resuming the loaded thread returns its
+    model, provider and active permission profile, so the checks can be made on it.
+  - **Every check at every turn.** Before a kept app-server is used, the environment,
+    the configuration, the MCP server listing, the instructions and Dromon's tools are
+    checked and digested as at a new start, and any difference opens a new
+    app-server. On the kept connection the account is read again, the loaded thread is
+    resumed and its provider, model and permission profile checked, and the MCP server
+    and app listings checked, all before the turn starts. Any refusal, and any failed
+    request, closes the connection.
+  - **A message router.** A pump reads every message. A response to a request made
+    outside the turn's own loop resolves that request, so a Dromon tool can list
+    terminals during a turn without a deadlock. Writes come from the turn, the pump, a
+    tool's request and an interrupt, so each message is written whole under a lock.
+    Between turns a request from the engine is refused, an approval declined, and a
+    turn the engine begins by itself interrupted and noted. An interrupt is never sent
+    without the turn's identifier, so a turn begun without one closes the app-server
+    instead.
+  - **The line's own terminals.** Dromon does not rely on the app-server scoping a
+    listing to the thread. It records the process and item identifiers of every
+    command execution the line's own turns report on the connection, and a listed
+    terminal is the line's only if one of its identifiers matches.
+  - **`list_background` and `stop_background`.** Only a Codex line with `keep_session`
+    has them. The first lists the line's own background terminals, at most 64, with
+    `process_id`, `os_pid` and `command`, where the command field's name was not read
+    and is looked for as `command`, `commandLine` or `cmd`. The second takes a
+    `process_id` of 1 to 128 characters, which must be in a fresh listing of the same
+    thread, and terminates it. Both refuse when no Codex session is kept.
+  - **Not done.** Codex was not found to report a terminal's end as an event, so a
+    Codex line gets no note when one ends, and its count of terminals is refreshed by a
+    listing at the end of each turn.
