@@ -47,8 +47,8 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `ping` | An empty object |
 | `status` | `daemon_version`, `protocol_version`, `pid`, `project`, `started_at`, and `event_log` with `last_seq`, `lines`, `operators` and `open_questions` |
 | `stop` | `{"stopping": true}`, after which the daemon closes its connections, removes its socket and exits |
-| `create_line` | Arguments `line_id`, `model`, `strategy`, and optionally `config`, an object of [`LINE_CONFIG.md`](LINE_CONFIG.md), and `engine_session`, an existing engine session to continue, recorded as `line_session` right after `line_created` and checked as that event is. Result `{"line_id": ...}`. Refused when no packaged driver serves the model and strategy, or when the configuration's `workdir` is not allowed |
-| `configure_line` | Arguments `line_id` and `config`. Replaces the line's configuration from its next turn. A changed `workdir` also appends `line_session_cleared`. Refused when the `workdir` is not allowed |
+| `create_line` | Arguments `line_id`, `model`, `strategy`, and optionally `config`, an object of [`LINE_CONFIG.md`](LINE_CONFIG.md), and `engine_session`, an existing engine session to continue, recorded as `line_session` right after `line_created` and checked as that event is. Result `{"line_id": ...}`. Refused when no packaged driver serves the model and strategy, when the configuration's `workdir` is not allowed, or when the project requires a sandbox and the line would run on Claude Code without one |
+| `configure_line` | Arguments `line_id` and `config`. Replaces the line's configuration from its next turn. A changed `workdir` also appends `line_session_cleared`. Refused when the `workdir` is not allowed, or when the project requires a sandbox and the line would run on Claude Code without one |
 | `questions` | Optionally `operator`. Result `{"questions": [...]}`, the open questions for that operator, or for all when omitted, oldest first, each with `question_id`, `line`, `operator`, `text` and `choices`. Listing marks each question delivered, because the client has shown it |
 | `mail` | Arguments `operator`, and optionally `unread_only`, `sender`, `offset` and `limit`, at most 50. Delivers the operator's undelivered mail, then returns `total`, `unread`, `unanswered` and `messages`, a page of headers with `message_id`, `sender`, `kind`, `reply_to`, `read` and `outcome`, one of `replied`, `acknowledged` and `unanswered`, oldest first |
 | `acknowledge` | Arguments `operator` and `message_id`. Marks a message in the operator's mailbox dealt with, without a reply |
@@ -59,7 +59,7 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `settings` | Optionally `line_id`. Returns `project`, the project's settings, `models`, every model a line may be created on, and with `line_id` also `line_id` and `line`, the line's settings, each as the settings section below specifies |
 | `set_setting` | Arguments `scope`, `line` with `line_id` or `project` without it, `key`, and optionally `value`. Records the value as an override, or removes the key's override when `value` is omitted. Returns `scope`, `line_id` for a line, `key`, `value` and `source`, the value now in force and its layer, and `shadowed`, true when a value was set but a higher layer still decides. Refused, recording nothing, for an unknown key or a value its key or its meaning does not accept |
 | `clear_session` | Argument `line_id`. The line's next turn starts a new engine session. Refused while the line runs a turn |
-| `reload_project` | No arguments. Reads `.dromon/dromon.toml` again and applies its lines, limits, wake policy, operator and tick cadence. Returns `file`, `present` and `lines`, the lines it declares. Refused, applying nothing, for an invalid file, a file that changes a line's model or strategy, or one that changes the sandbox, the engine settings, the teacher or the external agent policy, which apply only when the daemon restarts |
+| `reload_project` | No arguments. Reads `.dromon/dromon.toml` again and applies its lines, limits, wake policy, operator, tick cadence, sandbox requirement and disclosure list, which it reads again. Returns `file`, `present` and `lines`, the lines it declares. Refused, applying nothing, for an invalid file, a file that changes a line's model or strategy, one that changes the sandbox, the engine settings, the teacher or the external agent policy, which apply only when the daemon restarts, one whose disclosure list cannot be read, or one that requires a sandbox a line lacks |
 | `interrupt` | Argument `line_id`. Cancels the line's turn in flight. Returns `line_id` and `interrupted`, false when no turn was in flight. Refused for an unknown line |
 | `release` | Argument `line_id`. Releases a line held at a conversation limit and resets its counts |
 | `agent_add` | Arguments `agent` and `access`. Registers an external agent, or replaces its access and token. Returns `agent`, `access`, `effective_access` under the policy's ceiling, `token`, shown only here, and `listening` |
@@ -72,8 +72,10 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 entry per line with `line_id`, `engine`, `strategy`, `state`, `pending`, the count of
 undelivered messages, `turns`, the turns run in this daemon's lifetime,
 `tool_policy`, `autonomous_turns`, the turns in a row without operator mail,
-`cost_estimate_usd`, a decimal string, and `held_by`, the question holding the line or
-`null`.
+`cost_estimate_usd`, a decimal string, `held_by`, the question holding the line or
+`null`, and `scheduled_wake`, the line's pending scheduled wake as `due`, its due time,
+and `message_id`, the identifier its note will carry, or `null`. The note itself is not
+shown. `line_view` returns the same entry as `line`.
 
 ## Responses
 
@@ -262,7 +264,8 @@ sorted keys. Each entry of a `settings` result has `key`, `kind`, one of `bool`,
 and `editable`. Entries of kind `info` cannot be changed from a client. They show a
 line's engine, strategy, engine session and working directory, its MCP servers by name
 only, whether a sandbox or engine settings document is set, and the project's file,
-declared lines, teacher and external agent policy.
+declared lines, teacher, external agent policy, `daemon.require_sandbox`, and
+`daemon.disclosure_terms` by its path only, never its terms.
 
 A client cannot change a line's strategy, because it decides whether usage is billed
 per token, and such usage never starts from a one-word command. It cannot change MCP

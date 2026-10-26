@@ -142,7 +142,8 @@ succeeded and the one that wrote in the home directory was refused.
   Dromon's tools run inside the daemon.
 - A line without an enabled sandbox can still reach the daemon's socket through its
   shell, because the daemon does not check peer credentials. This is recorded as debt
-  in `CLIENT.md`.
+  in `CLIENT.md`. A project can require an enabled sandbox for every Claude Code line
+  with `daemon.require_sandbox`, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies.
 - The git guard protects only the files of its set, the hooks directory, `config`,
   `config.worktree` and a linked worktree's two pointers. Every other file under the
   git directory stays as writable as the line's grants make it. Git runs no other file

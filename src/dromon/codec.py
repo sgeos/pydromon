@@ -44,6 +44,7 @@ from dromon.model import (
     QuestionWithdrawn,
     WakeIssued,
     WakeRequested,
+    WakeScheduled,
     parse_address,
 )
 
@@ -80,6 +81,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "message_acknowledged": ("message_id",),
     "wake_requested": ("wake_id", "line_id", "message_id"),
     "wake_issued": ("wake_id",),
+    "wake_scheduled": ("line_id", "message_id", "due", "note"),
     "question_withdrawn": ("message_id",),
     "question_superseded": ("message_id", "superseded_by"),
 }
@@ -210,6 +212,13 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
             }
         case WakeIssued():
             return "wake_issued", {"wake_id": event.wake_id}
+        case WakeScheduled():
+            return "wake_scheduled", {
+                "line_id": event.line_id,
+                "message_id": event.message_id,
+                "due": event.due,
+                "note": event.note,
+            }
         case QuestionWithdrawn():
             return "question_withdrawn", {"message_id": event.message_id}
         case QuestionSuperseded():
@@ -277,6 +286,13 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
             )
         case "wake_issued":
             return WakeIssued(_str(data, "wake_id"))
+        case "wake_scheduled":
+            return WakeScheduled(
+                _str(data, "line_id"),
+                _str(data, "message_id"),
+                _str(data, "due"),
+                _str(data, "note"),
+            )
         case "question_withdrawn":
             return QuestionWithdrawn(_str(data, "message_id"))
         case "question_superseded":

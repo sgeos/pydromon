@@ -200,6 +200,16 @@ def project_entries(
             ),
             info("sandbox", "the project's sandbox", _present(config.sandbox)),
             info(
+                "daemon.require_sandbox",
+                "whether every Claude Code line needs an enabled sandbox",
+                "on" if config.require_sandbox else "off",
+            ),
+            info(
+                "daemon.disclosure_terms",
+                "the disclosure list messages are checked against, by path only",
+                config.disclosure_terms or "none",
+            ),
+            info(
                 "settings", "the project's engine settings", _present(config.settings)
             ),
             info(

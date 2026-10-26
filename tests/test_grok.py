@@ -639,6 +639,7 @@ def test_the_line_socket_serves_only_the_lines_own_tools(
         assert names == {
             "send_message",
             "ask_operator",
+            "wake_after",
             "list_mail",
             "read_mail",
             "acknowledge_mail",

@@ -78,6 +78,50 @@ out of the event log.
   and a turn is refused when the engine offers a built-in tool not in `builtin_tools`
   or a tool of a server not in `mcp_servers`.
 
+## Dromon's own tools
+
+Every line has Dromon's own tools, whatever its configuration, and each fixes its
+sender to the line. External agents have a subset, as [`AGENTS.md`](AGENTS.md)
+specifies. Their arguments are untrusted input and are checked strictly, and an
+argument outside a tool's schema is refused.
+
+| Tool | Effect |
+|---|---|
+| `send_message` | Sends a note to a line or an operator, delivered in a later tick |
+| `ask_operator` | Asks an operator a question, which never pauses the line |
+| `wake_after` | Schedules one wake for the line, as below |
+| `list_mail`, `read_mail`, `acknowledge_mail` | Page through, open and acknowledge the line's mailbox |
+| `list_sent` | Lists what became of the line's sent mail |
+
+**`wake_after`.** **Decided by the operator on 2026-10-26.** A line that starts a long
+command in the background, which survives the end of its turn, needs a way to be woken
+to read the result.
+
+- **Arguments.** `seconds`, a whole number from 60 to 86,400, and `note`, text of at
+  most 2,000 bytes. A number with a fraction, a boolean or text is refused.
+- **Effect.** The daemon appends `wake_scheduled` with the due time, the wall clock in
+  Coordinated Universal Time plus `seconds`, rounded up to the whole second so a wake
+  never fires early. A line has at most one pending scheduled wake, and a new call
+  replaces it, which the tool's answer reports with the replaced due time.
+- **Firing.** At the first tick at or after the due time, the note is recorded as a
+  message from the line to itself, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies under
+  scheduled wakes. It wakes the line through the ordinary path in a later tick, counts
+  toward the line's autonomous-turn limit like any mail that is not from an operator,
+  and waits like other mail while the line is held. A wake that fell due while the
+  daemon was down fires at its first tick. A note that the disclosure list in force at
+  firing covers is replaced by a fixed notice, as [`EVENT_LOG.md`](EVENT_LOG.md)
+  specifies, so a list changed by a reload or a restart still applies.
+- **Rest.** While nothing else is in flight, the daemon's loop rests until the next
+  wake falls due, for at most 60 seconds at a time, so a change of the wall clock
+  delays a wake by at most that much.
+- **Visibility.** `status` and `line_view` show the pending wake's due time and the
+  identifier its note will carry, as [`CLIENT.md`](CLIENT.md) specifies.
+
+**Disclosure guard.** When the project names a disclosure list, `send_message`,
+`ask_operator` and `wake_after` refuse a body, question, choice or note that contains a
+listed term, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, and record nothing.
+A wake note is checked again when it fires.
+
 ## Instructions
 
 Dromon starts Claude Code with no settings sources, so Claude Code reads no

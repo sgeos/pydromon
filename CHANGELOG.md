@@ -67,6 +67,24 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Lines gain `wake_after`, which schedules one wake from 60 to 86,400 seconds ahead,
+  replacing any pending one. It is recorded as the new `wake_scheduled` event with its
+  due time in Coordinated Universal Time, and fires at the first tick after the due
+  time by recording the note as a message from the line to itself, the one
+  self-addressed message the event model admits. Firing is one append, so it survives
+  a crash or a restart without firing twice. `status` and `line_view` show the pending
+  wake, and the scheduler's wall clock is injected.
+- `daemon.require_sandbox` in the project file refuses a Claude Code line whose merged
+  sandbox is not enabled, at start, `create_line`, `configure_line` and reload, naming
+  the line. Codex and Grok lines satisfy it.
+- `daemon.disclosure_terms` names a disclosure list, read at start and reload. A note,
+  question, choice or wake note that a line or an external agent sends through
+  Dromon's tools is refused, and nothing recorded, when it contains a listed term
+  without regard to case, and the refusal never names the term. Operator messages are
+  not checked. The settings view shows both keys, the list by its path only. A wake
+  note is checked again when it fires, and fires as a fixed notice if a reloaded or
+  restarted list now covers it. An anonymous external agent whose chosen name contains
+  a listed term is refused. Agents registered with `agent_add` are exempt.
 - A line's configuration takes `workdir`, the directory its engine runs in, so a line
   can work in a git worktree of its own. It is set in the project file, or with
   `--workdir` on `dromon create` and `dromon configure`. A relative path resolves

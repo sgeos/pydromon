@@ -62,6 +62,8 @@ every_ticks = 5
 | `version` | integer | required | Must be 1 |
 | `daemon.operator` | identifier | `operator` | The default operator |
 | `daemon.tick_seconds` | number in [0, 60] | 1 | The tick cadence |
+| `daemon.require_sandbox` | boolean | `false` | Whether every Claude Code line must run with an enabled sandbox, as below |
+| `daemon.disclosure_terms` | path | none | The project's disclosure list, relative to the project root, as below |
 | `limits.*` | as in `CLIENT.md` | 12, 2, 0 | The conversation limits of every line |
 | `wake.every_ticks` | integer in [1, 3600] | 1 | The wake policy of every line |
 | `profiles.NAME` | table | none | A reusable line template with every line key but `profile` and `session` |
@@ -119,6 +121,57 @@ every_ticks = 5
   engine's own sandbox.
 - **Restart.** The policies of limits and wake live in the daemon and are re-read on
   every start. The lines and their configurations are events in the log.
+
+## Guards
+
+**Decided by the operator on 2026-10-26.**
+
+**Required sandbox.** With `daemon.require_sandbox` true, the daemon refuses any Claude
+Code line whose merged sandbox, the project's `[sandbox]` with the line's own as
+[`SANDBOX.md`](SANDBOX.md) merges them, is absent or not enabled. The check runs at
+start, over the lines the file declares and the lines created through a client, at
+`create_line`, at `configure_line`, and at reload, where it uses the reloaded file's
+value, so a reload may turn the requirement on or off. A refusal names the line and
+changes nothing. Codex and Grok lines run under their own permission profiles, as
+[`CODEX.md`](CODEX.md) and [`GROK.md`](GROK.md) specify, and satisfy it. **Why.** A
+line without an enabled sandbox can reach the daemon's socket from its shell and act
+with operator authority, as [`SANDBOX.md`](SANDBOX.md) records.
+
+**Disclosure list.** `daemon.disclosure_terms` names a file of terms that must not leave
+the machine through Dromon, such as private context or code names, resolved against
+the project root. Each line is one term, used as written, and blank lines and lines
+whose first character other than white space is `#` are ignored, as in
+`scripts/check.sh`. The daemon reads the file at start and at each reload, and at most
+1 MiB of UTF-8 is accepted. A file that is missing, unreadable, too large or not UTF-8
+stops the start, or refuses the reload and keeps the previous list.
+
+- **What is checked.** A note that a line or an external agent sends with
+  `send_message`, a question and its choices that a line asks with `ask_operator`, and
+  a note a line schedules with `wake_after`. A text is refused when it contains any
+  term as a substring, compared after Unicode case folding. A wake note is checked
+  again when it fires, against the list then in force, and fires as a fixed notice if
+  it now discloses, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies. **Why not refuse the
+  reload.** A reload that refused while a pending note disclosed would leave a restart
+  unguarded, and a restart refused for the same reason would leave the operator no way
+  to start the daemon and clear the wake. Checking at firing covers both and still
+  wakes the line.
+- **Anonymous agents.** An external agent admitted without a token names itself, and
+  the name becomes the sender of its mail. An anonymous connection whose name contains
+  a listed term is refused with the same text, and nothing is recorded. This applies
+  on every connection, so a name listed after the agent first connected is refused
+  from then on. An agent the operator registered with `agent_add` was named by the
+  operator and is exempt. Agent names hold only lowercase letters, digits, `.`, `_` and
+  `-`, so a term with a space or a capital letter matches only its folded form, and a
+  term with a space matches no name.
+- **What a refusal says.** That the text contains a term from the project's disclosure
+  list, and never which term. Nothing is recorded.
+- **Not checked.** Messages from operators, who hold authority, and the questions the
+  daemon asks on a held line's behalf.
+- **Secrecy.** Terms are never logged, returned or stored. Errors about the file name
+  the file and not its content. The settings view shows the path only.
+- **Limits.** A term written another way, split across messages, or encoded passes.
+  The guard catches accidents and is not a barrier against a line that tries to evade
+  it. Engine transcripts, which the engines keep themselves, are outside it.
 
 ## Trust
 

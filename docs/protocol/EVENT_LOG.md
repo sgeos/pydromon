@@ -35,6 +35,8 @@ state by replaying the same log.
 | Boolean | `true` or `false`, never a number |
 | Line state | `idle`, `running` or `stopped` |
 | Message kind | `note` or `question` |
+| Due time | A time in Coordinated Universal Time to the second, written exactly as `YYYY-MM-DDTHH:MM:SSZ`, such as `2026-10-26T09:30:00Z`, and a valid date and time |
+| Wake note | Text of at most 2,000 bytes |
 
 Identifiers are never reused within their kind, even after a line stops or a question
 closes. A resent event is therefore rejected rather than applied twice. Lines and
@@ -75,12 +77,15 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `message_delivered` | `message_id` | The message exists and was not delivered. For a line, delivery is into a turn. For an operator, delivery is acceptance by the operator's relay or display in a client |
 | `wake_requested` | `wake_id`, `line_id`, `message_id` | The wake does not exist, the line exists and is not stopped, and the message exists with the line as its recipient |
 | `wake_issued` | `wake_id` | The wake exists and was not issued, and its line is idle |
+| `wake_scheduled` | `line_id`, `message_id`, `due` due time, `note` wake note | The line exists, no message has the identifier, and no other line's pending scheduled wake reserves it. Becomes the line's one pending scheduled wake, replacing any earlier one, and reserves `message_id` for its note |
 | `question_withdrawn` | `message_id` | The message is a question and is open |
 | `question_superseded` | `message_id`, `superseded_by` | Both messages are open questions, they differ, and they come from the same line |
 
 **Message rules.** A `message_sent` applies when every one of these holds.
 
-1. The message does not exist, and the sender and recipient both exist and differ.
+1. The message does not exist, and the sender and recipient both exist and differ. The
+   one exception is the firing of a scheduled wake, below. A message whose identifier a
+   pending scheduled wake reserves is refused unless it is that firing.
 2. A note has no choices.
 3. A question comes from a line that is not stopped and goes to an operator. A new
    question is open.
@@ -90,6 +95,32 @@ Each event has a kind and fields, all required. An optional value is written as 
    is refused.
 5. A reply to a question requires the question to be open, must be a note, and marks
    the question answered by this reply.
+
+**Scheduled wakes.** **Decided by the operator on 2026-10-26.** A line schedules a wake
+for itself with the `wake_after` tool, as [`LINE_CONFIG.md`](LINE_CONFIG.md)
+specifies. A line has at most one pending scheduled wake. When its due time has passed,
+the daemon fires it by appending one `message_sent` whose `message_id` is the reserved
+identifier, whose sender and recipient are both the line, whose kind is `note`, whose
+body is the note or the fixed withheld text below, and which has no choices and no
+`reply_to`. Applying it clears the
+pending wake. That is the only message a party may send itself.
+
+- **Sender.** The model has no address for the daemon, an operator sender would make
+  the note operator mail, which carries authority and resets a line's autonomous-turn
+  count, and an agent sender would need a registered agent. A note from the line to
+  itself is accurate, since the line scheduled it, shows as `from alpha` and never as
+  operator mail, and needs no new kind of address in any port.
+- **Idempotence.** Firing is a single append, so a crash leaves the wake either pending
+  or fired. A pending wake fires at the daemon's first tick after it restarts, and a
+  fired one cannot fire again, since its message exists.
+- **Withheld note.** The daemon checks the note again when it fires, against the
+  disclosure list then in force, which a reload or a restart may have changed. A note
+  that now contains a listed term fires with the body
+  `Your scheduled wake fell due. Its note was withheld, because it contains a term from the project's disclosure list.`
+  The line is still woken, the note goes no further, and the fixed text reveals no
+  term. The model admits exactly these two bodies.
+- **Due time.** The model checks only the form. The daemon compares the due time with
+  its wall clock in Coordinated Universal Time.
 
 **Line transitions.** `idle` to `running`, `running` to `idle`, `idle` to `stopped`,
 `running` to `stopped`, and `stopped` to `idle`. No other change is permitted, including

@@ -44,6 +44,7 @@ from typing import Any, Final, Protocol, cast
 
 from claude_agent_sdk import SdkMcpTool
 
+from dromon import disclosure
 from dromon.model import (
     ID_PATTERN,
     AgentAccess,
@@ -264,6 +265,8 @@ class Host(Protocol):
 
     def mail_tools(self, owner: AgentAddress) -> list[SdkMcpTool[Any]]: ...
 
+    def discloses(self, *texts: str) -> bool: ...
+
 
 type Handler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
@@ -306,6 +309,11 @@ class Gateway:
         elif token is not None:
             raise AgentError(f"agent {agent_id} is not registered with a token")
         else:
+            # An anonymous agent names itself, and the name becomes the sender of
+            # its mail, so it is held to the project's disclosure list. An agent the
+            # operator registered with a token was named by the operator.
+            if self.host.discloses(agent_id):
+                raise AgentError(disclosure.REFUSAL)
             access = _capped(self.policy.anonymous, self.policy.max_access)
             if access.rank >= AgentAccess.MESSAGE.rank and (
                 known is None or known.access != access

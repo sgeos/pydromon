@@ -19,7 +19,23 @@ After a restart, every undelivered message in the log was sent in an earlier tic
 it starts in the post office.
 
 Cadence. While anything is in flight, ticks follow one another every ``tick_seconds``.
-When nothing is, the loop rests until a message arrives.
+When nothing is, the loop rests until a message arrives or a scheduled wake falls due.
+
+Scheduled wakes. A line's ``wake_after`` tool schedules one wake, recorded as
+``wake_scheduled`` with its due time in Coordinated Universal Time and the identifier
+its note will carry. A new call replaces the line's pending wake. The first tick at or
+after the due time records the note as a ``message_sent`` from the line to itself,
+which the event model permits only for that reserved identifier, so the note is never
+mistaken for operator mail. It then wakes the line through the post office like any
+mail and counts toward the line's autonomous-turn limit. Firing is that one append, so
+a crash leaves a wake either pending or fired, and a wake that fell due while the
+daemon was down fires at its first tick. The wall clock is injected, so tests control
+it, and it is distinct from the monotonic clock that measures cooldowns.
+
+Disclosure guard. When the project names a disclosure list, a message, question or
+wake note that a line or an external agent sends through these tools is refused, and
+nothing is recorded, if its text holds a listed term, as ``dromon.disclosure``
+specifies. The refusal never names the term.
 
 Safety. Two lines can wake each other without end, and a line can run up cost without
 anyone watching. ``dromon.limits`` sets how many turns a line may take in a row without
@@ -49,6 +65,7 @@ import contextlib
 import secrets
 import time
 import sys
+from datetime import UTC, datetime, timedelta
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,6 +74,7 @@ from typing import Any, Final, Protocol, cast
 from claude_agent_sdk import SdkMcpTool
 
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
+from dromon import disclosure
 from dromon.overrides import (
     OverrideError,
     Scope,
@@ -121,9 +139,14 @@ from dromon.model import (
     AgentAddress,
     OperatorRegistered,
     QuestionStatus,
+    ScheduledWake,
     WakeIssued,
     WakeRequested,
+    WITHHELD_WAKE_NOTE,
+    WakeScheduled,
+    format_due,
     parse_address,
+    parse_due,
 )
 
 DEFAULT_OPERATOR: Final = "operator"
@@ -174,6 +197,39 @@ ASK_TOOL_SCHEMA: Final[dict[str, object]] = {
     "required": ["question"],
     "additionalProperties": False,
 }
+
+WAKE_TOOL_NAME: Final = "wake_after"
+
+MIN_WAKE_SECONDS: Final = 60
+MAX_WAKE_SECONDS: Final = 86400
+
+WAKE_TOOL_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "seconds": {
+            "type": "integer",
+            "minimum": MIN_WAKE_SECONDS,
+            "maximum": MAX_WAKE_SECONDS,
+            "description": "How long from now to wake you, in whole seconds",
+        },
+        "note": {
+            "type": "string",
+            "description": "What the wake is for. It arrives as a message from you",
+        },
+    },
+    "required": ["seconds", "note"],
+    "additionalProperties": False,
+}
+
+MAX_REST_SECONDS: Final = 60.0
+"""The longest the loop rests while a scheduled wake is pending, so that a change of
+the wall clock delays a wake by at most this much."""
+
+
+def utc_clock() -> datetime:
+    """The wall clock in Coordinated Universal Time, the scheduler's default."""
+    return datetime.now(UTC)
+
 
 LIST_MAIL_TOOL_NAME: Final = "list_mail"
 
@@ -400,6 +456,7 @@ class Scheduler:
         tick_seconds: float = DEFAULT_TICK_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         wake_every_ticks: int = 1,
+        wall_clock: Callable[[], datetime] = utc_clock,
     ) -> None:
         if not 1 <= wake_every_ticks <= MAX_WAKE_EVERY_TICKS:
             raise ValueError(f"wake_every_ticks must be in [1, {MAX_WAKE_EVERY_TICKS}]")
@@ -407,6 +464,9 @@ class Scheduler:
             raise ValueError(f"tick_seconds must be in [0, {MAX_TICK_SECONDS}]")
         self._log = log
         self._engine_factory = engine_factory
+        self._wall_clock = wall_clock
+        self._disclosure: tuple[str, ...] = ()
+        """The project's disclosure terms, case folded. Never logged or returned."""
         self.limits = limits
         self.wake_every_ticks = wake_every_ticks
         self._line_limits: dict[str, Limits] = {}
@@ -516,6 +576,14 @@ class Scheduler:
         if operator_id not in self._log.state.operators:
             self._log.append(OperatorRegistered(operator_id))
 
+    def set_disclosure_terms(self, terms: Sequence[str]) -> None:
+        """Replace the disclosure terms the tools check, already case folded."""
+        self._disclosure = tuple(terms)
+
+    def discloses(self, *texts: str) -> bool:
+        """Whether any of ``texts`` holds a term of the project's disclosure list."""
+        return disclosure.discloses(self._disclosure, texts)
+
     def send(
         self,
         sender: Address,
@@ -556,6 +624,8 @@ class Scheduler:
                 return _tool_error("to and body must be text")
             if reply_to is not None and not isinstance(reply_to, str):
                 return _tool_error("reply_to must be text")
+            if self.discloses(body):
+                return _tool_error(disclosure.REFUSAL)
             try:
                 message_id = self.send(sender, parse_address(to), body, reply_to)
             except (InvalidField, EventRejected) as error:
@@ -647,6 +717,8 @@ class Scheduler:
                 isinstance(choice, str) for choice in cast(list[object], choices)
             ):
                 return _tool_error("choices must be a list of text")
+            if self.discloses(question, *cast(list[str], choices)):
+                return _tool_error(disclosure.REFUSAL)
             try:
                 operator = self._operator_for(line_id, to)
                 message_id = self.ask(
@@ -679,6 +751,130 @@ class Scheduler:
             input_schema=ASK_TOOL_SCHEMA,
             handler=handler,
         )
+
+    def schedule_wake(self, line_id: str, seconds: int, note: str) -> tuple[str, str]:
+        """Schedule ``line_id``'s one wake ``seconds`` from now, replacing any pending
+        one, and return the identifier its note will carry and its due time.
+
+        The due time is rounded up to the whole second, so a wake never fires early.
+        Raises ``InvalidField`` or ``EventRejected``.
+        """
+        if (
+            type(seconds) is not int
+            or not MIN_WAKE_SECONDS <= seconds <= MAX_WAKE_SECONDS
+        ):
+            raise InvalidField(
+                f"seconds must be a whole number from {MIN_WAKE_SECONDS}"
+                f" to {MAX_WAKE_SECONDS}"
+            )
+        now = self._wall_clock().astimezone(UTC)
+        start = now.replace(microsecond=0)
+        if start < now:
+            start += timedelta(seconds=1)
+        due = format_due(start + timedelta(seconds=seconds))
+        message_id = new_id("m")
+        self._log.append(WakeScheduled(line_id, message_id, due, note))
+        self._work.set()
+        return message_id, due
+
+    def _due_wakes(self) -> list[str]:
+        """The lines whose scheduled wake has fallen due, in a fixed order."""
+        now = self._wall_clock()
+        return [
+            line_id
+            for line_id, pending in sorted(self._log.state.scheduled.items())
+            if parse_due(pending.due) <= now
+        ]
+
+    def fire_due_wakes(self) -> list[str]:
+        """Record the note of every scheduled wake that has fallen due, as a message
+        from its line to itself, and return their identifiers. Each goes to the sent
+        queue, so it is delivered from the next tick on.
+
+        The note is checked again against the disclosure list in force now, which a
+        reload or a restart may have changed since the wake was scheduled. A note that
+        now discloses fires as ``WITHHELD_WAKE_NOTE``, so the line is still woken and
+        the note goes no further."""
+        fired: list[str] = []
+        for line_id in self._due_wakes():
+            pending = self._log.state.scheduled[line_id]
+            address = LineAddress(line_id)
+            body = WITHHELD_WAKE_NOTE if self.discloses(pending.note) else pending.note
+            self._log.append(
+                MessageSent(
+                    pending.message_id,
+                    address,
+                    address,
+                    MessageKind.NOTE,
+                    body,
+                )
+            )
+            self._sent.append(pending.message_id)
+            self._failed.discard(line_id)
+            fired.append(pending.message_id)
+        return fired
+
+    def seconds_until_next_wake(self) -> float | None:
+        """How long until the earliest pending scheduled wake falls due, at least 0,
+        or ``None`` when no wake is pending."""
+        pending = self._log.state.scheduled.values()
+        if not pending:
+            return None
+        earliest = min(parse_due(wake.due) for wake in pending)
+        return max(0.0, (earliest - self._wall_clock()).total_seconds())
+
+    def wake_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``wake_after`` tool for ``line_id``, whose line it fixes."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, WAKE_TOOL_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            seconds: object = args.get("seconds")
+            note: object = args.get("note")
+            if type(seconds) is not int:
+                return _tool_error("seconds must be a whole number")
+            if not isinstance(note, str):
+                return _tool_error("note must be text")
+            if self.discloses(note):
+                return _tool_error(disclosure.REFUSAL)
+            replaced = self._log.state.scheduled.get(line_id)
+            try:
+                message_id, due = self.schedule_wake(line_id, seconds, note)
+            except (InvalidField, EventRejected) as error:
+                return _tool_error(str(error))
+            text = (
+                f"a wake is scheduled for {due}. Its note will arrive as {message_id},"
+                " a message from you."
+            )
+            if replaced is not None:
+                text += f" It replaces the wake that was due at {replaced.due}."
+            return _tool_text(text)
+
+        return SdkMcpTool(
+            name=WAKE_TOOL_NAME,
+            description=(
+                "Schedule one wake for yourself, such as to read the result of a long"
+                " command you started in the background. After the given seconds,"
+                " from 60 to 86400, your note arrives as a message from you, which"
+                " wakes you. You have at most one scheduled wake, and a new call"
+                " replaces it."
+            ),
+            input_schema=WAKE_TOOL_SCHEMA,
+            handler=handler,
+        )
+
+    def own_tools(self, line_id: str) -> list[SdkMcpTool[Any]]:
+        """A line's own Dromon tools, whose sender each fixes to the line."""
+        return [
+            self.send_tool(line_id),
+            self.ask_tool(line_id),
+            self.wake_tool(line_id),
+            self.list_mail_tool(line_id),
+            self.read_mail_tool(line_id),
+            self.acknowledge_mail_tool(line_id),
+            self.list_sent_tool(line_id),
+        ]
 
     def collect(self, owner: OperatorAddress | AgentAddress) -> None:
         """Deliver every undelivered message for ``owner``, as its client shows them.
@@ -1064,7 +1260,7 @@ class Scheduler:
         the loop ticking, so its turn starts on time rather than when more mail
         arrives.
         """
-        if self._running or self._sent:
+        if self._running or self._sent or self._due_wakes():
             return True
         return any(
             self._eligible(line_id) and self.deliverable(line_id)
@@ -1127,8 +1323,10 @@ class Scheduler:
 
     def step(self) -> None:
         """Run one tick: update every line once, then move the sent queue to the post
-        office. Turns the tick starts run on after it, as tasks."""
+        office. Turns the tick starts run on after it, as tasks. Scheduled wakes that
+        have fallen due fire first, into the sent queue."""
         self.tick += 1
+        self.fire_due_wakes()
         for line_id in sorted(self._log.state.lines):
             if not self._can_start(line_id):
                 continue
@@ -1154,8 +1352,12 @@ class Scheduler:
                 self._work.clear()
                 worker = asyncio.create_task(self._work.wait())
                 stopping = asyncio.create_task(stop.wait())
+                # Rest until work arrives, or until the next scheduled wake falls due.
+                until = self.seconds_until_next_wake()
                 await asyncio.wait(
-                    {worker, stopping}, return_when=asyncio.FIRST_COMPLETED
+                    {worker, stopping},
+                    timeout=None if until is None else min(until, MAX_REST_SECONDS),
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
                 worker.cancel()
                 stopping.cancel()
@@ -1266,17 +1468,7 @@ class Scheduler:
                 line.engine_session,
                 self.activity.observer(line_id),
             )
-            engine = self._engine_factory(
-                spec,
-                [
-                    self.send_tool(line_id),
-                    self.ask_tool(line_id),
-                    self.list_mail_tool(line_id),
-                    self.read_mail_tool(line_id),
-                    self.acknowledge_mail_tool(line_id),
-                    self.list_sent_tool(line_id),
-                ],
-            )
+            engine = self._engine_factory(spec, self.own_tools(line_id))
             self._engines[line_id] = engine
         return engine
 
@@ -1295,6 +1487,7 @@ class Scheduler:
                 "cost_estimate_usd": f"{self._cost.get(line_id, 0.0):.4f}",
                 "held_by": line.held_by,
                 "tool_policy": self.effective_config(line_id).tool_policy.value,
+                "scheduled_wake": _scheduled_summary(state.scheduled.get(line_id)),
             }
             for line_id, line in sorted(state.lines.items())
         ]
@@ -1307,6 +1500,14 @@ def _unexpected(args: dict[str, Any], schema: dict[str, object]) -> str | None:
     if extra:
         return "unexpected argument " + ", ".join(extra)
     return None
+
+
+def _scheduled_summary(pending: ScheduledWake | None) -> dict[str, object] | None:
+    """A line's pending scheduled wake as a client sees it, without its note, which
+    is the line's own text and may be long."""
+    if pending is None:
+        return None
+    return {"due": pending.due, "message_id": pending.message_id}
 
 
 def _tool_text(text: str) -> dict[str, Any]:
