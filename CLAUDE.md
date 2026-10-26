@@ -63,15 +63,21 @@ operator has modified it.
 `main` is always green. Work happens on short-lived feature branches named
 `<scope>/<short-description>`, merged into `main` by a no-fast-forward merge through a
 pull request once checks pass. A feature branch may be red between commits. Only its tip
-at merge must be green. Use scoped conventional commits such as `feat:`, `fix:`, `docs:`, `test:` and `chore:`. Attribute assisted
-commits to the assistant that actually contributed, with
-`Co-Authored-By: Claude <noreply@anthropic.com>` for Claude,
-`Co-Authored-By: Codex <noreply@openai.com>` for Codex, and the equivalent line for any
-other assistant.
+at merge must be green. Use scoped conventional commits such as `feat:`, `fix:`, `docs:`,
+`test:` and `chore:`. Commit messages carry no `Co-Authored-By` trailer, at the
+operator's instruction of 2026-10-25, which applies to every repository.
 
 The remote is `https://github.com/sgeos/pydromon`, a public repository. Its git
 configuration uses the GitHub command-line tool as the credential helper, because SSH
 keys are unreachable from inside agent sandboxes.
+
+**One writer per checkout.** When more than one line works on the repository at once,
+each works in its own worktree on its own branch, created with `scripts/worktree.sh`.
+Two lines in one checkout share an index and a dirty tree, so one line's `git add`,
+stash or reset can take in or discard the other's work.
+Claude Code's sandbox denies the default location beside the repository, so inside it
+set `WORKTREE_BASE="$PWD/tmp/worktrees"`, which was verified on 2026-10-25. Removing a
+branch there warns that `.git/config` could not be locked, which is harmless.
 
 **Irreversible or outward-facing actions need the operator's confirmation in session.**
 That includes pushing to the remote, changing repository visibility or settings,
@@ -91,11 +97,16 @@ uv run ruff check . && uv run ruff format --check .
 uv run pyright                                 # strict type checks
 uv run dromon --help                           # the client and its subcommands
 uv run dromond --help                          # the daemon
+scripts/worktree.sh new feat/some-thing        # an isolated worktree for a parallel line
+scripts/worktree.sh rm  feat/some-thing        # remove it once merged
 ```
 
-`scripts/check.sh` runs the hygiene checks, `uv sync --locked`, Ruff, pyright, pytest
-with warnings as errors and with its arguments, and shellcheck when it is installed.
-Live tests are never part of it, because they spend the operator's subscriptions.
+`scripts/check.sh` runs the template's hygiene checks, which include shellcheck on every
+shell script and fail when it is not installed, then `uv sync --locked`, Ruff, pyright,
+and pytest with warnings as errors and with its arguments. Live tests are never part of
+it, because they spend the operator's subscriptions. `git config core.hooksPath
+scripts/hooks` runs the gate before every push, in its full form, so a push from
+inside a sandbox runs the sandbox form first and then uses `git push --no-verify`.
 
 ## Before Trusting a Green Run
 
@@ -103,6 +114,9 @@ Live tests are never part of it, because they spend the operator's subscriptions
   Run `uv sync` after changing dependencies or entry points.
 - **Count what was reached.** A suite that collected zero tests, or skipped them all, passes.
   Check the count in the summary line.
+- **Opt-in tests are counted as skipped, not as passed.** The `socket` tests are
+  deselected inside a sandbox, and the `live` tests always unless `DROMON_LIVE_TESTS=1`
+  and `-m live` are given. Report how many were left out and why.
 - **A local pass is not a remote pass.** Continuous integration runs on other operating
   systems and tool versions, and runs the socket tests a sandbox skips. Say which one was
   observed.
@@ -119,7 +133,10 @@ ignored whole. Never copy its contents into tracked files, commit messages, issu
 pull requests.
 
 `scripts/check.sh` fails if anything under `secret/`, or anything under `tmp/` other than
-its marker, is tracked. Both rules follow the Keleusma repository.
+its marker, is tracked. If `secret/disclosure-terms.txt` exists, one term per line, the
+gate also fails when a tracked file contains any of those terms, and it prints only the
+file and line. The scan cannot run in a clone or in continuous integration, which do not
+have the list, and the gate says so when it skips.
 
 ## Coding Conventions
 

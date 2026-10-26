@@ -20,6 +20,7 @@ specification, then confirm details against the source.
 - [CLAUDE.md](https://github.com/sgeos/pydromon/blob/main/CLAUDE.md): Authoritative project context, conventions and per-session protocol.
 - [README](https://github.com/sgeos/pydromon/blob/main/README.md): Overview, status and setup.
 - [CONTRIBUTING](https://github.com/sgeos/pydromon/blob/main/CONTRIBUTING.md): The gate and the test markers.
+- [Code of conduct](https://github.com/sgeos/pydromon/blob/main/CODE_OF_CONDUCT.md): How participants treat each other, for people and agents alike.
 
 ## Specification
 

@@ -22,9 +22,13 @@
 .env.*
 !.env.example
 
-# Agent runtime state, such as session lock files and host-specific settings. Local
-# to each contributor's session and not project content.
-.claude/
+# Agent runtime state and personal settings, local to each contributor and not project
+# content. Shared Claude Code configuration, such as .claude/settings.json, skills,
+# agents and commands, is not ignored, so a project can commit it deliberately. Codex's
+# directory holds host-specific settings, such as a context window, and is ignored
+# whole.
+.claude/settings.local.json
+.claude/.cc-writes/
 .codex/
 
 # Operating system and editor droppings.
