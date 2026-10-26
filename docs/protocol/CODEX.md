@@ -27,7 +27,9 @@ from the engine before reading on. The process is stopped when the turn ends.
    usage. Any other type is refused. The driver accepts or refuses the credential
    before any thread exists.
 3. `thread/start` for a new line, or `thread/resume` with the stored thread
-   identifier, with the driver's model, the project root as `cwd`, `permissions` set to
+   identifier, with the driver's model, the line's working directory as `cwd`, which is
+   its `workdir` as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies or the project root,
+   `permissions` set to
    `dromon-line`, `approvalPolicy` set to `never` and `approvalsReviewer` set to `user`.
    A new thread also receives Dromon's own tools as `dynamicTools`.
 4. The response's `modelProvider` must be `openai`, its `activePermissionProfile` must
@@ -84,6 +86,8 @@ extends = ":workspace"
 "/real/path/of/runtime" = "deny"
 ```
 
+- The workspace root `.` is the line's working directory. Its relative `instructions`
+  paths resolve there too.
 - The workspace is `write` for a line given `Edit` or `Write`, and `read` otherwise.
 - `.git` is always `read`, so a Codex line never commits. Codex documents that a
   profile extending `:workspace` keeps `.git` read-only, and a reported issue says it
@@ -145,7 +149,17 @@ turn. `dromon probe --model gpt-6-luna` reported the subscription credential.
 ## Not at parity with Claude Code lines
 
 - No MCP servers, no sandbox or settings documents, and no way to commit, since `.git`
-  is always read-only.
+  is always read-only. In a linked worktree `.git` is a file, and the common git
+  directory, with its hooks and configuration, lies outside the workspace. It is not
+  writable either, because the profile leaves everything outside the workspace
+  read-only apart from the temporary directories. That rule comes from Codex's
+  `:workspace` profile, which `dromon-line` extends. Dromon's own entries grant writes
+  only to the workspace root and add denies, as `permission_profile` in
+  `dromon.codex` shows. **Fact, observed on 2026-10-25** under the profile, as recorded
+  above. A write in the home directory failed. Two exceptions follow from the same
+  rule. A common git directory under `$TMPDIR` or `/tmp` would be writable. So would one
+  inside the workspace, when a line's `workdir` contains another checkout's git
+  directory, since only the workspace's own `.git` is held read-only.
 - No extra writable paths. **Fact, observed on 2026-10-26 in pydromon.** uv could not
   write its cache in the home directory, so a Codex line runs the gate with
   `UV_CACHE_DIR` under `$TMPDIR` and `UV_OFFLINE=1`, which works while the environment

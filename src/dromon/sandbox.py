@@ -24,6 +24,9 @@ runtime directories, which hold the event log, the project file and the daemon's
 socket. A command that could write them could grant its own line tools at the next
 start, and one that could reach the socket could act with operator authority. This
 mirrors Claude Code's protection of its own settings files, and no layer can lift it.
+Every enabled sandbox also denies writing the hooks and configuration of the git
+checkout its line works in, which ``dromon.workdir`` finds, because git would run a
+planted hook outside the sandbox in the operator's own commit or push.
 
 Trust. The project file is like a repository's ``.claude/settings.json``, so keys that
 Claude Code accepts only from user or managed settings, because they remove a boundary,
@@ -333,8 +336,9 @@ def merge(layers: Sequence[SandboxConfig | None]) -> SandboxConfig | None:
 def _resolve(path: str, root: Path) -> str:
     """An absolute path, or a home-relative one that Claude Code expands.
 
-    Relative paths are resolved against the project root here, because their meaning
-    in Claude Code depends on the file that sets them, and Dromon sets none.
+    Relative paths are resolved against ``root``, the line's working directory, here,
+    because their meaning in Claude Code depends on the file that sets them, and Dromon
+    sets none.
     """
     if path == "~" or path.startswith("~/") or path.startswith("/"):
         return path
@@ -354,11 +358,16 @@ def _within(path: str, directory: Path) -> bool:
 
 
 def effective(
-    sandbox: SandboxConfig | None, root: Path, protected: Sequence[Path]
+    sandbox: SandboxConfig | None,
+    root: Path,
+    protected: Sequence[Path],
+    guarded_writes: Sequence[Path] = (),
 ) -> dict[str, object] | None:
     """The settings to hand the engine for a line whose merged document is
-    ``sandbox``, with relative paths resolved against ``root``, the unattended
-    defaults filled in and ``protected`` denied. ``None`` when nothing is set.
+    ``sandbox``, with relative paths resolved against ``root``, the line's working
+    directory, the unattended defaults filled in, ``protected`` denied, and
+    ``guarded_writes``, such as a checkout's git hooks, denied to writes. ``None``
+    when nothing is set.
 
     Raises ``SandboxError`` when an allowed Unix socket lies in a protected directory.
     """
@@ -399,6 +408,13 @@ def effective(
     for name in ("denyRead", "denyWrite"):
         existing = cast(list[str], filesystem.get(name, []))
         filesystem[name] = sorted({*existing, *guarded})
+    # Denied even where an allowWrite entry grants the directory around them. A deny
+    # entry winning over an allow entry was verified live on 2026-10-26, as
+    # docs/protocol/SANDBOX.md records.
+    written = cast(list[str], filesystem["denyWrite"])
+    filesystem["denyWrite"] = sorted(
+        {*written, *(os.path.normpath(path) for path in guarded_writes)}
+    )
     for name in ("allowRead", "allowWrite"):
         for path in cast(list[str], filesystem.get(name, [])):
             for directory in protected:

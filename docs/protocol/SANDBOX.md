@@ -82,8 +82,10 @@ Claude Code. Nothing is passed when no layer sets anything, and the line then ha
 sandbox but any managed policy, because Dromon starts Claude Code without user or
 project settings.
 
-1. **Paths.** A relative path is resolved against the project root. A path that starts
-   with `/` or `~` is passed as written, and Claude Code expands `~`.
+1. **Paths.** A relative path is resolved against the line's working directory, its
+   `workdir` as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies, which is the project root
+   by default. A path that starts with `/` or `~` is passed as written, and Claude Code
+   expands `~`.
 2. **Unattended defaults.** When the document enables the sandbox, Dromon fills in
    `failIfUnavailable` as true, `allowUnsandboxedCommands` as false and
    `network.strictAllowlist` as true, unless the document sets them. Claude Code's own
@@ -96,7 +98,25 @@ project settings.
    refused, after `~` expansion and symbolic link resolution. `dromond` checks the
    project file's documents before it starts, and a line whose document fails the check
    at its first turn has that turn end before any command runs.
-4. **Unsandboxed retries.** Dromon's permission gate refuses a Bash, PowerShell or
+4. **Git hooks and configuration.** When the line's working directory lies in a git
+   checkout, an enabled sandbox also denies writes to the hooks and configuration git
+   would act on there, whether or not any layer grants the git directory. A command
+   that could write them would plant code that git later runs outside every sandbox, in
+   the operator's own commit or push. The paths are found by reading the checkout's
+   `.git`, a directory or a file of the form `gitdir: PATH`, and the git directory's
+   `commondir` file, following relative paths as git does, without running git. They
+   are the common git directory's `hooks` and `config`, and the git directory's
+   `config.worktree`. For a linked worktree, whose `.git` is a file, they also include
+   that file and its `commondir`, since rewriting either would hand git a directory of
+   the line's own making. Only writes are denied, so the line can still read them and
+   commit. A `.git` or `commondir` that cannot be read, or that is malformed, ends the
+   turn before any command runs, and `dromond` refuses a project file with such a line.
+   Git itself refuses such a checkout. **Fact, observed on 2026-10-26 with Claude
+   Code 2.1.310 on macOS.** A deny entry wins over an allow entry. A Haiku line in a
+   linked worktree, granted the whole common git directory, committed, while its
+   writes to that directory's `hooks` and `config` failed with `Operation not
+   permitted`.
+5. **Unsandboxed retries.** Dromon's permission gate refuses a Bash, PowerShell or
    Monitor call that sets `dangerouslyDisableSandbox` while the sandbox is enabled
    without `allowUnsandboxedCommands`, whatever the line's tool policy.
 
@@ -123,5 +143,19 @@ succeeded and the one that wrote in the home directory was refused.
 - A line without an enabled sandbox can still reach the daemon's socket through its
   shell, because the daemon does not check peer credentials. This is recorded as debt
   in `CLIENT.md`.
+- The git guard protects only the files of its set, the hooks directory, `config`,
+  `config.worktree` and a linked worktree's two pointers. Every other file under the
+  git directory stays as writable as the line's grants make it. Git runs no other file
+  there as code unless configuration tells it to. A filter or merge driver, for
+  example, is named in `.gitattributes` but defined in configuration, which is guarded.
+  The exception is a file that the existing configuration already includes with
+  `include.path` or `includeIf`, which the guard does not follow.
+  **Inference, from git's documentation of attributes, drivers and includes, not
+  tested.**
+- The git guard covers the checkout of the line's working directory only. A
+  `core.hooksPath` in the operator's global git configuration, a `GIT_DIR` set in the
+  environment, and other repositories the line can write are outside it. Codex and Grok
+  lines keep their own rules, which leave `.git` read-only in their workspace, as
+  [`CODEX.md`](CODEX.md) and [`GROK.md`](GROK.md) specify.
 - Linux and WSL2 behaviour is specified by Claude Code and has not been verified live
   by this line. Continuous integration runs the unit tests on Linux.

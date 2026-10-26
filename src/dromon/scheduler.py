@@ -80,6 +80,7 @@ from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, effective, merge
 from dromon.settings import SettingsConfig
+from dromon.workdir import git_write_guards, resolve_workdir
 from dromon.mailbox import (
     MAX_PAGE,
     MailSummary,
@@ -249,7 +250,7 @@ type EngineFactory = Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], LineEngine]
 
 
 def engine_factory(
-    cwd: str,
+    root: str,
     *,
     project_sandbox: SandboxConfig | None = None,
     project_settings: SettingsConfig | None = None,
@@ -257,18 +258,23 @@ def engine_factory(
     line_tokens: LineTokens | None = None,
     line_socket: Path | None = None,
 ) -> EngineFactory:
-    """The production factory: each line on Claude Code with its packaged driver.
+    """The production factory: each line on its packaged driver's engine.
 
-    Each line's sandbox is the project's document merged with its own, with relative
-    paths resolved against ``cwd`` and the ``protected`` directories denied. A
-    document that cannot be made safe raises ``SandboxError``, which ends the turn
-    before any command runs. Each line's engine settings are the project's merged
-    with its own, with ``ask`` rules denied and the ``protected`` directories denied
-    to the built-in file tools.
+    Each engine runs in the line's working directory, its ``workdir`` resolved
+    against the project ``root``, or the root itself. A directory that is gone or
+    no longer allowed raises ``ConfigError``. Each line's sandbox is the project's
+    document merged with its own, with relative paths resolved against the working
+    directory, the ``protected`` directories denied, and, when it is enabled, the
+    hooks and configuration of the working directory's git checkout denied to
+    writes. A document that cannot be made safe raises ``SandboxError``. Either
+    ends the turn before any command runs. Each line's engine settings are the
+    project's merged with its own, with ``ask`` rules denied and the ``protected``
+    directories denied to the built-in file tools.
     """
 
     def build(spec: LineSpec, own_tools: Sequence[SdkMcpTool[Any]]) -> LineEngine:
         driver = Driver.for_model(spec.model, spec.strategy)
+        workdir = resolve_workdir(spec.config.workdir, Path(root), protected)
         if driver.settings.engine == codex.ENGINE_NAME:
             if project_sandbox is not None or project_settings is not None:
                 raise EngineRefused(
@@ -277,7 +283,7 @@ def engine_factory(
                 )
             return CodexLine(
                 driver,
-                Path(cwd),
+                workdir,
                 config=spec.config,
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
@@ -295,11 +301,11 @@ def engine_factory(
             if line_tokens is not None and line_socket is not None:
                 token = line_tokens.issue(spec.line_id)
                 bridge = grok.bridge_command(
-                    Path(cwd), line_socket.parent, spec.line_id
+                    Path(root), line_socket.parent, spec.line_id
                 )
             return GrokLine(
                 driver,
-                Path(cwd),
+                workdir,
                 config=spec.config,
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
@@ -309,13 +315,15 @@ def engine_factory(
                 observe=spec.observe,
             )
         merged = merge([project_sandbox, spec.config.sandbox])
+        enabled = merged is not None and merged.enabled
+        guarded = git_write_guards(workdir) if enabled else ()
         return ClaudeCodeLine(
             driver,
-            Path(cwd),
+            workdir,
             config=spec.config,
             mcp_tools=list(own_tools),
             session_id=spec.session_id,
-            sandbox=effective(merged, Path(cwd), protected),
+            sandbox=effective(merged, workdir, protected, guarded),
             settings=engine_settings.effective(
                 engine_settings.merge([project_settings, spec.config.settings]),
                 protected,
@@ -417,10 +425,13 @@ class Scheduler:
         self._tick_seconds = tick_seconds
         self._running: dict[str, asyncio.Task[None]] = {}
         self.activity = ActivityLog()
+        """What each line's engine is doing, for attached clients. Not persisted."""
         self._reported: set[tuple[str, str]] = set()
         self._interrupted: set[str] = set()
         """Lines whose turn an operator cancelled, until the turn task ends."""
-        """What each line's engine is doing, for attached clients. Not persisted."""
+        self._moved: set[str] = set()
+        """Lines whose working directory changed during their turn in flight, whose
+        session that turn must not record, since it belongs to the old directory."""
         self._sent: list[str] = []
         """Messages sent during the current tick, moved to the post office after it."""
         self._post_office: set[str] = {
@@ -449,9 +460,15 @@ class Scheduler:
         model: str,
         strategy: Strategy,
         config: LineConfig = DEFAULT_CONFIG,
+        engine_session: str | None = None,
     ) -> None:
         """Create a line after checking that a driver exists for it and that Dromon
-        has an adapter for the driver's engine."""
+        has an adapter for the driver's engine.
+
+        ``engine_session`` adopts an existing engine session, recorded right after
+        the line is created, so the line's first turn continues it. It must have been
+        started in the line's working directory, where Claude Code keeps it.
+        """
         driver = Driver.for_model(model, strategy)
         if model not in MODELS:
             raise DriverError(
@@ -459,21 +476,40 @@ class Scheduler:
                 " has no adapter yet"
             )
         _check_engine_supports(driver, config)
+        # Built first, so a malformed session refuses the line before it exists.
+        adopted = (
+            None if engine_session is None else LineSession(line_id, engine_session)
+        )
         self._log.append(LineCreated(line_id, model, strategy.value))
+        if adopted is not None:
+            self._log.append(adopted)
         if config != DEFAULT_CONFIG:
-            self.configure_line(line_id, config)
+            self._configure(line_id, config, creating=True)
 
     def configure_line(self, line_id: str, config: LineConfig) -> None:
         """Replace a line's tool configuration. It applies from the line's next turn.
 
         The engine is rebuilt with the new configuration, and resumes the same engine
-        session, so the line keeps its conversation.
+        session, so the line keeps its conversation. A change of working directory
+        is the exception. Claude Code keeps a session under the directory it ran in,
+        so the line's next turn starts a new session, recorded as
+        ``line_session_cleared``.
         """
+        self._configure(line_id, config, creating=False)
+
+    def _configure(self, line_id: str, config: LineConfig, *, creating: bool) -> None:
         line = self._log.state.lines.get(line_id)
+        previous: str | None = None
         if line is not None:
             driver = Driver.for_model(line.engine, Strategy(line.strategy))
             _check_engine_supports(driver, config)
+            if line.config is not None:
+                previous = decode_config(line.config).workdir
         self._log.append(LineConfigured(line_id, encode_config(config)))
+        if not creating and line is not None and previous != config.workdir:
+            self._log.append(LineSessionCleared(line_id))
+            if line_id in self._running:
+                self._moved.add(line_id)
         self._engines.pop(line_id, None)
 
     def ensure_operator(self, operator_id: str) -> None:
@@ -1172,7 +1208,8 @@ class Scheduler:
             report = await self.engine_for(line_id).run_turn(prompt)
             self.turn_reports.append((line_id, report))
             recorded = self._log.state.lines[line_id].engine_session
-            if report.session_id and report.session_id != recorded:
+            moved = line_id in self._moved
+            if report.session_id and report.session_id != recorded and not moved:
                 self._log.append(LineSession(line_id, report.session_id))
             ending = report.subtype
             if report.interrupted_for is not None:
@@ -1189,6 +1226,7 @@ class Scheduler:
             print(f"dromond: line {line_id} turn failed: {error}", file=sys.stderr)
         finally:
             self._interrupted.discard(line_id)
+            self._moved.discard(line_id)
             self.activity.record(line_id, ActivityKind.TURN_ENDED, ending)
             if self._log.state.lines[line_id].state is LineState.RUNNING:
                 self._log.append(LineStateChanged(line_id, LineState.IDLE))

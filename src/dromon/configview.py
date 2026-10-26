@@ -271,6 +271,11 @@ def line_entries(facts: LineFacts, project: Sequence[Layer]) -> list[dict[str, o
             "the engine session the next turn resumes",
             facts.session or "new",
         ),
+        info(
+            "workdir",
+            "the directory the engine runs in, changed only by configuration",
+            facts.config.workdir or "the project root",
+        ),
     ]
     effort = config.effort
     entries.append(

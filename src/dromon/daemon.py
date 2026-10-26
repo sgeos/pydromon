@@ -68,6 +68,7 @@ from dromon.lineconfig import (
 )
 from dromon.projectconfig import ConfigFileError, ProjectConfig, config_path, load
 from dromon.sandbox import SandboxError, effective, merge
+from dromon.workdir import git_write_guards, resolve_workdir
 from dromon.configview import (
     OVERRIDE,
     LineFacts,
@@ -505,13 +506,19 @@ class Daemon:
 
     def _create_line(self, args: dict[str, object]) -> dict[str, object]:
         texts = {key: value for key, value in args.items() if key != "config"}
-        line_id, model, strategy = _text_args(texts, ("line_id", "model", "strategy"))
+        names = ("line_id", "model", "strategy")
+        if "engine_session" in texts:
+            names += ("engine_session",)
+        values = _text_args(texts, names)
+        line_id, model, strategy = values[:3]
+        session = values[3] if len(values) > 3 else None
         try:
             chosen = Strategy(strategy)
         except ValueError as error:
             raise DriverError(f"unknown strategy {strategy!r}") from error
         config = _config_arg(args) if "config" in args else DEFAULT_CONFIG
-        self.scheduler.create_line(line_id, model, chosen, config)
+        self._check_workdir(config)
+        self.scheduler.create_line(line_id, model, chosen, config, session)
         return {"line_id": line_id}
 
     def _configure_line(self, args: dict[str, object]) -> dict[str, object]:
@@ -521,8 +528,15 @@ class Daemon:
             raise ProtocolError(ErrorCode.BAD_REQUEST, "configure_line needs a config")
         if line_id not in self.log.state.lines:
             raise EventRejected(f"no line {line_id}")
-        self.scheduler.configure_line(line_id, _config_arg(args))
+        config = _config_arg(args)
+        self._check_workdir(config)
+        self.scheduler.configure_line(line_id, config)
         return {"line_id": line_id}
+
+    def _check_workdir(self, config: LineConfig) -> None:
+        """Refuse a working directory that does not exist or is not allowed, before
+        anything is recorded. Raises ``ConfigError``."""
+        resolve_workdir(config.workdir, self.paths.root, protected_dirs(self.paths))
 
     def _questions(self, args: dict[str, object]) -> dict[str, object]:
         """Open questions for ``operator``, or for every operator when it is omitted."""
@@ -1157,12 +1171,17 @@ def protected_dirs(paths: ProjectPaths) -> tuple[Path, ...]:
 
 
 def check_sandboxes(config: ProjectConfig, paths: ProjectPaths) -> None:
-    """Refuse a project file whose sandboxes cannot be made safe, before anything
-    starts, rather than at each line's first turn. Raises ``SandboxError``."""
+    """Refuse a project file whose working directories are not allowed, or whose
+    sandboxes cannot be made safe in them, before anything starts, rather than at
+    each line's first turn. Raises ``ConfigError`` or ``SandboxError``."""
     protected = protected_dirs(paths)
     effective(config.sandbox, paths.root, protected)
     for line in config.lines.values():
-        effective(merge([config.sandbox, line.config.sandbox]), paths.root, protected)
+        workdir = resolve_workdir(line.config.workdir, paths.root, protected)
+        merged = merge([config.sandbox, line.config.sandbox])
+        enabled = merged is not None and merged.enabled
+        guarded = git_write_guards(workdir) if enabled else ()
+        effective(merged, workdir, protected, guarded)
 
 
 def check_engines(config: ProjectConfig) -> None:
@@ -1252,8 +1271,10 @@ def check_project(log: EventLog, config: ProjectConfig) -> None:
 def apply_project(scheduler: Scheduler, log: EventLog, config: ProjectConfig) -> None:
     """Bring the log's lines into line with the file's definitions.
 
-    A declared line that does not exist is created. One whose tools changed is
-    reconfigured, under any overrides an operator set from a client. A file that
+    A declared line that does not exist is created, adopting the file's ``session``
+    if it gives one. One whose tools changed is reconfigured, under any overrides an
+    operator set from a client, which starts a new engine session when its working
+    directory moved. A ``session`` for a line that exists is not used. A file that
     changes a line's model or strategy is refused before anything is applied. Lines
     created through the client and absent from the file are left as they are.
     """
@@ -1262,7 +1283,11 @@ def apply_project(scheduler: Scheduler, log: EventLog, config: ProjectConfig) ->
         existing = log.state.lines.get(line_id)
         if existing is None:
             scheduler.create_line(
-                line_id, definition.model, definition.strategy, definition.config
+                line_id,
+                definition.model,
+                definition.strategy,
+                definition.config,
+                definition.session,
             )
         else:
             stored = (

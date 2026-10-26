@@ -53,7 +53,9 @@ declares MCP servers for mail and documents.
    tools inside its sandbox. The protocol version must be 1 and
    `defaultAuthMethodId` must be `cached_token`.
 4. **`session/new`**, or `session/load` with the stored session identifier, with the
-   project root, Dromon's MCP server, and `_meta` with `yoloMode` and `autoMode` false
+   line's working directory as `cwd`, which is its `workdir` as
+   [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies or the project root, Dromon's MCP
+   server, and `_meta` with `yoloMode` and `autoMode` false
    and the line's instructions as `rules`.
 5. **Model and mode.** The response's `models.currentModelId`, or its `model` config
    option, is handed to the driver. Its `modes.currentModeId` must be `default` or
@@ -95,7 +97,12 @@ deny = [".dromon"]
 Before each turn Dromon checks that the profile extends `read-only` for a reader, or
 `workspace` or `strict` for a writer, that its `deny` entries cover the state and runtime
 directories as Grok resolves them, with `~` at the home directory and other relative
-entries at the workspace, and that a writer's `read_only` or `deny` covers `.git`.
+entries at the workspace, and that a writer's `read_only` or `deny` covers `.git`. The
+workspace is the line's working directory, and a project's own `.grok/sandbox.toml` is
+read there. The profile names are fixed, so Grok lines in different working directories
+share one definition of each, whose entries must cover every one of their `.git` paths
+and every protected directory by its real path. The bridge below still runs in the
+project root, where it finds the runtime directory.
 **Inference, not verified.** A `read_only` entry inside a writable workspace keeps it
 read-only, as the field's name says.
 

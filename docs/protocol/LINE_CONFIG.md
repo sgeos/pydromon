@@ -41,7 +41,8 @@ keys, duplicate keys and numbers are refused.
 | `settings` | The line's own engine settings, as [`SETTINGS.md`](SETTINGS.md) specifies, before the project's are merged in. Omitted when unset | none |
 | `effort` | `low`, `medium`, `high`, `xhigh` or `max`, replacing the driver's effort. Omitted when unset | the driver's |
 | `claude_code_prompt` | Run a Claude Code line on Claude Code's own system prompt rather than an empty one. Omitted when false | `false` |
-| `instructions` | At most 16 distinct files, such as `CLAUDE.md`, whose text is appended to the system prompt at each turn. A relative path is resolved against the project root and `~` against the home directory. Omitted when empty | none |
+| `instructions` | At most 16 distinct files, such as `CLAUDE.md`, whose text is appended to the system prompt at each turn. A relative path is resolved against the line's working directory and `~` against the home directory. Omitted when empty | none |
+| `workdir` | The directory the line's engine runs in, as the working directory section below specifies. Omitted when unset | the project root |
 
 A server name is an identifier and may not be `dromon`, which Dromon's own tools use. A
 `stdio` server has `command` and optionally `args` and `env`. An `http` or `sse` server
@@ -87,6 +88,56 @@ and a file that is missing, larger than 256 KiB or not UTF-8 refuses the turn. O
 paths are stored. On Codex the text becomes the thread's developer instructions, and
 `claude_code_prompt` is refused, since Codex uses its own.
 
+## Working directory
+
+**Decided by the operator on 2026-10-25.** Each line's engine runs in its own working
+directory, so that a line can work in a git worktree of its own while the daemon's
+state stays in the project.
+
+- **Resolution.** `workdir` is text of 1 to 4,096 characters without NUL. A relative
+  path is resolved against the project root, and `~` or `~/` against the home
+  directory. Another user's home, such as `~ana/`, is refused. Only the path is stored.
+- **Checks.** After symbolic links are resolved, the directory must exist. It may not
+  be the project's state directory or runtime directory or lie inside either. It may
+  not contain either, unless it is the project root itself, which contains the state
+  directory by default and is protected as every line's root is. A configuration that
+  fails a check is refused when it is created, configured or read from the project
+  file, and a turn whose directory has since vanished or moved under a protected
+  directory ends before its engine starts.
+- **Default.** Without `workdir` a line runs in the project root, as before, and its
+  configuration encodes exactly as it did before the key existed.
+- **What follows the directory.** Claude Code's working directory, the Codex workspace
+  and its `:workspace_roots`, and the Grok agent's working directory. A line's relative
+  `instructions` paths, and the relative paths of its sandbox document, resolve against
+  it. Permission rules in its settings are interpreted by Claude Code against the same
+  working directory. The project's state and runtime directories stay protected for
+  every line wherever it runs.
+- **Sessions.** Claude Code keeps a session under the directory it ran in. When a
+  line's `workdir` changes, by `configure_line` or by the project file at start or
+  reload, the daemon appends `line_session_cleared`, so the line's next turn starts a
+  new session. A turn in flight at the change does not record its session. The
+  comparison is of the stored text, so writing the same directory another way also
+  starts a new session, including a first explicit `workdir` that names the project
+  root. Other configuration changes keep the session.
+- **Limit, a re-pointed link.** Because only the text is compared, a `workdir` that
+  names a symbolic link keeps its text when the link is re-pointed to another
+  directory. No `line_session_cleared` is appended, and the line's next turn resumes a
+  session from the old directory, which Claude Code is then expected not to find. The
+  directory itself is checked again when the engine is built, so the new target must
+  still be allowed. An operator who re-points such a link can send `clear_session`.
+- **Clients.** A client cannot change `workdir` through `set_setting`. The settings
+  view shows it as an `info` entry, and `configure_line`, which replaces the whole
+  configuration, is the way to change it. A `configure_line` without `workdir` returns
+  the line to the project root.
+- **Git safety.** Every enabled Claude Code sandbox denies writes to the hooks and
+  configuration of the git checkout the line works in, as [`SANDBOX.md`](SANDBOX.md)
+  specifies.
+
+**Fact, observed on 2026-10-26 with Claude Code 2.1.310.** Claude Code stores a
+session under a directory of `~/.claude/projects/` named for the working directory. A
+Haiku line with its workdir in a linked worktree had its session stored under that
+worktree's name, so a session resumed from another directory would not be found.
+
 ## Engines
 
 A line on the Codex or Grok Build engine accepts only the configurations
@@ -97,7 +148,8 @@ line is created or configured.
 
 The daemon validates a configuration, then appends `line_configured` with its canonical
 JSON, which adds `"v": 1` and sorts every key. A new configuration replaces the old one
-whole and applies from the line's next turn, which resumes the same engine session.
+whole and applies from the line's next turn, which resumes the same engine session
+unless the line's `workdir` changed.
 
 ## Trust
 

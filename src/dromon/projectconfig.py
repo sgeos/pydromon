@@ -34,7 +34,7 @@ from typing import Final, cast
 from dromon.driver import MODELS, Strategy
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.lineconfig import ConfigError, LineConfig, config_from_document
-from dromon.model import ID_PATTERN
+from dromon.model import ID_PATTERN, InvalidField, LineSession
 from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, SandboxError, merge, parse_sandbox
 from dromon.settings import SettingsConfig, SettingsError, parse_settings
@@ -76,16 +76,19 @@ TOOL_KEYS: Final = frozenset(
         "effort",
         "claude_code_prompt",
         "instructions",
+        "workdir",
     }
 )
 LAYERED_KEYS: Final = frozenset({"sandbox", "settings"})
 """Keys whose profile and line tables merge as Claude Code's scopes do."""
 LINE_KEYS: Final = (
-    frozenset({"profile", "model", "strategy", "limits", "wake"})
+    frozenset({"profile", "model", "strategy", "limits", "wake", "session"})
     | TOOL_KEYS
     | LAYERED_KEYS
 )
-PROFILE_KEYS: Final = LINE_KEYS - {"profile"}
+PROFILE_KEYS: Final = LINE_KEYS - {"profile", "session"}
+"""A profile has every line key but ``profile``, and but ``session``, since one engine
+session cannot continue in several lines."""
 
 
 class ConfigFileError(ValueError):
@@ -123,6 +126,8 @@ class LineDefinition:
     """The line's own limits, merged onto the file's ``[limits]``, or ``None``."""
     wake_every_ticks: int | None
     """The line's own wake policy, or ``None`` for the project's."""
+    session: str | None = None
+    """An existing engine session the line adopts when the daemon creates it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,6 +390,14 @@ class _Reader:
             sandbox=merge([profile_sandbox, own_sandbox]),
             settings=engine_settings.merge([profile_settings, own_settings]),
         )
+        session = own.get("session")
+        if session is not None:
+            if not isinstance(session, str):
+                raise self.fail(f"{key}.session", "must be text")
+            try:
+                LineSession(line_id, session)
+            except InvalidField as error:
+                raise self.fail(f"{key}.session", str(error)) from error
         return LineDefinition(
             line_id=line_id,
             model=cast(str, model),
@@ -396,4 +409,5 @@ class _Reader:
             wake_every_ticks=None
             if "wake" not in merged
             else self.wake(merged["wake"], f"{key}.wake", wake),
+            session=session,
         )

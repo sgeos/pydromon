@@ -210,6 +210,7 @@ def _config_document(arguments: argparse.Namespace) -> dict[str, object] | None:
     inherit: bool = arguments.inherit_account_mcp
     instructions: list[str] = arguments.instructions or []
     prompt: bool = arguments.claude_code_prompt
+    workdir: str | None = arguments.workdir
     given = (
         tools,
         allowed,
@@ -221,7 +222,7 @@ def _config_document(arguments: argparse.Namespace) -> dict[str, object] | None:
         instructions,
         prompt,
     )
-    if not any(given) and effort is None:
+    if not any(given) and effort is None and workdir is None:
         return None
     document: dict[str, object] = {
         "builtin_tools": tools,
@@ -251,6 +252,8 @@ def _config_document(arguments: argparse.Namespace) -> dict[str, object] | None:
         document["instructions"] = instructions
     if prompt:
         document["claude_code_prompt"] = True
+    if workdir is not None:
+        document["workdir"] = workdir
     return document
 
 
@@ -270,6 +273,8 @@ def _create(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         return exits.FAILURE
     if config is not None:
         args["config"] = config
+    if arguments.session is not None:
+        args["engine_session"] = arguments.session
     return _request(paths, "create", Operation.CREATE_LINE, args)
 
 
@@ -459,6 +464,7 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             f" {_sandbox_summary(merge([config.sandbox, line.config.sandbox]))},"
             f" {_settings_summary(line_settings)}"
             + (f", effort {line.config.effort}" if line.config.effort else "")
+            + (f", in {line.config.workdir}" if line.config.workdir else "")
         )
     return exits.OK
 
@@ -773,13 +779,19 @@ def _add_tool_options(command: argparse.ArgumentParser) -> None:
     command.add_argument(
         "--instructions",
         action="append",
-        help="a file appended to the system prompt, relative to the project root,"
-        " repeatable",
+        help="a file appended to the system prompt, relative to the line's working"
+        " directory, repeatable",
     )
     command.add_argument(
         "--claude-code-prompt",
         action="store_true",
         help="run on Claude Code's own system prompt instead of an empty one",
+    )
+    command.add_argument(
+        "--workdir",
+        default=None,
+        help="the directory the line's engine runs in, relative to the project root,"
+        " default the project root",
     )
     command.add_argument(
         "--effort",
@@ -864,6 +876,13 @@ def build_parser() -> argparse.ArgumentParser:
         if name in ("create", "configure"):
             command.add_argument("line_id", help="the line's identifier")
             _add_tool_options(command)
+        if name == "create":
+            command.add_argument(
+                "--session",
+                default=None,
+                help="an existing engine session to continue, started in the line's"
+                " working directory",
+            )
         if name in ("create", "probe"):
             _add_driver_options(command)
         if name == "agent":
