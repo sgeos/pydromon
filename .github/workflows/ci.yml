@@ -43,6 +43,10 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    # pykeleusma must install from a published wheel. Ubuntu runners ship Rust, so
+    # without this a wheel that stopped matching would build from source silently.
+    env:
+      UV_NO_BUILD_PACKAGE: pykeleusma
     strategy:
       fail-fast: false
       max-parallel: 2

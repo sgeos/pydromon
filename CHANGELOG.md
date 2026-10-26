@@ -83,7 +83,8 @@ All notable changes are recorded here. The format follows
   `19d4558` of its repository. Every call Dromon makes is unchanged, and the packaged
   drivers run as before. The release has wheels for Python 3.12 or later on Linux,
   macOS and Windows, so CI no longer installs a Rust toolchain, and the README no
-  longer asks for one.
+  longer asks for one. CI sets `UV_NO_BUILD_PACKAGE=pykeleusma`, so a wheel that
+  stopped matching fails the run instead of building from source unnoticed.
 - A compaction's `trigger` is only what the engine reported, with a `trigger_note`,
   so a Codex compaction, which reports none, no longer shows a `manual` that Dromon
   made up. A Codex compaction is reported as such even when Dromon had no earlier
