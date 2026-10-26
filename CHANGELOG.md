@@ -67,6 +67,21 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- A line's configuration takes `workdir`, the directory its engine runs in, so a line
+  can work in a git worktree of its own. It is set in the project file, or with
+  `--workdir` on `dromon create` and `dromon configure`. A relative path resolves
+  against the project root, and the directory must exist and may not be, lie in or
+  contain the state or runtime directory, the project root excepted. Claude Code's
+  working directory, the Codex workspace and the Grok agent's working directory follow
+  it, as do the line's relative instruction and sandbox paths. A changed `workdir`
+  appends `line_session_cleared`, since Claude Code keeps a session per directory, and
+  a client cannot change it through `set_setting`. The settings view shows it.
+- `create_line` takes `engine_session`, `dromon create` takes `--session`, and a project
+  file line may give `session`, so a new line can continue an existing engine session.
+- Every enabled Claude Code sandbox denies writes to the hooks and configuration of the
+  git checkout its line works in, found by reading `.git` and `commondir` without
+  running git, and for a linked worktree also to its `.git` file and `commondir`, so a
+  line cannot plant a hook that git would run outside the sandbox.
 - Settings for lines and for the project can be shown and changed from a client, as
   overrides layered over the project file and recorded in the event log as the new
   `line_overridden` and `project_overridden` events. The attached client gains

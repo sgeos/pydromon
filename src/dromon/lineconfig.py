@@ -13,8 +13,14 @@ the operator's user settings and claude.ai account, which are otherwise excluded
 Instructions. ``claude_code_prompt`` runs a Claude Code line on Claude Code's own system
 prompt instead of an empty one, and ``instructions`` names files, such as a project's
 ``CLAUDE.md``, whose text is appended to the system prompt at the start of each turn. A
-relative path is resolved against the project root, and ``~`` against the home
-directory. Only the paths are stored.
+relative path is resolved against the line's working directory, and ``~`` against the
+home directory. Only the paths are stored.
+
+Working directory. ``workdir`` names the directory a line's engine runs in, such as a
+git worktree of its own. A relative path is resolved against the project root, and
+``~`` against the home directory, when the line is configured and again at each turn,
+by ``dromon.workdir``. Only the path is stored, and a line without one runs in the
+project root. The line's relative instruction and sandbox paths resolve against it.
 
 References. Any text of an MCP server may hold ``${NAME}`` or ``${NAME:-default}``,
 which the engine replaces with the daemon's environment at the start of each turn, as
@@ -174,6 +180,9 @@ class LineConfig:
     """Whether a Claude Code line runs on Claude Code's own system prompt."""
     instructions: tuple[str, ...] = ()
     """Files whose text is appended to the system prompt, in order."""
+    workdir: str | None = None
+    """The directory the engine runs in, as written, or ``None`` for the project
+    root."""
 
     def allows(self, tool_name: str, own_tools: frozenset[str]) -> bool:
         """Whether the policy allows ``tool_name``. Dromon's own tools always pass."""
@@ -220,6 +229,8 @@ def encode_config(config: LineConfig) -> str:
         document["claude_code_prompt"] = True
     if config.instructions:
         document["instructions"] = list(config.instructions)
+    if config.workdir is not None:
+        document["workdir"] = config.workdir
     return json.dumps(
         document,
         ensure_ascii=False,
@@ -256,6 +267,18 @@ def _text(value: object, what: str) -> str:
     if not isinstance(value, str) or not value or len(value) > MAX_TEXT:
         _fail(f"{what} must be text of 1 to {MAX_TEXT} characters")
     return value
+
+
+def _workdir(value: object) -> str:
+    """A working directory as written. Whether it exists and where it lies is
+    checked against the project by ``dromon.workdir``, since this module has no
+    project."""
+    text = _text(value, "workdir")
+    if "\x00" in text:
+        _fail("workdir must not contain a NUL character")
+    if text.startswith("~") and text != "~" and not text.startswith("~/"):
+        _fail("workdir may start with ~ only as ~ or ~/, not as another user's home")
+    return text
 
 
 def _server_text(value: object, what: str) -> str:
@@ -347,6 +370,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         "effort",
         "claude_code_prompt",
         "instructions",
+        "workdir",
     }
     unknown = set(document) - allowed
     if unknown:
@@ -393,6 +417,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         _fail(f"instructions names more than {MAX_INSTRUCTION_FILES} files")
     if len(set(instructions)) != len(instructions):
         _fail("instructions names a file twice")
+    workdir = _workdir(document["workdir"]) if "workdir" in document else None
     return LineConfig(
         builtin_tools=tuple(sorted(set(builtin))),
         mcp_servers=parse_servers(document.get("mcp_servers", {})),
@@ -404,6 +429,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         effort=cast(str | None, effort),
         claude_code_prompt=prompt,
         instructions=instructions,
+        workdir=workdir,
     )
 
 

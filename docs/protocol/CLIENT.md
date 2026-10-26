@@ -47,8 +47,8 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `ping` | An empty object |
 | `status` | `daemon_version`, `protocol_version`, `pid`, `project`, `started_at`, and `event_log` with `last_seq`, `lines`, `operators` and `open_questions` |
 | `stop` | `{"stopping": true}`, after which the daemon closes its connections, removes its socket and exits |
-| `create_line` | Arguments `line_id`, `model`, `strategy`, and optionally `config`, an object of [`LINE_CONFIG.md`](LINE_CONFIG.md). Result `{"line_id": ...}`. Refused when no packaged driver serves the model and strategy |
-| `configure_line` | Arguments `line_id` and `config`. Replaces the line's configuration from its next turn |
+| `create_line` | Arguments `line_id`, `model`, `strategy`, and optionally `config`, an object of [`LINE_CONFIG.md`](LINE_CONFIG.md), and `engine_session`, an existing engine session to continue, recorded as `line_session` right after `line_created` and checked as that event is. Result `{"line_id": ...}`. Refused when no packaged driver serves the model and strategy, or when the configuration's `workdir` is not allowed |
+| `configure_line` | Arguments `line_id` and `config`. Replaces the line's configuration from its next turn. A changed `workdir` also appends `line_session_cleared`. Refused when the `workdir` is not allowed |
 | `questions` | Optionally `operator`. Result `{"questions": [...]}`, the open questions for that operator, or for all when omitted, oldest first, each with `question_id`, `line`, `operator`, `text` and `choices`. Listing marks each question delivered, because the client has shown it |
 | `mail` | Arguments `operator`, and optionally `unread_only`, `sender`, `offset` and `limit`, at most 50. Delivers the operator's undelivered mail, then returns `total`, `unread`, `unanswered` and `messages`, a page of headers with `message_id`, `sender`, `kind`, `reply_to`, `read` and `outcome`, one of `replied`, `acknowledged` and `unanswered`, oldest first |
 | `acknowledge` | Arguments `operator` and `message_id`. Marks a message in the operator's mailbox dealt with, without a reply |
@@ -112,7 +112,7 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromon start` | Starts a detached `dromond` in a new session and waits up to 10 seconds for it to answer `ping`. Succeeds without action when a daemon already answers | 0, or 1 on failure |
 | `dromon status` | Prints the `status` result | 0, 4 when no daemon answers, or 1 |
 | `dromon stop` | Sends `stop` and waits up to 10 seconds for the socket to disappear | 0, 4 when no daemon answers, or 1 |
-| `dromon create LINE` | Sends `create_line`, with `--model`, default `claude-haiku-5-5`, `--strategy`, default `subscription`, and the tool options below | 0, 4, or 1 |
+| `dromon create LINE` | Sends `create_line`, with `--model`, default `claude-haiku-5-5`, `--strategy`, default `subscription`, `--session`, an engine session to continue, which must have been started in the line's working directory, and the tool options below | 0, 4, or 1 |
 | `dromon configure LINE` | Sends `configure_line` with the tool options below. No option means the default configuration | 0, 4, or 1 |
 | `dromon send RECIPIENT BODY` | Sends `send`, with `--operator`, default the login name, and `--reply-to` | 0, 4, or 1 |
 | `dromon questions` | Sends `questions` for `--operator`, default the login name, or for every operator with `--all`, and prints each question with its choices | 0, 4, or 1 |
@@ -140,7 +140,8 @@ sandbox object or a settings file whose `sandbox` key is taken, as
 [`SANDBOX.md`](SANDBOX.md) specifies, `--settings-config FILE`, a Claude Code settings
 file whose permissions, hooks, `env`, attribution and sandbox are taken, and
 `--effort LEVEL`, both as [`SETTINGS.md`](SETTINGS.md) specifies, and
-`--instructions FILE`, repeatable, and `--claude-code-prompt`, as
+`--instructions FILE`, repeatable, `--claude-code-prompt`, and `--workdir DIR`, a
+directory the daemon resolves against the project root, as
 [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies.
 
 Status 2 is a usage error and status 3 marks a subcommand not yet implemented.
@@ -259,14 +260,16 @@ An override document is a JSON object from keys to values, written canonically w
 sorted keys. Each entry of a `settings` result has `key`, `kind`, one of `bool`, `int`,
 `decimal`, `text`, `choice`, `list` and `info`, `summary`, `choices`, `value`, `source`
 and `editable`. Entries of kind `info` cannot be changed from a client. They show a
-line's engine, strategy and engine session, its MCP servers by name only, whether a
-sandbox or engine settings document is set, and the project's file, declared lines,
-teacher and external agent policy.
+line's engine, strategy, engine session and working directory, its MCP servers by name
+only, whether a sandbox or engine settings document is set, and the project's file,
+declared lines, teacher and external agent policy.
 
 A client cannot change a line's strategy, because it decides whether usage is billed
 per token, and such usage never starts from a one-word command. It cannot change MCP
 servers, sandbox or engine settings documents, the teacher or the agent policy either,
-because they are long documents that belong in a reviewed file. A stored override
+because they are long documents that belong in a reviewed file. Nor can it change a
+line's working directory, which moves the line to a new engine session, so it changes
+only through `configure_line` or the project file. A stored override
 that no longer applies, for example after an upgrade, is skipped and reported on
 standard error once, rather than stopping the line or the daemon.
 

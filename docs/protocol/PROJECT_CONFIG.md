@@ -64,14 +64,15 @@ every_ticks = 5
 | `daemon.tick_seconds` | number in [0, 60] | 1 | The tick cadence |
 | `limits.*` | as in `CLIENT.md` | 12, 2, 0 | The conversation limits of every line |
 | `wake.every_ticks` | integer in [1, 3600] | 1 | The wake policy of every line |
-| `profiles.NAME` | table | none | A reusable line template with every line key but `profile` |
+| `profiles.NAME` | table | none | A reusable line template with every line key but `profile` and `session` |
 | `lines.ID` | table | none | A line, named by a line identifier |
 | `lines.ID.profile` | profile name | none | The profile the line starts from |
 | `lines.ID.model` | model | required | `claude-opus-5-5`, `claude-haiku-5-5`, `gpt-6-luna` on Codex as [`CODEX.md`](CODEX.md) specifies, or `grok-4.7` on Grok Build as [`GROK.md`](GROK.md) specifies |
 | `lines.ID.strategy` | strategy | `subscription` | `subscription`, `api` or `flexible` |
 | `lines.ID.limits` | table | the file's | Limits for this line, each key defaulting to the file's |
 | `lines.ID.wake` | table | the file's | The wake policy for this line |
-| tool keys | as in `LINE_CONFIG.md` | as there | `builtin_tools`, `mcp_servers`, `tool_policy`, `allowed_tools`, `inherit_account_mcp`, `effort`, `claude_code_prompt`, `instructions` |
+| tool keys | as in `LINE_CONFIG.md` | as there | `builtin_tools`, `mcp_servers`, `tool_policy`, `allowed_tools`, `inherit_account_mcp`, `effort`, `claude_code_prompt`, `instructions`, `workdir` |
+| `lines.ID.session` | text | none | An existing engine session the line adopts when the daemon creates it, checked as `line_session` is in [`EVENT_LOG.md`](EVENT_LOG.md). Ignored for a line that exists |
 | `teacher` | table | none | The project's local teacher model, as [`TEACHER.md`](TEACHER.md) specifies |
 | `agents` | table | off | Which external agents may connect, and with what access, as [`AGENTS.md`](AGENTS.md) specifies |
 | `sandbox` | table | none | The project's sandbox, merged under every line's, as [`SANDBOX.md`](SANDBOX.md) specifies |
@@ -93,11 +94,18 @@ every_ticks = 5
   and recorded in the event log, as the settings section of
   [`CLIENT.md`](CLIENT.md) specifies, and the daemon never writes this file. User and
   managed layers are not yet specified.
+- **Working directories.** Before it starts, and before a reload applies anything,
+  the daemon checks every declared line's `workdir` as
+  [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies, and for each line whose merged sandbox
+  is enabled, reads the git files [`SANDBOX.md`](SANDBOX.md) guards. A failure refuses
+  the start or the reload.
 - **Located errors.** Every error names the file. A syntax error carries its line and
   column. Any other error carries the dotted key path and the line of its table or key
   when it can be found. The daemon refuses to start on an invalid file.
-- **Application.** At start, a declared line that does not exist is created, and one
-  whose tools differ is reconfigured. A line's model and strategy are fixed at
+- **Application.** At start, a declared line that does not exist is created, adopting
+  its `session` when one is given, and one whose tools differ is reconfigured. A
+  reconfiguration that changes the line's `workdir` also appends
+  `line_session_cleared`, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies. A line's model and strategy are fixed at
   creation, so a file that changes either is refused and the daemon does not start.
   A client may still switch a line's model within its engine, as an override. Lines
   created through the client and absent from the file are left as they are.
