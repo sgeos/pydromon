@@ -332,17 +332,32 @@ ends with each turn, and the next turn resumes the session in a new one.
   prompt of a connection, and again only after a change of model or permission mode.
   So before each later prompt Dromon sends the permission mode the last `init`
   reported, which leaves the mode unchanged and makes the engine report its `init`
-  again, and the tool, credential and model checks run on it as on a new connection. A
-  turn on a reused connection that shows the model's output before an `init` is
-  refused and interrupted, and its connection closed.
+  again, and the tool, credential and model checks run on it as on a new connection.
+- **No call before the init check.** **Decided by the operator on 2026-10-26** in the
+  round 2 review. On every Claude Code turn, kept or not, fresh or reused, the
+  permission gate denies every tool call until the turn's `init` check has passed, and
+  a turn that shows the model's output before an `init` is refused and interrupted. A
+  refusal stands for the rest of the turn, so a later `init`, even one that passes,
+  cannot clear it. A refused kept turn closes its connection.
 - **The gate between turns.** On a kept connection the permission gate denies every tool
-  call outside a Dromon turn, and inside a reused turn until its `init` check passes.
-- **A residual risk.** **Inference from the engine's reload messages, not tested.** The
-  engine watches its settings and plugins and may reload them while idle. The line's
-  sandbox denies it writing them, but another writer could change them between turns,
-  and a turn the engine began by itself could run a reloaded hook before Dromon
-  interrupts it. The next turn's checks then refuse and close the connection. Within
-  one turn the same window existed before, between the check and the engine's start.
+  call outside a Dromon turn.
+- **Shell tools need a sandbox.** **Decided by the operator on 2026-10-26** in the round 2
+  review. A line with `keep_session` and `Bash`, `Monitor` or `PowerShell` in
+  `builtin_tools` needs an enabled sandbox, since what such a tool starts in the
+  background outlives the turn, and every turn of such a line without one is refused.
+  That `Monitor` runs commands is an inference from its description.
+- **Loaded files between turns.** **Decided by the operator on 2026-10-26** in the round
+  2 review. The engine watches its settings and plugins and may reload them while
+  idle, an inference from its reload messages that was not tested. So between turns
+  the watch digests every plugin tree, and the working directory's `.claude` under
+  `project_settings`, every 5 seconds, and closes the connection as soon as the digest
+  differs from the one taken when it opened, or can no longer be taken. The digest runs
+  on the event loop's thread, because a Keleusma driver's virtual machine may be
+  dropped only on the thread that made it. **A residual risk.** A change made less
+  than 5 seconds before the engine reloads it could still reach a turn the engine began
+  by itself, before the watch closes the connection. A change during a turn is left to
+  the next turn's checks, as the same window between a check and the engine's start
+  always was.
 - **The driver's budget.** Each turn starts the driver afresh, so its tool budget is per
   turn as before.
 - **Turns the engine begins.** **Inference from the engine's own Bash description, not
@@ -355,7 +370,10 @@ ends with each turn, and the next turn resumes the session in a new one.
   Dromon counts those running. A connection closes after `keep_session_idle_seconds`
   without a turn, or, while the engine reports tasks running, after
   `keep_session_max_seconds`, both counted from the end of the last turn and checked
-  every 30 seconds. Closing the connection ends the engine's process.
+  every 5 seconds. Closing the connection ends the engine's process. An error in the
+  watch is reported on the daemon's standard error and the watch goes on, so neither
+  deadline is left unenforced. An interrupt or a close begun outside a turn is held by
+  the engine until it ends, since asyncio keeps only weak references to tasks.
 - **Other closes.** The connection also closes when the line is configured, overridden,
   rebound or has its session cleared, which includes a change of `workdir`, when the
   daemon stops, and when a turn is refused or fails, including by a check before the

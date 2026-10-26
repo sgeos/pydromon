@@ -31,8 +31,10 @@ from claude_agent_sdk import (
 from dromon.driver import Driver, Strategy
 from dromon.engine import (
     DIED_NOTE,
+    FILES_CHANGED,
     MAX_FINGERPRINT_FILE_BYTES,
     SELF_STARTED_NOTE,
+    AgentSession,
     ClaudeCodeLine,
     EngineRefused,
     KeptSession,
@@ -197,6 +199,7 @@ def line(
     config: LineConfig = KEPT,
     clock: Clock | None = None,
     poll: float = 3600.0,
+    sandbox: dict[str, object] | None = None,
 ) -> ClaudeCodeLine:
     return ClaudeCodeLine(
         Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
@@ -206,6 +209,7 @@ def line(
         kept_factory=factory,
         clock=clock or Clock(),
         poll_seconds=poll,
+        sandbox=sandbox,
     )
 
 
@@ -803,3 +807,304 @@ def test_the_line_view_shows_keep_session() -> None:
     assert value(KEPT) == (
         "on, closing after 1800 seconds idle, or 14400 with background tasks running"
     )
+
+
+# Review of round 2. F1, no tool call is admitted before the init check, on any
+# connection.
+
+
+def test_a_fresh_kept_connection_admits_no_call_before_its_init(
+    tmp_path: Path,
+) -> None:
+    config = LineConfig(keep_session=True, builtin_tools=("Read",))
+    factory = Factory([[]])
+    factory.reports_init = False
+    engine = line(factory, tmp_path, config=config)
+    decisions: list[object] = []
+
+    async def go() -> None:
+        turn = asyncio.create_task(engine.run_turn("first"))
+        await settle()
+        gate = factory.options[0].can_use_tool
+        assert gate is not None
+        decisions.append(await gate("Read", {}, CONTEXT))
+        factory.connections[0].stream.put_nowait(init())
+        await settle()
+        decisions.append(await gate("Read", {}, CONTEXT))
+        factory.connections[0].stream.put_nowait(result())
+        await turn
+        await engine.close()
+
+    asyncio.run(go())
+    assert isinstance(decisions[0], PermissionResultDeny)
+    assert isinstance(decisions[1], PermissionResultAllow)
+
+
+def test_a_fresh_kept_connection_with_output_before_init_is_refused(
+    tmp_path: Path,
+) -> None:
+    factory = Factory([[say("too early"), init(), result()]])
+    factory.reports_init = False
+    engine = line(factory, tmp_path)
+
+    async def go() -> None:
+        with pytest.raises(EngineRefused, match="before its output"):
+            await engine.run_turn("first")
+
+    asyncio.run(go())
+    assert factory.connections[0].interrupts == 1
+    assert factory.connections[0].closed
+
+
+class GateFirst:
+    """A one-turn session that asks the gate before and after its init."""
+
+    def __init__(self, options: ClaudeAgentOptions, decisions: list[object]) -> None:
+        self.options = options
+        self.decisions = decisions
+        self.interrupts = 0
+
+    async def query(self, prompt: str) -> None:
+        del prompt
+
+    async def receive_response(self) -> AsyncIterator[Message]:
+        gate = self.options.can_use_tool
+        assert gate is not None
+        self.decisions.append(await gate("Read", {}, CONTEXT))
+        yield init()
+        self.decisions.append(await gate("Read", {}, CONTEXT))
+        yield result()
+
+    async def interrupt(self) -> None:
+        self.interrupts += 1
+
+
+def test_a_turn_without_keep_session_admits_no_call_before_its_init(
+    tmp_path: Path,
+) -> None:
+    decisions: list[object] = []
+
+    @asynccontextmanager
+    async def factory(options: ClaudeAgentOptions) -> AsyncGenerator[AgentSession]:
+        yield GateFirst(options, decisions)
+
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        config=LineConfig(builtin_tools=("Read",)),
+        environment={},
+        session_factory=factory,
+    )
+    asyncio.run(engine.run_turn("first"))
+    assert isinstance(decisions[0], PermissionResultDeny)
+    assert isinstance(decisions[1], PermissionResultAllow)
+    gate = engine.options().can_use_tool
+    assert gate is not None
+
+    async def after() -> object:
+        return await gate("Read", {}, CONTEXT)
+
+    assert isinstance(asyncio.run(after()), PermissionResultDeny)
+
+
+def test_a_turn_without_keep_session_and_output_before_init_is_refused(
+    tmp_path: Path,
+) -> None:
+    class Early(GateFirst):
+        async def receive_response(self) -> AsyncIterator[Message]:
+            yield say("too early")
+            yield result()
+
+    @asynccontextmanager
+    async def factory(options: ClaudeAgentOptions) -> AsyncGenerator[AgentSession]:
+        yield Early(options, [])
+
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        environment={},
+        session_factory=factory,
+    )
+    with pytest.raises(EngineRefused, match="before its output"):
+        asyncio.run(engine.run_turn("first"))
+
+
+# F2, a change to a loaded file closes an idle connection.
+
+SANDBOX: dict[str, object] = {"enabled": True}
+LOADS = LineConfig(keep_session=True, project_settings=True)
+
+
+def project(tmp_path: Path) -> Path:
+    (tmp_path / ".claude").mkdir()
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.write_text("{}")
+    return settings
+
+
+async def wait_closed(connection: Connection) -> None:
+    for _ in range(400):
+        if connection.closed:
+            return
+        await asyncio.sleep(0.005)
+
+
+def test_an_idle_connection_closes_when_a_loaded_file_changes(tmp_path: Path) -> None:
+    settings = project(tmp_path)
+    factory = Factory([[result()], [result()]])
+    engine = line(factory, tmp_path, config=LOADS, poll=0.001, sandbox=SANDBOX)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        await asyncio.sleep(0.02)
+        assert not factory.connections[0].closed
+        settings.write_text('{"$schema": "changed"}')
+        await wait_closed(factory.connections[0])
+        assert engine.kept_status()["kept"] is False
+        await engine.run_turn("second")
+        await engine.close()
+
+    asyncio.run(go())
+    assert factory.connections[0].closed
+    assert factory.connections[1].prompts[0].startswith(closed_note(FILES_CHANGED, 0))
+
+
+def test_a_loaded_file_that_cannot_be_digested_closes_the_connection(
+    tmp_path: Path,
+) -> None:
+    project(tmp_path)
+    factory = Factory([[result()]])
+    engine = line(factory, tmp_path, config=LOADS, poll=0.001, sandbox=SANDBOX)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        big = tmp_path / ".claude" / "skills"
+        big.mkdir()
+        (big / "huge").write_bytes(b"x" * (MAX_FINGERPRINT_FILE_BYTES + 1))
+        await wait_closed(factory.connections[0])
+
+    asyncio.run(go())
+    assert factory.connections[0].closed
+
+
+def test_a_change_during_a_turn_is_left_to_the_next_turn(tmp_path: Path) -> None:
+    settings = project(tmp_path)
+    factory = Factory([[], [result()]])
+    engine = line(factory, tmp_path, config=LOADS, poll=0.001, sandbox=SANDBOX)
+
+    async def go() -> None:
+        turn = asyncio.create_task(engine.run_turn("first"))
+        await settle()
+        settings.write_text('{"$schema": "changed"}')
+        await asyncio.sleep(0.02)
+        assert not factory.connections[0].closed
+        factory.connections[0].stream.put_nowait(result())
+        await turn
+        # The next turn's fingerprint differs, so it opens a new connection.
+        await engine.run_turn("second")
+        await engine.close()
+
+    asyncio.run(go())
+    assert len(factory.connections) == 2
+
+
+# F3, interrupts and closes begun outside a turn are held until they end.
+
+
+def test_a_settle_task_survives_a_concurrent_retire(tmp_path: Path) -> None:
+    import gc
+
+    factory = Factory([[]])
+    engine = line(factory, tmp_path)
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def go() -> None:
+        turn = asyncio.create_task(engine.run_turn("first"))
+        await settle()
+        connection = factory.connections[0]
+
+        async def slow_interrupt() -> None:
+            calls.append("started")
+            await release.wait()
+            calls.append("ended")
+
+        connection.interrupt = slow_interrupt  # type: ignore[method-assign]
+        await engine.retire()
+        turn.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+        assert len(engine._background) == 2  # pyright: ignore[reportPrivateUsage]
+        gc.collect()
+        await settle()
+        release.set()
+        await settle()
+
+    asyncio.run(go())
+    assert calls == ["started", "ended"]
+    assert factory.connections[0].closed
+    assert not engine._background  # pyright: ignore[reportPrivateUsage]
+
+
+# F4, the watch reports an error and goes on.
+
+
+def test_the_watch_survives_an_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clock = Clock()
+    config = LineConfig(keep_session=True, keep_session_idle_seconds=60)
+    factory = Factory([[result()]])
+    engine = line(factory, tmp_path, config=config, clock=clock, poll=0.001)
+    real = engine.expire
+    failures = [RuntimeError("a fault in the watch")]
+
+    async def flaky() -> bool:
+        if failures:
+            raise failures.pop()
+        return await real()
+
+    engine.expire = flaky  # type: ignore[method-assign]
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        clock.now += 61
+        await wait_closed(factory.connections[0])
+
+    asyncio.run(go())
+    assert factory.connections[0].closed
+    assert "the watch of a kept session failed and goes on" in capsys.readouterr().err
+
+
+# A kept line with a shell tool needs an enabled sandbox.
+
+
+@pytest.mark.parametrize("shell", ["Bash", "Monitor", "PowerShell"])
+def test_a_kept_line_with_a_shell_needs_an_enabled_sandbox(
+    tmp_path: Path, shell: str
+) -> None:
+    config = LineConfig(keep_session=True, builtin_tools=(shell, "Read"))
+    with pytest.raises(EngineRefused, match=f"has {shell} needs an enabled sandbox"):
+        line(Factory([]), tmp_path, config=config).options()
+    with pytest.raises(EngineRefused, match="needs an enabled sandbox"):
+        line(Factory([]), tmp_path, config=config, sandbox={"enabled": False}).options()
+    line(Factory([]), tmp_path, config=config, sandbox=SANDBOX).options()
+
+
+def test_the_shell_rule_leaves_other_lines_alone(tmp_path: Path) -> None:
+    line(Factory([]), tmp_path, config=LineConfig(builtin_tools=("Bash",))).options()
+    kept_reader = LineConfig(keep_session=True, builtin_tools=("Read", "TaskStop"))
+    line(Factory([]), tmp_path, config=kept_reader).options()
+
+
+def test_a_later_init_that_passes_does_not_clear_a_refusal(tmp_path: Path) -> None:
+    factory = Factory([[init(), say("x"), result()]])
+    factory.init_message = init(tools=["Bash"])
+    engine = line(factory, tmp_path)
+
+    async def go() -> None:
+        with pytest.raises(EngineRefused, match="tools the line was not given"):
+            await engine.run_turn("first")
+
+    asyncio.run(go())
+    assert factory.connections[0].interrupts == 1

@@ -85,6 +85,12 @@ All notable changes are recorded here. The format follows
   unanswered count leaves out replies to hold questions, and `list_mail` entries carry
   `repeat_of` and a fired wake's due and delivery times.
 
+- The round 2 review. No Claude Code turn admits a tool call before its init check,
+  on any connection, and a refusal can no longer be cleared by a later init. An idle
+  kept connection closes as soon as a plugin or `.claude` file it loaded changes. The
+  watch survives its own errors, interrupts and closes begun outside a turn are held
+  until they end, and a kept line with a shell tool needs an enabled sandbox.
+
 - Lines gain `list_processes` and `stop_process`. Every command a line runs carries
   `DROMON_LINE_MARK`, the line's identifier and a random token of its own issued per
   daemon run, including commands that outlive a turn, so no line can present another
