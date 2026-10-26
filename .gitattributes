@@ -5,6 +5,12 @@
 *.sh text eol=lf
 scripts/hooks/* text eol=lf
 
+# Windows batch files keep CRLF endings, because cmd.exe can mishandle labels and goto
+# in a batch file with LF endings. scripts/check.sh exempts them from its carriage-return
+# check.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
 # Documentation does not count toward the repository's language statistics. Mark
 # vendored or generated code the same way, with linguist-vendored or
 # linguist-generated, as it appears.

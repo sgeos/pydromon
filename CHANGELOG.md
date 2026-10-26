@@ -7,6 +7,18 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- Synced with `sgeos/project-template` a second time. The repository gains
+  `CODE_OF_CONDUCT.md`, linked from the README, `CONTRIBUTING.md` and `llms.txt`,
+  `.github/CODEOWNERS`, `.github/release.yml`, an issue template `config.yml` that
+  routes security reports to private advisories, `docs/decisions/TEMPLATE.md`,
+  `scripts/worktree.sh` and an opt-in `scripts/hooks/pre-push`. `scripts/check.sh` takes
+  the template's hygiene checks, which add Markdown link, text, size and executable
+  checks, require shellcheck, and scan for the terms in an untracked
+  `secret/disclosure-terms.txt`, and it takes `--hygiene-only`. CI grants no permissions
+  by default, installs shellcheck on macOS where missing, and lints its workflows with
+  actionlint and zizmor. Dependabot groups action updates weekly. Commit messages no
+  longer carry a `Co-Authored-By` trailer, on the operator's instruction.
+
 - CI groups concurrent runs by the pull request's ref and otherwise by run, as the
   Keleusma repository does, so a second merge to `main` no longer cancels the first
   merge's run. The test matrix runs at most two jobs at once, and Linux jobs require

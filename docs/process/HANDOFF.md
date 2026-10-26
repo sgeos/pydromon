@@ -60,7 +60,7 @@ completed, moved or abandoned.
 - **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310, and
   `pykeleusma` from its repository at `19d4558`, which needs a Rust toolchain to build.
 - **Published.** Public `sgeos/pydromon`, 0BSD, over HTTPS with the GitHub CLI as
-  credential helper, synced with `sgeos/project-template`. CI runs `scripts/check.sh`
+  credential helper, synced with `sgeos/project-template` at `f829df4`. CI runs `scripts/check.sh`
   on Ubuntu and macOS for Python 3.12 and 3.15. Repository settings and the `main`
   ruleset of `.github/rulesets/main.json` were applied on 2026-10-25.
 - **pykeleusma.** Cannot yet drive a script, its task 5. Dromon does not need it.

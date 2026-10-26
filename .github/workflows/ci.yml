@@ -7,7 +7,9 @@
 # Supply chain. Actions are pinned to full commit hashes with the release tag in a
 # comment, so a moved or compromised tag cannot change what runs. The pins are
 # releases already in use by the pykeleusma repository, and Dependabot proposes
-# newer ones after a cooldown. The workflow only reads the repository.
+# newer ones after a cooldown. The workflow only reads the repository, and the
+# workflows job lints this file with actionlint and zizmor, as sgeos/project-template
+# does.
 #
 # Account load. GitHub-hosted runners share one concurrent-job limit across the whole
 # sgeos account, and macOS runners a smaller one, so the matrix runs two jobs at a
@@ -22,8 +24,8 @@ on:
   pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: read
+# No permissions by default. Each job grants only what it needs.
+permissions: {}
 
 # Supersede an in-flight run when a pull request is pushed again, and leave branch runs
 # alone. The group is the ref for a pull request and the unique run identifier
@@ -39,6 +41,8 @@ jobs:
     name: test (${{ matrix.os }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -67,13 +71,11 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      # Required here rather than skipped, since a step that passed without the tool
-      # would read as coverage while checking nothing.
-      - name: Shell scripts
-        if: runner.os == 'Linux'
-        run: |
-          command -v shellcheck >/dev/null || { echo "shellcheck is not on this runner, so this step would check nothing"; exit 1; }
-          shellcheck scripts/*.sh
+      # The gate fails without shellcheck, so that a green run never means "not
+      # checked". Ubuntu runners include it, and macOS runners may not.
+      - name: Install shellcheck where it is missing
+        if: runner.os == 'macOS'
+        run: command -v shellcheck >/dev/null || brew install shellcheck
 
       # Socket tests run here, since runners allow Unix domain sockets. UV_PYTHON makes
       # the gate's locked sync install for this job's interpreter.
@@ -81,3 +83,29 @@ jobs:
         env:
           UV_PYTHON: ${{ steps.python.outputs.python-path }}
         run: ./scripts/check.sh
+
+  # Lints the workflows themselves. actionlint checks syntax, expressions and the
+  # shell in run steps, and zizmor checks for known security weaknesses, such as
+  # injection through untrusted input, excessive permissions and unpinned actions. Both
+  # run here only. The actionlint image is pinned by digest, and zizmor's version is
+  # pinned explicitly, as in sgeos/project-template.
+  workflows:
+    name: workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: actionlint
+        run: >-
+          docker run --rm --volume "$PWD:/repo" --workdir /repo
+          rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+          -color
+      - name: zizmor
+        uses: zizmorcore/zizmor-action@85b2b9fb8e3325e7a23d7d0a9d7ba5ae0f999e3e # v0.7.1
+        with:
+          version: 1.31.1
+          advanced-security: false

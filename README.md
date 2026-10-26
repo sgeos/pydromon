@@ -28,8 +28,9 @@ through a Keleusma driver, and reports the engine's capabilities. `dromon create
 message arrives. Lines message each other through a `send_message` tool. Lines ask operators
 questions through an `ask_operator` tool, and `dromon questions` and `dromon answer`
 work the queue. Every party has a mailbox, which lines search with `list_mail` and
-`read_mail` and operators with `dromon mail` and `dromon read`. `dromon attach LINE` opens a
-curses client attached to one line, or a Tk window with `--gui`, and any number may be
+`read_mail` and operators with `dromon mail` and `dromon read`. `dromon attach LINE` opens an
+interactive client in the terminal, or a Tk window with `--gui`, that follows a line's
+turns as they run and changes line and project settings, and any number may be
 attached at once. A project declares its lines, limits and wake policy in
 `.dromon/dromon.toml`, as
 [`docs/protocol/PROJECT_CONFIG.md`](docs/protocol/PROJECT_CONFIG.md) specifies, and
@@ -87,10 +88,12 @@ in its environment.
 uv sync
 ./scripts/check.sh                                # the gate, which CI also runs
 ./scripts/check.sh -m "not socket and not live"   # the same, inside an agent sandbox
+scripts/worktree.sh new feat/some-thing           # an isolated worktree for a parallel line
 ```
 
 [`CONTRIBUTING.md`](CONTRIBUTING.md) describes the gate and the test markers, and
-[`SECURITY.md`](SECURITY.md) how to report a vulnerability.
+[`SECURITY.md`](SECURITY.md) how to report a vulnerability. Participation is governed by
+the [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
 
 ## License
 

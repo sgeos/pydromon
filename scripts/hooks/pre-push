@@ -1,0 +1,10 @@
+#!/bin/sh
+# Pre-push hook. Runs the local gate before code leaves the machine, so a push that
+# would fail continuous integration fails here first.
+#
+# Opt in once per clone with `git config core.hooksPath scripts/hooks`.
+# Skip it for a work-in-progress push with `git push --no-verify`.
+
+set -eu
+
+exec "$(git rev-parse --show-toplevel)/scripts/check.sh"

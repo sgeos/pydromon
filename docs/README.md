@@ -4,7 +4,7 @@
 
 | Section | Path | Contents |
 |---|---|---|
-| Architecture | [`architecture/`](architecture/README.md) | The planned system |
+| Architecture | [`architecture/`](architecture/README.md) | The planned and implemented system |
 | Decisions | [`decisions/`](decisions/README.md) | Decisions and the analysis behind them |
 | Roadmap | [`roadmap/`](roadmap/README.md) | Milestones |
 | Protocol | [`protocol/`](protocol/README.md) | The normative specification shared by every implementation |

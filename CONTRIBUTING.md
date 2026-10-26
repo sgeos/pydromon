@@ -6,6 +6,10 @@ Contributions are welcome, including fixes, documentation and tests.
 is released under the same licence. Do not contribute material that you did not write,
 or that carries terms of its own.
 
+Participation in the project's spaces follows the
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md). Contributions are judged on their technical
+merits.
+
 ## Setting up
 
 The build needs Python 3.12 or newer, [uv](https://github.com/astral-sh/uv), and a Rust
@@ -20,7 +24,9 @@ uv sync
 
 `./scripts/check.sh` runs the repository hygiene checks, then Ruff, pyright in strict
 mode and pytest with warnings treated as errors. Continuous integration runs the same
-script. Arguments are passed to pytest.
+script. Arguments are passed to pytest, and `--hygiene-only` runs the repository checks
+alone. The hygiene checks need `python3` and `shellcheck`, and fail without them.
+`git config core.hooksPath scripts/hooks` runs the gate before every push.
 
 - **Socket tests** bind Unix domain sockets. They run by default. Inside a sandbox that
   denies sockets, such as Claude Code's, run `./scripts/check.sh -m "not socket and not
