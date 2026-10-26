@@ -15,6 +15,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
+from dromon import grok as grok_module
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon.agents import AgentError, LineTokens
 from dromon.daemon import Daemon
@@ -94,25 +95,32 @@ def chunk(text: str) -> dict[str, Any]:
     )
 
 
-def tool_call(kind: str, name: str = "") -> dict[str, Any]:
+def tool_call(kind: str, name: str = "", ident: str = "t") -> dict[str, Any]:
     return note(
         {
             "sessionUpdate": "tool_call",
-            "toolCallId": "t",
+            "toolCallId": ident,
             "kind": kind,
             "toolName": name,
         }
     )
 
 
-def permission(kind: str, name: str = "", request_id: str = "p1") -> dict[str, Any]:
+def call_update(ident: object, **fields: object) -> dict[str, Any]:
+    """A ``tool_call_update`` for ``ident`` carrying only ``fields``."""
+    return note({"sessionUpdate": "tool_call_update", "toolCallId": ident, **fields})
+
+
+def permission(
+    kind: str, name: str = "", request_id: str = "p1", ident: str = "t"
+) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
         "id": request_id,
         "method": "session/request_permission",
         "params": {
             "sessionId": "s1",
-            "toolCall": {"toolCallId": "t", "kind": kind, "toolName": name},
+            "toolCall": {"toolCallId": ident, "kind": kind, "toolName": name},
             "options": [
                 {"optionId": "yes", "kind": "allow_once", "name": "Allow"},
                 {"optionId": "always", "kind": "allow_always", "name": "Always"},
@@ -149,6 +157,9 @@ class FakeGrok:
         self.environment: dict[str, str] = {}
         self.prompt_id: object = None
         self.answer_prompt = True
+        self.ignores_cancel = False
+        """Whether this Grok neither answers a cancel nor closes, so waits block."""
+        self.stops = 0
 
     def methods(self) -> list[str]:
         return [m["method"] for m in self.sent if "method" in m]
@@ -164,6 +175,8 @@ class FakeGrok:
         self.sent.append(sent)
         method = sent.get("method")
         if method == "session/cancel":
+            if self.ignores_cancel:
+                return
             # An ACP agent ends a cancelled prompt with stopReason cancelled.
             self.queue = deque(m for m in self.queue if m.get("id") != self.prompt_id)
             self.queue.append(
@@ -204,6 +217,8 @@ class FakeGrok:
 
     async def receive(self) -> dict[str, Any] | None:
         await asyncio.sleep(0)
+        if not self.queue and self.ignores_cancel:
+            await asyncio.Event().wait()
         return self.queue.popleft() if self.queue else None
 
 
@@ -226,7 +241,10 @@ def line(
         del cwd
         server.arguments = arguments
         server.environment = dict(env)
-        yield server
+        try:
+            yield server
+        finally:
+            server.stops += 1
 
     return GrokLine(
         driver or grok(),
@@ -493,24 +511,37 @@ def test_an_always_approve_session_is_switched_to_the_ask_mode(
 def test_permission_requests_follow_the_lines_tools(
     project: tuple[Path, Path, Path],
 ) -> None:
+    reader = LineConfig(builtin_tools=("Read",))
     server = FakeGrok(
         [
-            permission("execute", request_id="p1"),
-            permission("read", request_id="p2"),
-            permission("other", "dromon__send_message", request_id="p3"),
-            permission("other", "gmail__send", request_id="p4"),
+            permission("read", request_id="p1", ident="a"),
+            permission("other", "dromon__send_message", request_id="p2", ident="b"),
             {"jsonrpc": "2.0", "id": "x", "method": "fs/read_text_file", "params": {}},
             chunk("done"),
         ]
     )
-    run(line(server, project, config=LineConfig(builtin_tools=("Read",))))
+    report = run(line(server, project, config=reader))
     answers = {a["id"]: a for a in server.answers()}
     picked = {
-        key: answers[key]["result"]["outcome"]["optionId"]
-        for key in ("p1", "p2", "p3", "p4")
+        key: answers[key]["result"]["outcome"]["optionId"] for key in ("p1", "p2")
     }
-    assert picked == {"p1": "no", "p2": "yes", "p3": "yes", "p4": "no"}
+    assert picked == {"p1": "yes", "p2": "yes"}
     assert answers["x"]["error"]["code"] == -32601
+    assert report.tool_uses == ("Read", "dromon__send_message")
+    # A refused request cancels the turn, and ACP requires every request after a
+    # cancel to be answered as cancelled, which grants nothing.
+    refused = FakeGrok(
+        [
+            permission("execute", request_id="p1", ident="a"),
+            permission("read", request_id="p2", ident="b"),
+            permission("other", "gmail__send", request_id="p3", ident="c"),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="not given: execute"):
+        run(line(refused, project, config=reader))
+    answers = {a["id"]: a["result"]["outcome"] for a in refused.answers()}
+    assert answers["p1"]["optionId"] == "no"
+    assert answers["p2"] == answers["p3"] == {"outcome": "cancelled"}
 
 
 def test_the_turn_is_reported_to_the_observer_as_it_streams(
@@ -544,7 +575,12 @@ def test_the_turn_is_reported_to_the_observer_as_it_streams(
 def test_tool_calls_are_counted_and_others_cancel_the_turn(
     project: tuple[Path, Path, Path],
 ) -> None:
-    server = FakeGrok([tool_call("read"), tool_call("other", "dromon__send_message")])
+    server = FakeGrok(
+        [
+            tool_call("read", ident="a"),
+            tool_call("other", "dromon__send_message", ident="b"),
+        ]
+    )
     report = run(line(server, project, config=LineConfig(builtin_tools=("Read",))))
     assert report.tool_uses == ("Read", "dromon__send_message")
     blocked = FakeGrok([tool_call("execute")])
@@ -556,15 +592,175 @@ def test_tool_calls_are_counted_and_others_cancel_the_turn(
         run(line(foreign, project))
 
 
+def test_a_title_never_names_one_of_dromons_tools(
+    project: tuple[Path, Path, Path],
+) -> None:
+    """Antigravity review, F4, applied to Grok through the shared client. A call that
+    names Dromon's tool only in its title is judged by its kind, and refused."""
+    titled = {
+        "toolCallId": "t",
+        "kind": "other",
+        "title": "dromon__send_message",
+    }
+    asked = permission("other")
+    asked["params"]["toolCall"] = titled
+    server = FakeGrok([asked, chunk("done")])
+    with pytest.raises(EngineRefused, match="not given: dromon__send_message"):
+        run(line(server, project))
+    answers = {a["id"]: a for a in server.answers()}
+    assert answers["p1"]["result"]["outcome"]["optionId"] == "no"
+    used = FakeGrok([note({"sessionUpdate": "tool_call", **titled})])
+    with pytest.raises(EngineRefused, match="not given: dromon__send_message"):
+        run(line(used, project))
+
+
+def test_no_kind_is_exempt_from_the_tool_check(
+    project: tuple[Path, Path, Path],
+) -> None:
+    """Antigravity review, F1, applied to Grok on 2026-10-26. A ``think`` call was
+    once let through uncounted, and is now judged as any other kind, so refused."""
+    server = FakeGrok([tool_call("think")])
+    with pytest.raises(EngineRefused, match="not given: think"):
+        run(line(server, project))
+    asked = FakeGrok([permission("think")])
+    with pytest.raises(EngineRefused, match="not given: think"):
+        run(line(asked, project))
+    assert asked.answers()[0]["result"]["outcome"]["optionId"] == "no"
+
+
+@pytest.mark.parametrize(
+    ("first", "later", "field"),
+    [
+        (tool_call("read"), call_update("t", kind="execute"), "kind"),
+        (
+            tool_call("other", "dromon__send_message"),
+            call_update("t", toolName="gmail__send"),
+            "toolName",
+        ),
+        (tool_call("read"), call_update("t", title="anything"), "title"),
+        (tool_call("read"), tool_call("execute"), "kind"),
+        # Re-review, N3. A field the first report lacked is a change too, so a
+        # Grok that adds the kind only in a later update is refused.
+        (
+            call_update("t", toolName="dromon__send_message"),
+            call_update("t", kind="other"),
+            "kind",
+        ),
+    ],
+)
+def test_a_tool_call_whose_identity_changes_refuses_the_turn(
+    project: tuple[Path, Path, Path],
+    first: dict[str, Any],
+    later: dict[str, Any],
+    field: str,
+) -> None:
+    """Antigravity review, F2 and F3, applied to Grok. A call is judged when first
+    seen, so a later update that renames it, retitles it or changes its kind refuses
+    the turn, even from a permitted call to another permitted one."""
+    server = FakeGrok([first, later, chunk("done")])
+    config = LineConfig(builtin_tools=("Read", "Bash"))
+    with pytest.raises(EngineRefused, match=f"changed the {field} of its tool call"):
+        run(line(server, project, config=config))
+    assert server.params("session/cancel") == {"sessionId": "s1"}
+
+
+def test_a_permission_request_that_changes_a_call_is_rejected(
+    project: tuple[Path, Path, Path],
+) -> None:
+    """A request naming one of Dromon's tools for a call first seen as a read is not
+    the call that was checked, so it is rejected and the turn refused."""
+    server = FakeGrok(
+        [
+            tool_call("read"),
+            permission("other", "dromon__send_message"),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="changed the toolName of its tool call"):
+        run(line(server, project, config=LineConfig(builtin_tools=("Read",))))
+    assert server.answers()[0]["result"]["outcome"]["optionId"] == "no"
+
+
+def test_a_tool_call_without_an_identifier_refuses_the_turn(
+    project: tuple[Path, Path, Path],
+) -> None:
+    for update in (call_update(None, kind="read"), call_update("", kind="read")):
+        server = FakeGrok([update])
+        with pytest.raises(EngineRefused, match="without an identifier"):
+            run(line(server, project, config=LineConfig(builtin_tools=("Read",))))
+    asked = permission("read")
+    del asked["params"]["toolCall"]["toolCallId"]
+    server = FakeGrok([asked])
+    with pytest.raises(EngineRefused, match="without an identifier"):
+        run(line(server, project, config=LineConfig(builtin_tools=("Read",))))
+    assert server.answers()[0]["result"]["outcome"]["optionId"] == "no"
+
+
+def test_a_call_is_judged_and_counted_once_when_first_seen(
+    project: tuple[Path, Path, Path],
+) -> None:
+    """Updates that repeat or leave out the identity fields are the call already
+    judged, whether it was first seen as a request or as a notification."""
+    server = FakeGrok(
+        [
+            permission("read", ident="a"),
+            tool_call("read", ident="a"),
+            call_update("a", status="completed"),
+            tool_call("other", "dromon__send_message", ident="b"),
+            call_update("b", toolName="dromon__send_message", status="completed"),
+            chunk("done"),
+        ]
+    )
+    report = run(line(server, project, config=LineConfig(builtin_tools=("Read",))))
+    assert report.tool_uses == ("Read", "dromon__send_message")
+    assert "session/cancel" not in server.methods()
+
+
+def test_an_update_seen_first_is_judged_by_its_own_fields(
+    project: tuple[Path, Path, Path],
+) -> None:
+    """An update for a call never announced is judged as a new call, and one with no
+    kind is of the kind ``other``, which only Dromon's tools may be."""
+    server = FakeGrok([call_update("a", kind="execute")])
+    with pytest.raises(EngineRefused, match="not given: execute"):
+        run(line(server, project, config=LineConfig(builtin_tools=("Read",))))
+    bare = FakeGrok([call_update("a", status="in_progress")])
+    with pytest.raises(EngineRefused, match="not given: an unnamed tool"):
+        run(line(bare, project))
+
+
 def test_the_driver_budget_cancels_a_turn_once(
     project: tuple[Path, Path, Path],
 ) -> None:
     budget = grok().settings.tool_budget
-    server = FakeGrok([tool_call("read")] * (budget + 3))
+    server = FakeGrok([tool_call("read", ident=f"t{i}") for i in range(budget + 3)])
     report = run(line(server, project, config=LineConfig(builtin_tools=("Read",))))
     assert report.interrupted_for == "tool_budget"
     assert report.subtype == "cancelled"
     assert server.methods().count("session/cancel") == 1
+
+
+def test_a_cancel_grok_ignores_ends_the_turn_and_stops_grok(
+    project: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-review, N2. A cancel bounds the wait for Grok's answer, after which the
+    connection is left, which stops Grok. An interrupt stays an interrupt, and a
+    refusal keeps its own reason."""
+    monkeypatch.setattr(grok_module, "ABORT_SECONDS", 0.05)
+    budget = grok().settings.tool_budget
+    server = FakeGrok([tool_call("read", ident=f"t{i}") for i in range(budget + 1)])
+    server.answer_prompt = False
+    server.ignores_cancel = True
+    report = run(line(server, project, config=LineConfig(builtin_tools=("Read",))))
+    assert report.interrupted_for == "tool_budget"
+    assert report.subtype == "cancelled"
+    assert server.methods().count("session/cancel") == 1
+    assert server.stops == 1
+    refused = FakeGrok([tool_call("execute")])
+    refused.answer_prompt = False
+    refused.ignores_cancel = True
+    with pytest.raises(EngineRefused, match="not given: execute"):
+        run(line(refused, project, config=LineConfig(builtin_tools=("Read",))))
+    assert refused.stops == 1
 
 
 def test_a_closed_connection_refuses_the_turn(

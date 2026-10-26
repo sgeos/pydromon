@@ -27,9 +27,14 @@ process's network access under any profile.
 Tools and permissions. Grok loads the operator's configuration, including MCP servers
 and a permission mode. Dromon asks for Grok's ask mode, refuses a session that reports
 any other mode, answers every permission request from the line's configuration, and
-interrupts and refuses a turn in which Grok uses a tool the line was not given. Dromon's
+interrupts and refuses a turn in which Grok uses a tool the line was not given. Each
+tool call is judged when first seen, and a later update or request that changes its
+name, title or kind refuses the turn. Dromon's
 own tools reach Grok as an MCP server, ``dromon mcp --line``, through the daemon's line
 socket and a token the daemon issued for the line.
+
+The protocol itself, its request loop and the answers Dromon gives, lives in
+``dromon.acp``, which the Antigravity adapter shares.
 
 Porting note. The protocol is JSON lines over a pipe, and the adapter is sequential, as
 the Codex adapter is.
@@ -39,7 +44,6 @@ import asyncio
 import json
 import os
 import shutil
-import sys
 import tomllib
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -49,6 +53,8 @@ from typing import Any, Final, Protocol, cast
 
 from claude_agent_sdk import SdkMcpTool
 
+from dromon import acp
+from dromon.acp import bridge_command as bridge_command
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
 from dromon.engine import EngineRefused, TurnReport, read_instructions
@@ -57,8 +63,6 @@ from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
 
 ENGINE_NAME: Final = "grok-build"
 """The engine this adapter runs, as drivers name it."""
-
-PROTOCOL_VERSION: Final = 1
 
 SUPPORTED_BUILTINS: Final = frozenset(
     {"Bash", "Read", "Grep", "Glob", "Edit", "Write", "WebFetch", "WebSearch"}
@@ -77,8 +81,6 @@ KIND_TOOLS: Final[dict[str, frozenset[str]]] = {
     "fetch": frozenset({"WebFetch", "WebSearch"}),
 }
 """Each ACP tool kind, and the built-in tools any one of which permits it."""
-
-QUIET_KINDS: Final = frozenset({"think"})
 
 READER_PROFILE: Final = "dromon-reader"
 WRITER_PROFILE: Final = "dromon-writer"
@@ -114,8 +116,12 @@ EFFORTS: Final[dict[str, str]] = {
 }
 """Dromon's efforts as Grok's, which have no ``max``."""
 
-MCP_SERVER_NAME: Final = "dromon"
 MAX_LINE: Final = 64 * 1024 * 1024
+
+ABORT_SECONDS: Final = 60
+"""**Re-review, N2.** How long a cancelled turn waits for Grok to answer its prompt
+before Grok is stopped. Before, a Grok that ignored the cancel held the line for
+ever."""
 
 
 def unsupported(config: LineConfig) -> str | None:
@@ -356,14 +362,14 @@ async def _grok_agent(
                 await process.wait()
 
 
-class _RpcError(Exception):
-    pass
-
-
 @dataclass(slots=True)
 class _Turn:
     text: list[str] = field(default_factory=list[str])
     tool_uses: list[str] = field(default_factory=list[str])
+    calls: dict[str, dict[str, object]] = field(
+        default_factory=dict[str, dict[str, object]]
+    )
+    """Each tool call's identity as first recorded, by its identifier."""
     interrupted_for: str | None = None
     refusal: str | None = None
     cancelled: bool = False
@@ -411,9 +417,7 @@ class GrokLine:
         self.driver = driver
         self.cwd = cwd
         self.config = config
-        self.own_tools = frozenset(
-            f"{MCP_SERVER_NAME}__{tool.name}" for tool in mcp_tools
-        )
+        self.own_tools = acp.own_tool_names([tool.name for tool in mcp_tools])
         self.session_id = session_id
         self.protected = tuple(protected)
         self.bridge = tuple(bridge)
@@ -424,8 +428,7 @@ class GrokLine:
         self._observe = observe
         self.mark = mark
         """The process mark every process of this line inherits, if issued."""
-        self._next_id = 0
-        self._connection: Connection | None = None
+        self._client: acp.Client | None = None
         self.session_id_in_use: str | None = None
 
     async def run_turn(self, prompt: str) -> TurnReport:
@@ -445,21 +448,34 @@ class GrokLine:
             raise EngineRefused(f"the driver names an unknown effort {effort!r}")
         arguments = grok_arguments(self.driver.settings.model, effort)
         turn = _Turn()
+        credential: Credential | None = None
+        session_id: str | None = None
+        stop = "refused"
         async with self._connect(arguments, self.cwd, environment) as connection:
-            self._connection = connection
+
+            async def dispatch(message: dict[str, Any]) -> None:
+                await self._dispatch(message, turn)
+
+            self._client = acp.Client(connection, dispatch)
             try:
                 credential = await self._start(turn)
                 session_id = await self._open_session(turn)
                 if turn.refusal is None:
                     stop = await self._prompt(session_id, prompt, turn)
-                else:
-                    stop = "refused"
-            except _RpcError as error:
+            except acp.RpcError as error:
                 raise EngineRefused(f"the engine refused a request: {error}") from error
+            except TimeoutError:
+                # Only a cancel sets the client's deadline, so Grok did not answer
+                # its prompt in time after one. Leaving the connection stops Grok.
+                if turn.refusal is None and turn.interrupted_for is None:
+                    turn.refusal = "the engine did not finish cancelling its turn"
+                stop = "cancelled"
             finally:
-                self._connection = None
+                self._client = None
         if turn.refusal is not None:
             raise EngineRefused(turn.refusal)
+        if credential is None or session_id is None:
+            raise EngineRefused("the engine did not finish cancelling its turn")
         self.session_id = session_id
         subtype = "success" if stop == "end_turn" else stop
         self.driver.step(Event("result", subtype, 1))
@@ -477,33 +493,10 @@ class GrokLine:
 
     # The protocol.
 
-    def _open(self) -> Connection:
-        if self._connection is None:
+    def _rpc(self) -> acp.Client:
+        if self._client is None:
             raise EngineRefused("the engine connection is not open")
-        return self._connection
-
-    async def _receive(self) -> dict[str, Any]:
-        message = await self._open().receive()
-        if message is None:
-            raise EngineRefused("the engine closed its connection during the turn")
-        return message
-
-    async def _call(
-        self, method: str, params: Mapping[str, object], turn: _Turn
-    ) -> dict[str, Any]:
-        self._next_id += 1
-        request_id = self._next_id
-        await self._open().send(
-            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
-        )
-        while True:
-            message = await self._receive()
-            if message.get("id") == request_id and "method" not in message:
-                if "error" in message:
-                    raise _RpcError(f"{method}: {message['error']}")
-                result: object = message.get("result")
-                return cast(dict[str, Any], result) if isinstance(result, dict) else {}
-            await self._dispatch(message, turn)
+        return self._client
 
     async def _dispatch(self, message: dict[str, Any], turn: _Turn) -> None:
         method = message.get("method")
@@ -516,14 +509,20 @@ class GrokLine:
             await self._update(cast(dict[str, Any], params.get("update") or {}), turn)
 
     def _permits(self, tool_call: Mapping[str, Any]) -> tuple[bool, str]:
-        """Whether the line may make ``tool_call``, and the tool name to count it as."""
-        name = str(tool_call.get("toolName") or tool_call.get("title") or "")
+        """Whether the line may make ``tool_call``, and the tool name to count it as.
+
+        **Antigravity review, F4.** One of the line's own tools is recognised only by
+        the structured ``toolName``, never by a title, which a file name or the model
+        could make equal to it. A call with only a title is judged by its kind, and
+        any other kind than a built-in tool's is refused. No kind is exempt, since
+        the review's F1 was applied to Grok on 2026-10-26."""
+        name = acp.tool_name(tool_call)
         if name in self.own_tools:
             return True, name
         kind = str(tool_call.get("kind") or "other")
         allowed = KIND_TOOLS.get(kind)
         if allowed is None:
-            return False, name or kind
+            return False, acp.tool_label(tool_call)
         given = allowed & set(self.config.builtin_tools)
         return bool(given), min(given) if given else kind
 
@@ -531,32 +530,31 @@ class GrokLine:
         self, request_id: object, method: str, params: dict[str, Any], turn: _Turn
     ) -> None:
         if method == "session/request_permission":
-            tool_call = cast(dict[str, Any], params.get("toolCall") or {})
-            permitted, _ = self._permits(tool_call)
-            wanted = ("allow_once",) if permitted else ("reject_once", "reject_always")
+            raw: object = params.get("toolCall")
+            tool_call = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
+            if turn.cancelled:
+                # ACP requires every request pending after a cancel to be answered
+                # as cancelled, which grants nothing.
+                await self._rpc().respond(
+                    request_id, {"outcome": {"outcome": "cancelled"}}
+                )
+                return
+            identifier = tool_call.get("toolCallId")
+            refusal = acp.identity_refusal(identifier, tool_call, turn.calls)
+            # With no field changed, the call is what was recorded plus what the
+            # request adds, so a request that omits the recorded kind keeps it.
+            known = turn.calls.get(str(identifier), {})
+            permitted = refusal is None and self._permits({**known, **tool_call})[0]
             options = cast(list[dict[str, Any]], params.get("options") or [])
-            chosen = next(
-                (o.get("optionId") for o in options if o.get("kind") in wanted), None
+            await self._rpc().respond(
+                request_id, acp.permission_result(options, permitted)
             )
-            outcome: dict[str, object] = (
-                {"outcome": "selected", "optionId": chosen}
-                if chosen is not None
-                else {"outcome": "cancelled"}
-            )
-            await self._open().send(
-                {"jsonrpc": "2.0", "id": request_id, "result": {"outcome": outcome}}
-            )
+            if refusal is not None:
+                await self._cancel(turn, refusal)
+            else:
+                await self._record(str(identifier), tool_call, turn)
         else:
-            await self._open().send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "error": {
-                        "code": -32601,
-                        "message": f"Dromon does not serve {method}",
-                    },
-                }
-            )
+            await self._rpc().refuse(request_id, method)
 
     async def _update(self, update: dict[str, Any], turn: _Turn) -> None:
         kind = update.get("sessionUpdate")
@@ -569,18 +567,35 @@ class GrokLine:
         elif kind == "agent_thought_chunk":
             self._observe(ActivityKind.THINKING, "")
             await self._act(Event("thinking"), turn)
-        elif kind == "tool_call":
-            if str(update.get("kind")) in QUIET_KINDS:
+        elif kind in ("tool_call", "tool_call_update"):
+            # Antigravity review, F1 to F3, applied to Grok on 2026-10-26. No kind is
+            # exempt, and every update to a call is compared with its record.
+            identifier = update.get("toolCallId")
+            refusal = acp.identity_refusal(identifier, update, turn.calls)
+            if refusal is not None:
+                await self._cancel(turn, refusal)
                 return
-            permitted, name = self._permits(update)
-            if not permitted:
-                await self._cancel(
-                    turn, f"the engine used a tool the line was not given: {name}"
-                )
-                return
-            turn.tool_uses.append(name)
-            self._observe(ActivityKind.TOOL, name)
-            await self._act(Event("tool_use", name), turn)
+            await self._record(str(identifier), update, turn)
+
+    async def _record(
+        self, identifier: str, fields: Mapping[str, Any], turn: _Turn
+    ) -> None:
+        """Record a tool call the first time it is seen and judge it then, counting
+        it if it is permitted and cancelling the turn if not. A later update or
+        permission request for it has passed ``acp.identity_refusal``, so it is the
+        call already judged."""
+        if identifier in turn.calls:
+            return
+        turn.calls[identifier] = acp.identity(fields)
+        permitted, name = self._permits(fields)
+        if not permitted:
+            await self._cancel(
+                turn, f"the engine used a tool the line was not given: {name}"
+            )
+            return
+        turn.tool_uses.append(name)
+        self._observe(ActivityKind.TOOL, name)
+        await self._act(Event("tool_use", name), turn)
 
     async def _act(self, event: Event, turn: _Turn) -> None:
         action = self.driver.step(event)
@@ -594,29 +609,24 @@ class GrokLine:
         if turn.cancelled or self.session_id_in_use is None:
             return
         turn.cancelled = True
-        await self._open().send(
-            {
-                "jsonrpc": "2.0",
-                "method": "session/cancel",
-                "params": {"sessionId": self.session_id_in_use},
-            }
+        client = self._rpc()
+        bound = asyncio.get_running_loop().time() + ABORT_SECONDS
+        client.deadline = (
+            bound if client.deadline is None else min(client.deadline, bound)
         )
+        await client.notify("session/cancel", {"sessionId": self.session_id_in_use})
 
     # The steps of a turn.
 
     async def _start(self, turn: _Turn) -> Credential:
-        result = await self._call(
+        result = await self._rpc().call(
             "initialize",
             {
-                "protocolVersion": PROTOCOL_VERSION,
-                "clientCapabilities": {
-                    "fs": {"readTextFile": False, "writeTextFile": False},
-                    "terminal": False,
-                },
+                "protocolVersion": acp.PROTOCOL_VERSION,
+                "clientCapabilities": acp.CLIENT_CAPABILITIES,
             },
-            turn,
         )
-        if result.get("protocolVersion") != PROTOCOL_VERSION:
+        if result.get("protocolVersion") != acp.PROTOCOL_VERSION:
             raise EngineRefused(
                 f"the engine speaks ACP version {result.get('protocolVersion')!r}"
             )
@@ -636,18 +646,6 @@ class GrokLine:
             )
         return credential
 
-    def _mcp_servers(self) -> list[dict[str, object]]:
-        if not self.bridge or self.line_token is None:
-            return []
-        return [
-            {
-                "name": MCP_SERVER_NAME,
-                "command": self.bridge[0],
-                "args": list(self.bridge[1:]),
-                "env": [{"name": "DROMON_LINE_TOKEN", "value": self.line_token}],
-            }
-        ]
-
     async def _open_session(self, turn: _Turn) -> str:
         meta: dict[str, object] = {"yoloMode": False, "autoMode": False}
         instructions = read_instructions(self.config.instructions, self.cwd)
@@ -655,99 +653,40 @@ class GrokLine:
             meta["rules"] = instructions
         params: dict[str, object] = {
             "cwd": str(self.cwd),
-            "mcpServers": self._mcp_servers(),
+            "mcpServers": acp.mcp_servers(self.bridge, self.line_token),
             "_meta": meta,
         }
         if self.session_id is None:
-            result = await self._call("session/new", params, turn)
+            result = await self._rpc().call("session/new", params)
             session_id = str(result.get("sessionId") or "")
         else:
-            result = await self._call(
-                "session/load", {**params, "sessionId": self.session_id}, turn
+            result = await self._rpc().call(
+                "session/load", {**params, "sessionId": self.session_id}
             )
             session_id = self.session_id
         if not session_id:
             raise EngineRefused("the engine started a session without an identifier")
         self.session_id_in_use = session_id
-        model = _reported_model(result)
+        model = acp.reported_model(result)
         verdict = self.driver.step(Event("init", model or ""))
         if verdict.tag is ActionTag.REFUSE:
             turn.refusal = (
                 f"the driver for {verdict.text} refuses the engine model {model!r}"
             )
             return session_id
-        await self._ensure_ask_mode(session_id, result, turn)
-        return session_id
-
-    async def _ensure_ask_mode(
-        self, session_id: str, result: dict[str, Any], turn: _Turn
-    ) -> None:
-        """Refuse the turn unless the session is in a mode that asks before acting,
-        switching to ``default`` when Grok offers it."""
-        modes = result.get("modes")
-        if not isinstance(modes, dict):
-            turn.refusal = "the engine does not report its permission mode"
-            return
-        current = cast(dict[str, Any], modes).get("currentModeId")
-        if current in ASK_MODES:
-            return
-        available = {
-            str(mode.get("id"))
-            for mode in cast(
-                list[dict[str, Any]],
-                cast(dict[str, Any], modes).get("availableModes") or [],
-            )
-        }
-        if "default" not in available:
-            turn.refusal = f"the engine runs in the permission mode {current!r}"
-            return
-        await self._call(
-            "session/set_mode", {"sessionId": session_id, "modeId": "default"}, turn
+        # Refuse the turn unless the session asks before acting, switching to
+        # ``default`` when Grok offers it.
+        refusal = await acp.ensure_mode(
+            self._rpc(), session_id, result, ASK_MODES, "default"
         )
+        if refusal is not None:
+            turn.refusal = refusal
+        return session_id
 
     async def _prompt(self, session_id: str, prompt: str, turn: _Turn) -> str:
         self.driver.step(Event("turn_start"))
-        result = await self._call(
+        result = await self._rpc().call(
             "session/prompt",
             {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt}]},
-            turn,
         )
         return str(result.get("stopReason") or "")
-
-
-def _reported_model(result: Mapping[str, Any]) -> str | None:
-    """The model a session reports, from ``models`` or from its configuration
-    options, or ``None`` when it reports none."""
-    models = result.get("models")
-    if isinstance(models, dict):
-        current = cast(dict[str, Any], models).get("currentModelId")
-        if isinstance(current, str):
-            return current
-    for option in cast(list[Any], result.get("configOptions") or []):
-        if not isinstance(option, dict):
-            continue
-        entry = cast(dict[str, Any], option)
-        if (entry.get("id") or entry.get("configId")) != "model":
-            continue
-        value = entry.get("currentValue", entry.get("value"))
-        if isinstance(value, dict):
-            value = cast(dict[str, Any], value).get("value")
-        if isinstance(value, str):
-            return value
-    return None
-
-
-def bridge_command(root: Path, runtime_dir: Path, line_id: str) -> list[str]:
-    """The command Grok starts for a line's Dromon tools."""
-    return [
-        sys.executable,
-        "-m",
-        "dromon.cli",
-        "--project",
-        str(root),
-        "--runtime-dir",
-        str(runtime_dir),
-        "mcp",
-        "--line",
-        line_id,
-    ]

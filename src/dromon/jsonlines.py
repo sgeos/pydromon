@@ -1,14 +1,16 @@
 """A harness process that speaks JSON, one object per line, on its standard streams.
 
-The Pi, Cursor Agent and Antigravity adapters each start their harness this way. Pi
-keeps its standard input open for commands, while Cursor Agent and Antigravity take
-their prompt as an argument and only write. The Grok adapter predates this module and
-keeps its own copy, which a later change may fold in.
+The Pi, Cursor Agent and Antigravity adapters each start their harness this way. Pi and
+Antigravity's ACP runtime keep their standard input open for requests, while Cursor
+Agent takes its prompt as an argument and only writes. The Grok adapter predates this
+module and keeps its own copy, which a later change may fold in.
 
 Framing. A record ends at a line feed and at nothing else, as Pi's documentation
 requires, since a JSON string may hold the Unicode line and paragraph separators. A
 trailing carriage return is dropped. A line that is not a JSON object refuses the turn,
-because the adapters cannot tell what such output meant.
+because the adapters cannot tell what such output meant. ``NotJsonLine`` keeps the
+start of such a line apart from its message, for an adapter that recognises a
+harness's plain-text notice.
 
 Process group. **Cursor review, F5.** A harness starts in a session and process group
 of its own, and every signal Dromon sends reaches the whole group, so a child the
@@ -50,7 +52,7 @@ GROUP_POLL_SECONDS: Final = 0.1
 TURN_SECONDS: Final = 3600
 """**Cursor review, F6.** The longest a turn on these engines may run before Dromon
 stops it and refuses the turn, so that a hung or endless run cannot hold a line without
-bound. An hour, the same as the Antigravity print timeout Dromon passes."""
+bound. An hour."""
 
 CLOUD_PREFIXES: Final = (
     "ALIBABA_CLOUD_",
@@ -88,6 +90,21 @@ later cannot slip one past a subscription line."""
 def is_cloud_or_credential(name: str) -> bool:
     """Whether a subscription line's harness starts without the variable ``name``."""
     return name.startswith(CLOUD_PREFIXES) or name.endswith(CREDENTIAL_SUFFIXES)
+
+
+HEAD_BYTES: Final = 64
+"""How much of a line that is not JSON an adapter may inspect."""
+
+
+class NotJsonLine(EngineRefused):
+    """A harness wrote a line that is not JSON. ``head`` holds at most ``HEAD_BYTES`` of
+    it, so that an adapter can recognise a harness's own plain-text notice, such as a
+    request to sign in. The head never reaches the message, which goes to the event log,
+    since the line may carry a sign-in address or text near a credential."""
+
+    def __init__(self, head: bytes) -> None:
+        super().__init__("the engine sent a line that is not JSON")
+        self.head = head[:HEAD_BYTES]
 
 
 class Connection(Protocol):
@@ -138,7 +155,7 @@ class Process:
         try:
             decoded: object = json.loads(line.rstrip(b"\r\n"))
         except ValueError as error:
-            raise EngineRefused("the engine sent a line that is not JSON") from error
+            raise NotJsonLine(line) from error
         if not isinstance(decoded, dict):
             raise EngineRefused("the engine sent a record that is not an object")
         return cast(dict[str, Any], decoded)

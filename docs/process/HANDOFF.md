@@ -20,8 +20,8 @@ completed, moved or abandoned.
     `scheduler.engine_factory` picks the adapter. `dromon probe` runs one turn.
   - `codex.py` runs GPT-6-Luna through `codex app-server` on the ChatGPT plan,
     isolated from the user's MCP servers, under a profile denying Dromon's state.
-  - `grok.py` runs Grok 4.7 over ACP, unverified live: operator-defined sandbox
-    profiles Dromon checks, and tools via `dromon mcp --line` on `lines.sock`.
+  - `grok.py` and `antigravity.py` share `acp.py`, unverified live. Grok has checked
+    sandbox profiles, both get tools via `dromon mcp --line` on `lines.sock`.
   - `teacher.py` brings a project's local Ollama teacher up and down. Lines take
     `claude_code_prompt` and `instructions`, so they can follow a `CLAUDE.md`.
   - `agents.py` and `mcp.py` let outside harnesses reach the daemon over MCP as `&name`
@@ -74,10 +74,8 @@ the operator, per `docs/architecture/KELEUSMA_DOGFOOD.md`.
 
 ## Open
 
-- **pykeleusma shared data.** Its task 11. Notice
-  `pykeleusma-20261025-shared-data-update` says the VM now owns a zeroed block that
-  persists across calls. Drivers keep host-carried state, by choice, until a reason to
-  move appears. Adopting it means repinning `pykeleusma`.
+- **pykeleusma shared data.** Its task 11. The VM now owns a persistent zeroed block.
+  Drivers keep host-carried state by choice. Adopting it means repinning `pykeleusma`.
 - **Subscription usage.** Plan terms assume ordinary use, which many lines may exceed.
 - **Event log.** Loaded whole, no compaction or migration. Limit counts reset on restart.
 - **Operator relays.** Inbound adapters are deferred, per `RELAY.md`.
@@ -90,13 +88,14 @@ the operator, per `docs/architecture/KELEUSMA_DOGFOOD.md`.
   or MCP OAuth, and Linux not verified live, per `SANDBOX.md` and `SETTINGS.md`.
 - **Unrun engines.** Grok, Pi, Cursor Agent and Antigravity, each with a verify-first
   list. Cursor and Antigravity lines are refused, and `dromon probe` needs flags.
+- **Keep-session ceiling.** May it end background work? The operator decides.
 - **Flaky test.** `test_kept_session`'s grace-period test, once in five runs.
 - **Codex lines.** No MCP servers, commits, sandbox or settings documents, cost or turn
   limit, and refused calls escape the tool budget. See `CODEX.md`.
 - **Clients.** Polling, no token meter, Tk checked only withdrawn.
   Agents lack `interrupt` and settings.
-- **Keleusma.** Installed for kaizen, not started, until its live session ends. The
-  remote stays SSH, so no pushes. A line cannot list its own processes or limits.
+- **Keleusma.** Installed for kaizen, not started. Its remote stays SSH, so no pushes.
+  A line cannot list its own processes or limits.
 - **In the design.** Hosted teacher traces, the Rust repository's name, and remote
   clients.
 

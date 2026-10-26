@@ -12,7 +12,10 @@ prompt was sent.
 **Directed by the operator on 2026-10-25.** Nominal support for Grok, without testing
 until Grok usage is available. A line whose driver names the `grok-build` engine runs
 its turns through `grok agent --no-leader stdio`, which speaks the Agent Client
-Protocol, ACP, as JSON-RPC 2.0, one message per line.
+Protocol, ACP, as JSON-RPC 2.0, one message per line. The protocol client, its request
+loop and the answers Dromon gives, lives in `dromon.acp`, which the Antigravity adapter
+of [`ANTIGRAVITY.md`](ANTIGRAVITY.md) shares. Grok's sandbox profile, sign-in check and
+tool policy stay in `dromon.grok`.
 
 ## Evidence
 
@@ -61,12 +64,22 @@ declares MCP servers for mail and documents.
    option, is handed to the driver. Its `modes.currentModeId` must be `default` or
    `ask`. Otherwise Dromon sends `session/set_mode` with `default` if Grok offers it, and
    refuses the turn if not or if no mode is reported.
-6. **`session/prompt`** with the wake prompt. Message chunks are text, thought chunks
-   are thinking, and each `tool_call` is checked against the line's tools.
+6. **`session/prompt`** with the wake prompt. Message chunks are text and thought
+   chunks are thinking. A tool call is judged against the line's tools when it is first
+   seen, in a `tool_call`, a `tool_call_update` or a permission request, and its
+   `toolName`, `title` and `kind` are recorded then. A later update or request that
+   gives any of them another value, or one the call did not have, refuses the turn, as
+   does a call without an identifier.
 7. **Permission requests** are answered with an `allow_once` option for a permitted call
-   and a `reject` option otherwise. A tool call the line was not given, or the driver's
-   tool budget, sends `session/cancel`. Other requests from the agent are answered with
-   an error.
+   and a `reject` option otherwise. A tool call the line was not given, a refused
+   permission request, or the driver's tool budget, sends `session/cancel`, and every
+   permission request after it is answered as cancelled. Other requests from the agent
+   are answered with an error.
+8. **Cancel.** **Re-review, N2.** After `session/cancel` Dromon waits at most
+   `ABORT_SECONDS`, 60 seconds, for Grok to answer its prompt, and then leaves the
+   connection, which stops Grok. An interrupted turn is reported as cancelled, and a
+   refused one keeps its reason. Before, a Grok that ignored the cancel held the line
+   without bound.
 
 | ACP tool kind | Permitted by |
 |---|---|
@@ -75,8 +88,25 @@ declares MCP servers for mail and documents.
 | `edit`, `delete`, `move` | `Edit` or `Write` |
 | `execute` | `Bash` |
 | `fetch` | `WebFetch` or `WebSearch` |
-| `think` | Always, not counted |
-| Any other | Only a tool of Dromon's MCP server, `dromon__NAME` |
+| Any other | Only a tool of Dromon's MCP server, `dromon__NAME` in `toolName` |
+
+**Changed on 2026-10-26, Antigravity review, F4.** A call is one of Dromon's own tools
+only when its structured `toolName` names it. Before, the shared client fell back to
+the call's `title`, which a file name or the model can make equal to a Dromon tool's
+name. A call with only a title is now judged by its kind as in the table, so one of
+the kind `other` is refused. This fails closed. Grok's tool calls are expected to
+carry `toolName`, as Not verified below says, so a Grok line that uses its own tools
+is unaffected if that holds, and refused if it does not.
+
+**Changed on 2026-10-26, Antigravity review, F1 to F3, at the operator's direction.**
+Grok no longer exempts the `think` kind. A `think` call was let through uncounted, so
+any call reported with that kind escaped the tool check. It now falls under Any other
+in the table and is refused. Grok also judged only the `tool_call` notification, so a
+`tool_call_update` could rename or change the kind of a call already let through. Every
+update is now compared with what was recorded. **Hypothesis, not verified.** If Grok
+reports its reasoning as `think` tool calls, or refines a call's title while it runs,
+every such turn is refused. Both fail closed, and the first live turn should show
+which kinds and updates Grok sends.
 
 ## Sandbox profiles
 
@@ -126,6 +156,27 @@ that line, held only in memory, and it serves only that line's own tools.
   one.
 - That Grok's permission grants remembered for a project do not approve calls Dromon
   would refuse.
+
+## Verify first
+
+**Re-review, N1, at the operator's direction on 2026-10-26.** These are the checks for
+the first live Grok turn, in order. Each rule they test fails closed, so a wrong guess
+refuses turns rather than permits them.
+
+1. **Tool names.** Run a turn that calls one of Dromon's tools, such as
+   `send_message`, and record its `tool_call`, its `tool_call_update` messages and any
+   permission request. Confirm that each carries `toolName` as `dromon__send_message`.
+   A tool of Dromon's is recognised only by that structured field, never by a title. If
+   Grok names its MCP tools only in titles, every use of them is refused and a Grok line
+   cannot use its own tools, and the rule is to be revisited rather than loosened by
+   reading titles.
+2. **Kinds and updates.** Record the `kind` of each tool call a plain turn and a tool
+   turn carry, whether any arrives as `think`, and whether a later update repeats,
+   omits, adds or changes `toolName`, `title` or `kind`. A `think` call, an added field
+   and a changed field each refuse the turn.
+3. **Cancel.** Interrupt a turn and confirm that Grok answers its prompt with
+   `stopReason` `cancelled` within `ABORT_SECONDS`, 60 seconds, after which Dromon
+   stops Grok.
 
 ## Not at parity
 

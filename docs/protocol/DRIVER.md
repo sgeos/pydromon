@@ -51,9 +51,9 @@ subscription draws on a plan's limits while API usage is charged for every token
 | `cursor_agent__gpt_5_6_luna_medium_subscription.kel` | GPT-5.6 Luna on Cursor Agent | subscription | medium | 200 | 400 |
 | `cursor_agent__gpt_5_6_luna_medium_api.kel` | GPT-5.6 Luna on Cursor Agent | api | medium | 4 | 20 |
 | `cursor_agent__gpt_5_6_luna_medium_flexible.kel` | GPT-5.6 Luna on Cursor Agent | flexible | medium | 4 | 20 |
-| `antigravity__gemini_3_1_pro_subscription.kel` | Gemini 3.1 Pro on Antigravity | subscription | medium | 200 | 400 |
-| `antigravity__gemini_3_1_pro_api.kel` | Gemini 3.1 Pro on Antigravity | api | medium | 4 | 20 |
-| `antigravity__gemini_3_1_pro_flexible.kel` | Gemini 3.1 Pro on Antigravity | flexible | medium | 4 | 20 |
+| `antigravity__gemini_3_8_flash_high_subscription.kel` | Gemini 3.8 Flash at high effort on Antigravity | subscription | high | 200 | 400 |
+| `antigravity__gemini_3_8_flash_high_api.kel` | Gemini 3.8 Flash at high effort on Antigravity | api | high | 4 | 20 |
+| `antigravity__gemini_3_8_flash_high_flexible.kel` | Gemini 3.8 Flash at high effort on Antigravity | flexible | high | 4 | 20 |
 
 **Decided 2026-10-26, for dogfooding.** The subscription drivers' turn limits and tool
 budgets are sized for a line that develops software, which reads, edits and runs a
@@ -89,12 +89,15 @@ another engine. All three engines have adapters, as of 2026-10-25 for `codex`, w
 is not yet verified against a live turn. The `cursor-agent` engine has an adapter as of
 2026-10-26, which [`CURSOR.md`](CURSOR.md) specifies. A daemon refuses Cursor lines, and only `dromon
 probe --accept-partial-isolation` runs a Cursor turn. The `antigravity` engine has an adapter as of
-2026-10-26, written from documentation alone, which [`ANTIGRAVITY.md`](ANTIGRAVITY.md)
-specifies. A daemon refuses its lines, and the probe's flag reaches it, but its
+2026-10-26, on Antigravity's ACP runtime since the operator's decision of that day,
+which [`ANTIGRAVITY.md`](ANTIGRAVITY.md) specifies and which is not verified against a
+live turn. A daemon refuses its lines, and the probe's flag reaches it, but its
 credential is unverified, which no packaged driver accepts, so a turn is refused
-before `agy` starts unless the probe is also given `--accept-unverified-credential`,
-the operator's confirmation by hand, which puts `subscription` to the driver in its
-place. Its model identifier is a guess.
+before the runtime is located unless the probe is also given
+`--accept-unverified-credential`, the operator's confirmation by hand, which puts
+`subscription` to the driver in its place. Its model identifier is one a second
+implementation and a user report show to exist. Antigravity names the effort in the
+identifier, so its drivers declare the effort the identifier names.
 
 **Model names. Decided on 2026-10-26.** Claude Code, Codex and Grok Build each run their
 own vendor's models, which Dromon names by the vendor's identifier. Pi, Cursor Agent and

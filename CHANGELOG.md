@@ -34,18 +34,46 @@ All notable changes are recorded here. The format follows
   refused too. A resumed chat is refused, since the turn's data directory holds none,
   so a Cursor line runs a single turn until a kept data directory is designed.
 - A prospective Antigravity engine, `dromon.antigravity`, for
-  `antigravity:gemini-3.1-pro`, written from its documentation alone, as
-  `docs/protocol/ANTIGRAVITY.md` records. Its model identifier is a guess. A daemon
-  refuses an Antigravity line, since its documentation gives no way to add Dromon's MCP
-  server, and `dromon probe --accept-partial-isolation` reaches it. After review, its
-  credential is recorded as `unverified`, which no packaged driver accepts, so a turn
-  is refused before `agy` starts unless the probe is also given
-  `--accept-unverified-credential`, the operator's confirmation by hand that `agy` is
-  signed in to a plan, which gives the driver the subscription. Any record, step or
-  tool field the adapter does not name refuses the turn, as do `init` offering any
-  tool or another working directory, a `.gemini`, `.agy` or `.antigravity` directory in the workspace, a
-  `~/.gemini/.env`, and either user settings file approving a tool. The probe's help
-  says that neither probe flag changes the strategy.
+  `antigravity:gemini-3.8-flash-high`, which runs a turn through Google's Antigravity
+  ACP runtime, `agy_acp_server`, by the operator's decision of 2026-10-26, as
+  `docs/protocol/ANTIGRAVITY.md` records. It replaces a print-mode adapter for
+  `agy --print`, which was never released. It rests on the protocol's schema and a
+  second implementation, and the runtime is not installed, so nothing is verified
+  against a live turn. Dromon installs nothing. It finds the runtime the operator
+  installed, refuses a missing, incomplete or older one as the ACP runtime missing,
+  sets the runtime's profile beside it, and refuses a profile with a key file, hooks,
+  MCP servers, approvals or another sign-in method. It chooses the Google account
+  sign-in from the methods the runtime advertises. Dromon's tools reach the session as
+  its MCP server, a permission request for any other tool is refused before it runs,
+  and any other tool call, unknown update, request or notification refuses the turn.
+  A daemon still refuses Antigravity lines, since a tool the runtime runs without
+  asking can be stopped only after it starts, and `dromon probe
+  --accept-partial-isolation` reaches it. The credential stays `unverified`, which no
+  packaged driver accepts, unless the probe is also given
+  `--accept-unverified-credential`, the operator's confirmation by hand that the
+  runtime is signed in to a plan. The probe's help says that neither flag changes the
+  strategy. After review, every tool call and every update to one is checked whatever
+  its kind, a call whose name, title or kind changes refuses the turn, a tool is
+  Dromon's own only by its structured `toolName`, and any update that names a model
+  other than the driver's refuses the turn. Profile settings are an allowlist, and the
+  profile must name the Google account sign-in. The runtime starts with a home
+  directory of the turn's own and keeps its sign-in in the profile. Its reported usage
+  is counted, labelled unverified, and a turn that compacts is refused unless its cost
+  is reported. A turn with no reported cost says so in its usage note. The release location, version and checksums taken from the second
+  implementation are recorded as unverified hypotheses, and the procedure has no
+  download step until they are confirmed.
+- `dromon.acp`, the Agent Client Protocol client that Grok Build and Antigravity share,
+  holding the request loop, Dromon's answers and the shapes it reads, so that neither
+  adapter keeps a second copy. A Grok tool call is now one of Dromon's own tools only
+  by its structured `toolName`, not its title, so a call with only a title is judged
+  by its kind, as `docs/protocol/GROK.md` records. This fails closed. Grok no longer
+  lets a `think` call through unchecked, and like Antigravity it judges each tool call
+  when first seen and refuses a turn in which a later update or permission request
+  changes the call's name, title or kind. A refused permission request now cancels the
+  turn, and every request after a cancel is answered as cancelled. A Grok that ignores a
+  cancel is stopped after 60 seconds rather than holding the line, and `GROK.md` has a
+  verify-first list whose first step confirms that Grok names Dromon's tools in
+  `toolName`.
 - Models on harnesses that run other vendors' models are named `ENGINE:ID`, as
   `docs/protocol/DRIVER.md` records.
 

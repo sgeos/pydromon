@@ -71,7 +71,7 @@ every_ticks = 5
 | `profiles.NAME` | table | none | A reusable line template with every line key but `profile` and `session` |
 | `lines.ID` | table | none | A line, named by a line identifier |
 | `lines.ID.profile` | profile name | none | The profile the line starts from |
-| `lines.ID.model` | model | required | `claude-opus-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`, `gpt-6-luna` on Codex as [`CODEX.md`](CODEX.md) specifies, `grok-4.7` on Grok Build as [`GROK.md`](GROK.md) specifies, `pi:openai/gpt-6-luna` on Pi as [`PI.md`](PI.md) specifies, `cursor-agent:gpt-5.6-luna-medium` on Cursor Agent as [`CURSOR.md`](CURSOR.md) specifies, or `antigravity:gemini-3.1-pro` on Antigravity as [`ANTIGRAVITY.md`](ANTIGRAVITY.md) specifies. A daemon refuses Cursor and Antigravity lines |
+| `lines.ID.model` | model | required | `claude-opus-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`, `gpt-6-luna` on Codex as [`CODEX.md`](CODEX.md) specifies, `grok-4.7` on Grok Build as [`GROK.md`](GROK.md) specifies, `pi:openai/gpt-6-luna` on Pi as [`PI.md`](PI.md) specifies, `cursor-agent:gpt-5.6-luna-medium` on Cursor Agent as [`CURSOR.md`](CURSOR.md) specifies, or `antigravity:gemini-3.8-flash-high` on Antigravity as [`ANTIGRAVITY.md`](ANTIGRAVITY.md) specifies. A daemon refuses Cursor and Antigravity lines |
 | `lines.ID.strategy` | strategy | `subscription` | `subscription`, `api` or `flexible` |
 | `lines.ID.limits` | table | the file's | Limits for this line, each key defaulting to the file's |
 | `lines.ID.wake` | table | the file's | The wake policy for this line |

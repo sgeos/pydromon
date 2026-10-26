@@ -1,11 +1,13 @@
-"""The Antigravity adapter, driven by a scripted ``agy`` stream.
+"""The Antigravity adapter, driven by a scripted Antigravity ACP runtime.
 
-Antigravity is not installed on the operator's machine, so the events follow the
-operator's summary of its headless documentation, fetched on 2026-10-26.
+The runtime is not installed on the operator's machine, and no test starts it. The
+script follows the Agent Client Protocol's schema and what a second implementation,
+T3 Code, reads from the runtime, as ``docs/protocol/ANTIGRAVITY.md`` records.
 """
 
 import asyncio
 import json
+import shutil
 from collections import deque
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -16,250 +18,39 @@ import pytest
 from claude_agent_sdk import SdkMcpTool
 
 from dromon import antigravity, cli, exits
-from dromon.activity import ActivityKind, ActivityLog, Observer
+from dromon.activity import ActivityKind, ActivityLog
 from dromon.antigravity import (
+    DEFAULT_RUNTIME,
+    HARNESS_NAME,
     ISOLATION_REFUSAL,
-    KEY_FILE,
-    SETTINGS,
-    SETTINGS_FILES,
-    TOOLS_REFUSAL,
+    PROFILE_AUTH,
+    PROFILE_NAME,
+    RUNTIME_VARIABLE,
+    SIGN_IN_NOTICE,
     AntigravityLine,
-    agy_arguments,
-    check_settings,
+    check_profile,
     check_workspace,
     engine_environment,
     line_refusal,
+    locate_runtime,
+    runtime_version,
     unsupported,
 )
-from dromon.driver import (
-    ENGINE_OF,
-    Action,
-    ActionTag,
-    Credential,
-    Driver,
-    Event,
-    Strategy,
-)
+from dromon.driver import ENGINE_OF, Action, ActionTag, Credential, Driver, Event
+from dromon.driver import Strategy
 from dromon.engine import EngineRefused, TurnReport
-from dromon.jsonlines import Connection, ConnectionFactory
-from dromon.lineconfig import LineConfig
+from dromon.jsonlines import Connection, ConnectionFactory, NotJsonLine
+from dromon.lineconfig import LineConfig, McpServer
 from dromon.sandbox import parse_sandbox
 from dromon.scheduler import LineEngine, LineSpec, engine_factory
 
-AGY = "antigravity:gemini-3.1-pro"
+AGY = "antigravity:gemini-3.8-flash-high"
+MODEL = "gemini-3.8-flash-high"
+OWN = "dromon__send_message"
 
 
 def driver(strategy: Strategy = Strategy.SUBSCRIPTION) -> Driver:
     return Driver.for_model(AGY, strategy)
-
-
-class SubscriptionAssumed(Driver):
-    """The packaged driver, except that it takes the unverified credential to be the
-    subscription, which no packaged driver does. It lets the stream's handling be
-    tested past the credential."""
-
-    def step(self, event: Event) -> Action:
-        if event == Event("credential", Credential.UNVERIFIED.value):
-            event = Event("credential", Credential.SUBSCRIPTION.value)
-        return super().step(event)
-
-
-async def _record(args: dict[str, Any]) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": "ok"}]}
-
-
-SEND: SdkMcpTool[Any] = SdkMcpTool(
-    name="send_message", description="Send.", input_schema={}, handler=_record
-)
-
-
-LINE_CWD = "the line's working directory"
-"""Stands in an init event for the working directory the fake is started in."""
-
-
-def init(
-    model: str = "gemini-3.1-pro",
-    mode: str = "default",
-    *,
-    cwd: str = LINE_CWD,
-    tools: object = (),
-) -> dict[str, Any]:
-    event: dict[str, Any] = {
-        "type": "init",
-        "cwd": cwd,
-        "permission_mode": mode,
-        "model": model,
-    }
-    if tools is not None:
-        event["tools"] = [] if tools == () else tools
-    return event
-
-
-def response(text: str, index: int = 1) -> dict[str, Any]:
-    return {
-        "type": "step_update",
-        "step_index": index,
-        "state": "ACTIVE",
-        "step_type": "agent_response",
-        "text_delta": text,
-    }
-
-
-def tool(name: str = "read_file") -> dict[str, Any]:
-    return {
-        "type": "step_update",
-        "step_index": 2,
-        "state": "ACTIVE",
-        "step_type": "tool",
-        "tool_name": name,
-    }
-
-
-def result(status: str = "SUCCESS", conversation: str = "conv-1") -> dict[str, Any]:
-    return {
-        "type": "result",
-        "conversation_id": conversation,
-        "status": status,
-        "response": "done",
-        "duration_seconds": 1.0,
-        "num_turns": 1,
-        "usage": {"input_tokens": 100, "output_tokens": 5, "model": "x"},
-    }
-
-
-class FakeAgy:
-    """A scripted ``agy --output-format stream-json``."""
-
-    def __init__(
-        self, events: Sequence[dict[str, Any]] | None = None, *, hang: bool = False
-    ) -> None:
-        self.queue: deque[dict[str, Any]] = deque(
-            [init(), response("do"), response("ne"), result()]
-            if events is None
-            else events
-        )
-        self.hang = hang
-        """Whether the stream stays open after its events until it is stopped."""
-        self.stopped = asyncio.Event()
-        self.arguments: list[str] = []
-        self.environment: dict[str, str] = {}
-        self.cwd = ""
-        self.stops = 0
-        self.started = False
-
-    async def send(self, message: Mapping[str, object]) -> None:
-        raise AssertionError("print mode takes no input")
-
-    async def receive(self) -> dict[str, Any] | None:
-        await asyncio.sleep(0)
-        if self.queue:
-            record = self.queue.popleft()
-            if record.get("cwd") == LINE_CWD:
-                record = {**record, "cwd": self.cwd}
-            return record
-        if self.hang:
-            await self.stopped.wait()
-        return None
-
-    async def stop(self) -> None:
-        self.stops += 1
-        self.queue.clear()
-        self.stopped.set()
-
-
-@pytest.fixture
-def home(tmp_path: Path) -> Path:
-    home = tmp_path / "home"
-    home.mkdir()
-    return home
-
-
-def line(
-    server: FakeAgy,
-    home: Path,
-    *,
-    config: LineConfig | None = None,
-    strategy: Strategy = Strategy.SUBSCRIPTION,
-    session_id: str | None = None,
-    environment: Mapping[str, str] | None = None,
-    observe: Observer | None = None,
-    partial: bool = True,
-    tools: Sequence[SdkMcpTool[Any]] = (),
-    assumed: bool = True,
-    turn_seconds: float | None = None,
-    unverified: bool = False,
-    loaded: Driver | None = None,
-) -> AntigravityLine:
-    @asynccontextmanager
-    async def connect(
-        arguments: list[str], cwd: Path, env: Mapping[str, str]
-    ) -> AsyncGenerator[Connection]:
-        server.cwd = str(cwd)
-        server.started = True
-        server.arguments = arguments
-        server.environment = dict(env)
-        yield server
-
-    workdir = home.parent / "work"
-    workdir.mkdir(exist_ok=True)
-    extra: dict[str, Any] = {} if observe is None else {"observe": observe}
-    if turn_seconds is not None:
-        extra["turn_seconds"] = turn_seconds
-    if loaded is None:
-        loaded = (
-            SubscriptionAssumed.for_model(AGY, strategy)
-            if assumed
-            else driver(strategy)
-        )
-    return AntigravityLine(
-        loaded,
-        workdir,
-        config=config or LineConfig(),
-        mcp_tools=list(tools),
-        session_id=session_id,
-        environment={"PATH": "/usr/bin"} if environment is None else environment,
-        home=home,
-        connection_factory=connect,
-        partial_isolation=partial,
-        unverified_credential=unverified,
-        **extra,
-    )
-
-
-def run(target: AntigravityLine, prompt: str = "hello") -> TurnReport:
-    return asyncio.run(target.run_turn(prompt))
-
-
-def test_the_model_is_engine_qualified() -> None:
-    assert ENGINE_OF[AGY] == antigravity.ENGINE_NAME
-    for strategy in Strategy:
-        loaded = driver(strategy)
-        assert loaded.step(Event("init", "gemini-3.1-pro")).tag is ActionTag.ACCEPT
-        assert loaded.step(Event("init", AGY)).tag is ActionTag.REFUSE
-
-
-def test_every_turn_is_refused_until_partial_isolation_is_accepted(
-    home: Path,
-) -> None:
-    server = FakeAgy()
-    with pytest.raises(EngineRefused, match="--accept-partial-isolation"):
-        run(line(server, home, partial=False))
-    assert not server.started
-    assert "approval" in ISOLATION_REFUSAL
-
-
-def test_the_packaged_drivers_refuse_the_unverified_credential_before_agy_starts(
-    home: Path,
-) -> None:
-    """Antigravity review, F2. The stream names no credential source, so the
-    credential is unverified, and no packaged driver accepts it."""
-    for strategy in Strategy:
-        verdict = driver(strategy).step(Event("credential", "unverified"))
-        assert verdict.tag is ActionTag.REFUSE
-    server = FakeAgy()
-    with pytest.raises(EngineRefused, match="refuses the unverified credential"):
-        run(line(server, home, assumed=False))
-    assert not server.started
 
 
 class KeyReported(Driver):
@@ -272,271 +63,1267 @@ class KeyReported(Driver):
         return super().step(event)
 
 
-def test_the_operators_confirmation_gives_the_packaged_driver_the_subscription(
+class InterruptsOnText(Driver):
+    """The packaged driver, except that it interrupts the turn at its first text."""
+
+    def step(self, event: Event) -> Action:
+        if event.tag == "text":
+            return Action(ActionTag.INTERRUPT, "test", 0)
+        return super().step(event)
+
+
+async def _record(args: dict[str, Any]) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": "ok"}]}
+
+
+SEND: SdkMcpTool[Any] = SdkMcpTool(
+    name="send_message", description="Send.", input_schema={}, handler=_record
+)
+
+
+# The scripted runtime.
+
+
+def initialized(
+    *,
+    name: object = "antigravity-acp",
+    version: object = "1.3.0",
+    methods: Sequence[str] = ("oauth-personal",),
+    protocol: object = 1,
+    resume: bool = True,
+) -> dict[str, Any]:
+    capabilities: dict[str, Any] = {"loadSession": True, "sessionCapabilities": {}}
+    if resume:
+        capabilities["sessionCapabilities"]["resume"] = {}
+    return {
+        "protocolVersion": protocol,
+        "agentCapabilities": capabilities,
+        "authMethods": [{"id": m, "name": m} for m in methods],
+        "agentInfo": {"name": name, "version": version},
+    }
+
+
+def model_option(current: str, values: Sequence[str] = (MODEL,)) -> dict[str, Any]:
+    return {
+        "id": "model",
+        "name": "Model",
+        "type": "select",
+        "currentValue": current,
+        "options": [{"value": v, "name": v} for v in values],
+    }
+
+
+def session(
+    *,
+    mode: str | None = "default",
+    modes: Sequence[str] = ("default", "auto_edit", "yolo"),
+    model: str = MODEL,
+    models: Sequence[str] = (MODEL,),
+    session_id: object = "s1",
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "sessionId": session_id,
+        "configOptions": [model_option(model, models)],
+    }
+    if mode is not None:
+        result["modes"] = {
+            "currentModeId": mode,
+            "availableModes": [{"id": m, "name": m} for m in modes],
+        }
+    return result
+
+
+def update(body: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {"sessionId": "s1", "update": body},
+    }
+
+
+def said(text: str) -> dict[str, Any]:
+    return update(
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text},
+        }
+    )
+
+
+RUNNING = "Running send_message"
+"""How a second implementation's runtime titles an MCP tool call."""
+
+
+def tool(
+    title: str = "",
+    kind: str | None = "read",
+    status: str | None = "pending",
+    ident: str = "t1",
+    tool_name: str | None = None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": ident,
+        "title": title,
+    }
+    if kind is not None:
+        body["kind"] = kind
+    if status is not None:
+        body["status"] = status
+    if tool_name is not None:
+        body["toolName"] = tool_name
+    return update(body)
+
+
+def own(ident: str = "t1") -> dict[str, Any]:
+    """A call of Dromon's own tool, named in its structured field."""
+    return tool(RUNNING, kind="other", ident=ident, tool_name=OWN)
+
+
+def changed(ident: str = "t1", **fields: object) -> dict[str, Any]:
+    return update({"sessionUpdate": "tool_call_update", "toolCallId": ident, **fields})
+
+
+def permission(
+    title: str = "",
+    ident: str = "t1",
+    request: str = "p1",
+    tool_name: str | None = None,
+) -> dict[str, Any]:
+    called: dict[str, Any] = {"toolCallId": ident, "title": title}
+    if tool_name is not None:
+        called["toolName"] = tool_name
+    return {
+        "jsonrpc": "2.0",
+        "id": request,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "s1",
+            "toolCall": called,
+            "options": [
+                {"optionId": "once", "kind": "allow_once", "name": "Allow once"},
+                {"optionId": "always", "kind": "allow_always", "name": "Always"},
+                {"optionId": "no", "kind": "reject_once", "name": "Deny"},
+            ],
+        },
+    }
+
+
+SIGN_IN_LINE = object()
+"""Stands in the script for the runtime's plain-text sign-in notice."""
+
+OTHER_TEXT = object()
+"""Stands in the script for a plain-text line that is not the notice."""
+
+
+class FakeRuntime:
+    """A scripted ``agy_acp_server``. It answers Dromon's requests, plays ``events``
+    while a prompt runs, and then answers the prompt with ``stop``."""
+
+    def __init__(
+        self,
+        events: Sequence[object] = (said("do"), said("ne")),
+        *,
+        init: dict[str, Any] | None = None,
+        auth_error: dict[str, Any] | None = None,
+        auth_text: object = None,
+        opened: dict[str, Any] | None = None,
+        stop: str | None = "end_turn",
+        answers_cancel: bool = True,
+    ) -> None:
+        self.events = list(events)
+        self.init = initialized() if init is None else init
+        self.auth_error = auth_error
+        self.auth_text = auth_text
+        self.opened = session() if opened is None else opened
+        self.stop_reason = stop
+        self.answers_cancel = answers_cancel
+        self.outbox: deque[object] = deque()
+        self.sent: list[dict[str, Any]] = []
+        self.stopped = asyncio.Event()
+        self.stops = 0
+        self.prompt_id: object = None
+        self.started = False
+        self.arguments: list[str] = []
+        self.cwd = ""
+        self.environment: dict[str, str] = {}
+
+    def methods(self) -> list[str]:
+        return [str(m["method"]) for m in self.sent if "method" in m]
+
+    def request(self, method: str) -> dict[str, Any]:
+        return next(m for m in self.sent if m.get("method") == method)
+
+    def answer(self, request_id: object) -> dict[str, Any]:
+        return next(
+            m for m in self.sent if m.get("id") == request_id and "method" not in m
+        )
+
+    def _respond(self, request_id: object, result: object) -> None:
+        self.outbox.append({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+    async def send(self, message: Mapping[str, object]) -> None:
+        self.sent.append(dict(message))
+        method = message.get("method")
+        request_id = message.get("id")
+        if method == "initialize":
+            self._respond(request_id, self.init)
+        elif method == "authenticate":
+            if self.auth_text is not None:
+                self.outbox.append(self.auth_text)
+            elif self.auth_error is not None:
+                self.outbox.append(
+                    {"jsonrpc": "2.0", "id": request_id, "error": self.auth_error}
+                )
+            else:
+                self._respond(request_id, {})
+        elif method in ("session/new", "session/resume"):
+            self._respond(request_id, self.opened)
+        elif method == "session/set_mode":
+            self._respond(request_id, {})
+        elif method == "session/set_config_option":
+            params: Any = message["params"]
+            self._respond(
+                request_id, {"configOptions": [model_option(str(params["value"]))]}
+            )
+        elif method == "session/prompt":
+            self.prompt_id = request_id
+            self.outbox.extend(self.events)
+            if self.stop_reason is not None:
+                self._respond(request_id, {"stopReason": self.stop_reason})
+        elif (
+            method == "session/cancel"
+            and self.answers_cancel
+            and self.stop_reason is None
+            and self.prompt_id is not None
+        ):
+            self._respond(self.prompt_id, {"stopReason": "cancelled"})
+
+    async def receive(self) -> dict[str, Any] | None:
+        await asyncio.sleep(0)
+        if self.outbox:
+            item = self.outbox.popleft()
+            if item is SIGN_IN_LINE:
+                raise NotJsonLine(SIGN_IN_NOTICE + b"https://accounts.google.com/x\n")
+            if item is OTHER_TEXT:
+                raise NotJsonLine(b"Traceback (most recent call last):\n")
+            assert isinstance(item, dict)
+            return dict(item)  # pyright: ignore[reportUnknownArgumentType]
+        await self.stopped.wait()
+        return None
+
+    async def stop(self) -> None:
+        self.stops += 1
+        self.outbox.clear()
+        self.stopped.set()
+
+
+# The installation.
+
+
+def install(base: Path) -> Path:
+    """A runtime, its helper and a profile under ``base``, which only tests run."""
+    executable = base / "agy_acp_server.par"
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    for path in (executable, base / HARNESS_NAME):
+        path.write_text("#!/bin/sh\nexit 1\n")
+        path.chmod(0o755)
+    signed(base / PROFILE_NAME)
+    return executable
+
+
+def signed(profile: Path) -> Path:
+    """A profile whose settings name the Google account sign-in, as the operator's
+    must."""
+    path = profile / PROFILE_AUTH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"auth": {"type": "oauth-personal"}}))
+    return profile
+
+
+@pytest.fixture
+def home(tmp_path: Path) -> Path:
+    home = tmp_path / "home"
+    home.mkdir()
+    return home
+
+
+@pytest.fixture
+def runtime(tmp_path: Path) -> Path:
+    return install(tmp_path / "runtime")
+
+
+def line(
+    server: FakeRuntime,
     home: Path,
+    runtime: Path,
+    *,
+    config: LineConfig | None = None,
+    strategy: Strategy = Strategy.SUBSCRIPTION,
+    session_id: str | None = None,
+    environment: Mapping[str, str] | None = None,
+    observe: ActivityLog | None = None,
+    partial: bool = True,
+    unverified: bool = True,
+    loaded: Driver | None = None,
+    tools: bool = False,
+    turn_seconds: float | None = None,
+    cost_mark: tuple[str, float] | None = None,
+) -> AntigravityLine:
+    @asynccontextmanager
+    async def connect(
+        arguments: list[str], cwd: Path, env: Mapping[str, str]
+    ) -> AsyncGenerator[Connection]:
+        server.started = True
+        server.arguments = arguments
+        server.cwd = str(cwd)
+        server.environment = dict(env)
+        assert Path(env["TMPDIR"]).is_dir()
+        assert list(Path(env["HOME"]).iterdir()) == []
+        yield server
+
+    workdir = home.parent / "work"
+    workdir.mkdir(exist_ok=True)
+    base = {"PATH": "/usr/bin:/bin", RUNTIME_VARIABLE: str(runtime)}
+    extra: dict[str, Any] = {}
+    if observe is not None:
+        extra["observe"] = observe.observer("alpha")
+    if turn_seconds is not None:
+        extra["turn_seconds"] = turn_seconds
+    if tools:
+        extra |= {
+            "mcp_tools": [SEND],
+            "bridge": ["dromon-bridge", "--line", "alpha"],
+            "line_token": "tok",  # noqa: S106, a test token
+        }
+    return AntigravityLine(
+        loaded or driver(strategy),
+        workdir,
+        config=config or LineConfig(),
+        session_id=session_id,
+        environment=base if environment is None else {**base, **environment},
+        home=home,
+        connection_factory=connect,
+        partial_isolation=partial,
+        unverified_credential=unverified,
+        cost_mark=cost_mark,
+        **extra,
+    )
+
+
+def run(target: AntigravityLine, prompt: str = "hello") -> TurnReport:
+    return asyncio.run(target.run_turn(prompt))
+
+
+# Models and drivers.
+
+
+def test_the_model_is_engine_qualified_and_names_its_effort() -> None:
+    assert ENGINE_OF[AGY] == antigravity.ENGINE_NAME
+    for strategy in Strategy:
+        loaded = driver(strategy)
+        assert loaded.settings.effort == "high"
+        assert loaded.step(Event("init", MODEL)).tag is ActionTag.ACCEPT
+        for other in (AGY, "gemini-3.1-pro", "gemini-3.8-flash-medium"):
+            assert loaded.step(Event("init", other)).tag is ActionTag.REFUSE
+    assert "antigravity:gemini-3.1-pro" not in ENGINE_OF
+
+
+# Refusals before the runtime starts.
+
+
+def test_every_turn_is_refused_until_partial_isolation_is_accepted(
+    home: Path, runtime: Path
 ) -> None:
-    """The operator's decision of 2026-10-26. With the confirmation the packaged
-    driver runs the turn, which still reports the credential as unverified."""
-    server = FakeAgy()
-    report = run(line(server, home, assumed=False, unverified=True))
-    assert server.started
+    server = FakeRuntime()
+    with pytest.raises(EngineRefused, match="--accept-partial-isolation"):
+        run(line(server, home, runtime, partial=False))
+    assert not server.started
+    assert "without approval" in ISOLATION_REFUSAL
+
+
+def test_the_packaged_drivers_refuse_the_unverified_credential_before_it_starts(
+    home: Path, tmp_path: Path
+) -> None:
+    """Antigravity review, F2. The runtime does not report which credential it uses,
+    so the credential is unverified, and no packaged driver accepts it. The refusal
+    comes before the runtime is even located."""
+    for strategy in Strategy:
+        verdict = driver(strategy).step(Event("credential", "unverified"))
+        assert verdict.tag is ActionTag.REFUSE
+    server = FakeRuntime()
+    missing = tmp_path / "nowhere" / "agy_acp_server.par"
+    with pytest.raises(EngineRefused, match="refuses the unverified credential"):
+        run(line(server, home, missing, unverified=False))
+    assert not server.started
+
+
+def test_the_operators_confirmation_gives_the_driver_the_subscription(
+    home: Path, runtime: Path
+) -> None:
+    server = FakeRuntime()
+    report = run(line(server, home, runtime))
     assert report.subtype == "success"
     assert report.credential is Credential.UNVERIFIED
-    refused = FakeAgy()
+    refused = FakeRuntime()
     keyed = KeyReported.for_model(AGY, Strategy.SUBSCRIPTION)
     with pytest.raises(EngineRefused, match="refuses the subscription the operator"):
-        run(line(refused, home, unverified=True, loaded=keyed))
+        run(line(refused, home, runtime, loaded=keyed))
     assert not refused.started
 
 
-def test_the_operators_confirmation_does_not_pass_the_isolation_refusal(
-    home: Path,
-) -> None:
-    server = FakeAgy()
-    with pytest.raises(EngineRefused, match="--accept-partial-isolation"):
-        run(line(server, home, partial=False, assumed=False, unverified=True))
-    assert not server.started
-
-
-def test_dromons_tools_cannot_reach_an_antigravity_line(home: Path) -> None:
-    server = FakeAgy()
-    with pytest.raises(EngineRefused, match="MCP server"):
-        run(line(server, home, tools=[SEND]))
-    assert not server.started
-    assert line_refusal(LineConfig()) == TOOLS_REFUSAL
-    assert "built-in" in (line_refusal(LineConfig(builtin_tools=("Read",))) or "")
-
-
-def test_a_line_takes_no_builtin_tools_or_claude_code_features() -> None:
-    assert unsupported(LineConfig()) is None
-    assert "built-in" in (unsupported(LineConfig(builtin_tools=("Bash",))) or "")
-    assert "compact" in (unsupported(LineConfig(allow_compact=True)) or "")
-    sandboxed = LineConfig(sandbox=parse_sandbox({"enabled": True}, operator=True))
-    assert "sandbox" in (unsupported(sandboxed) or "")
-
-
-def test_only_a_subscription_without_google_credentials_runs() -> None:
-    environment = {
-        "PATH": "/usr/bin",
-        "GEMINI_API_KEY": "k",
-        "GOOGLE_APPLICATION_CREDENTIALS": "/sa.json",
-        "GOOGLE_CLOUD_PROJECT": "p",
-        "CLOUDSDK_CONFIG": "/c",
-        "OTHER_API_KEY": "k",
-        "DROMON_LINE_TOKEN": "t",
-        "AWS_ACCESS_KEY_ID": "a",
-        "AWS_SECRET_ACCESS_KEY": "s",
-        "AZURE_CLIENT_SECRET": "s",
-        "ARM_CLIENT_SECRET": "s",
-    }
-    assert engine_environment(environment, Strategy.SUBSCRIPTION) == {
-        "PATH": "/usr/bin"
-    }
+def test_only_the_subscription_strategy_runs(home: Path, runtime: Path) -> None:
     for strategy in (Strategy.API, Strategy.FLEXIBLE):
-        with pytest.raises(EngineRefused, match="only the subscription"):
-            engine_environment(environment, strategy)
+        server = FakeRuntime()
+        with pytest.raises(EngineRefused, match="only the subscription strategy"):
+            run(line(server, home, runtime, strategy=strategy))
+        assert not server.started
 
 
-@pytest.mark.parametrize("relative", SETTINGS_FILES)
-def test_settings_that_approve_tools_are_refused(home: Path, relative: Path) -> None:
-    """Re-review, N2, adds the Gemini tools' own user settings."""
-    check_settings(home)
-    path = home / relative
-    path.parent.mkdir(parents=True)
-    path.write_text(json.dumps({"permissions": {"allow": []}, "theme": "x"}))
-    check_settings(home)
-    path.write_text(json.dumps({"permissions": {"allow": ["command(git)"]}}))
-    with pytest.raises(EngineRefused, match="permissions.allow"):
-        check_settings(home)
-    path.write_text(json.dumps({"permissions": ["x"]}))
-    with pytest.raises(EngineRefused, match="not an object"):
-        check_settings(home)
-    path.write_text("{")
-    with pytest.raises(EngineRefused, match="not JSON"):
-        check_settings(home)
+def test_a_line_takes_its_drivers_effort(home: Path, runtime: Path) -> None:
+    server = FakeRuntime()
+    with pytest.raises(EngineRefused, match="effort in the model itself"):
+        run(line(server, home, runtime, config=LineConfig(effort="low")))
+    run(line(FakeRuntime(), home, runtime, config=LineConfig(effort="high")))
 
 
-def test_a_gemini_key_file_refuses_the_turn_before_agy_starts(home: Path) -> None:
-    """Re-review, N2. The file's existence alone refuses, whatever it holds, and the
-    operator's confirmation of the credential does not pass it."""
-    assert SETTINGS in SETTINGS_FILES and KEY_FILE.parent == SETTINGS.parents[1]
-    key = home / KEY_FILE
-    key.parent.mkdir(parents=True)
-    key.write_text("")
-    with pytest.raises(EngineRefused, match=r"\.env exists"):
-        check_settings(home)
-    server = FakeAgy()
-    with pytest.raises(EngineRefused, match=r"\.env exists"):
-        run(line(server, home, assumed=False, unverified=True))
-    assert not server.started
-    key.unlink()
-    key.symlink_to(home / "absent")
-    with pytest.raises(EngineRefused, match=r"\.env exists"):
-        check_settings(home)
+@pytest.mark.parametrize(
+    ("config", "reason"),
+    [
+        (LineConfig(builtin_tools=("Read",)), "no built-in tools"),
+        (
+            LineConfig(mcp_servers=(("x", McpServer("stdio", command="x")),)),
+            "only Dromon's own MCP",
+        ),
+        (LineConfig(inherit_account_mcp=True), "only Dromon's own MCP"),
+        (LineConfig(claude_code_prompt=True), "own prompt"),
+        (LineConfig(project_settings=True), "project settings"),
+        (LineConfig(allow_compact=True), "cannot compact"),
+        (LineConfig(keep_session=True), "do not keep"),
+    ],
+)
+def test_configurations_an_antigravity_line_refuses(
+    config: LineConfig, reason: str
+) -> None:
+    assert reason in (unsupported(config) or "")
+    assert reason in (line_refusal(config) or "")
+
+
+def test_a_daemon_refuses_every_antigravity_line_for_isolation() -> None:
+    assert unsupported(LineConfig()) is None
+    assert line_refusal(LineConfig()) == ISOLATION_REFUSAL
+
+
+def test_the_environment_carries_no_key_profile_or_sign_in_method(
+    home: Path, runtime: Path
+) -> None:
+    hostile = {
+        "GEMINI_API_KEY": "k",
+        "GEMINI_HOME": "/elsewhere",
+        "GOOGLE_API_KEY": "k",
+        "GOOGLE_APPLICATION_CREDENTIALS": "/c.json",
+        "GOOGLE_GENAI_USE_VERTEXAI": "1",
+        "AGY_ACP_ENABLE_OAUTH": "1",
+        "AGY_ACP_FORCE_FILE_STORAGE": "0",
+        "ANTIGRAVITY_HARNESS_PATH": "/elsewhere/harness",
+        "AWS_SECRET_ACCESS_KEY": "s",
+        "SOME_API_KEY": "s",
+        "DROMON_LINE_TOKEN": "t",
+        "BROWSER": "open",
+        "TMPDIR": "/shared",
+        "HOME": "/elsewhere/home",
+        "XDG_CONFIG_HOME": "/elsewhere/home/.config",
+        "XDG_DATA_HOME": "/elsewhere/home/.local/share",
+        "XDG_STATE_HOME": "/elsewhere/home/.local/state",
+        "XDG_CACHE_HOME": "/elsewhere/home/.cache",
+    }
+    server = FakeRuntime()
+    target = line(server, home, runtime, environment={**hostile, "LANG": "C"})
+    target.mark = "alpha:mark"
+    run(target)
+    env = server.environment
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "AGY_ACP_ENABLE_OAUTH"):
+        assert name not in env
+    for name in ("AWS_SECRET_ACCESS_KEY", "SOME_API_KEY", "DROMON_LINE_TOKEN"):
+        assert name not in env
+    assert "GOOGLE_GENAI_USE_VERTEXAI" not in env
+    assert RUNTIME_VARIABLE not in env
+    # Antigravity review, F7. The operator's home is out of reach through HOME and
+    # the XDG variables, and the sign-in is a file in the profile.
+    assert env["AGY_ACP_FORCE_FILE_STORAGE"] == "1"
+    for name in antigravity.HOME_VARIABLES[1:]:
+        assert name not in env
+    assert env["HOME"] != "/elsewhere/home"
+    assert Path(env["HOME"]).parent == Path(env["TMPDIR"]).parent
+    assert env["HOME"] != env["TMPDIR"]
+    assert not Path(env["HOME"]).exists()
+    assert env["GEMINI_HOME"] == str(runtime.parent / PROFILE_NAME)
+    assert env["ANTIGRAVITY_HARNESS_PATH"] == str(runtime.parent / HARNESS_NAME)
+    assert Path(env["BROWSER"]).name == "true"
+    assert env["PYTHONUNBUFFERED"] == "1"
+    assert env["LANG"] == "C"
+    assert env["DROMON_LINE_MARK"] == "alpha:mark"
+    assert env["TMPDIR"] != "/shared"
+    assert not Path(env["TMPDIR"]).exists()
+    assert server.arguments == []
+    assert engine_environment(
+        {"GEMINI_HOME": "/x", "PATH": "/b"}, Strategy.SUBSCRIPTION
+    ) == {"PATH": "/b"}
+
+
+# The installation.
+
+
+def test_a_missing_runtime_is_named_as_the_acp_runtime(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    with pytest.raises(EngineRefused) as refused:
+        locate_runtime({}, home)
+    message = str(refused.value)
+    assert "Antigravity ACP runtime is missing" in message
+    assert str(home / DEFAULT_RUNTIME) in message
+    assert "agy command do not provide it" in message
+    found = install((home / DEFAULT_RUNTIME).parent)
+    assert locate_runtime({}, home).executable == found
+    with pytest.raises(EngineRefused, match="absolute path"):
+        locate_runtime({RUNTIME_VARIABLE: "relative/agy"}, home)
+
+
+def test_an_incomplete_or_unsigned_runtime_is_refused(tmp_path: Path) -> None:
+    base = tmp_path / "rt"
+    executable = install(base)
+    environment = {RUNTIME_VARIABLE: str(executable)}
+    assert locate_runtime(environment, tmp_path).profile == base / PROFILE_NAME
+    shutil.rmtree(base / PROFILE_NAME)
+    with pytest.raises(EngineRefused, match="not been signed in"):
+        locate_runtime(environment, tmp_path)
+    (base / PROFILE_NAME).mkdir()
+    (base / HARNESS_NAME).unlink()
+    with pytest.raises(EngineRefused, match="incomplete"):
+        locate_runtime(environment, tmp_path)
+    executable.chmod(0o644)
+    with pytest.raises(EngineRefused, match="missing"):
+        locate_runtime(environment, tmp_path)
+
+
+def test_the_version_is_read_as_three_numbers() -> None:
+    assert runtime_version("1.3.0") == (1, 3, 0)
+    assert runtime_version("1.12.4-beta") == (1, 12, 4)
+    for bad in ("1.3", "v1.3.0", "", None, 13):
+        assert runtime_version(bad) is None
 
 
 @pytest.mark.parametrize("name", antigravity.WORKSPACE_DIRECTORIES)
-def test_a_workspace_that_may_configure_antigravity_is_refused(
+def test_project_directories_for_antigravity_refuse_the_turn(
     tmp_path: Path, name: str
 ) -> None:
-    """Antigravity review, F3. The home directory's own are checked by
-    ``check_settings`` alone."""
+    """Antigravity review, F3. The home directory's are its own."""
     home = tmp_path / "home"
     workspace = home / "repo" / "sub"
     workspace.mkdir(parents=True)
+    check_workspace(workspace, home)
     (home / name).mkdir()
     check_workspace(workspace, home)
     (home / "repo" / name).mkdir()
-    with pytest.raises(EngineRefused, match=rf"repo/\{name}"):
+    with pytest.raises(EngineRefused, match=f"repo/{name}"):
         check_workspace(workspace, home)
-    server = FakeAgy()
-    target = line(server, home)
-    (target.cwd / name).mkdir()
-    with pytest.raises(EngineRefused, match="has not read"):
-        run(target)
+
+
+def test_a_key_file_in_the_profile_or_home_refuses_the_turn(tmp_path: Path) -> None:
+    """Re-review, N2. Existence alone refuses, and Dromon never reads it."""
+    profile = signed(tmp_path / "profile")
+    home = tmp_path / "home"
+    check_profile(profile, home)
+    for key in (profile / ".env", home / ".gemini" / ".env"):
+        key.parent.mkdir(parents=True, exist_ok=True)
+        key.symlink_to(tmp_path / "absent")
+        with pytest.raises(EngineRefused, match=r"\.env exists"):
+            check_profile(profile, home)
+        key.unlink()
+
+
+@pytest.mark.parametrize(
+    ("relative", "key"),
+    [("config/hooks.json", "hooks"), ("config/mcp_config.json", "mcpServers")],
+)
+def test_profile_hooks_and_mcp_servers_refuse_the_turn(
+    tmp_path: Path, relative: str, key: str
+) -> None:
+    profile = signed(tmp_path / "profile")
+    path = profile / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({key: {}}))
+    check_profile(profile, tmp_path)
+    path.write_text("{}")
+    check_profile(profile, tmp_path)
+    declared: list[dict[str, Any]] = [
+        {key: {"x": {"command": "x"}}},
+        {key: {}, "other": {"x": {"command": "x"}}},
+        {"other": {}},
+    ]
+    for document in declared:
+        path.write_text(json.dumps(document))
+        with pytest.raises(EngineRefused, match=f"declares {key} or another key"):
+            check_profile(profile, tmp_path)
+    path.write_text("[")
+    with pytest.raises(EngineRefused, match="not JSON"):
+        check_profile(profile, tmp_path)
+
+
+@pytest.mark.parametrize("relative", ["settings.json", "antigravity-cli/settings.json"])
+def test_profile_settings_hold_only_reviewed_keys(
+    tmp_path: Path, relative: str
+) -> None:
+    """Antigravity review, F6. The settings are an allowlist, so a key Dromon has not
+    reviewed, such as one that approves every tool, refuses the turn."""
+    profile = signed(tmp_path / "profile")
+    path = profile / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"$schema": "x", "permissions": {"allow": []}}))
+    check_profile(profile, tmp_path)
+    path.write_text(json.dumps({"permissions": {"deny": ["command(rm)"]}}))
+    check_profile(profile, tmp_path)
+    path.write_text(json.dumps({"permissions": {"allow": ["command(git)"]}}))
+    with pytest.raises(EngineRefused, match="permissions.allow"):
+        check_profile(profile, tmp_path)
+    path.write_text(json.dumps({"permissions": ["x"]}))
+    with pytest.raises(EngineRefused, match="not an object"):
+        check_profile(profile, tmp_path)
+    for document, named in (
+        ({"autoApprove": True}, "'autoApprove'"),
+        ({"yolo": False, "theme": "dark"}, "'theme', 'yolo'"),
+        ({"permissions": {"defaultMode": "yolo"}}, "permissions 'defaultMode'"),
+    ):
+        path.write_text(json.dumps(document))
+        with pytest.raises(EngineRefused, match=f"sets {named}.*not reviewed"):
+            check_profile(profile, tmp_path)
+
+
+def test_the_profile_must_name_the_google_sign_in_alone(tmp_path: Path) -> None:
+    """Antigravity review, F6. A missing file refuses, since the method the runtime
+    would choose without it is not shown."""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    with pytest.raises(EngineRefused, match="is missing, so the sign-in method"):
+        check_profile(profile, tmp_path)
+    path = signed(profile) / PROFILE_AUTH
+    check_profile(profile, tmp_path)
+    for document in (
+        {"auth": {"type": "gemini-api-key"}},
+        {"auth": {"type": "agent-platform"}},
+    ):
+        path.write_text(json.dumps(document))
+        with pytest.raises(EngineRefused, match="sets the sign-in method"):
+            check_profile(profile, tmp_path)
+    for document in (
+        {"auth": {"type": "oauth-personal"}, "gcp": {"project": "p"}},
+        {"auth": {"type": "oauth-personal", "apiKey": "k"}},
+        {"auth": "oauth-personal"},
+        {},
+    ):
+        path.write_text(json.dumps(document))
+        with pytest.raises(EngineRefused, match="keys other than auth.type"):
+            check_profile(profile, tmp_path)
+
+
+def test_the_profile_is_checked_before_the_runtime_starts(
+    home: Path, runtime: Path
+) -> None:
+    (runtime.parent / PROFILE_NAME / ".env").write_text("")
+    server = FakeRuntime()
+    with pytest.raises(EngineRefused, match=r"\.env exists"):
+        run(line(server, home, runtime))
     assert not server.started
 
 
-def test_the_arguments_attach_the_prompt_and_map_effort() -> None:
-    arguments = agy_arguments(
-        "gemini-3.1-pro", "max", conversation="conv-1", prompt="-dash"
+# The handshake.
+
+
+@pytest.mark.parametrize(
+    ("init", "reason"),
+    [
+        (initialized(protocol=2), "ACP version 2"),
+        (initialized(name="something-else"), "names itself 'something-else'"),
+        (initialized(version="1.2.9"), "Dromon needs 1.3.0 or later"),
+        (initialized(version="unknown"), "reports version 'unknown'"),
+        (initialized(methods=("gemini-api-key",)), "only gemini-api-key"),
+        (initialized(methods=()), "only none"),
+    ],
+)
+def test_the_runtime_must_identify_itself_and_offer_the_google_sign_in(
+    home: Path, runtime: Path, init: dict[str, Any], reason: str
+) -> None:
+    server = FakeRuntime(init=init)
+    with pytest.raises(EngineRefused, match=reason):
+        run(line(server, home, runtime))
+    assert "authenticate" not in server.methods()
+    assert server.request("initialize")["params"]["clientCapabilities"] == {
+        "fs": {"readTextFile": False, "writeTextFile": False},
+        "terminal": False,
+    }
+
+
+def test_dromon_chooses_the_google_account_sign_in(home: Path, runtime: Path) -> None:
+    server = FakeRuntime(init=initialized(version="1.4.2"))
+    run(line(server, home, runtime))
+    assert server.request("authenticate")["params"] == {"methodId": "oauth-personal"}
+    assert server.methods()[:3] == ["initialize", "authenticate", "session/new"]
+
+
+@pytest.mark.parametrize("by_text", [True, False])
+def test_a_runtime_that_is_not_signed_in_is_refused(
+    home: Path, runtime: Path, by_text: bool
+) -> None:
+    server = (
+        FakeRuntime(auth_text=SIGN_IN_LINE)
+        if by_text
+        else FakeRuntime(auth_error={"code": -32000, "message": "auth"})
     )
-    assert arguments[:2] == ["--output-format", "stream-json"]
-    assert arguments[arguments.index("--effort") + 1] == "high"
-    assert arguments[arguments.index("--conversation") + 1] == "conv-1"
-    assert arguments[arguments.index("--print-timeout") + 1] == "60m"
-    assert "--sandbox" in arguments
-    assert arguments[-1] == "--prompt=-dash"
-    assert "--dangerously-skip-permissions" not in arguments
-    assert "--conversation" not in agy_arguments(
-        "m", "low", conversation=None, prompt="p"
-    )
+    with pytest.raises(EngineRefused, match="not signed in") as refused:
+        run(line(server, home, runtime))
+    assert "accounts.google.com" not in str(refused.value)
+    assert "session/new" not in server.methods()
 
 
-def test_a_plain_turn_reports_text_usage_and_conversation(home: Path) -> None:
-    target = line(FakeAgy(), home)
-    report = run(target)
-    assert report.subtype == "success"
-    assert report.text == "done"
-    assert report.credential is Credential.UNVERIFIED
-    assert report.session_id == "conv-1" == target.session_id
-    assert report.usage == {"input_tokens": 100, "output_tokens": 5}
-    assert report.usage_note == antigravity.ANTIGRAVITY_USAGE_NOTE
-    assert report.cost_estimate_usd is None
+def test_other_plain_text_and_other_errors_refuse_the_turn(
+    home: Path, runtime: Path
+) -> None:
+    with pytest.raises(EngineRefused, match="not JSON"):
+        run(line(FakeRuntime(auth_text=OTHER_TEXT), home, runtime))
+    with pytest.raises(EngineRefused, match="refused a request"):
+        run(line(FakeRuntime(auth_error={"code": -1, "message": "no"}), home, runtime))
 
 
-def test_instructions_open_a_new_conversation_only(home: Path) -> None:
+def test_dromons_tools_reach_the_session_as_its_mcp_server(
+    home: Path, runtime: Path
+) -> None:
+    server = FakeRuntime()
+    run(line(server, home, runtime, tools=True))
+    params = server.request("session/new")["params"]
+    assert params["cwd"] == server.cwd
+    assert params["mcpServers"] == [
+        {
+            "name": "dromon",
+            "command": "dromon-bridge",
+            "args": ["--line", "alpha"],
+            "env": [{"name": "DROMON_LINE_TOKEN", "value": "tok"}],
+        }
+    ]
+    assert "DROMON_LINE_TOKEN" not in server.environment
+    bare = FakeRuntime()
+    run(line(bare, home, runtime))
+    assert bare.request("session/new")["params"]["mcpServers"] == []
+
+
+def test_the_session_must_ask_before_acting(home: Path, runtime: Path) -> None:
+    switched = FakeRuntime(opened=session(mode="yolo"))
+    run(line(switched, home, runtime))
+    assert switched.request("session/set_mode")["params"] == {
+        "sessionId": "s1",
+        "modeId": "default",
+    }
+    with pytest.raises(EngineRefused, match="permission mode 'yolo'"):
+        run(
+            line(
+                FakeRuntime(opened=session(mode="yolo", modes=("yolo",))), home, runtime
+            )
+        )
+    with pytest.raises(EngineRefused, match="does not report its permission mode"):
+        run(line(FakeRuntime(opened=session(mode=None)), home, runtime))
+
+
+def test_the_drivers_model_is_selected_and_judged(home: Path, runtime: Path) -> None:
+    offered = (MODEL, "gemini-3.8-flash-low")
+    chosen = FakeRuntime(opened=session(model="gemini-3.8-flash-low", models=offered))
+    run(line(chosen, home, runtime))
+    assert chosen.request("session/set_config_option")["params"] == {
+        "sessionId": "s1",
+        "configId": "model",
+        "value": MODEL,
+    }
+    absent = FakeRuntime(opened=session(model="gemini-4-argon-high", models=()))
+    with pytest.raises(EngineRefused, match="refuses the engine model"):
+        run(line(absent, home, runtime))
+    assert "session/prompt" not in absent.methods()
+    plain = FakeRuntime()
+    run(line(plain, home, runtime))
+    assert "session/set_config_option" not in plain.methods()
+
+
+def test_an_invalid_session_identifier_is_refused(home: Path, runtime: Path) -> None:
+    with pytest.raises(EngineRefused, match="invalid session"):
+        run(line(FakeRuntime(opened=session(session_id="--x")), home, runtime))
+    with pytest.raises(EngineRefused, match="is invalid"):
+        run(line(FakeRuntime(), home, runtime, session_id="--x"))
+
+
+# Turns.
+
+
+def test_a_plain_turn_reports_text_and_its_session(home: Path, runtime: Path) -> None:
     workdir = home.parent / "work"
     workdir.mkdir(exist_ok=True)
     (workdir / "notes.md").write_text("Be brief.")
     config = LineConfig(instructions=("notes.md",))
-    server = FakeAgy()
-    run(line(server, home, config=config))
-    assert (
-        server.arguments[-1] == "--prompt=Contents of notes.md:\n\nBe brief.\n\nhello"
-    )
-    resumed = FakeAgy()
-    run(line(resumed, home, config=config, session_id="conv-1"))
-    assert resumed.arguments[-1] == "--prompt=hello"
-
-
-def test_a_continued_conversation_must_be_the_same(home: Path) -> None:
-    server = FakeAgy([init(), result(conversation="conv-2")])
-    with pytest.raises(EngineRefused, match="continued"):
-        run(line(server, home, session_id="conv-1"))
-    with pytest.raises(EngineRefused, match="invalid"):
-        run(line(FakeAgy(), home, session_id="--x"))
-
-
-def test_an_unexpected_model_or_mode_stops_the_turn(home: Path) -> None:
-    server = FakeAgy([init(model="gemini-3.8-flash"), result()])
-    with pytest.raises(EngineRefused, match="refuses the engine model"):
-        run(line(server, home))
-    assert server.stops == 1
-    with pytest.raises(EngineRefused, match="permission mode"):
-        run(line(FakeAgy([init(mode="skip_permissions"), result()]), home))
-
-
-def test_init_must_offer_no_tool_and_run_in_the_lines_directory(home: Path) -> None:
-    """Antigravity review, F4."""
-    for event, reason in (
-        (init(tools=["read_file"]), "offers tools"),
-        (init(tools=None), "offers tools"),
-        (init(tools="all"), "offers tools"),
-        (init(cwd="/elsewhere"), "runs in '/elsewhere'"),
-        ({**init(), "cwd": None}, "runs in None"),
-    ):
-        server = FakeAgy([event, response("x"), result()])
-        with pytest.raises(EngineRefused, match=reason):
-            run(line(server, home))
-        assert server.stops == 1
-
-
-@pytest.mark.parametrize(
-    "event",
-    [
-        tool("read_file"),
-        tool("run_command"),
-        {**response("x"), "subagent_info": {"a": 1}},
-        {**response("x"), "subagent_info": None},
-        {**response("x"), "tool_info": {"kind": "read"}},
-        {**response("x"), "tool_name": ""},
-    ],
-)
-def test_any_tool_or_subagent_stops_and_refuses_the_turn(
-    home: Path, event: dict[str, Any]
-) -> None:
-    server = FakeAgy([init(), event, result()])
-    with pytest.raises(EngineRefused, match="not given|subagent"):
-        run(line(server, home))
-    assert server.stops == 1
-
-
-@pytest.mark.parametrize(
-    "event",
-    [
-        {**response("x"), "step_type": "thinking"},
-        {**response("x"), "step_type": "tool_call"},
-        {k: v for k, v in response("x").items() if k != "step_type"},
-        {"type": "progress"},
-        {"type": None},
-    ],
-)
-def test_a_record_or_step_of_an_unknown_shape_is_refused(
-    home: Path, event: dict[str, Any]
-) -> None:
-    """Antigravity review, F1. Only shapes the adapter names pass."""
-    server = FakeAgy([init(), event, result()])
-    with pytest.raises(EngineRefused, match="does not know"):
-        run(line(server, home))
-    assert server.stops == 1
-
-
-def test_a_turn_past_its_deadline_is_stopped_and_refused(home: Path) -> None:
-    server = FakeAgy([init(), response("still going")], hang=True)
-    with pytest.raises(EngineRefused, match="deadline of 0.05 seconds"):
-        run(line(server, home, turn_seconds=0.05))
-    assert server.stops == 1
-
-
-def test_statuses_and_missing_events_are_reported(home: Path) -> None:
-    for status, subtype in (("ERROR", "error"), ("CANCELED", "interrupted")):
-        report = run(line(FakeAgy([init(), result(status)]), home))
-        assert report.subtype == subtype
-    with pytest.raises(EngineRefused, match="without a result"):
-        run(line(FakeAgy([init(), response("x")]), home))
-    with pytest.raises(EngineRefused, match="before its init event"):
-        run(line(FakeAgy([response("x"), init(), result()]), home))
-    with pytest.raises(EngineRefused, match="ended before its init event"):
-        run(line(FakeAgy([]), home))
-
-
-def test_the_turn_streams_to_the_observer(home: Path) -> None:
-    log = ActivityLog()
-    run(line(FakeAgy(), home, observe=log.observer("alpha")))
-    assert [(entry.kind, entry.text) for entry in log.after("alpha", 0)] == [
-        (ActivityKind.TEXT, "done")
+    server = FakeRuntime()
+    target = line(server, home, runtime, config=config)
+    report = run(target)
+    assert report.subtype == "success"
+    assert report.text == "done"
+    assert report.session_id == "s1" == target.session_id
+    assert report.usage is None and report.cost_estimate_usd is None
+    prompt = server.request("session/prompt")["params"]
+    assert prompt["sessionId"] == "s1"
+    assert prompt["prompt"] == [
+        {"type": "text", "text": "Contents of notes.md:\n\nBe brief.\n\nhello"}
     ]
+
+
+def test_a_resumed_session_takes_no_instructions_and_needs_the_capability(
+    home: Path, runtime: Path
+) -> None:
+    server = FakeRuntime()
+    run(line(server, home, runtime, session_id="s1"))
+    assert "session/new" not in server.methods()
+    assert server.request("session/resume")["params"]["sessionId"] == "s1"
+    assert server.request("session/prompt")["params"]["prompt"][0]["text"] == "hello"
+    unable = FakeRuntime(init=initialized(resume=False))
+    with pytest.raises(EngineRefused, match="does not offer to resume"):
+        run(line(unable, home, runtime, session_id="s1"))
+
+
+def test_the_turn_streams_to_the_observer(home: Path, runtime: Path) -> None:
+    log = ActivityLog()
+    events = [said("done"), update({"sessionUpdate": "agent_thought_chunk"})]
+    run(line(FakeRuntime(events), home, runtime, observe=log))
+    assert [entry.kind for entry in log.after("alpha", 0)] == [
+        ActivityKind.TEXT,
+        ActivityKind.THINKING,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("stop", "subtype"),
+    [("end_turn", "success"), ("max_tokens", "error"), ("refusal", "error")],
+)
+def test_stop_reasons_become_subtypes(
+    home: Path, runtime: Path, stop: str, subtype: str
+) -> None:
+    assert run(line(FakeRuntime(stop=stop), home, runtime)).subtype == subtype
+
+
+def test_an_unknown_stop_reason_refuses_the_turn(home: Path, runtime: Path) -> None:
+    with pytest.raises(EngineRefused, match="ended its turn for 'paused'"):
+        run(line(FakeRuntime(stop="paused"), home, runtime))
+
+
+def test_dromons_own_tool_is_allowed_once_and_counted(
+    home: Path, runtime: Path
+) -> None:
+    events = [
+        own(),
+        permission(RUNNING, tool_name=OWN),
+        changed(status="in_progress"),
+        changed(status="completed", title=RUNNING, kind="other", toolName=OWN),
+        own(),
+        said("sent"),
+    ]
+    server = FakeRuntime(events)
+    report = run(line(server, home, runtime, tools=True))
+    assert report.tool_uses == (OWN,)
+    assert server.answer("p1")["result"] == {
+        "outcome": {"outcome": "selected", "optionId": "once"}
+    }
+    assert "session/cancel" not in server.methods()
+
+
+def test_a_permission_request_that_omits_the_recorded_name_still_names_it(
+    home: Path, runtime: Path
+) -> None:
+    """The request adds nothing that conflicts, so the call is the one recorded."""
+    server = FakeRuntime([own(), permission(RUNNING), said("sent")])
+    report = run(line(server, home, runtime, tools=True))
+    assert report.tool_uses == (OWN,)
+    assert server.answer("p1")["result"]["outcome"]["optionId"] == "once"
+
+
+def test_another_tools_permission_is_refused_before_it_runs(
+    home: Path, runtime: Path
+) -> None:
+    server = FakeRuntime([permission("Read /etc/hosts"), said("x")])
+    with pytest.raises(EngineRefused, match="refused before it ran: Read /etc/hosts"):
+        run(line(server, home, runtime, tools=True))
+    assert server.answer("p1")["result"] == {
+        "outcome": {"outcome": "selected", "optionId": "no"}
+    }
+    assert server.request("session/cancel")["params"] == {"sessionId": "s1"}
+
+
+@pytest.mark.parametrize(
+    ("status", "when"),
+    [
+        ("pending", "before it ran"),
+        ("in_progress", "after it started"),
+        (None, "after"),
+    ],
+)
+def test_another_tool_call_cancels_the_turn(
+    home: Path, runtime: Path, status: str | None, when: str
+) -> None:
+    server = FakeRuntime([tool("view_file", status=status)])
+    with pytest.raises(EngineRefused, match=f"stopped {when}"):
+        run(line(server, home, runtime))
+    assert "session/cancel" in server.methods()
+
+
+@pytest.mark.parametrize("status", ["pending", "in_progress"])
+def test_no_kind_exempts_a_tool_call_from_the_check(
+    home: Path, runtime: Path, status: str
+) -> None:
+    """Antigravity review, F1. The kind is the runtime's own report, so a call of the
+    kind ``think`` titled as a shell command is refused like any other."""
+    server = FakeRuntime([tool("rm -rf ~", kind="think", status=status), said("x")])
+    with pytest.raises(EngineRefused, match=r"not given, stopped .*: rm -rf ~"):
+        run(line(server, home, runtime, tools=True))
+    assert "session/cancel" in server.methods()
+    plain = FakeRuntime([tool("plan", kind="think"), said("x")])
+    with pytest.raises(EngineRefused, match="not given"):
+        run(line(plain, home, runtime))
+
+
+def test_a_quiet_looking_call_that_turns_into_a_command_is_refused(
+    home: Path, runtime: Path
+) -> None:
+    """Antigravity review, F2. The call is refused at its first report, and its later
+    update, which changes it into a command, is checked again rather than skipped."""
+    events = [
+        tool("plan", kind="think", ident="k1"),
+        changed("k1", title="rm -rf ~", kind="execute", status="in_progress"),
+    ]
+    server = FakeRuntime(events, stop=None)
+    with pytest.raises(EngineRefused, match="stopped before it ran: plan"):
+        run(line(server, home, runtime, tools=True))
+    assert server.methods().count("session/cancel") == 1
+
+
+@pytest.mark.parametrize(
+    ("fields", "key"),
+    [
+        ({"toolName": "run_shell_command"}, "toolName"),
+        ({"title": "rm -rf ~"}, "title"),
+        ({"kind": "execute"}, "kind"),
+        ({"toolName": None}, "toolName"),
+    ],
+)
+def test_an_own_call_whose_identity_changes_refuses_the_turn(
+    home: Path, runtime: Path, fields: dict[str, object], key: str
+) -> None:
+    """Antigravity review, F3. Permission was granted for the call as it was, so an
+    update that changes its name, title or kind refuses the turn."""
+    later = update({"sessionUpdate": "tool_call_update", "toolCallId": "t1", **fields})
+    events = [own(), permission(RUNNING, tool_name=OWN), later, said("x")]
+    server = FakeRuntime(events)
+    with pytest.raises(EngineRefused, match=f"changed the {key} of its tool call"):
+        run(line(server, home, runtime, tools=True))
+    assert server.answer("p1")["result"]["outcome"]["optionId"] == "once"
+    assert "session/cancel" in server.methods()
+
+
+def test_a_field_the_recorded_call_lacked_is_a_change(
+    home: Path, runtime: Path
+) -> None:
+    """An own call first reported without a kind cannot gain one later."""
+    events = [
+        tool(RUNNING, kind=None, tool_name=OWN),
+        changed(kind="execute"),
+    ]
+    with pytest.raises(EngineRefused, match="changed the kind"):
+        run(line(FakeRuntime(events), home, runtime, tools=True))
+
+
+def test_a_permission_request_that_changes_a_call_is_rejected(
+    home: Path, runtime: Path
+) -> None:
+    """Antigravity review, F3. A request for a recorded call under another title is
+    answered with a rejection, even when it names Dromon's tool."""
+    events = [own(), permission("rm -rf ~", tool_name=OWN), said("x")]
+    server = FakeRuntime(events)
+    with pytest.raises(EngineRefused, match="changed the title"):
+        run(line(server, home, runtime, tools=True))
+    assert server.answer("p1")["result"]["outcome"]["optionId"] == "no"
+
+
+def test_a_title_never_names_dromons_tool(home: Path, runtime: Path) -> None:
+    """Antigravity review, F4. Only the structured toolName names one of Dromon's
+    tools, so a call whose title equals its name is refused, both as a permission
+    request and as a call."""
+    asked = FakeRuntime([permission(OWN), said("x")])
+    with pytest.raises(EngineRefused, match=f"refused before it ran: {OWN}"):
+        run(line(asked, home, runtime, tools=True))
+    assert asked.answer("p1")["result"]["outcome"]["optionId"] == "no"
+    used = FakeRuntime([tool(OWN, kind="other"), said("x")])
+    with pytest.raises(EngineRefused, match=f"not given, stopped before it ran: {OWN}"):
+        run(line(used, home, runtime, tools=True))
+
+
+@pytest.mark.parametrize("ident", [None, "", 7])
+def test_a_tool_call_without_an_identifier_refuses_the_turn(
+    home: Path, runtime: Path, ident: object
+) -> None:
+    body: dict[str, Any] = {"sessionUpdate": "tool_call", "kind": "other"}
+    body |= {"toolName": OWN, "title": RUNNING}
+    if ident is not None:
+        body["toolCallId"] = ident
+    with pytest.raises(EngineRefused, match="tool call without an identifier"):
+        run(line(FakeRuntime([update(body)]), home, runtime, tools=True))
+    request = permission(RUNNING, tool_name=OWN)
+    del request["params"]["toolCall"]["toolCallId"]
+    server = FakeRuntime([request])
+    with pytest.raises(EngineRefused, match="tool call without an identifier"):
+        run(line(server, home, runtime, tools=True))
+    assert server.answer("p1")["result"]["outcome"]["optionId"] == "no"
+
+
+def test_a_request_after_a_cancel_is_answered_as_cancelled(
+    home: Path, runtime: Path
+) -> None:
+    """ACP requires it, and a cancelled outcome grants nothing, even for Dromon's own
+    tool. The first refusal stands."""
+    asked = permission(RUNNING, ident="t2", tool_name=OWN)
+    server = FakeRuntime([tool("view_file"), asked])
+    with pytest.raises(EngineRefused, match="view_file"):
+        run(line(server, home, runtime, tools=True))
+    assert server.answer("p1")["result"] == {"outcome": {"outcome": "cancelled"}}
+    loaded = InterruptsOnText.for_model(AGY, Strategy.SUBSCRIPTION)
+    again = permission(RUNNING, tool_name=OWN)
+    interrupted = FakeRuntime([said("x"), again], stop=None)
+    report = run(line(interrupted, home, runtime, tools=True, loaded=loaded))
+    assert report.subtype == "interrupted"
+    assert interrupted.answer("p1")["result"] == {"outcome": {"outcome": "cancelled"}}
+
+
+def test_a_question_from_the_runtime_is_cancelled_and_refuses_the_turn(
+    home: Path, runtime: Path
+) -> None:
+    server = FakeRuntime([permission("Which?", ident="interaction_1")])
+    with pytest.raises(EngineRefused, match="question Dromon cannot answer"):
+        run(line(server, home, runtime))
+    assert server.answer("p1")["result"] == {"outcome": {"outcome": "cancelled"}}
+
+
+@pytest.mark.parametrize(
+    ("event", "reason"),
+    [
+        (update({"sessionUpdate": "agent_dance"}), "update Dromon does not know"),
+        (
+            {"jsonrpc": "2.0", "id": "q", "method": "fs/read_text_file", "params": {}},
+            "asked for fs/read_text_file",
+        ),
+        (
+            {"jsonrpc": "2.0", "method": "x.ai/task_started", "params": {}},
+            "notification Dromon does not know",
+        ),
+        ({"jsonrpc": "2.0", "id": 99, "result": {}}, "did not expect"),
+        (
+            update({"sessionUpdate": "current_mode_update", "currentModeId": "yolo"}),
+            "switched to the permission mode 'yolo'",
+        ),
+        (
+            update(
+                {
+                    "sessionUpdate": "config_option_update",
+                    "configOptions": [model_option("gemini-3.8-flash-low")],
+                }
+            ),
+            "switched to the model",
+        ),
+    ],
+)
+def test_unknown_or_unsafe_messages_refuse_the_turn(
+    home: Path, runtime: Path, event: dict[str, Any], reason: str
+) -> None:
+    server = FakeRuntime([event])
+    with pytest.raises(EngineRefused, match=reason):
+        run(line(server, home, runtime))
+    assert "session/cancel" in server.methods()
+    if "id" in event and "method" in event:
+        assert server.answer("q")["error"]["code"] == -32601
+
+
+def test_known_informational_updates_pass(home: Path, runtime: Path) -> None:
+    events = [
+        update({"sessionUpdate": "available_commands_update", "availableCommands": []}),
+        update({"sessionUpdate": "plan", "entries": []}),
+        update({"sessionUpdate": "current_mode_update", "currentModeId": "default"}),
+        said("ok"),
+    ]
+    assert run(line(FakeRuntime(events), home, runtime)).subtype == "success"
+
+
+def configured(**fields: object) -> dict[str, Any]:
+    return update({"sessionUpdate": "config_option_update", **fields})
+
+
+@pytest.mark.parametrize(
+    ("event", "shown"),
+    [
+        (configured(configId="model", value="gemini-4-argon-high"), "argon"),
+        (configured(configId="model"), "None"),
+        (configured(configOptions=[{"id": "model", "currentValue": 5}]), "5"),
+        (configured(configOptions="model"), "'model'"),
+        (configured(models={"currentModelId": "gemini-3.8-flash-low"}), "low"),
+        (
+            configured(configOptions=[model_option(MODEL), model_option("x")]),
+            "'x'",
+        ),
+    ],
+)
+def test_any_model_update_but_the_drivers_refuses_the_turn(
+    home: Path, runtime: Path, event: dict[str, Any], shown: str
+) -> None:
+    """Antigravity review, F5. The update's own fields are read as well as the
+    schema's, and a value that cannot be read is not the driver's model."""
+    server = FakeRuntime([event, said("x")])
+    with pytest.raises(EngineRefused, match=f"switched to the model .*{shown}"):
+        run(line(server, home, runtime))
+    assert "session/cancel" in server.methods()
+
+
+def test_a_model_update_that_keeps_the_drivers_model_passes(
+    home: Path, runtime: Path
+) -> None:
+    events = [
+        configured(configOptions=[model_option(MODEL)]),
+        configured(configId="model", value=MODEL),
+        configured(configOptions=[{"id": "mode", "currentValue": "default"}]),
+        said("ok"),
+    ]
+    assert run(line(FakeRuntime(events), home, runtime)).subtype == "success"
+
+
+def used(tokens: object = 1200, cost: object = None) -> dict[str, Any]:
+    body: dict[str, Any] = {"sessionUpdate": "usage_update", "used": tokens}
+    body["size"] = 1_000_000
+    if cost is not None:
+        body["cost"] = cost
+    return update(body)
+
+
+def dollars(amount: object) -> dict[str, object]:
+    return {"amount": amount, "currency": "USD"}
+
+
+def test_usage_is_counted_where_its_shape_allows_and_labelled(
+    home: Path, runtime: Path
+) -> None:
+    """Antigravity review, F9. The cost is the session's running total, so a second
+    turn on the same session counts the difference, and both are labelled
+    unverified."""
+    first = FakeRuntime([used(800, dollars(0.25)), used(1200, dollars(0.5))])
+    target = line(first, home, runtime)
+    report = run(target)
+    assert report.cost_estimate_usd == 0.5
+    assert report.cost_mark == ("s1", 0.5)
+    assert report.cost_source == "difference"
+    assert report.context_tokens == 1200
+    assert report.usage_note is not None and "unverified" in report.usage_note
+    second = FakeRuntime([used(2000, dollars(0.75))])
+    rebuilt = line(second, home, runtime, session_id="s1", cost_mark=report.cost_mark)
+    again = run(rebuilt)
+    assert again.cost_estimate_usd == 0.25
+    assert rebuilt.cost_mark == ("s1", 0.75)
+    other = FakeRuntime([used(2000, dollars(0.75))], opened=session(session_id="s2"))
+    fresh = run(line(other, home, runtime, cost_mark=("s1", 0.5)))
+    assert fresh.cost_estimate_usd == 0.75
+
+
+@pytest.mark.parametrize(
+    "cost",
+    [
+        {"amount": 1.0, "currency": "EUR"},
+        dollars(True),
+        dollars(-1),
+        dollars(float("inf")),
+        dollars("1"),
+        "1.0",
+    ],
+)
+def test_usage_of_another_shape_is_left_uncounted(
+    home: Path, runtime: Path, cost: object
+) -> None:
+    report = run(line(FakeRuntime([used(-1, cost), said("x")]), home, runtime))
+    assert report.cost_estimate_usd is None and report.cost_mark is None
+    assert report.context_tokens is None
+    assert report.usage_note == antigravity.NO_COST_NOTE
+
+
+def test_a_turn_without_a_reported_cost_says_so_plainly(
+    home: Path, runtime: Path
+) -> None:
+    """Re-review, N5. The turn is accepted, as a subscription's would be, and its
+    note says that no cost was seen, whether or not a context was counted."""
+    plain = run(line(FakeRuntime([said("x")]), home, runtime))
+    assert plain.cost_estimate_usd is None
+    assert plain.usage_note == antigravity.NO_COST_NOTE
+    assert plain.usage_note.startswith("no cost was seen")
+    sized = run(line(FakeRuntime([used(900, None), said("x")]), home, runtime))
+    assert sized.cost_estimate_usd is None and sized.context_tokens == 900
+    assert sized.usage_note is not None
+    assert sized.usage_note.startswith(antigravity.NO_COST_NOTE)
+    assert antigravity.CONTEXT_NOTE in sized.usage_note
+
+
+@pytest.mark.parametrize("kind", sorted(antigravity.COMPACTIONS))
+def test_a_turn_that_compacts_is_refused_unless_its_cost_is_counted(
+    home: Path, runtime: Path, kind: str
+) -> None:
+    """Antigravity review, F9. A compaction is a model call of its own, so a cost
+    must be reported after it, and the refused turn leaves the mark unmoved."""
+    compacted = update({"sessionUpdate": kind, "compactionId": "c1"})
+    before = FakeRuntime([used(10, dollars(0.1)), compacted, said("x")])
+    target = line(before, home, runtime)
+    with pytest.raises(EngineRefused, match="compacted its session"):
+        run(target)
+    assert target.cost_mark is None
+    shapeless = FakeRuntime([compacted, used(10, {"amount": 1, "currency": "EUR"})])
+    with pytest.raises(EngineRefused, match="compacted its session"):
+        run(line(shapeless, home, runtime))
+    after = FakeRuntime([compacted, used(10, dollars(0.2)), said("x")])
+    assert run(line(after, home, runtime)).cost_estimate_usd == 0.2
+
+
+def test_a_driver_interrupt_cancels_and_waits_for_the_prompt(
+    home: Path, runtime: Path
+) -> None:
+    server = FakeRuntime([said("x")], stop=None)
+    loaded = InterruptsOnText.for_model(AGY, Strategy.SUBSCRIPTION)
+    report = run(line(server, home, runtime, loaded=loaded))
+    assert report.subtype == "interrupted" and report.interrupted_for == "test"
+    assert server.methods().count("session/cancel") == 1
+    assert server.stops == 0
+
+
+def test_a_cancel_the_runtime_ignores_ends_the_process(
+    home: Path, runtime: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(antigravity, "ABORT_SECONDS", 0.05)
+    server = FakeRuntime([said("x")], stop=None, answers_cancel=False)
+    loaded = InterruptsOnText.for_model(AGY, Strategy.SUBSCRIPTION)
+    report = run(line(server, home, runtime, loaded=loaded))
+    assert report.subtype == "interrupted"
+    assert server.stops == 1
+
+
+def test_a_turn_past_its_deadline_is_cancelled_and_refused(
+    home: Path, runtime: Path
+) -> None:
+    server = FakeRuntime([said("x")], stop=None, answers_cancel=False)
+    with pytest.raises(EngineRefused, match="deadline of 0.05 seconds"):
+        run(line(server, home, runtime, turn_seconds=0.05))
+    assert "session/cancel" in server.methods()
+    assert server.stops == 1
+
+
+# The factory and the probe.
 
 
 def test_the_factory_builds_a_refusing_line(tmp_path: Path) -> None:
@@ -544,12 +1331,9 @@ def test_the_factory_builds_a_refusing_line(tmp_path: Path) -> None:
     engine: LineEngine = build(LineSpec("probe", AGY, Strategy.SUBSCRIPTION), [])
     assert isinstance(engine, AntigravityLine)
     assert engine.partial_isolation is False
+    assert engine.unverified_credential is False
     with pytest.raises(EngineRefused, match="partial-isolation"):
         asyncio.run(engine.run_turn("ready?"))
-    accepting = engine_factory(str(tmp_path), accept_partial_isolation=True)
-    probe = accepting(LineSpec("probe", AGY, Strategy.SUBSCRIPTION), [])
-    assert isinstance(probe, AntigravityLine) and probe.partial_isolation is True
-    assert probe.unverified_credential is False
     confirming = engine_factory(
         str(tmp_path),
         accept_partial_isolation=True,
@@ -557,7 +1341,11 @@ def test_the_factory_builds_a_refusing_line(tmp_path: Path) -> None:
     )
     confirmed = confirming(LineSpec("probe", AGY, Strategy.SUBSCRIPTION), [])
     assert isinstance(confirmed, AntigravityLine)
-    assert confirmed.unverified_credential is True
+    assert confirmed.partial_isolation and confirmed.unverified_credential
+    marked = build(
+        LineSpec("probe", AGY, Strategy.SUBSCRIPTION, cost_mark=("s1", 0.5)), []
+    )
+    assert isinstance(marked, AntigravityLine) and marked.cost_mark == ("s1", 0.5)
     sandboxed = engine_factory(
         str(tmp_path), project_sandbox=parse_sandbox({"enabled": True}, operator=True)
     )
@@ -565,13 +1353,13 @@ def test_the_factory_builds_a_refusing_line(tmp_path: Path) -> None:
         sandboxed(LineSpec("probe", AGY, Strategy.SUBSCRIPTION), [])
 
 
-def test_the_probes_flag_reaches_antigravity_and_its_credential_refuses(
+def test_the_probes_flags_reach_antigravity_and_its_credential_refuses(
     tmp_path: Path,
     short_runtime: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The flag is accepted for an Antigravity model, and the turn is then refused on
-    its unverified credential before ``agy`` is started."""
+    """The isolation flag reaches an Antigravity model, and the turn is then refused on
+    its unverified credential before anything is located or started."""
     base = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime), "probe"]
     assert cli.main([*base, "--model", AGY]) == exits.FAILURE
     assert "--accept-partial-isolation" in capsys.readouterr().err
@@ -580,7 +1368,10 @@ def test_the_probes_flag_reaches_antigravity_and_its_credential_refuses(
     assert "unverified credential" in capsys.readouterr().err
     with pytest.raises(SystemExit):
         cli.main([*base, "--help"])
-    assert "Antigravity's tools" in " ".join(capsys.readouterr().out.split())
+    shown = " ".join(capsys.readouterr().out.split())
+    assert "Antigravity's tools are refused before they run" in shown
+    assert "--strategy api still bills per token" in shown
+    assert "Antigravity ACP runtime" in shown and "step 3 of the verify-first" in shown
 
 
 def test_the_probes_credential_flag_is_refused_outside_its_scope(
@@ -588,7 +1379,6 @@ def test_the_probes_credential_flag_is_refused_outside_its_scope(
     short_runtime: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Only an Antigravity model, and only with ``--accept-partial-isolation``."""
     base = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime), "probe"]
     flag = "--accept-unverified-credential"
     cursor_model = next(m for m, e in ENGINE_OF.items() if e == "cursor-agent")
@@ -599,44 +1389,41 @@ def test_the_probes_credential_flag_is_refused_outside_its_scope(
         assert "applies only to Antigravity models" in capsys.readouterr().err
     assert cli.main([*base, "--model", AGY, flag]) == exits.FAILURE
     assert "only together with --accept-partial-isolation" in capsys.readouterr().err
-    with pytest.raises(SystemExit):
-        cli.main([*base, "--help"])
-    shown = " ".join(capsys.readouterr().out.split())
-    assert flag in shown and "step 2 of the verify-first list" in shown
-    # Re-review, N4. Neither flag restricts the strategy.
-    assert "--strategy api still bills per token" in shown
-    assert "It does not change the strategy" in shown
 
 
-def test_the_probe_runs_antigravity_with_both_flags(
+def test_the_probe_runs_the_runtime_with_both_flags(
     tmp_path: Path,
     short_runtime: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The scripted ``agy`` stands in for the harness, and the home directory is a
-    fresh one, so no real settings or harness are reached."""
-    server = FakeAgy()
+    """The scripted runtime stands in for the real one, which is located under a fresh
+    home directory, so no real runtime, profile or setting is reached."""
+    server = FakeRuntime()
 
     @asynccontextmanager
     async def connect(
         arguments: list[str], cwd: Path, env: Mapping[str, str]
     ) -> AsyncGenerator[Connection]:
-        server.cwd = str(cwd)
         server.started = True
+        server.environment = dict(env)
         yield server
 
+    located: list[str] = []
+
     def factory(command: str, *, keep_input: bool) -> ConnectionFactory:
-        assert command == antigravity.COMMAND and not keep_input
+        assert keep_input
+        located.append(command)
         return connect
 
     home = tmp_path / "home"
-    home.mkdir()
+    executable = install((home / DEFAULT_RUNTIME).parent)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv(RUNTIME_VARIABLE, raising=False)
     monkeypatch.setattr(antigravity, "json_lines_factory", factory)
     base = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime), "probe"]
     flags = ["--accept-partial-isolation", "--accept-unverified-credential"]
     assert cli.main([*base, "--model", AGY, *flags]) == exits.OK
     shown = capsys.readouterr().out
-    assert server.started
+    assert server.started and located == [str(executable)]
     assert "credential unverified" in shown and "turn success" in shown

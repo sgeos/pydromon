@@ -1,13 +1,15 @@
-// Dromon driver for Gemini 3.1 Pro run through Antigravity, driver interface 3.
+// Dromon driver for Gemini 3.8 Flash at high effort, run through Antigravity's ACP
+// runtime, driver interface 3.
 //
-// Strategy: flexible. The line accepts a subscription or API usage billed per token. Its
-// settings are the API-safe ones, because the line may be charged per token, and the
-// credential actually used is recorded in the driver's state.
+// Strategy: API only. The line runs on API usage billed per token. The driver refuses a
+// subscription, so a line meant to be metered is never silently moved onto a plan, and
+// its settings keep turns short because every token is charged.
 //
-// Dromon's Antigravity adapter was written from its documentation alone, since agy was
-// not installed. The identifier gemini-3.1-pro is a guess, to be checked against
-// agy models, and the context window of 1,000,000 tokens is not verified.
-// Antigravity's efforts are low, medium and high.
+// The identifier gemini-3.8-flash-high is reported, not observed by Dromon. A second
+// implementation lists it as current for Antigravity's ACP runtime, and a user report
+// quotes it from agy models. Antigravity names the effort in the identifier, so this
+// driver's effort is high and a line may not set another. The context window of
+// 1,000,000 tokens is a hypothesis.
 //
 // The host sends one event per cycle together with the driver's state, and receives
 // one action together with the next state. The host stores the state between cycles,
@@ -21,12 +23,13 @@
 // Credential codes are 0 before the engine reports one, 1 for a subscription and 2 for
 // API usage billed per token.
 
-fn model() -> Text { "antigravity:gemini-3.1-pro" }
+fn model() -> Text { "antigravity:gemini-3.8-flash-high" }
 
-// The model as Antigravity reports it, inferred to be the identifier it was given.
-fn engine_model() -> Text { "gemini-3.1-pro" }
+// The model as the runtime reports it in the session's model option, inferred to be
+// the identifier it was given.
+fn engine_model() -> Text { "gemini-3.8-flash-high" }
 
-fn strategy() -> Text { "flexible" }
+fn strategy() -> Text { "api" }
 
 fn tool_budget() -> Word { 20 }
 
@@ -36,7 +39,7 @@ fn setting(index: Word) -> (Text, Text, Word) {
         0 => ("interface", "", 3),
         1 => ("strategy", strategy(), 0),
         2 => ("model", model(), 0),
-        3 => ("effort", "medium", 0),
+        3 => ("effort", "high", 0),
         4 => ("max_turns", "", 4),
         5 => ("tool_budget", "", tool_budget()),
         6 => ("context_window", "", 1000000),
@@ -57,7 +60,7 @@ fn on_credential(
     credential: Text,
     state: (Word, Word, Word),
 ) -> ((Text, Text, Word), (Word, Word, Word)) {
-    if credential == "subscription" or credential == "api" {
+    if credential == "api" {
         let code = credential_code(credential);
         (("accept", credential, code), (state.0, state.1, code))
     } else {
