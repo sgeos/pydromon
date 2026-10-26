@@ -716,12 +716,18 @@ def compaction_note(
     compaction: Mapping[str, int | str | None],
     reason: str = COMPACTION_REQUESTED,
     context_line: str | None = None,
+    reported: bool | None = None,
 ) -> str:
     """The note a turn that began with a compaction opens with, for ``reason``, and
     then ``context_line``, the prompt's context warning computed after the
-    compaction, where there still is one."""
+    compaction, where there still is one. ``reported`` says whether the engine
+    reported the compaction. When it is ``None`` a report is inferred from a size,
+    as Claude Code's boundary gives one, while Codex says so apart, since its report
+    carries no size."""
     before, after = compaction.get("before_tokens"), compaction.get("after_tokens")
-    if before is None and after is None:
+    if reported is None:
+        reported = before is not None or after is not None
+    if not reported:
         note = (
             "Dromon note: your session was to be compacted at the start of this turn"
             f" {reason}, but the engine reported no compaction, so it may not have"

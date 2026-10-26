@@ -332,10 +332,13 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
   compaction is pending, and the `last_compaction`, with its `trigger`, `manual` or
   `auto`, its `before_tokens` and `after_tokens`, and the time `at` which Dromon
   recorded it. Its `cause` is `compact_session` or `auto_compact_tokens` for a
-  compaction Dromon asked for, which the engine reports as `manual`, or `engine` for
+  compaction Dromon asked for, which Claude Code reports as `manual`, or `engine` for
   one the engine made by itself. The live probe of round 6 showed an automatic
   compaction reported as `manual`, which is why the cause is given apart from the
-  trigger. While the estimate is unknown after a compaction whose size was not
+  trigger. The `trigger` is only what the engine reported, with a `trigger_note`
+  saying what it means. Codex reports none, so a Codex compaction has a `null`
+  trigger. Before the round 7 report of luna, Dromon filled in `manual` for Codex,
+  which read as contradicting an automatic cause. While the estimate is unknown after a compaction whose size was not
   reported, its `note` says so. All are kept in memory. **Fixed after the live probe of 2026-10-26.** A
   compaction, asked for or automatic, is recorded the moment the engine reports it,
   so a status read later in the same turn shows it, and the estimate then becomes the

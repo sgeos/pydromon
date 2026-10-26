@@ -800,7 +800,8 @@ class CodexLine:
             turn.refusal = work.refusal
         after = work.calls[-1].get("total_tokens") if work.calls else None
         compaction: dict[str, int | str | None] = {
-            "trigger": "manual" if work.compacted else None,
+            # Codex reports no trigger, so none is made up for it.
+            "trigger": None,
             "before_tokens": before if work.compacted else None,
             "after_tokens": after if work.compacted else None,
             "after_estimate_tokens": None,
@@ -821,7 +822,9 @@ class CodexLine:
         except Exception as error:  # noqa: BLE001
             print(f"dromond: the context line failed: {error}", file=sys.stderr)
             context_line = None
-        note = compaction_note(compaction, request.reason, context_line)
+        note = compaction_note(
+            compaction, request.reason, context_line, reported=work.compacted
+        )
         return note, (compaction, work)
 
     async def run_turn(self, prompt: str) -> TurnReport:

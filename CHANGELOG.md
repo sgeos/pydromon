@@ -7,6 +7,12 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- A compaction's `trigger` is only what the engine reported, with a `trigger_note`,
+  so a Codex compaction, which reports none, no longer shows a `manual` that Dromon
+  made up. A Codex compaction is reported as such even when Dromon had no earlier
+  estimate of its size. The context note for a call no longer uses Claude Code's
+  wording on Codex lines.
+
 - The gate runs pyright for Linux and for macOS, since pyright skips another
   platform's branch, which let a Linux-only type error reach `main` in pull request 42.
 

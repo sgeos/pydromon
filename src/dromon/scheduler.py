@@ -397,7 +397,8 @@ CONTEXT_FROM_COMPACTION: Final = "compaction"
 CONTEXT_FROM_ESTIMATE: Final = "compaction_estimate"
 CONTEXT_NOTES: Final[dict[str, str]] = {
     CONTEXT_FROM_CALL: (
-        "the last main-loop engine call's input, cached and written tokens"
+        "the last engine call's context, its input, cached and written tokens,"
+        " counting on Claude Code only the line's own calls and not its subagents'"
     ),
     CONTEXT_FROM_COMPACTION: (
         "the size the last compaction left, as the engine reported it, until a"
@@ -1526,6 +1527,7 @@ class Scheduler:
         cause = self._compaction_cause.pop(line_id, "engine")
         record: dict[str, object] = {
             "trigger": compaction.get("trigger"),
+            "trigger_note": trigger_note(compaction.get("trigger")),
             "cause": cause,
             "before_tokens": compaction.get("before_tokens"),
             "after_tokens": compaction.get("after_tokens"),
@@ -3304,6 +3306,24 @@ def _between_usage_note(usage: Mapping[str, int] | None) -> str | None:
     return None
 
 
+def trigger_note(trigger: object) -> str:
+    """What a compaction's ``trigger`` means. **Round 7 report of luna.** A Codex
+    compaction was shown as ``manual``, which Dromon had filled in and which read as
+    contradicting its automatic cause. The trigger is now only what the engine
+    reported, and ``cause`` alone says why Dromon asked."""
+    if trigger == "manual":
+        return (
+            "the engine's word for a compaction it was told to make, which is how"
+            " Dromon makes both compact_session and auto_compact_tokens compactions,"
+            " so cause says why"
+        )
+    if trigger == "auto":
+        return "the engine's word for a compaction it made by itself"
+    if trigger is None:
+        return "the engine reports no trigger, as Codex does not"
+    return "a trigger the engine reported that Dromon does not know"
+
+
 def _compaction_entry(report: TurnReport) -> dict[str, object] | None:
     """The compaction a turn began with, its own cost and tokens, which the turn's
     are counted with, or ``None`` when it began with none."""
@@ -3312,6 +3332,7 @@ def _compaction_entry(report: TurnReport) -> dict[str, object] | None:
     spent = report.compaction_cost_usd
     return {
         **dict(report.compaction),
+        "trigger_note": trigger_note(report.compaction.get("trigger")),
         "after_estimate_tokens": report.compaction.get("after_estimate_tokens"),
         "cost_usd": None if spent is None else f"{spent:.4f}",
         "usage": (
