@@ -369,9 +369,9 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
   - **Its own wake.** `compact_session` takes an optional `seconds`, from 60 to
     86,400, by default 60, and schedules a wake through the `wake_after` machinery,
     so the compaction does not wait for unrelated mail. A wake already pending stays,
-    and none is added. A bad `seconds` is refused with nothing asked or scheduled. The
-    event log has no event that cancels a wake, so a compaction an earlier turn
-    consumed leaves the wake to fire, which costs one short turn. **Review, F4.** The
+    and none is added. A bad `seconds` is refused with nothing asked or scheduled. In
+    round 6 a compaction an earlier turn consumed left the wake to fire, which cost one
+    short turn. Round 7 withdraws it, as below. **Review, F4.** The
     request is held in memory, so a daemon restart loses it while the wake survives.
     The wake's note says so, since the wake's turn cannot tell a lost request from a
     consumed one, and a line without a compaction note may ask again.
@@ -423,6 +423,54 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
     600 seconds. The size before is Dromon's last estimate. The size after is not
     reported, and the estimate is unknown until the line's next call reports one. Its
     cost stays unknown.
+- **Round 7, decided by the operator on 2026-10-26** from the round 6 reports.
+  - **The compaction's wake is withdrawn.** When the engine reports a compaction that
+    `compact_session` asked for, the daemon appends `wake_withdrawn` for the wake that
+    call scheduled, if it is still pending, and `last_compaction.withdrawn_wake` names
+    it, or is `null`. A wake the line scheduled itself, before or after, is never
+    withdrawn, since only the identifier of the wake `compact_session` scheduled is
+    matched. The wake is withdrawn on the engine's report and not when a turn takes the
+    request, so a turn that fails or is refused before compacting leaves the wake to
+    fire, and its note says that without a compaction note the line may ask again. A
+    wake that falls due while the turn that took its request is still compacting is
+    held back until that turn reports the compaction, which withdraws it, or ends,
+    which lets it fire on the next tick. The hold is bounded by the turn.
+    **Review, F1 to F4.** A withdrawn identifier is kept in the state, and a later
+    `wake_scheduled`, `message_sent` or `task_noted` that takes it is refused, so a
+    reply reference to it cannot reach another message. The compaction is recorded
+    before the wake is withdrawn, and a withdrawal the log refuses is reported and
+    leaves the wake to fire, so `last_compaction` always agrees with the turn. The
+    hold begins when the turn is dispatched with its compaction decided, not when the
+    turn's task starts, so no tick in between can fire the wake. A test confirms that
+    a held wake fires on the first tick after its turn ends without compacting. **The restart case.** The
+    identifier of the compaction's wake is in memory, as the request is, so after a
+    restart the wake is not withdrawn and fires, and its note says that a restart
+    loses the request. **Rejected alternative.** Skipping the wake at delivery was
+    rejected, because a fired note is already a `message_sent` in the log, and dropping
+    it would need an event of its own anyway and would leave a message sent and never
+    delivered. **Porting cost.** One event kind with two identifiers, its check that
+    the line's pending wake has that identifier, and one in-memory map per line.
+  - **Zero or nothing.** A `self_started` or `interrupted` entry's `cost_note` says
+    that the engine reported no cost, so none was counted, or that it reported a cost
+    of zero, not nothing, with the likely reason, a turn that ended before any engine
+    call, marked as an inference. Its `usage_note` says the same of its tokens. Both
+    are `null` when the engine reported a nonzero amount.
+  - **The estimate's source.** The context `note` names where the estimate came from:
+    the last main-loop call, the size the last compaction left as the engine reported
+    it, or the estimate below. The compaction's size stays the source until the turn's
+    end replaces it with its last call's context.
+  - **Codex's size after.** **Fact, observed live on Codex 0.164.0.** The engine does
+    not report a compaction's size after, so `after_tokens` stays `null`. The first
+    engine call after the compaction in the same turn gives
+    `last_compaction.after_estimate_tokens`, the call's `inputTokens`, or its
+    `totalTokens` where no input is given, with `after_estimate_note` saying that it
+    is an upper bound because it includes the turn's prompt. The estimate is reported
+    at once, becomes the context estimate, and holds automatic compaction when it is at
+    or past `auto_compact_tokens` and releases it when below, as a reported size does.
+    It is also given in that turn's `recent_turns` compaction entry. An estimate is
+    ignored when the last compaction's size was reported, when one was already
+    recorded for it, or when it is not a positive whole number. A Claude Code
+    compaction gives none, and both fields stay `null`.
 
 ## Kept sessions
 

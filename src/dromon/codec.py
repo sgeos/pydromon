@@ -46,6 +46,7 @@ from dromon.model import (
     WakeIssued,
     WakeRequested,
     WakeScheduled,
+    WakeWithdrawn,
     TaskNoted,
     LineCostMarked,
     parse_address,
@@ -86,6 +87,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "wake_requested": ("wake_id", "line_id", "message_id"),
     "wake_issued": ("wake_id",),
     "wake_scheduled": ("line_id", "message_id", "due", "note"),
+    "wake_withdrawn": ("line_id", "message_id"),
     "task_noted": ("line_id", "message_id", "task_id", "status", "body"),
     "line_cost_marked": ("line_id", "engine_session", "total_micro_usd"),
     "question_withdrawn": ("message_id",),
@@ -231,6 +233,11 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "due": event.due,
                 "note": event.note,
             }
+        case WakeWithdrawn():
+            return "wake_withdrawn", {
+                "line_id": event.line_id,
+                "message_id": event.message_id,
+            }
         case LineCostMarked():
             return "line_cost_marked", {
                 "line_id": event.line_id,
@@ -323,6 +330,8 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "due"),
                 _str(data, "note"),
             )
+        case "wake_withdrawn":
+            return WakeWithdrawn(_str(data, "line_id"), _str(data, "message_id"))
         case "line_cost_marked":
             return LineCostMarked(
                 _str(data, "line_id"),

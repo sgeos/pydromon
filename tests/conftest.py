@@ -38,6 +38,7 @@ from dromon.model import (
     WakeIssued,
     WakeRequested,
     WakeScheduled,
+    WakeWithdrawn,
     TaskNoted,
     LineCostMarked,
 )
@@ -101,6 +102,8 @@ SCENARIO: tuple[Event, ...] = (
     WakeScheduled("beta", "s1", "2026-10-26T09:30:00Z", "read the gate's log"),
     WakeScheduled("beta", "s2", "2026-10-26T10:00:00Z", "read it again"),
     MessageSent("s2", BETA, BETA, NOTE, "read it again"),
+    WakeScheduled("beta", "s3", "2026-10-26T10:30:00Z", "compact wake"),
+    WakeWithdrawn("beta", "s3"),
     TaskNoted("beta", "n1", "b8k2", "completed", "Your background task b8k2 ended."),
     LineCostMarked("beta", "session-b", 1_250_000),
     LineRebound("alpha", "claude-haiku-5-5", "subscription"),

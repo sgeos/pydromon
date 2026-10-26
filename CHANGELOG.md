@@ -85,6 +85,20 @@ All notable changes are recorded here. The format follows
   unanswered count leaves out replies to hold questions, and `list_mail` entries carry
   `repeat_of` and a fired wake's due and delivery times.
 
+- Round 7 of the session-line experience. The engine's report of a compaction that
+  `compact_session` asked for withdraws the wake that call scheduled, through the new
+  `wake_withdrawn` event, and holds it back while the compacting turn runs, so it no
+  longer starts a turn for nothing. After a restart the wake still fires, as its note
+  says. A `self_started` or `interrupted` entry says whether the engine reported a
+  cost and tokens of zero or reported nothing. The context note names the compaction
+  as the estimate's source until a turn's end replaces it. On Codex, the first engine
+  call after a compaction whose size was not reported gives
+  `last_compaction.after_estimate_tokens`, an upper bound that includes the turn's
+  prompt, which feeds the estimate and the `auto_compact_tokens` hold at once.
+  From its review, a withdrawn wake's identifier cannot be taken again, a withdrawal
+  that fails no longer loses the compaction's record, and the wake is held from the
+  turn's dispatch rather than from its start.
+
 - The round 6 review. Automatic compaction is held after a compaction whose size
   after is unknown or still past the threshold, until a lower context is reported,
   which `line_status` shows as `auto_compact_held`. A compaction request belongs to

@@ -560,6 +560,22 @@ class WakeScheduled:
         check_text("note", self.note, MAX_WAKE_NOTE_BYTES)
 
 
+@dataclass(frozen=True, slots=True)
+class WakeWithdrawn:
+    """The daemon withdrew a line's pending scheduled wake before it fell due, so it
+    never fires. Its ``message_id`` is kept, and no later message, task note or
+    scheduled wake may take it. Only the daemon records it, when the wake
+    ``compact_session`` scheduled has lost its purpose because an earlier turn
+    already made the compaction it was for."""
+
+    line_id: str
+    message_id: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_id("message_id", self.message_id)
+
+
 MAX_TASK_STATUS_BYTES: Final = 32
 MAX_TASK_NOTE_BYTES: Final = 8192
 """The largest task-end note, which fits a quoted command and the head of the task's
@@ -628,6 +644,7 @@ type Event = (
     | WakeRequested
     | WakeIssued
     | WakeScheduled
+    | WakeWithdrawn
     | TaskNoted
     | LineCostMarked
     | QuestionWithdrawn
@@ -727,6 +744,11 @@ class State:
     """Every question Dromon asked on a line's behalf when it held the line, so an
     operator's reply to one is not counted as mail the line must answer."""
 
+    withdrawn_wakes: set[str] = field(default_factory=set[str])
+    """The identifier of every withdrawn scheduled wake, which no later message,
+    task note or scheduled wake may take, so a reply reference to it cannot reach
+    another message. **Round 7 review, F1.**"""
+
     def copy(self) -> "State":
         """Return an independent snapshot. The records are frozen, so maps suffice."""
         return State(
@@ -739,6 +761,7 @@ class State:
             dict(self.scheduled),
             dict(self.fired_dues),
             set(self.hold_questions),
+            set(self.withdrawn_wakes),
         )
 
     def open_questions(self, operator_id: str) -> list[str]:
@@ -820,6 +843,14 @@ class State:
                 self._check_wake_issued(event)
             case WakeScheduled():
                 self._check_wake_scheduled(event)
+            case WakeWithdrawn():
+                self._line(event.line_id)
+                pending = self.scheduled.get(event.line_id)
+                if pending is None or pending.message_id != event.message_id:
+                    raise EventRejected(
+                        f"line {event.line_id} has no pending scheduled wake"
+                        f" {event.message_id}"
+                    )
             case TaskNoted():
                 self._check_task_noted(event)
             case LineCostMarked():
@@ -903,6 +934,9 @@ class State:
                 self.scheduled[event.line_id] = ScheduledWake(
                     event.message_id, event.due, event.note
                 )
+            case WakeWithdrawn():
+                del self.scheduled[event.line_id]
+                self.withdrawn_wakes.add(event.message_id)
             case LineCostMarked():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(
@@ -999,6 +1033,7 @@ class State:
     def _check_message_sent(self, event: MessageSent) -> None:
         if event.message_id in self.messages:
             raise EventRejected(f"message {event.message_id} exists")
+        self._check_withdrawn(event.message_id)
         self._require_party(event.sender)
         self._require_party(event.recipient)
         firing = self._is_firing(event)
@@ -1052,10 +1087,17 @@ class State:
         if line.state is not LineState.IDLE:
             raise EventRejected(f"line {wake.line_id} is {line.state}, not idle")
 
+    def _check_withdrawn(self, message_id: str) -> None:
+        if message_id in self.withdrawn_wakes:
+            raise EventRejected(
+                f"message {message_id} was the identifier of a withdrawn wake"
+            )
+
     def _check_wake_scheduled(self, event: WakeScheduled) -> None:
         self._line(event.line_id)
         if event.message_id in self.messages:
             raise EventRejected(f"message {event.message_id} exists")
+        self._check_withdrawn(event.message_id)
         reserver = self._reserver(event.message_id)
         if reserver is not None and reserver != event.line_id:
             raise EventRejected(
@@ -1067,6 +1109,7 @@ class State:
         self._line(event.line_id)
         if event.message_id in self.messages:
             raise EventRejected(f"message {event.message_id} exists")
+        self._check_withdrawn(event.message_id)
         reserver = self._reserver(event.message_id)
         if reserver is not None:
             raise EventRejected(

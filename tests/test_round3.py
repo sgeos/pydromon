@@ -1132,6 +1132,9 @@ def test_a_compaction_shows_in_the_status_within_its_turn(world: World) -> None:
         "cause": "engine",
         "before_tokens": 30_074,
         "after_tokens": 3_655,
+        "after_estimate_tokens": None,
+        "after_estimate_note": None,
+        "withdrawn_wake": None,
         "at": "2026-10-26T09:00:05Z",
     }
     after = world.status()["context"]
