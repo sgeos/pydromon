@@ -601,6 +601,10 @@ def test_a_terminal_that_ends_between_turns_is_noted_once(tmp_path: Path) -> Non
         assert ends == []
         clock.now += 1
         await engine._poll_terminals(kept)  # pyright: ignore[reportPrivateUsage]
+        # The end waits one interval for the engine's completion report.
+        assert ends == []
+        clock.now += 15
+        await engine._poll_terminals(kept)  # pyright: ignore[reportPrivateUsage]
         assert ends == [BackgroundEnd("p1", "sleep 120", "ended")]
         # Nothing is listed now, so nothing more is polled or noted.
         clock.now += 60
@@ -656,10 +660,15 @@ def test_an_end_found_after_a_turn_is_noted(tmp_path: Path) -> None:
     world.terminals = [{"itemId": "i1", "processId": "p1", "osPid": 41}]
     engine = world.line(tmp_path, ends=ends)
 
+    clock = Clock()
+    engine = world.line(tmp_path, ends=ends, clock=clock)
+
     async def go() -> None:
         await engine.run_turn("first")
         world.terminals = []
         await engine.run_turn("second")
+        clock.now += 15
+        await engine._poll_terminals(kept_of(engine))  # pyright: ignore[reportPrivateUsage]
         await engine.close()
 
     asyncio.run(go())
@@ -694,3 +703,148 @@ def test_numbers_and_text_name_the_same_identifier() -> None:
     assert identifier(59780) == identifier("59780") == "59780"
     assert identifier(True) is None and identifier("") is None
     assert identifier("x" * 129) is None and identifier(None) is None
+
+
+# Round 5. E, a terminal's end gives the exit code and output the engine reported.
+
+
+def completed_command(
+    item_id: str, process_id: object, code: int, output: str
+) -> dict[str, Any]:
+    return {
+        "method": "item/completed",
+        "params": {
+            "item": {
+                "type": "commandExecution",
+                "id": item_id,
+                "processId": process_id,
+                "exitCode": code,
+                "aggregatedOutput": output,
+            }
+        },
+    }
+
+
+def test_a_completion_between_turns_gives_the_end_its_code_and_output(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    ends: list[BackgroundEnd] = []
+    world = World([[started_command("i1", "p1", "sleep 45"), done()]])
+    world.terminals = [{"itemId": "i1", "processId": "p1", "osPid": 41}]
+    engine = world.line(tmp_path, clock=clock, ends=ends)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        server = world.servers[0]
+        server.out.put_nowait(completed_command("i1", "p1", 0, "slept\n"))
+        # A completion for a command no turn of this line ran is not taken.
+        server.out.put_nowait(completed_command("x9", "p9", 1, "other\n"))
+        await settle()
+        world.terminals = []
+        clock.now += 15
+        await engine._poll_terminals(kept_of(engine))  # pyright: ignore[reportPrivateUsage]
+        await engine.close()
+
+    asyncio.run(go())
+    assert ends == [BackgroundEnd("p1", "sleep 45", "completed", 0, output="slept\n")]
+
+
+def test_a_completion_reported_in_the_turn_is_kept_for_a_later_end(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    ends: list[BackgroundEnd] = []
+    world = World(
+        [
+            [
+                started_command("i1", 7, "make"),
+                completed_command("i1", 7, 2, "failed\n"),
+                done(),
+            ]
+        ]
+    )
+    world.terminals = [{"itemId": "i1", "processId": 7, "osPid": 41}]
+    engine = world.line(tmp_path, clock=clock, ends=ends)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        world.terminals = []
+        clock.now += 15
+        await engine._poll_terminals(kept_of(engine))  # pyright: ignore[reportPrivateUsage]
+        await engine.close()
+
+    asyncio.run(go())
+    assert ends == [BackgroundEnd("7", "make", "completed", 2, output="failed\n")]
+
+
+# Review of round 5. F3 and F4, the own identifiers.
+
+
+def test_a_completion_for_a_foreign_command_in_a_turn_is_not_taken(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    ends: list[BackgroundEnd] = []
+    world = World(
+        [
+            [
+                started_command("i1", "p1", "make"),
+                completed_command("x9", "p1", 7, "forged\n"),
+                done(),
+            ]
+        ]
+    )
+    world.terminals = [{"itemId": "i1", "processId": "p1", "osPid": 41}]
+    engine = world.line(tmp_path, clock=clock, ends=ends)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        world.terminals = []
+        clock.now += 15
+        await engine._poll_terminals(kept_of(engine))  # pyright: ignore[reportPrivateUsage]
+        clock.now += 15
+        await engine._poll_terminals(kept_of(engine))  # pyright: ignore[reportPrivateUsage]
+        await engine.close()
+
+    asyncio.run(go())
+    # x9 was never the line's, so its completion does not name p1's end. The
+    # completion's own process identifier is not taken either.
+    assert ends == [BackgroundEnd("p1", "make", "ended")]
+
+
+def test_eviction_at_the_cap_keeps_what_is_still_needed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dromon import codex as codex_module
+
+    monkeypatch.setattr(codex_module, "MAX_OWN_COMMANDS", 3)
+    world = World([[done()]])
+    engine = world.line(tmp_path)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        kept = kept_of(engine)
+        engine._in_turn = True  # pyright: ignore[reportPrivateUsage]
+        remember = engine._remember_command  # pyright: ignore[reportPrivateUsage]
+        remember({"type": "commandExecution", "id": "a", "command": "one"})
+        remember(
+            {
+                "type": "commandExecution",
+                "id": "a",
+                "exitCode": 0,
+                "aggregatedOutput": "x",
+            },
+            completed=True,
+        )
+        kept.waiting["a"] = ("one", 0.0)
+        remember({"type": "commandExecution", "id": "b", "command": "two"})
+        remember({"type": "commandExecution", "id": "c", "command": "three"})
+        remember({"type": "commandExecution", "id": "d", "command": "four"})
+        # "b", the oldest not waiting, made room. "a" keeps its completion.
+        assert list(kept.own) == ["a", "c", "d"]
+        assert kept.finished["a"] == (0, "x") and "b" not in kept.commands
+        engine._in_turn = False  # pyright: ignore[reportPrivateUsage]
+        await engine.close()
+
+    asyncio.run(go())

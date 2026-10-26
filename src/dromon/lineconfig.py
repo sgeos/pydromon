@@ -75,6 +75,14 @@ MAX_INSTRUCTION_FILES: Final = 16
 
 MAX_PLUGINS: Final = 16
 
+DEFAULT_CONTEXT_WARN_TOKENS: Final = 150_000
+"""The context size past which a line's prompt warns. Each engine call re-reads the
+whole context, so past this a turn of a few calls re-reads a million tokens, which
+the round 4 worker line observed as most of its cost, and it leaves room before an
+engine's automatic compaction near a 200,000 token window."""
+MIN_CONTEXT_WARN_TOKENS: Final = 1_000
+MAX_CONTEXT_WARN_TOKENS: Final = 10_000_000
+
 DEFAULT_KEEP_IDLE_SECONDS: Final = 1800
 DEFAULT_KEEP_MAX_SECONDS: Final = 14400
 MIN_KEEP_SECONDS: Final = 60
@@ -209,6 +217,11 @@ class LineConfig:
     keep_session_max_seconds: int = DEFAULT_KEEP_MAX_SECONDS
     """How long after the last turn a kept connection may stay open while the engine
     reports background tasks still running."""
+    context_warn_tokens: int = DEFAULT_CONTEXT_WARN_TOKENS
+    """The context size past which the line's prompt warns."""
+    allow_compact: bool = False
+    """Whether a Claude Code line has ``compact_session``, to compact its own
+    session."""
 
     def allows(self, tool_name: str, own_tools: frozenset[str]) -> bool:
         """Whether the policy allows ``tool_name``. Dromon's own tools always pass."""
@@ -267,6 +280,10 @@ def encode_config(config: LineConfig) -> str:
         document["keep_session_idle_seconds"] = config.keep_session_idle_seconds
     if config.keep_session_max_seconds != DEFAULT_KEEP_MAX_SECONDS:
         document["keep_session_max_seconds"] = config.keep_session_max_seconds
+    if config.context_warn_tokens != DEFAULT_CONTEXT_WARN_TOKENS:
+        document["context_warn_tokens"] = config.context_warn_tokens
+    if config.allow_compact:
+        document["allow_compact"] = True
     return json.dumps(
         document,
         ensure_ascii=False,
@@ -422,6 +439,8 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         "keep_session",
         "keep_session_idle_seconds",
         "keep_session_max_seconds",
+        "context_warn_tokens",
+        "allow_compact",
     }
     unknown = set(document) - allowed
     if unknown:
@@ -491,6 +510,18 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         _fail(
             "keep_session_max_seconds must not be less than keep_session_idle_seconds"
         )
+    warn = document.get("context_warn_tokens", DEFAULT_CONTEXT_WARN_TOKENS)
+    if (
+        type(warn) is not int
+        or not MIN_CONTEXT_WARN_TOKENS <= warn <= MAX_CONTEXT_WARN_TOKENS
+    ):
+        _fail(
+            f"context_warn_tokens must be a whole number from {MIN_CONTEXT_WARN_TOKENS}"
+            f" to {MAX_CONTEXT_WARN_TOKENS}"
+        )
+    compact = document.get("allow_compact", False)
+    if type(compact) is not bool:
+        _fail("allow_compact must be a boolean")
     return LineConfig(
         builtin_tools=tuple(sorted(set(builtin))),
         mcp_servers=parse_servers(document.get("mcp_servers", {})),
@@ -508,6 +539,8 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         keep_session=keep,
         keep_session_idle_seconds=idle,
         keep_session_max_seconds=ceiling,
+        context_warn_tokens=warn,
+        allow_compact=compact,
     )
 
 

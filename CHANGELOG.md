@@ -85,6 +85,21 @@ All notable changes are recorded here. The format follows
   unanswered count leaves out replies to hold questions, and `list_mail` entries carry
   `repeat_of` and a fired wake's due and delivery times.
 
+- The round 5 review. A pending compaction is dropped on a configuration change and
+  checked again against `allow_compact` when consumed, and none is sent after a
+  refused init. A Codex completion counts only for the line's own item, in a turn
+  too, and the identifier cap forgets the oldest entries one at a time, keeping any
+  still needed.
+
+- Round 5 of the session-line experience. `line_status` estimates the line's context
+  from each engine call's usage and lists the calls of each recent turn, and the
+  prompt warns past `context_warn_tokens`. A Claude Code line with `allow_compact` has
+  `compact_session`, which begins its next turn with `/compact` and reports the
+  context before and after. Task-end notes state the output's state plainly and give
+  when the end was detected and delivered, and `line_status` keeps the last one's
+  lateness. A Codex terminal's end carries the exit code and output of its completed
+  command.
+
 - The round 4 review. A Claude Code turn's cost and tokens come from the engine's
   own per-turn usage where its result carries it, kept through a session wrapper
   that reuses the SDK's parser, with the difference of running totals as the

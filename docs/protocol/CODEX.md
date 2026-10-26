@@ -267,6 +267,19 @@ turn. `dromon probe --model gpt-6-luna` reported the subscription credential.
     turn, by `list_background`, and between turns by polling. Identifiers are matched
     as text whether the engine sends text or a whole number. Commands are named from
     the line's own command execution items when a listing gives none.
+  - **Exit code and output.** **Decided by the operator on 2026-10-26** in round 5. When
+    the engine reports a `commandExecution` item completed, in a turn or between
+    turns, its `exitCode` and `aggregatedOutput` are kept for the line's own command,
+    by its process and item identifiers. A completion, in a turn or between turns,
+    counts only when its item identifier is already the line's, since a process
+    identifier names a process and not the item, and Dromon does not rely on the
+    engine scoping items to the thread. At the cap of 1,024 identifiers the oldest are
+    forgotten one at a time, with their commands and completions, but never one that
+    names a terminal still listed or an end still waiting to be noted. A terminal's end found by a listing
+    waits up to one polling interval for that report, and the note then gives the exit
+    code and the first lines of the output, quoted as data, or says that the engine
+    reported neither. **Inference, not run.** The field names are those the
+    app-server's items use for a finished command.
   - **Why the two views disagreed.** **Not established.** The luna line saw a task in
     the status that `list_background` did not list. In round 3 the status showed the
     listing taken at the end of the previous turn, while the tool listed afresh, so the

@@ -590,6 +590,9 @@ class BackgroundEnd:
     self_started: bool = False
     """Whether the end also made the engine begin a turn by itself, which Dromon
     interrupted, so one note can say both."""
+    output: str | None = None
+    """The task's output as the engine reported it inline, where it does, as Codex
+    does for a completed command execution."""
 
 
 SELF_START_GRACE_SECONDS: Final = 2.0
@@ -613,6 +616,123 @@ USAGE_KEYS: Final = (
 **Fact, read from the engine's own field description on 2026-10-26.** A result's
 ``usage`` covers the main agent loop only and is per turn, while its cost covers
 subagents and helper calls too, so the tokens explain most, not all, of the cost."""
+
+
+COMPACT_COMMAND: Final = "/compact"
+"""What asks the engine to compact its session, sent as a prompt. **Fact, read from
+the bundled Claude Code 2.1.310 on 2026-10-26.** ``compact`` is a built-in command
+that runs outside an interactive session, unless ``DISABLE_COMPACT`` is set, and the
+engine reports it with a ``compact_boundary`` system message whose
+``compact_metadata`` gives ``trigger``, ``manual`` for a typed command,
+``pre_tokens`` and, optionally, ``post_tokens``."""
+
+MAX_CALLS: Final = 50
+"""How many engine calls one turn's report lists."""
+
+CALL_KEYS: Final = (
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
+
+
+def record_call(
+    calls: dict[str, dict[str, int | bool]], message: AssistantMessage
+) -> dict[str, int | bool] | None:
+    """Note one engine call's token counts, once per message identifier.
+    **Fact, read from Agent SDK 0.2.174.** An assistant message carries the usage of
+    the engine call that produced it, and its message identifier."""
+    if message.message_id is None or message.usage is None:
+        return None
+    if message.message_id in calls:
+        return None
+    counts: dict[str, int | bool] = {
+        key: value
+        for key in CALL_KEYS
+        if type(value := message.usage.get(key)) is int and value >= 0
+    }
+    counts["subagent"] = message.parent_tool_use_id is not None
+    calls[message.message_id] = counts
+    while len(calls) > MAX_CALLS:
+        del calls[next(iter(calls))]
+    return counts
+
+
+def context_of(call: Mapping[str, int | bool] | None) -> int | None:
+    """The context the next call will re-read, from a main-loop call: what it read,
+    fresh and cached, and what it wrote."""
+    if call is None:
+        return None
+    total = sum(int(call[key]) for key in CALL_KEYS if key in call)
+    return total or None
+
+
+def compaction_of(metadata: object) -> dict[str, int | str | None]:
+    """A compaction's trigger, ``manual`` or ``auto``, and the context before and
+    after it, as its metadata reports them."""
+    found: dict[str, int | str | None] = {
+        "trigger": None,
+        "before_tokens": None,
+        "after_tokens": None,
+    }
+    if isinstance(metadata, dict):
+        fields_ = cast(dict[str, object], metadata)
+        trigger = fields_.get("trigger")
+        if trigger in ("manual", "auto"):
+            found["trigger"] = cast(str, trigger)
+        for key, name in (
+            ("pre_tokens", "before_tokens"),
+            ("post_tokens", "after_tokens"),
+        ):
+            value = fields_.get(key)
+            if type(value) is int and value >= 0:
+                found[name] = value
+    return found
+
+
+def compaction_note(compaction: Mapping[str, int | str | None]) -> str:
+    """The note a turn that began with a compaction opens with."""
+    before, after = compaction.get("before_tokens"), compaction.get("after_tokens")
+    if before is None and after is None:
+        return (
+            "Dromon note: your session's compaction was asked for at the start of this"
+            " turn, but the engine reported no compaction, so it may not have happened."
+        )
+    shown_before = "not reported" if before is None else f"{before} tokens"
+    shown_after = "not reported" if after is None else f"{after} tokens"
+    return (
+        "Dromon note: your session was compacted at your request at the start of this"
+        f" turn. Context before: {shown_before}. After: {shown_after}."
+    )
+
+
+def add_costs(first: float | None, second: float | None) -> float | None:
+    if first is None:
+        return second
+    return first if second is None else first + second
+
+
+def add_usage(
+    first: Mapping[str, int] | None, second: Mapping[str, int] | None
+) -> dict[str, int] | None:
+    if first is None:
+        return None if second is None else dict(second)
+    merged = dict(first)
+    for key, value in (second or {}).items():
+        merged[key] = merged.get(key, 0) + value
+    return merged
+
+
+async def _drain(
+    inbox: "asyncio.Queue[Message | None]",
+) -> AsyncIterator[Message | None]:
+    """A kept turn's messages, until the pump's end-of-stream marker."""
+    while True:
+        message = await inbox.get()
+        yield message
+        if message is None or isinstance(message, ResultMessage):
+            return
 
 
 PER_TURN_SOURCE: Final = "per_turn"
@@ -687,6 +807,11 @@ def end_details(message: Message) -> tuple[int | None, str | None]:
     found = EXIT_CODE.search(message.summary or "")
     output = message.output_file or None
     return (int(found.group(1)) if found else None), output
+
+
+def ignore_compaction(compaction: Mapping[str, int | str | None]) -> None:
+    """The default for an engine whose compactions nobody follows."""
+    del compaction
 
 
 def ignore_end(end: BackgroundEnd) -> None:
@@ -812,6 +937,15 @@ class TurnReport:
     cost_source: str | None = None
     """What the cost and usage were taken from, ``PER_TURN_SOURCE`` or
     ``DIFFERENCE_SOURCE``, or ``None`` when the engine reported no cost."""
+    calls: tuple[Mapping[str, int | bool], ...] = ()
+    """Each engine call's token counts, the latest ``MAX_CALLS``, with whether a
+    subagent made it. The engine reports cost per turn and model, not per call."""
+    context_tokens: int | None = None
+    """The context the next turn will re-read, estimated from the last main-loop
+    call, or ``None`` where the engine reports no per-call usage."""
+    compaction: Mapping[str, int | str | None] | None = None
+    """The trigger and the context before and after the turn's latest compaction,
+    as the engine reported them, or ``None`` when there was none."""
 
 
 def _strings(value: object) -> tuple[str, ...]:
@@ -850,6 +984,18 @@ class _Turn:
     require_init: bool = True
     """Whether the turn must see the engine's init before the model's output and
     before any tool call is admitted. Every Claude Code turn requires it."""
+    calls: dict[str, dict[str, int | bool]] = field(
+        default_factory=dict[str, dict[str, int | bool]]
+    )
+    """Each engine call's token counts, by message identifier, the latest
+    ``MAX_CALLS``. One response can arrive as several messages with one identifier
+    and the same usage, so each call is counted once."""
+    compaction_cost: float | None = None
+    compaction_usage: dict[str, int] | None = None
+    compaction: dict[str, int | str | None] | None = None
+    last_main_call: dict[str, int | bool] | None = None
+    """The latest main-loop call since the turn began or the session was last
+    compacted, from which the context is estimated."""
 
 
 type PermissionGate = Callable[
@@ -1138,6 +1284,9 @@ class ClaudeCodeLine:
         poll_seconds: float = KEEP_POLL_SECONDS,
         task_ended: Callable[[BackgroundEnd], object] = ignore_end,
         cost_mark: CostMark | None = None,
+        compacted: Callable[
+            [Mapping[str, int | str | None]], object
+        ] = ignore_compaction,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -1158,7 +1307,11 @@ class ClaudeCodeLine:
         """The process mark every process of this line inherits, if issued."""
         self._kept_factory = kept_factory
         self._task_ended = task_ended
+        self._compacted = compacted
+        """Called the moment the engine reports a compaction of the session."""
         self.cost_mark = cost_mark
+        self._compact = False
+        """Whether the next turn begins by compacting the session."""
         self._usage: dict[str, int] | None = None
         self._source: str | None = None
         """What the last measured turn's cost and usage came from."""
@@ -1275,6 +1428,14 @@ class ClaudeCodeLine:
         try:
             async with AsyncExitStack() as stack:
                 session = await self._enter(stack, self._session_factory, options)
+                if self._compact and self._compaction_allowed(turn):
+                    await session.query(COMPACT_COMMAND)
+                    note = await self._run_compaction(
+                        session, turn, aiter(session.receive_response())
+                    )
+                    prompt = f"{note}\n\n{prompt}"
+                if turn.refusal is not None:
+                    raise EngineRefused(turn.refusal)
                 await session.query(prompt)
                 async for message in session.receive_response():
                     if isinstance(message, ResultMessage):
@@ -1311,6 +1472,69 @@ class ClaudeCodeLine:
             "the engine's start timed out at initialize, so Dromon starts it once more",
         )
         return await stack.enter_async_context(factory(options))
+
+    def request_compaction(self) -> None:
+        """Compact the line's own session at the start of its next turn."""
+        self._compact = True
+
+    def _compaction_allowed(self, turn: _Turn) -> bool:
+        """Whether the turn may begin with its compaction: not when an init seen
+        before it was refused, in which case no ``/compact`` is sent and the request
+        is spent. The engine reports its init only with its reply to a prompt, so
+        normally the compaction's own reply carries it, and the init check then
+        refuses and interrupts the compaction as it would an ordinary prompt, which
+        is no weaker than a turn without one."""
+        if turn.refusal is None:
+            return True
+        self._compact = False
+        return False
+
+    async def _run_compaction(
+        self,
+        session: AgentSession | KeptSession,
+        turn: _Turn,
+        messages: AsyncIterator[Message | None],
+    ) -> str:
+        """Read the messages of a ``/compact`` sent at the start of the turn, through
+        the turn's own checks, and return the note the turn's prompt opens with."""
+        self._compact = False
+        result: ResultMessage | None = None
+        # Bounded by the engine's result for the command, or the end of its stream.
+        async for message in messages:
+            if message is None:
+                break
+            if isinstance(message, ResultMessage):
+                result = message
+                break
+            await self._handle(session, message, turn)
+        if result is not None:
+            turn.compaction_cost = self._measure(result)
+            turn.compaction_usage = self._usage
+        if turn.compaction is None:
+            turn.compaction = compaction_of(None)
+        return compaction_note(turn.compaction)
+
+    def _compaction_seen(self, turn: _Turn, metadata: object) -> None:
+        """Note a compaction, asked for or automatic, the moment the engine reports
+        it: the turn's estimate starts again from the compacted context, and the
+        scheduler hears of it at once, so a status read in the same turn shows it."""
+        turn.compaction = compaction_of(metadata)
+        turn.last_main_call = None
+        try:
+            self._compacted(dict(turn.compaction))
+        except Exception as error:  # noqa: BLE001
+            print(
+                f"dromond: a compaction could not be recorded: {error}", file=sys.stderr
+            )
+
+    def _context_after(self, turn: _Turn) -> int | None:
+        """The context the next turn will re-read: the last main-loop call since the
+        turn began or the session was compacted, or the size the compaction left."""
+        found = context_of(turn.last_main_call)
+        if found is not None or turn.compaction is None:
+            return found
+        after = turn.compaction.get("after_tokens")
+        return after if isinstance(after, int) else None
 
     def _measure(self, result: ResultMessage) -> float | None:
         """The turn's own cost from its result, moving the cost mark on. The
@@ -1349,10 +1573,13 @@ class ClaudeCodeLine:
             credential=turn.credential,
             session_id=result.session_id,
             capabilities=turn.capabilities,
-            cost_estimate_usd=cost,
+            cost_estimate_usd=add_costs(turn.compaction_cost, cost),
             cost_mark=self.cost_mark,
-            usage=self._usage,
+            usage=add_usage(turn.compaction_usage, self._usage),
             cost_source=self._source,
+            calls=tuple(dict(call) for call in turn.calls.values()),
+            context_tokens=self._context_after(turn),
+            compaction=turn.compaction,
         )
 
     async def _handle(
@@ -1361,6 +1588,10 @@ class ClaudeCodeLine:
         if isinstance(message, SystemMessage) and message.subtype == "init":
             turn.capabilities = _capabilities(message.data)
             await self._check_init(session, turn.capabilities, turn)
+        elif (
+            isinstance(message, SystemMessage) and message.subtype == "compact_boundary"
+        ):
+            self._compaction_seen(turn, message.data.get("compact_metadata"))
         elif isinstance(message, AssistantMessage):
             if turn.require_init and turn.capabilities is None:
                 if turn.refusal is None:
@@ -1370,6 +1601,9 @@ class ClaudeCodeLine:
                     )
                     await session.interrupt()
                 return
+            counts = record_call(turn.calls, message)
+            if counts is not None and not counts["subagent"]:
+                turn.last_main_call = counts
             for block in message.content:
                 if isinstance(block, TextBlock):
                     turn.text.append(block.text)
@@ -1796,6 +2030,17 @@ class ClaudeCodeLine:
         try:
             if reused:
                 await connection.session.set_permission_mode(connection.permission_mode)
+            if self._compact and self._compaction_allowed(turn):
+                await connection.session.query(COMPACT_COMMAND)
+                note = await self._run_compaction(
+                    connection.session, turn, _drain(inbox)
+                )
+                prompt = f"{note}\n\n{prompt}"
+                # The pump let go of the inbox at the compaction's result.
+                inbox = asyncio.Queue()
+                connection.inbox = inbox
+            if turn.refusal is not None:
+                raise EngineRefused(turn.refusal)
             await connection.session.query(prompt)
             # Bounded by the engine's result, which its max_turns caps, or by the
             # pump's end-of-stream marker.

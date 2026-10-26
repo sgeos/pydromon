@@ -237,3 +237,15 @@ something the engine produces rather than the harness.
   wake the line when a terminal ends, by polling. **Not observed live.**
 - **`dromon start` waits 60 seconds** by default, and takes `--wait`.
 - **An engine start that times out** at its initialize request is tried once more.
+
+## Round 5
+
+**Decided by the operator on 2026-10-26**, from the lines' round 4 reports.
+
+- **Context.** `line_status` estimates the context the next turn re-reads, from each
+  engine call's usage, and the prompt warns past `context_warn_tokens`.
+- **`compact_session`**, for Claude Code lines with `allow_compact`, begins the next
+  turn with `/compact` and says the context before and after.
+- **Per-call usage** in `recent_turns`, with the note that cost is per turn and model.
+- **Task-end notes** state the output's state plainly, give when the end was detected
+  and delivered, and, on Codex, carry the exit code and output of a completed command.
