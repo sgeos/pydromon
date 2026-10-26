@@ -1922,3 +1922,294 @@ def test_the_wrapper_reads_a_real_clients_messages_with_their_per_turn_usage() -
     asyncio.run(go())
     assert len(received) == 1 and isinstance(received[0], TurnResult)
     assert received[0].turn_model_usage == PER_TURN
+
+
+# Round 5. A and C, per-call usage and the context estimate.
+
+
+def call(
+    message_id: str, read: int, written: int = 10, parent: str | None = None
+) -> AssistantMessage:
+    return AssistantMessage(
+        content=[TextBlock("x")],
+        model=MODEL,
+        parent_tool_use_id=parent,
+        usage={
+            "input_tokens": 5,
+            "output_tokens": written,
+            "cache_read_input_tokens": read,
+            "cache_creation_input_tokens": 100,
+        },
+        message_id=message_id,
+    )
+
+
+def test_each_engine_call_is_counted_once_and_the_context_estimated(
+    tmp_path: Path,
+) -> None:
+    factory = Factory(
+        [
+            [
+                call("a", 1000),
+                call("a", 1000),
+                call("s", 50, parent="tu"),
+                call("b", 2000),
+                result(),
+            ]
+        ]
+    )
+    engine = line(factory, tmp_path)
+
+    async def go() -> None:
+        report = await engine.run_turn("one")
+        assert [c["cache_read_input_tokens"] for c in report.calls] == [1000, 50, 2000]
+        assert [c["subagent"] for c in report.calls] == [False, True, False]
+        # The last main-loop call: 5 fresh, 2000 cached, 100 cache written, 10 out.
+        assert report.context_tokens == 2115
+        await engine.close()
+
+    asyncio.run(go())
+
+
+def test_calls_are_bounded_and_a_turn_without_them_estimates_nothing() -> None:
+    from dromon.engine import MAX_CALLS, context_of, record_call
+
+    calls: dict[str, dict[str, int | bool]] = {}
+    for index in range(MAX_CALLS + 5):
+        record_call(calls, call(f"m{index}", index))
+    assert len(calls) == MAX_CALLS and next(iter(calls)) == "m5"
+    record_call(calls, AssistantMessage(content=[], model=MODEL))
+    assert len(calls) == MAX_CALLS
+    assert context_of(None) is None
+    assert context_of({"subagent": False}) is None
+    assert context_of({"input_tokens": 9, "subagent": False}) == 9
+
+
+# B, compaction at the start of a turn.
+
+
+def boundary(before: object, after: object = None) -> SystemMessage:
+    metadata: dict[str, object] = {"trigger": "manual", "pre_tokens": before}
+    if after is not None:
+        metadata["post_tokens"] = after
+    return SystemMessage(
+        subtype="compact_boundary", data={"compact_metadata": metadata}
+    )
+
+
+def test_a_kept_turn_compacts_first_and_says_before_and_after(tmp_path: Path) -> None:
+    from dromon.engine import COMPACT_COMMAND
+
+    factory = Factory([[boundary(180_000, 20_000), costed(0.5)], [costed(0.75)]])
+    engine = line(factory, tmp_path)
+
+    async def go() -> None:
+        engine.request_compaction()
+        report = await engine.run_turn("work")
+        assert report.compaction == {
+            "trigger": "manual",
+            "before_tokens": 180_000,
+            "after_tokens": 20_000,
+        }
+        # Both the compaction's and the prompt's costs count.
+        assert report.cost_estimate_usd == pytest.approx(0.75)
+        await engine.close()
+
+    asyncio.run(go())
+    prompts = factory.connections[0].prompts
+    assert prompts[0] == COMPACT_COMMAND
+    assert prompts[1].startswith(
+        "Dromon note: your session was compacted at your request at the start of this"
+        " turn. Context before: 180000 tokens. After: 20000 tokens."
+    )
+    assert prompts[1].endswith("work")
+
+
+def test_a_compaction_the_engine_does_not_report_is_said_plainly(
+    tmp_path: Path,
+) -> None:
+    sent: list[str] = []
+
+    class Compacting(OneTurn):
+        async def query(self, prompt: str) -> None:
+            sent.append(prompt)
+
+        async def receive_response(self) -> AsyncIterator[Message]:
+            if len(sent) == 1:
+                yield init()
+            yield session_result("s", 0.1 * len(sent))
+
+    @asynccontextmanager
+    async def factory(options: ClaudeAgentOptions) -> AsyncGenerator[AgentSession]:
+        del options
+        yield Compacting("s", 0.0)
+
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        environment={},
+        session_factory=factory,
+    )
+    engine.request_compaction()
+    report = asyncio.run(engine.run_turn("work"))
+    assert sent[0] == "/compact"
+    assert "the engine reported no compaction, so it may not have happened" in sent[1]
+    assert report.compaction == {
+        "trigger": None,
+        "before_tokens": None,
+        "after_tokens": None,
+    }
+    # The request is spent.
+    asyncio.run(engine.run_turn("again"))
+    assert sent[2] == "again"
+
+
+def test_a_refused_compaction_sends_no_prompt(tmp_path: Path) -> None:
+    factory = Factory([[boundary(10), result()], [result()]])
+    factory.init_message = init(tools=["Bash"])
+    engine = line(factory, tmp_path)
+
+    async def go() -> None:
+        engine.request_compaction()
+        with pytest.raises(EngineRefused, match="tools the line was not given"):
+            await engine.run_turn("work")
+
+    asyncio.run(go())
+    assert factory.connections[0].prompts == ["/compact"]
+
+
+def test_compaction_metadata_is_read_defensively() -> None:
+    from dromon.engine import compaction_note, compaction_of
+
+    assert compaction_of({"pre_tokens": 5, "post_tokens": -1, "trigger": "x"}) == {
+        "trigger": None,
+        "before_tokens": 5,
+        "after_tokens": None,
+    }
+    assert compaction_of("nonsense") == {
+        "trigger": None,
+        "before_tokens": None,
+        "after_tokens": None,
+    }
+    assert "After: not reported." in compaction_note({"before_tokens": 5})
+
+
+# Round 5 live fixes: a compaction is recorded when it happens, and the context
+# estimate follows it.
+
+
+def auto_boundary(before: int, after: int) -> SystemMessage:
+    return SystemMessage(
+        subtype="compact_boundary",
+        data={
+            "compact_metadata": {
+                "trigger": "auto",
+                "pre_tokens": before,
+                "post_tokens": after,
+            }
+        },
+    )
+
+
+def test_a_compaction_is_reported_before_the_prompt_is_sent(tmp_path: Path) -> None:
+    factory = Factory([[boundary(30_074, 3_655), result()], [result()]])
+    seen: list[tuple[dict[str, object], list[str]]] = []
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        config=KEPT,
+        environment={},
+        kept_factory=factory,
+        compacted=lambda info: seen.append(
+            (dict(info), list(factory.connections[0].prompts))
+        ),
+    )
+
+    async def go() -> None:
+        engine.request_compaction()
+        report = await engine.run_turn("work")
+        # No call followed the compaction, so the estimate is what it left.
+        assert report.context_tokens == 3_655
+        await engine.close()
+
+    asyncio.run(go())
+    assert seen == [
+        (
+            {"trigger": "manual", "before_tokens": 30_074, "after_tokens": 3_655},
+            ["/compact"],
+        )
+    ]
+
+
+def test_the_estimate_counts_only_calls_after_a_compaction(tmp_path: Path) -> None:
+    seen: list[dict[str, object]] = []
+    factory = Factory(
+        [
+            [
+                call("before", 29_000),
+                auto_boundary(29_891, 4_000),
+                call("after", 4_100),
+                result(),
+            ]
+        ]
+    )
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        config=KEPT,
+        environment={},
+        kept_factory=factory,
+        compacted=lambda info: seen.append(dict(info)),
+    )
+
+    async def go() -> None:
+        report = await engine.run_turn("work")
+        # 5 fresh, 4100 cached, 100 cache written, 10 written by the call after.
+        assert report.context_tokens == 4_215
+        assert report.compaction is not None and report.compaction["trigger"] == "auto"
+        await engine.close()
+
+    asyncio.run(go())
+    assert seen == [{"trigger": "auto", "before_tokens": 29_891, "after_tokens": 4_000}]
+
+
+def test_a_failing_compaction_record_does_not_end_the_turn(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    factory = Factory([[auto_boundary(10, 5), result()]])
+
+    def broken(info: object) -> None:
+        del info
+        raise RuntimeError("no record")
+
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        config=KEPT,
+        environment={},
+        kept_factory=factory,
+        compacted=broken,
+    )
+
+    async def go() -> None:
+        await engine.run_turn("work")
+        await engine.close()
+
+    asyncio.run(go())
+    assert "a compaction could not be recorded: no record" in capsys.readouterr().err
+
+
+# Review of round 5. F2, no compaction after a refused init.
+
+
+def test_no_compaction_is_sent_once_the_init_was_refused(tmp_path: Path) -> None:
+    from dromon.engine import _Turn  # pyright: ignore[reportPrivateUsage]
+
+    engine = line(Factory([]), tmp_path)
+    engine.request_compaction()
+    refused = _Turn()
+    refused.refusal = "the engine offers tools the line was not given: Bash"
+    assert not engine._compaction_allowed(refused)  # pyright: ignore[reportPrivateUsage]
+    assert engine._compact is False  # pyright: ignore[reportPrivateUsage]
+    engine.request_compaction()
+    assert engine._compaction_allowed(_Turn())  # pyright: ignore[reportPrivateUsage]

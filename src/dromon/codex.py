@@ -200,6 +200,8 @@ def unsupported(config: LineConfig) -> str | None:
         return "Codex lines do not load Claude Code's project settings"
     if config.plugins:
         return "Codex lines do not load Claude Code plugins"
+    if config.allow_compact:
+        return "Codex lines cannot compact their session through Dromon"
     if config.sandbox is not None or config.settings is not None:
         return (
             "Codex lines run under Dromon's Codex permission profile, and take no"
@@ -586,6 +588,18 @@ class _Kept:
     diagnosis."""
     stopped: set[str] = field(default_factory=set[str])
     """Terminals the line stopped with ``stop_background``, whose end needs no note."""
+    finished: dict[str, tuple[int | None, str | None]] = field(
+        default_factory=dict[str, tuple[int | None, str | None]]
+    )
+    """The exit code and output of each of the line's commands the engine reported
+    completed, by process and item identifier, bounded with ``own``."""
+    item_of: dict[str, str] = field(default_factory=dict[str, str])
+    """Each listed terminal's item identifier, by process identifier."""
+    waiting: dict[str, tuple[str, float]] = field(
+        default_factory=dict[str, tuple[str, float]]
+    )
+    """Ends found by a listing that wait for the engine's completion report, with
+    their command and when they were found."""
     poll_failures: int = 0
     """Consecutive failed listings between turns. Polling stops after
     ``MAX_POLL_FAILURES`` until the next turn ends."""
@@ -593,9 +607,9 @@ class _Kept:
     """The command each of the line's own command executions ran, by its process
     and item identifiers, so a terminal is named even when a listing gives no
     command."""
-    own: set[str] = field(default_factory=set[str])
+    own: dict[str, None] = field(default_factory=dict[str, None])
     """The process and item identifiers of the commands the line's own turns ran on
-    this connection, from the items the engine reported, bounded by
+    this connection, from the items the engine reported, oldest first, bounded by
     ``MAX_OWN_COMMANDS``. A listed terminal is the line's only if it matches one, so
     the line never depends on the engine's scoping by thread."""
 
@@ -789,7 +803,10 @@ class CodexLine:
 
     async def _notice(self, method: str, params: dict[str, Any], turn: _Turn) -> None:
         if method in ("item/started", "item/completed"):
-            self._remember_command(cast(dict[str, Any], params.get("item") or {}))
+            self._remember_command(
+                cast(dict[str, Any], params.get("item") or {}),
+                completed=method == "item/completed",
+            )
         if method == "item/started":
             await self._item_started(
                 cast(dict[str, Any], params.get("item") or {}), turn
@@ -1129,6 +1146,12 @@ class CodexLine:
             )
             await kept.routed.send(answer)
             return
+        if method == "item/completed":
+            params = cast(dict[str, Any], message.get("params") or {})
+            self._remember_command(
+                cast(dict[str, Any], params.get("item") or {}), completed=True
+            )
+            return
         if method == "turn/started":
             started = cast(dict[str, Any], message.get("params") or {})
             turn_id = cast(dict[str, Any], started.get("turn") or {}).get("id")
@@ -1167,6 +1190,8 @@ class CodexLine:
         """Between turns, list the line's own terminals again when one was listed
         and the last listing is ``TERMINAL_POLL_SECONDS`` old, so that an end wakes
         the line. Bounded by that interval and by ``MAX_POLL_FAILURES``."""
+        if kept.waiting and not self._in_turn:
+            self._post_ends(kept)
         if (
             self._in_turn
             or not kept.terminals
@@ -1213,22 +1238,60 @@ class CodexLine:
         result: object = message.get("result")
         return cast(dict[str, Any], result) if isinstance(result, dict) else {}
 
-    def _remember_command(self, item: dict[str, Any]) -> None:
+    def _remember_command(
+        self, item: dict[str, Any], *, completed: bool = False
+    ) -> None:
         """Note a command the line's own turn ran as the line's, by its process and
-        item identifiers, on a kept connection."""
+        item identifiers, on a kept connection, and, when the engine reports it
+        completed, its exit code and output. A completion, in a turn or between
+        turns, is the engine's report of an item the line's turn started, so it is
+        noted only when its item identifier is already the line's, which also makes
+        a process identifier first seen on the completion the line's. A process
+        identifier alone does not suffice, since it names a process, not the item.
+        Dromon does not rely on the engine scoping items to the thread."""
         kept = self._kept
         if kept is None or item.get("type") != "commandExecution":
             return
         command = item.get("command")
-        for key in ("processId", "id"):
-            value = identifier(item.get(key))
-            if value is not None:
-                if len(kept.own) >= MAX_OWN_COMMANDS:
-                    kept.own.clear()
-                    kept.commands.clear()
-                kept.own.add(value)
-                if isinstance(command, str) and command:
-                    kept.commands[value] = command[:200]
+        names = [
+            name
+            for name in (identifier(item.get("processId")), identifier(item.get("id")))
+            if name is not None
+        ]
+        item_id = identifier(item.get("id"))
+        if completed and (item_id is None or item_id not in kept.own):
+            return
+        for value in names:
+            if value not in kept.own:
+                self._evict(kept)
+            kept.own[value] = None
+            if isinstance(command, str) and command:
+                kept.commands[value] = command[:200]
+            if completed:
+                code = item.get("exitCode")
+                output = item.get("aggregatedOutput")
+                kept.finished[value] = (
+                    code if type(code) is int else None,
+                    output if isinstance(output, str) else None,
+                )
+
+    def _evict(self, kept: _Kept) -> None:
+        """Make room for one identifier at ``MAX_OWN_COMMANDS`` by forgetting the
+        oldest ones, with their commands and completions, but never one that names a
+        terminal still listed or an end still waiting to be noted. Bounded by one
+        pass over the identifiers."""
+        if len(kept.own) < MAX_OWN_COMMANDS:
+            return
+        keep = set(kept.waiting) | {str(t["process_id"]) for t in kept.terminals}
+        keep |= {kept.item_of[name] for name in keep if name in kept.item_of}
+        for name in list(kept.own):
+            if len(kept.own) < MAX_OWN_COMMANDS:
+                return
+            if name in keep:
+                continue
+            del kept.own[name]
+            kept.commands.pop(name, None)
+            kept.finished.pop(name, None)
 
     async def list_background(self) -> list[dict[str, object]]:
         """The background terminals of the line's own thread. Raises
@@ -1255,9 +1318,13 @@ class CodexLine:
                 ),
                 self._own_command(fields),
             )
+            item_id = identifier(fields.get("itemId"))
+            process = identifier(fields.get("processId")) or ""
+            if item_id is not None and self._kept is not None:
+                self._kept.item_of[process] = item_id
             terminals.append(
                 {
-                    "process_id": identifier(fields.get("processId")) or "",
+                    "process_id": process,
                     "os_pid": fields.get("osPid")
                     if isinstance(fields.get("osPid"), int)
                     else None,
@@ -1273,8 +1340,9 @@ class CodexLine:
         return terminals
 
     def _note_ends(self, kept: _Kept, terminals: list[dict[str, object]]) -> None:
-        """Report, between turns, each of the line's terminals that the last listing
-        held and this one does not, unless the line stopped it itself."""
+        """Find, between turns, each of the line's terminals that the last listing
+        held and this one does not, unless the line stopped it itself, and wait for
+        its completion report, up to one polling interval, before noting it."""
         now = {str(t["process_id"]) for t in terminals}
         for gone in kept.terminals:
             process_id = str(gone["process_id"])
@@ -1285,9 +1353,29 @@ class CodexLine:
                 continue
             if self._in_turn:
                 continue
+            kept.waiting[process_id] = (str(gone.get("command") or ""), self._clock())
+        self._post_ends(kept)
+
+    def _post_ends(self, kept: _Kept) -> None:
+        """Note each waiting end whose completion the engine reported, or that has
+        waited ``TERMINAL_POLL_SECONDS``, with what is known of it."""
+        for process_id, (command, found_at) in list(kept.waiting.items()):
+            finished = kept.finished.get(process_id) or kept.finished.get(
+                kept.item_of.get(process_id, "")
+            )
+            if finished is None and self._clock() - found_at < TERMINAL_POLL_SECONDS:
+                continue
+            del kept.waiting[process_id]
+            code, output = finished or (None, None)
             try:
                 self._task_ended(
-                    BackgroundEnd(process_id, str(gone.get("command") or ""), "ended")
+                    BackgroundEnd(
+                        process_id,
+                        command,
+                        "completed" if code is not None else "ended",
+                        exit_code=code,
+                        output=output,
+                    )
                 )
             except Exception as error:  # noqa: BLE001
                 print(

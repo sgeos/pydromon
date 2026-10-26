@@ -136,6 +136,8 @@ def unsupported(config: LineConfig) -> str | None:
         return "Grok lines do not load Claude Code's project settings"
     if config.plugins:
         return "Grok lines do not load Claude Code plugins"
+    if config.allow_compact:
+        return "Grok lines cannot compact their session through Dromon"
     if config.keep_session:
         return "Grok lines do not yet keep their engine session between turns"
     if config.sandbox is not None or config.settings is not None:

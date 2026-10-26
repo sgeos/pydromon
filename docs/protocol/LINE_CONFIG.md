@@ -47,6 +47,8 @@ keys, duplicate keys and numbers are refused.
 | `workdir` | The directory the line's engine runs in, as the working directory section below specifies. Omitted when unset | the project root |
 | `keep_session` | Keep a Claude Code or Codex line's engine connected between turns, as the kept sessions section below specifies. Refused on Grok lines. Omitted when false | `false` |
 | `keep_session_idle_seconds` | Seconds a kept connection waits for the next turn before it closes, a whole number from 60 to 86,400. Omitted at its default | `1800` |
+| `context_warn_tokens` | The estimated context, in tokens, past which the line's prompt warns, a whole number from 1,000 to 10,000,000, as the context section below specifies. Omitted at its default | `150000` |
+| `allow_compact` | Give a Claude Code line `compact_session`, to compact its own session. Refused on Codex and Grok lines. Omitted when false | `false` |
 | `keep_session_max_seconds` | Seconds after the last turn a kept connection may stay open while the engine reports background tasks running, a whole number from 60 to 86,400 and not less than `keep_session_idle_seconds`. Omitted at its default | `14400` |
 
 A server name is an identifier and may not be `dromon`, which Dromon's own tools use. A
@@ -310,6 +312,53 @@ to read the result.
 listed term, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, and record nothing.
 A wake note is checked again when it fires.
 
+## Context and compaction
+
+**Decided by the operator on 2026-10-26** in round 5, from the worker line's round 4
+report, which found that about 2,000,000 cached tokens re-read in one turn set its cost.
+
+- **Per-call usage.** **Fact, read from Agent SDK 0.2.174.** Each assistant message
+  carries its engine call's `usage` and the call's message identifier. One response
+  can arrive as several messages with one identifier, so each call is counted once.
+  Each of `recent_turns` lists its `calls`, the latest 50, each with its fresh, cached
+  and written input tokens and output tokens and whether a subagent made it, and a
+  `calls_note` saying that the engine reports cost per turn and model only, not per
+  call, or that the engine reports no per-call usage, as Codex does.
+- **The context estimate.** `line_status` gives `context`, with `estimated_tokens`, the
+  last main-loop call's fresh, cached and cache-written input and its output, which the
+  next call re-reads, `warn_at`, whether the line has `compact_session`, whether a
+  compaction is pending, and the `last_compaction`, with its `trigger`, `manual` or
+  `auto`, its `before_tokens` and `after_tokens`, and the time `at` which Dromon
+  recorded it. All are kept in memory. **Fixed after the live probe of 2026-10-26.** A
+  compaction, asked for or automatic, is recorded the moment the engine reports it,
+  so a status read later in the same turn shows it, and the estimate then becomes the
+  size it left, or unknown when the engine did not report that size. At the turn's end
+  the estimate comes from the last main-loop call after the compaction, or the size it
+  left when no call followed. Before the fix both were updated only at the turn's end,
+  and a status read in the compacted turn showed no compaction and the old size.
+- **The warning.** When the estimate after a turn reaches `context_warn_tokens`, the
+  next prompt's first line says the context's size, that every engine call re-reads
+  it, and that `compact_session` compacts it, or that an operator can enable it. The
+  default of 150,000 leaves room before an engine's automatic compaction near a
+  200,000 token window, and past it a turn of a few calls re-reads a million tokens.
+- **`compact_session`.** No arguments. Only a Claude Code line whose configuration sets
+  `allow_compact` has it, and it is refused if the setting is withdrawn. It marks the
+  line's own next turn to begin with a compaction. **Fact, read from the bundled Claude
+  Code 2.1.310.** `compact` is a built-in command that runs outside an interactive
+  session unless `DISABLE_COMPACT` is set, and the engine reports it with a
+  `compact_boundary` system message whose `compact_metadata` gives `trigger`,
+  `manual` for a typed command, `pre_tokens` and, optionally, `post_tokens`. So the
+  turn first sends `/compact` as a prompt, through the turn's own checks, then its
+  prompt, which opens with a note giving the context before and after, or saying that
+  either was not reported, or that the engine reported no compaction. Both results'
+  costs count toward the turn. A turn refused during the compaction sends no prompt.
+  **From the round 5 review.** A pending request is dropped when the line's
+  configuration changes, and `allow_compact` is checked again when the turn consumes
+  it. No `/compact` is sent once the turn's init has been seen and refused. The engine
+  reports its init only with its reply to a prompt, so normally the compaction's own
+  reply carries it, and the init check then refuses and interrupts the compaction as
+  it would an ordinary prompt, which is no weaker than a turn without a compaction.
+
 ## Kept sessions
 
 **Decided by the operator on 2026-10-26** in round 2, from the round 1 reports of three
@@ -401,8 +450,15 @@ ends with each turn, and the next turn resumes the session in a new one.
   following any link, as `write_scratch` writes, so a directory swapped for a link at
   any moment cannot redirect the read. It is never read when it has more than one
   name or another owner, and never inside a directory Dromon protects, so that a line
-  cannot have the daemon read for it a file its own sandbox denies. **Fact, read from the
-  engine's code.** A task's
+  cannot have the daemon read for it a file its own sandbox denies.
+  **Round 5, decided by the operator on 2026-10-26.** The note states the output's
+  state plainly: quoted, empty, missing, not readable, outside the allowed locations,
+  withheld, that the engine named no output file, or, when it reported neither an exit
+  code nor output, that it reported none. It ends with the time Dromon detected the
+  end, and its header in the prompt gives that time and the time it was delivered.
+  `line_status` keeps the last task note's `last_task_note`, with its `message_id`,
+  `detected` and `delivered` times and `late_seconds`, as it does for wakes.
+  **Fact, read from the engine's code.** A task's
   start reports its identifier, its kind, the description the line gave its tool
   call, and the identifier of that tool call, but not the command. So Dromon takes the
   command from the tool call's `command` input, and the description when it has none.
