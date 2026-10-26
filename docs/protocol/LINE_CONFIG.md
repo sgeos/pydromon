@@ -45,6 +45,9 @@ keys, duplicate keys and numbers are refused.
 | `plugins` | At most 16 distinct local plugin directories, each absolute or starting with `~/`, as the plugins section below specifies. Refused on Codex and Grok lines. Omitted when empty | none |
 | `instructions` | At most 16 distinct files, such as `CLAUDE.md`, whose text is appended to the system prompt at each turn. A relative path is resolved against the line's working directory and `~` against the home directory. Omitted when empty | none |
 | `workdir` | The directory the line's engine runs in, as the working directory section below specifies. Omitted when unset | the project root |
+| `keep_session` | Keep a Claude Code line's engine connected between turns, as the kept sessions section below specifies. Refused on Codex and Grok lines. Omitted when false | `false` |
+| `keep_session_idle_seconds` | Seconds a kept connection waits for the next turn before it closes, a whole number from 60 to 86,400. Omitted at its default | `1800` |
+| `keep_session_max_seconds` | Seconds after the last turn a kept connection may stay open while the engine reports background tasks running, a whole number from 60 to 86,400 and not less than `keep_session_idle_seconds`. Omitted at its default | `14400` |
 
 A server name is an identifier and may not be `dromon`, which Dromon's own tools use. A
 `stdio` server has `command` and optionally `args` and `env`. An `http` or `sse` server
@@ -107,21 +110,47 @@ in this section.
 question holding it as `held_by`, its `autonomous_turns` used and allowed, its estimated
 `cost_usd` since its last release and its limit, its `leases` with their ends, its
 `scheduled_wake`, its `unread` mail and `pending` deliveries, its `model` and
-`strategy`, its `workdir` as configured and as `workdir_path` resolved, and its
-`engine_session`. It adds the daemon's `version` and `commit`, and for every other line
-its `line_id`, `state`, whether it is `held`, and the names of its `leases`. It holds no
-configuration document and no message body. The commit is read once when `dromond`
-starts, from the `HEAD` of the checkout its own code runs from, following loose refs,
-`packed-refs` and a linked worktree's pointers without running git, and is `null` when
-the daemon does not run from a checkout or the commit cannot be read.
+`strategy`, its `workdir` as configured and as `workdir_path` resolved, its
+`engine_session`, and its `kept_session`, as the kept sessions section below specifies.
+It adds a `daemon` object and, for every other line, its `line_id`, `state`, whether it
+is `held`, and the names of its `leases`. It holds no configuration document and no
+message body.
 
-**`read_instructions`.** No arguments. It returns the instructions the line's next turn
-receives as its engine adapter composes them from `instructions`: the system prompt
-text of a Claude Code line, marked as following Claude Code's own prompt when
-`claude_code_prompt` is set, and the developer instructions of a Codex line or the
-rules of a Grok line. Files the engine loads itself, such as a project's `CLAUDE.md`
-under `project_settings`, are named but not shown. An unreadable instruction file is
-reported as the turn would refuse it.
+The `daemon` object holds the following, decided by the operator on 2026-10-26 in round
+2.
+
+- **`version`.** The package version. **`version_note`** says that `0.0.0` is the version
+  of every unreleased build, so that the commit identifies it, and is `null` for any
+  other version.
+- **`commit`.** The commit the daemon started from, read once when `dromond` starts, from
+  the `HEAD` of the checkout its own code runs from, following loose refs, `packed-refs`
+  and a linked worktree's pointers without running git. It is `null` when the daemon
+  does not run from a checkout or the commit cannot be read.
+- **`checkout_commit`.** The same checkout's `HEAD`, read again at every call, which costs
+  a few reads of small files and no process.
+- **`stale`.** `true` when the two differ, `false` when they match, and `null` when
+  either is unknown. **`stale_note`** then says that the running daemon does not have the
+  newer code until an operator restarts it. A checkout that moved does not prove that
+  the code differs, since a commit can change only documents, so the note is a prompt to
+  check rather than a verdict.
+
+**`read_instructions`.** One optional argument, `full`, a boolean. The instructions are
+those the line's next turn receives as its engine adapter composes them from
+`instructions`, the system prompt text of a Claude Code line, marked as following
+Claude Code's own prompt when `claude_code_prompt` is set, and the developer
+instructions of a Codex line or the rules of a Grok line. Files the engine loads itself,
+such as a project's `CLAUDE.md` under `project_settings`, are named but not shown. An
+unreadable instruction file is reported as the turn would refuse it.
+
+- **Summary.** Without `full`, or with it `false`, the tool returns JSON with the
+  composed text's size in `bytes` of UTF-8, its `sha256` digest in hexadecimal, and its
+  `sources` in order, each a `source` and its `bytes`. Claude Code's own prompt and the
+  project files the engine loads itself are listed with `bytes` of `null`, since Dromon
+  does not hold their text. A line compares the digest with an earlier one to tell
+  whether its instructions changed without spending its context on the whole text.
+  **Decided by the operator on 2026-10-26** in round 2.
+- **Whole text.** With `full` set to `true` the tool returns the composed text itself. A
+  `full` that is not a boolean is refused.
 
 **`write_scratch`.** Arguments `path`, relative to `tmp/` in the line's working
 directory, and `text`, at most 262,144 bytes of UTF-8, which replaces the file whole.
@@ -185,9 +214,9 @@ tools do the same for a line.
   `launchd` and led its own process group. So `list_processes` returned an empty
   listing and `stop_process` refused on a Claude Code line and on a Codex line. On such
   a platform the mark cannot identify a line's processes, and the self-test above
-  makes the tools say so. The Linux path through `/proc` is unaffected. Keeping a
-  line's engine session alive between turns, so that the engines' own background task
-  tools can be used, is recorded as a round 2 item in `docs/process/DOGFOOD.md`.
+  makes the tools say so. The Linux path through `/proc` is unaffected. A Claude Code
+  line may instead keep its engine connected between turns, so that the engine's own
+  background task tools work, as the kept sessions section below specifies.
 - **Limits.** A pid reused by another process between the check and the signal is the
   race every signal by pid has, narrowed by checking immediately before. External
   agents have neither tool.
@@ -208,6 +237,17 @@ headers of the newly delivered mail follow, and bodies stay in the mailbox.
 - **Scheduled wakes.** A fired wake's header says it is the line's scheduled wake and
   gives the time it was due and the time it is delivered. The due time is kept in the
   state the event log builds, so it survives a restart.
+- **`list_mail`.** **Decided by the operator on 2026-10-26** in round 2. A listed entry
+  ends with `repeat_of` and the earlier message's identifier when its message repeated
+  one, and a fired wake's entry ends with `scheduled wake due` and its due time, then
+  `delivered` and the time it was delivered. The repeat marks and delivery times live
+  in the daemon's memory, at most 4,096 of each with the oldest forgotten first, so
+  after a restart a wake's entry gives its due time only and no entry is a repeat.
+- **Unanswered.** The summary's unanswered count leaves out a reply to a question Dromon
+  asked on the line's behalf when it held the line, such as an operator's `resume`,
+  because such a reply asks nothing of the line. The state the event log builds keeps
+  every such question's identifier from its `line_held` event, so the rule survives a
+  restart. **Decided by the operator on 2026-10-26** in round 2.
 
 **Leases.** **Decided by the operator on 2026-10-26.** A project declares named leases
 in its `[leases]` table, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, so its
@@ -262,6 +302,83 @@ to read the result.
 `ask_operator` and `wake_after` refuse a body, question, choice or note that contains a
 listed term, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, and record nothing.
 A wake note is checked again when it fires.
+
+## Kept sessions
+
+**Decided by the operator on 2026-10-26** in round 2, from the round 1 reports of three
+lines. A Claude Code line with `keep_session` keeps its engine connected between turns,
+so that a command it starts with Bash's `run_in_background` outlives the turn and the
+engine's own background task tools work across turns. Without it, the engine's process
+ends with each turn, and the next turn resumes the session in a new one.
+
+- **The engine's tools.** **Fact, read from the Claude Code 2.1.310 bundled with Agent
+  SDK 0.2.174 on 2026-10-26.** `TaskStop` is a built-in tool that stops a running
+  background task by its identifier, and `KillShell` and `KillBash` are aliases of it.
+  `TaskOutput` and `BashOutput` are in the engine's list of removed tools, so no tool
+  reads a task's output. A background command's output goes to a file the engine
+  names, which `Read` reads. A line is given these tools by naming them in
+  `builtin_tools`, as any built-in. `TaskList` is defined beside `TaskStop`, but whether
+  it lists background commands was not established.
+- **Every check still runs.** At each turn the environment check runs, the
+  configuration's MCP servers are expanded, and the instructions, project settings and
+  plugins are read and checked, before the kept connection is used. A digest of
+  everything the connection was opened with, and of every file under the working
+  directory's `.claude` for `project_settings` and under each plugin, is compared with
+  the connection's. Any difference closes the connection and opens a new one. A tree of
+  more than 4,096 files, or a file over 1 MiB, refuses the turn, since a change there
+  could not be noticed.
+- **The init check on a reused connection.** **Fact, read from the same engine.** The
+  engine reports its `init`, with its tools, credential source and model, on the first
+  prompt of a connection, and again only after a change of model or permission mode.
+  So before each later prompt Dromon sends the permission mode the last `init`
+  reported, which leaves the mode unchanged and makes the engine report its `init`
+  again, and the tool, credential and model checks run on it as on a new connection. A
+  turn on a reused connection that shows the model's output before an `init` is
+  refused and interrupted, and its connection closed.
+- **The gate between turns.** On a kept connection the permission gate denies every tool
+  call outside a Dromon turn, and inside a reused turn until its `init` check passes.
+- **A residual risk.** **Inference from the engine's reload messages, not tested.** The
+  engine watches its settings and plugins and may reload them while idle. The line's
+  sandbox denies it writing them, but another writer could change them between turns,
+  and a turn the engine began by itself could run a reloaded hook before Dromon
+  interrupts it. The next turn's checks then refuse and close the connection. Within
+  one turn the same window existed before, between the check and the engine's start.
+- **The driver's budget.** Each turn starts the driver afresh, so its tool budget is per
+  turn as before.
+- **Turns the engine begins.** **Inference from the engine's own Bash description, not
+  observed.** When a background command ends while the connection is idle, the engine
+  re-invokes the model by itself. Only Dromon starts turns, so such a turn is
+  interrupted as soon as it shows, its tool calls are denied by the gate, its remaining
+  output is discarded, and the line's next prompt says so. If it has not finished by
+  the next turn, the connection is closed instead.
+- **Background tasks.** The engine reports each background task's start and end, and
+  Dromon counts those running. A connection closes after `keep_session_idle_seconds`
+  without a turn, or, while the engine reports tasks running, after
+  `keep_session_max_seconds`, both counted from the end of the last turn and checked
+  every 30 seconds. Closing the connection ends the engine's process.
+- **Other closes.** The connection also closes when the line is configured, overridden,
+  rebound or has its session cleared, which includes a change of `workdir`, when the
+  daemon stops, and when a turn is refused or fails, including by a check before the
+  connection is used, since the engine may already have loaded what the check refused. A change made while a turn runs
+  closes the connection when that turn ends. The next turn resumes the session in a new
+  process as before, and when Dromon closed it for a reason the line could not see, the
+  prompt says why and how many background tasks were running.
+- **The engine's death.** When the engine's process ends between turns, the next turn
+  resumes the session in a new process, and its prompt says that the old process's
+  background tasks were lost. When it ends during a turn, the turn fails, and the next
+  prompt says the same.
+- **Interrupt.** An operator's interrupt cancels the turn. Dromon interrupts the engine
+  and discards the rest of that turn's output, and the connection stays open. If the
+  engine does not take the interrupt within 10 seconds, the connection is closed.
+  **Hypothesis, not observed.** The engine may stop its background tasks on an
+  interrupt.
+- **`line_status`.** `kept_session` gives whether the line is `configured` to keep its
+  session, whether a connection is `kept` now, the time it `closes_at` in Coordinated
+  Universal Time, which is `null` during a turn, and the number of `background_tasks`
+  the engine reports running.
+- **Not yet.** Codex and Grok lines refuse `keep_session`. A Codex line could keep its
+  app-server thread and use its background terminal methods, which is recorded as
+  future work in [`CODEX.md`](CODEX.md).
 
 ## Instructions
 

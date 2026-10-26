@@ -70,6 +70,21 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Round 2 of the session-line experience. A Claude Code line with `keep_session`
+  keeps its engine connected between turns, so commands started in the background
+  outlive the turn and the engine's `TaskStop` works across turns. Every per-turn check
+  still runs, and a reused connection is made to report its `init` again, with the
+  turn refused when it does not. The gate denies tool calls outside a checked turn, a
+  turn the engine begins by itself is interrupted and noted, and the connection closes
+  on a configuration change, a refused or failed turn, the daemon's stop, after
+  `keep_session_idle_seconds`, or after `keep_session_max_seconds` while background
+  tasks run. A dead engine is resumed with a note that its tasks were lost.
+  `line_status` reports the kept session and its deadline, and whether the daemon's
+  checkout has moved since it started, with a note that version 0.0.0 is unreleased.
+  `read_instructions` returns a size, digest and sources unless `full` is set. The
+  unanswered count leaves out replies to hold questions, and `list_mail` entries carry
+  `repeat_of` and a fired wake's due and delivery times.
+
 - Lines gain `list_processes` and `stop_process`. Every command a line runs carries
   `DROMON_LINE_MARK`, the line's identifier and a random token of its own issued per
   daemon run, including commands that outlive a turn, so no line can present another

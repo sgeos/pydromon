@@ -16,6 +16,12 @@ prompt instead of an empty one, and ``instructions`` names files, such as a proj
 relative path is resolved against the line's working directory, and ``~`` against the
 home directory. Only the paths are stored.
 
+Kept sessions. ``keep_session`` keeps a Claude Code line's engine connected between
+turns, so that commands it runs in the background outlive the turn. The connection
+closes after ``keep_session_idle_seconds`` without a turn, or after
+``keep_session_max_seconds`` while the engine reports background tasks still running.
+``dromon.engine`` describes the checks a kept connection still passes at every turn.
+
 Working directory. ``workdir`` names the directory a line's engine runs in, such as a
 git worktree of its own. A relative path is resolved against the project root, and
 ``~`` against the home directory, when the line is configured and again at each turn,
@@ -68,6 +74,11 @@ MAX_TEXT: Final = 4096
 MAX_INSTRUCTION_FILES: Final = 16
 
 MAX_PLUGINS: Final = 16
+
+DEFAULT_KEEP_IDLE_SECONDS: Final = 1800
+DEFAULT_KEEP_MAX_SECONDS: Final = 14400
+MIN_KEEP_SECONDS: Final = 60
+MAX_KEEP_SECONDS: Final = 86400
 
 EFFORTS: Final = ("low", "medium", "high", "xhigh", "max")
 """The reasoning efforts Claude Code accepts."""
@@ -191,6 +202,13 @@ class LineConfig:
     plugins: tuple[str, ...] = ()
     """Local plugin directories a Claude Code line loads, absolute or under ``~``, as
     written. Each is checked against an allowlist at every turn."""
+    keep_session: bool = False
+    """Whether a Claude Code line's engine stays connected between turns."""
+    keep_session_idle_seconds: int = DEFAULT_KEEP_IDLE_SECONDS
+    """How long a kept connection waits for the next turn before it closes."""
+    keep_session_max_seconds: int = DEFAULT_KEEP_MAX_SECONDS
+    """How long after the last turn a kept connection may stay open while the engine
+    reports background tasks still running."""
 
     def allows(self, tool_name: str, own_tools: frozenset[str]) -> bool:
         """Whether the policy allows ``tool_name``. Dromon's own tools always pass."""
@@ -243,6 +261,12 @@ def encode_config(config: LineConfig) -> str:
         document["project_settings"] = True
     if config.plugins:
         document["plugins"] = list(config.plugins)
+    if config.keep_session:
+        document["keep_session"] = True
+    if config.keep_session_idle_seconds != DEFAULT_KEEP_IDLE_SECONDS:
+        document["keep_session_idle_seconds"] = config.keep_session_idle_seconds
+    if config.keep_session_max_seconds != DEFAULT_KEEP_MAX_SECONDS:
+        document["keep_session_max_seconds"] = config.keep_session_max_seconds
     return json.dumps(
         document,
         ensure_ascii=False,
@@ -291,6 +315,16 @@ def _workdir(value: object) -> str:
     if text.startswith("~") and text != "~" and not text.startswith("~/"):
         _fail("workdir may start with ~ only as ~ or ~/, not as another user's home")
     return text
+
+
+def _seconds(document: Mapping[str, object], key: str, default: int) -> int:
+    value = document.get(key, default)
+    if type(value) is not int or not MIN_KEEP_SECONDS <= value <= MAX_KEEP_SECONDS:
+        _fail(
+            f"{key} must be a whole number from {MIN_KEEP_SECONDS} to"
+            f" {MAX_KEEP_SECONDS}"
+        )
+    return value
 
 
 def _server_text(value: object, what: str) -> str:
@@ -385,6 +419,9 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         "workdir",
         "project_settings",
         "plugins",
+        "keep_session",
+        "keep_session_idle_seconds",
+        "keep_session_max_seconds",
     }
     unknown = set(document) - allowed
     if unknown:
@@ -445,6 +482,15 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
             plugin.startswith("/") or plugin == "~" or plugin.startswith("~/")
         ):
             _fail(f"plugin {plugin!r} must be an absolute path or start with ~/")
+    keep = document.get("keep_session", False)
+    if type(keep) is not bool:
+        _fail("keep_session must be a boolean")
+    idle = _seconds(document, "keep_session_idle_seconds", DEFAULT_KEEP_IDLE_SECONDS)
+    ceiling = _seconds(document, "keep_session_max_seconds", DEFAULT_KEEP_MAX_SECONDS)
+    if ceiling < idle:
+        _fail(
+            "keep_session_max_seconds must not be less than keep_session_idle_seconds"
+        )
     return LineConfig(
         builtin_tools=tuple(sorted(set(builtin))),
         mcp_servers=parse_servers(document.get("mcp_servers", {})),
@@ -459,6 +505,9 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         workdir=workdir,
         project_settings=project_settings,
         plugins=plugins,
+        keep_session=keep,
+        keep_session_idle_seconds=idle,
+        keep_session_max_seconds=ceiling,
     )
 
 

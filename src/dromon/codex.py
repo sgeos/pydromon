@@ -145,6 +145,8 @@ def unsupported(config: LineConfig) -> str | None:
         return "Codex lines do not load Claude Code's project settings"
     if config.plugins:
         return "Codex lines do not load Claude Code plugins"
+    if config.keep_session:
+        return "Codex lines do not yet keep their engine session between turns"
     if config.sandbox is not None or config.settings is not None:
         return (
             "Codex lines run under Dromon's Codex permission profile, and take no"

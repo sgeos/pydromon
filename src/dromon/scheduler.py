@@ -86,7 +86,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Protocol, cast
+from typing import Any, Final, Protocol, cast, runtime_checkable
 
 from claude_agent_sdk import SdkMcpTool
 
@@ -111,11 +111,14 @@ from dromon.agents import LineTokens
 from dromon.codex import CodexLine
 from dromon.grok import GrokLine
 from dromon import __version__
+from dromon.engine import ENGINE_NAME as ENGINE_NAME_CLAUDE
 from dromon.engine import (
+    CLAUDE_CODE_PROMPT_MARK,
     ClaudeCodeLine,
     EngineRefused,
     TurnReport,
     composed_instructions,
+    instruction_sizes,
     resolve_plugin,
 )
 from dromon.eventlog import EventLog
@@ -131,7 +134,7 @@ from dromon.processes import (
     line_processes,
     stop_line_process,
 )
-from dromon.workdir import git_write_guards, resolve_workdir
+from dromon.workdir import git_write_guards, read_head_commit, resolve_workdir
 from dromon.mailbox import (
     MAX_PAGE,
     MailSummary,
@@ -298,6 +301,26 @@ NO_ARGUMENTS_SCHEMA: Final[dict[str, object]] = {
     "additionalProperties": False,
 }
 
+READ_INSTRUCTIONS_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "full": {
+            "type": "boolean",
+            "description": "Return the whole text. Default false, a summary",
+        },
+    },
+    "additionalProperties": False,
+}
+
+UNRELEASED_VERSION: Final = "0.0.0"
+UNRELEASED_NOTE: Final = (
+    "0.0.0 is the version of every unreleased build, so the commit identifies it."
+)
+
+MAX_REMEMBERED_NOTES: Final = 4096
+"""How many repeat marks and wake delivery times ``list_mail`` remembers, oldest
+forgotten first, so memory stays bounded over a long daemon run."""
+
 WRITE_SCRATCH_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
     "properties": {
@@ -399,6 +422,18 @@ class LineEngine(Protocol):
     session_id: str | None
 
     async def run_turn(self, prompt: str) -> TurnReport: ...
+
+
+@runtime_checkable
+class KeptEngine(Protocol):
+    """An engine that may keep its connection between turns, as a Claude Code line
+    with ``keep_session`` does. Porting note: the scheduler tells such an engine
+    apart by its methods, which a port would express as a capability of the engine
+    type."""
+
+    async def retire(self) -> None: ...
+
+    def kept_status(self) -> dict[str, object]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -592,6 +627,7 @@ class Scheduler:
         root: Path | None = None,
         protected: Sequence[Path] = (),
         daemon_commit: str | None = None,
+        daemon_checkout: Path | None = None,
         processes: ProcessTable | None = None,
         processes_identifiable: bool = True,
     ) -> None:
@@ -608,6 +644,17 @@ class Scheduler:
         self._protected = tuple(protected)
         self._daemon_commit = daemon_commit
         """The commit the daemon's own checkout had at start, if it runs from one."""
+        self._daemon_checkout = daemon_checkout
+        """A directory in the daemon's own checkout, whose HEAD ``line_status`` reads
+        again at each call, or ``None``."""
+        self._retiring: set[asyncio.Task[None]] = set()
+        """Kept engine connections being closed after their engine was discarded."""
+        self._repeat_of: dict[str, str] = {}
+        """Each message to a line that repeated an earlier one, and that one, for
+        ``list_mail``. Insertion ordered and bounded by ``MAX_REMEMBERED_NOTES``."""
+        self._wake_delivered: dict[str, str] = {}
+        """When each fired wake's note was delivered, for ``list_mail``. In memory,
+        so a note delivered before a restart shows its due time only."""
         self._processes: ProcessTable = processes or SystemProcesses()
         self._processes_identifiable = processes_identifiable
         """Whether the daemon's start-time self-test could read another process's
@@ -734,7 +781,7 @@ class Scheduler:
             self._end_leases(line_id)
             if line_id in self._running:
                 self._moved.add(line_id)
-        self._engines.pop(line_id, None)
+        self._drop_engine(line_id)
 
     def ensure_operator(self, operator_id: str) -> None:
         if operator_id not in self._log.state.operators:
@@ -1193,6 +1240,7 @@ class Scheduler:
         queue = self._recent.setdefault(key, deque())
         if queue and sent_at - queue[-1][0] <= REPEAT_WINDOW:
             self._repeats[message_id] = queue[-1][1]
+            _bounded_put(self._repeat_of, message_id, queue[-1][1])
         queue.append((sent_at, message_id))
         self._recent_order.append((sent_at, key, message_id))
 
@@ -1208,6 +1256,7 @@ class Scheduler:
             if repeated is not None:
                 parts.append(f"a repeat of {repeated}")
             if message_id in fired:
+                _bounded_put(self._wake_delivered, message_id, delivered)
                 parts.append(
                     f"your scheduled wake, due {fired[message_id]}, delivered"
                     f" {delivered}"
@@ -1215,6 +1264,21 @@ class Scheduler:
             if parts:
                 notes[message_id] = ", ".join(parts)
         return notes
+
+    def mail_notes(self, message_id: str) -> str:
+        """What ``list_mail`` adds to a message's header: the message it repeated,
+        and for a fired wake when it was due and when it was delivered."""
+        parts: list[str] = []
+        repeated = self._repeat_of.get(message_id)
+        if repeated is not None:
+            parts.append(f"repeat_of {repeated}")
+        due = self._log.state.fired_dues.get(message_id)
+        if due is not None:
+            parts.append(f"scheduled wake due {due}")
+            delivered = self._wake_delivered.get(message_id)
+            if delivered is not None:
+                parts.append(f"delivered {delivered}")
+        return ", ".join(parts)
 
     def _workdir_of(self, line_id: str) -> Path:
         """The line's working directory, resolved and checked, or
@@ -1271,12 +1335,41 @@ class Scheduler:
             "workdir": config.workdir,
             "workdir_path": workdir,
             "engine_session": line.engine_session,
-            "daemon": {"version": __version__, "commit": self._daemon_commit},
+            "kept_session": self.kept_session(line_id),
+            "daemon": self.daemon_status(),
             "processes": {
                 "identifiable": self._processes_identifiable,
                 "note": None if self._processes_identifiable else UNIDENTIFIABLE,
             },
             "other_lines": others,
+        }
+
+    def daemon_status(self) -> dict[str, object]:
+        """The daemon's version and the commit it started from, and whether its
+        checkout has moved since, read again now from a few small files."""
+        current = (
+            None
+            if self._daemon_checkout is None
+            else read_head_commit(self._daemon_checkout)
+        )
+        started = self._daemon_commit
+        stale = None if current is None or started is None else current != started
+        note: str | None = None
+        if current is not None and started is not None and stale:
+            note = (
+                f"The daemon's checkout has moved from {started[:12]} to"
+                f" {current[:12]} since the daemon started, so the running daemon does"
+                " not have that code until an operator restarts it."
+            )
+        return {
+            "version": __version__,
+            "version_note": UNRELEASED_NOTE
+            if __version__ == UNRELEASED_VERSION
+            else None,
+            "commit": started,
+            "checkout_commit": current,
+            "stale": stale,
+            "stale_note": note,
         }
 
     def write_scratch(self, line_id: str, path: str, text: str) -> str:
@@ -1348,6 +1441,36 @@ class Scheduler:
                 " Dromon does not compose and which are not shown here."
             )
         return text
+
+    def instructions_summary(self, line_id: str) -> dict[str, object]:
+        """The size, SHA-256 digest and sources of what ``line_instructions``
+        returns, so a line can tell whether its instructions changed without reading
+        them whole. Raises ``LineToolRefused``."""
+        text = self.line_instructions(line_id)
+        config = self.effective_config(line_id)
+        engine = ENGINE_OF[self.model_of(line_id)]
+        try:
+            files = instruction_sizes(config.instructions, self._workdir_of(line_id))
+        except EngineRefused as error:
+            raise LineToolRefused(str(error)) from error
+        sources: list[dict[str, object]] = []
+        if engine == ENGINE_NAME_CLAUDE and config.claude_code_prompt:
+            sources.append({"source": CLAUDE_CODE_PROMPT_MARK, "bytes": None})
+        sources.extend({"source": path, "bytes": size} for path, size in files)
+        if config.project_settings:
+            sources.append(
+                {
+                    "source": "the project's own CLAUDE.md files, loaded by the engine",
+                    "bytes": None,
+                }
+            )
+        data = text.encode("utf-8")
+        return {
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "sources": sources,
+            "full": "Call read_instructions with full set to true for the whole text.",
+        }
 
     def line_mark(self, line_id: str) -> str:
         """The value of ``DROMON_LINE_MARK`` for ``line_id``'s processes in this run,
@@ -1447,18 +1570,40 @@ class Scheduler:
             LINE_STATUS_TOOL_NAME,
             "Show your own state: your hold, autonomous turns and estimated cost with"
             " their limits, leases, scheduled wake, unread mail, model, working"
-            " directory and engine session, the daemon's version and commit, and the"
+            " directory, engine session and whether it is kept, the daemon's version"
+            " and commit and whether its checkout has moved since it started, and the"
             " other lines' state, read only.",
             lambda: json.dumps(self.line_status(line_id), indent=2, sort_keys=True),
         )
 
     def read_instructions_tool(self, line_id: str) -> SdkMcpTool[Any]:
-        """The ``read_instructions`` tool for ``line_id``."""
-        return self._view_tool(
-            READ_INSTRUCTIONS_TOOL_NAME,
-            "Show the instructions your next turn receives, as Dromon composes them"
-            " from your configuration.",
-            lambda: self.line_instructions(line_id),
+        """The ``read_instructions`` tool for ``line_id``. By default it returns a
+        summary, and with ``full`` the whole text."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, READ_INSTRUCTIONS_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            full: object = args.get("full", False)
+            if type(full) is not bool:
+                return _tool_error("full must be true or false")
+            try:
+                if full:
+                    return _tool_text(self.line_instructions(line_id))
+                summary_ = self.instructions_summary(line_id)
+            except LineToolRefused as error:
+                return _tool_error(str(error))
+            return _tool_text(json.dumps(summary_, indent=2, sort_keys=True))
+
+        return SdkMcpTool(
+            name=READ_INSTRUCTIONS_TOOL_NAME,
+            description=(
+                "Show the instructions your next turn receives, as Dromon composes"
+                " them from your configuration: by default their size, SHA-256 digest"
+                " and sources, and with full set to true the whole text."
+            ),
+            input_schema=READ_INSTRUCTIONS_SCHEMA,
+            handler=handler,
         )
 
     def write_scratch_tool(self, line_id: str) -> SdkMcpTool[Any]:
@@ -1644,7 +1789,10 @@ class Scheduler:
                 return _tool_error(str(error))
             answered = replied_ids(self._log.state, mailbox_owner)
             lines = [f"{len(page)} of {total} matching messages, from {offset}."]
-            lines.extend(header(i, m, answered) for i, m in page)
+            for message_id, message in page:
+                entry = header(message_id, message, answered)
+                noted = self.mail_notes(message_id)
+                lines.append(f"{entry}, {noted}" if noted else entry)
             return _tool_text("\n".join(lines))
 
         return SdkMcpTool(
@@ -1652,7 +1800,9 @@ class Scheduler:
             description=(
                 "List messages in your mailbox, oldest first, without their bodies."
                 " Filter to unread messages or one sender, and page with offset and"
-                f" limit, at most {MAX_PAGE} at a time."
+                f" limit, at most {MAX_PAGE} at a time. An entry names the message it"
+                " repeats, and a scheduled wake's note says when it was due and"
+                " delivered."
             ),
             input_schema=LIST_MAIL_SCHEMA,
             handler=handler,
@@ -1823,7 +1973,7 @@ class Scheduler:
                 f"wake.every_ticks must be in [1, {MAX_WAKE_EVERY_TICKS}]"
             )
         self._log.append(LineOverridden(line_id, encode_override(document)))
-        self._engines.pop(line_id, None)
+        self._drop_engine(line_id)
 
     def _skipped(self, line_id: str, reason: str) -> None:
         """Report, once, a stored override that no longer applies. It is skipped,
@@ -1845,7 +1995,7 @@ class Scheduler:
         if line_id in self._running:
             raise EventRejected(f"line {line_id} is in a turn. Interrupt it first")
         self._log.append(LineSessionCleared(line_id))
-        self._engines.pop(line_id, None)
+        self._drop_engine(line_id)
         self._end_leases(line_id)
 
     def rebind_line(self, line_id: str, model: str, strategy: Strategy) -> None:
@@ -1884,7 +2034,7 @@ class Scheduler:
                 LineOverridden(line_id, encode_override_document(overrides))
             )
         self._log.append(LineRebound(line_id, model, strategy.value))
-        self._engines.pop(line_id, None)
+        self._drop_engine(line_id)
         self._end_leases(line_id)
 
     def set_project(
@@ -2039,6 +2189,7 @@ class Scheduler:
                 turn.cancel()
             if self._running:
                 await asyncio.gather(*self._running.values(), return_exceptions=True)
+            await self.close_engines()
 
     async def idle(self) -> None:
         """Wait until nothing is in flight and no tick would start a turn. For tests."""
@@ -2116,10 +2267,11 @@ class Scheduler:
         """Cancel ``line_id``'s turn in flight, and say whether there was one.
 
         The turn task is cancelled, so the engine's session or subprocess is closed
-        wherever it is. Mail the turn had already received stays delivered, and the
-        engine session resumes from what the engine itself recorded, which may include
-        part of the cancelled turn. An interrupted turn does not count toward the
-        line's limits, because it produced no report.
+        wherever it is, except a kept Claude Code connection, which interrupts the
+        engine and stays open. Mail the turn had already received stays delivered, and
+        the engine session resumes from what the engine itself recorded, which may
+        include part of the cancelled turn. An interrupted turn does not count toward
+        the line's limits, because it produced no report.
         """
         if line_id not in self._log.state.lines:
             raise EventRejected(f"no line {line_id}")
@@ -2129,6 +2281,51 @@ class Scheduler:
         self._interrupted.add(line_id)
         task.cancel()
         return True
+
+    def _drop_engine(self, line_id: str) -> None:
+        """Discard ``line_id``'s engine, so its next turn builds a new one, and close
+        a connection it kept, once any turn in progress has ended."""
+        engine = self._engines.pop(line_id, None)
+        if not isinstance(engine, KeptEngine):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Without a running loop no connection can have been opened.
+            return
+        task = loop.create_task(engine.retire())
+        self._retiring.add(task)
+        task.add_done_callback(self._retiring.discard)
+
+    async def close_engines(self) -> None:
+        """Close every kept engine connection, as the daemon stops. Engines that
+        keep nothing stay built."""
+        for line_id, engine in sorted(self._engines.items()):
+            if isinstance(engine, KeptEngine):
+                self._drop_engine(line_id)
+        if self._retiring:
+            await asyncio.gather(*self._retiring, return_exceptions=True)
+
+    def kept_session(self, line_id: str) -> dict[str, object]:
+        """Whether ``line_id``'s engine connection is kept, and until when."""
+        engine = self._engines.get(line_id)
+        status: dict[str, object] = (
+            engine.kept_status()
+            if isinstance(engine, KeptEngine)
+            else {"kept": False, "seconds_to_close": None, "background_tasks": 0}
+        )
+        seconds = status.get("seconds_to_close")
+        closes_at = (
+            format_due(self._wall_clock() + timedelta(seconds=max(0.0, seconds)))
+            if isinstance(seconds, int | float)
+            else None
+        )
+        return {
+            "configured": self.effective_config(line_id).keep_session,
+            "kept": status.get("kept") is True,
+            "closes_at": closes_at,
+            "background_tasks": status.get("background_tasks", 0),
+        }
 
     def engine_for(self, line_id: str) -> LineEngine:
         """The line's engine, built on first use and kept for the session's life."""
@@ -2201,6 +2398,14 @@ def _enter(parent: int, name: str, path: str, *, scratch_root: bool) -> int:
         raise LineToolRefused(
             f"cannot create a directory for {path}: {error.strerror}"
         ) from error
+
+
+def _bounded_put(store: dict[str, str], key: str, value: str) -> None:
+    """Record ``key`` in an insertion-ordered ``store``, forgetting the oldest entry
+    past ``MAX_REMEMBERED_NOTES``."""
+    store[key] = value
+    if len(store) > MAX_REMEMBERED_NOTES:
+        del store[next(iter(store))]
 
 
 def _scheduled_summary(pending: ScheduledWake | None) -> dict[str, object] | None:
