@@ -317,7 +317,7 @@ def test_rebind_line_moves_the_line_for_an_operator(paths: ProjectPaths) -> None
             ProjectConfig(sandbox=parse_sandbox({"enabled": True}, operator=False)),
             rebind_args(LUNA),
             ErrorCode.REJECTED,
-            "own sandbox",
+            "an engine that takes neither",
         ),
         (
             ProjectConfig(require_sandbox=True),

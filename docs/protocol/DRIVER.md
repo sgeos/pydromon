@@ -45,6 +45,15 @@ subscription draws on a plan's limits while API usage is charged for every token
 | `grok_4_7_subscription.kel` | Grok 4.7 on Grok Build | subscription | high | 200 | 400 |
 | `grok_4_7_api.kel` | Grok 4.7 on Grok Build | api | medium | 4 | 20 |
 | `grok_4_7_flexible.kel` | Grok 4.7 on Grok Build | flexible | medium | 4 | 20 |
+| `pi__openai__gpt_6_luna_subscription.kel` | GPT-6-Luna on Pi | subscription | medium | 200 | 400 |
+| `pi__openai__gpt_6_luna_api.kel` | GPT-6-Luna on Pi | api | medium | 4 | 20 |
+| `pi__openai__gpt_6_luna_flexible.kel` | GPT-6-Luna on Pi | flexible | medium | 4 | 20 |
+| `cursor_agent__gpt_5_6_luna_medium_subscription.kel` | GPT-5.6 Luna on Cursor Agent | subscription | medium | 200 | 400 |
+| `cursor_agent__gpt_5_6_luna_medium_api.kel` | GPT-5.6 Luna on Cursor Agent | api | medium | 4 | 20 |
+| `cursor_agent__gpt_5_6_luna_medium_flexible.kel` | GPT-5.6 Luna on Cursor Agent | flexible | medium | 4 | 20 |
+| `antigravity__gemini_3_1_pro_subscription.kel` | Gemini 3.1 Pro on Antigravity | subscription | medium | 200 | 400 |
+| `antigravity__gemini_3_1_pro_api.kel` | Gemini 3.1 Pro on Antigravity | api | medium | 4 | 20 |
+| `antigravity__gemini_3_1_pro_flexible.kel` | Gemini 3.1 Pro on Antigravity | flexible | medium | 4 | 20 |
 
 **Decided 2026-10-26, for dogfooding.** The subscription drivers' turn limits and tool
 budgets are sized for a line that develops software, which reads, edits and runs a
@@ -68,13 +77,35 @@ ChatGPT plan the subscription strategy means Codex's own sign-in.
 
 ## Engines
 
-Each driver names the engine it is written for, `claude-code`, `codex` or
-`grok-build`. A file is named for its model with `-` and `.` written as `_`. A model has
+Each driver names the engine it is written for, `claude-code`, `codex`, `grok-build`,
+`pi`, `cursor-agent` or `antigravity`. A file is named for its model with `-` and `.` written as `_`, and with the `:`
+and `/` of an engine-qualified name written as `__`. A model has
 packaged drivers once they are written, but a line can be created on it only when
 Dromon has an adapter for its engine, and an adapter refuses a driver written for
 another engine. All three engines have adapters, as of 2026-10-25 for `codex`, which
 [`CODEX.md`](CODEX.md) specifies, and for `grok-build`, which
-[`GROK.md`](GROK.md) specifies and which is not yet verified against a live turn.
+[`GROK.md`](GROK.md) specifies and which is not yet verified against a live turn. The
+`pi` engine has an adapter as of 2026-10-26, which [`PI.md`](PI.md) specifies and which
+is not yet verified against a live turn. The `cursor-agent` engine has an adapter as of
+2026-10-26, which [`CURSOR.md`](CURSOR.md) specifies. A daemon refuses Cursor lines, and only `dromon
+probe --accept-partial-isolation` runs a Cursor turn. The `antigravity` engine has an adapter as of
+2026-10-26, written from documentation alone, which [`ANTIGRAVITY.md`](ANTIGRAVITY.md)
+specifies. A daemon refuses its lines, and the probe's flag reaches it, but its
+credential is unverified, which no packaged driver accepts, so a turn is refused
+before `agy` starts unless the probe is also given `--accept-unverified-credential`,
+the operator's confirmation by hand, which puts `subscription` to the driver in its
+place. Its model identifier is a guess.
+
+**Model names. Decided on 2026-10-26.** Claude Code, Codex and Grok Build each run their
+own vendor's models, which Dromon names by the vendor's identifier. Pi, Cursor Agent and
+Antigravity run other vendors' models, so their identifiers would read as, or come to
+collide with, the models above, which run on another engine with other credentials and
+costs. Their models are named `ENGINE:ID`, the engine and the harness's own identifier,
+such as `pi:openai/gpt-6-luna`. The engine can be read from the name, and a name never
+stands for two engines. No identifier seen in the three harnesses' catalogues on
+2026-10-26 contains a colon, so the first colon divides the two parts. An adapter hands
+the driver's `init` event the name its engine reports, the harness's own identifier or,
+for Cursor Agent, which reports a display name such as `GPT-5.6 Luna 1M`, that name.
 A file is named for its model and strategy, and the host refuses a file whose declared
 model or strategy differs from its name.
 
@@ -116,7 +147,7 @@ buffer to the module's `data` block. A later interface may use either.
 | Tag | Text | Number | When |
 |---|---|---|---|
 | `settings` | | Setting index | Before the first turn, for each index from 0 until the driver answers `end` |
-| `credential` | `subscription` or `api` | | When the engine reports its session, before `init`. The driver answers `accept` with the credential code, or `refuse` naming its strategy |
+| `credential` | `subscription`, `api` or `unverified` | | When the engine reports its session, before `init`. The driver answers `accept` with the credential code, or `refuse` naming its strategy. `unverified` is sent for an engine that names no credential source, Antigravity alone, and no packaged driver accepts it. `dromon probe --accept-unverified-credential` sends `subscription` in its place, on the operator's confirmation by hand |
 | `init` | The model the engine reports | | When the engine reports its session |
 | `turn_start` | | | Before each turn |
 | `text` | | Length of the text | For each text block |
@@ -148,7 +179,7 @@ At most 32 settings are read.
 | Name | Value | Required |
 |---|---|---|
 | `interface` | Number `3` | Yes |
-| `engine` | Text, `claude-code`, `codex` or `grok-build` | Yes |
+| `engine` | Text, `claude-code`, `codex`, `grok-build`, `pi`, `cursor-agent` or `antigravity` | Yes |
 | `strategy` | Text, `subscription`, `api` or `flexible` | Yes |
 | `model` | Text, the model identifier | Yes |
 | `effort` | Text, one of `low`, `medium`, `high`, `xhigh` and `max` | Yes |

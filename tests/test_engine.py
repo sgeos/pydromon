@@ -280,7 +280,9 @@ def test_an_empty_variable_does_not_count() -> None:
 
 def test_every_known_key_source_maps_to_a_credential() -> None:
     assert credential_of("none") is Credential.SUBSCRIPTION
-    assert {credential_of(source) for source in KEY_SOURCES} == set(Credential)
+    # Claude Code names its key source, so its credential is never unverified.
+    known = set(Credential) - {Credential.UNVERIFIED}
+    assert {credential_of(source) for source in KEY_SOURCES} == known
     assert credential_of("something new") is None
 
 

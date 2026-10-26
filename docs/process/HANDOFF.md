@@ -78,11 +78,9 @@ the operator, per `docs/architecture/KELEUSMA_DOGFOOD.md`.
   `pykeleusma-20261025-shared-data-update` says the VM now owns a zeroed block that
   persists across calls. Drivers keep host-carried state, by choice, until a reason to
   move appears. Adopting it means repinning `pykeleusma`.
-- **Subscription usage.** Plan terms assume ordinary, individual use. Many lines
-  running continuously may exceed that.
+- **Subscription usage.** Plan terms assume ordinary use, which many lines may exceed.
 - **Event log.** Loaded whole, no compaction or migration. Limit counts reset on restart.
-- **Operator relays.** Inbound adapters are deferred, with their properties in
-  `RELAY.md`.
+- **Operator relays.** Inbound adapters are deferred, per `RELAY.md`.
 - **Secrets.** Literal MCP credentials and `env` values sit in the owner-only event log.
   Environment references exist, file and keychain ones do not.
 - **Daemon debt.** No peer credential check, no relay forwarding, SQLite on the event
@@ -90,11 +88,13 @@ the operator, per `docs/architecture/KELEUSMA_DOGFOOD.md`.
 - **Project file.** No user or managed layer, per `PROJECT_CONFIG.md`.
 - **Parity gaps.** No credential masking, approval reviewer, plugins, language servers
   or MCP OAuth, and Linux not verified live, per `SANDBOX.md` and `SETTINGS.md`.
-- **Grok lines.** Never run live. `GROK.md` lists what to verify first.
+- **Unrun engines.** Grok, Pi, Cursor Agent and Antigravity, each with a verify-first
+  list. Cursor and Antigravity lines are refused, and `dromon probe` needs flags.
+- **Flaky test.** `test_kept_session`'s grace-period test, once in five runs.
 - **Codex lines.** No MCP servers, commits, sandbox or settings documents, cost or turn
   limit, and refused calls escape the tool budget. See `CODEX.md`.
-- **Clients.** Polling, no token meter, Tk checked only withdrawn. Agents lack
-  `interrupt` and settings.
+- **Clients.** Polling, no token meter, Tk checked only withdrawn.
+  Agents lack `interrupt` and settings.
 - **Keleusma.** Installed for kaizen, not started, until its live session ends. The
   remote stays SSH, so no pushes. A line cannot list its own processes or limits.
 - **In the design.** Hosted teacher traces, the Rust repository's name, and remote
@@ -111,7 +111,7 @@ need a command outside it. The rest run inside it with `-m "not socket and not l
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-./scripts/check.sh          # 1865 tests pass, plus 10 live tests deselected
+./scripts/check.sh          # about 2100 tests pass, plus 10 live tests deselected
 ```
 
 Report any check not run, and any commit after the one that last rewrote this file.

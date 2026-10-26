@@ -36,7 +36,11 @@ attached at once. A project declares its lines, limits and wake policy in
 [`docs/protocol/PROJECT_CONFIG.md`](docs/protocol/PROJECT_CONFIG.md) specifies, and
 `dromon config` validates it. Lines run on Claude Code or, for OpenAI models such as GPT-6-Luna, on Codex, as
 [`docs/protocol/CODEX.md`](docs/protocol/CODEX.md) specifies, and nominally on Grok
-Build for Grok 4.7, as [`docs/protocol/GROK.md`](docs/protocol/GROK.md) specifies. A line's shell commands
+Build for Grok 4.7, as [`docs/protocol/GROK.md`](docs/protocol/GROK.md) specifies, and
+prospectively on Pi, Cursor Agent and Antigravity, as
+[`docs/protocol/PI.md`](docs/protocol/PI.md),
+[`docs/protocol/CURSOR.md`](docs/protocol/CURSOR.md) and
+[`docs/protocol/ANTIGRAVITY.md`](docs/protocol/ANTIGRAVITY.md) specify. A line's shell commands
 can run in Claude Code's sandbox,
 configured per project and per line as
 [`docs/protocol/SANDBOX.md`](docs/protocol/SANDBOX.md) specifies, and its permission

@@ -5,6 +5,50 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- A prospective Pi engine, `dromon.pi`, for `pi:openai/gpt-6-luna`, which runs a line's
+  turns through `pi --mode rpc` and is not verified against a live turn, as
+  `docs/protocol/PI.md` records. Pi has no sandbox, so a Pi line takes no built-in tool
+  and reaches only Dromon's own tools, through a packaged extension that registers them
+  and blocks every other call. Pi runs on a dedicated agent directory, and `pi auth
+  check` tells a subscription sign-in from an API key before each turn. After review,
+  that directory must switch Pi's cache warming off and hold no `SYSTEM.md` or
+  `APPEND_SYSTEM.md`, a compaction's summary call counts towards the turn's cost,
+  endpoint and credential-location variables are stripped too, and a Claude sign-in
+  through Pi is not taken to be a subscription.
+- Pi, Cursor Agent and Antigravity start in a process group of their own, which Dromon
+  signals whole, so a child cannot outlive the turn. A turn on any of them has a
+  deadline of an hour, after which it is stopped and refused. A subscription line on
+  any of them starts without any cloud provider's variable, by prefix, or any variable
+  named as a credential or password.
+- A prospective Cursor Agent engine, `dromon.cursor`, for
+  `cursor-agent:gpt-5.6-luna-medium`, which runs a turn through `cursor-agent --print
+  --output-format stream-json` on a configuration directory Dromon writes for the turn,
+  as `docs/protocol/CURSOR.md` records. Cursor's built-in tools cannot all be switched
+  off or shown to be denied, so a daemon refuses Cursor lines, and only `dromon probe
+  --accept-partial-isolation` runs a Cursor turn. After review, any `.cursor` directory
+  in the working directory or above it refuses the turn, as do most entries of
+  `~/.cursor`, the turn runs on an empty data directory of its own, any event type the
+  adapter does not name refuses the turn, and a tool reported only on completion is
+  refused too. A resumed chat is refused, since the turn's data directory holds none,
+  so a Cursor line runs a single turn until a kept data directory is designed.
+- A prospective Antigravity engine, `dromon.antigravity`, for
+  `antigravity:gemini-3.1-pro`, written from its documentation alone, as
+  `docs/protocol/ANTIGRAVITY.md` records. Its model identifier is a guess. A daemon
+  refuses an Antigravity line, since its documentation gives no way to add Dromon's MCP
+  server, and `dromon probe --accept-partial-isolation` reaches it. After review, its
+  credential is recorded as `unverified`, which no packaged driver accepts, so a turn
+  is refused before `agy` starts unless the probe is also given
+  `--accept-unverified-credential`, the operator's confirmation by hand that `agy` is
+  signed in to a plan, which gives the driver the subscription. Any record, step or
+  tool field the adapter does not name refuses the turn, as do `init` offering any
+  tool or another working directory, a `.gemini`, `.agy` or `.antigravity` directory in the workspace, a
+  `~/.gemini/.env`, and either user settings file approving a tool. The probe's help
+  says that neither probe flag changes the strategy.
+- Models on harnesses that run other vendors' models are named `ENGINE:ID`, as
+  `docs/protocol/DRIVER.md` records.
+
 ### Changed
 
 - A compaction's `trigger` is only what the engine reported, with a `trigger_note`,
