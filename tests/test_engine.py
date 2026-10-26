@@ -7,6 +7,7 @@ deselection, and the variable keeps such a run from calling the engine by accide
 """
 
 import asyncio
+import re
 import os
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -226,8 +227,8 @@ def test_the_next_turn_resumes_the_engine_session() -> None:
 def test_the_driver_budget_interrupts_a_turn_once() -> None:
     resource = driver_resource(MODEL, Strategy.SUBSCRIPTION)
     text = resources.files("dromon.drivers").joinpath(resource).read_text()
-    budgeted = text.replace(
-        "fn tool_budget() -> Word { 20 }", "fn tool_budget() -> Word { 1 }"
+    budgeted = re.sub(
+        r"fn tool_budget\(\) -> Word \{ \d+ \}", "fn tool_budget() -> Word { 1 }", text
     )
     assert budgeted != text
     driver = Driver(budgeted)

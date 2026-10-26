@@ -24,7 +24,7 @@ fn model() -> Text { "gpt-6-luna" }
 
 fn strategy() -> Text { "subscription" }
 
-fn tool_budget() -> Word { 20 }
+fn tool_budget() -> Word { 400 }
 
 // Settings read by index before the first turn. The list ends with the tag "end".
 fn setting(index: Word) -> (Text, Text, Word) {
@@ -33,7 +33,7 @@ fn setting(index: Word) -> (Text, Text, Word) {
         1 => ("strategy", strategy(), 0),
         2 => ("model", model(), 0),
         3 => ("effort", "medium", 0),
-        4 => ("max_turns", "", 4),
+        4 => ("max_turns", "", 200),
         5 => ("tool_budget", "", tool_budget()),
         6 => ("context_window", "", 272000),
         7 => ("engine", "codex", 0),
