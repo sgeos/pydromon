@@ -26,10 +26,12 @@ from claude_agent_sdk import (
     TaskUpdatedMessage,
     TextBlock,
     ToolPermissionContext,
+    ToolUseBlock,
 )
 
 from dromon.driver import Driver, Strategy
 from dromon.engine import (
+    BackgroundEnd,
     DIED_NOTE,
     FILES_CHANGED,
     MAX_FINGERPRINT_FILE_BYTES,
@@ -43,7 +45,9 @@ from dromon.engine import (
     permission_gate,
     permission_mode_of,
     task_ended,
+    task_status,
     tree_digest,
+    turn_cost,
 )
 from dromon import engine as engine_module
 from dromon.lineconfig import (
@@ -254,6 +258,7 @@ def test_a_line_without_keep_session_does_not_use_a_kept_connection(
         "kept": False,
         "seconds_to_close": None,
         "background_tasks": 0,
+        "tasks": [],
     }
     assert factory.connections == []
 
@@ -768,8 +773,8 @@ def test_keep_session_keys_are_checked(
         config_from_document(document)
 
 
-def test_codex_and_grok_lines_refuse_keep_session() -> None:
-    assert "do not yet keep" in (codex.unsupported(KEPT) or "")
+def test_codex_lines_accept_keep_session_and_grok_lines_refuse_it() -> None:
+    assert codex.unsupported(KEPT) is None
     assert "do not yet keep" in (grok.unsupported(KEPT) or "")
 
 
@@ -1108,3 +1113,329 @@ def test_a_later_init_that_passes_does_not_clear_a_refusal(tmp_path: Path) -> No
 
     asyncio.run(go())
     assert factory.connections[0].interrupts == 1
+
+
+# Round 3, A. The cost of a turn on a kept connection.
+
+
+def costed(total: float | None) -> ResultMessage:
+    return ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id="session-1",
+        total_cost_usd=total,
+    )
+
+
+def test_turn_cost_is_the_difference_within_one_session() -> None:
+    assert turn_cost(1.5, "s", None) == 1.5
+    assert turn_cost(4.0, "s", ("s", 1.5)) == 2.5
+    assert turn_cost(1.5, "s", ("s", 1.5)) == 0.0
+    # A fall means the count restarted, so all of it counts.
+    assert turn_cost(0.5, "s", ("s", 4.0)) == 0.5
+    assert turn_cost(None, "s", ("s", 4.0)) is None
+
+
+def test_turn_cost_takes_the_whole_total_when_the_session_changes() -> None:
+    # The review's case: a restart whose new total has passed the old mark.
+    assert turn_cost(2.5, "new", ("old", 2.0)) == 2.5
+
+
+def test_a_kept_connection_reports_each_turns_own_cost(tmp_path: Path) -> None:
+    factory = Factory(
+        [[costed(1.0)], [costed(2.5)], [costed(2.5)], [costed(4.0)], [costed(0.75)]]
+    )
+    engine = line(factory, tmp_path)
+    costs: list[float | None] = []
+
+    async def go() -> None:
+        for prompt in ("one", "two", "three", "four"):
+            costs.append((await engine.run_turn(prompt)).cost_estimate_usd)
+        # A new connection starts its own count, from no baseline.
+        await engine.close()
+        costs.append((await engine.run_turn("five")).cost_estimate_usd)
+        await engine.close()
+
+    asyncio.run(go())
+    assert costs == [1.0, 1.5, 0.0, 1.5, 0.75]
+    assert len(factory.connections) == 2
+
+
+def test_a_kept_turn_without_a_reported_cost_keeps_the_baseline(
+    tmp_path: Path,
+) -> None:
+    factory = Factory([[costed(1.0)], [costed(None)], [costed(3.0)]])
+    engine = line(factory, tmp_path)
+    costs: list[float | None] = []
+
+    async def go() -> None:
+        for prompt in ("one", "two", "three"):
+            costs.append((await engine.run_turn(prompt)).cost_estimate_usd)
+        await engine.close()
+
+    asyncio.run(go())
+    assert costs == [1.0, None, 2.0]
+
+
+# Round 3, B. A background task that ends between turns.
+
+
+def bash(tool_use_id: str, command: str) -> AssistantMessage:
+    return AssistantMessage(
+        content=[
+            ToolUseBlock(
+                id=tool_use_id,
+                name="Bash",
+                input={"command": command, "run_in_background": True},
+            )
+        ],
+        model=MODEL,
+    )
+
+
+def stop_call(task_id: str) -> AssistantMessage:
+    return AssistantMessage(
+        content=[ToolUseBlock(id="stop", name="TaskStop", input={"task_id": task_id})],
+        model=MODEL,
+    )
+
+
+def launched(task_id: str, tool_use_id: str | None) -> TaskStartedMessage:
+    return TaskStartedMessage(
+        subtype="task_started",
+        data={},
+        task_id=task_id,
+        description="the engine's description",
+        uuid="u",
+        session_id="session-1",
+        tool_use_id=tool_use_id,
+        task_type="local_bash",
+    )
+
+
+def background_line(
+    factory: Factory, tmp_path: Path, ends: list[BackgroundEnd]
+) -> ClaudeCodeLine:
+    return ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        config=LineConfig(keep_session=True, builtin_tools=("Bash",)),
+        environment={},
+        sandbox={"enabled": True},
+        kept_factory=factory,
+        clock=Clock(),
+        poll_seconds=3600.0,
+        task_ended=ends.append,
+    )
+
+
+def test_a_task_that_ends_between_turns_is_reported_once(tmp_path: Path) -> None:
+    factory = Factory([[bash("tu1", "make gate"), launched("t1", "tu1"), result()]])
+    ends: list[BackgroundEnd] = []
+    engine = background_line(factory, tmp_path, ends)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        assert engine.kept_status()["tasks"] == [
+            {"task_id": "t1", "command": "make gate"}
+        ]
+        connection = factory.connections[0]
+        connection.stream.put_nowait(notified("t1"))
+        connection.stream.put_nowait(
+            TaskUpdatedMessage(
+                subtype="task_updated",
+                data={},
+                task_id="t1",
+                patch={"status": "killed"},
+            )
+        )
+        await settle()
+        await engine.close()
+
+    asyncio.run(go())
+    assert ends == [BackgroundEnd("t1", "make gate", "completed")]
+
+
+def test_a_task_without_a_known_command_is_named_by_its_description(
+    tmp_path: Path,
+) -> None:
+    factory = Factory([[launched("t2", None), result()]])
+    ends: list[BackgroundEnd] = []
+    engine = background_line(factory, tmp_path, ends)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        factory.connections[0].stream.put_nowait(
+            TaskUpdatedMessage(
+                subtype="task_updated",
+                data={},
+                task_id="t2",
+                patch={"status": "failed"},
+            )
+        )
+        await settle()
+        await engine.close()
+
+    asyncio.run(go())
+    assert ends == [BackgroundEnd("t2", "the engine's description", "failed")]
+
+
+def test_ends_inside_a_turn_or_asked_for_by_the_line_are_not_reported(
+    tmp_path: Path,
+) -> None:
+    factory = Factory(
+        [
+            [
+                bash("tu1", "sleep 1"),
+                launched("t1", "tu1"),
+                notified("t1"),
+                bash("tu2", "sleep 300"),
+                launched("t2", "tu2"),
+                result(),
+            ],
+            [stop_call("t2"), result()],
+        ]
+    )
+    ends: list[BackgroundEnd] = []
+    engine = background_line(factory, tmp_path, ends)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        await engine.run_turn("second")
+        # The stop the line asked for lands after its turn.
+        factory.connections[0].stream.put_nowait(notified("t2"))
+        await settle()
+        await engine.close()
+
+    asyncio.run(go())
+    assert ends == []
+
+
+def test_task_status_reads_each_report() -> None:
+    assert task_status(notified("t")) == "completed"
+    assert (
+        task_status(
+            TaskUpdatedMessage(
+                subtype="task_updated", data={}, task_id="t", patch={"status": "killed"}
+            )
+        )
+        == "killed"
+    )
+    assert (
+        task_status(
+            TaskUpdatedMessage(subtype="task_updated", data={}, task_id="t", patch={})
+        )
+        == "ended"
+    )
+    assert task_status(say("x")) == "ended"
+
+
+# Review of round 3. F1 and F2, the cost mark across sessions and connections.
+
+
+def session_result(session: str, total: float) -> ResultMessage:
+    return ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id=session,
+        total_cost_usd=total,
+    )
+
+
+def test_a_new_connection_on_the_same_session_takes_the_difference(
+    tmp_path: Path,
+) -> None:
+    # The engine restores the session's total on resume, so the new connection's
+    # first total continues from the old one.
+    factory = Factory([[session_result("s", 2.0)], [session_result("s", 2.75)]])
+    engine = line(factory, tmp_path)
+    costs: list[float | None] = []
+
+    async def go() -> None:
+        costs.append((await engine.run_turn("one")).cost_estimate_usd)
+        await engine.close()
+        costs.append((await engine.run_turn("two")).cost_estimate_usd)
+        await engine.close()
+
+    asyncio.run(go())
+    assert costs == [2.0, 0.75]
+    assert factory.options[1].resume == "s"
+
+
+def test_a_changed_session_takes_the_whole_total(tmp_path: Path) -> None:
+    factory = Factory([[session_result("s", 2.0)], [session_result("t", 2.5)]])
+    engine = line(factory, tmp_path)
+    costs: list[float | None] = []
+
+    async def go() -> None:
+        costs.append((await engine.run_turn("one")).cost_estimate_usd)
+        costs.append((await engine.run_turn("two")).cost_estimate_usd)
+        await engine.close()
+
+    asyncio.run(go())
+    assert costs == [2.0, 2.5]
+
+
+def test_a_rebuilt_engine_measures_from_the_mark_it_is_given(tmp_path: Path) -> None:
+    factory = Factory([[session_result("s", 5.25)]])
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        config=KEPT,
+        environment={},
+        kept_factory=factory,
+        cost_mark=("s", 5.0),
+    )
+
+    async def go() -> None:
+        report = await engine.run_turn("one")
+        assert report.cost_estimate_usd == 0.25
+        assert report.cost_mark == ("s", 5.25)
+        await engine.close()
+
+    asyncio.run(go())
+
+
+class OneTurn:
+    """A session that is not kept, for one turn with a given total."""
+
+    def __init__(self, session: str, total: float) -> None:
+        self.session = session
+        self.total = total
+
+    async def query(self, prompt: str) -> None:
+        del prompt
+
+    async def receive_response(self) -> AsyncIterator[Message]:
+        yield init()
+        yield session_result(self.session, self.total)
+
+    async def interrupt(self) -> None:
+        pass
+
+
+def test_a_line_without_keep_session_also_takes_the_difference(
+    tmp_path: Path,
+) -> None:
+    # Each turn is a new process that resumes the session and restores its total.
+    totals = iter([1.0, 1.5, 2.25])
+
+    @asynccontextmanager
+    async def factory(options: ClaudeAgentOptions) -> AsyncGenerator[AgentSession]:
+        del options
+        yield OneTurn("s", next(totals))
+
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        environment={},
+        session_factory=factory,
+    )
+    costs = [asyncio.run(engine.run_turn(p)).cost_estimate_usd for p in "abc"]
+    assert costs == [1.0, 0.5, 0.75]

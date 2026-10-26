@@ -110,13 +110,16 @@ def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 def _stop(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     del arguments
     try:
-        stop(paths)
+        answer = stop(paths)
     except DaemonNotRunning:
         print(f"dromon stop: not running for {paths.root}")
         return exits.NOT_RUNNING
     except (DaemonFailed, ProtocolError, TimeoutError, OSError) as error:
         print(f"dromon stop: {error}", file=sys.stderr)
         return exits.FAILURE
+    warning = answer.get("warning")
+    if isinstance(warning, str):
+        print(f"dromon stop: {warning}")
     print("dromon stop: stopped")
     return exits.OK
 

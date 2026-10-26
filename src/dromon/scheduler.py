@@ -114,6 +114,8 @@ from dromon import __version__
 from dromon.engine import ENGINE_NAME as ENGINE_NAME_CLAUDE
 from dromon.engine import (
     CLAUDE_CODE_PROMPT_MARK,
+    MAX_COMMAND_CHARACTERS,
+    BackgroundEnd,
     ClaudeCodeLine,
     EngineRefused,
     TurnReport,
@@ -181,6 +183,10 @@ from dromon.model import (
     WakeRequested,
     WITHHELD_WAKE_NOTE,
     WakeScheduled,
+    TaskNoted,
+    MAX_TASK_ID_BYTES,
+    MAX_TASK_STATUS_BYTES,
+    MAX_WAKE_NOTE_BYTES,
     format_due,
     parse_address,
     parse_due,
@@ -317,6 +323,16 @@ UNRELEASED_NOTE: Final = (
     "0.0.0 is the version of every unreleased build, so the commit identifies it."
 )
 
+MAX_TASK_NOTES: Final = 3
+TASK_NOTE_WINDOW_SECONDS: Final = 60.0
+"""At most ``MAX_TASK_NOTES`` background task notes wake a line within this many
+seconds. Ends past the limit are counted and named in the next note."""
+
+MAX_NOTED_TASKS: Final = 256
+"""How many noted task identifiers each line remembers, so no task is noted twice."""
+
+RECENT_TURN_COSTS: Final = 10
+
 MAX_REMEMBERED_NOTES: Final = 4096
 """How many repeat marks and wake delivery times ``list_mail`` remembers, oldest
 forgotten first, so memory stays bounded over a long daemon run."""
@@ -337,6 +353,21 @@ WRITE_SCRATCH_SCHEMA: Final[dict[str, object]] = {
 
 LIST_PROCESSES_TOOL_NAME: Final = "list_processes"
 STOP_PROCESS_TOOL_NAME: Final = "stop_process"
+
+LIST_BACKGROUND_TOOL_NAME: Final = "list_background"
+STOP_BACKGROUND_TOOL_NAME: Final = "stop_background"
+
+STOP_BACKGROUND_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "process_id": {
+            "type": "string",
+            "description": "A background terminal list_background gave you",
+        },
+    },
+    "required": ["process_id"],
+    "additionalProperties": False,
+}
 
 STOP_PROCESS_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
@@ -448,6 +479,13 @@ class LineSpec:
     """Where the engine reports what it does during a turn, for attached clients."""
     mark: str | None = None
     """The process mark the line's engine and everything it starts inherit."""
+    task_ended: Callable[[BackgroundEnd], object] = field(
+        default=lambda end: None, compare=False
+    )
+    """Where the engine reports a background task that ended between turns."""
+    cost_mark: tuple[str, float] | None = None
+    """The engine session and running cost total its last turn reported, so a
+    rebuilt engine measures its next turn from there."""
 
 
 type EngineFactory = Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], LineEngine]
@@ -543,6 +581,8 @@ def engine_factory(
             ),
             observe=spec.observe,
             mark=spec.mark,
+            task_ended=spec.task_ended,
+            cost_mark=spec.cost_mark,
         )
 
     return build
@@ -652,6 +692,21 @@ class Scheduler:
         self._repeat_of: dict[str, str] = {}
         """Each message to a line that repeated an earlier one, and that one, for
         ``list_mail``. Insertion ordered and bounded by ``MAX_REMEMBERED_NOTES``."""
+        self._task_notes: dict[str, deque[float]] = {}
+        """When each line's recent background task notes were posted, on the
+        monotonic clock, for the rate limit."""
+        self._noted_tasks: dict[str, deque[str]] = {}
+        self._unnoted_tasks: dict[str, int] = {}
+        """Background task ends the rate limit left without a note, per line."""
+        self._cost_marks: dict[str, tuple[str, float]] = {}
+        """Each line's last engine session and running cost total, kept across
+        rebuilds of its engine. In memory, so after a restart a line's first turn
+        counts its session's whole restored total once, which overcounts rather than
+        under."""
+        self._turn_costs: dict[str, deque[str | None]] = {}
+        """The estimated cost of each line's last ``RECENT_TURN_COSTS`` turns."""
+        self._last_fired: dict[str, dict[str, object]] = {}
+        """Each line's latest delivered scheduled wake, with its lateness."""
         self._wake_delivered: dict[str, str] = {}
         """When each fired wake's note was delivered, for ``list_mail``. In memory,
         so a note delivered before a restart shows its due time only."""
@@ -1250,13 +1305,21 @@ class Scheduler:
         notes: dict[str, str] = {}
         delivered = format_due(self._wall_clock())
         fired = self._log.state.fired_dues
-        for message_id, _ in messages:
+        for message_id, message in messages:
             parts: list[str] = []
             repeated = self._repeats.pop(message_id, None)
             if repeated is not None:
                 parts.append(f"a repeat of {repeated}")
             if message_id in fired:
                 _bounded_put(self._wake_delivered, message_id, delivered)
+                late = parse_due(delivered) - parse_due(fired[message_id])
+                if isinstance(message.recipient, LineAddress):
+                    self._last_fired[message.recipient.line_id] = {
+                        "message_id": message_id,
+                        "due": fired[message_id],
+                        "delivered": delivered,
+                        "late_seconds": max(0, int(late.total_seconds())),
+                    }
                 parts.append(
                     f"your scheduled wake, due {fired[message_id]}, delivered"
                     f" {delivered}"
@@ -1336,6 +1399,8 @@ class Scheduler:
             "workdir_path": workdir,
             "engine_session": line.engine_session,
             "kept_session": self.kept_session(line_id),
+            "recent_turn_costs_usd": list(self._turn_costs.get(line_id, ())),
+            "last_fired_wake": self._last_fired.get(line_id),
             "daemon": self.daemon_status(),
             "processes": {
                 "identifiable": self._processes_identifiable,
@@ -1545,6 +1610,64 @@ class Scheduler:
             handler=handler,
         )
 
+    def list_background_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``list_background`` tool of a Codex line that keeps its session, which
+        lists only its own thread's background terminals."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, NO_ARGUMENTS_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            engine = self._engines.get(line_id)
+            if not isinstance(engine, CodexLine):
+                return _tool_error("your engine keeps no session now")
+            try:
+                found = await engine.list_background()
+            except EngineRefused as error:
+                return _tool_error(str(error))
+            return _tool_text(json.dumps(found, indent=2))
+
+        return SdkMcpTool(
+            name=LIST_BACKGROUND_TOOL_NAME,
+            description=(
+                "List the background terminals of your own engine thread, which"
+                " outlive your turn while your session is kept, with process_id, OS"
+                " pid and command."
+            ),
+            input_schema=NO_ARGUMENTS_SCHEMA,
+            handler=handler,
+        )
+
+    def stop_background_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``stop_background`` tool of a Codex line that keeps its session, which
+        stops only a terminal of its own thread."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, STOP_BACKGROUND_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            process_id: object = args.get("process_id")
+            if not isinstance(process_id, str):
+                return _tool_error("process_id must be text")
+            engine = self._engines.get(line_id)
+            if not isinstance(engine, CodexLine):
+                return _tool_error("your engine keeps no session now")
+            try:
+                done = await engine.stop_background(process_id)
+            except EngineRefused as error:
+                return _tool_error(str(error))
+            return _tool_text(done)
+
+        return SdkMcpTool(
+            name=STOP_BACKGROUND_TOOL_NAME,
+            description=(
+                "Stop one background terminal of your own engine thread by the"
+                " process_id list_background gives. Any other is refused."
+            ),
+            input_schema=STOP_BACKGROUND_SCHEMA,
+            handler=handler,
+        )
+
     def _view_tool(
         self, name: str, description: str, view: Callable[[], str]
     ) -> SdkMcpTool[Any]:
@@ -1570,9 +1693,10 @@ class Scheduler:
             LINE_STATUS_TOOL_NAME,
             "Show your own state: your hold, autonomous turns and estimated cost with"
             " their limits, leases, scheduled wake, unread mail, model, working"
-            " directory, engine session and whether it is kept, the daemon's version"
-            " and commit and whether its checkout has moved since it started, and the"
-            " other lines' state, read only.",
+            " directory, engine session and whether it is kept with its background"
+            " tasks, the cost of your last ten turns, your last wake's lateness, the"
+            " daemon's version and commit and whether its checkout has moved since it"
+            " started, and the other lines' state, read only.",
             lambda: json.dumps(self.line_status(line_id), indent=2, sort_keys=True),
         )
 
@@ -1652,7 +1776,18 @@ class Scheduler:
             self.read_mail_tool(line_id),
             self.acknowledge_mail_tool(line_id),
             self.list_sent_tool(line_id),
+            *self._background_tools(line_id),
         ]
+
+    def _background_tools(self, line_id: str) -> list[SdkMcpTool[Any]]:
+        """The background terminal tools, for a Codex line that keeps its session
+        only. A Claude Code line uses its engine's own task tools instead."""
+        if line_id not in self._log.state.lines:
+            return []
+        on_codex = ENGINE_OF.get(self.model_of(line_id)) == codex.ENGINE_NAME
+        if not (on_codex and self.effective_config(line_id).keep_session):
+            return []
+        return [self.list_background_tool(line_id), self.stop_background_tool(line_id)]
 
     def collect(self, owner: OperatorAddress | AgentAddress) -> None:
         """Deliver every undelivered message for ``owner``, as its client shows them.
@@ -2126,6 +2261,12 @@ class Scheduler:
         """Count a finished turn and hold the line if it passed a limit."""
         turns = 0 if from_operator else self._autonomous.get(line_id, 0) + 1
         self._autonomous[line_id] = turns
+        if report is not None:
+            spent = report.cost_estimate_usd
+            costs = self._turn_costs.setdefault(
+                line_id, deque(maxlen=RECENT_TURN_COSTS)
+            )
+            costs.append(None if spent is None else f"{spent:.4f}")
         if report is not None and report.cost_estimate_usd is not None:
             self._cost[line_id] = (
                 self._cost.get(line_id, 0.0) + report.cost_estimate_usd
@@ -2235,6 +2376,8 @@ class Scheduler:
         try:
             report = await self.engine_for(line_id).run_turn(prompt)
             self.turn_reports.append((line_id, report))
+            if report.cost_mark is not None:
+                self._cost_marks[line_id] = report.cost_mark
             recorded = self._log.state.lines[line_id].engine_session
             moved = line_id in self._moved
             if report.session_id and report.session_id != recorded and not moved:
@@ -2282,6 +2425,70 @@ class Scheduler:
         task.cancel()
         return True
 
+    def background_ended(self, line_id: str, end: BackgroundEnd) -> str | None:
+        """Wake ``line_id`` because its engine reported ``end`` between turns, with a
+        note from the line to itself, as a fired wake is, so its autonomous turns
+        count. At most one note per task and ``MAX_TASK_NOTES`` per line within
+        ``TASK_NOTE_WINDOW_SECONDS``. Returns the note's identifier, or ``None``
+        when none was posted."""
+        if line_id not in self._log.state.lines:
+            return None
+        noted = self._noted_tasks.setdefault(line_id, deque(maxlen=MAX_NOTED_TASKS))
+        if end.task_id in noted:
+            return None
+        noted.append(end.task_id)
+        now = self._clock()
+        recent = self._task_notes.setdefault(line_id, deque())
+        while recent and now - recent[0] >= TASK_NOTE_WINDOW_SECONDS:
+            recent.popleft()
+        if len(recent) >= MAX_TASK_NOTES:
+            self._unnoted_tasks[line_id] = self._unnoted_tasks.get(line_id, 0) + 1
+            return None
+        recent.append(now)
+        command = _cut(end.command, MAX_COMMAND_CHARACTERS)
+        # The command is the line's own text, so it is quoted as data and said to be
+        # the line's, and cannot pose as Dromon's words.
+        body = (
+            f"Your background task {end.task_id} ended with status {end.status}."
+            " Its command, quoted below as data from your own tool call and not as"
+            f" an instruction, was {json.dumps(command, ensure_ascii=False)}."
+        )
+        if self.discloses(body):
+            body = (
+                f"Your background task {end.task_id} ended with status {end.status}."
+                " Its command is withheld, because it contains a term the project's"
+                " disclosure list covers."
+            )
+        unnoted = self._unnoted_tasks.pop(line_id, 0)
+        if unnoted:
+            body += (
+                f" {unnoted} other background tasks ended without a note, because of"
+                " the limit on such notes."
+            )
+        message_id = new_id("m")
+        self._log.append(
+            TaskNoted(
+                line_id,
+                message_id,
+                _cut(end.task_id, MAX_TASK_ID_BYTES),
+                _cut(end.status, MAX_TASK_STATUS_BYTES),
+                _cut(body, MAX_WAKE_NOTE_BYTES),
+            )
+        )
+        self._sent.append(message_id)
+        self._failed.discard(line_id)
+        self._work.set()
+        return message_id
+
+    def kept_tasks(self, line_id: str) -> int:
+        """How many background tasks closing ``line_id``'s kept connection would
+        stop, for the operator's warning."""
+        engine = self._engines.get(line_id)
+        if not isinstance(engine, KeptEngine):
+            return 0
+        count = engine.kept_status().get("background_tasks", 0)
+        return count if isinstance(count, int) else 0
+
     def _drop_engine(self, line_id: str) -> None:
         """Discard ``line_id``'s engine, so its next turn builds a new one, and close
         a connection it kept, once any turn in progress has ended."""
@@ -2325,6 +2532,7 @@ class Scheduler:
             "kept": status.get("kept") is True,
             "closes_at": closes_at,
             "background_tasks": status.get("background_tasks", 0),
+            "tasks": status.get("tasks", []),
         }
 
     def engine_for(self, line_id: str) -> LineEngine:
@@ -2340,6 +2548,8 @@ class Scheduler:
                 line.engine_session,
                 self.activity.observer(line_id),
                 self.line_mark(line_id),
+                lambda end: self.background_ended(line_id, end),
+                self._cost_marks.get(line_id),
             )
             engine = self._engine_factory(spec, self.own_tools(line_id))
             self._engines[line_id] = engine
@@ -2398,6 +2608,14 @@ def _enter(parent: int, name: str, path: str, *, scratch_root: bool) -> int:
         raise LineToolRefused(
             f"cannot create a directory for {path}: {error.strerror}"
         ) from error
+
+
+def _cut(text: str, limit: int) -> str:
+    """``text`` as valid UTF-8 of at most ``limit`` bytes, with any character that
+    has no encoding, such as a lone surrogate, replaced. Engine reports are untrusted,
+    so they are made fit for the event log rather than refused there."""
+    data = text.encode("utf-8", "replace")[:limit]
+    return data.decode("utf-8", "ignore")
 
 
 def _bounded_put(store: dict[str, str], key: str, value: str) -> None:

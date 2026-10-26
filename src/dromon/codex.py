@@ -39,9 +39,15 @@ configurations are refused otherwise. Codex reports no cost, and has no turn lim
 the driver's tool budget is the bound. Dynamic tools are an experimental part of the
 protocol, and the app-server is documented as experimental.
 
+Kept sessions. With ``keep_session`` the app-server stays up between turns, so its
+background terminals outlive a turn, and ``list_background`` and ``stop_background``
+reach them. A pump then reads every message and routes responses, every check above
+runs again at each turn on the live connection, and any change to what the app-server
+was started with opens a new one. ``docs/protocol/CODEX.md`` is normative.
+
 Porting note. The protocol is JSON lines over a pipe, which the Rust port can speak
-unchanged. The adapter is sequential: it reads one message at a time and answers each
-server request before reading on.
+unchanged. Without a kept session the adapter is sequential: it reads one message at a
+time and answers each server request before reading on.
 """
 
 import asyncio
@@ -50,12 +56,21 @@ import contextlib
 import hashlib
 import json
 import os
+import sys
 import tempfile
 import re
 import shutil
 import subprocess
-from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+import time
+from collections.abc import (
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Mapping,
+    Sequence,
+)
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, Protocol, cast
@@ -65,7 +80,15 @@ from claude_agent_sdk import SdkMcpTool
 from dromon import __version__
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
-from dromon.engine import EngineRefused, TurnReport, read_instructions
+from dromon.engine import (
+    DIED_NOTE,
+    INTERRUPT_TIMEOUT_SECONDS,
+    KEEP_POLL_SECONDS,
+    EngineRefused,
+    TurnReport,
+    closed_note,
+    read_instructions,
+)
 from dromon.processes import MARK_VARIABLE
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
 
@@ -128,6 +151,28 @@ BARE_KEY: Final = re.compile(r"[A-Za-z0-9_-]{1,128}")
 MAX_LINE: Final = 64 * 1024 * 1024
 """The longest protocol line Dromon reads, so a runaway engine cannot exhaust memory."""
 
+LIST_TERMINALS: Final = "thread/backgroundTerminals/list"
+TERMINATE_TERMINAL: Final = "thread/backgroundTerminals/terminate"
+"""The app-server's methods for a thread's background terminals. **Fact, read from the
+installed Codex 0.164.0 binary on 2026-10-26.** They exist beside
+``thread/backgroundTerminals/clean``. A listed terminal has seven fields, of which
+``itemId``, ``processId``, ``osPid``, ``cpuPercent`` and ``rssKb`` were read. The list
+takes three parameters and termination two, whose names beyond ``threadId`` and
+``processId`` are an inference. Not run, since a line may not start Codex."""
+
+MAX_TERMINALS: Final = 64
+
+MAX_OWN_COMMANDS: Final = 1024
+"""How many command identifiers a kept connection remembers as the line's own."""
+"""The most background terminals a listing returns."""
+
+REQUEST_TIMEOUT_SECONDS: Final = 30.0
+
+CODEX_SELF_STARTED_NOTE: Final = (
+    "Dromon note: between your turns the engine began a turn by itself. Only Dromon"
+    " starts turns, so it was interrupted, and its tool calls were refused."
+)
+
 
 def unsupported(config: LineConfig) -> str | None:
     """Why a Codex line cannot run ``config``, or ``None`` if it can."""
@@ -145,8 +190,6 @@ def unsupported(config: LineConfig) -> str | None:
         return "Codex lines do not load Claude Code's project settings"
     if config.plugins:
         return "Codex lines do not load Claude Code plugins"
-    if config.keep_session:
-        return "Codex lines do not yet keep their engine session between turns"
     if config.sandbox is not None or config.settings is not None:
         return (
             "Codex lines run under Dromon's Codex permission profile, and take no"
@@ -437,6 +480,89 @@ class _Turn:
     """Whether this turn started a new thread because Dromon's tools changed."""
 
 
+class _Routed:
+    """A kept app-server connection. A pump reads every message. A response to a
+    request made outside the turn's own loop, such as a background terminal listing
+    asked for by a tool during the turn, resolves that request's future, so the turn
+    cannot deadlock on it. During a turn every other message goes to the turn, which
+    reads it through ``receive``, and between turns ``between`` handles it."""
+
+    def __init__(
+        self,
+        inner: Connection,
+        between: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        self.inner = inner
+        self._writing = asyncio.Lock()
+        """Writes come from the turn, the pump, a tool's request and an interrupt
+        task, so each message is written whole under this lock."""
+        self.queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        self.pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self.active = False
+        self.alive = True
+        self._between = between
+
+    async def send(self, message: Mapping[str, object]) -> None:
+        async with self._writing:
+            await self.inner.send(message)
+
+    async def receive(self) -> dict[str, Any] | None:
+        return await self.queue.get()
+
+    async def pump(self) -> None:
+        try:
+            while True:
+                message = await self.inner.receive()
+                if message is None:
+                    return
+                request_id = message.get("id")
+                if (
+                    "method" not in message
+                    and isinstance(request_id, int)
+                    and request_id in self.pending
+                ):
+                    future = self.pending.pop(request_id)
+                    if not future.done():
+                        future.set_result(message)
+                elif self.active:
+                    self.queue.put_nowait(message)
+                else:
+                    await self._between(message)
+        except Exception:  # noqa: BLE001, S110
+            # The engine's process or its pipe ended, which marks the connection
+            # dead below, and the next turn starts a new one.
+            pass
+        finally:
+            self.alive = False
+            self.queue.put_nowait(None)
+            for future in self.pending.values():
+                if not future.done():
+                    future.set_exception(
+                        EngineRefused("the engine closed its connection")
+                    )
+            self.pending.clear()
+
+
+@dataclass(slots=True)
+class _Kept:
+    stack: AsyncExitStack
+    routed: _Routed
+    fingerprint: str
+    last_end: float
+    pump: "asyncio.Task[None] | None" = None
+    watch: "asyncio.Task[None] | None" = None
+    started: bool = False
+    """Whether the connection has been initialized, which only its first turn does."""
+    terminals: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
+    """The line's own background terminals in the last listing, for the status and
+    the ceiling."""
+    own: set[str] = field(default_factory=set[str])
+    """The process and item identifiers of the commands the line's own turns ran on
+    this connection, from the items the engine reported, bounded by
+    ``MAX_OWN_COMMANDS``. A listed terminal is the line's only if it matches one, so
+    the line never depends on the engine's scoping by thread."""
+
+
 class CodexLine:
     """One session line on the Codex engine, with its driver."""
 
@@ -454,6 +580,8 @@ class CodexLine:
         server_lister: ServerLister = list_servers,
         observe: Observer = ignore,
         mark: str | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        poll_seconds: float = KEEP_POLL_SECONDS,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -475,18 +603,33 @@ class CodexLine:
         self._next_id = 0
         self._thread_id = ""
         self._connection: Connection | None = None
+        self._clock = clock
+        self._poll_seconds = poll_seconds
+        self._kept: _Kept | None = None
+        self._notes: list[str] = []
+        self._retired = False
+        self._in_turn = False
+        self._background: set[asyncio.Task[None]] = set()
 
     async def run_turn(self, prompt: str) -> TurnReport:
-        """Run one turn for ``prompt`` and return what happened."""
-        environment = engine_environment(
-            self._environment, self.driver.settings.strategy
-        )
-        reason = unsupported(self.config)
-        if reason is not None:
-            raise EngineRefused(reason)
-        arguments = server_arguments(
-            self._list_servers(environment), self.config, self.protected, self.mark
-        )
+        """Run one turn for ``prompt`` and return what happened. A check that
+        refuses the turn also closes a kept connection."""
+        try:
+            environment = engine_environment(
+                self._environment, self.driver.settings.strategy
+            )
+            reason = unsupported(self.config)
+            if reason is not None:
+                raise EngineRefused(reason)
+            arguments = server_arguments(
+                self._list_servers(environment), self.config, self.protected, self.mark
+            )
+            instructions = read_instructions(self.config.instructions, self.cwd)
+        except Exception:
+            await self.close()
+            raise
+        if self.config.keep_session:
+            return await self._kept_turn(prompt, arguments, environment, instructions)
         turn = _Turn()
         async with self._connect(arguments, self.cwd, environment) as connection:
             self._connection = connection
@@ -503,6 +646,11 @@ class CodexLine:
                 self._connection = None
         if turn.refusal is not None:
             raise EngineRefused(turn.refusal)
+        return self._report(turn, credential, thread_id)
+
+    def _report(
+        self, turn: _Turn, credential: Credential, thread_id: str
+    ) -> TurnReport:
         session = f"{thread_id}{SESSION_SEPARATOR}{self.tools_fingerprint()}"
         self.session_id = session
         subtype = "success" if turn.status == "completed" else turn.status
@@ -601,6 +749,8 @@ class CodexLine:
             )
 
     async def _notice(self, method: str, params: dict[str, Any], turn: _Turn) -> None:
+        if method in ("item/started", "item/completed"):
+            self._remember_command(cast(dict[str, Any], params.get("item") or {}))
         if method == "item/started":
             await self._item_started(
                 cast(dict[str, Any], params.get("item") or {}), turn
@@ -680,6 +830,11 @@ class CodexLine:
             turn,
         )
         await self._send({"method": "initialized"})
+        return await self._credential(turn)
+
+    async def _credential(self, turn: _Turn) -> Credential:
+        """The account the engine reports, as a credential the driver accepts. A kept
+        connection asks again at every turn."""
         account = (await self._call("account/read", {}, turn)).get("account")
         kind = (
             cast(dict[str, Any], account).get("type")
@@ -792,3 +947,366 @@ class CodexLine:
         )
         while not turn.status:
             await self._dispatch(await self._receive(), turn)
+
+    # A kept connection. Porting note: as for Claude Code lines, the pump and the
+    # watch are asyncio tasks that share the connection's fields with the turn
+    # without a lock, which is sound only because asyncio switches tasks at awaits.
+
+    def fingerprint(
+        self,
+        arguments: Sequence[str],
+        environment: Mapping[str, str],
+        instructions: str,
+    ) -> str:
+        """A digest of everything a kept app-server was started and its thread opened
+        with, which a turn compares before reusing it. The environment holds
+        credentials, so only its digest is kept, in memory."""
+        document = {
+            "arguments": list(arguments),
+            "environment": sorted(environment.items()),
+            "cwd": str(self.cwd),
+            "instructions": instructions,
+            "tools": self.tools_fingerprint(),
+            "model": self.driver.settings.model,
+            "effort": self.config.effort or self.driver.settings.effort,
+            "builtin_tools": list(self.config.builtin_tools),
+        }
+        text = json.dumps(document, sort_keys=True)
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def seconds_to_close(self) -> float | None:
+        kept = self._kept
+        if kept is None or not kept.routed.alive or self._in_turn:
+            return None
+        allowed = (
+            self.config.keep_session_max_seconds
+            if kept.terminals
+            else self.config.keep_session_idle_seconds
+        )
+        return kept.last_end + allowed - self._clock()
+
+    def kept_status(self) -> dict[str, object]:
+        kept = self._kept
+        alive = kept is not None and kept.routed.alive
+        terminals = kept.terminals if kept is not None and alive else []
+        return {
+            "keep_session": self.config.keep_session,
+            "kept": alive,
+            "seconds_to_close": self.seconds_to_close(),
+            "background_tasks": len(terminals),
+            "tasks": [
+                {"task_id": str(t.get("process_id")), "command": str(t.get("command"))}
+                for t in terminals
+            ],
+        }
+
+    async def expire(self) -> bool:
+        remaining = self.seconds_to_close()
+        kept = self._kept
+        if kept is None or remaining is None or remaining > 0:
+            return False
+        await self.close(
+            "it reached keep_session_max_seconds with background terminals running"
+            if kept.terminals
+            else "it waited keep_session_idle_seconds without a turn"
+        )
+        return True
+
+    async def retire(self) -> None:
+        self._retired = True
+        if not self._in_turn:
+            await self.close()
+
+    async def close(self, reason: str | None = None) -> None:
+        """Close the kept app-server, which ends its background terminals. With
+        ``reason`` the next prompt says why."""
+        kept = self._kept
+        if kept is None:
+            return
+        self._kept = None
+        if reason is not None:
+            self._notes.append(closed_note(reason, len(kept.terminals)))
+        current = asyncio.current_task()
+        helpers = [
+            t for t in (kept.pump, kept.watch) if t is not None and t is not current
+        ]
+        for task in helpers:
+            task.cancel()
+        await asyncio.gather(*helpers, return_exceptions=True)
+        with contextlib.suppress(Exception):
+            await kept.stack.aclose()
+
+    def _spawn(self, work: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.get_running_loop().create_task(work)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _open_kept(
+        self,
+        arguments: list[str],
+        environment: Mapping[str, str],
+        fingerprint: str,
+    ) -> _Kept:
+        stack = AsyncExitStack()
+        try:
+            inner = await stack.enter_async_context(
+                self._connect(arguments, self.cwd, environment)
+            )
+        except BaseException:
+            await stack.aclose()
+            raise
+        kept = _Kept(stack, _Routed(inner, self._between), fingerprint, self._clock())
+        loop = asyncio.get_running_loop()
+        kept.pump = loop.create_task(kept.routed.pump())
+        kept.watch = loop.create_task(self._watch(kept))
+        self._kept = kept
+        return kept
+
+    async def _between(self, message: dict[str, Any]) -> None:
+        """A message between turns. A request is refused, so no tool runs and no
+        approval is given outside a turn, and a turn the engine began by itself is
+        interrupted and noted."""
+        kept = self._kept
+        if kept is None:
+            return
+        method = message.get("method")
+        if "id" in message and isinstance(method, str):
+            answer: dict[str, object] = (
+                {"id": message["id"], "result": {"decision": "decline"}}
+                if method.endswith("/requestApproval")
+                else {
+                    "id": message["id"],
+                    "error": {
+                        "code": -32601,
+                        "message": "Dromon has not started a turn",
+                    },
+                }
+            )
+            await kept.routed.send(answer)
+            return
+        if method == "turn/started":
+            started = cast(dict[str, Any], message.get("params") or {})
+            turn_id = cast(dict[str, Any], started.get("turn") or {}).get("id")
+            if CODEX_SELF_STARTED_NOTE not in self._notes:
+                self._notes.append(CODEX_SELF_STARTED_NOTE)
+            if not isinstance(turn_id, str) or not turn_id or not self._thread_id:
+                # An interrupt needs the turn's identifier, so without one the only
+                # sure way to stop the turn is to end the app-server.
+                await self.close("the engine began a turn by itself without naming it")
+                return
+            self._next_id += 1
+            await kept.routed.send(
+                {
+                    "id": self._next_id,
+                    "method": "turn/interrupt",
+                    "params": {"threadId": self._thread_id, "turnId": turn_id},
+                }
+            )
+
+    async def _watch(self, kept: _Kept) -> None:
+        while kept is self._kept and kept.routed.alive:
+            await asyncio.sleep(self._poll_seconds)
+            if kept is not self._kept:
+                return
+            try:
+                await self.expire()
+            except Exception as error:  # noqa: BLE001
+                print(
+                    f"dromond: the watch of a kept session failed and goes on: {error}",
+                    file=sys.stderr,
+                )
+
+    async def request(
+        self, method: str, params: Mapping[str, object]
+    ) -> dict[str, Any]:
+        """Call ``method`` on the kept app-server, during a turn or between turns,
+        and return its result. Raises ``EngineRefused``."""
+        kept = self._kept
+        if kept is None or not kept.routed.alive or not kept.started:
+            raise EngineRefused("this line keeps no engine session now")
+        self._next_id += 1
+        request_id = self._next_id
+        future: asyncio.Future[dict[str, Any]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        kept.routed.pending[request_id] = future
+        try:
+            await kept.routed.send(
+                {"id": request_id, "method": method, "params": params}
+            )
+            message = await asyncio.wait_for(future, REQUEST_TIMEOUT_SECONDS)
+        except TimeoutError as error:
+            raise EngineRefused(f"the engine did not answer {method}") from error
+        finally:
+            kept.routed.pending.pop(request_id, None)
+        if "error" in message:
+            raise EngineRefused(f"the engine refused {method}: {message['error']}")
+        result: object = message.get("result")
+        return cast(dict[str, Any], result) if isinstance(result, dict) else {}
+
+    def _remember_command(self, item: dict[str, Any]) -> None:
+        """Note a command the line's own turn ran as the line's, by its process and
+        item identifiers, on a kept connection."""
+        kept = self._kept
+        if kept is None or item.get("type") != "commandExecution":
+            return
+        for key in ("processId", "id"):
+            value = item.get(key)
+            if isinstance(value, str) and value and len(value) <= 128:
+                if len(kept.own) >= MAX_OWN_COMMANDS:
+                    kept.own.clear()
+                kept.own.add(value)
+
+    async def list_background(self) -> list[dict[str, object]]:
+        """The background terminals of the line's own thread. Raises
+        ``EngineRefused``."""
+        result = await self.request(LIST_TERMINALS, {"threadId": self._thread_id})
+        # The listing's field name was not read, so its one list is taken.
+        listed: list[object] = []
+        for value in result.values():
+            if isinstance(value, list):
+                listed = cast(list[object], value)
+                break
+        terminals: list[dict[str, object]] = []
+        for entry in listed[:MAX_TERMINALS]:
+            if not isinstance(entry, dict):
+                continue
+            fields = cast(dict[str, object], entry)
+            if not self._is_own(fields):
+                continue
+            command = next(
+                (
+                    fields[key]
+                    for key in ("command", "commandLine", "cmd")
+                    if isinstance(fields.get(key), str)
+                ),
+                "",
+            )
+            terminals.append(
+                {
+                    "process_id": str(fields.get("processId") or ""),
+                    "os_pid": fields.get("osPid")
+                    if isinstance(fields.get("osPid"), int)
+                    else None,
+                    "command": str(command)[:200],
+                }
+            )
+        if self._kept is not None:
+            self._kept.terminals = terminals
+        return terminals
+
+    def _is_own(self, fields: Mapping[str, object]) -> bool:
+        """Whether a listed terminal was started by the line's own turn on this
+        connection, by its process or item identifier."""
+        kept = self._kept
+        if kept is None:
+            return False
+        names = {fields.get("processId"), fields.get("itemId")}
+        return any(isinstance(name, str) and name in kept.own for name in names)
+
+    async def stop_background(self, process_id: str) -> str:
+        """Terminate one background terminal of the line's own thread, which must be
+        in a fresh listing. Raises ``EngineRefused``."""
+        if not process_id or len(process_id) > 128:
+            raise EngineRefused("process_id must be text of 1 to 128 characters")
+        listed = await self.list_background()
+        if process_id not in {str(t["process_id"]) for t in listed}:
+            raise EngineRefused(f"{process_id} is not one of your background terminals")
+        await self.request(
+            TERMINATE_TERMINAL, {"threadId": self._thread_id, "processId": process_id}
+        )
+        with contextlib.suppress(EngineRefused):
+            await self.list_background()
+        return f"terminated background terminal {process_id}"
+
+    async def _kept_turn(
+        self,
+        prompt: str,
+        arguments: list[str],
+        environment: Mapping[str, str],
+        instructions: str,
+    ) -> TurnReport:
+        """A turn on the kept app-server, opened anew when there is none, when it
+        ended, or when what it was started with changed. On a reused connection every
+        check of a new one runs again: the account, the thread's provider, model and
+        permission profile through ``thread/resume`` of the loaded thread, whose
+        overrides the engine ignores, and the MCP server and app listings."""
+        fingerprint = self.fingerprint(arguments, environment, instructions)
+        kept = self._kept
+        if kept is not None:
+            if not kept.routed.alive:
+                await self.close()
+                self._notes.append(DIED_NOTE)
+            elif kept.fingerprint != fingerprint:
+                await self.close(
+                    "its configuration, instructions, tools or environment changed"
+                )
+        kept = self._kept or await self._open_kept(arguments, environment, fingerprint)
+        if self._notes:
+            prompt = "\n\n".join([*self._notes, prompt])
+            self._notes.clear()
+        turn = _Turn()
+        kept.routed.active = True
+        self._connection = kept.routed
+        self._in_turn = True
+        try:
+            credential = await (
+                self._credential(turn) if kept.started else self._start(turn)
+            )
+            kept.started = True
+            thread_id = await self._open_thread(turn)
+            if turn.refusal is None:
+                await self._check_isolation(thread_id, turn)
+            if turn.refusal is None:
+                await self._run(thread_id, prompt, turn)
+        except asyncio.CancelledError:
+            if turn.turn_id is not None and not turn.status:
+                self._spawn(self._interrupt_kept(kept, turn.turn_id))
+            raise
+        except _RpcError as error:
+            await self.close()
+            raise EngineRefused(f"the engine refused a request: {error}") from error
+        except Exception:
+            died = not kept.routed.alive
+            await self.close()
+            if died:
+                self._notes.append(DIED_NOTE)
+            raise
+        finally:
+            self._in_turn = False
+            self._connection = None
+            kept.routed.active = False
+            kept.last_end = self._clock()
+            while not kept.routed.queue.empty():
+                leftover = kept.routed.queue.get_nowait()
+                if leftover is not None:
+                    await self._between(leftover)
+            if self._retired:
+                self._spawn(self.close())
+        if turn.refusal is not None:
+            await self.close()
+            raise EngineRefused(turn.refusal)
+        # A listing that fails leaves the count empty, so the shorter idle time
+        # applies.
+        with contextlib.suppress(EngineRefused):
+            await self.list_background()
+        return self._report(turn, credential, thread_id)
+
+    async def _interrupt_kept(self, kept: _Kept, turn_id: str) -> None:
+        """After an operator's interrupt, interrupt the engine's turn, and close the
+        connection if that cannot be sent."""
+        self._next_id += 1
+        try:
+            await asyncio.wait_for(
+                kept.routed.send(
+                    {
+                        "id": self._next_id,
+                        "method": "turn/interrupt",
+                        "params": {"threadId": self._thread_id, "turnId": turn_id},
+                    }
+                ),
+                INTERRUPT_TIMEOUT_SECONDS,
+            )
+        except Exception:  # noqa: BLE001
+            if kept is self._kept:
+                await self.close()

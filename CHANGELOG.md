@@ -85,6 +85,26 @@ All notable changes are recorded here. The format follows
   unanswered count leaves out replies to hold questions, and `list_mail` entries carry
   `repeat_of` and a fired wake's due and delivery times.
 
+- The round 3 review. A Claude Code turn's cost is the difference from the last total
+  reported for the same engine session, kept across engine rebuilds, and the whole
+  total when the session changes or the total falls. The engine restores a resumed
+  session's total, so this also stops turns that are not kept from counting their
+  session's history. A task-end note quotes the command as the line's own data. A
+  kept Codex connection never interrupts without a turn identifier, lists and stops
+  only terminals of commands its own turns ran, and writes each message whole under
+  a lock.
+
+- Round 3 of the session-line experience. A kept connection's turn now costs the
+  difference from the previous result's running total, which had been added whole. A
+  background task that ends between turns wakes its line with a `task_noted` note, at
+  most once per task and three a minute. `line_status` lists running tasks with their
+  commands, the cost of the last ten turns, and the last fired wake's lateness. An
+  operator's action that stops a kept session's tasks says how many in its response.
+  Codex lines may keep their app-server between turns, with every check run again on
+  the live connection, and gain `list_background` and `stop_background` for their own
+  thread's background terminals. The lines' rules ask for tracked background tasks
+  instead of `nohup`.
+
 - The round 2 review. No Claude Code turn admits a tool call before its init check,
   on any connection, and a refusal can no longer be cleared by a later init. An idle
   kept connection closes as soon as a plugin or `.claude` file it loaded changes. The
