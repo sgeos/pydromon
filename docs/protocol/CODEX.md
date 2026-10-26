@@ -134,6 +134,7 @@ driver. **Fact, observed on 2026-10-25.** The operator's environment sets
 | `instructions` | Their text becomes the thread's developer instructions |
 | `claude_code_prompt` | Refused, since Codex uses its own instructions |
 | `project_settings` | Refused, since it loads Claude Code's settings |
+| `plugins` | Refused, since they are Claude Code plugins |
 
 A configuration a Codex line cannot run is refused when the line is created or
 configured.

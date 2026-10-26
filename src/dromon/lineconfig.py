@@ -67,6 +67,8 @@ MAX_TEXT: Final = 4096
 
 MAX_INSTRUCTION_FILES: Final = 16
 
+MAX_PLUGINS: Final = 16
+
 EFFORTS: Final = ("low", "medium", "high", "xhigh", "max")
 """The reasoning efforts Claude Code accepts."""
 
@@ -186,6 +188,9 @@ class LineConfig:
     project_settings: bool = False
     """Whether a Claude Code line also loads Claude Code's project setting source, the
     working directory's ``.claude/settings.json`` and what it brings."""
+    plugins: tuple[str, ...] = ()
+    """Local plugin directories a Claude Code line loads, absolute or under ``~``, as
+    written. Each is checked against an allowlist at every turn."""
 
     def allows(self, tool_name: str, own_tools: frozenset[str]) -> bool:
         """Whether the policy allows ``tool_name``. Dromon's own tools always pass."""
@@ -236,6 +241,8 @@ def encode_config(config: LineConfig) -> str:
         document["workdir"] = config.workdir
     if config.project_settings:
         document["project_settings"] = True
+    if config.plugins:
+        document["plugins"] = list(config.plugins)
     return json.dumps(
         document,
         ensure_ascii=False,
@@ -377,6 +384,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         "instructions",
         "workdir",
         "project_settings",
+        "plugins",
     }
     unknown = set(document) - allowed
     if unknown:
@@ -427,6 +435,16 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
     project_settings = document.get("project_settings", False)
     if type(project_settings) is not bool:
         _fail("project_settings must be a boolean")
+    plugins = _texts(document.get("plugins", []), "plugins")
+    if len(plugins) > MAX_PLUGINS:
+        _fail(f"plugins names more than {MAX_PLUGINS} directories")
+    if len(set(plugins)) != len(plugins):
+        _fail("plugins names a directory twice")
+    for plugin in plugins:
+        if "\x00" in plugin or not (
+            plugin.startswith("/") or plugin == "~" or plugin.startswith("~/")
+        ):
+            _fail(f"plugin {plugin!r} must be an absolute path or start with ~/")
     return LineConfig(
         builtin_tools=tuple(sorted(set(builtin))),
         mcp_servers=parse_servers(document.get("mcp_servers", {})),
@@ -440,6 +458,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         instructions=instructions,
         workdir=workdir,
         project_settings=project_settings,
+        plugins=plugins,
     )
 
 

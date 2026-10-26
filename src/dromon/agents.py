@@ -376,6 +376,17 @@ class Gateway:
             return _error(
                 f"{tool} needs {spec.minimum} access, and this agent has {access}"
             )
+        config = args.get("config")
+        if (
+            spec.name in ("create_line", "configure_line")
+            and isinstance(config, dict)
+            and "plugins" in config
+            and access is not AgentAccess.OPERATOR
+        ):
+            return _error(
+                f"plugins load code into a line, so {tool} may set them only with"
+                f" operator access, and this agent has {access}"
+            )
         return self._daemon_tool(agent_id, spec.name, args)
 
     def _daemon_tool(

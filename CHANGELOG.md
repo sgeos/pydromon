@@ -67,6 +67,18 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- `plugins`, a line key, lists local plugin directories a Claude Code line loads
+  through the Agent SDK's `plugins` option, so no user setting source opens. Only
+  operator authority sets it. At every turn each plugin must pass allowlists of its
+  entries, its manifest and listing keys and its skills' front matter, so a plugin with
+  hooks, MCP servers, commands, agents, output styles or language servers refuses the
+  turn. A listing entry's source must stay inside the plugin, `skills` may hold only
+  skill directories, and front matter admits only allowlisted keys at column zero and
+  block scalar text. A line that loads plugins or project settings needs an enabled
+  sandbox whatever its tools, and the sandbox and `Edit` rules deny writes to each
+  plugin directory. A line that uses a plugin's skill lists `Skill`, and
+  the init check still refuses any tool the line was not given. Codex and Grok lines
+  refuse it.
 - `docs/architecture/KELEUSMA_DOGFOOD.md` records what Dromon needed to run Keleusma's
   four lines, the read-only trial of those lines, and a validated Keleusma project file.
 
@@ -76,7 +88,8 @@ All notable changes are recorded here. The format follows
   its engine session is cleared and its engine rebuilt. A rebind that changes nothing,
   has no driver or adapter, or that the new engine cannot run is refused, as is one
   during a turn. It is operator only. The project file's check of a line's model and
-  strategy compares with the current binding.
+  strategy compares with the current binding, and the settings view labels the
+  model's source `rebound`.
 - `project_settings`, a line key, starts a Claude Code line with Claude Code's project
   setting source, so its working directory's `.claude/settings.json`, skills and
   `CLAUDE.md` load. At the start of every turn, what it would load is checked against

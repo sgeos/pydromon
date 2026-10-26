@@ -31,15 +31,22 @@ autonomous-turn holds. The reviewer's duplicate request was a deliberate resend 
 its first turn failed to start. Luna's intermittent collection failure was the
 `.dromon` defect, fixed by pytest's `--ignore`.
 
-**Not verified.** No live turn ran on Fable 5.1, on a line's project settings, or on a
-cross-engine rebind. The four lines have not run as writing lines, because their live
-sessions work in the same worktrees.
+**Verified live afterwards, 2026-10-26.** In a scratch project, `require_sandbox`
+refused an unsandboxed line, the disclosure guard refused a line's message without
+naming the term, a project skill loaded and a project hook refused its turn, a rebind
+from Haiku to Opus answered as Opus, and the `plugins` key loaded Keleusma's required
+skill. In a private clone of Keleusma, a writing kaizen line took the lease, built a
+crate in the background with two scheduled wakes, committed in its worktree, pushed to
+a local remote, and released the lease. Stage 4, the plugin opt-in, merged with its
+review findings fixed.
+
+**Not verified.** No live turn ran on Fable 5.1, which the project file does not use.
+The real Keleusma lines have not run as writing lines, because their live sessions work
+in the same worktrees, and installing the file is the operator's decision.
 
 **For the operator.**
 1. Whether to install the Keleusma project file, which stops the live sessions of
    those lines, and whether those lines keep their authority to commit, push and merge.
 2. Keleusma's remote over HTTPS, and `secret/disclosure-terms.txt` there.
-3. The `typesafe-ai` skill Keleusma requires is a user plugin, which Dromon does not
-   load. Whether to add an opt-in for it.
-4. The lines' top suggestions: let a line list and stop its own processes, and show a
+3. The lines' top suggestions: let a line list and stop its own processes, and show a
    line its own holds, limits and leases.

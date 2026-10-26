@@ -56,6 +56,7 @@ from dromon.agents import (
 from dromon import codex, grok
 from dromon.disclosure import DisclosureError, load_terms
 from dromon.engine import ENGINE_NAME as CLAUDE_CODE_ENGINE
+from dromon.engine import EngineRefused, check_plugin, resolve_plugin
 from dromon.teacher import Teacher, TeacherError
 from dromon.driver import ENGINE_OF, MODELS, DriverError, Strategy
 from dromon.eventlog import EventLog, LogError, utc_now
@@ -229,6 +230,7 @@ class Daemon:
             own_limits=own_limits,
             wake_every_ticks=scheduler.wake_every_for(line_id),
             own_wake=own_wake,
+            rebound=line.rebound,
         )
 
     # The gateway's view of the daemon.
@@ -567,9 +569,11 @@ class Daemon:
         return {"line_id": line_id, "model": model, "strategy": chosen.value}
 
     def _check_workdir(self, config: LineConfig) -> None:
-        """Refuse a working directory that does not exist or is not allowed, before
-        anything is recorded. Raises ``ConfigError``."""
+        """Refuse a working directory that does not exist or is not allowed, and a
+        plugin that would not load, before anything is recorded. Raises
+        ``ConfigError``."""
         resolve_workdir(config.workdir, self.paths.root, protected_dirs(self.paths))
+        check_plugins(config)
 
     def _questions(self, args: dict[str, object]) -> dict[str, object]:
         """Open questions for ``operator``, or for every operator when it is omitted."""
@@ -1207,6 +1211,16 @@ def protected_dirs(paths: ProjectPaths) -> tuple[Path, ...]:
     return (paths.state_dir.resolve(), paths.runtime_dir.resolve())
 
 
+def check_plugins(config: LineConfig) -> None:
+    """Refuse a configuration whose plugins would not load, as the engine would at its
+    next turn. Raises ``ConfigError``."""
+    for path in config.plugins:
+        try:
+            check_plugin(resolve_plugin(path))
+        except EngineRefused as error:
+            raise ConfigError(str(error)) from error
+
+
 def check_sandboxes(config: ProjectConfig, paths: ProjectPaths) -> None:
     """Refuse a project file whose working directories are not allowed, or whose
     sandboxes cannot be made safe in them, before anything starts, rather than at
@@ -1214,6 +1228,7 @@ def check_sandboxes(config: ProjectConfig, paths: ProjectPaths) -> None:
     protected = protected_dirs(paths)
     effective(config.sandbox, paths.root, protected)
     for line in config.lines.values():
+        check_plugins(line.config)
         workdir = resolve_workdir(line.config.workdir, paths.root, protected)
         merged = merge([config.sandbox, line.config.sandbox])
         enabled = merged is not None and merged.enabled

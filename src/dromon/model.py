@@ -593,6 +593,9 @@ class Line:
     """The question whose answer releases the line, while the line is held."""
     overrides: str | None = None
     """The latest ``line_overridden`` text, or ``None`` when nothing was overridden."""
+    rebound: bool = False
+    """Whether ``line_rebound``, rather than ``line_created``, set the current
+    binding."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -789,6 +792,7 @@ class State:
                     engine=event.engine,
                     strategy=event.strategy,
                     engine_session=None,
+                    rebound=True,
                 )
             case LineOverridden():
                 line = self.lines[event.line_id]

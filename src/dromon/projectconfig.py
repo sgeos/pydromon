@@ -86,6 +86,7 @@ TOOL_KEYS: Final = frozenset(
         "instructions",
         "workdir",
         "project_settings",
+        "plugins",
     }
 )
 LAYERED_KEYS: Final = frozenset({"sandbox", "settings"})

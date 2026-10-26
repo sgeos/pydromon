@@ -133,6 +133,8 @@ def unsupported(config: LineConfig) -> str | None:
         return "Grok lines run on Grok's own prompt, not Claude Code's"
     if config.project_settings:
         return "Grok lines do not load Claude Code's project settings"
+    if config.plugins:
+        return "Grok lines do not load Claude Code plugins"
     if config.sandbox is not None or config.settings is not None:
         return (
             "Grok lines run under a Grok sandbox profile, and take no sandbox or"

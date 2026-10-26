@@ -53,10 +53,11 @@ configured tools, and the init check still refuses any other. A project file mus
 run code or grant anything, since an ``allow`` rule, for one, would approve a call
 without the permission gate. So at the start of every turn ``check_project_settings``
 admits only allowlisted settings keys, allowlisted ``.claude`` entries and skills with
-allowlisted front matter, and refuses the turn otherwise. A line with a shell tool
-needs an enabled sandbox, in which the factory denies writes to the working
-directory's ``.claude``, as its ``Edit`` rules do for the built-in editing tools, so the
-line cannot change what it loads.
+allowlisted front matter, and refuses the turn otherwise. Plugins pass similar
+allowlists. A line that loads either needs an enabled sandbox, whatever its tools, in
+which the factory denies writes to the working directory's ``.claude`` and to each
+plugin, as its ``Edit`` rules do for the built-in editing tools, so the line cannot
+change what it loads.
 
 Instructions. With ``claude_code_prompt`` a line runs on Claude Code's own system
 prompt, and otherwise on an empty one, which the SDK passes when no prompt is given.
@@ -94,6 +95,7 @@ from claude_agent_sdk import (
     TextBlock,
     ThinkingBlock,
     SandboxSettings,
+    SdkPluginConfig,
     ToolPermissionContext,
     ToolUseBlock,
     create_sdk_mcp_server,
@@ -104,7 +106,7 @@ from claude_agent_sdk.types import SystemPromptPreset
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
 from dromon.lineconfig import DEFAULT_CONFIG, ConfigError, LineConfig
-from dromon.sandbox import SHELL_TOOLS, blocks_unsandboxed
+from dromon.sandbox import blocks_unsandboxed
 
 ENGINE_NAME: Final = "claude-code"
 """The engine this adapter runs, as drivers name it."""
@@ -138,6 +140,50 @@ SKILL_FRONTMATTER_KEYS: Final = frozenset({"name", "description", "license", "ve
 """The only front matter keys a project skill's ``SKILL.md`` may set. Others, such as
 ``allowed-tools``, ``hooks`` or ``model``, grant a tool, run code or change the
 model."""
+
+PLUGIN_ENTRIES: Final = frozenset(
+    {
+        ".claude-plugin",
+        "skills",
+        ".in_use",
+        "README",
+        "README.md",
+        "README.txt",
+        "LICENSE",
+        "LICENSE.md",
+        "LICENSE.txt",
+    }
+)
+"""The only entries a plugin directory may hold for a Dromon line. ``.in_use`` is
+Claude Code's own record of the sessions using an installed plugin."""
+
+PLUGIN_MANIFEST_ENTRIES: Final = frozenset({"plugin.json", "marketplace.json"})
+
+PLUGIN_KEYS: Final = frozenset(
+    {
+        "name",
+        "version",
+        "description",
+        "author",
+        "homepage",
+        "repository",
+        "license",
+        "keywords",
+    }
+)
+"""The only keys a plugin's ``plugin.json`` may set. Each describes the plugin and none
+names a component, so none grants a tool or runs code. Component keys such as
+``hooks``, ``mcpServers``, ``commands``, ``agents``, ``outputStyles``, ``lspServers``
+and ``skills``, and any unknown key, refuse the turn. Skills load from the plugin's
+own ``skills`` directory, which needs no key."""
+
+MARKETPLACE_KEYS: Final = frozenset(
+    {"$schema", "name", "description", "owner", "plugins"}
+)
+MARKETPLACE_ENTRY_KEYS: Final = PLUGIN_KEYS | {"source"}
+"""A ``marketplace.json`` beside the manifest may list its plugins, and each entry only
+describes one and names its ``source``. An entry can otherwise declare components, so
+any other key refuses the turn."""
 
 MAX_SKILLS: Final = 256
 MAX_FRONTMATTER_LINES: Final = 256
@@ -374,31 +420,156 @@ def _check_settings_file(file: Path) -> None:
         )
 
 
-FRONTMATTER_KEY: Final = re.compile(r"([A-Za-z0-9_-]+)\s*:")
+FRONTMATTER_KEY: Final = re.compile(r"([A-Za-z0-9_-]+):(?:[ \t]+(.*))?")
+"""A top-level key as YAML writes one without quotes, at column zero."""
+
+BLOCK_SCALAR: Final = re.compile(r"[|>][+-]?")
+"""A block scalar indicator, ``|`` or ``>`` with an optional chomping indicator, such as
+``>`` or ``|-``, after which indented lines up to the next line at column zero are the
+key's literal text rather than keys. An explicit indentation indicator is refused."""
 
 
 def _check_skill(file: Path) -> None:
-    """Refuse a skill whose front matter sets a key outside the allowlist. The front
-    matter is the block between a first line ``---`` and the next ``---``, and a key is
-    a line that starts with a name and a colon, as YAML writes a top-level key."""
-    lines = _read_bounded(file, "skill").decode("utf-8", "replace").splitlines()
-    if not lines or lines[0].strip() != "---":
+    """Refuse a skill whose front matter could set anything outside the allowlist.
+
+    The front matter is the block between a first line ``---``, after any byte order
+    mark, and the next line ``---``. Each line in it must be blank, a comment, or an
+    allowlisted key without quotes at column zero. An indented line is accepted only
+    as the text of a block scalar such as ``description: >``, where YAML reads it as
+    text. Anything else, an indented or quoted key included, refuses the turn. This is
+    stricter than YAML, deliberately, since no YAML parser is used."""
+    text = _read_bounded(file, "skill").decode("utf-8", "replace")
+    lines = text.removeprefix("\ufeff").splitlines()
+    if not lines or lines[0].rstrip() != "---":
         return
-    found: set[str] = set()
-    for line in lines[1 : 1 + MAX_FRONTMATTER_LINES]:
-        if line.strip() == "---":
-            break
-        key = FRONTMATTER_KEY.match(line)
-        if key is not None:
-            found.add(key.group(1))
-    else:
-        raise EngineRefused(f"the skill {file} has front matter that does not end")
-    extra = sorted(found - SKILL_FRONTMATTER_KEYS)
+    in_block = False
+    for number, line in enumerate(lines[1 : 1 + MAX_FRONTMATTER_LINES], start=2):
+        if line.rstrip() == "---":
+            return
+        if not line.strip():
+            continue
+        if in_block and line[0] in " \t":
+            continue
+        in_block = False
+        if line.lstrip().startswith("#"):
+            continue
+        key = FRONTMATTER_KEY.fullmatch(line.rstrip())
+        if key is None:
+            raise EngineRefused(
+                f"the skill {file} has front matter line {number} that is neither"
+                " blank, a comment nor a key at column zero"
+            )
+        if key.group(1) not in SKILL_FRONTMATTER_KEYS:
+            raise EngineRefused(
+                f"the skill {file} sets {key.group(1)} in its front matter, which a"
+                " Dromon line may not take from a project or plugin"
+            )
+        value = (key.group(2) or "").strip()
+        in_block = BLOCK_SCALAR.fullmatch(value) is not None
+    raise EngineRefused(f"the skill {file} has front matter that does not end")
+
+
+def _json_object(file: Path, what: str) -> dict[str, object]:
+    raw = _read_bounded(file, what)
+    try:
+        document: object = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise EngineRefused(f"the {what} {file} is not JSON") from error
+    if not isinstance(document, dict):
+        raise EngineRefused(f"the {what} {file} is not a JSON object")
+    return cast(dict[str, object], document)
+
+
+def _refuse_keys(found: set[str], allowed: frozenset[str], where: str) -> None:
+    extra = sorted(found - allowed)
     if extra:
         raise EngineRefused(
-            f"the skill {file} sets {', '.join(extra)} in its front matter, which a"
-            " Dromon line may not take from a project"
+            f"{where} sets {', '.join(extra)}, which a Dromon line may not load"
         )
+
+
+def _check_skills(skills: Path) -> None:
+    if not os.path.lexists(skills):
+        return
+    if not skills.is_dir():
+        raise EngineRefused(f"{skills} is not a directory")
+    names = sorted(os.listdir(skills))
+    if len(names) > MAX_SKILLS:
+        raise EngineRefused(f"{skills} holds more than {MAX_SKILLS} skills")
+    for name in names:
+        skill = skills / name / "SKILL.md"
+        if not (skills / name).is_dir() or not skill.is_file():
+            raise EngineRefused(
+                f"{skills} holds {name}, which is not a skill directory with a SKILL.md"
+            )
+        _check_skill(skill)
+
+
+def _check_source(source: object, directory: Path, where: str) -> None:
+    """Refuse a listing entry whose ``source`` is not a relative path that stays in the
+    plugin directory, such as ``./``. A remote or absolute source would fetch or load
+    a plugin no allowlist saw."""
+    if not isinstance(source, str) or not source:
+        raise EngineRefused(f"{where} lists a plugin whose source is not a path")
+    if source.startswith(("/", "~")) or "://" in source or "\x00" in source:
+        raise EngineRefused(f"{where} lists a plugin whose source is not relative")
+    real = Path(os.path.realpath(directory / source))
+    if real != directory and directory not in real.parents:
+        raise EngineRefused(f"{where} lists a plugin whose source leaves the plugin")
+
+
+def resolve_plugin(path: str) -> Path:
+    """The real directory a configured plugin path names, with ``~`` expanded."""
+    return Path(os.path.realpath(os.path.expanduser(path)))
+
+
+def check_plugin(directory: Path) -> None:
+    """Refuse the turn unless the plugin at ``directory`` grants nothing and runs
+    nothing: allowlisted entries, a ``plugin.json`` of descriptive keys only, an
+    optional ``marketplace.json`` that only describes, and skills whose front matter
+    passes the project skill allowlist. Raises ``EngineRefused``, naming the plugin
+    and the key or entry, never a value."""
+    if not directory.is_dir():
+        raise EngineRefused(f"the plugin {directory} is not a directory")
+    try:
+        entries = set(os.listdir(directory))
+    except OSError as error:
+        raise EngineRefused(f"cannot list the plugin {directory}: {error}") from error
+    extra = sorted(entries - PLUGIN_ENTRIES)
+    if extra:
+        raise EngineRefused(
+            f"the plugin {directory} holds {', '.join(extra)}, which a Dromon line"
+            " may not load"
+        )
+    manifest_dir = directory / ".claude-plugin"
+    if not manifest_dir.is_dir():
+        raise EngineRefused(f"the plugin {directory} has no .claude-plugin directory")
+    found = sorted(set(os.listdir(manifest_dir)) - PLUGIN_MANIFEST_ENTRIES)
+    if found:
+        raise EngineRefused(
+            f"the plugin {directory} holds .claude-plugin/{', '.join(found)}, which a"
+            " Dromon line may not load"
+        )
+    manifest = manifest_dir / "plugin.json"
+    if not manifest.is_file():
+        raise EngineRefused(f"the plugin {directory} has no plugin.json")
+    document = _json_object(manifest, "plugin manifest")
+    _refuse_keys(set(document), PLUGIN_KEYS, f"the plugin {directory}")
+    marketplace = manifest_dir / "marketplace.json"
+    if os.path.lexists(marketplace):
+        listing = _json_object(marketplace, "plugin marketplace")
+        where = f"the plugin {directory} marketplace"
+        _refuse_keys(set(listing), MARKETPLACE_KEYS, where)
+        listed = listing.get("plugins", [])
+        if not isinstance(listed, list):
+            raise EngineRefused(f"{where} lists its plugins in something not a list")
+        for entry in cast(list[object], listed):
+            if not isinstance(entry, dict):
+                raise EngineRefused(f"{where} lists a plugin that is not an object")
+            listed_entry = cast(dict[str, object], entry)
+            _refuse_keys(set(listed_entry), MARKETPLACE_ENTRY_KEYS, where)
+            _check_source(listed_entry.get("source"), directory, where)
+    _check_skills(directory / "skills")
 
 
 def check_project_settings(cwd: Path) -> None:
@@ -426,18 +597,7 @@ def check_project_settings(cwd: Path) -> None:
     settings = cwd / PROJECT_SETTINGS_FILE
     if os.path.lexists(settings):
         _check_settings_file(settings)
-    skills = directory / "skills"
-    if not os.path.lexists(skills):
-        return
-    if not skills.is_dir():
-        raise EngineRefused(f"{skills} is not a directory")
-    names = sorted(os.listdir(skills))
-    if len(names) > MAX_SKILLS:
-        raise EngineRefused(f"{skills} holds more than {MAX_SKILLS} skills")
-    for name in names:
-        skill = skills / name / "SKILL.md"
-        if os.path.lexists(skill):
-            _check_skill(skill)
+    _check_skills(directory / "skills")
 
 
 def mcp_server_of(tool_name: str) -> str | None:
@@ -513,14 +673,21 @@ class ClaudeCodeLine:
             servers[MCP_SERVER_NAME] = create_sdk_mcp_server(
                 MCP_SERVER_NAME, tools=list(self.mcp_tools)
             )
+        loads = self.config.project_settings or self.config.plugins
+        sandboxed = self.sandbox is not None and self.sandbox.get("enabled") is True
+        if loads and not sandboxed:
+            raise EngineRefused(
+                "a line that loads project settings or plugins needs an enabled"
+                " sandbox, whatever its tools, so that what it loads is write"
+                " protected by the sandbox and not by permission rules alone"
+            )
         if self.config.project_settings:
-            sandboxed = self.sandbox is not None and self.sandbox.get("enabled") is True
-            if SHELL_TOOLS & set(self.config.builtin_tools) and not sandboxed:
-                raise EngineRefused(
-                    "a line that loads project settings and has a shell tool needs an"
-                    " enabled sandbox, so it cannot write the hooks it would load"
-                )
             check_project_settings(self.cwd)
+        plugins: list[SdkPluginConfig] = []
+        for written in self.config.plugins:
+            directory = resolve_plugin(written)
+            check_plugin(directory)
+            plugins.append({"type": "local", "path": str(directory)})
         return ClaudeAgentOptions(
             model=settings.model,
             tools=list(self.config.builtin_tools),
@@ -528,6 +695,7 @@ class ClaudeCodeLine:
             strict_mcp_config=not self.config.inherit_account_mcp,
             can_use_tool=permission_gate(self.config, self.own_tools, self.sandbox),
             setting_sources=["project"] if self.config.project_settings else [],
+            plugins=plugins,
             max_turns=settings.max_turns,
             effort=effort,
             cwd=str(self.cwd),
