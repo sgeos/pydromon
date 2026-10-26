@@ -56,11 +56,12 @@ their small budgets.
 
 Claude Haiku 5.5 is the least expensive model and is the default for probes and tests.
 
-**Claude Fable 5.1 is not verified.** **Added on 2026-10-26 at the operator's
-direction.** Its drivers copy the Opus 5.5 drivers, model aside, including the context
-window of 1,000,000 tokens, which is assumed rather than read from any catalogue. No
-live turn has run on it. Whether a Claude subscription offers it through Claude Code,
-and so whether its subscription driver can ever accept a credential, is not verified.
+**Claude Fable 5.1, verified on 2026-10-26.** Added at the operator's direction for
+Keleusma's proofs line. One `dromon probe --model claude-fable-5-1` turn, run with the
+operator's approval, reported the subscription credential and the model
+`claude-fable-5-1` from Claude Code 2.1.310, and replied `ready`. Its context window of
+1,000,000 tokens is copied from the Opus drivers and is not verified.
+
 GPT-6-Luna's settings follow Codex's model catalogue as fetched on 2026-10-25, which
 gives it a default effort of medium and a context window of 272,000 tokens, and for a
 ChatGPT plan the subscription strategy means Codex's own sign-in.
