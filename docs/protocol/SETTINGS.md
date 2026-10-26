@@ -198,16 +198,38 @@ Every other settings key refuses the turn, explicitly including `hooks`, `mcpSer
 `enableAllProjectMcpServers`, `enabledMcpjsonServers`, `statusLine`, `permissions` of
 every kind, `sandbox`, `env` and the plugin keys, and any key Claude Code adds later. A
 line's hooks, such as Keleusma's mailbox reminders, belong in Dromon's own settings
-document, which the operator controls. The front matter of a skill is the block between
-a first line `---` and the next, read as top-level `name:` lines without a YAML parser,
-which is a limit. A missing `.claude` is accepted, and one that cannot be read, a
-settings file that is not a JSON object, or front matter that never ends refuses the
-turn.
+document, which the operator controls. A missing `.claude` is accepted, and one that
+cannot be read, or a settings file that is not a JSON object, refuses the turn.
 
-**What the line may not write.** A line with `Bash`, `PowerShell` or `Monitor` must run
-with an enabled sandbox. Every `project_settings` line's sandbox, whatever its tools,
-denies writes to its working directory's `.claude`, and its settings deny it to the
-built-in editing tools with an `Edit` rule, so the line cannot change what it loads.
+**Skills.** `skills` may hold only directories, each with a `SKILL.md`, so a loose file
+or an empty directory refuses the turn. A skill's front matter is the block between a
+first line `---`, after any byte order mark, and the next line `---`, and one that never
+ends refuses the turn. Each of its lines must be blank, a comment, or an allowlisted key
+written without quotes at column zero. An indented line is accepted only as the body
+of a block scalar, after an allowlisted key whose value is `|` or `>` with an optional
+chomping indicator, `+` or `-`, and until the next line at column zero. There YAML
+reads it as literal text, so a line that looks like a key grants nothing. An explicit
+indentation indicator such as `>2` is refused.
+Any other line, an indented or quoted key or a flow mapping included, refuses the turn.
+This is deliberately stricter than YAML, since no YAML parser is used, and a front
+matter that YAML would read as setting a refused key cannot pass it.
+
+**What the line may not write.** **Decided by the operator on 2026-10-26.** A line that
+sets `project_settings` or `plugins` must run with an enabled sandbox, whatever its
+tools, so that what it loads is protected by the sandbox and not by permission rules
+alone. That sandbox denies writes to the working directory's `.claude` and to each
+plugin directory, and the line's settings deny the same paths to the built-in editing
+tools with `Edit` rules.
+
+**Edits during a turn.** The checks run at the start of each turn, before the engine
+starts. What changes afterwards, during the turn, is read by the engine unchecked
+until the next turn's check, for example a skill file read only when the skill is
+used. **Inference, from the rules above, not tested live.** The line itself cannot make
+such a change. Its shell commands run in the enabled sandbox, which denies writes to
+those paths, and its built-in editing tools are refused by the `Edit` rules, which a
+deny keeps from being approved. A process outside the line, such as the operator or a
+line whose sandbox grants those paths, can still change them during a turn, and that
+change is read unchecked until the next turn.
 
 **Fact, read on 2026-10-26 in Claude Code 2.1.310, bundled with the Agent SDK 0.2.174
 in this environment.** The CLI's permission rule validator maps a rule for `Write`,
@@ -217,6 +239,35 @@ cover all file-editing tools", and for a deny rule adds a notice that it "never
 matches". This was read from the bundled executable's embedded source, not observed in
 a live turn. So Dromon hands over only the `Edit` rule, which covers `Write`, and no
 `Write` rule.
+
+## Plugins
+
+**Decided by the operator on 2026-10-26.** A Claude Code line's `plugins`, as
+[`LINE_CONFIG.md`](LINE_CONFIG.md) specifies, are local plugin directories passed to
+the engine through the Agent SDK's `plugins` option, which the SDK hands to Claude Code
+as `--plugin-dir`. **Fact, read on 2026-10-26** in the command builder of the installed
+Agent SDK 0.2.174. No setting source is opened for them.
+
+A plugin can bring hooks, MCP servers, commands, agents, output styles and language
+servers, any of which runs code or grants a tool. So at every turn each plugin must
+pass these allowlists, or the turn is refused, naming the plugin and the key or entry.
+
+| What | Accepted | Why only these |
+|---|---|---|
+| Entries of the plugin directory | `.claude-plugin`, `skills`, `README`, `LICENSE`, each also with `.md` or `.txt`, and `.in_use` | `.in_use` is Claude Code's own record of the sessions using an installed plugin. Directories such as `hooks`, `commands` or `agents` hold components |
+| Entries of `.claude-plugin` | `plugin.json`, `marketplace.json` | The manifest and the listing that installed plugins carry |
+| Keys of `plugin.json` | `name`, `version`, `description`, `author`, `homepage`, `repository`, `license`, `keywords` | Each describes the plugin. Component keys such as `hooks`, `mcpServers`, `commands`, `agents`, `outputStyles`, `lspServers` and `skills`, and any unknown key, are refused |
+| Keys of `marketplace.json` | `$schema`, `name`, `description`, `owner`, `plugins`, whose entries may set the `plugin.json` keys and `source` | A listing entry can otherwise declare components |
+| Entries of `skills` | Directories, each with a `SKILL.md` | As for project skills |
+| Front matter of each `skills/NAME/SKILL.md` | The project skill allowlist above | As for project skills |
+| `source` of each listing entry | A relative path that stays inside the plugin directory, such as `./` | A remote, absolute or escaping source would load a plugin no allowlist saw |
+
+`plugin.json` is required. **Fact, observed on 2026-10-26.** The one user plugin a
+downstream project's instructions require, installed on this machine, passes these
+allowlists unchanged. It holds only the accepted entries, descriptive manifest keys and
+one skill whose front matter sets `name`, `license` and `description`. That its skill
+loads without a manifest key is an inference from its layout, and was not observed in
+a live turn.
 
 ## Rules are guards, the sandbox is the barrier
 
@@ -248,10 +299,10 @@ secret belongs in the daemon's environment, where an MCP server can refer to it 
 - **Project and user settings.** Only the project source is available, through
   `project_settings`, and only within the allowlists above. The user and local sources
   are never loaded.
-- **Plugins and language servers.** The SDK loads only local plugin directories, and the
-  official language server plugins declare their servers in their marketplace entry,
-  not in the plugin directory. Dromon has no plugin layer, so `LSP` tools and plugin
-  MCP servers are unavailable. A plugin's MCP server can be declared in `mcp_servers`.
+- **Plugins and language servers.** A line loads only local plugins that pass the
+  allowlists above, so plugins with hooks, servers, commands or agents, and with them
+  `LSP` tools and plugin MCP servers, are unavailable. A plugin's MCP server can be
+  declared in `mcp_servers`.
 - **MCP OAuth.** Dromon cannot perform an MCP server's OAuth flow. A server that needs
   one can be reached through a claude.ai connector with `inherit_account_mcp`, or with a
   token held in the daemon's environment and named by a `${NAME}` header.

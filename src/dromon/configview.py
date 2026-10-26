@@ -46,6 +46,7 @@ CONFIGURED: Final = "line configuration"
 """A line's own configuration, from the project file, its creation or ``configure``."""
 LINE_FILE: Final = "line in project file"
 CREATED: Final = "created"
+REBOUND: Final = "rebound"
 DRIVER: Final = "driver"
 
 
@@ -255,6 +256,8 @@ class LineFacts:
     """Whether the project file gives the line limits of its own."""
     wake_every_ticks: int
     own_wake: bool
+    rebound: bool = False
+    """Whether a rebind set the line's current binding."""
 
 
 def _driver_effort(model: str, strategy: str) -> str:
@@ -277,7 +280,7 @@ def line_entries(facts: LineFacts, project: Sequence[Layer]) -> list[dict[str, o
         entry(
             spec_of(Scope.LINE, "model"),
             facts.model,
-            source("model", CREATED),
+            source("model", REBOUND if facts.rebound else CREATED),
             facts.model_choices,
         ),
         info("engine", "the engine the model runs on", ENGINE_OF.get(facts.model, "")),
@@ -297,6 +300,11 @@ def line_entries(facts: LineFacts, project: Sequence[Layer]) -> list[dict[str, o
             "whether the line loads Claude Code's project settings, changed only by"
             " configuration",
             "on" if facts.config.project_settings else "off",
+        ),
+        info(
+            "plugins",
+            "local plugin directories the line loads, changed only by configuration",
+            ", ".join(facts.config.plugins) or "none",
         ),
     ]
     effort = config.effort

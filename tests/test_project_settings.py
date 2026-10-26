@@ -34,6 +34,8 @@ from dromon.sandbox import parse_sandbox
 from dromon.scheduler import LineSpec, engine_factory
 
 HAIKU = "claude-haiku-5-5"
+SANDBOX: dict[str, object] = {"enabled": True}
+"""Every line that loads project settings needs an enabled sandbox."""
 
 
 def driver() -> Driver:
@@ -128,7 +130,7 @@ def test_the_project_source_loads_and_the_tools_stay_as_configured(
     tmp_path: Path,
 ) -> None:
     config = LineConfig(builtin_tools=("Read",), project_settings=True)
-    target = ClaudeCodeLine(driver(), tmp_path, config=config)
+    target = ClaudeCodeLine(driver(), tmp_path, config=config, sandbox=SANDBOX)
     options = target.options()
     assert options.setting_sources == ["project"]
     assert options.tools == ["Read"]
@@ -145,6 +147,7 @@ def test_the_init_check_still_refuses_a_tool_the_line_was_not_given(
         driver(),
         tmp_path,
         config=config,
+        sandbox=SANDBOX,
         environment={},
         session_factory=session.factory,
     )
@@ -229,12 +232,13 @@ def write_skill(directory: Path, name: str, text: str) -> Path:
 def test_skills_with_allowlisted_front_matter_are_accepted(tmp_path: Path) -> None:
     write_skill(
         tmp_path,
-        "typesafe",
-        "---\nname: typesafe\ndescription: Checks types.\n  continued: text\n"
-        "license: MIT\nversion: 1\n---\n# Body may say allowed-tools: Bash\n",
+        "folded",
+        "\ufeff---\nname: folded\n# a comment\n\ndescription: >\n  Checks types,\n"
+        "  allowed-tools: Bash is text here.\nlicense: MIT\nversion: 1\n---\n"
+        "# Body may say allowed-tools: Bash\n",
     )
+    write_skill(tmp_path, "literal", "---\nname: literal\ndescription: |-\n  x\n---\n")
     write_skill(tmp_path, "plain", "No front matter at all.\n")
-    (tmp_path / ".claude" / "skills" / "empty").mkdir()
     check_project_settings(tmp_path)
 
 
@@ -282,6 +286,7 @@ def test_the_project_files_are_checked_at_the_start_of_every_turn(
         driver(),
         tmp_path,
         config=LineConfig(project_settings=True),
+        sandbox=SANDBOX,
         environment={},
         session_factory=session.factory,
     )
@@ -294,9 +299,13 @@ def test_the_project_files_are_checked_at_the_start_of_every_turn(
     assert plain.options().setting_sources == []
 
 
-def test_a_shell_line_needs_an_enabled_sandbox_to_load_project_settings(
+def test_any_line_needs_an_enabled_sandbox_to_load_project_settings(
     tmp_path: Path,
 ) -> None:
+    for tools in ((), ("Read",)):
+        bare = LineConfig(builtin_tools=tools, project_settings=True)
+        with pytest.raises(EngineRefused, match="whatever its tools"):
+            ClaudeCodeLine(driver(), tmp_path, config=bare).options()
     config = LineConfig(builtin_tools=("Bash",), project_settings=True)
     with pytest.raises(EngineRefused, match="needs an enabled sandbox"):
         ClaudeCodeLine(driver(), tmp_path, config=config).options()
@@ -429,3 +438,80 @@ def test_the_claude_directory_is_write_protected_whatever_the_tools(
         # Write rule as one that never matches, so no Write rule is handed over.
         assert f"Edit(/{root / '.claude'}/**)" in deny["deny"]
         assert not any(rule.startswith("Write(") for rule in deny["deny"])
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("﻿---\nname: x\nallowed-tools: Bash\n---\n", "sets allowed-tools"),
+        ("---\nname: x\n  allowed-tools: Bash\n---\n", "front matter line 3"),
+        ('---\nname: x\n"allowed-tools": Bash\n---\n', "front matter line 3"),
+        ("---\nname: x\n'hooks': {}\n---\n", "front matter line 3"),
+        ("---\n{allowed-tools: Bash}\n---\n", "front matter line 2"),
+        ("---\n\tallowed-tools: Bash\n---\n", "front matter line 2"),
+        ("---\ndescription: plain\n  hooks: x\n---\n", "front matter line 3"),
+        ("---\ndescription: >\n  text\nhooks: x\n---\n", "sets hooks"),
+        ("---\nname x\n---\n", "front matter line 2"),
+    ],
+)
+def test_front_matter_admits_only_allowed_keys_at_column_zero(
+    tmp_path: Path, text: str, message: str
+) -> None:
+    write_skill(tmp_path, "risky", text)
+    with pytest.raises(EngineRefused, match=message):
+        check_project_settings(tmp_path)
+
+
+@pytest.mark.parametrize("make", ["file", "empty directory"])
+def test_skills_may_hold_only_skill_directories(tmp_path: Path, make: str) -> None:
+    skills = tmp_path / ".claude" / "skills"
+    skills.mkdir(parents=True)
+    if make == "file":
+        (skills / "loose.md").write_text("---\nname: loose\n---\n")
+        name = "loose.md"
+    else:
+        (skills / "empty").mkdir()
+        name = "empty"
+    with pytest.raises(EngineRefused, match=f"holds {name}, which is not a skill"):
+        check_project_settings(tmp_path)
+
+
+REAL_SHAPE = (
+    "---\n"
+    "name: fake-skill\n"
+    "license: MIT\n"
+    "description: >\n"
+    "  Build things with a fake service: small units you can use like\n"
+    "  programming primitives. Use when a feature needs judgment, such as\n"
+    "  routing: ranking, extraction, verification; these are starting points.\n"
+    "  allowed-tools: Bash is only folded text in this position.\n"
+    "---\n"
+    "\n"
+    "# Fake skill\n"
+)
+
+
+def test_the_real_front_matter_shape_passes(tmp_path: Path) -> None:
+    write_skill(tmp_path, "fake-skill", REAL_SHAPE)
+    check_project_settings(tmp_path)
+
+
+@pytest.mark.parametrize("indicator", [">", ">-", ">+", "|", "|-", "|+"])
+def test_every_chomping_form_of_a_block_scalar_passes(
+    tmp_path: Path, indicator: str
+) -> None:
+    write_skill(
+        tmp_path, "block", f"---\nname: block\ndescription: {indicator}\n  text\n---\n"
+    )
+    check_project_settings(tmp_path)
+
+
+@pytest.mark.parametrize("indicator", [">2", "|1-", ">-2", "<", ">>"])
+def test_any_other_indicator_leaves_the_indented_line_refused(
+    tmp_path: Path, indicator: str
+) -> None:
+    write_skill(
+        tmp_path, "block", f"---\nname: block\ndescription: {indicator}\n  text\n---\n"
+    )
+    with pytest.raises(EngineRefused, match="front matter line 4"):
+        check_project_settings(tmp_path)

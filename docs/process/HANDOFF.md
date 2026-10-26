@@ -96,9 +96,9 @@ are in `tmp/harness-report-*.md`.
   limit, and refused calls escape the tool budget. See `CODEX.md`.
 - **Clients.** Polling, no token meter, Tk checked only withdrawn. Agents lack
   `interrupt` and settings.
-- **Keleusma.** User plugins such as its required skill do not load. Its remote needs
-  HTTPS for pushes. Fable 5.1 drivers never ran. Line processes cannot be listed or
-  stopped from a line, and a line cannot see its own limits.
+- **Keleusma.** Installing its project file and its lines' authority await the
+  operator. Its remote needs HTTPS. Fable 5.1 never ran. A line cannot list or stop
+  its own processes or see its own limits.
 - **In the design.** Hosted teacher traces, the Rust repository's name, and remote
   clients.
 
@@ -113,7 +113,7 @@ need a command outside it. The rest run inside it with `-m "not socket and not l
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-./scripts/check.sh          # 1409 tests pass, plus 10 live tests deselected
+./scripts/check.sh          # 1483 tests pass, plus 10 live tests deselected
 ```
 
 Report any check not run, and any commit after the one that last rewrote this file.

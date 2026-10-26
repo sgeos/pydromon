@@ -23,13 +23,14 @@ live and merged pull requests 35 to 38.
 | Each line works in its own worktree | Done. `workdir`, verified live, with session adoption and a guard on git hooks and config |
 | Commits from a linked worktree | Done for Claude Code lines, through an `allowWrite` on the common git directory, verified live |
 | Long gates and continuation | Done. `wake_after`, verified live. A command started with `nohup` outlives its turn, observed live |
-| A mandatory sandbox | Done. `[daemon] require_sandbox` |
-| A disclosure guard on messages | Done. `[daemon] disclosure_terms` |
-| Engine changes that keep a line's identity | Done. `rebind_line`, operator only |
-| Project settings and skills | Done for project skills, under allowlists. User plugins are not loaded, see below |
-| One full gate at a time | Done. `[leases]`, verified in the trial |
+| A mandatory sandbox | Done. `[daemon] require_sandbox`, verified live: a line without a sandbox was refused |
+| A disclosure guard on messages | Done. `[daemon] disclosure_terms`, verified live: a line's message holding a term was refused without naming it, and the term was stored only in the operator's exempt brief |
+| Engine changes that keep a line's identity | Done. `rebind_line`, operator only, verified live: a Haiku line rebound to Opus answered as Opus in a fresh session |
+| Project settings and skills | Done, under allowlists, verified live: a project skill loaded and ran, and a project hook refused the turn before it started, and never ran |
+| The required user plugin | Done. `plugins` loads one plugin by path, under allowlists, verified live: a line saw `typesafe:typesafe-ai` and the plugin's files were not written |
+| One full gate at a time | Done. `[leases]`, verified in both trials |
 | Turn budgets for real work | Done. Subscription drivers allow 200 engine turns and 400 tool calls |
-| The proofs line's model | Fable 5.1 drivers packaged, not run live |
+| The proofs line's model | Fable 5.1 drivers packaged, not run live. The project file runs proofs on Opus, so dogfooding does not depend on them |
 | Pushing over HTTPS and pull requests | Keleusma's configuration, for the operator |
 
 ## The trial
@@ -42,12 +43,21 @@ and reported what it would need. No line wrote anything. One worktree showed cha
 during the trial, and their times and the trial line's tool calls showed they came from
 a live session working there.
 
-What the lines reported a real deployment needs, beyond the trial's rules:
+**Fact, observed on 2026-10-26.** A writing trial ran the kaizen line on Haiku in a
+private clone of Keleusma, with a local bare repository as its remote, so neither the
+real worktrees nor GitHub were touched. The line read Appendix B, acquired the
+`full-gate` lease, started `cargo build -p keleusma-arena` in the background with
+`nohup`, scheduled `wake_after` twice while it ran, wrote one file, committed it in its
+linked worktree, pushed the branch, and released the lease. The first build failed
+because the sandbox refuses `sccache`, and succeeded with `RUSTC_WRAPPER` unset, which
+the project file below therefore sets.
+
+What the lines reported a real deployment needs, beyond the read-only trial's rules:
 
 - Reading Appendix B before any tracked write. The project file below leaves it
   readable and closes it to writes.
 - The `typesafe-ai` skill, which Keleusma's instructions require. It is a user plugin,
-  and Dromon loads no user setting source or plugin. **Open.**
+  which the `plugins` key now loads by path.
 - Network to the crate registry and to GitHub, and a push path, which needs Keleusma's
   remote on HTTPS with the GitHub command-line helper.
 - Writes to the worktree, the common git directory, the interline store and the cargo
@@ -93,8 +103,10 @@ max_cost_usd = 60.0
 
 [profiles.keleusma]
 model = "claude-opus-5-5"
-builtin_tools = ["Read", "Grep", "Glob", "Edit", "Write", "Bash"]
+builtin_tools = ["Read", "Grep", "Glob", "Edit", "Write", "Bash", "Skill"]
 claude_code_prompt = true
+# Keleusma's instructions require this user plugin's skill.
+plugins = ["~/.claude/plugins/cache/typesafe-ai/typesafe/VERSION"]
 
 [profiles.keleusma.sandbox]
 enabled = true
@@ -106,6 +118,10 @@ denyRead = ["~/.ssh", "~/.aws"]
 
 [profiles.keleusma.sandbox.network]
 allowedDomains = ["github.com", "api.github.com", "codeload.github.com", "objects.githubusercontent.com", "index.crates.io", "static.crates.io", "crates.io"]
+
+# The sandbox refuses sccache, which a build otherwise runs through.
+[profiles.keleusma.settings.env]
+RUSTC_WRAPPER = ""
 
 [profiles.keleusma.settings.permissions]
 deny = ["Read(~/.ssh/**)", "Read(~/.aws/**)", "Read(~/.codex/auth.json)", "Read(~/.grok/auth.json)"]

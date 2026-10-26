@@ -42,6 +42,7 @@ keys, duplicate keys and numbers are refused.
 | `effort` | `low`, `medium`, `high`, `xhigh` or `max`, replacing the driver's effort. Omitted when unset | the driver's |
 | `claude_code_prompt` | Run a Claude Code line on Claude Code's own system prompt rather than an empty one. Omitted when false | `false` |
 | `project_settings` | Also load Claude Code's project setting source in the line's working directory, as [`SETTINGS.md`](SETTINGS.md) specifies. Refused on Codex and Grok lines. Omitted when false | `false` |
+| `plugins` | At most 16 distinct local plugin directories, each absolute or starting with `~/`, as the plugins section below specifies. Refused on Codex and Grok lines. Omitted when empty | none |
 | `instructions` | At most 16 distinct files, such as `CLAUDE.md`, whose text is appended to the system prompt at each turn. A relative path is resolved against the line's working directory and `~` against the home directory. Omitted when empty | none |
 | `workdir` | The directory the line's engine runs in, as the working directory section below specifies. Omitted when unset | the project root |
 
@@ -208,6 +209,32 @@ state stays in the project.
 session under a directory of `~/.claude/projects/` named for the working directory. A
 Haiku line with its workdir in a linked worktree had its session stored under that
 worktree's name, so a session resumed from another directory would not be found.
+
+## Plugins
+
+**Decided by the operator on 2026-10-26.** A line may load the local plugins its
+instructions require, such as one that provides a skill, without opening Dromon's
+isolation. Dromon loads no user setting source, so a user's installed plugins do not
+reach a line unless its configuration names them.
+
+- **Authority.** `plugins` is set only by the project file, by `create_line` or
+  `configure_line` from a client, or by an external agent with `operator` access. An
+  agent with `manage` access is refused, and `set_setting` cannot change it. The
+  settings view shows it as an `info` entry.
+- **Loading.** Each directory, with `~` expanded and links resolved, is handed to the
+  engine as a local plugin, as the Agent SDK's `plugins` option does, so no setting
+  source is opened.
+- **Checks.** At every turn, before the engine starts, each plugin is checked against
+  the allowlists [`SETTINGS.md`](SETTINGS.md) specifies, and a plugin that fails refuses
+  the turn, naming the plugin and the key or entry. The same check runs when a
+  configuration is accepted and when `dromond` reads its project file.
+- **Skills.** A plugin's skills are used through the `Skill` tool, so a line that uses
+  one lists `Skill` in `builtin_tools`. The init check accepts `Skill` only when it is
+  configured and still refuses every other tool the line was not given.
+- **Write protection.** An enabled sandbox denies writes to each plugin directory,
+  whatever the line's tools, and the line's settings deny it to the built-in editing
+  tools with an `Edit` rule, so a line cannot change what loads at its next turn. A
+  line that loads any plugin must run with an enabled sandbox, whatever its tools.
 
 ## Engines
 

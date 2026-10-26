@@ -370,3 +370,21 @@ def test_dromon_rebind_sends_the_operation(
         cli.build_parser().parse_args(
             ["rebind", "alpha", "--model", "nope", "--strategy", "api"]
         )
+
+
+def test_the_settings_view_labels_a_rebound_models_source(paths: ProjectPaths) -> None:
+    with attached(paths, ProjectConfig()) as target:
+
+        def model_entry() -> dict[str, object]:
+            line = {"id": "r", "op": "settings", "v": 1, "args": {"line_id": "alpha"}}
+            response = target.respond((json.dumps(line) + "\n").encode())
+            assert response.ok and response.result is not None
+            entries = cast(list[dict[str, object]], response.result["line"])
+            return next(e for e in entries if e["key"] == "model")
+
+        assert (model_entry()["value"], model_entry()["source"]) == (HAIKU, "created")
+        assert ask(target, rebind_args(OPUS)).ok
+        assert (model_entry()["value"], model_entry()["source"]) == (OPUS, "rebound")
+        target.scheduler.override_line("alpha", "model", HAIKU)
+        assert model_entry()["source"] == "override"
+        assert target.log.state.lines["alpha"].rebound is True

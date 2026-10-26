@@ -271,6 +271,9 @@ project's file, declared lines, teacher, external agent policy,
 `daemon.require_sandbox`, `daemon.disclosure_terms` by its path only, never its terms,
 and its leases with their time to live.
 
+A line's model shows the source `created`, or `rebound` once `rebind_line` has set its
+current binding, unless an override decides it.
+
 A client cannot change a line's strategy, because it decides whether usage is billed
 per token, and such usage never starts from a one-word command. It cannot change MCP
 servers, sandbox or engine settings documents, the teacher or the agent policy either,

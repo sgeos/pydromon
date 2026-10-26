@@ -105,7 +105,7 @@ from dromon import codex, grok
 from dromon.agents import LineTokens
 from dromon.codex import CodexLine
 from dromon.grok import GrokLine
-from dromon.engine import ClaudeCodeLine, EngineRefused, TurnReport
+from dromon.engine import ClaudeCodeLine, EngineRefused, TurnReport, resolve_plugin
 from dromon.eventlog import EventLog
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon import settings as engine_settings
@@ -414,9 +414,11 @@ def engine_factory(
         merged = merge([project_sandbox, spec.config.sandbox])
         enabled = merged is not None and merged.enabled
         guarded = git_write_guards(workdir) if enabled else ()
-        # A line that loads project settings must not write the file it loads.
+        # A line that loads project settings or plugins must not write what it loads.
         claude_dir = (workdir / ".claude",) if spec.config.project_settings else ()
-        guarded = (*guarded, *claude_dir)
+        plugin_dirs = tuple(resolve_plugin(path) for path in spec.config.plugins)
+        write_protected = (*claude_dir, *plugin_dirs)
+        guarded = (*guarded, *write_protected)
         return ClaudeCodeLine(
             driver,
             workdir,
@@ -427,7 +429,7 @@ def engine_factory(
             settings=engine_settings.effective(
                 engine_settings.merge([project_settings, spec.config.settings]),
                 protected,
-                claude_dir,
+                write_protected,
             ),
             observe=spec.observe,
         )
