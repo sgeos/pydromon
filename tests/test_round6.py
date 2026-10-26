@@ -6,7 +6,14 @@ Codex lines."""
 
 import asyncio
 from collections import deque
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Generator,
+    Mapping,
+    Sequence,
+)
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -214,8 +221,24 @@ def compactable(world: World, **keys: object) -> None:
 
 
 @pytest.fixture
-def world(tmp_path: Path) -> World:
-    return World(tmp_path / "events.sqlite")
+def worlds(tmp_path: Path) -> Generator[Callable[..., World]]:
+    """Builds worlds whose event logs are closed after the test, since an unclosed
+    SQLite connection warns on Python 3.15 and the gate makes warnings errors."""
+    built: list[World] = []
+
+    def build(**keys: bool) -> World:
+        target = World(tmp_path / f"events-{len(built)}.sqlite", **keys)
+        built.append(target)
+        return target
+
+    yield build
+    for target in built:
+        target.log.close()
+
+
+@pytest.fixture
+def world(worlds: Callable[..., World]) -> World:
+    return worlds()
 
 
 # A. compact_session schedules its own wake.
@@ -326,9 +349,9 @@ def test_a_compaction_that_leaves_a_large_context_still_warns(world: World) -> N
 
 
 def test_an_engine_that_cannot_compact_gets_the_warning_in_its_prompt(
-    tmp_path: Path,
+    worlds: Callable[..., World],
 ) -> None:
-    world = World(tmp_path / "events.sqlite", compacting=False)
+    world = worlds(compacting=False)
     compactable(world)
     world.context = 400_000
     world.run("grow")
@@ -1132,9 +1155,11 @@ def test_a_codex_line_without_a_request_does_not_compact() -> None:
     assert COMPACT_START not in server.methods()
 
 
-def test_codex_lines_may_compact_and_have_the_tool(tmp_path: Path) -> None:
+def test_codex_lines_may_compact_and_have_the_tool(
+    worlds: Callable[..., World],
+) -> None:
     assert unsupported(LineConfig(allow_compact=True)) is None
-    world = World(tmp_path / "events.sqlite")
+    world = worlds()
     world.scheduler.create_line("luna", LUNA, Strategy.SUBSCRIPTION)
     world.scheduler.configure_line("luna", LineConfig(allow_compact=True))
     names = [t.name for t in world.scheduler.own_tools("luna")]
@@ -1148,7 +1173,7 @@ def test_codex_lines_may_compact_and_have_the_tool(tmp_path: Path) -> None:
 
 
 def test_f1_an_unsized_codex_compaction_holds_automatic_compaction(
-    tmp_path: Path,
+    worlds: Callable[..., World],
 ) -> None:
     server = Server(
         [
@@ -1163,7 +1188,7 @@ def test_f1_an_unsized_codex_compaction_holds_automatic_compaction(
         ],
         OBSERVED_COMPACTION,
     )
-    world = World(tmp_path / "events.sqlite")
+    world = worlds()
 
     def build(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> CodexLine:
         del tools
