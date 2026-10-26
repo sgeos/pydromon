@@ -265,8 +265,11 @@ uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .
 pass "ruff lint and format"
 
-uv run --no-sync pyright
-pass "pyright strict"
+# Both platforms the daemon supports, since pyright skips a branch for another
+# platform as unreachable, which once let a Linux-only type error reach main.
+uv run --no-sync pyright --pythonplatform Linux
+uv run --no-sync pyright --pythonplatform Darwin
+pass "pyright strict, for Linux and macOS"
 
 # Warnings are errors. pytest exits non-zero when it collects nothing, so an empty
 # selection fails here rather than passing.

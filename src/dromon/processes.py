@@ -124,7 +124,7 @@ def read_environments(uid: int) -> dict[int, list[str]]:
                 environments[int(fields[0])] = fields[1:]
         return environments
     if sys.platform.startswith("linux"):
-        environments = {}
+        environments: dict[int, list[str]] = {}
         for entry in PROC.iterdir():
             if not entry.name.isdigit():
                 continue

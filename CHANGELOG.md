@@ -7,6 +7,9 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- The gate runs pyright for Linux and for macOS, since pyright skips another
+  platform's branch, which let a Linux-only type error reach `main` in pull request 42.
+
 - The subscription drivers allow a development turn: 200 engine turns and 400 tool
   calls for Opus, GPT-6-Luna and Grok, and 100 and 200 for Haiku. The API and flexible
   drivers keep their small budgets.
