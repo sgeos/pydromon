@@ -67,6 +67,9 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- `docs/architecture/KELEUSMA_DOGFOOD.md` records what Dromon needed to run Keleusma's
+  four lines, the read-only trial of those lines, and a validated Keleusma project file.
+
 - `rebind_line` and `dromon rebind LINE --model M --strategy S` move a line to another
   model and driver strategy, recorded as the new `line_rebound` event. The line keeps
   its identity, mailbox, configuration and overrides, its model override is dropped,

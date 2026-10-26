@@ -67,10 +67,11 @@ completed, moved or abandoned.
 
 ## Next step
 
-pydromon develops itself with Dromon, as `docs/process/DOGFOOD.md` records. Its local
-`.dromon/` holds lines `worker` (Opus), `reviewer` (Haiku) and `luna` (GPT-6-Luna) and
-their rules. Lines never commit. The operator's session commits their work. epagoge
-has a similar local setup with its teacher.
+pydromon develops itself with Dromon, per `docs/process/DOGFOOD.md`: lines `worker`,
+`reviewer` and `luna` in a local `.dromon/`, and the operator's session commits. The
+harness is ready for Keleusma, per `docs/architecture/KELEUSMA_DOGFOOD.md`, whose
+project file awaits the operator's decision to install it. The lines' harness reports
+are in `tmp/harness-report-*.md`.
 
 ## Open
 
@@ -80,26 +81,24 @@ has a similar local setup with its teacher.
   move appears. Adopting it means repinning `pykeleusma`.
 - **Subscription usage.** Plan terms assume ordinary, individual use. Many lines
   running continuously may exceed that.
-- **Event log.** `read_entries` loads the whole log, with no compaction or migration.
-  Limit counts reset on restart.
+- **Event log.** Loaded whole, no compaction or migration. Limit counts reset on restart.
 - **Operator relays.** Inbound adapters are deferred, with their properties in
   `RELAY.md`.
 - **Secrets.** Literal MCP credentials and `env` values sit in the owner-only event log.
   Environment references exist, file and keychain ones do not.
-- **Daemon debt.** No peer credential check on connections, no relay forwarding, and
-  SQLite calls on the event loop thread. Driver state lives only in memory. All are
-  recorded in `CLIENT.md` or the module documentation.
+- **Daemon debt.** No peer credential check, no relay forwarding, SQLite on the event
+  loop thread, driver state only in memory. Recorded in `CLIENT.md` and the modules.
 - **Project file.** No user or managed layer, per `PROJECT_CONFIG.md`.
-- **Parity gaps.** No credential masking, no automatic approval reviewer, no plugins
-  or language servers, no MCP OAuth, and Linux not verified live. The merge of `Read`
-  and `Edit` rules into the sandbox is untested. Listed in `SANDBOX.md` and
-  `SETTINGS.md`.
+- **Parity gaps.** No credential masking, approval reviewer, plugins, language servers
+  or MCP OAuth, and Linux not verified live, per `SANDBOX.md` and `SETTINGS.md`.
 - **Grok lines.** Never run live. `GROK.md` lists what to verify first.
 - **Codex lines.** No MCP servers, commits, sandbox or settings documents, cost or turn
   limit, and refused calls escape the tool budget. See `CODEX.md`.
-- **Clients.** Polling stands in for pushed updates. No token meter or permission
-  prompts. The Tk window is checked only withdrawn. Agents lack `interrupt` and
-  settings. A model switch is not verified live.
+- **Clients.** Polling, no token meter, Tk checked only withdrawn. Agents lack
+  `interrupt` and settings.
+- **Keleusma.** User plugins such as its required skill do not load. Its remote needs
+  HTTPS for pushes. Fable 5.1 drivers never ran. Line processes cannot be listed or
+  stopped from a line, and a line cannot see its own limits.
 - **In the design.** Hosted teacher traces, the Rust repository's name, and remote
   clients.
 
@@ -114,7 +113,7 @@ need a command outside it. The rest run inside it with `-m "not socket and not l
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-./scripts/check.sh          # 1170 tests pass, plus 10 live tests deselected
+./scripts/check.sh          # 1409 tests pass, plus 10 live tests deselected
 ```
 
 Report any check not run, and any commit after the one that last rewrote this file.
