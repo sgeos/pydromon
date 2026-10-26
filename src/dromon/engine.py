@@ -65,17 +65,35 @@ The text of the configuration's ``instructions`` files is appended at each turn,
 project's ``CLAUDE.md`` reaches a line although ``setting_sources=[]`` keeps Claude Code
 from loading it. A missing or oversized file refuses the turn.
 
+Kept sessions. With ``keep_session`` the connection stays open between turns, so
+background commands outlive a turn. Every check above still runs at each turn, and a
+digest of the options and of the loaded plugin and ``.claude`` files must match the
+connection's, or it is closed and opened anew. Claude Code 2.1.310 reports its init on
+a connection's first prompt and again only after a model or permission mode change, a
+fact read from its bundled code, so a reused turn first sends the unchanged permission
+mode and is refused if no init arrives before the model's output. A pump task reads
+the connection between turns, counts background tasks, and interrupts a turn the
+engine begins by itself, while the gate denies every call outside a checked turn,
+and on every turn, kept or not, before its init check. Between turns the watch closes
+the connection when a plugin or ``.claude`` file the engine loaded changes.
+``docs/protocol/LINE_CONFIG.md`` is normative.
+
 Failure modes. A refusal by the policy or the driver raises ``EngineRefused`` after the
 turn is interrupted. A driver failure raises ``DriverError``. Engine and transport
 failures from the SDK propagate unchanged.
 """
 
+import asyncio
+import contextlib
+import hashlib
 import importlib.metadata
 import json
 import os
 import re
+import sys
+import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, Protocol, cast
@@ -87,17 +105,24 @@ from claude_agent_sdk import (
     McpSdkServerConfig,
     McpServerConfig,
     Message,
+    PermissionMode,
     PermissionResultAllow,
     PermissionResultDeny,
     ResultMessage,
     SdkMcpTool,
+    StreamEvent,
     SystemMessage,
     TextBlock,
     ThinkingBlock,
     SandboxSettings,
     SdkPluginConfig,
+    TaskNotificationMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
+    TERMINAL_TASK_STATUSES,
     ToolPermissionContext,
     ToolUseBlock,
+    UserMessage,
     create_sdk_mcp_server,
 )
 
@@ -232,28 +257,38 @@ def read_instructions(paths: Sequence[str], root: Path) -> str:
     """The text of the instruction files ``paths``, each under a heading naming it,
     with relative paths resolved against ``root``. Raises ``EngineRefused`` for a file
     that cannot be read, is not UTF-8, or exceeds ``MAX_INSTRUCTION_BYTES``."""
-    sections: list[str] = []
-    for path in paths:
-        file = Path(path).expanduser()
-        if not file.is_absolute():
-            file = root / file
-        try:
-            with file.open("rb") as handle:
-                raw = handle.read(MAX_INSTRUCTION_BYTES + 1)
-        except OSError as error:
-            raise EngineRefused(
-                f"cannot read the instructions {path}: {error}"
-            ) from error
-        if len(raw) > MAX_INSTRUCTION_BYTES:
-            raise EngineRefused(
-                f"the instructions {path} exceed {MAX_INSTRUCTION_BYTES} bytes"
-            )
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise EngineRefused(f"the instructions {path} are not UTF-8") from error
-        sections.append(f"Contents of {path}:\n\n{text.strip()}")
+    sections = [
+        f"Contents of {path}:\n\n{_instruction_text(path, root).strip()}"
+        for path in paths
+    ]
     return "\n\n".join(sections)
+
+
+def instruction_sizes(paths: Sequence[str], root: Path) -> list[tuple[str, int]]:
+    """Each instruction file of ``paths`` with its size in bytes, read as
+    ``read_instructions`` reads it, and refused as it refuses."""
+    return [
+        (path, len(_instruction_text(path, root).encode("utf-8"))) for path in paths
+    ]
+
+
+def _instruction_text(path: str, root: Path) -> str:
+    file = Path(path).expanduser()
+    if not file.is_absolute():
+        file = root / file
+    try:
+        with file.open("rb") as handle:
+            raw = handle.read(MAX_INSTRUCTION_BYTES + 1)
+    except OSError as error:
+        raise EngineRefused(f"cannot read the instructions {path}: {error}") from error
+    if len(raw) > MAX_INSTRUCTION_BYTES:
+        raise EngineRefused(
+            f"the instructions {path} exceed {MAX_INSTRUCTION_BYTES} bytes"
+        )
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EngineRefused(f"the instructions {path} are not UTF-8") from error
 
 
 CLAUDE_CODE_PROMPT_MARK: Final = "[Claude Code's own system prompt]"
@@ -297,6 +332,179 @@ def _sdk_session(
     return cast(
         AbstractAsyncContextManager[AgentSession], ClaudeSDKClient(options=options)
     )
+
+
+class KeptSession(Protocol):
+    """The part of ``ClaudeSDKClient`` a kept connection uses, so tests can substitute
+    it. ``receive_messages`` reads every message, between turns too, and
+    ``set_permission_mode`` asks the engine to report its init again."""
+
+    async def query(self, prompt: str) -> None: ...
+
+    def receive_messages(self) -> AsyncIterator[Message]: ...
+
+    async def interrupt(self) -> None: ...
+
+    async def set_permission_mode(self, mode: PermissionMode) -> None: ...
+
+
+type KeptSessionFactory = Callable[
+    [ClaudeAgentOptions], AbstractAsyncContextManager[KeptSession]
+]
+
+
+def _sdk_kept_session(
+    options: ClaudeAgentOptions,
+) -> AbstractAsyncContextManager[KeptSession]:
+    return cast(
+        AbstractAsyncContextManager[KeptSession], ClaudeSDKClient(options=options)
+    )
+
+
+KEEP_POLL_SECONDS: Final = 5.0
+"""How often a kept connection's watch looks at its idle deadline and, between turns,
+at the files its engine loaded."""
+
+SHELL_TOOLS: Final = frozenset({"Bash", "Monitor", "PowerShell"})
+"""Built-in tools that run commands, which a kept line may give only inside an enabled
+sandbox, since what they start in the background outlives the turn. ``Monitor``
+streams a command's output, which is an inference from its description."""
+
+FILES_CHANGED: Final = "files its engine loaded changed between turns"
+
+INTERRUPT_TIMEOUT_SECONDS: Final = 10.0
+"""How long an interrupt of a kept connection may take before it is closed instead."""
+
+MAX_FINGERPRINT_FILES: Final = 4096
+MAX_FINGERPRINT_FILE_BYTES: Final = 1024 * 1024
+
+DIED_NOTE: Final = (
+    "Dromon note: your engine's process ended since your last turn, so this turn"
+    " resumes your session in a new process, and every background task of the old"
+    " one was lost. Check for partial output before starting again."
+)
+
+SELF_STARTED_NOTE: Final = (
+    "Dromon note: between your turns the engine began a turn by itself, most likely"
+    " because a background task ended. Only Dromon starts turns, so it was"
+    " interrupted, and its tool calls were denied. Read the task's output file to"
+    " see how it ended."
+)
+
+
+def closed_note(reason: str, tasks: int) -> str:
+    """The note a line's next prompt carries after Dromon closed its kept
+    connection for ``reason`` with ``tasks`` background tasks reported running."""
+    lost = (
+        f" The {tasks} background tasks the engine reported running were stopped"
+        " with it."
+        if tasks
+        else ""
+    )
+    return (
+        f"Dromon note: your kept engine session was closed because {reason}, so this"
+        f" turn resumes it in a new process.{lost}"
+    )
+
+
+def tree_digest(directory: Path) -> str:
+    """A SHA-256 digest of every regular file's path and content under
+    ``directory``, without following links, so that a kept connection notices a
+    change to what its engine loaded. A missing directory has a digest of its own.
+    Raises ``EngineRefused`` past ``MAX_FINGERPRINT_FILES`` files or for a file over
+    ``MAX_FINGERPRINT_FILE_BYTES``, since a change there could not be noticed."""
+    digest = hashlib.sha256()
+    if not directory.is_dir():
+        digest.update(b"absent")
+        return digest.hexdigest()
+    count = 0
+    for parent, directories, files in os.walk(directory, followlinks=False):
+        directories.sort()
+        for name in sorted(files):
+            count += 1
+            if count > MAX_FINGERPRINT_FILES:
+                raise EngineRefused(
+                    f"{directory} holds more than {MAX_FINGERPRINT_FILES} files, too"
+                    " many to check between turns of a kept session"
+                )
+            file = Path(parent) / name
+            relative = str(file.relative_to(directory)).encode("utf-8", "replace")
+            digest.update(len(relative).to_bytes(8, "big") + relative)
+            if file.is_symlink() or not file.is_file():
+                digest.update(b"special")
+                continue
+            try:
+                with file.open("rb") as handle:
+                    raw = handle.read(MAX_FINGERPRINT_FILE_BYTES + 1)
+            except OSError as error:
+                raise EngineRefused(f"cannot read {file}: {error}") from error
+            if len(raw) > MAX_FINGERPRINT_FILE_BYTES:
+                raise EngineRefused(
+                    f"{file} exceeds {MAX_FINGERPRINT_FILE_BYTES} bytes, too large to"
+                    " check between turns of a kept session"
+                )
+            digest.update(hashlib.sha256(raw).digest())
+    return digest.hexdigest()
+
+
+PERMISSION_MODES: Final[dict[str, PermissionMode]] = {
+    "default": "default",
+    "acceptEdits": "acceptEdits",
+    "plan": "plan",
+    "bypassPermissions": "bypassPermissions",
+    "dontAsk": "dontAsk",
+    "auto": "auto",
+}
+
+
+def permission_mode_of(data: Mapping[str, object]) -> PermissionMode:
+    """The permission mode an init reports, to be sent back unchanged so that the
+    engine reports its init again, or ``"default"`` for one the SDK does not name."""
+    mode = data.get("permissionMode")
+    return PERMISSION_MODES.get(mode, "default") if isinstance(mode, str) else "default"
+
+
+def begins_turn(message: Message) -> bool:
+    """Whether ``message``, arriving between Dromon's turns, shows that the engine
+    began a turn by itself. A background task's report, or any other system notice,
+    does not."""
+    if isinstance(message, SystemMessage):
+        return message.subtype == "init"
+    return isinstance(
+        message, AssistantMessage | UserMessage | StreamEvent | ResultMessage
+    )
+
+
+def task_ended(message: Message) -> str | None:
+    """The background task ``message`` reports ended, or ``None``."""
+    if isinstance(message, TaskNotificationMessage):
+        return message.task_id
+    if isinstance(message, TaskUpdatedMessage):
+        status = message.status or message.patch.get("status")
+        if status in TERMINAL_TASK_STATUSES:
+            return message.task_id
+    return None
+
+
+@dataclass(slots=True)
+class _Connection:
+    """A kept connection to the engine, and what its pump has seen."""
+
+    stack: AsyncExitStack
+    session: KeptSession
+    fingerprint: str
+    last_end: float
+    files: str = ""
+    """The digest of the files the engine loaded, as the connection opened."""
+    pump: "asyncio.Task[None] | None" = None
+    watch: "asyncio.Task[None] | None" = None
+    inbox: "asyncio.Queue[Message | None] | None" = None
+    tasks: set[str] = field(default_factory=set[str])
+    permission_mode: PermissionMode = "default"
+    alive: bool = True
+    draining: bool = False
+    """Whether the pump discards messages until a result, the tail of a turn that
+    was cancelled or that the engine began by itself."""
 
 
 def check_environment(environment: Mapping[str, str], strategy: Strategy) -> None:
@@ -380,6 +588,9 @@ class _Turn:
     refusal: str | None = None
     capabilities: Capabilities | None = None
     credential: Credential | None = None
+    require_init: bool = True
+    """Whether the turn must see the engine's init before the model's output and
+    before any tool call is admitted. Every Claude Code turn requires it."""
 
 
 type PermissionGate = Callable[
@@ -392,14 +603,21 @@ def permission_gate(
     config: LineConfig,
     own_tools: frozenset[str],
     sandbox: Mapping[str, object] | None = None,
+    admits: Callable[[], bool] | None = None,
 ) -> PermissionGate:
     """A gate that applies ``config``'s policy and denies every other tool call,
-    and every shell call that would leave the ``sandbox`` without its leave."""
+    and every shell call that would leave the ``sandbox`` without its leave. With
+    ``admits``, every call is denied while it returns ``False``, as it does on a kept
+    connection outside a checked Dromon turn."""
 
     async def gate(
         tool_name: str, tool_input: dict[str, Any], context: ToolPermissionContext
     ) -> PermissionResultAllow | PermissionResultDeny:
         del context
+        if admits is not None and not admits():
+            return PermissionResultDeny(
+                message="Dromon has not started and checked a turn on this session"
+            )
         if blocks_unsandboxed(sandbox, tool_name, tool_input):
             return PermissionResultDeny(
                 message="this line's sandbox does not allow unsandboxed commands"
@@ -654,8 +872,11 @@ class ClaudeCodeLine:
         settings: Mapping[str, object] | None = None,
         environment: Mapping[str, str] | None = None,
         session_factory: SessionFactory = _sdk_session,
+        kept_factory: KeptSessionFactory = _sdk_kept_session,
         observe: Observer = ignore,
         mark: str | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        poll_seconds: float = KEEP_POLL_SECONDS,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -674,6 +895,18 @@ class ClaudeCodeLine:
         self._observe = observe
         self.mark = mark
         """The process mark every process of this line inherits, if issued."""
+        self._kept_factory = kept_factory
+        self._clock = clock
+        self._poll_seconds = poll_seconds
+        self._kept: _Connection | None = None
+        self._turn: _Turn | None = None
+        """The turn in progress, if any, whose init check the gate waits for."""
+        self._notes: list[str] = []
+        """Notes the next prompt carries, about what happened to the kept connection."""
+        self._retired = False
+        self._background: set[asyncio.Task[None]] = set()
+        """Interrupts and closes begun outside a turn. asyncio holds only weak
+        references to tasks, so each is kept here until it ends."""
 
     @property
     def own_tools(self) -> frozenset[str]:
@@ -705,6 +938,14 @@ class ClaudeCodeLine:
                 " sandbox, whatever its tools, so that what it loads is write"
                 " protected by the sandbox and not by permission rules alone"
             )
+        shells = sorted(SHELL_TOOLS & set(self.config.builtin_tools))
+        if self.config.keep_session and shells and not sandboxed:
+            raise EngineRefused(
+                "a line that keeps its session and has "
+                + ", ".join(shells)
+                + " needs an enabled sandbox, since what it starts in the background"
+                " outlives its turn"
+            )
         if self.config.project_settings:
             check_project_settings(self.cwd)
         plugins: list[SdkPluginConfig] = []
@@ -717,7 +958,12 @@ class ClaudeCodeLine:
             tools=list(self.config.builtin_tools),
             mcp_servers=cast(dict[str, McpServerConfig], servers),
             strict_mcp_config=not self.config.inherit_account_mcp,
-            can_use_tool=permission_gate(self.config, self.own_tools, self.sandbox),
+            can_use_tool=permission_gate(
+                self.config,
+                self.own_tools,
+                self.sandbox,
+                self._admits,
+            ),
             setting_sources=["project"] if self.config.project_settings else [],
             plugins=plugins,
             max_turns=settings.max_turns,
@@ -740,24 +986,39 @@ class ClaudeCodeLine:
         return appended or None
 
     async def run_turn(self, prompt: str) -> TurnReport:
-        """Run one turn for ``prompt`` and return what happened."""
-        check_environment(self._environment, self.driver.settings.strategy)
-        options = self.options()
+        """Run one turn for ``prompt`` and return what happened. A check that
+        refuses the turn also closes a kept connection, whose engine may already have
+        loaded what the check refused."""
+        try:
+            check_environment(self._environment, self.driver.settings.strategy)
+            options = self.options()
+        except Exception:
+            await self.close()
+            raise
+        if self.config.keep_session:
+            return await self._kept_turn(prompt, options)
         self.driver.step(Event("turn_start"))
         turn = _Turn()
         result: ResultMessage | None = None
-        async with self._session_factory(options) as session:
-            await session.query(prompt)
-            async for message in session.receive_response():
-                if isinstance(message, ResultMessage):
-                    result = message
-                    self.driver.step(
-                        Event("result", message.subtype, message.num_turns)
-                    )
-                    break
-                await self._handle(session, message, turn)
+        self._turn = turn
+        try:
+            async with self._session_factory(options) as session:
+                await session.query(prompt)
+                async for message in session.receive_response():
+                    if isinstance(message, ResultMessage):
+                        result = message
+                        self.driver.step(
+                            Event("result", message.subtype, message.num_turns)
+                        )
+                        break
+                    await self._handle(session, message, turn)
+        finally:
+            self._turn = None
         if turn.refusal is not None:
             raise EngineRefused(turn.refusal)
+        return self._report(result, turn)
+
+    def _report(self, result: ResultMessage | None, turn: _Turn) -> TurnReport:
         if result is None:
             raise EngineRefused("the engine ended the turn without a result")
         self.session_id = result.session_id
@@ -774,12 +1035,20 @@ class ClaudeCodeLine:
         )
 
     async def _handle(
-        self, session: AgentSession, message: Message, turn: _Turn
+        self, session: AgentSession | KeptSession, message: Message, turn: _Turn
     ) -> None:
         if isinstance(message, SystemMessage) and message.subtype == "init":
             turn.capabilities = _capabilities(message.data)
             await self._check_init(session, turn.capabilities, turn)
         elif isinstance(message, AssistantMessage):
+            if turn.require_init and turn.capabilities is None:
+                if turn.refusal is None:
+                    turn.refusal = (
+                        "the engine did not report its tools and credential before"
+                        " its output, so the turn could not be checked"
+                    )
+                    await session.interrupt()
+                return
             for block in message.content:
                 if isinstance(block, TextBlock):
                     turn.text.append(block.text)
@@ -800,8 +1069,14 @@ class ClaudeCodeLine:
                     await session.interrupt()
 
     async def _check_init(
-        self, session: AgentSession, capabilities: Capabilities, turn: _Turn
+        self,
+        session: AgentSession | KeptSession,
+        capabilities: Capabilities,
+        turn: _Turn,
     ) -> None:
+        # A refusal stands, so a later init, even one that passes, cannot clear it.
+        if turn.refusal is not None:
+            return
         turn.refusal = self._refusal(capabilities, turn)
         if turn.refusal is not None:
             await session.interrupt()
@@ -841,3 +1116,322 @@ class ClaudeCodeLine:
                 f" {capabilities.model!r}"
             )
         return None
+
+    # A kept connection. Porting note: the pump and the watch are asyncio tasks
+    # beside the turn, and the turn and the pump share the connection's fields
+    # without a lock, which is sound only because asyncio switches tasks at awaits.
+
+    def _admits(self) -> bool:
+        """Whether a tool call may reach the gate's policy now: only inside a Dromon
+        turn whose init check has passed."""
+        turn = self._turn
+        if turn is None or turn.refusal is not None:
+            return False
+        return not turn.require_init or turn.capabilities is not None
+
+    def fingerprint(self, options: ClaudeAgentOptions) -> str:
+        """A digest of everything a connection was opened with, and of the files the
+        engine loaded, so a turn can tell whether a kept connection still matches.
+        The session to resume and the gate are left out, since neither changes what
+        the engine was given. Raises ``EngineRefused`` as ``tree_digest`` does."""
+        servers: dict[str, object] = {}
+        if isinstance(options.mcp_servers, dict):
+            for name, server in options.mcp_servers.items():
+                servers[name] = (
+                    sorted(self.own_tools) if name == MCP_SERVER_NAME else server
+                )
+        plugins = [str(plugin["path"]) for plugin in options.plugins]
+        document: dict[str, object] = {
+            "model": options.model,
+            "tools": options.tools,
+            "servers": servers,
+            "strict_mcp_config": options.strict_mcp_config,
+            "setting_sources": options.setting_sources,
+            "plugins": plugins,
+            "plugin_files": [tree_digest(Path(path)) for path in plugins],
+            "claude_dir": (
+                tree_digest(self.cwd / ".claude")
+                if self.config.project_settings
+                else None
+            ),
+            "max_turns": options.max_turns,
+            "effort": options.effort,
+            "cwd": str(options.cwd),
+            "sandbox": options.sandbox,
+            "settings": options.settings,
+            "env": options.env,
+            "system_prompt": options.system_prompt,
+        }
+        text = json.dumps(document, sort_keys=True, default=str)
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def loaded_files_digest(self) -> str:
+        """A digest of the files the engine loads itself, every plugin tree and the
+        working directory's ``.claude`` under ``project_settings``, which the watch
+        compares between turns. Raises ``EngineRefused`` as ``tree_digest`` does."""
+        trees = [resolve_plugin(path) for path in self.config.plugins]
+        if self.config.project_settings:
+            trees.append(self.cwd / ".claude")
+        digests = [f"{tree}={tree_digest(tree)}" for tree in trees]
+        return hashlib.sha256("\n".join(digests).encode("utf-8")).hexdigest()
+
+    def seconds_to_close(self) -> float | None:
+        """How long the kept connection has before it closes, or ``None`` when there
+        is none, it has ended, or a turn is in progress."""
+        connection = self._kept
+        if connection is None or not connection.alive or self._turn is not None:
+            return None
+        allowed = (
+            self.config.keep_session_max_seconds
+            if connection.tasks
+            else self.config.keep_session_idle_seconds
+        )
+        return connection.last_end + allowed - self._clock()
+
+    def kept_status(self) -> dict[str, object]:
+        """Whether the engine's connection is kept, for ``line_status``."""
+        connection = self._kept
+        alive = connection is not None and connection.alive
+        return {
+            "keep_session": self.config.keep_session,
+            "kept": alive,
+            "seconds_to_close": self.seconds_to_close(),
+            "background_tasks": len(connection.tasks) if connection and alive else 0,
+        }
+
+    async def expire(self) -> bool:
+        """Close the kept connection if its deadline has passed, and say whether it
+        was closed. The watch calls this, and tests may call it with their clock."""
+        remaining = self.seconds_to_close()
+        connection = self._kept
+        if connection is None or remaining is None or remaining > 0:
+            return False
+        await self.close(
+            "it reached keep_session_max_seconds with background tasks still running"
+            if connection.tasks
+            else "it waited keep_session_idle_seconds without a turn"
+        )
+        return True
+
+    async def retire(self) -> None:
+        """Close the kept connection for good, once any turn in progress has ended.
+        The scheduler calls this when it discards the engine."""
+        self._retired = True
+        if self._turn is None:
+            await self.close()
+
+    async def close(self, reason: str | None = None) -> None:
+        """Close the kept connection, if any, which ends the engine's process and its
+        background tasks. With ``reason`` the next prompt says why."""
+        connection = self._kept
+        if connection is None:
+            return
+        self._kept = None
+        if reason is not None:
+            self._notes.append(closed_note(reason, len(connection.tasks)))
+        current = asyncio.current_task()
+        helpers = [
+            task
+            for task in (connection.pump, connection.watch)
+            if task is not None and task is not current
+        ]
+        for task in helpers:
+            task.cancel()
+        await asyncio.gather(*helpers, return_exceptions=True)
+        # The engine may already be gone, and closing must still forget it.
+        with contextlib.suppress(Exception):
+            await connection.stack.aclose()
+
+    def _spawn(self, work: Coroutine[Any, Any, None]) -> None:
+        """Run ``work`` as a task held in ``_background`` until it ends."""
+        task = asyncio.get_running_loop().create_task(work)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _connect(
+        self, options: ClaudeAgentOptions, fingerprint: str
+    ) -> _Connection:
+        # Digested before the engine starts, so a refusal leaves nothing open.
+        files = self.loaded_files_digest()
+        stack = AsyncExitStack()
+        try:
+            session = await stack.enter_async_context(self._kept_factory(options))
+        except BaseException:
+            await stack.aclose()
+            raise
+        connection = _Connection(stack, session, fingerprint, self._clock(), files)
+        loop = asyncio.get_running_loop()
+        connection.pump = loop.create_task(self._pump(connection))
+        connection.watch = loop.create_task(self._watch(connection))
+        self._kept = connection
+        return connection
+
+    async def _interrupt(self, connection: _Connection) -> bool:
+        try:
+            await asyncio.wait_for(
+                connection.session.interrupt(), INTERRUPT_TIMEOUT_SECONDS
+            )
+        except Exception:  # noqa: BLE001
+            # Any failure leaves the engine in an unknown state, which the caller
+            # resolves by closing the connection.
+            return False
+        return True
+
+    async def _pump(self, connection: _Connection) -> None:
+        """Read every message of the connection. During a turn each goes to the
+        turn. Between turns a background task's report is tracked, and the start of
+        a turn the engine began by itself is interrupted and noted."""
+        try:
+            async for message in connection.session.receive_messages():
+                ended = task_ended(message)
+                if ended is not None:
+                    connection.tasks.discard(ended)
+                elif isinstance(message, TaskStartedMessage):
+                    connection.tasks.add(message.task_id)
+                inbox = connection.inbox
+                if inbox is not None:
+                    inbox.put_nowait(message)
+                    if isinstance(message, ResultMessage):
+                        connection.inbox = None
+                    continue
+                if connection.draining:
+                    if isinstance(message, ResultMessage):
+                        connection.draining = False
+                    continue
+                if not begins_turn(message):
+                    continue
+                connection.draining = not isinstance(message, ResultMessage)
+                if SELF_STARTED_NOTE not in self._notes:
+                    self._notes.append(SELF_STARTED_NOTE)
+                if not await self._interrupt(connection):
+                    return
+        except Exception:  # noqa: BLE001, S110
+            # The engine's process or its transport ended. The connection is
+            # marked dead below, and the next turn resumes in a new process.
+            pass
+        finally:
+            connection.alive = False
+            if connection.inbox is not None:
+                connection.inbox.put_nowait(None)
+
+    async def _watch(self, connection: _Connection) -> None:
+        """Close the kept connection when, between turns, a file its engine loaded
+        changes, and at its deadline. An error is reported and the watch goes on,
+        since a dead watch would leave both unenforced. Ends with the connection."""
+        while connection is self._kept and connection.alive:
+            await asyncio.sleep(self._poll_seconds)
+            if connection is not self._kept:
+                return
+            try:
+                if await self._files_changed(connection):
+                    await self.close(FILES_CHANGED)
+                    return
+                await self.expire()
+            except Exception as error:  # noqa: BLE001
+                print(
+                    f"dromond: the watch of a kept session failed and goes on: {error}",
+                    file=sys.stderr,
+                )
+
+    async def _files_changed(self, connection: _Connection) -> bool:
+        """Whether, between turns, the files the engine loaded no longer match the
+        connection's digest, or can no longer be digested. A turn in progress has
+        passed its checks, and the next turn compares them again."""
+        if not (self.config.plugins or self.config.project_settings):
+            return False
+        if self._turn is not None:
+            return False
+        # On the event loop's thread, not in a worker. A Keleusma driver's virtual
+        # machine may be dropped only on the thread that made it, and a collection
+        # in a worker thread could drop one. The reads are bounded by tree_digest.
+        try:
+            current = self.loaded_files_digest()
+        except EngineRefused:
+            current = None
+        return (
+            connection is self._kept
+            and self._turn is None
+            and current != connection.files
+        )
+
+    def _settle(self, connection: _Connection) -> None:
+        """After a cancelled turn, interrupt the engine in a task of its own, since
+        the cancelled turn must not wait, and close the connection if that fails."""
+
+        async def settle() -> None:
+            if not await self._interrupt(connection) and connection is self._kept:
+                await self.close()
+
+        self._spawn(settle())
+
+    async def _kept_turn(self, prompt: str, options: ClaudeAgentOptions) -> TurnReport:
+        """Run a turn on the kept connection, opening one when there is none or when
+        the one there no longer matches. Every check of a fresh turn has run by now
+        in ``options``. On a reused connection the engine is asked to report its init
+        again, and the turn is refused if it does not, before any tool call is
+        admitted."""
+        fingerprint = self.fingerprint(options)
+        connection = self._kept
+        if connection is not None:
+            if not connection.alive:
+                await self.close()
+                self._notes.append(DIED_NOTE)
+            elif connection.draining:
+                await self.close("the engine had not finished its previous turn")
+            elif connection.fingerprint != fingerprint:
+                await self.close(
+                    "its configuration, instructions, settings or loaded files changed"
+                )
+        reused = self._kept is not None
+        self.driver.step(Event("turn_start"))
+        connection = self._kept or await self._connect(options, fingerprint)
+        turn = _Turn()
+        if self._notes:
+            prompt = "\n\n".join([*self._notes, prompt])
+            self._notes.clear()
+        inbox: asyncio.Queue[Message | None] = asyncio.Queue()
+        connection.inbox = inbox
+        self._turn = turn
+        result: ResultMessage | None = None
+        try:
+            if reused:
+                await connection.session.set_permission_mode(connection.permission_mode)
+            await connection.session.query(prompt)
+            # Bounded by the engine's result, which its max_turns caps, or by the
+            # pump's end-of-stream marker.
+            while True:
+                message = await inbox.get()
+                if message is None:
+                    break
+                if isinstance(message, ResultMessage):
+                    result = message
+                    self.driver.step(
+                        Event("result", message.subtype, message.num_turns)
+                    )
+                    break
+                if isinstance(message, SystemMessage) and message.subtype == "init":
+                    connection.permission_mode = permission_mode_of(message.data)
+                await self._handle(connection.session, message, turn)
+        except asyncio.CancelledError:
+            if result is None and connection.alive:
+                connection.inbox = None
+                connection.draining = True
+                self._settle(connection)
+            raise
+        except Exception:
+            await self.close()
+            raise
+        finally:
+            self._turn = None
+            connection.inbox = None
+            connection.last_end = self._clock()
+            if self._retired:
+                self._spawn(self.close())
+        if result is None:
+            await self.close()
+            self._notes.append(DIED_NOTE)
+            raise EngineRefused("the engine's process ended during the turn")
+        if turn.refusal is not None:
+            await self.close()
+            raise EngineRefused(turn.refusal)
+        return self._report(result, turn)

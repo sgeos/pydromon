@@ -63,7 +63,10 @@ def is_answered(message_id: str, message: Message, replied: set[str]) -> bool:
 
 
 def summary(state: State, owner: Address, new: int) -> MailSummary:
-    """The counts for ``owner``'s mailbox after ``new`` messages arrived."""
+    """The counts for ``owner``'s mailbox after ``new`` messages arrived. A reply to a
+    question Dromon asked on the owner's behalf when it held the owner, such as an
+    operator's ``resume``, is not counted unanswered, since it asks nothing of the
+    owner."""
     held = mailbox(state, owner)
     replied = replied_ids(state, owner)
     return MailSummary(
@@ -73,6 +76,7 @@ def summary(state: State, owner: Address, new: int) -> MailSummary:
             1
             for message_id, message in held
             if not is_answered(message_id, message, replied)
+            and message.reply_to not in state.hold_questions
         ),
     )
 

@@ -87,6 +87,9 @@ TOOL_KEYS: Final = frozenset(
         "workdir",
         "project_settings",
         "plugins",
+        "keep_session",
+        "keep_session_idle_seconds",
+        "keep_session_max_seconds",
     }
 )
 LAYERED_KEYS: Final = frozenset({"sandbox", "settings"})

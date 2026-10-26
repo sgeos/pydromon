@@ -217,3 +217,10 @@ turn. `dromon probe --model gpt-6-luna` reported the subscription credential.
   adapter.
 - **Inference, not checked.** Codex loads its usual `AGENTS.md` instruction files,
   while a Claude Code line loads no settings sources and so no `CLAUDE.md`.
+- **No kept session.** A Codex line refuses `keep_session`, which keeps a Claude Code
+  line's engine connected between turns, as [`LINE_CONFIG.md`](LINE_CONFIG.md)
+  specifies. **Future work, recorded on 2026-10-26** in round 2. A Codex line could keep
+  its app-server and thread between turns and use the app-server's background terminal
+  methods for commands that outlive a turn. That needs the same per-turn checks a kept
+  Claude Code connection passes, and a way to tell the thread's tool list has not
+  changed, since resuming does not take dynamic tools.

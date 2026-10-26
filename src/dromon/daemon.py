@@ -1448,6 +1448,7 @@ def run(
                 root=paths.root,
                 protected=protected_dirs(paths),
                 daemon_commit=read_head_commit(Path(__file__).parent),
+                daemon_checkout=Path(__file__).parent,
                 processes_identifiable=environment_reading_works(),
             )
             scheduler.set_disclosure_terms(terms)

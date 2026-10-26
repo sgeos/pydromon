@@ -661,6 +661,9 @@ class State:
     fired_dues: dict[str, str] = field(default_factory=dict[str, str])
     """The due time of each scheduled wake that has fired, keyed by its note's message
     identifier, so a turn can say when the wake was due."""
+    hold_questions: set[str] = field(default_factory=set[str])
+    """Every question Dromon asked on a line's behalf when it held the line, so an
+    operator's reply to one is not counted as mail the line must answer."""
 
     def copy(self) -> "State":
         """Return an independent snapshot. The records are frozen, so maps suffice."""
@@ -673,6 +676,7 @@ class State:
             self.project_overrides,
             dict(self.scheduled),
             dict(self.fired_dues),
+            set(self.hold_questions),
         )
 
     def open_questions(self, operator_id: str) -> list[str]:
@@ -778,6 +782,7 @@ class State:
             case LineHeld():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, held_by=event.question_id)
+                self.hold_questions.add(event.question_id)
             case LineReleased():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, held_by=None)

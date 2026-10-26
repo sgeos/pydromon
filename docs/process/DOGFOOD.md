@@ -171,3 +171,26 @@ something the engine produces rather than the harness.
   but each turn ends the engine's process, and their tasks with it. Keeping the engine
   session alive from turn to turn would let a line start a long command, end its turn,
   and find, read or stop the task with the engine's own tools at its next turn.
+  **Implemented for Claude Code lines on 2026-10-26** as `keep_session`, as
+  [`LINE_CONFIG.md`](../protocol/LINE_CONFIG.md) specifies under kept sessions. Every
+  per-turn check still runs, and a reused connection is made to report its `init` again
+  before any tool call is admitted. Codex lines are future work, recorded in
+  [`CODEX.md`](../protocol/CODEX.md). **Not yet observed live.** The scripted tests
+  follow the engine as its bundled code was read, and the following are hypotheses for
+  the first live probe.
+  - A background command's end while the connection is idle makes the engine begin a
+    turn by itself, which Dromon interrupts and notes.
+  - A background Bash command is reported as a task, with `task_started` and a later
+    `task_notification` or terminal `task_updated`, so the count in `line_status` is
+    right.
+  - Sending the unchanged permission mode makes the engine report its `init` again
+    before the next prompt.
+  - An interrupt may stop the engine's background tasks.
+- **`line_status` says when the daemon is stale**, by reading its checkout's `HEAD` again
+  at each call and comparing it with the commit it started from, and notes that version
+  `0.0.0` means an unreleased build.
+- **`read_instructions` returns a summary by default**, its size, digest and sources,
+  and the whole text with `full`.
+- **The unanswered count leaves out a reply to a hold question**, such as `resume`.
+- **`list_mail` names what a repeat repeats**, and gives a fired wake's due and delivery
+  times.

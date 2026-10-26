@@ -306,6 +306,18 @@ def line_entries(facts: LineFacts, project: Sequence[Layer]) -> list[dict[str, o
             "local plugin directories the line loads, changed only by configuration",
             ", ".join(facts.config.plugins) or "none",
         ),
+        info(
+            "keep_session",
+            "whether the engine stays connected between turns, changed only by"
+            " configuration",
+            (
+                f"on, closing after {facts.config.keep_session_idle_seconds} seconds"
+                f" idle, or {facts.config.keep_session_max_seconds} with background"
+                " tasks running"
+            )
+            if facts.config.keep_session
+            else "off",
+        ),
     ]
     effort = config.effort
     entries.append(

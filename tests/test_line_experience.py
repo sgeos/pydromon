@@ -3,6 +3,7 @@ and wake notes, ``read_instructions``, ``write_scratch``, the daemon's commit an
 Codex cache default."""
 
 import asyncio
+import hashlib
 import json
 import os
 from collections.abc import Generator, Sequence
@@ -21,9 +22,22 @@ from dromon.engine import CLAUDE_CODE_PROMPT_MARK, TurnReport
 from dromon.eventlog import EventLog
 from dromon.lineconfig import LineConfig, McpServer
 from dromon.limits import Limits
-from dromon.model import LineAddress, OperatorAddress
+from dromon import scheduler as scheduler_module
+from dromon.mailbox import summary
+from dromon.model import (
+    LineAddress,
+    LineCreated,
+    LineHeld,
+    MessageDelivered,
+    MessageKind,
+    MessageSent,
+    OperatorAddress,
+    OperatorRegistered,
+    State,
+)
 from dromon.scheduler import (
     MAX_SCRATCH_BYTES,
+    UNRELEASED_NOTE,
     LineSpec,
     LineToolRefused,
     Scheduler,
@@ -35,6 +49,7 @@ LUNA = "gpt-6-luna"
 ANA = OperatorAddress("ana")
 START = datetime(2026, 10, 26, 9, 0, 0, tzinfo=UTC)
 COMMIT = "a" * 40
+FULL: dict[str, object] = {"full": True}
 
 
 class Clock:
@@ -155,7 +170,16 @@ def test_line_status_shows_the_line_its_daemon_and_the_others(world: World) -> N
     assert (status["model"], status["strategy"]) == (HAIKU, "subscription")
     assert (status["workdir"], status["workdir_path"]) == (None, str(world.root))
     assert status["engine_session"] == "session-1"
-    assert status["daemon"] == {"version": __version__, "commit": COMMIT}
+    assert (status["daemon"]["version"], status["daemon"]["commit"]) == (
+        __version__,
+        COMMIT,
+    )
+    assert status["kept_session"] == {
+        "configured": False,
+        "kept": False,
+        "closes_at": None,
+        "background_tasks": 0,
+    }
     assert status["leases"] == []
     assert status["other_lines"] == [
         {"line_id": "beta", "state": "idle", "held": False, "leases": ["gate"]}
@@ -255,20 +279,20 @@ def test_a_fired_wake_says_when_it_was_due_and_delivered(world: World) -> None:
 def test_read_instructions_returns_what_the_adapter_composes(world: World) -> None:
     (world.root / "CLAUDE.md").write_text("Follow the rules.\n")
     scheduler = world.scheduler
-    text, error = world.call("read_instructions")
+    text, error = world.call("read_instructions", FULL)
     assert (text, error) == (
         "This line's next turn receives no instructions from Dromon.",
         False,
     )
     scheduler.configure_line("alpha", LineConfig(instructions=("CLAUDE.md",)))
-    assert world.call("read_instructions") == (
+    assert world.call("read_instructions", FULL) == (
         "Contents of CLAUDE.md:\n\nFollow the rules.",
         False,
     )
     scheduler.configure_line(
         "alpha", LineConfig(instructions=("CLAUDE.md",), claude_code_prompt=True)
     )
-    text, _ = world.call("read_instructions")
+    text, _ = world.call("read_instructions", FULL)
     assert (
         text
         == f"{CLAUDE_CODE_PROMPT_MARK}\n\nContents of CLAUDE.md:\n\nFollow the rules."
@@ -276,10 +300,10 @@ def test_read_instructions_returns_what_the_adapter_composes(world: World) -> No
     scheduler.configure_line(
         "alpha", LineConfig(instructions=("CLAUDE.md",), project_settings=True)
     )
-    text, _ = world.call("read_instructions")
+    text, _ = world.call("read_instructions", FULL)
     assert "project's own CLAUDE.md files" in text
     scheduler.configure_line("alpha", LineConfig(instructions=("MISSING.md",)))
-    text, error = world.call("read_instructions")
+    text, error = world.call("read_instructions", FULL)
     assert error and "cannot read the instructions MISSING.md" in text
 
 
@@ -287,7 +311,7 @@ def test_a_codex_line_reads_its_developer_instructions(world: World) -> None:
     (world.root / "AGENTS.md").write_text("Codex rules.\n")
     world.scheduler.rebind_line("alpha", LUNA, Strategy.SUBSCRIPTION)
     world.scheduler.configure_line("alpha", LineConfig(instructions=("AGENTS.md",)))
-    assert world.call("read_instructions") == (
+    assert world.call("read_instructions", FULL) == (
         "Contents of AGENTS.md:\n\nCodex rules.",
         False,
     )
@@ -559,3 +583,238 @@ def test_the_codex_cache_is_private_and_refused_when_unsafe(
     monkeypatch.setattr(os, "getuid", lambda: real_uid + 1)
     with pytest.raises(EngineRefused, match="belongs to another user"):
         ensure_cache_home(fresh)
+
+
+# Round 2, a kept engine session in line_status, and its retirement.
+
+
+class KeptRecorder(Recorder):
+    def __init__(self, spec: LineSpec) -> None:
+        super().__init__(spec)
+        self.retired = 0
+
+    async def retire(self) -> None:
+        self.retired += 1
+
+    def kept_status(self) -> dict[str, object]:
+        return {"kept": True, "seconds_to_close": 90.0, "background_tasks": 2}
+
+
+def kept_engine(world: World) -> KeptRecorder:
+    engine = KeptRecorder(LineSpec("alpha", HAIKU, Strategy.SUBSCRIPTION))
+    world.engines["alpha"] = engine
+    return engine
+
+
+def test_line_status_reports_a_kept_session_and_its_deadline(world: World) -> None:
+    world.scheduler.configure_line("alpha", LineConfig(keep_session=True))
+    kept_engine(world)
+    world.scheduler.engine_for("alpha")
+    status = json.loads(world.call("line_status")[0])
+    assert status["kept_session"] == {
+        "configured": True,
+        "kept": True,
+        "closes_at": "2026-10-26T09:01:30Z",
+        "background_tasks": 2,
+    }
+
+
+def test_discarding_a_kept_engine_retires_it(world: World) -> None:
+    engine = kept_engine(world)
+
+    async def go() -> None:
+        world.scheduler.engine_for("alpha")
+        world.scheduler.clear_session("alpha")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    asyncio.run(go())
+    assert engine.retired == 1
+
+
+def test_discarding_an_engine_outside_a_loop_needs_no_retirement(world: World) -> None:
+    engine = kept_engine(world)
+    world.scheduler.engine_for("alpha")
+    world.scheduler.configure_line("alpha", LineConfig(keep_session=True))
+    assert engine.retired == 0
+
+
+def test_stopping_the_scheduler_retires_kept_engines(world: World) -> None:
+    engine = kept_engine(world)
+    world.turn("hello")
+    assert engine.retired == 1
+
+
+# Round 2, the daemon's staleness.
+
+
+def checkout(directory: Path, commit: str) -> Path:
+    (directory / ".git").mkdir(parents=True, exist_ok=True)
+    (directory / ".git" / "HEAD").write_text(commit + "\n")
+    return directory
+
+
+def test_daemon_status_says_when_the_checkout_moved(
+    world: World, tmp_path: Path
+) -> None:
+    daemon = checkout(tmp_path / "daemon", COMMIT)
+    scheduler = Scheduler(
+        world.log, world.build, daemon_commit=COMMIT, daemon_checkout=daemon
+    )
+    status = scheduler.daemon_status()
+    assert (status["stale"], status["checkout_commit"]) == (False, COMMIT)
+    assert status["stale_note"] is None
+    assert status["version_note"] == (
+        UNRELEASED_NOTE if __version__ == "0.0.0" else None
+    )
+    moved = "b" * 40
+    checkout(daemon, moved)
+    status = scheduler.daemon_status()
+    assert (status["stale"], status["checkout_commit"]) == (True, moved)
+    note = cast(str, status["stale_note"])
+    assert COMMIT[:12] in note and moved[:12] in note and "restarts" in note
+
+
+def test_staleness_is_unknown_without_a_checkout_or_a_start_commit(
+    world: World, tmp_path: Path
+) -> None:
+    assert world.scheduler.daemon_status()["stale"] is None
+    daemon = checkout(tmp_path / "daemon", COMMIT)
+    scheduler = Scheduler(world.log, world.build, daemon_checkout=daemon)
+    status = scheduler.daemon_status()
+    assert (status["stale"], status["checkout_commit"]) == (None, COMMIT)
+
+
+# Round 2, the read_instructions summary.
+
+
+def test_read_instructions_summarises_by_default(world: World) -> None:
+    (world.root / "CLAUDE.md").write_text("Follow the rules.\n")
+    (world.root / "MORE.md").write_text("More.\n")
+    world.scheduler.configure_line(
+        "alpha",
+        LineConfig(instructions=("CLAUDE.md", "MORE.md"), claude_code_prompt=True),
+    )
+    full, error = world.call("read_instructions", FULL)
+    assert not error
+    text, error = world.call("read_instructions")
+    assert not error
+    found = json.loads(text)
+    data = full.encode("utf-8")
+    assert found["bytes"] == len(data)
+    assert found["sha256"] == hashlib.sha256(data).hexdigest()
+    assert found["sources"] == [
+        {"source": CLAUDE_CODE_PROMPT_MARK, "bytes": None},
+        {"source": "CLAUDE.md", "bytes": len((world.root / "CLAUDE.md").read_bytes())},
+        {"source": "MORE.md", "bytes": len((world.root / "MORE.md").read_bytes())},
+    ]
+    assert "full set to true" in found["full"]
+    assert world.call("read_instructions", {"full": False}) == (text, False)
+
+
+def test_read_instructions_names_what_the_engine_loads_itself(world: World) -> None:
+    world.scheduler.configure_line("alpha", LineConfig(project_settings=True))
+    found = json.loads(world.call("read_instructions")[0])
+    assert found["sources"] == [
+        {
+            "source": "the project's own CLAUDE.md files, loaded by the engine",
+            "bytes": None,
+        }
+    ]
+
+
+def test_read_instructions_refuses_bad_arguments_and_missing_files(
+    world: World,
+) -> None:
+    text, error = world.call("read_instructions", {"full": "yes"})
+    assert error and "full must be true or false" in text
+    text, error = world.call("read_instructions", {"whole": True})
+    assert error and "unexpected argument whole" in text
+    world.scheduler.configure_line("alpha", LineConfig(instructions=("MISSING.md",)))
+    text, error = world.call("read_instructions")
+    assert error and "cannot read the instructions MISSING.md" in text
+
+
+# Round 2, replies to hold questions.
+
+
+def test_a_reply_to_a_hold_question_is_not_counted_unanswered(world: World) -> None:
+    question = world.scheduler.hold("alpha", "was held for this test")
+    operator = cast(OperatorAddress, world.log.state.messages[question].recipient)
+    reply = world.scheduler.answer(operator, question, "resume")
+    request = world.scheduler.send(ANA, LineAddress("alpha"), "a real request")
+    for message_id in (reply, request):
+        world.log.append(MessageDelivered(message_id))
+    counts = summary(world.log.state, LineAddress("alpha"), 0)
+    assert (counts.unread, counts.unanswered) == (2, 1)
+
+
+def test_an_ordinary_reply_to_a_lines_question_still_counts(world: World) -> None:
+    question = world.scheduler.ask("alpha", ANA, "which branch?")
+    reply = world.scheduler.answer(ANA, question, "main")
+    world.log.append(MessageDelivered(reply))
+    assert summary(world.log.state, LineAddress("alpha"), 0).unanswered == 1
+
+
+def test_hold_questions_are_part_of_the_state_and_its_copy() -> None:
+    state = State()
+    state.apply(OperatorRegistered("ana"))
+    state.apply(LineCreated("alpha", HAIKU, "subscription"))
+    state.apply(
+        MessageSent(
+            "q-1", LineAddress("alpha"), ANA, MessageKind.QUESTION, "held", ("resume",)
+        )
+    )
+    state.apply(LineHeld("alpha", "q-1"))
+    assert state.hold_questions == {"q-1"}
+    copied = state.copy()
+    state.hold_questions.add("q-2")
+    assert copied.hold_questions == {"q-1"}
+
+
+# Round 2, list_mail notes.
+
+
+def test_list_mail_names_the_message_a_repeat_repeats(world: World) -> None:
+    world.turn("please run the gate")
+    first_id = list(world.log.state.messages)[-1]
+    world.clock.now += timedelta(minutes=1)
+    world.turn("please run the gate")
+    second_id = list(world.log.state.messages)[-1]
+    text, error = world.call("list_mail")
+    assert not error
+    entries = {line.split(" ")[0]: line for line in text.splitlines()[1:]}
+    assert "repeat_of" not in entries[first_id]
+    assert entries[second_id].endswith(f", repeat_of {first_id}")
+
+
+def test_list_mail_gives_a_fired_wake_its_due_and_delivery_times(
+    world: World,
+) -> None:
+    _, due = world.scheduler.schedule_wake("alpha", 60, "check the log")
+    world.clock.now += timedelta(seconds=73)
+
+    async def go() -> None:
+        stop = asyncio.Event()
+        loop = asyncio.create_task(world.scheduler.run(stop))
+        await asyncio.sleep(0)
+        await world.scheduler.idle()
+        stop.set()
+        await loop
+
+    asyncio.run(go())
+    text, _ = world.call("list_mail")
+    assert text.splitlines()[-1].endswith(
+        f", scheduled wake due {due}, delivered 2026-10-26T09:01:13Z"
+    )
+    world.start()
+    text, _ = world.call("list_mail")
+    assert text.splitlines()[-1].endswith(f", scheduled wake due {due}")
+
+
+def test_list_mail_notes_stay_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(scheduler_module, "MAX_REMEMBERED_NOTES", 2)
+    store: dict[str, str] = {}
+    for key in ("a", "b", "c"):
+        scheduler_module._bounded_put(store, key, key.upper())  # pyright: ignore[reportPrivateUsage]
+    assert store == {"b": "B", "c": "C"}
