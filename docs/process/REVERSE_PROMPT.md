@@ -4,29 +4,42 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-26, pydromon dogfoods itself
+## 2026-10-26, the harness brought to Keleusma, through the dogfooded harness
 
-**Done.** On the operator's goal that the project be in order to dogfood its own
-development.
+**Done.** On the operator's goal that pydromon be in order for its session to direct
+further development through Dromon, and that the harness be brought to a standard
+where Keleusma's four lines can run on it.
 
-- **Local setup.** `.dromon/dromon.toml` declares `worker` on Opus, `reviewer` on Haiku
-  and `luna` on GPT-6-Luna, and `.dromon/LINES.md` gives their rules. Lines never
-  commit, push or use `gh`, write only when given the task, run the sandbox form of the
-  gate, and never spend a subscription or start a daemon. `docs/process/DOGFOOD.md`
-  records both files with placeholders for the absolute paths.
-- **A defect found and fixed.** pytest's collection stats every entry of the root
-  directory, and a Codex line's profile denies even the metadata of `.dromon`, so a
-  Codex line could not run the gate here. pytest now ignores `.dromon`, and a test ties
-  the option to Dromon's state directory name. A Codex line also needs uv's cache under
-  `$TMPDIR`, which the rules give it.
+- **Directed work.** The Opus line `worker` inspected Keleusma read only and ranked the
+  gaps, then built three stages. The Haiku line `reviewer` reviewed each, and its
+  findings were fixed. The operator's session verified each stage live and merged pull
+  requests 35 to 38. The record is `docs/architecture/KELEUSMA_DOGFOOD.md`.
+- **Built.** Development-scale turn budgets, per-line working directories with session
+  adoption and a git hooks and config guard, `wake_after`, `require_sandbox`, a
+  disclosure guard, operator-only rebinding, allowlisted project settings, leases, and
+  Fable 5.1 drivers.
+- **Tried.** A scratch project ran Keleusma's four lines on Haiku in their real
+  worktrees, read only. Each identified its line and task, the lease was contended as
+  designed, and nothing in Keleusma was written.
+- **Validated.** A Keleusma project file passes `dromon config` against the real
+  worktrees, and is recorded with placeholder paths.
+- **Reports.** The three lines' harness reports are in `tmp/harness-report-*.md`, and
+  the trial's reports in `tmp/keleusma-trial-reports.txt`.
 
-**Verification.** The daemon runs for this checkout. Through it, a Haiku line ran the
-hygiene gate, was refused a `.git` write and a commit, and opened Appendix B without
-reading it, and then passed the sandbox gate with 1153 tests. A GPT-6-Luna line passed
-the same gate with 1154 tests after the fix. The failure was reproduced and the fix
-checked with macOS's sandbox denying `.dromon`. The full gate passed locally with 1170
-tests. No Opus turn was run.
+**Corrections to the lines' reports.** The worker's holds were cost holds, not
+autonomous-turn holds. The reviewer's duplicate request was a deliberate resend after
+its first turn failed to start. Luna's intermittent collection failure was the
+`.dromon` defect, fixed by pytest's `--ignore`.
 
-**For the operator.** The daemon is left running, so lines can be attached with
-`uv run dromon attach worker`. It runs this working tree and picks up merged changes
-when restarted with `dromon stop` and `dromon start`.
+**Not verified.** No live turn ran on Fable 5.1, on a line's project settings, or on a
+cross-engine rebind. The four lines have not run as writing lines, because their live
+sessions work in the same worktrees.
+
+**For the operator.**
+1. Whether to install the Keleusma project file, which stops the live sessions of
+   those lines, and whether those lines keep their authority to commit, push and merge.
+2. Keleusma's remote over HTTPS, and `secret/disclosure-terms.txt` there.
+3. The `typesafe-ai` skill Keleusma requires is a user plugin, which Dromon does not
+   load. Whether to add an opt-in for it.
+4. The lines' top suggestions: let a line list and stop its own processes, and show a
+   line its own holds, limits and leases.

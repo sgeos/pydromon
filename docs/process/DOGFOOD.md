@@ -20,7 +20,11 @@ uv run dromon attach worker # or reviewer or luna, with --gui for a window
 ```
 
 The daemon runs this working tree, which is an editable install, so a line's edits
-reach the daemon only when the operator restarts it.
+reach the daemon only when the operator restarts it. On a loaded host, start it with
+`CLAUDE_CODE_STREAM_CLOSE_TIMEOUT=300000`, because Claude Code can miss the Agent SDK's
+60 second start timeout, which fails the turn. An Opus line's estimated cost for one
+stage of work ran from $20 to $35, so set its `limits.max_cost_usd` above that, for
+example with `dromon set --line worker limits.max_cost_usd 60`.
 
 ## Lines
 
