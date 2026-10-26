@@ -966,20 +966,22 @@ def build_parser() -> argparse.ArgumentParser:
                 " with partial isolation. Cursor's built-in reads, writes, commands"
                 " and web fetches are denied before they run, but its subagents,"
                 " searches, image and screen tools are stopped only after they start."
-                " Antigravity's tools are all stopped only after they start. Either"
-                " way such a tool may act before the turn is refused. Neither this"
-                " flag nor --accept-unverified-credential changes the strategy, so"
+                " Antigravity's tools are refused before they run when its ACP runtime"
+                " asks first, and stopped only after they start when it does not."
+                " Either way such a tool may act before the turn is refused. Neither"
+                " this flag nor --accept-unverified-credential changes the strategy, so"
                 " --strategy api still bills per token",
             )
             command.add_argument(
                 "--accept-unverified-credential",
                 action="store_true",
                 help="let an Antigravity model run this one turn although Dromon"
-                " cannot tell which credential agy uses, a sign-in to a plan or a key"
-                " billed per token. First confirm by hand that agy is signed in to a"
-                " plan and not billing per token, step 2 of the verify-first list in"
-                " docs/protocol/ANTIGRAVITY.md. Accepted only together with"
-                " --accept-partial-isolation. It does not change the strategy",
+                " cannot tell which credential the Antigravity ACP runtime uses, a"
+                " sign-in to a plan or a key billed per token. First confirm by hand"
+                " that the runtime is signed in to a plan and not billing per token,"
+                " step 3 of the verify-first list in docs/protocol/ANTIGRAVITY.md."
+                " Accepted only together with --accept-partial-isolation. It does not"
+                " change the strategy",
             )
         if name == "agent":
             command.add_argument("action", choices=["add", "list", "revoke"])

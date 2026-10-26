@@ -12,9 +12,12 @@ from pathlib import Path
 import pytest
 
 from dromon import jsonlines
+from dromon.engine import EngineRefused
 from dromon.jsonlines import (
     CLOUD_PREFIXES,
     CREDENTIAL_SUFFIXES,
+    HEAD_BYTES,
+    NotJsonLine,
     is_cloud_or_credential,
     json_lines_factory,
 )
@@ -87,6 +90,24 @@ def test_a_child_left_behind_by_an_exited_harness_is_ended(
         return await gone(child)
 
     assert asyncio.run(scenario())
+
+
+def test_a_line_that_is_not_json_keeps_only_a_bounded_head(tmp_path: Path) -> None:
+    """The head lets an adapter recognise a notice, and the message never quotes it."""
+    notice = "Open the following link: https://example.invalid/" + "x" * 200
+    write_harness(tmp_path / "bin", f"print({notice!r}, flush=True)\n")
+    factory = json_lines_factory("harness", keep_input=False)
+
+    async def scenario() -> NotJsonLine:
+        async with factory([], tmp_path, {"PATH": str(tmp_path / "bin")}) as harness:
+            with pytest.raises(NotJsonLine) as refused:
+                await harness.receive()
+            return refused.value
+
+    error = asyncio.run(scenario())
+    assert error.head == notice.encode()[:HEAD_BYTES]
+    assert "example.invalid" not in str(error)
+    assert isinstance(error, EngineRefused)
 
 
 @pytest.mark.parametrize(

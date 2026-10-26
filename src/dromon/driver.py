@@ -47,7 +47,7 @@ ENGINE_OF: Final[dict[str, str]] = {
     "grok-4.7": "grok-build",
     "pi:openai/gpt-6-luna": "pi",
     "cursor-agent:gpt-5.6-luna-medium": "cursor-agent",
-    "antigravity:gemini-3.1-pro": "antigravity",
+    "antigravity:gemini-3.8-flash-high": "antigravity",
 }
 """Each model with a packaged driver for every strategy, and the engine it runs on.
 

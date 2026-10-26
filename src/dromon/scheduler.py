@@ -108,7 +108,7 @@ from dromon.overrides import decode as decode_override
 from dromon.overrides import encode as encode_override_document
 from dromon.overrides import encode as encode_override
 from dromon.driver import ENGINE_OF, MODELS, Driver, DriverError, Strategy
-from dromon import antigravity, codex, cursor, grok, pi
+from dromon import acp, antigravity, codex, cursor, grok, pi
 from dromon.agents import LineTokens
 from dromon.codex import CodexLine
 from dromon.grok import GrokLine
@@ -674,7 +674,7 @@ def engine_factory(
         if line_tokens is None or line_socket is None:
             return [], None
         token = line_tokens.issue(line_id)
-        return grok.bridge_command(Path(root), line_socket.parent, line_id), token
+        return acp.bridge_command(Path(root), line_socket.parent, line_id), token
 
     def build(spec: LineSpec, own_tools: Sequence[SdkMcpTool[Any]]) -> LineEngine:
         driver = Driver.for_model(spec.model, spec.strategy)
@@ -761,16 +761,20 @@ def engine_factory(
                     "Antigravity lines take no sandbox or settings, and the project"
                     " file sets one for every line"
                 )
+            bridge, token = _line_bridge(spec.line_id)
             return AntigravityLine(
                 driver,
                 workdir,
                 config=spec.config,
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
+                bridge=bridge,
+                line_token=token,
                 observe=spec.observe,
                 mark=spec.mark,
                 partial_isolation=accept_partial_isolation,
                 unverified_credential=accept_unverified_credential,
+                cost_mark=spec.cost_mark,
             )
         merged = merge([project_sandbox, spec.config.sandbox])
         enabled = merged is not None and merged.enabled
