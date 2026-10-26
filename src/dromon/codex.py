@@ -90,6 +90,7 @@ from dromon.engine import (
     compaction_note,
     ignore_compaction,
     ignore_end,
+    ignore_estimate,
     no_context_line,
     INTERRUPT_TIMEOUT_SECONDS,
     KEEP_POLL_SECONDS,
@@ -573,6 +574,9 @@ class _Turn:
     last_total: dict[str, int] | None = None
     compacted: bool = False
     """Whether the engine reported a compaction of the thread during the turn."""
+    estimate_for: dict[str, int | str | None] | None = None
+    """The compaction this turn began with, while its size after is unknown and the
+    turn's first engine call has not yet estimated it."""
 
 
 class _Routed:
@@ -719,6 +723,7 @@ class CodexLine:
         compacted: Callable[
             [Mapping[str, int | str | None]], object
         ] = ignore_compaction,
+        compaction_estimated: Callable[[int], object] = ignore_estimate,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -749,6 +754,7 @@ class CodexLine:
         self._in_turn = False
         self._background: set[asyncio.Task[None]] = set()
         self._compacted = compacted
+        self._estimated = compaction_estimated
         self._request: CompactionRequest | None = None
         """The compaction the next turn begins with, if any, which each turn takes
         as it starts, as on a Claude Code line."""
@@ -797,9 +803,12 @@ class CodexLine:
             "trigger": "manual" if work.compacted else None,
             "before_tokens": before if work.compacted else None,
             "after_tokens": after if work.compacted else None,
+            "after_estimate_tokens": None,
         }
         if work.compacted:
             self._context = after
+            if after is None:
+                turn.estimate_for = compaction
             try:
                 self._compacted(dict(compaction))
             except Exception as error:  # noqa: BLE001
@@ -1035,6 +1044,7 @@ class CodexLine:
             del turn.calls[:-MAX_CALLS]
             context = last.get("total_tokens")
             self._context = context if context else self._context
+            self._estimate_after(turn, last)
         if total:
             if turn.first_total is None:
                 turn.first_total = {
@@ -1042,6 +1052,29 @@ class CodexLine:
                     for key, value in total.items()
                 }
             turn.last_total = total
+
+    def _estimate_after(self, turn: _Turn, call: Mapping[str, int]) -> None:
+        """Estimate the size a compaction left from the first engine call after it in
+        the same turn, when the engine did not report the size, and report the
+        estimate at once. It is the call's input, which holds the compacted thread
+        and the turn's prompt, and so is an upper bound on the size after. Codex
+        0.164.0 was observed live not to report the size after, so this is the only
+        estimate a turn can give before its end."""
+        compaction = turn.estimate_for
+        if compaction is None:
+            return
+        tokens = call.get("input_tokens") or call.get("total_tokens")
+        if not tokens:
+            return
+        turn.estimate_for = None
+        compaction["after_estimate_tokens"] = tokens
+        try:
+            self._estimated(tokens)
+        except Exception as error:  # noqa: BLE001
+            print(
+                f"dromond: a compaction estimate could not be recorded: {error}",
+                file=sys.stderr,
+            )
 
     async def _item_started(self, item: dict[str, Any], turn: _Turn) -> None:
         kind = str(item.get("type") or "")

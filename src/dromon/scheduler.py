@@ -188,6 +188,7 @@ from dromon.model import (
     WakeRequested,
     WITHHELD_WAKE_NOTE,
     WakeScheduled,
+    WakeWithdrawn,
     TaskNoted,
     LineCostMarked,
     MAX_COST_MICRO_USD,
@@ -391,6 +392,35 @@ STOP_BACKGROUND_TOOL_NAME: Final = "stop_background"
 
 DEFAULT_COMPACT_WAKE_SECONDS: Final = 60
 
+CONTEXT_FROM_CALL: Final = "call"
+CONTEXT_FROM_COMPACTION: Final = "compaction"
+CONTEXT_FROM_ESTIMATE: Final = "compaction_estimate"
+CONTEXT_NOTES: Final[dict[str, str]] = {
+    CONTEXT_FROM_CALL: (
+        "the last main-loop engine call's input, cached and written tokens"
+    ),
+    CONTEXT_FROM_COMPACTION: (
+        "the size the last compaction left, as the engine reported it, until a"
+        " turn's end gives its last engine call's context instead"
+    ),
+    CONTEXT_FROM_ESTIMATE: (
+        "the first engine call's input after the last compaction, whose size the"
+        " engine did not report, an upper bound that includes that turn's prompt,"
+        " until the turn's end gives its last engine call's context instead"
+    ),
+}
+"""Where a line's context estimate came from, and the note ``line_status`` gives
+with each. **Round 7, C.** Just after a compaction the estimate is the compaction's
+size, not a call's, and the note says so until the turn's end replaces it."""
+
+AFTER_ESTIMATE_NOTE: Final = (
+    "the first engine call's input after the compaction, in the same turn, an upper"
+    " bound on the size the compaction left, since it includes that turn's prompt"
+)
+"""**Round 7, D.** Codex 0.164.0 was observed live not to report a compaction's size
+after, so the first call after it gives the only estimate. ``after_tokens`` stays
+``None`` beside it, so a reader can tell the estimate from a reported size."""
+
 COMPACT_SESSION_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
     "properties": {
@@ -410,23 +440,32 @@ COMPACT_SESSION_SCHEMA: Final[dict[str, object]] = {
 
 COMPACT_WAKE_NOTE: Final = (
     "Dromon wake for compact_session: this turn begins with the compaction you asked"
-    " for, unless an earlier turn already began with it, or the daemon restarted"
-    " since you asked, which loses the request. Only a turn that compacted opens"
-    " with a note saying so, so without one, call compact_session again if you still"
-    " need it."
+    " for, unless the daemon restarted since you asked, which loses the request, or"
+    " an earlier turn took the request and the engine did not compact. Only a turn"
+    " that compacted opens with a note saying so, so without one, call"
+    " compact_session again if you still need it."
 )
 """The note of the wake ``compact_session`` schedules, so that the compaction does
-not wait for unrelated mail. The event log has no event that cancels a scheduled
-wake, so a compaction an earlier turn consumed leaves the wake to fire anyway, which
-costs one short turn. That is technical debt, accepted for round 6.
+not wait for unrelated mail.
+
+**Round 7, A.** When an earlier turn makes the compaction, the engine's report of it
+withdraws this wake with ``wake_withdrawn``, so it starts no turn for nothing. The
+wake is withdrawn on the engine's report, not when a turn takes the request, so a
+turn that fails before compacting leaves the wake to fire and say so. A wake that
+falls due while the turn that took its request is still compacting is held back
+until that turn reports the compaction or ends, so it cannot fire in that window.
+Withdrawing at delivery instead was rejected, because a fired note is already a
+message in the log, and removing it would need an event of its own anyway and would
+leave a message that was sent and never delivered. The porting cost is one event
+kind with two identifiers, and the in-memory record of which wake is the compaction's.
 
 **Round 6 review, F4.** The request is held in memory, so a restart loses it while
 the wake, which is in the event log, survives. The note says so, rather than the
 wake's turn saying that the request was lost, because that turn cannot tell a lost
-request from one an earlier turn consumed. Both leave no request, and the record of
-the consumption is in memory too. Recording requests in the event log would let it
-tell them apart, at the cost of a protocol event every port must carry, for a loss
-that only a restart between the request and its wake causes."""
+request from one an earlier turn consumed without compacting. Both leave no request,
+and the record of the consumption is in memory too. Recording requests in the event
+log would let it tell them apart, at the cost of a protocol event every port must
+carry, for a loss that only a restart between the request and its wake causes."""
 
 STOP_BACKGROUND_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
@@ -576,6 +615,11 @@ class LineSpec:
     )
     """Where the engine reports the cost of a turn outside Dromon's own, one it began
     by itself or one an operator interrupted, whose result arrived later."""
+    compaction_estimated: Callable[[int], object] = field(
+        default=lambda tokens: None, compare=False
+    )
+    """Where the engine reports its estimate of the size a compaction left, from the
+    first engine call after it, when it did not report the size itself."""
 
 
 type EngineFactory = Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], LineEngine]
@@ -625,6 +669,7 @@ def engine_factory(
                 mark=spec.mark,
                 task_ended=spec.task_ended,
                 compacted=spec.compacted,
+                compaction_estimated=spec.compaction_estimated,
             )
         if driver.settings.engine == grok.ENGINE_NAME:
             if project_sandbox is not None or project_settings is not None:
@@ -810,6 +855,13 @@ class Scheduler:
         """Each line's latest compaction, as ``line_status`` gives it. In memory."""
         self._compaction_cause: dict[str, str] = {}
         """Why Dromon asked for the compaction a line's running turn begins with."""
+        self._compact_wake: dict[str, str] = {}
+        """The identifier of the wake each line's latest ``compact_session`` call
+        scheduled, which the compaction withdraws. In memory, so after a restart the
+        wake fires, and its note says that a restart loses the request."""
+        self._context_source: dict[str, str] = {}
+        """Where each line's context estimate came from, one of the
+        ``CONTEXT_FROM_*`` values, for the note ``line_status`` gives with it."""
         self._auto_held: set[str] = set()
         """Lines whose last compaction left the context at or past their
         ``auto_compact_tokens``, or left it unknown, so no automatic compaction
@@ -1154,13 +1206,38 @@ class Scheduler:
         return message_id, due
 
     def _due_wakes(self) -> list[str]:
-        """The lines whose scheduled wake has fallen due, in a fixed order."""
+        """The lines whose scheduled wake has fallen due, in a fixed order. A
+        ``compact_session`` wake is held back while a running turn is making the
+        compaction it was for, since that compaction withdraws it. The hold ends
+        with the turn, so it is bounded by the turn's own length."""
         now = self._wall_clock()
         return [
             line_id
             for line_id, pending in sorted(self._log.state.scheduled.items())
-            if parse_due(pending.due) <= now
+            if parse_due(pending.due) <= now and not self._compacting_for(line_id)
         ]
+
+    def _compacting_for(self, line_id: str) -> bool:
+        """Whether the line's running turn is making the compaction that its pending
+        ``compact_session`` wake was scheduled for, from the dispatch that decided
+        the compaction until the engine reports it or the turn ends."""
+        pending = self._log.state.scheduled.get(line_id)
+        return (
+            pending is not None
+            and line_id in self._running
+            and self._compact_wake.get(line_id) == pending.message_id
+            and self._compaction_cause.get(line_id) == COMPACT_SESSION_TOOL_NAME
+        )
+
+    def _withdraw_compact_wake(self, line_id: str) -> str | None:
+        """Withdraw the line's pending wake if ``compact_session`` scheduled it, and
+        return its identifier, or ``None`` when there was none to withdraw."""
+        message_id = self._compact_wake.pop(line_id, None)
+        pending = self._log.state.scheduled.get(line_id)
+        if message_id is None or pending is None or pending.message_id != message_id:
+            return None
+        self._log.append(WakeWithdrawn(line_id, message_id))
+        return message_id
 
     def fire_due_wakes(self) -> list[str]:
         """Record the note of every scheduled wake that has fallen due, as a message
@@ -1408,15 +1485,16 @@ class Scheduler:
         )
 
     def context_status(self, line_id: str) -> dict[str, object]:
-        """The context the line's next turn will re-read, for ``line_status``."""
+        """The context the line's next turn will re-read, for ``line_status``, with a
+        note naming where the estimate came from."""
         context = self._context.get(line_id)
         last = self._last_compaction.get(line_id)
         if context is not None:
-            note = "the last main-loop engine call's input, cached and written tokens"
+            note = CONTEXT_NOTES[self._context_source.get(line_id, CONTEXT_FROM_CALL)]
         elif last is not None and last.get("after_tokens") is None:
             note = (
                 "unknown since the last compaction, whose size the engine did not"
-                " report, until a turn ends with the engine's per-call usage"
+                " report, until an engine call after it estimates it"
             )
         else:
             note = "the engine reported no per-call usage yet"
@@ -1437,33 +1515,82 @@ class Scheduler:
         the turn, so a status read later in the same turn shows it. Its ``cause`` is
         ``compact_session`` or ``auto_compact_tokens`` for one Dromon asked for, whose
         ``trigger`` the engine reports as manual, and ``engine`` for one the engine
-        made by itself. The context
-        estimate becomes the size the compaction left, or unknown when the engine
-        did not report it, until the turn's own calls estimate it again."""
-        self._last_compaction[line_id] = {
+        made by itself. A ``compact_session`` compaction withdraws the wake that call
+        scheduled, which has nothing left to do. The context estimate becomes the
+        size the compaction left, or unknown when the engine did not report it, until
+        the turn's own calls estimate it again.
+
+        **Round 7 review, F2.** The compaction is recorded before the wake is
+        withdrawn, and a withdrawal that fails is reported and leaves the wake to
+        fire, so the record never disagrees with the turn's own report."""
+        cause = self._compaction_cause.pop(line_id, "engine")
+        record: dict[str, object] = {
             "trigger": compaction.get("trigger"),
-            "cause": self._compaction_cause.pop(line_id, "engine"),
+            "cause": cause,
             "before_tokens": compaction.get("before_tokens"),
             "after_tokens": compaction.get("after_tokens"),
+            "after_estimate_tokens": None,
+            "after_estimate_note": None,
+            "withdrawn_wake": None,
             "at": format_due(self._wall_clock()),
         }
+        self._last_compaction[line_id] = record
         after = compaction.get("after_tokens")
         threshold = self.effective_config(line_id).auto_compact_tokens
         if isinstance(after, int):
-            self._context_reported(line_id, after)
+            self._context_reported(line_id, after, CONTEXT_FROM_COMPACTION)
             if threshold is not None and after >= threshold:
                 self._auto_held.add(line_id)
         else:
             self._context.pop(line_id, None)
+            self._context_source.pop(line_id, None)
             # Whether it got below the threshold is unknown, so it is held.
             self._auto_held.add(line_id)
+        if cause != COMPACT_SESSION_TOOL_NAME:
+            return
+        try:
+            record["withdrawn_wake"] = self._withdraw_compact_wake(line_id)
+        except Exception as error:  # noqa: BLE001
+            # The event log refused or is closing. The wake fires, and its note says
+            # that a turn without a compaction note may ask again.
+            print(
+                f"dromond: line {line_id}'s compaction wake could not be withdrawn:"
+                f" {error}",
+                file=sys.stderr,
+            )
 
-    def _context_reported(self, line_id: str, tokens: int) -> None:
-        """Record a context estimate the engine reported, and hold or release
-        automatic compaction on it: an estimate at or past ``auto_compact_tokens``
-        just after a compaction holds it, and any estimate below releases it.
-        Called with the size a compaction left, and with each turn's estimate."""
+    def compaction_estimated(self, line_id: str, tokens: int) -> None:
+        """Record the engine's estimate of the size the line's last compaction left,
+        which it gives from the first engine call after a compaction whose size it
+        did not report. The estimate is an upper bound, since that call's input also
+        holds the turn's prompt. It holds or releases automatic compaction as a
+        reported size does, and is the context estimate until the turn ends. An
+        estimate with no unreported compaction to belong to, or a second one for the
+        same compaction, is ignored, so a confused engine cannot overwrite a size."""
+        last = self._last_compaction.get(line_id)
+        if (
+            type(tokens) is not int
+            or tokens <= 0
+            or last is None
+            or last.get("after_tokens") is not None
+            or last.get("after_estimate_tokens") is not None
+        ):
+            return
+        last["after_estimate_tokens"] = tokens
+        last["after_estimate_note"] = AFTER_ESTIMATE_NOTE
+        self._context_reported(line_id, tokens, CONTEXT_FROM_ESTIMATE)
+        threshold = self.effective_config(line_id).auto_compact_tokens
+        if threshold is not None and tokens >= threshold:
+            self._auto_held.add(line_id)
+
+    def _context_reported(self, line_id: str, tokens: int, source: str) -> None:
+        """Record a context estimate the engine reported and where it came from,
+        one of the ``CONTEXT_FROM_*`` values, and hold or release automatic
+        compaction on it: an estimate at or past ``auto_compact_tokens`` just after
+        a compaction holds it, and any estimate below releases it. Called with the
+        size a compaction left or its estimate, and with each turn's estimate."""
         self._context[line_id] = tokens
+        self._context_source[line_id] = source
         threshold = self.effective_config(line_id).auto_compact_tokens
         if threshold is None or tokens < threshold:
             self._auto_held.discard(line_id)
@@ -2097,10 +2224,12 @@ class Scheduler:
             except (InvalidField, EventRejected) as error:
                 return _tool_error(str(error))
             self._compact_requests.add(line_id)
+            self._compact_wake[line_id] = message_id
             return _tool_text(
                 "Your session will be compacted at the start of your next turn. A wake"
                 f" is scheduled for {due}, whose note arrives as {message_id}, so the"
-                " compaction does not wait for other mail. The prompt gives the"
+                " compaction does not wait for other mail. If an earlier turn makes"
+                " the compaction, the wake is withdrawn. The prompt gives the"
                 " context before and after where the engine reports them."
             )
 
@@ -2110,7 +2239,8 @@ class Scheduler:
                 "Compact your own engine session at the start of your next turn, which"
                 " summarizes the conversation so far so that each engine call re-reads"
                 " less. It schedules a wake for that turn, after 60 seconds or the"
-                " seconds given, unless a wake is already pending. Your next prompt"
+                " seconds given, unless a wake is already pending, and withdraws that"
+                " wake if an earlier turn makes the compaction. Your next prompt"
                 " says the context before and after."
             ),
             input_schema=COMPACT_SESSION_SCHEMA,
@@ -2695,6 +2825,17 @@ class Scheduler:
         )
         self._counting[line_id] = not from_operator
         compaction = self._compaction_reason(line_id)
+        # Round 7 review, F3. The cause, which also marks the compaction as under
+        # way for ``_compacting_for``, is set as the compaction is decided, so a tick
+        # between this dispatch and the turn's start cannot fire its wake.
+        if compaction is None:
+            self._compaction_cause.pop(line_id, None)
+        else:
+            self._compaction_cause[line_id] = (
+                COMPACT_SESSION_TOOL_NAME
+                if compaction == COMPACTION_REQUESTED
+                else "auto_compact_tokens"
+            )
         prompt = compose_prompt(
             line_id,
             messages,
@@ -2722,22 +2863,20 @@ class Scheduler:
             engine = self.engine_for(line_id)
             if compaction is not None:
                 if isinstance(engine, CompactingEngine):
-                    self._compaction_cause[line_id] = (
-                        COMPACT_SESSION_TOOL_NAME
-                        if compaction == COMPACTION_REQUESTED
-                        else "auto_compact_tokens"
-                    )
                     engine.request_compaction(
                         compaction, lambda: self._context_warning(line_id)
                     )
                 else:
+                    self._compaction_cause.pop(line_id, None)
                     # The prompt left the warning out for a compaction that this
                     # engine cannot make, so it is given here instead.
                     warning = self._context_warning(line_id)
                     prompt = f"{warning}\n\n{prompt}" if warning else prompt
             report = await engine.run_turn(prompt)
             if report.context_tokens is not None:
-                self._context_reported(line_id, report.context_tokens)
+                self._context_reported(
+                    line_id, report.context_tokens, CONTEXT_FROM_CALL
+                )
             self.turn_reports.append((line_id, report))
             self._mark_cost(line_id, report.cost_mark)
             recorded = self._log.state.lines[line_id].engine_session
@@ -3059,6 +3198,7 @@ class Scheduler:
                 lambda kind, cost, usage: self.spent_between(
                     line_id, kind, cost, usage
                 ),
+                lambda tokens: self.compaction_estimated(line_id, tokens),
             )
             engine = self._engine_factory(spec, self.own_tools(line_id))
             self._engines[line_id] = engine
@@ -3132,10 +3272,36 @@ def _between_entry(
             " Dromon interrupted"
         ),
         "cost_usd": None if cost is None else f"{cost:.4f}",
-        "cost_note": "the engine reports no cost" if cost is None else None,
+        "cost_note": _between_cost_note(cost),
         "usage": None if usage is None else dict(usage),
+        "usage_note": _between_usage_note(usage),
         "compaction": None,
     }
+
+
+def _between_cost_note(cost: float | None) -> str | None:
+    """Whether the engine reported nothing or reported zero for a turn outside
+    Dromon's own. **Round 7, B.** Both used to read alike as a cost of nothing, which
+    hid whether the engine reported anything. Zero is shown as reported, with the
+    likely reason marked as an inference."""
+    if cost is None:
+        return "the engine reported no cost for this turn, so none was counted"
+    if cost == 0:
+        return (
+            "the engine reported a cost of zero, not nothing. Inferred, not observed,"
+            " the turn ended before any engine call"
+        )
+    return None
+
+
+def _between_usage_note(usage: Mapping[str, int] | None) -> str | None:
+    """Whether the engine reported no token usage or reported zero tokens for a turn
+    outside Dromon's own, as ``_between_cost_note`` does for its cost."""
+    if usage is None:
+        return "the engine reported no token usage for this turn"
+    if not any(usage.values()):
+        return "the engine reported zero tokens, not nothing"
+    return None
 
 
 def _compaction_entry(report: TurnReport) -> dict[str, object] | None:
@@ -3146,6 +3312,7 @@ def _compaction_entry(report: TurnReport) -> dict[str, object] | None:
     spent = report.compaction_cost_usd
     return {
         **dict(report.compaction),
+        "after_estimate_tokens": report.compaction.get("after_estimate_tokens"),
         "cost_usd": None if spent is None else f"{spent:.4f}",
         "usage": (
             None if report.compaction_usage is None else dict(report.compaction_usage)

@@ -844,6 +844,12 @@ def ignore_compaction(compaction: Mapping[str, int | str | None]) -> None:
     del compaction
 
 
+def ignore_estimate(tokens: int) -> None:
+    """The default for an engine whose estimates of a compaction's size after nobody
+    follows."""
+    del tokens
+
+
 SELF_STARTED_KIND: Final = "self_started"
 """A turn the engine began by itself between Dromon's turns, which Dromon
 interrupted."""

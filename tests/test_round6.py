@@ -635,7 +635,9 @@ def test_an_unreported_cost_between_turns_is_said_plainly(world: World) -> None:
     world.scheduler.spent_between("alpha", INTERRUPTED_KIND, None, None)
     (entry,) = world.status()["recent_turns"]
     assert entry["kind"] == INTERRUPTED_KIND
-    assert entry["cost_note"] == "the engine reports no cost"
+    assert entry["cost_note"] == (
+        "the engine reported no cost for this turn, so none was counted"
+    )
     assert world.status()["cost_usd"]["estimate"] == "0.0000"
 
 
@@ -1056,7 +1058,12 @@ def test_a_codex_line_compacts_its_thread_before_the_prompt() -> None:
     server, compactions, report = compacted_after_first_turn(OBSERVED_COMPACTION)
     assert server.methods().count(COMPACT_START) == 1
     assert server.methods().index(COMPACT_START) < len(server.methods()) - 1
-    expected = {"trigger": "manual", "before_tokens": 8_000, "after_tokens": None}
+    expected = {
+        "trigger": "manual",
+        "before_tokens": 8_000,
+        "after_tokens": None,
+        "after_estimate_tokens": None,
+    }
     assert compactions == [expected]
     assert report.compaction == expected
     # Round 6 review, F3. No call was seen in the compaction, so its tokens are
@@ -1085,7 +1092,12 @@ def test_a_codex_compaction_notice_is_still_accepted() -> None:
             done("c1"),
         ]
     )
-    expected = {"trigger": "manual", "before_tokens": 8_000, "after_tokens": 500}
+    expected = {
+        "trigger": "manual",
+        "before_tokens": 8_000,
+        "after_tokens": 500,
+        "after_estimate_tokens": None,
+    }
     assert compactions == [expected]
     assert "After: 500 tokens." in server.prompt()
 
@@ -1116,6 +1128,7 @@ def test_a_codex_compaction_the_engine_does_not_report_is_said_plainly() -> None
         "trigger": None,
         "before_tokens": None,
         "after_tokens": None,
+        "after_estimate_tokens": None,
     }
     assert "reported no compaction" in server.prompt()
     assert "STILL LARGE" in server.prompt()
