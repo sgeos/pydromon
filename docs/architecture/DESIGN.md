@@ -58,10 +58,10 @@ checked.
 
 | Engine | Interface | Evidence on 2026-10-25 |
 |---|---|---|
-| Grok Build | Agent Client Protocol | Its local user guide describes it as native to that protocol |
+| Grok Build | Agent Client Protocol | Implemented 2026-10-25 for Grok 4.7 from Grok Build 1.0.70's documentation, not verified against a live turn |
 | Cursor Agent | Agent Client Protocol through `agent acp` | Reported in July 2026 research by the operator's sessions. Not rechecked |
 | Claude Code | Claude Agent SDK | Implemented 2026-10-25 with Agent SDK 0.2.174 and Claude Code 2.1.310, on the subscription |
-| Codex | Codex SDK or its app-server | Vendor interfaces. Not tested here |
+| Codex | Its app-server | Implemented 2026-10-25 with Codex 0.164.0 and GPT-6-Luna, on the ChatGPT plan |
 | Dromon's own loop | Direct model calls | Needed where full control of each step is required |
 
 **Decided 2026-10-25.** The first adapter targets the model Claude Opus 5.5. The operator
@@ -87,6 +87,9 @@ while the Agent SDK overview points developers to API keys.
 **Decided 2026-10-25 by the operator.** The operator's only credential is the
 subscription, so lines run on Claude Code through the Agent SDK, driven from outside by
 Dromon. The per-model drivers are written in Keleusma and run through `pykeleusma`.
+**Later the same day,** the operator directed that OpenAI models run on Dromon. Codex on
+the operator's machine is signed in to a ChatGPT plan, which Codex lines use, as the
+Codex section below records.
 
 **Implemented 2026-10-25, roadmap task 4.** `dromon.engine` runs each turn through
 `ClaudeSDKClient` with no user or project settings and no tools unless configured. It
@@ -114,6 +117,82 @@ subscription model, is used for testing.
 
 Each adapter should probe the engine's capabilities at startup, because support varies by
 engine version.
+
+### Codex and Grok Build against the Claude Code conclusions
+
+**Reviewed 2026-10-25 at the operator's request**, which asked whether the conclusions
+above for Claude Code hold for Codex and Grok Build. Vendor documents were read on that
+day. xAI's consumer terms refused the request, so nothing here rests on them.
+
+| Conclusion for Claude Code | Codex | Grok Build |
+|---|---|---|
+| Dromon's own loop cannot use the subscription | Does not hold, see below | Unknown |
+| Dromon never reads, stores or forwards the sign-in token | Holds when Dromon drives the Codex binary | Holds, as the conservative default |
+| Unattended subscription use is unclear | Similar, API keys are the recommended default | Documents invite automation |
+| Per-token billing must never start silently | Holds, with OpenAI's variables | Holds, with xAI's variables |
+| Account tools must be kept out of a line | Holds, without an equivalent isolation switch | Holds, without an equivalent isolation switch |
+
+- **Fact.** OpenAI's Sign in with ChatGPT documents ChatGPT plan usage "for open-source
+  and locally hosted apps", which may request "permission to use the user's ChatGPT
+  plan for eligible Responses API requests". The host app then holds and renews the
+  OAuth tokens itself. Source <https://developers.openai.com/siwc/token-sharing-open-source>
+  and <https://developers.openai.com/siwc/token-sharing-open-source/codex-app-server>.
+- **Inference.** Dromon is open source and runs locally, so its own loop could run
+  OpenAI models on a ChatGPT plan, which Anthropic's terms rule out for Claude. Doing so
+  would make Dromon hold tokens, the reverse of the Claude rule, and needs the
+  operator's decision. The program and the app-server it pairs with are described as
+  preview and "experimental".
+- **Fact.** OpenAI's Codex authentication page says "API keys are still the recommended
+  default for automation", and its app-server page says to use the Codex SDK for jobs
+  and CI. Codex keeps its login in `~/.codex/auth.json` or the system credential store,
+  and says to "treat ~/.codex/auth.json like a password". Source
+  <https://learn.chatgpt.com/docs/auth> and <https://learn.chatgpt.com/docs/app-server>.
+- **Fact.** xAI's Grok Build overview calls headless use "ideal for scripts,
+  automations, or integration into other apps" and names the Agent Client Protocol for
+  use "in other apps". xAI's own posts endorse subscription sign-in inside OpenCode and
+  Kilo Code. No xAI program for other apps to use the subscription was found. Source
+  <https://docs.x.ai/build/overview> and <https://x.ai/news/grok-opencode>.
+- **Fact.** On the operator's machine, the user configurations of both Codex and Grok
+  Build declare mail, document and calendar MCP servers.
+- **Inference.** A line on either engine started on the operator's configuration would
+  inherit those servers. A separate configuration directory would also leave the login
+  behind, and copying the login would breach the token rule, so isolating a line is an
+  open design problem for both. Codex's `-c` overrides may disable servers by name.
+- **Owed before a Codex or Grok line runs.** The environment check and the reserved
+  variables of `SETTINGS.md` name only Anthropic's credentials, and must add at least
+  `OPENAI_API_KEY` and `XAI_API_KEY`, and each adapter needs a way to read the
+  credential the engine actually used, as `apiKeySource` does for Claude Code. A
+  third-party report, not verified, says a Codex session on a ChatGPT plan may fall back
+  to a smaller model at a limit, which the driver's model check exists to catch.
+- **Concrete drivers carry over.** Each model and credential strategy keeps its own
+  driver. Dromon's own loop on OpenAI's program would add a credential the current
+  strategies do not name.
+
+**Implemented 2026-10-25, on the operator's direction.** Drivers for GPT-6-Luna on
+Codex are packaged in all three strategies, under driver interface 3, which adds the
+engine each driver is written for.
+
+**Implemented 2026-10-25, on the operator's direction to run OpenAI models.**
+`dromon.codex` runs a line through `codex app-server`, as
+[`../protocol/CODEX.md`](../protocol/CODEX.md) specifies. The items owed above are met
+as follows. The account Codex reports is the credential handed to the driver. A
+subscription line's Codex starts without API variables, and the reserved variables name
+OpenAI, Codex and xAI prefixes. Every MCP server Codex lists is disabled by name, and
+connector features are disabled, then verified. Dromon's tools reach the model as
+dynamic tools. The app-server was chosen over `codex exec`, which OpenAI recommends for
+automation, because only the app-server lets Dromon serve its own tools in process and
+see each item as it starts. **Porting hazard.** The app-server and dynamic tools are
+experimental. **Later the same day,** Codex lines gained write access under a Dromon
+permission profile that denies Dromon's state and runtime directories and keeps `.git`
+read-only, as `CODEX.md` records.
+
+**Implemented 2026-10-25, on the operator's direction for nominal Grok support while
+Grok usage was exhausted.** `dromon.grok` runs a line through `grok agent stdio` over the
+Agent Client Protocol, as [`../protocol/GROK.md`](../protocol/GROK.md) specifies. Grok's
+custom sandbox profiles live only in its own files, so the operator defines Dromon's two
+profiles and Dromon checks them before each turn. ACP has no client-hosted tools, so
+Dromon's tools reach a Grok line through `dromon mcp --line` and a per-line token on a
+line socket. Every behaviour that could not be confirmed refuses the turn.
 
 ## Communication
 
@@ -250,9 +329,81 @@ applications.
 **Implemented 2026-10-25, roadmap task 8.** `dromon attach LINE` opens a curses client,
 the standard library's counterpart to Ratatui and Crossterm and so a direct map onto
 the Rust port, and `dromon attach LINE --gui` opens a Tk window, which also ships with
-Python. Both are thin shells over `dromon.attach`, which polls the new `line_view`
-operation and turns typed input into operator commands. Every client is an independent
+Python. Both were thin shells over `dromon.attach`, since replaced as recorded below,
+which polled the new `line_view` operation and turned typed input into commands. Every client is an independent
 connection, so any number may attach to any lines at once.
+
+**Decided 2026-10-25 by the operator, as direction.** The terminal and graphical clients
+are taken near parity with Claude Code, Codex and Grok Build, on a shared core, in the
+shape of the operator's Rust projects. Those have a `no_std` core, a platform layer
+that implements the core's traits, and an entry point that wires the two together.
+
+**Implemented 2026-10-25.** The clients live in `dromon.ui`, in three layers.
+
+- **The core**, the counterpart of the `no_std` crate. Its modules perform no input or
+  output, and a test checks their imports. It is an Elm-style state machine. `update`
+  takes the model and an event, a key, a tick, a size or a daemon result, and returns
+  the next model and the effects to perform, a fetch, a request, a bell or an exit.
+  `frame` draws a model as rows of styled text with a cursor. The input editor, the
+  history, the commands with their completion, polling, scrolling, the panes, the
+  line list and the help panel are all here, and are tested without a terminal.
+- **The ports and the shared runtime.** The `Daemon` port is one `call` method. The
+  runtime owns the model, performs effects through the port, and feeds results back
+  as events within a fixed bound of steps. Both platforms use the same runtime.
+- **The platforms.** `terminal` translates curses keys and paints frames with curses
+  attributes, and `window` does the same with Tk events and text tags, adding the
+  mouse wheel. Neither holds client behaviour of its own. The entry point in
+  `dromon.cli` wires a platform, the runtime and the socket adapter together.
+
+For a turn to be followed as it runs, the daemon gained a bounded, in-memory activity
+tail per line, fed by an observer that each engine adapter calls, and two operations,
+`line_activity` and `interrupt`, as [`../protocol/CLIENT.md`](../protocol/CLIENT.md)
+specifies. A client polls four times as often while its line runs a turn, which
+stands in for pushed updates.
+
+**Not at parity, recorded as limitations.** The clients show no token or context
+meter, because the engines report none to Dromon, offer no permission prompts,
+because Dromon decides tool use by policy rather than by asking, render Markdown only
+to the extent of fenced code and headings, and assume each character fills one column.
+Codex text appears only when a message completes, and Claude Code text a message at a
+time, because only Grok's adapter receives streamed chunks.
+
+**Porting note.** The core maps onto a Rust crate whose events and effects are `enum`s
+and whose `update` is a total function, and from there onto a Keleusma stream
+processor. The platforms map onto Ratatui with Crossterm and onto a native toolkit.
+
+**Decided 2026-10-25 by the operator, as direction.** The daemon and client pair is
+taken to near parity with Claude Code, Codex and Grok Build, with settings for session
+lines and for projects, keeping the core, platform and entry point layering.
+
+**Implemented 2026-10-25.** Settings have two scopes, the project and a line, and
+each value has layers, as [`../protocol/CLIENT.md`](../protocol/CLIENT.md) specifies.
+
+- **The project file stays the shared layer.** What an operator changes from a client
+  is an override, recorded in the event log as `line_overridden` or
+  `project_overridden`, and layered over the file, as Claude Code layers its local
+  settings over its shared project settings. The daemon never writes the file. The
+  alternative, a daemon that rewrites a committed, reviewed TOML file, would lose its
+  comments and blur who changed what.
+- **The command line wins**, as Claude Code's does, and a value it shadows is
+  reported as such rather than silently ignored.
+- **Layering in code.** `dromon.overrides` and `dromon.configview` are pure, and hold
+  the keys, their kinds, validation and the layers. The scheduler and the daemon apply
+  them. The client core reads typed text by the kinds the daemon reports, so it holds
+  no list of settings and learns of a new one without a release.
+- **What a client cannot change.** A line's strategy, because it decides per-token
+  billing, and the long documents, MCP servers, sandbox, engine settings, the teacher
+  and the agent policy, which belong in a reviewed file. MCP servers are shown by name
+  only, so that no credential in their environment reaches a client.
+- **Also added.** `/clear` starts a line's next turn in a new engine session, as
+  Claude Code's `/clear` and Codex's `/new` do. `/create` makes a line from the
+  client. `/reload` applies the project file without a restart, and refuses a change
+  that only a restart can apply, applying nothing.
+
+**Inference, not verified live.** Switching a Claude Code line's model resumes its
+engine session on the new model, as Claude Code's own `/model` does. Codex is given
+the new model when its thread is started or resumed, which the scripted tests cover
+but no live turn has exercised.
 
 **Inference.** The client protocol of [`../protocol/CLIENT.md`](../protocol/CLIENT.md) is
 then the game's network protocol. It needs pushed updates for attached clients, and
@@ -360,9 +511,33 @@ of the data model. The specification is [`../protocol/EVENT_LOG.md`](../protocol
 - The daemon runs outside every session line's sandbox, so it can act as a credential
   broker under policy, for example pushing to git on a line's request. That also makes it
   a high-value target. Every brokered action needs an explicit per-project allowance.
-- Each session line keeps its own sandbox profile.
+- Each session line keeps its own sandbox profile. **Decided 2026-10-25, by the
+  operator's direction to reach parity with Claude Code.** A line's shell commands run
+  in Claude Code's own sandbox, configured per project and per line in Claude Code's
+  vocabulary, with unattended defaults and with Dromon's state and runtime directories
+  protected, as [`../protocol/SANDBOX.md`](../protocol/SANDBOX.md) specifies. **Porting
+  hazard.** The Rust port inherits the dependency on Claude Code's sandbox runtime for
+  the Claude Code engine, and another engine needs a sandbox of its own.
+- Each session line carries engine settings. **Decided 2026-10-25, by the operator's
+  direction to reach parity with the settings actually used in Claude Code, Codex and
+  Grok Build.** Permission rules, command hooks, environment variables and attribution
+  use Claude Code's vocabulary, layer per project, profile and line, and reach Claude
+  Code through its settings flag, as [`../protocol/SETTINGS.md`](../protocol/SETTINGS.md)
+  specifies. An `ask` rule denies, since nothing pauses a line, and every line's file
+  tools are denied Dromon's state and runtime directories. MCP servers may refer to
+  secrets in the daemon's environment. **Porting hazard.** Claude Code parses the rules
+  and runs the hooks, so another engine needs its own rule matcher and hook runner to
+  honour the same documents.
 - Messages from other session lines, harnesses and machines are untrusted data. Only the
   operator, through a client, holds operator authority.
+- External agents reach the daemon over MCP. **Decided 2026-10-25, by the operator's
+  direction.** Another harness, such as a Claude Code session, starts `dromon mcp` as an
+  MCP server and becomes the party `&name` with its own mailbox. The project file sets
+  whether an agent socket exists, the access of an anonymous connection and a ceiling,
+  from off to every connection trusted as an operator, and registered agents carry
+  tokens stored as digests, as [`../protocol/AGENTS.md`](../protocol/AGENTS.md)
+  specifies. An agent's messages carry no operator authority unless its level is
+  `operator`.
 
 ## Keleusma
 
@@ -378,7 +553,29 @@ mapped to the binding's tasks, are in [`KELEUSMA_INTEGRATION.md`](KELEUSMA_INTEG
 
 **Open.** Before the operator clarified that Dromon is its own project, they mentioned
 supporting teacher models that help train new language models. Its place in Dromon's
-scope is not settled. **Unverified, from the seeding session's memory.** Several model
+scope is not settled.
+
+**Decided 2026-10-25, by the operator's direction to dogfood Dromon in the epagoge
+project.** Dromon can spin up a project's local teacher, a model the project's own
+generators call through Ollama on the loopback interface, as
+[`../protocol/TEACHER.md`](../protocol/TEACHER.md) specifies. A teacher is a served model,
+not a session line. Lines reach it through the project's tools, and Dromon only loads
+and releases it. Lines also gained `claude_code_prompt` and `instructions`, because a
+Claude Code line had an empty system prompt and read no `CLAUDE.md`, so it could not
+follow a project's own rules.
+
+**Fact, observed on 2026-10-25 in epagoge.** With the teacher loaded by `dromon
+teacher up` and `dromond` running there, a Claude Haiku 5.5 line in Claude Code's
+sandbox queried the teacher over loopback and answered a question from the project's
+`CLAUDE.md`, and a GPT-6-Luna line answered one from its instructions. Both replied to
+the operator by `send_message`. Dromon's state there is excluded from git through the
+repository's local exclude file, so the project's own checks never see it.
+
+**Fact, observed later on 2026-10-25 in epagoge, after its line reviewed the setup.** The
+project's full gate passed from a sandboxed Claude Haiku 5.5 line, with 678 tests and a
+clean disclosure scan. With the sandbox denying writes to `.git`, the same line could not
+write there, so no spelling of a commit succeeds from its shell. `dromon teacher up` now
+refuses to load a model that would leave less than its headroom of available memory. **Unverified, from the seeding session's memory.** Several model
 vendors' terms forbid using their outputs to train competing models, and subscription
 plans tend to be stricter than paid interface use. Check each vendor's current terms
 before any trace capture, and record the source model and licence of every trace.
@@ -391,4 +588,9 @@ before any trace capture, and record the source model and licence of every trace
    through the Agent SDK, on the subscription, with a Keleusma driver.
 3. The contents of `.dromon/dromon.toml`.
 4. Mid-turn injection. Decided 2026-10-25, not used, because delivery is tick based.
-5. Teacher-model scope and licensing.
+5. Teacher-model scope and licensing. A local teacher served by Ollama is decided.
+   Training on traces from hosted models remains open.
+6. Whether Dromon retires the interline store, or keeps it for sessions Dromon does not
+   drive. Moved here from the handoff on 2026-10-25. Since the same day, a session
+   Dromon does not drive can reach Dromon's lines as an external agent, which removes
+   one reason to keep a separate store.

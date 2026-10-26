@@ -19,13 +19,20 @@ from typing import Final, NoReturn, assert_never
 
 from dromon.model import (
     Address,
+    AgentAccess,
+    AgentRegistered,
+    AgentRevoked,
     Event,
     InvalidField,
     LineConfigured,
     LineCreated,
     LineHeld,
     LineReleased,
+    LineOverridden,
     LineSession,
+    LineSessionCleared,
+    LineRebound,
+    ProjectOverridden,
     LineState,
     LineStateChanged,
     MessageDelivered,
@@ -38,6 +45,10 @@ from dromon.model import (
     QuestionWithdrawn,
     WakeIssued,
     WakeRequested,
+    WakeScheduled,
+    WakeWithdrawn,
+    TaskNoted,
+    LineCostMarked,
     parse_address,
 )
 
@@ -52,9 +63,15 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "line_state_changed": ("line_id", "state"),
     "line_configured": ("line_id", "config"),
     "line_session": ("line_id", "engine_session"),
+    "line_session_cleared": ("line_id",),
+    "line_rebound": ("line_id", "engine", "strategy"),
+    "line_overridden": ("line_id", "overrides"),
+    "project_overridden": ("overrides",),
     "line_held": ("line_id", "question_id"),
     "line_released": ("line_id",),
     "operator_registered": ("operator_id",),
+    "agent_registered": ("agent_id", "access", "token_sha256"),
+    "agent_revoked": ("agent_id",),
     "message_sent": (
         "message_id",
         "sender",
@@ -69,6 +86,10 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "message_acknowledged": ("message_id",),
     "wake_requested": ("wake_id", "line_id", "message_id"),
     "wake_issued": ("wake_id",),
+    "wake_scheduled": ("line_id", "message_id", "due", "note"),
+    "wake_withdrawn": ("line_id", "message_id"),
+    "task_noted": ("line_id", "message_id", "task_id", "status", "body"),
+    "line_cost_marked": ("line_id", "engine_session", "total_micro_usd"),
     "question_withdrawn": ("message_id",),
     "question_superseded": ("message_id", "superseded_by"),
 }
@@ -156,8 +177,31 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "line_id": event.line_id,
                 "engine_session": event.engine_session,
             }
+        case LineSessionCleared():
+            return "line_session_cleared", {"line_id": event.line_id}
+        case LineRebound():
+            return "line_rebound", {
+                "line_id": event.line_id,
+                "engine": event.engine,
+                "strategy": event.strategy,
+            }
+        case LineOverridden():
+            return "line_overridden", {
+                "line_id": event.line_id,
+                "overrides": event.overrides,
+            }
+        case ProjectOverridden():
+            return "project_overridden", {"overrides": event.overrides}
         case OperatorRegistered():
             return "operator_registered", {"operator_id": event.operator_id}
+        case AgentRegistered():
+            return "agent_registered", {
+                "agent_id": event.agent_id,
+                "access": event.access.value,
+                "token_sha256": event.token_sha256,
+            }
+        case AgentRevoked():
+            return "agent_revoked", {"agent_id": event.agent_id}
         case MessageSent():
             return "message_sent", {
                 "message_id": event.message_id,
@@ -182,6 +226,32 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
             }
         case WakeIssued():
             return "wake_issued", {"wake_id": event.wake_id}
+        case WakeScheduled():
+            return "wake_scheduled", {
+                "line_id": event.line_id,
+                "message_id": event.message_id,
+                "due": event.due,
+                "note": event.note,
+            }
+        case WakeWithdrawn():
+            return "wake_withdrawn", {
+                "line_id": event.line_id,
+                "message_id": event.message_id,
+            }
+        case LineCostMarked():
+            return "line_cost_marked", {
+                "line_id": event.line_id,
+                "engine_session": event.engine_session,
+                "total_micro_usd": event.total_micro_usd,
+            }
+        case TaskNoted():
+            return "task_noted", {
+                "line_id": event.line_id,
+                "message_id": event.message_id,
+                "task_id": event.task_id,
+                "status": event.status,
+                "body": event.body,
+            }
         case QuestionWithdrawn():
             return "question_withdrawn", {"message_id": event.message_id}
         case QuestionSuperseded():
@@ -211,8 +281,26 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
             return LineReleased(_str(data, "line_id"))
         case "line_session":
             return LineSession(_str(data, "line_id"), _str(data, "engine_session"))
+        case "line_session_cleared":
+            return LineSessionCleared(_str(data, "line_id"))
+        case "line_rebound":
+            return LineRebound(
+                _str(data, "line_id"), _str(data, "engine"), _str(data, "strategy")
+            )
+        case "line_overridden":
+            return LineOverridden(_str(data, "line_id"), _str(data, "overrides"))
+        case "project_overridden":
+            return ProjectOverridden(_str(data, "overrides"))
         case "operator_registered":
             return OperatorRegistered(_str(data, "operator_id"))
+        case "agent_registered":
+            return AgentRegistered(
+                _str(data, "agent_id"),
+                _member(data, "access", AgentAccess),
+                _str(data, "token_sha256"),
+            )
+        case "agent_revoked":
+            return AgentRevoked(_str(data, "agent_id"))
         case "message_sent":
             return MessageSent(
                 _str(data, "message_id"),
@@ -235,6 +323,29 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
             )
         case "wake_issued":
             return WakeIssued(_str(data, "wake_id"))
+        case "wake_scheduled":
+            return WakeScheduled(
+                _str(data, "line_id"),
+                _str(data, "message_id"),
+                _str(data, "due"),
+                _str(data, "note"),
+            )
+        case "wake_withdrawn":
+            return WakeWithdrawn(_str(data, "line_id"), _str(data, "message_id"))
+        case "line_cost_marked":
+            return LineCostMarked(
+                _str(data, "line_id"),
+                _str(data, "engine_session"),
+                _int(data, "total_micro_usd"),
+            )
+        case "task_noted":
+            return TaskNoted(
+                _str(data, "line_id"),
+                _str(data, "message_id"),
+                _str(data, "task_id"),
+                _str(data, "status"),
+                _str(data, "body"),
+            )
         case "question_withdrawn":
             return QuestionWithdrawn(_str(data, "message_id"))
         case "question_superseded":
@@ -266,6 +377,13 @@ def _str(data: dict[str, object], name: str) -> str:
     return value
 
 
+def _int(data: dict[str, object], name: str) -> int:
+    value = data[name]
+    if type(value) is not int:
+        raise DecodeError(f"{name} is not a whole number")
+    return value
+
+
 def _optional_str(data: dict[str, object], name: str) -> str | None:
     value = data[name]
     if value is None:
@@ -279,7 +397,7 @@ def _address(data: dict[str, object], name: str) -> Address:
     return parse_address(_str(data, name))
 
 
-def _member[T: (LineState, MessageKind)](
+def _member[T: (LineState, MessageKind, AgentAccess)](
     data: dict[str, object], name: str, kind: type[T]
 ) -> T:
     value = _str(data, name)

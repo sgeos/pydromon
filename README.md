@@ -1,5 +1,13 @@
 # pydromon
 
+[![CI](https://github.com/sgeos/pydromon/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sgeos/pydromon/actions/workflows/ci.yml)
+[![License: 0BSD](https://img.shields.io/badge/license-0BSD-blue.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Checked with pyright](https://microsoft.github.io/pyright/img/pyright_badge.svg)](https://microsoft.github.io/pyright/)
+[![Status: prototype](https://img.shields.io/badge/status-prototype-orange)](docs/process/HANDOFF.md)
+
 The Python prototype of **Dromon**, a harness that runs several AI agent session lines at
 once inside one daemon, lets them message and wake each other, and tracks the questions
 they raise for the human operator as a first-class feature.
@@ -20,12 +28,24 @@ through a Keleusma driver, and reports the engine's capabilities. `dromon create
 message arrives. Lines message each other through a `send_message` tool. Lines ask operators
 questions through an `ask_operator` tool, and `dromon questions` and `dromon answer`
 work the queue. Every party has a mailbox, which lines search with `list_mail` and
-`read_mail` and operators with `dromon mail` and `dromon read`. `dromon attach LINE` opens a
-curses client attached to one line, or a Tk window with `--gui`, and any number may be
+`read_mail` and operators with `dromon mail` and `dromon read`. `dromon attach LINE` opens an
+interactive client in the terminal, or a Tk window with `--gui`, that follows a line's
+turns as they run and changes line and project settings, and any number may be
 attached at once. A project declares its lines, limits and wake policy in
 `.dromon/dromon.toml`, as
 [`docs/protocol/PROJECT_CONFIG.md`](docs/protocol/PROJECT_CONFIG.md) specifies, and
-`dromon config` validates it. The first milestone is
+`dromon config` validates it. Lines run on Claude Code or, for OpenAI models such as GPT-6-Luna, on Codex, as
+[`docs/protocol/CODEX.md`](docs/protocol/CODEX.md) specifies, and nominally on Grok
+Build for Grok 4.7, as [`docs/protocol/GROK.md`](docs/protocol/GROK.md) specifies. A line's shell commands
+can run in Claude Code's sandbox,
+configured per project and per line as
+[`docs/protocol/SANDBOX.md`](docs/protocol/SANDBOX.md) specifies, and its permission
+rules, hooks and environment as
+[`docs/protocol/SETTINGS.md`](docs/protocol/SETTINGS.md) specifies. A project's local
+teacher model, served by Ollama, is brought up with `dromon teacher up`, as
+[`docs/protocol/TEACHER.md`](docs/protocol/TEACHER.md) specifies. Agents outside the
+daemon, such as another Claude Code session, reach it and its lines over MCP through
+`dromon mcp`, as [`docs/protocol/AGENTS.md`](docs/protocol/AGENTS.md) specifies. The first milestone is
 [`docs/roadmap/V0_1_0.md`](docs/roadmap/V0_1_0.md) and the planned system is
 [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md). What Dromon needs from
 the Keleusma Python bindings is in
@@ -59,15 +79,21 @@ all three stages. See [`docs/decisions/NAMING_AND_PORTS.md`](docs/decisions/NAMI
 ## Development
 
 The build needs a Rust toolchain, because `pykeleusma` is built from its repository at a
-pinned commit. Running a line needs a Claude subscription signed in to Claude Code, and
-no `ANTHROPIC_API_KEY` in the environment.
+pinned commit. Running a Claude line needs a Claude subscription signed in to Claude
+Code, and no `ANTHROPIC_API_KEY` in the environment. Running a GPT-6-Luna line needs
+Codex signed in to a ChatGPT plan, and Dromon starts Codex without any OpenAI API key
+in its environment.
 
 ```sh
 uv sync
-uv run pytest
-uv run ruff check . && uv run ruff format --check .
-uv run pyright
+./scripts/check.sh                                # the gate, which CI also runs
+./scripts/check.sh -m "not socket and not live"   # the same, inside an agent sandbox
+scripts/worktree.sh new feat/some-thing           # an isolated worktree for a parallel line
 ```
+
+[`CONTRIBUTING.md`](CONTRIBUTING.md) describes the gate and the test markers, and
+[`SECURITY.md`](SECURITY.md) how to report a vulnerability. Participation is governed by
+the [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
 
 ## License
 

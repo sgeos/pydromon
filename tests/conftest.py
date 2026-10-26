@@ -9,12 +9,19 @@ import pytest
 
 from dromon.lineconfig import LineConfig, encode_config
 from dromon.model import (
+    AgentAccess,
+    AgentAddress,
+    AgentRegistered,
+    AgentRevoked,
     Event,
     LineAddress,
     LineConfigured,
     LineHeld,
     LineReleased,
+    LineOverridden,
     LineSession,
+    LineSessionCleared,
+    LineRebound,
     LineCreated,
     LineState,
     LineStateChanged,
@@ -25,10 +32,15 @@ from dromon.model import (
     MessageSent,
     OperatorAddress,
     OperatorRegistered,
+    ProjectOverridden,
     QuestionSuperseded,
     QuestionWithdrawn,
     WakeIssued,
     WakeRequested,
+    WakeScheduled,
+    WakeWithdrawn,
+    TaskNoted,
+    LineCostMarked,
 )
 
 ENGINE = "claude-opus-5-5"
@@ -36,10 +48,11 @@ ALPHA = LineAddress("alpha")
 BETA = LineAddress("beta")
 ANA = OperatorAddress("ana")
 BEN = OperatorAddress("ben")
+PROBE = AgentAddress("probe")
 NOTE = MessageKind.NOTE
 QUESTION = MessageKind.QUESTION
 
-# A valid history that uses every event kind, both message kinds and both address kinds
+# A valid history that uses every event kind, both message kinds and every address kind
 # as sender and recipient, with two operators. The coverage tests check that it really
 # does, so a new event kind cannot be left out of it silently.
 SCENARIO: tuple[Event, ...] = (
@@ -52,6 +65,10 @@ SCENARIO: tuple[Event, ...] = (
         ),
     ),
     LineSession("beta", "0b9f2c6e-session"),
+    LineSessionCleared("beta"),
+    LineSession("beta", "0b9f2c6e-session"),
+    LineOverridden("alpha", '{"effort":"low"}'),
+    ProjectOverridden('{"limits.max_cost_usd":"5"}'),
     OperatorRegistered("ana"),
     OperatorRegistered("ben"),
     MessageSent("m1", ALPHA, BETA, NOTE, "hello"),
@@ -77,6 +94,19 @@ SCENARIO: tuple[Event, ...] = (
     QuestionWithdrawn("q3"),
     MessageSent("m2", BEN, ALPHA, NOTE, "from an operator"),
     MessageSent("m3", ALPHA, BEN, NOTE, "thank you", reply_to="m2"),
+    AgentRegistered("probe", AgentAccess.MESSAGE, "0" * 64),
+    MessageSent("m4", PROBE, BETA, NOTE, "from an agent"),
+    MessageSent("m5", BETA, PROBE, NOTE, "to an agent", reply_to="m4"),
+    AgentRegistered("guest", AgentAccess.OBSERVE, ""),
+    AgentRevoked("guest"),
+    WakeScheduled("beta", "s1", "2026-10-26T09:30:00Z", "read the gate's log"),
+    WakeScheduled("beta", "s2", "2026-10-26T10:00:00Z", "read it again"),
+    MessageSent("s2", BETA, BETA, NOTE, "read it again"),
+    WakeScheduled("beta", "s3", "2026-10-26T10:30:00Z", "compact wake"),
+    WakeWithdrawn("beta", "s3"),
+    TaskNoted("beta", "n1", "b8k2", "completed", "Your background task b8k2 ended."),
+    LineCostMarked("beta", "session-b", 1_250_000),
+    LineRebound("alpha", "claude-haiku-5-5", "subscription"),
     LineStateChanged("alpha", LineState.STOPPED),
 )
 

@@ -46,6 +46,18 @@ class ProjectPaths:
         return self.runtime_dir / "dromond.sock"
 
     @property
+    def agent_socket(self) -> Path:
+        """The socket external agents connect to, which exists only when the project
+        lets agents in."""
+        return self.runtime_dir / "agents.sock"
+
+    @property
+    def line_socket(self) -> Path:
+        """The socket through which a line's engine reaches the line's own tools, for
+        engines that cannot host them in process."""
+        return self.runtime_dir / "lines.sock"
+
+    @property
     def lock(self) -> Path:
         return self.runtime_dir / "dromond.lock"
 

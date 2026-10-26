@@ -1,3 +1,43 @@
+# Project-local scratch directory, committed through a .gitkeep marker with its
+# contents ignored. Use `tmp/` for transient files such as commit messages, draft
+# text, scratch scripts and probe outputs. The pattern matches the Keleusma and
+# pykeleusma repositories. scripts/check.sh fails if anything else under tmp/ is
+# tracked.
+/tmp/*
+!/tmp/.gitkeep
+
+# Local, never-committed material such as credentials, API keys and
+# environment-specific notes. Ignored whole, as in the Keleusma repository, so the
+# directory does not exist in a fresh clone. scripts/check.sh fails if anything
+# under it is tracked.
+/secret/
+
+# Per-project Dromon state, the event log and the daemon's runtime files, which hold
+# messages, answers and stored MCP credentials and are never committed.
+/.dromon/
+
+# Environment files, which usually hold credentials. Commit an example with
+# placeholder values instead.
+.env
+.env.*
+!.env.example
+
+# Agent runtime state and personal settings, local to each contributor and not project
+# content. Shared Claude Code configuration, such as .claude/settings.json, skills,
+# agents and commands, is not ignored, so a project can commit it deliberately. Codex's
+# directory holds host-specific settings, such as a context window, and is ignored
+# whole.
+.claude/settings.local.json
+.claude/.cc-writes/
+.codex/
+
+# Operating system and editor droppings.
+.DS_Store
+Thumbs.db
+*.swp
+*~
+nvim.log
+
 # Python
 __pycache__/
 *.py[cod]
@@ -10,22 +50,3 @@ dist/
 .ruff_cache/
 .pytest_cache/
 .mypy_cache/
-
-# Claude Code agent runtime state, such as session lock files. Local to each
-# contributor's session and not project content.
-.claude/
-
-# Project-local scratch directory, committed through a .gitkeep marker with its
-# contents ignored. Use `tmp/` for transient files such as commit messages, draft
-# text, scratch scripts and probe outputs. The pattern matches the Keleusma and
-# pykeleusma repositories.
-/tmp/*
-!/tmp/.gitkeep
-
-# Per-project Dromon state, the event log and the daemon's runtime files, which hold
-# messages and answers and are never committed.
-/.dromon/
-
-# Local, never-committed material such as credentials, API keys and
-# environment-specific notes. Ignored whole, as in the Keleusma repository.
-/secret/

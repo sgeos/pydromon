@@ -38,6 +38,21 @@ class Operation(StrEnum):
     SENT = "sent"
     RELEASE = "release"
     LINE_VIEW = "line_view"
+    LINE_ACTIVITY = "line_activity"
+    INTERRUPT = "interrupt"
+    SETTINGS = "settings"
+    SET_SETTING = "set_setting"
+    CLEAR_SESSION = "clear_session"
+    REBIND_LINE = "rebind_line"
+    """Operator only. Not offered to external agents."""
+    RELOAD_PROJECT = "reload_project"
+    AGENT_ADD = "agent_add"
+    AGENT_REVOKE = "agent_revoke"
+    AGENT_LIST = "agent_list"
+    AGENT_TOOLS = "agent_tools"
+    """Served only on the agent socket."""
+    AGENT_CALL = "agent_call"
+    """Served only on the agent socket."""
 
 
 class ErrorCode(StrEnum):

@@ -16,23 +16,31 @@ Design notes from the settings of other harnesses, reviewed on 2026-10-25.
   and column for a syntax error, or the key path and the line of its table otherwise.
 - Precedence is command line flags over this file over built-in defaults. User and
   managed layers are not yet specified. A line's own keys replace its profile's whole,
-  rather than merging lists, so a line's tools are always readable in one place.
+  rather than merging lists, so a line's tools are always readable in one place. The
+  ``sandbox`` and ``settings`` tables merge instead, so no layer drops a deny entry.
 
 Trust. The file is operator configuration, committed with the project. It can grant a
-line tools, MCP servers and credentials, so it deserves the review any such file does.
+line tools, MCP servers, hooks and credentials, so it deserves the review any such file
+does. MCP servers may refer to secrets in the daemon's environment instead.
 """
 
 import re
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Final, cast
 
 from dromon.driver import MODELS, Strategy
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.lineconfig import ConfigError, LineConfig, config_from_document
-from dromon.model import ID_PATTERN
+from dromon.model import ID_PATTERN, InvalidField, LineSession
+from dromon import settings as engine_settings
+from dromon.sandbox import SandboxConfig, SandboxError, merge, parse_sandbox
+from dromon.settings import SettingsConfig, SettingsError, parse_settings
+from dromon.agents import OFF as AGENTS_OFF
+from dromon.agents import AgentError, AgentPolicy, parse_policy
+from dromon.teacher import TeacherConfig, TeacherError, parse_teacher
 
 CONFIG_FILE_NAME: Final = "dromon.toml"
 FILE_VERSION: Final = 1
@@ -40,13 +48,32 @@ MAX_WAKE_EVERY: Final = 3600
 MAX_FILE_BYTES: Final = 4 * 1024 * 1024
 
 TOP_KEYS: Final = frozenset(
-    {"version", "daemon", "limits", "wake", "profiles", "lines"}
+    {
+        "version",
+        "daemon",
+        "limits",
+        "wake",
+        "sandbox",
+        "settings",
+        "teacher",
+        "agents",
+        "leases",
+        "profiles",
+        "lines",
+    }
 )
-DAEMON_KEYS: Final = frozenset({"operator", "tick_seconds"})
+DAEMON_KEYS: Final = frozenset(
+    {"operator", "tick_seconds", "require_sandbox", "disclosure_terms"}
+)
 LIMIT_KEYS: Final = frozenset(
     {"max_autonomous_turns", "max_cost_usd", "cooldown_seconds"}
 )
 WAKE_KEYS: Final = frozenset({"every_ticks"})
+LEASE_KEYS: Final = frozenset({"names", "ttl_seconds"})
+DEFAULT_LEASE_TTL: Final = 10800
+MIN_LEASE_TTL: Final = 60
+MAX_LEASE_TTL: Final = 86400
+MAX_LEASES: Final = 256
 TOOL_KEYS: Final = frozenset(
     {
         "builtin_tools",
@@ -54,12 +81,30 @@ TOOL_KEYS: Final = frozenset(
         "tool_policy",
         "allowed_tools",
         "inherit_account_mcp",
+        "effort",
+        "claude_code_prompt",
+        "instructions",
+        "workdir",
+        "project_settings",
+        "plugins",
+        "keep_session",
+        "keep_session_idle_seconds",
+        "keep_session_max_seconds",
+        "context_warn_tokens",
+        "allow_compact",
+        "auto_compact_tokens",
     }
 )
+LAYERED_KEYS: Final = frozenset({"sandbox", "settings"})
+"""Keys whose profile and line tables merge as Claude Code's scopes do."""
 LINE_KEYS: Final = (
-    frozenset({"profile", "model", "strategy", "limits", "wake"}) | TOOL_KEYS
+    frozenset({"profile", "model", "strategy", "limits", "wake", "session"})
+    | TOOL_KEYS
+    | LAYERED_KEYS
 )
-PROFILE_KEYS: Final = LINE_KEYS - {"profile"}
+PROFILE_KEYS: Final = LINE_KEYS - {"profile", "session"}
+"""A profile has every line key but ``profile``, and but ``session``, since one engine
+session cannot continue in several lines."""
 
 
 class ConfigFileError(ValueError):
@@ -97,6 +142,8 @@ class LineDefinition:
     """The line's own limits, merged onto the file's ``[limits]``, or ``None``."""
     wake_every_ticks: int | None
     """The line's own wake policy, or ``None`` for the project's."""
+    session: str | None = None
+    """An existing engine session the line adopts when the daemon creates it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +152,23 @@ class ProjectConfig:
     tick_seconds: float | None = None
     limits: Limits = DEFAULT_LIMITS
     wake_every_ticks: int = 1
+    sandbox: SandboxConfig | None = None
+    """The project's sandbox, merged under every line's own."""
+    settings: SettingsConfig | None = None
+    """The project's engine settings, merged under every line's own."""
+    teacher: TeacherConfig | None = None
+    """The project's local teacher model, if it declares one."""
+    agents: AgentPolicy = AGENTS_OFF
+    """Which external agents may connect, and with what access. Off by default."""
+    require_sandbox: bool = False
+    """Whether every Claude Code line must run with its merged sandbox enabled."""
+    disclosure_terms: str | None = None
+    """The project's disclosure list, a path relative to the project root, or
+    ``None``. Only the path is held here. The daemon reads the terms."""
+    lease_names: tuple[str, ...] = ()
+    """The leases the project's lines may acquire, by name."""
+    lease_ttl_seconds: int = DEFAULT_LEASE_TTL
+    """How long an acquired lease lasts unless it is released first."""
     lines: dict[str, LineDefinition] = field(default_factory=dict[str, LineDefinition])
 
 
@@ -204,8 +268,31 @@ class _Reader:
             tick = float(raw_tick)
             if not 0 <= tick <= 60:
                 raise self.fail("daemon.tick_seconds", "must be a number in [0, 60]")
+        require_sandbox = daemon.get("require_sandbox", False)
+        if type(require_sandbox) is not bool:
+            raise self.fail("daemon.require_sandbox", "must be a boolean")
+        terms = daemon.get("disclosure_terms")
+        if terms is not None and (
+            not isinstance(terms, str) or not terms or "\x00" in terms
+        ):
+            raise self.fail("daemon.disclosure_terms", "must be a path to a file")
         limits = self.limits(top.get("limits", {}), "limits", DEFAULT_LIMITS)
         wake = self.wake(top.get("wake", {}), "wake", 1)
+        sandbox = self.sandbox(top.get("sandbox"), "sandbox")
+        settings = self.settings(top.get("settings"), "settings")
+        teacher: TeacherConfig | None = None
+        if "teacher" in top:
+            try:
+                teacher = parse_teacher(top["teacher"])
+            except TeacherError as error:
+                raise self.fail("teacher", str(error)) from error
+        agents = AGENTS_OFF
+        if "agents" in top:
+            try:
+                agents = parse_policy(top["agents"])
+            except AgentError as error:
+                raise self.fail("agents", str(error)) from error
+        lease_names, lease_ttl = self.leases(top.get("leases", {}))
         profiles = self.profiles(top.get("profiles", {}))
         lines_table = top.get("lines", {})
         if not isinstance(lines_table, dict):
@@ -218,6 +305,14 @@ class _Reader:
             tick_seconds=tick,
             limits=limits,
             wake_every_ticks=wake,
+            sandbox=sandbox,
+            settings=settings,
+            teacher=teacher,
+            agents=agents,
+            require_sandbox=require_sandbox,
+            disclosure_terms=terms,
+            lease_names=lease_names,
+            lease_ttl_seconds=lease_ttl,
             lines=lines,
         )
 
@@ -236,6 +331,27 @@ class _Reader:
         except ValueError as error:
             raise self.fail(key, str(error)) from error
 
+    def leases(self, value: object) -> tuple[tuple[str, ...], int]:
+        """The ``[leases]`` table, as its names and their time to live."""
+        document = self.table(value, "leases", LEASE_KEYS)
+        names = document.get("names", [])
+        if not isinstance(names, list) or len(cast(list[object], names)) > MAX_LEASES:
+            raise self.fail("leases.names", f"must be a list of at most {MAX_LEASES}")
+        found: list[str] = []
+        for name in cast(list[object], names):
+            if not isinstance(name, str) or ID_PATTERN.fullmatch(name) is None:
+                raise self.fail("leases.names", f"{name!r} is not an identifier")
+            if name in found:
+                raise self.fail("leases.names", f"names {name!r} twice")
+            found.append(name)
+        ttl = document.get("ttl_seconds", DEFAULT_LEASE_TTL)
+        if type(ttl) is not int or not MIN_LEASE_TTL <= ttl <= MAX_LEASE_TTL:
+            raise self.fail(
+                "leases.ttl_seconds",
+                f"must be a whole number from {MIN_LEASE_TTL} to {MAX_LEASE_TTL}",
+            )
+        return tuple(sorted(found)), ttl
+
     def wake(self, value: object, key: str, base: int) -> int:
         document = self.table(value, key, WAKE_KEYS)
         every = document.get("every_ticks", base)
@@ -244,6 +360,30 @@ class _Reader:
                 f"{key}.every_ticks", f"must be an integer in [1, {MAX_WAKE_EVERY}]"
             )
         return every
+
+    def sandbox(self, value: object, key: str) -> SandboxConfig | None:
+        """A sandbox table from the file, which lacks operator authority."""
+        if value is None:
+            return None
+        try:
+            return parse_sandbox(value, operator=False)
+        except SandboxError as error:
+            where = f"{key}.{error.key}" if error.key else key
+            raise ConfigFileError(
+                self.path, str(error), key=key, line=self.line_of(where)
+            ) from error
+
+    def settings(self, value: object, key: str) -> SettingsConfig | None:
+        """An engine settings table from the file."""
+        if value is None:
+            return None
+        try:
+            return parse_settings(value)
+        except SettingsError as error:
+            where = f"{key}.{error.key}" if error.key else key
+            raise ConfigFileError(
+                self.path, str(error), key=key, line=self.line_of(where)
+            ) from error
 
     def profiles(self, value: object) -> dict[str, dict[str, object]]:
         if not isinstance(value, dict):
@@ -268,11 +408,21 @@ class _Reader:
             raise self.fail(key, "is not a valid line identifier")
         own = self.table(value, key, LINE_KEYS)
         merged: dict[str, object] = {}
+        profile_sandbox: SandboxConfig | None = None
+        profile_settings: SettingsConfig | None = None
         profile_name = own.get("profile")
         if profile_name is not None:
             if not isinstance(profile_name, str) or profile_name not in profiles:
                 raise self.fail(f"{key}.profile", f"names no profile: {profile_name!r}")
             merged.update(profiles[profile_name])
+            profile_sandbox = self.sandbox(
+                profiles[profile_name].get("sandbox"),
+                f"profiles.{profile_name}.sandbox",
+            )
+            profile_settings = self.settings(
+                profiles[profile_name].get("settings"),
+                f"profiles.{profile_name}.settings",
+            )
         merged.update({k: v for k, v in own.items() if k != "profile"})
         model = merged.get("model")
         if model not in MODELS:
@@ -290,6 +440,23 @@ class _Reader:
             config = config_from_document(tools)
         except ConfigError as error:
             raise self.fail(key, str(error)) from error
+        # Unlike the tool keys, sandbox and settings tables merge as Claude Code's
+        # scopes do, so a line cannot drop a deny entry its profile adds.
+        own_sandbox = self.sandbox(own.get("sandbox"), f"{key}.sandbox")
+        own_settings = self.settings(own.get("settings"), f"{key}.settings")
+        config = replace(
+            config,
+            sandbox=merge([profile_sandbox, own_sandbox]),
+            settings=engine_settings.merge([profile_settings, own_settings]),
+        )
+        session = own.get("session")
+        if session is not None:
+            if not isinstance(session, str):
+                raise self.fail(f"{key}.session", "must be text")
+            try:
+                LineSession(line_id, session)
+            except InvalidField as error:
+                raise self.fail(f"{key}.session", str(error)) from error
         return LineDefinition(
             line_id=line_id,
             model=cast(str, model),
@@ -301,4 +468,5 @@ class _Reader:
             wake_every_ticks=None
             if "wake" not in merged
             else self.wake(merged["wake"], f"{key}.wake", wake),
+            session=session,
         )

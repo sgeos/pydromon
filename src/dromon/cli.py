@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import getpass
 import json
+import os
 import re
 import sys
 from collections.abc import Callable, Sequence
@@ -16,11 +17,26 @@ from pathlib import Path
 from typing import Final, cast
 
 from dromon import __version__, exits
-from dromon.client import DaemonFailed, DaemonNotRunning, call, is_running, start, stop
+from dromon.client import (
+    STARTUP_TIMEOUT_SECONDS,
+    DaemonFailed,
+    DaemonNotRunning,
+    call,
+    is_running,
+    start,
+    stop,
+)
 from dromon.paths import PathError, ProjectPaths, project_paths
 from dromon.driver import MODELS, Driver, DriverError, Strategy
-from dromon.engine import ClaudeCodeLine, EngineRefused
+from dromon.engine import EngineRefused
+from dromon.agents import LINE_TOKEN_ENV, TOKEN_ENV
+from dromon.lineconfig import EFFORTS
+from dromon.model import AgentAccess
 from dromon.protocol import Operation, ProtocolError
+from dromon.scheduler import LineSpec, engine_factory
+from dromon import settings as engine_settings
+from dromon.sandbox import SandboxConfig, merge, sandbox_from_settings
+from dromon.settings import SettingsConfig, split_settings_file
 
 PROBE_MODEL: Final = "claude-haiku-5-5"
 """The least expensive subscription model, used for probes and tests by default."""
@@ -41,20 +57,27 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "ack": "acknowledge a message without replying",
     "sent": "show what became of the mail an operator sent",
     "release": "resume a line the daemon held at a conversation limit",
+    "rebind": "move a line to another model and strategy, keeping its identity",
+    "settings": "show the project's settings, and a line's, with where each comes from",
+    "set": "change a project or line setting, or return it to the layers below",
+    "reload": "read the project file again and apply its lines, limits and wake policy",
     "config": "check the project file and show what it declares",
     "probe": "run one short turn on the engine and report its capabilities",
+    "teacher": "bring the project's local teacher model up, report it, or release it",
+    "agent": "register, list or revoke the external agents that may connect",
+    "mcp": "serve an external agent over MCP on standard input and output",
 }
 """Planned subcommands and their one-line help, in display order."""
 
 
 def _start(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
-    del arguments
+    wait: float = arguments.wait
     if is_running(paths):
         print(f"dromon start: already running for {paths.root}")
         return exits.OK
     try:
-        pid = start(paths)
-    except (DaemonFailed, PathError) as error:
+        pid = start(paths, wait_seconds=wait)
+    except (DaemonFailed, PathError, ValueError) as error:
         print(f"dromon start: {error}", file=sys.stderr)
         return exits.FAILURE
     print(f"dromon start: started, pid {pid}")
@@ -95,13 +118,16 @@ def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 def _stop(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     del arguments
     try:
-        stop(paths)
+        answer = stop(paths)
     except DaemonNotRunning:
         print(f"dromon stop: not running for {paths.root}")
         return exits.NOT_RUNNING
     except (DaemonFailed, ProtocolError, TimeoutError, OSError) as error:
         print(f"dromon stop: {error}", file=sys.stderr)
         return exits.FAILURE
+    warning = answer.get("warning")
+    if isinstance(warning, str):
+        print(f"dromon stop: {warning}")
     print("dromon stop: stopped")
     return exits.OK
 
@@ -116,7 +142,7 @@ def _probe(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         model: str = arguments.model
         strategy = Strategy(arguments.strategy)
         driver = Driver.for_model(model, strategy)
-        line = ClaudeCodeLine(driver, paths.root)
+        line = engine_factory(str(paths.root))(LineSpec("probe", model, strategy), [])
         report = asyncio.run(line.run_turn(PROBE_PROMPT))
     except (DriverError, EngineRefused) as error:
         print(f"dromon probe: {error}", file=sys.stderr)
@@ -131,6 +157,7 @@ def _probe(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         f" tool budget {settings.tool_budget},"
         f" context window {settings.context_window}"
     )
+    print(f"engine {settings.engine}, credential {report.credential}")
     found = report.capabilities
     if found is not None:
         print(
@@ -180,13 +207,34 @@ def _config_document(arguments: argparse.Namespace) -> dict[str, object] | None:
 
     An ``--mcp-config`` file is read here, by the operator's client, and its contents
     travel to the daemon, which stores them in the event log, credentials included.
+    A ``--sandbox-config`` file holds a Claude Code sandbox object, or a settings file
+    whose ``sandbox`` key is taken. It is validated here with operator authority. A
+    ``--settings-config`` file is a Claude Code settings file whose supported keys are
+    taken, its ``sandbox`` key included, and any other key is an error.
     """
     tools: list[str] = arguments.tool or []
     allowed: list[str] = arguments.allow_tool or []
     mcp_file: Path | None = arguments.mcp_config
+    sandbox_file: Path | None = arguments.sandbox_config
+    settings_file: Path | None = arguments.settings_config
+    effort: str | None = arguments.effort
     allow_all: bool = arguments.allow_all_tools
     inherit: bool = arguments.inherit_account_mcp
-    if not (tools or allowed or mcp_file or allow_all or inherit):
+    instructions: list[str] = arguments.instructions or []
+    prompt: bool = arguments.claude_code_prompt
+    workdir: str | None = arguments.workdir
+    given = (
+        tools,
+        allowed,
+        mcp_file,
+        allow_all,
+        inherit,
+        sandbox_file,
+        settings_file,
+        instructions,
+        prompt,
+    )
+    if not any(given) and effort is None and workdir is None:
         return None
     document: dict[str, object] = {
         "builtin_tools": tools,
@@ -196,6 +244,28 @@ def _config_document(arguments: argparse.Namespace) -> dict[str, object] | None:
     }
     if mcp_file is not None:
         document["mcp_servers"] = json.loads(mcp_file.read_text(encoding="utf-8"))
+    if sandbox_file is not None:
+        loaded: object = json.loads(sandbox_file.read_text(encoding="utf-8"))
+        document["sandbox"] = sandbox_from_settings(loaded).document()
+    if settings_file is not None:
+        loaded = json.loads(settings_file.read_text(encoding="utf-8"))
+        settings, sandbox = split_settings_file(loaded)
+        if settings is not None:
+            document["settings"] = settings.document()
+        if sandbox is not None:
+            if "sandbox" in document:
+                raise ValueError(
+                    "the settings file has a sandbox, and so does --sandbox-config"
+                )
+            document["sandbox"] = sandbox_from_settings(sandbox).document()
+    if effort is not None:
+        document["effort"] = effort
+    if instructions:
+        document["instructions"] = instructions
+    if prompt:
+        document["claude_code_prompt"] = True
+    if workdir is not None:
+        document["workdir"] = workdir
     return document
 
 
@@ -209,12 +279,14 @@ def _create(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         config = _config_document(arguments)
     except (OSError, ValueError) as error:
         print(
-            f"dromon create: cannot read the MCP configuration: {error}",
+            f"dromon create: cannot read the line configuration: {error}",
             file=sys.stderr,
         )
         return exits.FAILURE
     if config is not None:
         args["config"] = config
+    if arguments.session is not None:
+        args["engine_session"] = arguments.session
     return _request(paths, "create", Operation.CREATE_LINE, args)
 
 
@@ -223,7 +295,7 @@ def _configure(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         config = _config_document(arguments) or {}
     except (OSError, ValueError) as error:
         print(
-            f"dromon configure: cannot read the MCP configuration: {error}",
+            f"dromon configure: cannot read the line configuration: {error}",
             file=sys.stderr,
         )
         return exits.FAILURE
@@ -341,16 +413,24 @@ def _sent(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 
 
 def _attach(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
-    from dromon.attach import Attachment
+    """Wire a platform, the shared runtime and the daemon's socket together."""
+    from dromon.ui.link import SocketDaemon
 
-    attachment = Attachment(paths, arguments.line_id, arguments.operator)
+    if not arguments.poll_seconds > 0:
+        print("dromon attach: --poll-seconds must be positive", file=sys.stderr)
+        return exits.USAGE
+    daemon = SocketDaemon(paths)
     if arguments.gui:
-        from dromon import gui
+        from dromon.ui import window
 
-        return gui.run(attachment, round(arguments.poll_seconds * 1000))
-    from dromon import tui
+        return window.run(
+            daemon, arguments.line_id, arguments.operator, arguments.poll_seconds
+        )
+    from dromon.ui import terminal
 
-    return tui.run(attachment, arguments.poll_seconds)
+    return terminal.run(
+        daemon, arguments.line_id, arguments.operator, arguments.poll_seconds
+    )
 
 
 def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
@@ -374,19 +454,241 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         f" ${limits.max_cost_usd} estimated cost, {limits.cooldown_seconds}s cooldown"
     )
     print(f"wake every {config.wake_every_ticks} ticks")
+    print(
+        f"project: {_sandbox_summary(config.sandbox)},"
+        f" {_settings_summary(config.settings)}"
+    )
+    if config.teacher is not None:
+        teacher = config.teacher
+        print(
+            f"teacher: {teacher.model} at {teacher.endpoint},"
+            f" context {teacher.context},"
+            f" keep alive {teacher.keep_alive},"
+            + (" autostart" if teacher.autostart else " started with dromon teacher up")
+        )
     for line_id, line in sorted(config.lines.items()):
+        line_settings = engine_settings.merge([config.settings, line.config.settings])
         tools = ", ".join(line.config.builtin_tools) or "no built-in tools"
         servers = ", ".join(line.config.server_names()) or "no MCP servers"
         print(
             f"line {line_id}: {line.model} {line.strategy},"
-            f" {line.config.tool_policy}, {tools}, {servers}"
+            f" {line.config.tool_policy}, {tools}, {servers},"
+            f" {_sandbox_summary(merge([config.sandbox, line.config.sandbox]))},"
+            f" {_settings_summary(line_settings)}"
+            + (f", effort {line.config.effort}" if line.config.effort else "")
+            + (f", in {line.config.workdir}" if line.config.workdir else "")
         )
     return exits.OK
+
+
+def _agent(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Register, list or revoke external agents, through the daemon."""
+    action: str = arguments.action
+    name: str | None = arguments.name
+    if action != "list" and name is None:
+        print(f"dromon agent {action}: name the agent", file=sys.stderr)
+        return exits.USAGE
+    if action == "list":
+        operation, args = Operation.AGENT_LIST, {}
+    elif action == "add":
+        operation = Operation.AGENT_ADD
+        args = {"agent": name, "access": arguments.access}
+    else:
+        operation, args = Operation.AGENT_REVOKE, {"agent": name}
+    try:
+        response = call(paths.socket, operation, args=cast(dict[str, object], args))
+    except DaemonNotRunning:
+        print(f"dromon agent: no daemon is running for {paths.root}", file=sys.stderr)
+        return exits.NOT_RUNNING
+    except (ProtocolError, TimeoutError, OSError) as error:
+        print(f"dromon agent: {error}", file=sys.stderr)
+        return exits.FAILURE
+    if not response.ok or response.result is None:
+        print(f"dromon agent: {response.error_message}", file=sys.stderr)
+        return exits.FAILURE
+    result = response.result
+    if action == "list":
+        policy = cast(dict[str, object], result["policy"])
+        listening = "listening" if policy["listen"] else "not listening"
+        print(
+            f"agents {listening}, anonymous {policy['anonymous']},"
+            f" at most {policy['max_access']}"
+        )
+        for entry in cast(list[dict[str, object]], result["agents"]):
+            how = "token" if entry["token"] else "anonymous"
+            revoked = ", revoked" if entry["revoked"] else ""
+            print(f"{entry['agent']} {entry['access']}, {how}{revoked}")
+        return exits.OK
+    if action == "revoke":
+        print(f"revoked {result['agent']}")
+        return exits.OK
+    print(
+        f"registered {result['agent']} with {result['access']} access,"
+        f" effective {result['effective_access']}"
+    )
+    if not result["listening"]:
+        print("the project file does not set [agents] listen, so it cannot connect yet")
+    print(f"token {result['token']}")
+    print("The token is shown once. An MCP configuration for the agent:")
+    server = {
+        "command": _dromon_command(),
+        "args": ["--project", str(paths.root), "mcp", "--agent", name],
+        "env": {TOKEN_ENV: result["token"]},
+    }
+    print(json.dumps({"mcpServers": {"dromon": server}}, indent=2))
+    return exits.OK
+
+
+def _dromon_command() -> str:
+    """The path of this ``dromon``, so an MCP configuration starts the same one."""
+    launched = Path(sys.argv[0])
+    return str(launched.resolve()) if launched.is_file() else "dromon"
+
+
+def _mcp(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Serve one external agent over MCP on standard input and output."""
+    from dromon.mcp import Bridge, serve
+
+    line: str | None = arguments.line
+    if line is not None:
+        bridge = Bridge(
+            paths.line_socket,
+            line,
+            os.environ.get(LINE_TOKEN_ENV) or None,
+            party="line",
+        )
+    else:
+        bridge = Bridge(
+            paths.agent_socket, arguments.agent, os.environ.get(TOKEN_ENV) or None
+        )
+    return serve(bridge, sys.stdin, sys.stdout)
+
+
+def _teacher(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Bring the project's teacher up, report it, or release it, without a daemon."""
+    from dromon.projectconfig import ConfigFileError, config_path, load
+    from dromon.teacher import Teacher, TeacherError
+
+    file = config_path(paths.state_dir)
+    try:
+        config = load(file) if file.exists() else None
+    except ConfigFileError as error:
+        print(f"dromon teacher: {error}", file=sys.stderr)
+        return exits.FAILURE
+    if config is None or config.teacher is None:
+        print(f"dromon teacher: {file} declares no [teacher]", file=sys.stderr)
+        return exits.FAILURE
+    teacher = Teacher(config.teacher, paths.runtime_dir)
+    action: str = arguments.action
+    try:
+        if action == "up":
+            print(f"dromon teacher: loading {config.teacher.model}")
+            found = teacher.up(force=arguments.force)
+        elif action == "down":
+            found = teacher.down()
+        else:
+            found = teacher.status()
+    except TeacherError as error:
+        print(f"dromon teacher: {error}", file=sys.stderr)
+        return exits.FAILURE
+    print(
+        f"teacher {config.teacher.model} at {config.teacher.endpoint}:"
+        f" {found.summary()}"
+    )
+    if action == "status":
+        return exits.OK
+    return exits.OK if found.loaded == (action == "up") else exits.FAILURE
+
+
+def _settings_summary(settings: SettingsConfig | None) -> str:
+    return "no engine settings" if settings is None else settings.summary()
+
+
+def _sandbox_summary(sandbox: SandboxConfig | None) -> str:
+    if sandbox is None:
+        return "no sandbox settings"
+    return "sandboxed" if sandbox.enabled else "not sandboxed"
 
 
 def _release(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     args: dict[str, object] = {"line_id": arguments.line_id}
     return _request(paths, "release", Operation.RELEASE, args)
+
+
+def _rebind(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    args: dict[str, object] = {
+        "line_id": arguments.line_id,
+        "model": arguments.model,
+        "strategy": arguments.strategy,
+    }
+    return _request(paths, "rebind", Operation.REBIND_LINE, args)
+
+
+def _settings(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    args: dict[str, object] = {}
+    if arguments.line_id is not None:
+        args["line_id"] = arguments.line_id
+    response = _call(paths, "settings", Operation.SETTINGS, args)
+    if isinstance(response, int):
+        return response
+    from dromon.ui.data import settings_of
+
+    found = settings_of(response)
+    sections = [("project.", "Project", found.project)]
+    if arguments.line_id is not None:
+        sections.insert(0, ("", f"Line {found.line_id}", found.line))
+    for prefix, title, entries in sections:
+        print(title)
+        for entry in entries:
+            source = f"  [{entry.source}]" if entry.source else "  [read only]"
+            print(f"  {prefix}{entry.key} = {entry.shown}{source}")
+    return exits.OK
+
+
+def _set(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Check the value against the daemon's settings, as the interactive client does,
+    then send it. A line key needs ``--line``, and a project key its prefix."""
+    from dromon.ui.commands import PROJECT_PREFIX, Set
+    from dromon.ui.data import settings_of
+    from dromon.ui.settings import request_of
+
+    project = arguments.key.startswith(PROJECT_PREFIX)
+    if not project and arguments.line_id is None:
+        print(
+            f"dromon set: {arguments.key} is a line setting and needs --line,"
+            f" or write {PROJECT_PREFIX}{arguments.key} for the project",
+            file=sys.stderr,
+        )
+        return exits.USAGE
+    if arguments.unset == bool(arguments.value):
+        print("dromon set: give a value or --unset, not both", file=sys.stderr)
+        return exits.USAGE
+    query: dict[str, object] = {}
+    if arguments.line_id is not None:
+        query["line_id"] = arguments.line_id
+    response = _call(paths, "set", Operation.SETTINGS, query)
+    if isinstance(response, int):
+        return response
+    text = None if arguments.unset else " ".join(arguments.value)
+    checked = request_of(settings_of(response), Set(arguments.key, text))
+    if isinstance(checked, str):
+        print(f"dromon set: {checked}", file=sys.stderr)
+        return exits.FAILURE
+    args: dict[str, object] = {
+        "scope": "project" if checked.project else "line",
+        "key": checked.key,
+    }
+    if not checked.project:
+        args["line_id"] = arguments.line_id
+    if checked.value is not None:
+        value = checked.value
+        args["value"] = list(value) if isinstance(value, tuple) else value
+    return _request(paths, "set", Operation.SET_SETTING, args)
+
+
+def _reload(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    del arguments
+    return _request(paths, "reload", Operation.RELOAD_PROJECT, {})
 
 
 def _read(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
@@ -450,8 +752,15 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "ack": _ack,
     "sent": _sent,
     "release": _release,
+    "rebind": _rebind,
+    "settings": _settings,
+    "set": _set,
+    "reload": _reload,
     "attach": _attach,
     "config": _config,
+    "teacher": _teacher,
+    "agent": _agent,
+    "mcp": _mcp,
 }
 
 
@@ -476,6 +785,41 @@ def _add_tool_options(command: argparse.ArgumentParser) -> None:
         type=Path,
         default=None,
         help="a JSON file of MCP servers, in the mcpServers shape",
+    )
+    command.add_argument(
+        "--sandbox-config",
+        type=Path,
+        default=None,
+        help="a JSON file of Claude Code sandbox settings for the line's commands",
+    )
+    command.add_argument(
+        "--settings-config",
+        type=Path,
+        default=None,
+        help="a Claude Code settings file of permissions, hooks, env and attribution",
+    )
+    command.add_argument(
+        "--instructions",
+        action="append",
+        help="a file appended to the system prompt, relative to the line's working"
+        " directory, repeatable",
+    )
+    command.add_argument(
+        "--claude-code-prompt",
+        action="store_true",
+        help="run on Claude Code's own system prompt instead of an empty one",
+    )
+    command.add_argument(
+        "--workdir",
+        default=None,
+        help="the directory the line's engine runs in, relative to the project root,"
+        " default the project root",
+    )
+    command.add_argument(
+        "--effort",
+        choices=EFFORTS,
+        default=None,
+        help="the reasoning effort, instead of the one the driver declares",
     )
     command.add_argument(
         "--allow-tool",
@@ -513,8 +857,47 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     for name, help_text in SUBCOMMANDS.items():
         command = commands.add_parser(name, help=help_text, description=help_text)
+        if name == "rebind":
+            command.add_argument("line_id", help="the line to move")
+            command.add_argument(
+                "--model", required=True, choices=MODELS, help="the new model"
+            )
+            command.add_argument(
+                "--strategy",
+                required=True,
+                choices=[strategy.value for strategy in Strategy],
+                help="the new driver's credential strategy",
+            )
         if name == "release":
             command.add_argument("line_id", help="the held line")
+        if name == "start":
+            command.add_argument(
+                "--wait",
+                type=float,
+                default=STARTUP_TIMEOUT_SECONDS,
+                metavar="SECONDS",
+                help="how long to wait for the daemon to answer, default %(default)g",
+            )
+        if name == "settings":
+            command.add_argument(
+                "line_id", nargs="?", help="the line whose settings to show as well"
+            )
+        if name == "set":
+            command.add_argument(
+                "key",
+                help="a line key, or a project key such as project.wake.every_ticks",
+            )
+            command.add_argument(
+                "value", nargs="*", help="the value, as the client takes it"
+            )
+            command.add_argument(
+                "--line", dest="line_id", help="the line, for a line key"
+            )
+            command.add_argument(
+                "--unset",
+                action="store_true",
+                help="return the key to the layers below",
+            )
         if name == "attach":
             command.add_argument("line_id", help="the line to attach to")
             command.add_argument(
@@ -534,8 +917,50 @@ def build_parser() -> argparse.ArgumentParser:
         if name in ("create", "configure"):
             command.add_argument("line_id", help="the line's identifier")
             _add_tool_options(command)
+        if name == "create":
+            command.add_argument(
+                "--session",
+                default=None,
+                help="an existing engine session to continue, started in the line's"
+                " working directory",
+            )
         if name in ("create", "probe"):
             _add_driver_options(command)
+        if name == "agent":
+            command.add_argument("action", choices=["add", "list", "revoke"])
+            command.add_argument(
+                "name", nargs="?", help="the agent, for add and revoke"
+            )
+            command.add_argument(
+                "--access",
+                choices=[level.value for level in AgentAccess],
+                default=AgentAccess.MESSAGE.value,
+                help="what the agent may do, for add, default %(default)s",
+            )
+        if name == "mcp":
+            party = command.add_mutually_exclusive_group(required=True)
+            party.add_argument(
+                "--agent",
+                help="the agent's name. Its token is read from DROMON_AGENT_TOKEN",
+            )
+            party.add_argument(
+                "--line",
+                help="the line whose own tools to serve, for its engine. Its token is"
+                " read from DROMON_LINE_TOKEN",
+            )
+        if name == "teacher":
+            command.add_argument(
+                "action",
+                choices=["up", "status", "down"],
+                nargs="?",
+                default="status",
+                help="default %(default)s",
+            )
+            command.add_argument(
+                "--force",
+                action="store_true",
+                help="load the model even when too little memory is available",
+            )
         if name == "questions":
             command.add_argument(
                 "--operator",

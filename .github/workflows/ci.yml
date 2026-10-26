@@ -1,13 +1,20 @@
 # Continuous integration, roadmap task 10.
 #
-# Each job runs the local gate that CLAUDE.md lists, so a green run here means what a
+# Each job runs the local gate, scripts/check.sh, so a green run here means what a
 # green run on a developer machine means. Live tests are not run, because they need
-# the operator's Claude subscription, and no credential of any kind is given to CI.
+# the operator's subscriptions, and no credential of any kind is given to CI.
 #
 # Supply chain. Actions are pinned to full commit hashes with the release tag in a
 # comment, so a moved or compromised tag cannot change what runs. The pins are
 # releases already in use by the pykeleusma repository, and Dependabot proposes
-# newer ones after a cooldown. The workflow only reads the repository.
+# newer ones after a cooldown. The workflow only reads the repository, and the
+# workflows job lints this file with actionlint and zizmor, as sgeos/project-template
+# does.
+#
+# Account load. GitHub-hosted runners share one concurrent-job limit across the whole
+# sgeos account, and macOS runners a smaller one, so the matrix runs two jobs at a
+# time. paths-ignore is not used, because a pull request with no checks would stall the
+# merge procedure, which waits on them.
 
 name: CI
 
@@ -17,11 +24,16 @@ on:
   pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: read
+# No permissions by default. Each job grants only what it needs.
+permissions: {}
 
+# Supersede an in-flight run when a pull request is pushed again, and leave branch runs
+# alone. The group is the ref for a pull request and the unique run identifier
+# otherwise, so that a second merge to main cannot cancel the first merge's run and
+# leave a commit on main with no result of its own. This follows the Keleusma
+# repository's reasoning in its own ci.yml, by way of sgeos/project-template.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -29,8 +41,11 @@ jobs:
     name: test (${{ matrix.os }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         os: [ubuntu-latest, macos-latest]
         # 3.12 is requires-python in pyproject.toml, and 3.15 the newest release.
@@ -56,18 +71,41 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Install the package and tools
-        run: uv sync --locked --python "${{ steps.python.outputs.python-path }}"
+      # The gate fails without shellcheck, so that a green run never means "not
+      # checked". Ubuntu runners include it, and macOS runners may not.
+      - name: Install shellcheck where it is missing
+        if: runner.os == 'macOS'
+        run: command -v shellcheck >/dev/null || brew install shellcheck
 
-      - name: Ruff
-        run: |
-          uv run --no-sync ruff check .
-          uv run --no-sync ruff format --check .
+      # Socket tests run here, since runners allow Unix domain sockets. UV_PYTHON makes
+      # the gate's locked sync install for this job's interpreter.
+      - name: The local gate
+        env:
+          UV_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: ./scripts/check.sh
 
-      - name: Pyright
-        run: uv run --no-sync pyright
-
-      # Socket tests run here, since runners allow Unix domain sockets. Warnings are
-      # errors, as in the local gate.
-      - name: Tests
-        run: uv run --no-sync pytest -W error
+  # Lints the workflows themselves. actionlint checks syntax, expressions and the
+  # shell in run steps, and zizmor checks for known security weaknesses, such as
+  # injection through untrusted input, excessive permissions and unpinned actions. Both
+  # run here only. The actionlint image is pinned by digest, and zizmor's version is
+  # pinned explicitly, as in sgeos/project-template.
+  workflows:
+    name: workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: actionlint
+        run: >-
+          docker run --rm --volume "$PWD:/repo" --workdir /repo
+          rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+          -color
+      - name: zizmor
+        uses: zizmorcore/zizmor-action@85b2b9fb8e3325e7a23d7d0a9d7ba5ae0f999e3e # v0.7.1
+        with:
+          version: 1.31.1
+          advanced-security: false

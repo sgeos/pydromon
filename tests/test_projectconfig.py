@@ -228,7 +228,7 @@ def test_a_file_that_changes_a_lines_model_is_refused(tmp_path: Path) -> None:
     with EventLog(tmp_path / "events.sqlite") as log:
         scheduler = Scheduler(log, no_engine, hold_wakes=True)
         scheduler.create_line("alpha", "claude-opus-5-5", Strategy.SUBSCRIPTION)
-        with pytest.raises(ProjectMismatch, match="Create a new line instead"):
+        with pytest.raises(ProjectMismatch, match="create a new line instead"):
             apply_project(scheduler, log, parse(EXAMPLE))
 
 

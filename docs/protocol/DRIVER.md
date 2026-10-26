@@ -2,8 +2,9 @@
 
 > **Navigation**: [Protocol](./README.md) | [Documentation Root](../README.md)
 
-**Status.** Draft, driver interface 2, written on 2026-10-25 for roadmap task 4 and
-revised the same day to separate credential strategies. Normative. `dromon.driver`
+**Status.** Draft, driver interface 3, written on 2026-10-25 for roadmap task 4 and
+revised the same day to separate credential strategies and, in interface 3, to name
+each driver's engine. Normative. `dromon.driver`
 hosts drivers through `pykeleusma`, and the packaged drivers are in
 `src/dromon/drivers/`.
 
@@ -23,20 +24,57 @@ subscription draws on a plan's limits while API usage is charged for every token
 
 | Strategy | Accepts | Settings |
 |---|---|---|
-| `subscription` | A Claude subscription only | Tuned for the plan's limits |
+| `subscription` | A subscription only, a Claude plan or a ChatGPT plan | Tuned for the plan's limits |
 | `api` | API usage billed per token only | Shorter turns and smaller budgets, since every token is charged |
 | `flexible` | Either | The API-safe settings, because the line may be charged per token |
 
 | Driver file | Model | Strategy | Effort | Max turns | Tool budget |
 |---|---|---|---|---|---|
-| `claude_opus_5_5_subscription.kel` | Claude Opus 5.5 | subscription | high | 8 | 40 |
+| `claude_opus_5_5_subscription.kel` | Claude Opus 5.5 | subscription | high | 200 | 400 |
 | `claude_opus_5_5_api.kel` | Claude Opus 5.5 | api | medium | 4 | 20 |
 | `claude_opus_5_5_flexible.kel` | Claude Opus 5.5 | flexible | medium | 4 | 20 |
-| `claude_haiku_5_5_subscription.kel` | Claude Haiku 5.5 | subscription | low | 4 | 20 |
+| `claude_haiku_5_5_subscription.kel` | Claude Haiku 5.5 | subscription | low | 100 | 200 |
 | `claude_haiku_5_5_api.kel` | Claude Haiku 5.5 | api | low | 2 | 10 |
 | `claude_haiku_5_5_flexible.kel` | Claude Haiku 5.5 | flexible | low | 2 | 10 |
+| `claude_fable_5_1_subscription.kel` | Claude Fable 5.1 | subscription | high | 200 | 400 |
+| `claude_fable_5_1_api.kel` | Claude Fable 5.1 | api | medium | 4 | 20 |
+| `claude_fable_5_1_flexible.kel` | Claude Fable 5.1 | flexible | medium | 4 | 20 |
+| `gpt_6_luna_subscription.kel` | GPT-6-Luna on Codex | subscription | medium | 200 | 400 |
+| `gpt_6_luna_api.kel` | GPT-6-Luna on Codex | api | low | 2 | 10 |
+| `gpt_6_luna_flexible.kel` | GPT-6-Luna on Codex | flexible | low | 2 | 10 |
+| `grok_4_7_subscription.kel` | Grok 4.7 on Grok Build | subscription | high | 200 | 400 |
+| `grok_4_7_api.kel` | Grok 4.7 on Grok Build | api | medium | 4 | 20 |
+| `grok_4_7_flexible.kel` | Grok 4.7 on Grok Build | flexible | medium | 4 | 20 |
+
+**Decided 2026-10-26, for dogfooding.** The subscription drivers' turn limits and tool
+budgets are sized for a line that develops software, which reads, edits and runs a
+gate many times in one turn. The earlier values, 4 to 8 engine turns and 20 to 40 tool
+calls, ended such turns early. A subscription draws on a plan's limits rather than
+charging per token, and the per-line conversation limits, which a client can now set,
+remain the operator's bound on a line's work. Drivers that may bill per token keep
+their small budgets.
 
 Claude Haiku 5.5 is the least expensive model and is the default for probes and tests.
+
+**Claude Fable 5.1, verified on 2026-10-26.** Added at the operator's direction for
+Keleusma's proofs line. One `dromon probe --model claude-fable-5-1` turn, run with the
+operator's approval, reported the subscription credential and the model
+`claude-fable-5-1` from Claude Code 2.1.310, and replied `ready`. Its context window of
+1,000,000 tokens is copied from the Opus drivers and is not verified.
+
+GPT-6-Luna's settings follow Codex's model catalogue as fetched on 2026-10-25, which
+gives it a default effort of medium and a context window of 272,000 tokens, and for a
+ChatGPT plan the subscription strategy means Codex's own sign-in.
+
+## Engines
+
+Each driver names the engine it is written for, `claude-code`, `codex` or
+`grok-build`. A file is named for its model with `-` and `.` written as `_`. A model has
+packaged drivers once they are written, but a line can be created on it only when
+Dromon has an adapter for its engine, and an adapter refuses a driver written for
+another engine. All three engines have adapters, as of 2026-10-25 for `codex`, which
+[`CODEX.md`](CODEX.md) specifies, and for `grok-build`, which
+[`GROK.md`](GROK.md) specifies and which is not yet verified against a live turn.
 A file is named for its model and strategy, and the host refuses a file whose declared
 model or strategy differs from its name.
 
@@ -109,7 +147,8 @@ At most 32 settings are read.
 
 | Name | Value | Required |
 |---|---|---|
-| `interface` | Number `2` | Yes |
+| `interface` | Number `3` | Yes |
+| `engine` | Text, `claude-code`, `codex` or `grok-build` | Yes |
 | `strategy` | Text, `subscription`, `api` or `flexible` | Yes |
 | `model` | Text, the model identifier | Yes |
 | `effort` | Text, one of `low`, `medium`, `high`, `xhigh` and `max` | Yes |
@@ -119,7 +158,9 @@ At most 32 settings are read.
 
 ## Credentials in the host
 
-The host maps Claude Code's reported `apiKeySource` to a credential. `none` is a
+For Codex, the host maps the account Codex reports, `chatgpt` to a subscription and
+`apiKey` to API usage, as [`CODEX.md`](CODEX.md) specifies. For Claude Code, the host
+maps Claude Code's reported `apiKeySource` to a credential. `none` is a
 subscription, and `ANTHROPIC_API_KEY`, `apiKeyHelper` and `/login managed key` are API
 usage. Any other value is refused without consulting the driver. Before a turn the host
 refuses every cloud provider, whose source would also read `none`, and for a

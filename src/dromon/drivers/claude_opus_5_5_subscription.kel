@@ -1,4 +1,4 @@
-// Dromon driver for Claude Opus 5.5 run through Claude Code, driver interface 2.
+// Dromon driver for Claude Opus 5.5 run through Claude Code, driver interface 3.
 //
 // Strategy: subscription only. The line runs on a Claude subscription and draws on the
 // plan's limits. The driver refuses API usage billed per token, so a misconfigured
@@ -20,18 +20,19 @@ fn model() -> Text { "claude-opus-5-5" }
 
 fn strategy() -> Text { "subscription" }
 
-fn tool_budget() -> Word { 40 }
+fn tool_budget() -> Word { 400 }
 
 // Settings read by index before the first turn. The list ends with the tag "end".
 fn setting(index: Word) -> (Text, Text, Word) {
     match index {
-        0 => ("interface", "", 2),
+        0 => ("interface", "", 3),
         1 => ("strategy", strategy(), 0),
         2 => ("model", model(), 0),
         3 => ("effort", "high", 0),
-        4 => ("max_turns", "", 8),
+        4 => ("max_turns", "", 200),
         5 => ("tool_budget", "", tool_budget()),
         6 => ("context_window", "", 1000000),
+        7 => ("engine", "claude-code", 0),
         _ => ("end", "", 0),
     }
 }

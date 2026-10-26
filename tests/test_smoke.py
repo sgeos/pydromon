@@ -27,3 +27,13 @@ def test_each_declared_command_resolves_to_a_callable() -> None:
     for target in PYPROJECT["project"]["scripts"].values():
         module_name, _, attribute = target.partition(":")
         assert callable(getattr(import_module(module_name), attribute))
+
+
+def test_collection_skips_the_state_directory_a_line_cannot_read() -> None:
+    # A Codex line's profile denies even the metadata of the state directory, and
+    # pytest stats every entry of the root directory while collecting, so a project
+    # that develops Dromon with Dromon must not collect there.
+    from dromon.paths import STATE_DIR_NAME
+
+    options = PYPROJECT["tool"]["pytest"]["ini_options"]["addopts"].split()
+    assert f"--ignore={STATE_DIR_NAME}" in options

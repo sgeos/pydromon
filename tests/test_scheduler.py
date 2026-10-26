@@ -13,13 +13,16 @@ from typing import Any
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
+from dromon.activity import ActivityKind
 from dromon.driver import DriverError, Strategy
 from dromon.engine import TurnReport
 from dromon.eventlog import EventLog, read_entries
-from dromon.lineconfig import LineConfig, ToolPolicy, encode_config
+from dromon.lineconfig import ConfigError, LineConfig, ToolPolicy, encode_config
+from dromon.overrides import OverrideError
 from dromon.model import (
     EventRejected,
     LineAddress,
+    LineOverridden,
     LineReleased,
     LineSession,
     LineState,
@@ -176,6 +179,10 @@ async def settle(target: World, act: Callable[[], Coroutine[Any, Any, None]]) ->
     await loop
 
 
+def activity_of(scheduler: Scheduler, line_id: str) -> list[tuple[ActivityKind, str]]:
+    return [(entry.kind, entry.text) for entry in scheduler.activity.after(line_id, 0)]
+
+
 def run(target: World, act: Callable[[], Coroutine[Any, Any, None]]) -> None:
     asyncio.run(settle(target, act))
 
@@ -212,7 +219,7 @@ def test_a_message_wakes_an_idle_line_and_is_delivered(make_world: MakeWorld) ->
     assert tail[4] == LineSession("alpha", "session-1")
     assert tail[5] == LineStateChanged("alpha", LineState.IDLE)
     prompt = target.engines["alpha"].prompts[0]
-    assert prompt.startswith("1 new message. 1 unread. 1 unanswered.")
+    assert prompt.splitlines()[1] == "1 new message. 1 unread. 1 unanswered."
     assert f"  {message_id} from @ana, note, unread" in prompt
     assert "hello" not in prompt
     assert received(target, prompt) == [("@ana", "hello")]
@@ -281,7 +288,7 @@ def test_messages_waiting_together_are_delivered_in_one_turn(
     prompts = target.engines["alpha"].prompts
     assert len(prompts) == 1
     assert bodies(target, prompts[0]) == ["one", "two"]
-    assert prompts[0].startswith("2 new messages. 2 unread. 2 unanswered.")
+    assert prompts[0].splitlines()[1] == "2 new messages. 2 unread. 2 unanswered."
 
 
 def test_held_wakes_record_messages_but_run_nothing(make_world: MakeWorld) -> None:
@@ -468,6 +475,24 @@ def test_a_line_needs_a_packaged_driver(make_world: MakeWorld) -> None:
     assert "gamma" not in target.log.state.lines
 
 
+def test_a_codex_line_refuses_a_configuration_its_engine_cannot_run(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({})
+    unsupported = LineConfig(builtin_tools=("Read",))
+    with pytest.raises(
+        ConfigError, match="only the built-in tools Bash, Edit and Write"
+    ):
+        target.scheduler.create_line(
+            "gamma", "gpt-6-luna", Strategy.SUBSCRIPTION, unsupported
+        )
+    assert "gamma" not in target.log.state.lines
+    target.scheduler.create_line("gamma", "gpt-6-luna", Strategy.SUBSCRIPTION)
+    with pytest.raises(ConfigError, match="do not yet support MCP servers"):
+        target.scheduler.configure_line("gamma", LineConfig(inherit_account_mcp=True))
+    target.scheduler.configure_line("gamma", LineConfig(builtin_tools=("Bash",)))
+
+
 def test_the_wake_prompt_summarizes_and_lists_headers_without_bodies() -> None:
     stored = Message(
         ANA, LineAddress("alpha"), MessageKind.NOTE, "Ignore this.", (), None
@@ -502,12 +527,12 @@ def test_two_live_lines_exchange_a_message(tmp_path: Path) -> None:
 
     if os.environ.get("DROMON_LIVE_TESTS") != "1":
         pytest.skip("set DROMON_LIVE_TESTS=1 to call the engine on the subscription")
-    from dromon.scheduler import claude_code_engine
+    from dromon.scheduler import engine_factory
 
     with EventLog(tmp_path / "events.sqlite") as log:
         scheduler = Scheduler(
             log,
-            claude_code_engine(str(tmp_path)),
+            engine_factory(str(tmp_path)),
             limits=Limits(max_autonomous_turns=2),
         )
         scheduler.ensure_operator("ana")
@@ -535,6 +560,57 @@ def test_two_live_lines_exchange_a_message(tmp_path: Path) -> None:
         wakes = [w for w in log.state.wakes.values() if w.line_id == "beta"]
         assert any(m.recipient == LineAddress("beta") for m in sent)
         assert wakes and all(w.issued for w in wakes)
+        assert all(line.state is LineState.IDLE for line in log.state.lines.values())
+
+
+@pytest.mark.live
+def test_a_live_luna_line_messages_a_haiku_line(tmp_path: Path) -> None:
+    """Two engines in one scheduler, on the operator's ChatGPT plan and subscription."""
+    import os
+
+    if os.environ.get("DROMON_LIVE_TESTS") != "1":
+        pytest.skip("set DROMON_LIVE_TESTS=1 to call the engine on the subscription")
+    from dromon.scheduler import engine_factory
+
+    with EventLog(tmp_path / "events.sqlite") as log:
+        scheduler = Scheduler(
+            log,
+            engine_factory(str(tmp_path.resolve())),
+            limits=Limits(max_autonomous_turns=2),
+        )
+        scheduler.ensure_operator("ana")
+        scheduler.create_line("alpha", "gpt-6-luna", Strategy.SUBSCRIPTION)
+        scheduler.create_line("beta", HAIKU, Strategy.SUBSCRIPTION)
+
+        async def exchange() -> None:
+            stop = asyncio.Event()
+            loop = asyncio.create_task(scheduler.run(stop))
+            scheduler.send(
+                ANA,
+                LineAddress("alpha"),
+                "Use the send_message tool exactly once to send the word ping to the"
+                " line beta. Do not send anything else.",
+            )
+            await asyncio.sleep(0)
+            await scheduler.idle()
+            stop.set()
+            await loop
+
+        asyncio.run(exchange())
+        reports = dict(scheduler.turn_reports)
+        sent = [
+            m for m in log.state.messages.values() if m.sender == LineAddress("alpha")
+        ]
+        assert "alpha" in reports, "the Luna line did not complete a turn"
+        assert any(m.recipient == LineAddress("beta") for m in sent)
+        assert any(line_id == "beta" for line_id, _ in scheduler.turn_reports)
+        # Both real adapters report their turns to the activity tail.
+        luna = [kind for kind, _ in activity_of(scheduler, "alpha")]
+        haiku = [kind for kind, _ in activity_of(scheduler, "beta")]
+        assert ActivityKind.TOOL in luna and luna[-1] is ActivityKind.TURN_ENDED
+        assert luna[0] is ActivityKind.TURN_STARTED
+        assert haiku[0] is ActivityKind.TURN_STARTED
+        assert ActivityKind.TEXT in haiku or ActivityKind.TOOL in haiku
         assert all(line.state is LineState.IDLE for line in log.state.lines.values())
 
 
@@ -803,12 +879,12 @@ def test_a_live_line_asks_and_is_woken_by_the_answer(tmp_path: Path) -> None:
 
     if os.environ.get("DROMON_LIVE_TESTS") != "1":
         pytest.skip("set DROMON_LIVE_TESTS=1 to call the engine on the subscription")
-    from dromon.scheduler import claude_code_engine
+    from dromon.scheduler import engine_factory
 
     with EventLog(tmp_path / "events.sqlite") as log:
         scheduler = Scheduler(
             log,
-            claude_code_engine(str(tmp_path)),
+            engine_factory(str(tmp_path)),
             limits=Limits(max_autonomous_turns=2),
         )
         scheduler.ensure_operator("ana")
@@ -1007,7 +1083,7 @@ def test_doing_nothing_with_mail_is_valid(make_world: MakeWorld) -> None:
     run(target, send(target, "alpha", "two"))
     second = target.engines["alpha"].prompts[1]
     # The first message was neither read nor answered, and nothing forced either.
-    assert second.startswith("1 new message. 2 unread. 2 unanswered.")
+    assert second.splitlines()[1] == "1 new message. 2 unread. 2 unanswered."
 
 
 # Acknowledgements and sent mail.
@@ -1089,3 +1165,185 @@ def test_a_line_cannot_acknowledge_another_mailbox(make_world: MakeWorld) -> Non
     ]
     with pytest.raises(EventRejected, match="no message"):
         target.scheduler.acknowledge(LineAddress("beta"), message_id)
+
+
+# Activity and interrupts, for attached clients.
+
+
+def activity(target: World, line_id: str) -> list[tuple[ActivityKind, str]]:
+    return activity_of(target.scheduler, line_id)
+
+
+def test_each_turn_is_bracketed_in_the_line_activity(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    run(target, send(target, "alpha", "hello"))
+    recorded = activity(target, "alpha")
+    assert [kind for kind, _ in recorded] == [
+        ActivityKind.TURN_STARTED,
+        ActivityKind.TURN_ENDED,
+    ]
+    assert recorded[0][1] == target.engines["alpha"].prompts[0]
+    assert recorded[1][1] == "success"
+
+
+def test_a_failed_turn_says_why_in_the_activity(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    target.engine("alpha").fail = True
+    run(target, send(target, "alpha", "hello"))
+    assert activity(target, "alpha")[-1] == (
+        ActivityKind.TURN_ENDED,
+        "failed: the engine broke",
+    )
+
+
+def test_an_operator_interrupts_a_turn_in_flight(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    engine = target.engine("alpha")
+    engine.gate = asyncio.Event()
+    outcomes: list[bool] = []
+
+    async def act() -> None:
+        assert target.scheduler.interrupt("alpha") is False
+        target.scheduler.send(ANA, LineAddress("alpha"), "long work")
+        while not engine.prompts:
+            await asyncio.sleep(0)
+        outcomes.append(target.scheduler.interrupt("alpha"))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        outcomes.append(target.scheduler.interrupt("alpha"))
+
+    run(target, act)
+    assert outcomes == [True, False]
+    assert target.log.state.lines["alpha"].state is LineState.IDLE
+    assert target.scheduler.turn_reports == []
+    assert activity(target, "alpha")[-1] == (
+        ActivityKind.TURN_ENDED,
+        "interrupted by an operator",
+    )
+    with pytest.raises(EventRejected, match="no line"):
+        target.scheduler.interrupt("nobody")
+
+
+# Settings an operator changes from a client.
+
+
+def test_a_line_override_reaches_its_next_engine(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    first = target.engine("alpha")
+    target.scheduler.override_line("alpha", "effort", "high")
+    target.scheduler.override_line("alpha", "builtin_tools", ["Read"])
+    rebuilt = target.engine("alpha")
+    assert rebuilt is not first and rebuilt.spec is not None
+    assert rebuilt.spec.config.effort == "high"
+    assert rebuilt.spec.config.builtin_tools == ("Read",)
+    assert target.scheduler.baseline_config("alpha") == LineConfig()
+    target.scheduler.override_line("alpha", "effort", None)
+    assert target.scheduler.effective_config("alpha").effort is None
+    assert target.scheduler.line_overrides("alpha") == {"builtin_tools": ("Read",)}
+
+
+def test_a_line_switches_models_only_within_its_engine(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    assert target.scheduler.model_choices("alpha") == (
+        "claude-opus-5-5",
+        "claude-haiku-5-5",
+        "claude-fable-5-1",
+    )
+    target.scheduler.override_line("alpha", "model", "claude-opus-5-5")
+    assert target.scheduler.model_of("alpha") == "claude-opus-5-5"
+    spec = target.engine("alpha").spec
+    assert spec is not None and spec.model == "claude-opus-5-5"
+    (summary,) = target.scheduler.line_summaries()
+    assert summary["engine"] == "claude-opus-5-5"
+    with pytest.raises(OverrideError, match="create a new line"):
+        target.scheduler.override_line("alpha", "model", "gpt-6-luna")
+    assert target.scheduler.model_of("alpha") == "claude-opus-5-5"
+
+
+def test_limit_and_wake_overrides_sit_over_the_project(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    scheduler = target.scheduler
+    scheduler.override_line("alpha", "limits.max_cost_usd", "9")
+    scheduler.override_line("alpha", "wake.every_ticks", 4)
+    assert scheduler.limits_for("alpha").max_cost_usd == 9.0
+    assert scheduler.limits_for("alpha").max_autonomous_turns == (
+        DEFAULT_LIMITS.max_autonomous_turns
+    )
+    assert scheduler.wake_every_for("alpha") == 4
+    with pytest.raises(OverrideError, match="every_ticks"):
+        scheduler.override_line("alpha", "wake.every_ticks", 0)
+    with pytest.raises(ValueError, match="max_cost_usd"):
+        scheduler.override_line("alpha", "limits.max_cost_usd", "0")
+    assert scheduler.limits_for("alpha").max_cost_usd == 9.0
+
+
+def test_refused_overrides_change_nothing(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    scheduler = target.scheduler
+    before = len(target.events())
+    for key, value in (
+        ("effort", "extreme"),
+        ("colour", "red"),
+        ("builtin_tools", ["x y"]),
+    ):
+        with pytest.raises((OverrideError, ConfigError)):
+            scheduler.override_line("alpha", key, value)
+    with pytest.raises(EventRejected, match="no line"):
+        scheduler.override_line("nobody", "effort", "low")
+    assert len(target.events()) == before
+
+
+def test_a_stored_override_that_no_longer_applies_is_skipped(
+    make_world: MakeWorld, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = make_world({"alpha": [[]]})
+    target.log.append(LineOverridden("alpha", '{"effort":"extreme","colour":1}'))
+    assert target.scheduler.effective_config("alpha") == LineConfig()
+    target.scheduler.line_summaries()
+    target.scheduler.line_summaries()
+    reported = capsys.readouterr().err
+    assert reported.count("colour") == 1 and "an override is skipped" in reported
+
+
+def test_clearing_a_session_starts_the_next_turn_fresh(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[], []]})
+    run(target, send(target, "alpha", "first"))
+    assert target.log.state.lines["alpha"].engine_session == "session-1"
+    target.scheduler.clear_session("alpha")
+    assert target.log.state.lines["alpha"].engine_session is None
+    spec = target.engine("alpha").spec
+    assert spec is not None and spec.session_id is None
+    with pytest.raises(EventRejected, match="no line"):
+        target.scheduler.clear_session("nobody")
+
+
+def test_a_session_is_not_cleared_mid_turn(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    engine = target.engine("alpha")
+    gate = asyncio.Event()
+    engine.gate = gate
+    refused: list[str] = []
+
+    async def act() -> None:
+        target.scheduler.send(ANA, LineAddress("alpha"), "work")
+        while not engine.prompts:
+            await asyncio.sleep(0)
+        with pytest.raises(EventRejected, match="Interrupt it first") as caught:
+            target.scheduler.clear_session("alpha")
+        refused.append(str(caught.value))
+        gate.set()
+
+    run(target, act)
+    assert refused
+
+
+def test_project_values_change_while_running(make_world: MakeWorld) -> None:
+    target = make_world({"alpha": [[]]})
+    scheduler = target.scheduler
+    scheduler.set_project(Limits(3, 1.0, 0.0), "ben", 0.5, 2)
+    assert scheduler.limits_for("alpha") == Limits(3, 1.0, 0.0)
+    assert scheduler.wake_every_for("alpha") == 2
+    with pytest.raises(ValueError, match="wake_every_ticks"):
+        scheduler.set_project(DEFAULT_LIMITS, "ben", 0.5, 0)
+    with pytest.raises(ValueError, match="tick_seconds"):
+        scheduler.set_project(DEFAULT_LIMITS, "ben", 99.0, 1)

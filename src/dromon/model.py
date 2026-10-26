@@ -5,10 +5,12 @@ directly. It is rebuilt by applying events in order, so the event list is the
 specification of the data model. ``docs/protocol/EVENT_LOG.md`` is normative and this
 module follows it.
 
-Parties. Session lines and operators are both addresses. An operator question is a
-message from a line to an operator, and the answer is the operator's reply, so questions
-travel by the same path as every other message. There may be any number of operators,
-each addressed separately.
+Parties. Session lines, operators and external agents are all addresses. An operator
+question is a message from a line to an operator, and the answer is the operator's
+reply, so questions travel by the same path as every other message. There may be any
+number of operators, each addressed separately. An external agent is a harness outside
+the daemon, such as another Claude Code session, registered with an access level and a
+token hash, and its messages are untrusted data like a line's.
 
 Trust. The model checks that each event is well formed and applicable to the current
 state. It does not authenticate anyone. Attribution, such as which operator sent a
@@ -20,6 +22,7 @@ each event has one explicit check, so each maps onto a Rust enum and a ``match``
 
 import re
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Final, assert_never
 
@@ -29,6 +32,12 @@ ID_PATTERN: Final = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 OPERATOR_PREFIX: Final = "@"
 """Marks an operator address. It never appears in an identifier, so a line address and
 an operator address cannot be confused even when their identifiers are equal."""
+
+AGENT_PREFIX: Final = "&"
+"""Marks an external agent's address, distinct from both other kinds."""
+
+TOKEN_HASH: Final = re.compile(r"[0-9a-f]{64}")
+"""A SHA-256 digest in lowercase hexadecimal, the only form a token is stored in."""
 
 MAX_TEXT_BYTES: Final = 1024 * 1024
 """Upper bound on the UTF-8 size of a message body."""
@@ -41,6 +50,25 @@ MAX_SESSION_BYTES: Final = 256
 
 MAX_CHOICES: Final = 16
 MAX_CHOICE_BYTES: Final = 1024
+
+MAX_WAKE_NOTE_BYTES: Final = 2000
+"""Upper bound on the UTF-8 size of a scheduled wake's note."""
+
+DUE_FORMAT: Final = "%Y-%m-%dT%H:%M:%SZ"
+"""A scheduled wake's due time, Coordinated Universal Time to the second, such as
+``2026-10-26T09:30:00Z``. One fixed form, so every port compares it the same way."""
+
+WITHHELD_WAKE_NOTE: Final = (
+    "Your scheduled wake fell due. Its note was withheld, because it contains a term"
+    " from the project's disclosure list."
+)
+"""The body a scheduled wake fires with in place of a note that the project's
+disclosure list, read again since the wake was scheduled, now covers. Fixed, so it
+never reveals the term."""
+
+DUE_PATTERN: Final = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
+)
 
 
 class InvalidField(ValueError):
@@ -77,6 +105,26 @@ def check_text(name: str, value: object, limit: int = MAX_TEXT_BYTES) -> None:
         raise InvalidField(f"{name} is not valid Unicode text") from error
     if size > limit:
         raise InvalidField(f"{name} is {size} bytes, over the limit of {limit}")
+
+
+def parse_due(value: str) -> datetime:
+    """The instant a due time names, or ``InvalidField`` unless it is a valid time in
+    exactly the ``DUE_FORMAT`` form."""
+    if DUE_PATTERN.fullmatch(value) is None:
+        raise InvalidField(
+            f"due is not a time of the form YYYY-MM-DDTHH:MM:SSZ: {value!r}"
+        )
+    try:
+        return datetime.strptime(value, DUE_FORMAT).replace(tzinfo=UTC)
+    except ValueError as error:
+        raise InvalidField(f"due is not a valid time: {value!r}") from error
+
+
+def format_due(instant: datetime) -> str:
+    """``instant``, which must be aware, as a due time."""
+    if instant.tzinfo is None:
+        raise InvalidField("a due time needs an aware instant")
+    return instant.astimezone(UTC).strftime(DUE_FORMAT)
 
 
 def check_member(name: str, value: object, kind: type[StrEnum]) -> None:
@@ -123,19 +171,32 @@ class OperatorAddress:
         return OPERATOR_PREFIX + self.operator_id
 
 
-type Address = LineAddress | OperatorAddress
+@dataclass(frozen=True, slots=True)
+class AgentAddress:
+    agent_id: str
+
+    def __post_init__(self) -> None:
+        check_id("agent_id", self.agent_id)
+
+    def __str__(self) -> str:
+        return AGENT_PREFIX + self.agent_id
+
+
+type Address = LineAddress | OperatorAddress | AgentAddress
 
 
 def parse_address(text: str) -> Address:
-    """Return the address written as ``text``, either ``line`` or ``@operator``."""
+    """Return the address written as ``text``: ``line``, ``@operator`` or ``&agent``."""
     if text.startswith(OPERATOR_PREFIX):
         return OperatorAddress(text.removeprefix(OPERATOR_PREFIX))
+    if text.startswith(AGENT_PREFIX):
+        return AgentAddress(text.removeprefix(AGENT_PREFIX))
     return LineAddress(text)
 
 
 def check_address(name: str, value: object) -> None:
     """Raise ``InvalidField`` unless ``value`` is an address."""
-    if not isinstance(value, LineAddress | OperatorAddress):
+    if not isinstance(value, LineAddress | OperatorAddress | AgentAddress):
         raise InvalidField(f"{name} is not an address: {value!r}")
 
 
@@ -163,6 +224,29 @@ LINE_TRANSITIONS: Final[frozenset[tuple[LineState, LineState]]] = frozenset(
 class MessageKind(StrEnum):
     NOTE = "note"
     QUESTION = "question"
+
+
+class AgentAccess(StrEnum):
+    """What an external agent may do. Each level includes every level before it."""
+
+    NONE = "none"
+    OBSERVE = "observe"
+    MESSAGE = "message"
+    MANAGE = "manage"
+    OPERATOR = "operator"
+
+    @property
+    def rank(self) -> int:
+        return ACCESS_ORDER.index(self)
+
+
+ACCESS_ORDER: Final = (
+    AgentAccess.NONE,
+    AgentAccess.OBSERVE,
+    AgentAccess.MESSAGE,
+    AgentAccess.MANAGE,
+    AgentAccess.OPERATOR,
+)
 
 
 class QuestionStatus(StrEnum):
@@ -234,6 +318,87 @@ class LineSession:
             raise InvalidField("engine_session is empty")
 
 
+MAX_COST_MICRO_USD: Final = 10**15
+"""The largest running cost total an event records, in millionths of a dollar."""
+
+
+@dataclass(frozen=True, slots=True)
+class LineCostMarked:
+    """The running cost total an engine reported for a line's session after its last
+    turn, in whole millionths of a dollar, since the log admits no fractions. It lets
+    a restarted daemon measure the next turn from there, because the engine restores
+    a resumed session's total. One is recorded after each turn whose engine reports a
+    total."""
+
+    line_id: str
+    engine_session: str
+    total_micro_usd: int
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_text("engine_session", self.engine_session, MAX_SESSION_BYTES)
+        if not self.engine_session:
+            raise InvalidField("engine_session is empty")
+        total = self.total_micro_usd
+        if type(total) is not int or not 0 <= total <= MAX_COST_MICRO_USD:
+            raise InvalidField(
+                f"total_micro_usd must be a whole number from 0 to {MAX_COST_MICRO_USD}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class LineSessionCleared:
+    """A line's next turn starts a new engine session, as an operator asked.
+
+    The engine keeps the old session. Dromon only stops resuming it.
+    """
+
+    line_id: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+
+
+@dataclass(frozen=True, slots=True)
+class LineRebound:
+    """A line now runs ``engine``, a model, with the driver ``strategy``, as an operator
+    asked. Its identity, mailbox, configuration and overrides stay, and its next turn
+    starts a new engine session."""
+
+    line_id: str
+    engine: str
+    strategy: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_id("engine", self.engine)
+        check_id("strategy", self.strategy)
+
+
+@dataclass(frozen=True, slots=True)
+class LineOverridden:
+    """The settings an operator changed for a line from a client, as the canonical
+    JSON of ``dromon.overrides``, replacing the line's earlier overrides whole."""
+
+    line_id: str
+    overrides: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_text("overrides", self.overrides, MAX_CONFIG_BYTES)
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectOverridden:
+    """The settings an operator changed for the whole project from a client,
+    replacing the earlier project overrides whole."""
+
+    overrides: str
+
+    def __post_init__(self) -> None:
+        check_text("overrides", self.overrides, MAX_CONFIG_BYTES)
+
+
 @dataclass(frozen=True, slots=True)
 class LineHeld:
     """The daemon stopped waking a line until an operator answers ``question_id``."""
@@ -262,6 +427,33 @@ class OperatorRegistered:
 
     def __post_init__(self) -> None:
         check_id("operator_id", self.operator_id)
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRegistered:
+    """An external agent, with its access and the SHA-256 of its token, or with an
+    empty hash for an agent admitted without a token. Registering an agent again
+    replaces its access and hash, and restores it if it was revoked."""
+
+    agent_id: str
+    access: AgentAccess
+    token_sha256: str
+
+    def __post_init__(self) -> None:
+        check_id("agent_id", self.agent_id)
+        check_member("access", self.access, AgentAccess)
+        if self.token_sha256 and TOKEN_HASH.fullmatch(self.token_sha256) is None:
+            raise InvalidField("token_sha256 is not a SHA-256 hex digest")
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRevoked:
+    """The agent may no longer connect, send or receive."""
+
+    agent_id: str
+
+    def __post_init__(self) -> None:
+        check_id("agent_id", self.agent_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,6 +537,75 @@ class WakeIssued:
 
 
 @dataclass(frozen=True, slots=True)
+class WakeScheduled:
+    """A line's one scheduled wake, replacing any earlier one it had.
+
+    When ``due`` has passed, the daemon records ``note`` as a ``message_sent`` from the
+    line to itself, under the ``message_id`` reserved here, which wakes the line as any
+    mail does, or records ``WITHHELD_WAKE_NOTE`` instead when the note now discloses a
+    listed term. Recording that one message is the whole of firing, so a crash either
+    leaves the wake pending or fired, never both.
+    """
+
+    line_id: str
+    message_id: str
+    due: str
+    note: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_id("message_id", self.message_id)
+        check_text("due", self.due, len("YYYY-MM-DDTHH:MM:SSZ"))
+        parse_due(self.due)
+        check_text("note", self.note, MAX_WAKE_NOTE_BYTES)
+
+
+@dataclass(frozen=True, slots=True)
+class WakeWithdrawn:
+    """The daemon withdrew a line's pending scheduled wake before it fell due, so it
+    never fires. Its ``message_id`` is kept, and no later message, task note or
+    scheduled wake may take it. Only the daemon records it, when the wake
+    ``compact_session`` scheduled has lost its purpose because an earlier turn
+    already made the compaction it was for."""
+
+    line_id: str
+    message_id: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_id("message_id", self.message_id)
+
+
+MAX_TASK_STATUS_BYTES: Final = 32
+MAX_TASK_NOTE_BYTES: Final = 8192
+"""The largest task-end note, which fits a quoted command and the head of the task's
+output."""
+MAX_TASK_ID_BYTES: Final = 128
+
+
+@dataclass(frozen=True, slots=True)
+class TaskNoted:
+    """A note from a line to itself saying that a background task of its engine
+    ended between turns, which wakes the line as any mail does. Only the daemon
+    records it, when the line's engine reports the end, and recording it is the
+    whole of sending, so it needs no separate ``message_sent``. A line cannot send
+    itself mail any other way but by a scheduled wake."""
+
+    line_id: str
+    message_id: str
+    task_id: str
+    status: str
+    body: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_id("message_id", self.message_id)
+        check_text("task_id", self.task_id, MAX_TASK_ID_BYTES)
+        check_text("status", self.status, MAX_TASK_STATUS_BYTES)
+        check_text("body", self.body, MAX_TASK_NOTE_BYTES)
+
+
+@dataclass(frozen=True, slots=True)
 class QuestionWithdrawn:
     message_id: str
 
@@ -367,15 +628,25 @@ type Event = (
     | LineStateChanged
     | LineConfigured
     | LineSession
+    | LineSessionCleared
+    | LineRebound
+    | LineOverridden
+    | ProjectOverridden
     | LineHeld
     | LineReleased
     | OperatorRegistered
+    | AgentRegistered
+    | AgentRevoked
     | MessageSent
     | MessageDelivered
     | MessageRead
     | MessageAcknowledged
     | WakeRequested
     | WakeIssued
+    | WakeScheduled
+    | WakeWithdrawn
+    | TaskNoted
+    | LineCostMarked
     | QuestionWithdrawn
     | QuestionSuperseded
 )
@@ -396,6 +667,22 @@ class Line:
     """The engine session the line's next turn resumes, if one was recorded."""
     held_by: str | None = None
     """The question whose answer releases the line, while the line is held."""
+    overrides: str | None = None
+    """The latest ``line_overridden`` text, or ``None`` when nothing was overridden."""
+    rebound: bool = False
+    """Whether ``line_rebound``, rather than ``line_created``, set the current
+    binding."""
+    cost_mark: tuple[str, int] | None = None
+    """The session and running cost total, in millionths of a dollar, of the line's
+    latest ``line_cost_marked``."""
+
+
+@dataclass(frozen=True, slots=True)
+class Agent:
+    access: AgentAccess
+    token_sha256: str
+    """Empty for an agent admitted without a token."""
+    revoked: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,6 +709,15 @@ class Wake:
     issued: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ScheduledWake:
+    """A line's pending scheduled wake, until its note is recorded."""
+
+    message_id: str
+    due: str
+    note: str
+
+
 @dataclass(slots=True)
 class State:
     """Everything the event log records, keyed by identifier.
@@ -434,11 +730,38 @@ class State:
     operators: set[str] = field(default_factory=set[str])
     messages: dict[str, Message] = field(default_factory=dict[str, Message])
     wakes: dict[str, Wake] = field(default_factory=dict[str, Wake])
+    agents: dict[str, Agent] = field(default_factory=dict[str, Agent])
+    project_overrides: str | None = None
+    """The latest ``project_overridden`` text, or ``None``."""
+    scheduled: dict[str, ScheduledWake] = field(
+        default_factory=dict[str, ScheduledWake]
+    )
+    """Each line's pending scheduled wake, keyed by line. At most one per line."""
+    fired_dues: dict[str, str] = field(default_factory=dict[str, str])
+    """The due time of each scheduled wake that has fired, keyed by its note's message
+    identifier, so a turn can say when the wake was due."""
+    hold_questions: set[str] = field(default_factory=set[str])
+    """Every question Dromon asked on a line's behalf when it held the line, so an
+    operator's reply to one is not counted as mail the line must answer."""
+
+    withdrawn_wakes: set[str] = field(default_factory=set[str])
+    """The identifier of every withdrawn scheduled wake, which no later message,
+    task note or scheduled wake may take, so a reply reference to it cannot reach
+    another message. **Round 7 review, F1.**"""
 
     def copy(self) -> "State":
         """Return an independent snapshot. The records are frozen, so maps suffice."""
         return State(
-            dict(self.lines), set(self.operators), dict(self.messages), dict(self.wakes)
+            dict(self.lines),
+            set(self.operators),
+            dict(self.messages),
+            dict(self.wakes),
+            dict(self.agents),
+            self.project_overrides,
+            dict(self.scheduled),
+            dict(self.fired_dues),
+            set(self.hold_questions),
+            set(self.withdrawn_wakes),
         )
 
     def open_questions(self, operator_id: str) -> list[str]:
@@ -461,8 +784,22 @@ class State:
                     raise EventRejected(f"line {event.line_id} exists")
             case LineStateChanged():
                 self._check_line_state(event)
-            case LineConfigured() | LineSession():
+            case (
+                LineConfigured()
+                | LineSession()
+                | LineSessionCleared()
+                | LineOverridden()
+            ):
                 self._line(event.line_id)
+            case ProjectOverridden():
+                pass
+            case LineRebound():
+                line = self._line(event.line_id)
+                if (line.engine, line.strategy) == (event.engine, event.strategy):
+                    raise EventRejected(
+                        f"line {event.line_id} already runs {event.engine} with the"
+                        f" {event.strategy} strategy"
+                    )
             case LineHeld():
                 if self._line(event.line_id).held_by is not None:
                     raise EventRejected(f"line {event.line_id} is held")
@@ -477,6 +814,12 @@ class State:
             case OperatorRegistered():
                 if event.operator_id in self.operators:
                     raise EventRejected(f"operator {event.operator_id} exists")
+            case AgentRegistered():
+                pass
+            case AgentRevoked():
+                agent = self.agents.get(event.agent_id)
+                if agent is None or agent.revoked:
+                    raise EventRejected(f"no agent {event.agent_id} to revoke")
             case MessageSent():
                 self._check_message_sent(event)
             case MessageDelivered():
@@ -498,6 +841,20 @@ class State:
                 self._check_wake_requested(event)
             case WakeIssued():
                 self._check_wake_issued(event)
+            case WakeScheduled():
+                self._check_wake_scheduled(event)
+            case WakeWithdrawn():
+                self._line(event.line_id)
+                pending = self.scheduled.get(event.line_id)
+                if pending is None or pending.message_id != event.message_id:
+                    raise EventRejected(
+                        f"line {event.line_id} has no pending scheduled wake"
+                        f" {event.message_id}"
+                    )
+            case TaskNoted():
+                self._check_task_noted(event)
+            case LineCostMarked():
+                self._line(event.line_id)
             case QuestionWithdrawn():
                 self._open_question(event.message_id)
             case QuestionSuperseded():
@@ -522,6 +879,7 @@ class State:
             case LineHeld():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, held_by=event.question_id)
+                self.hold_questions.add(event.question_id)
             case LineReleased():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, held_by=None)
@@ -530,8 +888,30 @@ class State:
                 self.lines[event.line_id] = replace(
                     line, engine_session=event.engine_session
                 )
+            case LineSessionCleared():
+                line = self.lines[event.line_id]
+                self.lines[event.line_id] = replace(line, engine_session=None)
+            case LineRebound():
+                line = self.lines[event.line_id]
+                self.lines[event.line_id] = replace(
+                    line,
+                    engine=event.engine,
+                    strategy=event.strategy,
+                    engine_session=None,
+                    rebound=True,
+                )
+            case LineOverridden():
+                line = self.lines[event.line_id]
+                self.lines[event.line_id] = replace(line, overrides=event.overrides)
+            case ProjectOverridden():
+                self.project_overrides = event.overrides
             case OperatorRegistered():
                 self.operators.add(event.operator_id)
+            case AgentRegistered():
+                self.agents[event.agent_id] = Agent(event.access, event.token_sha256)
+            case AgentRevoked():
+                agent = self.agents[event.agent_id]
+                self.agents[event.agent_id] = replace(agent, revoked=True)
             case MessageSent():
                 self._apply_message_sent(event)
             case MessageDelivered():
@@ -550,6 +930,23 @@ class State:
             case WakeIssued():
                 wake = self.wakes[event.wake_id]
                 self.wakes[event.wake_id] = replace(wake, issued=True)
+            case WakeScheduled():
+                self.scheduled[event.line_id] = ScheduledWake(
+                    event.message_id, event.due, event.note
+                )
+            case WakeWithdrawn():
+                del self.scheduled[event.line_id]
+                self.withdrawn_wakes.add(event.message_id)
+            case LineCostMarked():
+                line = self.lines[event.line_id]
+                self.lines[event.line_id] = replace(
+                    line, cost_mark=(event.engine_session, event.total_micro_usd)
+                )
+            case TaskNoted():
+                address = LineAddress(event.line_id)
+                self.messages[event.message_id] = Message(
+                    address, address, MessageKind.NOTE, event.body, (), None
+                )
             case QuestionWithdrawn():
                 self._close(event.message_id, QuestionStatus.WITHDRAWN)
             case QuestionSuperseded():
@@ -582,6 +979,10 @@ class State:
             case OperatorAddress():
                 if address.operator_id not in self.operators:
                     raise EventRejected(f"no operator {address.operator_id}")
+            case AgentAddress():
+                agent = self.agents.get(address.agent_id)
+                if agent is None or agent.revoked:
+                    raise EventRejected(f"no agent {address.agent_id}")
             case _:
                 assert_never(address)
 
@@ -608,13 +1009,42 @@ class State:
                 f"line {event.line_id} cannot go from {line.state} to {event.state}"
             )
 
+    def _reserver(self, message_id: str) -> str | None:
+        """The line whose pending scheduled wake reserves ``message_id``, if any."""
+        for line_id, pending in self.scheduled.items():
+            if pending.message_id == message_id:
+                return line_id
+        return None
+
+    def _is_firing(self, event: MessageSent) -> bool:
+        """Whether ``event`` is the note of its sender's pending scheduled wake, the
+        only message a party may send itself."""
+        if not isinstance(event.sender, LineAddress) or event.sender != event.recipient:
+            return False
+        pending = self.scheduled.get(event.sender.line_id)
+        return (
+            pending is not None
+            and pending.message_id == event.message_id
+            and event.kind is MessageKind.NOTE
+            and event.body in (pending.note, WITHHELD_WAKE_NOTE)
+            and event.reply_to is None
+        )
+
     def _check_message_sent(self, event: MessageSent) -> None:
         if event.message_id in self.messages:
             raise EventRejected(f"message {event.message_id} exists")
+        self._check_withdrawn(event.message_id)
         self._require_party(event.sender)
         self._require_party(event.recipient)
-        if event.sender == event.recipient:
+        firing = self._is_firing(event)
+        if event.sender == event.recipient and not firing:
             raise EventRejected(f"{event.sender} cannot message itself")
+        reserver = self._reserver(event.message_id)
+        if reserver is not None and not firing:
+            raise EventRejected(
+                f"message {event.message_id} is reserved by line {reserver}'s"
+                " scheduled wake"
+            )
         if event.kind is MessageKind.QUESTION:
             if not isinstance(event.sender, LineAddress):
                 raise EventRejected("only a line asks a question")
@@ -657,6 +1087,36 @@ class State:
         if line.state is not LineState.IDLE:
             raise EventRejected(f"line {wake.line_id} is {line.state}, not idle")
 
+    def _check_withdrawn(self, message_id: str) -> None:
+        if message_id in self.withdrawn_wakes:
+            raise EventRejected(
+                f"message {message_id} was the identifier of a withdrawn wake"
+            )
+
+    def _check_wake_scheduled(self, event: WakeScheduled) -> None:
+        self._line(event.line_id)
+        if event.message_id in self.messages:
+            raise EventRejected(f"message {event.message_id} exists")
+        self._check_withdrawn(event.message_id)
+        reserver = self._reserver(event.message_id)
+        if reserver is not None and reserver != event.line_id:
+            raise EventRejected(
+                f"message {event.message_id} is reserved by line {reserver}'s"
+                " scheduled wake"
+            )
+
+    def _check_task_noted(self, event: TaskNoted) -> None:
+        self._line(event.line_id)
+        if event.message_id in self.messages:
+            raise EventRejected(f"message {event.message_id} exists")
+        self._check_withdrawn(event.message_id)
+        reserver = self._reserver(event.message_id)
+        if reserver is not None:
+            raise EventRejected(
+                f"message {event.message_id} is reserved by line {reserver}'s"
+                " scheduled wake"
+            )
+
     def _check_superseded(self, event: QuestionSuperseded) -> None:
         old = self._open_question(event.message_id)
         if event.superseded_by == event.message_id:
@@ -671,6 +1131,9 @@ class State:
     # Mutations.
 
     def _apply_message_sent(self, event: MessageSent) -> None:
+        if self._is_firing(event) and isinstance(event.sender, LineAddress):
+            fired = self.scheduled.pop(event.sender.line_id)
+            self.fired_dues[event.message_id] = fired.due
         status = QuestionStatus.OPEN if event.kind is MessageKind.QUESTION else None
         self.messages[event.message_id] = Message(
             event.sender,

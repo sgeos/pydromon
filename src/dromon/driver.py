@@ -5,7 +5,7 @@ and its reaction to each engine event, such as interrupting a turn that exceeds 
 tool budget. The host performs every action a driver yields, so no Python callable runs
 inside the bounded path and the driver's worst-case time covers its whole decision.
 
-Driver interface 2. The entry point is
+Driver interface 3. The entry point is
 ``loop main(input: (Event, State)) -> (Action, State)``, where an event and an action
 are ``(Text, Text, Word)`` and the state is ``(Word, Word, Word)``. The host owns the
 state between cycles, so the event log can record it and a restarted line can resume
@@ -19,6 +19,11 @@ limits while API usage is charged per token, so the strategies differ in what th
 accept and how they run the model. The engine reports the credential actually in use
 with a ``credential`` event, and the driver accepts or refuses it.
 
+Engines. Each driver names the engine it is written for, ``claude-code`` or ``codex``.
+A model has a packaged driver once its drivers are written, but a line can be created
+on it only once Dromon has an adapter for its engine, so a driver can be written and
+tested ahead of its adapter without a line ever running it on the wrong engine.
+
 Trust. Drivers ship with Dromon and are trusted code, but every yielded action is still
 checked, so a driver defect surfaces as ``DriverError`` and never as a silent misstep.
 """
@@ -30,12 +35,29 @@ from typing import Final, cast
 
 import keleusma
 
-INTERFACE_VERSION: Final = 2
+INTERFACE_VERSION: Final = 3
 MAX_SETTINGS: Final = 32
 """Upper bound on the settings a driver may declare, so reading them terminates."""
 
-MODELS: Final = ("claude-opus-5-5", "claude-haiku-5-5")
-"""Models with a packaged driver for every strategy."""
+ENGINE_OF: Final[dict[str, str]] = {
+    "claude-opus-5-5": "claude-code",
+    "claude-haiku-5-5": "claude-code",
+    "claude-fable-5-1": "claude-code",
+    "gpt-6-luna": "codex",
+    "grok-4.7": "grok-build",
+}
+"""Each model with a packaged driver for every strategy, and the engine it runs on."""
+
+ENGINES: Final = ("claude-code", "codex", "grok-build")
+"""The engines a driver may name."""
+
+ADAPTED_ENGINES: Final = frozenset({"claude-code", "codex", "grok-build"})
+"""The engines Dromon has an adapter for."""
+
+MODELS: Final = tuple(
+    model for model, engine in ENGINE_OF.items() if engine in ADAPTED_ENGINES
+)
+"""Models a line can be created on, those whose engine has an adapter."""
 
 type Triple = tuple[str, str, int]
 type DriverState = tuple[int, int, int]
@@ -67,7 +89,7 @@ class Strategy(StrEnum):
 
 def driver_resource(model: str, strategy: Strategy) -> str:
     """The packaged file name of the driver for ``model`` and ``strategy``."""
-    return f"{model.replace('-', '_')}_{strategy.value}.kel"
+    return f"{model.replace('-', '_').replace('.', '_')}_{strategy.value}.kel"
 
 
 class ActionTag(StrEnum):
@@ -94,6 +116,7 @@ class Action:
 
 @dataclass(frozen=True, slots=True)
 class DriverSettings:
+    engine: str
     strategy: Strategy
     model: str
     effort: str
@@ -150,18 +173,20 @@ class Driver:
         *,
         state: DriverState = INITIAL_STATE,
     ) -> "Driver":
-        """Load the packaged driver for ``model`` and ``strategy``."""
-        if model not in MODELS:
+        """Load the packaged driver for ``model`` and ``strategy``, whether or not its
+        engine has an adapter yet."""
+        if model not in ENGINE_OF:
             raise DriverError(f"no driver for model {model!r}")
         resource = resources.files("dromon.drivers").joinpath(
             driver_resource(model, strategy)
         )
         driver = cls(resource.read_text(encoding="utf-8"), state=state)
         found = driver.settings
-        if (found.model, found.strategy) != (model, strategy):
+        expected = (ENGINE_OF[model], model, strategy)
+        if (found.engine, found.model, found.strategy) != expected:
             raise DriverError(
                 f"the packaged driver for {model} {strategy} declares"
-                f" {found.model} {found.strategy}"
+                f" {found.model} {found.strategy} on {found.engine}"
             )
         return driver
 
@@ -219,6 +244,7 @@ class Driver:
             raise DriverError(f"the driver declares more than {MAX_SETTINGS} settings")
         required = {
             "interface",
+            "engine",
             "strategy",
             "model",
             "effort",
@@ -241,7 +267,11 @@ class Driver:
             raise DriverError(
                 f"the driver declares an unknown strategy {declared!r}"
             ) from error
+        engine = found["engine"][1]
+        if engine not in ENGINES:
+            raise DriverError(f"the driver names an unknown engine {engine!r}")
         settings = DriverSettings(
+            engine=engine,
             strategy=strategy,
             model=found["model"][1],
             effort=found["effort"][1],

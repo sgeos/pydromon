@@ -1,5 +1,6 @@
 """The packaged Keleusma drivers run through pykeleusma, and the host's checks."""
 
+import re
 from importlib import resources
 
 import pytest
@@ -7,6 +8,9 @@ import pytest
 from dromon.driver import (
     INITIAL_STATE,
     INTERFACE_VERSION,
+    ADAPTED_ENGINES,
+    ENGINE_OF,
+    ENGINES,
     MAX_SETTINGS,
     MODELS,
     ActionTag,
@@ -19,7 +23,8 @@ from dromon.driver import (
 
 OPUS = "claude-opus-5-5"
 HAIKU = "claude-haiku-5-5"
-EVERY_DRIVER = [(model, strategy) for model in MODELS for strategy in Strategy]
+LUNA = "gpt-6-luna"
+EVERY_DRIVER = [(model, strategy) for model in ENGINE_OF for strategy in Strategy]
 
 
 def packaged_source(
@@ -29,12 +34,19 @@ def packaged_source(
     return path.read_text(encoding="utf-8")
 
 
-def with_budget(budget: int) -> Driver:
-    source = packaged_source().replace(
-        "fn tool_budget() -> Word { 40 }", f"fn tool_budget() -> Word {{ {budget} }}"
+def budget_source(budget: int) -> str:
+    """The packaged Opus driver with its tool budget replaced, whatever it was."""
+    source = re.sub(
+        r"fn tool_budget\(\) -> Word \{ \d+ \}",
+        f"fn tool_budget() -> Word {{ {budget} }}",
+        packaged_source(),
     )
-    assert f"{{ {budget} }}" in source
-    return Driver(source)
+    assert f"fn tool_budget() -> Word {{ {budget} }}" in source
+    return source
+
+
+def with_budget(budget: int) -> Driver:
+    return Driver(budget_source(budget))
 
 
 @pytest.mark.parametrize(("model", "strategy"), EVERY_DRIVER)
@@ -43,6 +55,7 @@ def test_every_packaged_driver_declares_its_own_model_and_strategy(
 ) -> None:
     driver = Driver.for_model(model, strategy)
     assert (driver.settings.model, driver.settings.strategy) == (model, strategy)
+    assert driver.settings.engine == ENGINE_OF[model]
     assert driver.settings.max_turns >= 1
     assert driver.wcet_per_iteration > 0
     assert driver.state == INITIAL_STATE
@@ -75,7 +88,7 @@ def test_each_strategy_accepts_exactly_its_credentials(
         assert driver.state == INITIAL_STATE
 
 
-@pytest.mark.parametrize("model", MODELS)
+@pytest.mark.parametrize("model", ENGINE_OF)
 def test_metered_strategies_run_shorter_than_the_subscription(model: str) -> None:
     subscription = Driver.for_model(model, Strategy.SUBSCRIPTION).settings
     for metered in (Strategy.API, Strategy.FLEXIBLE):
@@ -92,6 +105,24 @@ def test_haiku_is_the_low_effort_testing_model() -> None:
     for strategy in Strategy:
         assert Driver.for_model(HAIKU, strategy).settings.effort == "low"
     assert Driver.for_model(OPUS, Strategy.SUBSCRIPTION).settings.effort == "high"
+
+
+def test_luna_runs_on_codex_with_the_catalogues_default_effort_and_window() -> None:
+    # Codex's model catalogue, fetched on 2026-10-25, gives GPT-6-Luna a default
+    # effort of medium and a context window of 272,000 tokens.
+    subscription = Driver.for_model(LUNA, Strategy.SUBSCRIPTION).settings
+    assert (subscription.engine, subscription.effort) == ("codex", "medium")
+    for strategy in Strategy:
+        assert Driver.for_model(LUNA, strategy).settings.context_window == 272000
+    for metered in (Strategy.API, Strategy.FLEXIBLE):
+        assert Driver.for_model(LUNA, metered).settings.effort == "low"
+
+
+def test_only_models_on_an_adapted_engine_can_carry_a_line() -> None:
+    assert set(MODELS) == {m for m, e in ENGINE_OF.items() if e in ADAPTED_ENGINES}
+    assert LUNA in MODELS
+    assert set(ENGINE_OF.values()) <= set(ENGINES)
+    assert set(ENGINES) >= ADAPTED_ENGINES
 
 
 @pytest.mark.parametrize(("model", "strategy"), EVERY_DRIVER)
@@ -137,7 +168,7 @@ def test_state_carries_across_a_restart() -> None:
     first = with_budget(1)
     first.step(Event("turn_start"))
     first.step(Event("tool_use", "Read"))
-    restarted = Driver(packaged_source().replace("{ 40 }", "{ 1 }"), state=first.state)
+    restarted = Driver(budget_source(1), state=first.state)
     assert restarted.step(Event("tool_use", "Bash")).tag is ActionTag.INTERRUPT
 
 
@@ -183,6 +214,7 @@ def driver_source(settings: str, action: str = '("continue", "", 0)') -> str:
 
 GOOD_SETTINGS = (
     f'0 => ("interface", "", {INTERFACE_VERSION}), 1 => ("model", "m", 0), '
+    '7 => ("engine", "codex", 0), '
     '6 => ("strategy", "flexible", 0), '
     '2 => ("effort", "high", 0), 3 => ("max_turns", "", 2), '
     '4 => ("tool_budget", "", 1), 5 => ("context_window", "", 10),'
@@ -212,12 +244,20 @@ def test_a_minimal_valid_driver_loads() -> None:
             "invalid settings",
         ),
         (
-            driver_source(GOOD_SETTINGS + ' 7 => ("model", "n", 0),'),
+            driver_source(GOOD_SETTINGS + ' 8 => ("model", "n", 0),'),
             "repeats the setting",
         ),
         (
             driver_source(GOOD_SETTINGS.replace('"flexible"', '"metered"')),
             "unknown strategy 'metered'",
+        ),
+        (
+            driver_source(GOOD_SETTINGS.replace('"codex"', '"gemini-cli"')),
+            "unknown engine 'gemini-cli'",
+        ),
+        (
+            driver_source(GOOD_SETTINGS.replace('7 => ("engine", "codex", 0), ', "")),
+            "omits the settings \\['engine'\\]",
         ),
     ],
 )
@@ -239,3 +279,43 @@ def test_an_unknown_action_is_refused() -> None:
     driver = Driver(driver_source(GOOD_SETTINGS, '("launch", "", 0)'))
     with pytest.raises(DriverError, match="unknown action 'launch'"):
         driver.step(Event("turn_start"))
+
+
+DEVELOPMENT_TOOL_BUDGET = 100
+DEVELOPMENT_TURNS = 50
+
+
+@pytest.mark.parametrize("model", list(ENGINE_OF))
+def test_subscription_drivers_allow_a_development_turn(model: str) -> None:
+    # A line that develops software reads, edits and runs a gate many times in one
+    # turn, so a subscription driver's budgets are sized for that. The per-line cost
+    # and autonomous-turn limits are the operator's safety net. Drivers that may bill
+    # per token keep their small budgets, which the strategy tests above order.
+    settings = Driver.for_model(model, Strategy.SUBSCRIPTION).settings
+    assert settings.tool_budget >= DEVELOPMENT_TOOL_BUDGET
+    assert settings.max_turns >= DEVELOPMENT_TURNS
+
+
+def test_fable_follows_the_opus_drivers_on_claude_code() -> None:
+    # No live turn has run on Claude Fable 5.1, so its settings copy Opus 5.5's,
+    # which are the development-scale ones on a subscription and small otherwise.
+    assert ENGINE_OF["claude-fable-5-1"] == "claude-code"
+    for strategy in Strategy:
+        fable = Driver.for_model("claude-fable-5-1", strategy).settings
+        opus = Driver.for_model(OPUS, strategy).settings
+        assert fable.model == "claude-fable-5-1"
+        assert (
+            fable.engine,
+            fable.strategy,
+            fable.effort,
+            fable.max_turns,
+            fable.tool_budget,
+            fable.context_window,
+        ) == (
+            opus.engine,
+            opus.strategy,
+            opus.effort,
+            opus.max_turns,
+            opus.tool_budget,
+            opus.context_window,
+        )

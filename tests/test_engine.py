@@ -7,6 +7,7 @@ deselection, and the variable keeps such a run from calling the engine by accide
 """
 
 import asyncio
+import re
 import os
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -30,6 +31,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
+from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon.driver import Credential, Driver, Strategy, driver_resource
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, McpServer, ToolPolicy
 from dromon.engine import (
@@ -132,12 +134,14 @@ def line(
     session: Scripted,
     driver: Driver | None = None,
     environment: Mapping[str, str] | None = None,
+    observe: Observer = ignore,
 ) -> ClaudeCodeLine:
     return ClaudeCodeLine(
         driver or Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
         Path("/work"),
         environment=environment or {},
         session_factory=session.factory,
+        observe=observe,
     )
 
 
@@ -170,6 +174,26 @@ def test_a_plain_turn_reports_text_capabilities_and_session() -> None:
     assert target.driver.state == (0, 1, 1)
 
 
+def test_the_turn_is_reported_to_the_observer_as_it_runs() -> None:
+    session = Scripted(
+        [
+            init(),
+            say(ThinkingBlock("", ""), TextBlock("rea"), TextBlock("dy")),
+            say(ToolUseBlock("t1", "mcp__dromon__send", {})),
+            result(),
+        ]
+    )
+    log = ActivityLog()
+    run(line(session, observe=log.observer("alpha")))
+    # Whole text blocks are not chunks, so each stays its own entry.
+    assert [(entry.kind, entry.text) for entry in log.after("alpha", 0)] == [
+        (ActivityKind.THINKING, ""),
+        (ActivityKind.TEXT, "rea"),
+        (ActivityKind.TEXT, "dy"),
+        (ActivityKind.TOOL, "mcp__dromon__send"),
+    ]
+
+
 def test_options_follow_the_driver_and_isolate_the_line() -> None:
     session = Scripted([init(), result()])
     target = line(session)
@@ -186,6 +210,12 @@ def test_options_follow_the_driver_and_isolate_the_line() -> None:
     assert options.cwd == "/work"
 
 
+def test_the_claude_code_adapter_refuses_a_driver_for_another_engine() -> None:
+    codex = Driver.for_model("gpt-6-luna", Strategy.SUBSCRIPTION)
+    with pytest.raises(EngineRefused, match="written for the codex engine"):
+        ClaudeCodeLine(codex, Path("/work"))
+
+
 def test_the_next_turn_resumes_the_engine_session() -> None:
     session = Scripted([init(), result()])
     target = line(session)
@@ -197,8 +227,8 @@ def test_the_next_turn_resumes_the_engine_session() -> None:
 def test_the_driver_budget_interrupts_a_turn_once() -> None:
     resource = driver_resource(MODEL, Strategy.SUBSCRIPTION)
     text = resources.files("dromon.drivers").joinpath(resource).read_text()
-    budgeted = text.replace(
-        "fn tool_budget() -> Word { 20 }", "fn tool_budget() -> Word { 1 }"
+    budgeted = re.sub(
+        r"fn tool_budget\(\) -> Word \{ \d+ \}", "fn tool_budget() -> Word { 1 }", text
     )
     assert budgeted != text
     driver = Driver(budgeted)
