@@ -43,6 +43,8 @@ class Operation(StrEnum):
     SETTINGS = "settings"
     SET_SETTING = "set_setting"
     CLEAR_SESSION = "clear_session"
+    REBIND_LINE = "rebind_line"
+    """Operator only. Not offered to external agents."""
     RELOAD_PROJECT = "reload_project"
     AGENT_ADD = "agent_add"
     AGENT_REVOKE = "agent_revoke"

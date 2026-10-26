@@ -210,6 +210,12 @@ def project_entries(
                 config.disclosure_terms or "none",
             ),
             info(
+                "leases",
+                "the leases lines may acquire, and how long each lasts",
+                (", ".join(config.lease_names) or "none")
+                + f", {config.lease_ttl_seconds} seconds",
+            ),
+            info(
                 "settings", "the project's engine settings", _present(config.settings)
             ),
             info(
@@ -285,6 +291,12 @@ def line_entries(facts: LineFacts, project: Sequence[Layer]) -> list[dict[str, o
             "workdir",
             "the directory the engine runs in, changed only by configuration",
             facts.config.workdir or "the project root",
+        ),
+        info(
+            "project_settings",
+            "whether the line loads Claude Code's project settings, changed only by"
+            " configuration",
+            "on" if facts.config.project_settings else "off",
         ),
     ]
     effort = config.effort

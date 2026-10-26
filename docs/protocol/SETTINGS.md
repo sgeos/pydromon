@@ -144,6 +144,80 @@ an `ask` rule refused a Bash call while an unmatched Bash call ran, and a
 `UserPromptSubmit` hook ran, saw a variable set in `env`, and its output reached the
 model.
 
+## Project settings
+
+**Decided by the operator on 2026-10-26.** A Claude Code line with `project_settings`
+set, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies, starts with Claude Code's
+`project` setting source instead of none. Dromon's own settings document still arrives
+through `--settings` as above.
+
+**Fact, read on 2026-10-26 in the Agent SDK 0.2.174 installed in this environment.**
+The docstring of `ClaudeAgentOptions.setting_sources` in `claude_agent_sdk/types.py`
+lists `"project"` as the project settings, `.claude/settings.json`, and says that the
+list must include `"project"` for `CLAUDE.md` files to load. The SDK's command builder
+in `claude_agent_sdk/_internal/transport/subprocess_cli.py` passes the list to Claude
+Code as `--setting-sources=project`. The docstring of `ClaudeAgentOptions.skills` says
+that enabling skills makes the SDK load the user and project sources so that Claude
+Code discovers installed skills. What Claude Code then reads is its own behaviour. It
+was not observed live by this line.
+
+**Inferences, not verified live.**
+
+- The working directory's `.claude/settings.json`, its `CLAUDE.md` files and its
+  project skills reach the line. `.claude/settings.local.json` is the separate `local`
+  source and does not.
+- A skill is used through the `Skill` tool, so a line that should use skills lists
+  `Skill` in `builtin_tools`, since the engine is offered only the configured tools.
+- A `CLAUDE.md` also named in `instructions` reaches the line twice.
+
+**What still holds, confirmed in code.** The engine is started with `tools` set to the
+line's configured built-in tools and with strict MCP configuration, as before. The init
+check compares every tool the engine reports with the configuration and refuses the
+turn on any other, whatever a project file declares. A test drives a turn whose engine
+offers `Skill` and `Bash` beyond a configured `Read` and sees it refused.
+
+**What a project allow rule could do.** Claude Code approves a call that matches an
+`allow` rule without consulting Dromon's permission gate, as section 3 above records
+for Dromon's own rules, and it merges such arrays across sources. A project
+`permissions.allow` rule could therefore approve a configured tool's call that the gate
+would refuse, such as an MCP tool of a configured server outside `allowed_tools`, or a
+shell call that asks to leave the sandbox.
+
+**Allowlists.** **Decided by the operator on 2026-10-26.** What the project source loads
+must not run code or grant anything. At the start of every turn, before the engine
+starts, Dromon checks what it would load under the line's working directory and refuses
+the turn, naming the file and the key or entry, unless all of these hold.
+
+| What | Accepted | Why only these |
+|---|---|---|
+| Keys of `.claude/settings.json` | `$schema`, `attribution`, `includeCoAuthoredBy` | The first names a schema for editors, and the others only choose attribution text in commits and pull requests |
+| Entries of `.claude` | `settings.json`, `settings.local.json`, `skills`, `CLAUDE.md` | The local settings are a source Dromon never loads. Commands, agents, hooks and output styles can grant tools or run commands |
+| Front matter keys of `.claude/skills/NAME/SKILL.md` | `name`, `description`, `license`, `version` | Keys such as `allowed-tools`, `hooks` and `model` grant a tool, run code or change the model |
+
+Every other settings key refuses the turn, explicitly including `hooks`, `mcpServers`,
+`enableAllProjectMcpServers`, `enabledMcpjsonServers`, `statusLine`, `permissions` of
+every kind, `sandbox`, `env` and the plugin keys, and any key Claude Code adds later. A
+line's hooks, such as Keleusma's mailbox reminders, belong in Dromon's own settings
+document, which the operator controls. The front matter of a skill is the block between
+a first line `---` and the next, read as top-level `name:` lines without a YAML parser,
+which is a limit. A missing `.claude` is accepted, and one that cannot be read, a
+settings file that is not a JSON object, or front matter that never ends refuses the
+turn.
+
+**What the line may not write.** A line with `Bash`, `PowerShell` or `Monitor` must run
+with an enabled sandbox. Every `project_settings` line's sandbox, whatever its tools,
+denies writes to its working directory's `.claude`, and its settings deny it to the
+built-in editing tools with an `Edit` rule, so the line cannot change what it loads.
+
+**Fact, read on 2026-10-26 in Claude Code 2.1.310, bundled with the Agent SDK 0.2.174
+in this environment.** The CLI's permission rule validator maps a rule for `Write`,
+`MultiEdit` or `NotebookEdit` with a path to `Edit`, warns that such a rule "is not
+matched by file permission checks", only `Edit(path)` rules are, because "Edit rules
+cover all file-editing tools", and for a deny rule adds a notice that it "never
+matches". This was read from the bundled executable's embedded source, not observed in
+a live turn. So Dromon hands over only the `Edit` rule, which covers `Write`, and no
+`Write` rule.
+
 ## Rules are guards, the sandbox is the barrier
 
 Claude Code matches a Bash rule against the command as written, so `ask` or `deny` on
@@ -171,6 +245,9 @@ secret belongs in the daemon's environment, where an MCP server can refer to it 
   model judge each call. Dromon has no reviewer. Its nearest equivalents are an
   allowlist with `allow` and `deny` rules, or `allow_all` inside an enabled sandbox, and
   a reviewer would spend usage the operator has not agreed to.
+- **Project and user settings.** Only the project source is available, through
+  `project_settings`, and only within the allowlists above. The user and local sources
+  are never loaded.
 - **Plugins and language servers.** The SDK loads only local plugin directories, and the
   official language server plugins declare their servers in their marketplace entry,
   not in the plugin directory. Dromon has no plugin layer, so `LSP` tools and plugin

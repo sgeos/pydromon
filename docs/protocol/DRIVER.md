@@ -36,6 +36,9 @@ subscription draws on a plan's limits while API usage is charged for every token
 | `claude_haiku_5_5_subscription.kel` | Claude Haiku 5.5 | subscription | low | 100 | 200 |
 | `claude_haiku_5_5_api.kel` | Claude Haiku 5.5 | api | low | 2 | 10 |
 | `claude_haiku_5_5_flexible.kel` | Claude Haiku 5.5 | flexible | low | 2 | 10 |
+| `claude_fable_5_1_subscription.kel` | Claude Fable 5.1 | subscription | high | 200 | 400 |
+| `claude_fable_5_1_api.kel` | Claude Fable 5.1 | api | medium | 4 | 20 |
+| `claude_fable_5_1_flexible.kel` | Claude Fable 5.1 | flexible | medium | 4 | 20 |
 | `gpt_6_luna_subscription.kel` | GPT-6-Luna on Codex | subscription | medium | 200 | 400 |
 | `gpt_6_luna_api.kel` | GPT-6-Luna on Codex | api | low | 2 | 10 |
 | `gpt_6_luna_flexible.kel` | GPT-6-Luna on Codex | flexible | low | 2 | 10 |
@@ -52,6 +55,12 @@ remain the operator's bound on a line's work. Drivers that may bill per token ke
 their small budgets.
 
 Claude Haiku 5.5 is the least expensive model and is the default for probes and tests.
+
+**Claude Fable 5.1 is not verified.** **Added on 2026-10-26 at the operator's
+direction.** Its drivers copy the Opus 5.5 drivers, model aside, including the context
+window of 1,000,000 tokens, which is assumed rather than read from any catalogue. No
+live turn has run on it. Whether a Claude subscription offers it through Claude Code,
+and so whether its subscription driver can ever accept a credential, is not verified.
 GPT-6-Luna's settings follow Codex's model catalogue as fetched on 2026-10-25, which
 gives it a default effort of medium and a context window of 272,000 tokens, and for a
 ChatGPT plan the subscription strategy means Codex's own sign-in.

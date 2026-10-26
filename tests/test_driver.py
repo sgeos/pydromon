@@ -294,3 +294,28 @@ def test_subscription_drivers_allow_a_development_turn(model: str) -> None:
     settings = Driver.for_model(model, Strategy.SUBSCRIPTION).settings
     assert settings.tool_budget >= DEVELOPMENT_TOOL_BUDGET
     assert settings.max_turns >= DEVELOPMENT_TURNS
+
+
+def test_fable_follows_the_opus_drivers_on_claude_code() -> None:
+    # No live turn has run on Claude Fable 5.1, so its settings copy Opus 5.5's,
+    # which are the development-scale ones on a subscription and small otherwise.
+    assert ENGINE_OF["claude-fable-5-1"] == "claude-code"
+    for strategy in Strategy:
+        fable = Driver.for_model("claude-fable-5-1", strategy).settings
+        opus = Driver.for_model(OPUS, strategy).settings
+        assert fable.model == "claude-fable-5-1"
+        assert (
+            fable.engine,
+            fable.strategy,
+            fable.effort,
+            fable.max_turns,
+            fable.tool_budget,
+            fable.context_window,
+        ) == (
+            opus.engine,
+            opus.strategy,
+            opus.effort,
+            opus.max_turns,
+            opus.tool_budget,
+            opus.context_window,
+        )

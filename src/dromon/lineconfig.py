@@ -183,6 +183,9 @@ class LineConfig:
     workdir: str | None = None
     """The directory the engine runs in, as written, or ``None`` for the project
     root."""
+    project_settings: bool = False
+    """Whether a Claude Code line also loads Claude Code's project setting source, the
+    working directory's ``.claude/settings.json`` and what it brings."""
 
     def allows(self, tool_name: str, own_tools: frozenset[str]) -> bool:
         """Whether the policy allows ``tool_name``. Dromon's own tools always pass."""
@@ -231,6 +234,8 @@ def encode_config(config: LineConfig) -> str:
         document["instructions"] = list(config.instructions)
     if config.workdir is not None:
         document["workdir"] = config.workdir
+    if config.project_settings:
+        document["project_settings"] = True
     return json.dumps(
         document,
         ensure_ascii=False,
@@ -371,6 +376,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         "claude_code_prompt",
         "instructions",
         "workdir",
+        "project_settings",
     }
     unknown = set(document) - allowed
     if unknown:
@@ -418,6 +424,9 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
     if len(set(instructions)) != len(instructions):
         _fail("instructions names a file twice")
     workdir = _workdir(document["workdir"]) if "workdir" in document else None
+    project_settings = document.get("project_settings", False)
+    if type(project_settings) is not bool:
+        _fail("project_settings must be a boolean")
     return LineConfig(
         builtin_tools=tuple(sorted(set(builtin))),
         mcp_servers=parse_servers(document.get("mcp_servers", {})),
@@ -430,6 +439,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         claude_code_prompt=prompt,
         instructions=instructions,
         workdir=workdir,
+        project_settings=project_settings,
     )
 
 

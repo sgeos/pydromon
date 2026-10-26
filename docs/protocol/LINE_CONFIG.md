@@ -41,6 +41,7 @@ keys, duplicate keys and numbers are refused.
 | `settings` | The line's own engine settings, as [`SETTINGS.md`](SETTINGS.md) specifies, before the project's are merged in. Omitted when unset | none |
 | `effort` | `low`, `medium`, `high`, `xhigh` or `max`, replacing the driver's effort. Omitted when unset | the driver's |
 | `claude_code_prompt` | Run a Claude Code line on Claude Code's own system prompt rather than an empty one. Omitted when false | `false` |
+| `project_settings` | Also load Claude Code's project setting source in the line's working directory, as [`SETTINGS.md`](SETTINGS.md) specifies. Refused on Codex and Grok lines. Omitted when false | `false` |
 | `instructions` | At most 16 distinct files, such as `CLAUDE.md`, whose text is appended to the system prompt at each turn. A relative path is resolved against the line's working directory and `~` against the home directory. Omitted when empty | none |
 | `workdir` | The directory the line's engine runs in, as the working directory section below specifies. Omitted when unset | the project root |
 
@@ -92,6 +93,32 @@ argument outside a tool's schema is refused.
 | `wake_after` | Schedules one wake for the line, as below |
 | `list_mail`, `read_mail`, `acknowledge_mail` | Page through, open and acknowledge the line's mailbox |
 | `list_sent` | Lists what became of the line's sent mail |
+| `acquire_lease`, `release_lease` | Take and give up a lease the project declares, as below |
+
+**Leases.** **Decided by the operator on 2026-10-26.** A project declares named leases
+in its `[leases]` table, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, so its
+lines can take turns at a shared resource, such as a machine that runs one full gate at
+a time.
+
+- **`acquire_lease`.** Argument `name`. It succeeds when no line holds the lease, and
+  answers with the lease's end, the wall clock in Coordinated Universal Time plus the
+  project's time to live, rounded up to the whole second. It is refused while any line
+  holds it, naming the holder and when that lease ends, including the line itself, so
+  one acquisition lasts at most one time to live. The holder may acquire it again once
+  it has expired. Expiry follows the daemon's wall clock, so a change of that clock
+  moves it. A name the project does not declare is refused, listing the declared
+  names.
+- **`release_lease`.** Argument `name`. It ends the line's lease, and is refused for a
+  lease the line does not hold.
+- **Ends.** A lease ends when released, when its time to live passes, when its holder's
+  engine session is cleared, whether by `clear_session` or by a change of its
+  `workdir`, when its holder is rebound, and when a reload stops declaring its name.
+- **Memory only.** Leases live in the daemon's memory and are not events, so a restart
+  drops every lease. A resource a stopped daemon's lines were using is then no longer
+  guarded, which suits a resource such as a gate whose processes the operator restarts
+  too. A line that needs the lease after a restart acquires it again.
+- **Visibility.** `status` and `line_view` show the leases each line holds.
+- **Agents.** External agents have no lease tools.
 
 **`wake_after`.** **Decided by the operator on 2026-10-26.** A line that starts a long
 command in the background, which survives the end of its turn, needs a way to be woken

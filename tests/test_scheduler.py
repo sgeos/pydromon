@@ -1247,6 +1247,7 @@ def test_a_line_switches_models_only_within_its_engine(make_world: MakeWorld) ->
     assert target.scheduler.model_choices("alpha") == (
         "claude-opus-5-5",
         "claude-haiku-5-5",
+        "claude-fable-5-1",
     )
     target.scheduler.override_line("alpha", "model", "claude-opus-5-5")
     assert target.scheduler.model_of("alpha") == "claude-opus-5-5"

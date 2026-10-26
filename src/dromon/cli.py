@@ -49,6 +49,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "ack": "acknowledge a message without replying",
     "sent": "show what became of the mail an operator sent",
     "release": "resume a line the daemon held at a conversation limit",
+    "rebind": "move a line to another model and strategy, keeping its identity",
     "settings": "show the project's settings, and a line's, with where each comes from",
     "set": "change a project or line setting, or return it to the layers below",
     "reload": "read the project file again and apply its lines, limits and wake policy",
@@ -603,6 +604,15 @@ def _release(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return _request(paths, "release", Operation.RELEASE, args)
 
 
+def _rebind(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    args: dict[str, object] = {
+        "line_id": arguments.line_id,
+        "model": arguments.model,
+        "strategy": arguments.strategy,
+    }
+    return _request(paths, "rebind", Operation.REBIND_LINE, args)
+
+
 def _settings(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     args: dict[str, object] = {}
     if arguments.line_id is not None:
@@ -731,6 +741,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "ack": _ack,
     "sent": _sent,
     "release": _release,
+    "rebind": _rebind,
     "settings": _settings,
     "set": _set,
     "reload": _reload,
@@ -835,6 +846,17 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     for name, help_text in SUBCOMMANDS.items():
         command = commands.add_parser(name, help=help_text, description=help_text)
+        if name == "rebind":
+            command.add_argument("line_id", help="the line to move")
+            command.add_argument(
+                "--model", required=True, choices=MODELS, help="the new model"
+            )
+            command.add_argument(
+                "--strategy",
+                required=True,
+                choices=[strategy.value for strategy in Strategy],
+                help="the new driver's credential strategy",
+            )
         if name == "release":
             command.add_argument("line_id", help="the held line")
         if name == "settings":

@@ -67,6 +67,29 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- `rebind_line` and `dromon rebind LINE --model M --strategy S` move a line to another
+  model and driver strategy, recorded as the new `line_rebound` event. The line keeps
+  its identity, mailbox, configuration and overrides, its model override is dropped,
+  its engine session is cleared and its engine rebuilt. A rebind that changes nothing,
+  has no driver or adapter, or that the new engine cannot run is refused, as is one
+  during a turn. It is operator only. The project file's check of a line's model and
+  strategy compares with the current binding.
+- `project_settings`, a line key, starts a Claude Code line with Claude Code's project
+  setting source, so its working directory's `.claude/settings.json`, skills and
+  `CLAUDE.md` load. At the start of every turn, what it would load is checked against
+  allowlists: the settings file may set only `$schema`, `attribution` and
+  `includeCoAuthoredBy`, `.claude` may hold only the settings files, `skills` and
+  `CLAUDE.md`, and a skill's front matter only `name`, `description`, `license` and
+  `version`. Anything else refuses the turn, hooks and permissions included. A shell
+  line needs an enabled sandbox, and every such line's sandbox and `Edit` rules deny
+  writes to the working directory's `.claude`. Codex and Grok lines refuse it.
+- Leases. A project's `[leases]` table declares names and a time to live, and lines
+  gain `acquire_lease` and `release_lease`. A lease held by any line, the caller
+  included, cannot be acquired until it ends. A lease ends when released, when its time
+  passes, when its holder's session is cleared or its holder is rebound, and at a
+  restart, since leases live in memory. `status` shows held leases.
+- Packaged drivers for Claude Fable 5.1 on Claude Code in the three strategies, copying
+  the Opus 5.5 settings. No live turn has run on it.
 - Lines gain `wake_after`, which schedules one wake from 60 to 86,400 seconds ahead,
   replacing any pending one. It is recorded as the new `wake_scheduled` event with its
   due time in Coordinated Universal Time, and fires at the first tick after the due

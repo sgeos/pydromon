@@ -31,6 +31,7 @@ from dromon.model import (
     LineOverridden,
     LineSession,
     LineSessionCleared,
+    LineRebound,
     ProjectOverridden,
     LineState,
     LineStateChanged,
@@ -60,6 +61,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "line_configured": ("line_id", "config"),
     "line_session": ("line_id", "engine_session"),
     "line_session_cleared": ("line_id",),
+    "line_rebound": ("line_id", "engine", "strategy"),
     "line_overridden": ("line_id", "overrides"),
     "project_overridden": ("overrides",),
     "line_held": ("line_id", "question_id"),
@@ -171,6 +173,12 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
             }
         case LineSessionCleared():
             return "line_session_cleared", {"line_id": event.line_id}
+        case LineRebound():
+            return "line_rebound", {
+                "line_id": event.line_id,
+                "engine": event.engine,
+                "strategy": event.strategy,
+            }
         case LineOverridden():
             return "line_overridden", {
                 "line_id": event.line_id,
@@ -250,6 +258,10 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
             return LineSession(_str(data, "line_id"), _str(data, "engine_session"))
         case "line_session_cleared":
             return LineSessionCleared(_str(data, "line_id"))
+        case "line_rebound":
+            return LineRebound(
+                _str(data, "line_id"), _str(data, "engine"), _str(data, "strategy")
+            )
         case "line_overridden":
             return LineOverridden(_str(data, "line_id"), _str(data, "overrides"))
         case "project_overridden":

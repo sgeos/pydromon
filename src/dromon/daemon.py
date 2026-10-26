@@ -420,6 +420,7 @@ class Daemon:
                 | Operation.SETTINGS
                 | Operation.SET_SETTING
                 | Operation.CLEAR_SESSION
+                | Operation.REBIND_LINE
                 | Operation.RELOAD_PROJECT
                 | Operation.AGENT_ADD
                 | Operation.AGENT_REVOKE
@@ -465,6 +466,8 @@ class Daemon:
                     (line_id,) = _text_args(request.args, ("line_id",))
                     self.scheduler.clear_session(line_id)
                     result = {"line_id": line_id}
+                case Operation.REBIND_LINE:
+                    result = self._rebind_line(request.args)
                 case Operation.RELOAD_PROJECT:
                     result = self._reload_project(request.args)
                 case Operation.AGENT_ADD:
@@ -535,6 +538,33 @@ class Daemon:
         )
         self.scheduler.configure_line(line_id, config)
         return {"line_id": line_id}
+
+    def _rebind_line(self, args: dict[str, object]) -> dict[str, object]:
+        """Move a line to another model and strategy, as only an operator may.
+
+        Besides the scheduler's own checks, a line moving onto Codex or Grok is
+        refused while the project's own sandbox or settings would reach it, and a
+        line moving onto Claude Code is refused when the project requires a sandbox
+        it lacks, as at ``create_line``.
+        """
+        line_id, model, strategy = _text_args(args, ("line_id", "model", "strategy"))
+        try:
+            chosen = Strategy(strategy)
+        except ValueError as error:
+            raise DriverError(f"unknown strategy {strategy!r}") from error
+        if line_id not in self.log.state.lines:
+            raise EventRejected(f"no line {line_id}")
+        engine = ENGINE_OF.get(model)
+        own = self.project.sandbox is not None or self.project.settings is not None
+        if engine in (codex.ENGINE_NAME, grok.ENGINE_NAME) and own:
+            raise ConfigError(
+                f"the project's sandbox or settings would apply to line {line_id},"
+                f" which on {model} runs in its engine's own sandbox and takes neither"
+            )
+        config = self.scheduler.effective_config(line_id)
+        check_sandbox_required(self.project, line_id, model, config)
+        self.scheduler.rebind_line(line_id, model, chosen)
+        return {"line_id": line_id, "model": model, "strategy": chosen.value}
 
     def _check_workdir(self, config: LineConfig) -> None:
         """Refuse a working directory that does not exist or is not allowed, before
@@ -815,6 +845,7 @@ class Daemon:
                 self.scheduler.set_line_policy(line_id, None, None)
         apply_project(self.scheduler, self.log, config)
         self.scheduler.set_disclosure_terms(terms)
+        self.scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
         self.project = config
         self.project_file_present = present
         self.apply_project_values()
@@ -1297,9 +1328,11 @@ def resolve(config: ProjectConfig, overrides: Overrides) -> tuple[Limits, str, f
 
 
 def check_project(log: EventLog, config: ProjectConfig) -> None:
-    """Raise ``ProjectMismatch`` if the file changes a line's model or strategy, which
-    are fixed when it is created, so that nothing is applied from such a file. A
-    client may still switch a line's model within its engine, as an override."""
+    """Raise ``ProjectMismatch`` if the file changes a line's model or strategy, so
+    that nothing is applied from such a file. The comparison is with the line's
+    current binding, which ``rebind_line`` may have moved since the line was created,
+    so a file updated after a rebind matches. A client may still switch a line's model
+    within its engine, as an override."""
     for line_id, definition in sorted(config.lines.items()):
         existing = log.state.lines.get(line_id)
         if existing is not None and (existing.engine, existing.strategy) != (
@@ -1310,7 +1343,8 @@ def check_project(log: EventLog, config: ProjectConfig) -> None:
                 f"line {line_id} runs {existing.engine} with the"
                 f" {existing.strategy} strategy, but the project file says"
                 f" {definition.model} with"
-                f" {definition.strategy}. Create a new line instead."
+                f" {definition.strategy}. Change the file to the line's current"
+                " binding, rebind the line, or create a new line instead."
             )
 
 
@@ -1397,6 +1431,7 @@ def run(
                 wake_every_ticks=config.wake_every_ticks,
             )
             scheduler.set_disclosure_terms(terms)
+            scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
             check_lines_sandboxed(config, log, scheduler)
             apply_project(scheduler, log, config)
             teacher = start_teacher(config, paths)

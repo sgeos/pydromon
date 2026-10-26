@@ -332,6 +332,22 @@ class LineSessionCleared:
 
 
 @dataclass(frozen=True, slots=True)
+class LineRebound:
+    """A line now runs ``engine``, a model, with the driver ``strategy``, as an operator
+    asked. Its identity, mailbox, configuration and overrides stay, and its next turn
+    starts a new engine session."""
+
+    line_id: str
+    engine: str
+    strategy: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_id("engine", self.engine)
+        check_id("strategy", self.strategy)
+
+
+@dataclass(frozen=True, slots=True)
 class LineOverridden:
     """The settings an operator changed for a line from a client, as the canonical
     JSON of ``dromon.overrides``, replacing the line's earlier overrides whole."""
@@ -540,6 +556,7 @@ type Event = (
     | LineConfigured
     | LineSession
     | LineSessionCleared
+    | LineRebound
     | LineOverridden
     | ProjectOverridden
     | LineHeld
@@ -680,6 +697,13 @@ class State:
                 self._line(event.line_id)
             case ProjectOverridden():
                 pass
+            case LineRebound():
+                line = self._line(event.line_id)
+                if (line.engine, line.strategy) == (event.engine, event.strategy):
+                    raise EventRejected(
+                        f"line {event.line_id} already runs {event.engine} with the"
+                        f" {event.strategy} strategy"
+                    )
             case LineHeld():
                 if self._line(event.line_id).held_by is not None:
                     raise EventRejected(f"line {event.line_id} is held")
@@ -758,6 +782,14 @@ class State:
             case LineSessionCleared():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, engine_session=None)
+            case LineRebound():
+                line = self.lines[event.line_id]
+                self.lines[event.line_id] = replace(
+                    line,
+                    engine=event.engine,
+                    strategy=event.strategy,
+                    engine_session=None,
+                )
             case LineOverridden():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, overrides=event.overrides)
