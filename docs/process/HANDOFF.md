@@ -58,12 +58,11 @@ completed, moved or abandoned.
     `LINE_CONFIG.md`, `PROJECT_CONFIG.md`, `SANDBOX.md`, `SETTINGS.md`, `CODEX.md`,
     `TEACHER.md` and `AGENTS.md`.
 - **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310, and
-  `pykeleusma` from its repository at `19d4558`, which needs a Rust toolchain to build.
+  `pykeleusma==0.2.2.0` from PyPI, whose wheels need no Rust toolchain.
 - **Published.** Public `sgeos/pydromon`, 0BSD, over HTTPS with the GitHub CLI as
   credential helper, synced with `sgeos/project-template` at `f829df4`. CI runs `scripts/check.sh`
   on Ubuntu and macOS for Python 3.12 and 3.15. Repository settings and the `main`
   ruleset of `.github/rulesets/main.json` were applied on 2026-10-25.
-- **pykeleusma.** Cannot yet drive a script, its task 5. Dromon does not need it.
 
 ## Next step
 
@@ -75,7 +74,8 @@ the operator, per `docs/architecture/KELEUSMA_DOGFOOD.md`.
 ## Open
 
 - **pykeleusma shared data.** Its task 11. The VM now owns a persistent zeroed block.
-  Drivers keep host-carried state by choice. Adopting it means repinning `pykeleusma`.
+  Drivers keep host-carried state by choice. Release `0.2.2.0` has it, through
+  `shared=` on `call` and `resume`, so adopting it needs no repin.
 - **Subscription usage.** Plan terms assume ordinary use, which many lines may exceed.
 - **Event log.** Loaded whole, no compaction or migration. Limit counts reset on restart.
 - **Operator relays.** Inbound adapters are deferred, per `RELAY.md`.

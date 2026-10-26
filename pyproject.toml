@@ -15,11 +15,12 @@ license-files = ["LICENSE"]
 authors = [{ name = "Brendan Sechter", email = "sgeos@hotmail.com" }]
 requires-python = ">=3.12"
 # Both are pinned exactly. The Agent SDK bundles the Claude Code binary, so its version
-# fixes the engine's behaviour. pykeleusma is not on PyPI and builds from its
-# repository at a reviewed commit, which needs a Rust toolchain.
+# fixes the engine's behaviour. pykeleusma's version names the Keleusma release it
+# binds, 0.2.2, and its own release against it. Its wheels need no Rust toolchain, and
+# only a platform without a wheel builds it from source with one.
 dependencies = [
     "claude-agent-sdk==0.2.174",
-    "pykeleusma",
+    "pykeleusma==0.2.2.0",
 ]
 classifiers = [
     "Development Status :: 1 - Planning",
@@ -38,9 +39,6 @@ dev = ["pytest==9.1.1", "ruff==0.17.2", "pyright==1.1.414"]
 
 [tool.uv.build-backend]
 module-name = "dromon"
-
-[tool.uv.sources]
-pykeleusma = { git = "https://github.com/sgeos/pykeleusma", rev = "19d4558ad6d4afa66e496c1fdef75cca98a249e3" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

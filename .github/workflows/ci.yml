@@ -60,16 +60,10 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # The cache keeps the pykeleusma wheel, which otherwise builds from source.
+      # pykeleusma installs from its published wheels, so no Rust toolchain is needed.
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
-
-      # pykeleusma is a git dependency with a Rust extension, so it needs cargo.
-      - name: Install the Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
 
       # The gate fails without shellcheck, so that a green run never means "not
       # checked". Ubuntu runners include it, and macOS runners may not.

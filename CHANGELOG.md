@@ -79,6 +79,11 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- `pykeleusma` is pinned to its first PyPI release, `0.2.2.0`, in place of commit
+  `19d4558` of its repository. Every call Dromon makes is unchanged, and the packaged
+  drivers run as before. The release has wheels for Python 3.12 or later on Linux,
+  macOS and Windows, so CI no longer installs a Rust toolchain, and the README no
+  longer asks for one.
 - A compaction's `trigger` is only what the engine reported, with a `trigger_note`,
   so a Codex compaction, which reports none, no longer shows a `manual` that Dromon
   made up. A Codex compaction is reported as such even when Dromon had no earlier

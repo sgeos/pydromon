@@ -543,12 +543,13 @@ of the data model. The specification is [`../protocol/EVENT_LOG.md`](../protocol
 
 ## Keleusma
 
-**Decided.** The prototype uses the `pykeleusma` wrapper. The final implementation is in
-Keleusma, entirely or almost entirely.
+**Decided.** The prototype uses the `pykeleusma` wrapper, pinned to its PyPI release
+`0.2.2.0`, which binds Keleusma 0.2.2. The final implementation is in Keleusma,
+entirely or almost entirely.
 
 **Proposed.** Keleusma's bounded execution suits the harness's policy layer, such as
 message routing, wake policy and permission checks, where a hook must never hang. Use it
-there once `pykeleusma` can run scripts, which it could not on 2026-10-24. The needs,
+there, since `pykeleusma` runs scripts, as the per-model drivers show. The needs,
 mapped to the binding's tasks, are in [`KELEUSMA_INTEGRATION.md`](KELEUSMA_INTEGRATION.md).
 
 ## Teacher models
