@@ -129,6 +129,7 @@ from dromon.engine import (
     MAX_COMMAND_CHARACTERS,
     BackgroundEnd,
     ClaudeCodeLine,
+    EnginePlanLimit,
     EngineRefused,
     TurnReport,
     composed_instructions,
@@ -3228,6 +3229,10 @@ class Scheduler:
                 ending = "interrupted by an operator"
             self._count_interrupted(line_id, engine)
             raise
+        except EnginePlanLimit as error:
+            self.hold(line_id, str(error))
+            ending = f"held: {error}"
+            print(f"dromond: line {line_id} held: {error}", file=sys.stderr)
         except Exception as error:  # noqa: BLE001
             # The boundary between the scheduler and an engine. Any engine failure
             # ends only this turn, and is reported rather than crashing the daemon.

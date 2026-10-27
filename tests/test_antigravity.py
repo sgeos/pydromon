@@ -12,7 +12,7 @@ from collections import deque
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
@@ -247,6 +247,8 @@ class FakeRuntime:
         self.arguments: list[str] = []
         self.cwd = ""
         self.environment: dict[str, str] = {}
+        self.blocked_method: str | None = None
+        self.activity_delay = 0.0
 
     def methods(self) -> list[str]:
         return [str(m["method"]) for m in self.sent if "method" in m]
@@ -266,6 +268,8 @@ class FakeRuntime:
         self.sent.append(dict(message))
         method = message.get("method")
         request_id = message.get("id")
+        if method == self.blocked_method:
+            return
         if method == "initialize":
             self._respond(request_id, self.init)
         elif method == "authenticate":
@@ -308,7 +312,10 @@ class FakeRuntime:
             if item is OTHER_TEXT:
                 raise NotJsonLine(b"Traceback (most recent call last):\n")
             assert isinstance(item, dict)
-            return dict(item)  # pyright: ignore[reportUnknownArgumentType]
+            message = cast(dict[str, Any], item)
+            if message.get("method") == "session/update":
+                await asyncio.sleep(self.activity_delay)
+            return message
         await self.stopped.wait()
         return None
 
@@ -368,6 +375,8 @@ def line(
     loaded: Driver | None = None,
     tools: bool = False,
     turn_seconds: float | None = None,
+    first_output_seconds: float | None = None,
+    absolute_turn_seconds: float | None = None,
     cost_mark: tuple[str, float] | None = None,
 ) -> AntigravityLine:
     @asynccontextmanager
@@ -390,6 +399,10 @@ def line(
         extra["observe"] = observe.observer("alpha")
     if turn_seconds is not None:
         extra["turn_seconds"] = turn_seconds
+    if first_output_seconds is not None:
+        extra["first_output_seconds"] = first_output_seconds
+    if absolute_turn_seconds is not None:
+        extra["absolute_turn_seconds"] = absolute_turn_seconds
     if tools:
         extra |= {
             "mcp_tools": [SEND],
@@ -1317,10 +1330,68 @@ def test_a_turn_past_its_deadline_is_cancelled_and_refused(
     home: Path, runtime: Path
 ) -> None:
     server = FakeRuntime([said("x")], stop=None, answers_cancel=False)
-    with pytest.raises(EngineRefused, match="deadline of 0.05 seconds"):
+    with pytest.raises(EngineRefused, match="no activity for 0.05 seconds"):
         run(line(server, home, runtime, turn_seconds=0.05))
     assert "session/cancel" in server.methods()
     assert server.stops == 1
+
+
+def test_no_first_output_has_a_bounded_stage_named_failure(
+    home: Path, runtime: Path
+) -> None:
+    server = FakeRuntime([], stop=None)
+    target = line(server, home, runtime, first_output_seconds=0.01)
+    with pytest.raises(
+        EngineRefused, match="first model output before its first output"
+    ):
+        run(target)
+    assert server.stops == 1
+
+    stalled_sign_in = FakeRuntime()
+    stalled_sign_in.blocked_method = "authenticate"
+    target = line(stalled_sign_in, home, runtime, first_output_seconds=0.01)
+    with pytest.raises(EngineRefused, match="sign-in before its first output"):
+        run(target)
+    assert stalled_sign_in.stops == 1
+
+
+def test_stage_is_reset_for_each_antigravity_turn(home: Path, runtime: Path) -> None:
+    server = FakeRuntime()
+    target = line(server, home, runtime, first_output_seconds=0.01)
+    run(target)
+    server.blocked_method = "initialize"
+    with pytest.raises(EngineRefused, match="initialize before its first output"):
+        run(target)
+
+
+def test_antigravity_sliding_deadline_has_an_absolute_cap(
+    home: Path, runtime: Path
+) -> None:
+    active = FakeRuntime([said(str(index)) for index in range(6)])
+    active.activity_delay = 0.02
+    report = run(
+        line(
+            active,
+            home,
+            runtime,
+            turn_seconds=0.1,
+            absolute_turn_seconds=0.5,
+        )
+    )
+    assert report.text == "012345"
+
+    capped = FakeRuntime([said(str(index)) for index in range(10)])
+    capped.activity_delay = 0.02
+    with pytest.raises(EngineRefused, match="absolute cap of 0.15 seconds"):
+        run(
+            line(
+                capped,
+                home,
+                runtime,
+                turn_seconds=0.1,
+                absolute_turn_seconds=0.15,
+            )
+        )
 
 
 # The factory and the probe.

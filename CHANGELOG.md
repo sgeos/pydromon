@@ -7,6 +7,22 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Bounded engine waits and Codex subscription-limit handling. Grok has separate
+  initialization and turn deadlines. Antigravity has a deadline through its first
+  model output, with the stalled stage named. Codex fails pending requests after a
+  bounded output-close wait, pages background terminal listings, treats unfinished
+  paging as unknown, reports inherited thread usage correctly and holds a line after
+  a plan limit with its reported reset time.
+- Grok Build 1.0.70 help was read on 2026-10-26. It exposes `--always-approve`, but
+  neither `grok agent --help` nor `grok agent stdio --help` exposes a permission-mode
+  flag. Dromon does not pass an unsupported option and continues to set and verify the
+  session's default mode through ACP.
+- Kept Codex sessions preserve unknown terminal state after a failed or oversized
+  listing, and a plan limit from a listing now reaches the scheduler's hold path. Plan
+  classification prefers inferred structured error codes and rejects an unrelated
+  `quota` message. Grok and Antigravity use sliding inactivity deadlines under a named
+  four hour absolute turn cap. Pi and Cursor keep their existing absolute turn bound.
+
 - Daemon guarantees from rows 1, 2, 4, 5 and 12 of the T3 Code review, with the
   operator's decisions A and B of 2026-10-26.
   - **Row 1, a stop stops.** An operator's interrupt now withdraws the line's pending

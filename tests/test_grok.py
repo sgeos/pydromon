@@ -158,6 +158,8 @@ class FakeGrok:
         self.prompt_id: object = None
         self.answer_prompt = True
         self.ignores_cancel = False
+        self.blocked_method: str | None = None
+        self.activity_delay = 0.0
         """Whether this Grok neither answers a cancel nor closes, so waits block."""
         self.stops = 0
 
@@ -189,6 +191,8 @@ class FakeGrok:
             return
         if not isinstance(method, str) or "id" not in sent:
             return
+        if method == self.blocked_method:
+            return
         reply = {"jsonrpc": "2.0", "id": sent["id"]}
         if method == "initialize":
             self.queue.append(
@@ -217,9 +221,12 @@ class FakeGrok:
 
     async def receive(self) -> dict[str, Any] | None:
         await asyncio.sleep(0)
-        if not self.queue and self.ignores_cancel:
+        if not self.queue and (self.ignores_cancel or self.blocked_method is not None):
             await asyncio.Event().wait()
-        return self.queue.popleft() if self.queue else None
+        message = self.queue.popleft() if self.queue else None
+        if message is not None and message.get("method") == "session/update":
+            await asyncio.sleep(self.activity_delay)
+        return message
 
 
 def line(
@@ -770,6 +777,50 @@ def test_a_closed_connection_refuses_the_turn(
     server.answer_prompt = False
     with pytest.raises(EngineRefused, match="closed its connection"):
         run(line(server, project))
+
+
+def test_grok_start_and_turn_deadlines_are_bounded(
+    project: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(grok_module, "START_SECONDS", 0.01)
+    stalled_start = FakeGrok()
+    stalled_start.blocked_method = "session/new"
+    with pytest.raises(EngineRefused, match="start timed out during open session"):
+        run(line(stalled_start, project))
+    assert stalled_start.stops == 1
+
+    stalled_initialize = FakeGrok()
+    stalled_initialize.blocked_method = "initialize"
+    with pytest.raises(EngineRefused, match="start timed out during initialize"):
+        run(line(stalled_initialize, project))
+    assert stalled_initialize.stops == 1
+
+    monkeypatch.setattr(grok_module, "TURN_SECONDS", 0.1)
+    stalled_turn = FakeGrok()
+    stalled_turn.answer_prompt = False
+    stalled_turn.ignores_cancel = True
+    with pytest.raises(
+        EngineRefused, match="Grok turn had no activity for 0.1 seconds"
+    ):
+        run(line(stalled_turn, project))
+    assert stalled_turn.stops == 1
+
+
+def test_grok_sliding_deadline_resets_on_activity_and_obeys_absolute_cap(
+    project: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(grok_module, "TURN_SECONDS", 0.1)
+    monkeypatch.setattr(grok_module, "ABSOLUTE_TURN_SECONDS", 0.5)
+    active = FakeGrok([chunk(str(index)) for index in range(6)])
+    active.activity_delay = 0.02
+    report = run(line(active, project))
+    assert report.text == "012345"
+
+    monkeypatch.setattr(grok_module, "ABSOLUTE_TURN_SECONDS", 0.15)
+    capped = FakeGrok([chunk(str(index)) for index in range(10)])
+    capped.activity_delay = 0.02
+    with pytest.raises(EngineRefused, match="absolute cap of 0.15 seconds"):
+        run(line(capped, project))
 
 
 def test_the_grok_adapter_refuses_a_driver_for_another_engine(
