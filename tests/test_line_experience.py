@@ -43,6 +43,7 @@ from dromon.model import (
     State,
 )
 from dromon.scheduler import (
+    MAX_LINE_STATUS_DEFAULT_BYTES,
     MAX_SCRATCH_BYTES,
     UNRELEASED_NOTE,
     LineSpec,
@@ -152,7 +153,7 @@ def world(tmp_path: Path) -> Generator[World]:
 # R2 to R4, line_status.
 
 
-def test_line_status_shows_the_line_its_daemon_and_the_others(world: World) -> None:
+def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
     scheduler = world.scheduler
     secret_config = LineConfig(
         builtin_tools=("Read",),
@@ -172,41 +173,84 @@ def test_line_status_shows_the_line_its_daemon_and_the_others(world: World) -> N
     assert status["line_id"] == "alpha" and status["held_by"] == question
     turns = status["autonomous_turns"]
     assert (turns["used"], turns["allowed"]) == (0, 5)
-    assert turns["current_turn_counts"] is None
     assert status["cost_usd"] == {
+        "estimate": "0.2500",
+        "basis": "exact",
+        "limit": "3.00",
+    }
+    assert status["scheduled_wake"] == {"due": due, "message_id": message_id}
+    assert status["unread"] == 1 and status["pending"] == 0
+    assert (status["model"], status["strategy"]) == (HAIKU, "subscription")
+    assert status["daemon"]["version"] == __version__
+    assert "recent_turns" not in status and "other_lines" not in status
+    assert len(text.encode("utf-8")) <= 8192
+    full_text, full_error = world.call("line_status", {"detail": True, "lists": True})
+    assert not full_error
+    full = json.loads(full_text)
+    assert full["autonomous_turns"]["current_turn_counts"] is None
+    assert full["cost_usd"] == {
         "estimate": "0.2500",
         "basis": "exact",
         "unknown_turns": 0,
         "limit": "3.00",
         "note": None,
     }
-    assert status["scheduled_wake"] == {"due": due, "message_id": message_id}
-    assert status["unread"] == 1 and status["pending"] == 0
-    assert (status["model"], status["strategy"]) == (HAIKU, "subscription")
-    assert (status["workdir"], status["workdir_path"]) == (None, str(world.root))
-    assert status["engine_session"] == "session-1"
-    assert (status["daemon"]["version"], status["daemon"]["commit"]) == (
+    assert (full["workdir"], full["workdir_path"]) == (None, str(world.root))
+    assert full["engine_session"] == "session-1"
+    assert (full["daemon"]["version"], full["daemon"]["commit"]) == (
         __version__,
         COMMIT,
     )
-    assert status["kept_session"] == {
+    assert full["kept_session"] == {
         "configured": False,
         "kept": False,
         "closes_at": None,
         "background_tasks": 0,
         "tasks": [],
     }
-    assert status["leases"] == []
-    assert status["other_lines"] == [
+    assert full["leases"] == []
+    assert full["other_lines"] == [
         {"line_id": "beta", "state": "idle", "held": False, "leases": ["gate"]}
     ]
     for secret in ("a private body", "notes", "s3", "was held for this test"):
-        assert secret not in text
+        assert secret not in full_text
 
 
-def test_line_status_takes_no_arguments(world: World) -> None:
+def test_line_status_refuses_unknown_and_bad_arguments(world: World) -> None:
     text, error = world.call("line_status", {"line": "beta"})
     assert error and "unexpected argument line" in text
+    text, error = world.call("line_status", {"detail": "yes"})
+    assert error and "detail must be true or false" in text
+    text, error = world.call("line_status", {"lists": 1})
+    assert error and "lists must be true or false" in text
+
+
+def test_line_status_requests_long_lists_separately(world: World) -> None:
+    detail_text, detail_error = world.call("line_status", {"detail": True})
+    assert not detail_error
+    detail = json.loads(detail_text)
+    assert detail["other_line_count"] == 1
+    assert "other_lines" not in detail and "recent_turns" not in detail
+    lists_text, lists_error = world.call("line_status", {"lists": True})
+    assert not lists_error
+    lists = json.loads(lists_text)["lists"]
+    assert lists["other_lines"][0]["line_id"] == "beta"
+    assert isinstance(lists["recent_turns"], list)
+
+
+def test_default_line_status_has_a_hard_size_bound(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = world.scheduler.daemon_status
+    monkeypatch.setattr(
+        world.scheduler,
+        "daemon_status",
+        lambda: {**original(), "commit": "x" * (MAX_LINE_STATUS_DEFAULT_BYTES * 2)},
+    )
+    text, error = world.call("line_status")
+    assert not error
+    assert len(text.encode("utf-8")) <= MAX_LINE_STATUS_DEFAULT_BYTES
+    assert json.loads(text)["status_truncated"] is True
 
 
 # R2, the budget line.
@@ -813,7 +857,7 @@ def test_line_status_reports_a_kept_session_and_its_deadline(world: World) -> No
     world.scheduler.configure_line("alpha", LineConfig(keep_session=True))
     kept_engine(world)
     world.scheduler.engine_for("alpha")
-    status = json.loads(world.call("line_status")[0])
+    status = json.loads(world.call("line_status", {"detail": True, "lists": True})[0])
     assert status["kept_session"] == {
         "configured": True,
         "kept": True,

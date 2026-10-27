@@ -42,6 +42,7 @@ from dromon.model import (
 from dromon.scheduler import (
     AFTER_ESTIMATE_NOTE,
     COMPACT_WAKE_NOTE,
+    COMPACTION_CONTEXT_WARNING,
     CONTEXT_FROM_CALL,
     CONTEXT_FROM_COMPACTION,
     CONTEXT_FROM_ESTIMATE,
@@ -240,6 +241,42 @@ def test_the_wakes_own_turn_compacts_and_withdraws_nothing(world: World) -> None
     assert message_id in world.log.state.messages
     assert withdrawn(world) == []
     assert world.status()["context"]["last_compaction"]["withdrawn_wake"] is None
+
+
+def test_context_warning_wakes_compactable_line_without_mail(world: World) -> None:
+    world.scheduler._context_reported(  # pyright: ignore[reportPrivateUsage]
+        "alpha", 150_001, CONTEXT_FROM_CALL
+    )
+    assert world.log.state.scheduled["alpha"].note.startswith("Dromon requests")
+    world.run()
+    assert world.engine.reasons == [COMPACTION_CONTEXT_WARNING]
+    assert world.status()["context"]["estimated_tokens"] == 5_000
+
+
+def test_context_warning_does_not_wake_muted_line(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def muted(_line_id: str) -> bool:
+        return True
+
+    monkeypatch.setattr(
+        world.scheduler,
+        "_line_muted",
+        muted,
+    )
+    world.scheduler._context_reported(  # pyright: ignore[reportPrivateUsage]
+        "alpha", 150_001, CONTEXT_FROM_CALL
+    )
+    assert world.scheduler._sent == []  # pyright: ignore[reportPrivateUsage]
+    assert world.scheduler._context_compaction_wakes == set()  # pyright: ignore[reportPrivateUsage]
+    assert "alpha" not in world.log.state.scheduled
+
+    def unmuted(_line_id: str) -> bool:
+        return False
+
+    monkeypatch.setattr(world.scheduler, "_line_muted", unmuted)
+    assert world.scheduler._work_waiting() is True  # pyright: ignore[reportPrivateUsage]
+    assert "alpha" in world.log.state.scheduled
 
 
 def test_a_wake_the_line_scheduled_itself_is_never_withdrawn(world: World) -> None:
@@ -564,6 +601,7 @@ def context(world: World) -> dict[str, Any]:
 def test_a_reported_compaction_is_named_as_the_source_until_the_turn_ends(
     world: World,
 ) -> None:
+    world.compactable(context_warn_tokens=500_000)
     world.context = 288_128
     world.run("grow")
     assert context(world)["note"] == CONTEXT_NOTES[CONTEXT_FROM_CALL]
@@ -909,7 +947,13 @@ def test_the_codex_estimate_reaches_the_status_within_its_turn(
     world.scheduler.create_line("luna", LUNA, Strategy.SUBSCRIPTION)
     world.scheduler.configure_line(
         "luna",
-        config_from_document({"allow_compact": True, "auto_compact_tokens": 180_000}),
+        config_from_document(
+            {
+                "allow_compact": True,
+                "context_warn_tokens": 250_000,
+                "auto_compact_tokens": 180_000,
+            }
+        ),
     )
     for body in ("one", "two"):
         run_luna(world, body)

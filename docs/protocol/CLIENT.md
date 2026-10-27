@@ -117,6 +117,8 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 |---|---|---|
 | `dromon start` | Starts a detached `dromond` in a new session and waits for it to answer `ping`, up to 60 seconds or the `--wait` seconds given, above 0 and at most 600. On a loaded host the daemon was observed still starting after 10 seconds. Succeeds without action when a daemon already answers | 0, or 1 on failure |
 | `dromon status` | Prints the `status` result | 0, 4 when no daemon answers, or 1 |
+| `dromon proposal list` | Lists proposed changes recorded by lines | 0, or 1 on a read error |
+| `dromon proposal show PROPOSAL_ID` | Shows a proposal's message, file list and patch as untrusted text | 0, or 1 when missing or invalid |
 | `dromon stop` | Sends `stop` and waits up to 10 seconds for the socket to disappear | 0, 4 when no daemon answers, or 1 |
 | `dromon create LINE` | Sends `create_line`, with `--model`, default `claude-haiku-5-5`, `--strategy`, default `subscription`, `--session`, an engine session to continue, which must have been started in the line's working directory, and the tool options below | 0, 4, or 1 |
 | `dromon configure LINE` | Sends `configure_line` with the tool options below. No option means the default configuration | 0, 4, or 1 |

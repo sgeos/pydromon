@@ -49,7 +49,7 @@ keys, duplicate keys and numbers are refused.
 | `keep_session_idle_seconds` | Seconds a kept connection waits for the next turn before it closes, a whole number from 60 to 86,400. Omitted at its default | `1800` |
 | `context_warn_tokens` | The estimated context, in tokens, past which the line's prompt warns, a whole number from 1,000 to 10,000,000, as the context section below specifies. Omitted at its default | `150000` |
 | `allow_compact` | Give a Claude Code or Codex line `compact_session`, to compact its own session. Refused on Grok lines. Omitted when false | `false` |
-| `auto_compact_tokens` | The context estimate at or past which a turn begins by compacting the session, a whole number from 1,000 to 10,000,000, as the context section below specifies. Needs `allow_compact`. Set by an operator. Omitted when unset | unset |
+| `auto_compact_tokens` | An optional earlier context threshold for compaction, a whole number from 1,000 to 10,000,000, as the context section below specifies. Needs `allow_compact`. Omitted when unset | unset |
 | `keep_session_max_seconds` | Seconds after the last turn a kept connection may stay open while the engine reports background tasks running, before `keep_session_at_max` applies, a whole number from 60 to 86,400 and not less than `keep_session_idle_seconds`. Omitted at its default | `14400` |
 | `keep_session_at_max` | What a kept connection does at `keep_session_max_seconds` with background tasks still running, `close`, `ask` or `keep`, as the ceiling section below specifies. Omitted at its default | `close` |
 | `keep_session_hard_seconds` | Seconds after the last turn past which no choice keeps a connection open, a whole number from 60 to 604,800 and not less than `keep_session_max_seconds`. Omitted at its default | `86400` |
@@ -105,7 +105,8 @@ argument outside a tool's schema is refused.
 | `list_mail`, `read_mail`, `acknowledge_mail` | Page through, open and acknowledge the line's mailbox |
 | `list_sent` | Lists what became of the line's sent mail |
 | `acquire_lease`, `release_lease` | Take and give up a lease the project declares, as below |
-| `line_status` | Shows the line's own state, its daemon and the other lines, read only, as below |
+| `line_status` | Shows a compact read-only status by default, with diagnostic detail and long lists available by argument, as below |
+| `propose_change` | Records a proposed patch, file list and message for operator review; it does not change project files |
 | `read_instructions` | Shows the instructions the line's next turn receives, as below |
 | `write_scratch` | Writes a file under `tmp/` in the line's working directory, as below |
 | `list_processes`, `stop_process` | List and stop the processes the line started, as below |
@@ -113,15 +114,29 @@ argument outside a tool's schema is refused.
 **Decided by the operator on 2026-10-26**, from the lines' own reports, for what follows
 in this section.
 
-**`line_status`.** No arguments. It returns JSON for the calling line: its `state`, the
-question holding it as `held_by`, its `autonomous_turns` used and allowed, its estimated
-`cost_usd` since its last release and its limit, its `leases` with their ends, its
-`scheduled_wake`, its `unread` mail and `pending` deliveries, its `model` and
-`strategy`, its `workdir` as configured and as `workdir_path` resolved, its
-`engine_session`, and its `kept_session`, as the kept sessions section below specifies.
-It adds a `daemon` object, an `event_log` object and, for every other line, its
-`line_id`, `state`, whether it is `held`, and the names of its `leases`. It holds no
-configuration document and no message body.
+**`line_status`.** It takes optional `detail` and `lists` booleans, both false by
+default. The compact JSON answer includes the line's `line_id`, `state`, `condition`,
+`held_by`, autonomous turn and cost summaries, `scheduled_wake`, unread and pending
+message counts, `model`, `strategy`, a short context summary and daemon version and
+commit. It includes counts of leases, background tasks, recent turns and other lines,
+not their contents. The default answer is bounded to 8,192 UTF-8 bytes. If required
+fields exceed that bound, it returns a small object with `status_truncated` and directs
+the caller to request detail or lists.
+
+Set `detail` to true for diagnostic fields, including the resolved `workdir`,
+`engine_session`, kept-session state, process status, event-log status and full context
+details. Detail mode keeps arrays summarized by counts. Set `lists` to true to receive
+the long lists of leases, recent turns, other lines, kept-session tasks and left
+processes under a `lists` object. With both arguments true, the tool returns the full
+diagnostic object and those lists. No mode returns a configuration document or message
+body.
+
+**`propose_change`.** It requires a non-empty message, one to 64 unique relative file
+paths, and a non-empty unified patch. The message is limited to 8 KiB and the patch to
+192 KiB. The daemon records the proposal in private project state with the submitting
+line and its resolved workdir. The operator can inspect proposals with `dromon proposal
+list` and `dromon proposal show PROPOSAL_ID`. Proposal text and patches are untrusted
+data. Dromon does not apply them, and lines have no commit operation.
 
 **Row 14 of the T3 Code review, 2026-10-27.** The `event_log` object holds `events`,
 the newest sequence number, `bytes`, the size of the log's database file with any
@@ -467,9 +482,12 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
   and a status read in the compacted turn showed no compaction and the old size.
 - **The warning.** When the estimate after a turn reaches `context_warn_tokens`, the
   next prompt's first line says the context's size, that every engine call re-reads
-  it, and that `compact_session` compacts it, or that an operator can enable it. The
-  default of 150,000 leaves room before an engine's automatic compaction near a
-  200,000 token window, and past it a turn of a few calls re-reads a million tokens.
+  it, and that `compact_session` compacts it, or that an operator can enable it. A
+  line with `allow_compact` is also sent a self-note that wakes it to compact before
+  its next real turn, even when no mail was waiting. A muted line receives no wake
+  until it is unmuted. The default of 150,000 leaves room before an engine's automatic
+  compaction near a 200,000 token window, and past it a turn of a few calls re-reads a
+  million tokens.
 - **`compact_session`.** No arguments before round 6. Only a Claude Code line, and
   from round 6 a Codex line, whose configuration sets `allow_compact` has it, and it is refused if the setting is withdrawn. It marks the
   line's own next turn to begin with a compaction. **Fact, read from the bundled Claude
@@ -502,9 +520,10 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
     warning as it stands once the compaction is recorded, so a compacted line is not
     told to compact again, and a compaction that leaves a large context still warns.
     An engine that cannot compact gets the warning at the head of its prompt instead.
-  - **Automatic compaction.** With `auto_compact_tokens` set, which needs
-    `allow_compact`, a turn whose estimate is at or past it begins with a compaction,
-    whose note says that it was automatic and why. A request the line made takes
+  - **Automatic compaction.** A compactable line is woken when its estimate reaches
+    `context_warn_tokens`. `auto_compact_tokens`, when set, can move the threshold
+    earlier. A turn whose estimate is at or past the effective threshold begins with
+    a compaction, whose note says that it was automatic and why. A request the line made takes
     precedence. No automatic compaction follows one that left the context at or past
     the threshold, or whose size after the engine did not report, as on Codex, until
     a context below the threshold is reported, because compacting again would not

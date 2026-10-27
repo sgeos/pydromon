@@ -960,6 +960,7 @@ def test_the_line_socket_serves_only_the_lines_own_tools(
             "line_status",
             "read_instructions",
             "write_scratch",
+            "propose_change",
             "list_processes",
             "stop_process",
             "list_mail",
