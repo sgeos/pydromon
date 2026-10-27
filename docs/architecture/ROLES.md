@@ -6,9 +6,11 @@
 of the iteration brief makes roles first class. A role has seats on several providers,
 and one seat at a time holds write ownership. This document gives the data model, the
 two flows the brief requires, and how the existing lines map onto roles. The events,
-their model checks and codec, and the `role_status` tool are implemented, as the first
-step of the order of work. The rest is not yet built. Facts about the present code are
-marked as such.
+their model checks and codec, the `role_status` tool, the project file's roles
+recorded at start and on reload, and the seat tools `record_role_note`,
+`relinquish_ownership` and `take_ownership` are implemented. The client operations,
+the `dromon role` and `dromon budget` commands and the read-only sandbox are not yet
+built. Facts about the present code are marked as such.
 
 ## Terms
 
@@ -37,7 +39,7 @@ a restart and a port carries it unchanged.
 |---|---|---|
 | `role_declared` | `role_id`, `workdir`, `handoff_seconds` | A role, its worktree relative to the project root, and how long a planned handoff may take, an hour by default |
 | `seat_bound` | `line_id`, `role_id`, `may_own` | A line becomes a seat of a role. `may_own` false makes a seat that may read and advise but never own |
-| `ownership_changed` | `role_id`, `owner` or null, `previous` or null, `cause`, `by`, `entry_id` or null, `changed_at` | Every change of owner. `cause` is `declared`, `handoff`, `recovery`, `operator` or `relinquished`. `by` is the operator or seat that made it |
+| `ownership_changed` | `role_id`, `owner` or null, `previous` or null, `cause`, `by`, `entry_id` or null, `changed_at`, `back_to` or null | Every change of owner. `cause` is `declared`, `handoff`, `recovery`, `operator` or `relinquished`. `by` is the operator or seat that made it. `back_to` is a handoff's seat to return to |
 | `role_noted` | `role_id`, `entry_id`, `line_id`, `kind`, `body`, `workdir_commit`, `daemon_commit`, `noted_at` | A journal entry. `kind` is `handoff`, `recovery` or `note`. The daemon stamps both commits itself, read from `HEAD`, so the stamp is observed and not claimed |
 | `budget_stated` | `provider`, `remaining_percent` or null, `resets_at` or null, `source`, `note`, `stated_at` | A provider's budget. `source` is `operator` or `engine` |
 
@@ -88,9 +90,13 @@ role. Its mail waits, as a muted line's does, until it owns the role or the oper
 lets it run unconfined. This is default deny. Which adapters can confine a seat is for
 the engines role to establish, and the capability table is where it is recorded.
 
-**Never two writers.** Ownership never changes while either seat has a turn in flight.
-A take while the owner runs is refused, and the operator who must take it now sends
-`interrupt` first. The former owner's engine is dropped and its kept connection closed,
+**Never two writers.** A take while the owner runs is refused, and the operator who
+must take it now sends `interrupt` first. **Implemented.** A seat's own tools change
+ownership during its own turn, so the rule as built is that the change is recorded at
+once, every turn goes on with the engine it started with, and no seat's turn as the
+owner starts while another seat's turn that started as the owner is in flight, or
+while that seat's kept connection is still closing. A seat that does not own the role
+runs beside the owner. The former owner's engine is dropped and its kept connection closed,
 by the line's stop policy, before the new owner's first turn starts. Processes the
 former owner left are recorded as `processes_left` records them today. **Fact.** On macOS the
 daemon cannot identify a line's processes, as `line_status` says, so a process that
@@ -154,6 +160,12 @@ stale. It records uncommitted work and any work-in-progress commit or stash the 
 owner left, without adopting it as its own. It reads the role's recent mail in and
 out. Then it calls `record_role_note` with kind `recovery` before it changes anything,
 so a further recovery can read what it found.
+
+**Implemented.** A seat's own recovery rests on a note entry that records its reason
+and the ground the harness observed. A plan-limit hold is known as such only in the
+daemon run that saw it, so after a restart only a provider budget recorded as 0 percent
+shows that a held owner cannot act, until the budget step records one at each plan
+limit. A budget of 0 percent whose reset time has passed is no ground.
 
 **The former owner learns of it.** The change is told to the former owner at the start
 of its next turn, in the preamble Dromon already gives each turn, and not by mail,
@@ -244,10 +256,10 @@ them.
 
 ## Order of work
 
-1. The events, model checks and codec, and `role_status`, which are done, then the
-   project file's roles, recorded at the daemon's start.
-2. `relinquish_ownership`, `take_ownership`, `record_role_note`, and the client
-   operations and `dromon role` commands.
+1. The events, model checks and codec, and `role_status`, then the project file's
+   roles, recorded at the daemon's start and on reload. Both are done.
+2. `relinquish_ownership`, `take_ownership` and `record_role_note`, which are done,
+   then the client operations and the `dromon role` and `dromon budget` commands.
 3. Read-only seats in each adapter's sandbox profile, which is the engines role's work,
    and the rule for seats that cannot be confined until then.
 4. `budget_stated` from operators and from plan limits, and the operator question at a

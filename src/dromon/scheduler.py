@@ -177,6 +177,15 @@ from dromon.processes import (
     stop_line_process,
 )
 from dromon.workdir import git_write_guards, read_head_commit, resolve_workdir
+from dromon.roles import (
+    Plan,
+    RoleConflict,
+    Stamp,
+    plan_note,
+    plan_relinquish,
+    plan_take,
+    recovery_ground,
+)
 from dromon.mailbox import (
     MAX_PAGE,
     MailSummary,
@@ -199,6 +208,9 @@ from dromon.model import (
     Address,
     BudgetStated,
     RoleNoted,
+    RoleNoteKind,
+    OwnershipChanged,
+    OwnershipCause,
     EventRejected,
     InvalidField,
     LineAddress,
@@ -376,6 +388,74 @@ ROLE_STATUS_TOOL_NAME: Final = "role_status"
 ROLE_STATUS_ENTRIES: Final = 5
 """How many of a role's latest journal entries ``role_status`` lists. Only the
 latest carries its body, which bounds the view by one entry's size."""
+RECOVERY_CHECKLIST: Final = (
+    "Before you change anything, read git status and the commits since the role's"
+    " last journal entry, and check that entry's stamp against HEAD by ancestry and"
+    " by content, since a stamp can stay an ancestor while its content goes stale."
+    " Record uncommitted work, and any work in progress commit or stash the former"
+    " owner left, without adopting it as yours. Read the role's recent mail in and"
+    " out. Then call record_role_note with kind recovery, so a further recovery can"
+    " read what you found."
+)
+"""What a new owner by a recovery or an operator's gift is told first, as the
+recovery section of ``ROLES.md`` gives it."""
+UNSEEN_PROCESSES_NOTE: Final = (
+    "This platform does not let the daemon identify a line's processes, so a process"
+    " the former owner started that outlived its engine cannot be ruled out."
+)
+RECORD_ROLE_NOTE_TOOL_NAME: Final = "record_role_note"
+RELINQUISH_OWNERSHIP_TOOL_NAME: Final = "relinquish_ownership"
+TAKE_OWNERSHIP_TOOL_NAME: Final = "take_ownership"
+MAX_TAKE_REASON_BYTES: Final = 4096
+
+RECORD_ROLE_NOTE_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "kind": {
+            "type": "string",
+            "enum": ["note", "recovery"],
+            "description": "note, by any seat, or recovery, by the owner after a take",
+        },
+        "body": {"type": "string", "description": "The entry, at most 64 KiB"},
+    },
+    "required": ["kind", "body"],
+    "additionalProperties": False,
+}
+
+RELINQUISH_OWNERSHIP_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "note": {
+            "type": "string",
+            "description": "The handoff note, on the template in ROLES.md, at most"
+            " 64 KiB",
+        },
+        "to": {
+            "type": "string",
+            "description": "Optional. The seat that takes the role. Omit it to return"
+            " the role where your handoff said, or else to leave it vacant",
+        },
+        "back_to": {
+            "type": "string",
+            "description": "Optional, with to. The seat the role returns to when the"
+            " successor next relinquishes without naming one",
+        },
+    },
+    "required": ["note"],
+    "additionalProperties": False,
+}
+
+TAKE_OWNERSHIP_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "reason": {
+            "type": "string",
+            "description": "Why you take the role, at most 4 KiB",
+        },
+    },
+    "required": ["reason"],
+    "additionalProperties": False,
+}
 WRITE_SCRATCH_TOOL_NAME: Final = "write_scratch"
 READ_INSTRUCTIONS_TOOL_NAME: Final = "read_instructions"
 
@@ -1198,6 +1278,23 @@ class Scheduler:
         self._clock = clock
         self._hold = hold_wakes
         self._engines: dict[str, LineEngine] = {}
+        self._plan_held: dict[str, str] = {}
+        """The question each line was held with at a plan limit its engine reported,
+        which a seat's own recovery may rest on while the hold lasts. In memory, so
+        after a restart only a provider budget recorded as 0 percent shows that an
+        owner cannot act. **Technical debt** until the budget step records one at
+        each plan limit."""
+        self._turn_owned: set[str] = set()
+        """Lines whose turn in flight started while they owned their role, so their
+        engine was built as the role's writer. No other seat's turn as owner starts
+        while one runs, so a role never has two writers."""
+        self._closing_writer: dict[str, asyncio.Task[None]] = {}
+        """The closing of a former owner's kept engine connection, which the new
+        owner's first turn waits for, since a kept connection's background tasks
+        keep the writer's sandbox until it closes."""
+        self._role_told: dict[str, OwnershipChanged] = {}
+        """The latest change of owner each seat's turn was told of. In memory, so a
+        restart tells a seat of the latest change once more."""
         self._engine_built: dict[str, int] = {}
         """When each engine was built, in nanoseconds of the wall clock, so that only a
         launcher started since is taken for the engine's own. Review N1."""
@@ -1733,6 +1830,16 @@ class Scheduler:
             )
         )
         return message_id
+
+    @property
+    def default_operator(self) -> OperatorAddress:
+        """The operator the daemon acts for where no message names one."""
+        return self._default_operator
+
+    def wall_due(self) -> str:
+        """The wall clock now, in the model's due-time format, for an event that
+        carries its own time."""
+        return format_due(self._wall_clock())
 
     def last_operator(self, line_id: str) -> OperatorAddress | None:
         """The operator who most recently sent ``line_id`` a message, if any."""
@@ -2968,7 +3075,7 @@ class Scheduler:
             if other.role_id != seat.role_id:
                 continue
             engine = ENGINE_OF.get(self.model_of(seat_id))
-            budget = state.budgets.get(engine) if engine is not None else None
+            budget = self._budget_of(seat_id)
             seats.append(
                 {
                     "line_id": seat_id,
@@ -3004,6 +3111,7 @@ class Scheduler:
                 "by": str(change.by),
                 "entry_id": change.entry_id,
                 "changed_at": change.changed_at,
+                "back_to": change.back_to,
             },
             "seats": seats,
             "journal": [
@@ -3020,6 +3128,316 @@ class Scheduler:
             " each seat with its condition, model and its provider's stated budget,"
             " and the latest journal entries, the newest with its text, read only.",
             lambda: json.dumps(self.role_status(line_id), indent=2, sort_keys=True),
+        )
+
+    # Ownership, roles step 2 of ``docs/architecture/ROLES.md``.
+
+    def _stamp(self, line_id: str) -> Stamp:
+        """What a journal entry by ``line_id`` is stamped with, observed now. The
+        worktree's commit is read from the seat's working directory, which the daemon
+        holds equal to its role's worktree, and the daemon's is the commit it started
+        from, which is the code that runs. Either is empty where it cannot be read."""
+        return Stamp(
+            self._workdir_commit(line_id) or "",
+            self._daemon_commit or "",
+            format_due(self._wall_clock()),
+        )
+
+    def _budget_of(self, line_id: str) -> BudgetStated | None:
+        """The stated budget of ``line_id``'s provider. Until the budget step, each
+        engine is its own provider."""
+        engine = ENGINE_OF.get(self.model_of(line_id))
+        return None if engine is None else self._log.state.budgets.get(engine)
+
+    def _plan_limited(self, line_id: str) -> bool:
+        """Whether ``line_id`` is held, still, by the hold of a plan limit its engine
+        reported in this daemon run."""
+        line = self._log.state.lines.get(line_id)
+        question = self._plan_held.get(line_id)
+        return line is not None and question is not None and line.held_by == question
+
+    def _append_plan(self, plan: Plan) -> None:
+        """Append an ownership plan's events in order. Each was checked against the
+        state the ones before it leave, and nothing else appends between them, since
+        the scheduler runs on one thread. A crash between them leaves a journal entry
+        without the change it was for, which records nothing false."""
+        for event in plan.events:
+            self._log.append(event)
+
+    def _ownership_moved(self, plan: Plan) -> None:
+        """What follows a change of owner. The engines of the former and the new owner
+        are dropped, since a sandbox is fixed for an engine session's life, so each
+        one's next turn is built with its new access. The former owner's kept
+        connection closes before the new owner's first turn starts. A successor by a
+        handoff is unmuted and sent a note from the former owner, which wakes it once
+        the former owner's turn has ended."""
+        for line_id in (plan.previous, plan.owner):
+            if line_id is None:
+                continue
+            closing = self._drop_engine(line_id)
+            if line_id == plan.previous and closing is not None:
+                self._closing_writer[line_id] = closing
+                closing.add_done_callback(lambda _: self._work.set())
+            self.activity.record(
+                line_id,
+                ActivityKind.NOTICE,
+                f"role {plan.role_id} passed from {plan.previous or 'no seat'} to"
+                f" {plan.owner or 'no seat'}",
+            )
+        change = self._log.state.roles[plan.role_id].changed
+        if (
+            change is not None
+            and change.cause is OwnershipCause.HANDOFF
+            and plan.owner is not None
+            and plan.previous is not None
+        ):
+            self.unmute(plan.owner)
+            self.send(
+                LineAddress(plan.previous),
+                LineAddress(plan.owner),
+                f"Line {plan.previous} handed role {plan.role_id} to you, with handoff"
+                f" entry {plan.entry_id}. You own the role from this turn. Read the"
+                " entry with role_status, check it against the worktree as a"
+                " recovery is checked, and continue.",
+            )
+        self._work.set()
+
+    def record_role_note(self, line_id: str, kind: RoleNoteKind, body: str) -> str:
+        """Record ``body`` in ``line_id``'s role journal, stamped by the daemon, and
+        return the entry's identifier. Raises ``LineToolRefused``."""
+        if self.discloses(body):
+            raise LineToolRefused(disclosure.REFUSAL)
+        try:
+            plan = plan_note(
+                self._log.state, line_id, kind, body, new_id("e"), self._stamp(line_id)
+            )
+        except RoleConflict as error:
+            raise LineToolRefused(str(error)) from error
+        self._append_plan(plan)
+        return cast(str, plan.entry_id)
+
+    def relinquish_ownership(
+        self, line_id: str, note: str, to: str | None, back_to: str | None
+    ) -> Plan:
+        """``line_id`` gives its role up with the handoff note ``note``, as
+        ``roles.plan_relinquish`` decides, and returns the plan applied. The caller's
+        turn goes on with the engine it started with, and the successor's first turn
+        waits for it to end. Raises ``LineToolRefused``."""
+        if self.discloses(note):
+            raise LineToolRefused(disclosure.REFUSAL)
+        try:
+            plan = plan_relinquish(
+                self._log.state,
+                line_id,
+                note,
+                to,
+                back_to,
+                new_id("e"),
+                self._stamp(line_id),
+            )
+        except RoleConflict as error:
+            raise LineToolRefused(str(error)) from error
+        self._append_plan(plan)
+        self._ownership_moved(plan)
+        return plan
+
+    def take_ownership(self, line_id: str, reason: str) -> tuple[Plan, str]:
+        """``line_id`` takes its role for itself, on a ground the harness observes,
+        and returns the plan applied with the ground. Raises ``LineToolRefused``,
+        among others while the owner has a turn in flight."""
+        if not reason or len(reason.encode("utf-8")) > MAX_TAKE_REASON_BYTES:
+            raise LineToolRefused(
+                f"reason must be text of 1 to {MAX_TAKE_REASON_BYTES} bytes"
+            )
+        if self.discloses(reason):
+            raise LineToolRefused(disclosure.REFUSAL)
+        state = self._log.state
+        seat = state.seats.get(line_id)
+        if seat is None:
+            raise LineToolRefused(f"line {line_id} is a seat of no role")
+        role = state.roles[seat.role_id]
+        owner = role.owner
+        ground = recovery_ground(
+            role,
+            owner_running=owner is not None and owner in self._running,
+            owner_plan_held=owner is not None and self._plan_limited(owner),
+            owner_budget=None if owner is None else self._budget_of(owner),
+            now=self._wall_clock(),
+        )
+        try:
+            plan = plan_take(
+                state, line_id, reason, ground, new_id("e"), self._stamp(line_id)
+            )
+        except RoleConflict as error:
+            raise LineToolRefused(str(error)) from error
+        self._append_plan(plan)
+        self._ownership_moved(plan)
+        return plan, cast(str, ground)
+
+    def _waits_for_writer(self, line_id: str) -> bool:
+        """Whether ``line_id`` owns its role while a former writer of it has not
+        finished, which is another seat whose turn in flight started as the owner,
+        or whose kept connection is still closing. **Never two writers**, as
+        ``ROLES.md`` requires, so the new owner's first turn waits for both."""
+        state = self._log.state
+        seat = state.seats.get(line_id)
+        if seat is None or state.roles[seat.role_id].owner != line_id:
+            return False
+        for other, its in state.seats.items():
+            if other == line_id or its.role_id != seat.role_id:
+                continue
+            if other in self._turn_owned:
+                return True
+            closing = self._closing_writer.get(other)
+            if closing is not None and not closing.done():
+                return True
+        return False
+
+    def _role_notice(self, line_id: str) -> str | None:
+        """What ``line_id``'s turn is told first of the latest change of its role's
+        owner, once, or ``None``. A former owner learns of a change it did not make
+        here and not by mail, since mail would wake a seat that has no budget. A new
+        owner by a recovery or an operator's gift is given the recovery checklist."""
+        state = self._log.state
+        seat = state.seats.get(line_id)
+        if seat is None:
+            return None
+        change = state.roles[seat.role_id].changed
+        if change is None or self._role_told.get(line_id) == change:
+            return None
+        self._role_told[line_id] = change
+        role_id = seat.role_id
+        caused = f"by {change.by}, with cause {change.cause}, at {change.changed_at}"
+        if change.previous == line_id and change.by != LineAddress(line_id):
+            return (
+                f"Role {role_id} passed from you to {change.owner or 'no seat'}"
+                f" {caused}. You no longer own it, so do not change files in its"
+                " worktree, which is read only to you where your engine can confine"
+                " it. role_status shows the journal, where a recovery record names"
+                " what it found, your uncommitted changes among it."
+            )
+        if change.owner != line_id or change.cause not in (
+            OwnershipCause.RECOVERY,
+            OwnershipCause.OPERATOR,
+        ):
+            return None
+        text = (
+            f"You own role {role_id} from this turn, {caused}, taken from"
+            f" {change.previous or 'no seat'}. {RECOVERY_CHECKLIST}"
+        )
+        if not self._processes_identifiable:
+            text += f" {UNSEEN_PROCESSES_NOTE}"
+        return text
+
+    def record_role_note_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``record_role_note`` tool for ``line_id``, offered only to a seat."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, RECORD_ROLE_NOTE_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            kind: object = args.get("kind")
+            body: object = args.get("body")
+            if kind not in (RoleNoteKind.NOTE.value, RoleNoteKind.RECOVERY.value):
+                return _tool_error("kind must be note or recovery")
+            if not isinstance(body, str):
+                return _tool_error("body must be text")
+            try:
+                entry_id = self.record_role_note(
+                    line_id, RoleNoteKind(cast(str, kind)), body
+                )
+            except LineToolRefused as error:
+                return _tool_error(str(error))
+            return _tool_text(f"recorded as entry {entry_id}, stamped by the daemon")
+
+        return SdkMcpTool(
+            name=RECORD_ROLE_NOTE_TOOL_NAME,
+            description=(
+                "Record an entry in your role's journal, which every seat of the role"
+                " reads with role_status. kind note is for any seat. kind recovery is"
+                " for the owner after a take, naming what it found before it changes"
+                " anything. The daemon stamps the worktree's and its own commit."
+            ),
+            input_schema=RECORD_ROLE_NOTE_SCHEMA,
+            handler=handler,
+        )
+
+    def relinquish_ownership_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``relinquish_ownership`` tool for ``line_id``, offered only to a seat."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, RELINQUISH_OWNERSHIP_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            note: object = args.get("note")
+            to: object = args.get("to")
+            back_to: object = args.get("back_to")
+            if not isinstance(note, str):
+                return _tool_error("note must be text")
+            if to is not None and not isinstance(to, str):
+                return _tool_error("to must be text")
+            if back_to is not None and not isinstance(back_to, str):
+                return _tool_error("back_to must be text")
+            try:
+                plan = self.relinquish_ownership(line_id, note, to, back_to)
+            except LineToolRefused as error:
+                return _tool_error(str(error))
+            text = (
+                f"role {plan.role_id} passed to {plan.owner} with handoff entry"
+                f" {plan.entry_id}. It is woken with a note once this turn ends."
+                if plan.owner is not None
+                else f"role {plan.role_id} is vacant, with handoff entry"
+                f" {plan.entry_id}. Any seat that may own it can take it."
+            )
+            text += " Your engine is rebuilt read only for your next turn."
+            return _tool_text(f"{text} {plan.note}".rstrip())
+
+        return SdkMcpTool(
+            name=RELINQUISH_OWNERSHIP_TOOL_NAME,
+            description=(
+                "Give up ownership of your role, with a handoff note on the template in"
+                " ROLES.md, to the seat to, or with no to to the seat your handoff"
+                " said, or else leaving the role vacant. Leave the work in order and"
+                " run the gate first. back_to, with to, returns the role to that seat"
+                " when the successor next relinquishes."
+            ),
+            input_schema=RELINQUISH_OWNERSHIP_SCHEMA,
+            handler=handler,
+        )
+
+    def take_ownership_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``take_ownership`` tool for ``line_id``, offered only to a seat."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, TAKE_OWNERSHIP_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            reason: object = args.get("reason")
+            if not isinstance(reason, str):
+                return _tool_error("reason must be text")
+            try:
+                plan, ground = self.take_ownership(line_id, reason)
+            except LineToolRefused as error:
+                return _tool_error(str(error))
+            return _tool_text(
+                f"you own role {plan.role_id} now, because {ground}, with entry"
+                f" {plan.entry_id}. This turn keeps the access it started with, and"
+                " your next turn is built as the owner and leads with the recovery"
+                " checklist. Record what you find with record_role_note, kind"
+                " recovery, before you change anything."
+            )
+
+        return SdkMcpTool(
+            name=TAKE_OWNERSHIP_TOOL_NAME,
+            description=(
+                "Take ownership of your role for yourself, with a reason. Allowed only"
+                " while the role is vacant, while its owner is held at a plan limit,"
+                " or while its owner's provider budget is recorded as 0 percent, and"
+                " never while its owner has a turn in flight. An operator can always"
+                " give a role."
+            ),
+            input_schema=TAKE_OWNERSHIP_SCHEMA,
+            handler=handler,
         )
 
     def read_instructions_tool(self, line_id: str) -> SdkMcpTool[Any]:
@@ -3099,7 +3517,12 @@ class Scheduler:
             self.acknowledge_mail_tool(line_id),
             self.list_sent_tool(line_id),
             *(
-                [self.role_status_tool(line_id)]
+                [
+                    self.role_status_tool(line_id),
+                    self.record_role_note_tool(line_id),
+                    self.relinquish_ownership_tool(line_id),
+                    self.take_ownership_tool(line_id),
+                ]
                 if line_id in self._log.state.seats
                 else []
             ),
@@ -3602,6 +4025,7 @@ class Scheduler:
             and not line.muted
             and line_id not in self._failed
             and self._restart is None
+            and not self._waits_for_writer(line_id)
         )
 
     def _cooling(self, line_id: str) -> bool:
@@ -3800,9 +4224,15 @@ class Scheduler:
             owed = self._handoff(line_id, messages)
             if owed is not None and owed[1] is not None:
                 prompt = f"{owed[1].text}\n\n{prompt}"
+            notice = self._role_notice(line_id)
+            if notice is not None:
+                prompt = f"{notice}\n\n{prompt}"
         except Exception as error:  # noqa: BLE001
             compaction, owed, refused = None, None, error
             prompt = f"the prompt could not be composed: {error}"
+        seat = self._log.state.seats.get(line_id)
+        if seat is not None and self._log.state.roles[seat.role_id].owner == line_id:
+            self._turn_owned.add(line_id)
         task = asyncio.get_running_loop().create_task(
             self._turn(line_id, prompt, from_operator, compaction, owed, refused)
         )
@@ -3872,7 +4302,7 @@ class Scheduler:
             self._count_interrupted(line_id, engine)
             raise
         except EnginePlanLimit as error:
-            self.hold(line_id, str(error))
+            self._plan_held[line_id] = self.hold(line_id, str(error))
             ending = f"held: {error}"
             print(f"dromond: line {line_id} held: {error}", file=sys.stderr)
         except Exception as error:  # noqa: BLE001
@@ -3898,6 +4328,7 @@ class Scheduler:
             if self._log.state.lines[line_id].state is LineState.RUNNING:
                 self._log.append(LineStateChanged(line_id, LineState.IDLE))
             self._running.pop(line_id, None)
+            self._turn_owned.discard(line_id)
             self._last_turn_end[line_id] = self._clock()
             self._work.set()
         self._apply_limits(line_id, from_operator, report)
@@ -4596,9 +5027,10 @@ class Scheduler:
         count = engine.kept_status().get("background_tasks", 0)
         return count if isinstance(count, int) else 0
 
-    def _drop_engine(self, line_id: str) -> None:
+    def _drop_engine(self, line_id: str) -> asyncio.Task[None] | None:
         """Discard ``line_id``'s engine, so its next turn builds a new one, and close
-        a connection it kept, once any turn in progress has ended."""
+        a connection it kept, once any turn in progress has ended. Returns the
+        closing of a kept connection, or ``None`` where there is nothing to close."""
         engine = self._engines.pop(line_id, None)
         self._engine_built.pop(line_id, None)
         # A configuration change discards the engine, and with it any compaction
@@ -4608,15 +5040,16 @@ class Scheduler:
             # The engine's process, if it kept one, ends with it.
             self._line_tokens.revoke(line_id)
         if not isinstance(engine, KeptEngine):
-            return
+            return None
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             # Without a running loop no connection can have been opened.
-            return
+            return None
         task = loop.create_task(engine.retire())
         self._retiring.add(task)
         task.add_done_callback(self._retiring.discard)
+        return task
 
     async def close_engines(self) -> None:
         """Close every kept engine connection, as the daemon stops. Engines that

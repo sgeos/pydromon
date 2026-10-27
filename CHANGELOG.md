@@ -7,6 +7,10 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- `dromon send` prints the message identifier alone again. Since priority mail it had
+  printed every key of the result, so a plain note ended with `priority False`. It now
+  adds `priority mail` on a second line only when the note is priority mail. Found by
+  the operator on 2026-10-27.
 - The client protocol carries no floats, and the daemon sent two. `dromon status`
   failed once the daemon had run for a minute, because `events_per_hour` was a
   fraction, and `dromon restart` failed at once, because its `--wait-seconds` went out
@@ -35,8 +39,23 @@ All notable changes are recorded here. The format follows
   and the codec, with checks that a role has at most one owner, that the owner is a
   live seat that may own it, that a change of owner names the owner it replaces so two
   that race cannot both apply, and that a handoff rests on the previous owner's latest
-  handoff entry. A seat has the `role_status` tool. Nothing records these events yet,
-  since the project file's roles and the ownership tools are the next steps.
+  handoff entry. A seat has the `role_status` tool.
+- The project file's `[roles.ID]` tables, with `workdir`, `seats`, `owner` and
+  `handoff_seconds`, and a line's `may_own`, as `docs/protocol/PROJECT_CONFIG.md`
+  specifies. The daemon records them at start and on reload, checked against the log
+  before any event is appended, and records the file's `owner` only while the role
+  has never had one. A seat without a `workdir` takes its role's. `reload_project`
+  returns `roles`.
+- The seat tools `record_role_note`, `relinquish_ownership` and `take_ownership`, as
+  `docs/protocol/LINE_CONFIG.md` specifies. The daemon stamps each journal entry with
+  the role worktree's commit and its own. A seat takes its role itself only on a ground
+  the harness observes. A change of owner drops the former and the new owner's
+  engines, unmutes and notes a successor by handoff, and starts no turn as the owner
+  until the former owner's turn has ended and its kept connection has closed. Each
+  seat's next turn is told of a change it did not make, and a new owner by recovery is
+  given the recovery checklist. `ownership_changed` gains `back_to`, for a short
+  alternation between two seats. The client operations and commands are the next
+  step.
 - Restart to upgrade, by the operator's decision of 2026-10-27, as
   `docs/protocol/RESTART.md` specifies.
   - `dromon restart [--interrupt] [--wait-seconds S] [--end-tasks]` and the client

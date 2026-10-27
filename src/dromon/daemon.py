@@ -82,6 +82,7 @@ from dromon.lineconfig import (
 from dromon.projectconfig import ConfigFileError, ProjectConfig, config_path, load
 from dromon.sandbox import SandboxConfig, SandboxError, effective, merge
 from dromon.processes import environment_reading_works
+from dromon.roles import RoleConflict, plan_roles
 from dromon.workdir import git_write_guards, read_head_commit, resolve_workdir
 from dromon.configview import (
     OVERRIDE,
@@ -912,6 +913,7 @@ class Daemon:
         except (ValueError, InvalidField) as error:
             raise OverrideError(str(error)) from error
         check_project(self.log, config)
+        check_roles(self.scheduler, self.log, config)
         terms = project_terms(config, self.paths)
         check_lines_sandboxed(config, self.log, self.scheduler)
         for line_id in sorted(set(self.project.lines) - set(config.lines)):
@@ -923,7 +925,13 @@ class Daemon:
         self.project = config
         self.project_file_present = present
         self.apply_project_values()
-        return {"file": str(file), "present": present, "lines": sorted(config.lines)}
+        apply_roles(self.scheduler, self.log, config)
+        return {
+            "file": str(file),
+            "present": present,
+            "lines": sorted(config.lines),
+            "roles": sorted(config.roles),
+        }
 
     def _agent_add(self, args: dict[str, object]) -> dict[str, object]:
         """Register an agent, or replace its access and token, and return the token.
@@ -1439,6 +1447,15 @@ def check_sandboxes(config: ProjectConfig, paths: ProjectPaths) -> None:
         enabled = merged is not None and merged.enabled
         guarded = git_write_guards(workdir) if enabled else ()
         effective(merged, workdir, protected, guarded)
+    for role_id, role in sorted(config.roles.items()):
+        worktree = resolve_workdir(role.workdir, paths.root, protected)
+        for line_id in role.seats:
+            seat = config.lines[line_id].config.workdir
+            if resolve_workdir(seat, paths.root, protected) != worktree:
+                raise ConfigError(
+                    f"line {line_id} is a seat of role {role_id}, so it runs in the"
+                    f" role's worktree {role.workdir}, not in {seat}"
+                )
 
 
 def check_sandbox_required(
@@ -1570,6 +1587,29 @@ def check_project(log: EventLog, config: ProjectConfig) -> None:
             )
 
 
+def check_roles(scheduler: Scheduler, log: EventLog, config: ProjectConfig) -> None:
+    """Raise ``ProjectMismatch`` if the file's roles cannot be recorded, so that
+    nothing is applied from such a file, as ``check_project`` does for lines."""
+    try:
+        plan_roles(log.state, config, scheduler.default_operator, scheduler.wall_due())
+    except RoleConflict as error:
+        raise ProjectMismatch(str(error)) from error
+
+
+def apply_roles(scheduler: Scheduler, log: EventLog, config: ProjectConfig) -> None:
+    """Record the file's roles, seats and first owners, as ``roles.plan_roles``
+    describes. It runs after ``apply_project``, which creates the seats' lines, and
+    after the project's operator is set, who is recorded as declaring an owner."""
+    try:
+        events = plan_roles(
+            log.state, config, scheduler.default_operator, scheduler.wall_due()
+        )
+    except RoleConflict as error:
+        raise ProjectMismatch(str(error)) from error
+    for event in events:
+        log.append(event)
+
+
 def apply_project(scheduler: Scheduler, log: EventLog, config: ProjectConfig) -> None:
     """Bring the log's lines into line with the file's definitions.
 
@@ -1667,6 +1707,7 @@ def run(
             scheduler.set_disclosure_terms(terms)
             scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
             check_lines_sandboxed(config, log, scheduler)
+            check_roles(scheduler, log, config)
             apply_project(scheduler, log, config)
             teacher = start_teacher(config, paths)
             try:
@@ -1683,6 +1724,7 @@ def run(
                     hold_wakes=hold_wakes,
                 )
                 daemon.apply_project_values()
+                apply_roles(scheduler, log, config)
                 asyncio.run(serve(daemon))
                 successor = daemon.successor
             finally:

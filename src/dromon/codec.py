@@ -133,6 +133,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "by",
         "entry_id",
         "changed_at",
+        "back_to",
     ),
     "role_noted": (
         "role_id",
@@ -373,6 +374,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "by": str(event.by),
                 "entry_id": event.entry_id,
                 "changed_at": event.changed_at,
+                "back_to": event.back_to,
             }
         case RoleNoted():
             return "role_noted", {
@@ -537,6 +539,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _address(data, "by"),
                 _optional_str(data, "entry_id"),
                 _str(data, "changed_at"),
+                _optional_str(data, "back_to"),
             )
         case "role_noted":
             return RoleNoted(

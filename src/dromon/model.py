@@ -923,7 +923,9 @@ class OwnershipChanged:
     operator that made it, and ``entry_id`` the journal entry it rests on, which a
     handoff requires. The model checks the change is consistent. The daemon checks
     that ``by`` had the authority, such as harness-observed exhaustion for a seat's
-    own recovery."""
+    own recovery. ``back_to``, only on a handoff, is the seat the role returns to
+    when ``owner`` next relinquishes without naming a successor, for a short
+    alternation between two seats."""
 
     role_id: str
     owner: str | None
@@ -932,6 +934,7 @@ class OwnershipChanged:
     by: Address
     entry_id: str | None
     changed_at: str
+    back_to: str | None = None
 
     def __post_init__(self) -> None:
         check_id("role_id", self.role_id)
@@ -941,8 +944,13 @@ class OwnershipChanged:
         check_address("by", self.by)
         check_optional_id("entry_id", self.entry_id)
         check_instant("changed_at", self.changed_at)
+        check_optional_id("back_to", self.back_to)
         if self.owner == self.previous:
             raise InvalidField("owner and previous are the same")
+        if self.back_to is not None and (
+            self.cause is not OwnershipCause.HANDOFF or self.back_to == self.owner
+        ):
+            raise InvalidField("back_to is a handoff's, and names another seat")
         cause = self.cause
         if self.owner is None and cause not in (
             OwnershipCause.RELINQUISHED,
@@ -1763,6 +1771,13 @@ class State:
                     f"line {event.owner} may not own role {event.role_id}"
                 )
             self._live_line(event.owner)
+        if (
+            event.back_to is not None
+            and not self._seat(event.back_to, event.role_id).may_own
+        ):
+            raise EventRejected(
+                f"line {event.back_to} may not own role {event.role_id}"
+            )
         if event.entry_id is not None:
             entry = self.role_entries.get(event.entry_id)
             if entry is None or entry.role_id != event.role_id:

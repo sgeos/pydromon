@@ -403,6 +403,7 @@ def test_a_copy_is_independent_of_the_roles() -> None:
                 "by": "@ana",
                 "entry_id": None,
                 "changed_at": AT,
+                "back_to": None,
             },
             "no value 'taken'",
         ),
@@ -491,6 +492,7 @@ def test_role_status_shows_the_role_its_seats_and_the_latest_entries(
             "by": "@ana",
             "entry_id": None,
             "changed_at": AT,
+            "back_to": None,
         }
         seats = cast(list[dict[str, object]], view["seats"])
         assert [seat["line_id"] for seat in seats] == ["alpha", "beta"]

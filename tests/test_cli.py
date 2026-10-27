@@ -328,6 +328,46 @@ def test_send_passes_priority_only_when_asked(
     assert args.get("priority") is expected
 
 
+@pytest.mark.parametrize(
+    ("priority", "printed"),
+    [(False, "message_id m-1\n"), (True, "message_id m-1\npriority mail\n")],
+)
+def test_send_prints_the_message_id_and_priority_only_when_true(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    short_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+    priority: bool,
+    printed: str,
+) -> None:
+    sent: list[tuple[Operation, dict[str, object] | None]] = []
+    answer: dict[str, object] = {"message_id": "m-1", "priority": priority}
+    monkeypatch.setattr(cli, "call", answering(sent, answer))
+    runtime = ["--runtime-dir", str(short_runtime)]
+    argv = ["--project", str(tmp_path), *runtime, "send", "alpha", "stop"]
+    assert cli.main([*argv, "--operator", "ana"]) == exits.OK
+    assert capsys.readouterr().out == printed
+
+
+def test_send_refused_by_the_daemon_is_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    short_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def refuse(
+        socket: Path, operation: Operation, args: dict[str, object] | None = None
+    ) -> Response:
+        del socket, operation, args
+        return Response("r", False, error_message="priority mail goes to a line")
+
+    monkeypatch.setattr(cli, "call", refuse)
+    runtime = ["--runtime-dir", str(short_runtime)]
+    argv = ["--project", str(tmp_path), *runtime, "send", "@ben", "stop"]
+    assert cli.main([*argv, "--operator", "ana", "--priority"]) == exits.FAILURE
+    assert "dromon send: priority mail goes to a line" in capsys.readouterr().err
+
+
 def test_status_lists_each_line_with_its_mute_and_hold(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

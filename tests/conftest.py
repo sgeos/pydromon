@@ -152,7 +152,9 @@ SCENARIO: tuple[Event, ...] = (
         "b" * 64,
         AT,
     ),
-    OwnershipChanged("core", "beta", "alpha", OwnershipCause.HANDOFF, ALPHA, "e2", AT),
+    OwnershipChanged(
+        "core", "beta", "alpha", OwnershipCause.HANDOFF, ALPHA, "e2", AT, "alpha"
+    ),
     RoleNoted("core", "e3", "beta", RoleNoteKind.RECOVERY, "found clean", "", "", AT),
     OwnershipChanged("core", None, "beta", OwnershipCause.RELINQUISHED, BETA, None, AT),
     OwnershipChanged("core", "alpha", None, OwnershipCause.RECOVERY, ALPHA, None, AT),

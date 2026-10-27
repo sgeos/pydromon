@@ -634,7 +634,15 @@ def _send(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         args["reply_to"] = arguments.reply_to
     if arguments.priority:
         args["priority"] = True
-    return _request(paths, "send", Operation.SEND, args)
+    answer = _call(paths, "send", Operation.SEND, args)
+    if isinstance(answer, int):
+        return answer
+    # The message id alone, as before priority mail, so that a script reading it
+    # still can. The result's priority flag is printed only when it is true.
+    print(f"message_id {answer.get('message_id')}")
+    if answer.get("priority") is True:
+        print("priority mail")
+    return exits.OK
 
 
 def _questions(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
