@@ -59,7 +59,7 @@ def load_terms(path: Path) -> tuple[str, ...]:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        terms.add(line.casefold())
+        terms.add(stripped.casefold())
     return tuple(sorted(terms))
 
 
