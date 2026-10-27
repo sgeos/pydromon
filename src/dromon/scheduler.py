@@ -197,6 +197,8 @@ from dromon.lineconfig import (
 )
 from dromon.model import (
     Address,
+    BudgetStated,
+    RoleNoted,
     EventRejected,
     InvalidField,
     LineAddress,
@@ -370,6 +372,10 @@ MAX_SCRATCH_BYTES: Final = 256 * 1024
 SCRATCH_DIRECTORY: Final = "tmp"
 
 LINE_STATUS_TOOL_NAME: Final = "line_status"
+ROLE_STATUS_TOOL_NAME: Final = "role_status"
+ROLE_STATUS_ENTRIES: Final = 5
+"""How many of a role's latest journal entries ``role_status`` lists. Only the
+latest carries its body, which bounds the view by one entry's size."""
 WRITE_SCRATCH_TOOL_NAME: Final = "write_scratch"
 READ_INSTRUCTIONS_TOOL_NAME: Final = "read_instructions"
 
@@ -2945,6 +2951,77 @@ class Scheduler:
             lambda: json.dumps(self.line_status(line_id), indent=2, sort_keys=True),
         )
 
+    def role_status(self, line_id: str) -> dict[str, object]:
+        """What a seat may know of its role: the worktree, the owner and the latest
+        change of owner, each seat's condition, engine and its provider's stated
+        budget, and the latest journal entries, the newest with its body. A seat
+        reads its peers here and messages them as any line does. **Roles step 1,
+        ``docs/architecture/ROLES.md``.** Each engine is its own provider until
+        the provider budget step reads Pi's from its configuration."""
+        state = self._log.state
+        seat = state.seats.get(line_id)
+        if seat is None:
+            raise LineToolRefused(f"line {line_id} is a seat of no role")
+        role = state.roles[seat.role_id]
+        seats: list[dict[str, object]] = []
+        for seat_id, other in sorted(state.seats.items()):
+            if other.role_id != seat.role_id:
+                continue
+            engine = ENGINE_OF.get(self.model_of(seat_id))
+            budget = state.budgets.get(engine) if engine is not None else None
+            seats.append(
+                {
+                    "line_id": seat_id,
+                    "may_own": other.may_own,
+                    "owner": role.owner == seat_id,
+                    "condition": self.condition(seat_id),
+                    "muted": state.lines[seat_id].muted,
+                    "model": self.model_of(seat_id),
+                    "provider": engine,
+                    "budget": None if budget is None else _budget_view(budget),
+                    "workdir_commit": self._workdir_commit(seat_id),
+                }
+            )
+        entries = [
+            entry
+            for entry in state.role_entries.values()
+            if entry.role_id == seat.role_id
+        ][-ROLE_STATUS_ENTRIES:]
+        change = role.changed
+        return {
+            "role_id": seat.role_id,
+            "workdir": role.workdir,
+            "handoff_seconds": role.handoff_seconds,
+            "owner": role.owner,
+            "you_own": role.owner == line_id,
+            "you_may_own": seat.may_own,
+            "last_change": None
+            if change is None
+            else {
+                "owner": change.owner,
+                "previous": change.previous,
+                "cause": change.cause.value,
+                "by": str(change.by),
+                "entry_id": change.entry_id,
+                "changed_at": change.changed_at,
+            },
+            "seats": seats,
+            "journal": [
+                _entry_view(entry, with_body=index == len(entries) - 1)
+                for index, entry in enumerate(entries)
+            ],
+        }
+
+    def role_status_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``role_status`` tool for ``line_id``, offered only to a seat."""
+        return self._view_tool(
+            ROLE_STATUS_TOOL_NAME,
+            "Show your role: its worktree, its owner and the latest change of owner,"
+            " each seat with its condition, model and its provider's stated budget,"
+            " and the latest journal entries, the newest with its text, read only.",
+            lambda: json.dumps(self.role_status(line_id), indent=2, sort_keys=True),
+        )
+
     def read_instructions_tool(self, line_id: str) -> SdkMcpTool[Any]:
         """The ``read_instructions`` tool for ``line_id``. By default it returns a
         summary, and with ``full`` the whole text."""
@@ -3021,6 +3098,11 @@ class Scheduler:
             self.read_mail_tool(line_id),
             self.acknowledge_mail_tool(line_id),
             self.list_sent_tool(line_id),
+            *(
+                [self.role_status_tool(line_id)]
+                if line_id in self._log.state.seats
+                else []
+            ),
             *self._background_tools(line_id),
             *(
                 [self.compact_session_tool(line_id)]
@@ -4858,6 +4940,34 @@ def _scheduled_summary(pending: ScheduledWake | None) -> dict[str, object] | Non
     if pending is None:
         return None
     return {"due": pending.due, "message_id": pending.message_id}
+
+
+def _budget_view(budget: BudgetStated) -> dict[str, object]:
+    """A provider's stated budget as ``role_status`` gives it, with its source and
+    time, since it is a snapshot."""
+    return {
+        "remaining_percent": budget.remaining_percent,
+        "resets_at": budget.resets_at,
+        "source": budget.source.value,
+        "note": budget.note,
+        "stated_at": budget.stated_at,
+    }
+
+
+def _entry_view(entry: RoleNoted, *, with_body: bool) -> dict[str, object]:
+    """A journal entry as ``role_status`` gives it, with its body or its size."""
+    view: dict[str, object] = {
+        "entry_id": entry.entry_id,
+        "line_id": entry.line_id,
+        "kind": entry.kind.value,
+        "workdir_commit": entry.workdir_commit or None,
+        "daemon_commit": entry.daemon_commit or None,
+        "noted_at": entry.noted_at,
+        "chars": len(entry.body),
+    }
+    if with_body:
+        view["body"] = entry.body
+    return view
 
 
 def _tool_text(text: str) -> dict[str, Any]:

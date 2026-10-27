@@ -106,6 +106,7 @@ argument outside a tool's schema is refused.
 | `list_sent` | Lists what became of the line's sent mail |
 | `acquire_lease`, `release_lease` | Take and give up a lease the project declares, as below |
 | `line_status` | Shows the line's own state, its daemon and the other lines, read only, as below |
+| `role_status` | Offered only to a seat of a role. Shows the role's worktree, owner and latest change of owner, its seats with their condition, model, provider and stated budget, and its latest five journal entries, the newest with its body, read only, as [`ROLES.md`](../architecture/ROLES.md) describes. Added on 2026-10-27 |
 | `read_instructions` | Shows the instructions the line's next turn receives, as below |
 | `write_scratch` | Writes a file under `tmp/` in the line's working directory, as below |
 | `list_processes`, `stop_process` | List and stop the processes the line started, as below |

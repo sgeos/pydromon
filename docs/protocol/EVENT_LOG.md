@@ -37,6 +37,12 @@ state by replaying the same log.
 | Message kind | `note` or `question` |
 | Due time | A time in Coordinated Universal Time to the second, written exactly as `YYYY-MM-DDTHH:MM:SSZ`, such as `2026-10-26T09:30:00Z`, and a valid date and time |
 | Wake note | Text of at most 2,000 bytes |
+| Time | Written as a due time is. An event whose time matters carries it, since the model never reads `recorded_at` |
+| Workdir | A relative path of at most 1,024 bytes, written with `/`, with no empty, `.` or `..` step, no `\` and no NUL, or `.` for the project root |
+| Commit | 40 or 64 lowercase hexadecimal characters, or empty where the daemon could not read one |
+| Ownership cause | `declared`, `handoff`, `recovery`, `operator` or `relinquished` |
+| Entry kind | `handoff`, `recovery` or `note` |
+| Budget source | `operator` or `engine` |
 
 Identifiers are never reused within their kind, even after a line stops or a question
 closes. A resent event is therefore rejected rather than applied twice. Lines and
@@ -92,6 +98,11 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `question_withdrawn` | `message_id` | The message is a question and is open |
 | `question_superseded` | `message_id`, `superseded_by` | Both messages are open questions, they differ, and they come from the same line |
 | `context_handed_off` | `line_id`, `cause` of `rebound` or `cleared`, `outcome` of `given` or `opted_out`, `message_ids`, at most 64 identifiers, `chars`, a whole number from 0 to 1,048,576, and `sha256`, a lowercase hexadecimal SHA-256 digest when given and empty otherwise | The line exists and is owed a handoff for this cause, which `line_rebound` and `line_session_cleared` set, as their `rebound` and `cleared`. An `opted_out` handoff selects nothing, with no identifiers, zero `chars` and an empty digest. Ends the handoff. Only the daemon records it, once the engine ran the turn that carried it, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies. Added on 2026-10-27 |
+| `role_declared` | `role_id`, `workdir`, `handoff_seconds` a whole number from 60 to 86,400 | The role does not exist, or exists and this changes its workdir or its handoff bound, and its workdir changes only while no seat owns it. The handoff bound is how long an owner asked to hand the role over has before the operator is asked to recover it instead, an hour by default. Added on 2026-10-27 |
+| `seat_bound` | `line_id`, `role_id`, `may_own` boolean | The line and the role exist, the line is a seat of no other role, and this is a new seat or changes the seat's `may_own`. A seat whose `may_own` is false never owns its role, and an owner cannot be made one. Added on 2026-10-27 |
+| `ownership_changed` | `role_id`, `owner` and `previous` line identifiers or `null`, `cause` ownership cause, `by` address, `entry_id` or `null`, `changed_at` time | See the ownership rules below. Added on 2026-10-27 |
+| `role_noted` | `role_id`, `entry_id`, `line_id`, `kind` entry kind, `body` text of 1 to 65,536 bytes, `workdir_commit` and `daemon_commit` commits, `noted_at` time | No entry has the identifier, the role exists and the line is its seat. A `handoff` or `recovery` entry is by the role's current owner, and a `note` by any seat. The daemon stamps both commits itself from `HEAD`. Added on 2026-10-27 |
+| `budget_stated` | `provider` identifier, `remaining_percent` a whole number from 0 to 100 or `null`, `resets_at` time or `null`, not both `null`, `source` budget source, `note` text of at most 1,024 bytes, `stated_at` time | Always. Replaces the provider's earlier statement. It is a snapshot and later turns do not adjust it. Added on 2026-10-27 |
 
 **Message rules.** A `message_sent` applies when every one of these holds.
 
@@ -139,6 +150,26 @@ pending wake. It is the only message to itself that clears a scheduled wake.
   identifier, so a later turn can say when the wake was due, also after a restart.
 - **Due time.** The model checks only the form. The daemon compares the due time with
   its wall clock in Coordinated Universal Time.
+
+**Ownership rules.** Roles are specified in
+[`ROLES.md`](../architecture/ROLES.md), approved by the operator on 2026-10-27. An
+`ownership_changed` applies when every one of these holds.
+
+1. `previous` is the role's current owner, both `null` for a vacant role, and `owner`
+   differs from it. Two changes that race name the same `previous`, so only the first
+   applies.
+2. `owner`, unless `null`, is a seat of the role whose `may_own` is true, and its line
+   is not stopped. `owner` is `null` only for `relinquished` or `operator`.
+3. `by` exists. A line `by` is a seat of the role.
+4. `declared` replaces no owner and `declared` and `operator` are made by an operator.
+   `handoff` and `relinquished` are made by the previous owner, and `relinquished`
+   leaves the role vacant. `recovery` names an owner and is made by an operator or by
+   the new owner itself, never by an external agent.
+5. `entry_id`, unless `null`, names an entry of the role. A `handoff` requires one, and
+   it is the role's latest entry, a `handoff` entry by the previous owner.
+
+The model checks that a change is consistent. The daemon checks that its maker had the
+authority, such as the harness-observed exhaustion that a seat's own recovery needs.
 
 **Line transitions.** `idle` to `running`, `running` to `idle`, `idle` to `stopped`,
 `running` to `stopped`, and `stopped` to `idle`. No other change is permitted, including

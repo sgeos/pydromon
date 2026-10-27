@@ -51,6 +51,14 @@ from dromon.model import (
     ProcessesLeft,
     StopUnverified,
     WalkLimited,
+    RoleDeclared,
+    SeatBound,
+    OwnershipChanged,
+    OwnershipCause,
+    RoleNoted,
+    RoleNoteKind,
+    BudgetStated,
+    BudgetSource,
 )
 
 ENGINE = "claude-opus-5-5"
@@ -61,6 +69,7 @@ BEN = OperatorAddress("ben")
 PROBE = AgentAddress("probe")
 NOTE = MessageKind.NOTE
 QUESTION = MessageKind.QUESTION
+AT = "2026-10-27T05:00:00Z"
 
 # A valid history that uses every event kind, both message kinds and every address kind
 # as sender and recipient, with two operators. The coverage tests check that it really
@@ -127,6 +136,32 @@ SCENARIO: tuple[Event, ...] = (
     StopUnverified("beta", "the launcher exited before its stop finished"),
     LineRebound("alpha", "claude-haiku-5-5", "subscription"),
     ContextHandedOff("alpha", "rebound", "given", ("q4", "m3"), 812, "a" * 64),
+    RoleDeclared("core", "tmp/worktrees/core"),
+    SeatBound("alpha", "core", True),
+    SeatBound("beta", "core", False),
+    SeatBound("beta", "core", True),
+    OwnershipChanged("core", "alpha", None, OwnershipCause.DECLARED, ANA, None, AT),
+    RoleNoted("core", "e1", "beta", RoleNoteKind.NOTE, "ready to take it", "", "", AT),
+    RoleNoted(
+        "core",
+        "e2",
+        "alpha",
+        RoleNoteKind.HANDOFF,
+        "the gate passed",
+        "a" * 40,
+        "b" * 64,
+        AT,
+    ),
+    OwnershipChanged("core", "beta", "alpha", OwnershipCause.HANDOFF, ALPHA, "e2", AT),
+    RoleNoted("core", "e3", "beta", RoleNoteKind.RECOVERY, "found clean", "", "", AT),
+    OwnershipChanged("core", None, "beta", OwnershipCause.RELINQUISHED, BETA, None, AT),
+    OwnershipChanged("core", "alpha", None, OwnershipCause.RECOVERY, ALPHA, None, AT),
+    OwnershipChanged("core", "beta", "alpha", OwnershipCause.OPERATOR, BEN, None, AT),
+    RoleDeclared("core", "tmp/worktrees/core", 7200),
+    BudgetStated(
+        "claude-code", 40, "2026-10-28T00:00:00Z", BudgetSource.OPERATOR, "", AT
+    ),
+    BudgetStated("codex", 0, None, BudgetSource.ENGINE, "a plan limit", AT),
     LineStateChanged("alpha", LineState.STOPPED),
 )
 

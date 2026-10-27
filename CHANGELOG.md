@@ -29,6 +29,14 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Roles with seats on several providers, approved by the operator on 2026-10-27, as
+  `docs/architecture/ROLES.md` describes, first step. The events `role_declared`,
+  `seat_bound`, `ownership_changed`, `role_noted` and `budget_stated` are in the model
+  and the codec, with checks that a role has at most one owner, that the owner is a
+  live seat that may own it, that a change of owner names the owner it replaces so two
+  that race cannot both apply, and that a handoff rests on the previous owner's latest
+  handoff entry. A seat has the `role_status` tool. Nothing records these events yet,
+  since the project file's roles and the ownership tools are the next steps.
 - Restart to upgrade, by the operator's decision of 2026-10-27, as
   `docs/protocol/RESTART.md` specifies.
   - `dromon restart [--interrupt] [--wait-seconds S] [--end-tasks]` and the client

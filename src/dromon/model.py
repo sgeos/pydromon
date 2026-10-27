@@ -798,6 +798,244 @@ class ContextHandedOff:
             raise InvalidField("a handoff the line opted out of selects nothing")
 
 
+# Roles, seats and ownership. ``docs/architecture/ROLES.md``, approved by the operator
+# on 2026-10-27. A role is a line of work with one worktree, its seats are lines, and
+# at most one seat owns the role, which is to say may write its worktree.
+
+MAX_WORKDIR_BYTES: Final = 1024
+DEFAULT_HANDOFF_SECONDS: Final = 3600
+"""How long an owner asked to hand a role over has before the operator is asked
+whether to recover it instead. One hour, configurable per role, as the operator
+decided on 2026-10-27."""
+MIN_HANDOFF_SECONDS: Final = 60
+MAX_HANDOFF_SECONDS: Final = 86400
+MAX_ROLE_NOTE_BYTES: Final = 64 * 1024
+"""The largest journal entry, which fits the handoff template with room to spare."""
+MAX_BUDGET_NOTE_BYTES: Final = 1024
+COMMIT_PATTERN: Final = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+"""A git commit, SHA-1 or SHA-256, in lowercase hexadecimal."""
+
+
+class OwnershipCause(StrEnum):
+    DECLARED = "declared"
+    """The project file named the first owner."""
+    HANDOFF = "handoff"
+    """The owner passed the role to a successor, with a handoff entry."""
+    RECOVERY = "recovery"
+    """A seat or an operator took the role while its owner could not act."""
+    OPERATOR = "operator"
+    """An operator gave the role to a seat, or left it vacant."""
+    RELINQUISHED = "relinquished"
+    """The owner gave the role up with no successor."""
+
+
+class RoleNoteKind(StrEnum):
+    HANDOFF = "handoff"
+    RECOVERY = "recovery"
+    NOTE = "note"
+
+
+class BudgetSource(StrEnum):
+    OPERATOR = "operator"
+    ENGINE = "engine"
+
+
+def check_instant(name: str, value: object) -> None:
+    """Raise ``InvalidField`` unless ``value`` is a time in the ``DUE_FORMAT`` form.
+    The model never reads the log's own ``recorded_at``, so an event whose time
+    matters carries it."""
+    check_text(name, value, len("YYYY-MM-DDTHH:MM:SSZ"))
+    if not isinstance(value, str):  # Unreachable, since check_text refuses it.
+        raise InvalidField(f"{value!r} is not text")
+    parse_due(value)
+
+
+def check_workdir(value: object) -> None:
+    """Raise ``InvalidField`` unless ``value`` is a relative path inside the project,
+    written with ``/`` and without ``.`` or ``..`` steps, or ``.`` for the project
+    root itself. The daemon resolves it and refuses a protected directory."""
+    check_text("workdir", value, MAX_WORKDIR_BYTES)
+    if not isinstance(value, str):  # Unreachable, since check_text refuses it.
+        raise InvalidField(f"{value!r} is not text")
+    if value == ".":
+        return
+    if not value or value.startswith("/") or "\\" in value or "\x00" in value:
+        raise InvalidField(f"workdir is not a relative path: {value!r}")
+    if any(step in ("", ".", "..") for step in value.split("/")):
+        raise InvalidField(f"workdir has an empty, . or .. step: {value!r}")
+
+
+def check_commit(name: str, value: object) -> None:
+    """Raise ``InvalidField`` unless ``value`` is a commit, or empty where the daemon
+    could not read one."""
+    check_text(name, value, 64)
+    if not isinstance(value, str):  # Unreachable, since check_text refuses it.
+        raise InvalidField(f"{value!r} is not text")
+    if value and COMMIT_PATTERN.fullmatch(value) is None:
+        raise InvalidField(f"{name} is not a commit: {value!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class RoleDeclared:
+    """A role and its worktree, relative to the project root, with how long a
+    planned handoff may take. Declaring a role again changes these, and is refused
+    when nothing changes or when the worktree would change while a seat owns it."""
+
+    role_id: str
+    workdir: str
+    handoff_seconds: int = DEFAULT_HANDOFF_SECONDS
+
+    def __post_init__(self) -> None:
+        check_id("role_id", self.role_id)
+        check_workdir(self.workdir)
+        seconds = self.handoff_seconds
+        if type(seconds) is not int or not (
+            MIN_HANDOFF_SECONDS <= seconds <= MAX_HANDOFF_SECONDS
+        ):
+            raise InvalidField(
+                "handoff_seconds must be a whole number from"
+                f" {MIN_HANDOFF_SECONDS} to {MAX_HANDOFF_SECONDS}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class SeatBound:
+    """A line becomes a seat of a role, or a seat's ``may_own`` changes. A seat whose
+    ``may_own`` is false may read and advise but never own. A line is a seat of at
+    most one role."""
+
+    line_id: str
+    role_id: str
+    may_own: bool
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_id("role_id", self.role_id)
+        if type(self.may_own) is not bool:
+            raise InvalidField("may_own must be true or false")
+
+
+@dataclass(frozen=True, slots=True)
+class OwnershipChanged:
+    """A role's owner changes from ``previous`` to ``owner``, either of which may be
+    ``None`` for a vacant role. It applies only while ``previous`` is the current
+    owner, so of two changes that race only the first applies. ``by`` is the seat or
+    operator that made it, and ``entry_id`` the journal entry it rests on, which a
+    handoff requires. The model checks the change is consistent. The daemon checks
+    that ``by`` had the authority, such as harness-observed exhaustion for a seat's
+    own recovery."""
+
+    role_id: str
+    owner: str | None
+    previous: str | None
+    cause: OwnershipCause
+    by: Address
+    entry_id: str | None
+    changed_at: str
+
+    def __post_init__(self) -> None:
+        check_id("role_id", self.role_id)
+        check_optional_id("owner", self.owner)
+        check_optional_id("previous", self.previous)
+        check_member("cause", self.cause, OwnershipCause)
+        check_address("by", self.by)
+        check_optional_id("entry_id", self.entry_id)
+        check_instant("changed_at", self.changed_at)
+        if self.owner == self.previous:
+            raise InvalidField("owner and previous are the same")
+        cause = self.cause
+        if self.owner is None and cause not in (
+            OwnershipCause.RELINQUISHED,
+            OwnershipCause.OPERATOR,
+        ):
+            raise InvalidField(f"a {cause} change names an owner")
+        if cause is OwnershipCause.RELINQUISHED and self.owner is not None:
+            raise InvalidField("a relinquished role has no owner")
+        if cause is OwnershipCause.DECLARED and self.previous is not None:
+            raise InvalidField("a declared owner replaces no owner")
+        if cause is OwnershipCause.HANDOFF and (
+            self.previous is None or self.entry_id is None
+        ):
+            raise InvalidField("a handoff names the previous owner and its entry")
+        operator_only = (OwnershipCause.DECLARED, OwnershipCause.OPERATOR)
+        if cause in operator_only and not isinstance(self.by, OperatorAddress):
+            raise InvalidField(f"a {cause} change is made by an operator")
+        from_owner = (OwnershipCause.HANDOFF, OwnershipCause.RELINQUISHED)
+        if cause in from_owner and (
+            self.previous is None or self.by != LineAddress(self.previous)
+        ):
+            raise InvalidField(f"a {cause} change is made by the previous owner")
+        if (
+            cause is OwnershipCause.RECOVERY
+            and isinstance(self.by, LineAddress)
+            and self.by.line_id != self.owner
+        ):
+            raise InvalidField("a seat recovers a role only for itself")
+        if cause is OwnershipCause.RECOVERY and isinstance(self.by, AgentAddress):
+            raise InvalidField("an external agent does not recover a role")
+
+
+@dataclass(frozen=True, slots=True)
+class RoleNoted:
+    """An entry in a role's journal by one of its seats. A handoff or recovery entry
+    is written by the current owner, a note by any seat. The daemon stamps both
+    commits itself, read from ``HEAD``, so the stamp is observed and not claimed,
+    and leaves one empty when it cannot read it."""
+
+    role_id: str
+    entry_id: str
+    line_id: str
+    kind: RoleNoteKind
+    body: str
+    workdir_commit: str
+    daemon_commit: str
+    noted_at: str
+
+    def __post_init__(self) -> None:
+        check_id("role_id", self.role_id)
+        check_id("entry_id", self.entry_id)
+        check_id("line_id", self.line_id)
+        check_member("kind", self.kind, RoleNoteKind)
+        check_text("body", self.body, MAX_ROLE_NOTE_BYTES)
+        if not self.body:
+            raise InvalidField("body must not be empty")
+        check_commit("workdir_commit", self.workdir_commit)
+        check_commit("daemon_commit", self.daemon_commit)
+        check_instant("noted_at", self.noted_at)
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetStated:
+    """What remains of a provider's plan, as an operator states it or an engine
+    reports it at a plan limit, replacing the provider's earlier statement. It is a
+    snapshot with its time, never adjusted by later turns, since a turn's cost does
+    not convert reliably to a plan's percentage."""
+
+    provider: str
+    remaining_percent: int | None
+    resets_at: str | None
+    source: BudgetSource
+    note: str
+    stated_at: str
+
+    def __post_init__(self) -> None:
+        check_id("provider", self.provider)
+        percent = self.remaining_percent
+        if percent is not None and (
+            type(percent) is not int or not 0 <= percent <= 100
+        ):
+            raise InvalidField("remaining_percent must be a whole number from 0 to 100")
+        if self.resets_at is not None:
+            check_instant("resets_at", self.resets_at)
+        if percent is None and self.resets_at is None:
+            raise InvalidField(
+                "a budget states a remaining percentage, a reset or both"
+            )
+        check_member("source", self.source, BudgetSource)
+        check_text("note", self.note, MAX_BUDGET_NOTE_BYTES)
+        check_instant("stated_at", self.stated_at)
+
+
 type Event = (
     LineCreated
     | LineStateChanged
@@ -832,6 +1070,11 @@ type Event = (
     | QuestionWithdrawn
     | QuestionSuperseded
     | ContextHandedOff
+    | RoleDeclared
+    | SeatBound
+    | OwnershipChanged
+    | RoleNoted
+    | BudgetStated
 )
 
 
@@ -916,6 +1159,23 @@ class ScheduledWake:
     note: str
 
 
+@dataclass(frozen=True, slots=True)
+class Role:
+    workdir: str
+    handoff_seconds: int
+    owner: str | None = None
+    """The seat that may write the role's worktree, or ``None`` while it is vacant."""
+    changed: OwnershipChanged | None = None
+    """The role's latest ``ownership_changed``, which a former owner's next turn is
+    told of."""
+
+
+@dataclass(frozen=True, slots=True)
+class Seat:
+    role_id: str
+    may_own: bool
+
+
 @dataclass(slots=True)
 class State:
     """Everything the event log records, keyed by identifier.
@@ -948,6 +1208,13 @@ class State:
     another message. **Round 7 review, F1.**"""
     walk_limit: str = ""
     """The latest ``walk_limited`` note, empty when none is recorded."""
+    roles: dict[str, Role] = field(default_factory=dict[str, Role])
+    seats: dict[str, Seat] = field(default_factory=dict[str, Seat])
+    """Each seat's binding, keyed by line. A line is a seat of at most one role."""
+    role_entries: dict[str, RoleNoted] = field(default_factory=dict[str, RoleNoted])
+    """Every role's journal entries, keyed by entry, in the order they were noted."""
+    budgets: dict[str, BudgetStated] = field(default_factory=dict[str, BudgetStated])
+    """Each provider's latest stated budget, keyed by provider."""
 
     def copy(self) -> "State":
         """Return an independent snapshot. The records are frozen, so maps suffice."""
@@ -963,6 +1230,10 @@ class State:
             set(self.hold_questions),
             set(self.withdrawn_wakes),
             self.walk_limit,
+            dict(self.roles),
+            dict(self.seats),
+            dict(self.role_entries),
+            dict(self.budgets),
         )
 
     def open_questions(self, operator_id: str) -> list[str]:
@@ -1080,6 +1351,16 @@ class State:
                     raise EventRejected(
                         f"line {event.line_id} is owed no handoff for {event.cause}"
                     )
+            case RoleDeclared():
+                self._check_role_declared(event)
+            case SeatBound():
+                self._check_seat_bound(event)
+            case OwnershipChanged():
+                self._check_ownership_changed(event)
+            case RoleNoted():
+                self._check_role_noted(event)
+            case BudgetStated():
+                pass
             case _:
                 assert_never(event)
 
@@ -1205,6 +1486,28 @@ class State:
                     QuestionStatus.SUPERSEDED,
                     superseded_by=event.superseded_by,
                 )
+            case RoleDeclared():
+                role = self.roles.get(event.role_id)
+                self.roles[event.role_id] = (
+                    Role(event.workdir, event.handoff_seconds)
+                    if role is None
+                    else replace(
+                        role,
+                        workdir=event.workdir,
+                        handoff_seconds=event.handoff_seconds,
+                    )
+                )
+            case SeatBound():
+                self.seats[event.line_id] = Seat(event.role_id, event.may_own)
+            case OwnershipChanged():
+                role = self.roles[event.role_id]
+                self.roles[event.role_id] = replace(
+                    role, owner=event.owner, changed=event
+                )
+            case RoleNoted():
+                self.role_entries[event.entry_id] = event
+            case BudgetStated():
+                self.budgets[event.provider] = event
             case _:
                 assert_never(event)
 
@@ -1396,6 +1699,102 @@ class State:
             raise EventRejected(
                 f"question {event.superseded_by} is from another line than"
                 f" {event.message_id}"
+            )
+
+    def _role(self, role_id: str) -> Role:
+        role = self.roles.get(role_id)
+        if role is None:
+            raise EventRejected(f"no role {role_id}")
+        return role
+
+    def _seat(self, line_id: str, role_id: str) -> Seat:
+        """The seat ``line_id`` holds in ``role_id``, or a rejection."""
+        seat = self.seats.get(line_id)
+        if seat is None or seat.role_id != role_id:
+            raise EventRejected(f"line {line_id} is not a seat of role {role_id}")
+        return seat
+
+    def _check_role_declared(self, event: RoleDeclared) -> None:
+        role = self.roles.get(event.role_id)
+        if role is None:
+            return
+        if (role.workdir, role.handoff_seconds) == (
+            event.workdir,
+            event.handoff_seconds,
+        ):
+            raise EventRejected(f"role {event.role_id} is declared so already")
+        if role.workdir != event.workdir and role.owner is not None:
+            raise EventRejected(
+                f"role {event.role_id} changes its worktree only while vacant,"
+                f" and {role.owner} owns it"
+            )
+
+    def _check_seat_bound(self, event: SeatBound) -> None:
+        self._line(event.line_id)
+        role = self._role(event.role_id)
+        seat = self.seats.get(event.line_id)
+        if seat is not None and seat.role_id != event.role_id:
+            raise EventRejected(
+                f"line {event.line_id} is a seat of role {seat.role_id}"
+            )
+        if seat is not None and seat.may_own == event.may_own:
+            raise EventRejected(
+                f"line {event.line_id} is bound to role {event.role_id} so already"
+            )
+        if not event.may_own and role.owner == event.line_id:
+            raise EventRejected(
+                f"line {event.line_id} owns role {event.role_id}, so it must give"
+                " the role up before it can be barred from owning it"
+            )
+
+    def _check_ownership_changed(self, event: OwnershipChanged) -> None:
+        role = self._role(event.role_id)
+        if role.owner != event.previous:
+            raise EventRejected(
+                f"role {event.role_id} is owned by {role.owner or 'no seat'},"
+                f" not {event.previous or 'no seat'}"
+            )
+        self._require_party(event.by)
+        if isinstance(event.by, LineAddress):
+            self._seat(event.by.line_id, event.role_id)
+        if event.owner is not None:
+            if not self._seat(event.owner, event.role_id).may_own:
+                raise EventRejected(
+                    f"line {event.owner} may not own role {event.role_id}"
+                )
+            self._live_line(event.owner)
+        if event.entry_id is not None:
+            entry = self.role_entries.get(event.entry_id)
+            if entry is None or entry.role_id != event.role_id:
+                raise EventRejected(
+                    f"role {event.role_id} has no entry {event.entry_id}"
+                )
+            if event.cause is OwnershipCause.HANDOFF and (
+                entry.kind is not RoleNoteKind.HANDOFF
+                or entry.line_id != event.previous
+                or self.latest_entry(event.role_id) != event.entry_id
+            ):
+                raise EventRejected(
+                    f"entry {event.entry_id} is not the latest entry of role"
+                    f" {event.role_id}, a handoff by {event.previous}"
+                )
+
+    def latest_entry(self, role_id: str) -> str | None:
+        """The identifier of ``role_id``'s latest journal entry, if it has one."""
+        for entry_id in reversed(self.role_entries):
+            if self.role_entries[entry_id].role_id == role_id:
+                return entry_id
+        return None
+
+    def _check_role_noted(self, event: RoleNoted) -> None:
+        if event.entry_id in self.role_entries:
+            raise EventRejected(f"entry {event.entry_id} exists")
+        role = self._role(event.role_id)
+        self._seat(event.line_id, event.role_id)
+        if event.kind is not RoleNoteKind.NOTE and role.owner != event.line_id:
+            raise EventRejected(
+                f"a {event.kind} entry of role {event.role_id} is written by its"
+                f" owner, not {event.line_id}"
             )
 
     # Mutations.

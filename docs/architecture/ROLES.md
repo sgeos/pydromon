@@ -2,12 +2,13 @@
 
 > **Navigation**: [Architecture](./README.md) | [Documentation Root](../README.md)
 
-**Proposed on 2026-10-27, for the operator's review before any of it is built.** Item 4
+**Approved by the operator on 2026-10-27, with the decisions recorded below.** Item 4
 of the iteration brief makes roles first class. A role has seats on several providers,
-and one seat at a time holds write ownership. This document proposes the data model,
-the two flows the brief requires, and how the existing lines map onto roles. Nothing
-here is implemented. Facts about the present code are marked as such, and the rest is
-proposal.
+and one seat at a time holds write ownership. This document gives the data model, the
+two flows the brief requires, and how the existing lines map onto roles. The events,
+their model checks and codec, and the `role_status` tool are implemented, as the first
+step of the order of work. The rest is not yet built. Facts about the present code are
+marked as such.
 
 ## Terms
 
@@ -34,16 +35,21 @@ a restart and a port carries it unchanged.
 
 | Event | Fields | Records |
 |---|---|---|
-| `role_declared` | `role_id`, `workdir` | A role and its worktree, relative to the project root |
+| `role_declared` | `role_id`, `workdir`, `handoff_seconds` | A role, its worktree relative to the project root, and how long a planned handoff may take, an hour by default |
 | `seat_bound` | `line_id`, `role_id`, `may_own` | A line becomes a seat of a role. `may_own` false makes a seat that may read and advise but never own |
-| `ownership_changed` | `role_id`, `owner` or null, `previous` or null, `cause`, `by`, `entry_id` or null | Every change of owner. `cause` is `declared`, `handoff`, `recovery`, `operator` or `relinquished`. `by` is the operator or seat that made it |
-| `role_noted` | `role_id`, `entry_id`, `line_id`, `kind`, `body`, `workdir_commit`, `daemon_commit` | A journal entry. `kind` is `handoff`, `recovery` or `note`. The daemon stamps both commits itself, read from `HEAD`, so the stamp is observed and not claimed |
-| `budget_stated` | `provider`, `remaining_percent` or null, `resets_at` or null, `source`, `note` | A provider's budget. `source` is `operator` or `engine` |
+| `ownership_changed` | `role_id`, `owner` or null, `previous` or null, `cause`, `by`, `entry_id` or null, `changed_at` | Every change of owner. `cause` is `declared`, `handoff`, `recovery`, `operator` or `relinquished`. `by` is the operator or seat that made it |
+| `role_noted` | `role_id`, `entry_id`, `line_id`, `kind`, `body`, `workdir_commit`, `daemon_commit`, `noted_at` | A journal entry. `kind` is `handoff`, `recovery` or `note`. The daemon stamps both commits itself, read from `HEAD`, so the stamp is observed and not claimed |
+| `budget_stated` | `provider`, `remaining_percent` or null, `resets_at` or null, `source`, `note`, `stated_at` | A provider's budget. `source` is `operator` or `engine` |
 
 The model's checks give these invariants. A role has at most one owner. The owner is a
-seat of the role whose `may_own` is true. A line is a seat of at most one role. A
-journal entry names a seat of its role. An `ownership_changed` whose `previous` is not
-the current owner is refused, so two changes that race cannot both apply.
+seat of the role whose `may_own` is true, and is not stopped. A line is a seat of at
+most one role. A journal entry names a seat of its role, and a handoff or recovery
+entry is by the current owner. An `ownership_changed` whose `previous` is not the
+current owner is refused, so two changes that race cannot both apply. A handoff rests
+on the role's latest entry, a handoff entry by the previous owner. A role's worktree
+changes only while it is vacant. The model never reads the log's `recorded_at`, so the
+events whose time matters carry it. The normative rules are in
+[`EVENT_LOG.md`](../protocol/EVENT_LOG.md).
 
 **Declared in the project file.** A role and its seats are declared in
 `.dromon/dromon.toml`, which an operator owns, in the way lines are declared today, and
@@ -55,7 +61,8 @@ lines. The first owner is the seat the file names as `owner`, recorded with caus
 [roles.core]
 workdir = "tmp/worktrees/core"
 owner = "core"
-seats = ["core", "core-codex", "core-grok"]
+seats = ["core", "core-luna", "core-grok"]
+handoff_seconds = 3600   # the default
 
 [lines.core-grok]
 model = "grok-4.7"
@@ -66,9 +73,11 @@ may_own = false   # until an operator probe has run Grok live in Dromon
 
 **Enforced through the sandbox.** A seat that owns its role runs with the role's
 worktree writable. Every other seat of the role runs with it read only, through the
-sandbox profile each engine adapter already builds. The scratch directory `tmp/` of the
-worktree is the one exception, so a seat that does not own the role can still write its
-notes with `write_scratch`. Ownership is read when a seat's turn starts. An ownership
+sandbox profile each engine adapter already builds. **Decided on 2026-10-27.** A seat
+that does not own the role may read the worktree at any time, also while the owner
+writes, so it can prepare a handoff, and it writes only the worktree's scratch
+directory `tmp/`, with `write_scratch` or its own tools. What it reads in the middle of
+the owner's change may be inconsistent, which the recovery checklist accounts for. Ownership is read when a seat's turn starts. An ownership
 change drops the engine of every seat whose access changed, so the next turn builds a
 new session with the new profile, since a sandbox is fixed for an engine session's
 life.
@@ -117,15 +126,18 @@ successor next relinquishes, ownership returns to that seat with cause `handoff`
 operator step, so two seats can pass a role back and forth for a few tasks. The seat
 list has no order, and any seat with `may_own` can receive a role.
 
-**An owner that does not hand over.** If the owner has not relinquished within an hour
-of the request, the operator is asked whether to recover the role instead.
+**An owner that does not hand over.** If the owner has not relinquished within the
+role's `handoff_seconds` of the request, an hour unless the role declares otherwise, the
+operator is asked whether to recover the role instead.
 
 ## Recovery
 
 A seat takes ownership with `take_ownership` and a reason, or the operator gives it with
-`dromon role take ROLE --seat SEAT`. A seat's own take is allowed only when the harness
-itself shows that the owner cannot act, so a line cannot take a role from a working
-seat by claiming otherwise.
+`dromon role take ROLE --seat SEAT`. **Decided on 2026-10-27.** A seat's own take is
+allowed, since ownership must pass when the owner's provider is out of tokens, but
+only when the harness itself shows that the owner cannot act, by the first three rows
+below, so a line cannot take a role from a working seat by claiming otherwise. An
+operator can always take.
 
 | Owner's state | A seat may take | The operator may take |
 |---|---|---|
@@ -152,9 +164,11 @@ changes, if any, are named in the recovery record it can read.
 ## Messages between seats
 
 **Fact.** Any line may already send any line a note, so seats of a role can message
-each other today. The proposal adds `role_status`, which lists the role's seats, each
-seat's condition, mute, provider and budget, the owner, and the latest journal entries,
-so a seat can find its peers. A note between seats is ordinary line mail, data from its
+each other today. **Implemented.** `role_status`, a tool offered only to a seat,
+lists the role's worktree and handoff bound, the owner and the latest change of owner,
+each seat's condition, mute, model, provider, stated budget and worktree commit, and
+the role's latest five journal entries, the newest with its body, so a seat can find
+its peers. Until the budget step, each engine counts as its own provider. A note between seats is ordinary line mail, data from its
 sender like any other, and counts toward the autonomous limits as mail between lines
 does. No role-wide broadcast is proposed, because a broadcast multiplies turns across
 providers whose budgets are short.
@@ -181,21 +195,21 @@ recovery.
 
 ## Mapping the existing lines
 
-**Proposed.** Each line that works in a role's worktree becomes that role's first seat
-and owner, keeping its identity, session and mailbox.
+**Decided on 2026-10-27.** The primary seats stay `core`, `engines` and `review`, each
+its role's first seat and owner, keeping its identity, session and mailbox. An
+alternate seat is named for its role and its engine.
 
 | Role | Worktree | First seat and owner | Alternate seats, created muted |
 |---|---|---|---|
-| core | `tmp/worktrees/core` | `core` | `core-codex`, `core-grok` |
-| engines | `tmp/worktrees/engines` | `engines` | `engines-claude`, `engines-grok` |
-| review | `tmp/worktrees/review` | `review` | `review-codex`, `review-grok` |
+| core | `tmp/worktrees/core` | `core` | `core-luna`, `core-grok` |
+| engines | `tmp/worktrees/engines` | `engines` | `engines-opus`, `engines-grok` |
+| review | `tmp/worktrees/review` | `review` | `review-luna`, `review-grok` |
 
 The alternate seats are created muted, so that they spend nothing until a handoff or a
 recovery unmutes them, and the Grok seats have `may_own` false until an operator probe
 has run Grok live in Dromon. The review role's owner writes only its report, as today.
-The other lines in this project are not mapped. The operator decides whether each
-becomes a seat, stays a line without a role, or is retired. A line without a role
-behaves exactly as today.
+The lines `worker`, `reviewer` and `luna` are retired and are no longer declared. A
+line without a role behaves exactly as today.
 
 ## Failure modes
 
@@ -214,21 +228,24 @@ behaves exactly as today.
 - **Approximate budget.** A budget is a snapshot from an operator or a plan-limit
   report, and is shown with its source and age.
 
-## Open questions for the operator
+## Decisions
 
-1. Whether a seat's own `take_ownership` should be allowed at all, or recovery should
-   always need an operator. This proposal allows it only on harness-observed
-   exhaustion.
-2. Whether non-owner seats should read the worktree while the owner writes, which risks
-   reading a tree in the middle of a change, or should run only between the owner's
-   turns.
-3. The names of alternate seats, and whether the other lines in this project become
-   seats.
-4. Whether the one-hour bound on a planned handoff suits you.
+The operator answered the four open questions on 2026-10-27, and may overrule any of
+them.
 
-## Order of work, once approved
+1. A seat may take ownership itself when the harness shows the owner cannot act, by the
+   three conditions of the recovery table. An operator can always take.
+2. A seat that does not own its role may read the worktree at any time, read only, and
+   writes only `tmp/`.
+3. The primary seats are `core`, `engines` and `review`, and the alternates are named
+   for role and engine, muted at creation, with the Grok seats unable to own until the
+   probe. `worker`, `reviewer` and `luna` are retired.
+4. The handoff bound is one hour, configurable per role as `handoff_seconds`.
 
-1. The events, model checks and codec, with the project file's roles, and `role_status`.
+## Order of work
+
+1. The events, model checks and codec, and `role_status`, which are done, then the
+   project file's roles, recorded at the daemon's start.
 2. `relinquish_ownership`, `take_ownership`, `record_role_note`, and the client
    operations and `dromon role` commands.
 3. Read-only seats in each adapter's sandbox profile, which is the engines role's work,

@@ -57,6 +57,14 @@ from dromon.model import (
     ProcessesLeft,
     StopUnverified,
     WalkLimited,
+    RoleDeclared,
+    SeatBound,
+    OwnershipChanged,
+    OwnershipCause,
+    RoleNoted,
+    RoleNoteKind,
+    BudgetStated,
+    BudgetSource,
     parse_address,
 )
 
@@ -114,6 +122,35 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "message_ids",
         "chars",
         "sha256",
+    ),
+    "role_declared": ("role_id", "workdir", "handoff_seconds"),
+    "seat_bound": ("line_id", "role_id", "may_own"),
+    "ownership_changed": (
+        "role_id",
+        "owner",
+        "previous",
+        "cause",
+        "by",
+        "entry_id",
+        "changed_at",
+    ),
+    "role_noted": (
+        "role_id",
+        "entry_id",
+        "line_id",
+        "kind",
+        "body",
+        "workdir_commit",
+        "daemon_commit",
+        "noted_at",
+    ),
+    "budget_stated": (
+        "provider",
+        "remaining_percent",
+        "resets_at",
+        "source",
+        "note",
+        "stated_at",
     ),
 }
 """The wire name of each event kind and its fields, in declaration order."""
@@ -315,6 +352,48 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "chars": event.chars,
                 "sha256": event.sha256,
             }
+        case RoleDeclared():
+            return "role_declared", {
+                "role_id": event.role_id,
+                "workdir": event.workdir,
+                "handoff_seconds": event.handoff_seconds,
+            }
+        case SeatBound():
+            return "seat_bound", {
+                "line_id": event.line_id,
+                "role_id": event.role_id,
+                "may_own": event.may_own,
+            }
+        case OwnershipChanged():
+            return "ownership_changed", {
+                "role_id": event.role_id,
+                "owner": event.owner,
+                "previous": event.previous,
+                "cause": event.cause.value,
+                "by": str(event.by),
+                "entry_id": event.entry_id,
+                "changed_at": event.changed_at,
+            }
+        case RoleNoted():
+            return "role_noted", {
+                "role_id": event.role_id,
+                "entry_id": event.entry_id,
+                "line_id": event.line_id,
+                "kind": event.kind.value,
+                "body": event.body,
+                "workdir_commit": event.workdir_commit,
+                "daemon_commit": event.daemon_commit,
+                "noted_at": event.noted_at,
+            }
+        case BudgetStated():
+            return "budget_stated", {
+                "provider": event.provider,
+                "remaining_percent": event.remaining_percent,
+                "resets_at": event.resets_at,
+                "source": event.source.value,
+                "note": event.note,
+                "stated_at": event.stated_at,
+            }
         case _:
             assert_never(event)
 
@@ -439,6 +518,46 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _int(data, "chars"),
                 _str(data, "sha256"),
             )
+        case "role_declared":
+            return RoleDeclared(
+                _str(data, "role_id"),
+                _str(data, "workdir"),
+                _int(data, "handoff_seconds"),
+            )
+        case "seat_bound":
+            return SeatBound(
+                _str(data, "line_id"), _str(data, "role_id"), _bool(data, "may_own")
+            )
+        case "ownership_changed":
+            return OwnershipChanged(
+                _str(data, "role_id"),
+                _optional_str(data, "owner"),
+                _optional_str(data, "previous"),
+                _member(data, "cause", OwnershipCause),
+                _address(data, "by"),
+                _optional_str(data, "entry_id"),
+                _str(data, "changed_at"),
+            )
+        case "role_noted":
+            return RoleNoted(
+                _str(data, "role_id"),
+                _str(data, "entry_id"),
+                _str(data, "line_id"),
+                _member(data, "kind", RoleNoteKind),
+                _str(data, "body"),
+                _str(data, "workdir_commit"),
+                _str(data, "daemon_commit"),
+                _str(data, "noted_at"),
+            )
+        case "budget_stated":
+            return BudgetStated(
+                _str(data, "provider"),
+                _optional_int(data, "remaining_percent"),
+                _optional_str(data, "resets_at"),
+                _member(data, "source", BudgetSource),
+                _str(data, "note"),
+                _str(data, "stated_at"),
+            )
         case _:
             raise DecodeError(f"unknown event kind {kind!r}")
 
@@ -471,6 +590,22 @@ def _int(data: dict[str, object], name: str) -> int:
     return value
 
 
+def _optional_int(data: dict[str, object], name: str) -> int | None:
+    value = data[name]
+    if value is None:
+        return None
+    if type(value) is not int:
+        raise DecodeError(f"{name} is not a whole number or null")
+    return value
+
+
+def _bool(data: dict[str, object], name: str) -> bool:
+    value = data[name]
+    if type(value) is not bool:
+        raise DecodeError(f"{name} is not true or false")
+    return value
+
+
 def _optional_str(data: dict[str, object], name: str) -> str | None:
     value = data[name]
     if value is None:
@@ -484,9 +619,16 @@ def _address(data: dict[str, object], name: str) -> Address:
     return parse_address(_str(data, name))
 
 
-def _member[T: (LineState, MessageKind, AgentAccess)](
-    data: dict[str, object], name: str, kind: type[T]
-) -> T:
+def _member[
+    T: (
+        LineState,
+        MessageKind,
+        AgentAccess,
+        OwnershipCause,
+        RoleNoteKind,
+        BudgetSource,
+    )
+](data: dict[str, object], name: str, kind: type[T]) -> T:
     value = _str(data, name)
     try:
         return kind(value)
