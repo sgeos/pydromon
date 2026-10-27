@@ -125,6 +125,15 @@ ABORT_SECONDS: Final = 60
 before Grok is stopped. Before, a Grok that ignored the cancel held the line for
 ever."""
 
+TURN_SECONDS: Final = 3600
+"""Maximum inactivity between model or tool events during a turn."""
+
+START_SECONDS: Final = 180
+"""Maximum duration of Grok initialization, including sign-in and session setup."""
+
+ABSOLUTE_TURN_SECONDS: Final = 4 * 60 * 60
+"""Absolute four hour cap for one Grok turn, even while activity continues."""
+
 
 def unsupported(config: LineConfig) -> str | None:
     """Why a Grok line cannot run ``config``, or ``None`` if it can."""
@@ -372,6 +381,7 @@ class _Turn:
     interrupted_for: str | None = None
     refusal: str | None = None
     cancelled: bool = False
+    absolute_deadline: float | None = None
 
 
 def grok_arguments(model: str, effort: str) -> list[str]:
@@ -458,17 +468,33 @@ class GrokLine:
 
             self._client = acp.Client(connection, dispatch)
             try:
-                credential = await self._start(turn)
-                session_id = await self._open_session(turn)
+                self._client.deadline = (
+                    asyncio.get_running_loop().time() + START_SECONDS
+                )
+                stage = "initialize"
+                try:
+                    credential = await self._start(turn)
+                    stage = "open session"
+                    session_id = await self._open_session(turn)
+                except TimeoutError as error:
+                    raise EngineRefused(
+                        f"Grok start timed out during {stage}"
+                    ) from error
                 if turn.refusal is None:
                     stop = await self._prompt(session_id, prompt, turn)
             except acp.RpcError as error:
                 raise EngineRefused(f"the engine refused a request: {error}") from error
             except TimeoutError:
-                # Only a cancel sets the client's deadline, so Grok did not answer
-                # its prompt in time after one. Leaving the connection stops Grok.
+                # Closing the connection stops Grok if its turn exceeds the bound.
                 if turn.refusal is None and turn.interrupted_for is None:
-                    turn.refusal = "the engine did not finish cancelling its turn"
+                    now = asyncio.get_running_loop().time()
+                    turn.refusal = (
+                        f"Grok turn reached its absolute cap of "
+                        f"{ABSOLUTE_TURN_SECONDS} seconds"
+                        if turn.absolute_deadline is not None
+                        and now >= turn.absolute_deadline
+                        else f"Grok turn had no activity for {TURN_SECONDS} seconds"
+                    )
                 stop = "cancelled"
             finally:
                 self._client = None
@@ -502,6 +528,8 @@ class GrokLine:
         method = message.get("method")
         if not isinstance(method, str):
             return
+        if method == "session/update" or method == "session/request_permission":
+            self._extend_turn_deadline(turn)
         params = cast(dict[str, Any], message.get("params") or {})
         if "id" in message:
             await self._answer(message["id"], method, params, turn)
@@ -685,8 +713,21 @@ class GrokLine:
 
     async def _prompt(self, session_id: str, prompt: str, turn: _Turn) -> str:
         self.driver.step(Event("turn_start"))
+        now = asyncio.get_running_loop().time()
+        turn.absolute_deadline = now + ABSOLUTE_TURN_SECONDS
+        self._rpc().deadline = min(now + TURN_SECONDS, turn.absolute_deadline)
         result = await self._rpc().call(
             "session/prompt",
             {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt}]},
         )
         return str(result.get("stopReason") or "")
+
+    def _extend_turn_deadline(self, turn: _Turn) -> None:
+        """Slide the inactivity bound on model or tool activity, under the cap."""
+        if turn.absolute_deadline is None:
+            return
+        client = self._rpc()
+        client.deadline = min(
+            asyncio.get_running_loop().time() + TURN_SECONDS,
+            turn.absolute_deadline,
+        )

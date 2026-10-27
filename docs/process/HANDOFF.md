@@ -22,6 +22,8 @@ completed, moved or abandoned.
     isolated from the user's MCP servers, under a profile denying Dromon's state.
   - `grok.py` and `antigravity.py` share `acp.py`, unverified live. Grok has checked
     sandbox profiles, both get tools via `dromon mcp --line` on `lines.sock`.
+  - Every engine wait is bounded and names its stage. Grok and Antigravity use a
+    sliding hour under a four-hour cap. A Codex plan limit holds the line.
   - `teacher.py` brings a project's local Ollama teacher up and down. Lines take
     `claude_code_prompt` and `instructions`, so they can follow a `CLAUDE.md`.
   - `agents.py` and `mcp.py` let outside harnesses reach the daemon over MCP as `&name`
@@ -59,10 +61,8 @@ completed, moved or abandoned.
     `TEACHER.md` and `AGENTS.md`.
 - **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310, and
   `pykeleusma==0.2.2.0` from PyPI, whose wheels need no Rust toolchain.
-- **Published.** Public `sgeos/pydromon`, 0BSD, over HTTPS with the GitHub CLI as
-  credential helper, synced with `sgeos/project-template` at `f829df4`. CI runs `scripts/check.sh`
-  on Ubuntu and macOS for Python 3.12 and 3.15. Repository settings and the `main`
-  ruleset of `.github/rulesets/main.json` were applied on 2026-10-25.
+- **Published.** Public `sgeos/pydromon`, 0BSD, synced with `sgeos/project-template` at
+  `f829df4`. CI runs `scripts/check.sh` on Ubuntu and macOS for Python 3.12 and 3.15.
 
 ## Next step
 
