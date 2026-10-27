@@ -120,6 +120,9 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | Command | Behaviour | Exit status |
 |---|---|---|
 | `dromon start` | Starts a detached `dromond` in a new session and waits for it to answer `ping`, up to 60 seconds or the `--wait` seconds given, above 0 and at most 600. On a loaded host the daemon was observed still starting after 10 seconds. Succeeds without action when a daemon already answers | 0, or 1 on failure |
+| `dromon status` | Prints the `status` result | 0, 4 when no daemon answers, or 1 |
+| `dromon proposal list` | Lists proposed changes recorded by lines | 0, or 1 on a read error |
+| `dromon proposal show PROPOSAL_ID` | Shows a proposal's message, file list and patch as untrusted text | 0, or 1 when missing or invalid |
 | `dromon status` | Prints the `status` result, with one row per line giving its condition, its pending mail, and a mute or hold its condition does not already name | 0, 4 when no daemon answers, or 1 |
 | `dromon stop` | Sends `stop` and waits up to 10 seconds for the socket to disappear | 0, 4 when no daemon answers, or 1 |
 | `dromon restart [--interrupt] [--wait-seconds S] [--end-tasks]` | Checks that the installed daemon imports, by running it with `--version`, and stops nothing if it does not. Sends `restart`, then polls `status` until a daemon with another `pid` answers, and prints its commit and the commit before. Fails if the restart is abandoned or no successor answers within the wait and 70 seconds more | 0, 4, or 1 |
