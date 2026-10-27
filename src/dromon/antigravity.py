@@ -87,6 +87,7 @@ from dromon.jsonlines import (
     json_lines_factory,
 )
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
+from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
 
 ENGINE_NAME: Final = "antigravity"
@@ -617,6 +618,7 @@ class AntigravityLine:
             raise EngineRefused("no true command to stand in for a sign-in browser")
         if self.mark is not None:
             environment[MARK_VARIABLE] = self.mark
+        environment[STOP_POLICY_VARIABLE] = self.config.stop_policy.value
         connect = self._connect or json_lines_factory(
             str(runtime.executable), keep_input=True
         )

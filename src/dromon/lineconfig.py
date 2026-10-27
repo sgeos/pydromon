@@ -20,7 +20,13 @@ Kept sessions. ``keep_session`` keeps a Claude Code line's engine connected betw
 turns, so that commands it runs in the background outlive the turn. The connection
 closes after ``keep_session_idle_seconds`` without a turn, or after
 ``keep_session_max_seconds`` while the engine reports background tasks still running.
-``dromon.engine`` describes the checks a kept connection still passes at every turn.
+``keep_session_at_max`` decides what happens at that ceiling, as ``dromon.ceiling``
+describes, and ``keep_session_hard_seconds`` bounds every choice. ``dromon.engine``
+describes the checks a kept connection still passes at every turn.
+
+Stop policy. ``stop_policy`` decides whether stopping a line's engine, or the daemon,
+ends everything the engine started, which is the default, or leaves background
+descendants running, as ``dromon.launcher`` describes.
 
 Working directory. ``workdir`` names the directory a line's engine runs in, such as a
 git worktree of its own. A relative path is resolved against the project root, and
@@ -50,6 +56,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Final, NoReturn, cast
 
+from dromon.launcher import StopPolicy
 from dromon.model import ID_PATTERN
 from dromon.sandbox import SandboxConfig, SandboxError, parse_sandbox
 from dromon.settings import (
@@ -87,6 +94,9 @@ DEFAULT_KEEP_IDLE_SECONDS: Final = 1800
 DEFAULT_KEEP_MAX_SECONDS: Final = 14400
 MIN_KEEP_SECONDS: Final = 60
 MAX_KEEP_SECONDS: Final = 86400
+DEFAULT_KEEP_HARD_SECONDS: Final = 86400
+"""The hard bound past which no choice at the ceiling keeps a connection, a day."""
+MAX_KEEP_HARD_SECONDS: Final = 7 * 86400
 
 EFFORTS: Final = ("low", "medium", "high", "xhigh", "max")
 """The reasoning efforts Claude Code accepts."""
@@ -142,6 +152,20 @@ def _check_url(url: str, what: str) -> str:
 class ToolPolicy(StrEnum):
     ALLOWLIST = "allowlist"
     ALLOW_ALL = "allow_all"
+
+
+class AtMax(StrEnum):
+    """What a kept connection does when it reaches ``keep_session_max_seconds`` with
+    background work still running. Each is bounded by ``keep_session_hard_seconds``.
+
+    The default is ``CLOSE``, the behaviour before the choice existed, so that no
+    stored configuration changes meaning, and so that an operator who is away cannot
+    leave work running longer than the ceiling they set. ``ASK`` keeps the work until
+    an operator answers, which an absent operator would turn into the hard bound."""
+
+    CLOSE = "close"
+    ASK = "ask"
+    KEEP = "keep"
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,7 +240,15 @@ class LineConfig:
     """How long a kept connection waits for the next turn before it closes."""
     keep_session_max_seconds: int = DEFAULT_KEEP_MAX_SECONDS
     """How long after the last turn a kept connection may stay open while the engine
-    reports background tasks still running."""
+    reports background tasks still running, before ``keep_session_at_max`` applies."""
+    keep_session_at_max: AtMax = AtMax.CLOSE
+    """What the connection does at ``keep_session_max_seconds``."""
+    keep_session_hard_seconds: int = DEFAULT_KEEP_HARD_SECONDS
+    """How long after the last turn a kept connection may stay open, whatever was
+    chosen at its ceiling."""
+    stop_policy: StopPolicy = StopPolicy.KILL_ALL
+    """Whether stopping the engine ends what it started or leaves its background
+    descendants running."""
     context_warn_tokens: int = DEFAULT_CONTEXT_WARN_TOKENS
     """The context size past which the line's prompt warns."""
     allow_compact: bool = False
@@ -283,6 +315,12 @@ def encode_config(config: LineConfig) -> str:
         document["keep_session_idle_seconds"] = config.keep_session_idle_seconds
     if config.keep_session_max_seconds != DEFAULT_KEEP_MAX_SECONDS:
         document["keep_session_max_seconds"] = config.keep_session_max_seconds
+    if config.keep_session_at_max is not AtMax.CLOSE:
+        document["keep_session_at_max"] = config.keep_session_at_max.value
+    if config.keep_session_hard_seconds != DEFAULT_KEEP_HARD_SECONDS:
+        document["keep_session_hard_seconds"] = config.keep_session_hard_seconds
+    if config.stop_policy is not StopPolicy.KILL_ALL:
+        document["stop_policy"] = config.stop_policy.value
     if config.context_warn_tokens != DEFAULT_CONTEXT_WARN_TOKENS:
         document["context_warn_tokens"] = config.context_warn_tokens
     if config.allow_compact:
@@ -347,6 +385,18 @@ def _seconds(document: Mapping[str, object], key: str, default: int) -> int:
             f" {MAX_KEEP_SECONDS}"
         )
     return value
+
+
+def _choice[C: StrEnum](
+    document: Mapping[str, object], key: str, kind: type[C], default: C
+) -> C:
+    """The member of ``kind`` that ``document`` names under ``key``, or ``default``.
+    Anything but one of the members' exact names is refused."""
+    value = document.get(key, default.value)
+    names = [member.value for member in kind]
+    if not isinstance(value, str) or value not in names:
+        _fail(f"{key} must be one of {names}, found {value!r}")
+    return kind(value)
 
 
 def _server_text(value: object, what: str) -> str:
@@ -444,6 +494,9 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         "keep_session",
         "keep_session_idle_seconds",
         "keep_session_max_seconds",
+        "keep_session_at_max",
+        "keep_session_hard_seconds",
+        "stop_policy",
         "context_warn_tokens",
         "allow_compact",
         "auto_compact_tokens",
@@ -516,6 +569,18 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         _fail(
             "keep_session_max_seconds must not be less than keep_session_idle_seconds"
         )
+    at_max = _choice(document, "keep_session_at_max", AtMax, AtMax.CLOSE)
+    hard = document.get("keep_session_hard_seconds", DEFAULT_KEEP_HARD_SECONDS)
+    if type(hard) is not int or not MIN_KEEP_SECONDS <= hard <= MAX_KEEP_HARD_SECONDS:
+        _fail(
+            f"keep_session_hard_seconds must be a whole number from {MIN_KEEP_SECONDS}"
+            f" to {MAX_KEEP_HARD_SECONDS}"
+        )
+    if hard < ceiling:
+        _fail(
+            "keep_session_hard_seconds must not be less than keep_session_max_seconds"
+        )
+    stop_policy = _choice(document, "stop_policy", StopPolicy, StopPolicy.KILL_ALL)
     warn = document.get("context_warn_tokens", DEFAULT_CONTEXT_WARN_TOKENS)
     if (
         type(warn) is not int
@@ -557,6 +622,9 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         keep_session=keep,
         keep_session_idle_seconds=idle,
         keep_session_max_seconds=ceiling,
+        keep_session_at_max=at_max,
+        keep_session_hard_seconds=hard,
+        stop_policy=stop_policy,
         context_warn_tokens=warn,
         allow_compact=compact,
         auto_compact_tokens=auto,

@@ -37,6 +37,7 @@ from dromon.grok import bridge_command
 from dromon.jsonlines import Connection, json_lines_factory
 from dromon.lineconfig import LineConfig
 from dromon.pi import (
+    DIALOG_REFUSED,
     AGENT_DIR,
     PiLine,
     check_agent_dir,
@@ -755,9 +756,18 @@ def test_dialogs_from_extensions_are_cancelled(home: Path) -> None:
     dialog = {"type": "extension_ui_request", "id": "u1", "method": "confirm"}
     notice = {"type": "extension_ui_request", "id": "u2", "method": "notify"}
     server = FakePi([TURN_START, dialog, notice, *reply()])
-    run(line(server, home))
+    log = ActivityLog()
+    run(line(server, home, observe=log.observer("alpha")))
     answers = [m for m in server.sent if m.get("type") == "extension_ui_response"]
     assert answers == [{"type": "extension_ui_response", "id": "u1", "cancelled": True}]
+    # Row 5 of the T3 Code review. The refused request is surfaced, and the notice,
+    # which asks for no decision, is not.
+    notices = [
+        entry.text
+        for entry in log.after("alpha", 0)
+        if entry.kind is ActivityKind.NOTICE
+    ]
+    assert notices == [DIALOG_REFUSED.format("confirm")]
 
 
 def test_an_extension_error_refuses_the_turn(home: Path) -> None:
@@ -911,3 +921,28 @@ def test_a_harness_that_is_not_installed_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(EngineRefused, match="not installed"):
         asyncio.run(start())
+
+
+def test_a_cancelled_turn_keeps_the_cost_pi_reported_for_it(home: Path) -> None:
+    """Review N8 of the stop policy's re-review. An operator's interrupt cancels the
+    turn, and the cost Pi reported for its calls until then is given once, for the
+    line's budget."""
+    server = FakePi(
+        [TURN_START, assistant("partial", spent=usage(10, 5, cost=0.2))], hang=True
+    )
+    target = line(server, home)
+
+    async def go() -> None:
+        turn = asyncio.ensure_future(target.run_turn("long work"))
+        # Bounded: the fake's queue holds three messages after the prompt's answer.
+        for _ in range(1000):
+            if server.started and not server.queue and "prompt" in server.commands():
+                break
+            await asyncio.sleep(0.001)
+        turn.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+
+    asyncio.run(go())
+    assert target.take_interrupted_cost() == pytest.approx(0.2)
+    assert target.take_interrupted_cost() is None

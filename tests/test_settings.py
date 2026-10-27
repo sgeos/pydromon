@@ -11,7 +11,7 @@ import pytest
 
 from dromon import cli, exits
 from dromon.driver import Driver, Strategy
-from dromon.engine import ClaudeCodeLine, EngineRefused
+from dromon.engine import ClaudeCodeLine, EngineRefused, flag_settings
 from dromon.lineconfig import (
     DEFAULT_CONFIG,
     ConfigError,
@@ -437,8 +437,10 @@ def test_the_engine_hands_settings_to_claude_code_as_json() -> None:
     target = ClaudeCodeLine(driver(), ROOT, settings=handed)
     text = target.options().settings
     assert text is not None
-    assert json.loads(text) == handed
-    assert ClaudeCodeLine(driver(), ROOT).options().settings is None
+    assert json.loads(text) == flag_settings(handed)
+    assert ClaudeCodeLine(driver(), ROOT).options().settings == json.dumps(
+        flag_settings(None)
+    )
 
 
 def test_a_line_effort_replaces_the_drivers() -> None:

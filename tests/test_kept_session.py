@@ -6,6 +6,7 @@ only after ``set_permission_mode``, as Claude Code 2.1.310's engine loop does.
 """
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -30,7 +31,32 @@ from claude_agent_sdk import (
 )
 
 from dromon.driver import Driver, Strategy
+from dromon import launcher, redact
+from dromon.activity import ActivityKind, ActivityLog
+from dromon.ceiling import HARD_REASON, STOP_REASON, Choice
 from dromon.engine import (
+    CONSENT_FALLBACK,
+    FALLBACK_SUBTYPES,
+    HALT_REASON,
+    HANDLED_SYSTEM_SUBTYPES,
+    HANDOFF_NOTICE,
+    HANDOFF_REFUSAL,
+    HANDOFF_RESENDS,
+    HANDSHAKE_KIND,
+    TASKS_CHANGED,
+    TurnReport,
+    MAX_HANDOFF_TEXT_CHARACTERS,
+    handoff_text_notice,
+    is_handoff,
+    HUMAN_DECISION_REFUSAL,
+    HUMAN_DECISION_TOOLS,
+    TOOL_SEARCH_PINNED,
+    TOOL_SEARCH_VARIABLE,
+    claude_cli,
+    consent_question,
+    fallback_text,
+    flag_settings,
+    is_handshake,
     BackgroundEnd,
     DIED_NOTE,
     FILES_CHANGED,
@@ -50,7 +76,11 @@ from dromon.engine import (
     turn_cost,
 )
 from dromon import engine as engine_module
+from dromon.launcher import StopPolicy
+from dromon.settings import PINNED_VARIABLES
 from dromon.lineconfig import (
+    AtMax,
+    ToolPolicy,
     DEFAULT_CONFIG,
     ConfigError,
     LineConfig,
@@ -810,7 +840,8 @@ def test_the_line_view_shows_keep_session() -> None:
 
     assert value(DEFAULT_CONFIG) == "off"
     assert value(KEPT) == (
-        "on, closing after 1800 seconds idle, or 14400 with background tasks running"
+        "on, closing after 1800 seconds idle, or 14400 with background tasks"
+        " running, where it does close, and at the latest after 86400"
     )
 
 
@@ -2211,3 +2242,792 @@ def test_no_compaction_is_sent_once_the_init_was_refused(tmp_path: Path) -> None
     # refused turn leaves nothing for a later one, as test_round6.py checks.
     assert not ClaudeCodeLine._compaction_allowed(refused)  # pyright: ignore[reportPrivateUsage]
     assert ClaudeCodeLine._compaction_allowed(_Turn())  # pyright: ignore[reportPrivateUsage]
+
+
+# Rows 1, 4 and 5 of the T3 Code review, and the operator's decisions A and B.
+
+
+class Asked:
+    """Stands for the scheduler at a connection's ceiling."""
+
+    def __init__(self) -> None:
+        self.asked: list[int] = []
+        self.withdrawn: list[str] = []
+
+    def ask(self, tasks: int) -> str:
+        self.asked.append(tasks)
+        return f"q{len(self.asked)}"
+
+    def settle(self, question_id: str) -> None:
+        self.withdrawn.append(question_id)
+
+
+ASK = LineConfig(
+    keep_session=True,
+    keep_session_idle_seconds=60,
+    keep_session_max_seconds=600,
+    keep_session_hard_seconds=3600,
+    keep_session_at_max=AtMax.ASK,
+)
+
+
+def asking(
+    factory: Factory, tmp_path: Path, clock: Clock, asked: Asked
+) -> ClaudeCodeLine:
+    return ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        config=ASK,
+        environment={},
+        kept_factory=factory,
+        clock=clock,
+        poll_seconds=3600.0,
+        ceiling_reached=asked.ask,
+        ceiling_settled=asked.settle,
+    )
+
+
+def test_a_kept_line_asks_at_its_ceiling_and_carries_out_the_answer(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    asked = Asked()
+    factory = Factory([[started("t1"), result()], [result()]])
+    engine = asking(factory, tmp_path, clock, asked)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        clock.now += 600
+        assert not await engine.expire()
+        assert asked.asked == [1]
+        assert engine.seconds_to_close() == 3000
+        assert await engine.decide_ceiling("q9", "stop") is None
+        assert await engine.decide_ceiling("q1", "extend") is Choice.EXTEND
+        assert engine.seconds_to_close() == 600
+        clock.now += 600
+        assert not await engine.expire()
+        assert asked.asked == [1, 1]
+        assert await engine.decide_ceiling("q2", "stop") is Choice.STOP
+        assert engine.kept_status()["kept"] is False
+        await engine.run_turn("second")
+        await engine.close()
+
+    asyncio.run(go())
+    assert factory.connections[0].closed
+    note = closed_note(STOP_REASON, 1)
+    assert factory.connections[1].prompts[0].startswith(note)
+
+
+def test_an_unanswered_ceiling_closes_at_the_hard_bound_and_withdraws(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    asked = Asked()
+    factory = Factory([[started("t1"), result()]])
+    engine = asking(factory, tmp_path, clock, asked)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        clock.now += 600
+        assert not await engine.expire()
+        clock.now += 2999
+        assert not await engine.expire()
+        clock.now += 1
+        assert await engine.expire()
+
+    asyncio.run(go())
+    assert asked.withdrawn == ["q1"]
+    assert engine.kept_status()["kept"] is False
+    assert closed_note(HARD_REASON, 1) in engine._notes  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_turn_withdraws_an_open_ceiling_question(tmp_path: Path) -> None:
+    clock = Clock()
+    asked = Asked()
+    factory = Factory([[started("t1"), result()], [result()]])
+    engine = asking(factory, tmp_path, clock, asked)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        clock.now += 600
+        await engine.expire()
+        await engine.run_turn("second")
+        assert engine.seconds_to_close() == 600
+        await engine.close()
+
+    asyncio.run(go())
+    assert asked.withdrawn == ["q1"]
+
+
+def test_an_operators_stop_closes_a_connection_that_still_runs_work(
+    tmp_path: Path,
+) -> None:
+    """Row 1. The interrupt settles, but a background task still runs, so the stop
+    escalates to closing the engine."""
+    factory = Factory([[started("t1")], [result()]])
+    engine = line(factory, tmp_path)
+
+    async def go() -> str | None:
+        turn = asyncio.create_task(engine.run_turn("first"))
+        await settle()
+        turn.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await turn
+        reason = await engine.halt()
+        await engine.run_turn("second")
+        await engine.close()
+        return reason
+
+    assert asyncio.run(go()) == HALT_REASON
+    assert factory.connections[0].closed and factory.connections[0].interrupts == 1
+    assert factory.connections[1].prompts[0].startswith(closed_note(HALT_REASON, 1))
+
+
+def test_an_operators_stop_that_settled_without_work_keeps_the_connection(
+    tmp_path: Path,
+) -> None:
+    factory = Factory([[say("working")]])
+    engine = line(factory, tmp_path)
+
+    async def go() -> str | None:
+        turn = asyncio.create_task(engine.run_turn("first"))
+        await settle()
+        turn.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await turn
+        # The engine answers the interrupt with the cancelled turn's result.
+        factory.connections[0].stream.put_nowait(result())
+        await settle()
+        reason = await engine.halt()
+        assert engine.kept_status()["kept"] is True
+        await engine.close()
+        return reason
+
+    assert asyncio.run(go()) is None
+    assert factory.connections[0].interrupts == 1
+
+
+def test_a_stop_without_a_connection_has_nothing_to_halt(tmp_path: Path) -> None:
+    assert asyncio.run(line(Factory([]), tmp_path).halt()) is None
+
+
+def test_a_result_with_no_turn_behind_it_is_not_a_turn(tmp_path: Path) -> None:
+    """Row 5. A result between turns with ``num_turns`` of zero, as a resume's
+    answer, is neither noted as a turn the engine began nor interrupted, and its
+    cost, if any, is still counted, as a handshake."""
+    spent: list[str] = []
+    factory = Factory([[result()], [result()]])
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        config=KEPT,
+        environment={},
+        kept_factory=factory,
+        clock=Clock(),
+        poll_seconds=3600.0,
+        spent_between=lambda kind, cost, usage: spent.append(kind),
+    )
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        handshake = result()
+        handshake.num_turns = 0
+        factory.connections[0].stream.put_nowait(handshake)
+        await settle()
+        await engine.run_turn("second")
+        await engine.close()
+
+    asyncio.run(go())
+    assert spent == [HANDSHAKE_KIND]
+    assert factory.connections[0].interrupts == 0
+    assert SELF_STARTED_NOTE not in factory.connections[0].prompts[1]
+    assert is_handshake(result()) is False
+
+
+def observed(factory: Factory, tmp_path: Path, log: ActivityLog) -> ClaudeCodeLine:
+    return ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        config=KEPT,
+        environment={},
+        kept_factory=factory,
+        clock=Clock(),
+        poll_seconds=3600.0,
+        observe=log.observer("alpha"),
+    )
+
+
+def notices(log: ActivityLog) -> list[str]:
+    return [e.text for e in log.after("alpha", 0) if e.kind is ActivityKind.NOTICE]
+
+
+def test_an_unhandled_system_message_is_surfaced_once(tmp_path: Path) -> None:
+    """Row 5. Never passed over silently, and never repeated, while handled
+    subtypes, the background task reports among them, are not surfaced."""
+    odd = SystemMessage(subtype="turn_duration", data={})
+    status = SystemMessage(subtype="status", data={})
+    factory = Factory([[odd, status, odd, started("t1"), result()], [odd, result()]])
+    log = ActivityLog()
+    engine = observed(factory, tmp_path, log)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        factory.connections[0].stream.put_nowait(
+            SystemMessage(subtype="ui_toast", data={})
+        )
+        await settle()
+        await engine.run_turn("second")
+        await engine.close()
+
+    asyncio.run(go())
+    assert notices(log) == [
+        'the engine sent a system message of subtype "turn_duration", which Dromon'
+        " does not handle",
+        'the engine sent a system message of subtype "ui_toast", which Dromon does'
+        " not handle",
+    ]
+    assert {"init", "task_started", "compact_boundary"} <= HANDLED_SYSTEM_SUBTYPES
+
+
+def fallback(subtype: str, moved_to: str | None) -> SystemMessage:
+    data: dict[str, Any] = {"original_model": "claude-fable-5-1"}
+    if moved_to is not None:
+        data["fallback_model"] = moved_to
+    if subtype == CONSENT_FALLBACK:
+        data["choice"] = "cancelled"
+    return SystemMessage(subtype=subtype, data=data)
+
+
+def test_a_fallback_to_another_model_refuses_the_turn(tmp_path: Path) -> None:
+    """Review F16. The model the engine went on with is not the driver's, or is not
+    named, which counts as another."""
+    for subtype in sorted(FALLBACK_SUBTYPES):
+        for moved_to in ("claude-opus-5-5", None):
+            factory = Factory([[fallback(subtype, moved_to), result()]])
+            log = ActivityLog()
+            engine = observed(factory, tmp_path, log)
+            with pytest.raises(EngineRefused, match=f"not the model {MODEL}"):
+                asyncio.run(engine.run_turn("first"))
+            assert factory.connections[0].interrupts == 1
+            assert len(notices(log)) == 1
+
+
+def test_a_fallback_to_the_driver_s_own_model_goes_on(tmp_path: Path) -> None:
+    """Review F16. Only a model the driver was not written for is refused."""
+    for subtype in sorted(FALLBACK_SUBTYPES):
+        factory = Factory([[fallback(subtype, MODEL), result()]])
+        log = ActivityLog()
+        engine = observed(factory, tmp_path, log)
+        asyncio.run(engine.run_turn("first"))
+        assert factory.connections[0].interrupts == 0
+        assert len(notices(log)) == 1
+
+
+def test_a_consent_fallback_is_put_to_an_operator(tmp_path: Path) -> None:
+    """Review F16. The consent is a human's decision, so it becomes a question,
+    whether or not the turn goes on."""
+    for moved_to, stopped in (("claude-opus-5-5", True), (MODEL, False)):
+        asked: list[str] = []
+        factory = Factory([[fallback(CONSENT_FALLBACK, moved_to), result()]])
+        engine = ClaudeCodeLine(
+            Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+            tmp_path,
+            config=KEPT,
+            environment={},
+            kept_factory=factory,
+            clock=Clock(),
+            poll_seconds=3600.0,
+            consent_asked=asked.append,
+        )
+        if stopped:
+            with pytest.raises(EngineRefused):
+                asyncio.run(engine.run_turn("first"))
+        else:
+            asyncio.run(engine.run_turn("first"))
+        (text,) = asked
+        assert text == consent_question(
+            fallback(CONSENT_FALLBACK, moved_to).data, MODEL, stopped
+        )
+        assert f"moved its session to {moved_to}" in text
+        assert ("Dromon stopped the turn" in text) is stopped
+
+
+def test_a_failing_consent_question_does_not_end_the_turn(tmp_path: Path) -> None:
+    def broken(text: str) -> None:
+        raise RuntimeError("no operator")
+
+    factory = Factory([[fallback(CONSENT_FALLBACK, MODEL), result()]])
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        config=KEPT,
+        environment={},
+        kept_factory=factory,
+        clock=Clock(),
+        poll_seconds=3600.0,
+        consent_asked=broken,
+    )
+    asyncio.run(engine.run_turn("first"))
+
+
+def test_fallback_fields_are_bounded() -> None:
+    assert fallback_text("x" * 500) == "x" * 80
+    for missing in (None, "", 7):
+        assert fallback_text(missing) == "an unnamed one"
+
+
+def test_a_connection_that_dies_withdraws_its_ceiling_question(
+    tmp_path: Path,
+) -> None:
+    """Review F12. The engine's process ends without a close."""
+    clock = Clock()
+    asked = Asked()
+    factory = Factory([[started("t1"), result()]])
+    engine = asking(factory, tmp_path, clock, asked)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        clock.now += 600
+        await engine.expire()
+        assert asked.asked == [1] and asked.withdrawn == []
+        factory.connections[0].die()
+        await settle()
+        assert asked.withdrawn == ["q1"]
+        await engine.close()
+
+    asyncio.run(go())
+    assert asked.withdrawn == ["q1"]
+
+
+def test_every_claude_line_pins_tool_search_and_runs_under_the_launcher(
+    tmp_path: Path,
+) -> None:
+    """Row 4, and decision B. The pin holds whatever the daemon's own environment
+    says, since the engine's environment takes the line's values over it."""
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        environment={"ENABLE_TOOL_SEARCH": "auto"},
+    )
+    options = engine.options()
+    assert options.env[TOOL_SEARCH_VARIABLE] == TOOL_SEARCH_PINNED == "true"
+    assert options.cli_path == launcher.script_path()
+    assert options.env[launcher.TARGET_VARIABLE] == claude_cli()
+    assert options.env[launcher.STOP_POLICY_VARIABLE] == "kill_all"
+    leave = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        config=LineConfig(stop_policy=StopPolicy.LEAVE_BACKGROUND),
+    )
+    assert leave.options().env[launcher.STOP_POLICY_VARIABLE] == "leave_background"
+    assert TOOL_SEARCH_VARIABLE in PINNED_VARIABLES
+
+
+def test_the_pin_is_also_in_the_flag_settings_env_block(tmp_path: Path) -> None:
+    """Review F9. Claude Code copies its global configuration's env block over its
+    process environment, and the flag settings' env block after that."""
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        settings={"env": {"SCCACHE_DIR": "/cache", TOOL_SEARCH_VARIABLE: "auto"}},
+    )
+    text = engine.options().settings
+    assert text is not None
+    assert json.loads(text)["env"] == {
+        "SCCACHE_DIR": "/cache",
+        TOOL_SEARCH_VARIABLE: TOOL_SEARCH_PINNED,
+    }
+    assert flag_settings(None) == {"env": {TOOL_SEARCH_VARIABLE: TOOL_SEARCH_PINNED}}
+    assert flag_settings({"env": "odd"}) == {
+        "env": {TOOL_SEARCH_VARIABLE: TOOL_SEARCH_PINNED}
+    }
+
+
+def test_a_missing_launcher_refuses_the_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def missing() -> str:
+        raise FileNotFoundError("dromon-launch is not installed")
+
+    monkeypatch.setattr(launcher, "script_path", missing)
+    engine = ClaudeCodeLine(Driver.for_model(MODEL, Strategy.SUBSCRIPTION), tmp_path)
+    with pytest.raises(EngineRefused, match="launcher is not installed"):
+        engine.options()
+
+
+def test_the_gate_refuses_every_request_for_a_human_decision() -> None:
+    """Row 5. Even a line configured with the tools, whatever its policy."""
+    config = LineConfig(
+        builtin_tools=tuple(sorted(HUMAN_DECISION_TOOLS)),
+        tool_policy=ToolPolicy.ALLOW_ALL,
+    )
+    gate = permission_gate(config, frozenset())
+    for name in sorted(HUMAN_DECISION_TOOLS):
+        verdict = asyncio.run(gate(name, {}, CONTEXT))
+        assert isinstance(verdict, PermissionResultDeny)
+        assert verdict.message == HUMAN_DECISION_REFUSAL
+        assert "ask_operator" in verdict.message
+    allowed = asyncio.run(gate("Read", {}, CONTEXT))
+    assert isinstance(allowed, PermissionResultAllow)
+
+
+# Item 6 of the live check of 2026-10-26, a resumed session's handoff result.
+
+
+def handoff() -> ResultMessage:
+    """The shape observed live and read from the bundled engine: a success with no
+    turn, no text and no cost, which ran nothing."""
+    return ResultMessage(
+        subtype="success",
+        duration_ms=0,
+        duration_api_ms=0,
+        is_error=False,
+        num_turns=0,
+        session_id="session-1",
+        total_cost_usd=0.0,
+        result="",
+    )
+
+
+def counted(
+    factory: Factory, tmp_path: Path, spent: list[str], log: ActivityLog
+) -> ClaudeCodeLine:
+    return ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        config=KEPT,
+        environment={},
+        kept_factory=factory,
+        clock=Clock(),
+        poll_seconds=3600.0,
+        spent_between=lambda kind, cost, usage: spent.append(kind),
+        observe=log.observer("alpha"),
+    )
+
+
+def test_a_handoff_inside_a_turn_sends_the_prompt_again(tmp_path: Path) -> None:
+    factory = Factory([[handoff()], [say("answered"), result()]])
+    spent: list[str] = []
+    log = ActivityLog()
+    engine = counted(factory, tmp_path, spent, log)
+
+    async def go() -> TurnReport:
+        report = await engine.run_turn("read your mail")
+        await engine.close()
+        return report
+
+    report = asyncio.run(go())
+    assert (report.text, report.num_turns) == ("answered", 1)
+    assert factory.connections[0].prompts == ["read your mail", "read your mail"]
+    assert spent == [HANDSHAKE_KIND]
+    assert notices(log) == [HANDOFF_NOTICE]
+    assert is_handoff(handoff()) and not is_handoff(result())
+
+
+def test_a_second_handoff_refuses_the_turn(tmp_path: Path) -> None:
+    factory = Factory([[handoff()], [handoff()]])
+    spent: list[str] = []
+    engine = counted(factory, tmp_path, spent, ActivityLog())
+
+    async def go() -> None:
+        with pytest.raises(EngineRefused, match="without running its prompt"):
+            await engine.run_turn("read your mail")
+        assert engine.kept_status()["kept"] is False
+
+    asyncio.run(go())
+    assert len(factory.connections[0].prompts) == 1 + HANDOFF_RESENDS
+    assert spent == [HANDSHAKE_KIND, HANDSHAKE_KIND]
+    assert HANDOFF_REFUSAL.startswith("the engine ended the turn again")
+
+
+def test_a_zero_turn_result_that_is_not_a_handoff_stays_the_outcome(
+    tmp_path: Path,
+) -> None:
+    """An error with no turn is the turn's honest outcome, and a zero-turn result
+    after the model's output is the turn's own."""
+    failed = handoff()
+    failed.subtype = "error_during_execution"
+    failed.is_error = True
+    after_output = handoff()
+    factory = Factory([[failed], [say("partial"), after_output]])
+    spent: list[str] = []
+    engine = counted(factory, tmp_path, spent, ActivityLog())
+
+    async def go() -> list[TurnReport]:
+        reports = [await engine.run_turn(f"turn {n}") for n in range(2)]
+        await engine.close()
+        return reports
+
+    reports = asyncio.run(go())
+    assert [r.subtype for r in reports] == ["error_during_execution", "success"]
+    assert reports[1].text == "partial"
+    assert factory.connections[0].prompts == ["turn 0", "turn 1"]
+    assert spent == []
+
+
+def test_a_worded_zero_turn_success_before_output_is_a_handoff(
+    tmp_path: Path,
+) -> None:
+    """Review N5. A short text, such as a resumed session's own note, shows no more
+    than an empty one that the prompt was run, so the prompt is sent again and the
+    text is shown as a notice, not taken as the answer."""
+    worded = handoff()
+    worded.result = "resumed"
+    factory = Factory([[worded], [say("answered"), result()]])
+    spent: list[str] = []
+    log = ActivityLog()
+    engine = counted(factory, tmp_path, spent, log)
+
+    async def go() -> TurnReport:
+        report = await engine.run_turn("read your mail")
+        await engine.close()
+        return report
+
+    report = asyncio.run(go())
+    assert report.text == "answered"
+    assert factory.connections[0].prompts == ["read your mail", "read your mail"]
+    assert spent == [HANDSHAKE_KIND]
+    assert notices(log) == [handoff_text_notice("resumed"), HANDOFF_NOTICE]
+    assert is_handoff(worded)
+
+
+def test_a_handoff_text_is_quoted_and_cut() -> None:
+    long = "x" * (MAX_HANDOFF_TEXT_CHARACTERS + 50)
+    notice = handoff_text_notice(long)
+    assert repr("x" * MAX_HANDOFF_TEXT_CHARACTERS) in notice
+    assert "x" * (MAX_HANDOFF_TEXT_CHARACTERS + 1) not in notice
+
+
+class Batches:
+    """A one-shot session whose every prompt takes the next batch of the script."""
+
+    def __init__(self, script: list[list[Message]]) -> None:
+        self.script = script
+        self.prompts: list[str] = []
+
+    async def query(self, prompt: str) -> None:
+        self.prompts.append(prompt)
+
+    async def receive_response(self) -> AsyncIterator[Message]:
+        for message in self.script.pop(0):
+            yield message
+
+    async def interrupt(self) -> None:
+        return None
+
+    def factory(
+        self, options: ClaudeAgentOptions
+    ) -> AbstractAsyncContextManager[AgentSession]:
+        del options
+
+        @asynccontextmanager
+        async def opened() -> AsyncGenerator[AgentSession]:
+            yield self
+
+        return opened()
+
+
+def test_a_handoff_on_a_one_shot_turn_sends_the_prompt_again(tmp_path: Path) -> None:
+    session = Batches([[init(), handoff()], [say("answered"), result()]])
+    spent: list[str] = []
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        config=DEFAULT_CONFIG,
+        environment={},
+        session_factory=session.factory,
+        spent_between=lambda kind, cost, usage: spent.append(kind),
+    )
+    report = asyncio.run(engine.run_turn("read your mail"))
+    assert report.text == "answered"
+    assert session.prompts == ["read your mail", "read your mail"]
+    assert spent == [HANDSHAKE_KIND]
+    # The driver saw one turn start and one result.
+    assert engine.driver.state == (0, 1, 1)
+
+
+def test_a_second_handoff_on_a_one_shot_turn_refuses_it(tmp_path: Path) -> None:
+    session = Batches([[init(), handoff()], [handoff()]])
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        config=DEFAULT_CONFIG,
+        environment={},
+        session_factory=session.factory,
+    )
+    with pytest.raises(EngineRefused, match="without running its prompt"):
+        asyncio.run(engine.run_turn("read your mail"))
+    assert len(session.prompts) == 1 + HANDOFF_RESENDS
+
+
+# Item 8 of the live check of 2026-10-26, the engine's whole task set.
+
+
+def task_set(*tasks: tuple[str, str]) -> SystemMessage:
+    """``background_tasks_changed`` in the shape of the bundled engine's schema."""
+    return SystemMessage(
+        subtype=TASKS_CHANGED,
+        data={
+            "type": "system",
+            "subtype": TASKS_CHANGED,
+            "tasks": [
+                {"task_id": task_id, "task_type": "local_bash", "description": text}
+                for task_id, text in tasks
+            ],
+            "uuid": "u",
+            "session_id": "session-1",
+        },
+    )
+
+
+def test_the_task_set_removes_ended_tasks_between_turns_and_keeps_their_note(
+    tmp_path: Path,
+) -> None:
+    factory = Factory(
+        [[bash("tu1", "sleep 611"), launched("t1", "tu1"), task_set(), result()]]
+    )
+    ends: list[BackgroundEnd] = []
+    engine = background_line(factory, tmp_path, ends)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        # During the turn a set without t1 removed nothing.
+        assert engine.kept_status()["background_tasks"] == 1
+        connection = factory.connections[0]
+        connection.stream.put_nowait(task_set())
+        await settle()
+        assert engine.kept_status()["background_tasks"] == 0
+        connection.stream.put_nowait(notified("t1"))
+        await settle()
+        await engine.close()
+
+    asyncio.run(go())
+    assert ends == [BackgroundEnd("t1", "sleep 611", "completed", None, "out.txt")]
+
+
+def test_the_task_set_adds_a_task_whose_start_was_not_seen(tmp_path: Path) -> None:
+    factory = Factory([[task_set(("t9", "a monitor")), result()]])
+    log = ActivityLog()
+    engine = observed(factory, tmp_path, log)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        assert engine.kept_status()["tasks"] == [
+            {"task_id": "t9", "command": "a monitor"}
+        ]
+        await engine.close()
+
+    asyncio.run(go())
+    assert TASKS_CHANGED in HANDLED_SYSTEM_SUBTYPES
+    assert not any(TASKS_CHANGED in text for text in notices(log))
+
+
+def test_a_malformed_task_set_changes_nothing(tmp_path: Path) -> None:
+    factory = Factory([[bash("tu1", "sleep 611"), launched("t1", "tu1"), result()]])
+    engine = background_line(factory, tmp_path, [])
+    malformed = [
+        SystemMessage(subtype=TASKS_CHANGED, data={}),
+        SystemMessage(subtype=TASKS_CHANGED, data={"tasks": "none"}),
+        # Overlong, so its unread tail might name t1.
+        SystemMessage(subtype=TASKS_CHANGED, data={"tasks": [7] * 300}),
+    ]
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        for message in malformed:
+            factory.connections[0].stream.put_nowait(message)
+        await settle()
+        assert engine.kept_status()["background_tasks"] == 1
+        # Entries that are not tasks are skipped, and the rest still count.
+        factory.connections[0].stream.put_nowait(
+            SystemMessage(
+                subtype=TASKS_CHANGED,
+                data={"tasks": [7, {"task_id": ""}, {"task_id": "t1"}]},
+            )
+        )
+        await settle()
+        assert engine.kept_status()["background_tasks"] == 1
+        await engine.close()
+
+    asyncio.run(go())
+
+
+# Item 7 of the live check of 2026-10-26, the wording under leave_background.
+
+
+def test_the_closed_note_says_what_the_stop_policy_did() -> None:
+    assert "were stopped with it" in closed_note("a reason", 2)
+    left = closed_note("a reason", 2, left=True)
+    assert "were not ended by Dromon" in left and "stopped with it" not in left
+    assert closed_note("a reason", 0, left=True) == closed_note("a reason", 0)
+
+
+def test_a_kept_line_under_leave_background_says_its_tasks_were_left(
+    tmp_path: Path,
+) -> None:
+    factory = Factory(
+        [[bash("tu1", "sleep 613"), launched("t1", "tu1"), result()], [result()]]
+    )
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        config=LineConfig(
+            keep_session=True,
+            builtin_tools=("Bash",),
+            stop_policy=StopPolicy.LEAVE_BACKGROUND,
+        ),
+        environment={},
+        sandbox={"enabled": True},
+        kept_factory=factory,
+        clock=Clock(),
+        poll_seconds=3600.0,
+    )
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        await engine.close("a reason")
+        await engine.run_turn("second")
+        await engine.close()
+
+    asyncio.run(go())
+    assert (
+        factory.connections[1]
+        .prompts[0]
+        .startswith(closed_note("a reason", 1, left=True))
+    )
+
+
+# Review N10 of the stop policy's re-review. A task's command and description reach
+# the line's status and its end's note, which is logged, so secrets are masked.
+
+
+def test_a_task_s_command_and_description_are_masked_as_taken_in(
+    tmp_path: Path,
+) -> None:
+    carried = "curl -H 'Authorization: Bearer s3cret' https://ana:pw@example.com/x"
+    factory = Factory(
+        [
+            [
+                bash("tu1", carried),
+                launched("t1", "tu1"),
+                task_set(("t1", carried), ("t2", "deploy --token tok123")),
+                result(),
+            ]
+        ]
+    )
+    engine = background_line(factory, tmp_path, [])
+
+    async def go() -> list[dict[str, str]]:
+        await engine.run_turn("first")
+        tasks = cast(list[dict[str, str]], engine.kept_status()["tasks"])
+        await engine.close()
+        return tasks
+
+    tasks = asyncio.run(go())
+    assert tasks == [
+        {"task_id": "t1", "command": redact.mask(carried)},
+        {"task_id": "t2", "command": "deploy --token ***"},
+    ]
+    shown = json.dumps(tasks)
+    for leaked in ("s3cret", "ana:pw", "tok123"):
+        assert leaked not in shown

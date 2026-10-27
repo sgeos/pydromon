@@ -58,6 +58,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "ack": "acknowledge a message without replying",
     "sent": "show what became of the mail an operator sent",
     "release": "resume a line the daemon held at a conversation limit",
+    "interrupt": "stop a line's turn in flight, as Escape does in an attached client",
     "rebind": "move a line to another model and strategy, keeping its identity",
     "settings": "show the project's settings, and a line's, with where each comes from",
     "set": "change a project or line setting, or return it to the layers below",
@@ -647,6 +648,20 @@ def _release(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return _request(paths, "release", Operation.RELEASE, args)
 
 
+def _interrupt(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Send ``interrupt``. A line with no turn in flight is not a failure, since the
+    turn may have ended as the request was made, and the output says which."""
+    line_id: str = arguments.line_id
+    response = _call(paths, "interrupt", Operation.INTERRUPT, {"line_id": line_id})
+    if isinstance(response, int):
+        return response
+    if response.get("interrupted") is True:
+        print(f"interrupted the turn of {line_id}")
+    else:
+        print(f"{line_id} had no turn in flight, so nothing changed")
+    return exits.OK
+
+
 def _rebind(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     args: dict[str, object] = {
         "line_id": arguments.line_id,
@@ -784,6 +799,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "ack": _ack,
     "sent": _sent,
     "release": _release,
+    "interrupt": _interrupt,
     "rebind": _rebind,
     "settings": _settings,
     "set": _set,
@@ -902,6 +918,8 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if name == "release":
             command.add_argument("line_id", help="the held line")
+        if name == "interrupt":
+            command.add_argument("line_id", help="the line whose turn to stop")
         if name == "start":
             command.add_argument(
                 "--wait",

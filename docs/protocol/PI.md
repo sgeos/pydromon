@@ -124,12 +124,16 @@ on a plan uncounted. Dromon never opens its `auth.json`.
    `tool_execution_start` is checked against Dromon's tools. Any other tool, an
    `extension_error`, the driver's tool budget or a `turn_start` past the driver's
    `max_turns` sends `abort`, and the turn waits at most 60 seconds for Pi to settle.
-   An extension dialog is answered as cancelled.
+   An extension dialog is answered as cancelled, and the line's activity says so in a
+   `notice`, since nobody is at the line's prompt to decide. **Row 5 of the T3 Code
+   review.**
 8. **Deadline.** A turn that has not settled an hour after it started is aborted the
    same way and refused, as the Cursor review asked of all three engines.
-9. **End.** Standard input is closed. Pi starts in a process group of its own, so once
-   it exits, or is terminated after ten seconds, whatever remains of the group, such as
-   the `dromon mcp --line` child, is terminated and then killed. The session file is
+9. **End.** Standard input is closed. Pi runs under Dromon's launcher in a process
+   group of its own, so once it exits, or is terminated after ten seconds, whatever
+   remains of the group, such as the `dromon mcp --line` child, is terminated and then
+   killed, or left and recorded under the `leave_background` stop policy, as
+   [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies. The session file is
    kept for the next turn only once Pi has written it.
 
 ## Dromon's tools and its extension
@@ -222,9 +226,11 @@ Run these by hand, then one turn with `dromon probe --model pi:openai/gpt-6-luna
    would hold the line's token and its connection to `lines.sock`. Dromon now signals
    Pi's whole process group, so only a child that starts a session of its own could
    survive. **Fact, from
-   `agents.py`.** Each line has one token for the daemon's life, held in memory and
-   reused by every engine build, not a new one per build, so a surviving child's token
-   works until the daemon restarts.
+   `agents.py`, changed on 2026-10-26 by row 12 of the T3 Code review.** A line's
+   token is renewed as each turn starts a new engine process and revoked as that
+   process ends, which for Pi is within its turn, and expires after an hour without
+   use between turns, so a surviving child's token no longer works once its turn has
+   ended.
 9. **Review F1.** Confirm that with `"cacheWarming": "off"` no request follows the
    turn's last one, and that a compacting turn's cost includes the summary call.
 10. **Review F7.** Before the first live turn, the operator confirms against the ChatGPT

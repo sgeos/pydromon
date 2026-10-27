@@ -3,7 +3,7 @@ fake app-server that answers requests as the installed Codex was read to answer
 them. Nothing here runs Codex."""
 
 import asyncio
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -19,8 +19,15 @@ from dromon.codex import (
     Connection,
 )
 from dromon.driver import Driver, Strategy
-from dromon.engine import DIED_NOTE, BackgroundEnd, EngineRefused, closed_note
-from dromon.lineconfig import LineConfig
+from dromon.ceiling import STOP_REASON, Choice
+from dromon.engine import (
+    DIED_NOTE,
+    HALT_REASON,
+    BackgroundEnd,
+    EngineRefused,
+    closed_note,
+)
+from dromon.lineconfig import AtMax, LineConfig
 
 LUNA = "gpt-6-luna"
 KEPT = LineConfig(keep_session=True, builtin_tools=("Bash",))
@@ -143,6 +150,8 @@ class World:
         poll: float = 3600.0,
         tools: list[SdkMcpTool[Any]] | None = None,
         ends: list[BackgroundEnd] | None = None,
+        reached: Callable[[int], str | None] | None = None,
+        settled: Callable[[str], object] | None = None,
     ) -> CodexLine:
         @asynccontextmanager
         async def connect(
@@ -168,6 +177,8 @@ class World:
             clock=clock or Clock(),
             poll_seconds=poll,
             task_ended=(ends if ends is not None else []).append,
+            ceiling_reached=reached or (lambda tasks: None),
+            ceiling_settled=settled or (lambda question_id: None),
         )
 
 
@@ -848,3 +859,119 @@ def test_eviction_at_the_cap_keeps_what_is_still_needed(
         await engine.close()
 
     asyncio.run(go())
+
+
+# The operator's decision A and row 1 of the T3 Code review, on a Codex line.
+
+
+def test_a_kept_codex_line_asks_at_its_ceiling_and_stops_when_told(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    asked: list[int] = []
+    withdrawn: list[str] = []
+    config = LineConfig(
+        keep_session=True,
+        keep_session_idle_seconds=60,
+        keep_session_max_seconds=600,
+        keep_session_hard_seconds=3600,
+        keep_session_at_max=AtMax.ASK,
+        builtin_tools=("Bash",),
+    )
+    world = World([[ran("i1", "p1"), done()]])
+    world.terminals = [{"processId": "p1", "osPid": 41}]
+
+    def ask(tasks: int) -> str:
+        asked.append(tasks)
+        return f"q{len(asked)}"
+
+    engine = world.line(
+        tmp_path, config=config, clock=clock, reached=ask, settled=withdrawn.append
+    )
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        clock.now += 600
+        assert not await engine.expire()
+        assert asked == [1] and engine.seconds_to_close() == 3000
+        assert await engine.decide_ceiling("q1", "stop") is Choice.STOP
+        assert await engine.decide_ceiling("q1", "stop") is None
+
+    asyncio.run(go())
+    assert world.servers[0].closed and withdrawn == []
+    assert closed_note(STOP_REASON, 1) in engine._notes  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_dead_codex_app_server_withdraws_its_ceiling_question(
+    tmp_path: Path,
+) -> None:
+    """Review F12. The app-server's process ends without a close."""
+    clock = Clock()
+    asked: list[int] = []
+    withdrawn: list[str] = []
+    config = LineConfig(
+        keep_session=True,
+        keep_session_idle_seconds=60,
+        keep_session_max_seconds=600,
+        keep_session_hard_seconds=3600,
+        keep_session_at_max=AtMax.ASK,
+        builtin_tools=("Bash",),
+    )
+    world = World([[ran("i1", "p1"), done()]])
+    world.terminals = [{"processId": "p1", "osPid": 41}]
+
+    def ask(tasks: int) -> str:
+        asked.append(tasks)
+        return f"q{len(asked)}"
+
+    engine = world.line(
+        tmp_path, config=config, clock=clock, reached=ask, settled=withdrawn.append
+    )
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        clock.now += 600
+        assert not await engine.expire()
+        assert asked == [1] and withdrawn == []
+        world.servers[0].out.put_nowait(None)
+        await settle()
+        assert withdrawn == ["q1"]
+        await engine.close()
+
+    asyncio.run(go())
+    assert withdrawn == ["q1"]
+
+
+def test_an_operators_stop_closes_a_codex_line_that_lists_terminals(
+    tmp_path: Path,
+) -> None:
+    world = World([[ran("i1", "p1"), done()], []])
+    world.terminals = [{"processId": "p1", "osPid": 41}]
+    engine = world.line(
+        tmp_path, config=LineConfig(keep_session=True, builtin_tools=("Bash",))
+    )
+
+    async def go() -> tuple[str | None, str | None]:
+        await engine.run_turn("first")
+        before = await engine.halt()
+        assert before == HALT_REASON
+        return before, await engine.halt()
+
+    first, second = asyncio.run(go())
+    assert (first, second) == (HALT_REASON, None)
+    assert world.servers[0].closed
+
+
+def test_an_operators_stop_keeps_a_codex_line_without_terminals(
+    tmp_path: Path,
+) -> None:
+    world = World([[done()]])
+    engine = world.line(tmp_path)
+
+    async def go() -> str | None:
+        await engine.run_turn("first")
+        reason = await engine.halt()
+        await engine.close()
+        return reason
+
+    assert asyncio.run(go()) is None

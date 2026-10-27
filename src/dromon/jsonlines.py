@@ -12,14 +12,15 @@ because the adapters cannot tell what such output meant. ``NotJsonLine`` keeps t
 start of such a line apart from its message, for an adapter that recognises a
 harness's plain-text notice.
 
-Process group. **Cursor review, F5.** A harness starts in a session and process group
-of its own, and every signal Dromon sends reaches the whole group, so a child the
-harness started, such as Pi's MCP bridge or a tool's process, cannot outlive the turn.
-Once the harness has exited, any member of its group that remains is terminated and
-then killed. **Platform limit.** A child that starts a session of its own leaves the
-group and is not reached. **Porting hazard.** ``os.killpg`` is POSIX only, and a group
-identifier could in principle be reused once the group is empty, a window of at most
-``EXIT_SECONDS`` after the harness exits.
+Process group. **Cursor review, F5.** A harness starts under ``dromon.launcher``, in
+a session and process group of its own, so a child the harness started, such as Pi's
+MCP bridge or a tool's process, cannot outlive the turn, and the launcher also ends
+the harness if the daemon dies. The line's stop policy, which its adapter passes in
+the environment, decides whether a stop ends everything the harness started, the
+default, or leaves its background descendants running and records them. **Porting
+hazard.** ``os.killpg`` is POSIX only, and a group identifier could in principle be
+reused once the group is empty, a window of at most ``EXIT_SECONDS`` after the harness
+exits.
 
 Standard error is discarded. A harness may print diagnostics there that Dromon cannot
 parse, and in principle text near a credential, so none of it reaches the event log.
@@ -29,7 +30,6 @@ Porting note. Each record is read whole up to ``MAX_LINE`` bytes, a bound a port
 
 import asyncio
 import json
-import os
 import shutil
 import signal
 from collections.abc import AsyncGenerator, Callable, Mapping
@@ -37,7 +37,9 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
 from typing import Any, Final, Protocol, cast
 
+from dromon import launcher
 from dromon.engine import EngineRefused
+from dromon.launcher import StopPolicy
 
 MAX_LINE: Final = 64 * 1024 * 1024
 """The longest record accepted, in bytes."""
@@ -45,9 +47,6 @@ MAX_LINE: Final = 64 * 1024 * 1024
 EXIT_SECONDS: Final = 10
 """How long a harness may take to exit once its input is closed, before it is
 terminated, and again before it is killed."""
-
-GROUP_POLL_SECONDS: Final = 0.1
-"""How often a harness's remaining process group is checked while it is terminated."""
 
 TURN_SECONDS: Final = 3600
 """**Cursor review, F6.** The longest a turn on these engines may run before Dromon
@@ -128,8 +127,13 @@ type ConnectionFactory = Callable[
 class Process:
     """A started harness behind the ``Connection`` interface."""
 
-    def __init__(self, process: asyncio.subprocess.Process) -> None:
+    def __init__(
+        self,
+        process: asyncio.subprocess.Process,
+        policy: StopPolicy = StopPolicy.KILL_ALL,
+    ) -> None:
         self._process = process
+        self._policy = policy
 
     async def send(self, message: Mapping[str, object]) -> None:
         stdin = self._process.stdin
@@ -162,7 +166,7 @@ class Process:
 
     async def stop(self) -> None:
         if self._process.returncode is None:
-            signal_group(self._process.pid, signal.SIGTERM)
+            launcher.signal_launch(self._process.pid, signal.SIGTERM, self._policy)
 
 
 def json_lines_factory(command: str, *, keep_input: bool) -> ConnectionFactory:
@@ -178,66 +182,22 @@ def json_lines_factory(command: str, *, keep_input: bool) -> ConnectionFactory:
             raise EngineRefused(
                 f"the {command} command is not installed or not on PATH"
             )
+        argv, launched, policy = launcher.wrap([found, *arguments], environment)
         process = await asyncio.create_subprocess_exec(
-            found,
-            *arguments,
+            *argv,
             stdin=asyncio.subprocess.PIPE if keep_input else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             cwd=cwd,
-            env=dict(environment),
+            env=launched,
             limit=MAX_LINE,
             start_new_session=True,
         )
         try:
-            yield Process(process)
+            yield Process(process, policy)
         finally:
-            await _finish(process)
+            await launcher.end(
+                process, policy, close_input=True, input_seconds=EXIT_SECONDS
+            )
 
     return start
-
-
-def signal_group(group: int, number: int) -> bool:
-    """Send ``number`` to every process in ``group``, or with zero only ask whether any
-    remains. Returns whether any remained."""
-    try:
-        os.killpg(group, number)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # A member that changed its credentials cannot be signalled, and macOS also
-        # reports a group of zombies so. Neither is a process Dromon can end.
-        return False
-    return True
-
-
-async def _finish(process: asyncio.subprocess.Process) -> None:
-    """Close the harness's input, which asks Pi for an orderly exit, then terminate
-    and at last kill a harness that does not exit, and then the rest of its group.
-    A child that keeps the harness's output open keeps the harness from counting as
-    exited, so such a group is signalled after ``EXIT_SECONDS``."""
-    if process.stdin is not None and not process.stdin.is_closing():
-        process.stdin.close()
-    if process.returncode is None:
-        try:
-            await asyncio.wait_for(process.wait(), timeout=EXIT_SECONDS)
-        except TimeoutError:
-            signal_group(process.pid, signal.SIGTERM)
-            try:
-                await asyncio.wait_for(process.wait(), timeout=EXIT_SECONDS)
-            except TimeoutError:
-                signal_group(process.pid, signal.SIGKILL)
-                await process.wait()
-    await sweep_group(process.pid)
-
-
-async def sweep_group(group: int) -> None:
-    """End what remains of a harness's process group once the harness has exited,
-    with a termination, a bounded wait and then a kill."""
-    if not signal_group(group, signal.SIGTERM):
-        return
-    for _ in range(int(EXIT_SECONDS / GROUP_POLL_SECONDS)):
-        await asyncio.sleep(GROUP_POLL_SECONDS)
-        if not signal_group(group, 0):
-            return
-    signal_group(group, signal.SIGKILL)

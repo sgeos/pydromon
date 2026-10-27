@@ -41,6 +41,9 @@ from dromon.model import (
     WakeWithdrawn,
     TaskNoted,
     LineCostMarked,
+    ProcessesLeft,
+    StopUnverified,
+    WalkLimited,
 )
 
 ENGINE = "claude-opus-5-5"
@@ -106,6 +109,9 @@ SCENARIO: tuple[Event, ...] = (
     WakeWithdrawn("beta", "s3"),
     TaskNoted("beta", "n1", "b8k2", "completed", "Your background task b8k2 ended."),
     LineCostMarked("beta", "session-b", 1_250_000),
+    ProcessesLeft("beta", "stopped", (4242, 4243), ("sleep 600", "make watch"), 1),
+    WalkLimited("descendants may exist beyond the walk"),
+    StopUnverified("beta", "the launcher exited before its stop finished"),
     LineRebound("alpha", "claude-haiku-5-5", "subscription"),
     LineStateChanged("alpha", LineState.STOPPED),
 )

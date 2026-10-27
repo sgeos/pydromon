@@ -110,6 +110,8 @@ from dromon.overrides import encode as encode_override
 from dromon.driver import ENGINE_OF, MODELS, Driver, DriverError, Strategy
 from dromon import acp, antigravity, codex, cursor, grok, pi
 from dromon.agents import LineTokens
+from dromon import launcher, redact
+from dromon.ceiling import CHOICES, Choice, is_question, question_text
 from dromon.codex import CodexLine
 from dromon.grok import GrokLine
 from dromon.antigravity import AntigravityLine
@@ -120,7 +122,9 @@ from dromon.engine import ENGINE_NAME as ENGINE_NAME_CLAUDE
 from dromon.engine import (
     CLAUDE_CODE_PROMPT_MARK,
     COMPACTION_REQUESTED,
+    HANDSHAKE_KIND,
     INTERRUPTED_KIND,
+    SELF_STARTED_KIND,
     PER_TURN_SOURCE,
     MAX_COMMAND_CHARACTERS,
     BackgroundEnd,
@@ -141,7 +145,9 @@ from dromon.processes import (
     ProcessTable,
     UNIDENTIFIABLE,
     SystemProcesses,
+    TreeRow,
     line_processes,
+    marked_processes,
     stop_line_process,
 )
 from dromon.workdir import git_write_guards, read_head_commit, resolve_workdir
@@ -194,6 +200,13 @@ from dromon.model import (
     WakeWithdrawn,
     TaskNoted,
     LineCostMarked,
+    ProcessesLeft,
+    QuestionWithdrawn,
+    StopUnverified,
+    WalkLimited,
+    MAX_LEFT_COMMAND_BYTES,
+    MAX_LEFT_MORE,
+    MAX_LEFT_PROCESSES,
     MAX_COST_MICRO_USD,
     MAX_TASK_ID_BYTES,
     MAX_TASK_STATUS_BYTES,
@@ -366,6 +379,42 @@ OUTPUT_HEAD_BYTES: Final = 2048
 """How much of a task's output its note quotes."""
 """How many noted task identifiers each line remembers, so no task is noted twice."""
 
+STOPPED_REASON: Final = "was stopped by an operator"
+"""Why an operator's stop holds a line, as ``Scheduler.interrupt`` describes."""
+
+DETACHED_CAUSE: Final = "detached"
+SWEPT_CAUSE: Final = "swept"
+
+WALK_FAILED_NOTE: Final = (
+    "the launcher could not read the process table when it stopped the engine, so"
+    " what the engine started may not all have been ended or listed"
+)
+"""**Review F2.** The ``stop_unverified`` note for a launcher's failed walk."""
+
+UNFINISHED_KILL_NOTE: Final = (
+    "the launcher exited before it finished stopping the engine, so the daemon"
+    " ended what it could find of the engine's process group, {count} processes,"
+    " and reached nothing that had left that group"
+)
+UNFINISHED_LEAVE_NOTE: Final = (
+    "the launcher exited before it finished stopping the engine, so the daemon"
+    " killed the engine, continued its process group, and recorded what still ran"
+)
+"""**Review N1.** The ``stop_unverified`` notes for a launcher the daemon swept."""
+
+LAUNCHER_LOST_NOTE: Final = (
+    "its engine's launcher exited while the engine ran, so the engine is treated as"
+    " failed and its connection is closed, and the next turn starts a new one"
+)
+
+COMPLETED: Final = "completed"
+FAILED: Final = "failed"
+INTERRUPTED: Final = "interrupted"
+"""**Row 5 of the T3 Code review.** How a turn that produced a report ended: its
+engine reported success, reported anything else, or was interrupted by its driver.
+A turn an operator stopped, or one cancelled at shutdown, produces no report. A line's
+condition in ``line_status`` keeps running, held, failed, waiting and idle apart."""
+
 RECENT_TURN_COSTS: Final = 10
 
 MAX_REMEMBERED_NOTES: Final = 4096
@@ -507,9 +556,16 @@ class LineToolRefused(ValueError):
     """A line tool cannot do what the line asked."""
 
 
+class TurnRefused(RuntimeError):
+    """The scheduler refused to start a line's turn, for the reason it gives."""
+
+
 MAX_REST_SECONDS: Final = 60.0
-"""The longest the loop rests while a scheduled wake is pending, so that a change of
-the wall clock delays a wake by at most this much."""
+"""The longest the loop rests, with or without a scheduled wake pending, so that a
+change of the wall clock delays a wake by at most this much, and launch records are
+swept at least this often while the daemon is idle. **Fourth live run of N1,
+2026-10-26.** The rest was unbounded when no wake was pending, so an idle daemon never
+swept a kept connection's dead launcher."""
 
 
 def utc_clock() -> datetime:
@@ -588,6 +644,50 @@ class KeptEngine(Protocol):
 
 
 @runtime_checkable
+class HaltingEngine(Protocol):
+    """An engine whose kept connection an operator's stop may have to close after
+    the stopped turn ended, as ``ClaudeCodeLine.halt`` describes. Porting note: told
+    apart by its method, as ``KeptEngine``."""
+
+    async def halt(self) -> str | None: ...
+
+
+@runtime_checkable
+class CeilingEngine(Protocol):
+    """An engine whose kept connection can ask an operator at its ceiling, as
+    ``dromon.ceiling`` describes."""
+
+    async def decide_ceiling(self, question_id: str, answer: str) -> Choice | None: ...
+
+
+@runtime_checkable
+class InterruptedCostEngine(Protocol):
+    """An engine that measures a turn's cost as the turn runs, and so can say what a
+    turn an operator interrupted had cost by then. **Review N8.** A kept Claude Code
+    connection needs no such method, since the engine reports the interrupted turn's
+    result later, which ``spent_between`` counts."""
+
+    def take_interrupted_cost(self) -> float | None: ...
+
+
+@runtime_checkable
+class TokenEngine(Protocol):
+    """An engine that reaches Dromon's tools with a line token, which the scheduler
+    renews as a turn starts a new process and revokes as that process ends."""
+
+    line_token: str | None
+
+
+@runtime_checkable
+class ProcessKeepingEngine(Protocol):
+    """An engine whose process can outlive its turn, and so keeps its line token
+    between turns. **Review F14.** No engine that uses tokens does so today, and this
+    is the seam through which one would."""
+
+    def process_running(self) -> bool: ...
+
+
+@runtime_checkable
 class CompactingEngine(Protocol):
     """An engine that can compact its session at the start of a turn, as Claude Code
     and Codex lines can. Porting note: told apart by its method, as ``KeptEngine``."""
@@ -630,6 +730,20 @@ class LineSpec:
     )
     """Where the engine reports its estimate of the size a compaction left, from the
     first engine call after it, when it did not report the size itself."""
+    ceiling_reached: Callable[[int], str | None] = field(
+        default=lambda tasks: None, compare=False
+    )
+    """Where a kept connection asks an operator at its ceiling, as ``dromon.ceiling``
+    describes, which returns the question's identifier."""
+    ceiling_settled: Callable[[str], object] = field(
+        default=lambda question_id: None, compare=False
+    )
+    """Where a kept connection withdraws its ceiling question."""
+    consent_asked: Callable[[str], object] = field(
+        default=lambda text: None, compare=False
+    )
+    """Where a Claude Code engine puts a consent fallback to an operator, with the
+    question's text after the line's name. **Review F16.**"""
 
 
 type EngineFactory = Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], LineEngine]
@@ -697,6 +811,8 @@ def engine_factory(
                 task_ended=spec.task_ended,
                 compacted=spec.compacted,
                 compaction_estimated=spec.compaction_estimated,
+                ceiling_reached=spec.ceiling_reached,
+                ceiling_settled=spec.ceiling_settled,
             )
         if driver.settings.engine == grok.ENGINE_NAME:
             if project_sandbox is not None or project_settings is not None:
@@ -802,6 +918,9 @@ def engine_factory(
             cost_mark=spec.cost_mark,
             compacted=spec.compacted,
             spent_between=spec.spent_between,
+            ceiling_reached=spec.ceiling_reached,
+            ceiling_settled=spec.ceiling_settled,
+            consent_asked=spec.consent_asked,
         )
 
     return build
@@ -895,6 +1014,10 @@ class Scheduler:
         daemon_checkout: Path | None = None,
         processes: ProcessTable | None = None,
         processes_identifiable: bool = True,
+        line_tokens: LineTokens | None = None,
+        report_dir: Path | None = None,
+        walk_check: Callable[[], str | None] | None = None,
+        sweep_read: Callable[[], list[TreeRow] | str] = launcher.read_rows,
     ) -> None:
         if not 1 <= wake_every_ticks <= MAX_WAKE_EVERY_TICKS:
             raise ValueError(f"wake_every_ticks must be in [1, {MAX_WAKE_EVERY_TICKS}]")
@@ -956,6 +1079,32 @@ class Scheduler:
         """When each fired wake's note was delivered, for ``list_mail``. In memory,
         so a note delivered before a restart shows its due time only."""
         self._processes: ProcessTable = processes or SystemProcesses()
+        self._line_tokens = line_tokens
+        """The tokens lines' engines reach Dromon's tools with, which each turn
+        renews and revokes, or ``None`` where no engine uses them."""
+        self._report_dir = report_dir
+        """Where launchers write what they left running, as ``dromon.launcher``
+        describes, or ``None``."""
+        self._walk_check = walk_check
+        """Why the process table cannot be walked, asked before each turn under the
+        ``kill_all`` stop policy, which the turn is then refused for. **Review F2.**
+        The daemon passes ``launcher.walk_unavailable``. ``None`` asks nothing, for
+        tests whose engines start no process."""
+        self._ceiling_questions: dict[str, str] = {}
+        """Each open ceiling question, by its identifier, with its line. In memory.
+        The connection a question was about does not survive a restart, so
+        ``recover`` withdraws every ceiling question still open."""
+        self._halting: set[asyncio.Task[None]] = set()
+        """Operators' stops still finishing once their turn ended."""
+        self._sweep_read = sweep_read
+        """How the sweep of launch records reads the process table. **Review N1.**"""
+        self._sweeping: asyncio.Task[None] | None = None
+        """The sweep of launch records under way, of which at most one runs."""
+        self._sweep_failure: str | None = None
+        """Why the last sweep could not read the process table, said once."""
+        self._detached: dict[str, tuple[int, ...]] = {}
+        """The pids each line was last reported to have left outside its engine's
+        tree, so the same set is not recorded again at every turn."""
         self._processes_identifiable = processes_identifiable
         """Whether the daemon's start-time self-test could read another process's
         environment. Where it could not, the process tools explain instead."""
@@ -985,6 +1134,9 @@ class Scheduler:
         self._clock = clock
         self._hold = hold_wakes
         self._engines: dict[str, LineEngine] = {}
+        self._engine_built: dict[str, int] = {}
+        """When each engine was built, in nanoseconds of the wall clock, so that only a
+        launcher started since is taken for the engine's own. Review N1."""
         self._turns: dict[str, int] = {}
         self._autonomous: dict[str, int] = {}
         """Turns each line took in a row without mail from an operator."""
@@ -1022,7 +1174,50 @@ class Scheduler:
         for line_id, line in sorted(self._log.state.lines.items()):
             if line.state is LineState.RUNNING:
                 self._log.append(LineStateChanged(line_id, LineState.IDLE))
+        # What launchers left running while the daemon was down, such as after a
+        # crash, is recorded now.
+        self.collect_left()
+        self._record_survivors()
+        self._withdraw_stale_ceilings()
         self._work.set()
+
+    def record_walk_gap(self, note: str | None) -> None:
+        """Record what this platform keeps the launcher's walk from reaching, once,
+        when it differs from what the log holds. ``line_status`` shows it to every
+        line. **Review F1.**"""
+        text = note or ""
+        if self._log.state.walk_limit != text:
+            self._log.append(WalkLimited(text))
+
+    def _record_survivors(self) -> None:
+        """At start, record the processes of an earlier run that still carry a line's
+        mark, since no engine of this run has started yet. Only what the platform
+        lets the daemon see is found, which on macOS 27 is nothing. **Review F1.**"""
+        if not self._processes_identifiable:
+            return
+        try:
+            found = marked_processes(self._processes, os.getpid())
+        except (ProcessRefused, OSError):
+            return
+        for line_id, processes in sorted(found.items()):
+            if line_id not in self._log.state.lines:
+                continue
+            self._detached[line_id] = tuple(pid for pid, _ in processes)
+            self._record_left(line_id, DETACHED_CAUSE, processes)
+
+    def _withdraw_stale_ceilings(self) -> None:
+        """Withdraw every ceiling question still open at start, since the kept
+        connection it was about ended with the earlier run. **Review F11.**"""
+        state = self._log.state
+        stale = [
+            message_id
+            for message_id, message in state.messages.items()
+            if message.status is QuestionStatus.OPEN
+            and isinstance(message.sender, LineAddress)
+            and is_question(message.body, message.choices)
+        ]
+        for message_id in stale:
+            self._log.append(QuestionWithdrawn(message_id))
 
     def create_line(
         self,
@@ -1117,6 +1312,8 @@ class Scheduler:
             line = self._log.state.lines.get(recipient.line_id)
             if line is not None and line.held_by == reply_to:
                 self.release(recipient.line_id)
+            if isinstance(sender, OperatorAddress):
+                self._answer_ceiling(recipient.line_id, reply_to, body)
         if isinstance(recipient, LineAddress):
             self._failed.discard(recipient.line_id)
         self._work.set()
@@ -1873,9 +2070,12 @@ class Scheduler:
             for other_id, other in sorted(state.lines.items())
             if other_id != line_id
         ]
+        self.collect_left()
+        line = state.lines[line_id]
         return {
             "line_id": line_id,
             "state": line.state.value,
+            "condition": self.condition(line_id),
             "held_by": line.held_by,
             "autonomous_turns": {
                 "used": self._autonomous.get(line_id, 0),
@@ -1910,9 +2110,37 @@ class Scheduler:
             "processes": {
                 "identifiable": self._processes_identifiable,
                 "note": None if self._processes_identifiable else UNIDENTIFIABLE,
+                "stop_policy": config.stop_policy.value,
+                "left": _left_summary(line.left),
+                "stop_unverified": (
+                    None if line.unverified is None else line.unverified.note
+                ),
+                "walk_limit": state.walk_limit or None,
             },
             "other_lines": others,
         }
+
+    def condition(self, line_id: str) -> str:
+        """**Row 5 of the T3 Code review.** One word for where a line stands, which
+        keeps apart a line that is running, held for an operator, stopped by a failed
+        turn, waiting on a question it asked an operator, and idle, in that order of
+        precedence."""
+        state = self._log.state
+        line = state.lines[line_id]
+        if line_id in self._running or line.state is LineState.RUNNING:
+            return "running"
+        if line.held_by is not None:
+            return "held"
+        if line_id in self._failed:
+            return "failed"
+        address = LineAddress(line_id)
+        asking = any(
+            message.sender == address
+            and message.status is QuestionStatus.OPEN
+            and isinstance(message.recipient, OperatorAddress)
+            for message in state.messages.values()
+        )
+        return "waiting" if asking else "idle"
 
     def daemon_status(self) -> dict[str, object]:
         """The daemon's version and the commit it started from, and whether its
@@ -2880,13 +3108,18 @@ class Scheduler:
                         await asyncio.sleep(0)
                     continue
                 self._work.clear()
+                # Each rest, at most MAX_REST_SECONDS apart, also sweeps the launch
+                # records of launchers that exited between turns. Review N1.
+                self.collect_left()
                 worker = asyncio.create_task(self._work.wait())
                 stopping = asyncio.create_task(stop.wait())
                 # Rest until work arrives, or until the next scheduled wake falls due.
                 until = self.seconds_until_next_wake()
                 await asyncio.wait(
                     {worker, stopping},
-                    timeout=None if until is None else min(until, MAX_REST_SECONDS),
+                    timeout=MAX_REST_SECONDS
+                    if until is None
+                    else min(until, MAX_REST_SECONDS),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 worker.cancel()
@@ -2957,9 +3190,12 @@ class Scheduler:
     ) -> None:
         report: TurnReport | None = None
         ending = "cancelled"
+        engine: LineEngine | None = None
         self.activity.record(line_id, ActivityKind.TURN_STARTED, prompt)
         try:
+            await self._check_walk(line_id)
             engine = self.engine_for(line_id)
+            self._start_token(line_id, engine)
             if compaction is not None:
                 if isinstance(engine, CompactingEngine):
                     engine.request_compaction(
@@ -2985,9 +3221,12 @@ class Scheduler:
             ending = report.subtype
             if report.interrupted_for is not None:
                 ending += f", interrupted by its driver: {report.interrupted_for}"
+            elif turn_outcome(report) == FAILED:
+                ending = f"failed: the engine ended the turn as {report.subtype}"
         except asyncio.CancelledError:
             if line_id in self._interrupted:
                 ending = "interrupted by an operator"
+            self._count_interrupted(line_id, engine)
             raise
         except Exception as error:  # noqa: BLE001
             # The boundary between the scheduler and an engine. Any engine failure
@@ -2996,6 +3235,9 @@ class Scheduler:
             ending = f"failed: {error}"
             print(f"dromond: line {line_id} turn failed: {error}", file=sys.stderr)
         finally:
+            self._end_token(line_id, engine)
+            self.collect_left()
+            self._spawn_check(line_id)
             self._interrupted.discard(line_id)
             self._moved.discard(line_id)
             # A compaction the engine did not report leaves no cause for a later one.
@@ -3007,6 +3249,84 @@ class Scheduler:
             self._last_turn_end[line_id] = self._clock()
             self._work.set()
         self._apply_limits(line_id, from_operator, report)
+
+    async def _check_walk(self, line_id: str) -> None:
+        """Refuse the turn when the line's stop policy is ``kill_all`` and the
+        process table cannot be walked, since the stop could then reach only the
+        engine's own group and could not say what it missed. **Review F2.**"""
+        if self._walk_check is None:
+            return
+        if (
+            self.effective_config(line_id).stop_policy
+            is not launcher.StopPolicy.KILL_ALL
+        ):
+            return
+        # On the event loop's thread, not in a worker, for the reason
+        # report_detached gives. One ps of the user's processes, bounded.
+        reason = self._walk_check()
+        if reason is not None:
+            raise TurnRefused(
+                "the line's stop policy is kill_all, which must find everything its"
+                " engine starts, and the process table cannot be read here, so the"
+                f" turn was not started: {reason}"
+            )
+
+    def _count_interrupted(self, line_id: str, engine: LineEngine | None) -> None:
+        """Count the cost a cancelled turn's engine measured before it ended toward
+        the line's budget, as a turn outside Dromon's own. **Review N8.** An engine
+        that measured none counts nothing, and a failure to ask is reported and
+        counts nothing."""
+        if not isinstance(engine, InterruptedCostEngine):
+            return
+        try:
+            cost = engine.take_interrupted_cost()
+        except Exception as error:  # noqa: BLE001
+            print(
+                f"dromond: an interrupted turn's cost failed: {error}", file=sys.stderr
+            )
+            return
+        if cost is not None:
+            self.spent_between(line_id, INTERRUPTED_KIND, cost, None)
+
+    def _start_token(self, line_id: str, engine: LineEngine) -> None:
+        """Give a turn its line token. A turn on an engine process that outlived the
+        last one keeps that process's token. Any other turn starts a new process,
+        and gets a new token, which revokes the one before. **Review F14 and F15.**"""
+        tokens = self._line_tokens
+        if tokens is None or not isinstance(engine, TokenEngine):
+            return
+        if engine.line_token is None:
+            return
+        if isinstance(engine, ProcessKeepingEngine) and engine.process_running():
+            kept = tokens.begin(line_id)
+            if kept is not None:
+                tokens.bind(line_id, engine.process_running)
+                return
+        engine.line_token = tokens.renew(line_id)
+
+    def _end_token(self, line_id: str, engine: LineEngine | None) -> None:
+        """Revoke the line's token when its engine's process has ended, which for
+        every engine that uses tokens today is as the turn ends, and otherwise keep
+        it for the process that still runs. **Review F14.**"""
+        tokens = self._line_tokens
+        if tokens is None:
+            return
+        if isinstance(engine, ProcessKeepingEngine) and engine.process_running():
+            tokens.finish(line_id)
+            tokens.bind(line_id, engine.process_running)
+            return
+        tokens.revoke(line_id)
+
+    def _spawn_check(self, line_id: str) -> None:
+        """Look for the line's detached processes in a task of its own, so that the
+        turn's end is recorded before the look, which runs ``ps``, begins."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self.report_detached(line_id))
+        self._halting.add(task)
+        task.add_done_callback(self._halting.discard)
 
     def _mark_cost(self, line_id: str, mark: tuple[str, float] | None) -> None:
         """Record the engine's running cost total for the line's session, so a
@@ -3027,8 +3347,14 @@ class Scheduler:
         wherever it is, except a kept Claude Code connection, which interrupts the
         engine and stays open. Mail the turn had already received stays delivered, and
         the engine session resumes from what the engine itself recorded, which may
-        include part of the cancelled turn. An interrupted turn does not count toward
-        the line's limits, because it produced no report.
+        include part of the cancelled turn. An interrupted turn does not count as an
+        autonomous turn, because it produced no report. Its cost counts toward the
+        line's budget when the engine reports one. **Review N8.** A kept Claude Code
+        connection reports the stopped turn's result after it, which
+        ``spent_between`` counts, and an engine that measures cost as a turn runs
+        gives what it measured, as ``InterruptedCostEngine`` says. An engine closed
+        before it reported a cost, such as a Claude Code turn without a kept
+        connection, counts nothing.
         """
         if line_id not in self._log.state.lines:
             raise EventRejected(f"no line {line_id}")
@@ -3037,7 +3363,322 @@ class Scheduler:
             return False
         self._interrupted.add(line_id)
         task.cancel()
+        self._stop_line(line_id, task)
         return True
+
+    def _stop_line(self, line_id: str, turn: "asyncio.Task[None]") -> None:
+        """**Row 1 of the T3 Code review.** Make an operator's stop hold. The line's
+        pending scheduled wake is withdrawn and the line is held until an operator
+        releases it, so no wake, task note or mail starts its next turn, and once
+        the stopped turn has ended an engine that still runs work is closed."""
+        pending = self._log.state.scheduled.get(line_id)
+        if pending is not None:
+            self._log.append(WakeWithdrawn(line_id, pending.message_id))
+            self._compact_wake.pop(line_id, None)
+        if self._log.state.lines[line_id].held_by is None:
+            self.hold(line_id, STOPPED_REASON)
+        engine = self._engines.get(line_id)
+        if not isinstance(engine, HaltingEngine):
+            return
+
+        async def finish() -> None:
+            await asyncio.gather(turn, return_exceptions=True)
+            try:
+                reason = await engine.halt()
+            except Exception as error:  # noqa: BLE001
+                print(
+                    f"dromond: line {line_id}'s stop failed: {error}", file=sys.stderr
+                )
+                return
+            if reason is not None:
+                self.activity.record(
+                    line_id,
+                    ActivityKind.NOTICE,
+                    f"its engine was closed because {reason}",
+                )
+
+        task = asyncio.get_running_loop().create_task(finish())
+        self._halting.add(task)
+        task.add_done_callback(self._halting.discard)
+
+    # Keep-session ceilings, as dromon.ceiling describes.
+
+    def ceiling_reached(self, line_id: str, tasks: int) -> str | None:
+        """Ask an operator what a kept connection of ``line_id`` with ``tasks``
+        background tasks does at its ceiling, and return the question's identifier,
+        or ``None`` when no question could be recorded."""
+        if line_id not in self._log.state.lines:
+            return None
+        operator = self.last_operator(line_id) or self._default_operator
+        try:
+            self.ensure_operator(operator.operator_id)
+            question = self.ask(
+                line_id,
+                operator,
+                question_text(line_id, tasks, self.effective_config(line_id)),
+                CHOICES,
+            )
+        except Exception as error:  # noqa: BLE001
+            # Review F13. Any failure, not only a rejected event, leaves no question,
+            # and the connection then closes at once, as close does.
+            print(f"dromond: a ceiling question failed: {error}", file=sys.stderr)
+            return None
+        self._ceiling_questions[question] = line_id
+        return question
+
+    def consent_fallback(self, line_id: str, text: str) -> str | None:
+        """Put a consent fallback of ``line_id``'s engine to an operator, as
+        ``engine.FALLBACK_SUBTYPES`` describes, and return the question's
+        identifier, or ``None`` when none could be recorded. **Review F16.**"""
+        if line_id not in self._log.state.lines:
+            return None
+        operator = self.last_operator(line_id) or self._default_operator
+        try:
+            self.ensure_operator(operator.operator_id)
+            return self.ask(line_id, operator, f"Line {line_id}'s engine {text}")
+        except Exception as error:  # noqa: BLE001
+            print(f"dromond: a consent question failed: {error}", file=sys.stderr)
+            return None
+
+    def ceiling_settled(self, question_id: str) -> None:
+        """Withdraw a ceiling question that is still open, since its connection
+        closed or a turn changed its premise."""
+        self._ceiling_questions.pop(question_id, None)
+        message = self._log.state.messages.get(question_id)
+        if message is not None and message.status is QuestionStatus.OPEN:
+            self._log.append(QuestionWithdrawn(question_id))
+
+    def _answer_ceiling(self, line_id: str, question_id: str, body: str) -> None:
+        """Carry an operator's answer to a ceiling question to the line's engine.
+        The answer also reaches the line as mail, as every answer does."""
+        if self._ceiling_questions.pop(question_id, None) != line_id:
+            return
+        engine = self._engines.get(line_id)
+        if not isinstance(engine, CeilingEngine):
+            return
+
+        async def decide() -> None:
+            try:
+                choice = await engine.decide_ceiling(question_id, body)
+            except Exception as error:  # noqa: BLE001
+                print(f"dromond: a ceiling answer failed: {error}", file=sys.stderr)
+                return
+            self.activity.record(
+                line_id,
+                ActivityKind.NOTICE,
+                "an operator's answer at its kept session's ceiling made no choice, so"
+                " it closes at its hard bound"
+                if choice is None
+                else f"an operator chose {choice.value} at its kept session's ceiling",
+            )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(decide())
+        self._halting.add(task)
+        task.add_done_callback(self._halting.discard)
+
+    # What engines left running, by the stop policy or outside their tree.
+
+    def collect_left(self) -> None:
+        """Record what launchers reported leaving running, one ``processes_left``
+        per report, and a launcher's failed walk as ``stop_unverified``, for a line
+        that still exists. The reports are kept aside, as ``dromon.launcher`` says.
+        Then sweep the launch records of launchers that have exited, in a task of its
+        own, as ``sweep_launches`` says."""
+        for report in launcher.collect_reports(self._report_dir):
+            if report.line_id not in self._log.state.lines:
+                continue
+            if not report.listed:
+                self._record_unverified(report.line_id, WALK_FAILED_NOTE)
+            if report.processes:
+                self._record_left(
+                    report.line_id, report.cause, report.processes, report.more
+                )
+        self._start_sweep()
+
+    def _start_sweep(self) -> None:
+        """Start a sweep of the launch records, unless one is under way or there is
+        no event loop."""
+        if self._report_dir is None:
+            return
+        if self._sweeping is not None and not self._sweeping.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._sweeping = loop.create_task(self.sweep())
+
+    async def sweep(self) -> None:
+        """Sweep the launch records of launchers that have exited, and record what
+        each sweep found, as ``launcher.sweep_launches`` says. **Review N1.** A failure
+        is reported on the daemon's standard error, and the records wait for the next
+        sweep. The process table is read on the event loop's thread, for the reason
+        ``report_detached`` gives, bounded by ``PS_TIMEOUT_SECONDS``."""
+        try:
+            found = await launcher.sweep_launches(self._report_dir, self._sweep_read)
+            if isinstance(found, str):
+                if self._sweep_failure != found:
+                    self._sweep_failure = found
+                    print(
+                        f"dromond: launch records wait, as the process table cannot"
+                        f" be read: {found}",
+                        file=sys.stderr,
+                    )
+                return
+            if self._sweep_failure is not None:
+                self._sweep_failure = None
+                print(
+                    "dromond: the process table can be read again, so launch"
+                    " records are swept",
+                    file=sys.stderr,
+                )
+            for swept in found:
+                self._record_swept(swept)
+        except Exception as error:  # noqa: BLE001
+            # Any failure, in the sweep or in recording what it did, is said, since
+            # the task that runs a sweep is not awaited until the daemon stops.
+            print(
+                f"dromond: the sweep of launch records failed: {error!r}",
+                file=sys.stderr,
+            )
+
+    async def finish_sweep(self) -> None:
+        """Run one last sweep, after any under way, as the daemon stops."""
+        if self._sweeping is not None:
+            await asyncio.gather(self._sweeping, return_exceptions=True)
+        await self.sweep()
+
+    def _record_swept(self, swept: launcher.Swept) -> None:
+        line_id = swept.line_id
+        if swept.skipped is not None:
+            print(
+                f"dromond: a launch record of {line_id} was not swept: {swept.skipped}",
+                file=sys.stderr,
+            )
+            return
+        print(
+            f"dromond: swept the launch record of {line_id}, finished"
+            f" {swept.finished}, {len(swept.ended)} ended, {len(swept.left)} left",
+            file=sys.stderr,
+        )
+        if line_id is None or line_id not in self._log.state.lines:
+            return
+        if not swept.finished:
+            self._record_unverified(
+                line_id,
+                UNFINISHED_KILL_NOTE.format(count=len(swept.ended))
+                if swept.policy is launcher.StopPolicy.KILL_ALL
+                else UNFINISHED_LEAVE_NOTE,
+            )
+            self._fail_engine(line_id, swept.launched_ns)
+        if swept.left:
+            self._record_left(
+                line_id,
+                SWEPT_CAUSE,
+                [(row.pid, row.command) for row in swept.left],
+            )
+
+    def _fail_engine(self, line_id: str, launched_ns: int | None) -> None:
+        """Treat ``line_id``'s engine as failed and close it, when the launcher just
+        swept was started since the engine was built. **Third live run of N1,
+        2026-10-26.** A kept connection whose launcher died otherwise looks healthy,
+        since its harness keeps the Agent SDK's pipes. The sweep has already ended the
+        harness under either policy, so closing the connection afterwards cannot end
+        background work that ``leave_background`` keeps, as an orderly close of a
+        living harness would. A launcher older than the engine was a former engine's,
+        and the present one is left alone. Assumption, the wall clock does not step
+        back between the engine's building and its launcher's start."""
+        built = self._engine_built.get(line_id)
+        if built is None or launched_ns is None or launched_ns < built:
+            return
+        self.activity.record(line_id, ActivityKind.NOTICE, LAUNCHER_LOST_NOTE)
+        print(f"dromond: line {line_id}: {LAUNCHER_LOST_NOTE}", file=sys.stderr)
+        self._drop_engine(line_id)
+
+    def _record_unverified(self, line_id: str, note: str) -> None:
+        try:
+            self._log.append(StopUnverified(line_id, note))
+        except (EventRejected, InvalidField) as error:
+            print(
+                f"dromond: an unverified stop could not be recorded: {error}",
+                file=sys.stderr,
+            )
+            return
+        self.activity.record(line_id, ActivityKind.NOTICE, note)
+
+    def _record_left(
+        self,
+        line_id: str,
+        cause: str,
+        processes: Sequence[tuple[int, str]],
+        more: int = 0,
+    ) -> None:
+        named = list(processes)[:MAX_LEFT_PROCESSES]
+        try:
+            self._log.append(
+                ProcessesLeft(
+                    line_id,
+                    cause,
+                    tuple(pid for pid, _ in named),
+                    tuple(
+                        _cut(redact.summary(command), MAX_LEFT_COMMAND_BYTES)
+                        for _, command in named
+                    ),
+                    min(more + len(processes) - len(named), MAX_LEFT_MORE),
+                )
+            )
+        except (EventRejected, InvalidField) as error:
+            print(
+                f"dromond: what was left could not be recorded: {error}",
+                file=sys.stderr,
+            )
+            return
+        pids = ", ".join(str(pid) for pid, _ in named)
+        self.activity.record(
+            line_id,
+            ActivityKind.NOTICE,
+            f"processes were left running, {cause}, with pids {pids}",
+        )
+
+    async def report_detached(self, line_id: str) -> None:
+        """**Row 2 of the T3 Code review.** At the end of a turn whose engine has
+        ended, record the line's processes that still run, found by its mark, which
+        have left the engine's process tree, so that no stop reached them. Nothing is
+        ended. The same set is not recorded twice in a row, and nothing is checked
+        where the platform does not let the daemon read the mark."""
+        if not self._processes_identifiable or line_id not in self._log.state.lines:
+            return
+        if self.kept_session(line_id).get("kept") is True:
+            return
+        # On the event loop's thread, not in a worker, as engine.py reads digests. A
+        # Keleusma driver's virtual machine may be dropped only on the thread that
+        # made it, and a collection in a worker thread could drop one, which a
+        # check after every turn made happen in the tests. The look is one ps and
+        # one read of environments, each bounded by PS_TIMEOUT_SECONDS. Porting
+        # note, this is a hazard of Python's collector alone.
+        try:
+            found = line_processes(
+                self._processes, self.line_mark(line_id), os.getpid()
+            )
+        except ProcessRefused:
+            return
+        processes = [
+            (cast(int, p["pid"]), str(p["command"]))
+            for p in found
+            if isinstance(p.get("pid"), int)
+        ]
+        pids = tuple(pid for pid, _ in processes)
+        if not pids:
+            self._detached.pop(line_id, None)
+            return
+        if self._detached.get(line_id) == pids or line_id not in self._log.state.lines:
+            return
+        self._detached[line_id] = pids
+        self._record_left(line_id, DETACHED_CAUSE, processes)
 
     def background_ended(self, line_id: str, end: BackgroundEnd) -> str | None:
         """Wake ``line_id`` because its engine reported ``end`` between turns, with a
@@ -3233,9 +3874,13 @@ class Scheduler:
         """Discard ``line_id``'s engine, so its next turn builds a new one, and close
         a connection it kept, once any turn in progress has ended."""
         engine = self._engines.pop(line_id, None)
+        self._engine_built.pop(line_id, None)
         # A configuration change discards the engine, and with it any compaction
         # the line asked for under the old configuration.
         self._compact_requests.discard(line_id)
+        if self._line_tokens is not None and line_id not in self._running:
+            # The engine's process, if it kept one, ends with it.
+            self._line_tokens.revoke(line_id)
         if not isinstance(engine, KeptEngine):
             return
         try:
@@ -3255,6 +3900,10 @@ class Scheduler:
                 self._drop_engine(line_id)
         if self._retiring:
             await asyncio.gather(*self._retiring, return_exceptions=True)
+        # The launchers of the engines just closed have exited, so their records
+        # are swept now rather than at the next start. Review N1.
+        self.collect_left()
+        await self.finish_sweep()
 
     def kept_session(self, line_id: str) -> dict[str, object]:
         """Whether ``line_id``'s engine connection is kept, and until when."""
@@ -3298,9 +3947,13 @@ class Scheduler:
                     line_id, kind, cost, usage
                 ),
                 lambda tokens: self.compaction_estimated(line_id, tokens),
+                lambda tasks: self.ceiling_reached(line_id, tasks),
+                self.ceiling_settled,
+                lambda text: self.consent_fallback(line_id, text),
             )
             engine = self._engine_factory(spec, self.own_tools(line_id))
             self._engines[line_id] = engine
+            self._engine_built[line_id] = time.time_ns()
         return engine
 
     def line_summaries(self) -> list[Mapping[str, object]]:
@@ -3358,18 +4011,29 @@ def _enter(parent: int, name: str, path: str, *, scratch_root: bool) -> int:
         ) from error
 
 
+BETWEEN_NOTES: Final = {
+    INTERRUPTED_KIND: (
+        "a turn an operator interrupted, with the cost its engine reported for it"
+    ),
+    SELF_STARTED_KIND: (
+        "a turn the engine began by itself between Dromon's turns, which Dromon"
+        " interrupted"
+    ),
+    HANDSHAKE_KIND: (
+        "a result with no turn behind it, with which a resumed engine session settled"
+        " the turn its last process left"
+    ),
+}
+"""What each of ``line_status``'s recent turns outside Dromon's own was."""
+
+
 def _between_entry(
     kind: str, cost: float | None, usage: Mapping[str, int] | None
 ) -> dict[str, object]:
     """One of ``line_status``'s recent turns for a turn outside Dromon's own."""
     return {
         "kind": kind,
-        "note": (
-            "a turn an operator interrupted, whose result the engine reported after it"
-            if kind == INTERRUPTED_KIND
-            else "a turn the engine began by itself between Dromon's turns, which"
-            " Dromon interrupted"
-        ),
+        "note": BETWEEN_NOTES.get(kind, BETWEEN_NOTES[SELF_STARTED_KIND]),
         "cost_usd": None if cost is None else f"{cost:.4f}",
         "cost_note": _between_cost_note(cost),
         "usage": None if usage is None else dict(usage),
@@ -3439,12 +4103,24 @@ def _compaction_entry(report: TurnReport) -> dict[str, object] | None:
     }
 
 
+def turn_outcome(report: TurnReport) -> str:
+    """How a reported turn ended, ``COMPLETED``, ``FAILED`` or ``INTERRUPTED``. Only
+    the subtype ``success`` is a completion. Every other subtype, such as one for
+    reaching ``max_turns`` or an error during execution, is a failure, so that a turn
+    that did not finish its work is never shown as finished."""
+    if report.interrupted_for is not None:
+        return INTERRUPTED
+    return COMPLETED if report.subtype == "success" else FAILED
+
+
 def _turn_entry(report: TurnReport) -> dict[str, object]:
     """One of ``line_status``'s recent turns: its cost and the tokens behind it, or
     plain words where the engine reports neither."""
     spent = report.cost_estimate_usd
     return {
         "kind": "turn",
+        "outcome": turn_outcome(report),
+        "subtype": report.subtype,
         "compaction": _compaction_entry(report),
         "calls": [dict(call) for call in report.calls],
         "calls_note": (
@@ -3467,6 +4143,24 @@ def _turn_entry(report: TurnReport) -> dict[str, object]:
             else "tokens of the engine's main loop for this turn, as it reports them."
             " The cost, a difference of running totals, also covers its subagents and"
             " helper calls"
+        ),
+    }
+
+
+def _left_summary(left: ProcessesLeft | None) -> dict[str, object] | None:
+    """The line's latest ``processes_left``, as ``line_status`` gives it."""
+    if left is None:
+        return None
+    return {
+        "cause": left.cause,
+        "processes": [
+            {"pid": pid, "command": command}
+            for pid, command in zip(left.pids, left.commands, strict=True)
+        ],
+        "more": left.more,
+        "note": (
+            "processes Dromon left running and no longer ends, as recorded, each as"
+            " its executable's name and its arguments with secrets masked"
         ),
     }
 

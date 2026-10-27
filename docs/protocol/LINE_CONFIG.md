@@ -50,7 +50,10 @@ keys, duplicate keys and numbers are refused.
 | `context_warn_tokens` | The estimated context, in tokens, past which the line's prompt warns, a whole number from 1,000 to 10,000,000, as the context section below specifies. Omitted at its default | `150000` |
 | `allow_compact` | Give a Claude Code or Codex line `compact_session`, to compact its own session. Refused on Grok lines. Omitted when false | `false` |
 | `auto_compact_tokens` | The context estimate at or past which a turn begins by compacting the session, a whole number from 1,000 to 10,000,000, as the context section below specifies. Needs `allow_compact`. Set by an operator. Omitted when unset | unset |
-| `keep_session_max_seconds` | Seconds after the last turn a kept connection may stay open while the engine reports background tasks running, a whole number from 60 to 86,400 and not less than `keep_session_idle_seconds`. Omitted at its default | `14400` |
+| `keep_session_max_seconds` | Seconds after the last turn a kept connection may stay open while the engine reports background tasks running, before `keep_session_at_max` applies, a whole number from 60 to 86,400 and not less than `keep_session_idle_seconds`. Omitted at its default | `14400` |
+| `keep_session_at_max` | What a kept connection does at `keep_session_max_seconds` with background tasks still running, `close`, `ask` or `keep`, as the ceiling section below specifies. Omitted at its default | `close` |
+| `keep_session_hard_seconds` | Seconds after the last turn past which no choice keeps a connection open, a whole number from 60 to 604,800 and not less than `keep_session_max_seconds`. Omitted at its default | `86400` |
+| `stop_policy` | `kill_all` or `leave_background`, whether stopping the line's engine, or the daemon, ends everything the engine started or leaves its background descendants running, as the stop policy section below specifies. Omitted at its default | `kill_all` |
 
 A server name is an identifier and may not be `dromon`, which Dromon's own tools use. A
 `stdio` server has `command` and optionally `args` and `env`. An `http` or `sse` server
@@ -118,6 +121,19 @@ question holding it as `held_by`, its `autonomous_turns` used and allowed, its e
 It adds a `daemon` object and, for every other line, its `line_id`, `state`, whether it
 is `held`, and the names of its `leases`. It holds no configuration document and no
 message body.
+
+**Row 5 of the T3 Code review, 2026-10-26.** `condition` names where the line stands,
+in this order of precedence, `running`, `held` for an operator, `failed` by its last
+turn, `waiting` on a question it asked an operator, or `idle`. Each entry of
+`recent_turns` for a turn gives its `outcome`, `completed` only for the subtype
+`success`, `interrupted` when its driver interrupted it, and `failed` for every other
+subtype, with the `subtype` itself. `processes` adds the line's `stop_policy`, as
+`left` the latest record of processes left running, as `stop_unverified` the note of
+the latest stop Dromon could not verify was complete, and as `walk_limit` what the
+daemon's platform keeps the launcher's walk from reaching, each or `null`, as the stop
+policy section below specifies. A `recent_turns` entry for a turn outside Dromon's own
+gives its `kind`, `interrupted` for a turn an operator stopped, with the cost its
+engine reported for it, which counts toward the line's budget.
 
 The `daemon` object holds the following, decided by the operator on 2026-10-26 in round
 2.
@@ -399,8 +415,10 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
     `cost_usd` and `usage`, which the turn's own include, or `null`. A Claude Code
     result that ends a turn outside Dromon's own is measured when it arrives, so the
     cost mark moves past it, and becomes an entry of its own, of kind `self_started`
-    for a turn the engine began by itself or `interrupted` for a turn an operator
-    interrupted. Its cost counts toward the budget, and a line past it is held, but it
+    for a turn the engine began by itself, `interrupted` for a turn an operator
+    interrupted, or `handshake` for a result with no turn behind it, between turns or
+    as a resumed session's handoff, as [Kept sessions](#kept-sessions) says. Its cost
+    counts toward the budget, and a line past it is held, but it
     is not an autonomous turn. Before round 6 such a result was discarded, which lost
     its cost where the engine reports per-turn usage.
   - **Codex lines.** **Facts, observed live on Codex 0.164.0 on 2026-10-26.** The
@@ -623,10 +641,17 @@ ends with each turn, and the next turn resumes the session in a new one.
   would be undercounted by that total, since a restart is told only by a fall. Before
   this, every turn that was not kept counted the session's whole history.
 - **Background tasks.** The engine reports each background task's start and end, and
-  Dromon counts those running. A connection closes after `keep_session_idle_seconds`
-  without a turn, or, while the engine reports tasks running, after
-  `keep_session_max_seconds`, both counted from the end of the last turn and checked
-  every 5 seconds. Closing the connection ends the engine's process. An error in the
+  Dromon counts those running. **Item 8 of the live check of 2026-10-26, read from the
+  bundled Claude Code 2.1.310.** The engine also sends `background_tasks_changed`,
+  its whole set of live background tasks, whenever the set changes. Dromon adds from it
+  a task whose start it did not see, at any time, and removes by it a task the set no
+  longer names only between turns, since during a turn a foreground agent still
+  running is not in the set. A removed task's end, if reported later, is still noted.
+  A malformed set, or one longer than 256 entries, removes nothing. A connection closes after `keep_session_idle_seconds`
+  without a turn, or, while the engine reports tasks running, when
+  `keep_session_max_seconds` and `keep_session_at_max` say, as the ceiling section
+  below specifies, all counted from the end of the last turn and checked every 5
+  seconds. Closing the connection ends the engine's process. An error in the
   watch is reported on the daemon's standard error and the watch goes on, so neither
   deadline is left unenforced. An interrupt or a close begun outside a turn is held by
   the engine until it ends, since asyncio keeps only weak references to tasks.
@@ -637,15 +662,29 @@ ends with each turn, and the next turn resumes the session in a new one.
   closes the connection when that turn ends. The next turn resumes the session in a new
   process as before, and when Dromon closed it for a reason the line could not see, the
   prompt says why and how many background tasks were running.
+- **A resumed session's handoff.** **Item 6 of the live check of 2026-10-26. Fact,
+  read from the bundled Claude Code 2.1.310.** A session resumed with a turn its last
+  process left unfinished settles that turn on its first prompt, and where nothing is
+  left to run, reports a result of subtype `success` with `num_turns` of zero, an
+  empty `result` and no model call, without reading the prompt. A Dromon turn, kept or
+  not, that receives such a result before any of the model's output counts its cost as
+  a `handshake`, notes in the line's activity that the prompt was sent again, and
+  sends it once more. A second such result refuses the turn, which closes a kept
+  connection, since a success that ran nothing would misreport the turn. A result that
+  reports an error is the turn's outcome as before.
 - **The engine's death.** When the engine's process ends between turns, the next turn
   resumes the session in a new process, and its prompt says that the old process's
   background tasks were lost. When it ends during a turn, the turn fails, and the next
   prompt says the same.
 - **Interrupt.** An operator's interrupt cancels the turn. Dromon interrupts the engine
-  and discards the rest of that turn's output, and the connection stays open. If the
-  engine does not take the interrupt within 10 seconds, the connection is closed.
-  **Hypothesis, not observed.** The engine may stop its background tasks on an
-  interrupt.
+  and discards the rest of that turn's output. If the engine does not take the
+  interrupt within 10 seconds, the connection is closed. **Row 1 of the T3 Code review,
+  decided by the operator on 2026-10-26.** Once the stopped turn has ended, a
+  connection whose interrupt settled while the engine still reports background tasks
+  running, or before the stopped turn's result arrived, is closed too, which ends the
+  engine and, by the stop policy, what it started. Otherwise the connection stays
+  open. [`CLIENT.md`](CLIENT.md) specifies what else a stop does. **Hypothesis, not
+  observed.** The engine may stop its background tasks on an interrupt.
 - **`line_status`.** `kept_session` gives whether the line is `configured` to keep its
   session, whether a connection is `kept` now, the time it `closes_at` in Coordinated
   Universal Time, which is `null` during a turn, the number of `background_tasks` the
@@ -669,6 +708,300 @@ ends with each turn, and the next turn resumes the session in a new one.
   task that ends in between is counted.
 - **Other engines.** A Codex line may keep its session too, with the checks and tools
   [`CODEX.md`](CODEX.md) specifies. A Grok line refuses `keep_session`.
+
+### The ceiling
+
+**Decided by the operator on 2026-10-26**, decision A, from row 12 of the T3 Code
+review, which asked whether `keep_session_max_seconds` may end background work. A kept
+connection, of a Claude Code or a Codex line, that still has background work running
+`keep_session_max_seconds` after the line's last turn does what `keep_session_at_max`
+says.
+
+| Value | At the ceiling |
+|---|---|
+| `close` | The connection closes, which ends its background work. The default, and the behaviour before the choice existed |
+| `ask` | Dromon asks an operator, the one who last wrote to the line or the project's default, with the choices `extend`, `stop` and `let it finish`, and keeps the connection until the answer comes |
+| `keep` | The connection stays open while the work runs |
+
+- **The hard bound.** Whatever was chosen, the connection closes
+  `keep_session_hard_seconds` after the last turn, so no wait is unbounded. An
+  unanswered question keeps the connection until then.
+- **The answers.** `extend` allows another `keep_session_max_seconds` from the answer,
+  after which Dromon asks again. `stop` closes the connection at once. `let it finish`
+  keeps it while the work runs, for the rest of the connection's life. An answer is
+  read with its case and surrounding space set aside, and one that is none of the
+  three decides nothing, so the connection closes at the hard bound. The answer also
+  reaches the line as mail, as every answer does, and wakes it.
+- **Withdrawal.** A turn starts the count again and withdraws a question still open,
+  since its premise changed, and so do the connection's close and, **review F12**, its
+  death without a close. **Review F11.** The connection does not survive a restart, so
+  the daemon withdraws every ceiling question still open as it starts, told by its
+  choices and its fixed wording. A line's own question written to match is withdrawn
+  with them, which is accepted.
+- **Without an operator.** A question that cannot be recorded, for any reason, closes
+  the connection as `close` does.
+- **Why `close` is the default.** It keeps the meaning of every configuration stored
+  before the choice existed, and it is the only choice that an operator who is away
+  cannot turn into a longer wait, since an unanswered `ask` lasts until the hard bound.
+- **Notes.** The next prompt says why Dromon closed the connection. The reasons are
+  `keep_session_idle_seconds`, `keep_session_max_seconds`, the hard bound, an
+  operator's `stop`, and a question that could not be asked.
+
+## Stop policy
+
+**Decided by the operator on 2026-10-26**, decision B, from row 2 of the T3 Code review.
+Every harness, of every engine, runs under Dromon's launcher, which ends it when the
+daemon stops it, when the daemon stops or dies, and when the line's engine is stopped.
+`stop_policy` decides what else ends with it.
+
+| Value | Effect |
+|---|---|
+| `kill_all` | The harness, its process group, and every descendant a walk of the process table finds are terminated and then killed. The default, which fails closed |
+| `leave_background` | The harness alone is frozen, listed around and killed, without being asked to stop or seeing its input close, and whatever it started is left running and recorded |
+
+- **What is left is recorded.** Under `leave_background` the launcher writes the
+  processes it left, at most 64 with their pids and commands, to a report in the
+  state directory's `left` directory, readable by its owner alone. The daemon records
+  each report as a `processes_left` event, as [`EVENT_LOG.md`](EVENT_LOG.md)
+  specifies, at the end of each turn, at each `line_status`, at each rest of its
+  scheduler, at most a minute apart, and when it starts, which covers a report written
+  after a crash. `line_status` gives the line's latest under `processes.left`, with
+  its `stop_policy`. A recorded process is no longer Dromon's to end.
+- **Commands are recorded masked.** **Review N9 and N10 of the stop policy's
+  re-review, 2026-10-27.** A command line can carry a credential. The event log and
+  `line_status` therefore record each left process as its pid, its executable's name
+  and its arguments with bearer and basic credentials, a user and password in a URL,
+  and the values of options and `name=value` pairs whose names hold `password`,
+  `passwd`, `pwd`, `token`, `key`, `secret`, `credential` or `auth` masked. The whole
+  command stays only in the report, which the daemon keeps aside once read, the
+  newest 256. A background task's command and description are masked the same way
+  as they are taken in. Masking is by pattern, so a credential in another form, such
+  as a bare argument, is recorded as it is.
+- **The daemon's death.** The launcher checks every half second that its parent is
+  still the daemon that started it, which on macOS and on Linux stops being so when
+  the daemon exits, however it exits, and then stops the harness by the policy.
+- **Detached processes.** **Row 2 of the T3 Code review.** At the end of a turn whose
+  engine has ended, the line's processes that still carry its mark have left the
+  engine's tree, so no stop reached them. They are recorded with the cause
+  `detached`, and are not ended. The same set is not recorded twice in a row.
+- **Order and bounds.** **Review of the stop policy, F3 to F5, 2026-10-26.** Under
+  `kill_all` the launcher's first act is `SIGSTOP` to the harness's whole group, so
+  that nothing in it exits, and so orphans a child, while the process table is
+  walked. Then `SIGTERM` and `SIGCONT` go to the group and to every descendant found,
+  and `SIGKILL` to what remains 2 seconds later. Under `leave_background` the harness
+  runs on for half a second with its input still open, then alone is stopped, listed
+  around and killed. Each walk may take half a second, and a killed harness half a
+  second more to be reaped, so a stop takes at most 4 seconds. **Fact, read from
+  Agent SDK 0.2.174.** The SDK's close closes the engine's standard input, waits 5
+  seconds, sends `SIGTERM`, waits 5 seconds more and sends `SIGKILL`, to the launcher,
+  which therefore finishes with a second to spare. The daemon signals a launcher by
+  its pid and by its group, kills it 6 seconds later, and waits 2 seconds more for it,
+  then reports one that is still there and goes on.
+- **A launcher that cannot finish.** **Review N1 of the stop policy's re-review,
+  2026-10-27.** A launcher killed with `SIGKILL` cannot act, and one killed between
+  its `SIGSTOP` and its `SIGCONT` would leave the harness's group frozen and alive. As
+  the harness starts, the launcher therefore writes a launch record beside its
+  reports, naming the line, itself, the harness's pid, which is its group's, the
+  harness's executable and the policy, and marks it done once its stop has finished.
+  Once a launcher has exited, for any reason, the daemon sweeps the group its record
+  names, within the same bounds. Under `kill_all` it sends the group and the harness's
+  descendants `SIGTERM` and `SIGCONT`, then `SIGKILL` 2 seconds later. Under
+  `leave_background`, if the launcher did not finish, it kills the harness and sends
+  its group `SIGCONT`. It records a stop the launcher did not finish as
+  `stop_unverified`, which `line_status` shows as `processes.stop_unverified`, and
+  what still ran as `processes_left` with the cause `swept`. It touches no group whose
+  leader now runs another executable, or whose pid a running launcher's record
+  claims, and when the process table cannot be read it touches nothing and the record
+  waits. It reads the table whenever a record is unfinished, or its launcher's pid no
+  longer answers a signal, so a sweep costs one `ps` while any engine runs. A
+  launcher counts as exited when its pid is gone, when `ps` shows it `<defunct>`, or
+  when its harness has another parent, since a running launcher stays its harness's
+  parent until it reaps it. **Third live run, 2026-10-26.** A kept connection's
+  launcher killed with `SIGKILL` still answered a signal for over 80 seconds, and the
+  sweep, which then looked only at that answer, never reached its record while the
+  daemon ran. That it stayed an unreaped child of the daemon is an inference, which
+  a probe of the Agent SDK's process start did not reproduce. When a swept launcher
+  was started since the line's present engine was built, the daemon treats that
+  engine as failed, closes its connection after the sweep, says so in the line's
+  activity, and builds a new engine for the next turn. A kept connection otherwise
+  looks healthy, since its harness keeps the Agent SDK's pipes. Closing after the
+  sweep keeps an orderly close of a living harness from ending the background work
+  that `leave_background` keeps. The daemon sweeps at the end of each turn, at each
+  `line_status`, as it starts and as it stops, and at each rest, which lasts at most
+  60 seconds even when no wake is pending, so an idle daemon sweeps at least once a
+  minute. **Fourth live run, 2026-10-26.** The rest was unbounded without a pending
+  wake, so an idle daemon with a kept connection never swept its dead launcher. Each
+  sweep that acts, each failure of one, and the process table's being readable again
+  after a failure are written to the daemon's log. It reaches only the harness's group
+  and, while the harness lives, its descendants, so a descendant in a group of its
+  own whose parent exited is beyond it. On Linux the harness is also given a parent
+  death signal, `SIGTERM` under `kill_all` and `SIGKILL` under `leave_background`, so
+  it learns at once that its launcher died.
+- **No reaped pid is signalled.** The launcher sees the harness exit without reaping
+  it, and reaps it last, so the harness's pid, and with it its group's identifier,
+  cannot have been reused by an unrelated process when it is signalled.
+- **A walk that cannot be made refuses the turn.** **Review F2.** Under `kill_all` the
+  daemon asks before each turn whether `ps` can list the process table, and refuses to
+  start the turn, saying why, when it cannot. A failed walk is never taken for an
+  empty tree. A launcher whose walk fails at stop time still ends the harness's group,
+  says so on its standard error, and reports it, which the daemon records as
+  `stop_unverified`. **Review F2 of the re-review, 2026-10-27.**
+- **The harness's own teardown.** **Item 7 of the live check of 2026-10-26.** Under
+  `leave_background` a graceful stop of the daemon still ended a background `sleep`,
+  and nothing was recorded. **Fact, read from the bundled Claude Code 2.1.310.** Once
+  its input has closed, Claude Code's print mode kills each background shell after a
+  grace of 5 seconds, and kills any shell still running when its stream closes. The
+  Agent SDK's close closes that input first, so Claude Code ended its own background
+  work before the launcher could act. Under `leave_background` the launcher therefore
+  stands between the daemon's input and the harness's, when that input is a pipe or a
+  socket. It copies the input across and never closes the harness's side. When the
+  daemon's side closes, or a stop arrives, the launcher lets the harness run on for
+  half a second, then freezes it, lists its descendants and kills it with `SIGKILL`,
+  which no harness can answer by ending what it started. Under `kill_all` nothing is
+  relayed, and the harness's own close is kept. **Review N3.** The relay holds up to
+  1 MiB the harness has not yet read, so a harness that stops reading does not keep
+  the daemon's close from being seen. Past that bound it reads no more, and sees no
+  close, until the harness reads again, while the stop signals and the parent check
+  still reach the launcher.
+- **What `leave_background` costs.** The harness has no orderly exit under it. Claude
+  Code writes its session as it goes, and a session was resumed after a `SIGKILL` in
+  the live check, but whatever it would have written as it closed is lost. **Review
+  N2, read from the bundled Claude Code 2.1.310.** Claude Code offers no request that
+  writes out its session without ending it or starting a turn. It writes its
+  transcript from a queue it drains every 100 milliseconds, and as it resumes it seals
+  a last line that a kill cut short. The half second the harness runs on before its
+  freeze is that chance to write, five such drains. Whether a write larger than one
+  drain can still be cut is not verified. A kept
+  connection that Dromon closes, at its ceiling, its hard bound or an operator's
+  `stop`, also leaves its background work running under this policy, and the ceiling's
+  question and the line's next prompt say so instead of promising an end.
+- **Platform limits.** **Review F1.** On Linux the launcher is a child subreaper, so a
+  descendant whose parent exited, even one in a session of its own, is given to the
+  launcher, and the walk reaches it. macOS has no subreaper. There a descendant that
+  started a session of its own and whose parent exited before the walk is reached by
+  no walk, and only its mark finds it, which macOS 27 does not let the daemon read.
+  The daemon records that gap once in the event log, as `walk_limited`, and shows it
+  in every line's status as `processes.walk_limit`. As it starts, the daemon also
+  records the processes of an earlier run that still carry a line's mark, where it
+  can read marks, as `detached`. A descendant that is not the launcher's own child
+  can still be reaped by its parent, and its pid reused, between the walk and a
+  signal, which repeating the walk before the last round narrows. `dromon.launcher`
+  records these in full.
+
+### Unverified under Claude Code, and the check to run first
+
+**Review F7, F8, F10, F9, F5 and F16.** The tests use scripted harnesses only. What
+follows is read from the Agent SDK's and the bundled Claude Code's source. The live
+check of 2026-10-26, run by the operator's session with Claude Haiku 5.5 on macOS,
+observed part of it, as the list below records.
+
+- **No terminal.** **F7.** The harness runs in a session of its own, with no
+  controlling terminal. Under the Agent SDK it had none before either, since the SDK
+  starts it with pipes, so no change in behaviour is expected. This is an inference.
+- **The command path and the version check.** **F8. Fact, read from Agent SDK
+  0.2.174.** The SDK uses `cli_path` only to run it, and reads nothing beside it on
+  disk. Before each connection it runs `cli_path -v` with its own environment, not the
+  engine's, under a 2 second bound, warns when the version is below its minimum, and
+  ignores every failure. The launcher answers that query from the same lookup the
+  engine starts Claude Code from, by running that command with `-v` in its place. A
+  test runs the SDK's own check through the launcher with a scripted version. The
+  lookup imports the SDK, which took about 0.7 seconds here, inside the 2 second
+  bound.
+- **Signals and exit status.** **F10.** The harness sees no signal from the SDK
+  directly. It sees `SIGSTOP`, `SIGTERM` and `SIGCONT` from the launcher, and `SIGKILL`
+  two seconds later if it stays. A harness that dies by signal `n` makes the launcher
+  exit with `128 + n`, where the SDK would have read `-n`. **Fact, read from Agent SDK
+  0.2.174.** The SDK uses the status only in the text of the error it raises for any
+  status other than 0, so only that text differs.
+- **Settings and the pinned tool search.** **F9. Read from the bundled Claude Code
+  2.1.310.** `setting_sources=[]` loads none of the user, project and local settings
+  files, so none of their env blocks applies. Claude Code still copies the `env` key
+  of its global configuration file, `~/.claude.json`, over its process environment,
+  and then the flag and the managed policy settings' env blocks. Dromon therefore also
+  pins `ENABLE_TOOL_SEARCH` in the flag settings it passes, which come after the
+  global configuration. Managed policy settings come last, and Dromon does not
+  override them.
+- **The SDK's timing.** **F5.** The 5 second windows are read from the SDK, and the
+  launcher's 3.5 second budget is measured only against scripted harnesses.
+- **Fallback messages.** **F16. Read from the message schemas in the bundled Claude
+  Code 2.1.310.** `model_fallback`, `model_refusal_fallback` and
+  `model_consent_fallback` each name `original_model` and `fallback_model`. A turn is
+  refused only when `fallback_model` is not the driver's model, and a consent fallback
+  is also put to an operator as a question.
+
+**The verify-first list,** for a live check with Claude Haiku 5.5, in this order. An
+interrupt can be scripted with `dromon interrupt LINE`, as
+[`CLIENT.md`](CLIENT.md) specifies.
+
+1. A turn under the launcher completes, with `line_status` showing it `completed`, and
+   its result and cost match a turn of the same prompt without the launcher, which can
+   be had by pointing `cli_path` at Claude Code directly in a scratch run. **Observed
+   in part on 2026-10-26.** A probe under the launcher finished in 3.7 seconds and
+   reported Claude Code 2.1.310. The comparison without the launcher was not run.
+2. The SDK's version check through the launcher reads the bundled Claude Code's
+   version, which the SDK's warning at a raised minimum shows, and finishes within its
+   2 second bound. **Not observed separately on 2026-10-26.** The probe raised no
+   version warning, which is consistent with it and does not show it.
+3. An operator's interrupt of a turn that runs `sleep 600` in the background ends the
+   harness and the `sleep` within 5 seconds of the SDK's `SIGTERM`, and the launcher
+   exits before the SDK's `SIGKILL`. **Not run on 2026-10-26,** for want of a
+   scriptable interrupt.
+4. The same with a background command that starts a session of its own, as `setsid
+   sleep 600` does on Linux, and on macOS that `processes.walk_limit` names the gap.
+   **Not run on 2026-10-26.** The tree observed was the launcher, then Claude Code,
+   then a `bash` in a process group of its own, then the `sleep` in that group, so
+   Claude Code puts each background command in a new group, which a signal to the
+   harness's group alone never reaches.
+5. The daemon killed with `SIGKILL` during such a turn leaves no harness and no
+   `sleep` running. **Observed on 2026-10-26** under `kill_all`. All four processes
+   were gone within about 6 seconds, longer than the about one second this item first
+   expected. The parent check and the stop's bound account for at most 4 seconds of
+   it. The rest is not explained, and the observation's own resolution is not known.
+6. `leave_background` leaves the `sleep` running and records it in
+   `processes.left`, after a graceful `dromon stop` and after an interrupt. **Failed
+   on 2026-10-26** for a graceful stop, which Claude Code answered by ending the
+   `sleep` itself, as the stop policy section says. The input relay is the change made
+   for it, and is to be checked again.
+7. With `"env": {"ENABLE_TOOL_SEARCH": "auto"}` in `~/.claude.json`, the init message's
+   tools still show tool search on. **Not run on 2026-10-26.**
+8. A harness that exits with an error shows the SDK's error text with the launcher's
+   status. **Not run on 2026-10-26.**
+9. The first turn after the daemon is killed with `SIGKILL` during a turn, on the
+   resumed kept session, runs its prompt. **Failed on 2026-10-26.** It ended in about 2
+   seconds as a success with no tool call, no text and no cost, and the waiting
+   message was answered only in a later turn. The engine now sends the prompt once
+   more after such a handoff result, notes so in the line's activity, and refuses the
+   turn after a second, as [Kept sessions](#kept-sessions) says. That the handoff
+   reaches no model output before its result, which the check relies on, is read from
+   the source and is to be checked again. **Review N5.** Any success with no turn
+  before the model's output now counts as a handoff, whatever its text, and the text
+  is shown in the line's activity.
+10. The daemon's log has no line for an unhandled `background_tasks_changed`, and
+    `line_status` counts a background task that ends between turns out as soon as the
+    engine's task set drops it. **Observed on 2026-10-26** as unhandled, which is now
+    handled, and is to be checked again.
+11. Under `leave_background`, a kept session closed at its ceiling or by an operator's
+    `stop` leaves its background work running and records it, and its question says
+    so beforehand. **Not run.**
+12. Under `leave_background`, a `dromon stop` of the daemon leaves a turn's transcript
+    whole, which a following turn resumes, and the launcher's half second of grace
+    shows in the stop's time. **Not run.**
+13. A launcher killed with `SIGKILL` during a turn, with the daemon still running,
+    leaves its harness swept within a minute, and `processes.stop_unverified` says so.
+    On Linux the harness ends at once by its parent death signal. **Third live run,
+    2026-10-26, on macOS.** The sweep as the daemon started worked, but a kept
+    connection's killed launcher was not swept while the daemon ran. The fourth run,
+    after a fix of the liveness check, still swept nothing for 4 minutes, because an
+    idle daemon's rest was unbounded. Both have been changed since, and item 14
+    checks them. **Not run since.**
+14. A kept connection's launcher killed with `SIGKILL` between turns, with the
+    daemon still running, leaves the line's activity saying its engine was closed as
+    failed, and the next turn starts a new connection. **Not run.**
+15. Claude Code does not exit promptly when its input closes. **Observed in the
+    third live run, 2026-10-26, on macOS.** With its launcher and then the daemon
+    killed with `SIGKILL`, Claude Code 2.1.310 still ran 10 seconds after its input
+    closed. So neither the launcher's stop nor the sweep relies on its own exit, and
+    each ends it by signal within its bound.
 
 ## Instructions
 

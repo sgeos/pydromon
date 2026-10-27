@@ -64,6 +64,7 @@ from dromon.jsonlines import (
     json_lines_factory,
 )
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
+from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
 
 ENGINE_NAME: Final = "pi"
@@ -255,6 +256,11 @@ ABORT_SECONDS: Final = 60
 stopped."""
 UI_DIALOGS: Final = frozenset({"select", "confirm", "input", "editor"})
 """Extension requests that wait for an answer. Dromon cancels each."""
+
+DIALOG_REFUSED: Final = (
+    "an extension asked for a {} dialog, which Dromon cancelled, since nobody is at"
+    " this line's prompt. A line asks an operator with ask_operator"
+)
 
 PI_AFTER_ESTIMATE_NOTE: Final = (
     "Pi's own estimate of the size its compaction left, not a measured size"
@@ -619,6 +625,8 @@ class PiLine:
         self._deadline = 0.0
         self._next_id = 0
         self._connection: Connection | None = None
+        self._interrupted_cost: float | None = None
+        """What a cancelled turn had cost when it was cancelled, until taken."""
 
     async def run_turn(self, prompt: str) -> TurnReport:
         """Run one turn for ``prompt`` and return what happened."""
@@ -651,6 +659,7 @@ class PiLine:
             environment["DROMON_LINE_TOKEN"] = self.line_token
         if self.mark is not None:
             environment[MARK_VARIABLE] = self.mark
+        environment[STOP_POLICY_VARIABLE] = self.config.stop_policy.value
         arguments = pi_arguments(
             model,
             effort,
@@ -662,17 +671,27 @@ class PiLine:
         )
         turn = _Turn()
         self._deadline = asyncio.get_running_loop().time() + self.turn_seconds
-        async with self._connect(arguments, self.cwd, environment) as connection:
-            self._connection = connection
-            try:
-                session_file = await self._converse(prompt, turn)
-            finally:
-                self._connection = None
+        try:
+            async with self._connect(arguments, self.cwd, environment) as connection:
+                self._connection = connection
+                try:
+                    session_file = await self._converse(prompt, turn)
+                finally:
+                    self._connection = None
+        except asyncio.CancelledError:
+            self._interrupted_cost = turn.cost
+            raise
         if turn.refusal is not None:
             raise EngineRefused(turn.refusal)
         if session_file is not None and os.path.isfile(session_file):
             self.session_id = session_file
         return self._report(turn, credential)
+
+    def take_interrupted_cost(self) -> float | None:
+        """The cost Pi reported for the calls of a turn that was cancelled, such as
+        by an operator's interrupt, once. **Review N8.** ``None`` when none was."""
+        cost, self._interrupted_cost = self._interrupted_cost, None
+        return cost
 
     def _session_to_resume(self) -> str | None:
         """The session file to resume, after checking that it is still a file under
@@ -829,7 +848,8 @@ class PiLine:
     async def _dispatch(self, record: dict[str, Any], turn: _Turn) -> None:
         kind = record.get("type")
         if kind == "extension_ui_request":
-            if record.get("method") in UI_DIALOGS:
+            method = record.get("method")
+            if method in UI_DIALOGS:
                 await self._open().send(
                     {
                         "type": "extension_ui_response",
@@ -837,6 +857,9 @@ class PiLine:
                         "cancelled": True,
                     }
                 )
+                # Row 5 of the T3 Code review. The refusal is explicit to the engine,
+                # and is surfaced, so that no request for a decision passes unseen.
+                self._observe(ActivityKind.NOTICE, DIALOG_REFUSED.format(method))
         elif kind == "extension_error":
             await self._abort(
                 turn, f"an extension failed in the engine: {record.get('error')!r}"

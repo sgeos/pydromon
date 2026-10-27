@@ -19,8 +19,14 @@ def test_the_distribution_name_matches_pyproject() -> None:
     assert PYPROJECT["project"]["name"] == dromon.DISTRIBUTION
 
 
-def test_exactly_the_two_shared_commands_are_declared() -> None:
-    assert set(PYPROJECT["project"]["scripts"]) == {"dromon", "dromond"}
+def test_exactly_the_shared_commands_and_the_launcher_are_declared() -> None:
+    """The two shared commands, and the launcher the Agent SDK runs in place of
+    Claude Code, which is not for an operator."""
+    assert set(PYPROJECT["project"]["scripts"]) == {
+        "dromon",
+        "dromond",
+        "dromon-launch",
+    }
 
 
 def test_each_declared_command_resolves_to_a_callable() -> None:

@@ -102,12 +102,30 @@ RESERVED_VARIABLES: Final = frozenset(
     }
 )
 
+DROMON_PREFIX: Final = "DROMON_"
+"""Variables Dromon gives a line's processes or its launcher, such as the process mark
+and the stop policy, which no line sets for itself."""
+
+PINNED_VARIABLES: Final = frozenset({"ENABLE_TOOL_SEARCH"})
+"""Variables Dromon pins for every Claude Code line, so a line may not set them.
+**Row 4 of the T3 Code review.** ``ENABLE_TOOL_SEARCH`` decides whether the engine
+sends every tool schema in full or defers them behind its tool search. **Fact, read
+from the bundled Claude Code 2.1.310 on 2026-10-26.** Unset, ``true`` or ``auto:0``
+keep tool search on, ``false`` or ``auto:100`` keep it off, and ``auto`` or ``auto:N``
+switch between the two by the share of the context window the schemas take, so the
+set of schemas sent can change between requests and rewrite the prompt cache.
+``dromon.engine`` pins it to ``true``."""
+
 
 def reserved_variable(name: str) -> bool:
     """Whether a line may not set or reference ``name``, because it selects or holds
-    the engine's credential or provider, or is the mark Dromon gives a line's
-    processes."""
-    return name in RESERVED_VARIABLES or name.startswith(RESERVED_PREFIXES)
+    the engine's credential or provider, is one Dromon gives a line's processes, or
+    is one Dromon pins."""
+    return (
+        name in RESERVED_VARIABLES
+        or name in PINNED_VARIABLES
+        or name.startswith((*RESERVED_PREFIXES, DROMON_PREFIX))
+    )
 
 
 class SettingsError(ValueError):
@@ -239,6 +257,14 @@ def _env(value: object) -> dict[str, object]:
         key = f"env.{name}"
         if VARIABLE_PATTERN.fullmatch(name) is None:
             _fail(f"settings.env name {name!r} is not a variable name", key)
+        if name in PINNED_VARIABLES:
+            _fail(
+                f"settings.env may not set {name}, which Dromon pins so that the"
+                " engine's tool schemas, and with them its prompt cache, stay stable",
+                key,
+            )
+        if name.startswith(DROMON_PREFIX):
+            _fail(f"settings.env may not set {name}, which Dromon sets itself", key)
         if reserved_variable(name):
             _fail(
                 f"settings.env may not set {name}, which selects or holds the engine's"

@@ -15,7 +15,7 @@ defaults.
 """
 
 import json
-from typing import Final, NoReturn, assert_never
+from typing import Final, NoReturn, assert_never, cast
 
 from dromon.model import (
     Address,
@@ -49,6 +49,9 @@ from dromon.model import (
     WakeWithdrawn,
     TaskNoted,
     LineCostMarked,
+    ProcessesLeft,
+    StopUnverified,
+    WalkLimited,
     parse_address,
 )
 
@@ -90,6 +93,9 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "wake_withdrawn": ("line_id", "message_id"),
     "task_noted": ("line_id", "message_id", "task_id", "status", "body"),
     "line_cost_marked": ("line_id", "engine_session", "total_micro_usd"),
+    "processes_left": ("line_id", "cause", "pids", "commands", "more"),
+    "stop_unverified": ("line_id", "note"),
+    "walk_limited": ("note",),
     "question_withdrawn": ("message_id",),
     "question_superseded": ("message_id", "superseded_by"),
 }
@@ -244,6 +250,18 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "engine_session": event.engine_session,
                 "total_micro_usd": event.total_micro_usd,
             }
+        case ProcessesLeft():
+            return "processes_left", {
+                "line_id": event.line_id,
+                "cause": event.cause,
+                "pids": list(event.pids),
+                "commands": list(event.commands),
+                "more": event.more,
+            }
+        case StopUnverified():
+            return "stop_unverified", {"line_id": event.line_id, "note": event.note}
+        case WalkLimited():
+            return "walk_limited", {"note": event.note}
         case TaskNoted():
             return "task_noted", {
                 "line_id": event.line_id,
@@ -338,6 +356,18 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "engine_session"),
                 _int(data, "total_micro_usd"),
             )
+        case "processes_left":
+            return ProcessesLeft(
+                _str(data, "line_id"),
+                _str(data, "cause"),
+                tuple(_list(data, "pids", int)),
+                tuple(_list(data, "commands", str)),
+                _int(data, "more"),
+            )
+        case "stop_unverified":
+            return StopUnverified(_str(data, "line_id"), _str(data, "note"))
+        case "walk_limited":
+            return WalkLimited(_str(data, "note"))
         case "task_noted":
             return TaskNoted(
                 _str(data, "line_id"),
@@ -405,6 +435,20 @@ def _member[T: (LineState, MessageKind, AgentAccess)](
         return kind(value)
     except ValueError as error:
         raise DecodeError(f"{name} has no value {value!r}") from error
+
+
+def _list[T: (int, str)](data: dict[str, object], name: str, kind: type[T]) -> list[T]:
+    """The array ``name`` of ``data``, each item exactly of ``kind``."""
+    value = data[name]
+    if not isinstance(value, list):
+        raise DecodeError(f"{name} is not an array")
+    items: list[object] = value  # pyright: ignore[reportUnknownVariableType]
+    found: list[T] = []
+    for item in items:
+        if type(item) is not kind:
+            raise DecodeError(f"an item of {name} is not a {kind.__name__}")
+        found.append(cast(T, item))
+    return found
 
 
 def _choices(data: dict[str, object]) -> tuple[str, ...]:

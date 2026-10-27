@@ -130,7 +130,17 @@ from claude_agent_sdk._internal.message_parser import parse_message
 from claude_agent_sdk._internal.transport import Transport
 from claude_agent_sdk.types import SystemPromptPreset
 
+from dromon import launcher, redact
 from dromon.activity import ActivityKind, Observer, ignore
+from dromon.ceiling import (
+    STOP_REASON,
+    Ask,
+    Ceiling,
+    Choice,
+    Settle,
+    no_operator,
+    nothing_to_settle,
+)
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
 from dromon.lineconfig import DEFAULT_CONFIG, ConfigError, LineConfig
 from dromon.processes import MARK_VARIABLE
@@ -442,6 +452,133 @@ FILES_CHANGED: Final = "files its engine loaded changed between turns"
 INTERRUPT_TIMEOUT_SECONDS: Final = 10.0
 """How long an interrupt of a kept connection may take before it is closed instead."""
 
+HALT_REASON: Final = (
+    "an operator stopped the line while its engine still ran background work"
+)
+"""**Row 1 of the T3 Code review.** Why an operator's stop closed a kept connection
+whose interrupt settled while the engine still ran work."""
+
+TOOL_SEARCH_VARIABLE: Final = "ENABLE_TOOL_SEARCH"
+TOOL_SEARCH_PINNED: Final = "true"
+"""**Row 4 of the T3 Code review.** Every Claude Code line runs with tool search on,
+so the set of tool schemas the engine sends does not change between requests and
+rewrite the prompt cache, as ``dromon.settings`` explains. It is set in the engine's
+own environment, over whatever the daemon's holds, and in the env block of the flag
+settings Dromon passes, which ``flag_settings`` explains, and a line's settings may not
+set it. **Residual.** Managed policy settings apply after both, and could still set
+it."""
+
+
+def flag_settings(settings: Mapping[str, object] | None) -> dict[str, object]:
+    """The settings Dromon passes Claude Code with ``--settings``, its flag
+    settings, with the pinned tool search in their env block. **Review F9.**
+
+    **Read from the bundled Claude Code 2.1.310 on 2026-10-26, unverified by a live
+    probe.** ``setting_sources=[]`` reaches the engine as ``--setting-sources=``,
+    which loads none of the user, project and local settings files, so no env block
+    of theirs applies. Claude Code then still copies three env blocks over its
+    process environment, in this order. The ``env`` key of its global configuration
+    file, ``~/.claude.json``, which no setting source governs. The flag settings.
+    The managed policy settings. The process environment alone would lose to the
+    first, so the pin is also set here, in the second, which comes after it. The
+    third is an administrator's, and Dromon does not override it."""
+    merged = dict(settings or {})
+    given = merged.get("env")
+    block: dict[str, object] = (
+        dict(cast(Mapping[str, object], given)) if isinstance(given, Mapping) else {}
+    )
+    block[TOOL_SEARCH_VARIABLE] = TOOL_SEARCH_PINNED
+    merged["env"] = block
+    return merged
+
+
+HANDLED_SYSTEM_SUBTYPES: Final = frozenset(
+    {
+        "init",
+        "compact_boundary",
+        "task_started",
+        "task_progress",
+        "task_notification",
+        "task_updated",
+        "background_tasks_changed",
+        "hook_started",
+        "hook_response",
+        "session_state_changed",
+        "status",
+        "api_retry",
+    }
+)
+"""System message subtypes Dromon handles, or knows to carry nothing it must act on.
+**Row 5 of the T3 Code review.** Every other subtype is surfaced in the line's activity,
+once per subtype and engine, and is never passed over silently. **Fact, read from the
+bundled Claude Code 2.1.310 on 2026-10-26.** The engine can emit about forty
+subtypes, most of them for its own interface."""
+
+FALLBACK_SUBTYPES: Final = frozenset(
+    {"model_fallback", "model_refusal_fallback", "model_consent_fallback"}
+)
+"""System message subtypes with which the engine reports that it went on with another
+model than the one its init reported. **Review F16, read from the message schemas in
+the bundled Claude Code 2.1.310 on 2026-10-26, unverified live.** Each carries
+``original_model`` and ``fallback_model``. ``model_fallback`` is for one turn, after
+the primary model failed. ``model_refusal_fallback`` retries a refused response.
+``model_consent_fallback`` moves the session after a consent prompt, such as one for
+usage credits, was declined or could not be honoured. A turn is refused and
+interrupted only when ``fallback_model`` is not the model its driver was written for,
+compared exactly as the driver compares the init's model, and a missing one counts as
+another. A consent fallback is also put to an operator as a question, since the
+consent is a human's decision."""
+
+CONSENT_FALLBACK: Final = "model_consent_fallback"
+
+MAX_FALLBACK_FIELD_CHARACTERS: Final = 80
+
+
+def no_consent_question(text: str) -> None:
+    """Where a consent fallback goes when no operator can be asked."""
+    del text
+
+
+def fallback_text(field: object) -> str:
+    """A fallback message's model or choice, from engine output, cut to a bound."""
+    if not isinstance(field, str) or not field:
+        return "an unnamed one"
+    return field[:MAX_FALLBACK_FIELD_CHARACTERS]
+
+
+def consent_question(data: Mapping[str, object], bound_to: str, stopped: bool) -> str:
+    """The operator question a consent fallback raises, after the line's name."""
+    outcome = (
+        f"Dromon stopped the turn, since the line is bound to {bound_to}."
+        if stopped
+        else f"The turn went on, since {bound_to} is the model the line is bound to."
+    )
+    return (
+        f"asked for consent to use {fallback_text(data.get('original_model'))}, and"
+        f" on the answer {fallback_text(data.get('choice'))} moved its session to"
+        f" {fallback_text(data.get('fallback_model'))}. {outcome} The consent is"
+        " yours to give in Claude Code itself, or the line can be rebound. An answer"
+        " here reaches the line as mail."
+    )
+
+
+MAX_SURFACED_SUBTYPES: Final = 64
+MAX_SUBTYPE_CHARACTERS: Final = 64
+
+HANDSHAKE_KIND: Final = "handshake"
+"""A result with no turn behind it, which is not a turn: one between turns, or a
+resumed session's handoff, as ``is_handoff`` says."""
+
+HUMAN_DECISION_TOOLS: Final = frozenset({"AskUserQuestion", "ExitPlanMode"})
+"""Built-in tools with which the engine asks the person at its prompt to decide.
+**Row 5 of the T3 Code review.** A Dromon line has nobody there, so the gate refuses
+them whatever the configuration says, with a refusal that names the durable way."""
+
+HUMAN_DECISION_REFUSAL: Final = (
+    "Nobody is at this line's prompt to decide. Ask an operator with ask_operator,"
+    " whose answer arrives as mail in a later turn."
+)
+
 MAX_FINGERPRINT_FILES: Final = 4096
 MAX_FINGERPRINT_FILE_BYTES: Final = 1024 * 1024
 
@@ -459,15 +596,24 @@ SELF_STARTED_NOTE: Final = (
 )
 
 
-def closed_note(reason: str, tasks: int) -> str:
+def closed_note(reason: str, tasks: int, left: bool = False) -> str:
     """The note a line's next prompt carries after Dromon closed its kept
-    connection for ``reason`` with ``tasks`` background tasks reported running."""
-    lost = (
-        f" The {tasks} background tasks the engine reported running were stopped"
-        " with it."
-        if tasks
-        else ""
-    )
+    connection for ``reason`` with ``tasks`` background tasks reported running.
+    ``left`` is whether the line's stop policy is ``leave_background``, under which
+    Dromon does not end them."""
+    if not tasks:
+        lost = ""
+    elif left:
+        lost = (
+            f" The {tasks} background tasks the engine reported running were not ended"
+            " by Dromon, by the leave_background stop policy. Any still running are"
+            " in your line status, and their output files may still grow."
+        )
+    else:
+        lost = (
+            f" The {tasks} background tasks the engine reported running were stopped"
+            " with it."
+        )
     return (
         f"Dromon note: your kept engine session was closed because {reason}, so this"
         f" turn resumes it in a new process.{lost}"
@@ -541,6 +687,77 @@ def begins_turn(message: Message) -> bool:
         message, AssistantMessage | UserMessage | StreamEvent | ResultMessage
     )
 
+
+def is_handshake(message: Message) -> bool:
+    """Whether ``message``, arriving between Dromon's turns and outside the tail of
+    one, is a result with no turn behind it, as the engine's answer to a resume.
+    **Row 5 of the T3 Code review.** A second implementation saw a resumed session
+    send a result with ``num_turns`` of zero, which it had taken for a finished turn.
+    Whether Claude Code 2.1.310 sends one to Dromon is not verified."""
+    return isinstance(message, ResultMessage) and message.num_turns == 0
+
+
+HANDOFF_RESENDS: Final = 1
+"""How many times a turn sends its prompt again after a handoff result."""
+
+HANDOFF_NOTICE: Final = (
+    "the resumed engine session ended the turn it carried over from its last process"
+    " without running the prompt, so Dromon sent the prompt again"
+)
+
+HANDOFF_REFUSAL: Final = (
+    "the engine ended the turn again without running its prompt, after the prompt was"
+    " sent a second time"
+)
+
+
+def is_handoff(result: ResultMessage) -> bool:
+    """Whether ``result``, arriving inside a Dromon turn before any output of the
+    model, ended the turn without running its prompt.
+
+    **Review N5.** Any success with ``num_turns`` of zero before the model's output is
+    one, whatever its text, since a text alone shows no prompt was run. The text is
+    shown as a notice, not taken as the turn's answer. A slash command answered by
+    the engine itself would read so too, and Dromon sends none as a prompt.
+
+    **Fact, read from the bundled Claude Code 2.1.310 on 2026-10-26.** A session
+    resumed with a turn its last process left unfinished settles that turn on its
+    first prompt. Where the carried turn's history is appended without running, or
+    there is nothing to run, the engine reports a result of subtype ``success`` with
+    ``num_turns`` of zero, an empty ``result`` and no model call, and returns without
+    reading the prompt. **Observed live on 2026-10-26.** The first turn after a
+    ``SIGKILL`` of the daemon ended so in about 2 seconds, and was recorded as a
+    success with no output and no cost. A result that reports an error is not a
+    handoff, and stays the turn's honest outcome."""
+    return result.num_turns == 0 and result.subtype == "success"
+
+
+MAX_HANDOFF_TEXT_CHARACTERS: Final = 200
+"""How much of a handoff result's text its notice quotes."""
+
+
+def handoff_text_notice(text: str) -> str:
+    """The notice for a handoff result's text, which is engine output, so it is
+    quoted and cut."""
+    quoted = text[:MAX_HANDOFF_TEXT_CHARACTERS]
+    return f"the engine's result for the turn it carried over said {quoted!r}"
+
+
+TASKS_CHANGED: Final = "background_tasks_changed"
+"""The system message subtype with which the engine reports its whole set of live
+background tasks. **Fact, read from the message schema in the bundled Claude Code
+2.1.310 on 2026-10-26.** It carries ``tasks``, a list of objects each with a
+``task_id``, a ``task_type`` and a ``description``, and is sent whenever the set
+changes, by a start, an end, a kill or a foreground agent moved to the background. Its
+receiver is to replace its own set with it. **Observed live on 2026-10-26** as an
+unhandled subtype. The Agent SDK does not narrow its own set by it, since during a turn
+a foreground agent that is still running is not in it. Dromon therefore adds from it at
+any time, and removes by it only between turns, when every live task is a background
+one."""
+
+MAX_LISTED_TASKS: Final = 256
+"""The most entries of one task set Dromon reads. A longer set is not used to remove
+any task, since its tail is unread."""
 
 STOP_TOOLS: Final = frozenset({"TaskStop", "KillShell", "KillBash"})
 """The engine's tool that stops a background task, under its name and its aliases."""
@@ -933,6 +1150,10 @@ class _Connection:
     start names. Bounded by ``MAX_TRACKED_COMMANDS``."""
     stopped: set[str] = field(default_factory=set[str])
     """Tasks the line stopped itself in a turn, whose end needs no note."""
+    departed: dict[str, str] = field(default_factory=dict[str, str])
+    """Tasks the engine's task set no longer holds, with their commands, kept so that
+    an end reported after the set still has its note. Bounded by
+    ``MAX_TRACKED_COMMANDS``."""
     pending: dict[str, BackgroundEnd] = field(default_factory=dict[str, BackgroundEnd])
     """Ends between turns that wait, up to ``SELF_START_GRACE_SECONDS``, for a turn
     the engine may begin by itself on them."""
@@ -944,6 +1165,8 @@ class _Connection:
     drained: str = SELF_STARTED_KIND
     """Which of the two the pump is draining, ``SELF_STARTED_KIND`` or
     ``INTERRUPTED_KIND``, so the result it ends with is reported as that kind."""
+    ceiling: Ceiling | None = None
+    """Where the connection stands against ``keep_session_max_seconds``."""
 
 
 def check_environment(environment: Mapping[str, str], strategy: Strategy) -> None:
@@ -1099,6 +1322,8 @@ def permission_gate(
             return PermissionResultDeny(
                 message="this line's sandbox does not allow unsandboxed commands"
             )
+        if tool_name in HUMAN_DECISION_TOOLS:
+            return PermissionResultDeny(message=HUMAN_DECISION_REFUSAL)
         if config.allows(tool_name, own_tools):
             return PermissionResultAllow()
         return PermissionResultDeny(
@@ -1329,6 +1554,28 @@ def mcp_tool_name(tool: SdkMcpTool[object]) -> str:
     return f"mcp__{MCP_SERVER_NAME}__{tool.name}"
 
 
+def claude_cli() -> str:
+    """The Claude Code command the Agent SDK would run, found as the SDK finds it,
+    which the launcher starts in its place. The launcher answers the SDK's version
+    check from the same lookup, so the two cannot name different commands."""
+    try:
+        return launcher.claude_command()
+    except Exception as error:  # noqa: BLE001
+        raise EngineRefused(f"Claude Code cannot be found: {error}") from error
+
+
+def launch_environment(
+    mark: str | None, stop_policy: launcher.StopPolicy
+) -> dict[str, str]:
+    """The variables a Claude Code line's engine starts with, beside the daemon's own:
+    the pinned tool search, the line's process mark, and what its launcher needs."""
+    environment = {TOOL_SEARCH_VARIABLE: TOOL_SEARCH_PINNED}
+    environment.update(launcher.launch_environment(claude_cli(), stop_policy))
+    if mark is not None:
+        environment[MARK_VARIABLE] = mark
+    return environment
+
+
 class ClaudeCodeLine:
     """One session line on the Claude Code engine, with its driver.
 
@@ -1360,6 +1607,9 @@ class ClaudeCodeLine:
             [Mapping[str, int | str | None]], object
         ] = ignore_compaction,
         spent_between: SpentBetween = ignore_spent,
+        ceiling_reached: Ask = no_operator,
+        ceiling_settled: Settle = nothing_to_settle,
+        consent_asked: Callable[[str], object] = no_consent_question,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -1408,6 +1658,15 @@ class ClaudeCodeLine:
         self._background: set[asyncio.Task[None]] = set()
         """Interrupts and closes begun outside a turn. asyncio holds only weak
         references to tasks, so each is kept here until it ends."""
+        self._ceiling_reached = ceiling_reached
+        self._ceiling_settled = ceiling_settled
+        self._consent_asked = consent_asked
+        """Where a consent fallback is put to an operator, as ``FALLBACK_SUBTYPES``
+        says."""
+        """Where a kept connection's ceiling asks an operator, and withdraws the
+        question, as ``dromon.ceiling`` describes."""
+        self._surfaced: set[str] = set()
+        """System message subtypes already surfaced, so each is surfaced once."""
 
     @property
     def own_tools(self) -> frozenset[str]:
@@ -1472,10 +1731,28 @@ class ClaudeCodeLine:
             cwd=str(self.cwd),
             resume=self.session_id,
             sandbox=cast(SandboxSettings, self.sandbox),
-            settings=None if self.settings is None else json.dumps(self.settings),
-            env={} if self.mark is None else {MARK_VARIABLE: self.mark},
+            settings=json.dumps(flag_settings(self.settings)),
+            env=launch_environment(self.mark, self.config.stop_policy),
+            cli_path=self._launcher(),
             system_prompt=self._system_prompt(),
         )
+
+    def _leaves_background(self) -> bool:
+        """Whether the line's stop policy leaves its background work running when its
+        engine is closed."""
+        return self.config.stop_policy is launcher.StopPolicy.LEAVE_BACKGROUND
+
+    @staticmethod
+    def _launcher() -> str:
+        """The launcher command the SDK runs in place of Claude Code, which ends the
+        engine and, by the line's stop policy, what it started, when the daemon stops
+        it or dies. Its absence refuses the turn."""
+        try:
+            return launcher.script_path()
+        except FileNotFoundError as error:
+            raise EngineRefused(
+                f"the Dromon launcher is not installed: {error}"
+            ) from error
 
     def _system_prompt(self) -> str | SystemPromptPreset | None:
         appended = read_instructions(self.config.instructions, self.cwd)
@@ -1514,15 +1791,25 @@ class ClaudeCodeLine:
                     prompt = f"{note}\n\n{prompt}"
                 if turn.refusal is not None:
                     raise EngineRefused(turn.refusal)
-                await session.query(prompt)
-                async for message in session.receive_response():
-                    if isinstance(message, ResultMessage):
-                        result = message
-                        self.driver.step(
-                            Event("result", message.subtype, message.num_turns)
+                answered = False
+                # Bounded by HANDOFF_RESENDS, past which _handed_off refuses.
+                for resends in range(HANDOFF_RESENDS + 1):
+                    await session.query(prompt)
+                    async for message in session.receive_response():
+                        if isinstance(message, ResultMessage):
+                            result = message
+                            break
+                        answered = answered or isinstance(
+                            message, AssistantMessage | StreamEvent
                         )
+                        await self._handle(session, message, turn)
+                    if result is None or not self._handed_off(
+                        result, turn, answered, resends
+                    ):
                         break
-                    await self._handle(session, message, turn)
+                    result = None
+                if result is not None:
+                    self.driver.step(Event("result", result.subtype, result.num_turns))
         finally:
             self._turn = None
         cost = None if result is None else self._measure(result)
@@ -1681,6 +1968,13 @@ class ClaudeCodeLine:
             isinstance(message, SystemMessage) and message.subtype == "compact_boundary"
         ):
             self._compaction_seen(turn, message.data.get("compact_metadata"))
+        elif (
+            isinstance(message, SystemMessage) and message.subtype in FALLBACK_SUBTYPES
+        ):
+            self._surface(message.subtype)
+            await self._fallen_back(session, message, turn)
+        elif isinstance(message, SystemMessage):
+            self._surface(message.subtype)
         elif isinstance(message, AssistantMessage):
             if turn.require_init and turn.capabilities is None:
                 if turn.refusal is None:
@@ -1711,6 +2005,47 @@ class ClaudeCodeLine:
                 if action.tag is ActionTag.INTERRUPT and turn.interrupted_for is None:
                     turn.interrupted_for = action.text
                     await session.interrupt()
+
+    async def _fallen_back(
+        self, session: AgentSession | KeptSession, message: SystemMessage, turn: _Turn
+    ) -> None:
+        """Refuse and interrupt a turn the engine moved to a model its driver was not
+        written for, and put a consent fallback to an operator. **Review F16.**"""
+        bound_to = self.driver.settings.model
+        moved_to = message.data.get("fallback_model")
+        stopped = moved_to != bound_to
+        if message.subtype == CONSENT_FALLBACK:
+            try:
+                self._consent_asked(consent_question(message.data, bound_to, stopped))
+            except Exception as error:  # noqa: BLE001
+                print(f"dromond: a consent question failed: {error}", file=sys.stderr)
+        if not stopped or turn.refusal is not None:
+            return
+        turn.refusal = (
+            f"the engine reported {message.subtype}, which moved the turn from"
+            f" {fallback_text(message.data.get('original_model'))} to"
+            f" {fallback_text(moved_to)}, not the model {bound_to} its driver was"
+            " written for"
+        )
+        await session.interrupt()
+
+    def _surface(self, subtype: str) -> None:
+        """Report a system message subtype Dromon does not handle in the line's
+        activity, once per subtype, so that none is passed over silently. Handled
+        subtypes are not reported. The subtype is the engine's text, so it is quoted
+        and cut."""
+        if subtype in HANDLED_SYSTEM_SUBTYPES or subtype in self._surfaced:
+            return
+        if len(self._surfaced) >= MAX_SURFACED_SUBTYPES:
+            return
+        self._surfaced.add(subtype)
+        shown = json.dumps(subtype[:MAX_SUBTYPE_CHARACTERS], ensure_ascii=True)
+        self._observe(
+            ActivityKind.NOTICE,
+            f"the engine sent a system message of subtype {shown}, which Dromon does"
+            " not handle",
+        )
+        print(f"dromond: an unhandled system message subtype {shown}", file=sys.stderr)
 
     async def _check_init(
         self,
@@ -1825,12 +2160,17 @@ class ClaudeCodeLine:
         connection = self._kept
         if connection is None or not connection.alive or self._turn is not None:
             return None
-        allowed = (
-            self.config.keep_session_max_seconds
-            if connection.tasks
-            else self.config.keep_session_idle_seconds
+        ceiling = self._ceiling_of(connection)
+        return ceiling.deadline(connection.last_end, bool(connection.tasks)) - (
+            self._clock()
         )
-        return connection.last_end + allowed - self._clock()
+
+    def _ceiling_of(self, connection: _Connection) -> Ceiling:
+        if connection.ceiling is None:
+            connection.ceiling = Ceiling(
+                self.config, self._ceiling_reached, self._ceiling_settled
+            )
+        return connection.ceiling
 
     def kept_status(self) -> dict[str, object]:
         """Whether the engine's connection is kept, for ``line_status``."""
@@ -1852,18 +2192,49 @@ class ClaudeCodeLine:
         }
 
     async def expire(self) -> bool:
-        """Close the kept connection if its deadline has passed, and say whether it
-        was closed. The watch calls this, and tests may call it with their clock."""
-        remaining = self.seconds_to_close()
+        """Close the kept connection if its deadline has passed, or ask an operator
+        at its ceiling as ``keep_session_at_max`` says, and say whether it was
+        closed. The watch calls this, and tests may call it with their clock."""
         connection = self._kept
-        if connection is None or remaining is None or remaining > 0:
+        if connection is None or not connection.alive or self._turn is not None:
             return False
-        await self.close(
-            "it reached keep_session_max_seconds with background tasks still running"
-            if connection.tasks
-            else "it waited keep_session_idle_seconds without a turn"
+        reason = self._ceiling_of(connection).due(
+            connection.last_end, len(connection.tasks), self._clock()
         )
+        if reason is None:
+            return False
+        await self.close(reason)
         return True
+
+    async def decide_ceiling(self, question_id: str, answer: str) -> Choice | None:
+        """Carry out an operator's answer to the kept connection's ceiling question,
+        and return the choice made, or ``None`` when it made none."""
+        connection = self._kept
+        if connection is None:
+            return None
+        choice = self._ceiling_of(connection).decide(question_id, answer, self._clock())
+        if choice is Choice.STOP:
+            await self.close(STOP_REASON)
+        return choice
+
+    async def halt(self) -> str | None:
+        """Finish an operator's stop, once the stopped turn has ended. **Row 1 of the
+        T3 Code review.** The interrupt the cancelled turn began is awaited, within
+        its own bound. If it failed, it has closed the connection already. If it
+        settled while the engine still runs background work, or has not finished
+        the stopped turn, the connection is closed here, which ends the engine and,
+        by the line's stop policy, what it started. Returns the reason it closed the
+        connection, or ``None``."""
+        pending = list(self._background)
+        if pending:
+            await asyncio.wait(pending, timeout=INTERRUPT_TIMEOUT_SECONDS + 1)
+        connection = self._kept
+        if connection is None or not connection.alive:
+            return None
+        if not connection.tasks and not connection.draining:
+            return None
+        await self.close(HALT_REASON)
+        return HALT_REASON
 
     async def retire(self) -> None:
         """Close the kept connection for good, once any turn in progress has ended.
@@ -1872,6 +2243,20 @@ class ClaudeCodeLine:
         if self._turn is None:
             await self.close()
 
+    @staticmethod
+    def _withdraw_ceiling(connection: _Connection) -> None:
+        """Withdraw the connection's open ceiling question, if any. A failure is
+        reported and goes no further, since the pump calls this as it ends."""
+        if connection.ceiling is None:
+            return
+        try:
+            connection.ceiling.withdraw()
+        except Exception as error:  # noqa: BLE001
+            print(
+                f"dromond: a ceiling question was not withdrawn: {error}",
+                file=sys.stderr,
+            )
+
     async def close(self, reason: str | None = None) -> None:
         """Close the kept connection, if any, which ends the engine's process and its
         background tasks. With ``reason`` the next prompt says why."""
@@ -1879,10 +2264,13 @@ class ClaudeCodeLine:
         if connection is None:
             return
         self._kept = None
+        self._withdraw_ceiling(connection)
         if connection.pending:
             self._flush(connection, self_started=False)
         if reason is not None:
-            self._notes.append(closed_note(reason, len(connection.tasks)))
+            self._notes.append(
+                closed_note(reason, len(connection.tasks), self._leaves_background())
+            )
         current = asyncio.current_task()
         helpers = [
             task
@@ -1949,6 +2337,13 @@ class ClaudeCodeLine:
                         connection.draining = False
                         self._spent_alone(message, connection.drained)
                     continue
+                if isinstance(message, SystemMessage):
+                    self._surface(message.subtype)
+                if isinstance(message, ResultMessage) and is_handshake(message):
+                    # Row 5 of the T3 Code review. Not a turn, so neither noted nor
+                    # interrupted, while a cost it may carry still counts.
+                    self._spent_alone(message, HANDSHAKE_KIND)
+                    continue
                 if not begins_turn(message):
                     continue
                 connection.draining = not isinstance(message, ResultMessage)
@@ -1971,6 +2366,32 @@ class ClaudeCodeLine:
             connection.alive = False
             if connection.inbox is not None:
                 connection.inbox.put_nowait(None)
+            # Review F12. A connection that dies without a close withdraws its
+            # ceiling question here, since nothing can act on an answer now.
+            self._withdraw_ceiling(connection)
+
+    def _handed_off(
+        self, result: ResultMessage, turn: _Turn, answered: bool, resends: int
+    ) -> bool:
+        """Whether ``result`` is a handoff, as ``is_handoff`` says, after which the
+        turn sends its prompt again. Its cost counts as a handshake's. A turn already
+        refused or interrupted is not resent, and a second handoff refuses the turn,
+        since a success that ran nothing would misreport it. **Item 6 of the live
+        check of 2026-10-26.**"""
+        if (
+            answered
+            or turn.refusal is not None
+            or turn.interrupted_for is not None
+            or not is_handoff(result)
+        ):
+            return False
+        self._spent_alone(result, HANDSHAKE_KIND)
+        if result.result:
+            self._observe(ActivityKind.NOTICE, handoff_text_notice(result.result))
+        if resends >= HANDOFF_RESENDS:
+            raise EngineRefused(HANDOFF_REFUSAL)
+        self._observe(ActivityKind.NOTICE, HANDOFF_NOTICE)
+        return True
 
     def _spent_alone(self, result: ResultMessage, kind: str) -> None:
         """Report the cost of a result that ends a turn outside Dromon's own, so it
@@ -1992,7 +2413,11 @@ class ClaudeCodeLine:
                     continue
                 command = block.input.get("command")
                 if isinstance(command, str):
-                    connection.commands[block.id] = command[:MAX_COMMAND_CHARACTERS]
+                    # Review N10. Masked as it is taken in, since a task's command
+                    # reaches the line's status and its end's note, which is logged.
+                    connection.commands[block.id] = redact.mask(command)[
+                        :MAX_COMMAND_CHARACTERS
+                    ]
                     while len(connection.commands) > MAX_TRACKED_COMMANDS:
                         del connection.commands[next(iter(connection.commands))]
                 stopped = block.input.get("task_id") or block.input.get("shell_id")
@@ -2004,8 +2429,11 @@ class ClaudeCodeLine:
         if isinstance(message, TaskStartedMessage):
             command = connection.commands.get(message.tool_use_id or "")
             connection.tasks[message.task_id] = (
-                command or message.description[:MAX_COMMAND_CHARACTERS]
+                command or redact.mask(message.description)[:MAX_COMMAND_CHARACTERS]
             )
+            return
+        if isinstance(message, SystemMessage) and message.subtype == TASKS_CHANGED:
+            self._reconcile(connection, message.data)
             return
         ended = task_ended(message)
         if ended is None:
@@ -2022,6 +2450,8 @@ class ClaudeCodeLine:
             )
             return
         command = connection.tasks.pop(ended, None)
+        departed = connection.departed.pop(ended, None)
+        command = command or departed
         between = connection.inbox is None
         asked = ended in connection.stopped
         connection.stopped.discard(ended)
@@ -2031,6 +2461,45 @@ class ClaudeCodeLine:
             ended, command, task_status(message), exit_code, output
         )
         self._spawn(self._flush_later(connection))
+
+    @staticmethod
+    def _reconcile(connection: _Connection, data: Mapping[str, Any]) -> None:
+        """Follow the engine's whole set of live background tasks, as ``TASKS_CHANGED``
+        says. A task it names that Dromon did not see start is added under its
+        description. Between turns a task it no longer names is moved to
+        ``departed``, so it stops counting as running while its end, if reported
+        later, is still noted. A malformed or overlong set changes nothing that it
+        cannot vouch for."""
+        listed = data.get("tasks")
+        if not isinstance(listed, list):
+            return
+        entries = cast(list[object], listed)
+        named: set[str] = set()
+        for entry in entries[:MAX_LISTED_TASKS]:
+            if not isinstance(entry, Mapping):
+                continue
+            task = cast(Mapping[str, object], entry)
+            task_id = task.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                continue
+            named.add(task_id)
+            if (
+                task_id in connection.tasks
+                or len(connection.tasks) >= MAX_TRACKED_COMMANDS
+            ):
+                continue
+            description = task.get("description")
+            connection.tasks[task_id] = (
+                redact.mask(description)[:MAX_COMMAND_CHARACTERS]
+                if isinstance(description, str) and description
+                else "a background task"
+            )
+        if connection.inbox is not None or len(entries) > MAX_LISTED_TASKS:
+            return
+        for task_id in [known for known in connection.tasks if known not in named]:
+            connection.departed[task_id] = connection.tasks.pop(task_id)
+            while len(connection.departed) > MAX_TRACKED_COMMANDS:
+                del connection.departed[next(iter(connection.departed))]
 
     def _flush(self, connection: _Connection, self_started: bool) -> None:
         """Report every waiting end, once each."""
@@ -2150,18 +2619,29 @@ class ClaudeCodeLine:
             if turn.refusal is not None:
                 raise EngineRefused(turn.refusal)
             await connection.session.query(prompt)
+            answered = False
+            resends = 0
             # Bounded by the engine's result, which its max_turns caps, or by the
-            # pump's end-of-stream marker.
+            # pump's end-of-stream marker, and by HANDOFF_RESENDS.
             while True:
                 message = await inbox.get()
                 if message is None:
                     break
                 if isinstance(message, ResultMessage):
+                    if self._handed_off(message, turn, answered, resends):
+                        resends += 1
+                        # The pump let go of the inbox at the result.
+                        connection.inbox = inbox
+                        await connection.session.query(prompt)
+                        continue
                     result = message
                     self.driver.step(
                         Event("result", message.subtype, message.num_turns)
                     )
                     break
+                answered = answered or isinstance(
+                    message, AssistantMessage | StreamEvent
+                )
                 if isinstance(message, SystemMessage) and message.subtype == "init":
                     connection.permission_mode = permission_mode_of(message.data)
                 await self._handle(connection.session, message, turn)
@@ -2179,6 +2659,7 @@ class ClaudeCodeLine:
             self._turn = None
             connection.inbox = None
             connection.last_end = self._clock()
+            self._ceiling_of(connection).turn_ended()
             if self._retired:
                 self._spawn(self.close())
         if result is None:

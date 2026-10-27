@@ -31,6 +31,11 @@ from dromon.codex import (
 from dromon.daemon import check_engines
 from dromon.driver import Credential, Driver, Strategy
 from dromon.engine import EngineRefused, TurnReport
+from dromon.launcher import (
+    LAUNCH_MARK_VARIABLE,
+    LAUNCH_VARIABLES,
+    STOP_POLICY_VARIABLE,
+)
 from dromon.lineconfig import LineConfig
 from dromon.projectconfig import parse
 from dromon.sandbox import parse_sandbox
@@ -490,7 +495,12 @@ def test_a_subscription_lines_codex_never_sees_an_api_key() -> None:
         assert engine_environment(environment, metered) == {**environment, **cache}
     server = FakeServer()
     run(line(server, environment=environment))
-    assert server.environment == expected
+    # The launcher's own variables, which it removes before Codex starts.
+    assert server.environment[STOP_POLICY_VARIABLE] == "kill_all"
+    launched = {
+        k: v for k, v in server.environment.items() if k not in LAUNCH_VARIABLES
+    }
+    assert launched == expected
 
 
 def test_a_redirected_provider_is_always_refused() -> None:
@@ -732,6 +742,9 @@ def test_the_mark_reaches_codexs_shell_commands_and_not_codex_itself() -> None:
     target.mark = "alpha.token"
     run(target)
     assert "DROMON_LINE_MARK" not in server.environment
+    # Only for the launcher, which names the line by it and removes it.
+    assert server.environment[LAUNCH_MARK_VARIABLE] == "alpha.token"
+    assert LAUNCH_MARK_VARIABLE in LAUNCH_VARIABLES
     pairs = list(zip(server.arguments, server.arguments[1:], strict=False))
     assert (
         "-c",

@@ -58,6 +58,13 @@ class ProjectPaths:
         return self.runtime_dir / "lines.sock"
 
     @property
+    def left_reports(self) -> Path:
+        """Where each harness's launcher reports what it left running, which the
+        daemon records and removes. In the state directory, so that a report written
+        after a crash survives until the next start."""
+        return self.state_dir / "left"
+
+    @property
     def lock(self) -> Path:
         return self.runtime_dir / "dromond.lock"
 

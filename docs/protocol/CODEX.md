@@ -222,6 +222,12 @@ turn. `dromon probe --model gpt-6-luna` reported the subscription credential.
   thread between turns, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies for kept
   sessions. Every Codex line runs under the `dromon-line` permission profile, so the
   rule that a kept line with a shell needs an enabled sandbox is met by construction.
+  **From 2026-10-26** the ceiling, `keep_session_at_max` and the hard bound apply to
+  the background terminals Dromon last listed, as to a Claude Code line's tasks, and an
+  operator's stop closes a kept app-server that still lists the line's terminals once
+  the stopped turn has ended. The app-server runs under Dromon's launcher, which is
+  given the line's mark in a variable of its own and removes it, so Codex itself still
+  does not carry the mark.
   - **Facts, read from the installed Codex 0.164.0 binary on 2026-10-26, not run.** The
     app-server has `thread/backgroundTerminals/list`, `thread/backgroundTerminals/terminate`
     and `thread/backgroundTerminals/clean`. A listed terminal has seven fields, of which
