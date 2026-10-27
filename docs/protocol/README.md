@@ -9,6 +9,8 @@ Documents here describe behaviour and formats, never Python details.
 
 - [`EVENT_LOG.md`](EVENT_LOG.md), the data model as events, their JSON encoding and their SQLite storage. Draft, version 1.
 - [`CLIENT.md`](CLIENT.md), the requests between `dromon` and `dromond` over the project's Unix domain socket, with the command exit statuses. Draft, version 1.
+- [`PRIORITY.md`](PRIORITY.md), wake mute, priority mail with its safe point on each engine and its rate limit, and self mail. Draft, part of version 1, with one hypothesis about Claude Code owed a live check.
+- [`RESTART.md`](RESTART.md), restart to upgrade, which drains turns, ends them at a safe point when asked, and starts a successor that resumes every session. Draft, part of version 1, not verified against a live daemon.
 - [`DRIVER.md`](DRIVER.md), the interface between a per-model Keleusma driver and its host. Draft, interface 1.
 - [`LINE_CONFIG.md`](LINE_CONFIG.md), a session line's built-in tools, MCP servers and allow-all or allowlist tool policy. Draft, version 1.
 - [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md), the `.dromon/dromon.toml` file that declares a project's lines, limits and wake policy. Draft, version 1.

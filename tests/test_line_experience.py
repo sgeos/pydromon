@@ -182,6 +182,12 @@ def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
     assert status["unread"] == 1 and status["pending"] == 0
     assert (status["model"], status["strategy"]) == (HAIKU, "subscription")
     assert status["daemon"]["version"] == __version__
+    assert status["commits"]["workdir"] is None
+    assert status["commits"]["daemon"] == COMMIT
+    assert status["commits"]["cite"] == (
+        f"line alpha read its worktree at commit unknown, under the daemon at commit"
+        f" {COMMIT}."
+    )
     assert "recent_turns" not in status and "other_lines" not in status
     assert len(text.encode("utf-8")) <= 8192
     full_text, full_error = world.call("line_status", {"detail": True, "lists": True})
@@ -210,8 +216,17 @@ def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
     }
     assert full["leases"] == []
     assert full["other_lines"] == [
-        {"line_id": "beta", "state": "idle", "held": False, "leases": ["gate"]}
+        {
+            "line_id": "beta",
+            "state": "idle",
+            "held": False,
+            "muted": False,
+            "workdir_commit": None,
+            "leases": ["gate"],
+        }
     ]
+    assert full["commits"]["workdir"] is None
+    assert full["commits"]["daemon"] == COMMIT
     for secret in ("a private body", "notes", "s3", "was held for this test"):
         assert secret not in full_text
 
@@ -948,6 +963,55 @@ def test_daemon_status_says_when_the_checkout_moved(
     assert (status["stale"], status["checkout_commit"]) == (True, moved)
     note = cast(str, status["stale_note"])
     assert COMMIT[:12] in note and moved[:12] in note and "restarts" in note
+
+
+def test_line_status_cites_the_worktree_and_daemon_commits(
+    world: World, tmp_path: Path
+) -> None:
+    """Restart to upgrade, decided on 2026-10-27. A review names both commits, so
+    line_status gives each in full and one sentence that cites them."""
+    work = checkout(world.root, "c" * 40)
+    daemon = checkout(tmp_path / "daemon", COMMIT)
+    world.scheduler = Scheduler(
+        world.log,
+        world.build,
+        root=work,
+        protected=(work / ".dromon",),
+        daemon_commit=COMMIT,
+        daemon_checkout=daemon,
+    )
+    compact_text, compact_error = world.call("line_status")
+    assert not compact_error
+    compact_commits = json.loads(compact_text)["commits"]
+    assert (compact_commits["workdir"], compact_commits["daemon"]) == (
+        "c" * 40,
+        COMMIT,
+    )
+    assert compact_commits["cite"].endswith(f"under the daemon at commit {COMMIT}.")
+
+    text, error = world.call("line_status", {"detail": True, "lists": True})
+    assert not error
+    commits = json.loads(text)["commits"]
+    assert (commits["workdir"], commits["daemon"]) == ("c" * 40, COMMIT)
+    assert (commits["daemon_checkout"], commits["stale"]) == (COMMIT, False)
+    assert commits["cite"] == (
+        f"line alpha read its worktree at commit {'c' * 40}, under the daemon at"
+        f" commit {COMMIT}."
+    )
+    others = json.loads(text)["other_lines"]
+    assert [other["workdir_commit"] for other in others] == ["c" * 40]
+    moved = "d" * 40
+    checkout(daemon, moved)
+    compact_text, _ = world.call("line_status")
+    compact_commits = json.loads(compact_text)["commits"]
+    assert compact_commits["stale"] is True
+    assert compact_commits["cite"].endswith(
+        f", whose checkout has since moved to {moved}."
+    )
+    text, _ = world.call("line_status", {"detail": True, "lists": True})
+    commits = json.loads(text)["commits"]
+    assert commits["stale"] is True
+    assert commits["cite"].endswith(f", whose checkout has since moved to {moved}.")
 
 
 def test_staleness_is_unknown_without_a_checkout_or_a_start_commit(

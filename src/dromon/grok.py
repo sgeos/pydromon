@@ -56,7 +56,7 @@ from claude_agent_sdk import SdkMcpTool
 from dromon import acp, evidence
 from dromon.acp import bridge_command as bridge_command
 from dromon.activity import ActivityKind, Observer, ignore
-from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
+from dromon.driver import TOOL_RESULT, ActionTag, Credential, Driver, Event, Strategy
 from dromon.engine import EngineRefused, TurnReport, read_instructions
 from dromon import launcher
 from dromon.launcher import STOP_POLICY_VARIABLE
@@ -391,6 +391,9 @@ class _Turn:
         default_factory=dict[str, dict[str, object]]
     )
     """Each tool call's identity as first recorded, by its identifier."""
+    finished: set[str] = field(default_factory=set[str])
+    """Tool calls whose update reported them finished, so each result is fed to the
+    driver once."""
     interrupted_for: str | None = None
     refusal: str | None = None
     cancelled: bool = False
@@ -617,6 +620,10 @@ class GrokLine:
                 await self._cancel(turn, refusal)
                 return
             await self._record(str(identifier), update, turn)
+            if acp.newly_finished(str(identifier), update, turn.finished):
+                # The safe point before the next model call that priority mail
+                # takes, as ``dromon.priority`` describes.
+                await self._act(Event(TOOL_RESULT), turn)
 
     async def _record(
         self, identifier: str, fields: Mapping[str, Any], turn: _Turn

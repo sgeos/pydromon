@@ -40,6 +40,12 @@ class Operation(StrEnum):
     LINE_VIEW = "line_view"
     LINE_ACTIVITY = "line_activity"
     INTERRUPT = "interrupt"
+    MUTE = "mute"
+    """Operator only. Not offered to external agents."""
+    UNMUTE = "unmute"
+    """Operator only. Not offered to external agents."""
+    RESTART = "restart"
+    """Operator only. Not offered to external agents."""
     SETTINGS = "settings"
     SET_SETTING = "set_setting"
     CLEAR_SESSION = "clear_session"
@@ -101,7 +107,35 @@ def _dumps(document: dict[str, object]) -> bytes:
     line = (text + "\n").encode("utf-8")
     if len(line) > MAX_LINE_BYTES:
         raise ProtocolError(ErrorCode.TOO_LONG, f"the line exceeds {MAX_LINE_BYTES}")
+    found = _float_at(document)
+    if found is not None:
+        # The decoder refuses every float, so a sender that let one through would
+        # only fail at the other end, as ``dromon status`` once did on a rate.
+        raise ProtocolError(
+            ErrorCode.INTERNAL,
+            f"{found} is a float, which the protocol does not carry",
+        )
     return line
+
+
+def _float_at(document: dict[str, object]) -> str | None:
+    """The path of the first float in ``document``, or ``None``. Called only once
+    ``json.dumps`` has refused any cycle and the line limit has bounded the size, so
+    the walk visits a finite tree and ends."""
+    pending: list[tuple[str, object]] = [("", document)]
+    while pending:
+        path, value = pending.pop()
+        if isinstance(value, float):
+            return path or "the message"
+        if isinstance(value, dict):
+            items = cast(dict[object, object], value).items()
+            pending.extend(
+                (f"{path}.{key}" if path else str(key), v) for key, v in items
+            )
+        elif isinstance(value, list | tuple):
+            members = cast(list[object] | tuple[object, ...], value)
+            pending.extend((f"{path}[{index}]", v) for index, v in enumerate(members))
+    return None
 
 
 def _reject_number(text: str) -> NoReturn:
@@ -194,9 +228,22 @@ def request_id_of(line: bytes) -> str:
     """Return the request id in a line that failed to decode, or ``""`` if none.
 
     Lets an error response name the request it answers whenever the id is readable.
+    The parse here accepts floats, so that a request refused for holding one is still
+    answered under its own id, and the client reports the refusal rather than a
+    mismatched id.
     """
+    if len(line) > MAX_LINE_BYTES:
+        return ""
     try:
-        return _request_id(_loads(line))
+        document: object = json.loads(
+            line.decode("utf-8"), object_pairs_hook=_object_without_duplicates
+        )
+    except (ProtocolError, UnicodeDecodeError, ValueError, RecursionError):
+        return ""
+    if not isinstance(document, dict):
+        return ""
+    try:
+        return _request_id(cast(dict[str, object], document))
     except ProtocolError:
         return ""
 

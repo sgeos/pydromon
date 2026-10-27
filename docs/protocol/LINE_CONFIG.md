@@ -99,7 +99,7 @@ argument outside a tool's schema is refused.
 
 | Tool | Effect |
 |---|---|
-| `send_message` | Sends a note to a line or an operator, delivered in a later tick |
+| `send_message` | Sends a note to a line, an operator or the line itself, delivered in a later tick. With `priority` true, a note to another line is priority mail, rate limited, as [`PRIORITY.md`](PRIORITY.md) specifies |
 | `ask_operator` | Asks an operator a question, which never pauses the line |
 | `wake_after` | Schedules one wake for the line, as below |
 | `list_mail`, `read_mail`, `acknowledge_mail` | Page through, open and acknowledge the line's mailbox |
@@ -118,7 +118,8 @@ in this section.
 default. The compact JSON answer includes the line's `line_id`, `state`, `condition`,
 `held_by`, autonomous turn and cost summaries, `scheduled_wake`, unread and pending
 message counts, `model`, `strategy`, a short context summary and daemon version and
-commit. It includes counts of leases, background tasks, recent turns and other lines,
+commit. It also includes a `commits` object with the worktree commit, the daemon commit
+and a sentence citing both. It includes counts of leases, background tasks, recent turns and other lines,
 not their contents. The default answer and every response that includes lists are
 bounded to 8,192 UTF-8 bytes. If a response exceeds that bound, it returns a small
 object with `status_truncated`. A truncated list response also sets `lists_truncated`
@@ -126,7 +127,9 @@ and suggests `detail: true, lists: false` to omit the lists.
 
 Set `detail` to true for diagnostic fields, including the resolved `workdir`,
 `engine_session`, kept-session state, process status, event-log status and full context
-details. Detail mode keeps arrays summarized by counts. Set `lists` to true to receive
+details. The detailed response also reports whether the line is muted and gives the
+worktree and daemon commits with a sentence that cites both. Detail mode keeps arrays
+summarized by counts. Set `lists` to true to receive
 the long lists of leases, recent turns, other lines, kept-session tasks and left
 processes under a `lists` object. With both arguments true, the tool returns the full
 diagnostic object and those lists. No mode returns a configuration document or message
@@ -145,8 +148,9 @@ and lines have no commit operation.
 the newest sequence number, `bytes`, the size of the log's database file with any
 SQLite write ahead log or journal beside it, and `since_start`, with the `events` and
 `bytes` added and the whole `seconds` passed since this daemon opened the log. It
-gives `events_per_hour` and `bytes_per_hour` once the daemon has had the log for 60
-seconds, and `null` before. A size that cannot be read is `null`, never zero, and so
+gives `events_per_hour` and `bytes_per_hour`, each rounded to a whole number since the
+client protocol carries no floats, once the daemon has had the log for 60 seconds, and
+`null` before. A size that cannot be read is `null`, never zero, and so
 is any growth derived from it. `compaction` is `none`, since nothing compacts the log
 yet, so it only grows. The daemon's `status` carries the same fields in its
 `event_log`, as [`CLIENT.md`](CLIENT.md) specifies.
@@ -181,7 +185,10 @@ turn that failed before it began was recorded only in the line's activity log, a
 operator learned of it for hours. Each entry of
 `recent_turns` for a turn gives its `outcome`, `completed` only for the subtype
 `success`, `interrupted` when its driver interrupted it, and `failed` for every other
-subtype, with the `subtype` itself. `processes` adds the line's `stop_policy`, as
+subtype, with the `subtype` itself. `interrupted_for` gives why the driver interrupted
+it, such as `priority mail m-1 from @ana` or `a daemon restart`, and is `null` for a
+turn it did not interrupt, since the engine's subtype for such a turn, such as
+`error_during_execution`, reads as an error. `processes` adds the line's `stop_policy`, as
 `left` the latest record of processes left running, as `stop_unverified` the note of
 the latest stop Dromon could not verify was complete, and as `walk_limit` what the
 daemon's platform keeps the launcher's walk from reaching, each or `null`, as the stop
@@ -206,6 +213,21 @@ The `daemon` object holds the following, decided by the operator on 2026-10-26 i
   newer code until an operator restarts it. A checkout that moved does not prove that
   the code differs, since a commit can change only documents, so the note is a prompt to
   check rather than a verdict.
+
+The `commits` object, decided by the operator on 2026-10-27 with restart to upgrade,
+gives what a review or report names, read at every call in the way `checkout_commit`
+is read.
+
+- **`workdir`.** The full commit at `HEAD` of the checkout holding the line's working
+  directory, or `null` when the directory is not allowed or not in a checkout. Each
+  entry of `other_lines` gives the same for its line as `workdir_commit`.
+- **`daemon`**, **`daemon_checkout`** and **`stale`.** The `daemon` object's `commit`,
+  `checkout_commit` and `stale`, repeated so the object stands alone.
+- **`cite`.** One sentence naming both full commits, such as `line core read its
+  worktree at commit C, under the daemon at commit D.`, with the commit the daemon's
+  checkout has moved to when it is stale, so a report can quote it whole.
+- **`note`.** That both commits are read from `HEAD`. Uncommitted changes in the
+  worktree are part of neither, and only `git status` shows them.
 
 **`read_instructions`.** One optional argument, `full`, a boolean. The instructions are
 those the line's next turn receives as its engine adapter composes them from

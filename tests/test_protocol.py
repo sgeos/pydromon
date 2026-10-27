@@ -150,3 +150,59 @@ def test_arguments_must_be_an_object() -> None:
     with pytest.raises(ProtocolError) as raised:
         decode_request(line({"id": "r", "op": "send", "v": 1, "args": []}))
     assert raised.value.code is ErrorCode.BAD_REQUEST
+
+
+# No floats on the wire. The live check of 2026-10-27 found ``dromon status`` failing
+# on a float rate the daemon sent, which the decoder refused only at the client.
+
+
+@pytest.mark.parametrize(
+    ("result", "path"),
+    [
+        ({"rate": 805.2}, "result.rate"),
+        ({"log": {"rate": 1.0}}, "result.log.rate"),
+        ({"rates": [1, 2.5]}, "result.rates[1]"),
+        ({"rows": [{"cost": 0.5}]}, "result.rows[0].cost"),
+    ],
+)
+def test_a_response_holding_a_float_is_refused_where_it_is_encoded(
+    result: dict[str, object], path: str
+) -> None:
+    with pytest.raises(ProtocolError) as raised:
+        encode_response(Response("r1", ok=True, result=result))
+    assert raised.value.code is ErrorCode.INTERNAL
+    assert str(raised.value).startswith(f"{path} is a float")
+
+
+def test_a_request_holding_a_float_is_refused_where_it_is_encoded() -> None:
+    request = Request("r1", Operation.RESTART, {"wait_seconds": 600.0})
+    with pytest.raises(ProtocolError, match="args.wait_seconds is a float"):
+        encode_request(request)
+
+
+def test_whole_numbers_booleans_and_null_still_encode() -> None:
+    result: dict[str, object] = {"n": 805, "ok": True, "none": None, "rows": [[1]]}
+    decoded = decode_response(encode_response(Response("r1", ok=True, result=result)))
+    assert decoded.result == result
+
+
+def test_a_request_refused_for_a_float_is_still_answered_under_its_id() -> None:
+    sent = line({"id": "r-7", "op": "restart", "v": 1, "args": {"wait_seconds": 1.5}})
+    with pytest.raises(ProtocolError, match="non-integer number"):
+        decode_request(sent)
+    assert request_id_of(sent) == "r-7"
+
+
+@pytest.mark.parametrize(
+    "sent",
+    [
+        b"not json\n",
+        b"[1]\n",
+        b'{"id": "a", "id": "b"}\n',
+        b'{"id": "has space"}\n',
+        b"\xff\n",
+        b'{"id": "' + b"a" * MAX_LINE_BYTES + b'"}\n',
+    ],
+)
+def test_request_id_of_gives_nothing_for_an_unreadable_id(sent: bytes) -> None:
+    assert request_id_of(sent) == ""

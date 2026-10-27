@@ -5,6 +5,28 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- The client protocol carries no floats, and the daemon sent two. `dromon status`
+  failed once the daemon had run for a minute, because `events_per_hour` was a
+  fraction, and `dromon restart` failed at once, because its `--wait-seconds` went out
+  as a float. Both are whole numbers now, and `--wait-seconds` takes whole seconds. The
+  encoder refuses a float wherever it appears and names its path, the daemon answers a
+  response it cannot encode with an internal error under the request's identifier, and
+  a request refused for holding a float is answered under its own identifier. Found by
+  the operator's live check of 2026-10-27.
+- The safe point of priority mail, and so of `dromon restart --interrupt`, moved to
+  the moment after a tool result is delivered and before the next model call, once
+  every tool use of the turn has its result, or the end of an assistant message that
+  holds no tool use, by the operator's decision of 2026-10-27 after a review. It was a
+  text or thinking event, which can share a message with a tool use after it. Each
+  adapter feeds the new driver events `tool_result` and Pi also `message_end`, which
+  the packaged drivers answer with `continue`.
+- `recent_turns` gives `interrupted_for`, so a turn ended for priority mail or a
+  restart says so beside an engine subtype such as `error_during_execution`.
+- Claude Code's `thinking_tokens` system message, a progress estimate while the model
+  thinks, is handled and no longer reported as unknown.
+
 ### Added
 
 - Compact `line_status` responses by default, with bounded output and explicit requests
@@ -15,8 +37,44 @@ All notable changes are recorded here. The format follows
   review through `dromon proposal list` and `dromon proposal show`; its file list must
   match the patch headers and excludes protected paths. It never applies a patch or
   commits. `dromon config` warns when writing-capable lines share a workdir.
+- Restart to upgrade, by the operator's decision of 2026-10-27, as
+  `docs/protocol/RESTART.md` specifies.
+  - `dromon restart [--interrupt] [--wait-seconds S] [--end-tasks]` and the client
+    operation `restart`. The daemon drains, so no turn starts and no scheduled wake
+    fires, and waits for running turns to end, or with `--interrupt` asks each to end
+    at its next safe point, the point priority mail uses. A turn still running at the
+    bound abandons the restart, and no turn is cut. Background tasks of kept sessions
+    refuse it unless `--end-tasks` is given.
+  - Once no turn runs, the daemon stops and starts its successor itself, from the
+    installed code and with the same command-line options, after it has released its
+    lock. Sessions, mutes, scheduled wakes, holds and mail survive in the event log.
+    `dromon restart` checks that the installed daemon imports before it asks, and
+    prints the successor's commit and the commit before.
+  - The event `restart_noted`, a note from a line to itself that a restart ended its
+    turn, which wakes it in the successor with a header saying so.
+  - The daemon's `status` gives `daemon`, with its commit, and `restart`.
+  - `line_status` gives `commits`, the full commits of the line's worktree and of the
+    daemon with a sentence that cites both, and each of `other_lines` gives its
+    `workdir_commit`.
 
-### Added
+- Wake mute, priority mail and self mail, by the operator's decision of 2026-10-27, as
+  `docs/protocol/PRIORITY.md` specifies.
+  - `dromon mute LINE` and `dromon unmute LINE`, the client operations `mute` and
+    `unmute`, and the events `line_muted` and `line_unmuted`. A muted line starts no
+    turn, by mail, self mail, a scheduled wake, a task note or an answer, and keeps
+    its mail, session and pending scheduled wake, which fires once it is unmuted. A
+    turn in flight finishes. `line_status`, the daemon's `status` and `dromon status`
+    show the mute, and `condition` is `muted`.
+  - `dromon send --priority`, `priority` on `send`, and `priority` on `send_message`,
+    recorded as `message_prioritized`. Priority mail ends the recipient's running turn
+    at its next safe point, through the line's driver, which every adapter already
+    honours, and leads the next turn, which skips the cooldown. Lines' priority mail
+    is limited to 3 sent and 2 received per 10 minutes, counts a restart sets to zero,
+    operators' is unlimited, and external agents may not send it.
+  - A line may send itself a note with `send_message`, with no rate limit, since the
+    autonomous-turn limit and the cost hold bound a chain of them. Operators and
+    agents still may not.
+  - `dromon status` prints one row per line.
 
 - Grok, Codex and Antigravity capability tables, and probe recording for Codex and
   Grok, after the bounded-waits branch was merged.

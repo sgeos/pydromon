@@ -159,6 +159,18 @@ class Event:
     number: int = 0
 
 
+TOOL_RESULT: Final = "tool_result"
+"""The event an adapter feeds once a tool the turn used has finished and its result
+was delivered to the model. Added on 2026-10-27 for the safe point of priority mail,
+as ``dromon.priority`` describes. The packaged drivers answer it with ``continue``,
+as they answer every tag they do not name."""
+
+MESSAGE_END: Final = "message_end"
+"""The event an adapter feeds at the end of an assistant message, with the message's
+count of tool uses as its number, where the engine reports a whole message. Added
+with ``TOOL_RESULT``, and answered with ``continue`` in the same way."""
+
+
 @dataclass(frozen=True, slots=True)
 class Action:
     tag: ActionTag
