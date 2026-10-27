@@ -56,6 +56,7 @@ from dromon.jsonlines import (
     json_lines_factory,
 )
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
+from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
 
 ENGINE_NAME: Final = "cursor-agent"
@@ -401,6 +402,7 @@ class CursorLine:
         check_workspace(self.cwd, self._home)
         if self.mark is not None:
             environment[MARK_VARIABLE] = self.mark
+        environment[STOP_POLICY_VARIABLE] = self.config.stop_policy.value
         if self.tool_names and self.line_token is not None:
             environment["DROMON_LINE_TOKEN"] = self.line_token
         # Every turn opens a new chat, so it carries the line's instructions.

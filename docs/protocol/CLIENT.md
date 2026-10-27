@@ -61,7 +61,7 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `clear_session` | Argument `line_id`. The line's next turn starts a new engine session, and the leases it holds end. Refused while the line runs a turn |
 | `rebind_line` | Arguments `line_id`, `model` and `strategy`. Moves the line to another model and driver strategy, recorded as `line_rebound`. The line keeps its identity, mailbox, configuration and overrides, except a model override, which is dropped with a `line_overridden`. Its engine session is cleared, its engine rebuilt and its leases end. Result `{"line_id": ..., "model": ..., "strategy": ...}`. Refused while the line runs a turn, for a model and strategy with no packaged driver or adapter, for the binding the line already has, for a configuration or override the new engine cannot run, as `create_line` checks one, for a move onto Codex or Grok while the project's own sandbox or settings would reach the line, and for a move onto Claude Code without a sandbox the project requires. Operator only, and not offered to external agents |
 | `reload_project` | No arguments. Reads `.dromon/dromon.toml` again and applies its lines, limits, wake policy, operator, tick cadence, sandbox requirement and disclosure list, which it reads again. Returns `file`, `present` and `lines`, the lines it declares. Refused, applying nothing, for an invalid file, a file that changes a line's model or strategy, one that changes the sandbox, the engine settings, the teacher or the external agent policy, which apply only when the daemon restarts, one whose disclosure list cannot be read, or one that requires a sandbox a line lacks |
-| `interrupt` | Argument `line_id`. Cancels the line's turn in flight. Returns `line_id` and `interrupted`, false when no turn was in flight. Refused for an unknown line |
+| `interrupt` | Argument `line_id`. Stops the line's turn in flight, as the interrupt paragraph below specifies. Returns `line_id` and `interrupted`, false when no turn was in flight, in which case nothing changes. Refused for an unknown line |
 | `release` | Argument `line_id`. Releases a line held at a conversation limit and resets its counts |
 | `agent_add` | Arguments `agent` and `access`. Registers an external agent, or replaces its access and token. Returns `agent`, `access`, `effective_access` under the policy's ceiling, `token`, shown only here, and `listening` |
 | `agent_revoke` | Argument `agent`. Revokes it |
@@ -126,6 +126,7 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromon sent` | Sends `sent`, with `--operator`, `--unanswered`, `--offset N` and `--limit N`, and prints each message's fate | 0, 4, or 1 |
 | `dromon attach LINE` | Opens an interactive client attached to the line, in the terminal or in a Tk window with `--gui`, speaking for `--operator` and refreshing every `--poll-seconds`, default 1, and four times as often while the line runs a turn. Text sends a message. The commands, keys and panes are those of the attached client section below. Any number may attach at once | 0, or 2 on a poll interval that is not positive |
 | `dromon release LINE` | Sends `release` | 0, 4, or 1 |
+| `dromon interrupt LINE` | Sends `interrupt`, as Escape does in an attached client, and prints whether a turn was in flight. A line with none is not a failure, since its turn may have ended as the request was made | 0, 4, or 1 |
 | `dromon rebind LINE` | Sends `rebind_line`, with `--model` and `--strategy`, both required | 0, 2, 4, or 1 |
 | `dromon settings [LINE]` | Sends `settings` and prints the project's settings, and the line's when given, each with its layer | 0, 4, or 1 |
 | `dromon set KEY [VALUE...]` | Checks the value against `settings` as the attached client does, then sends `set_setting`. A line key needs `--line LINE`, and a project key is written with the `project.` prefix. `--unset` removes the override instead | 0, 2, 4, or 1 |
@@ -163,7 +164,7 @@ not part of the event log, is not persisted, and is lost when the daemon stops.
 | `text` | Text the engine wrote |
 | `thinking` | Empty. The engine reasoned, and reasoning is not shown |
 | `tool` | The name of the tool the engine called |
-| `turn_ended` | How the turn ended. The engine's result subtype, such as `success`, with the reason when its driver interrupted it, `failed:` and the error, `interrupted by an operator`, or `cancelled` at shutdown |
+| `turn_ended` | How the turn ended. The engine's result subtype `success`, another subtype with the reason when its driver interrupted it, `failed: the engine ended the turn as` and any other subtype, `failed:` and the error, `interrupted by an operator`, or `cancelled` at shutdown |
 | `notice` | Dromon's own remark on the turn, such as that the engine's start timed out at its initialize request and was tried once more. **Fact, read from Agent SDK 0.2.174 and tested.** The client's failed connect disconnects before it raises, which ends the first engine process before the second start |
 
 Each entry has an `entry_id`, which never changes, and a `seq`, the daemon-wide revision
@@ -181,6 +182,16 @@ An interrupt cancels the turn's task, which closes the engine's session or subpr
 wherever it is. Mail the turn had received stays delivered. The engine session resumes
 from what the engine itself recorded, which may include part of the cancelled turn. An
 interrupted turn produces no turn report, so it counts toward no limit.
+
+**Row 1 of the T3 Code review, decided by the operator on 2026-10-26.** A stop holds.
+An interrupt that cancels a turn also withdraws the line's pending scheduled wake,
+recorded as `wake_withdrawn`, and holds the line with an operator question, as a limit
+does, unless it is held already. So no wake, task note or mail starts its next turn
+until an operator answers the question or releases the line. Once the stopped turn has
+ended, a kept engine connection whose interrupt did not settle, or settled while the
+engine still runs background work, is closed, which ends the engine and, by the line's
+stop policy, what it started, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies. The
+line's activity then says so in a `notice`.
 
 ## The attached client
 

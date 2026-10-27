@@ -313,10 +313,18 @@ def line_entries(facts: LineFacts, project: Sequence[Layer]) -> list[dict[str, o
             (
                 f"on, closing after {facts.config.keep_session_idle_seconds} seconds"
                 f" idle, or {facts.config.keep_session_max_seconds} with background"
-                " tasks running"
+                f" tasks running, where it does"
+                f" {facts.config.keep_session_at_max.value}, and at the latest after"
+                f" {facts.config.keep_session_hard_seconds}"
             )
             if facts.config.keep_session
             else "off",
+        ),
+        info(
+            "stop_policy",
+            "whether stopping the engine ends what it started, changed only by"
+            " configuration",
+            facts.config.stop_policy.value,
         ),
     ]
     effort = config.effort

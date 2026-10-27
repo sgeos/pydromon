@@ -87,7 +87,24 @@ names, so that one can be copied from `.claude/settings.json`.
   provider. These are every name that starts with `ANTHROPIC_`,
   `CLAUDE_CODE_USE_`, `OPENAI_`, `CODEX_` or `XAI_`, and `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR` and
   `AWS_BEARER_TOKEN_BEDROCK`. Claude Code applies `env` to itself, and usage billed per
-  token must never start silently.
+  token must never start silently. **From 2026-10-26** `env` may also not set any name
+  that starts with `DROMON_`, which Dromon sets itself, such as the stop policy its
+  launcher reads.
+- **Pinned tool search.** **Row 4 of the T3 Code review, 2026-10-26.** Dromon starts
+  every Claude Code line's engine with `ENABLE_TOOL_SEARCH` set to `true`, over
+  whatever the daemon's environment holds, and `env` may not set it to any value. **Fact,
+  read from the bundled Claude Code 2.1.310.** Unset, `true` or `auto:0` keep tool
+  search on, `false` or `auto:100` keep it off, and `auto` or `auto:N` switch between
+  the two by the share of the context window the tool schemas take, so the schemas
+  sent can change between requests and rewrite the prompt cache. A second
+  implementation reported about ten times the cache writes in that mode. **Review F9,
+  read from the bundled Claude Code 2.1.310, unverified live.** Without setting
+  sources no settings file's env block applies, but Claude Code still copies the
+  `env` key of `~/.claude.json` over its process environment, so Dromon also pins the
+  variable in the env block of the flag settings it passes, which Claude Code copies
+  after it. **Residual.** Managed policy settings are copied last, whatever Dromon
+  passes, and could still set it. An MCP server may not refer to either kind of
+  variable.
 - **Strict keys.** Any other key, `permissions.defaultMode` included, is an error.
   Rules are sorted and deduplicated, hooks keep their order, and documents are stored
   as canonical JSON. At most 256 entries are accepted in any array or table, and each

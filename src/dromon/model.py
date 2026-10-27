@@ -605,6 +605,83 @@ class TaskNoted:
         check_text("body", self.body, MAX_TASK_NOTE_BYTES)
 
 
+MAX_LEFT_PROCESSES: Final = 64
+MAX_LEFT_COMMAND_BYTES: Final = 1024
+MAX_LEFT_MORE: Final = 1_000_000
+LEFT_CAUSES: Final = frozenset({"exited", "stopped", "orphaned", "detached", "swept"})
+"""Why processes were left: the engine exited, Dromon stopped it, or the daemon died,
+each under the ``leave_background`` stop policy, or they had left the engine's
+process tree and were found by the line's process mark, or the daemon's sweep of a
+launcher that had exited found them still running. **Review N1.**"""
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessesLeft:
+    """Processes a line's engine left running, with their pids and commands, which
+    the line's status shows. Only the daemon records it, from a launcher's report or
+    from the process mark. It is a record, and does not make the processes Dromon's
+    to end."""
+
+    line_id: str
+    cause: str
+    pids: tuple[int, ...]
+    commands: tuple[str, ...]
+    more: int = 0
+    """How many more were left than are named."""
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        if self.cause not in LEFT_CAUSES:
+            raise InvalidField(f"cause must be one of {sorted(LEFT_CAUSES)}")
+        if len(self.pids) != len(self.commands):
+            raise InvalidField("pids and commands must be as many")
+        if not self.pids or len(self.pids) > MAX_LEFT_PROCESSES:
+            raise InvalidField(f"pids must name 1 to {MAX_LEFT_PROCESSES} processes")
+        for pid in self.pids:
+            if type(pid) is not int or not 1 < pid < 2**31:
+                raise InvalidField("a pid must be a whole number above 1")
+        for command in self.commands:
+            check_text("command", command, MAX_LEFT_COMMAND_BYTES)
+        if type(self.more) is not int or not 0 <= self.more <= MAX_LEFT_MORE:
+            raise InvalidField(f"more must be a whole number from 0 to {MAX_LEFT_MORE}")
+
+
+MAX_STOP_NOTE_BYTES: Final = 1024
+
+
+@dataclass(frozen=True, slots=True)
+class StopUnverified:
+    """A stop of a line's engine that Dromon could not verify was complete, which
+    the line's status shows as the latest: the launcher could not read the process
+    table, or exited before it finished its stop and was swept by the daemon. Only
+    the daemon records it. **Review F2 and N1.**"""
+
+    line_id: str
+    note: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_text("note", self.note, MAX_STOP_NOTE_BYTES)
+        if not self.note:
+            raise InvalidField("note must not be empty")
+
+
+MAX_WALK_LIMIT_BYTES: Final = 1024
+
+
+@dataclass(frozen=True, slots=True)
+class WalkLimited:
+    """What the daemon's platform keeps the launcher's walk of the process table from
+    reaching, which every line's status shows, or empty text where nothing is beyond
+    it. Only the daemon records it, as it starts, and only when it differs from the
+    log's, so a platform's gap is recorded once. **Review F1.**"""
+
+    note: str
+
+    def __post_init__(self) -> None:
+        check_text("note", self.note, MAX_WALK_LIMIT_BYTES)
+
+
 @dataclass(frozen=True, slots=True)
 class QuestionWithdrawn:
     message_id: str
@@ -647,6 +724,9 @@ type Event = (
     | WakeWithdrawn
     | TaskNoted
     | LineCostMarked
+    | ProcessesLeft
+    | StopUnverified
+    | WalkLimited
     | QuestionWithdrawn
     | QuestionSuperseded
 )
@@ -675,6 +755,10 @@ class Line:
     cost_mark: tuple[str, int] | None = None
     """The session and running cost total, in millionths of a dollar, of the line's
     latest ``line_cost_marked``."""
+    left: ProcessesLeft | None = None
+    """The line's latest ``processes_left``."""
+    unverified: StopUnverified | None = None
+    """The line's latest ``stop_unverified``."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -748,6 +832,8 @@ class State:
     """The identifier of every withdrawn scheduled wake, which no later message,
     task note or scheduled wake may take, so a reply reference to it cannot reach
     another message. **Round 7 review, F1.**"""
+    walk_limit: str = ""
+    """The latest ``walk_limited`` note, empty when none is recorded."""
 
     def copy(self) -> "State":
         """Return an independent snapshot. The records are frozen, so maps suffice."""
@@ -762,6 +848,7 @@ class State:
             dict(self.fired_dues),
             set(self.hold_questions),
             set(self.withdrawn_wakes),
+            self.walk_limit,
         )
 
     def open_questions(self, operator_id: str) -> list[str]:
@@ -855,6 +942,10 @@ class State:
                 self._check_task_noted(event)
             case LineCostMarked():
                 self._line(event.line_id)
+            case ProcessesLeft() | StopUnverified():
+                self._line(event.line_id)
+            case WalkLimited():
+                pass
             case QuestionWithdrawn():
                 self._open_question(event.message_id)
             case QuestionSuperseded():
@@ -942,6 +1033,14 @@ class State:
                 self.lines[event.line_id] = replace(
                     line, cost_mark=(event.engine_session, event.total_micro_usd)
                 )
+            case ProcessesLeft():
+                line = self.lines[event.line_id]
+                self.lines[event.line_id] = replace(line, left=event)
+            case StopUnverified():
+                line = self.lines[event.line_id]
+                self.lines[event.line_id] = replace(line, unverified=event)
+            case WalkLimited():
+                self.walk_limit = event.note
             case TaskNoted():
                 address = LineAddress(event.line_id)
                 self.messages[event.message_id] = Message(

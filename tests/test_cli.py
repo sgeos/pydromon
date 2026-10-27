@@ -7,6 +7,7 @@ import pytest
 from pathlib import Path
 
 from dromon import __version__, cli, daemon, exits
+from dromon.protocol import Operation, Response
 
 
 def test_every_planned_subcommand_is_implemented() -> None:
@@ -172,3 +173,62 @@ def test_an_unreadable_mcp_file_fails_before_contacting_the_daemon(
     ]
     assert cli.main(argv) == exits.FAILURE
     assert "cannot read the line configuration" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("interrupted", "printed"),
+    [(True, "interrupted the turn of alpha"), (False, "alpha had no turn in flight")],
+)
+def test_interrupt_sends_the_operation_and_says_whether_a_turn_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    short_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+    interrupted: bool,
+    printed: str,
+) -> None:
+    """Item 9 of the live check of 2026-10-26, a scriptable interrupt."""
+    sent: list[tuple[Operation, dict[str, object] | None]] = []
+
+    def answer(
+        socket: Path, operation: Operation, args: dict[str, object] | None = None
+    ) -> Response:
+        del socket
+        sent.append((operation, args))
+        return Response(
+            "r", True, result={"line_id": "alpha", "interrupted": interrupted}
+        )
+
+    monkeypatch.setattr(cli, "call", answer)
+    runtime = ["--runtime-dir", str(short_runtime)]
+    argv = ["--project", str(tmp_path), *runtime, "interrupt", "alpha"]
+    assert cli.main(argv) == exits.OK
+    assert sent == [(Operation.INTERRUPT, {"line_id": "alpha"})]
+    assert printed in capsys.readouterr().out
+
+
+def test_interrupt_reports_a_refusal_as_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    short_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def refuse(
+        socket: Path, operation: Operation, args: dict[str, object] | None = None
+    ) -> Response:
+        del socket, operation, args
+        return Response("r", False, error_message="unknown line nobody")
+
+    monkeypatch.setattr(cli, "call", refuse)
+    runtime = ["--runtime-dir", str(short_runtime)]
+    argv = ["--project", str(tmp_path), *runtime, "interrupt", "nobody"]
+    assert cli.main(argv) == exits.FAILURE
+    assert "dromon interrupt: unknown line nobody" in capsys.readouterr().err
+
+
+def test_interrupt_without_a_daemon_reports_not_running(
+    tmp_path: Path, short_runtime: Path
+) -> None:
+    runtime = ["--runtime-dir", str(short_runtime)]
+    argv = ["--project", str(tmp_path), *runtime, "interrupt", "alpha"]
+    assert cli.main(argv) == exits.NOT_RUNNING

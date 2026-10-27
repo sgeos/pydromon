@@ -7,6 +7,85 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Daemon guarantees from rows 1, 2, 4, 5 and 12 of the T3 Code review, with the
+  operator's decisions A and B of 2026-10-26.
+  - **Row 1, a stop stops.** An operator's interrupt now withdraws the line's pending
+    scheduled wake and holds the line with an operator question until it is released.
+    Once the stopped turn has ended, a kept Claude Code connection whose interrupt
+    settled while the engine still ran background work, or before the turn's result
+    arrived, is closed, and so is a kept Codex app-server that still lists terminals.
+  - **Row 2 and decision B, nothing outlives its owner.** Every harness, Claude Code's
+    included, runs under `dromon.launcher`, through the new `dromon-launch` command. It
+    ends the harness when the daemon stops it and when it sees that the daemon has
+    died, however it died. The new line key `stop_policy` decides whether the
+    harness's whole group and every descendant a walk of the process table finds end
+    with it, `kill_all`, the default, or are left running, `leave_background`, in
+    which case the launcher reports them and the daemon records them with their pids
+    and commands as the new `processes_left` event, shown in `line_status`. At the end
+    of a turn whose engine has ended, processes still carrying the line's mark are
+    recorded as detached, where the platform lets the daemon read the mark. Grok and
+    Codex had been signalled at their leader only. After review, on Linux the launcher
+    is a child subreaper, so a descendant in a session of its own whose parent exited
+    is still ended, and elsewhere that gap is recorded once as the new `walk_limited`
+    event and shown in `line_status`. The daemon records an earlier run's marked
+    survivors as it starts, and refuses a `kill_all` turn where `ps` cannot read the
+    process table. The launcher's first act on a stop is `SIGSTOP` to the harness's
+    group, its whole stop fits 3.5 seconds inside the Agent SDK's 5, it never signals
+    a reaped pid, and the daemon signals a launcher by pid as well as group, with
+    every wait bounded. The launcher answers the SDK's version check for the Claude
+    Code it would start.
+  - **Decision A, the keep-session ceiling.** The new line keys `keep_session_at_max`,
+    `close` by default, `ask` or `keep`, and `keep_session_hard_seconds`, a day by
+    default, decide what a kept Claude Code or Codex connection with background work
+    does at `keep_session_max_seconds`. `ask` raises an operator question with the
+    choices `extend`, `stop` and `let it finish`. Every choice ends at the hard bound.
+  - **Row 4.** Every Claude Code line runs with `ENABLE_TOOL_SEARCH` pinned to `true`,
+    so its tool schemas, and with them the prompt cache, stay stable between requests.
+    A line's `settings.env` may not set it, nor any variable starting with `DROMON_`.
+    After review the pin is also passed in the flag settings' env block, which Claude
+    Code applies after the `env` key of `~/.claude.json`.
+  - **Row 5, honest outcomes.** A Claude Code result between turns with no turn behind
+    it is not taken for a turn the engine began. A system message subtype Dromon does
+    not handle is surfaced in the line's activity, once, and a reported fallback to a
+    model the driver was not written for refuses the turn, while a consent fallback
+    is also put to an operator as a question. The permission gate refuses `AskUserQuestion` and
+    `ExitPlanMode` with the advice to use `ask_operator`, and a Pi extension's dialog,
+    still cancelled, is surfaced. A turn whose engine reports anything but success
+    ends as failed, each recent turn names its outcome, and `line_status` gives the
+    line's `condition`.
+  - **Row 12.** A line token is renewed as a turn starts a new engine process,
+    revoked when that process ends, and expires after an hour without use between
+    turns, never during one.
+  - **Decision A after review.** Ceiling questions still open when the daemon starts,
+    or whose connection dies without a close, are withdrawn, and any failure to ask
+    one closes the connection, as `close` does.
+  - **After the live check of 2026-10-26.** A resumed Claude Code session's handoff
+    result, a success that ran nothing, no longer ends the turn. The prompt is sent
+    once more, and a second handoff refuses the turn. The engine's
+    `background_tasks_changed` set is followed, and narrows the count of running
+    tasks only between turns. Claude Code ends its own background shells once its
+    input closes, so under `leave_background` the launcher now relays the harness's
+    input, never closes it, and kills the harness alone without asking it to stop.
+    The ceiling's question and the next prompt say what that policy leaves running.
+    The new `dromon interrupt LINE` sends the client protocol's `interrupt`.
+  - **After the re-review of the stop policy.** The daemon sweeps the process group
+    of every launcher that has exited, from a launch record each launcher writes, so a
+    launcher killed while its harness was frozen no longer leaves it frozen and alive,
+    and on Linux the harness has a parent death signal. A stop that could not be
+    verified, by a failed walk or an unfinished launcher, is recorded as the new
+    `stop_unverified` event. Under `leave_background` the harness runs on for half a
+    second before its freeze, so it can write out its transcript, and the input relay
+    holds what a harness has not read, so it still sees the daemon's close. Left
+    processes and background tasks are recorded as the executable's name with masked
+    arguments, and the whole command stays only in the report file. Any success with
+    no turn before the model's output is a handoff, and an interrupted turn's
+    reported cost counts toward the budget. A launcher that `ps` shows unreaped, or
+    whose harness has another parent, counts as exited, so a kept connection's killed
+    launcher is swept while the daemon runs, and the line's engine is then treated
+    as failed and closed. The scheduler's rest is bounded at a minute even with no
+    wake pending, so an idle daemon sweeps too, and every sweep that acts or fails is
+    written to the daemon's log.
+
 - A prospective Pi engine, `dromon.pi`, for `pi:openai/gpt-6-luna`, which runs a line's
   turns through `pi --mode rpc` and is not verified against a live turn, as
   `docs/protocol/PI.md` records. Pi has no sandbox, so a Pi line takes no built-in tool

@@ -31,6 +31,8 @@ from dromon.scheduler import LineEngine, LineSpec, Scheduler, engine_factory
 
 HAIKU = "claude-haiku-5-5"
 DAEMON = 1000
+LAUNCHER = 1500
+"""The launcher the daemon starts, whose child is the engine."""
 MARK = "alpha.0123abcd"
 OTHER = "beta.0123abcd"
 
@@ -76,7 +78,8 @@ def table() -> FakeTable:
     return FakeTable(
         [
             ProcessInfo(DAEMON, 1, "01:00:00", "dromond"),
-            ProcessInfo(1001, DAEMON, "59:00", "claude --engine"),
+            ProcessInfo(LAUNCHER, DAEMON, "59:00", "python -I -m dromon.launcher"),
+            ProcessInfo(1001, LAUNCHER, "59:00", "claude --engine"),
             ProcessInfo(2001, 1001, "02:00", "uv run pytest " + "x" * 300),
             ProcessInfo(2002, 1, "1-02:03:04", "nohup ./gate.sh"),
             ProcessInfo(2003, 1001, "00:05", "sleep 100"),
@@ -85,6 +88,7 @@ def table() -> FakeTable:
         ],
         {
             DAEMON: mark(),
+            LAUNCHER: mark(),
             1001: mark(),
             2001: mark(),
             2002: mark(),
@@ -243,8 +247,9 @@ def test_the_environment_is_read_per_platform_and_none_means_not_the_lines(
 def test_a_claude_line_starts_with_its_mark(tmp_path: Path) -> None:
     driver = Driver.for_model(HAIKU, Strategy.SUBSCRIPTION)
     marked = ClaudeCodeLine(driver, tmp_path, mark=MARK)
-    assert marked.options().env == {MARK_VARIABLE: MARK}
-    assert ClaudeCodeLine(driver, tmp_path).options().env == {}
+    environment = marked.options().env
+    assert environment[MARK_VARIABLE] == MARK
+    assert MARK_VARIABLE not in ClaudeCodeLine(driver, tmp_path).options().env
     build = engine_factory(str(tmp_path))
     engine = build(LineSpec("alpha", HAIKU, Strategy.SUBSCRIPTION, mark=MARK), [])
     assert isinstance(engine, ClaudeCodeLine) and engine.mark == MARK
@@ -532,7 +537,14 @@ def test_where_processes_cannot_be_identified_the_tools_explain(
             text, error = call(blind, "alpha", name, args)
             assert (text, error) == (processes.UNIDENTIFIABLE, True)
         status = blind.line_status("alpha")["processes"]
-        assert status == {"identifiable": False, "note": processes.UNIDENTIFIABLE}
+        assert status == {
+            "identifiable": False,
+            "note": processes.UNIDENTIFIABLE,
+            "stop_policy": "kill_all",
+            "left": None,
+            "stop_unverified": None,
+            "walk_limit": None,
+        }
     assert calls == [] and table.sent == []
 
 
@@ -542,4 +554,8 @@ def test_where_processes_can_be_identified_line_status_says_so(
     assert scheduler.line_status("alpha")["processes"] == {
         "identifiable": True,
         "note": None,
+        "stop_policy": "kill_all",
+        "left": None,
+        "stop_unverified": None,
+        "walk_limit": None,
     }

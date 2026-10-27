@@ -33,6 +33,9 @@ classifiers = [
 # habits carry across the Python, Rust and Keleusma versions.
 dromond = "dromon.daemon:main"
 dromon = "dromon.cli:main"
+# The watcher each harness runs under, which the Agent SDK starts in place of Claude
+# Code. It is not for an operator to run, see dromon.launcher.
+dromon-launch = "dromon.launcher:main"
 
 [dependency-groups]
 dev = ["pytest==9.1.1", "ruff==0.17.2", "pyright==1.1.414"]

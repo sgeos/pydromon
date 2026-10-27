@@ -88,7 +88,8 @@ the operator, per `docs/architecture/KELEUSMA_DOGFOOD.md`.
   or MCP OAuth, and Linux not verified live, per `SANDBOX.md` and `SETTINGS.md`.
 - **Unrun engines.** Grok, Pi, Cursor Agent and Antigravity, each with a verify-first
   list. Cursor and Antigravity lines are refused, and `dromon probe` needs flags.
-- **Keep-session ceiling.** May it end background work? The operator decides.
+- **Launcher.** `stop_policy` and the sweep pass live on macOS. Linux paths, a
+  `setsid` child and `~/.claude.json` are unverified, per `LINE_CONFIG.md`.
 - **Flaky test.** `test_kept_session`'s grace-period test, once in five runs.
 - **Codex lines.** No MCP servers, commits, sandbox or settings documents, cost or turn
   limit, and refused calls escape the tool budget. See `CODEX.md`.

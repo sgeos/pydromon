@@ -83,6 +83,7 @@ from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
 from dromon.engine import (
     COMPACTION_REQUESTED,
     DIED_NOTE,
+    HALT_REASON,
     CompactionRequest,
     MAX_CALLS,
     BackgroundEnd,
@@ -99,6 +100,17 @@ from dromon.engine import (
     closed_note,
     read_instructions,
 )
+from dromon import launcher, redact
+from dromon.ceiling import (
+    STOP_REASON,
+    Ask,
+    Ceiling,
+    Choice,
+    Settle,
+    no_operator,
+    nothing_to_settle,
+)
+from dromon.launcher import STOP_POLICY_VARIABLE, StopPolicy
 from dromon.processes import MARK_VARIABLE
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
 
@@ -478,26 +490,23 @@ def codex_path() -> str:
 async def _app_server(
     arguments: list[str], cwd: Path, environment: Mapping[str, str]
 ) -> AsyncGenerator[Connection]:
+    command, launched, policy = launcher.wrap([codex_path(), *arguments], environment)
     process = await asyncio.create_subprocess_exec(
-        codex_path(),
-        *arguments,
+        *command,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
         cwd=cwd,
-        env=dict(environment),
+        env=launched,
         limit=MAX_LINE,
+        start_new_session=True,
     )
     try:
         yield _Process(process)
     finally:
-        if process.returncode is None:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=10)
-            except TimeoutError:
-                process.kill()
-                await process.wait()
+        # The launcher ends the app-server and, by the line's stop policy, its group
+        # and every descendant.
+        await launcher.end(process, policy, close_input=False)
 
 
 def list_servers(environment: Mapping[str, str]) -> Sequence[str]:
@@ -674,6 +683,8 @@ class _Kept:
     )
     """Ends found by a listing that wait for the engine's completion report, with
     their command and when they were found."""
+    ceiling: Ceiling | None = None
+    """Where the connection stands against ``keep_session_max_seconds``."""
     poll_failures: int = 0
     """Consecutive failed listings between turns. Polling stops after
     ``MAX_POLL_FAILURES`` until the next turn ends."""
@@ -724,6 +735,8 @@ class CodexLine:
             [Mapping[str, int | str | None]], object
         ] = ignore_compaction,
         compaction_estimated: Callable[[int], object] = ignore_estimate,
+        ceiling_reached: Ask = no_operator,
+        ceiling_settled: Settle = nothing_to_settle,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -755,6 +768,8 @@ class CodexLine:
         self._background: set[asyncio.Task[None]] = set()
         self._compacted = compacted
         self._estimated = compaction_estimated
+        self._ceiling_reached = ceiling_reached
+        self._ceiling_settled = ceiling_settled
         self._request: CompactionRequest | None = None
         """The compaction the next turn begins with, if any, which each turn takes
         as it starts, as on a Claude Code line."""
@@ -835,6 +850,11 @@ class CodexLine:
             environment = engine_environment(
                 self._environment, self.driver.settings.strategy
             )
+            # For the launcher, which removes both before the app-server starts and
+            # names the line by its mark in what it reports.
+            environment[STOP_POLICY_VARIABLE] = self.config.stop_policy.value
+            if self.mark is not None:
+                environment[launcher.LAUNCH_MARK_VARIABLE] = self.mark
             reason = unsupported(self.config)
             if reason is not None:
                 raise EngineRefused(reason)
@@ -1284,12 +1304,15 @@ class CodexLine:
         kept = self._kept
         if kept is None or not kept.routed.alive or self._in_turn:
             return None
-        allowed = (
-            self.config.keep_session_max_seconds
-            if kept.terminals
-            else self.config.keep_session_idle_seconds
-        )
-        return kept.last_end + allowed - self._clock()
+        deadline = self._ceiling_of(kept).deadline(kept.last_end, bool(kept.terminals))
+        return deadline - self._clock()
+
+    def _ceiling_of(self, kept: _Kept) -> Ceiling:
+        if kept.ceiling is None:
+            kept.ceiling = Ceiling(
+                self.config, self._ceiling_reached, self._ceiling_settled
+            )
+        return kept.ceiling
 
     def kept_status(self) -> dict[str, object]:
         kept = self._kept
@@ -1313,21 +1336,60 @@ class CodexLine:
         }
 
     async def expire(self) -> bool:
-        remaining = self.seconds_to_close()
+        """Close the kept app-server at its deadline, or ask an operator at its
+        ceiling, as ``dromon.ceiling`` describes, and say whether it was closed."""
         kept = self._kept
-        if kept is None or remaining is None or remaining > 0:
+        if kept is None or not kept.routed.alive or self._in_turn:
             return False
-        await self.close(
-            "it reached keep_session_max_seconds with background terminals running"
-            if kept.terminals
-            else "it waited keep_session_idle_seconds without a turn"
+        reason = self._ceiling_of(kept).due(
+            kept.last_end, len(kept.terminals), self._clock()
         )
+        if reason is None:
+            return False
+        await self.close(reason)
         return True
+
+    async def decide_ceiling(self, question_id: str, answer: str) -> Choice | None:
+        """Carry out an operator's answer to the ceiling question."""
+        kept = self._kept
+        if kept is None:
+            return None
+        choice = self._ceiling_of(kept).decide(question_id, answer, self._clock())
+        if choice is Choice.STOP:
+            await self.close(STOP_REASON)
+        return choice
+
+    async def halt(self) -> str | None:
+        """Finish an operator's stop once the stopped turn has ended, as
+        ``ClaudeCodeLine.halt`` does. A failed interrupt has closed the app-server
+        already. One that still lists background terminals is closed here."""
+        pending = list(self._background)
+        if pending:
+            await asyncio.wait(pending, timeout=INTERRUPT_TIMEOUT_SECONDS + 1)
+        kept = self._kept
+        if kept is None or not kept.routed.alive or not kept.terminals:
+            return None
+        await self.close(HALT_REASON)
+        return HALT_REASON
 
     async def retire(self) -> None:
         self._retired = True
         if not self._in_turn:
             await self.close()
+
+    @staticmethod
+    def _withdraw_ceiling(kept: _Kept) -> None:
+        """Withdraw the connection's open ceiling question, if any. A failure is
+        reported and goes no further, since the caller may be a done callback."""
+        if kept.ceiling is None:
+            return
+        try:
+            kept.ceiling.withdraw()
+        except Exception as error:  # noqa: BLE001
+            print(
+                f"dromond: a ceiling question was not withdrawn: {error}",
+                file=sys.stderr,
+            )
 
     async def close(self, reason: str | None = None) -> None:
         """Close the kept app-server, which ends its background terminals. With
@@ -1336,8 +1398,10 @@ class CodexLine:
         if kept is None:
             return
         self._kept = None
+        self._withdraw_ceiling(kept)
         if reason is not None:
-            self._notes.append(closed_note(reason, len(kept.terminals)))
+            left = self.config.stop_policy is StopPolicy.LEAVE_BACKGROUND
+            self._notes.append(closed_note(reason, len(kept.terminals), left))
         current = asyncio.current_task()
         helpers = [
             t for t in (kept.pump, kept.watch) if t is not None and t is not current
@@ -1370,6 +1434,9 @@ class CodexLine:
         kept = _Kept(stack, _Routed(inner, self._between), fingerprint, self._clock())
         loop = asyncio.get_running_loop()
         kept.pump = loop.create_task(kept.routed.pump())
+        # Review F12. A connection that dies without a close withdraws its ceiling
+        # question as the pump ends, since nothing can act on an answer now.
+        kept.pump.add_done_callback(lambda _: self._withdraw_ceiling(kept))
         kept.watch = loop.create_task(self._watch(kept))
         self._kept = kept
         return kept
@@ -1516,7 +1583,8 @@ class CodexLine:
                 self._evict(kept)
             kept.own[value] = None
             if isinstance(command, str) and command:
-                kept.commands[value] = command[:200]
+                # Review N10, masked as for Claude Code's tasks.
+                kept.commands[value] = redact.mask(command)[:200]
             if completed:
                 code = item.get("exitCode")
                 output = item.get("aggregatedOutput")
@@ -1733,6 +1801,7 @@ class CodexLine:
             self._connection = None
             kept.routed.active = False
             kept.last_end = self._clock()
+            self._ceiling_of(kept).turn_ended()
             kept.poll_failures = 0
             while not kept.routed.queue.empty():
                 leftover = kept.routed.queue.get_nowait()

@@ -113,6 +113,7 @@ from dromon.model import (
     State,
     parse_address,
 )
+from dromon import launcher
 from dromon.paths import PathError, ProjectPaths, ensure_private_dir, project_paths
 from dromon.protocol import (
     MAX_LINE_BYTES,
@@ -1451,6 +1452,7 @@ def run(
     try:
         ensure_private_dir(paths.state_dir)
         ensure_private_dir(paths.runtime_dir)
+        ensure_private_dir(paths.left_reports)
         file = config_path(paths.state_dir)
         config = load(file) if file.exists() else ProjectConfig()
         check_sandboxes(config, paths)
@@ -1465,6 +1467,7 @@ def run(
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
     line_tokens = LineTokens()
+    launcher.configure(paths.left_reports)
     try:
         with EventLog(paths.event_log) as log:
             scheduler = Scheduler(
@@ -1487,7 +1490,11 @@ def run(
                 daemon_commit=read_head_commit(Path(__file__).parent),
                 daemon_checkout=Path(__file__).parent,
                 processes_identifiable=environment_reading_works(),
+                line_tokens=line_tokens,
+                report_dir=paths.left_reports,
+                walk_check=launcher.walk_unavailable,
             )
+            scheduler.record_walk_gap(launcher.walk_gap())
             scheduler.set_disclosure_terms(terms)
             scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
             check_lines_sandboxed(config, log, scheduler)

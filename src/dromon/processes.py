@@ -7,7 +7,8 @@ only its own mark and cannot present another line's. A restart issues new tokens
 process from an earlier daemon run is no longer listed as the line's.
 
 Scope. ``list_processes`` shows only processes of the daemon's own user that carry the
-calling line's mark, without the daemon and the engines it started directly, and
+calling line's mark, without the daemon, the launchers it started directly and the
+engine each launcher started, as ``dromon.launcher`` describes, and
 ``stop_process`` signals only such a process, reading its environment again at the
 moment of stopping. Claude Code, Codex and Grok Build scope their own process
 controls to the agent's own session in the same way.
@@ -250,9 +251,113 @@ def parse_ps(output: str) -> list[ProcessInfo]:
     return rows
 
 
-def _excluded(process: ProcessInfo, daemon_pid: int) -> bool:
-    """The daemon and the engines it started directly are never a line's to stop."""
-    return process.pid == daemon_pid or process.ppid == daemon_pid
+def _excluded(
+    process: ProcessInfo, daemon_pid: int, launched: frozenset[int] = frozenset()
+) -> bool:
+    """The daemon, the launchers it started directly and the engines each launcher
+    started are never a line's to stop. ``launched`` holds the pids of the daemon's
+    direct children, whose children are the engines."""
+    return (
+        process.pid == daemon_pid
+        or process.ppid == daemon_pid
+        or process.ppid in launched
+    )
+
+
+def _launched(processes: Sequence[ProcessInfo], daemon_pid: int) -> frozenset[int]:
+    return frozenset(p.pid for p in processes if p.ppid == daemon_pid)
+
+
+@dataclass(frozen=True, slots=True)
+class TreeRow:
+    """A process with its group, as the launcher walks the process tree."""
+
+    pid: int
+    ppid: int
+    pgid: int
+    command: str
+
+
+def parse_tree(output: str) -> list[TreeRow]:
+    """Rows of ``ps -o pid=,ppid=,pgid=,args=``. A malformed row is skipped."""
+    rows: list[TreeRow] = []
+    for line in output.splitlines():
+        fields = line.split(None, 3)
+        if len(fields) < 3:
+            continue
+        try:
+            pid, ppid, pgid = int(fields[0]), int(fields[1]), int(fields[2])
+        except ValueError:
+            continue
+        command = fields[3] if len(fields) == 4 else ""
+        rows.append(TreeRow(pid, ppid, pgid, command[:MAX_COMMAND_CHARACTERS]))
+    return rows
+
+
+def read_tree(uid: int, timeout: float = PS_TIMEOUT_SECONDS) -> list[TreeRow] | None:
+    """Every process of ``uid`` with its parent and group, or ``None`` when ``ps``
+    cannot be run, fails or takes longer than ``timeout``. ``None`` is never an empty
+    tree, since a caller that ends what it finds must know that it found nothing
+    because it could not look."""
+    found = tree_or_reason(uid, timeout)
+    return None if isinstance(found, str) else found
+
+
+def tree_or_reason(
+    uid: int, timeout: float = PS_TIMEOUT_SECONDS
+) -> list[TreeRow] | str:
+    """Every process of ``uid`` with its parent and group, or why ``ps`` could not
+    list them. ``ps`` takes these fields alike on macOS and Linux."""
+    try:
+        found = subprocess.run(  # noqa: S603
+            [  # noqa: S607
+                "ps",
+                "-ww",
+                "-U",
+                str(uid),
+                "-o",
+                "pid=,ppid=,pgid=,args=",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except OSError as error:
+        return f"ps cannot be run: {error}"
+    except subprocess.TimeoutExpired:
+        return f"ps did not answer within {timeout:g} seconds"
+    if found.returncode != 0:
+        said = found.stderr.strip().splitlines()
+        detail = said[0][:MAX_COMMAND_CHARACTERS] if said else "nothing"
+        return f"ps failed with status {found.returncode} and said {detail}"
+    return parse_tree(found.stdout)
+
+
+def descendants(rows: Sequence[TreeRow], root: int) -> list[TreeRow]:
+    """Every process below ``root`` in ``rows`` by parent, and every member of a
+    group that ``root`` or one of those leads, without ``root``, lowest pid first.
+    The walk visits each row at most once, so it ends within ``len(rows)`` passes.
+
+    **Platform limit.** A process whose parent has already exited has been given to
+    the system's first process, or a subreaper, so its tree no longer leads here.
+    Only the process mark can find it, which this platform may not let Dromon read."""
+    children: dict[int, list[TreeRow]] = {}
+    for row in rows:
+        children.setdefault(row.ppid, []).append(row)
+    found: dict[int, TreeRow] = {}
+    frontier = [root]
+    while frontier:
+        parent = frontier.pop()
+        for row in children.get(parent, ()):
+            if row.pid != root and row.pid not in found:
+                found[row.pid] = row
+                frontier.append(row.pid)
+    groups = {root} | {row.pgid for row in found.values() if row.pgid == row.pid}
+    for row in rows:
+        if row.pgid in groups and row.pid != root and row.pid not in found:
+            found[row.pid] = row
+    return sorted(found.values(), key=lambda row: row.pid)
 
 
 def line_processes(
@@ -263,8 +368,10 @@ def line_processes(
     assignment = f"{MARK_VARIABLE}={mark}"
     environments = table.environments()
     found: list[dict[str, object]] = []
-    for process in sorted(table.own_processes(), key=lambda p: p.pid):
-        if _excluded(process, daemon_pid):
+    processes = table.own_processes()
+    launched = _launched(processes, daemon_pid)
+    for process in sorted(processes, key=lambda p: p.pid):
+        if _excluded(process, daemon_pid, launched):
             continue
         if assignment not in environments.get(process.pid, ()):
             continue
@@ -278,6 +385,34 @@ def line_processes(
     return found
 
 
+def marked_processes(
+    table: ProcessTable, daemon_pid: int
+) -> dict[str, list[tuple[int, str]]]:
+    """Every process of the daemon's user that carries a line's mark, of this run or
+    an earlier one, with its pid and its command cut to ``MAX_COMMAND_CHARACTERS``,
+    by the line the mark names, oldest pid first. The daemon, its launchers and their
+    engines are left out. Only readable environments are searched."""
+    prefix = f"{MARK_VARIABLE}="
+    environments = table.environments()
+    processes = table.own_processes()
+    launched = _launched(processes, daemon_pid)
+    found: dict[str, list[tuple[int, str]]] = {}
+    for process in sorted(processes, key=lambda p: p.pid):
+        if _excluded(process, daemon_pid, launched):
+            continue
+        for entry in environments.get(process.pid, ()):
+            if not entry.startswith(prefix):
+                continue
+            mark = entry[len(prefix) :]
+            line_id = mark.rsplit(".", 1)[0] if "." in mark else ""
+            if line_id:
+                found.setdefault(line_id, []).append(
+                    (process.pid, process.command[:MAX_COMMAND_CHARACTERS])
+                )
+            break
+    return found
+
+
 def stop_line_process(
     table: ProcessTable, mark: str, daemon_pid: int, pid: int, force: bool
 ) -> str:
@@ -285,10 +420,11 @@ def stop_line_process(
     checking its mark again now. Returns what was done, or raises ``ProcessRefused``."""
     if type(pid) is not int or pid <= 1:
         raise ProcessRefused("pid must be a whole number above 1")
-    process = next((p for p in table.own_processes() if p.pid == pid), None)
+    processes = table.own_processes()
+    process = next((p for p in processes if p.pid == pid), None)
     if process is None:
         raise ProcessRefused(f"process {pid} is not one of yours")
-    if _excluded(process, daemon_pid):
+    if _excluded(process, daemon_pid, _launched(processes, daemon_pid)):
         raise ProcessRefused(f"process {pid} is the daemon or a line's engine")
     if not table.has_variable(pid, f"{MARK_VARIABLE}={mark}"):
         raise ProcessRefused(f"process {pid} is not one of yours")

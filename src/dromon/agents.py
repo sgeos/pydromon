@@ -38,6 +38,7 @@ import hmac
 import json
 import secrets
 import sys
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Final, Protocol, cast
@@ -130,27 +131,136 @@ def _capped(access: AgentAccess, ceiling: AgentAccess) -> AgentAccess:
     return access if access.rank <= ceiling.rank else ceiling
 
 
+LINE_TOKEN_IDLE_SECONDS: Final = 3600.0
+"""How long a line token stays valid without use between turns. **Row 12 of the T3
+Code review, and review F15.** A token never expires while its line's turn runs, which
+the turn's own deadline bounds, so a tool call late in a long turn is not refused.
+Expiry bounds only a revocation that never came, such as one lost with an engine
+process that outlived its turn."""
+
+
 class LineTokens:
     """Tokens through which an engine that cannot host Dromon's tools in process,
-    such as Grok Build, reaches them over ``dromon mcp --line``. Each line has one token
-    for the daemon's life, held only in memory, so a restart invalidates them all."""
+    such as Grok Build, reaches them over ``dromon mcp --line``, held only in memory,
+    so a restart invalidates them all.
 
-    def __init__(self) -> None:
+    **Row 12 of the T3 Code review, and review F14.** A token is scoped to one engine
+    process. The scheduler renews a line's token as a turn starts a new process, which
+    revokes the one before, and revokes it when that process ends. Every engine that
+    uses tokens today starts its process for the turn and ends it within the turn, so
+    its token ends with the turn. An engine whose process outlives its turn keeps its
+    token between turns, with ``finish``, and has a liveness check, with ``bind``, so
+    that a call after its process ended is refused and revokes the token. A token
+    also expires after ``LINE_TOKEN_IDLE_SECONDS`` without use between turns. So a
+    bridge child that outlived its engine holds a token that no longer works.
+    ``issue`` returns the line's current token, or a new one, for an engine being
+    built."""
+
+    def __init__(self, clock: Callable[[], float] | None = None) -> None:
         self._tokens: dict[str, str] = {}
+        self._used: dict[str, float] = {}
+        """When each token was issued, last checked or last left by a turn, on
+        ``clock``."""
+        self._busy: set[str] = set()
+        """Lines whose turn is running, whose token does not expire."""
+        self._alive: dict[str, Callable[[], bool]] = {}
+        """Each line's check of whether the process its token belongs to still runs,
+        for an engine whose process outlives its turn."""
+        self._clock: Callable[[], float] = clock or _monotonic
 
     def issue(self, line_id: str) -> str:
-        if ID_PATTERN.fullmatch(line_id) is None:
-            raise AgentError(f"line {line_id!r} is not an identifier")
-        return self._tokens.setdefault(line_id, new_token())
+        """The line's current token, or a new one when it has none."""
+        _check_line(line_id)
+        token = self._tokens.get(line_id)
+        if token is None or self._expired(line_id):
+            return self._new(line_id)
+        return token
+
+    def renew(self, line_id: str) -> str:
+        """A new token for a turn that starts a new engine process, which revokes the
+        one before. It does not expire until the turn ends."""
+        token = self._new(line_id)
+        self._busy.add(line_id)
+        return token
+
+    def begin(self, line_id: str) -> str | None:
+        """Keep the line's token for a turn on the engine process that already holds
+        it, and return it, or ``None`` when it has none or it expired."""
+        _check_line(line_id)
+        if line_id not in self._tokens or self._expired(line_id):
+            self.revoke(line_id)
+            return None
+        self._busy.add(line_id)
+        return self._tokens[line_id]
+
+    def finish(self, line_id: str) -> None:
+        """The line's turn ended and its engine's process still runs, so its token
+        stays, and from now expires after ``LINE_TOKEN_IDLE_SECONDS`` unused."""
+        self._busy.discard(line_id)
+        if line_id in self._tokens:
+            self._used[line_id] = self._clock()
+
+    def bind(self, line_id: str, alive: Callable[[], bool]) -> None:
+        """Check ``alive`` at each use of the line's token, which is refused and
+        revoked once the engine's process has ended."""
+        self._alive[line_id] = alive
+
+    def revoke(self, line_id: str) -> None:
+        """End the line's token, as its engine's process ends. A line with none is
+        left as it is."""
+        self._tokens.pop(line_id, None)
+        self._used.pop(line_id, None)
+        self._busy.discard(line_id)
+        self._alive.pop(line_id, None)
 
     def check(self, line_id: object, token: object) -> str:
-        """The line ``token`` belongs to, or ``AgentError``."""
+        """The line ``token`` belongs to, or ``AgentError``. A valid check counts as
+        a use, which keeps the token from expiring."""
         if not isinstance(line_id, str) or not isinstance(token, str):
             raise AgentError("line and token must be text")
         issued = self._tokens.get(line_id)
         if issued is None or not hmac.compare_digest(issued, token):
             raise AgentError(f"line {line_id} needs its token")
+        if self._expired(line_id):
+            self.revoke(line_id)
+            raise AgentError(f"line {line_id}'s token expired unused")
+        alive = self._alive.get(line_id)
+        if alive is not None and not _still(alive):
+            self.revoke(line_id)
+            raise AgentError(f"line {line_id}'s engine process has ended")
+        self._used[line_id] = self._clock()
         return line_id
+
+    def _new(self, line_id: str) -> str:
+        _check_line(line_id)
+        token = new_token()
+        self._tokens[line_id] = token
+        self._used[line_id] = self._clock()
+        self._alive.pop(line_id, None)
+        return token
+
+    def _expired(self, line_id: str) -> bool:
+        if line_id in self._busy:
+            return False
+        used = self._used.get(line_id)
+        return used is None or self._clock() - used > LINE_TOKEN_IDLE_SECONDS
+
+
+def _still(alive: Callable[[], bool]) -> bool:
+    """``alive``'s answer, and ``False`` when it fails, which fails closed."""
+    try:
+        return alive()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _monotonic() -> float:
+    return time.monotonic()
+
+
+def _check_line(line_id: str) -> None:
+    if ID_PATTERN.fullmatch(line_id) is None:
+        raise AgentError(f"line {line_id!r} is not an identifier")
 
 
 # Tools.

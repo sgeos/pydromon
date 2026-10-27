@@ -58,6 +58,8 @@ from dromon.acp import bridge_command as bridge_command
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
 from dromon.engine import EngineRefused, TurnReport, read_instructions
+from dromon import launcher
+from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
 
@@ -340,26 +342,23 @@ async def _grok_agent(
     found = shutil.which("grok")
     if found is None:
         raise EngineRefused("the grok command is not installed or not on PATH")
+    command, launched, policy = launcher.wrap([found, *arguments], environment)
     process = await asyncio.create_subprocess_exec(
-        found,
-        *arguments,
+        *command,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
         cwd=cwd,
-        env=dict(environment),
+        env=launched,
         limit=MAX_LINE,
+        start_new_session=True,
     )
     try:
         yield _Process(process)
     finally:
-        if process.returncode is None:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=10)
-            except TimeoutError:
-                process.kill()
-                await process.wait()
+        # The launcher ends the agent and, by the line's stop policy, its group and
+        # every descendant, which Grok's detached tool groups need.
+        await launcher.end(process, policy, close_input=False)
 
 
 @dataclass(slots=True)
@@ -437,6 +436,7 @@ class GrokLine:
         environment = engine_environment(self._environment, strategy)
         if self.mark is not None:
             environment[MARK_VARIABLE] = self.mark
+        environment[STOP_POLICY_VARIABLE] = self.config.stop_policy.value
         reason = unsupported(self.config)
         if reason is not None:
             raise EngineRefused(reason)

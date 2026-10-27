@@ -142,7 +142,17 @@ ACP has no tools hosted by the client, so a Grok line reaches its own tools, suc
 `send_message`, through `dromon mcp --line LINE`, which Grok starts as a stdio MCP
 server. The bridge connects to `lines.sock` in the runtime directory, mode 0600, which
 the daemon always opens. A request there must carry the token the daemon issued for
-that line, held only in memory, and it serves only that line's own tools.
+that line, held only in memory, and it serves only that line's own tools. **Row 12 of
+the T3 Code review, 2026-10-26.** The token is renewed as each turn starts Grok's
+process and revoked as that process ends, which is within the turn. It does not expire
+while the turn runs, and expires after an hour without use between turns.
+
+**Rows 1 and 2 of the T3 Code review, 2026-10-26.** Grok runs under Dromon's
+launcher, which ends Grok's whole process group and every descendant a walk of the
+process table finds, which covers the nested groups a second implementation saw
+Grok's tools start, or leaves them and records them under the `leave_background` stop
+policy. Before this, Dromon signalled the agent process only. [`LINE_CONFIG.md`](LINE_CONFIG.md)
+specifies the stop policy.
 
 ## Not verified
 

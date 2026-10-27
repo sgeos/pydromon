@@ -447,6 +447,42 @@ held within the limit, and both lines raise questions.
 lines, catches a runaway among any number of lines, and a single operator message
 resets it, which matches the intent of an operator supervising the work.
 
+**Implemented 2026-10-26, from rows 1, 2, 4, 5 and 12 of the T3 Code review and the
+operator's decisions A and B.** Daemon guarantees, each specified in
+[`../protocol/LINE_CONFIG.md`](../protocol/LINE_CONFIG.md) and
+[`../protocol/CLIENT.md`](../protocol/CLIENT.md).
+
+- **A stop stops.** An operator's interrupt withdraws the line's pending wake and holds
+  the line until released, and a kept engine connection that still runs work after
+  its interrupt is closed.
+- **Nothing outlives its owner.** Every harness runs under `dromon.launcher`, a watcher
+  that ends it when the daemon stops it or dies. `stop_policy` decides whether
+  everything the harness started ends with it, the default, which fails closed, or is
+  left and recorded with its pids as `processes_left`. Processes found by the line's
+  mark after its engine ended are recorded as detached. **Platform limits.** The
+  launcher polls its parent, and its walk of the process table needs `ps`, without
+  which a `kill_all` turn is refused. On Linux the launcher is a child subreaper, so
+  it adopts a descendant that lost its parent. Elsewhere such a descendant, in a
+  session of its own, is found only by the mark, which macOS 27 does not let the
+  daemon read, and the daemon records and shows that gap.
+- **A bounded ceiling.** `keep_session_at_max` decides whether a kept connection closes,
+  asks an operator or keeps going at `keep_session_max_seconds`, with
+  `keep_session_hard_seconds` as a bound on every choice. The default is `close`.
+- **A stable prompt cache.** Every Claude Code line runs with tool search pinned on.
+- **Honest outcomes.** A result with no turn behind it is not a turn, a system message
+  Dromon does not handle is surfaced, a reported fallback to a model the driver was
+  not written for refuses the turn, a consent fallback is put to an operator, a
+  request for a human decision is refused with the way to ask an operator, and a
+  line's condition and each turn's outcome are named.
+- **Tokens per engine process.** A line token is renewed as a turn starts a new engine
+  process and revoked when that process ends, never expires while a turn runs, and
+  expires when idle between turns.
+
+**Porting note.** The launcher is a Python process today. A port replaces it with a
+native watcher, using `kqueue` on macOS and a pidfd or `PR_SET_PDEATHSIG` on Linux in
+place of the poll, `prctl` for the subreaper, and `waitid` or `kqueue` to see the
+harness exit without reaping it.
+
 ## Stream processors and scheduling
 
 **Decided.** In the Keleusma version, each model has its own per-turn or per-sub-turn

@@ -4,31 +4,30 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-26, Antigravity on its ACP runtime
+## 2026-10-26, stop policies and a process launcher
 
-**Done.** On the operator's decision of 2026-10-26, after a review of T3 Code, a second
-implementation that runs these engines for real, the Antigravity adapter moved from
-`agy --print` to Google's ACP runtime, `agy_acp_server`.
+**Done.** On the operator's decisions of 2026-10-26, from the review of T3 Code.
 
-- **Work.** The Opus `worker` line wrote `acp.py`, an engine-neutral ACP client, moved
-  `grok.py` onto it, and rewrote `antigravity.py`. The packaged model became
-  `gemini-3.8-flash-high`, which a user report shows exists. The Haiku `reviewer` line
-  reviewed it twice, and three fix rounds followed.
-- **Fail closed.** No tool kind is exempt from the name check, on either engine. Each
-  call's identity is recorded at first sight, and any later change refuses the turn. A
-  tool is named only by its structured `toolName`, never its title. A model change, an
-  unknown profile setting or a missing sign-in file refuses. The runtime gets an empty
-  home directory of its own. Grok's cancel is now bounded.
-- **Refusals.** MCP control is lifted. Deny-before-run is partial, since tools the
-  runtime runs without asking are stopped only after they start, so daemon lines stay
-  refused. The credential stays unverified, so the probe still needs both flags.
+- **Settings.** `stop_policy` chooses `kill_all`, the default, or `leave_background`.
+  `keep_session_at_max` chooses `close`, `ask` or `keep` at the keep-session ceiling,
+  always under `keep_session_hard_seconds`.
+- **Launcher.** Every harness runs under `dromon-launch`, which ends it with the daemon.
+  A daemon sweeps the group of any harness whose launcher died, at start-up and at
+  each rest of at most 60 seconds.
+- **Outcomes.** An interrupt holds the line and closes a session still running work.
+  A resume handoff is not a turn. Tool search is pinned. Line tokens live as long as
+  the engine process. Recorded commands are redacted.
+- **Work.** The Opus `worker` line wrote it over five rounds, the Haiku `reviewer`
+  line reviewed it twice, and the operator's session checked it live four times with
+  Claude Haiku 5.5, which found three faults the tests had not.
 
-**Not verified.** Nothing ran against a real runtime. `ANTIGRAVITY.md` and `GROK.md`
-each list what to verify first. If either runtime names Dromon's tools only by title,
-every use of them is refused. The checksums, version and download location come from
-unverified third-party material.
+**Verified live on macOS.** A turn through the launcher, the daemon killed with
+`SIGKILL`, an ordinary stop under each policy, an interrupt, a resumed session after a
+restart, and the launcher alone killed, swept within 57 seconds.
 
-**For the operator.**
-1. Decide whether `keep_session_max_seconds` may end background work still running.
-   The recommendation is an operator question at the limit, with a 24-hour hard stop.
-2. Install the runtime and sign in by hand per `ANTIGRAVITY.md` before a probe.
+**Not verified.** The Linux subreaper and parent-death signal, a background command in a
+session of its own, and a `~/.claude.json` that sets tool search. The verify-first list
+is in `LINE_CONFIG.md`.
+
+**For the operator.** Under `leave_background` Claude Code is killed without an orderly
+exit, since a closed input makes it end its own background work.
