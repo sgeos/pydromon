@@ -10,9 +10,11 @@ their model checks and codec, the `role_status` tool, the project file's roles
 recorded at start and on reload, the seat tools `record_role_note`,
 `relinquish_ownership` and `take_ownership`, and the client operations with the
 `dromon role` and `dromon budget` commands are implemented, as is the rule that a seat
-whose engine cannot confine it waits while another seat owns its role. The read-only
-sandbox itself, the question at an owner that does not hand over and budgets from plan
-limits are not yet built. Facts about the present code are marked as such.
+whose engine cannot confine it waits while another seat owns its role. Automatic
+switching, which is the failover policy, the planned handoff by budget and the budgets
+engines report at a plan limit, is implemented as step 3, amended by the operator on
+2026-10-27. The read-only sandbox itself and the question at an owner that does not
+hand over are not yet built. Facts about the present code are marked as such.
 
 ## Terms
 
@@ -33,15 +35,15 @@ could be meant, this document says ownership handoff.
 ## The data model
 
 A seat is an ordinary line. It keeps its own engine session, mailbox, limits, cost,
-mute and hold, so everything the daemon does for a line it does for a seat. What a role
+hibernate and hold, so everything the daemon does for a line it does for a seat. What a role
 adds is a binding, one owner and a journal, all of it in the event log, so it survives
 a restart and a port carries it unchanged.
 
 | Event | Fields | Records |
 |---|---|---|
-| `role_declared` | `role_id`, `workdir`, `handoff_seconds` | A role, its worktree relative to the project root, and how long a planned handoff may take, an hour by default |
+| `role_declared` | `role_id`, `workdir`, `handoff_seconds`, `seats`, `failover`, `handoff_below_percent` | A role, its worktree relative to the project root, how long a planned handoff may take, an hour by default, its seats in the order a failover follows, its failover policy, and the budget below which its owner is asked to prepare a handoff |
 | `seat_bound` | `line_id`, `role_id`, `may_own` | A line becomes a seat of a role. `may_own` false makes a seat that may read and advise but never own |
-| `ownership_changed` | `role_id`, `owner` or null, `previous` or null, `cause`, `by`, `entry_id` or null, `changed_at`, `back_to` or null | Every change of owner. `cause` is `declared`, `handoff`, `recovery`, `operator` or `relinquished`. `by` is the operator or seat that made it. `back_to` is a handoff's seat to return to |
+| `ownership_changed` | `role_id`, `owner` or null, `previous` or null, `cause`, `by`, `entry_id` or null, `changed_at`, `back_to` or null | Every change of owner. `cause` is `declared`, `handoff`, `recovery`, `operator`, `relinquished` or `failover`. `by` is the operator or seat that made it. `back_to` is a handoff's seat to return to |
 | `role_noted` | `role_id`, `entry_id`, `line_id`, `kind`, `body`, `workdir_commit`, `daemon_commit`, `noted_at` | A journal entry. `kind` is `handoff`, `recovery` or `note`. The daemon stamps both commits itself, read from `HEAD`, so the stamp is observed and not claimed |
 | `budget_stated` | `provider`, `remaining_percent` or null, `resets_at` or null, `source`, `note`, `stated_at` | A provider's budget. `source` is `operator` or `engine` |
 
@@ -65,8 +67,10 @@ lines. The first owner is the seat the file names as `owner`, recorded with caus
 [roles.core]
 workdir = "tmp/worktrees/core"
 owner = "core"
-seats = ["core", "core-luna", "core-grok"]
+seats = ["core", "core-luna", "core-grok"]   # the order a failover follows
 handoff_seconds = 3600   # the default
+failover = "automatic"   # the default, or "ask"
+handoff_below_percent = 10   # the default, or 0 for never
 
 [lines.core-grok]
 model = "grok-4.7"
@@ -88,7 +92,7 @@ life.
 
 **An engine that cannot confine a seat.** **Inference.** Not every adapter can make one
 directory read only. A seat on such an engine is not woken while another seat owns the
-role. Its mail waits, as a muted line's does, until it owns the role or the operator
+role. Its mail waits, as a hibernated line's does, until it owns the role or the operator
 lets it run unconfined. This is default deny. Which adapters can confine a seat is for
 the engines role to establish, and the capability table is where it is recorded.
 **Implemented,** except the operator's leave to run unconfined, which is not built.
@@ -124,8 +128,8 @@ The operator asks with `dromon role handoff ROLE --to SEAT`, or in words to the 
    and mail in flight, and calls `relinquish_ownership` with a handoff note and the
    successor's identifier.
 3. The daemon records the note as a `role_noted` entry of kind `handoff`, stamped with
-   both commits, then `ownership_changed` with cause `handoff`. It unmutes the
-   successor if it was muted, and sends it a note that wakes it with the entry's
+   both commits, then `ownership_changed` with cause `handoff`. It awakens the
+   successor if it was hibernated, and sends it a note that wakes it with the entry's
    identifier.
 4. The successor reads the entry with `role_status`, checks it as the next section
    checks a recovery, and continues.
@@ -137,8 +141,18 @@ the checks not performed, and the next step.
 
 **Short alternation.** `relinquish_ownership` takes an optional `back_to`. When the
 successor next relinquishes, ownership returns to that seat with cause `handoff` and no
-operator step, so two seats can pass a role back and forth for a few tasks. The seat
-list has no order, and any seat with `may_own` can receive a role.
+operator step, so two seats can pass a role back and forth for a few tasks. Any seat
+with `may_own` can receive a role by a handoff, whatever its place in the order.
+
+**A handoff asked for by budget.** **Implemented, at the operator's instruction of
+2026-10-27.** When a provider's budget is stated above 0 and below a role's
+`handoff_below_percent`, 10 percent unless the role declares otherwise, and the role's
+owner runs on that provider, the daemon asks the owner to prepare a handoff to the seat
+a failover would choose, with the handoff note's template. The request is a note from
+the owner's own address, as a scheduled wake is, since the harness has no address of
+its own and must not claim an operator's. It is not priority mail, so the owner's work
+in flight is not cut short. With no usable seat the owner is not asked, and the
+statement's output says so. A threshold of 0 never asks.
 
 **An owner that does not hand over.** If the owner has not relinquished within the
 role's `handoff_seconds` of the request, an hour unless the role declares otherwise, the
@@ -148,7 +162,41 @@ keep, so the question waits for an event that records a handoff request.
 
 **Implemented.** `dromon role handoff` checks that the successor is a live seat that
 may own the role, then sends the request with the handoff note's template. An owner
-that is muted reads it once unmuted, and the command says so.
+that is hibernated reads it once awakened, and the command says so.
+
+## Automatic failover
+
+**Decided by the operator on 2026-10-27, implemented as step 3.** Each role has a
+failover policy, `automatic` by default or `ask`. When the owner cannot act, by the
+first three rows of the recovery table below, the harness itself applies the policy.
+It looks when one of the owner's turns ends, which covers a turn held at a plan limit,
+and when an operator states a budget for the owner's provider. It never moves a role
+while the owner's turn is in flight, and the statement's output says the role fails
+over when that turn ends.
+
+Under `automatic` the role passes to the next usable seat in the declared order, from
+the owner round to the front. A seat is usable when it may own the role, is not
+stopped, hibernated, held or failed, and its provider's stated budget does not show it
+spent. The change is recorded with cause `failover` and rests on a note entry that says
+the harness wrote it, why, and from whom to whom. The new owner is woken by a note to
+itself, and its turn leads with the recovery checklist. The operator who last wrote to
+the former owner is told in a note recorded as from the former owner, as a hold's
+question is. With no usable seat nothing changes, and the operator is told once until
+what it would be told changes.
+
+Under `ask` no owner changes. A plan limit holds the owner and asks the operator as it
+always has, and `dromon role take` gives the role to another seat.
+
+**Fact.** A hibernated seat is not usable, at the operator's instruction, so an alternate
+that is hibernated at creation is passed over until an operator awakens it. Its awakening
+does not by itself fail the role over. The next statement of the owner's budget, or the
+end of the owner's next turn, does.
+
+**What counts as unable to act.** The plan-limit hold of the recovery table, with the
+budget an engine reports, and a budget stated at 0 percent whose reset has not passed.
+Each engine's out-of-credit errors are classified only where their shape is on
+record, as the next section says. A turn that fails in any other way holds the line as
+before, and is not a ground.
 
 ## Recovery
 
@@ -162,7 +210,7 @@ operator can always take.
 **Implemented.** `dromon role take ROLE --seat SEAT` gives the role and `dromon role
 vacate ROLE` leaves it vacant, each with cause `operator`. Either is refused while the
 owner has a turn in flight, and says to interrupt it first. A seat given the role is
-unmuted and sent a note from the operator, which wakes it once no former writer's turn
+awakened and sent a note from the operator, which wakes it once no former writer's turn
 is in flight, and its turn leads with the recovery checklist. An operator's take has no
 journal entry, since the model takes entries only from seats.
 
@@ -199,7 +247,7 @@ changes, if any, are named in the recovery record it can read.
 **Fact.** Any line may already send any line a note, so seats of a role can message
 each other today. **Implemented.** `role_status`, a tool offered only to a seat,
 lists the role's worktree and handoff bound, the owner and the latest change of owner,
-each seat's condition, mute, model, provider, stated budget and worktree commit, and
+each seat's condition, hibernation, model, provider, stated budget and worktree commit, and
 the role's latest five journal entries, the newest with its body, so a seat can find
 its peers. Until the budget step, each engine counts as its own provider. A note between seats is ordinary line mail, data from its
 sender like any other, and counts toward the autonomous limits as mail between lines
@@ -214,21 +262,37 @@ configuration.
 
 **Sources.** An operator states a budget with `dromon budget set PROVIDER` and a
 remaining percentage, a reset time or both. An engine reports one when it stops at a
-plan limit. **Fact.** The Claude Code and Codex adapters already raise a plan limit,
-and Codex sometimes reports a reset time with it. That becomes `budget_stated` with
-`remaining_percent` 0, `source` `engine`, and the reset time where one was given. A
+plan limit, which becomes `budget_stated` with `remaining_percent` 0, `source`
+`engine`, and the reset time where one was given in the model's form. **Implemented.**
+The classification of each engine is as follows, and each rests on a shape that is on
+record. Only Codex's camel-case shapes were observed live, by the operator on
+2026-10-27, from a Codex app-server probe with no credit left.
+
+| Engine | Classified as budget exhausted | Source of the shape |
+|---|---|---|
+| Claude Code | A failed turn while the engine's latest `rate_limit_event` has status `rejected` and its overage is not `allowed` or `allowed_warning`, with its reset time. An assistant message whose `error` is `billing_error`, in any turn | The `RateLimitInfo` and `AssistantMessageError` types of the installed Agent SDK |
+| Codex | A turn that does not complete after an `error` notice, or with a `turn.error`, whose `codexErrorInfo` is `usageLimitExceeded`, with the reset time read from its message. Before any turn fails, an `account/rateLimits/updated` notice whose `credits` has `hasCredits` and `unlimited` both false, which records the budget at 0 with no reset at once. The older snake-case codes and phrases of [`CODEX.md`](../protocol/CODEX.md) still count, and their reset time stays in the hold's text | The camel-case shapes observed live on 2026-10-27. The snake-case codes are inferred and unverified |
+| Grok, Pi, Cursor, Antigravity | Nothing. A failed turn holds the line as before | No shape is on record |
+
+**Inference.** The engine reports a change of rate-limit status, not each turn, so the
+Claude Code adapter keeps the latest across turns. A rebuilt engine starts with none,
+so a failure before its first report is not classified. A
 stated budget is not adjusted by the cost of later turns, since a per-turn cost does
 not convert reliably to a plan's percentage, so a statement is a snapshot with its time.
 **Implemented** for an operator. `dromon budget set` accepts only an engine's name as
 the provider until the budget step, since a statement for any other name would ground
 nothing, and `dromon budget` and `dromon role status` show each statement with its
-source and time. The engine's report at a plan limit is not built yet.
+source and time. **Implemented** for engines. A plan limit an engine reports records
+the budget, and so does a Codex notice of no credit left, which fails an owner over at
+once when it arrives between the owner's turns.
 
-**Use.** `role_status` and `dromon status` show each seat's provider budget and its
-source and age. The harness does not move ownership by budget alone. When an owner is
-held at a plan limit, the daemon asks the operator a question with the role's other
-seats as choices, ordered by stated budget, and an answer that names a seat makes the
-recovery.
+**Use.** `role_status` and `dromon role` show the failover policy, the threshold, the
+seat a failover would choose now, and each seat in the failover order with its
+provider's budget, its source and its time, and whether it is usable. A budget at 0
+percent fails an owner over, and a budget below the threshold asks for a planned
+handoff, as the sections above say. **Superseded on 2026-10-27.** The earlier design
+had the harness move no role by budget, and ask the operator with the other seats as
+choices instead. That question is not built, and `ask` keeps the hold's question.
 
 ## Mapping the existing lines
 
@@ -236,14 +300,14 @@ recovery.
 its role's first seat and owner, keeping its identity, session and mailbox. An
 alternate seat is named for its role and its engine.
 
-| Role | Worktree | First seat and owner | Alternate seats, created muted |
+| Role | Worktree | First seat and owner | Alternate seats, created hibernated |
 |---|---|---|---|
 | core | `tmp/worktrees/core` | `core` | `core-luna`, `core-grok` |
 | engines | `tmp/worktrees/engines` | `engines` | `engines-opus`, `engines-grok` |
 | review | `tmp/worktrees/review` | `review` | `review-luna`, `review-grok` |
 
-The alternate seats are created muted, so that they spend nothing until a handoff or a
-recovery unmutes them, and the Grok seats have `may_own` false until an operator probe
+The alternate seats are created hibernated, so that they spend nothing until a handoff or a
+recovery awakens them, and the Grok seats have `may_own` false until an operator probe
 has run Grok live in Dromon. The review role's owner writes only its report, as today.
 The lines `worker`, `reviewer` and `luna` are retired and are no longer declared. A
 line without a role behaves exactly as today.
@@ -264,6 +328,26 @@ line without a role behaves exactly as today.
   the owner it replaces.
 - **Approximate budget.** A budget is a snapshot from an operator or a plan-limit
   report, and is shown with its source and age.
+- **A misclassified limit.** A failure counted as budget exhausted when it was not
+  moves the role and records the provider spent until an operator states otherwise.
+  The Claude Code shapes come from the Agent SDK's types, and Codex's snake-case codes
+  are inferred. Codex's camel-case shapes were observed live. **Open question.** Only an
+  account with no credit and no reported plan window was observed, so whether an
+  account with allowance left in a window also reports `hasCredits` false is unknown. If
+  it does, its notice records a spent budget where there is none. A limit not counted
+  holds the line, and the role stays put.
+- **A stale spent budget.** A statement of 0 percent with no reset time keeps its
+  provider's seats unusable until an operator states another budget. A Codex notice of
+  no credit left records such a statement. The turn that then fails at the limit
+  records the reset its message gives. A later notice with credit is not recorded,
+  since it states no percentage.
+- **A reset in the wrong zone.** Codex's limit message names no time zone, and is read
+  in the daemon host's local zone, on the inference that Codex formats it there. A
+  wrong zone moves the reset by whole hours.
+- **Failover at a restart.** A plan-limit hold is known only in the daemon run that saw
+  it, but its budget is in the log, so a failover after a restart still sees the
+  provider spent. The daemon does not look for a failover at its start. The first
+  statement of a budget, or the end of the owner's next turn, does.
 
 ## Decisions
 
@@ -275,9 +359,23 @@ them.
 2. A seat that does not own its role may read the worktree at any time, read only, and
    writes only `tmp/`.
 3. The primary seats are `core`, `engines` and `review`, and the alternates are named
-   for role and engine, muted at creation, with the Grok seats unable to own until the
+   for role and engine, hibernated at creation, with the Grok seats unable to own until the
    probe. `worker`, `reviewer` and `luna` are retired.
 4. The handoff bound is one hour, configurable per role as `handoff_seconds`.
+
+**Amended by the operator on 2026-10-27, for step 3.**
+
+5. Switching is automatic by default. Each role has a failover policy, `automatic` or
+   `ask`. Under `automatic` the harness passes the role to the next seat in the
+   declared order that may own it, is not hibernated, and has a provider with budget, and
+   records why, wakes the new owner with the recovery checklist and tells the
+   operator. Under `ask` it changes nothing and the operator decides.
+6. A stated budget below a role's threshold asks the owner to prepare a handoff to the
+   next seat.
+7. Each engine's out-of-credit errors are classified as budget exhausted only where
+   their shape is known. An unknown shape holds the line as before.
+8. External agents may not change ownership, and each engine is its own provider until
+   the budget step.
 
 ## Order of work
 
@@ -285,11 +383,13 @@ them.
    roles, recorded at the daemon's start and on reload. Both are done.
 2. `relinquish_ownership`, `take_ownership` and `record_role_note`, then the client
    operations and the `dromon role` and `dromon budget` commands. All are done.
-3. Read-only seats in each adapter's sandbox profile, which is the engines role's work,
+3. Automatic switching, which is the failover policy, the declared order, the
+   planned handoff by budget, and `budget_stated` from plan limits. Done.
+4. Read-only seats in each adapter's sandbox profile, which is the engines role's work,
    and the rule for seats that cannot be confined until then. The rule is done, and the
    profiles wait for the engines role's branch to merge.
-4. `budget_stated` from operators and from plan limits, and the operator question at a
-   held owner.
+5. The question at an owner that does not hand over within `handoff_seconds`, and
+   providers that are not engines, such as Pi's.
 
 ## Porting notes
 

@@ -28,6 +28,8 @@ from claude_agent_sdk import (
     Message,
     PermissionResultAllow,
     PermissionResultDeny,
+    RateLimitEvent,
+    RateLimitInfo,
     SdkMcpTool,
     ToolPermissionContext,
     ResultMessage,
@@ -39,12 +41,15 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
+from claude_agent_sdk.types import RateLimitStatus
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon.driver import Credential, Driver, Strategy, driver_resource
 from dromon.priority import SteeredDriver
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, McpServer, ToolPolicy
 from dromon.engine import (
     API_ENVIRONMENT,
+    BILLING_LIMIT,
+    EnginePlanLimit,
     KEY_SOURCES,
     MCP_SERVER_NAME,
     NON_SUBSCRIPTION_ENVIRONMENT,
@@ -498,3 +503,62 @@ def test_priority_mail_ends_the_turn_at_the_tool_result_and_not_the_text(
     assert asked == [1]
     assert report.interrupted_for == REASON
     assert session.interrupts == 1
+
+
+# Plan limits, roles step 3. A rejected window holds a turn that failed, and a billing
+# error holds any turn, as ``rejected_limit`` and ``BILLING_ERROR`` describe.
+
+RESETS = 1_793_199_600
+"""2026-10-28T15:00:00Z in seconds since the epoch."""
+
+
+def rate_limit(
+    status: RateLimitStatus, overage: RateLimitStatus | None = None
+) -> RateLimitEvent:
+    info = RateLimitInfo(status, RESETS, "five_hour", overage_status=overage)
+    return RateLimitEvent(info, "u-1", "session-1")
+
+
+def failed() -> ResultMessage:
+    message = result("success")
+    message.is_error = True
+    return message
+
+
+def test_a_failed_turn_after_a_rejected_window_is_a_plan_limit() -> None:
+    session = Scripted([init(), rate_limit("rejected"), failed()])
+    with pytest.raises(EnginePlanLimit, match="five_hour window") as raised:
+        run(line(session))
+    assert raised.value.resets_at == "2026-10-28T15:00:00Z"
+
+
+def test_a_turn_that_succeeds_past_a_rejected_window_is_kept() -> None:
+    session = Scripted([init(), rate_limit("rejected"), say(TextBlock("ok")), result()])
+    target = line(session)
+    assert run(target).text == "ok"
+    # The engine reports a change of status, not each turn, so the next turn that
+    # fails is held at the limit without a report of its own.
+    session.messages = list[Message]([init(), failed()])
+    with pytest.raises(EnginePlanLimit):
+        run(target)
+
+
+def test_a_window_served_by_overage_or_allowed_again_is_no_limit() -> None:
+    for messages in (
+        [init(), rate_limit("rejected", "allowed"), failed()],
+        [init(), rate_limit("rejected"), rate_limit("allowed"), failed()],
+        [init(), failed()],
+    ):
+        report = run(line(Scripted(messages)))
+        assert report.subtype == "success"
+
+
+def test_a_billing_error_is_a_plan_limit_even_in_a_turn_that_succeeds() -> None:
+    billing = AssistantMessage(content=[], model=MODEL, error="billing_error")
+    session = Scripted([init(), billing, result()])
+    with pytest.raises(EnginePlanLimit, match=BILLING_LIMIT) as raised:
+        run(line(session))
+    assert raised.value.resets_at is None
+    # Another error is not classified, so the turn ends as the engine ended it.
+    other = AssistantMessage(content=[], model=MODEL, error="rate_limit")
+    assert run(line(Scripted([init(), other, result()]))).subtype == "success"

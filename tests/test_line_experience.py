@@ -202,7 +202,7 @@ def test_line_status_shows_the_line_its_daemon_and_the_others(world: World) -> N
             "line_id": "beta",
             "state": "idle",
             "held": False,
-            "muted": False,
+            "hibernated": False,
             "workdir_commit": None,
             "leases": ["gate"],
         }

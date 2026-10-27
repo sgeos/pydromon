@@ -40,7 +40,8 @@ state by replaying the same log.
 | Time | Written as a due time is. An event whose time matters carries it, since the model never reads `recorded_at` |
 | Workdir | A relative path of at most 1,024 bytes, written with `/`, with no empty, `.` or `..` step, no `\` and no NUL, or `.` for the project root |
 | Commit | 40 or 64 lowercase hexadecimal characters, or empty where the daemon could not read one |
-| Ownership cause | `declared`, `handoff`, `recovery`, `operator` or `relinquished` |
+| Ownership cause | `declared`, `handoff`, `recovery`, `operator`, `relinquished` or `failover` |
+| Failover policy | `automatic` or `ask` |
 | Entry kind | `handoff`, `recovery` or `note` |
 | Budget source | `operator` or `engine` |
 
@@ -75,8 +76,8 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `project_overridden` | `overrides` text of at most 262,144 bytes | Always. The project's override document, replacing any earlier one |
 | `line_held` | `line_id`, `question_id` | The line exists and is not held, and the question is open and from the line. The daemon wakes the line no more until it is released |
 | `line_released` | `line_id` | The line is held |
-| `line_muted` | `line_id` | The line exists and is not muted. The daemon starts no turn of the line until it is unmuted, and its mail, session and pending scheduled wake are kept, as [`PRIORITY.md`](PRIORITY.md) specifies. Only an operator's `mute` records it. Added on 2026-10-27 |
-| `line_unmuted` | `line_id` | The line exists and is muted. Ends the mute. Only an operator's `unmute` records it. Added on 2026-10-27 |
+| `line_hibernated` | `line_id` | The line exists and is not hibernated. The daemon starts no turn of the line until it is awakened, and its mail, session and pending scheduled wake are kept, as [`PRIORITY.md`](PRIORITY.md) specifies. Only an operator's `hibernate` records it. Added on 2026-10-27. A log written before the rename of the same day holds it as `line_muted`, which still decodes as `line_hibernated` |
+| `line_awakened` | `line_id` | The line exists and is hibernated. Ends the hibernation. Only an operator's `awaken` records it. Added on 2026-10-27. A log written before the rename holds it as `line_unmuted`, which still decodes as `line_awakened` |
 | `operator_registered` | `operator_id` | The operator does not exist |
 | `agent_registered` | `agent_id`, `access`, `token_sha256` | Always. Registers the agent, or replaces its access and digest and restores it if revoked. A token itself is never stored |
 | `agent_revoked` | `agent_id` | The agent exists and is not revoked |
@@ -98,7 +99,7 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `question_withdrawn` | `message_id` | The message is a question and is open |
 | `question_superseded` | `message_id`, `superseded_by` | Both messages are open questions, they differ, and they come from the same line |
 | `context_handed_off` | `line_id`, `cause` of `rebound` or `cleared`, `outcome` of `given` or `opted_out`, `message_ids`, at most 64 identifiers, `chars`, a whole number from 0 to 1,048,576, and `sha256`, a lowercase hexadecimal SHA-256 digest when given and empty otherwise | The line exists and is owed a handoff for this cause, which `line_rebound` and `line_session_cleared` set, as their `rebound` and `cleared`. An `opted_out` handoff selects nothing, with no identifiers, zero `chars` and an empty digest. Ends the handoff. Only the daemon records it, once the engine ran the turn that carried it, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies. Added on 2026-10-27 |
-| `role_declared` | `role_id`, `workdir`, `handoff_seconds` a whole number from 60 to 86,400 | The role does not exist, or exists and this changes its workdir or its handoff bound, and its workdir changes only while no seat owns it. The handoff bound is how long an owner asked to hand the role over has before the operator is asked to recover it instead, an hour by default. Added on 2026-10-27 |
+| `role_declared` | `role_id`, `workdir`, `handoff_seconds` a whole number from 60 to 86,400, `seats` an array of at most 16 distinct line identifiers, `failover` failover policy, `handoff_below_percent` a whole number from 0 to 100 | The role does not exist, or exists and this changes any of its fields, and its workdir changes only while no seat owns it. The handoff bound is how long an owner asked to hand the role over has before the operator is asked to recover it instead, an hour by default. `seats` is the declared order a failover follows, and may name a line before it is bound. `failover` says whether the harness passes the role on itself when its owner cannot act. The owner is asked to prepare a handoff when its provider's stated budget is above 0 and below `handoff_below_percent`, and never when it is 0. A record written before step 3 of roles has only the first three fields, and decodes with an empty order, `automatic` and 10. Added on 2026-10-27, and the last three fields the same day, before any release |
 | `seat_bound` | `line_id`, `role_id`, `may_own` boolean | The line and the role exist, the line is a seat of no other role, and this is a new seat or changes the seat's `may_own`. A seat whose `may_own` is false never owns its role, and an owner cannot be made one. Added on 2026-10-27 |
 | `ownership_changed` | `role_id`, `owner` and `previous` line identifiers or `null`, `cause` ownership cause, `by` address, `entry_id` or `null`, `changed_at` time, `back_to` line identifier or `null` | See the ownership rules below. Added on 2026-10-27, and `back_to` the same day, before any release |
 | `role_noted` | `role_id`, `entry_id`, `line_id`, `kind` entry kind, `body` text of 1 to 65,536 bytes, `workdir_commit` and `daemon_commit` commits, `noted_at` time | No entry has the identifier, the role exists and the line is its seat. A `handoff` or `recovery` entry is by the role's current owner, and a `note` by any seat. The daemon stamps both commits itself from `HEAD`. Added on 2026-10-27 |
@@ -164,7 +165,9 @@ pending wake. It is the only message to itself that clears a scheduled wake.
 4. `declared` replaces no owner and `declared` and `operator` are made by an operator.
    `handoff` and `relinquished` are made by the previous owner, and `relinquished`
    leaves the role vacant. `recovery` names an owner and is made by an operator or by
-   the new owner itself, never by an external agent.
+   the new owner itself, never by an external agent. `failover` names the previous
+   owner and an entry, and is recorded by the new owner's address, since the log has
+   no address for the harness that makes it.
 5. `entry_id`, unless `null`, names an entry of the role. A `handoff` requires one, and
    it is the role's latest entry, a `handoff` entry by the previous owner.
 6. `back_to`, unless `null`, is on a `handoff`, differs from `owner`, and is a seat of
@@ -172,7 +175,9 @@ pending wake. It is the only message to itself that clears a scheduled wake.
    `owner` next relinquishes without naming a successor.
 
 The model checks that a change is consistent. The daemon checks that its maker had the
-authority, such as the harness-observed exhaustion that a seat's own recovery needs.
+authority, such as the harness-observed exhaustion that a seat's own recovery needs. Only
+the daemon records a `failover`, on the same grounds, under the role's `automatic`
+policy.
 
 **Line transitions.** `idle` to `running`, `running` to `idle`, `idle` to `stopped`,
 `running` to `stopped`, and `stopped` to `idle`. No other change is permitted, including

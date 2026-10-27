@@ -49,6 +49,7 @@ from dromon.model import (
     SeatBound,
     State,
     parse_due,
+    role_terms,
 )
 from dromon.projectconfig import ProjectConfig
 
@@ -110,14 +111,16 @@ def plan_roles(
 
     for role_id, definition in sorted(config.roles.items()):
         role = trial.roles.get(role_id)
-        if role is None or (role.workdir, role.handoff_seconds) != (
+        declared = RoleDeclared(
+            role_id,
             definition.workdir,
             definition.handoff_seconds,
-        ):
-            add(
-                role_id,
-                RoleDeclared(role_id, definition.workdir, definition.handoff_seconds),
-            )
+            definition.seats,
+            definition.failover,
+            definition.handoff_below_percent,
+        )
+        if role is None or role_terms(role) != role_terms(declared):
+            add(role_id, declared)
         for line_id in definition.seats:
             may_own = config.lines[line_id].may_own
             if trial.seats.get(line_id) != Seat(role_id, may_own):
@@ -445,10 +448,83 @@ def waits_unconfined(
     """Whether ``line_id`` may not start a turn because it is a seat of a role that
     another seat owns and its ``engine`` is not in ``confining``, so nothing would
     keep it from writing the owner's worktree. **Default deny.** Its mail waits, as a
-    muted line's does, until it owns the role, the role is vacant, or its engine can
-    confine it. A seat of a vacant role runs, so that it can take the role."""
+    hibernated line's does, until it owns the role, the role is vacant, or its engine
+    can confine it. A seat of a vacant role runs, so that it can take the role."""
     seat = state.seats.get(line_id)
     if seat is None:
         return False
     owner = state.roles[seat.role_id].owner
     return owner is not None and owner != line_id and engine not in confining
+
+
+def seat_order(state: State, role_id: str) -> tuple[str, ...]:
+    """``role_id``'s seats in the order a failover follows, which is the declared
+    order with any name that is not a seat of the role left out, and then any other
+    seat in the order it was bound, so a seat bound by a client is not lost. Bounded
+    by the seats in the log."""
+    bound = [line for line, seat in state.seats.items() if seat.role_id == role_id]
+    declared = [line for line in state.roles[role_id].seats if line in bound]
+    return (*declared, *(line for line in bound if line not in declared))
+
+
+def next_seat(
+    order: tuple[str, ...], after: str | None, usable: frozenset[str]
+) -> str | None:
+    """The first seat of ``order`` in ``usable`` after ``after``, wrapping round, so
+    the seats after the owner come before the ones ahead of it, or ``None`` when no
+    seat is usable. ``after`` absent from the order starts at the front. The owner
+    itself is never chosen."""
+    start = order.index(after) + 1 if after in order else 0
+    for step in range(len(order)):
+        candidate = order[(start + step) % len(order)]
+        if candidate != after and candidate in usable:
+            return candidate
+    return None
+
+
+def plan_failover(
+    state: State,
+    role_id: str,
+    to: str,
+    ground: str,
+    entry_id: str,
+    stamp: Stamp,
+) -> Plan:
+    """The harness passes ``role_id`` from its owner to ``to``, on ``ground``, which
+    is what it observed of the owner. The entry the change rests on says the harness
+    wrote it, since the model takes entries only from seats and this one is filed
+    under the seat made owner. ``RoleConflict`` when the model refuses the change."""
+    role = state.roles.get(role_id)
+    if role is None:
+        raise RoleConflict(f"no role {role_id}")
+    if role.owner is None:
+        raise RoleConflict(f"role {role_id} is vacant, so it has no owner to fail over")
+    body = (
+        f"Failover, recorded by the harness and not written by {to}. Role {role_id}"
+        f" passed from {role.owner} to {to}, the next usable seat in the declared"
+        f" order, because {ground}."
+    )
+    entry = _entry(role_id, entry_id, to, RoleNoteKind.NOTE, body, stamp)
+    try:
+        change = OwnershipChanged(
+            role_id,
+            to,
+            role.owner,
+            OwnershipCause.FAILOVER,
+            LineAddress(to),
+            entry_id,
+            stamp.at,
+        )
+    except InvalidField as error:
+        raise RoleConflict(str(error)) from error
+    events = _checked(state, [entry, change])
+    return Plan(events, role_id, to, role.owner, entry_id, "")
+
+
+def below_handoff_threshold(role: Role, budget: BudgetStated | None) -> bool:
+    """Whether ``budget`` asks ``role``'s owner to prepare a handoff, which is a
+    stated percentage above 0 and below the role's threshold. A threshold of 0 never
+    asks, and 0 percent is a failover's ground, not a planned handoff's."""
+    if budget is None or budget.remaining_percent is None:
+        return False
+    return 0 < budget.remaining_percent < role.handoff_below_percent

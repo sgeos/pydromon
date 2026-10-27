@@ -106,9 +106,9 @@ argument outside a tool's schema is refused.
 | `list_sent` | Lists what became of the line's sent mail |
 | `acquire_lease`, `release_lease` | Take and give up a lease the project declares, as below |
 | `line_status` | Shows the line's own state, its daemon and the other lines, read only, as below |
-| `role_status` | Offered only to a seat of a role. Shows the role's worktree, owner and latest change of owner, its seats with their condition, worktree access, whether each waits because its engine cannot confine it, model, provider and stated budget, and its latest five journal entries, the newest with its body, read only, as [`ROLES.md`](../architecture/ROLES.md) describes. Added on 2026-10-27 |
+| `role_status` | Offered only to a seat of a role. Shows the role's worktree, failover policy, handoff threshold, owner, the seat a failover would pass it to now and the latest change of owner, its seats in the failover order with whether each is usable for a failover, their condition, worktree access, whether each waits because its engine cannot confine it, model, provider and stated budget, and its latest five journal entries, the newest with its body, read only, as [`ROLES.md`](../architecture/ROLES.md) describes. Added on 2026-10-27 |
 | `record_role_note` | Offered only to a seat. Records a journal entry of `kind` `note`, by any seat, or `recovery`, by the owner, which the daemon stamps with the role worktree's commit, its own commit and the time. A handoff entry is written only by `relinquish_ownership`. Added on 2026-10-27 |
-| `relinquish_ownership` | Offered only to a seat, and refused unless it owns its role. Records the handoff `note` as a handoff entry and gives the role to the seat `to`, or with no `to` to the seat the handoff that gave it the role named as `back_to`, or else leaves it vacant. A return to a seat that can no longer own the role leaves it vacant and says so. A successor is unmuted and sent a note from the former owner. `back_to`, which needs `to`, is the seat the role returns to when the successor next relinquishes without naming one. Added on 2026-10-27 |
+| `relinquish_ownership` | Offered only to a seat, and refused unless it owns its role. Records the handoff `note` as a handoff entry and gives the role to the seat `to`, or with no `to` to the seat the handoff that gave it the role named as `back_to`, or else leaves it vacant. A return to a seat that can no longer own the role leaves it vacant and says so. A successor is awakened and sent a note from the former owner. `back_to`, which needs `to`, is the seat the role returns to when the successor next relinquishes without naming one. Added on 2026-10-27 |
 | `take_ownership` | Offered only to a seat that may own its role. Takes the role, with cause `recovery`, only on a ground the harness observes, which is a vacant role, an owner held at a plan limit its engine reported in this daemon run, or an owner whose provider budget is recorded as 0 percent with no reset time passed, and never while the owner has a turn in flight. The `reason` of 1 to 4,096 bytes and the ground are recorded as a note entry that the change rests on. Added on 2026-10-27 |
 | `read_instructions` | Shows the instructions the line's next turn receives, as below |
 | `write_scratch` | Writes a file under `tmp/` in the line's working directory, as below |
@@ -118,13 +118,13 @@ argument outside a tool's schema is refused.
 in this section.
 
 **`line_status`.** No arguments. It returns JSON for the calling line: its `state`, the
-question holding it as `held_by`, whether an operator `muted` it, its `autonomous_turns` used and allowed, its estimated
+question holding it as `held_by`, whether an operator `hibernated` it, its `autonomous_turns` used and allowed, its estimated
 `cost_usd` since its last release and its limit, its `leases` with their ends, its
 `scheduled_wake`, its `unread` mail and `pending` deliveries, its `model` and
 `strategy`, its `workdir` as configured and as `workdir_path` resolved, its
 `engine_session`, and its `kept_session`, as the kept sessions section below specifies.
 It adds a `daemon` object, a `commits` object, an `event_log` object and, for every
-other line, its `line_id`, `state`, whether it is `held` and `muted`, its
+other line, its `line_id`, `state`, whether it is `held` and `hibernated`, its
 `workdir_commit`, and the names of its `leases`. It holds no configuration document and
 no message body.
 

@@ -422,10 +422,11 @@ class LineReleased:
 
 
 @dataclass(frozen=True, slots=True)
-class LineMuted:
-    """An operator muted the line's wakes. **Decided by the operator on 2026-10-27.**
+class LineHibernated:
+    """An operator hibernated the line. **Decided by the operator on 2026-10-27.**
     The line keeps its mail, its session and its pending scheduled wake, and starts
-    no turn until it is unmuted. A turn already running finishes."""
+    no turn until it is awakened. A turn already running finishes. The operator
+    renamed it from mute the same day, and ``line_muted`` still decodes as this."""
 
     line_id: str
 
@@ -434,8 +435,9 @@ class LineMuted:
 
 
 @dataclass(frozen=True, slots=True)
-class LineUnmuted:
-    """A muted line may be woken again, by the mail and wakes it kept."""
+class LineAwakened:
+    """A hibernated line may be woken again, by the mail and wakes it kept.
+    ``line_unmuted`` still decodes as this."""
 
     line_id: str
 
@@ -809,11 +811,26 @@ whether to recover it instead. One hour, configurable per role, as the operator
 decided on 2026-10-27."""
 MIN_HANDOFF_SECONDS: Final = 60
 MAX_HANDOFF_SECONDS: Final = 86400
+DEFAULT_HANDOFF_BELOW_PERCENT: Final = 10
+"""The stated budget below which an owner is asked to prepare a handoff, as the
+operator asked on 2026-10-27. **Assumption.** Ten percent is a starting value the
+operator may change per role. Zero turns the planned handoff by budget off."""
+MAX_ROLE_SEATS: Final = 16
+"""The most seats a role's declared order names, a bound on every walk of it."""
 MAX_ROLE_NOTE_BYTES: Final = 64 * 1024
 """The largest journal entry, which fits the handoff template with room to spare."""
 MAX_BUDGET_NOTE_BYTES: Final = 1024
 COMMIT_PATTERN: Final = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 """A git commit, SHA-1 or SHA-256, in lowercase hexadecimal."""
+
+
+class FailoverPolicy(StrEnum):
+    """What the harness does when a role's owner cannot act."""
+
+    AUTOMATIC = "automatic"
+    """The harness passes the role to the next usable seat in the declared order."""
+    ASK = "ask"
+    """The harness changes no owner, and an operator decides."""
 
 
 class OwnershipCause(StrEnum):
@@ -827,6 +844,9 @@ class OwnershipCause(StrEnum):
     """An operator gave the role to a seat, or left it vacant."""
     RELINQUISHED = "relinquished"
     """The owner gave the role up with no successor."""
+    FAILOVER = "failover"
+    """The harness itself passed the role from an owner it observed unable to act to
+    the next usable seat, under the role's automatic failover policy."""
 
 
 class RoleNoteKind(StrEnum):
@@ -883,16 +903,35 @@ def check_commit(name: str, value: object) -> None:
 @dataclass(frozen=True, slots=True)
 class RoleDeclared:
     """A role and its worktree, relative to the project root, with how long a
-    planned handoff may take. Declaring a role again changes these, and is refused
-    when nothing changes or when the worktree would change while a seat owns it."""
+    planned handoff may take, its seats in the declared order a failover follows,
+    its failover policy, and the stated budget below which its owner is asked to
+    prepare a handoff. Declaring a role again changes these, and is refused when
+    nothing changes or when the worktree would change while a seat owns it. The
+    order may name a line before it is bound, since the seats are bound after the
+    role, and a failover skips any name that is not a seat of the role."""
 
     role_id: str
     workdir: str
     handoff_seconds: int = DEFAULT_HANDOFF_SECONDS
+    seats: tuple[str, ...] = ()
+    failover: FailoverPolicy = FailoverPolicy.AUTOMATIC
+    handoff_below_percent: int = DEFAULT_HANDOFF_BELOW_PERCENT
 
     def __post_init__(self) -> None:
         check_id("role_id", self.role_id)
         check_workdir(self.workdir)
+        if type(self.seats) is not tuple or len(self.seats) > MAX_ROLE_SEATS:
+            raise InvalidField(f"seats must be a list of at most {MAX_ROLE_SEATS}")
+        for seat in self.seats:
+            check_id("seats", seat)
+        if len(set(self.seats)) != len(self.seats):
+            raise InvalidField("seats names a line twice")
+        check_member("failover", self.failover, FailoverPolicy)
+        percent = self.handoff_below_percent
+        if type(percent) is not int or not 0 <= percent <= 100:
+            raise InvalidField(
+                "handoff_below_percent must be a whole number from 0 to 100"
+            )
         seconds = self.handoff_seconds
         if type(seconds) is not int or not (
             MIN_HANDOFF_SECONDS <= seconds <= MAX_HANDOFF_SECONDS
@@ -984,6 +1023,18 @@ class OwnershipChanged:
             and self.by.line_id != self.owner
         ):
             raise InvalidField("a seat recovers a role only for itself")
+        # The log has no address for the harness itself, so a failover names the
+        # seat it made owner, and its cause and the entry it rests on say the
+        # harness made it.
+        if cause is OwnershipCause.FAILOVER and (
+            self.previous is None
+            or self.entry_id is None
+            or self.by != LineAddress(str(self.owner))
+        ):
+            raise InvalidField(
+                "a failover names the previous owner and its entry, and is recorded"
+                " by the seat made owner"
+            )
         if cause is OwnershipCause.RECOVERY and isinstance(self.by, AgentAddress):
             raise InvalidField("an external agent does not recover a role")
 
@@ -1060,8 +1111,8 @@ type Event = (
     | ProjectOverridden
     | LineHeld
     | LineReleased
-    | LineMuted
-    | LineUnmuted
+    | LineHibernated
+    | LineAwakened
     | OperatorRegistered
     | AgentRegistered
     | AgentRevoked
@@ -1121,9 +1172,9 @@ class Line:
     handoff: str | None = None
     """Why the line's next turn starts a new engine session and is owed a context
     handoff, ``rebound`` or ``cleared``, until ``context_handed_off`` ends it."""
-    muted: bool = False
-    """Whether an operator muted the line's wakes, from ``line_muted`` until
-    ``line_unmuted``."""
+    hibernated: bool = False
+    """Whether an operator hibernated the line, from ``line_hibernated`` until
+    ``line_awakened``."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1181,12 +1232,31 @@ class Role:
     changed: OwnershipChanged | None = None
     """The role's latest ``ownership_changed``, which a former owner's next turn is
     told of."""
+    seats: tuple[str, ...] = ()
+    """The declared order of the role's seats, which a failover follows."""
+    failover: FailoverPolicy = FailoverPolicy.AUTOMATIC
+    handoff_below_percent: int = DEFAULT_HANDOFF_BELOW_PERCENT
 
 
 @dataclass(frozen=True, slots=True)
 class Seat:
     role_id: str
     may_own: bool
+
+
+type RoleTerms = tuple[str, int, tuple[str, ...], FailoverPolicy, int]
+
+
+def role_terms(role: Role | RoleDeclared) -> RoleTerms:
+    """What a declaration of a role sets, so a declaration that changes none of it
+    is known as such."""
+    return (
+        role.workdir,
+        role.handoff_seconds,
+        role.seats,
+        role.failover,
+        role.handoff_below_percent,
+    )
 
 
 @dataclass(slots=True)
@@ -1296,12 +1366,12 @@ class State:
             case LineReleased():
                 if self._line(event.line_id).held_by is None:
                     raise EventRejected(f"line {event.line_id} is not held")
-            case LineMuted():
-                if self._line(event.line_id).muted:
-                    raise EventRejected(f"line {event.line_id} is muted")
-            case LineUnmuted():
-                if not self._line(event.line_id).muted:
-                    raise EventRejected(f"line {event.line_id} is not muted")
+            case LineHibernated():
+                if self._line(event.line_id).hibernated:
+                    raise EventRejected(f"line {event.line_id} is hibernated")
+            case LineAwakened():
+                if not self._line(event.line_id).hibernated:
+                    raise EventRejected(f"line {event.line_id} is not hibernated")
             case OperatorRegistered():
                 if event.operator_id in self.operators:
                     raise EventRejected(f"operator {event.operator_id} exists")
@@ -1398,12 +1468,12 @@ class State:
             case LineReleased():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, held_by=None)
-            case LineMuted():
+            case LineHibernated():
                 line = self.lines[event.line_id]
-                self.lines[event.line_id] = replace(line, muted=True)
-            case LineUnmuted():
+                self.lines[event.line_id] = replace(line, hibernated=True)
+            case LineAwakened():
                 line = self.lines[event.line_id]
-                self.lines[event.line_id] = replace(line, muted=False)
+                self.lines[event.line_id] = replace(line, hibernated=False)
             case LineSession():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(
@@ -1502,12 +1572,21 @@ class State:
             case RoleDeclared():
                 role = self.roles.get(event.role_id)
                 self.roles[event.role_id] = (
-                    Role(event.workdir, event.handoff_seconds)
+                    Role(
+                        event.workdir,
+                        event.handoff_seconds,
+                        seats=event.seats,
+                        failover=event.failover,
+                        handoff_below_percent=event.handoff_below_percent,
+                    )
                     if role is None
                     else replace(
                         role,
                         workdir=event.workdir,
                         handoff_seconds=event.handoff_seconds,
+                        seats=event.seats,
+                        failover=event.failover,
+                        handoff_below_percent=event.handoff_below_percent,
                     )
                 )
             case SeatBound():
@@ -1731,10 +1810,7 @@ class State:
         role = self.roles.get(event.role_id)
         if role is None:
             return
-        if (role.workdir, role.handoff_seconds) == (
-            event.workdir,
-            event.handoff_seconds,
-        ):
+        if role_terms(role) == role_terms(event):
             raise EventRejected(f"role {event.role_id} is declared so already")
         if role.workdir != event.workdir and role.owner is not None:
             raise EventRejected(

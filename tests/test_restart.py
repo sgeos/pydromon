@@ -382,18 +382,18 @@ def test_tasks_that_begin_during_the_drain_abandon_the_restart(
     assert status is not None and "lines beta" in cast(str, status["reason"])
 
 
-def test_a_muted_line_is_interrupted_by_a_restart_and_stays_muted_after(
+def test_a_hibernated_line_is_interrupted_by_a_restart_and_stays_hibernated_after(
     world: World,
 ) -> None:
     gate = asyncio.Event()
     world.gates["alpha"] = [gate]
     wake_id, _ = world.scheduler.schedule_wake("beta", 600, "later")
-    world.scheduler.mute("beta")
+    world.scheduler.hibernate("beta")
 
     async def act() -> None:
         world.scheduler.send(ANA, ALPHA, "work on it")
         await until(lambda: world.scheduler.running_lines() == ["alpha"])
-        world.scheduler.mute("alpha")
+        world.scheduler.hibernate("alpha")
         world.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 60)
         gate.set()
 
@@ -402,15 +402,15 @@ def test_a_muted_line_is_interrupted_by_a_restart_and_stays_muted_after(
     world.restart()
     run(world, nothing)
     state = world.log.state
-    assert state.lines["alpha"].muted and state.lines["beta"].muted
+    assert state.lines["alpha"].hibernated and state.lines["beta"].hibernated
     assert state.scheduled["beta"].message_id == wake_id
-    # The note waits for the unmute, like any mail of a muted line.
+    # The note waits for the awaken, like any mail of a hibernated line.
     assert len(world.prompts["alpha"]) == 1
 
-    async def unmute() -> None:
-        world.scheduler.unmute("alpha")
+    async def awaken() -> None:
+        world.scheduler.awaken("alpha")
 
-    run(world, unmute)
+    run(world, awaken)
     assert len(world.prompts["alpha"]) == 2
     assert "daemon restart" in world.prompts["alpha"][1]
 

@@ -361,7 +361,7 @@ def test_the_role_tools_are_offered_only_to_a_seat(world: World) -> None:
 def test_a_handoff_records_the_note_and_the_change_and_wakes_the_successor(
     world: World,
 ) -> None:
-    world.scheduler.mute("beta")
+    world.scheduler.hibernate("beta")
     text, error = world.call(
         "alpha",
         RELINQUISH_OWNERSHIP_TOOL_NAME,
@@ -383,7 +383,7 @@ def test_a_handoff_records_the_note_and_the_change_and_wakes_the_successor(
         "the gate passed",
     )
     assert entry.workdir_commit == WORKTREE_COMMIT
-    assert not world.log.state.lines["beta"].muted
+    assert not world.log.state.lines["beta"].hibernated
     wake(world)
     assert len(world.prompts("beta")) == 1
     (note,) = world.mail("alpha", "beta")
@@ -610,9 +610,9 @@ def test_an_operator_take_waits_for_the_owners_turn_and_wakes_the_new_owner(
     world: World,
 ) -> None:
     """An operator may always take, but not while the owner has a turn in flight.
-    Once it has ended, the take succeeds, the seat given the role is unmuted and
+    Once it has ended, the take succeeds, the seat given the role is awakened and
     woken by the operator's note, and its turn leads with the recovery checklist."""
-    world.scheduler.mute("beta")
+    world.scheduler.hibernate("beta")
     world.gates["alpha"] = asyncio.Event()
     world.scripts["alpha"].append([{"tool": "gate"}])
     refusals: list[str] = []
@@ -636,7 +636,7 @@ def test_an_operator_take_waits_for_the_owners_turn_and_wakes_the_new_owner(
         "beta",
         OwnershipCause.OPERATOR,
     )
-    assert not world.log.state.lines["beta"].muted
+    assert not world.log.state.lines["beta"].hibernated
     assert world.order == ["start alpha", "end alpha", "start beta", "end beta"]
     (prompt,) = world.prompts("beta")
     assert RECOVERY_CHECKLIST in prompt

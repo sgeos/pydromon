@@ -95,6 +95,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field, fields, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final, Protocol, cast
 
@@ -108,6 +109,8 @@ from claude_agent_sdk import (
     PermissionMode,
     PermissionResultAllow,
     PermissionResultDeny,
+    RateLimitEvent,
+    RateLimitInfo,
     ResultMessage,
     SdkMcpTool,
     StreamEvent,
@@ -146,6 +149,7 @@ from dromon.ceiling import (
 )
 from dromon.driver import TOOL_RESULT, ActionTag, Credential, Driver, Event, Strategy
 from dromon.lineconfig import DEFAULT_CONFIG, ConfigError, LineConfig
+from dromon.model import format_due
 from dromon.processes import MARK_VARIABLE
 from dromon.sandbox import blocks_unsandboxed
 
@@ -265,7 +269,51 @@ class EngineRefused(Exception):
 
 
 class EnginePlanLimit(EngineRefused):
-    """The subscription reached a plan limit and needs operator release."""
+    """The subscription reached a plan limit and needs operator release.
+    ``resets_at`` is the reset time the engine reported, in the model's
+    ``YYYY-MM-DDTHH:MM:SSZ`` form, or ``None`` when it gave none in a known form."""
+
+    def __init__(self, message: str, resets_at: str | None = None) -> None:
+        super().__init__(message)
+        self.resets_at = resets_at
+
+
+BILLING_ERROR: Final = "billing_error"
+"""The error an assistant message carries when the account cannot pay for the call.
+**Inference, read from the ``AssistantMessageError`` type of the installed Agent SDK
+on 2026-10-27, not observed live.** Dromon counts it as the provider's budget
+exhausted, since it is what an account with no usable credit reports."""
+
+BILLING_LIMIT: Final = (
+    "Claude reported a billing error, so its account has no usable credit"
+)
+
+OVERAGE_IN_USE: Final = frozenset({"allowed", "allowed_warning"})
+"""Overage statuses under which a rejected window is still served from overage."""
+
+
+def rejected_limit(info: RateLimitInfo) -> EnginePlanLimit | None:
+    """The plan limit a ``rate_limit_event`` reports, or ``None`` while the account
+    can still be served. **Inference, read from the ``RateLimitInfo`` type of the
+    installed Agent SDK on 2026-10-27, not observed live.** Its ``status`` is
+    ``rejected`` once a window's limit is hit, and its ``overage_status`` says
+    whether overage serves the account past it. A reset time in seconds since the
+    epoch is kept in the model's form, and one that is not a whole number or out of
+    range is left out rather than guessed at."""
+    if info.status != "rejected" or info.overage_status in OVERAGE_IN_USE:
+        return None
+    resets_at: str | None = None
+    if type(info.resets_at) is int:
+        try:
+            resets_at = format_due(datetime.fromtimestamp(info.resets_at, UTC))
+        except (OverflowError, OSError, ValueError):
+            resets_at = None
+    window = info.rate_limit_type or "unnamed"
+    suffix = "" if resets_at is None else f", which resets at {resets_at}"
+    return EnginePlanLimit(
+        f"Claude subscription plan limit reached in its {window} window{suffix}",
+        resets_at,
+    )
 
 
 MAX_INSTRUCTION_BYTES: Final = 256 * 1024
@@ -1464,6 +1512,8 @@ class _Turn:
     last_main_call: dict[str, int | bool] | None = None
     """The latest main-loop call since the turn began or the session was last
     compacted, from which the context is estimated."""
+    billing: bool = False
+    """Whether an assistant message of the turn carried ``BILLING_ERROR``."""
 
 
 type PermissionGate = Callable[
@@ -1822,6 +1872,12 @@ class ClaudeCodeLine:
         scheduler can wake the line."""
         self._clock = clock
         self._poll_seconds = poll_seconds
+        self._limit: EnginePlanLimit | None = None
+        """The plan limit the engine's latest ``rate_limit_event`` reported, if it
+        reported one, which a failed turn is held at. The engine reports a change of
+        status, not each turn, so the latest is kept across turns. **Assumption.** A
+        rebuilt engine starts with none, so a failure before its first report holds
+        the line as any failure does."""
         self._kept: _Connection | None = None
         self._turn: _Turn | None = None
         """The turn in progress, if any, whose init check the gate waits for."""
@@ -1988,7 +2044,19 @@ class ClaudeCodeLine:
         cost = None if result is None else self._measure(result)
         if turn.refusal is not None:
             raise EngineRefused(turn.refusal)
+        self._check_limit(result, turn)
         return self._report(result, turn, cost)
+
+    def _check_limit(self, result: ResultMessage | None, turn: _Turn) -> None:
+        """Raise ``EnginePlanLimit`` when the turn shows the provider's budget
+        exhausted, which is an assistant message with a billing error, or a turn
+        that ended in error while the engine's latest report was a rejected limit. A
+        turn that succeeded is kept, even past a limit, so its work is counted."""
+        if turn.billing:
+            raise EnginePlanLimit(BILLING_LIMIT)
+        failed = result is None or result.is_error
+        if failed and self._limit is not None:
+            raise EnginePlanLimit(str(self._limit), self._limit.resets_at)
 
     async def _enter[S](
         self,
@@ -2153,7 +2221,11 @@ class ClaudeCodeLine:
             await self._fallen_back(session, message, turn)
         elif isinstance(message, SystemMessage):
             self._surface(message.subtype)
+        elif isinstance(message, RateLimitEvent):
+            self._limit = rejected_limit(message.rate_limit_info)
         elif isinstance(message, AssistantMessage):
+            if message.error == BILLING_ERROR:
+                turn.billing = True
             if turn.require_init and turn.capabilities is None:
                 if turn.refusal is None:
                     turn.refusal = (
@@ -2871,4 +2943,5 @@ class ClaudeCodeLine:
         if turn.refusal is not None:
             await self.close()
             raise EngineRefused(turn.refusal)
+        self._check_limit(result, turn)
         return self._report(result, turn, cost)

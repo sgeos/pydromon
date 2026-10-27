@@ -443,8 +443,8 @@ class Daemon:
                 | Operation.LINE_VIEW
                 | Operation.LINE_ACTIVITY
                 | Operation.INTERRUPT
-                | Operation.MUTE
-                | Operation.UNMUTE
+                | Operation.HIBERNATE
+                | Operation.AWAKEN
                 | Operation.RESTART
                 | Operation.SETTINGS
                 | Operation.SET_SETTING
@@ -494,19 +494,23 @@ class Daemon:
                     (line_id,) = _text_args(request.args, ("line_id",))
                     interrupted = self.scheduler.interrupt(line_id)
                     result = {"line_id": line_id, "interrupted": interrupted}
-                case Operation.MUTE:
+                case Operation.HIBERNATE:
                     (line_id,) = _text_args(request.args, ("line_id",))
-                    changed = self.scheduler.mute(line_id)
+                    changed = self.scheduler.hibernate(line_id)
                     result = {
                         "line_id": line_id,
-                        "muted": True,
+                        "hibernated": True,
                         "changed": changed,
                         "running": self.scheduler.condition(line_id) == "running",
                     }
-                case Operation.UNMUTE:
+                case Operation.AWAKEN:
                     (line_id,) = _text_args(request.args, ("line_id",))
-                    changed = self.scheduler.unmute(line_id)
-                    result = {"line_id": line_id, "muted": False, "changed": changed}
+                    changed = self.scheduler.awaken(line_id)
+                    result = {
+                        "line_id": line_id,
+                        "hibernated": False,
+                        "changed": changed,
+                    }
                 case Operation.RESTART:
                     result = self._restart(request.args)
                 case Operation.SETTINGS:
@@ -552,7 +556,7 @@ class Daemon:
                         "owner": owner,
                         "to": to,
                         "message_id": message_id,
-                        "owner_muted": self.log.state.lines[owner].muted,
+                        "owner_hibernated": self.log.state.lines[owner].hibernated,
                     }
                 case Operation.BUDGETS:
                     _text_args(request.args, ())

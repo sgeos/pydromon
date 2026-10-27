@@ -51,8 +51,9 @@ def no_engine(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> LineEngine:
 
 class Desk:
     """A daemon over a real event log, with role core on the project root, seats
-    alpha, beta and gamma, alpha its owner, beta muted and gamma unable to own, and a
-    line delta that is a seat of no role. The client's requests reach it directly."""
+    alpha, beta and gamma, alpha its owner, beta hibernated and gamma unable to own,
+    and a line delta that is a seat of no role. The client's requests reach it
+    directly."""
 
     def __init__(self, paths: ProjectPaths) -> None:
         self.paths = paths
@@ -82,7 +83,7 @@ class Desk:
             ),
         ):
             self.log.append(event)
-        self.scheduler.mute("beta")
+        self.scheduler.hibernate("beta")
 
     def call(
         self, socket: Path, operation: Operation, args: dict[str, object] | None = None
@@ -147,10 +148,15 @@ def test_role_status_shows_the_owner_the_seats_and_the_last_change(
     assert status == exits.OK
     lines = out.splitlines()
     assert lines[0] == "role core in ., owner alpha, handoff within 3600 seconds"
-    assert "last change declared by @ana" in lines[1]
+    assert lines[1] == (
+        "  failover automatic, next seat none, handoff asked below 10 percent"
+    )
+    assert "last change declared by @ana" in lines[2]
     seats = [line for line in lines if line.startswith("  seat ")]
     assert [line.split()[1] for line in seats] == ["alpha", "beta", "gamma"]
-    assert "owner" in seats[0] and "muted" in seats[1] and "may not own" in seats[2]
+    assert (
+        "owner" in seats[0] and "hibernated" in seats[1] and "may not own" in seats[2]
+    )
     # No engine confines a seat yet, so the seats that do not own wait.
     waits = "waits, its engine cannot confine it"
     assert [waits in line for line in seats] == [False, True, True]
@@ -179,7 +185,7 @@ def test_role_entry_prints_one_entry_with_its_body(desk: Desk, dromon: Run) -> N
 # dromon role take and vacate.
 
 
-def test_an_operator_gives_a_role_and_the_seat_is_unmuted_and_told(
+def test_an_operator_gives_a_role_and_the_seat_is_awakened_and_told(
     desk: Desk, dromon: Run
 ) -> None:
     status, out, _ = dromon(
@@ -196,7 +202,7 @@ def test_an_operator_gives_a_role_and_the_seat_is_unmuted_and_told(
     )
     assert change.changed_at == format_due(NOW)
     assert "ben" in desk.log.state.operators
-    assert not desk.log.state.lines["beta"].muted
+    assert not desk.log.state.lines["beta"].hibernated
     (note,) = desk.notes(BEN, "beta")
     assert "gave you role core" in note and "recovery checklist" in note
 
@@ -307,13 +313,16 @@ def test_a_handoff_request_is_priority_mail_to_the_owner(
     assert desk.log.state.roles["core"].owner == "alpha"
 
 
-def test_a_handoff_request_to_a_muted_owner_says_it_waits(
+def test_a_handoff_request_to_a_hibernated_owner_says_it_waits(
     desk: Desk, dromon: Run
 ) -> None:
-    desk.scheduler.mute("alpha")
+    desk.scheduler.hibernate("alpha")
     status, out, _ = dromon("role", "handoff", "core", "--to", "beta")
     assert status == exits.OK
-    assert out.splitlines()[1] == "alpha is muted, so it reads the request once unmuted"
+    assert (
+        out.splitlines()[1]
+        == "alpha is hibernated, so it reads the request once awakened"
+    )
 
 
 @pytest.mark.parametrize(
@@ -360,6 +369,13 @@ def test_an_operator_states_a_budget_and_the_list_shows_it_spent(
     )
     assert status == exits.OK
     assert out.startswith(f"{PROVIDER}: 0 percent, resets 2026-10-28T00:00:00Z")
+    # The owner's provider is spent, and beta is hibernated and gamma may not own the
+    # role, so no seat can take it, which the statement's output says.
+    assert out.splitlines()[1] == (
+        "Role core stays with alpha, which cannot act because its owner alpha's"
+        " provider budget is recorded as 0 percent, since no other seat may own it,"
+        " is awakened, not held, and has a provider with budget."
+    )
     stated = desk.log.state.budgets[PROVIDER]
     assert (stated.source, stated.note, stated.stated_at) == (
         BudgetSource.OPERATOR,
@@ -374,6 +390,9 @@ def test_an_operator_states_a_budget_and_the_list_shows_it_spent(
     status, out, _ = dromon("role")
     (alpha,) = [line for line in out.splitlines() if line.startswith("  seat alpha")]
     assert "budget 0 percent, resets 2026-10-28T00:00:00Z, stated by operator" in alpha
+    assert "not usable for failover" not in alpha
+    (beta,) = [line for line in out.splitlines() if line.startswith("  seat beta")]
+    assert "not usable for failover" in beta
 
 
 def test_a_budget_with_a_passed_reset_is_not_spent(desk: Desk, dromon: Run) -> None:

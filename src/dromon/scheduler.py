@@ -19,11 +19,11 @@ except priority mail, which ``dromon.priority`` describes. After a restart, ever
 undelivered message in the log was sent in an earlier tick, so it starts in the post
 office. A line may send itself a note, which wakes it in a later turn like other mail.
 
-Mute. An operator may mute a line, recorded as ``line_muted``, so that it starts no
-turn, by mail, a scheduled wake, a task note or a ceiling answer, until it is
-unmuted. Its mail waits, its session is kept, and its scheduled wake stays pending
-and fires once the line is unmuted. A turn running when the line is muted finishes,
-unless an operator also interrupts it.
+Hibernation. An operator may hibernate a line, recorded as ``line_hibernated``, so
+that it starts no turn, by mail, a scheduled wake, a task note or a ceiling answer,
+until it is awakened. Its mail waits, its session is kept, and its scheduled wake
+stays pending and fires once the line is awakened. A turn running when the line is
+hibernated finishes, unless an operator also interrupts it.
 
 Restart. An operator may restart the daemon to upgrade it, as ``dromon.restart``
 describes. While a restart drains, no turn starts and no scheduled wake fires, and in
@@ -180,6 +180,10 @@ from dromon.workdir import git_write_guards, read_head_commit, resolve_workdir
 from dromon.roles import (
     CONFINING_ENGINES,
     Plan,
+    below_handoff_threshold,
+    next_seat,
+    plan_failover,
+    seat_order,
     RoleConflict,
     Stamp,
     budget_spent,
@@ -211,6 +215,9 @@ from dromon.lineconfig import (
     rooted_instructions,
 )
 from dromon.model import (
+    MAX_BUDGET_NOTE_BYTES,
+    FailoverPolicy,
+    check_instant,
     Address,
     BudgetSource,
     BudgetStated,
@@ -224,10 +231,10 @@ from dromon.model import (
     LineConfigured,
     LineCreated,
     LineHeld,
-    LineMuted,
+    LineHibernated,
     LineOverridden,
     LineReleased,
-    LineUnmuted,
+    LineAwakened,
     LineSession,
     LineSessionCleared,
     LineRebound,
@@ -901,6 +908,11 @@ class LineSpec:
     redirect: Callable[[], str | None] = field(default=lambda: None, compare=False)
     """Asked at each safe point of a turn, as ``dromon.priority`` describes. A reason
     ends the turn there, as a driver's interrupt does, and ``None`` lets it go on."""
+    credits_spent: Callable[[str], object] = field(
+        default=lambda note: None, compare=False
+    )
+    """Where an engine reports, with a note, that its account has no credit left,
+    before any turn fails, which a Codex engine does."""
 
 
 type EngineFactory = Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], LineEngine]
@@ -972,6 +984,7 @@ def engine_factory(
                 compaction_estimated=spec.compaction_estimated,
                 ceiling_reached=spec.ceiling_reached,
                 ceiling_settled=spec.ceiling_settled,
+                credits_spent=spec.credits_spent,
             )
         if driver.settings.engine == grok.ENGINE_NAME:
             if project_sandbox is not None or project_settings is not None:
@@ -1299,6 +1312,10 @@ class Scheduler:
         self._hold = hold_wakes
         self._engines: dict[str, LineEngine] = {}
         self._plan_held: dict[str, str] = {}
+        self._failover_told: dict[str, str] = {}
+        """What each role's operator was last told of a failover that found no seat,
+        so the same is not told at every turn's end. Lost at a restart, after which
+        it is told once again."""
         """The question each line was held with at a plan limit its engine reported,
         which a seat's own recovery may rest on while the hold lasts. In memory, so
         after a restart only a provider budget recorded as 0 percent shows that an
@@ -1575,7 +1592,7 @@ class Scheduler:
 
     def _restart_redirect(self, line_id: str) -> str | None:
         """``restart.REASON`` once for a running line while a restart drains in its
-        ``interrupt`` mode, muted or not, since the operator asked for it."""
+        ``interrupt`` mode, hibernated or not, since the operator asked for it."""
         plan = self._restart
         if (
             plan is None
@@ -1595,7 +1612,7 @@ class Scheduler:
 
     def _priority_redirect(self, line_id: str) -> str | None:
         """The priority note's reason to end ``line_id``'s turn, once, or ``None``. A
-        muted line's turn is not ended, and its priority note waits."""
+        hibernated line's turn is not ended, and its priority note waits."""
         message_id = self._redirect_for.get(line_id)
         if message_id is None or line_id not in self._running:
             return None
@@ -1605,7 +1622,7 @@ class Scheduler:
         if line is None or message is None or message.delivered:
             self._redirect_for.pop(line_id, None)
             return None
-        if line.muted:
+        if line.hibernated:
             return None
         del self._redirect_for[line_id]
         reason = priority.REASON.format(message_id=message_id, sender=message.sender)
@@ -1618,28 +1635,28 @@ class Scheduler:
         )
         return reason
 
-    # Wake mute, decided by the operator on 2026-10-27.
+    # Hibernation, decided by the operator on 2026-10-27.
 
-    def mute(self, line_id: str) -> bool:
-        """Mute ``line_id``'s wakes, and say whether it was not muted already. A turn
+    def hibernate(self, line_id: str) -> bool:
+        """Hibernate ``line_id``, and say whether it was not hibernated already. A turn
         in flight finishes. Raises ``EventRejected`` for an unknown line."""
         line = self._log.state.lines.get(line_id)
         if line is None:
             raise EventRejected(f"no line {line_id}")
-        if line.muted:
+        if line.hibernated:
             return False
-        self._log.append(LineMuted(line_id))
+        self._log.append(LineHibernated(line_id))
         return True
 
-    def unmute(self, line_id: str) -> bool:
-        """Unmute ``line_id``, and say whether it was muted. Its kept mail and any
+    def awaken(self, line_id: str) -> bool:
+        """Awaken ``line_id``, and say whether it was hibernated. Its kept mail and any
         scheduled wake that fell due wake it from the next tick. A hold stays."""
         line = self._log.state.lines.get(line_id)
         if line is None:
             raise EventRejected(f"no line {line_id}")
-        if not line.muted:
+        if not line.hibernated:
             return False
-        self._log.append(LineUnmuted(line_id))
+        self._log.append(LineAwakened(line_id))
         self._work.set()
         return True
 
@@ -1988,7 +2005,7 @@ class Scheduler:
             for line_id, pending in sorted(self._log.state.scheduled.items())
             if parse_due(pending.due) <= now
             and not self._compacting_for(line_id)
-            and not lines[line_id].muted
+            and not lines[line_id].hibernated
         ]
 
     def _compacting_for(self, line_id: str) -> bool:
@@ -2043,15 +2060,16 @@ class Scheduler:
 
     def seconds_until_next_wake(self) -> float | None:
         """How long until the earliest pending scheduled wake falls due, at least 0,
-        or ``None`` when no wake is pending. A muted line's wake is left out, since it
-        fires only once the line is unmuted, and none is due while a restart drains."""
+        or ``None`` when no wake is pending. A hibernated line's wake is left out, since
+        it fires only once the line is awakened, and none is due while a restart
+        drains."""
         if self._restart is not None:
             return None
         lines = self._log.state.lines
         pending = [
             wake
             for line_id, wake in self._log.state.scheduled.items()
-            if not lines[line_id].muted
+            if not lines[line_id].hibernated
         ]
         if not pending:
             return None
@@ -2594,7 +2612,7 @@ class Scheduler:
                 "line_id": other_id,
                 "state": other.state.value,
                 "held": other.held_by is not None,
-                "muted": other.muted,
+                "hibernated": other.hibernated,
                 "workdir_commit": self._workdir_commit(other_id),
                 "leases": [str(lease["name"]) for lease in self.leases_of(other_id)],
             }
@@ -2608,7 +2626,7 @@ class Scheduler:
             "state": line.state.value,
             "condition": self.condition(line_id),
             "held_by": line.held_by,
-            "muted": line.muted,
+            "hibernated": line.hibernated,
             "autonomous_turns": {
                 "used": self._autonomous.get(line_id, 0),
                 "allowed": limits.max_autonomous_turns,
@@ -2696,14 +2714,14 @@ class Scheduler:
         """**Row 5 of the T3 Code review.** One word for where a line stands, which
         keeps apart a line that is running, held for an operator, stopped by a failed
         turn, waiting on a question it asked an operator, and idle, in that order of
-        precedence. A muted line that is not running is ``muted``, before all but
-        ``running``, since nothing else wakes it."""
+        precedence. A hibernated line that is not running is ``hibernated``, before all
+        but ``running``, since nothing else wakes it."""
         state = self._log.state
         line = state.lines[line_id]
         if line_id in self._running or line.state is LineState.RUNNING:
             return "running"
-        if line.muted:
-            return "muted"
+        if line.hibernated:
+            return "hibernated"
         if line.held_by is not None:
             return "held"
         if line_id in self._failed:
@@ -3102,18 +3120,20 @@ class Scheduler:
         }
 
     def role_view(self, role_id: str) -> dict[str, object]:
-        """A role as a seat and an operator see it: the worktree, the owner and the
-        latest change of owner, each seat's condition, engine and its provider's
-        stated budget, and the latest journal entries, the newest with its body.
-        Raises ``EventRejected`` for an unknown role."""
+        """A role as a seat and an operator see it: the worktree, the failover
+        policy, the handoff threshold, the owner, the seat a failover would pass it
+        to now and the latest change of owner, each seat in the failover order with
+        its condition, engine and its provider's stated budget, and the latest
+        journal entries, the newest with its body. Raises ``EventRejected`` for an
+        unknown role."""
         state = self._log.state
         role = state.roles.get(role_id)
         if role is None:
             raise EventRejected(f"no role {role_id}")
         seats: list[dict[str, object]] = []
-        for seat_id, other in sorted(state.seats.items()):
-            if other.role_id != role_id:
-                continue
+        usable = self.usable_seats(role_id)
+        for seat_id in seat_order(state, role_id):
+            other = state.seats[seat_id]
             engine = ENGINE_OF.get(self.model_of(seat_id))
             budget = self._budget_of(seat_id)
             seats.append(
@@ -3122,8 +3142,9 @@ class Scheduler:
                     "may_own": other.may_own,
                     "owner": role.owner == seat_id,
                     "condition": self.condition(seat_id),
-                    "muted": state.lines[seat_id].muted,
+                    "hibernated": state.lines[seat_id].hibernated,
                     "access": seat_access(state, seat_id),
+                    "usable": seat_id in usable,
                     "waits_unconfined": self.waits_unconfined(seat_id),
                     "model": self.model_of(seat_id),
                     "provider": engine,
@@ -3139,6 +3160,9 @@ class Scheduler:
             "role_id": role_id,
             "workdir": role.workdir,
             "handoff_seconds": role.handoff_seconds,
+            "failover": role.failover.value,
+            "handoff_below_percent": role.handoff_below_percent,
+            "next_seat": None if role.owner is None else self.next_seat(role_id),
             "owner": role.owner,
             "last_change": None
             if change is None
@@ -3207,7 +3231,7 @@ class Scheduler:
         are dropped, since a sandbox is fixed for an engine session's life, so each
         one's next turn is built with its new access. The former owner's kept
         connection closes before the new owner's first turn starts. A successor by a
-        handoff is unmuted and sent a note from the former owner, which wakes it once
+        handoff is awakened and sent a note from the former owner, which wakes it once
         the former owner's turn has ended."""
         for line_id in (plan.previous, plan.owner):
             if line_id is None:
@@ -3229,7 +3253,7 @@ class Scheduler:
             and plan.owner is not None
             and plan.previous is not None
         ):
-            self.unmute(plan.owner)
+            self.awaken(plan.owner)
             self.send(
                 LineAddress(plan.previous),
                 LineAddress(plan.owner),
@@ -3312,6 +3336,232 @@ class Scheduler:
         self._ownership_moved(plan)
         return plan, cast(str, ground)
 
+    # Automatic switching, roles step 3 of ``docs/architecture/ROLES.md``.
+
+    def usable_seats(self, role_id: str) -> frozenset[str]:
+        """The seats of ``role_id`` a failover or a planned handoff may pass it to,
+        which may own it, are not stopped, hibernated, held or failed, and whose
+        provider's stated budget does not show it spent."""
+        state = self._log.state
+        now = self._wall_clock()
+        usable: set[str] = set()
+        for line_id, seat in state.seats.items():
+            line = state.lines[line_id]
+            if (
+                seat.role_id == role_id
+                and seat.may_own
+                and line.state is not LineState.STOPPED
+                and not line.hibernated
+                and line.held_by is None
+                and line_id not in self._failed
+                and not budget_spent(self._budget_of(line_id), now)
+            ):
+                usable.add(line_id)
+        return frozenset(usable)
+
+    def next_seat(self, role_id: str) -> str | None:
+        """The seat a failover of ``role_id`` would pass it to now, if any."""
+        role = self._log.state.roles[role_id]
+        order = seat_order(self._log.state, role_id)
+        return next_seat(order, role.owner, self.usable_seats(role_id))
+
+    def fail_over_if_unable(self, line_id: str) -> str | None:
+        """If ``line_id`` owns a role and the harness observes it unable to act,
+        which is a recovery ground of ``recovery_ground`` and never while its turn
+        is in flight, apply the role's failover policy and say what followed.
+        ``None`` when ``line_id`` owns no role or can act."""
+        state = self._log.state
+        seat = state.seats.get(line_id)
+        if seat is None or line_id in self._running:
+            return None
+        role = state.roles[seat.role_id]
+        if role.owner != line_id:
+            return None
+        ground = recovery_ground(
+            role,
+            owner_running=False,
+            owner_plan_held=self._plan_limited(line_id),
+            owner_budget=self._budget_of(line_id),
+            now=self._wall_clock(),
+        )
+        if ground is None:
+            return None
+        return self._fail_over(seat.role_id, ground)
+
+    def _fail_over(self, role_id: str, ground: str) -> str:
+        """Apply ``role_id``'s failover policy on ``ground`` and return what followed.
+        Under ``automatic`` the role passes to the next usable seat, which is woken
+        by a note to itself and given the recovery checklist, and the operator is
+        told. Under ``ask``, or with no usable seat, no owner changes."""
+        state = self._log.state
+        role = state.roles[role_id]
+        owner = cast(str, role.owner)
+        if role.failover is FailoverPolicy.ASK:
+            return (
+                f"Role {role_id} stays with {owner}, because its failover policy is"
+                f" ask. dromon role take gives it to another seat."
+            )
+        to = self.next_seat(role_id)
+        if to is None:
+            said = (
+                f"Role {role_id} stays with {owner}, which cannot act because"
+                f" {ground}, since no other seat may own it, is awakened, not held,"
+                " and has a provider with budget."
+            )
+            # Told once while nothing changes, since an owner whose budget shows it
+            # spent may still end turns, each of which comes here.
+            if self._failover_told.get(role_id) != said:
+                self._failover_told[role_id] = said
+                self._tell_operator(owner, f"Dromon could not fail over. {said}")
+            return said
+        try:
+            plan = plan_failover(
+                state, role_id, to, ground, new_id("e"), self._stamp(to)
+            )
+        except RoleConflict as error:
+            said = f"Role {role_id} could not fail over to {to}: {error}"
+            self._tell_operator(owner, f"Dromon {said[0].lower()}{said[1:]}")
+            return said
+        self._append_plan(plan)
+        self._ownership_moved(plan)
+        self._failover_told.pop(role_id, None)
+        said = (
+            f"Role {role_id} passed by failover from {owner} to {to}, because"
+            f" {ground}, with entry {plan.entry_id}."
+        )
+        address = LineAddress(to)
+        self.send(
+            address,
+            address,
+            f"Dromon passed role {role_id} to you by failover, because {ground}."
+            " You own it from your next turn, which leads with the recovery"
+            " checklist. Follow it before you change anything.",
+        )
+        self._tell_operator(owner, f"Dromon failed over. {said}")
+        return said
+
+    def _tell_operator(self, line_id: str, body: str) -> None:
+        """Tell the operator who last wrote to ``line_id`` what the harness did to
+        its role, in a note recorded as from ``line_id``, as a hold's question is,
+        since the log has no address for the harness itself."""
+        operator = self.last_operator(line_id) or self._default_operator
+        self.ensure_operator(operator.operator_id)
+        self.send(LineAddress(line_id), operator, body)
+
+    def _ask_to_prepare_handoff(self, role_id: str, budget: BudgetStated) -> str | None:
+        """Ask ``role_id``'s owner, in a note to itself, to prepare a handoff to the
+        next usable seat, when ``budget`` is below the role's threshold, and say so.
+        ``None`` when the budget does not ask for one. A note to itself is how the
+        harness wakes a line without claiming an operator's or another line's
+        authority, as a scheduled wake does."""
+        role = self._log.state.roles[role_id]
+        if role.owner is None or not below_handoff_threshold(role, budget):
+            return None
+        to = self.next_seat(role_id)
+        stated = (
+            f"its provider {budget.provider}'s stated budget is"
+            f" {budget.remaining_percent} percent, below the role's threshold of"
+            f" {role.handoff_below_percent} percent"
+        )
+        if to is None:
+            return (
+                f"Role {role_id}'s owner {role.owner} was not asked to prepare a"
+                f" handoff, though {stated}, since no other seat is usable."
+            )
+        address = LineAddress(role.owner)
+        self.send(
+            address,
+            address,
+            f"Dromon asks you to prepare a handoff of role {role_id} to {to}, since"
+            f" {stated}. Leave the work in order and run the gate, then call"
+            f" relinquish_ownership with to set to {to} and a handoff note."
+            f" {HANDOFF_TEMPLATE} If you cannot hand it over now, tell the operator"
+            " why.",
+        )
+        return (
+            f"Role {role_id}'s owner {role.owner} was asked to prepare a handoff to"
+            f" {to}, since {stated}."
+        )
+
+    def _budget_followed(self, budget: BudgetStated) -> list[str]:
+        """What a statement of ``budget`` sets off for each role whose owner runs on
+        its provider: a failover when it shows the provider spent, or a request to
+        prepare a handoff when it is below the role's threshold. An owner with a turn
+        in flight is failed over once that turn ends, as every owner is."""
+        said: list[str] = []
+        state = self._log.state
+        for role_id, role in sorted(state.roles.items()):
+            owner = role.owner
+            if owner is None or ENGINE_OF.get(self.model_of(owner)) != budget.provider:
+                continue
+            failed_over = self.fail_over_if_unable(owner)
+            if failed_over is not None:
+                said.append(failed_over)
+                continue
+            if owner in self._running and budget_spent(budget, self._wall_clock()):
+                said.append(
+                    f"Role {role_id}'s owner {owner} has a turn in flight, so the role"
+                    " fails over when that turn ends."
+                )
+                continue
+            asked = self._ask_to_prepare_handoff(role_id, budget)
+            if asked is not None:
+                said.append(asked)
+        return said
+
+    def plan_limit_reached(self, line_id: str, error: EnginePlanLimit) -> None:
+        """Record what ``line_id``'s engine reported at a plan limit as its provider's
+        budget, 0 percent with the reset time the engine gave, if any, so that a
+        failover passes over the provider's other seats."""
+        provider = ENGINE_OF.get(self.model_of(line_id))
+        if provider is None:
+            return
+        resets_at = error.resets_at
+        if resets_at is not None:
+            try:
+                check_instant("resets_at", resets_at)
+            except InvalidField:
+                # A reset time in another form is dropped, not guessed at.
+                resets_at = None
+        # Four bytes is the most one character takes in UTF-8.
+        note = str(error)[: MAX_BUDGET_NOTE_BYTES // 4]
+        self._log.append(
+            BudgetStated(
+                provider,
+                0,
+                resets_at,
+                BudgetSource.ENGINE,
+                note,
+                format_due(self._wall_clock()),
+            )
+        )
+
+    def credits_spent(self, line_id: str, note: str) -> None:
+        """Record ``line_id``'s provider's budget at 0 percent, with no reset, when its
+        engine reports the account has no credit left before any turn fails, and act
+        on it as on an operator's statement, so a role whose owner is between turns
+        fails over now. An engine repeats the report, so a budget already spent is
+        not stated again. The reset stays unknown until the turn's own error gives
+        it, or the operator states the budget."""
+        line = self._log.state.lines.get(line_id)
+        provider = None if line is None else ENGINE_OF.get(self.model_of(line_id))
+        if provider is None:
+            return
+        now = self._wall_clock()
+        if budget_spent(self._log.state.budgets.get(provider), now):
+            return
+        budget = BudgetStated(
+            provider,
+            0,
+            None,
+            BudgetSource.ENGINE,
+            note[: MAX_BUDGET_NOTE_BYTES // 4],
+            format_due(now),
+        )
+        self._log.append(budget)
+        self.activity.record(line_id, ActivityKind.NOTICE, note)
+        self._budget_followed(budget)
+
     # The operator's ownership commands, roles step 2 of ``docs/architecture/ROLES.md``.
 
     def roles_view(self, role_id: str | None) -> list[dict[str, object]]:
@@ -3334,7 +3584,7 @@ class Scheduler:
     ) -> Plan:
         """``operator`` gives ``role_id`` to ``seat``, or leaves it vacant, as
         ``roles.plan_give`` decides, refused while the owner has a turn in flight. A
-        seat given the role is unmuted, since an alternate seat is muted until it
+        seat given the role is awakened, since an alternate seat is hibernated until it
         comes to own, and is sent a note from the operator, which wakes it once no
         former writer's turn is in flight. Its turn leads with the recovery
         checklist. Raises ``EventRejected``, recording nothing."""
@@ -3354,7 +3604,7 @@ class Scheduler:
         self._append_plan(plan)
         self._ownership_moved(plan)
         if plan.owner is not None:
-            self.unmute(plan.owner)
+            self.awaken(plan.owner)
             self.send(
                 operator,
                 LineAddress(plan.owner),
@@ -3369,11 +3619,11 @@ class Scheduler:
     ) -> tuple[str, str]:
         """Ask ``role_id``'s owner, by priority mail from ``operator``, to hand the
         role to ``to``, and return the owner and the message's identifier. The
-        handoff is the owner's, made with ``relinquish_ownership``. A muted owner's
-        mail waits for its unmute. **Not yet built.** ``ROLES.md`` asks the operator
-        whether to recover the role when the owner has not relinquished within the
-        role's ``handoff_seconds``, which needs the request kept across a restart.
-        Raises ``EventRejected``, recording nothing."""
+        handoff is the owner's, made with ``relinquish_ownership``. A hibernated
+        owner's mail waits until it is awakened. **Not yet built.** ``ROLES.md`` asks
+        the operator whether to recover the role when the owner has not relinquished
+        within the role's ``handoff_seconds``, which needs the request kept across a
+        restart. Raises ``EventRejected``, recording nothing."""
         try:
             owner = check_handoff_request(self._log.state, role_id, to)
         except RoleConflict as error:
@@ -3415,7 +3665,11 @@ class Scheduler:
             format_due(self._wall_clock()),
         )
         self._log.append(event)
-        return {"provider": provider, **_budget_view(event)}
+        return {
+            "provider": provider,
+            **_budget_view(event),
+            "followed": self._budget_followed(event),
+        }
 
     def budgets_view(self) -> dict[str, object]:
         """Each provider's stated budget, with whether it shows the provider spent
@@ -3466,7 +3720,12 @@ class Scheduler:
             return None
         self._role_told[line_id] = change
         role_id = seat.role_id
-        caused = f"by {change.by}, with cause {change.cause}, at {change.changed_at}"
+        # A failover is recorded under the seat made owner, since the log has no
+        # address for the harness, so it is told as the harness's.
+        made_by = (
+            "the harness" if change.cause is OwnershipCause.FAILOVER else str(change.by)
+        )
+        caused = f"by {made_by}, with cause {change.cause}, at {change.changed_at}"
         if change.previous == line_id and change.by != LineAddress(line_id):
             return (
                 f"Role {role_id} passed from you to {change.owner or 'no seat'}"
@@ -3478,6 +3737,7 @@ class Scheduler:
         if change.owner != line_id or change.cause not in (
             OwnershipCause.RECOVERY,
             OwnershipCause.OPERATOR,
+            OwnershipCause.FAILOVER,
         ):
             return None
         text = (
@@ -4181,7 +4441,7 @@ class Scheduler:
             and line_id not in self._running
             and line.state is LineState.IDLE
             and line.held_by is None
-            and not line.muted
+            and not line.hibernated
             and line_id not in self._failed
             and self._restart is None
             and not self._waits_for_writer(line_id)
@@ -4470,6 +4730,7 @@ class Scheduler:
             self._count_interrupted(line_id, engine)
             raise
         except EnginePlanLimit as error:
+            self.plan_limit_reached(line_id, error)
             self._plan_held[line_id] = self.hold(line_id, str(error))
             ending = f"held: {error}"
             print(f"dromond: line {line_id} held: {error}", file=sys.stderr)
@@ -4502,6 +4763,7 @@ class Scheduler:
         self._apply_limits(line_id, from_operator, report)
         if failed and self._operator_mail(line_id) == mailed:
             self._hold_failed(line_id, ending)
+        self.fail_over_if_unable(line_id)
 
     def _handoff(
         self, line_id: str, messages: list[tuple[str, Message]]
@@ -5278,6 +5540,7 @@ class Scheduler:
                 self.ceiling_settled,
                 lambda text: self.consent_fallback(line_id, text),
                 lambda: self.redirect_reason(line_id),
+                lambda note: self.credits_spent(line_id, note),
             )
             engine = self._engine_factory(spec, self.own_tools(line_id))
             self._engines[line_id] = engine
@@ -5293,7 +5556,7 @@ class Scheduler:
                 "strategy": line.strategy,
                 "state": line.state.value,
                 "condition": self.condition(line_id),
-                "muted": line.muted,
+                "hibernated": line.hibernated,
                 "pending": len(self.pending(line_id)),
                 "turns": self._turns.get(line_id, 0),
                 "autonomous_turns": self._autonomous.get(line_id, 0),

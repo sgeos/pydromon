@@ -22,6 +22,8 @@ from dromon.daemon import (
 from dromon.eventlog import EventLog
 from dromon.lineconfig import ConfigError
 from dromon.model import (
+    DEFAULT_HANDOFF_BELOW_PERCENT,
+    FailoverPolicy,
     Event,
     LineAddress,
     LineCreated,
@@ -173,6 +175,24 @@ TOO_MANY = ", ".join(f'"s{n}"' for n in range(MAX_SEATS + 1))
             '[roles.b]\nworkdir = "y"\nseats = ["core"]',
             "already a seat of role a",
         ),
+        (
+            '[roles.core]\nworkdir = "x"\nseats = ["core"]\nfailover = "never"',
+            "must be one of automatic, ask",
+        ),
+        (
+            '[roles.core]\nworkdir = "x"\nseats = ["core"]\nfailover = true',
+            "must be one of automatic, ask",
+        ),
+        (
+            '[roles.core]\nworkdir = "x"\nseats = ["core"]\n'
+            "handoff_below_percent = 101",
+            "from 0 to 100",
+        ),
+        (
+            '[roles.core]\nworkdir = "x"\nseats = ["core"]\n'
+            "handoff_below_percent = 5.5",
+            "from 0 to 100",
+        ),
     ],
 )
 def test_a_bad_roles_table_is_refused(roles: str, message: str) -> None:
@@ -216,7 +236,7 @@ def test_a_new_role_is_declared_bound_and_given_its_first_owner() -> None:
     config = parse(project(CORE))
     events = plan_roles(State(), config, ANA, AT)
     assert events == (
-        RoleDeclared("core", WORKTREE, 3600),
+        RoleDeclared("core", WORKTREE, 3600, ("core", "core-luna", "core-grok")),
         SeatBound("core", "core", True),
         SeatBound("core-luna", "core", True),
         SeatBound("core-grok", "core", False),
@@ -268,11 +288,47 @@ def test_a_restart_does_not_undo_a_relinquishment() -> None:
     assert state.roles["core"].owner is None
 
 
+def test_a_role_takes_a_failover_policy_and_a_handoff_threshold() -> None:
+    (role,) = parse(project(CORE)).roles.values()
+    assert (role.failover, role.handoff_below_percent) == (
+        FailoverPolicy.AUTOMATIC,
+        DEFAULT_HANDOFF_BELOW_PERCENT,
+    )
+    text = CORE + 'failover = "ask"\nhandoff_below_percent = 0\n'
+    (role,) = parse(project(text)).roles.values()
+    assert (role.failover, role.handoff_below_percent) == (FailoverPolicy.ASK, 0)
+
+
+def test_a_changed_order_or_policy_declares_the_role_again() -> None:
+    config = parse(project(CORE))
+    state = applied(with_lines(config), plan_roles(State(), config, ANA, AT))
+    reordered = parse(
+        project(
+            CORE.replace(
+                '["core", "core-luna", "core-grok"]',
+                '["core-luna", "core", "core-grok"]',
+            )
+            + 'failover = "ask"\n'
+        )
+    )
+    assert plan_roles(state, reordered, ANA, AT) == (
+        RoleDeclared(
+            "core",
+            WORKTREE,
+            3600,
+            ("core-luna", "core", "core-grok"),
+            FailoverPolicy.ASK,
+        ),
+    )
+
+
 def test_a_changed_handoff_time_declares_the_role_again() -> None:
     config = parse(project(CORE))
     state = applied(with_lines(config), plan_roles(State(), config, ANA, AT))
     longer = parse(project(CORE + "handoff_seconds = 600\n"))
-    assert plan_roles(state, longer, ANA, AT) == (RoleDeclared("core", WORKTREE, 600),)
+    assert plan_roles(state, longer, ANA, AT) == (
+        RoleDeclared("core", WORKTREE, 600, ("core", "core-luna", "core-grok")),
+    )
 
 
 def test_a_moved_worktree_is_refused_while_owned_and_declared_while_vacant() -> None:
@@ -285,7 +341,9 @@ def test_a_moved_worktree_is_refused_while_owned_and_declared_while_vacant() -> 
     vacant = applied(with_lines(vacant_file), plan_roles(State(), vacant_file, ANA, AT))
     moved_vacant = parse(project(VACANT.replace(WORKTREE, "tmp/worktrees/core2")))
     events = plan_roles(vacant, moved_vacant, ANA, AT)
-    assert events[0] == RoleDeclared("core", "tmp/worktrees/core2", 3600)
+    assert events[0] == RoleDeclared(
+        "core", "tmp/worktrees/core2", 3600, ("core", "core-luna", "core-grok")
+    )
 
 
 def test_barring_the_current_owner_from_owning_is_refused() -> None:

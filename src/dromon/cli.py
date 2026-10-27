@@ -67,8 +67,8 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "sent": "show what became of the mail an operator sent",
     "release": "resume a line the daemon held at a conversation limit",
     "interrupt": "stop a line's turn in flight, as Escape does in an attached client",
-    "mute": "start no more turns of a line, keeping its mail, session and wakes",
-    "unmute": "let a muted line be woken again by the mail and wakes it kept",
+    "hibernate": "start no more turns of a line, keeping its mail, session and wakes",
+    "awaken": "let a hibernated line be woken again by the mail and wakes it kept",
     "rebind": "move a line to another model and strategy, keeping its identity",
     "settings": "show the project's settings, and a line's, with where each comes from",
     "set": "change a project or line setting, or return it to the layers below",
@@ -136,15 +136,15 @@ def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 
 
 def _line_row(line: Mapping[str, object]) -> str:
-    """One line of ``dromon status`` for a session line, naming a mute and a hold,
-    which each keep the line from waking."""
+    """One line of ``dromon status`` for a session line, naming a hibernation and a
+    hold, which each keep the line from waking."""
     parts = [
         f"line {line.get('line_id')}",
         str(line.get("condition", line.get("state"))),
         f"{line.get('pending')} pending",
     ]
-    if line.get("muted") is True and line.get("condition") != "muted":
-        parts.append("muted")
+    if line.get("hibernated") is True and line.get("condition") != "hibernated":
+        parts.append("hibernated")
     if line.get("held_by") is not None and line.get("condition") != "held":
         parts.append(f"held by {line.get('held_by')}")
     return ", ".join(parts)
@@ -962,33 +962,33 @@ def _interrupt(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
-def _mute(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
-    """Send ``mute``, and say whether a turn in flight finishes first."""
+def _hibernate(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Send ``hibernate``, and say whether a turn in flight finishes first."""
     line_id: str = arguments.line_id
-    response = _call(paths, "mute", Operation.MUTE, {"line_id": line_id})
+    response = _call(paths, "hibernate", Operation.HIBERNATE, {"line_id": line_id})
     if isinstance(response, int):
         return response
     if response.get("changed") is not True:
-        print(f"{line_id} was already muted")
+        print(f"{line_id} was already hibernated")
     elif response.get("running") is True:
         print(
-            f"muted {line_id}, whose turn in flight finishes first. dromon interrupt"
-            " stops it now"
+            f"hibernated {line_id}, whose turn in flight finishes first."
+            " dromon interrupt stops it now"
         )
     else:
-        print(f"muted {line_id}")
+        print(f"hibernated {line_id}")
     return exits.OK
 
 
-def _unmute(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+def _awaken(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     line_id: str = arguments.line_id
-    response = _call(paths, "unmute", Operation.UNMUTE, {"line_id": line_id})
+    response = _call(paths, "awaken", Operation.AWAKEN, {"line_id": line_id})
     if isinstance(response, int):
         return response
     if response.get("changed") is True:
-        print(f"unmuted {line_id}")
+        print(f"awakened {line_id}")
     else:
-        print(f"{line_id} was not muted, so nothing changed")
+        print(f"{line_id} was not hibernated, so nothing changed")
     return exits.OK
 
 
@@ -1148,9 +1148,10 @@ def _role(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
                 f"asked {result['owner']} to hand role {result['role_id']} to"
                 f" {result['to']}, in priority mail {result['message_id']}"
             )
-            if result["owner_muted"] is True:
+            if result["owner_hibernated"] is True:
                 print(
-                    f"{result['owner']} is muted, so it reads the request once unmuted"
+                    f"{result['owner']} is hibernated, so it reads the request"
+                    " once awakened"
                 )
     return exits.OK
 
@@ -1161,6 +1162,11 @@ def _print_role(role: Mapping[str, object]) -> None:
         f"role {role['role_id']} in {role['workdir']}, owner"
         f" {role['owner'] or 'none, vacant'}, handoff within"
         f" {role['handoff_seconds']} seconds"
+    )
+    below = role["handoff_below_percent"]
+    print(
+        f"  failover {role['failover']}, next seat {role['next_seat'] or 'none'},"
+        " handoff asked " + (f"below {below} percent" if below else "never by budget")
     )
     change = cast(Mapping[str, object] | None, role["last_change"])
     if change is not None:
@@ -1176,8 +1182,10 @@ def _print_role(role: Mapping[str, object]) -> None:
             marks.insert(0, "owner")
         if seat["may_own"] is not True:
             marks.append("may not own")
-        if seat["muted"] is True:
-            marks.append("muted")
+        if seat["hibernated"] is True:
+            marks.append("hibernated")
+        if seat["usable"] is not True and seat["owner"] is not True:
+            marks.append("not usable for failover")
         if seat["waits_unconfined"] is True:
             marks.append("waits, its engine cannot confine it")
         budget = cast(Mapping[str, object] | None, seat["budget"])
@@ -1241,6 +1249,8 @@ def _budget(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     if isinstance(result, int):
         return result
     print(f"{result['provider']}: {_budget_text(result)}")
+    for followed in cast(list[str], result["followed"]):
+        print(followed)
     return exits.OK
 
 
@@ -1288,8 +1298,8 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "sent": _sent,
     "release": _release,
     "interrupt": _interrupt,
-    "mute": _mute,
-    "unmute": _unmute,
+    "hibernate": _hibernate,
+    "awaken": _awaken,
     "rebind": _rebind,
     "settings": _settings,
     "set": _set,
@@ -1501,8 +1511,8 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("line_id", help="the held line")
         if name == "interrupt":
             command.add_argument("line_id", help="the line whose turn to stop")
-        if name == "mute":
-            command.add_argument("line_id", help="the line to mute")
+        if name == "hibernate":
+            command.add_argument("line_id", help="the line to hibernate")
         if name == "restart":
             command.add_argument(
                 "--interrupt",
@@ -1529,8 +1539,8 @@ def build_parser() -> argparse.ArgumentParser:
                 default=default_operator(),
                 help="who asks for the restart, default %(default)s",
             )
-        if name == "unmute":
-            command.add_argument("line_id", help="the muted line")
+        if name == "awaken":
+            command.add_argument("line_id", help="the hibernated line")
         if name == "start":
             command.add_argument(
                 "--wait",

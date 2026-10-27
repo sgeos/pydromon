@@ -9,6 +9,7 @@ from dromon.codec import (
     FORMAT_VERSION,
     KIND_FIELDS,
     MAX_PAYLOAD_BYTES,
+    RENAMED_KINDS,
     DecodeError,
     decode,
     encode,
@@ -19,7 +20,9 @@ from dromon.model import (
     MAX_TEXT_BYTES,
     Event,
     LineAddress,
+    LineAwakened,
     LineCreated,
+    LineHibernated,
     MessageKind,
     MessageSent,
     OperatorAddress,
@@ -51,6 +54,21 @@ def test_the_field_table_names_exactly_the_scenario_kinds(
 ) -> None:
     kinds = {json.loads(encode(event))["kind"] for event in scenario}
     assert kinds == set(KIND_FIELDS)
+
+
+def test_a_former_kind_decodes_as_its_replacement_and_is_never_written(
+    scenario: tuple[Event, ...],
+) -> None:
+    assert set(RENAMED_KINDS).isdisjoint(KIND_FIELDS)
+    assert set(RENAMED_KINDS.values()) <= set(KIND_FIELDS)
+    written = {json.loads(encode(event))["kind"] for event in scenario}
+    assert written.isdisjoint(RENAMED_KINDS)
+    for old, new in RENAMED_KINDS.items():
+        data = {"line_id": "beta"}
+        assert decode(wire(old, data)) == decode(wire(new, data))
+        assert json.loads(encode(decode(wire(old, data))))["kind"] == new
+    assert decode(wire("line_muted", {"line_id": "beta"})) == LineHibernated("beta")
+    assert decode(wire("line_unmuted", {"line_id": "beta"})) == LineAwakened("beta")
 
 
 def test_encoding_is_canonical(scenario: tuple[Event, ...]) -> None:

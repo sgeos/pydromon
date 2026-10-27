@@ -40,7 +40,10 @@ from dromon.lineconfig import (
     config_from_document,
 )
 from dromon.model import (
+    DEFAULT_HANDOFF_BELOW_PERCENT,
     DEFAULT_HANDOFF_SECONDS,
+    MAX_ROLE_SEATS,
+    FailoverPolicy,
     ID_PATTERN,
     MAX_HANDOFF_SECONDS,
     MIN_HANDOFF_SECONDS,
@@ -84,8 +87,17 @@ LIMIT_KEYS: Final = frozenset(
 )
 WAKE_KEYS: Final = frozenset({"every_ticks"})
 LEASE_KEYS: Final = frozenset({"names", "ttl_seconds"})
-ROLE_KEYS: Final = frozenset({"workdir", "owner", "seats", "handoff_seconds"})
-MAX_SEATS: Final = 16
+ROLE_KEYS: Final = frozenset(
+    {
+        "workdir",
+        "owner",
+        "seats",
+        "handoff_seconds",
+        "failover",
+        "handoff_below_percent",
+    }
+)
+MAX_SEATS: Final = MAX_ROLE_SEATS
 """The most seats one role may declare, a bound on the planning loop and the status."""
 DEFAULT_LEASE_TTL: Final = 10800
 MIN_LEASE_TTL: Final = 60
@@ -184,6 +196,12 @@ class RoleDefinition:
     """The seat that owns the role when it is first declared, or ``None`` for a role
     that starts vacant. Used only while the role has never had an owner."""
     handoff_seconds: int = DEFAULT_HANDOFF_SECONDS
+    failover: FailoverPolicy = FailoverPolicy.AUTOMATIC
+    """Whether the harness passes the role on by itself when its owner cannot act,
+    or leaves the change to an operator."""
+    handoff_below_percent: int = DEFAULT_HANDOFF_BELOW_PERCENT
+    """The stated budget below which the owner is asked to prepare a handoff, or 0
+    for never."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,12 +492,25 @@ class _Reader:
                 f"must be a whole number from {MIN_HANDOFF_SECONDS} to"
                 f" {MAX_HANDOFF_SECONDS}",
             )
+        failover = table.get("failover", FailoverPolicy.AUTOMATIC.value)
+        if failover not in tuple(FailoverPolicy):
+            raise self.fail(
+                f"{key}.failover",
+                f"must be one of {', '.join(p.value for p in FailoverPolicy)}",
+            )
+        below = table.get("handoff_below_percent", DEFAULT_HANDOFF_BELOW_PERCENT)
+        if type(below) is not int or not 0 <= below <= 100:
+            raise self.fail(
+                f"{key}.handoff_below_percent", "must be a whole number from 0 to 100"
+            )
         return RoleDefinition(
             role_id=role_id,
             workdir=cast(str, workdir),
             seats=tuple(names),
             owner=owner,
             handoff_seconds=seconds,
+            failover=FailoverPolicy(cast(str, failover)),
+            handoff_below_percent=below,
         )
 
     def wake(self, value: object, key: str, base: int) -> int:

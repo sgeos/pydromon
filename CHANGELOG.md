@@ -35,9 +35,33 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Automatic switching of a role's owner, roles step 3, at the operator's instruction
+  of 2026-10-27, as `docs/architecture/ROLES.md` describes. A role declares its seats'
+  order, a failover policy, `automatic` by default or `ask`, and
+  `handoff_below_percent`, 10 by default. When an owner is held at a plan limit or its
+  provider's budget is stated at 0 percent, the harness passes the role to the next
+  usable seat in the order, with the new cause `failover` and an entry saying why,
+  wakes the new owner with the recovery checklist, and tells the operator. A budget
+  stated below the threshold asks the owner to prepare a handoff. A plan limit records
+  its provider's budget as 0 percent, with the reset time an engine gave. The Claude
+  Code adapter now counts a rejected rate-limit window on a failed turn, and a billing
+  error on any turn, as a plan limit, read from the Agent SDK's types and not observed
+  live. Codex keeps its inferred codes, and Grok has no known shape, so its failures
+  hold the line as before. `role_status` and `dromon role` show the order, the policy
+  and the next seat, and `dromon budget set` prints what a statement set off.
+- Codex's usage limit as the operator observed it on 2026-10-27, as
+  `docs/protocol/CODEX.md` records. A turn that fails after an `error` notice, or with
+  a `turn.error`, whose `codexErrorInfo` is `usageLimitExceeded` in camel case, is a
+  plan limit, which the snake-case codes alone had missed. Its reset time is read from
+  the message's wording, in the daemon host's local zone, as an inference and an
+  assumption, and recorded with the budget. An `account/rateLimits/updated` notice
+  whose credits have `hasCredits` and `unlimited` both false records the Codex budget
+  at 0 at once, before any turn fails, so a role whose owner is between turns fails
+  over then. Grok stays unclassified.
+
 - A seat that does not own its role is not woken while another seat owns the role,
   unless its engine can make the role's worktree read only to it. Its mail waits, as a
-  muted line's does. No engine counts as able to yet, because the engines role's
+  hibernated line's does. No engine counts as able to yet, because the engines role's
   read-only seats are on an unmerged branch, so until that merges a seat runs only
   while it owns its role or the role is vacant. `role_status`, `roles` and
   `dromon role` show each seat's access and whether it waits. This is default deny, as
@@ -59,7 +83,7 @@ All notable changes are recorded here. The format follows
   `docs/protocol/LINE_CONFIG.md` specifies. The daemon stamps each journal entry with
   the role worktree's commit and its own. A seat takes its role itself only on a ground
   the harness observes. A change of owner drops the former and the new owner's
-  engines, unmutes and notes a successor by handoff, and starts no turn as the owner
+  engines, awakens and notes a successor by handoff, and starts no turn as the owner
   until the former owner's turn has ended and its kept connection has closed. Each
   seat's next turn is told of a change it did not make, and a new owner by recovery is
   given the recovery checklist. `ownership_changed` gains `back_to`, for a short
@@ -68,7 +92,7 @@ All notable changes are recorded here. The format follows
   `dromon role status [ROLE]` and `dromon role entry ENTRY` show roles, seats, the
   last change of owner and the journal. `dromon role take ROLE --seat SEAT` and
   `dromon role vacate ROLE` change the owner with cause `operator`, refused while the
-  owner has a turn in flight, and a seat given the role is unmuted and woken by a note
+  owner has a turn in flight, and a seat given the role is awakened and woken by a note
   whose turn leads with the recovery checklist. `dromon role handoff ROLE --to SEAT`
   asks the owner in priority mail to hand the role over with the handoff note's
   template. `dromon budget set PROVIDER` records `budget_stated` from an operator, and
@@ -87,7 +111,7 @@ All notable changes are recorded here. The format follows
     refuse it unless `--end-tasks` is given.
   - Once no turn runs, the daemon stops and starts its successor itself, from the
     installed code and with the same command-line options, after it has released its
-    lock. Sessions, mutes, scheduled wakes, holds and mail survive in the event log.
+    lock. Sessions, hibernations, scheduled wakes, holds and mail survive in the event log.
     `dromon restart` checks that the installed daemon imports before it asks, and
     prints the successor's commit and the commit before.
   - The event `restart_noted`, a note from a line to itself that a restart ended its
@@ -97,14 +121,14 @@ All notable changes are recorded here. The format follows
     daemon with a sentence that cites both, and each of `other_lines` gives its
     `workdir_commit`.
 
-- Wake mute, priority mail and self mail, by the operator's decision of 2026-10-27, as
+- Hibernation, priority mail and self mail, by the operator's decision of 2026-10-27, as
   `docs/protocol/PRIORITY.md` specifies.
-  - `dromon mute LINE` and `dromon unmute LINE`, the client operations `mute` and
-    `unmute`, and the events `line_muted` and `line_unmuted`. A muted line starts no
+  - `dromon hibernate LINE` and `dromon awaken LINE`, the client operations `hibernate` and
+    `awaken`, and the events `line_hibernated` and `line_awakened`. A hibernated line starts no
     turn, by mail, self mail, a scheduled wake, a task note or an answer, and keeps
-    its mail, session and pending scheduled wake, which fires once it is unmuted. A
+    its mail, session and pending scheduled wake, which fires once it is awakened. A
     turn in flight finishes. `line_status`, the daemon's `status` and `dromon status`
-    show the mute, and `condition` is `muted`.
+    show the hibernation, and `condition` is `hibernated`.
   - `dromon send --priority`, `priority` on `send`, and `priority` on `send_message`,
     recorded as `message_prioritized`. Priority mail ends the recipient's running turn
     at its next safe point, through the line's driver, which every adapter already
@@ -389,6 +413,15 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- Mute is renamed hibernate, at the operator's direction of 2026-10-27. The commands
+  are `dromon hibernate LINE` and `dromon awaken LINE`, the client operations
+  `hibernate` and `awaken`, the field and condition `hibernated`, the `role status`
+  mark `hibernated`, the `request_handoff` result `owner_hibernated`, and the events
+  `line_hibernated` and `line_awakened`. Event logs that already hold `line_muted` and
+  `line_unmuted` still replay, since the codec decodes those as the new kinds, and new
+  events are written only under the new names. `dromon mute` and `dromon unmute`, and
+  the operations `mute` and `unmute`, are removed without aliases, since no release
+  carried them.
 - A line's relative `instructions` paths resolve against the project root, not the
   line's `workdir`, so a line moved to a worktree still reads the project's files. The
   engine receives the absolute path, which the composed instructions now name.

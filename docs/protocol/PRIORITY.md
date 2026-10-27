@@ -1,48 +1,48 @@
-# Wake Mute, Priority Mail and Self Mail
+# Hibernation, Priority Mail and Self Mail
 
 > **Navigation**: [Protocol](./README.md) | [Documentation Root](../README.md)
 
 **Decided by the operator on 2026-10-27.** Three changes to how a line is woken. An
-operator may mute a line, so that no turn of it is spent without stopping the daemon.
+operator may hibernate a line, so that no turn of it is spent without stopping the daemon.
 An operator or a line may send a line priority mail, which redirects a long turn. A
 line may send itself a note. The events are specified in [`EVENT_LOG.md`](EVENT_LOG.md)
 and the requests in [`CLIENT.md`](CLIENT.md). This document gives their behaviour.
 
-## Wake mute
+## Hibernation
 
-`mute` records `line_muted` and `unmute` records `line_unmuted`. Both are operator
+`hibernate` records `line_hibernated` and `awaken` records `line_awakened`. Both are operator
 requests. External agents are not offered them, and no line tool reaches them.
 
-While a line is muted, no turn of it starts. That covers every way a turn starts.
+While a line is hibernated, no turn of it starts. That covers every way a turn starts.
 
-| Wake | While muted |
+| Wake | While hibernated |
 |---|---|
 | Mail from an operator, a line or an agent | Kept undelivered in the line's mailbox |
 | A note the line sent itself | Kept undelivered |
-| A scheduled wake, from `wake_after` or `compact_session` | Kept pending. It does not fire while the line is muted, and fires at the first tick after the line is unmuted, with its lateness in its delivery note |
+| A scheduled wake, from `wake_after` or `compact_session` | Kept pending. It does not fire while the line is hibernated, and fires at the first tick after the line is awakened, with its lateness in its delivery note |
 | A note that a background task ended | Recorded and kept undelivered |
 | An operator's answer to a question, including a ceiling question | Recorded and kept undelivered. A ceiling choice still reaches the kept connection at once |
 | Priority mail | Kept undelivered, and it ends no turn |
 
 A turn the engine begins by itself between Dromon's turns is interrupted whether or not
-the line is muted, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies for kept sessions.
+the line is hibernated, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies for kept sessions.
 
-The line keeps its engine session, its kept connection and its leases. A mute is not a
+The line keeps its engine session, its kept connection and its leases. Hibernation is not a
 hold. It asks no question, resets no count, and an operator's reply does not end it.
-A line may be held and muted at once, and then it needs both a release and an unmute.
+A line may be held and hibernated at once, and then it needs both a release and an awakening.
 
-**A turn in flight.** Muting a line with a turn in flight lets that turn finish. The
-line's own tools keep working until its end. The mute takes effect when the turn ends,
+**A turn in flight.** Hibernating a line with a turn in flight lets that turn finish. The
+line's own tools keep working until its end. Hibernation takes effect when the turn ends,
 and no turn follows. An operator who wants the turn stopped as well sends `interrupt`,
 which also holds the line, as [`CLIENT.md`](CLIENT.md) specifies.
 
-**Status.** `line_status` gives `muted`, and `condition` is `muted` for a muted line
+**Status.** `line_status` gives `hibernated`, and `condition` is `hibernated` for a hibernated line
 that is not running, ahead of every condition but `running`. `other_lines` gives each
-line's `muted`. The daemon's `status` gives each line's `condition` and `muted`, and
+line's `hibernated`. The daemon's `status` gives each line's `condition` and `hibernated`, and
 `dromon status` prints one row per line naming either.
 
-**Restart.** The mute is in the event log, so it survives a restart, and a scheduled
-wake that fell due while the daemon was down still waits for the unmute.
+**Restart.** Hibernation is in the event log, so it survives a restart, and a scheduled
+wake that fell due while the daemon was down still waits until the line is awakened,.
 
 ## Priority mail
 
@@ -56,7 +56,7 @@ A priority note is a note to a line, recorded as `message_sent` followed by
    recipient's other new mail. Their headers say `priority`, and a note that ended the
    last turn says so too. `list_mail` shows `priority` in its header notes.
 3. A turn with a priority note to deliver starts without waiting for the line's
-   cooldown or its wake tick. A muted, held or failed line still starts none.
+   cooldown or its wake tick. A hibernated, held or failed line still starts none.
 
 A priority note is otherwise ordinary mail. It carries no more authority than its
 sender has, and a line's priority note is data from that line like any other.
@@ -138,8 +138,8 @@ such as Claude Code's `error_during_execution`. It is not counted as a failure, 
 `recent_turns` entry in `line_status` gives `outcome` `interrupted` and
 `interrupted_for` with the reason, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies.
 
-**A muted recipient.** Priority mail never ends a muted line's turn, and waits for the
-unmute with the line's other mail.
+**A hibernated recipient.** Priority mail never ends a hibernated line's turn, and waits with the
+line's other mail until the line is awakened.
 
 **Crash.** The two appends are separate. A crash between them leaves an ordinary note,
 which is delivered as one. A crash during a turn the note was ending loses nothing,
@@ -165,7 +165,7 @@ a pending scheduled wake reserves.
 
 ## Porting notes
 
-The mute is one flag per line in the state. The rate limit is two bounded rings of
+Hibernation is one flag per line in the state. The rate limit is two bounded rings of
 monotonic times per party, checked and updated on the daemon's one event loop, so it
 needs no lock there, and a port with threads must make the check and the update one
 step. The safe point is a count of tool uses waiting for a result and one comparison
