@@ -99,7 +99,7 @@ argument outside a tool's schema is refused.
 
 | Tool | Effect |
 |---|---|
-| `send_message` | Sends a note to a line or an operator, delivered in a later tick |
+| `send_message` | Sends a note to a line, an operator or the line itself, delivered in a later tick. With `priority` true, a note to another line is priority mail, rate limited, as [`PRIORITY.md`](PRIORITY.md) specifies |
 | `ask_operator` | Asks an operator a question, which never pauses the line |
 | `wake_after` | Schedules one wake for the line, as below |
 | `list_mail`, `read_mail`, `acknowledge_mail` | Page through, open and acknowledge the line's mailbox |
@@ -114,21 +114,23 @@ argument outside a tool's schema is refused.
 in this section.
 
 **`line_status`.** No arguments. It returns JSON for the calling line: its `state`, the
-question holding it as `held_by`, its `autonomous_turns` used and allowed, its estimated
+question holding it as `held_by`, whether an operator `muted` it, its `autonomous_turns` used and allowed, its estimated
 `cost_usd` since its last release and its limit, its `leases` with their ends, its
 `scheduled_wake`, its `unread` mail and `pending` deliveries, its `model` and
 `strategy`, its `workdir` as configured and as `workdir_path` resolved, its
 `engine_session`, and its `kept_session`, as the kept sessions section below specifies.
-It adds a `daemon` object, an `event_log` object and, for every other line, its
-`line_id`, `state`, whether it is `held`, and the names of its `leases`. It holds no
-configuration document and no message body.
+It adds a `daemon` object, a `commits` object, an `event_log` object and, for every
+other line, its `line_id`, `state`, whether it is `held` and `muted`, its
+`workdir_commit`, and the names of its `leases`. It holds no configuration document and
+no message body.
 
 **Row 14 of the T3 Code review, 2026-10-27.** The `event_log` object holds `events`,
 the newest sequence number, `bytes`, the size of the log's database file with any
 SQLite write ahead log or journal beside it, and `since_start`, with the `events` and
 `bytes` added and the whole `seconds` passed since this daemon opened the log. It
-gives `events_per_hour` and `bytes_per_hour` once the daemon has had the log for 60
-seconds, and `null` before. A size that cannot be read is `null`, never zero, and so
+gives `events_per_hour` and `bytes_per_hour`, each rounded to a whole number since the
+client protocol carries no floats, once the daemon has had the log for 60 seconds, and
+`null` before. A size that cannot be read is `null`, never zero, and so
 is any growth derived from it. `compaction` is `none`, since nothing compacts the log
 yet, so it only grows. The daemon's `status` carries the same fields in its
 `event_log`, as [`CLIENT.md`](CLIENT.md) specifies.
@@ -163,7 +165,10 @@ turn that failed before it began was recorded only in the line's activity log, a
 operator learned of it for hours. Each entry of
 `recent_turns` for a turn gives its `outcome`, `completed` only for the subtype
 `success`, `interrupted` when its driver interrupted it, and `failed` for every other
-subtype, with the `subtype` itself. `processes` adds the line's `stop_policy`, as
+subtype, with the `subtype` itself. `interrupted_for` gives why the driver interrupted
+it, such as `priority mail m-1 from @ana` or `a daemon restart`, and is `null` for a
+turn it did not interrupt, since the engine's subtype for such a turn, such as
+`error_during_execution`, reads as an error. `processes` adds the line's `stop_policy`, as
 `left` the latest record of processes left running, as `stop_unverified` the note of
 the latest stop Dromon could not verify was complete, and as `walk_limit` what the
 daemon's platform keeps the launcher's walk from reaching, each or `null`, as the stop
@@ -188,6 +193,21 @@ The `daemon` object holds the following, decided by the operator on 2026-10-26 i
   newer code until an operator restarts it. A checkout that moved does not prove that
   the code differs, since a commit can change only documents, so the note is a prompt to
   check rather than a verdict.
+
+The `commits` object, decided by the operator on 2026-10-27 with restart to upgrade,
+gives what a review or report names, read at every call in the way `checkout_commit`
+is read.
+
+- **`workdir`.** The full commit at `HEAD` of the checkout holding the line's working
+  directory, or `null` when the directory is not allowed or not in a checkout. Each
+  entry of `other_lines` gives the same for its line as `workdir_commit`.
+- **`daemon`**, **`daemon_checkout`** and **`stale`.** The `daemon` object's `commit`,
+  `checkout_commit` and `stale`, repeated so the object stands alone.
+- **`cite`.** One sentence naming both full commits, such as `line core read its
+  worktree at commit C, under the daemon at commit D.`, with the commit the daemon's
+  checkout has moved to when it is stale, so a report can quote it whole.
+- **`note`.** That both commits are read from `HEAD`. Uncommitted changes in the
+  worktree are part of neither, and only `git status` shows them.
 
 **`read_instructions`.** One optional argument, `full`, a boolean. The instructions are
 those the line's next turn receives as its engine adapter composes them from

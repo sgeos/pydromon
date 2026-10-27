@@ -13,6 +13,9 @@ Lifecycle and failure modes.
 - A ``stop`` request, SIGTERM or SIGINT ends the loop. Open connections are closed,
   the socket file is removed and the event log is closed. The lock file is left in
   place, because removing a lock file races with the next daemon taking it.
+- A ``restart`` request drains first, as ``dromon.restart`` describes, then stops as
+  ``stop`` does and starts a successor from the installed code once the lock is
+  released, so the successor never finds it held.
 - Each connection has an idle timeout and a line limit, so a stalled or hostile client
   cannot hold the daemon or exhaust its memory.
 
@@ -43,7 +46,8 @@ from typing import Any, Final, cast
 
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import __version__, exits
+from dromon import __version__, exits, restart
+from dromon import client
 from dromon.agents import (
     OFF as AGENTS_OFF,
     AgentError,
@@ -187,6 +191,14 @@ class Daemon:
     """The project file as last loaded, at start or by ``reload_project``."""
     command_line: Overrides = field(default_factory=Overrides)
     project_file_present: bool = False
+    hold_wakes: bool = False
+    """Whether the command line held wakes, which a restart's successor keeps."""
+    successor: list[str] | None = field(default=None, init=False)
+    """The options a successor starts with, once a restart is ready to stop."""
+    _watches: set["asyncio.Task[None]"] = field(
+        default_factory=lambda: set[asyncio.Task[None]](), init=False, repr=False
+    )
+    """The watch of a draining restart, kept so that it is not collected."""
 
     # Settings, at the project's scope and each line's.
 
@@ -430,6 +442,9 @@ class Daemon:
                 | Operation.LINE_VIEW
                 | Operation.LINE_ACTIVITY
                 | Operation.INTERRUPT
+                | Operation.MUTE
+                | Operation.UNMUTE
+                | Operation.RESTART
                 | Operation.SETTINGS
                 | Operation.SET_SETTING
                 | Operation.CLEAR_SESSION
@@ -471,6 +486,21 @@ class Daemon:
                     (line_id,) = _text_args(request.args, ("line_id",))
                     interrupted = self.scheduler.interrupt(line_id)
                     result = {"line_id": line_id, "interrupted": interrupted}
+                case Operation.MUTE:
+                    (line_id,) = _text_args(request.args, ("line_id",))
+                    changed = self.scheduler.mute(line_id)
+                    result = {
+                        "line_id": line_id,
+                        "muted": True,
+                        "changed": changed,
+                        "running": self.scheduler.condition(line_id) == "running",
+                    }
+                case Operation.UNMUTE:
+                    (line_id,) = _text_args(request.args, ("line_id",))
+                    changed = self.scheduler.unmute(line_id)
+                    result = {"line_id": line_id, "muted": False, "changed": changed}
+                case Operation.RESTART:
+                    result = self._restart(request.args)
                 case Operation.SETTINGS:
                     result = self._settings(request.args)
                 case Operation.SET_SETTING:
@@ -504,6 +534,7 @@ class Daemon:
         except (
             InvalidField,
             EventRejected,
+            restart.RestartRefused,
             DriverError,
             ConfigError,
             OverrideError,
@@ -1001,15 +1032,91 @@ class Daemon:
         }
 
     def _send(self, args: dict[str, object]) -> dict[str, object]:
-        optional = ("reply_to",) if "reply_to" in args else ()
-        values = _text_args(args, ("recipient", "body", "operator", *optional))
+        """Record an operator's note. ``priority``, optional and default false, makes
+        it priority mail, which only a line may receive, and which for an operator
+        is unlimited."""
+        urgent = args.get("priority", False)
+        if not isinstance(urgent, bool):
+            raise ProtocolError(ErrorCode.BAD_REQUEST, "priority is not a boolean")
+        texts = {key: value for key, value in args.items() if key != "priority"}
+        optional = ("reply_to",) if "reply_to" in texts else ()
+        values = _text_args(texts, ("recipient", "body", "operator", *optional))
         recipient, body, operator = values[:3]
         reply_to = values[3] if optional else None
-        self.scheduler.ensure_operator(OperatorAddress(operator).operator_id)
+        sender = OperatorAddress(operator)
+        address = parse_address(recipient)
+        if urgent:
+            # Checked before the operator is registered, so a refusal records nothing.
+            self.scheduler.check_priority(sender, address)
+        self.scheduler.ensure_operator(sender.operator_id)
         message_id = self.scheduler.send(
-            OperatorAddress(operator), parse_address(recipient), body, reply_to
+            sender, address, body, reply_to, priority=urgent
         )
-        return {"message_id": message_id}
+        return {"message_id": message_id, "priority": urgent}
+
+    def _restart(self, args: dict[str, object]) -> dict[str, object]:
+        """Begin a restart for ``operator``. ``mode`` is ``wait``, the default, or
+        ``interrupt``, ``wait_seconds`` bounds the drain, and ``end_tasks``, default
+        false, lets it stop background tasks of kept sessions. Needs the daemon's
+        event loop, on which the watch runs."""
+        unknown = sorted(set(args) - {"operator", "mode", "wait_seconds", "end_tasks"})
+        if unknown:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST, f"restart takes no {', '.join(unknown)}"
+            )
+        texts = {key: args[key] for key in ("operator", "mode") if key in args}
+        names = ("operator", "mode") if "mode" in texts else ("operator",)
+        values = _text_args(texts, names)
+        operator = OperatorAddress(values[0]).operator_id
+        try:
+            mode = restart.Mode(values[1] if len(values) > 1 else restart.Mode.WAIT)
+        except ValueError as error:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST, "mode is not wait or interrupt"
+            ) from error
+        end_tasks = args.get("end_tasks", False)
+        if not isinstance(end_tasks, bool):
+            raise ProtocolError(ErrorCode.BAD_REQUEST, "end_tasks is not a boolean")
+        try:
+            wait = restart.check_wait(
+                args.get("wait_seconds", restart.DEFAULT_WAIT_SECONDS)
+            )
+        except restart.RestartRefused as error:
+            raise ProtocolError(ErrorCode.BAD_REQUEST, str(error)) from error
+        loop = asyncio.get_running_loop()
+        lost = self.tasks_lost(sorted(self.log.state.lines)) if end_tasks else {}
+        running = self.scheduler.begin_restart(
+            mode, operator, wait, end_tasks=end_tasks
+        )
+        watch = loop.create_task(self._watch_restart(wait))
+        self._watches.add(watch)
+        watch.add_done_callback(self._watches.discard)
+        return {
+            "restarting": True,
+            "mode": mode.value,
+            "wait_seconds": wait,
+            "running": cast(object, running),
+            "pid": os.getpid(),
+            "commit": self.scheduler.daemon_status()["commit"],
+            **lost,
+        }
+
+    async def _watch_restart(self, wait_seconds: int) -> None:
+        """Stop the daemon for its successor once the draining restart is ready, or
+        return once it is abandoned. Bounded by ``restart.polls``."""
+        for _ in range(restart.polls(wait_seconds)):
+            outcome = self.scheduler.restart_progress()
+            if outcome is restart.Outcome.READY:
+                self.successor = successor_args(self.command_line, self.hold_wakes)
+                print("dromond: stopping for a restart", file=sys.stderr)
+                self.stop_requested.set()
+                return
+            if outcome is restart.Outcome.ABANDONED:
+                return
+            await asyncio.sleep(restart.POLL_SECONDS)
+        self.scheduler.abandon_restart(
+            "its watch made every poll its wait allows without passing the deadline"
+        )
 
     def status(self) -> dict[str, object]:
         state = self.log.state
@@ -1030,6 +1137,8 @@ class Daemon:
                 **self.scheduler.event_log_status(),
             },
             "tick": self.scheduler.tick,
+            "daemon": self.scheduler.daemon_status(),
+            "restart": self.scheduler.restart_status(),
             "lines": self.scheduler.line_summaries(),
             "agents": {
                 "listen": self.agents.listen,
@@ -1104,7 +1213,22 @@ def _text_args(args: dict[str, object], names: tuple[str, ...]) -> tuple[str, ..
 
 
 async def _write(writer: asyncio.StreamWriter, response: Response) -> None:
-    writer.write(encode_response(response))
+    """Write ``response``, or, when it cannot be encoded, such as a result over the
+    line limit or one holding a float, an internal error that names the request, so
+    the client learns why instead of finding the connection closed."""
+    try:
+        encoded = encode_response(response)
+    except ProtocolError as error:
+        print(f"dromond: a response could not be encoded: {error}", file=sys.stderr)
+        encoded = encode_response(
+            Response(
+                response.request_id,
+                ok=False,
+                error_code=ErrorCode.INTERNAL,
+                error_message=f"the daemon could not encode its response: {error}",
+            )
+        )
+    writer.write(encoded)
     await writer.drain()
 
 
@@ -1239,6 +1363,47 @@ async def serve(daemon: Daemon) -> None:
                 )
         for signum in (signal.SIGTERM, signal.SIGINT):
             loop.remove_signal_handler(signum)
+
+
+def successor_args(overrides: Overrides, hold_wakes: bool) -> list[str]:
+    """The ``dromond`` options a restart's successor starts with, so that it keeps
+    what the command line gave. ``dromon.client.start`` adds the project and the
+    runtime directory. Floats are written with ``repr``, which reads back exactly."""
+    args: list[str] = []
+    if overrides.operator is not None:
+        args += ["--operator", overrides.operator]
+    if overrides.tick_seconds is not None:
+        args += ["--tick-seconds", repr(overrides.tick_seconds)]
+    if overrides.max_autonomous_turns is not None:
+        args += ["--max-autonomous-turns", str(overrides.max_autonomous_turns)]
+    if overrides.max_cost_usd is not None:
+        args += ["--max-cost-usd", repr(overrides.max_cost_usd)]
+    if overrides.cooldown_seconds is not None:
+        args += ["--cooldown-seconds", repr(overrides.cooldown_seconds)]
+    if hold_wakes:
+        args.append("--hold-wakes")
+    return args
+
+
+def start_successor(paths: ProjectPaths, args: Sequence[str]) -> int:
+    """Start a restart's successor once this daemon has released its lock and its
+    sockets, and return this daemon's exit status. A successor that does not start
+    leaves no daemon running, which is said, since the code it would run is the code
+    installed now, which the operator must fix or start by hand."""
+    try:
+        pid = client.start(paths, args)
+    except (client.DaemonFailed, PathError, ValueError, OSError) as error:
+        print(
+            f"dromond: the restarted daemon did not start: {error}. No daemon runs"
+            " for the project until dromon start succeeds",
+            file=sys.stderr,
+        )
+        return exits.FAILURE
+    print(
+        f"dromond: stopped for a restart, and the successor is pid {pid}",
+        file=sys.stderr,
+    )
+    return exits.OK
 
 
 class ProjectMismatch(Exception):
@@ -1471,6 +1636,7 @@ def run(
         return exits.FAILURE
     line_tokens = LineTokens()
     launcher.configure(paths.left_reports)
+    successor: list[str] | None = None
     try:
         with EventLog(paths.event_log) as log:
             scheduler = Scheduler(
@@ -1514,9 +1680,11 @@ def run(
                     project=config,
                     command_line=given,
                     project_file_present=file.exists(),
+                    hold_wakes=hold_wakes,
                 )
                 daemon.apply_project_values()
                 asyncio.run(serve(daemon))
+                successor = daemon.successor
             finally:
                 if teacher is not None:
                     release_teacher(teacher)
@@ -1535,6 +1703,8 @@ def run(
             with contextlib.suppress(FileNotFoundError):
                 stale.unlink()
         os.close(lock)
+    if successor is not None:
+        return start_successor(paths, successor)
     print("dromond: stopped", file=sys.stderr)
     return exits.OK
 

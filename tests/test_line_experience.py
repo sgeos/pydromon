@@ -198,8 +198,17 @@ def test_line_status_shows_the_line_its_daemon_and_the_others(world: World) -> N
     }
     assert status["leases"] == []
     assert status["other_lines"] == [
-        {"line_id": "beta", "state": "idle", "held": False, "leases": ["gate"]}
+        {
+            "line_id": "beta",
+            "state": "idle",
+            "held": False,
+            "muted": False,
+            "workdir_commit": None,
+            "leases": ["gate"],
+        }
     ]
+    assert status["commits"]["workdir"] is None
+    assert status["commits"]["daemon"] == COMMIT
     for secret in ("a private body", "notes", "s3", "was held for this test"):
         assert secret not in text
 
@@ -880,6 +889,40 @@ def test_daemon_status_says_when_the_checkout_moved(
     assert (status["stale"], status["checkout_commit"]) == (True, moved)
     note = cast(str, status["stale_note"])
     assert COMMIT[:12] in note and moved[:12] in note and "restarts" in note
+
+
+def test_line_status_cites_the_worktree_and_daemon_commits(
+    world: World, tmp_path: Path
+) -> None:
+    """Restart to upgrade, decided on 2026-10-27. A review names both commits, so
+    line_status gives each in full and one sentence that cites them."""
+    work = checkout(world.root, "c" * 40)
+    daemon = checkout(tmp_path / "daemon", COMMIT)
+    world.scheduler = Scheduler(
+        world.log,
+        world.build,
+        root=work,
+        protected=(work / ".dromon",),
+        daemon_commit=COMMIT,
+        daemon_checkout=daemon,
+    )
+    text, error = world.call("line_status")
+    assert not error
+    commits = json.loads(text)["commits"]
+    assert (commits["workdir"], commits["daemon"]) == ("c" * 40, COMMIT)
+    assert (commits["daemon_checkout"], commits["stale"]) == (COMMIT, False)
+    assert commits["cite"] == (
+        f"line alpha read its worktree at commit {'c' * 40}, under the daemon at"
+        f" commit {COMMIT}."
+    )
+    others = json.loads(text)["other_lines"]
+    assert [other["workdir_commit"] for other in others] == ["c" * 40]
+    moved = "d" * 40
+    checkout(daemon, moved)
+    text, _ = world.call("line_status")
+    commits = json.loads(text)["commits"]
+    assert commits["stale"] is True
+    assert commits["cite"].endswith(f", whose checkout has since moved to {moved}.")
 
 
 def test_staleness_is_unknown_without_a_checkout_or_a_start_commit(

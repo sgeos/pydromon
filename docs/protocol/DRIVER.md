@@ -156,10 +156,15 @@ buffer to the module's `data` block. A later interface may use either.
 | `text` | | Length of the text | For each text block |
 | `thinking` | | | For each thinking block |
 | `tool_use` | The tool's name | | For each tool call |
+| `tool_result` | | | Once a tool the turn used has finished and its result was delivered to the model. Added on 2026-10-27 |
+| `message_end` | | The message's count of tool uses | At the end of an assistant message, where the engine reports a whole message, which only Pi does. Added on 2026-10-27 |
 | `result` | The result subtype | The engine's turn count | When the turn ends |
 
 A driver answers an event it does not know with `continue`, so a host may add events
-without breaking older drivers.
+without breaking older drivers. The packaged drivers name neither `tool_result` nor
+`message_end`. The host uses both for the safe point of priority mail, as
+[`PRIORITY.md`](PRIORITY.md) specifies, and a test checks that every packaged driver
+continues at them with its state unchanged.
 
 ## Actions
 
