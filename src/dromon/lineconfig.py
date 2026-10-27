@@ -13,8 +13,8 @@ the operator's user settings and claude.ai account, which are otherwise excluded
 Instructions. ``claude_code_prompt`` runs a Claude Code line on Claude Code's own system
 prompt instead of an empty one, and ``instructions`` names files, such as a project's
 ``CLAUDE.md``, whose text is appended to the system prompt at the start of each turn. A
-relative path is resolved against the line's working directory, and ``~`` against the
-home directory. Only the paths are stored.
+relative path is resolved against the project root, as ``rooted_instructions`` says,
+and ``~`` against the home directory. Only the paths are stored.
 
 Kept sessions. ``keep_session`` keeps a Claude Code line's engine connected between
 turns, so that commands it runs in the background outlive the turn. The connection
@@ -52,8 +52,9 @@ account's mail and file connectors, and are meant for lines the operator trusts.
 import json
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
+from pathlib import Path
 from typing import Final, NoReturn, cast
 
 from dromon.launcher import StopPolicy
@@ -208,6 +209,66 @@ class McpServer:
         return config
 
 
+def _explicit(path: str) -> bool:
+    """Whether ``path`` names its file explicitly, from the home directory or the
+    file system's root, rather than relative to the project."""
+    return path.startswith("~") or Path(path).is_absolute()
+
+
+def _contained(path: str, root: Path) -> Path:
+    """The real path of the relative ``path`` under ``root``, or ``ConfigError`` when
+    it resolves, through ``..`` or a symbolic link, outside the project root."""
+    real_root = root.resolve()
+    file = (root / path).resolve()
+    if not file.is_relative_to(real_root):
+        _fail(f"the instructions {path} lie outside the project root")
+    return file
+
+
+def check_instructions(paths: tuple[str, ...], root: Path) -> None:
+    """Refuse instruction ``paths`` that a turn could not read safely, as the
+    configuration is loaded rather than when a turn starts. A relative path must
+    resolve, after symbolic links, inside the project ``root``, so a project file
+    cannot reach the operator's other files through it. A path from ``~`` or the root
+    of the file system is the operator's explicit choice and may lie anywhere, such as
+    ``~/.claude/CLAUDE.md``. Every path must name a regular file that exists. Raises
+    ``ConfigError`` naming the file.
+
+    **Review of 2026-10-27, I0-1 and I0-2.** A relative path was joined to the root
+    unchecked, and a missing file was found only when a turn failed. A file removed
+    after loading still fails its turn, which then holds the line and asks an
+    operator."""
+    for path in paths:
+        file = Path(path).expanduser() if _explicit(path) else _contained(path, root)
+        if not file.is_file():
+            _fail(f"the instructions {path} do not name a regular file that exists")
+
+
+def rooted_instructions(config: "LineConfig", root: Path) -> "LineConfig":
+    """``config`` with each relative path in ``instructions`` made absolute against
+    the project ``root``, as every engine adapter then reads it. A path that begins
+    with ``~`` is left for the reader to expand. **Luna's turn of 2026-10-27.** A
+    relative path was resolved against the line's working directory, so a line moved
+    to a worktree lost a file that only the project root held, and its turn failed
+    before it began. The project root is where the configuration is written, so a
+    path resolved there means the same for every line, whatever its workdir. Porting
+    note, a port resolves the paths once as the configuration is loaded.
+
+    A relative path is checked again here, when an engine is built, and raises
+    ``ConfigError`` if it now resolves outside the root, such as after a symbolic link
+    in the project was changed since loading."""
+    rooted: list[str] = []
+    for path in config.instructions:
+        if not _explicit(path):
+            _contained(path, root)
+            path = str(root / path)
+        rooted.append(path)
+    paths = tuple(rooted)
+    return (
+        config if paths == config.instructions else replace(config, instructions=paths)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class LineConfig:
     builtin_tools: tuple[str, ...] = ()
@@ -257,6 +318,9 @@ class LineConfig:
     auto_compact_tokens: int | None = None
     """The context estimate at or past which a turn of a line with ``allow_compact``
     begins by compacting the session, or ``None`` for never. Set by an operator."""
+    context_handoff: bool = True
+    """Whether the line's first turn in a new engine session, after a rebind or a
+    cleared session, begins with a selection from its mail. Row 13."""
 
     def allows(self, tool_name: str, own_tools: frozenset[str]) -> bool:
         """Whether the policy allows ``tool_name``. Dromon's own tools always pass."""
@@ -327,6 +391,8 @@ def encode_config(config: LineConfig) -> str:
         document["allow_compact"] = True
     if config.auto_compact_tokens is not None:
         document["auto_compact_tokens"] = config.auto_compact_tokens
+    if not config.context_handoff:
+        document["context_handoff"] = False
     return json.dumps(
         document,
         ensure_ascii=False,
@@ -500,6 +566,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         "context_warn_tokens",
         "allow_compact",
         "auto_compact_tokens",
+        "context_handoff",
     }
     unknown = set(document) - allowed
     if unknown:
@@ -563,6 +630,9 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
     keep = document.get("keep_session", False)
     if type(keep) is not bool:
         _fail("keep_session must be a boolean")
+    handoff = document.get("context_handoff", True)
+    if type(handoff) is not bool:
+        _fail("context_handoff must be a boolean")
     idle = _seconds(document, "keep_session_idle_seconds", DEFAULT_KEEP_IDLE_SECONDS)
     ceiling = _seconds(document, "keep_session_max_seconds", DEFAULT_KEEP_MAX_SECONDS)
     if ceiling < idle:
@@ -628,6 +698,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         context_warn_tokens=warn,
         allow_compact=compact,
         auto_compact_tokens=auto,
+        context_handoff=handoff,
     )
 
 

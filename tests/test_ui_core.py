@@ -761,6 +761,26 @@ def test_the_mail_pane_and_the_status_bar_show_the_view() -> None:
     assert "$0.0123 | pending 1 | mail" in text_of(bar)
 
 
+@pytest.mark.parametrize(
+    ("cost", "unknown", "shown", "absent"),
+    [
+        ("0.0123", 0, "$0.0123 | pending", "unknown"),
+        ("0.0123", 2, "$0.0123 + 2 unknown | pending", "cost unknown"),
+        (None, 2, "cost unknown | pending", "$"),
+        (None, 0, "turns 3 | pending", "$"),
+    ],
+)
+def test_the_status_bar_keeps_an_unknown_cost_apart_from_zero(
+    cost: str | None, unknown: int, shown: str, absent: str
+) -> None:
+    """Row 8 of the T3 Code review."""
+    line = {**LINE, "cost_estimate_usd": cost, "cost_unknown_turns": unknown}
+    model = attached(view=view_of({**VIEW, "line": line}), width=200)
+    bar = next(row for row in frame(model).rows if row and row[0].style is Style.BAR)
+    assert shown in text_of(bar)
+    assert absent not in text_of(bar)
+
+
 def test_a_held_line_says_how_to_release_it() -> None:
     view = view_of(VIEW)
     held = replace(view, line=replace(view.line, held_by="q-9"))

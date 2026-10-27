@@ -588,3 +588,31 @@ def test_the_model_accepts_only_the_note_or_the_fixed_withheld_text() -> None:
         state.check(MessageSent("s1", alpha, alpha, MessageKind.NOTE, "redacted"))
     state.apply(MessageSent("s1", alpha, alpha, MessageKind.NOTE, WITHHELD_WAKE_NOTE))
     assert "alpha" not in state.scheduled
+
+
+def test_instruction_paths_are_checked_where_a_configuration_arrives(
+    paths: ProjectPaths,
+) -> None:
+    """Review of 2026-10-27, I0-1 and I0-2. A client's configuration and a reloaded
+    project file are refused, with nothing recorded, for a relative path that leaves
+    the project root or a file that does not exist."""
+    (paths.root / "RULES.md").write_text("Rules.\n")
+    with attached(paths, ProjectConfig()) as client:
+        escaping = client.refused(
+            "create_line", create("alpha", instructions=["../outside.md"])
+        )
+        assert "outside the project root" in escaping
+        assert client.ask("create_line", create("alpha", instructions=["RULES.md"])).ok
+        missing = client.refused(
+            "configure_line",
+            {"line_id": "alpha", "config": {"instructions": ["GONE.md"]}},
+        )
+        assert "GONE.md do not name a regular file" in missing
+        write_file(
+            paths,
+            "[lines.alpha]\nmodel = 'claude-haiku-5-5'\n"
+            "instructions = ['../outside.md']\n",
+        )
+        reloaded = client.refused("reload_project", {})
+        assert "lines.alpha.instructions" in reloaded
+        assert "for line alpha" in reloaded

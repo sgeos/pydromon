@@ -12,7 +12,7 @@ import json
 import os
 import re
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from pathlib import Path
 from typing import Final, cast
 
@@ -27,8 +27,9 @@ from dromon.client import (
     stop,
 )
 from dromon.paths import PathError, ProjectPaths, project_paths
-from dromon.driver import MODELS, Driver, DriverError, Strategy
-from dromon import antigravity, cursor
+from dromon.driver import MODELS, Credential, Driver, DriverError, Strategy
+from dromon import antigravity, capabilities, cursor, evidence, pi
+from dromon.engine import ENGINE_NAME as CLAUDE_CODE_ENGINE
 from dromon.engine import EngineRefused
 from dromon.agents import LINE_TOKEN_ENV, TOKEN_ENV
 from dromon.lineconfig import EFFORTS
@@ -114,7 +115,36 @@ def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             f" operators {counts.get('operators')},"
             f" open questions {counts.get('open_questions')}"
         )
+        print(_log_growth(counts))
     return exits.OK
+
+
+def _log_growth(log: Mapping[str, object]) -> str:
+    """The event log's size and growth, as ``dromon status`` prints it, with an
+    unknown value said to be unknown rather than shown as zero."""
+    size = log.get("bytes")
+    since: object = log.get("since_start")
+    grown: Mapping[str, object] = (
+        cast(Mapping[str, object], since) if isinstance(since, dict) else {}
+    )
+    added = grown.get("bytes")
+    rate = log.get("events_per_hour")
+    parts = [
+        f"event log {_size(size)}",
+        f"{grown.get('events', 'unknown')} events and"
+        f" {_size(added)} since the daemon started",
+        f"{rate} events an hour" if rate is not None else "rate not yet known",
+        f"compaction {log.get('compaction', 'unknown')}",
+    ]
+    return ", ".join(parts)
+
+
+def _size(value: object) -> str:
+    if type(value) is not int:
+        return "unknown size"
+    if abs(value) < 1024 * 1024:
+        return f"{value / 1024:.1f} KiB"
+    return f"{value / (1024 * 1024):.1f} MiB"
 
 
 def _stop(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
@@ -135,7 +165,14 @@ def _stop(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 
 
 PARTIAL_ISOLATION_ENGINES: Final = frozenset(
-    {cursor.ENGINE_NAME, antigravity.ENGINE_NAME}
+    {
+        name
+        for name, table in capabilities.TABLES.items()
+        if capabilities.isolation_of(table) == "partial"
+    }
+    # Antigravity's table is pending the merge of the branch that changes its
+    # adapter, which isolates it partially, as ANTIGRAVITY.md records.
+    | {antigravity.ENGINE_NAME}
 )
 """Engines ``dromon probe --accept-partial-isolation`` lets run, by the operator's
 decision of 2026-10-26. A daemon refuses lines on either."""
@@ -145,12 +182,25 @@ UNVERIFIED_CREDENTIAL_ENGINES: Final = frozenset({antigravity.ENGINE_NAME})
 confirmation of the credential by hand, by the operator's decision of 2026-10-26."""
 
 
+RECORDING_ENGINES: Final = frozenset(
+    {CLAUDE_CODE_ENGINE, pi.ENGINE_NAME, cursor.ENGINE_NAME, antigravity.ENGINE_NAME}
+)
+"""Engines whose probe ``--record`` can record, as ``dromon.evidence`` says."""
+
+
 def _probe(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     """Run one short turn with no tools and report what the engine says.
 
     The driver's strategy decides which credential is acceptable, so the default
-    subscription driver can never start usage billed per token.
+    subscription driver can never start usage billed per token. With ``--scrub`` it
+    runs no turn and scrubs a recording instead.
     """
+    scrubbed: Path | None = arguments.scrub
+    if scrubbed is not None:
+        return _scrub(scrubbed, arguments.scrub_to)
+    if arguments.scrub_to is not None:
+        print("dromon probe: --scrub-to is accepted only with --scrub", file=sys.stderr)
+        return exits.FAILURE
     try:
         model: str = arguments.model
         strategy = Strategy(arguments.strategy)
@@ -171,14 +221,56 @@ def _probe(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
                 "--accept-unverified-credential is accepted only together with"
                 " --accept-partial-isolation"
             )
+        recorded: bool = arguments.record
+        with_stderr: bool = arguments.record_stderr
+        unchecked: bool = arguments.accept_unverified_check
+        if unchecked and not arguments.no_turn:
+            raise EngineRefused(
+                "--accept-unverified-check is accepted only together with --no-turn"
+            )
+        if arguments.no_turn:
+            if recorded or with_stderr:
+                raise EngineRefused(
+                    "--no-turn exchanges no frames, so it takes no --record"
+                )
+            return _sign_in(driver, unchecked)
+        if with_stderr and not recorded:
+            raise EngineRefused(
+                "--record-stderr is accepted only together with --record"
+            )
+        if recorded and driver.settings.engine not in RECORDING_ENGINES:
+            raise EngineRefused(
+                f"--record is not yet supported for {driver.settings.engine}, whose"
+                " adapter frames its own traffic"
+            )
         line = engine_factory(
             str(paths.root),
             accept_partial_isolation=accept,
             accept_unverified_credential=unverified,
         )(LineSpec("probe", model, strategy), [])
-        report = asyncio.run(line.run_turn(PROBE_PROMPT))
+        recording = (
+            evidence.Recording(
+                evidence.probe_path(paths.root, driver.settings.engine),
+                driver.settings.engine,
+                model,
+                stderr=with_stderr,
+            )
+            if recorded
+            else None
+        )
+        token = evidence.RECORDING.set(recording)
+        try:
+            report = asyncio.run(line.run_turn(PROBE_PROMPT))
+        finally:
+            evidence.RECORDING.reset(token)
+            if recording is not None:
+                recording.close()
+                print(f"dromon probe: frames recorded to {recording.path}")
     except (DriverError, EngineRefused) as error:
         print(f"dromon probe: {error}", file=sys.stderr)
+        return exits.FAILURE
+    except OSError as error:
+        print(f"dromon probe: cannot record the frames: {error}", file=sys.stderr)
         return exits.FAILURE
     settings = driver.settings
     print(
@@ -191,6 +283,10 @@ def _probe(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         f" context window {settings.context_window}"
     )
     print(f"engine {settings.engine}, credential {report.credential}")
+    for row in capabilities.report_lines(capabilities.table_of(settings.engine)):
+        print(row)
+    if report.sandbox_mode is not None:
+        print(f"sandbox {report.sandbox_mode}")
     found = report.capabilities
     if found is not None:
         print(
@@ -199,7 +295,8 @@ def _probe(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         )
         print(
             f"credential {report.credential} from {found.api_key_source!r},"
-            f" tools {len(found.tools)}, permission mode {found.permission_mode}"
+            f" tools {'unknown' if found.tools is None else len(found.tools)},"
+            f" permission mode {found.permission_mode}"
         )
         print("capabilities " + ", ".join(found.capabilities))
     print(f"turn {report.subtype} in {report.num_turns}, reply {report.text!r}")
@@ -476,7 +573,7 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         print(f"no project file at {file}. Built-in defaults apply.")
         return exits.OK
     try:
-        config = load(file)
+        config = load(file, paths.root)
     except ConfigFileError as error:
         print(f"dromon config: {error}", file=sys.stderr)
         return exits.FAILURE
@@ -812,6 +909,89 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
 }
 
 
+SignInCheck = Callable[[Driver], Coroutine[object, object, Credential]]
+"""A sign-in check, which runs no turn and answers the credential the engine uses."""
+
+SIGN_IN_CHECKS: Final[dict[str, SignInCheck]] = {}
+"""Each engine's sign-in check, which runs no turn, for the engines whose table says
+it has one. Row 16 of the T3 Code review. No check reads a credential store itself.
+No table says so yet."""
+
+UNVERIFIED_SIGN_IN_CHECKS: Final[dict[str, SignInCheck]] = {
+    pi.ENGINE_NAME: pi.check_sign_in,
+}
+"""Sign-in checks written from an engine's documentation, for engines never run live,
+whose table therefore says ``unknown``. **Review of 2026-10-27, C1.** Pi's table once
+said ``yes`` without a live run. Its check runs only with
+``--accept-unverified-check``, by the operator's decision."""
+
+
+def _sign_in(driver: Driver, unverified: bool = False) -> int:
+    """Check the engine's sign-in without a turn, where the engine offers a check, as
+    ``dromon probe --no-turn`` does. With ``unverified``, a check its table cannot
+    vouch for runs too, and the report says so."""
+    table = capabilities.table_of(driver.settings.engine)
+    check = SIGN_IN_CHECKS.get(table.engine)
+    if table.sign_in_check is not capabilities.Known.YES:
+        check = None
+    if check is None and unverified:
+        check = UNVERIFIED_SIGN_IN_CHECKS.get(table.engine)
+    if check is None:
+        hint = (
+            ". Its check was never run live, and runs with --accept-unverified-check"
+            if table.engine in UNVERIFIED_SIGN_IN_CHECKS
+            else ""
+        )
+        print(
+            f"dromon probe: {table.display} offers no sign-in check that Dromon knows,"
+            f" its table says {table.sign_in_check}{hint}, so nothing was checked and"
+            " no turn was run. dromon probe without --no-turn checks the sign-in with"
+            " one short turn",
+            file=sys.stderr,
+        )
+        return exits.FAILURE
+    try:
+        credential = asyncio.run(check(driver))
+    except (DriverError, EngineRefused) as error:
+        print(f"dromon probe: sign-in check failed: {error}", file=sys.stderr)
+        return exits.FAILURE
+    settings = driver.settings
+    print(
+        f"engine {settings.engine}, signed in with a {credential} credential, which"
+        f" the {settings.strategy} driver accepts. No turn was run"
+    )
+    if table.sign_in_check is not capabilities.Known.YES:
+        print(
+            f"The check was written from {table.display}'s documentation and was"
+            " never run live, so its answer is unverified"
+        )
+    return exits.OK
+
+
+def _scrub(source: Path, destination: Path | None) -> int:
+    """Scrub the recording at ``source`` into a file that may become a fixture, as
+    ``dromon.evidence.scrub_file`` says, without running a turn."""
+    target = destination or source.with_name(
+        source.name.removesuffix(".jsonl") + ".scrubbed.jsonl"
+    )
+    try:
+        written = evidence.scrub_file(source, target)
+    except evidence.RecordingError as error:
+        print(f"dromon probe: {error}", file=sys.stderr)
+        return exits.FAILURE
+    except OSError as error:
+        print(
+            f"dromon probe: cannot write the scrubbed recording: {error}",
+            file=sys.stderr,
+        )
+        return exits.FAILURE
+    print(f"dromon probe: scrubbed recording written to {written}")
+    print(
+        "dromon probe: the check is by pattern, so read the file before committing it"
+    )
+    return exits.OK
+
+
 def _add_driver_options(command: argparse.ArgumentParser) -> None:
     command.add_argument(
         "--model", choices=MODELS, default=PROBE_MODEL, help="default %(default)s"
@@ -977,6 +1157,53 @@ def build_parser() -> argparse.ArgumentParser:
         if name in ("create", "probe"):
             _add_driver_options(command)
         if name == "probe":
+            command.add_argument(
+                "--record",
+                action="store_true",
+                help="record every frame the adapter exchanged with the engine to a"
+                " new file under tmp/probes, readable by its owner alone, which a test"
+                " can replay through the adapter. Prompts and replies are recorded as"
+                " they were exchanged. Claude Code, Pi, Cursor Agent and Antigravity"
+                " record, and Codex and Grok do not yet",
+            )
+            command.add_argument(
+                "--no-turn",
+                action="store_true",
+                help="run no turn, and check only the engine's sign-in, where the"
+                " engine's table says it offers a check. No table says so yet."
+                " Dromon reads no credential store",
+            )
+            command.add_argument(
+                "--accept-unverified-check",
+                action="store_true",
+                help="with --no-turn, run a sign-in check written from an engine's"
+                " documentation but never run live, so its table says unknown. Pi has"
+                " one, pi auth check, which reads Pi's own credential store",
+            )
+            command.add_argument(
+                "--scrub",
+                type=Path,
+                default=None,
+                metavar="FILE",
+                help="run no turn. Write a copy of the recording FILE with the account"
+                " values, the home directory, session ids and uuids replaced by stable"
+                " placeholders, which still replays, and refuse it if the home"
+                " directory, the user name or an email address remains",
+            )
+            command.add_argument(
+                "--scrub-to",
+                type=Path,
+                default=None,
+                metavar="PATH",
+                help="with --scrub, where to write the copy, which must not exist."
+                " Default FILE with .scrubbed.jsonl in place of .jsonl",
+            )
+            command.add_argument(
+                "--record-stderr",
+                action="store_true",
+                help="with --record, also keep the engine's standard error, at most"
+                " 64 KiB, with credentials masked by pattern",
+            )
             command.add_argument(
                 "--accept-partial-isolation",
                 action="store_true",

@@ -31,6 +31,7 @@ from dromon.model import (
     LineOverridden,
     LineSession,
     LineSessionCleared,
+    ContextHandedOff,
     LineRebound,
     ProjectOverridden,
     LineState,
@@ -98,6 +99,14 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "walk_limited": ("note",),
     "question_withdrawn": ("message_id",),
     "question_superseded": ("message_id", "superseded_by"),
+    "context_handed_off": (
+        "line_id",
+        "cause",
+        "outcome",
+        "message_ids",
+        "chars",
+        "sha256",
+    ),
 }
 """The wire name of each event kind and its fields, in declaration order."""
 
@@ -277,6 +286,15 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "message_id": event.message_id,
                 "superseded_by": event.superseded_by,
             }
+        case ContextHandedOff():
+            return "context_handed_off", {
+                "line_id": event.line_id,
+                "cause": event.cause,
+                "outcome": event.outcome,
+                "message_ids": list(event.message_ids),
+                "chars": event.chars,
+                "sha256": event.sha256,
+            }
         case _:
             assert_never(event)
 
@@ -381,6 +399,15 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
         case "question_superseded":
             return QuestionSuperseded(
                 _str(data, "message_id"), _str(data, "superseded_by")
+            )
+        case "context_handed_off":
+            return ContextHandedOff(
+                _str(data, "line_id"),
+                _str(data, "cause"),
+                _str(data, "outcome"),
+                tuple(_list(data, "message_ids", str)),
+                _int(data, "chars"),
+                _str(data, "sha256"),
             )
         case _:
             raise DecodeError(f"unknown event kind {kind!r}")

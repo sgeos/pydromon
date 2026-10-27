@@ -90,12 +90,17 @@ class EventLog:
         _create_private(path)
         self._connection = sqlite3.connect(path, isolation_level=None)
         self._clock = clock
+        self.path = path
         try:
             _initialize(self._connection)
             self._state, self._last_seq = _replay(self._connection)
         except BaseException:
             self._connection.close()
             raise
+        self.opened_seq = self._last_seq
+        """The newest sequence number when this process opened the log."""
+        self.opened_bytes = self.size_bytes()
+        """The log's size when this process opened it, or ``None`` if unknown."""
 
     def __enter__(self) -> Self:
         return self
@@ -115,6 +120,20 @@ class EventLog:
     def state(self) -> State:
         """A snapshot of the current state. Changing it does not change the log."""
         return self._state.copy()
+
+    def size_bytes(self) -> int | None:
+        """The bytes the log takes on disk, its database file and any SQLite write
+        ahead log or rollback journal beside it, or ``None`` when a file cannot be
+        read. Row 14 of the T3 Code review. Nothing compacts the log yet."""
+        total = 0
+        for suffix in ("", "-wal", "-journal"):
+            try:
+                total += self.path.with_name(self.path.name + suffix).stat().st_size
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return None
+        return total
 
     @property
     def last_seq(self) -> int:

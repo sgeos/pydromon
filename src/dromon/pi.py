@@ -46,6 +46,7 @@ from typing import Any, Final, cast
 
 from claude_agent_sdk import SdkMcpTool
 
+from dromon import capabilities
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import (
     ActionTag,
@@ -304,7 +305,7 @@ def unsupported(config: LineConfig) -> str | None:
     if config.allow_compact:
         return "Pi lines cannot compact their session through Dromon"
     if config.keep_session:
-        return "Pi lines do not yet keep their engine session between turns"
+        return capabilities.kept_session_refusal(capabilities.PI)
     if config.sandbox is not None or config.settings is not None:
         return "Pi lines take no sandbox or settings document"
     return None
@@ -507,6 +508,53 @@ def credential_of(provider: str, answer: Mapping[str, object]) -> Credential:
     )
 
 
+def _quiet(agent_dir: Path) -> dict[str, str]:
+    """The variables every Pi Dromon starts runs with, its agent directory, offline
+    and without telemetry."""
+    return {
+        "PI_CODING_AGENT_DIR": str(agent_dir),
+        "PI_OFFLINE": "1",
+        "PI_TELEMETRY": "0",
+    }
+
+
+async def accepted_credential(
+    driver: Driver,
+    provider: str,
+    environment: Mapping[str, str],
+    auth_check: AuthChecker,
+) -> Credential:
+    """The credential ``pi auth check`` reports for ``provider``, once ``driver``
+    accepts it. Raises ``EngineRefused`` otherwise."""
+    credential = credential_of(provider, await auth_check(provider, environment))
+    verdict = driver.step(Event("credential", credential.value))
+    if verdict.tag is ActionTag.REFUSE:
+        raise EngineRefused(
+            f"the {verdict.text} driver refuses the {credential} credential"
+        )
+    return credential
+
+
+async def check_sign_in(
+    driver: Driver,
+    environment: Mapping[str, str] | None = None,
+    home: Path | None = None,
+    auth_check: AuthChecker = pi_auth_check,
+) -> Credential:
+    """Pi's sign-in check for ``driver``'s model, which runs no turn, as ``dromon
+    probe --no-turn`` does. It runs ``pi auth check`` in the environment a turn would
+    have, so Pi reads its own credential store and Dromon reads none. Row 16 of the
+    T3 Code review."""
+    if driver.settings.engine != ENGINE_NAME:
+        raise EngineRefused(f"{driver.settings.model} is not a Pi model")
+    started = engine_environment(
+        os.environ if environment is None else environment, driver.settings.strategy
+    )
+    started.update(_quiet((Path.home() if home is None else home) / AGENT_DIR))
+    provider = harness_model(driver.settings.model).partition("/")[0]
+    return await accepted_credential(driver, provider, started, auth_check)
+
+
 @dataclass(slots=True)
 class _Turn:
     text: list[str] = field(default_factory=list[str])
@@ -641,17 +689,10 @@ class PiLine:
             raise EngineRefused(f"the driver names an unknown effort {effort!r}")
         model = harness_model(settings.model)
         provider = model.partition("/")[0]
-        environment["PI_CODING_AGENT_DIR"] = str(self.agent_dir)
-        environment["PI_OFFLINE"] = "1"
-        environment["PI_TELEMETRY"] = "0"
-        credential = credential_of(
-            provider, await self._auth_check(provider, environment)
+        environment.update(_quiet(self.agent_dir))
+        credential = await accepted_credential(
+            self.driver, provider, environment, self._auth_check
         )
-        verdict = self.driver.step(Event("credential", credential.value))
-        if verdict.tag is ActionTag.REFUSE:
-            raise EngineRefused(
-                f"the {verdict.text} driver refuses the {credential} credential"
-            )
         tools = sorted(self.own_tools)
         environment["DROMON_PI_TOOLS"] = json.dumps(tools)
         if tools and self.line_token is not None:
@@ -754,6 +795,8 @@ class PiLine:
             calls=tuple(dict(call) for call in turn.calls[-50:]),
             context_tokens=turn.context,
             usage_note=PI_USAGE_NOTE if turn.calls else None,
+            # Pi documents that it has no sandbox, as the module says.
+            sandbox_mode="none",
         )
 
     # The protocol.

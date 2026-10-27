@@ -29,6 +29,7 @@ Porting note. Each record is read whole up to ``MAX_LINE`` bytes, a bound a port
 """
 
 import asyncio
+import contextlib
 import json
 import shutil
 import signal
@@ -37,7 +38,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
 from typing import Any, Final, Protocol, cast
 
-from dromon import launcher
+from dromon import evidence, launcher
 from dromon.engine import EngineRefused
 from dromon.launcher import StopPolicy
 
@@ -131,9 +132,11 @@ class Process:
         self,
         process: asyncio.subprocess.Process,
         policy: StopPolicy = StopPolicy.KILL_ALL,
+        recording: evidence.Recording | None = None,
     ) -> None:
         self._process = process
         self._policy = policy
+        self._recording = recording
 
     async def send(self, message: Mapping[str, object]) -> None:
         stdin = self._process.stdin
@@ -141,6 +144,8 @@ class Process:
             raise EngineRefused("the engine was started without a standard input")
         stdin.write((json.dumps(message) + "\n").encode())
         await stdin.drain()
+        if self._recording is not None:
+            self._recording.frame(evidence.OUT, message)
 
     async def receive(self) -> dict[str, Any] | None:
         stdout = self._process.stdout
@@ -162,7 +167,10 @@ class Process:
             raise NotJsonLine(line) from error
         if not isinstance(decoded, dict):
             raise EngineRefused("the engine sent a record that is not an object")
-        return cast(dict[str, Any], decoded)
+        record = cast(dict[str, Any], decoded)
+        if self._recording is not None:
+            self._recording.frame(evidence.IN, record)
+        return record
 
     async def stop(self) -> None:
         if self._process.returncode is None:
@@ -183,21 +191,36 @@ def json_lines_factory(command: str, *, keep_input: bool) -> ConnectionFactory:
                 f"the {command} command is not installed or not on PATH"
             )
         argv, launched, policy = launcher.wrap([found, *arguments], environment)
+        recording = evidence.RECORDING.get()
+        keep_stderr = recording is not None and recording.wants_stderr
         process = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE if keep_input else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE
+            if keep_stderr
+            else asyncio.subprocess.DEVNULL,
             cwd=cwd,
             env=launched,
             limit=MAX_LINE,
             start_new_session=True,
         )
+        draining = (
+            asyncio.create_task(evidence.drain_stderr(process.stderr, recording))
+            if recording is not None and process.stderr is not None
+            else None
+        )
         try:
-            yield Process(process, policy)
+            yield Process(process, policy, recording)
         finally:
             await launcher.end(
                 process, policy, close_input=True, input_seconds=EXIT_SECONDS
             )
+            if draining is not None:
+                # The harness has ended, so its standard error ends too, unless a
+                # descendant left running holds it, which the bound covers.
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(draining, EXIT_SECONDS)
+                draining.cancel()
 
     return start

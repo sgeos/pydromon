@@ -128,9 +128,11 @@ from claude_agent_sdk import (
 
 from claude_agent_sdk._internal.message_parser import parse_message
 from claude_agent_sdk._internal.transport import Transport
+from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 from claude_agent_sdk.types import SystemPromptPreset
 
-from dromon import launcher, redact
+from dromon import evidence, launcher, redact
+from dromon.capabilities import CLAUDE_CODE, version_refusal
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.ceiling import (
     STOP_REASON,
@@ -371,6 +373,9 @@ class _SdkClient:
     def __init__(
         self, options: ClaudeAgentOptions, transport: Transport | None = None
     ) -> None:
+        recording = evidence.RECORDING.get()
+        if transport is None and recording is not None:
+            options, transport = _recorded(options, recording)
         self._client = ClaudeSDKClient(options=options, transport=transport)
 
     async def __aenter__(self) -> "_SdkClient":
@@ -405,6 +410,158 @@ class _SdkClient:
             yield message
             if isinstance(message, ResultMessage):
                 return
+
+
+async def _no_prompt() -> AsyncIterator[dict[str, Any]]:
+    """The prompt stream of a streamed connection, which never yields, as the SDK's
+    own connect gives its transport."""
+    return
+    yield {}
+
+
+class RecordedTransport(Transport):
+    """A transport that records each frame written to and read from ``inner``.
+    **Row 7 of the T3 Code review.** Porting hazard: ``Transport`` is the Agent SDK's
+    internal interface, which an SDK upgrade must check."""
+
+    def __init__(self, inner: Transport, recording: evidence.Recording) -> None:
+        self._inner = inner
+        self._recording = recording
+
+    async def connect(self) -> None:
+        await self._inner.connect()
+
+    async def write(self, data: str) -> None:
+        for frame in _frames_of(data):
+            self._recording.frame(evidence.OUT, frame)
+        await self._inner.write(data)
+
+    def read_messages(self) -> AsyncIterator[dict[str, Any]]:
+        return self._read()
+
+    async def _read(self) -> AsyncIterator[dict[str, Any]]:
+        async for message in self._inner.read_messages():
+            self._recording.frame(evidence.IN, message)
+            yield message
+
+    async def close(self) -> None:
+        await self._inner.close()
+
+    def is_ready(self) -> bool:
+        return self._inner.is_ready()
+
+    async def end_input(self) -> None:
+        await self._inner.end_input()
+
+
+def _frames_of(data: str) -> list[dict[str, Any]]:
+    """The JSON objects among the lines the SDK writes."""
+    found: list[dict[str, Any]] = []
+    for line in data.splitlines():
+        with contextlib.suppress(ValueError):
+            document: object = json.loads(line)
+            if isinstance(document, dict):
+                found.append(cast(dict[str, Any], document))
+    return found
+
+
+class ReplayTransport(Transport):
+    """The engine's side of a recorded Claude Code exchange, for a test that runs the
+    real adapter and the real Agent SDK client against it. The SDK names each control
+    request it sends at random, so the answer to the recording's ``n``-th control
+    request is renamed for the ``n``-th the SDK sent."""
+
+    def __init__(self, replay: evidence.Replay) -> None:
+        self._replay = replay
+        self._recorded = [
+            str(frame["request_id"])
+            for frame in replay.recorded_out
+            if frame.get("type") == "control_request" and "request_id" in frame
+        ]
+        self._live: list[str] = []
+        self._ready = False
+
+    async def connect(self) -> None:
+        self._ready = True
+
+    async def write(self, data: str) -> None:
+        for frame in _frames_of(data):
+            if frame.get("type") == "control_request" and "request_id" in frame:
+                self._live.append(str(frame["request_id"]))
+            self._replay.send(frame)
+
+    def read_messages(self) -> AsyncIterator[dict[str, Any]]:
+        return self._read()
+
+    async def _read(self) -> AsyncIterator[dict[str, Any]]:
+        while True:
+            frame = await self._replay.receive()
+            if frame is None:
+                return
+            yield self._renamed(frame)
+
+    def _renamed(self, frame: dict[str, Any]) -> dict[str, Any]:
+        response = frame.get("response")
+        if frame.get("type") != "control_response" or not isinstance(response, dict):
+            return frame
+        answer = cast(dict[str, Any], response)
+        recorded = answer.get("request_id")
+        if recorded not in self._recorded:
+            return frame
+        index = self._recorded.index(str(recorded))
+        if index >= len(self._live):
+            return frame
+        return {**frame, "response": {**answer, "request_id": self._live[index]}}
+
+    async def close(self) -> None:
+        self._ready = False
+
+    def is_ready(self) -> bool:
+        return self._ready
+
+    async def end_input(self) -> None:
+        return
+
+
+def transport_session(make: Callable[[], Transport]) -> SessionFactory:
+    """A session factory that runs the real Agent SDK client over the transport
+    ``make`` gives, for a test or a replay."""
+
+    def factory(
+        options: ClaudeAgentOptions,
+    ) -> AbstractAsyncContextManager[AgentSession]:
+        return _SdkClient(options, transport=make())
+
+    return factory
+
+
+def replay_session(replay: evidence.Replay) -> SessionFactory:
+    """A session factory that runs the real Agent SDK client against ``replay``."""
+    return transport_session(lambda: ReplayTransport(replay))
+
+
+def _recorded(
+    options: ClaudeAgentOptions, recording: evidence.Recording
+) -> tuple[ClaudeAgentOptions, Transport]:
+    """``options`` with the engine's standard error kept, when the recording asks,
+    and a transport that records. The transport is given the options the SDK's own
+    connect would give it, with permission prompts over the control protocol when a
+    ``can_use_tool`` callback is set, as ``_configure_can_use_tool`` does in Agent SDK
+    0.2.174, since a transport given to the client is used as it is."""
+    if recording.wants_stderr:
+
+        def keep(line: str) -> None:
+            recording.stderr((line + "\n").encode())
+
+        options = replace(options, stderr=keep)
+    transported = (
+        replace(options, permission_prompt_tool_name="stdio")
+        if options.can_use_tool is not None
+        else options
+    )
+    return options, RecordedTransport(
+        SubprocessCLITransport(prompt=_no_prompt(), options=transported), recording
+    )
 
 
 def _sdk_session(
@@ -1198,7 +1355,9 @@ class Capabilities:
     claude_code_version: str
     model: str
     api_key_source: str
-    tools: tuple[str, ...]
+    tools: tuple[str, ...] | None
+    """The tools the engine offers, or ``None`` when its report held no list, which
+    is unknown, not empty. Row 10 of the T3 Code review."""
     permission_mode: str
     capabilities: tuple[str, ...]
 
@@ -1241,6 +1400,10 @@ class TurnReport:
     usage_note: str | None = None
     """What the engine's ``usage`` and ``calls`` mean, where an engine's differ from
     Claude Code's, or ``None`` for Claude Code's."""
+    sandbox_mode: str | None = None
+    """The sandbox the turn ran in, as the adapter knows it, such as ``enabled`` or
+    ``none``, or ``None`` where the adapter does not say. Row 8 of the T3 Code
+    review."""
 
 
 def _strings(value: object) -> tuple[str, ...]:
@@ -1260,7 +1423,7 @@ def _capabilities(data: Mapping[str, object]) -> Capabilities:
         claude_code_version=text("claude_code_version"),
         model=text("model"),
         api_key_source=text("apiKeySource"),
-        tools=_strings(data.get("tools")),
+        tools=_strings(data["tools"]) if isinstance(data.get("tools"), list) else None,
         permission_mode=text("permissionMode"),
         capabilities=_strings(data.get("capabilities")),
     )
@@ -1956,6 +2119,11 @@ class ClaudeCodeLine:
             compaction=turn.compaction,
             compaction_cost_usd=turn.compaction_cost,
             compaction_usage=turn.compaction_usage,
+            sandbox_mode=(
+                "enabled"
+                if self.sandbox is not None and self.sandbox.get("enabled") is True
+                else "disabled"
+            ),
         )
 
     async def _handle(
@@ -2071,6 +2239,17 @@ class ClaudeCodeLine:
 
     def _refusal(self, capabilities: Capabilities, turn: _Turn) -> str | None:
         """Why the driver or the policy refuses this engine, or ``None`` to proceed."""
+        # Row 7 of the T3 Code review. An engine older than the one Dromon was tested
+        # against is refused before anything else is judged.
+        too_old = version_refusal(CLAUDE_CODE, capabilities.claude_code_version or None)
+        if too_old is not None:
+            return too_old
+        if capabilities.tools is None:
+            # Row 10. A report without its list of tools is unknown, and an empty
+            # list would pass the check below that it cannot make.
+            return (
+                "the engine did not report its tools, so the turn could not be checked"
+            )
         unexpected = sorted(
             name for name in capabilities.tools if not self._offered_as_configured(name)
         )

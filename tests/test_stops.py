@@ -22,7 +22,7 @@ from dromon import scheduler as scheduler_module
 from dromon.activity import ActivityKind
 from dromon.agents import AgentError, LineTokens
 from dromon.ceiling import CHOICES, Choice, parse_choice
-from dromon.driver import Strategy
+from dromon.driver import Credential, Strategy
 from dromon.engine import HALT_REASON, INTERRUPTED_KIND, TurnReport
 from dromon.launcher import StopPolicy
 from dromon.lineconfig import LineConfig
@@ -43,6 +43,7 @@ from dromon.scheduler import (
     COMPLETED,
     FAILED,
     LAUNCHER_LOST_NOTE,
+    MAX_FAILURE_TEXT,
     STOPPED_REASON,
     SWEPT_CAUSE,
     UNFINISHED_KILL_NOTE,
@@ -66,13 +67,17 @@ class Engine:
         self.gate: asyncio.Event | None = None
         self.subtype = "success"
         self.fail = False
+        self.error = "the engine broke"
+        self.during: Callable[[], object] | None = None
 
     async def run_turn(self, prompt: str) -> TurnReport:
         self.prompts.append(prompt)
         if self.gate is not None:
             await self.gate.wait()
+        if self.during is not None:
+            self.during()
         if self.fail:
-            raise RuntimeError("the engine broke")
+            raise RuntimeError(self.error)
         self.session_id = "session-1"
         return TurnReport(
             self.subtype, 1, "ok", (), None, None, "session-1", None, None
@@ -750,14 +755,58 @@ def test_a_lines_condition_keeps_its_states_apart(
     assert world.scheduler.condition("alpha") == "waiting"
     assert world.scheduler.line_status("alpha")["condition"] == "waiting"
     engine.fail = True
+    # The line's own mail to an operator during the turn may explain its failure,
+    # so the line is left failed rather than held.
+    engine.during = lambda: world.scheduler.ask("alpha", ANA, "the tests broke")
 
     async def act() -> None:
         world.scheduler.send(ANA, LineAddress("alpha"), "x")
 
     run(world, act)
     assert world.scheduler.condition("alpha") == "failed"
+    assert world.log.state.lines["alpha"].held_by is None
     world.scheduler.hold("alpha", "was held")
     assert world.scheduler.condition("alpha") == "held"
+
+
+def test_a_failed_turn_without_operator_mail_is_held_with_its_cause(
+    worlds: Callable[..., World],
+) -> None:
+    """Luna's turn of 2026-10-27, as a refusal before the engine ran. A failure
+    after the line's earlier mail to an operator is still unexplained, since only
+    mail during the turn counts."""
+    engine = Engine()
+    world = worlds(engine)
+    world.scheduler.ask("alpha", ANA, "an earlier question")
+    engine.fail = True
+
+    async def act() -> None:
+        world.scheduler.send(ANA, LineAddress("alpha"), "x")
+
+    run(world, act)
+    line = world.log.state.lines["alpha"]
+    assert world.scheduler.condition("alpha") == "held"
+    assert line.held_by is not None
+    body = world.log.state.messages[line.held_by].body
+    assert "failed: the engine broke" in body
+    assert "sent no operator mail during it" in body
+
+
+def test_a_failure_s_quoted_cause_is_cut(worlds: Callable[..., World]) -> None:
+    engine = Engine()
+    world = worlds(engine)
+    engine.fail = True
+    engine.error = "x" * (MAX_FAILURE_TEXT * 2)
+
+    async def act() -> None:
+        world.scheduler.send(ANA, LineAddress("alpha"), "x")
+
+    run(world, act)
+    held = world.log.state.lines["alpha"].held_by
+    assert held is not None
+    body = world.log.state.messages[held].body
+    assert "x" * (MAX_FAILURE_TEXT - 20) in body
+    assert "x" * (MAX_FAILURE_TEXT + 1) not in body
 
 
 # The event that records it.
@@ -1160,6 +1209,116 @@ def test_a_sweep_that_fails_or_recovers_says_so(
     assert "cannot be read: ps is missing" in err
     assert "the process table can be read again" in err
     assert "sweep of launch records failed: RuntimeError('the record broke')" in err
+
+
+class Reporting(Engine):
+    """An engine whose turns report a cost, a credential and a sandbox, or none."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.costs: list[float | None] = []
+
+    async def run_turn(self, prompt: str) -> TurnReport:
+        self.prompts.append(prompt)
+        cost = self.costs.pop(0) if self.costs else None
+        return TurnReport(
+            "success",
+            1,
+            "ok",
+            (),
+            None,
+            Credential.SUBSCRIPTION if cost is not None else None,
+            "session-1",
+            None,
+            cost,
+            sandbox_mode="enabled" if cost is not None else None,
+        )
+
+
+def test_an_unknown_cost_is_kept_apart_from_zero(
+    worlds: Callable[..., World],
+) -> None:
+    """Row 8 of the T3 Code review. A turn that reports no cost makes the estimate a
+    lower bound, and with no reported cost at all it is unknown, never zero. A
+    release clears both."""
+    engine = Reporting()
+    world = worlds(engine)
+    scheduler = world.scheduler
+    assert scheduler.cost_status("alpha")["basis"] == "exact"
+    assert scheduler.cost_status("alpha")["estimate"] == "0.0000"
+    engine.costs = [None]
+
+    async def act() -> None:
+        scheduler.send(ANA, LineAddress("alpha"), "x")
+
+    run(world, act)
+    unknown = scheduler.cost_status("alpha")
+    assert (unknown["estimate"], unknown["basis"], unknown["unknown_turns"]) == (
+        None,
+        "unknown",
+        1,
+    )
+    assert "reported no cost" in str(unknown["note"])
+    (summary,) = scheduler.line_summaries()
+    assert summary["cost_estimate_usd"] is None
+    assert summary["cost_unknown_turns"] == 1
+    engine.costs = [0.25]
+    run(world, act)
+    bound = scheduler.cost_status("alpha")
+    assert (bound["estimate"], bound["basis"]) == ("0.2500", "lower_bound")
+    assert "1 turns of unknown cost" in engine.prompts[-1]
+    scheduler.hold("alpha", "was held for this test")
+    scheduler.release("alpha")
+    assert scheduler.cost_status("alpha")["basis"] == "exact"
+    assert scheduler.cost_status("alpha")["unknown_turns"] == 0
+
+
+def test_each_recent_turn_names_its_credential_sandbox_and_isolation(
+    worlds: Callable[..., World],
+) -> None:
+    """Row 8 of the T3 Code review. Unknown stays null, never a default."""
+    engine = Reporting()
+    engine.costs = [0.1, None]
+    world = worlds(engine)
+
+    async def act() -> None:
+        world.scheduler.send(ANA, LineAddress("alpha"), "x")
+
+    run(world, act)
+    run(world, act)
+    turns = cast(
+        list[dict[str, object]], world.scheduler.line_status("alpha")["recent_turns"]
+    )
+    first, second = turns[-2:]
+    assert (first["credential"], first["sandbox"], first["isolation"]) == (
+        "subscription",
+        "enabled",
+        "full",
+    )
+    assert first["credential_source"] is None
+    assert (second["credential"], second["sandbox"]) == (None, None)
+
+
+def test_a_failed_turn_s_cost_is_unknown(worlds: Callable[..., World]) -> None:
+    engine = Engine()
+    engine.fail = True
+    world = worlds(engine)
+
+    async def act() -> None:
+        world.scheduler.send(ANA, LineAddress("alpha"), "x")
+
+    run(world, act)
+    assert world.scheduler.cost_status("alpha")["basis"] == "unknown"
+
+
+def test_an_unreported_cost_between_turns_is_unknown(
+    worlds: Callable[..., World],
+) -> None:
+    world = worlds(Engine())
+    world.scheduler.spent_between("alpha", INTERRUPTED_KIND, 0.5, None)
+    world.scheduler.spent_between("alpha", INTERRUPTED_KIND, None, None)
+    status = world.scheduler.cost_status("alpha")
+    assert (status["estimate"], status["basis"]) == ("0.5000", "lower_bound")
 
 
 class Costing(Engine):

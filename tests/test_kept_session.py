@@ -103,6 +103,7 @@ def init(source: str = "none", tools: Sequence[str] = ()) -> SystemMessage:
         subtype="init",
         data={
             "model": MODEL,
+            "claude_code_version": "2.1.310",
             "apiKeySource": source,
             "tools": list(tools),
             "permissionMode": "default",

@@ -700,6 +700,48 @@ class QuestionSuperseded:
         check_id("superseded_by", self.superseded_by)
 
 
+HANDOFF_CAUSES: Final = frozenset({"rebound", "cleared"})
+HANDOFF_OUTCOMES: Final = frozenset({"given", "opted_out"})
+MAX_HANDOFF_MESSAGES: Final = 64
+
+
+@dataclass(frozen=True, slots=True)
+class ContextHandedOff:
+    """A line's first turn in a new engine session, after ``line_rebound`` or
+    ``line_session_cleared``, ran with a context handoff, a selection from the line's
+    mail, or ran without one because the line opted out. **Row 13 of the T3 Code
+    review.** It records which messages were selected, and the size and digest of the
+    text the prompt carried, so the selection can be checked against the log. Only
+    the daemon records it, once the engine ran the turn, which ends the handoff."""
+
+    line_id: str
+    cause: str
+    outcome: str
+    message_ids: tuple[str, ...]
+    chars: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        if self.cause not in HANDOFF_CAUSES:
+            raise InvalidField(f"cause must be one of {sorted(HANDOFF_CAUSES)}")
+        if self.outcome not in HANDOFF_OUTCOMES:
+            raise InvalidField(f"outcome must be one of {sorted(HANDOFF_OUTCOMES)}")
+        if len(self.message_ids) > MAX_HANDOFF_MESSAGES:
+            raise InvalidField(f"at most {MAX_HANDOFF_MESSAGES} messages are selected")
+        for message_id in self.message_ids:
+            check_id("message_id", message_id)
+        if type(self.chars) is not int or not 0 <= self.chars <= MAX_TEXT_BYTES:
+            raise InvalidField(
+                f"chars must be a whole number from 0 to {MAX_TEXT_BYTES}"
+            )
+        given = self.outcome == "given"
+        if given and TOKEN_HASH.fullmatch(self.sha256) is None:
+            raise InvalidField("sha256 is not a SHA-256 hex digest")
+        if not given and (self.sha256 or self.chars or self.message_ids):
+            raise InvalidField("a handoff the line opted out of selects nothing")
+
+
 type Event = (
     LineCreated
     | LineStateChanged
@@ -729,6 +771,7 @@ type Event = (
     | WalkLimited
     | QuestionWithdrawn
     | QuestionSuperseded
+    | ContextHandedOff
 )
 
 
@@ -759,6 +802,9 @@ class Line:
     """The line's latest ``processes_left``."""
     unverified: StopUnverified | None = None
     """The line's latest ``stop_unverified``."""
+    handoff: str | None = None
+    """Why the line's next turn starts a new engine session and is owed a context
+    handoff, ``rebound`` or ``cleared``, until ``context_handed_off`` ends it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -950,6 +996,12 @@ class State:
                 self._open_question(event.message_id)
             case QuestionSuperseded():
                 self._check_superseded(event)
+            case ContextHandedOff():
+                line = self._line(event.line_id)
+                if line.handoff != event.cause:
+                    raise EventRejected(
+                        f"line {event.line_id} is owed no handoff for {event.cause}"
+                    )
             case _:
                 assert_never(event)
 
@@ -981,7 +1033,9 @@ class State:
                 )
             case LineSessionCleared():
                 line = self.lines[event.line_id]
-                self.lines[event.line_id] = replace(line, engine_session=None)
+                self.lines[event.line_id] = replace(
+                    line, engine_session=None, handoff="cleared"
+                )
             case LineRebound():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(
@@ -990,7 +1044,11 @@ class State:
                     strategy=event.strategy,
                     engine_session=None,
                     rebound=True,
+                    handoff="rebound",
                 )
+            case ContextHandedOff():
+                line = self.lines[event.line_id]
+                self.lines[event.line_id] = replace(line, handoff=None)
             case LineOverridden():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, overrides=event.overrides)

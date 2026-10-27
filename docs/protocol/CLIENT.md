@@ -45,7 +45,7 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | Operation | Result |
 |---|---|
 | `ping` | An empty object |
-| `status` | `daemon_version`, `protocol_version`, `pid`, `project`, `started_at`, and `event_log` with `last_seq`, `lines`, `operators` and `open_questions` |
+| `status` | `daemon_version`, `protocol_version`, `pid`, `project`, `started_at`, and `event_log` with `last_seq`, `lines`, `operators`, `open_questions`, and the log's size and growth, `events`, `bytes`, `since_start`, `events_per_hour`, `bytes_per_hour` and `compaction`, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies for `line_status`, where an unknown size is `null` and never zero |
 | `stop` | `{"stopping": true}`, after which the daemon closes its connections, removes its socket and exits |
 | `create_line` | Arguments `line_id`, `model`, `strategy`, and optionally `config`, an object of [`LINE_CONFIG.md`](LINE_CONFIG.md), and `engine_session`, an existing engine session to continue, recorded as `line_session` right after `line_created` and checked as that event is. Result `{"line_id": ...}`. Refused when no packaged driver serves the model and strategy, when the configuration's `workdir` is not allowed, or when the project requires a sandbox and the line would run on Claude Code without one |
 | `configure_line` | Arguments `line_id` and `config`. Replaces the line's configuration from its next turn. A changed `workdir` also appends `line_session_cleared`. Refused when the `workdir` is not allowed, or when the project requires a sandbox and the line would run on Claude Code without one |
@@ -73,8 +73,10 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 entry per line with `line_id`, `engine`, `strategy`, `state`, `pending`, the count of
 undelivered messages, `turns`, the turns run in this daemon's lifetime,
 `tool_policy`, `autonomous_turns`, the turns in a row without operator mail,
-`cost_estimate_usd`, a decimal string, `held_by`, the question holding the line or
-`null`, `scheduled_wake`, the line's pending scheduled wake as `due`, its due time, and
+`cost_estimate_usd`, a decimal string, or `null` when no turn since the line's release
+reported a cost and some reported none, `cost_unknown_turns`, how many turns since the
+release reported no cost, so a client keeps an unknown cost apart from zero, `held_by`,
+the question holding the line or `null`, `scheduled_wake`, the line's pending scheduled wake as `due`, its due time, and
 `message_id`, the identifier its note will carry, or `null`, and `leases`, the leases
 the line holds, each with `name` and `expires`, its end as a due time. The note itself
 is not shown. `line_view` returns the same entry as `line`.

@@ -99,12 +99,13 @@ def test_status_reports_the_event_log(paths: ProjectPaths) -> None:
     assert response.ok and response.result is not None
     assert response.result["pid"] == os.getpid()
     assert response.result["project"] == str(paths.root)
-    assert response.result["event_log"] == {
-        "last_seq": 3,
-        "lines": 1,
-        "operators": 1,
-        "open_questions": 1,
+    log = cast(dict[str, object], response.result["event_log"])
+    counts = {
+        key: log[key] for key in ("last_seq", "lines", "operators", "open_questions")
     }
+    assert counts == {"last_seq": 3, "lines": 1, "operators": 1, "open_questions": 1}
+    assert log["events"] == 3 and type(log["bytes"]) is int
+    assert log["compaction"] == "none"
 
 
 def test_stop_answers_then_requests_the_stop(paths: ProjectPaths) -> None:

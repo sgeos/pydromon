@@ -33,7 +33,12 @@ from typing import Final, cast
 
 from dromon.driver import MODELS, Strategy
 from dromon.limits import DEFAULT_LIMITS, Limits
-from dromon.lineconfig import ConfigError, LineConfig, config_from_document
+from dromon.lineconfig import (
+    ConfigError,
+    LineConfig,
+    check_instructions,
+    config_from_document,
+)
 from dromon.model import ID_PATTERN, InvalidField, LineSession
 from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, SandboxError, merge, parse_sandbox
@@ -96,6 +101,7 @@ TOOL_KEYS: Final = frozenset(
         "context_warn_tokens",
         "allow_compact",
         "auto_compact_tokens",
+        "context_handoff",
     }
 )
 LAYERED_KEYS: Final = frozenset({"sandbox", "settings"})
@@ -182,8 +188,10 @@ def config_path(state_dir: Path) -> Path:
 _LOCATION = re.compile(r"\(at line (\d+), column (\d+)\)")
 
 
-def load(path: Path) -> ProjectConfig:
-    """Read and validate the file at ``path``, or raise ``ConfigFileError``."""
+def load(path: Path, root: Path | None = None) -> ProjectConfig:
+    """Read and validate the file at ``path``, or raise ``ConfigFileError``. With
+    the project ``root``, each line's instruction files are checked as
+    ``check_instructions`` says, and a refusal names the line and the file's line."""
     try:
         raw = path.read_bytes()
     except OSError as error:
@@ -194,11 +202,14 @@ def load(path: Path) -> ProjectConfig:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as error:
         raise ConfigFileError(path, "is not UTF-8 text") from error
-    return parse(text, path)
+    return parse(text, path, root)
 
 
-def parse(text: str, path: Path = Path(CONFIG_FILE_NAME)) -> ProjectConfig:
-    """Validate ``text`` as a project file, for tests and tools that hold the text."""
+def parse(
+    text: str, path: Path = Path(CONFIG_FILE_NAME), root: Path | None = None
+) -> ProjectConfig:
+    """Validate ``text`` as a project file, for tests and tools that hold the text.
+    Instruction files are checked only when ``root`` is given."""
     try:
         document = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
@@ -209,15 +220,16 @@ def parse(text: str, path: Path = Path(CONFIG_FILE_NAME)) -> ProjectConfig:
             line=int(found.group(1)) if found else None,
             column=int(found.group(2)) if found else None,
         ) from error
-    return _Reader(path, text).project(document)
+    return _Reader(path, text, root).project(document)
 
 
 class _Reader:
     """Validation of one decoded file, which knows where each table starts."""
 
-    def __init__(self, path: Path, text: str) -> None:
+    def __init__(self, path: Path, text: str, root: Path | None) -> None:
         self.path = path
         self.lines = text.splitlines()
+        self.root = root
 
     def fail(self, key: str, message: str) -> ConfigFileError:
         return ConfigFileError(self.path, message, key=key, line=self.line_of(key))
@@ -443,6 +455,14 @@ class _Reader:
             config = config_from_document(tools)
         except ConfigError as error:
             raise self.fail(key, str(error)) from error
+        if self.root is not None:
+            try:
+                check_instructions(config.instructions, self.root)
+            except ConfigError as error:
+                where = f"{key}.instructions"
+                if "instructions" not in own:
+                    where = f"profiles.{profile_name}.instructions"
+                raise self.fail(where, f"for line {line_id}, {error}") from error
         # Unlike the tool keys, sandbox and settings tables merge as Claude Code's
         # scopes do, so a line cannot drop a deny entry its profile adds.
         own_sandbox = self.sandbox(own.get("sandbox"), f"{key}.sandbox")

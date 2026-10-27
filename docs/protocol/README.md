@@ -21,4 +21,5 @@ Documents here describe behaviour and formats, never Python details.
 - [`CODEX.md`](CODEX.md), how a line runs on Codex through its app-server, with its isolation, credentials and the configurations a Codex line may have. Draft.
 - [`SETTINGS.md`](SETTINGS.md), a line's engine settings, permission rules, hooks, environment and attribution, with the review of the settings in use that motivated them. Draft, part of version 1.
 - [`SANDBOX.md`](SANDBOX.md), the Claude Code sandbox document of a line and a project, its layers, unattended defaults and protected directories. Draft, part of version 1.
+- [`ENGINES.md`](ENGINES.md), each engine's capabilities and minimum version as data, and the probe's recordings of the frames it exchanged, which tests replay through the real adapters. Draft.
 - [`RELAY.md`](RELAY.md), forwarding messages to operators through adapters for channels such as email or chat. Draft, version 1.
