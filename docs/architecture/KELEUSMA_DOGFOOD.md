@@ -113,12 +113,21 @@ and `objects.githubusercontent.com`, against the pydromon repository, public HTT
 `git fetch` succeeded without credentials, `gh auth status` read its token from the
 keyring, and `git push --dry-run` to an HTTPS URL through the `gh` credential helper
 succeeded for a new branch. This does not establish the same behavior under a Dromon
-line's own sandbox profile. `gh pr create`, `gh pr merge` and `gh run view --log` have
-not been observed.
+line's own sandbox profile. `gh pr view` works with `github.com` and `api.github.com`
+allowed. `gh pr create` and `gh pr merge` have not been observed.
+
+**Fact, observed 2026-10-27 by the operator's session.** In a Claude Code sandbox,
+`gh run view --log` was first refused for
+`results-receiver.actions.githubusercontent.com`. Adding that host and
+`*.blob.core.windows.net` to the network allowlist got past the network refusal, but the
+command could not write its cache under `~/.cache/gh`, which the sandbox denies. With
+`XDG_CACHE_HOME` pointed inside `TMPDIR`, it printed the workflow log. This observation
+was in a Claude Code sandbox, not a Dromon line sandbox.
 
 The next check is an operator-run scratch-project trial line with the Keleusma profile's
-network allowlist. That trial should check the same fetch and push behavior, then check
-pull request creation and merge and log retrieval.
+network allowlist. That trial should check fetch and push, pull request viewing and log
+retrieval in the Dromon line sandbox. Pull request creation should use a disposable draft
+on pydromon. A merge check requires the operator's confirmation in session.
 
 1. From each line's worktree, run `git -c http.followRedirects=true fetch
    https://github.com/sgeos/keleusma.git <branch>` and confirm it fetches the intended
@@ -137,8 +146,10 @@ pull request creation and merge and log retrieval.
    request. This merges that pull request and deletes its branch. These commands need
    `github.com` and `api.github.com`.
 4. Run `gh run view <run-id> --log` for a disposable completed workflow. This downloads
-   logs and needs `github.com`, `api.github.com`, `objects.githubusercontent.com` and
-   any redirect host reported by the live request.
+   logs and needs `github.com`, `api.github.com`, `objects.githubusercontent.com`,
+   `results-receiver.actions.githubusercontent.com` and `*.blob.core.windows.net`.
+   The template sets `XDG_CACHE_HOME` to a cache directory inside each line's own
+   worktree, avoiding a write grant to `~/.cache/gh`.
 5. In the Claude Code sandbox, run `test -w "$TMPDIR" && p=$(mktemp "$TMPDIR/dromon-check.XXXXXX") && rm "$p"`.
    This establishes whether the per-process temporary directory is writable.
 6. Outside the sandbox, first confirm that each credential file exists with `test -f`
@@ -249,7 +260,7 @@ denyWrite = ["/PATH/TO/keleusma/secret/notes"]
 denyRead = ["~/.ssh", "~/.aws", "~/.codex/auth.json", "~/.grok/auth.json", "~/.cargo/credentials.toml"]
 
 [profiles.keleusma.sandbox.network]
-allowedDomains = ["github.com", "api.github.com", "codeload.github.com", "objects.githubusercontent.com", "index.crates.io", "static.crates.io", "crates.io"]
+allowedDomains = ["github.com", "api.github.com", "codeload.github.com", "objects.githubusercontent.com", "results-receiver.actions.githubusercontent.com", "*.blob.core.windows.net", "index.crates.io", "static.crates.io", "crates.io"]
 
 # The sandbox refuses sccache, which a build otherwise runs through.
 [profiles.keleusma.settings.env]
@@ -265,6 +276,7 @@ instructions = ["CLAUDE.md", "~/.claude/CLAUDE.md"]
 
 [lines."kaizen".settings.env]
 CARGO_TARGET_DIR = "/PATH/TO/keleusma/.worktrees/kaizen/target"
+XDG_CACHE_HOME = "/PATH/TO/keleusma/.worktrees/kaizen/.cache"
 
 [lines."v0.2.3"]
 profile = "keleusma"
@@ -273,6 +285,7 @@ instructions = ["CLAUDE.md", "~/.claude/CLAUDE.md"]
 
 [lines."v0.2.3".settings.env]
 CARGO_TARGET_DIR = "/PATH/TO/keleusma-worktrees/v0.2.x/target"
+XDG_CACHE_HOME = "/PATH/TO/keleusma-worktrees/v0.2.x/.cache"
 
 [lines."v0.3.0"]
 profile = "keleusma"
@@ -281,6 +294,7 @@ instructions = ["CLAUDE.md", "~/.claude/CLAUDE.md"]
 
 [lines."v0.3.0".settings.env]
 CARGO_TARGET_DIR = "/PATH/TO/keleusma-worktrees/arena-composites/target"
+XDG_CACHE_HOME = "/PATH/TO/keleusma-worktrees/arena-composites/.cache"
 
 [lines."proofs"]
 profile = "keleusma"
@@ -289,6 +303,7 @@ instructions = ["CLAUDE.md", "~/.claude/CLAUDE.md"]
 
 [lines."proofs".settings.env]
 CARGO_TARGET_DIR = "/PATH/TO/keleusma-worktrees/proofs/target"
+XDG_CACHE_HOME = "/PATH/TO/keleusma-worktrees/proofs/.cache"
 
 [lines.proofs.wake]
 every_ticks = 10
