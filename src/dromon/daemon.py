@@ -71,6 +71,7 @@ from dromon.lineconfig import (
     DEFAULT_CONFIG,
     ConfigError,
     LineConfig,
+    check_instructions,
     config_from_document,
     decode_config,
 )
@@ -605,11 +606,12 @@ class Daemon:
         }
 
     def _check_workdir(self, config: LineConfig) -> None:
-        """Refuse a working directory that does not exist or is not allowed, and a
-        plugin that would not load, before anything is recorded. Raises
-        ``ConfigError``."""
+        """Refuse a working directory that does not exist or is not allowed, a
+        plugin that would not load, and instructions ``check_instructions`` refuses,
+        before anything is recorded. Raises ``ConfigError``."""
         resolve_workdir(config.workdir, self.paths.root, protected_dirs(self.paths))
         check_plugins(config)
+        check_instructions(config.instructions, self.paths.root)
 
     def _questions(self, args: dict[str, object]) -> dict[str, object]:
         """Open questions for ``operator``, or for every operator when it is omitted."""
@@ -856,7 +858,7 @@ class Daemon:
             raise ProtocolError(ErrorCode.BAD_REQUEST, "reload_project takes nothing")
         file = config_path(self.paths.state_dir)
         present = file.exists()
-        config = load(file) if present else ProjectConfig()
+        config = load(file, self.paths.root) if present else ProjectConfig()
         check_sandboxes(config, self.paths)
         try:
             check_engines(config)
@@ -1025,6 +1027,7 @@ class Daemon:
                 "lines": len(state.lines),
                 "operators": len(state.operators),
                 "open_questions": open_questions,
+                **self.scheduler.event_log_status(),
             },
             "tick": self.scheduler.tick,
             "lines": self.scheduler.line_summaries(),
@@ -1454,7 +1457,7 @@ def run(
         ensure_private_dir(paths.runtime_dir)
         ensure_private_dir(paths.left_reports)
         file = config_path(paths.state_dir)
-        config = load(file) if file.exists() else ProjectConfig()
+        config = load(file, paths.root) if file.exists() else ProjectConfig()
         check_sandboxes(config, paths)
         check_engines(config)
         terms = project_terms(config, paths)

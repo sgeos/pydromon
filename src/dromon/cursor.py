@@ -45,6 +45,7 @@ from typing import Any, Final, cast
 
 from claude_agent_sdk import SdkMcpTool
 
+from dromon import capabilities
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy, harness_id
 from dromon.engine import EngineRefused, TurnReport, read_instructions
@@ -165,7 +166,7 @@ def unsupported(config: LineConfig) -> str | None:
     if config.allow_compact:
         return "Cursor lines cannot compact their session through Dromon"
     if config.keep_session:
-        return "Cursor lines do not keep their engine between turns"
+        return capabilities.kept_session_refusal(capabilities.CURSOR)
     if config.sandbox is not None or config.settings is not None:
         return "Cursor lines take no sandbox or settings document"
     return None

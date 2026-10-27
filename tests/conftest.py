@@ -13,6 +13,7 @@ from dromon.model import (
     AgentAddress,
     AgentRegistered,
     AgentRevoked,
+    ContextHandedOff,
     Event,
     LineAddress,
     LineConfigured,
@@ -69,6 +70,7 @@ SCENARIO: tuple[Event, ...] = (
     ),
     LineSession("beta", "0b9f2c6e-session"),
     LineSessionCleared("beta"),
+    ContextHandedOff("beta", "cleared", "opted_out", (), 0, ""),
     LineSession("beta", "0b9f2c6e-session"),
     LineOverridden("alpha", '{"effort":"low"}'),
     ProjectOverridden('{"limits.max_cost_usd":"5"}'),
@@ -113,6 +115,7 @@ SCENARIO: tuple[Event, ...] = (
     WalkLimited("descendants may exist beyond the walk"),
     StopUnverified("beta", "the launcher exited before its stop finished"),
     LineRebound("alpha", "claude-haiku-5-5", "subscription"),
+    ContextHandedOff("alpha", "rebound", "given", ("q4", "m3"), 812, "a" * 64),
     LineStateChanged("alpha", LineState.STOPPED),
 )
 

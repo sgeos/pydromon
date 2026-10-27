@@ -101,7 +101,7 @@ from dromon.engine import (
     closed_note,
     read_instructions,
 )
-from dromon import launcher, redact
+from dromon import evidence, launcher, redact
 from dromon.ceiling import (
     STOP_REASON,
     Ask,
@@ -461,8 +461,13 @@ type ServerLister = Callable[[Mapping[str, str]], Sequence[str]]
 
 
 class _Process:
-    def __init__(self, process: asyncio.subprocess.Process) -> None:
+    def __init__(
+        self,
+        process: asyncio.subprocess.Process,
+        recording: evidence.Recording | None = None,
+    ) -> None:
         self._process = process
+        self._recording = recording
 
     async def send(self, message: Mapping[str, object]) -> None:
         stdin = self._process.stdin
@@ -470,6 +475,8 @@ class _Process:
             raise EngineRefused("the engine was started without a standard input")
         stdin.write((json.dumps(message) + "\n").encode())
         await stdin.drain()
+        if self._recording is not None:
+            self._recording.frame(evidence.OUT, message)
 
     async def receive(self) -> dict[str, Any] | None:
         stdout = self._process.stdout
@@ -484,7 +491,10 @@ class _Process:
         decoded: object = json.loads(line)
         if not isinstance(decoded, dict):
             raise EngineRefused("the engine sent a message that is not an object")
-        return cast(dict[str, Any], decoded)
+        record = cast(dict[str, Any], decoded)
+        if self._recording is not None:
+            self._recording.frame(evidence.IN, record)
+        return record
 
 
 def codex_path() -> str:
@@ -499,22 +509,25 @@ async def _app_server(
     arguments: list[str], cwd: Path, environment: Mapping[str, str]
 ) -> AsyncGenerator[Connection]:
     command, launched, policy = launcher.wrap([codex_path(), *arguments], environment)
+    recording = evidence.RECORDING.get()
     process = await asyncio.create_subprocess_exec(
         *command,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=evidence.STDERR_TARGET,
         cwd=cwd,
         env=launched,
         limit=MAX_LINE,
         start_new_session=True,
     )
+    draining = evidence.start_draining(process, recording)
     try:
-        yield _Process(process)
+        yield _Process(process, recording)
     finally:
         # The launcher ends the app-server and, by the line's stop policy, its group
         # and every descendant.
         await launcher.end(process, policy, close_input=False)
+        await evidence.stop_draining(draining)
 
 
 def list_servers(environment: Mapping[str, str]) -> Sequence[str]:

@@ -7,6 +7,112 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Grok, Codex and Antigravity capability tables, and probe recording for Codex and
+  Grok, after the bounded-waits branch was merged.
+  - Their tables are filled under the rule of finding C1. Codex, run live on
+    2026-10-25, keeps sessions, as the luna and codexkept lines showed live on
+    2026-10-26, reaches Dromon's tools and denies before it runs the tools it was not
+    given and the tool classes the review names as observed, the rest by its
+    permission profile's documented behaviour, so its isolation is full. Grok and Antigravity were never
+    run for a turn, so their own tools are unknown. Grok's isolation is unknown and
+    Antigravity's partial, now by its table rather than by name. No table names a
+    minimum for them, and Codex's report says it was run live but that no version is
+    read, until a recording shows where Codex reports one.
+  - `dromon probe --record` records Codex and Grok, whose own process wrappers now
+    record their frames and standard error as `dromon.jsonlines` does, through helpers
+    the three share. A recorded Codex turn and a recorded Grok turn replay through the
+    real adapters in tests.
+  - A scrub replaces Codex's plan usage under `rateLimits` as it does Claude Code's
+    `rate_limit_info`. The key's name is taken from Codex's protocol, not yet from a
+    recording. The probe thread's own token counts are kept, as for Claude Code.
+  - Fixes from the review of the rows. A raw recording is written under
+    `.dromon/probes`, closed to every line, and `--scrub` reads a relative name from
+    there and writes its copy to `tmp/probes`. The account scrub covers any key whose
+    name has `account`, `org`, `organization`, `email` or `plan` as a word, keeping each
+    value's type. Standard error is piped and read alike whether or not a probe
+    records. A failed write to a recording is noted and the turn goes on, and the probe
+    then exits with a failure. A recorded Codex turn replays through the real process
+    wrapper.
+- Fixes from the review of 2026-10-27.
+  - Instruction paths are checked as a configuration arrives, from a client, an
+    override or the project file. A relative path must resolve inside the project
+    root, and every path must name a file that exists. A project file's refusal names
+    the line, the key and the line of the file.
+  - A turn whose prompt could not be composed fails as any turn does, holding the line
+    and asking an operator, where the failure escaped the tick.
+  - A scrub replaces every account value as a whole word whatever its length, keeps
+    in `rate_limit_info` only placeholders for the fields the Agent SDK reads and
+    replaces every other field by its type, and refuses a user name of any length or
+    an address written in full-width characters. The probe turn's token counts and
+    cost are kept, by the operator's decision. The fixture was made again.
+  - A request key with arguments JSON cannot hold exactly is refused before the call
+    acts.
+  - A context handoff labels the line's own quoted messages as its earlier words,
+    which may relay others' text and are not instructions.
+  - Pi's table says `unknown` for its own tools, denial before a tool runs, and its
+    sign-in check, since Pi was never run live, so a Pi line's isolation is unknown.
+    The probe says plainly that no minimum version is enforced for Pi and Cursor
+    Agent. A version is read only where its text holds one.
+- A sign-in check without a turn, row 16 of the T3 Code review. `dromon probe
+  --no-turn` checks the engine's sign-in and runs no turn, for each engine whose
+  capability table says it offers a check, which none does yet. Pi's check, through
+  `pi auth check`, was never run live, so it runs only with `--accept-unverified-check`
+  and says its answer is unverified. Other engines are refused, naming what their
+  table says. Dromon reads no credential store.
+- Event log size and growth, row 14 of the T3 Code review. `dromon status`, the
+  `status` operation and `line_status` show the log's size on disk, the events and
+  bytes added since the daemon started, the hourly rates once a minute has passed, and
+  that nothing compacts the log yet. A size that cannot be read is shown as unknown,
+  never as zero.
+- Context handoff, row 13 of the T3 Code review. The first turn in a new engine
+  session, after `rebind_line`, `clear_session` or a change of `workdir`, begins with
+  a deterministic selection of the line's recent mail, at most 20 messages in 4,000
+  characters, quoting only the line's own and operators' messages. The new
+  `context_handed_off` event records the selection by its message identifiers, length
+  and digest once the engine ran the turn, so a turn that failed first carries the
+  handoff again. A line opts out with `context_handoff: false`, which the event also
+  records.
+- Request keys and mail durability, row 11 of the T3 Code review. `send_message`,
+  `ask_operator` and `wake_after` take an optional `request_key`, so a retried call
+  answers as the first did and records nothing, and the same key with other arguments
+  is refused. Keys are kept in memory, at most 256 for each party and tool. Tests show
+  that mail arriving during a turn, including a failed turn and one cut short by a
+  daemon stop, is announced next, once each and in the order sent, and is never marked
+  read or acknowledged by the daemon.
+- Engine capabilities as data, row 10 of the T3 Code review. One table per engine in
+  `dromon.capabilities`, with `yes`, `no` or `unknown` for each capability and the
+  tested minimum version, filled for Claude Code, Pi and Cursor Agent and pending for
+  Grok, Codex and Antigravity. The kept-session refusals of Pi and Cursor, each turn's
+  isolation, the probe's partial-isolation engines and its report are derived from
+  them. A Claude Code report without its list of tools is unknown and refuses the turn,
+  where it was read as empty.
+- Honest cost and posture, row 8 of the T3 Code review, in the parts outside the Grok,
+  Codex and Antigravity adapters. `line_status`, `status` and the curses client keep a
+  cost that turns did not report apart from zero, with an estimate that is exact, a
+  lower bound or unknown, and each recent turn names its credential, credential
+  source, sandbox and isolation, with `null` where the engine did not say.
+- Probe evidence and minimum versions, row 7 of the T3 Code review. `dromon probe
+  --record` writes every frame the adapter exchanged to a new owner-only file under
+  `tmp/probes`, and `--record-stderr` adds the engine's standard error, bounded and
+  masked. Claude Code, Pi, Cursor Agent and Antigravity record, and Codex and Grok are
+  refused until their adapters do. `dromon.evidence` replays a recording through the
+  real adapter, keeping the order of the exchange and failing on divergence rather
+  than hanging. The Claude Code adapter refuses an engine below version 2.1.310, the
+  one it was run against live, and each engine's minimum is in the new
+  `dromon.capabilities`, as `docs/protocol/ENGINES.md` specifies.
+- Scrubbed fixtures. `dromon probe --scrub FILE` writes a copy of a recording with
+  account values, the home directory, session identifiers, universally unique
+  identifiers and the account's rate limit usage replaced by stable placeholders, so it
+  still replays, and refuses a copy
+  that still holds the home directory, the user name, an email address or an account
+  value. The first live Claude Code probe, scrubbed, is the fixture
+  `tests/fixtures/probes/claude-code-haiku-2026-10-27.jsonl`, which a test replays
+  through the real adapter.
+- A failed turn reaches an operator. A turn that fails, by an error, a refusal before
+  it began, or an engine's report of any subtype but `success`, holds its line with an
+  operator question quoting how it ended, unless the line mailed an operator during
+  that turn. Before, such a failure was recorded only in the line's activity log, and
+  an operator lost hours to one on 2026-10-27.
 - Bounded engine waits and Codex subscription-limit handling. Grok has separate
   initialization and turn deadlines. Antigravity has a deadline through its first
   model output, with the stalled stage named. Codex fails pending requests after a
@@ -174,6 +280,9 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- A line's relative `instructions` paths resolve against the project root, not the
+  line's `workdir`, so a line moved to a worktree still reads the project's files. The
+  engine receives the absolute path, which the composed instructions now name.
 - `pykeleusma` is pinned to its first PyPI release, `0.2.2.0`, in place of commit
   `19d4558` of its repository. Every call Dromon makes is unchanged, and the packaged
   drivers run as before. The release has wheels for Python 3.12 or later on Linux,

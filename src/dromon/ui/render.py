@@ -25,7 +25,7 @@ from typing import Final
 
 from dromon.activity import ActivityKind
 from dromon.ui.commands import KEYS, SPECS, Pane
-from dromon.ui.data import Entry, View
+from dromon.ui.data import Entry, LineSummary, View
 from dromon.ui.editor import row_of
 from dromon.ui.model import Model, Overlay
 
@@ -324,6 +324,14 @@ def _questions(view: View | None, width: int) -> list[Row]:
     return rows
 
 
+def _cost(line: LineSummary) -> str:
+    """The line's cost for the bar, with unknown kept apart from zero."""
+    if not line.cost:
+        return "cost unknown" if line.cost_unknown else ""
+    unknown = f" + {line.cost_unknown} unknown" if line.cost_unknown else ""
+    return f"${line.cost}{unknown}"
+
+
 def _bar(model: Model, width: int) -> Row:
     view = model.view
     if view is None:
@@ -339,7 +347,7 @@ def _bar(model: Model, width: int) -> Row:
             f"{len(view.questions)} open questions" if view.questions else "",
             line.model,
             f"turns {line.turns}",
-            f"${line.cost}" if line.cost else "",
+            _cost(line),
             f"pending {line.pending}",
             model.pane.value,
             f"{model.scroll} rows below" if model.scroll else "",

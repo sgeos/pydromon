@@ -403,18 +403,32 @@ def test_a_hold_asks_the_default_operator_when_none_messaged(
     assert recipient == OperatorAddress("operator")
 
 
-def test_an_engine_failure_returns_the_line_to_idle_and_is_not_retried(
+def test_an_engine_failure_holds_the_line_and_asks_an_operator(
     make_world: MakeWorld, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """Luna's turn of 2026-10-27. A turn that failed, with no mail from the line to
+    an operator during it, reaches an operator as a question on a held line, so it
+    is neither lost in the activity log nor retried unseen by the next mail."""
     target = make_world({"alpha": [[], []]})
     target.engine("alpha").fail = True
     run(target, send(target, "alpha", "hello"))
-    assert target.log.state.lines["alpha"].state is LineState.IDLE
+    line = target.log.state.lines["alpha"]
+    assert line.state is LineState.IDLE
     assert len(target.engines["alpha"].prompts) == 1
-    assert "turn failed: the engine broke" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "turn failed: the engine broke" in err
+    (question_id,) = questions_for(target)
+    assert line.held_by == question_id
+    question = target.log.state.messages[question_id]
+    assert "failed: the engine broke" in question.body
     target.engines["alpha"].fail = False
     run(target, send(target, "alpha", "again"))
-    assert len(target.engines["alpha"].prompts) == 2
+    assert len(target.engines["alpha"].prompts) == 1
+    target.scheduler.send(ANA, LineAddress("alpha"), "resume", reply_to=question_id)
+    run(target, send(target, "alpha", "after"))
+    # The answer released the line, and the mail that waited is delivered.
+    assert len(target.engines["alpha"].prompts) > 1
+    assert target.log.state.lines["alpha"].held_by is None
 
 
 def test_a_plan_limit_holds_the_line_until_operator_release(

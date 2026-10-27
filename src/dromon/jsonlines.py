@@ -37,7 +37,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
 from typing import Any, Final, Protocol, cast
 
-from dromon import launcher
+from dromon import evidence, launcher
 from dromon.engine import EngineRefused
 from dromon.launcher import StopPolicy
 
@@ -131,9 +131,11 @@ class Process:
         self,
         process: asyncio.subprocess.Process,
         policy: StopPolicy = StopPolicy.KILL_ALL,
+        recording: evidence.Recording | None = None,
     ) -> None:
         self._process = process
         self._policy = policy
+        self._recording = recording
 
     async def send(self, message: Mapping[str, object]) -> None:
         stdin = self._process.stdin
@@ -141,6 +143,8 @@ class Process:
             raise EngineRefused("the engine was started without a standard input")
         stdin.write((json.dumps(message) + "\n").encode())
         await stdin.drain()
+        if self._recording is not None:
+            self._recording.frame(evidence.OUT, message)
 
     async def receive(self) -> dict[str, Any] | None:
         stdout = self._process.stdout
@@ -162,7 +166,10 @@ class Process:
             raise NotJsonLine(line) from error
         if not isinstance(decoded, dict):
             raise EngineRefused("the engine sent a record that is not an object")
-        return cast(dict[str, Any], decoded)
+        record = cast(dict[str, Any], decoded)
+        if self._recording is not None:
+            self._recording.frame(evidence.IN, record)
+        return record
 
     async def stop(self) -> None:
         if self._process.returncode is None:
@@ -183,21 +190,26 @@ def json_lines_factory(command: str, *, keep_input: bool) -> ConnectionFactory:
                 f"the {command} command is not installed or not on PATH"
             )
         argv, launched, policy = launcher.wrap([found, *arguments], environment)
+        recording = evidence.RECORDING.get()
         process = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE if keep_input else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=evidence.STDERR_TARGET,
             cwd=cwd,
             env=launched,
             limit=MAX_LINE,
             start_new_session=True,
         )
+        draining = evidence.start_draining(process, recording)
         try:
-            yield Process(process, policy)
+            yield Process(process, policy, recording)
         finally:
             await launcher.end(
                 process, policy, close_input=True, input_seconds=EXIT_SECONDS
             )
+            # The harness has ended, so its standard error ends too, unless a
+            # descendant left running holds it, which the bound covers.
+            await evidence.stop_draining(draining, EXIT_SECONDS)
 
     return start

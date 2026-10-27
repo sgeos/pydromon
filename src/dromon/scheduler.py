@@ -110,7 +110,15 @@ from dromon.overrides import encode as encode_override
 from dromon.driver import ENGINE_OF, MODELS, Driver, DriverError, Strategy
 from dromon import acp, antigravity, codex, cursor, grok, pi
 from dromon.agents import LineTokens
-from dromon import launcher, redact
+from dromon import capabilities, launcher, redact
+from dromon.handoff import Handoff
+from dromon.handoff import select as select_handoff
+from dromon.requestkeys import (
+    REQUEST_KEY,
+    REQUEST_KEY_PROPERTY,
+    RequestKeyRefused,
+    RequestKeys,
+)
 from dromon.ceiling import CHOICES, Choice, is_question, question_text
 from dromon.codex import CodexLine
 from dromon.grok import GrokLine
@@ -165,8 +173,10 @@ from dromon.lineconfig import (
     DEFAULT_CONFIG,
     ConfigError,
     LineConfig,
+    check_instructions,
     decode_config,
     encode_config,
+    rooted_instructions,
 )
 from dromon.model import (
     Address,
@@ -181,6 +191,7 @@ from dromon.model import (
     LineSession,
     LineSessionCleared,
     LineRebound,
+    ContextHandedOff,
     LineState,
     LineStateChanged,
     Message,
@@ -238,6 +249,7 @@ SEND_TOOL_SCHEMA: Final[dict[str, object]] = {
             "type": "string",
             "description": "The identifier of the message this one answers, if any",
         },
+        REQUEST_KEY: REQUEST_KEY_PROPERTY,
     },
     "required": ["to", "body"],
     "additionalProperties": False,
@@ -261,6 +273,7 @@ ASK_TOOL_SCHEMA: Final[dict[str, object]] = {
             "items": {"type": "string"},
             "description": "Suggested answers, if any. The operator may answer freely",
         },
+        REQUEST_KEY: REQUEST_KEY_PROPERTY,
     },
     "required": ["question"],
     "additionalProperties": False,
@@ -311,12 +324,16 @@ WAKE_TOOL_SCHEMA: Final[dict[str, object]] = {
             "type": "string",
             "description": "What the wake is for. It arrives as a message from you",
         },
+        REQUEST_KEY: REQUEST_KEY_PROPERTY,
     },
     "required": ["seconds", "note"],
     "additionalProperties": False,
 }
 
 REPEAT_WINDOW: Final = timedelta(minutes=15)
+
+MIN_RATE_SECONDS: Final = 60
+"""How long the daemon must have had its event log before a growth rate is given."""
 """How recent an identical message must be for a new one to be marked a repeat."""
 
 MAX_SCRATCH_BYTES: Final = 256 * 1024
@@ -407,6 +424,9 @@ LAUNCHER_LOST_NOTE: Final = (
     "its engine's launcher exited while the engine ran, so the engine is treated as"
     " failed and its connection is closed, and the next turn starts a new one"
 )
+
+MAX_FAILURE_TEXT: Final = 600
+"""The most of a failed turn's ending an operator's question quotes."""
 
 COMPLETED: Final = "completed"
 FAILED: Final = "failed"
@@ -1142,6 +1162,9 @@ class Scheduler:
         self._autonomous: dict[str, int] = {}
         """Turns each line took in a row without mail from an operator."""
         self._cost: dict[str, float] = {}
+        self._cost_unknown: dict[str, int] = {}
+        """How many turns since each line's release reported no cost, so an unknown
+        cost is never shown as zero. Row 8 of the T3 Code review."""
         """Estimated cost of each line's turns since its last release."""
         self._last_turn_end: dict[str, float] = {}
         self._failed: set[str] = set()
@@ -1167,6 +1190,10 @@ class Scheduler:
         self.tick = 0
         """The number of ticks run in this daemon's lifetime."""
         self.turn_reports: list[tuple[str, TurnReport]] = []
+        self._log_opened_at = clock()
+        """When the scheduler took the log, on its own clock, for the log's growth."""
+        self._request_keys = RequestKeys()
+        """Results of keyed mutating tool calls, so a retry acts once. Row 11."""
 
     # Commands from the client and from lines.
 
@@ -1329,6 +1356,12 @@ class Scheduler:
             unexpected = _unexpected(args, SEND_TOOL_SCHEMA)
             if unexpected:
                 return _tool_error(unexpected)
+            try:
+                earlier = self._request_keys.earlier(str(sender), SEND_TOOL_NAME, args)
+            except RequestKeyRefused as error:
+                return _tool_error(str(error))
+            if earlier is not None:
+                return earlier
             to: object = args.get("to")
             body: object = args.get("body")
             reply_to: object = args.get("reply_to")
@@ -1342,7 +1375,9 @@ class Scheduler:
                 message_id = self.send(sender, parse_address(to), body, reply_to)
             except (InvalidField, EventRejected) as error:
                 return _tool_error(str(error))
-            return {"content": [{"type": "text", "text": f"sent as {message_id}"}]}
+            result = _tool_text(f"sent as {message_id}")
+            self._request_keys.remember(str(sender), SEND_TOOL_NAME, args, result)
+            return result
 
         return SdkMcpTool(
             name=SEND_TOOL_NAME,
@@ -1418,6 +1453,12 @@ class Scheduler:
             unexpected = _unexpected(args, ASK_TOOL_SCHEMA)
             if unexpected:
                 return _tool_error(unexpected)
+            try:
+                earlier = self._request_keys.earlier(line_id, ASK_TOOL_NAME, args)
+            except RequestKeyRefused as error:
+                return _tool_error(str(error))
+            if earlier is not None:
+                return earlier
             question: object = args.get("question")
             to: object = args.get("to")
             choices: object = args.get("choices", [])
@@ -1441,16 +1482,12 @@ class Scheduler:
                 )
             except (InvalidField, EventRejected) as error:
                 return _tool_error(str(error))
-            return {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"asked {operator} as {message_id}. The answer"
-                        " arrives as a message in a later turn. You may end your"
-                        " turn or keep working meanwhile.",
-                    }
-                ]
-            }
+            result = _tool_text(
+                f"asked {operator} as {message_id}. The answer arrives as a message in"
+                " a later turn. You may end your turn or keep working meanwhile."
+            )
+            self._request_keys.remember(line_id, ASK_TOOL_NAME, args, result)
+            return result
 
         return SdkMcpTool(
             name=ASK_TOOL_NAME,
@@ -1567,6 +1604,12 @@ class Scheduler:
             unexpected = _unexpected(args, WAKE_TOOL_SCHEMA)
             if unexpected:
                 return _tool_error(unexpected)
+            try:
+                earlier = self._request_keys.earlier(line_id, WAKE_TOOL_NAME, args)
+            except RequestKeyRefused as error:
+                return _tool_error(str(error))
+            if earlier is not None:
+                return earlier
             seconds: object = args.get("seconds")
             note: object = args.get("note")
             if type(seconds) is not int:
@@ -1586,7 +1629,9 @@ class Scheduler:
             )
             if replaced is not None:
                 text += f" It replaces the wake that was due at {replaced.due}."
-            return _tool_text(text)
+            result = _tool_text(text)
+            self._request_keys.remember(line_id, WAKE_TOOL_NAME, args, result)
+            return result
 
         return SdkMcpTool(
             name=WAKE_TOOL_NAME,
@@ -1743,9 +1788,15 @@ class Scheduler:
             else f"This turn is autonomous, so the count becomes {used + 1} when it"
             " ends."
         )
+        unknown = self._cost_unknown.get(line_id, 0)
+        spent = (
+            f"${cost:.2f}"
+            if not unknown
+            else f"${cost:.2f} and {unknown} turns of unknown cost"
+        )
         line = (
             f"Autonomous turns used: {used} of {limits.max_autonomous_turns}."
-            f" Estimated cost since your last release: ${cost:.2f} of"
+            f" Estimated cost since your last release: {spent} of"
             f" ${limits.max_cost_usd:.2f}. A line past either is held. {counting}"
         )
         warning = self._context_warning(line_id) if warn else None
@@ -1941,6 +1992,7 @@ class Scheduler:
         costs = self._turn_costs.setdefault(line_id, deque(maxlen=RECENT_TURN_COSTS))
         costs.append(_between_entry(kind, cost, usage))
         if cost is None:
+            self._cost_unknown[line_id] = self._cost_unknown.get(line_id, 0) + 1
             return
         self._cost[line_id] = self._cost.get(line_id, 0.0) + cost
         limits = self.limits_for(line_id)
@@ -2089,10 +2141,7 @@ class Scheduler:
                     " ends, and a turn an operator's mail started resets the count."
                 ),
             },
-            "cost_usd": {
-                "estimate": f"{self._cost.get(line_id, 0.0):.4f}",
-                "limit": f"{limits.max_cost_usd:.2f}",
-            },
+            "cost_usd": self.cost_status(line_id),
             "leases": self.leases_of(line_id),
             "scheduled_wake": _scheduled_summary(pending),
             "unread": summary(state, LineAddress(line_id), 0).unread,
@@ -2108,6 +2157,7 @@ class Scheduler:
             "last_task_note": self._last_task_note.get(line_id),
             "context": self.context_status(line_id),
             "daemon": self.daemon_status(),
+            "event_log": self.event_log_status(),
             "processes": {
                 "identifiable": self._processes_identifiable,
                 "note": None if self._processes_identifiable else UNIDENTIFIABLE,
@@ -2119,6 +2169,47 @@ class Scheduler:
                 "walk_limit": state.walk_limit or None,
             },
             "other_lines": others,
+        }
+
+    def cost_status(self, line_id: str) -> dict[str, object]:
+        """**Row 8 of the T3 Code review.** The line's cost since its release, with
+        unknown kept apart from zero. ``estimate`` is the sum of the costs turns
+        reported, or ``None`` when none reported one and some reported none.
+        ``basis`` is ``exact`` when every turn reported a cost, ``lower_bound`` when
+        some did not, and ``unknown`` when none did."""
+        limits = self.limits_for(line_id)
+        known = line_id in self._cost
+        unknown = self._cost_unknown.get(line_id, 0)
+        basis = "exact" if not unknown else "lower_bound" if known else "unknown"
+        return {
+            "estimate": (
+                None if basis == "unknown" else f"{self._cost.get(line_id, 0.0):.4f}"
+            ),
+            "basis": basis,
+            "unknown_turns": unknown,
+            "limit": f"{limits.max_cost_usd:.2f}",
+            "note": (
+                None
+                if not unknown
+                else f"{unknown} turns since the last release reported no cost, so"
+                " the budget holds the line only on what the others reported"
+            ),
+        }
+
+    def _turn_posture(self, line_id: str, report: TurnReport) -> dict[str, object]:
+        """What a turn ran with, for its ``recent_turns`` entry. Row 8."""
+        engine = ENGINE_OF[self.model_of(line_id)]
+        return {
+            "credential": None
+            if report.credential is None
+            else report.credential.value,
+            "credential_source": (
+                None
+                if report.capabilities is None
+                else report.capabilities.api_key_source or None
+            ),
+            "sandbox": report.sandbox_mode,
+            "isolation": capabilities.isolation_of(capabilities.table_of(engine)),
         }
 
     def condition(self, line_id: str) -> str:
@@ -2142,6 +2233,33 @@ class Scheduler:
             for message in state.messages.values()
         )
         return "waiting" if asking else "idle"
+
+    def event_log_status(self) -> dict[str, object]:
+        """The event log's size and its growth since this daemon opened it. Row 14 of
+        the T3 Code review. A size that cannot be read is ``None``, never zero, and
+        a rate is given only after ``MIN_RATE_SECONDS``, since a rate over a few
+        seconds says little. The log is never compacted yet, so it only grows."""
+        size = self._log.size_bytes()
+        opened = self._log.opened_bytes
+        events = self._log.last_seq - self._log.opened_seq
+        seconds = max(0.0, self._clock() - self._log_opened_at)
+        hours = seconds / 3600
+        return {
+            "events": self._log.last_seq,
+            "bytes": size,
+            "since_start": {
+                "events": events,
+                "bytes": None if size is None or opened is None else size - opened,
+                "seconds": int(seconds),
+            },
+            "events_per_hour": round(events / hours, 1)
+            if seconds >= MIN_RATE_SECONDS
+            else None,
+            "bytes_per_hour": round((size - opened) / hours)
+            if seconds >= MIN_RATE_SECONDS and size is not None and opened is not None
+            else None,
+            "compaction": "none",
+        }
 
     def daemon_status(self) -> dict[str, object]:
         """The daemon's version and the commit it started from, and whether its
@@ -2222,15 +2340,23 @@ class Scheduler:
             handle.write(data)
         return f"{SCRATCH_DIRECTORY}/{Path(*parts)}"
 
+    def engine_config(self, line_id: str) -> LineConfig:
+        """The configuration ``line_id``'s engine is built with, which is the
+        effective one with its instruction paths resolved against the project root,
+        as ``rooted_instructions`` says. The effective configuration keeps the paths
+        as written, so a client shows and stores them unchanged."""
+        config = self.effective_config(line_id)
+        return config if self._root is None else rooted_instructions(config, self._root)
+
     def line_instructions(self, line_id: str) -> str:
         """The instructions ``line_id``'s next turn receives, as its engine adapter
         composes them. Raises ``LineToolRefused``."""
-        config = self.effective_config(line_id)
         engine = ENGINE_OF[self.model_of(line_id)]
         workdir = self._workdir_of(line_id)
         try:
+            config = self.engine_config(line_id)
             text = composed_instructions(engine, config, workdir)
-        except EngineRefused as error:
+        except (EngineRefused, ConfigError) as error:
             raise LineToolRefused(str(error)) from error
         if not text:
             text = "This line's next turn receives no instructions from Dromon."
@@ -2246,7 +2372,7 @@ class Scheduler:
         returns, so a line can tell whether its instructions changed without reading
         them whole. Raises ``LineToolRefused``."""
         text = self.line_instructions(line_id)
-        config = self.effective_config(line_id)
+        config = self.engine_config(line_id)
         engine = ENGINE_OF[self.model_of(line_id)]
         try:
             files = instruction_sizes(config.instructions, self._workdir_of(line_id))
@@ -2897,6 +3023,8 @@ class Scheduler:
             )
         config = apply_config(self.baseline_config(line_id), document)
         _check_engine_supports(Driver.for_model(model, Strategy(line.strategy)), config)
+        if self._root is not None and key == "instructions":
+            check_instructions(config.instructions, self._root)
         apply_limits(self._line_limits.get(line_id, self.limits), document)
         every = document.get("wake.every_ticks", 1)
         if type(every) is not int or not 1 <= every <= MAX_WAKE_EVERY_TICKS:
@@ -3048,6 +3176,7 @@ class Scheduler:
         self._log.append(LineReleased(line_id))
         self._autonomous.pop(line_id, None)
         self._cost.pop(line_id, None)
+        self._cost_unknown.pop(line_id, None)
         self._failed.discard(line_id)
         self._work.set()
 
@@ -3061,11 +3190,15 @@ class Scheduler:
             costs = self._turn_costs.setdefault(
                 line_id, deque(maxlen=RECENT_TURN_COSTS)
             )
-            costs.append(_turn_entry(report))
+            costs.append(_turn_entry(report, self._turn_posture(line_id, report)))
         if report is not None and report.cost_estimate_usd is not None:
             self._cost[line_id] = (
                 self._cost.get(line_id, 0.0) + report.cost_estimate_usd
             )
+        else:
+            # A turn that reported no cost, or ended without a report, may still
+            # have cost something, so it is counted apart rather than as zero.
+            self._cost_unknown[line_id] = self._cost_unknown.get(line_id, 0) + 1
         cost = self._cost.get(line_id, 0.0)
         limits = self.limits_for(line_id)
         reason: str | None = None
@@ -3157,28 +3290,44 @@ class Scheduler:
             isinstance(message.sender, OperatorAddress) for _, message in messages
         )
         self._counting[line_id] = not from_operator
-        compaction = self._compaction_reason(line_id)
-        # Round 7 review, F3. The cause, which also marks the compaction as under
-        # way for ``_compacting_for``, is set as the compaction is decided, so a tick
-        # between this dispatch and the turn's start cannot fire its wake.
-        if compaction is None:
-            self._compaction_cause.pop(line_id, None)
-        else:
-            self._compaction_cause[line_id] = (
-                COMPACT_SESSION_TOOL_NAME
-                if compaction == COMPACTION_REQUESTED
-                else "auto_compact_tokens"
+        compaction: str | None = None
+        owed: tuple[str, Handoff | None] | None = None
+        refused: Exception | None = None
+        # Review of 2026-10-27, I0-3. The line is already marked running and its mail
+        # delivered, so a failure composing the prompt is carried into the turn,
+        # which fails at once and holds the line as any failed turn does, rather than
+        # escaping the tick and stopping every line's scheduling.
+        try:
+            compaction = self._compaction_reason(line_id)
+            # Round 7 review, F3. The cause, which also marks the compaction as under
+            # way for ``_compacting_for``, is set as the compaction is decided, so a
+            # tick between this dispatch and the turn's start cannot fire its wake.
+            if compaction is None:
+                self._compaction_cause.pop(line_id, None)
+            else:
+                self._compaction_cause[line_id] = (
+                    COMPACT_SESSION_TOOL_NAME
+                    if compaction == COMPACTION_REQUESTED
+                    else "auto_compact_tokens"
+                )
+            prompt = compose_prompt(
+                line_id,
+                messages,
+                summary(self._log.state, address, len(messages)),
+                replied_ids(self._log.state, address),
+                budget=self._budget_line(
+                    line_id, from_operator, warn=compaction is None
+                ),
+                notes=self._notes(messages),
             )
-        prompt = compose_prompt(
-            line_id,
-            messages,
-            summary(self._log.state, address, len(messages)),
-            replied_ids(self._log.state, address),
-            budget=self._budget_line(line_id, from_operator, warn=compaction is None),
-            notes=self._notes(messages),
-        )
+            owed = self._handoff(line_id, messages)
+            if owed is not None and owed[1] is not None:
+                prompt = f"{owed[1].text}\n\n{prompt}"
+        except Exception as error:  # noqa: BLE001
+            compaction, owed, refused = None, None, error
+            prompt = f"the prompt could not be composed: {error}"
         task = asyncio.get_running_loop().create_task(
-            self._turn(line_id, prompt, from_operator, compaction)
+            self._turn(line_id, prompt, from_operator, compaction, owed, refused)
         )
         self._running[line_id] = task
 
@@ -3188,12 +3337,20 @@ class Scheduler:
         prompt: str,
         from_operator: bool,
         compaction: str | None = None,
+        owed: tuple[str, Handoff | None] | None = None,
+        refused: Exception | None = None,
     ) -> None:
+        """Run one turn of ``line_id``. ``refused`` is a failure that came before the
+        turn, as it was dispatched, which fails the turn before any engine runs."""
         report: TurnReport | None = None
         ending = "cancelled"
+        failed = False
         engine: LineEngine | None = None
+        mailed = self._operator_mail(line_id)
         self.activity.record(line_id, ActivityKind.TURN_STARTED, prompt)
         try:
+            if refused is not None:
+                raise refused
             await self._check_walk(line_id)
             engine = self.engine_for(line_id)
             self._start_token(line_id, engine)
@@ -3209,6 +3366,8 @@ class Scheduler:
                     warning = self._context_warning(line_id)
                     prompt = f"{warning}\n\n{prompt}" if warning else prompt
             report = await engine.run_turn(prompt)
+            if owed is not None:
+                self._handed_off(line_id, *owed)
             if report.context_tokens is not None:
                 self._context_reported(
                     line_id, report.context_tokens, CONTEXT_FROM_CALL
@@ -3224,6 +3383,7 @@ class Scheduler:
                 ending += f", interrupted by its driver: {report.interrupted_for}"
             elif turn_outcome(report) == FAILED:
                 ending = f"failed: the engine ended the turn as {report.subtype}"
+                failed = True
         except asyncio.CancelledError:
             if line_id in self._interrupted:
                 ending = "interrupted by an operator"
@@ -3238,6 +3398,7 @@ class Scheduler:
             # ends only this turn, and is reported rather than crashing the daemon.
             self._failed.add(line_id)
             ending = f"failed: {error}"
+            failed = True
             print(f"dromond: line {line_id} turn failed: {error}", file=sys.stderr)
         finally:
             self._end_token(line_id, engine)
@@ -3254,6 +3415,80 @@ class Scheduler:
             self._last_turn_end[line_id] = self._clock()
             self._work.set()
         self._apply_limits(line_id, from_operator, report)
+        if failed and self._operator_mail(line_id) == mailed:
+            self._hold_failed(line_id, ending)
+
+    def _handoff(
+        self, line_id: str, messages: list[tuple[str, Message]]
+    ) -> tuple[str, Handoff | None] | None:
+        """The context handoff ``line_id``'s turn owes, as its cause and its text, or
+        ``None`` for the text when the line opted out, or ``None`` when no handoff is
+        owed. Row 13, as ``dromon.handoff`` describes."""
+        line = self._log.state.lines[line_id]
+        if line.handoff is None:
+            return None
+        if not self.effective_config(line_id).context_handoff:
+            return line.handoff, None
+        return line.handoff, select_handoff(
+            self._log.state,
+            line_id,
+            line.handoff,
+            line.engine,
+            dict(messages),
+            self.discloses,
+        )
+
+    def _handed_off(self, line_id: str, cause: str, given: Handoff | None) -> None:
+        """Record that the engine ran the turn that carried the handoff, which ends
+        it. A turn that failed before its engine ran records nothing, so the next
+        turn carries the handoff again. A cause that changed during the turn, as a
+        change of working directory does, is left owed."""
+        line = self._log.state.lines.get(line_id)
+        if line is None or line.handoff != cause:
+            return
+        if given is None:
+            event = ContextHandedOff(line_id, cause, "opted_out", (), 0, "")
+        else:
+            event = ContextHandedOff(
+                line_id,
+                cause,
+                "given",
+                given.message_ids,
+                len(given.text),
+                given.sha256,
+            )
+        self._log.append(event)
+
+    def _operator_mail(self, line_id: str) -> int:
+        """How many messages ``line_id`` has sent to operators, so a turn can tell
+        whether it mailed one."""
+        address = LineAddress(line_id)
+        return sum(
+            1
+            for message in self._log.state.messages.values()
+            if message.sender == address
+            and isinstance(message.recipient, OperatorAddress)
+        )
+
+    def _hold_failed(self, line_id: str, ending: str) -> None:
+        """Hold a line whose turn failed and ask an operator, unless a limit already
+        held it. **Luna's turn of 2026-10-27.** A turn that failed before it began
+        was recorded only in the line's activity, and no operator learned of it for
+        hours. A line cannot report a failure that kept its turn from running, so the
+        daemon does, unless the line mailed an operator during the turn, whose mail
+        may explain it. The hold also keeps the next wake from failing the same way
+        unseen. Answering the question releases the line."""
+        line = self._log.state.lines.get(line_id)
+        if line is None or line.held_by is not None:
+            return
+        cut = (
+            ending
+            if len(ending) <= MAX_FAILURE_TEXT
+            else ending[:MAX_FAILURE_TEXT] + "..."
+        )
+        self.hold(
+            line_id, f"had a turn fail and sent no operator mail during it. {cut}"
+        )
 
     async def _check_walk(self, line_id: str) -> None:
         """Refuse the turn when the line's stop policy is ``kill_all`` and the
@@ -3941,7 +4176,7 @@ class Scheduler:
                 line_id,
                 self.model_of(line_id),
                 Strategy(line.strategy),
-                self.effective_config(line_id),
+                self.engine_config(line_id),
                 line.engine_session,
                 self.activity.observer(line_id),
                 self.line_mark(line_id),
@@ -3972,8 +4207,11 @@ class Scheduler:
                 "pending": len(self.pending(line_id)),
                 "turns": self._turns.get(line_id, 0),
                 "autonomous_turns": self._autonomous.get(line_id, 0),
-                # A decimal string, because the client protocol carries no floats.
-                "cost_estimate_usd": f"{self._cost.get(line_id, 0.0):.4f}",
+                # A decimal string, because the client protocol carries no floats,
+                # or null when no turn since the release reported a cost and some
+                # reported none, since that cost is unknown, not zero.
+                "cost_estimate_usd": self.cost_status(line_id)["estimate"],
+                "cost_unknown_turns": self._cost_unknown.get(line_id, 0),
                 "held_by": line.held_by,
                 "tool_policy": self.effective_config(line_id).tool_policy.value,
                 "scheduled_wake": _scheduled_summary(state.scheduled.get(line_id)),
@@ -4118,14 +4356,17 @@ def turn_outcome(report: TurnReport) -> str:
     return COMPLETED if report.subtype == "success" else FAILED
 
 
-def _turn_entry(report: TurnReport) -> dict[str, object]:
+def _turn_entry(
+    report: TurnReport, posture: Mapping[str, object] | None = None
+) -> dict[str, object]:
     """One of ``line_status``'s recent turns: its cost and the tokens behind it, or
-    plain words where the engine reports neither."""
+    plain words where the engine reports neither, and what it ran with."""
     spent = report.cost_estimate_usd
     return {
         "kind": "turn",
         "outcome": turn_outcome(report),
         "subtype": report.subtype,
+        **(posture or {}),
         "compaction": _compaction_entry(report),
         "calls": [dict(call) for call in report.calls],
         "calls_note": (

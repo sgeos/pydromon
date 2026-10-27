@@ -638,7 +638,13 @@ def test_an_unreported_cost_between_turns_is_said_plainly(world: World) -> None:
     assert entry["cost_note"] == (
         "the engine reported no cost for this turn, so none was counted"
     )
-    assert world.status()["cost_usd"]["estimate"] == "0.0000"
+    # Row 8. The cost is unknown, which is not zero.
+    cost = world.status()["cost_usd"]
+    assert (cost["estimate"], cost["basis"], cost["unknown_turns"]) == (
+        None,
+        "unknown",
+        1,
+    )
 
 
 def test_a_cost_between_turns_past_the_budget_holds_the_line(world: World) -> None:
@@ -671,6 +677,7 @@ def init() -> SystemMessage:
         subtype="init",
         data={
             "model": HAIKU,
+            "claude_code_version": "2.1.310",
             "apiKeySource": "none",
             "tools": [],
             "permissionMode": "default",

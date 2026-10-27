@@ -6,6 +6,7 @@ they need both the ``live`` marker selected and ``DROMON_LIVE_TESTS=1``.
 
 import asyncio
 import os
+import sys
 from collections import deque
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -16,6 +17,7 @@ import pytest
 from claude_agent_sdk import SdkMcpTool
 
 from dromon import codex as codex_module
+from dromon import evidence
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon.codex import (
     DISABLED_FEATURES,
@@ -33,6 +35,7 @@ from dromon.codex import (
 from dromon.daemon import check_engines
 from dromon.driver import Credential, Driver, Strategy
 from dromon.engine import EnginePlanLimit, EngineRefused, TurnReport
+from dromon.evidence import IN, OUT, Recording, Replay, read_recording, replay_factory
 from dromon.launcher import (
     LAUNCH_MARK_VARIABLE,
     LAUNCH_VARIABLES,
@@ -494,6 +497,158 @@ def test_tool_output_maps_text_and_errors() -> None:
         "contentItems": [{"type": "inputText", "text": "x"}],
     }
     assert tool_output({"content": [], "is_error": True})["success"] is False
+
+
+# A recording replayed through the real adapter.
+
+
+class Tap:
+    """The scripted app-server, recorded as the app-server's own process records."""
+
+    def __init__(self, server: FakeServer, recording: Recording) -> None:
+        self.server = server
+        self.recording = recording
+
+    async def send(self, message: Mapping[str, object]) -> None:
+        await self.server.send(message)
+        self.recording.frame(OUT, message)
+
+    async def receive(self) -> dict[str, Any] | None:
+        found = await self.server.receive()
+        if found is not None:
+            self.recording.frame(IN, found)
+        return found
+
+
+def test_a_recorded_turn_replays_through_the_real_adapter(tmp_path: Path) -> None:
+    """A Codex probe records this exchange, and the recording then stands in for
+    Codex, so the adapter gives the same report without the engine."""
+    path = tmp_path / "probe.jsonl"
+    recording = Recording(path, codex_module.ENGINE_NAME, LUNA)
+    server = FakeServer(
+        (item("dynamicToolCall", tool="record"), message("done"), completed())
+    )
+
+    @asynccontextmanager
+    async def tapped(
+        arguments: list[str], cwd: Path, env: Mapping[str, str]
+    ) -> AsyncGenerator[Connection]:
+        del arguments, cwd, env
+        yield Tap(server, recording)
+
+    def target(factory: Any) -> CodexLine:  # noqa: ANN401
+        return CodexLine(
+            luna(),
+            CWD,
+            config=LineConfig(),
+            mcp_tools=[RECORD],
+            environment={},
+            connection_factory=factory,
+            server_lister=lambda env: ["gmail"],
+        )
+
+    live = run(target(tapped))
+    recording.close()
+    assert (live.text, live.tool_uses) == ("done", ("record",))
+    replay = Replay(read_recording(path), wait_seconds=1.0)
+    replayed = run(target(replay_factory(replay)))
+    assert replay.finished()
+    assert replay.sent == replay.recorded_out
+    assert (replayed.subtype, replayed.text, replayed.tool_uses) == (
+        live.subtype,
+        live.text,
+        live.tool_uses,
+    )
+    assert (replayed.credential, replayed.session_id) == (
+        live.credential,
+        live.session_id,
+    )
+
+
+STAND_IN = """
+import json, sys
+sys.stderr.write("token=abc123 replaying\\n")
+sys.stderr.flush()
+with open(sys.argv[0] + ".jsonl", encoding="utf-8") as handle:
+    documents = [json.loads(line) for line in handle][1:]
+for document in documents:
+    if document.get("kind") != "frame":
+        continue
+    if document["dir"] == "out":
+        line = sys.stdin.readline()
+        if not line or json.loads(line) != document["frame"]:
+            sys.exit(3)
+    else:
+        sys.stdout.write(json.dumps(document["frame"]) + "\\n")
+        sys.stdout.flush()
+"""
+"""A stand-in for ``codex app-server`` that plays the recording beside it, checks each
+frame the adapter sends against the recorded one, and stops at the first that
+differs, so the turn then fails."""
+
+
+def test_a_recorded_turn_replays_through_the_process_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of 2026-10-27, P1. The other replay replaces the connection, so the
+    process wrapper, its standard error drain and the launcher never run. Here the
+    recording stands in for the engine's process, and the wrapper records the
+    replayed exchange as it would a live one."""
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    directory = tmp_path / "bin"
+    directory.mkdir()
+    stand_in = directory / "codex"
+    server = FakeServer(
+        (item("dynamicToolCall", tool="record"), message("done"), completed())
+    )
+    first = Recording(stand_in.with_name("codex.jsonl"), codex_module.ENGINE_NAME, LUNA)
+
+    @asynccontextmanager
+    async def tapped(
+        arguments: list[str], cwd: Path, env: Mapping[str, str]
+    ) -> AsyncGenerator[Connection]:
+        del arguments, cwd, env
+        yield Tap(server, first)
+
+    def target(factory: codex_module.ConnectionFactory) -> CodexLine:
+        return CodexLine(
+            luna(),
+            workspace,
+            config=LineConfig(),
+            mcp_tools=[RECORD],
+            environment={},
+            connection_factory=factory,
+            server_lister=lambda env: ["gmail"],
+        )
+
+    live = run(target(tapped))
+    first.close()
+    stand_in.write_text(f"#!{sys.executable}\n{STAND_IN}")
+    stand_in.chmod(0o755)
+    monkeypatch.setenv("PATH", str(directory))
+    second = Recording(
+        tmp_path / "again.jsonl", codex_module.ENGINE_NAME, LUNA, stderr=True
+    )
+    token = evidence.RECORDING.set(second)
+    try:
+        replayed = run(target(codex_module._app_server))  # pyright: ignore[reportPrivateUsage]
+    finally:
+        evidence.RECORDING.reset(token)
+        second.close()
+    assert (replayed.subtype, replayed.text, replayed.tool_uses) == (
+        live.subtype,
+        live.text,
+        live.tool_uses,
+    )
+    assert (replayed.credential, replayed.session_id) == (
+        live.credential,
+        live.session_id,
+    )
+    again = read_recording(second.path)
+    assert again.frames == read_recording(stand_in.with_name("codex.jsonl")).frames
+    assert again.stderr is not None and "token=***" in again.stderr
+    assert "abc123" not in again.stderr
 
 
 # Credentials, models and isolation.

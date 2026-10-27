@@ -20,7 +20,14 @@ from dromon.disclosure import REFUSAL, load_terms
 from dromon.driver import Strategy
 from dromon.engine import CLAUDE_CODE_PROMPT_MARK, TurnReport
 from dromon.eventlog import EventLog
-from dromon.lineconfig import LineConfig, McpServer
+from dromon.lineconfig import (
+    ConfigError,
+    LineConfig,
+    McpServer,
+    check_instructions,
+    rooted_instructions,
+)
+from dromon.projectconfig import ConfigFileError, parse
 from dromon.limits import Limits
 from dromon import scheduler as scheduler_module
 from dromon.mailbox import summary
@@ -166,7 +173,13 @@ def test_line_status_shows_the_line_its_daemon_and_the_others(world: World) -> N
     turns = status["autonomous_turns"]
     assert (turns["used"], turns["allowed"]) == (0, 5)
     assert turns["current_turn_counts"] is None
-    assert status["cost_usd"] == {"estimate": "0.2500", "limit": "3.00"}
+    assert status["cost_usd"] == {
+        "estimate": "0.2500",
+        "basis": "exact",
+        "unknown_turns": 0,
+        "limit": "3.00",
+        "note": None,
+    }
     assert status["scheduled_wake"] == {"due": due, "message_id": message_id}
     assert status["unread"] == 1 and status["pending"] == 0
     assert (status["model"], status["strategy"]) == (HAIKU, "subscription")
@@ -293,8 +306,10 @@ def test_read_instructions_returns_what_the_adapter_composes(world: World) -> No
         False,
     )
     scheduler.configure_line("alpha", LineConfig(instructions=("CLAUDE.md",)))
+    # The engine reads the path resolved against the project root, and names it so.
+    rules = world.root / "CLAUDE.md"
     assert world.call("read_instructions", FULL) == (
-        "Contents of CLAUDE.md:\n\nFollow the rules.",
+        f"Contents of {rules}:\n\nFollow the rules.",
         False,
     )
     scheduler.configure_line(
@@ -303,7 +318,7 @@ def test_read_instructions_returns_what_the_adapter_composes(world: World) -> No
     text, _ = world.call("read_instructions", FULL)
     assert (
         text
-        == f"{CLAUDE_CODE_PROMPT_MARK}\n\nContents of CLAUDE.md:\n\nFollow the rules."
+        == f"{CLAUDE_CODE_PROMPT_MARK}\n\nContents of {rules}:\n\nFollow the rules."
     )
     scheduler.configure_line(
         "alpha", LineConfig(instructions=("CLAUDE.md",), project_settings=True)
@@ -312,7 +327,7 @@ def test_read_instructions_returns_what_the_adapter_composes(world: World) -> No
     assert "project's own CLAUDE.md files" in text
     scheduler.configure_line("alpha", LineConfig(instructions=("MISSING.md",)))
     text, error = world.call("read_instructions", FULL)
-    assert error and "cannot read the instructions MISSING.md" in text
+    assert error and f"cannot read the instructions {world.root / 'MISSING.md'}" in text
 
 
 def test_a_codex_line_reads_its_developer_instructions(world: World) -> None:
@@ -320,9 +335,181 @@ def test_a_codex_line_reads_its_developer_instructions(world: World) -> None:
     world.scheduler.rebind_line("alpha", LUNA, Strategy.SUBSCRIPTION)
     world.scheduler.configure_line("alpha", LineConfig(instructions=("AGENTS.md",)))
     assert world.call("read_instructions", FULL) == (
-        "Contents of AGENTS.md:\n\nCodex rules.",
+        f"Contents of {world.root / 'AGENTS.md'}:\n\nCodex rules.",
         False,
     )
+
+
+def test_relative_instructions_resolve_against_the_project_root(world: World) -> None:
+    """Luna's turn of 2026-10-27. A line moved to a worktree still reads the file the
+    project root holds, and its engine is built with that absolute path, while the
+    stored configuration keeps the path as written."""
+    (world.root / "LINES.md").write_text("Line rules.\n")
+    worktree = world.root / "tmp" / "worktree"
+    worktree.mkdir(parents=True)
+    (worktree / "ONLY_HERE.md").write_text("Worktree rules.\n")
+    config = LineConfig(workdir="tmp/worktree", instructions=("LINES.md",))
+    world.scheduler.configure_line("alpha", config)
+    rules = world.root / "LINES.md"
+    assert world.call("read_instructions", FULL) == (
+        f"Contents of {rules}:\n\nLine rules.",
+        False,
+    )
+    assert world.scheduler.effective_config("alpha").instructions == ("LINES.md",)
+    assert world.scheduler.engine_config("alpha").instructions == (str(rules),)
+    world.scheduler.engine_for("alpha")
+    assert world.engines["alpha"].spec.config.instructions == (str(rules),)
+    # A file only the workdir holds is no longer found by a relative path.
+    world.scheduler.configure_line(
+        "alpha", LineConfig(workdir="tmp/worktree", instructions=("ONLY_HERE.md",))
+    )
+    text, error = world.call("read_instructions", FULL)
+    assert error
+    assert f"cannot read the instructions {world.root / 'ONLY_HERE.md'}" in text
+
+
+def test_rooting_keeps_absolute_and_home_paths(tmp_path: Path) -> None:
+    config = LineConfig(instructions=("/etc/rules.md", "~/rules.md", "a/b.md"))
+    rooted = rooted_instructions(config, tmp_path)
+    assert rooted.instructions == (
+        "/etc/rules.md",
+        "~/rules.md",
+        str(tmp_path / "a/b.md"),
+    )
+    assert rooted_instructions(LineConfig(), tmp_path) == LineConfig()
+    plain = LineConfig(instructions=("/etc/rules.md",))
+    assert rooted_instructions(plain, tmp_path) is plain
+
+
+@pytest.fixture
+def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A project root inside ``tmp_path``, beside a file outside it and a home
+    directory that holds a file."""
+    root = tmp_path / "project"
+    (root / "docs").mkdir(parents=True)
+    (root / "docs" / "RULES.md").write_text("Rules.\n")
+    (tmp_path / "outside.md").write_text("Not the project's.\n")
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "CLAUDE.md").write_text("The operator's own.\n")
+    monkeypatch.setenv("HOME", str(home))
+    return root
+
+
+def test_instructions_inside_the_root_or_named_explicitly_pass(
+    project: Path, tmp_path: Path
+) -> None:
+    check_instructions(
+        ("docs/RULES.md", "docs/../docs/RULES.md", "~/CLAUDE.md"), project
+    )
+    check_instructions((str(tmp_path / "outside.md"),), project)
+    (project / "linked.md").symlink_to(project / "docs" / "RULES.md")
+    check_instructions(("linked.md",), project)
+
+
+@pytest.mark.parametrize(
+    ("path", "message"),
+    [
+        ("../outside.md", "outside the project root"),
+        ("docs/../../outside.md", "outside the project root"),
+        ("escape.md", "outside the project root"),
+        ("GONE.md", "do not name a regular file"),
+        ("docs", "do not name a regular file"),
+        ("~/GONE.md", "do not name a regular file"),
+        ("/nonexistent/dromon/rules.md", "do not name a regular file"),
+    ],
+)
+def test_instructions_that_escape_or_are_missing_are_refused(
+    project: Path, tmp_path: Path, path: str, message: str
+) -> None:
+    (project / "escape.md").symlink_to(tmp_path / "outside.md")
+    with pytest.raises(ConfigError, match=message) as refused:
+        check_instructions((path,), project)
+    assert path in str(refused.value)
+
+
+def test_rooting_refuses_a_relative_path_that_now_escapes(
+    project: Path, tmp_path: Path
+) -> None:
+    """A link changed after loading is caught when the engine is built."""
+    (project / "escape.md").symlink_to(tmp_path / "outside.md")
+    with pytest.raises(ConfigError, match="outside the project root"):
+        rooted_instructions(LineConfig(instructions=("escape.md",)), project)
+
+
+def test_the_project_file_locates_a_refused_instruction_path(project: Path) -> None:
+    text = (
+        "version = 1\n"
+        "[profiles.ruled]\n"
+        "instructions = ['../outside.md']\n"
+        "[lines.alpha]\n"
+        f"model = '{HAIKU}'\n"
+        "instructions = ['docs/RULES.md']\n"
+        "[lines.beta]\n"
+        f"model = '{HAIKU}'\n"
+        "profile = 'ruled'\n"
+    )
+    file = project / ".dromon" / "dromon.toml"
+    parse(text.replace("../outside.md", "docs/RULES.md"), file, project)
+    parse(text, file)
+    with pytest.raises(ConfigFileError) as refused:
+        parse(text, file, project)
+    assert refused.value.key == "profiles.ruled.instructions"
+    assert refused.value.line == 2
+    assert "for line beta" in str(refused.value)
+    own = text.replace("['docs/RULES.md']", "['GONE.md']")
+    with pytest.raises(ConfigFileError) as refused:
+        parse(own.replace("../outside.md", "docs/RULES.md"), file, project)
+    assert refused.value.key == "lines.alpha.instructions"
+    assert refused.value.line == 4
+
+
+def test_an_override_naming_an_escaping_file_is_refused(world: World) -> None:
+    with pytest.raises(ConfigError, match="outside the project root"):
+        world.scheduler.override_line("alpha", "instructions", ["../events.sqlite"])
+    assert "instructions" not in world.scheduler.line_overrides("alpha")
+
+
+def test_read_instructions_refuses_a_path_stored_before_the_check(
+    world: World,
+) -> None:
+    world.scheduler.configure_line(
+        "alpha", LineConfig(instructions=("../events.sqlite",))
+    )
+    text, error = world.call("read_instructions", FULL)
+    assert error and "outside the project root" in text
+
+
+def test_a_failure_composing_the_prompt_holds_the_line(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of 2026-10-27, I0-3. A failure before the turn starts fails the turn
+    rather than the tick, so the line is held and an operator asked, and the other
+    lines are still scheduled."""
+
+    def broken(*_: object, **__: object) -> str:
+        raise RuntimeError("the prompt broke")
+
+    monkeypatch.setattr(scheduler_module, "compose_prompt", broken)
+    world.scheduler.send(ANA, LineAddress("beta"), "for beta")
+
+    async def go() -> None:
+        stop = asyncio.Event()
+        loop = asyncio.create_task(world.scheduler.run(stop))
+        world.scheduler.send(ANA, LineAddress("alpha"), "for alpha")
+        await asyncio.sleep(0)
+        await world.scheduler.idle()
+        stop.set()
+        await loop
+
+    asyncio.run(go())
+    assert world.engines == {}
+    for line_id in ("alpha", "beta"):
+        line = world.log.state.lines[line_id]
+        assert line.held_by is not None
+        body = world.log.state.messages[line.held_by].body
+        assert "failed: the prompt broke" in body
+        assert "sent no operator mail during it" in body
 
 
 # R5, write_scratch.
@@ -721,12 +908,18 @@ def test_read_instructions_summarises_by_default(world: World) -> None:
     assert not error
     found = json.loads(text)
     data = full.encode("utf-8")
+    sources = found["sources"]
     assert found["bytes"] == len(data)
     assert found["sha256"] == hashlib.sha256(data).hexdigest()
-    assert found["sources"] == [
+    assert sources == [
         {"source": CLAUDE_CODE_PROMPT_MARK, "bytes": None},
-        {"source": "CLAUDE.md", "bytes": len((world.root / "CLAUDE.md").read_bytes())},
-        {"source": "MORE.md", "bytes": len((world.root / "MORE.md").read_bytes())},
+        *(
+            {
+                "source": str(world.root / name),
+                "bytes": len((world.root / name).read_bytes()),
+            }
+            for name in ("CLAUDE.md", "MORE.md")
+        ),
     ]
     assert "full set to true" in found["full"]
     assert world.call("read_instructions", {"full": False}) == (text, False)
@@ -752,7 +945,7 @@ def test_read_instructions_refuses_bad_arguments_and_missing_files(
     assert error and "unexpected argument whole" in text
     world.scheduler.configure_line("alpha", LineConfig(instructions=("MISSING.md",)))
     text, error = world.call("read_instructions")
-    assert error and "cannot read the instructions MISSING.md" in text
+    assert error and f"cannot read the instructions {world.root / 'MISSING.md'}" in text
 
 
 # Round 2, replies to hold questions.

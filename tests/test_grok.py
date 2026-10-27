@@ -22,6 +22,7 @@ from dromon.daemon import Daemon
 from dromon.driver import Credential, Driver, Strategy
 from dromon.engine import EngineRefused, TurnReport
 from dromon.eventlog import EventLog
+from dromon.evidence import IN, OUT, Recording, Replay, read_recording, replay_factory
 from dromon.grok import (
     READER_PROFILE,
     WRITER_PROFILE,
@@ -438,6 +439,73 @@ def test_a_plain_turn_reports_text_credential_and_session(
         "fs": {"readTextFile": False, "writeTextFile": False},
         "terminal": False,
     }
+
+
+class Tap:
+    """The scripted agent, recorded as Grok's own process records."""
+
+    def __init__(self, server: FakeGrok, recording: Recording) -> None:
+        self.server = server
+        self.recording = recording
+
+    async def send(self, message: Mapping[str, object]) -> None:
+        await self.server.send(message)
+        self.recording.frame(OUT, message)
+
+    async def receive(self) -> dict[str, Any] | None:
+        found = await self.server.receive()
+        if found is not None:
+            self.recording.frame(IN, found)
+        return found
+
+
+def test_a_recorded_turn_replays_through_the_real_adapter(
+    project: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    """A Grok probe records this exchange, and the recording then stands in for
+    Grok, so the adapter gives the same report without the engine."""
+    workspace, home, state = project
+    path = tmp_path / "probe.jsonl"
+    recording = Recording(path, grok_module.ENGINE_NAME, GROK)
+    server = FakeGrok(
+        [chunk("hel"), tool_call("other", "dromon__send_message"), chunk("lo")]
+    )
+
+    @asynccontextmanager
+    async def tapped(
+        arguments: list[str], cwd: Path, env: Mapping[str, str]
+    ) -> AsyncGenerator[Connection]:
+        del arguments, cwd, env
+        yield Tap(server, recording)
+
+    def target(factory: Any) -> GrokLine:  # noqa: ANN401
+        return GrokLine(
+            grok(),
+            workspace,
+            config=LineConfig(),
+            mcp_tools=[SEND],
+            protected=(state,),
+            environment={},
+            home=home,
+            connection_factory=factory,
+        )
+
+    live = run(target(tapped))
+    recording.close()
+    assert (live.text, live.tool_uses) == ("hello", ("dromon__send_message",))
+    replay = Replay(read_recording(path), wait_seconds=1.0)
+    replayed = run(target(replay_factory(replay)))
+    assert replay.finished()
+    assert replay.sent == replay.recorded_out
+    assert (replayed.subtype, replayed.text, replayed.tool_uses) == (
+        live.subtype,
+        live.text,
+        live.tool_uses,
+    )
+    assert (replayed.credential, replayed.session_id) == (
+        live.credential,
+        live.session_id,
+    )
 
 
 def test_the_session_carries_dromons_tools_instructions_and_ask_mode(

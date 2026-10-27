@@ -1054,6 +1054,7 @@ def test_a_pending_compaction_reaches_the_lines_engine_at_its_next_turn(
                 subtype="init",
                 data={
                     "model": HAIKU,
+                    "claude_code_version": "2.1.310",
                     "apiKeySource": "none",
                     "tools": [],
                     "permissionMode": "default",

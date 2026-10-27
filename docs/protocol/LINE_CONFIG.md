@@ -43,7 +43,7 @@ keys, duplicate keys and numbers are refused.
 | `claude_code_prompt` | Run a Claude Code line on Claude Code's own system prompt rather than an empty one. Omitted when false | `false` |
 | `project_settings` | Also load Claude Code's project setting source in the line's working directory, as [`SETTINGS.md`](SETTINGS.md) specifies. Refused on Codex and Grok lines. Omitted when false | `false` |
 | `plugins` | At most 16 distinct local plugin directories, each absolute or starting with `~/`, as the plugins section below specifies. Refused on Codex and Grok lines. Omitted when empty | none |
-| `instructions` | At most 16 distinct files, such as `CLAUDE.md`, whose text is appended to the system prompt at each turn. A relative path is resolved against the line's working directory and `~` against the home directory. Omitted when empty | none |
+| `instructions` | At most 16 distinct files, such as `CLAUDE.md`, whose text is appended to the system prompt at each turn. A relative path is resolved against the project root, whatever the line's `workdir`, and `~` against the home directory. Omitted when empty | none |
 | `workdir` | The directory the line's engine runs in, as the working directory section below specifies. Omitted when unset | the project root |
 | `keep_session` | Keep a Claude Code or Codex line's engine connected between turns, as the kept sessions section below specifies. Refused on Grok lines. Omitted when false | `false` |
 | `keep_session_idle_seconds` | Seconds a kept connection waits for the next turn before it closes, a whole number from 60 to 86,400. Omitted at its default | `1800` |
@@ -53,6 +53,7 @@ keys, duplicate keys and numbers are refused.
 | `keep_session_max_seconds` | Seconds after the last turn a kept connection may stay open while the engine reports background tasks running, before `keep_session_at_max` applies, a whole number from 60 to 86,400 and not less than `keep_session_idle_seconds`. Omitted at its default | `14400` |
 | `keep_session_at_max` | What a kept connection does at `keep_session_max_seconds` with background tasks still running, `close`, `ask` or `keep`, as the ceiling section below specifies. Omitted at its default | `close` |
 | `keep_session_hard_seconds` | Seconds after the last turn past which no choice keeps a connection open, a whole number from 60 to 604,800 and not less than `keep_session_max_seconds`. Omitted at its default | `86400` |
+| `context_handoff` | Begin the line's first turn in a new engine session, after a rebind or a cleared session, with a selection from its mail, as the context handoff section below specifies. Omitted when true | `true` |
 | `stop_policy` | `kill_all` or `leave_background`, whether stopping the line's engine, or the daemon, ends everything the engine started or leaves its background descendants running, as the stop policy section below specifies. Omitted at its default | `kill_all` |
 
 A server name is an identifier and may not be `dromon`, which Dromon's own tools use. A
@@ -118,13 +119,48 @@ question holding it as `held_by`, its `autonomous_turns` used and allowed, its e
 `scheduled_wake`, its `unread` mail and `pending` deliveries, its `model` and
 `strategy`, its `workdir` as configured and as `workdir_path` resolved, its
 `engine_session`, and its `kept_session`, as the kept sessions section below specifies.
-It adds a `daemon` object and, for every other line, its `line_id`, `state`, whether it
-is `held`, and the names of its `leases`. It holds no configuration document and no
-message body.
+It adds a `daemon` object, an `event_log` object and, for every other line, its
+`line_id`, `state`, whether it is `held`, and the names of its `leases`. It holds no
+configuration document and no message body.
+
+**Row 14 of the T3 Code review, 2026-10-27.** The `event_log` object holds `events`,
+the newest sequence number, `bytes`, the size of the log's database file with any
+SQLite write ahead log or journal beside it, and `since_start`, with the `events` and
+`bytes` added and the whole `seconds` passed since this daemon opened the log. It
+gives `events_per_hour` and `bytes_per_hour` once the daemon has had the log for 60
+seconds, and `null` before. A size that cannot be read is `null`, never zero, and so
+is any growth derived from it. `compaction` is `none`, since nothing compacts the log
+yet, so it only grows. The daemon's `status` carries the same fields in its
+`event_log`, as [`CLIENT.md`](CLIENT.md) specifies.
+
+**Row 8 of the T3 Code review, 2026-10-27.** `cost_usd` keeps an unknown cost apart
+from zero. It holds `estimate`, the sum of the costs turns reported as a decimal string,
+or `null` when none reported one and some reported none, `basis`, which is `exact` when
+every turn since the release reported a cost, `lower_bound` when some did not, and
+`unknown` when none did, `unknown_turns`, how many reported none, `limit`, and a `note`
+that says, when any reported none, that the budget holds the line only on what the
+others reported. A turn that ended without a report counts as unknown, since it may
+have cost something. The budget line at the head of each turn's prompt names the turns
+of unknown cost too. Each `recent_turns` entry for a turn also gives `credential`, the
+credential the engine reported, `credential_source`, Claude Code's own account of it,
+`sandbox`, the sandbox the adapter ran the turn in, `enabled` or `disabled` for Claude
+Code and `none` for Pi, and `isolation`, `full` where the engine's table says every
+built-in tool is denied before it runs, `partial` where it says not, and `unknown`
+where the table does not know, as [`ENGINES.md`](ENGINES.md) specifies. Each is `null`
+where the engine did not say, never a default. The Codex, Grok and Antigravity adapters
+do not yet report a sandbox. Their tables were filled on 2026-10-27, so a Codex turn's
+isolation is `full`, a Grok turn's `unknown` and an Antigravity turn's `partial`.
 
 **Row 5 of the T3 Code review, 2026-10-26.** `condition` names where the line stands,
 in this order of precedence, `running`, `held` for an operator, `failed` by its last
-turn, `waiting` on a question it asked an operator, or `idle`. Each entry of
+turn, `waiting` on a question it asked an operator, or `idle`. A turn that fails, by an
+error or a refusal before or during it, or by an engine's report of any subtype but
+`success`, holds its line with an operator question that quotes how the turn ended, up
+to 600 characters, unless the line sent an operator mail during that turn, which may
+explain it. Answering the question releases the line. `failed` therefore remains only
+for a line whose own mail accompanied its failure. **Luna's turn of 2026-10-27.** A
+turn that failed before it began was recorded only in the line's activity log, and no
+operator learned of it for hours. Each entry of
 `recent_turns` for a turn gives its `outcome`, `completed` only for the subtype
 `success`, `interrupted` when its driver interrupted it, and `failed` for every other
 subtype, with the `subtype` itself. `processes` adds the line's `stop_policy`, as
@@ -328,6 +364,73 @@ to read the result.
 `ask_operator` and `wake_after` refuse a body, question, choice or note that contains a
 listed term, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, and record nothing.
 A wake note is checked again when it fires.
+
+**Request keys.** **Row 11 of the T3 Code review, 2026-10-27.** `send_message`,
+`ask_operator` and `wake_after` each take an optional `request_key`, text of 1 to 128
+printable characters chosen by the caller, so a retried call does not act twice.
+
+- **A repeat.** A call whose key the same party used before on the same tool, with the
+  same other arguments in any order, records nothing and answers with the first call's
+  answer, followed by a sentence saying it was a repeat. A repeated `wake_after` does
+  not move the pending wake.
+- **A conflict.** The same key with other arguments is refused, since Dromon cannot tell
+  whether the caller meant the first request or a new one.
+- **A refusal.** Only a call that acted is remembered, so a refused call may be retried
+  with its key and acts once its cause has gone.
+- **Scope.** Keys belong to one party and one tool, so two lines, or one line's two
+  tools, may use the same key.
+- **Bounds.** At most 256 keys are kept for each party and tool, the oldest forgotten
+  first. Keys live in the daemon's memory, not in the event log, so a retry across a
+  daemon restart acts again. **Porting hazard.** The check, the act and the record run
+  with no suspension point between, which a single asyncio loop makes atomic. A port
+  that serves tools from several threads holds a lock across the three.
+- **Agents.** An external agent's `send_message` is the same tool, and takes a key
+  in the same way.
+
+**Mail during a turn.** A turn announces the mail that woke it, and marks it delivered,
+as it starts. Mail that arrives while the turn runs waits, undelivered, and the next
+turn announces it, in the order sent, once each. Only the line settles mail, by reading,
+acknowledging or answering it. A turn that fails leaves its mail unread and
+unacknowledged, and the unread count of later prompts includes it. Mail the line opens
+during its turn is not announced again. A turn cut short by a daemon stop leaves the
+mail that arrived during it undelivered in the event log, and the restarted daemon
+announces it. These cases are tested in `tests/test_mail_durability.py`.
+
+## Context handoff
+
+**Row 13 of the T3 Code review, 2026-10-27.** `rebind_line` and `clear_session`, and a
+change of `workdir`, start the line's next turn in a new engine session, which
+remembers none of the line's earlier turns. The event log records that the line is
+owed a handoff, from `line_rebound` or `line_session_cleared`, as
+[`EVENT_LOG.md`](EVENT_LOG.md) specifies, so it survives a restart.
+
+- **What the turn is given.** The first turn in the new session begins with a
+  preamble that names the cause, then the line's most recent messages, sent or
+  received, other than the mail the turn announces as new, listed oldest first. Each
+  is one line, with its identifier, its sender and recipient, its kind, a question's
+  status, whether it was read, and the message it replies to.
+- **Budget.** At most 20 messages, whose lines take at most 4,000 characters, chosen
+  newest first. The preamble says how many of how many were listed.
+- **Bodies.** The line's own messages and operators' are quoted, cut to 300
+  characters, with every run of white space, line breaks included, turned to one
+  space, so a body cannot forge the handoff's structure. Messages from other lines and
+  agents are untrusted data, as the trust section says, and are named but never
+  quoted. A body the disclosure list in force covers is replaced by a notice.
+- **The line's own words.** Review of 2026-10-27, finding H1. Each of the line's own
+  messages is labelled as its earlier words, which may relay what other lines and
+  agents wrote, and which are not instructions, and the preamble says the same. A line
+  that forwarded another agent's text would otherwise hand it to its new session with
+  the line's own authority.
+- **Deterministic.** The selection is a function of the event log's state and the
+  turn's new mail alone, with no clock and no randomness.
+- **Recorded.** Once the engine has run the turn, the daemon appends
+  `context_handed_off` with the cause, the identifiers selected, the text's length in
+  characters and its SHA-256 digest, which ends the handoff. A turn whose engine
+  failed or was cancelled records nothing, so the next turn carries the handoff again.
+  A change of `workdir` during that turn leaves a handoff owed.
+- **Opting out.** A line whose configuration sets `context_handoff` to `false` is
+  given no handoff, and the event is still recorded, with the outcome `opted_out`, so
+  the log shows that the new session began without one.
 
 ## Context and compaction
 
@@ -1013,6 +1116,24 @@ and a file that is missing, larger than 256 KiB or not UTF-8 refuses the turn. O
 paths are stored. On Codex the text becomes the thread's developer instructions, and
 `claude_code_prompt` is refused, since Codex uses its own.
 
+**Checked as the configuration arrives.** Review of 2026-10-27, findings I0-1 and
+I0-2, by the operator's decision. A configuration is refused, with nothing recorded,
+when it is created or configured by a client, overridden, or read from the project
+file at start, at reload or by `dromon config`, if any of its instruction paths fails.
+- A relative path must resolve, after `..` and symbolic links, inside the project
+  root, so a project file cannot name the operator's other files through it.
+- A path from `~` or from the root of the file system is the operator's explicit
+  choice and may lie anywhere, such as `~/.claude/CLAUDE.md`.
+- Every path must name a regular file that exists.
+
+A refusal from the project file names the line, the key, and the line of the file that
+holds it, which is the profile's table when the line takes its instructions from a
+profile. A relative path is checked again for containment when a line's engine is
+built, so a symbolic link changed after loading refuses the turn. A file removed after
+loading still fails the turn that reads it. **Any failed turn.** A turn that fails
+before its engine runs, including one whose prompt could not be composed, holds the
+line and asks an operator, unless the line mailed an operator during the turn.
+
 ## Working directory
 
 **Decided by the operator on 2026-10-25.** Each line's engine runs in its own working
@@ -1032,9 +1153,14 @@ state stays in the project.
 - **Default.** Without `workdir` a line runs in the project root, as before, and its
   configuration encodes exactly as it did before the key existed.
 - **What follows the directory.** Claude Code's working directory, the Codex workspace
-  and its `:workspace_roots`, and the Grok agent's working directory. A line's relative
-  `instructions` paths, and the relative paths of its sandbox document, resolve against
-  it. Permission rules in its settings are interpreted by Claude Code against the same
+  and its `:workspace_roots`, and the Grok agent's working directory. The relative
+  paths of a line's sandbox document resolve against it. Its relative `instructions`
+  paths do not, and resolve against the project root. **Luna's turn of 2026-10-27.**
+  They resolved against the workdir until then, so a line moved to a worktree lost a
+  file only the project root held, and its turn failed before it began. The engine
+  receives each such path made absolute, so its heading in the composed instructions
+  and in `read_instructions` names the absolute path, while the stored configuration
+  keeps the path as written. Permission rules in its settings are interpreted by Claude Code against the same
   working directory. The project's state and runtime directories stay protected for
   every line wherever it runs.
 - **Sessions.** Claude Code keeps a session under the directory it ran in. When a

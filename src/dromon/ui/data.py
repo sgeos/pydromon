@@ -48,6 +48,9 @@ class LineSummary:
     turns: int
     cost: str
     held_by: str | None
+    cost_unknown: int = 0
+    """Turns since the release that reported no cost. With an empty ``cost`` it
+    means the cost is unknown, not zero. Row 8 of the T3 Code review."""
 
     @property
     def running(self) -> bool:
@@ -64,6 +67,7 @@ def line_summary(data: Mapping[str, object]) -> LineSummary:
         turns=_number(data, "turns"),
         cost=_text(data, "cost_estimate_usd"),
         held_by=_optional(data, "held_by"),
+        cost_unknown=_number(data, "cost_unknown_turns"),
     )
 
 

@@ -473,7 +473,22 @@ operator's decisions A and B.** Daemon guarantees, each specified in
   Dromon does not handle is surfaced, a reported fallback to a model the driver was
   not written for refuses the turn, a consent fallback is put to an operator, a
   request for a human decision is refused with the way to ask an operator, and a
-  line's condition and each turn's outcome are named.
+  line's condition and each turn's outcome are named. A failed turn that the line's
+  own mail during it does not accompany holds the line with an operator question, so
+  no failure stays only in an activity log.
+- **Evidence from probes.** A probe can record the frames it exchanged, and tests
+  replay such a recording through the real adapter. Each engine's capabilities and
+  minimum version are data, one table per engine, and an adapter refuses an engine
+  older than the one it was tested against, as [`ENGINES.md`](../protocol/ENGINES.md)
+  specifies. A recording is scrubbed of identifying values before it becomes a
+  fixture.
+- **Mail is durable and a retry acts once.** Mail that arrives during a turn waits for
+  the next, in order and once, and only the line settles it. `send_message`,
+  `ask_operator` and `wake_after` take a request key, so a retried call answers as the
+  first did and records nothing.
+- **A new session is handed its context.** After a rebind or a cleared session, the
+  first turn in the new engine session begins with a deterministic, budgeted selection
+  of the line's mail, recorded as `context_handed_off`, unless the line opted out.
 - **Tokens per engine process.** A line token is renewed as a turn starts a new engine
   process and revoked when that process ends, never expires while a turn runs, and
   expires when idle between turns.
@@ -540,6 +555,52 @@ spans, such as the `toml` crate, and keep the same messages.
 messages, wakes, questions and line state. It makes recovery after a crash and replay in
 a newly attached client straightforward, and the event list doubles as the specification
 of the data model. The specification is [`../protocol/EVENT_LOG.md`](../protocol/EVENT_LOG.md).
+
+### Workspace capture at turn boundaries, declined for now
+
+**Decided 2026-10-27, row 15 of the T3 Code review.** T3 Code captures each turn's
+working tree under hidden Git refs, through a temporary index, `write-tree`,
+`commit-tree` and `update-ref`, and refuses to restore a shared checkout. The operator
+asked whether capture alone, off by default, fits Dromon now that lines may share a
+working tree. It does not yet, for the following reasons.
+
+- **Attribution would be false in the shared tree.** **Fact.** The lines that develop
+  Dromon share one working tree, in which the operator's own session also works.
+  **Fact.** Dromon learns which tools a turn used, but not which files they changed, so
+  it cannot separate one writer's changes from another's. **Inference.** A capture at
+  one line's turn boundary would record the other lines' and the operator's uncommitted
+  work as that line's turn, so the audit trail it promises would mislead in exactly the
+  configuration Dromon runs in.
+- **Captured content becomes hard to remove.** **Fact.** A capture writes every changed
+  or untracked file that is not ignored into the repository's object store, and the
+  ref keeps it reachable. **Fact.** The repository's disclosure scan reads tracked
+  files, not hidden refs, and `git push --mirror` pushes every ref under `refs/`.
+  **Inference.** Scratch text or a draft holding a disclosure term that a line never
+  commits would still be kept, and could be published by a push the operator did not
+  intend to carry it. That is the irreversible failure mode Appendix B guards against.
+- **The daemon would become a Git writer beside the lines and the operator.** **Fact.**
+  Dromon's lines may not commit, and the operator's session does all writes to the
+  repository. **Inference.** Even with a temporary index, `update-ref` takes ref locks
+  and Git may start an automatic garbage collection, so a capture could contend with
+  the operator's own commits, in ways that fail rarely and are hard to see.
+- **Porting.** **Inference.** The Rust and Keleusma implementations would need Git, as
+  a library or a subprocess, in the daemon's core, for a feature whose output cannot
+  yet be trusted.
+
+**What would make it fit.** Each condition below is required, and none is met today.
+1. The line runs in a worktree of its own, which `scripts/worktree.sh` makes, and the
+   daemon refuses capture for a line whose working directory resolves to the same
+   worktree as another line's. The daemon cannot see an operator's session, so the
+   operator's configuration states that no one else writes there.
+2. Captures go to a private bare repository under the daemon's state directory, which
+   borrows the project's objects through Git's `alternates` file, and never to the
+   project's own refs, so no push of the project can carry them.
+3. The setting is per line and off by default, a capture is recorded in the event log
+   by its commit identifier, and restore stays refused.
+
+Until then, the event log's record of each turn, its tools, its outcome and the mail it
+carried, together with the line's own commits through the operator, is the audit
+trail.
 
 ## Security and trust
 
