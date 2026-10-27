@@ -449,6 +449,8 @@ NO_CREDIT: dict[str, Any] = {
         "rateLimits": {
             "limitId": "premium",
             "credits": {"hasCredits": False, "unlimited": False, "balance": "0"},
+            "primary": None,
+            "secondary": None,
         }
     },
 }

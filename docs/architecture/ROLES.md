@@ -271,7 +271,7 @@ record. Only Codex's camel-case shapes were observed live, by the operator on
 | Engine | Classified as budget exhausted | Source of the shape |
 |---|---|---|
 | Claude Code | A failed turn while the engine's latest `rate_limit_event` has status `rejected` and its overage is not `allowed` or `allowed_warning`, with its reset time. An assistant message whose `error` is `billing_error`, in any turn | The `RateLimitInfo` and `AssistantMessageError` types of the installed Agent SDK |
-| Codex | A turn that does not complete after an `error` notice, or with a `turn.error`, whose `codexErrorInfo` is `usageLimitExceeded`, with the reset time read from its message. Before any turn fails, an `account/rateLimits/updated` notice whose `credits` has `hasCredits` and `unlimited` both false, which records the budget at 0 with no reset at once. The older snake-case codes and phrases of [`CODEX.md`](../protocol/CODEX.md) still count, and their reset time stays in the hold's text | The camel-case shapes observed live on 2026-10-27. The snake-case codes are inferred and unverified |
+| Codex | A turn that does not complete after an `error` notice, or with a `turn.error`, whose `codexErrorInfo` is `usageLimitExceeded`, with the reset time read from its message. Before any turn fails, an `account/rateLimits/updated` notice whose `credits` has `hasCredits` and `unlimited` both false and whose `primary` and `secondary` windows are both null, which records the budget at 0 with no reset at once. The older snake-case codes and phrases of [`CODEX.md`](../protocol/CODEX.md) still count, and their reset time stays in the hold's text | The camel-case shapes observed live on 2026-10-27. The snake-case codes are inferred and unverified |
 | Grok, Pi, Cursor, Antigravity | Nothing. A failed turn holds the line as before | No shape is on record |
 
 **Inference.** The engine reports a change of rate-limit status, not each turn, so the
@@ -331,11 +331,12 @@ line without a role behaves exactly as today.
 - **A misclassified limit.** A failure counted as budget exhausted when it was not
   moves the role and records the provider spent until an operator states otherwise.
   The Claude Code shapes come from the Agent SDK's types, and Codex's snake-case codes
-  are inferred. Codex's camel-case shapes were observed live. **Open question.** Only an
-  account with no credit and no reported plan window was observed, so whether an
-  account with allowance left in a window also reports `hasCredits` false is unknown. If
-  it does, its notice records a spent budget where there is none. A limit not counted
-  holds the line, and the role stays put.
+  are inferred. Codex's camel-case shapes were observed live. Only an account with no
+  credit and no reported plan window was observed, so a notice of no credit counts only
+  when its `primary` and `secondary` windows are both null, by the operator's decision of
+  2026-10-27. A plan with a window therefore never reads as spent from that notice,
+  and its turn's limit error is what moves the role. A limit not counted holds the
+  line, and the role stays put.
 - **A stale spent budget.** A statement of 0 percent with no reset time keeps its
   provider's seats unusable until an operator states another budget. A Codex notice of
   no credit left records such a statement. The turn that then fails at the limit

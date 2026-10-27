@@ -55,8 +55,9 @@ All notable changes are recorded here. The format follows
   plan limit, which the snake-case codes alone had missed. Its reset time is read from
   the message's wording, in the daemon host's local zone, as an inference and an
   assumption, and recorded with the budget. An `account/rateLimits/updated` notice
-  whose credits have `hasCredits` and `unlimited` both false records the Codex budget
-  at 0 at once, before any turn fails, so a role whose owner is between turns fails
+  whose credits have `hasCredits` and `unlimited` both false, and whose `primary` and
+  `secondary` windows are both null as observed, records the Codex budget at 0 at once,
+  before any turn fails, so a role whose owner is between turns fails
   over then. Grok stays unclassified.
 
 - A seat that does not own its role is not woken while another seat owns the role,

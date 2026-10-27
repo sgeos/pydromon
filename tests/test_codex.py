@@ -426,6 +426,24 @@ def test_only_no_credit_and_no_unlimited_is_a_spent_credit() -> None:
     ):
         assert spent({"rateLimits": {**NO_CREDIT, "credits": credits}}) is None
     assert spent({}) is None
+
+
+def test_no_credit_with_a_reported_window_is_not_a_spent_credit() -> None:
+    """The operator's narrowing of 2026-10-27. Only the observed shape, both windows
+    present and null, counts, since an account with a plan window may still have
+    allowance left while it has no purchased credit."""
+    spent = codex_module.credits_spent
+    window: dict[str, object] = {"usedPercent": 40, "windowDurationMins": 300}
+    for name in ("primary", "secondary"):
+        assert spent({"rateLimits": {**NO_CREDIT, name: window}}) is None
+        missing = {key: value for key, value in NO_CREDIT.items() if key != name}
+        assert spent({"rateLimits": missing}) is None
+    spent_window: dict[str, object] = {"usedPercent": 100, "windowDurationMins": 300}
+    assert spent({"rateLimits": {**NO_CREDIT, "primary": spent_window}}) is None
+
+
+def test_the_unnamed_credit_note() -> None:
+    spent = codex_module.credits_spent
     unnamed = spent({"rateLimits": {**NO_CREDIT, "limitId": None}})
     assert unnamed == (
         "Codex reported no credit left, with hasCredits and unlimited false"

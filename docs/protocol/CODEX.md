@@ -85,12 +85,17 @@ inference about the wording, which a change to it defeats, leaving the reset unk
 daemon's host, which is the app-server's host, on the inference that Codex formats it
 in its host's zone.
 
-**Decided by the operator on 2026-10-27.** A `credits` report with `hasCredits` and
-`unlimited` both false is the provider's budget at 0, which the scheduler records with
-no reset as soon as the notice arrives, in a turn or between turns, and acts on before
-any turn fails. A repeated notice records nothing while the budget is spent.
-**Open question.** Only an account with no plan window reported was observed. Whether
-an account with allowance left in a window also reports `hasCredits` false is unknown.
+**Decided by the operator on 2026-10-27.** A notice whose `credits` has `hasCredits`
+and `unlimited` both false, and whose `primary` and `secondary` are both present and
+null, is the provider's budget at 0. That is the observed shape. The scheduler records
+it with no reset as soon as the notice arrives, in a turn or between turns, and acts on
+it before any turn fails. A repeated notice records nothing while the budget is spent.
+The operator narrowed the rule to require both windows null on the same day, because
+only an account with no plan window reported was observed, and whether an account with
+allowance left in a window also reports `hasCredits` false is unknown. A notice with a
+window, or without either window key, records nothing, even when the window is used up,
+and an account whose plan window is spent is left to the turn's `usageLimitExceeded`
+error.
 
 **Inference, not observed in a live app-server error.** The structured codes
 `plan_limit_reached`, `plan_limit_exceeded`, `usage_limit_reached` and

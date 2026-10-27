@@ -744,17 +744,24 @@ def usage_limit(error: object) -> EnginePlanLimit | None:
 
 def credits_spent(params: Mapping[str, Any]) -> str | None:
     """A note saying the account has no credit left, when a ``RATE_LIMITS_UPDATED``
-    notice reports ``hasCredits`` and ``unlimited`` both false, or ``None``.
+    notice reports ``hasCredits`` and ``unlimited`` both false and its ``primary``
+    and ``secondary`` windows present and null, or ``None``.
 
-    **Operator's rule, 2026-10-27.** That pair is the provider's budget at 0, which
-    the harness can act on before any turn fails. **Open question.** Only an account
-    with no credit and no reported window has been observed. Whether an account with
-    allowance left in a plan window also reports ``hasCredits`` false is unknown, and
-    if it does, this reads a spent budget where there is none."""
+    **Operator's rule, 2026-10-27.** That shape, which is the one observed, is the
+    provider's budget at 0, which the harness can act on before any turn fails. The
+    operator narrowed it the same day to require both windows null, because whether
+    an account with allowance left in a plan window also reports ``hasCredits`` false
+    is unknown. A notice with a window, or without the window keys, is therefore not
+    read as spent, and a plan whose windows are spent is left to the turn's
+    ``usageLimitExceeded`` error."""
     limits = params.get("rateLimits")
     if not isinstance(limits, dict):
         return None
-    credits = cast(dict[str, object], limits).get("credits")
+    reported_limits = cast(dict[str, object], limits)
+    for window in ("primary", "secondary"):
+        if window not in reported_limits or reported_limits[window] is not None:
+            return None
+    credits = reported_limits.get("credits")
     if not isinstance(credits, dict):
         return None
     reported = cast(dict[str, object], credits)
@@ -762,7 +769,7 @@ def credits_spent(params: Mapping[str, Any]) -> str | None:
         return None
     if reported.get("unlimited") is not False:
         return None
-    limit_id = cast(dict[str, object], limits).get("limitId")
+    limit_id = reported_limits.get("limitId")
     named = (
         f" for its {limit_id} limit"
         if isinstance(limit_id, str) and 0 < len(limit_id) <= 64
