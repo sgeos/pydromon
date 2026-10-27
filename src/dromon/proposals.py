@@ -216,11 +216,90 @@ def _validate(proposal: Proposal) -> None:
         raise ProposalError("proposal file list contains duplicates")
     for path in proposal.files:
         candidate = Path(path)
+        components = tuple(part.casefold() for part in candidate.parts)
         if (
             not path
             or "\x00" in path
             or candidate.is_absolute()
             or ".." in candidate.parts
+            or not candidate.parts
+            or "\\" in path
+            or path.startswith("~")
+            or (candidate.parts and candidate.parts[0].endswith(":"))
+            or any(part in {".git", ".dromon", "secret"} for part in components)
             or len(path.encode("utf-8")) > 4096
         ):
             raise ProposalError(f"invalid proposal file path {path!r}")
+    patch_paths = _patch_paths(proposal.patch)
+    if patch_paths != set(proposal.files):
+        raise ProposalError("proposal file list does not match the patch headers")
+
+
+def _patch_paths(patch: str) -> set[str]:
+    """Read unified diff paths, excluding deleted or new-file sentinels."""
+    paths: set[str] = set()
+    in_diff = False
+    old_path: str | None = None
+    diff_header: str | None = None
+    saw_diff = False
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            if in_diff and old_path is not None:
+                raise ProposalError("patch has an incomplete file header")
+            in_diff = True
+            old_path = None
+            diff_header = line
+            saw_diff = True
+            continue
+        if not in_diff:
+            continue
+        if line.startswith("--- "):
+            old_path = _diff_header_path(line[4:])
+            continue
+        if line.startswith("+++ "):
+            if old_path is None:
+                raise ProposalError("patch has an unexpected new-file header")
+            new_path = _diff_header_path(line[4:])
+            expected_old = old_path if old_path != "/dev/null" else new_path
+            expected_new = new_path if new_path != "/dev/null" else old_path
+            if diff_header != f"diff --git a/{expected_old} b/{expected_new}":
+                raise ProposalError("patch Git header does not match its file headers")
+            if old_path != "/dev/null":
+                paths.add(old_path)
+            if new_path != "/dev/null":
+                paths.add(new_path)
+            old_path = None
+            continue
+        if line.startswith("@@"):
+            in_diff = False
+            old_path = None
+    if not saw_diff:
+        raise ProposalError("patch must contain git unified diff headers")
+    if in_diff and old_path is not None:
+        raise ProposalError("patch has an incomplete file header")
+    for path in paths:
+        candidate = Path(path)
+        if (
+            not path
+            or candidate.is_absolute()
+            or ".." in candidate.parts
+            or not candidate.parts
+            or any(
+                part.casefold() in {".git", ".dromon", "secret"}
+                for part in candidate.parts
+            )
+        ):
+            raise ProposalError(f"invalid path in patch header {path!r}")
+    return paths
+
+
+def _diff_header_path(value: str) -> str:
+    """Normalize a plain git `a/` or `b/` header path, rejecting quoted forms."""
+    path = value.split("\t", maxsplit=1)[0]
+    if path.startswith('"'):
+        raise ProposalError("quoted patch header paths are not supported")
+    if path in {"/dev/null", "a//dev/null", "b//dev/null"}:
+        return "/dev/null"
+    if path.startswith(("a/", "b/")):
+        path = path[2:]
+    return path

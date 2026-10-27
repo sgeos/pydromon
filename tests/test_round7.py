@@ -253,6 +253,16 @@ def test_context_warning_wakes_compactable_line_without_mail(world: World) -> No
     assert world.status()["context"]["estimated_tokens"] == 5_000
 
 
+def test_context_warning_does_not_queue_a_note_for_a_held_line(world: World) -> None:
+    world.scheduler.hold("alpha", "a test hold")
+    assert world.log.state.lines["alpha"].held_by is not None
+    world.scheduler._context_reported(  # pyright: ignore[reportPrivateUsage]
+        "alpha", 150_001, CONTEXT_FROM_CALL
+    )
+    assert "alpha" not in world.log.state.scheduled
+    assert "alpha" not in world.scheduler._context_compaction_wakes  # pyright: ignore[reportPrivateUsage]
+
+
 def test_context_warning_does_not_wake_muted_line(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -277,6 +287,19 @@ def test_context_warning_does_not_wake_muted_line(
     monkeypatch.setattr(world.scheduler, "_line_muted", unmuted)
     assert world.scheduler._work_waiting() is True  # pyright: ignore[reportPrivateUsage]
     assert "alpha" in world.log.state.scheduled
+
+
+def test_compaction_that_leaves_context_high_does_not_queue_another_wake(
+    world: World,
+) -> None:
+    world.scheduler.session_compacted(
+        "alpha",
+        {"trigger": "manual", "before_tokens": 200_000, "after_tokens": 175_000},
+    )
+    assert world.status()["context"]["auto_compact_held"] is True
+    assert world.status()["context"]["compaction_pending"] is False
+    assert "alpha" not in world.log.state.scheduled
+    assert "alpha" not in world.scheduler._context_compaction_wakes  # pyright: ignore[reportPrivateUsage]
 
 
 def test_a_wake_the_line_scheduled_itself_is_never_withdrawn(world: World) -> None:

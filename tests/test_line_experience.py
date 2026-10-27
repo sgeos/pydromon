@@ -253,6 +253,30 @@ def test_default_line_status_has_a_hard_size_bound(
     assert json.loads(text)["status_truncated"] is True
 
 
+@pytest.mark.parametrize("detail", [False, True])
+def test_line_status_lists_have_a_hard_size_bound(
+    world: World, monkeypatch: pytest.MonkeyPatch, detail: bool
+) -> None:
+    original = world.scheduler._detailed_line_status  # pyright: ignore[reportPrivateUsage]
+
+    def oversized(line_id: str) -> dict[str, object]:
+        status = original(line_id)
+        status["other_lines"] = [
+            {"line_id": f"beta-{index}-" + "x" * 1_000, "state": "idle"}
+            for index in range(20)
+        ]
+        return status
+
+    monkeypatch.setattr(world.scheduler, "_detailed_line_status", oversized)
+    text, error = world.call("line_status", {"detail": detail, "lists": True})
+    assert not error
+    assert len(text.encode("utf-8")) <= MAX_LINE_STATUS_DEFAULT_BYTES
+    result = json.loads(text)
+    assert result["status_truncated"] is True
+    assert result["lists_truncated"] is True
+    assert result["suggested_arguments"] == {"detail": True, "lists": False}
+
+
 # R2, the budget line.
 
 

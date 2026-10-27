@@ -3,6 +3,7 @@
 import json
 import os
 import stat
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,13 @@ def sample(proposal_id: str = "p-0123456789ab") -> proposals.Proposal:
         workdir="/project/worktrees/worker",
         message="Fix the parser edge case.",
         files=("src/parser.py", "tests/test_parser.py"),
-        patch="diff --git a/src/parser.py b/src/parser.py\n",
+        patch=unified_patch(("src/parser.py", "tests/test_parser.py")),
+    )
+
+
+def unified_patch(files: tuple[str, ...]) -> str:
+    return "".join(
+        f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n" for path in files
     )
 
 
@@ -62,6 +69,33 @@ def test_invalid_proposal_fields_are_refused(
                 patch=patch,
             ),
         )
+
+
+@pytest.mark.parametrize(
+    "path", (".git/config", ".dromon/proposals/item.json", "secret/token")
+)
+def test_proposals_refuse_protected_paths(path: str, tmp_path: Path) -> None:
+    found = sample()
+    with pytest.raises(proposals.ProposalError, match="invalid proposal file path"):
+        proposals.write(
+            tmp_path,
+            replace(found, files=(path,), patch=unified_patch((path,))),
+        )
+
+
+def test_proposal_file_list_must_match_patch_headers(tmp_path: Path) -> None:
+    found = sample()
+    mismatched = proposals.Proposal(
+        proposal_id=found.proposal_id,
+        created_at=found.created_at,
+        line_id=found.line_id,
+        workdir=found.workdir,
+        message=found.message,
+        files=("src/other.py",),
+        patch=unified_patch(("src/parser.py",)),
+    )
+    with pytest.raises(proposals.ProposalError, match="does not match the patch"):
+        proposals.write(tmp_path, mismatched)
 
 
 def test_proposal_reader_rejects_symlink_and_malformed_records(

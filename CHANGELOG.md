@@ -8,11 +8,13 @@ All notable changes are recorded here. The format follows
 ### Added
 
 - Compact `line_status` responses by default, with bounded output and explicit requests
-  for diagnostic fields and long lists. Lines with context compaction enabled wake at
-  their context warning so compaction can happen before the next real turn. A new
+  for diagnostic fields and long lists. List responses are bounded too. Lines with
+  context compaction enabled wake at their context warning so compaction can happen
+  before the next real turn, except when held or muted. A new
   `propose_change` tool records a bounded patch, file list and message for operator
-  review through `dromon proposal list` and `dromon proposal show`; it never applies a
-  patch or commits. `dromon config` warns when writing-capable lines share a workdir.
+  review through `dromon proposal list` and `dromon proposal show`; its file list must
+  match the patch headers and excludes protected paths. It never applies a patch or
+  commits. `dromon config` warns when writing-capable lines share a workdir.
 
 ### Added
 

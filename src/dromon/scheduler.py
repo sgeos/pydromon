@@ -2025,6 +2025,7 @@ class Scheduler:
         context = self._context.get(line_id)
         if (
             not self._may_compact(line_id)
+            or self._log.state.lines[line_id].held_by is not None
             or context is None
             or context < threshold
             or line_id in self._auto_held
@@ -2244,17 +2245,12 @@ class Scheduler:
                 "background_tasks": kept["tasks"],
                 "left_processes": left_processes,
             }
+            if _status_size(compact) > MAX_LINE_STATUS_DEFAULT_BYTES:
+                return _truncated_line_status(full, lists_truncated=True)
             return compact
-        encoded = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
-        if len(encoded.encode("utf-8")) <= MAX_LINE_STATUS_DEFAULT_BYTES:
+        if _status_size(compact) <= MAX_LINE_STATUS_DEFAULT_BYTES:
             return compact
-        return {
-            "line_id": line_id,
-            "state": full["state"],
-            "status_truncated": True,
-            "detail_available": True,
-            "lists_available": True,
-        }
+        return _truncated_line_status(full, lists_truncated=False)
 
     def _detailed_line_status(self, line_id: str) -> dict[str, object]:
         """The full status before the caller selects compact, detail or list fields."""
@@ -2714,13 +2710,10 @@ class Scheduler:
                 return _tool_error("detail must be true or false")
             if type(lists) is not bool:
                 return _tool_error("lists must be true or false")
-            return _tool_text(
-                json.dumps(
-                    self.line_status(line_id, detail=detail, lists=lists),
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
+            status = self.line_status(line_id, detail=detail, lists=lists)
+            if lists and _status_size(status) > MAX_LINE_STATUS_DEFAULT_BYTES:
+                status = _truncated_line_status(status, lists_truncated=True)
+            return _tool_text(json.dumps(status, indent=2, sort_keys=True))
 
         return SdkMcpTool(
             name=LINE_STATUS_TOOL_NAME,
@@ -4700,6 +4693,34 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         "recent_turn_count": len(cast(list[dict[str, object]], full["recent_turns"])),
         "other_line_count": len(cast(list[dict[str, object]], full["other_lines"])),
     }
+
+
+def _status_size(status: dict[str, object]) -> int:
+    """The UTF-8 size of status as the line tool formats its JSON response."""
+    return len(json.dumps(status, indent=2, sort_keys=True).encode("utf-8"))
+
+
+def _truncated_line_status(
+    full: dict[str, object], *, lists_truncated: bool
+) -> dict[str, object]:
+    """A bounded status response that says which shorter request to make."""
+    compact = _compact_line_status(full)
+    result: dict[str, object] = {
+        "line_id": compact["line_id"],
+        "state": compact["state"],
+        "status_truncated": True,
+        "detail_available": True,
+        "lists_available": True,
+        "lists_truncated": lists_truncated,
+        "suggested_arguments": {"detail": True, "lists": False},
+    }
+    if _status_size(result) > MAX_LINE_STATUS_DEFAULT_BYTES:
+        return {
+            "line_id": compact["line_id"],
+            "state": compact["state"],
+            "status_truncated": True,
+        }
+    return result
 
 
 def engine_output_roots() -> list[Path]:

@@ -880,6 +880,28 @@ def test_dromon_config_warns_when_writing_lines_share_workdir(
     assert "reader" not in output.split("warning:", maxsplit=1)[1]
 
 
+def test_dromon_config_resolves_workdir_symlinks_for_shared_writer_warning(
+    tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tmp_path / ".dromon"
+    state.mkdir()
+    actual = tmp_path / "worktree"
+    actual.mkdir()
+    (tmp_path / "alias").symlink_to(actual, target_is_directory=True)
+    (state / "dromon.toml").write_text(
+        "version = 1\n"
+        "[lines.alpha]\nmodel = 'claude-haiku-5-5'\n"
+        "builtin_tools = ['Read', 'Write']\nworkdir = 'worktree'\n"
+        "[lines.beta]\nmodel = 'claude-opus-5-5'\n"
+        "builtin_tools = ['Bash']\nworkdir = 'alias'\n"
+    )
+    runtime = ["--runtime-dir", str(short_runtime)]
+    assert cli.main(["--project", str(tmp_path), *runtime, "config"]) == 0
+    output = capsys.readouterr().out
+    assert "warning: writing lines alpha, beta share workdir" in output
+    assert f"share workdir {actual}" in output
+
+
 def test_a_claude_line_reads_instructions_from_its_workdir(tmp_path: Path) -> None:
     (tmp_path / "wt").mkdir()
     (tmp_path / "wt" / "CLAUDE.md").write_text("Here.\n")

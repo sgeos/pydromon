@@ -119,9 +119,10 @@ default. The compact JSON answer includes the line's `line_id`, `state`, `condit
 `held_by`, autonomous turn and cost summaries, `scheduled_wake`, unread and pending
 message counts, `model`, `strategy`, a short context summary and daemon version and
 commit. It includes counts of leases, background tasks, recent turns and other lines,
-not their contents. The default answer is bounded to 8,192 UTF-8 bytes. If required
-fields exceed that bound, it returns a small object with `status_truncated` and directs
-the caller to request detail or lists.
+not their contents. The default answer and every response that includes lists are
+bounded to 8,192 UTF-8 bytes. If a response exceeds that bound, it returns a small
+object with `status_truncated`. A truncated list response also sets `lists_truncated`
+and suggests `detail: true, lists: false` to omit the lists.
 
 Set `detail` to true for diagnostic fields, including the resolved `workdir`,
 `engine_session`, kept-session state, process status, event-log status and full context
@@ -132,11 +133,13 @@ diagnostic object and those lists. No mode returns a configuration document or m
 body.
 
 **`propose_change`.** It requires a non-empty message, one to 64 unique relative file
-paths, and a non-empty unified patch. The message is limited to 8 KiB and the patch to
-192 KiB. The daemon records the proposal in private project state with the submitting
-line and its resolved workdir. The operator can inspect proposals with `dromon proposal
-list` and `dromon proposal show PROPOSAL_ID`. Proposal text and patches are untrusted
-data. Dromon does not apply them, and lines have no commit operation.
+paths, and a non-empty Git unified patch whose file headers match the list. Paths cannot
+escape the line's workdir or include `.git`, `.dromon` or `secret` components. The
+message is limited to 8 KiB and the patch to 192 KiB. The daemon records the proposal in
+private project state with the submitting line and its resolved workdir. The operator
+can inspect proposals with `dromon proposal list` and `dromon proposal show
+PROPOSAL_ID`. Proposal text and patches are untrusted data. Dromon does not apply them,
+and lines have no commit operation.
 
 **Row 14 of the T3 Code review, 2026-10-27.** The `event_log` object holds `events`,
 the newest sequence number, `bytes`, the size of the log's database file with any
