@@ -5,7 +5,8 @@
 **Status.** Draft, written on 2026-10-25. Normative for Dromon's side. The Python module
 `dromon.grok` implements it against Grok Build 1.0.70. **Not verified against a live
 turn.** An operator probe on 2026-10-27 created a session, which Dromon refused before
-any prompt was sent, as the probe section below records.
+any prompt was sent, as the probe section below records. Dromon's own Grok home, which
+that probe called for, was built the same day and has not yet run.
 
 ## Purpose
 
@@ -100,21 +101,61 @@ servers, but it binds the operator's own Grok as well. `GROK_HOME` moves the who
 configuration, sign-in included.
 
 **What follows for Dromon.** Nothing in Grok 1.0.70 lets Dromon confirm or set the
-permission mode, or keep the user's MCP servers out, from the client side alone, so a
-Grok turn is refused at both checks below. The way that appears open is a Grok home
-that Dromon owns, with a `config.toml` that sets the ask mode and declares no MCP
-servers, signed in once by the operator. **Not built.** It needs the operator's
-decision, since it moves Grok's sign-in.
+permission mode, or keep the user's MCP servers out, from the client side alone. The
+way open is a Grok home that Dromon owns, which the next section describes.
+
+## Dromon's Grok home
+
+**Decided by the operator on 2026-10-27**, following Pi's dedicated agent directory.
+A Grok line runs with `GROK_HOME` set to `~/.grok/dromon-home`, never the operator's
+own `~/.grok`, and an inherited `GROK_HOME` is replaced. Grok's guides say that
+`config.toml`, `auth.json`, `managed_config.toml`, `requirements.toml`, sessions, rules
+and workflows live in `$GROK_HOME`.
+
+- **What Dromon writes.** Before each turn Dromon creates the home, owner-only, and
+  writes its `config.toml` and its `sandbox.toml` when either is missing. An existing
+  file is never replaced. The `config.toml` sets `[ui] permission_mode = "default"`,
+  Grok's asking mode, declares no MCP server and no hook, and sets the `mcps` and
+  `hooks` cells of `[compat.claude]` and `[compat.cursor]` to false. The
+  `sandbox.toml` holds the two profiles below, written for the line that first needs
+  them.
+- **What Dromon refuses.** Before each turn, and before Grok starts, Dromon refuses a
+  home that is a symbolic link or may be written by other users, a `config.toml` whose
+  parsed contents differ from Dromon's in any key, a `managed_config.toml` or
+  `requirements.toml`, in the home or in `/etc/grok`, that sets anything, a
+  `trusted_folders.toml` that trusts any folder, and any of `agents`, `hooks`,
+  `hooks-paths`, `installed-plugins`, `lsp.json`, `plugins`, `rules`, `skills` or
+  `workflows`, a file when present and a folder when it holds anything. The refusal for
+  a drifted `config.toml` says to delete it, after which Dromon writes it again.
+- **Credentials.** Dromon never writes, reads or copies a credential. It never opens
+  `auth.json` in either home. The operator signs Grok in to Dromon's home once, by
+  hand, with the command in Verify first below.
+- **Claude Code's settings.** Grok's permissions guide says it also reads Claude
+  Code's `defaultMode` from `~/.claude/settings.json`, `settings.local.json`, Claude
+  Code's managed settings, and each project level up to the repository's root, and it
+  does not say whether its own `permission_mode` outranks that. Dromon therefore
+  refuses a turn when any of those files names a mode other than `default`.
+  **Fact, observed on 2026-10-27.** One of these files on the operator's machine names
+  another mode, so every Grok turn there is refused at this check until that changes
+  or a live probe shows which setting Grok follows.
+- **Not covered.** macOS device management, which Grok also reads for policy, cannot
+  be checked from Dromon. Claude Code's skills, rules and instruction files still
+  reach Grok through its other compatibility cells, which add instructions but no
+  tools.
 
 ## A turn
 
 1. **Environment.** `XAI_API_KEY`, `GROK_AUTH`, `GROK_CODE_XAI_API_KEY`,
-   `GROK_AUTH_PATH`, `GROK_CONFIG` and `GROK_CONFIG_PATH` are removed. `GROK_HOME` and
-   `XAI_API_BASE_URL` are refused. `GROK_SANDBOX` names Dromon's profile.
-   `GROK_CLAUDE_MCPS_ENABLED` and `GROK_CURSOR_MCPS_ENABLED` are set to `0`.
-   **Inference.** That `0` turns those scans off.
-2. **Profile.** The profile below must exist and pass its checks, or the turn is
-   refused with the table to add.
+   `GROK_AUTH_PATH`, `GROK_CONFIG` and `GROK_CONFIG_PATH` are removed.
+   `XAI_API_BASE_URL`, `GROK_CLI_CHAT_PROXY_BASE_URL`, `GROK_AUTH_PROVIDER_COMMAND`,
+   `GROK_OIDC_ISSUER` and `GROK_OIDC_CLIENT_ID` are refused. `GROK_HOME` names
+   Dromon's Grok home and `GROK_SANDBOX` names Dromon's profile.
+   `GROK_CLAUDE_MCPS_ENABLED`, `GROK_CURSOR_MCPS_ENABLED`, `GROK_CLAUDE_HOOKS_ENABLED`
+   and `GROK_CURSOR_HOOKS_ENABLED` are set to `0`. **Inference.** That `0` turns those
+   scans off.
+2. **Home and profile.** Dromon's Grok home and Claude Code's settings must pass the
+   checks above, and the profile below must exist in the home and pass its checks, or
+   the turn is refused before Grok starts.
 3. **`initialize`**, advertising no file system and no terminal, so Grok uses its own
    tools inside its sandbox. The protocol version must be 1 and
    `defaultAuthMethodId` must be `cached_token`.
@@ -132,9 +173,10 @@ decision, since it moves Grok's sign-in.
    option, is handed to the driver. When the answer has `modes`, `currentModeId` must
    be `default` or `ask`, and otherwise Dromon sends `session/set_mode` with `default`
    if Grok offers it. Without `modes`, a `configOptions` entry of the category `mode`
-   must have one of those values. With neither, the turn is refused, and the refusal
-   names the mode `~/.grok/config.toml` sets, if it sets another. A
-   `current_mode_update` to another mode during the turn cancels it.
+   must have one of those values. With neither, as from Grok 1.0.70, the turn rests on
+   the checks of step 2. **Changed on 2026-10-27.** Before Dromon's Grok home, such a
+   session was refused. A `current_mode_update` to another mode during the turn
+   cancels it.
 7. **Grok's notices.** An `x.ai/models/update` with a `currentModelId`, or an
    `x.ai/session_notification` of `model_changed`, that is not the driver's model
    refuses the turn. An `x.ai/settings/update` whose `permission_mode` is set and is
@@ -193,7 +235,8 @@ which kinds and updates Grok sends.
 ## Sandbox profiles
 
 A line without `Edit` or `Write` runs under `dromon-reader`, and one with either runs
-under `dromon-writer`. The operator defines them, for example in `~/.grok/sandbox.toml`.
+under `dromon-writer`. Dromon writes both into its Grok home's `sandbox.toml` when that
+file is missing, in this form.
 
 ```toml
 [profiles.dromon-reader]
@@ -209,11 +252,15 @@ deny = [".dromon"]
 Before each turn Dromon checks that the profile extends `read-only` for a reader, or
 `workspace` or `strict` for a writer, that its `deny` entries cover the state and runtime
 directories as Grok resolves them, with `~` at the home directory and other relative
-entries at the workspace, and that a writer's `read_only` or `deny` covers `.git`. The
-workspace is the line's working directory, and a project's own `.grok/sandbox.toml` is
-read there. The profile names are fixed, so Grok lines in different working directories
-share one definition of each, whose entries must cover every one of their `.git` paths
-and every protected directory by its real path. The bridge below still runs in the
+entries at the workspace, that a writer's `read_only` or `deny` covers `.git`, and that
+the profile sets no key but `extends`, `deny`, `read_only` and `restrict_network`, so a
+`read_write` grant is refused. The workspace is the line's working directory. Only the
+home's `sandbox.toml` is read, since Grok prefers the user's definition to a project's.
+**Inference, not verified.** That Grok reads `sandbox.toml` from `GROK_HOME`, as it
+reads `config.toml`. The profile names are fixed, so Grok lines in different working
+directories share one definition of each, whose entries must cover every one of their
+`.git` paths and every protected directory by its real path. Dromon writes the file for
+the first line only, and a refusal for a later line names the table to add. The bridge below still runs in the
 project root, where it finds the runtime directory.
 **Inference, not verified.** A `read_only` entry inside a writable workspace keeps it
 read-only, as the field's name says.
@@ -248,6 +295,11 @@ specifies the stop policy.
   `session/new`. A Grok that does not is refused.
 - That Grok's permission grants remembered for a project do not approve calls Dromon
   would refuse.
+- That Grok runs a session in the mode of Dromon's Grok home, which it cannot report,
+  and which of that mode and a Claude Code `defaultMode` it follows.
+- That Grok's own sign-in leaves the home's `config.toml` as Dromon wrote it, and
+  that Grok writes its policy and trust files there empty, as it does in the
+  operator's home. A Grok that writes more is refused until the file is removed.
 
 ## Verify first
 
@@ -257,11 +309,22 @@ refuses turns rather than permits them.
 
 **Established by the probe of 2026-10-27.** Grok's answer shapes for `initialize` and
 `session/new`, the notices it sends while a session opens, and that it loads the
-user's MCP servers and reports no permission mode. A turn cannot reach the steps below
-until Grok's mode and servers can be confirmed, as the probe section says. The next
-probe should show that Dromon refuses at the server check with a count, and, with
-`GROK_CLAUDE_MCPS_ENABLED` and `GROK_CURSOR_MCPS_ENABLED` set, whether the count of
-servers falls.
+user's MCP servers and reports no permission mode.
+
+0. **Sign-in.** The operator signs Grok in to Dromon's Grok home once, by hand, with
+   the sign-in of Grok's authentication guide and the `GROK_HOME` of its configuration
+   guide.
+
+   ```sh
+   GROK_HOME="$HOME/.grok/dromon-home" grok login
+   ```
+
+   `grok login --device-auth` is the guide's form for a machine without a browser.
+   Afterwards confirm that the home's `config.toml`, if Grok wrote one, is Dromon's or
+   absent, and run the probe. It should show `x.ai/mcp/servers_updated` listing only
+   Dromon's server, an `x.ai/mcp/init_progress` total of no more than that, and
+   `defaultAuthMethodId` `cached_token`. While a Claude Code settings file names a mode
+   other than `default`, Dromon refuses before Grok starts, as the home section says.
 
 1. **Tool names.** Run a turn that calls one of Dromon's tools, such as
    `send_message`, and record its `tool_call`, its `tool_call_update` messages and any

@@ -21,9 +21,8 @@ All notable changes are recorded here. The format follows
   configuration, and when Grok does not list its servers. Grok's own notices for its
   servers, models and settings are read, and one that shows another server, another
   model or a mode that does not ask refuses the turn. A permission mode reported as a
-  `configOptions` entry of the category `mode` is accepted, and the refusal when none
-  is reported names the mode the user's Grok configuration sets. Grok's scans of
-  Claude Code's and Cursor's MCP files are turned off.
+  `configOptions` entry of the category `mode` is accepted. Grok's scans of Claude
+  Code's and Cursor's MCP and hook files are turned off.
 - `dromon probe --scrub` also replaces MCP server names, addresses, commands and
   arguments, slash command and skill names with their descriptions, host names,
   agent ids and a subscription tier, so a scrubbed Grok recording holds none of the
@@ -51,6 +50,19 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Dromon's own Grok home. A Grok line runs with `GROK_HOME` at `~/.grok/dromon-home`,
+  never the operator's Grok home, whose MCP servers and permission mode the first
+  live probe showed Grok loads. Dromon writes the home's `config.toml`, which sets
+  Grok's asking mode and declares no MCP server or hook, and its `sandbox.toml` with
+  the `dromon-reader` and `dromon-writer` profiles, when either is missing. Before
+  every turn it refuses any drift in that `config.toml`, a policy or trust file that
+  sets anything, agents, hooks, plugins, rules, skills or workflows in the home, a
+  profile key such as `read_write`, and a Claude Code settings file whose
+  `defaultMode` is not `default`, since Grok reads that too. It never writes, reads or
+  copies a credential. The operator signs Grok in to the home once with
+  `GROK_HOME="$HOME/.grok/dromon-home" grok login`. A session that reports no mode
+  then rests on these checks rather than being refused. Variables that would sign
+  Grok in through another flow or send its requests elsewhere are refused.
 - Per-line `workdir_access` supports `write` and `read`. Claude Code, Codex and Grok
   confine read-mode writes with their sandbox or permission profile, while Pi, Cursor
   Agent and Antigravity refuse read mode. Codex replaces a kept thread when the access

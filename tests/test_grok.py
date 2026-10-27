@@ -6,6 +6,7 @@ script follows Grok Build 1.0.70's documentation and its ``initialize`` answer.
 
 import asyncio
 import json
+import tomllib
 from collections import deque
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -25,15 +26,21 @@ from dromon.engine import EngineRefused, TurnReport
 from dromon.eventlog import EventLog
 from dromon.evidence import IN, OUT, Recording, Replay, read_recording, replay_factory
 from dromon.grok import (
-    COMPAT_MCP_ENVIRONMENT,
+    COMPAT_ENVIRONMENT,
+    HOME_CONFIG,
+    HOME_DIR,
+    SIGN_IN,
     READER_PROFILE,
     WRITER_PROFILE,
     Connection,
     GrokLine,
     bridge_command,
+    check_home,
     check_profile,
+    claude_mode_refusal,
     engine_environment,
     grok_arguments,
+    prepare_home,
     profile_name,
     unsupported,
 )
@@ -62,10 +69,10 @@ SEND: SdkMcpTool[Any] = SdkMcpTool(
 
 
 def write_profiles(home: Path, workspace: Path, *, writer_git: bool = True) -> None:
-    (home / ".grok").mkdir(parents=True, exist_ok=True)
+    (home / HOME_DIR).mkdir(mode=0o700, parents=True, exist_ok=True)
     git = json.dumps(str((workspace / ".git").resolve()))
     read_only = f"read_only = [{git}]\n" if writer_git else ""
-    (home / ".grok" / "sandbox.toml").write_text(
+    (home / HOME_DIR / "sandbox.toml").write_text(
         f'[profiles.{READER_PROFILE}]\nextends = "read-only"\ndeny = [".dromon"]\n'
         f'[profiles.{WRITER_PROFILE}]\nextends = "workspace"\n{read_only}'
         'deny = [".dromon"]\n'
@@ -323,15 +330,17 @@ def test_the_environment_drops_credentials_and_refuses_redirection() -> None:
         "PATH": "/bin",
         "XAI_API_KEY": "k",
         "GROK_AUTH": "a",
+        "GROK_AUTH_PATH": "/elsewhere/auth.json",
         "GROK_CONFIG": "{}",
+        "GROK_HOME": "/elsewhere",
         "GROK_SANDBOX": "off",
     }
-    kept = {"PATH": "/bin", **COMPAT_MCP_ENVIRONMENT}
+    kept = {"PATH": "/bin", **COMPAT_ENVIRONMENT}
     assert engine_environment(environment, Strategy.SUBSCRIPTION) == kept
     assert engine_environment(environment, Strategy.FLEXIBLE) == kept
     with pytest.raises(EngineRefused, match="api strategy"):
         engine_environment(environment, Strategy.API)
-    for name in ("GROK_HOME", "XAI_API_BASE_URL"):
+    for name in grok_module.REFUSED_ENVIRONMENT:
         with pytest.raises(EngineRefused, match=name):
             engine_environment({name: "x"}, Strategy.SUBSCRIPTION)
 
@@ -349,6 +358,252 @@ def test_the_arguments_name_the_model_and_map_effort() -> None:
     assert grok_arguments(GROK, "max")[5] == "xhigh"
 
 
+# Dromon's Grok home.
+
+
+def prepared(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A workspace, its state directory and a Grok home Dromon has prepared."""
+    workspace = (tmp_path / "work").resolve()
+    (workspace / ".dromon").mkdir(parents=True)
+    (workspace / ".git").mkdir()
+    grok_home = tmp_path / "home" / HOME_DIR
+    prepare_home(grok_home, workspace, (workspace / ".dromon",))
+    return workspace, workspace / ".dromon", grok_home
+
+
+def test_the_sign_in_command_names_dromons_grok_home() -> None:
+    assert f'GROK_HOME="$HOME/{HOME_DIR.as_posix()}"' in SIGN_IN
+    assert SIGN_IN.endswith(" grok login")
+    assert HOME_DIR.parts == (".grok", "dromon-home")
+    protocol = Path(__file__).parents[1] / "docs" / "protocol" / "GROK.md"
+    assert SIGN_IN in protocol.read_text(encoding="utf-8")
+
+
+def test_a_prepared_home_is_owner_only_and_passes_its_own_checks(
+    tmp_path: Path,
+) -> None:
+    workspace, state, grok_home = prepared(tmp_path)
+    assert grok_home.stat().st_mode & 0o077 == 0
+    config = grok_home / "config.toml"
+    assert config.read_text() == HOME_CONFIG
+    assert config.stat().st_mode & 0o077 == 0
+    assert not (grok_home / "auth.json").exists()
+    check_home(grok_home, tmp_path / "etc")
+    home = tmp_path / "home"
+    for tools in (("Bash",), ("Edit",)):
+        check_profile(
+            LineConfig(builtin_tools=tools), workspace, (state,), home, grok_home
+        )
+
+
+def test_the_home_config_asks_and_loads_no_server_or_hook() -> None:
+    document = tomllib.loads(HOME_CONFIG)
+    assert document["ui"] == {"permission_mode": "default"}
+    assert document["ui"]["permission_mode"] in grok_module.ASK_MODES
+    assert "mcp_servers" not in document and "hooks" not in document
+    for vendor in ("claude", "cursor"):
+        assert document["compat"][vendor] == {"mcps": False, "hooks": False}
+
+
+def test_preparing_never_replaces_an_existing_file(tmp_path: Path) -> None:
+    workspace, state, grok_home = prepared(tmp_path)
+    (grok_home / "config.toml").write_text("[ui]\nyolo = true\n")
+    (grok_home / "sandbox.toml").write_text("# the operator's own\n")
+    prepare_home(grok_home, workspace, (state,))
+    assert (grok_home / "config.toml").read_text() == "[ui]\nyolo = true\n"
+    assert (grok_home / "sandbox.toml").read_text() == "# the operator's own\n"
+
+
+def test_a_linked_or_shared_home_is_refused(tmp_path: Path) -> None:
+    workspace, state, grok_home = prepared(tmp_path)
+    linked = tmp_path / "linked"
+    linked.symlink_to(grok_home)
+    with pytest.raises(EngineRefused, match="symbolic link"):
+        prepare_home(linked, workspace, (state,))
+    grok_home.chmod(0o770)
+    with pytest.raises(EngineRefused, match="other users"):
+        prepare_home(grok_home, workspace, (state,))
+    file = tmp_path / "file"
+    file.write_text("")
+    with pytest.raises(EngineRefused, match="cannot create|not a directory"):
+        prepare_home(file, workspace, (state,))
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        pytest.param('[ui]\npermission_mode = "always-approve"\n', id="always"),
+        pytest.param(HOME_CONFIG + "\n[ui.extra]\nyolo = true\n", id="added"),
+        pytest.param(
+            HOME_CONFIG + '\n[mcp_servers.notes]\ncommand = "notes"\n', id="server"
+        ),
+        pytest.param(HOME_CONFIG.replace("hooks = false", "hooks = true"), id="hooks"),
+        pytest.param("", id="empty"),
+    ],
+)
+def test_any_drift_in_the_home_config_is_refused(tmp_path: Path, document: str) -> None:
+    _, _, grok_home = prepared(tmp_path)
+    (grok_home / "config.toml").write_text(document)
+    with pytest.raises(EngineRefused, match="not the configuration Dromon wrote"):
+        check_home(grok_home, tmp_path / "etc")
+
+
+def test_the_home_config_is_compared_by_its_contents(tmp_path: Path) -> None:
+    _, _, grok_home = prepared(tmp_path)
+    (grok_home / "config.toml").write_text(
+        "[compat.cursor]\nhooks = false\nmcps = false\n"
+        '[ui]\npermission_mode = "default"\n'
+        "[compat.claude]\nhooks = false\nmcps = false\n"
+    )
+    check_home(grok_home, tmp_path / "etc")
+    (grok_home / "config.toml").write_text("not toml [")
+    with pytest.raises(EngineRefused, match="is not TOML"):
+        check_home(grok_home, tmp_path / "etc")
+    (grok_home / "config.toml").unlink()
+    with pytest.raises(EngineRefused, match="not the configuration Dromon wrote"):
+        check_home(grok_home, tmp_path / "etc")
+
+
+@pytest.mark.parametrize("name", grok_module.POLICY_FILES)
+@pytest.mark.parametrize("system", [False, True], ids=["home", "system"])
+def test_a_policy_file_may_exist_only_empty(
+    tmp_path: Path, name: str, system: bool
+) -> None:
+    _, _, grok_home = prepared(tmp_path)
+    etc = tmp_path / "etc"
+    etc.mkdir()
+    file = (etc if system else grok_home) / name
+    file.write_text("")
+    check_home(grok_home, etc)
+    file.write_text("[permission]\n")
+    check_home(grok_home, etc)
+    file.write_text('[ui]\npermission_mode = "always-approve"\n')
+    with pytest.raises(EngineRefused, match="sets Grok policy"):
+        check_home(grok_home, etc)
+
+
+def test_a_trusted_folder_is_refused(tmp_path: Path) -> None:
+    _, _, grok_home = prepared(tmp_path)
+    trust = grok_home / grok_module.TRUST_FILE
+    trust.write_text("[folders]\n")
+    check_home(grok_home, tmp_path / "etc")
+    trust.write_text('[folders."/work"]\ntrusted = true\n')
+    with pytest.raises(EngineRefused, match="trusts a folder"):
+        check_home(grok_home, tmp_path / "etc")
+
+
+@pytest.mark.parametrize("name", grok_module.REFUSED_HOME_ENTRIES)
+def test_an_entry_that_loads_more_is_refused_unless_an_empty_folder(
+    tmp_path: Path, name: str
+) -> None:
+    _, _, grok_home = prepared(tmp_path)
+    entry = grok_home / name
+    entry.mkdir()
+    check_home(grok_home, tmp_path / "etc")
+    (entry / "invented.md").write_text("")
+    with pytest.raises(EngineRefused, match=f"holds {name}"):
+        check_home(grok_home, tmp_path / "etc")
+    (entry / "invented.md").unlink()
+    entry.rmdir()
+    entry.write_text("")
+    with pytest.raises(EngineRefused, match=f"holds {name}"):
+        check_home(grok_home, tmp_path / "etc")
+
+
+def test_an_oversized_home_file_is_refused(tmp_path: Path) -> None:
+    _, _, grok_home = prepared(tmp_path)
+    (grok_home / "config.toml").write_text("#" * (grok_module.MAX_HOME_FILE + 1))
+    with pytest.raises(EngineRefused, match="exceeds"):
+        check_home(grok_home, tmp_path / "etc")
+
+
+# Claude Code's settings, which Grok also reads.
+
+
+def settings(directory: Path, document: object, name: str = "settings.json") -> None:
+    (directory / ".claude").mkdir(parents=True, exist_ok=True)
+    (directory / ".claude" / name).write_text(json.dumps(document))
+
+
+def test_no_claude_settings_let_a_grok_turn_run(tmp_path: Path) -> None:
+    workspace = tmp_path / "work"
+    (workspace / ".git").mkdir(parents=True)
+    assert claude_mode_refusal(tmp_path / "home", workspace) is None
+
+
+@pytest.mark.parametrize(
+    ("document", "refused"),
+    [
+        pytest.param({"permissions": {"defaultMode": "auto"}}, "'auto'", id="auto"),
+        pytest.param(
+            {"permissions": {"defaultMode": "bypassPermissions"}},
+            "'bypassPermissions'",
+            id="bypass",
+        ),
+        pytest.param({"defaultMode": "acceptEdits"}, "'acceptEdits'", id="top"),
+        pytest.param(
+            {"permissions": {"defaultMode": "default"}, "defaultMode": "auto"},
+            None,
+            id="nested-wins",
+        ),
+        pytest.param({"permissions": {"defaultMode": "default"}}, None, id="default"),
+        pytest.param({"permissions": {"allow": ["Read"]}}, None, id="no-mode"),
+        pytest.param(["not", "an", "object"], None, id="list"),
+    ],
+)
+@pytest.mark.parametrize("level", ["user", "user-local", "project", "repository"])
+def test_a_claude_settings_mode_other_than_asking_is_refused(
+    tmp_path: Path, document: object, refused: str | None, level: str
+) -> None:
+    home = tmp_path / "home"
+    repository = tmp_path / "repo"
+    workspace = repository / "packages" / "one"
+    workspace.mkdir(parents=True)
+    (repository / ".git").mkdir()
+    if level == "user":
+        settings(home, document)
+    elif level == "user-local":
+        settings(home, document, "settings.local.json")
+    elif level == "project":
+        settings(workspace, document, "settings.local.json")
+    else:
+        settings(repository, document)
+    reason = claude_mode_refusal(home, workspace)
+    if refused is None:
+        assert reason is None
+    else:
+        assert reason is not None and f"defaultMode to {refused}" in reason
+
+
+def test_claude_settings_above_the_repository_root_are_not_read(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "outer" / "repo"
+    (repository / ".git").mkdir(parents=True)
+    settings(tmp_path / "outer", {"permissions": {"defaultMode": "auto"}})
+    assert claude_mode_refusal(tmp_path / "home", repository) is None
+
+
+def test_outside_a_repository_only_the_workspace_settings_are_read(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "outer" / "work"
+    workspace.mkdir(parents=True)
+    settings(tmp_path / "outer", {"permissions": {"defaultMode": "auto"}})
+    assert claude_mode_refusal(tmp_path / "home", workspace) is None
+    settings(workspace, {"permissions": {"defaultMode": "auto"}})
+    assert claude_mode_refusal(tmp_path / "home", workspace) is not None
+
+
+def test_unreadable_claude_settings_refuse_the_turn(tmp_path: Path) -> None:
+    workspace = tmp_path / "work"
+    (workspace / ".git").mkdir(parents=True)
+    (workspace / ".claude").mkdir()
+    (workspace / ".claude" / "settings.json").write_text("{")
+    reason = claude_mode_refusal(tmp_path / "home", workspace)
+    assert reason is not None and "is not JSON" in reason
+
+
 # The sandbox profile.
 
 
@@ -356,11 +611,12 @@ def test_a_reader_and_a_writer_get_their_own_profiles(
     project: tuple[Path, Path, Path],
 ) -> None:
     workspace, home, state = project
+    grok_home = home / HOME_DIR
     reader = check_profile(
-        LineConfig(builtin_tools=("Bash",)), workspace, (state,), home
+        LineConfig(builtin_tools=("Bash",)), workspace, (state,), home, grok_home
     )
     writer = check_profile(
-        LineConfig(builtin_tools=("Edit",)), workspace, (state,), home
+        LineConfig(builtin_tools=("Edit",)), workspace, (state,), home, grok_home
     )
     assert (reader, writer) == (READER_PROFILE, WRITER_PROFILE)
 
@@ -376,14 +632,23 @@ def test_read_only_workdir_uses_the_grok_reader_profile() -> None:
 def test_a_missing_profile_is_refused_with_the_table_to_add(tmp_path: Path) -> None:
     workspace = tmp_path / "work"
     (workspace / ".dromon").mkdir(parents=True)
+    home = tmp_path / "home"
     with pytest.raises(EngineRefused) as raised:
         check_profile(
-            LineConfig(), workspace, (workspace / ".dromon",), tmp_path / "home"
+            LineConfig(), workspace, (workspace / ".dromon",), home, home / HOME_DIR
         )
     message = str(raised.value)
     assert f"no Grok sandbox profile {READER_PROFILE}" in message
+    assert str(home / HOME_DIR / "sandbox.toml") in message
     assert f"[profiles.{READER_PROFILE}]" in message
     assert 'extends = "read-only"' in message and '".dromon"' in message
+
+
+def write_reader(home: Path, table: str) -> None:
+    (home / HOME_DIR).mkdir(parents=True, exist_ok=True)
+    (home / HOME_DIR / "sandbox.toml").write_text(
+        f"[profiles.{READER_PROFILE}]\n{table}\n"
+    )
 
 
 @pytest.mark.parametrize(
@@ -394,6 +659,11 @@ def test_a_missing_profile_is_refused_with_the_table_to_add(tmp_path: Path) -> N
         ('extends = "read-only"\ndeny = ["**/.dromon"]', "does not deny"),
         ('extends = "read-only"\ndeny = ["other"]', "does not deny"),
         ('extends = "read-only"', "does not deny"),
+        (
+            'extends = "read-only"\ndeny = [".dromon"]\nread_write = ["/"]',
+            "sets read_write",
+        ),
+        ('extends = "read-only"\ndeny = [".dromon"]\nlater = 1', "sets later"),
     ],
 )
 def test_an_unsafe_reader_profile_is_refused(
@@ -402,12 +672,11 @@ def test_an_unsafe_reader_profile_is_refused(
     workspace = tmp_path / "work"
     (workspace / ".dromon").mkdir(parents=True)
     home = tmp_path / "home"
-    (home / ".grok").mkdir(parents=True)
-    (home / ".grok" / "sandbox.toml").write_text(
-        f"[profiles.{READER_PROFILE}]\n{table}\n"
-    )
+    write_reader(home, table)
     with pytest.raises(EngineRefused, match=reason):
-        check_profile(LineConfig(), workspace, (workspace / ".dromon",), home)
+        check_profile(
+            LineConfig(), workspace, (workspace / ".dromon",), home, home / HOME_DIR
+        )
 
 
 def test_a_writer_must_keep_git_read_only(tmp_path: Path) -> None:
@@ -422,6 +691,7 @@ def test_a_writer_must_keep_git_read_only(tmp_path: Path) -> None:
             workspace,
             (workspace / ".dromon",),
             home,
+            home / HOME_DIR,
         )
 
 
@@ -431,31 +701,29 @@ def test_deny_entries_resolve_as_grok_documents(tmp_path: Path) -> None:
     home = (tmp_path / "home").resolve()
     runtime = home / "run"
     runtime.mkdir(parents=True)
-    (home / ".grok").mkdir()
-    (home / ".grok" / "sandbox.toml").write_text(
-        f'[profiles.{READER_PROFILE}]\nextends = "read-only"\n'
-        f'deny = [".dromon", "~/run"]\n'
-    )
+    write_reader(home, 'extends = "read-only"\ndeny = [".dromon", "~/run"]')
     protected = (workspace / ".dromon", runtime)
-    assert check_profile(LineConfig(), workspace, protected, home) == READER_PROFILE
+    assert (
+        check_profile(LineConfig(), workspace, protected, home, home / HOME_DIR)
+        == READER_PROFILE
+    )
 
 
-def test_the_users_profile_wins_over_the_projects(tmp_path: Path) -> None:
+def test_neither_the_projects_nor_the_operators_own_profile_is_read(
+    tmp_path: Path,
+) -> None:
     workspace = (tmp_path / "work").resolve()
     (workspace / ".dromon").mkdir(parents=True)
+    table = f'[profiles.{READER_PROFILE}]\nextends = "read-only"\ndeny = [".dromon"]\n'
     (workspace / ".grok").mkdir()
-    (workspace / ".grok" / "sandbox.toml").write_text(
-        f'[profiles.{READER_PROFILE}]\nextends = "read-only"\ndeny = [".dromon"]\n'
-    )
+    (workspace / ".grok" / "sandbox.toml").write_text(table)
     home = tmp_path / "home"
-    protected = (workspace / ".dromon",)
-    assert check_profile(LineConfig(), workspace, protected, home) == READER_PROFILE
     (home / ".grok").mkdir(parents=True)
-    (home / ".grok" / "sandbox.toml").write_text(
-        f'[profiles.{READER_PROFILE}]\nextends = "read-only"\n'
-    )
-    with pytest.raises(EngineRefused, match="does not deny"):
-        check_profile(LineConfig(), workspace, protected, home)
+    (home / ".grok" / "sandbox.toml").write_text(table)
+    with pytest.raises(EngineRefused, match="no Grok sandbox profile"):
+        check_profile(
+            LineConfig(), workspace, (workspace / ".dromon",), home, home / HOME_DIR
+        )
 
 
 # A turn.
@@ -604,13 +872,13 @@ def test_an_engine_that_cannot_be_confirmed_is_refused_before_the_prompt(
     assert "session/prompt" not in server.methods()
 
 
-def test_a_session_without_reported_modes_is_refused(
+def test_a_session_without_reported_modes_rests_on_the_checked_home(
     project: tuple[Path, Path, Path],
 ) -> None:
     server = FakeGrok()
     server.modes = "none"
-    with pytest.raises(EngineRefused, match="does not report its permission mode"):
-        run(line(server, project))
+    assert run(line(server, project)).text == "done"
+    assert "session/set_mode" not in server.methods()
 
 
 def test_an_always_approve_session_is_switched_to_the_ask_mode(
@@ -1131,47 +1399,58 @@ def mode_option(value: str) -> dict[str, object]:
     }
 
 
-def test_a_session_shaped_as_grok_1_0_70_is_refused_for_its_unreported_mode(
-    project: tuple[Path, Path, Path],
-) -> None:
-    server = probed_grok()
-    with pytest.raises(EngineRefused) as refused:
-        run(line(server, project))
-    assert "does not report its permission mode" in str(refused.value)
-    assert "config.toml" not in str(refused.value)
-    assert "session/prompt" not in server.methods()
-    assert "session/set_mode" not in server.methods()
-
-
-def test_the_refusal_names_the_mode_the_users_configuration_sets(
+def test_a_session_shaped_as_grok_1_0_70_runs_on_dromons_grok_home(
     project: tuple[Path, Path, Path],
 ) -> None:
     _, home, _ = project
-    for document, named in (
-        ('[ui]\npermission_mode = "always-approve"\n', "'always-approve'"),
-        ("[ui]\nyolo = true\n", "'always-approve'"),
-        ('[ui]\npermission_mode = "auto"\n', "'auto'"),
-    ):
-        (home / ".grok" / "config.toml").write_text(document)
-        with pytest.raises(EngineRefused, match=f"permission_mode to {named}"):
-            run(line(probed_grok(), project))
+    server = probed_grok()
+    assert run(line(server, project)).text == "done"
+    assert server.environment["GROK_HOME"] == str(home / HOME_DIR)
+    assert (home / HOME_DIR / "config.toml").read_text() == HOME_CONFIG
+    assert "session/set_mode" not in server.methods()
 
 
-def test_the_configured_mode_is_read_only_from_a_readable_ui_table(
-    tmp_path: Path,
+def test_the_operators_own_grok_home_is_never_read(
+    project: tuple[Path, Path, Path],
 ) -> None:
-    assert grok_module.configured_mode(tmp_path) is None
-    (tmp_path / ".grok").mkdir()
-    config = tmp_path / ".grok" / "config.toml"
-    for document, expected in (
-        ("not toml [", None),
-        ("ui = 3\n", None),
-        ("[ui]\npermission_mode = 4\n", None),
-        ('[ui]\npermission_mode = "default"\n', "default"),
-        ('[ui]\nyolo = false\npermission_mode = "ask"\n', "ask"),
-    ):
-        config.write_text(document)
-        assert grok_module.configured_mode(tmp_path) == expected
+    _, home, _ = project
+    (home / ".grok" / "config.toml").write_text("[ui]\nyolo = true\n")
+    server = probed_grok()
+    assert run(line(server, project)).text == "done"
+    assert server.environment["GROK_HOME"] != str(home / ".grok")
+
+
+def test_a_drifted_home_refuses_the_turn_before_grok_starts(
+    project: tuple[Path, Path, Path],
+) -> None:
+    _, home, _ = project
+    run(line(probed_grok(), project))
+    (home / HOME_DIR / "config.toml").write_text(
+        '[ui]\npermission_mode = "always-approve"\n'
+    )
+    server = probed_grok()
+    with pytest.raises(EngineRefused, match="not the configuration Dromon wrote"):
+        run(line(server, project))
+    assert server.methods() == []
+
+
+def test_a_claude_settings_mode_refuses_the_turn_before_grok_starts(
+    project: tuple[Path, Path, Path],
+) -> None:
+    _, home, _ = project
+    settings(home, {"permissions": {"defaultMode": "auto"}})
+    server = probed_grok()
+    with pytest.raises(EngineRefused, match="defaultMode to 'auto'"):
+        run(line(server, project))
+    assert server.methods() == []
+
+
+def test_a_grok_that_is_not_signed_in_names_the_sign_in_command(
+    project: tuple[Path, Path, Path],
+) -> None:
+    with pytest.raises(EngineRefused) as refused:
+        run(line(FakeGrok(auth=None), project))
+    assert SIGN_IN in str(refused.value)
 
 
 def test_a_permission_mode_config_option_is_read_and_confirmed(
