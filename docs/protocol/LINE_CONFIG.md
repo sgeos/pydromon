@@ -119,9 +119,10 @@ question holding it as `held_by`, whether an operator `muted` it, its `autonomou
 `scheduled_wake`, its `unread` mail and `pending` deliveries, its `model` and
 `strategy`, its `workdir` as configured and as `workdir_path` resolved, its
 `engine_session`, and its `kept_session`, as the kept sessions section below specifies.
-It adds a `daemon` object, an `event_log` object and, for every other line, its
-`line_id`, `state`, whether it is `held` and `muted`, and the names of its `leases`. It holds no
-configuration document and no message body.
+It adds a `daemon` object, a `commits` object, an `event_log` object and, for every
+other line, its `line_id`, `state`, whether it is `held` and `muted`, its
+`workdir_commit`, and the names of its `leases`. It holds no configuration document and
+no message body.
 
 **Row 14 of the T3 Code review, 2026-10-27.** The `event_log` object holds `events`,
 the newest sequence number, `bytes`, the size of the log's database file with any
@@ -188,6 +189,21 @@ The `daemon` object holds the following, decided by the operator on 2026-10-26 i
   newer code until an operator restarts it. A checkout that moved does not prove that
   the code differs, since a commit can change only documents, so the note is a prompt to
   check rather than a verdict.
+
+The `commits` object, decided by the operator on 2026-10-27 with restart to upgrade,
+gives what a review or report names, read at every call in the way `checkout_commit`
+is read.
+
+- **`workdir`.** The full commit at `HEAD` of the checkout holding the line's working
+  directory, or `null` when the directory is not allowed or not in a checkout. Each
+  entry of `other_lines` gives the same for its line as `workdir_commit`.
+- **`daemon`**, **`daemon_checkout`** and **`stale`.** The `daemon` object's `commit`,
+  `checkout_commit` and `stale`, repeated so the object stands alone.
+- **`cite`.** One sentence naming both full commits, such as `line core read its
+  worktree at commit C, under the daemon at commit D.`, with the commit the daemon's
+  checkout has moved to when it is stale, so a report can quote it whole.
+- **`note`.** That both commits are read from `HEAD`. Uncommitted changes in the
+  worktree are part of neither, and only `git status` shows them.
 
 **`read_instructions`.** One optional argument, `full`, a boolean. The instructions are
 those the line's next turn receives as its engine adapter composes them from

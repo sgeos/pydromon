@@ -25,6 +25,12 @@ unmuted. Its mail waits, its session is kept, and its scheduled wake stays pendi
 and fires once the line is unmuted. A turn running when the line is muted finishes,
 unless an operator also interrupts it.
 
+Restart. An operator may restart the daemon to upgrade it, as ``dromon.restart``
+describes. While a restart drains, no turn starts and no scheduled wake fires, and in
+its ``interrupt`` mode each running turn is asked to end at its next safe point. A turn
+the restart ended leaves the line a ``restart_noted`` note, so the restarted daemon
+wakes it.
+
 Cadence. While anything is in flight, ticks follow one another every ``tick_seconds``.
 When nothing is, the loop rests until a message arrives or a scheduled wake falls due.
 
@@ -81,6 +87,7 @@ schedules, so the Keleusma version can keep these semantics exactly.
 """
 
 import asyncio
+import math
 import tempfile
 import stat
 import hashlib
@@ -116,7 +123,7 @@ from dromon.overrides import decode as decode_override
 from dromon.overrides import encode as encode_override_document
 from dromon.overrides import encode as encode_override
 from dromon.driver import ENGINE_OF, MODELS, Driver, DriverError, Strategy
-from dromon import priority
+from dromon import priority, restart
 from dromon.priority import PriorityLimiter, PriorityRefused
 from dromon import acp, antigravity, codex, cursor, grok, pi
 from dromon.agents import LineTokens
@@ -224,6 +231,7 @@ from dromon.model import (
     WakeScheduled,
     WakeWithdrawn,
     TaskNoted,
+    RestartNoted,
     LineCostMarked,
     ProcessesLeft,
     QuestionWithdrawn,
@@ -420,6 +428,8 @@ OUTPUT_HEAD_BYTES: Final = 2048
 """How many noted task identifiers each line remembers, so no task is noted twice."""
 
 STOPPED_REASON: Final = "was stopped by an operator"
+RESTART_HEADER: Final = "a daemon restart ended your last turn at a safe point"
+"""The header note of a ``restart_noted`` note, as ``dromon.restart`` describes."""
 """Why an operator's stop holds a line, as ``Scheduler.interrupt`` describes."""
 
 DETACHED_CAUSE: Final = "detached"
@@ -1231,6 +1241,14 @@ class Scheduler:
         """The reason each running line's turn was asked to end for priority mail."""
         self._ended_by: set[str] = set()
         """Priority notes that ended a turn, until they are delivered."""
+        self._restart: restart.Plan | None = None
+        """The restart draining now, as ``dromon.restart`` describes, or ``None``."""
+        self._restart_asked: set[str] = set()
+        self._restart_by: str | None = None
+        """The operator who asked for the last restart, for its note."""
+        """Lines whose turn the draining restart has asked to end at a safe point."""
+        self._last_restart: dict[str, object] | None = None
+        """What became of the last restart this daemon abandoned, for its status."""
 
     # Commands from the client and from lines.
 
@@ -1425,7 +1443,35 @@ class Scheduler:
 
     def redirect_reason(self, line_id: str) -> str | None:
         """Why ``line_id``'s running turn should end at this safe point, once, or
-        ``None``. Asked by the line's driver, as ``dromon.priority`` describes. A
+        ``None``. Asked by the line's driver, as ``dromon.priority`` describes, for
+        priority mail and then for a restart in its ``interrupt`` mode."""
+        reason = self._priority_redirect(line_id)
+        if reason is not None:
+            return reason
+        return self._restart_redirect(line_id)
+
+    def _restart_redirect(self, line_id: str) -> str | None:
+        """``restart.REASON`` once for a running line while a restart drains in its
+        ``interrupt`` mode, muted or not, since the operator asked for it."""
+        plan = self._restart
+        if (
+            plan is None
+            or plan.mode is not restart.Mode.INTERRUPT
+            or line_id not in self._running
+            or line_id in self._restart_asked
+        ):
+            return None
+        self._restart_asked.add(line_id)
+        self._redirected[line_id] = restart.REASON
+        self.activity.record(
+            line_id,
+            ActivityKind.NOTICE,
+            f"its turn is ending at a safe point for {restart.REASON}",
+        )
+        return restart.REASON
+
+    def _priority_redirect(self, line_id: str) -> str | None:
+        """The priority note's reason to end ``line_id``'s turn, once, or ``None``. A
         muted line's turn is not ended, and its priority note waits."""
         message_id = self._redirect_for.get(line_id)
         if message_id is None or line_id not in self._running:
@@ -1473,6 +1519,136 @@ class Scheduler:
         self._log.append(LineUnmuted(line_id))
         self._work.set()
         return True
+
+    # Restart to upgrade, decided by the operator on 2026-10-27.
+
+    def begin_restart(
+        self,
+        mode: restart.Mode,
+        operator: str,
+        wait_seconds: float,
+        *,
+        end_tasks: bool = False,
+    ) -> list[str]:
+        """Begin draining for a restart, and return the lines with a turn running.
+        From now no turn starts and no scheduled wake fires, and in the ``interrupt``
+        mode each running turn is asked to end at its next safe point. Raises
+        ``RestartRefused``, changing nothing, while a restart drains already, or while
+        kept engine sessions run background tasks and ``end_tasks`` is false."""
+        if self._restart is not None:
+            raise restart.RestartRefused("a restart is draining already")
+        if not end_tasks:
+            self._check_restart_tasks()
+        self._restart = restart.Plan(
+            mode, operator, wait_seconds, self._clock() + wait_seconds, end_tasks
+        )
+        self._restart_by = operator
+        self._last_restart = None
+        running = self.running_lines()
+        what = (
+            "asked its turn to end at its next safe point"
+            if mode is restart.Mode.INTERRUPT
+            else "is waiting for its turn to end"
+        )
+        for line_id in running:
+            self.activity.record(
+                line_id, ActivityKind.NOTICE, f"a daemon restart {what}"
+            )
+        return running
+
+    def _check_restart_tasks(self) -> None:
+        """Refuse a restart that would stop background tasks of kept sessions."""
+        busy = {
+            line_id: count
+            for line_id in sorted(self._log.state.lines)
+            if (count := self.kept_tasks(line_id))
+        }
+        if busy:
+            raise restart.RestartRefused(
+                f"{sum(busy.values())} background tasks run in the kept engine"
+                f" sessions of lines {', '.join(busy)}, and a restart stops them. Wait"
+                " for them to end, or restart with end_tasks to stop them"
+            )
+
+    def running_lines(self) -> list[str]:
+        """The lines with a turn in flight, in a fixed order."""
+        return sorted(
+            line_id
+            for line_id, line in self._log.state.lines.items()
+            if line_id in self._running or line.state is LineState.RUNNING
+        )
+
+    def restart_progress(self) -> restart.Outcome:
+        """Where the draining restart stands. It is ready once no turn runs. It is
+        abandoned at its deadline with a turn still running, whose interrupt could
+        not be honoured, or when background tasks it may not stop began meanwhile."""
+        plan = self._restart
+        if plan is None:
+            return restart.Outcome.ABANDONED
+        running = self.running_lines()
+        if not running:
+            if not plan.end_tasks:
+                try:
+                    self._check_restart_tasks()
+                except restart.RestartRefused as error:
+                    self.abandon_restart(str(error))
+                    return restart.Outcome.ABANDONED
+            return restart.Outcome.READY
+        if self._clock() >= plan.deadline:
+            self.abandon_restart(
+                f"the turns of lines {', '.join(running)} did not end within"
+                f" {plan.wait_seconds:g} seconds, so their interrupt could not be"
+                " honoured, and no turn was cut part way"
+            )
+            return restart.Outcome.ABANDONED
+        return restart.Outcome.WAITING
+
+    def abandon_restart(self, reason: str) -> None:
+        """End the draining restart without stopping, so turns start again."""
+        plan = self._restart
+        if plan is None:
+            return
+        self._restart = None
+        self._last_restart = {
+            "state": restart.Outcome.ABANDONED.value,
+            "mode": plan.mode.value,
+            "operator": plan.operator,
+            "reason": reason,
+        }
+        for line_id in self.running_lines():
+            self.activity.record(
+                line_id,
+                ActivityKind.NOTICE,
+                f"the daemon restart was abandoned: {reason}",
+            )
+        print(f"dromond: the restart was abandoned: {reason}", file=sys.stderr)
+        self._work.set()
+
+    def restart_status(self) -> dict[str, object] | None:
+        """The draining restart, or the last one abandoned, or ``None``."""
+        plan = self._restart
+        if plan is None:
+            return self._last_restart
+        return {
+            "state": restart.Outcome.WAITING.value,
+            "mode": plan.mode.value,
+            "operator": plan.operator,
+            "wait_seconds": plan.wait_seconds,
+            "seconds_left": max(0, math.ceil(plan.deadline - self._clock())),
+            "running": cast(object, self.running_lines()),
+            "end_tasks": plan.end_tasks,
+        }
+
+    def _note_restart(self, line_id: str) -> None:
+        """Leave ``line_id`` a note that a restart ended its turn, which wakes it once
+        the restarted daemon runs, or in this daemon when the restart was abandoned."""
+        template = restart.NOTE if self._restart is not None else restart.ABANDONED_NOTE
+        body = template.format(operator=self._restart_by)
+        message_id = new_id("m")
+        self._log.append(RestartNoted(line_id, message_id, body))
+        self._sent.append(message_id)
+        self._failed.discard(line_id)
+        self._work.set()
 
     def send_tool(self, owner: str | Address) -> SdkMcpTool[Any]:
         """The ``send_message`` tool for ``owner``, a line or an agent, whose sender it
@@ -1668,7 +1844,10 @@ class Scheduler:
         """The lines whose scheduled wake has fallen due, in a fixed order. A
         ``compact_session`` wake is held back while a running turn is making the
         compaction it was for, since that compaction withdraws it. The hold ends
-        with the turn, so it is bounded by the turn's own length."""
+        with the turn, so it is bounded by the turn's own length. While a restart
+        drains, no wake fires, so each stays pending for the restarted daemon."""
+        if self._restart is not None:
+            return []
         now = self._wall_clock()
         lines = self._log.state.lines
         return [
@@ -1732,7 +1911,9 @@ class Scheduler:
     def seconds_until_next_wake(self) -> float | None:
         """How long until the earliest pending scheduled wake falls due, at least 0,
         or ``None`` when no wake is pending. A muted line's wake is left out, since it
-        fires only once the line is unmuted."""
+        fires only once the line is unmuted, and none is due while a restart drains."""
+        if self._restart is not None:
+            return None
         lines = self._log.state.lines
         pending = [
             wake
@@ -2195,6 +2376,8 @@ class Scheduler:
                     else "priority"
                 )
                 self._ended_by.discard(message_id)
+            if message.restart_note:
+                parts.append(RESTART_HEADER)
             repeated = self._repeats.pop(message_id, None)
             if repeated is not None:
                 parts.append(f"a repeat of {repeated}")
@@ -2236,6 +2419,8 @@ class Scheduler:
         message = self._log.state.messages.get(message_id)
         if message is not None and message.priority:
             parts.append("priority")
+        if message is not None and message.restart_note:
+            parts.append(RESTART_HEADER)
         repeated = self._repeat_of.get(message_id)
         if repeated is not None:
             parts.append(f"repeat_of {repeated}")
@@ -2277,6 +2462,7 @@ class Scheduler:
                 "state": other.state.value,
                 "held": other.held_by is not None,
                 "muted": other.muted,
+                "workdir_commit": self._workdir_commit(other_id),
                 "leases": [str(lease["name"]) for lease in self.leases_of(other_id)],
             }
             for other_id, other in sorted(state.lines.items())
@@ -2317,6 +2503,7 @@ class Scheduler:
             "last_task_note": self._last_task_note.get(line_id),
             "context": self.context_status(line_id),
             "daemon": self.daemon_status(),
+            "commits": self.commits(line_id),
             "event_log": self.event_log_status(),
             "processes": {
                 "identifiable": self._processes_identifiable,
@@ -2422,6 +2609,39 @@ class Scheduler:
             if seconds >= MIN_RATE_SECONDS and size is not None and opened is not None
             else None,
             "compaction": "none",
+        }
+
+    def _workdir_commit(self, line_id: str) -> str | None:
+        """The commit checked out where ``line_id`` works, or ``None`` when its
+        working directory is not allowed or not in a checkout."""
+        try:
+            return read_head_commit(self._workdir_of(line_id))
+        except LineToolRefused:
+            return None
+
+    def commits(self, line_id: str) -> dict[str, object]:
+        """The commits a review or report by ``line_id`` names, read now, with one
+        sentence that cites both. The worktree's commit is ``HEAD`` and says nothing
+        of uncommitted changes, which only ``git status`` shows."""
+        daemon = self.daemon_status()
+        workdir = self._workdir_commit(line_id)
+        started = daemon["commit"]
+        cite = (
+            f"line {line_id} read its worktree at commit {workdir or 'unknown'},"
+            f" under the daemon at commit {started or 'unknown'}"
+        )
+        if daemon["stale"]:
+            cite += f", whose checkout has since moved to {daemon['checkout_commit']}"
+        return {
+            "workdir": workdir,
+            "daemon": started,
+            "daemon_checkout": daemon["checkout_commit"],
+            "stale": daemon["stale"],
+            "cite": cite + ".",
+            "note": (
+                "commits are read from HEAD, and uncommitted changes in the worktree"
+                " are not part of either"
+            ),
         }
 
     def daemon_status(self) -> dict[str, object]:
@@ -2719,7 +2939,8 @@ class Scheduler:
             " directory, engine session and whether it is kept with its background"
             " tasks, the cost of your last ten turns, your last wake's lateness, the"
             " daemon's version and commit and whether its checkout has moved since it"
-            " started, and the other lines' state, read only.",
+            " started, your worktree's commit with a sentence that cites both, and"
+            " the other lines' state, read only.",
             lambda: json.dumps(self.line_status(line_id), indent=2, sort_keys=True),
         )
 
@@ -3297,6 +3518,7 @@ class Scheduler:
             and line.held_by is None
             and not line.muted
             and line_id not in self._failed
+            and self._restart is None
         )
 
     def _cooling(self, line_id: str) -> bool:
@@ -3554,6 +3776,8 @@ class Scheduler:
             redirected = self._redirected.get(line_id)
             if redirected is not None and report.interrupted_for == redirected:
                 ending += f", ended at a safe point for {redirected}"
+                if redirected == restart.REASON:
+                    self._note_restart(line_id)
             elif report.interrupted_for is not None:
                 ending += f", interrupted by its driver: {report.interrupted_for}"
             elif turn_outcome(report) == FAILED:
@@ -3584,6 +3808,7 @@ class Scheduler:
             # Priority mail the turn did not end for leads the next turn instead.
             self._redirect_for.pop(line_id, None)
             self._redirected.pop(line_id, None)
+            self._restart_asked.discard(line_id)
             # A compaction the engine did not report leaves no cause for a later one.
             self._compaction_cause.pop(line_id, None)
             self.activity.record(line_id, ActivityKind.TURN_ENDED, ending)

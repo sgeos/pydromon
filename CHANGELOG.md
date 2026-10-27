@@ -7,6 +7,26 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Restart to upgrade, by the operator's decision of 2026-10-27, as
+  `docs/protocol/RESTART.md` specifies.
+  - `dromon restart [--interrupt] [--wait-seconds S] [--end-tasks]` and the client
+    operation `restart`. The daemon drains, so no turn starts and no scheduled wake
+    fires, and waits for running turns to end, or with `--interrupt` asks each to end
+    at its next safe point, the point priority mail uses. A turn still running at the
+    bound abandons the restart, and no turn is cut. Background tasks of kept sessions
+    refuse it unless `--end-tasks` is given.
+  - Once no turn runs, the daemon stops and starts its successor itself, from the
+    installed code and with the same command-line options, after it has released its
+    lock. Sessions, mutes, scheduled wakes, holds and mail survive in the event log.
+    `dromon restart` checks that the installed daemon imports before it asks, and
+    prints the successor's commit and the commit before.
+  - The event `restart_noted`, a note from a line to itself that a restart ended its
+    turn, which wakes it in the successor with a header saying so.
+  - The daemon's `status` gives `daemon`, with its commit, and `restart`.
+  - `line_status` gives `commits`, the full commits of the line's worktree and of the
+    daemon with a sentence that cites both, and each of `other_lines` gives its
+    `workdir_commit`.
+
 - Wake mute, priority mail and self mail, by the operator's decision of 2026-10-27, as
   `docs/protocol/PRIORITY.md` specifies.
   - `dromon mute LINE` and `dromon unmute LINE`, the client operations `mute` and

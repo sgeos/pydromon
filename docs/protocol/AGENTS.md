@@ -38,7 +38,8 @@ disclosure list, and refuses `priority`, which only operators and lines may send
 [`PRIORITY.md`](PRIORITY.md) specifies. Its `create_line` and `configure_line` are
 held to the project's sandbox requirement, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. It has no
 `wake_after`, `acquire_lease` or `release_lease`, which only lines have, and no
-`rebind_line`, which only an operator has through a client. Nor has it `line_status`,
+`rebind_line`, `mute`, `unmute` or `restart`, which only an operator has through a
+client. Nor has it `line_status`,
 `read_instructions`, `write_scratch`, `list_processes` or `stop_process`, which
 describe, write or act for a line. An agent below
 `operator` access is refused when its `create_line` or `configure_line` sets

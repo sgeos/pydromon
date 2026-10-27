@@ -44,6 +44,8 @@ class Operation(StrEnum):
     """Operator only. Not offered to external agents."""
     UNMUTE = "unmute"
     """Operator only. Not offered to external agents."""
+    RESTART = "restart"
+    """Operator only. Not offered to external agents."""
     SETTINGS = "settings"
     SET_SETTING = "set_setting"
     CLEAR_SESSION = "clear_session"

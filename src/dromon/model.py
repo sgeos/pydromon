@@ -622,8 +622,8 @@ class TaskNoted:
     """A note from a line to itself saying that a background task of its engine
     ended between turns, which wakes the line as any mail does. Only the daemon
     records it, when the line's engine reports the end, and recording it is the
-    whole of sending, so it needs no separate ``message_sent``. A line cannot send
-    itself mail any other way but by a scheduled wake."""
+    whole of sending, so it needs no separate ``message_sent``. A line may also send
+    itself a note with ``message_sent``, and the daemon records ``restart_noted``."""
 
     line_id: str
     message_id: str
@@ -637,6 +637,28 @@ class TaskNoted:
         check_text("task_id", self.task_id, MAX_TASK_ID_BYTES)
         check_text("status", self.status, MAX_TASK_STATUS_BYTES)
         check_text("body", self.body, MAX_TASK_NOTE_BYTES)
+
+
+MAX_RESTART_NOTE_BYTES: Final = 2048
+"""The largest note that a restart ended a line's turn."""
+
+
+@dataclass(frozen=True, slots=True)
+class RestartNoted:
+    """A note from a line to itself saying that a daemon restart ended its turn at a
+    safe point, which wakes the line once the restarted daemon runs, so the line's
+    work continues. Only the daemon records it, as the turn ends, and recording it is
+    the whole of sending, as for ``TaskNoted``. Restart to upgrade, decided by the
+    operator on 2026-10-27."""
+
+    line_id: str
+    message_id: str
+    body: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_id("message_id", self.message_id)
+        check_text("body", self.body, MAX_RESTART_NOTE_BYTES)
 
 
 MAX_LEFT_PROCESSES: Final = 64
@@ -802,6 +824,7 @@ type Event = (
     | WakeScheduled
     | WakeWithdrawn
     | TaskNoted
+    | RestartNoted
     | LineCostMarked
     | ProcessesLeft
     | StopUnverified
@@ -872,6 +895,9 @@ class Message:
     superseded_by: str | None = None
     priority: bool = False
     """Whether ``message_prioritized`` marked the note as priority mail."""
+    restart_note: bool = False
+    """Whether ``restart_noted`` recorded the note, so its header can say so in the
+    restarted daemon, which holds nothing else of the restart."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1036,6 +1062,8 @@ class State:
                     )
             case TaskNoted():
                 self._check_task_noted(event)
+            case RestartNoted():
+                self._check_noted(event.line_id, event.message_id)
             case LineCostMarked():
                 self._line(event.line_id)
             case ProcessesLeft() | StopUnverified():
@@ -1158,10 +1186,16 @@ class State:
                 self.lines[event.line_id] = replace(line, unverified=event)
             case WalkLimited():
                 self.walk_limit = event.note
-            case TaskNoted():
+            case TaskNoted() | RestartNoted():
                 address = LineAddress(event.line_id)
                 self.messages[event.message_id] = Message(
-                    address, address, MessageKind.NOTE, event.body, (), None
+                    address,
+                    address,
+                    MessageKind.NOTE,
+                    event.body,
+                    (),
+                    None,
+                    restart_note=isinstance(event, RestartNoted),
                 )
             case QuestionWithdrawn():
                 self._close(event.message_id, QuestionStatus.WITHDRAWN)
@@ -1338,15 +1372,19 @@ class State:
             )
 
     def _check_task_noted(self, event: TaskNoted) -> None:
-        self._line(event.line_id)
-        if event.message_id in self.messages:
-            raise EventRejected(f"message {event.message_id} exists")
-        self._check_withdrawn(event.message_id)
-        reserver = self._reserver(event.message_id)
+        self._check_noted(event.line_id, event.message_id)
+
+    def _check_noted(self, line_id: str, message_id: str) -> None:
+        """A note the daemon records from a line to itself needs the line, and a
+        new identifier that no scheduled wake reserves or withdrew."""
+        self._line(line_id)
+        if message_id in self.messages:
+            raise EventRejected(f"message {message_id} exists")
+        self._check_withdrawn(message_id)
+        reserver = self._reserver(message_id)
         if reserver is not None:
             raise EventRejected(
-                f"message {event.message_id} is reserved by line {reserver}'s"
-                " scheduled wake"
+                f"message {message_id} is reserved by line {reserver}'s scheduled wake"
             )
 
     def _check_superseded(self, event: QuestionSuperseded) -> None:
