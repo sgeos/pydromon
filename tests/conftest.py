@@ -2,11 +2,13 @@
 
 import shutil
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
 
+from dromon import priority
+from dromon.driver import Strategy
 from dromon.lineconfig import LineConfig, encode_config
 from dromon.model import (
     AgentAccess,
@@ -127,6 +129,33 @@ SCENARIO: tuple[Event, ...] = (
     ContextHandedOff("alpha", "rebound", "given", ("q4", "m3"), 812, "a" * 64),
     LineStateChanged("alpha", LineState.STOPPED),
 )
+
+
+STEERED_REASON = "priority mail m-1 from @ana"
+"""The reason the ``steered`` fixture's driver gives to end a turn."""
+
+
+@pytest.fixture
+def steered() -> Callable[[str, Strategy], tuple[priority.SteeredDriver, list[int]]]:
+    """A steered driver for a model and strategy whose steer always asks to end the
+    turn for priority mail, and the list of the driver's tool-use count each time it
+    was asked, the first part of every packaged driver's state. An adapter test can
+    so tell a safe point after a tool result from one at the text before it."""
+
+    def make(
+        model: str, strategy: Strategy
+    ) -> tuple[priority.SteeredDriver, list[int]]:
+        asked: list[int] = []
+        driver = priority.steered(model, strategy, lambda: None)
+
+        def steer() -> str:
+            asked.append(driver.state[0])
+            return STEERED_REASON
+
+        driver.redirect = steer
+        return driver, asked
+
+    return make
 
 
 @pytest.fixture

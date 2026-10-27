@@ -2467,7 +2467,14 @@ def test_an_unhandled_system_message_is_surfaced_once(tmp_path: Path) -> None:
     subtypes, the background task reports among them, are not surfaced."""
     odd = SystemMessage(subtype="turn_duration", data={})
     status = SystemMessage(subtype="status", data={})
-    factory = Factory([[odd, status, odd, started("t1"), result()], [odd, result()]])
+    # Seen live on 2026-10-27, a progress estimate while the model thinks.
+    thinking = SystemMessage(
+        subtype="thinking_tokens",
+        data={"estimated_tokens": 120, "estimated_tokens_delta": 40},
+    )
+    factory = Factory(
+        [[odd, status, thinking, odd, started("t1"), result()], [odd, result()]]
+    )
     log = ActivityLog()
     engine = observed(factory, tmp_path, log)
 
@@ -2487,7 +2494,12 @@ def test_an_unhandled_system_message_is_surfaced_once(tmp_path: Path) -> None:
         'the engine sent a system message of subtype "ui_toast", which Dromon does'
         " not handle",
     ]
-    assert {"init", "task_started", "compact_boundary"} <= HANDLED_SYSTEM_SUBTYPES
+    assert {
+        "init",
+        "task_started",
+        "compact_boundary",
+        "thinking_tokens",
+    } <= HANDLED_SYSTEM_SUBTYPES
 
 
 def fallback(subtype: str, moved_to: str | None) -> SystemMessage:

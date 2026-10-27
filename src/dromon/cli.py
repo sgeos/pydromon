@@ -243,7 +243,7 @@ def _restart(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     before = _call(paths, "restart", Operation.STATUS, {})
     if isinstance(before, int):
         return before
-    wait: float = arguments.wait_seconds
+    wait: int = arguments.wait_seconds
     args: dict[str, object] = {
         "operator": arguments.operator,
         "mode": (
@@ -263,7 +263,7 @@ def _restart(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     count = len(cast(list[object], running)) if isinstance(running, list) else 0
     print(
         f"dromon restart: draining, with {count} turns running, for at most"
-        f" {wait:g} seconds. The installed code is at commit"
+        f" {wait} seconds. The installed code is at commit"
         f" {_installed_commit() or 'unknown'}"
     )
     return _await_successor(paths, before, wait)
@@ -1343,11 +1343,11 @@ def build_parser() -> argparse.ArgumentParser:
             )
             command.add_argument(
                 "--wait-seconds",
-                type=float,
+                type=int,
                 default=restart.DEFAULT_WAIT_SECONDS,
                 metavar="SECONDS",
                 help="how long running turns may take to end before the restart is"
-                " abandoned, default %(default)g",
+                " abandoned, in whole seconds, default %(default)s",
             )
             command.add_argument(
                 "--end-tasks",

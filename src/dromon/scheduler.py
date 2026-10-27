@@ -1526,7 +1526,7 @@ class Scheduler:
         self,
         mode: restart.Mode,
         operator: str,
-        wait_seconds: float,
+        wait_seconds: int,
         *,
         end_tasks: bool = False,
     ) -> list[str]:
@@ -1597,7 +1597,7 @@ class Scheduler:
         if self._clock() >= plan.deadline:
             self.abandon_restart(
                 f"the turns of lines {', '.join(running)} did not end within"
-                f" {plan.wait_seconds:g} seconds, so their interrupt could not be"
+                f" {plan.wait_seconds} seconds, so their interrupt could not be"
                 " honoured, and no turn was cut part way"
             )
             return restart.Outcome.ABANDONED
@@ -2602,7 +2602,8 @@ class Scheduler:
                 "bytes": None if size is None or opened is None else size - opened,
                 "seconds": int(seconds),
             },
-            "events_per_hour": round(events / hours, 1)
+            # Whole numbers, because the client protocol carries no floats.
+            "events_per_hour": round(events / hours)
             if seconds >= MIN_RATE_SECONDS
             else None,
             "bytes_per_hour": round((size - opened) / hours)
@@ -4771,6 +4772,9 @@ def _turn_entry(
     return {
         "kind": "turn",
         "outcome": turn_outcome(report),
+        # Why the driver ended the turn, such as priority mail or a restart, since
+        # the engine's own subtype for such a turn reads as an error.
+        "interrupted_for": report.interrupted_for,
         "subtype": report.subtype,
         **(posture or {}),
         "compaction": _compaction_entry(report),

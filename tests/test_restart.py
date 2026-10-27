@@ -10,6 +10,7 @@ builds one, since no test here may start a real daemon.
 import argparse
 import asyncio
 import json
+import os
 import sys
 from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
@@ -28,7 +29,15 @@ from dromon.engine import TurnReport
 from dromon.eventlog import EventLog, read_entries
 from dromon.model import LineAddress, OperatorAddress, RestartNoted
 from dromon.paths import ProjectPaths, project_paths
-from dromon.protocol import ErrorCode, Operation, Response
+from dromon.protocol import (
+    ErrorCode,
+    Operation,
+    Request,
+    Response,
+    decode_response,
+    encode_request,
+    encode_response,
+)
 from dromon.scheduler import LineSpec, Scheduler
 
 HAIKU = "claude-haiku-5-5"
@@ -40,7 +49,7 @@ START = datetime(2026, 10, 27, 9, 0, 0, tzinfo=UTC)
 class Scripted:
     """A line engine that waits at a gate, if one is set, then reaches
     ``safe_points`` safe points, at each of which it asks to be redirected, as a
-    line's ``SteeredDriver`` does at each text or reasoning event, then waits at a
+    line's ``SteeredDriver`` does at each of its safe points, then waits at a
     second gate, if one is set, before it reports."""
 
     def __init__(self, spec: LineSpec, world: "World") -> None:
@@ -186,7 +195,7 @@ def test_interrupt_ends_a_turn_at_a_safe_point_and_the_successor_resumes_it(
     async def act() -> None:
         world.scheduler.send(ANA, ALPHA, "work on it")
         await until(lambda: world.scheduler.running_lines() == ["alpha"])
-        running = world.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 60.0)
+        running = world.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 60)
         assert running == ["alpha"]
         assert world.scheduler.restart_progress() is restart.Outcome.WAITING
         gate.set()
@@ -220,7 +229,7 @@ def test_wait_lets_a_turn_end_by_itself_and_leaves_no_note(world: World) -> None
     async def act() -> None:
         world.scheduler.send(ANA, ALPHA, "work on it")
         await until(lambda: world.scheduler.running_lines() == ["alpha"])
-        world.scheduler.begin_restart(restart.Mode.WAIT, "ana", 60.0)
+        world.scheduler.begin_restart(restart.Mode.WAIT, "ana", 60)
         gate.set()
         await until(lambda: not world.scheduler.running_lines())
         assert world.scheduler.restart_progress() is restart.Outcome.READY
@@ -236,7 +245,7 @@ def test_a_drain_starts_no_turn_and_fires_no_wake_until_it_is_abandoned(
 ) -> None:
     message_id, _ = world.scheduler.schedule_wake("beta", 60, "look again")
     world.now = START + timedelta(seconds=120)
-    world.scheduler.begin_restart(restart.Mode.WAIT, "ana", 60.0)
+    world.scheduler.begin_restart(restart.Mode.WAIT, "ana", 60)
 
     async def act() -> None:
         world.scheduler.send(ANA, ALPHA, "hello")
@@ -271,7 +280,7 @@ def test_a_turn_with_no_safe_point_by_the_deadline_abandons_the_restart(
     async def act() -> None:
         world.scheduler.send(ANA, ALPHA, "a long tool call")
         await until(lambda: world.scheduler.running_lines() == ["alpha"])
-        world.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 30.0)
+        world.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 30)
         status = world.scheduler.restart_status()
         assert status is not None
         assert (status["state"], status["seconds_left"]) == ("waiting", 30)
@@ -304,7 +313,7 @@ def test_a_restart_abandoned_before_the_safe_point_asks_nothing(
     async def act() -> None:
         world.scheduler.send(ANA, ALPHA, "work on it")
         await until(lambda: world.scheduler.running_lines() == ["alpha"])
-        world.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 60.0)
+        world.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 60)
         world.scheduler.abandon_restart("a test abandoned it")
         gate.set()
 
@@ -324,7 +333,7 @@ def test_a_turn_ended_for_a_restart_then_abandoned_is_told_so_and_woken(
     async def act() -> None:
         world.scheduler.send(ANA, ALPHA, "work on it")
         await until(lambda: world.scheduler.running_lines() == ["alpha"])
-        world.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 60.0)
+        world.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 60)
         gate.set()
         await until(lambda: "alpha" in world.reasons)
         # The engine was asked to end, and the restart is abandoned before the
@@ -343,9 +352,9 @@ def test_a_turn_ended_for_a_restart_then_abandoned_is_told_so_and_woken(
 
 
 def test_a_second_restart_is_refused_while_one_drains(world: World) -> None:
-    world.scheduler.begin_restart(restart.Mode.WAIT, "ana", 60.0)
+    world.scheduler.begin_restart(restart.Mode.WAIT, "ana", 60)
     with pytest.raises(restart.RestartRefused, match="draining already"):
-        world.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 60.0)
+        world.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 60)
 
 
 def test_a_restart_refuses_to_stop_background_tasks_unless_asked(
@@ -354,10 +363,10 @@ def test_a_restart_refuses_to_stop_background_tasks_unless_asked(
     tasks = {"alpha": 2}
     monkeypatch.setattr(world.scheduler, "kept_tasks", counter(tasks))
     with pytest.raises(restart.RestartRefused, match="2 background tasks") as refused:
-        world.scheduler.begin_restart(restart.Mode.WAIT, "ana", 60.0)
+        world.scheduler.begin_restart(restart.Mode.WAIT, "ana", 60)
     assert "lines alpha" in str(refused.value)
     assert world.scheduler.restart_status() is None
-    world.scheduler.begin_restart(restart.Mode.WAIT, "ana", 60.0, end_tasks=True)
+    world.scheduler.begin_restart(restart.Mode.WAIT, "ana", 60, end_tasks=True)
     assert world.scheduler.restart_progress() is restart.Outcome.READY
 
 
@@ -366,7 +375,7 @@ def test_tasks_that_begin_during_the_drain_abandon_the_restart(
 ) -> None:
     tasks: dict[str, int] = {}
     monkeypatch.setattr(world.scheduler, "kept_tasks", counter(tasks))
-    world.scheduler.begin_restart(restart.Mode.WAIT, "ana", 60.0)
+    world.scheduler.begin_restart(restart.Mode.WAIT, "ana", 60)
     tasks["beta"] = 1
     assert world.scheduler.restart_progress() is restart.Outcome.ABANDONED
     status = world.scheduler.restart_status()
@@ -385,7 +394,7 @@ def test_a_muted_line_is_interrupted_by_a_restart_and_stays_muted_after(
         world.scheduler.send(ANA, ALPHA, "work on it")
         await until(lambda: world.scheduler.running_lines() == ["alpha"])
         world.scheduler.mute("alpha")
-        world.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 60.0)
+        world.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 60)
         gate.set()
 
     run(world, act)
@@ -413,7 +422,7 @@ def test_priority_mail_takes_the_safe_point_before_a_restart(world: World) -> No
     async def act() -> None:
         world.scheduler.send(ANA, ALPHA, "work on it")
         await until(lambda: world.scheduler.running_lines() == ["alpha"])
-        world.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 60.0)
+        world.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 60)
         world.scheduler.send(ANA, ALPHA, "stop and look", priority=True)
         gate.set()
 
@@ -426,7 +435,9 @@ def test_priority_mail_takes_the_safe_point_before_a_restart(world: World) -> No
 # Pure parts.
 
 
-@pytest.mark.parametrize("value", [0, -1, 3601, float("nan"), float("inf"), True, "9"])
+@pytest.mark.parametrize(
+    "value", [0, -1, 3601, 1.5, 30.0, float("nan"), float("inf"), True, "9"]
+)
 def test_check_wait_refuses_what_is_not_a_bounded_wait(value: object) -> None:
     with pytest.raises(restart.RestartRefused):
         restart.check_wait(value)
@@ -434,8 +445,8 @@ def test_check_wait_refuses_what_is_not_a_bounded_wait(value: object) -> None:
 
 def test_check_wait_accepts_the_bounds_and_polls_pass_the_deadline() -> None:
     assert restart.check_wait(restart.MAX_WAIT_SECONDS) == restart.MAX_WAIT_SECONDS
-    assert restart.check_wait(1) == 1.0
-    for wait in (0.05, 1.0, 600.0):
+    assert restart.check_wait(1) == 1
+    for wait in (1, restart.DEFAULT_WAIT_SECONDS, restart.MAX_WAIT_SECONDS):
         assert restart.polls(wait) * restart.POLL_SECONDS > wait
 
 
@@ -577,7 +588,7 @@ def test_an_abandoned_restart_does_not_stop_the_daemon(
             ErrorCode.BAD_REQUEST,
             "wait or interrupt",
         ),
-        ({"operator": "ana", "wait_seconds": 0}, ErrorCode.BAD_REQUEST, "above 0"),
+        ({"operator": "ana", "wait_seconds": 0}, ErrorCode.BAD_REQUEST, "from 1"),
         ({"operator": "ana", "wait_seconds": "9"}, ErrorCode.BAD_REQUEST, "number"),
         ({"operator": "ana", "end_tasks": "yes"}, ErrorCode.BAD_REQUEST, "boolean"),
         ({"operator": "ana", "force": True}, ErrorCode.BAD_REQUEST, "no force"),
@@ -623,7 +634,7 @@ def test_a_restart_while_one_drains_is_rejected(world: World, tmp_path: Path) ->
 def namespace(**given: object) -> argparse.Namespace:
     values: dict[str, object] = {
         "interrupt": False,
-        "wait_seconds": 30.0,
+        "wait_seconds": 30,
         "end_tasks": False,
         "operator": "ana",
     }
@@ -692,7 +703,7 @@ def test_dromon_restart_waits_for_a_new_pid_and_names_both_commits(
     assert code == exits.OK
     (operation, args) = daemons.sent[1]
     assert operation is Operation.RESTART
-    assert args == {"operator": "ana", "mode": "interrupt", "wait_seconds": 30.0}
+    assert args == {"operator": "ana", "mode": "interrupt", "wait_seconds": 30}
     out = capsys.readouterr().out
     assert "draining, with 1 turns running, for at most 30 seconds" in out
     assert f"restarted, pid 2, at commit {'b' * 40}, which was {'a' * 40}" in out
@@ -738,7 +749,7 @@ def test_dromon_restart_gives_up_once_its_bound_passes(
     monkeypatch.setattr(cli.time, "sleep", no_sleep)
     daemons = Daemons({"restarting": True, "running": []}, [])
     monkeypatch.setattr(cli, "call", daemons)
-    code = cli._restart(cli_paths, namespace(wait_seconds=1.0))  # pyright: ignore[reportPrivateUsage]
+    code = cli._restart(cli_paths, namespace(wait_seconds=1))  # pyright: ignore[reportPrivateUsage]
     assert code == exits.FAILURE
     assert "no restarted daemon answered" in capsys.readouterr().err
     assert daemons.status_calls >= 2
@@ -816,11 +827,86 @@ def test_the_restart_subcommand_parses_its_options() -> None:
     )
     assert (parsed.interrupt, parsed.wait_seconds, parsed.end_tasks) == (
         True,
-        12.0,
+        12,
         True,
     )
+    assert type(parsed.wait_seconds) is int
     plain = cli.build_parser().parse_args(["restart"])
     assert (plain.interrupt, plain.wait_seconds) == (
         False,
         restart.DEFAULT_WAIT_SECONDS,
     )
+
+
+# Over the wire. The live check of 2026-10-27 found ``dromon restart`` failing at
+# once, because its wait went out as a float, and its status read failing once the
+# daemon's event-log rate was a fraction. The tests above give ``cli.call`` scripted
+# answers, so neither reached the codec.
+
+
+def test_dromon_restart_crosses_the_wire_to_a_daemon_whose_rates_are_known(
+    world: World,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(restart, "POLL_SECONDS", 1e-6)
+    monkeypatch.setattr(cli, "RESTART_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(cli, "_preflight", lambda: None)
+    target = make_daemon(world, tmp_path)
+    world.monotonic = 67.0
+    events = world.log.last_seq - world.log.opened_seq
+    assert events * 3600 % 67 != 0, "the rate must have a fraction"
+    sent: list[Operation] = []
+
+    def wire(
+        socket: Path, operation: Operation, args: dict[str, object] | None = None
+    ) -> Response:
+        del socket
+        sent.append(operation)
+        request = encode_request(Request(f"w{len(sent)}", operation, dict(args or {})))
+        response = decode_response(encode_response(target.respond(request)))
+        if operation is Operation.RESTART:
+            # The successor answers from here on, under another process id.
+            monkeypatch.setattr(os, "getpid", lambda: 4242)
+        return response
+
+    monkeypatch.setattr(cli, "call", wire)
+
+    async def go() -> int:
+        stop = asyncio.Event()
+        loop = asyncio.create_task(world.scheduler.run(stop))
+        code = cli._restart(target.paths, namespace(wait_seconds=600))  # pyright: ignore[reportPrivateUsage]
+        await until(target.stop_requested.is_set)
+        stop.set()
+        await loop
+        return code
+
+    assert asyncio.run(go()) == exits.OK
+    assert sent[:2] == [Operation.STATUS, Operation.RESTART]
+    out = capsys.readouterr().out
+    assert "for at most 600 seconds" in out
+    assert "restarted, pid 4242" in out
+
+
+def test_a_response_that_cannot_be_encoded_becomes_an_internal_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Writer:
+        def __init__(self) -> None:
+            self.data = bytearray()
+
+        def write(self, data: bytes) -> None:
+            self.data.extend(data)
+
+        async def drain(self) -> None:
+            return None
+
+    writer = Writer()
+    response = Response("r-1", ok=True, result={"rate": 0.5})
+    asyncio.run(daemon._write(cast(asyncio.StreamWriter, writer), response))  # pyright: ignore[reportPrivateUsage]
+    answer = decode_response(bytes(writer.data))
+    assert (answer.request_id, answer.ok) == ("r-1", False)
+    assert answer.error_code is ErrorCode.INTERNAL
+    assert "result.rate is a float" in (answer.error_message or "")
+    assert "could not be encoded" in capsys.readouterr().err

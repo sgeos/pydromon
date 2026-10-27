@@ -31,10 +31,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 
-DEFAULT_WAIT_SECONDS: Final = 600.0
-"""How long a restart waits for running turns to end, unless the request says."""
+DEFAULT_WAIT_SECONDS: Final = 600
+"""How long a restart waits for running turns to end, unless the request says. Whole
+seconds, because the client protocol carries no floats."""
 
-MAX_WAIT_SECONDS: Final = 3600.0
+MAX_WAIT_SECONDS: Final = 3600
 """The longest wait a restart request may ask for."""
 
 POLL_SECONDS: Final = 0.1
@@ -84,26 +85,24 @@ class Plan:
 
     mode: Mode
     operator: str
-    wait_seconds: float
+    wait_seconds: int
     deadline: float
     end_tasks: bool
 
 
-def check_wait(value: object) -> float:
-    """``value`` as a restart's wait in seconds, above 0 and at most
-    ``MAX_WAIT_SECONDS``. Raises ``RestartRefused`` for anything else, including a
-    boolean, which Python would otherwise count as a number."""
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise RestartRefused("wait_seconds is not a number")
-    seconds = float(value)
-    if not math.isfinite(seconds) or not 0 < seconds <= MAX_WAIT_SECONDS:
-        raise RestartRefused(
-            f"wait_seconds must be above 0 and at most {MAX_WAIT_SECONDS:g}"
-        )
-    return seconds
+def check_wait(value: object) -> int:
+    """``value`` as a restart's wait in whole seconds, from 1 to ``MAX_WAIT_SECONDS``.
+    Raises ``RestartRefused`` for anything else, including a boolean, which Python
+    would otherwise count as a number. The protocol decoder already refuses a float,
+    and this refuses one passed in directly."""
+    if type(value) is not int:
+        raise RestartRefused("wait_seconds is not a whole number")
+    if not 0 < value <= MAX_WAIT_SECONDS:
+        raise RestartRefused(f"wait_seconds must be from 1 to {MAX_WAIT_SECONDS}")
+    return value
 
 
-def polls(wait_seconds: float) -> int:
+def polls(wait_seconds: int) -> int:
     """How many polls the daemon's watch makes at most, enough to pass the deadline
     of a plan with ``wait_seconds``, so its loop is bounded."""
     return math.ceil(wait_seconds / POLL_SECONDS) + 2

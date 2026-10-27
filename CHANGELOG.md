@@ -5,6 +5,28 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- The client protocol carries no floats, and the daemon sent two. `dromon status`
+  failed once the daemon had run for a minute, because `events_per_hour` was a
+  fraction, and `dromon restart` failed at once, because its `--wait-seconds` went out
+  as a float. Both are whole numbers now, and `--wait-seconds` takes whole seconds. The
+  encoder refuses a float wherever it appears and names its path, the daemon answers a
+  response it cannot encode with an internal error under the request's identifier, and
+  a request refused for holding a float is answered under its own identifier. Found by
+  the operator's live check of 2026-10-27.
+- The safe point of priority mail, and so of `dromon restart --interrupt`, moved to
+  the moment after a tool result is delivered and before the next model call, once
+  every tool use of the turn has its result, or the end of an assistant message that
+  holds no tool use, by the operator's decision of 2026-10-27 after a review. It was a
+  text or thinking event, which can share a message with a tool use after it. Each
+  adapter feeds the new driver events `tool_result` and Pi also `message_end`, which
+  the packaged drivers answer with `continue`.
+- `recent_turns` gives `interrupted_for`, so a turn ended for priority mail or a
+  restart says so beside an engine subtype such as `error_during_execution`.
+- Claude Code's `thinking_tokens` system message, a progress estimate while the model
+  thinks, is handled and no longer reported as unknown.
+
 ### Added
 
 - Restart to upgrade, by the operator's decision of 2026-10-27, as
@@ -37,14 +59,13 @@ All notable changes are recorded here. The format follows
     show the mute, and `condition` is `muted`.
   - `dromon send --priority`, `priority` on `send`, and `priority` on `send_message`,
     recorded as `message_prioritized`. Priority mail ends the recipient's running turn
-    at its next text or reasoning event, through the line's driver, which every
-    adapter already honours, and leads the next turn, which skips the cooldown. Lines'
-    priority mail is limited to 3 sent and 2 received per 10 minutes, operators' is
-    unlimited, and external agents may not send it. Whether Claude Code's text block
-    always precedes the start of a following tool call is a hypothesis owed a live
-    check.
-  - A line may send itself a note with `send_message`. Operators and agents still may
-    not.
+    at its next safe point, through the line's driver, which every adapter already
+    honours, and leads the next turn, which skips the cooldown. Lines' priority mail
+    is limited to 3 sent and 2 received per 10 minutes, counts a restart sets to zero,
+    operators' is unlimited, and external agents may not send it.
+  - A line may send itself a note with `send_message`, with no rate limit, since the
+    autonomous-turn limit and the cost hold bound a chain of them. Operators and
+    agents still may not.
   - `dromon status` prints one row per line.
 
 - Grok, Codex and Antigravity capability tables, and probe recording for Codex and

@@ -21,10 +21,13 @@ turns keep working.
 | `wait`, the default | Each ends by itself |
 | `interrupt` | Each is asked to end at its next safe point, the point priority mail uses. The engine reports the turn and keeps its session. A muted line's turn is interrupted too, since the operator asked for it |
 
-A drain is bounded by `wait_seconds`, 600 by default and at most 3,600. Once no turn
+A drain is bounded by `wait_seconds`, a whole number of seconds, 600 by default and at
+most 3,600. Once no turn
 runs, the daemon stops as `stop` does and starts its successor. A turn still running at
 the bound is one whose interrupt could not be honoured, such as a turn in one long tool
-call, and the restart is then abandoned. Turns start again, the line's activity says
+call or a turn that makes no tool call, since the safe point comes only after a tool
+result or at the end of a message without a tool use, and the restart is then
+abandoned. Turns start again, the line's activity says
 so, and the daemon's `status` gives the reason under `restart`. No turn is cut part
 way. An operator who must end turns at once sends `stop` and then starts the daemon.
 

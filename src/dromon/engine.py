@@ -121,6 +121,7 @@ from claude_agent_sdk import (
     TaskUpdatedMessage,
     TERMINAL_TASK_STATUSES,
     ToolPermissionContext,
+    ToolResultBlock,
     ToolUseBlock,
     UserMessage,
     create_sdk_mcp_server,
@@ -143,7 +144,7 @@ from dromon.ceiling import (
     no_operator,
     nothing_to_settle,
 )
-from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
+from dromon.driver import TOOL_RESULT, ActionTag, Credential, Driver, Event, Strategy
 from dromon.lineconfig import DEFAULT_CONFIG, ConfigError, LineConfig
 from dromon.processes import MARK_VARIABLE
 from dromon.sandbox import blocks_unsandboxed
@@ -667,9 +668,14 @@ HANDLED_SYSTEM_SUBTYPES: Final = frozenset(
         "session_state_changed",
         "status",
         "api_retry",
+        "thinking_tokens",
     }
 )
 """System message subtypes Dromon handles, or knows to carry nothing it must act on.
+``thinking_tokens`` was seen live on 2026-10-27 and read from the bundled Claude Code
+the same day. It is a progress frame with ``estimated_tokens`` and
+``estimated_tokens_delta`` while the model thinks, which the engine sends many times a
+turn, and the turn's usage comes from its result, so Dromon takes nothing from it.
 **Row 5 of the T3 Code review.** Every other subtype is surfaced in the line's activity,
 once per subtype and engine, and is never passed over silently. **Fact, read from the
 bundled Claude Code 2.1.310 on 2026-10-26.** The engine can emit about forty
@@ -2173,10 +2179,22 @@ class ClaudeCodeLine:
                     event = Event("thinking")
                 else:
                     continue
-                action = self.driver.step(event)
-                if action.tag is ActionTag.INTERRUPT and turn.interrupted_for is None:
-                    turn.interrupted_for = action.text
-                    await session.interrupt()
+                await self._act(session, event, turn)
+        elif isinstance(message, UserMessage) and isinstance(message.content, list):
+            # The engine echoes a tool's result as it delivers it to the model, so
+            # this is the safe point before the next model call that priority mail
+            # takes, as ``dromon.priority`` describes.
+            for block in message.content:
+                if isinstance(block, ToolResultBlock):
+                    await self._act(session, Event(TOOL_RESULT), turn)
+
+    async def _act(
+        self, session: AgentSession | KeptSession, event: Event, turn: _Turn
+    ) -> None:
+        action = self.driver.step(event)
+        if action.tag is ActionTag.INTERRUPT and turn.interrupted_for is None:
+            turn.interrupted_for = action.text
+            await session.interrupt()
 
     async def _fallen_back(
         self, session: AgentSession | KeptSession, message: SystemMessage, turn: _Turn

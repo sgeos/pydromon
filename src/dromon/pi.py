@@ -49,6 +49,8 @@ from claude_agent_sdk import SdkMcpTool
 from dromon import capabilities
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import (
+    MESSAGE_END,
+    TOOL_RESULT,
     ActionTag,
     Credential,
     Driver,
@@ -593,6 +595,26 @@ def _call_usage(usage: Mapping[str, object]) -> dict[str, int | bool]:
     return call
 
 
+def tool_calls_in(message: Mapping[str, Any]) -> int:
+    """How many tool calls an assistant message holds, from its ``toolCall`` content
+    blocks, and at least one when it stopped for tool use. **Inference.** The block
+    type and the stop reason ``toolUse`` are Pi's as its documentation gives them,
+    not observed in a recording here, so either one alone marks the message as
+    holding a tool call, and the end of such a message is never a safe point."""
+    blocks = message.get("content")
+    count = 0
+    if isinstance(blocks, list):
+        for block in cast(list[object], blocks):
+            if (
+                isinstance(block, dict)
+                and cast(dict[str, object], block).get("type") == "toolCall"
+            ):
+                count += 1
+    if message.get("stopReason") == "toolUse":
+        count = max(count, 1)
+    return count
+
+
 def _count_usage(usage: Mapping[str, object], turn: _Turn) -> dict[str, int | bool]:
     """Add one engine call's tokens and cost to the turn, and return the call."""
     call = _call_usage(usage)
@@ -912,7 +934,12 @@ class PiLine:
                 cast(dict[str, Any], record.get("assistantMessageEvent") or {}), turn
             )
         elif kind == "message_end":
-            self._message_end(cast(dict[str, Any], record.get("message") or {}), turn)
+            message = cast(dict[str, Any], record.get("message") or {})
+            self._message_end(message, turn)
+            if message.get("role") == "assistant":
+                # A safe point of priority mail when the message holds no tool call,
+                # as ``dromon.priority`` describes.
+                await self._act(Event(MESSAGE_END, "", tool_calls_in(message)), turn)
         elif kind == "turn_start":
             turn.assistant_turns += 1
             if turn.assistant_turns > self.driver.settings.max_turns:
@@ -920,6 +947,11 @@ class PiLine:
                 await self._abort(turn, None)
         elif kind == "tool_execution_start":
             await self._tool(str(record.get("toolName") or ""), turn)
+        elif kind == "tool_execution_end":
+            if str(record.get("toolName") or "") in self.own_tools:
+                # The safe point before the next model call that priority mail
+                # takes, as ``dromon.priority`` describes.
+                await self._act(Event(TOOL_RESULT), turn)
         elif kind == "compaction_end":
             self._compaction(record, turn)
         elif kind == "agent_settled":

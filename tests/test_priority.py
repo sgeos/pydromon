@@ -1,7 +1,8 @@
 """Wake mute, priority mail and self mail, driven by scripted engines.
 
 The scripted engine asks ``LineSpec.redirect`` at each of its safe points, as a line's
-``SteeredDriver`` does at each text or reasoning event, and ends its turn with the
+``SteeredDriver`` does once a tool result is delivered or a message without a tool use
+ends, and ends its turn with the
 reason it is given, as every adapter does when its driver answers ``interrupt``. The
 steered driver itself runs here on the real packaged driver.
 """
@@ -10,17 +11,26 @@ import asyncio
 from collections.abc import Callable, Coroutine, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
 from dromon import priority
 from dromon.activity import ActivityKind
-from dromon.driver import ActionTag, Driver, Event, Strategy
+from dromon.driver import (
+    MESSAGE_END,
+    MODELS,
+    TOOL_RESULT,
+    ActionTag,
+    Driver,
+    Event,
+    Strategy,
+)
 from dromon.engine import BackgroundEnd, TurnReport
 from dromon.eventlog import EventLog, read_entries
 from dromon.limits import DEFAULT_LIMITS, Limits
+from dromon.lineconfig import LineConfig
 from dromon.model import (
     AgentAccess,
     AgentAddress,
@@ -193,35 +203,153 @@ def turn_endings(target: World, line_id: str) -> list[str]:
 # The steered driver, on the real packaged driver.
 
 
-def test_the_steered_driver_interrupts_only_at_a_safe_point_and_tracks_state() -> None:
-    reasons: list[str | None] = []
-    steered = priority.steered(HAIKU, Strategy.SUBSCRIPTION, lambda: reasons.pop(0))
+class Steer:
+    """A steer that records each time it is asked, and answers from a script."""
+
+    def __init__(self, *answers: str | None) -> None:
+        self.answers = list(answers)
+        self.asked = 0
+
+    def __call__(self) -> str | None:
+        self.asked += 1
+        return self.answers.pop(0) if self.answers else "priority mail m-1 from @ana"
+
+
+def steps(steer: Steer, events: Sequence[Event]) -> list[ActionTag]:
+    """The steered driver's action tags for ``events``, after checking that its state
+    advances exactly as the plain driver's does."""
+    steered = priority.steered(HAIKU, Strategy.SUBSCRIPTION, steer)
     plain = Driver.for_model(HAIKU, Strategy.SUBSCRIPTION)
-    events = [
-        Event("turn_start"),
-        Event("tool_use", "Read"),
-        Event("text", "", 5),
-        Event("thinking"),
-        Event("text", "", 3),
-    ]
-    reasons.extend(["priority mail m-1 from @ana", None, "priority mail m-2"])
-    actions = [steered.step(event) for event in events]
-    expected = [plain.step(event) for event in events]
+    tags = [steered.step(event).tag for event in events]
+    for event in events:
+        plain.step(event)
     assert steered.state == plain.state
-    # turn_start and tool_use are never safe points, so the steer is not asked.
-    assert actions[0] == expected[0]
-    assert actions[1] == expected[1]
-    assert actions[2].tag is ActionTag.INTERRUPT
-    assert actions[2].text == "priority mail m-1 from @ana"
-    assert actions[3] == expected[3]
-    assert actions[4].tag is ActionTag.INTERRUPT
-    assert reasons == []
+    return tags
+
+
+def test_text_and_thinking_are_never_safe_points() -> None:
+    # Review finding 1. A text block can share a message with a tool use after it.
+    steer = Steer()
+    tags = steps(
+        steer,
+        [Event("turn_start"), Event("thinking"), Event("text", "", 5), Event("text")],
+    )
+    assert ActionTag.INTERRUPT not in tags
+    assert steer.asked == 0
+
+
+def test_text_before_a_tool_use_in_one_message_is_not_a_safe_point() -> None:
+    steer = Steer()
+    tags = steps(
+        steer,
+        [
+            Event("turn_start"),
+            Event("text", "", 5),
+            Event("tool_use", "Read"),
+            Event(TOOL_RESULT),
+        ],
+    )
+    assert tags == [ActionTag.CONTINUE] * 3 + [ActionTag.INTERRUPT]
+    assert steer.asked == 1
+
+
+def test_a_tool_result_is_safe_only_once_every_tool_use_has_its_result() -> None:
+    steer = Steer()
+    tags = steps(
+        steer,
+        [
+            Event("turn_start"),
+            Event("tool_use", "Read"),
+            Event("tool_use", "Grep"),
+            Event(TOOL_RESULT),
+            Event(TOOL_RESULT),
+        ],
+    )
+    assert tags[3] is ActionTag.CONTINUE
+    assert tags[4] is ActionTag.INTERRUPT
+    assert steer.asked == 1
+
+
+def test_the_end_of_a_message_is_safe_only_without_a_tool_use() -> None:
+    steer = Steer(None)
+    tags = steps(
+        steer,
+        [
+            Event("turn_start"),
+            Event(MESSAGE_END, "", 1),
+            Event("tool_use", "Read"),
+            Event(MESSAGE_END, "", 0),
+            Event(TOOL_RESULT),
+            Event(MESSAGE_END, "", 0),
+        ],
+    )
+    # A message with a tool use, and a message's end while a tool runs, are not
+    # asked. The result is asked and declines, and the toolless end then interrupts.
+    assert tags[:4] == [ActionTag.CONTINUE] * 4
+    assert tags[4] is ActionTag.CONTINUE
+    assert tags[5] is ActionTag.INTERRUPT
+    assert steer.asked == 2
+
+
+def test_an_unannounced_result_cannot_make_a_later_tool_look_finished() -> None:
+    steer = Steer(None)
+    steered = priority.steered(HAIKU, Strategy.SUBSCRIPTION, steer)
+    steered.step(Event("turn_start"))
+    steered.step(Event(TOOL_RESULT))
+    assert steered.pending == 0
+    steered.step(Event("tool_use", "Bash"))
+    assert steered.pending == 1
+    assert steered.step(Event(MESSAGE_END, "", 0)).tag is ActionTag.CONTINUE
+
+
+def test_a_new_turn_forgets_a_tool_use_whose_result_never_came() -> None:
+    steer = Steer()
+    steered = priority.steered(HAIKU, Strategy.SUBSCRIPTION, steer)
+    steered.step(Event("turn_start"))
+    steered.step(Event("tool_use", "Bash"))
+    assert steered.step(Event(MESSAGE_END, "", 0)).tag is ActionTag.CONTINUE
+    steered.step(Event("turn_start"))
+    assert steered.step(Event(MESSAGE_END, "", 0)).tag is ActionTag.INTERRUPT
+
+
+def test_the_driver_s_own_interrupt_is_kept_and_the_steer_is_not_asked() -> None:
+    steer = Steer()
+    steered = priority.steered(HAIKU, Strategy.SUBSCRIPTION, steer)
+    steered.step(Event("turn_start"))
+    budget = steered.settings.tool_budget
+    for _ in range(budget):
+        steered.step(Event("tool_use", "Read"))
+        steered.step(Event(TOOL_RESULT))
+    asked = steer.asked
+    over = steered.step(Event("tool_use", "Read"))
+    assert over.tag is ActionTag.INTERRUPT and over.text == "tool_budget"
+    assert steer.asked == asked
+
+
+@pytest.mark.parametrize("model", MODELS)
+@pytest.mark.parametrize("strategy", list(Strategy))
+def test_every_packaged_driver_continues_at_both_new_events(
+    model: str, strategy: Strategy
+) -> None:
+    plain = Driver.for_model(model, strategy)
+    plain.step(Event("turn_start"))
+    before = plain.state
+    for event in (Event(TOOL_RESULT), Event(MESSAGE_END, "", 0)):
+        assert plain.step(event).tag is ActionTag.CONTINUE
+    assert plain.state == before
 
 
 def test_the_steered_driver_without_a_steer_is_the_plain_driver() -> None:
     steered = SteeredDriver.for_model(HAIKU, Strategy.SUBSCRIPTION)
     plain = Driver.for_model(HAIKU, Strategy.SUBSCRIPTION)
-    for event in (Event("text", "", 1), Event("thinking"), Event("tool_use", "Bash")):
+    events = (
+        Event("text", "", 1),
+        Event("thinking"),
+        Event("tool_use", "Bash"),
+        Event(TOOL_RESULT),
+        Event(MESSAGE_END, "", 0),
+    )
+    for event in events:
         assert steered.step(event) == plain.step(event)
 
 
@@ -274,6 +402,43 @@ def test_a_line_may_send_itself_a_note_that_wakes_its_next_turn(
     # A note to itself is not operator mail, so its turn counts as autonomous.
     turns = target.scheduler.line_status("alpha")["autonomous_turns"]
     assert isinstance(turns, dict) and turns["used"] == 1
+
+
+def test_a_self_note_with_the_pending_wake_s_text_is_no_firing(
+    make_world: MakeWorld,
+) -> None:
+    """Review finding 3 of 2026-10-27. A line cannot fire its own scheduled wake
+    early by sending itself the wake's note, nor send under the reserved identifier,
+    since the send tool takes none."""
+    target = make_world(["alpha"])
+    reserved, _ = target.scheduler.schedule_wake("alpha", 3600, "look again")
+    target.scripts["alpha"].append(
+        [
+            {"to": "alpha", "body": "look again"},
+            {"to": "alpha", "body": "look again", "message_id": reserved},
+        ]
+    )
+
+    async def act() -> None:
+        target.scheduler.send(ANA, ALPHA, "start")
+
+    run(target, act)
+    state = target.log.state
+    assert state.scheduled["alpha"].message_id == reserved
+    assert reserved not in state.messages and reserved not in state.fired_dues
+    own = [
+        message_id
+        for message_id, message in state.messages.items()
+        if message.sender == ALPHA and message.recipient == ALPHA
+    ]
+    assert len(own) == 1 and own[0] != reserved
+    assert not set(own) & set(state.fired_dues)
+    engine = target.engines["alpha"]
+    assert engine.results[1] == {
+        "content": [{"type": "text", "text": "unexpected argument message_id"}],
+        "is_error": True,
+    }
+    assert "your scheduled wake" not in engine.prompts[1]
 
 
 # Mute.
@@ -344,6 +509,73 @@ def test_a_muted_line_keeps_its_scheduled_wake_pending_until_unmuted(
     assert "alpha" not in target.log.state.scheduled
     assert len(target.prompts("alpha")) == 1
     assert "your scheduled wake, due" in target.prompts("alpha")[0]
+
+
+def held_while_muted(target: World, wake: Callable[[], object]) -> list[str]:
+    """Mute alpha, run ``wake``, check that no turn ran, then unmute and return the
+    prompts of the turns that followed. Review finding 2 of 2026-10-27."""
+    target.scheduler.mute("alpha")
+
+    async def act() -> None:
+        wake()
+
+    run(target, act)
+    assert target.prompts("alpha") == []
+    assert target.scheduler.condition("alpha") == "muted"
+
+    async def unmute() -> None:
+        target.scheduler.unmute("alpha")
+
+    run(target, unmute)
+    return target.prompts("alpha")
+
+
+def test_a_muted_line_runs_no_turn_for_a_question_answer(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world(["alpha"])
+    question = target.scheduler.ask("alpha", ANA, "Which file?", ("a.md", "b.md"))
+    answers: list[str] = []
+    prompts = held_while_muted(
+        target, lambda: answers.append(target.scheduler.answer(ANA, question, "b.md"))
+    )
+    assert len(prompts) == 1 and answers[0] in prompts[0]
+
+
+def test_a_muted_line_runs_no_turn_for_a_ceiling_answer(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world(["alpha"])
+    question = target.scheduler.ceiling_reached("alpha", 2)
+    assert question is not None
+    asked = target.log.state.messages[question]
+    assert isinstance(asked.recipient, OperatorAddress)
+    operator = asked.recipient
+    answers: list[str] = []
+    prompts = held_while_muted(
+        target,
+        lambda: answers.append(
+            target.scheduler.answer(operator, question, asked.choices[0])
+        ),
+    )
+    assert len(prompts) == 1 and answers[0] in prompts[0]
+
+
+def test_a_muted_line_keeps_its_compaction_wake_pending_until_unmuted(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world(["alpha"])
+    target.scheduler.configure_line("alpha", LineConfig(allow_compact=True))
+    tool = target.scheduler.compact_session_tool("alpha")
+    asyncio.run(call(tool, {"seconds": 60}))
+    reserved = target.log.state.scheduled["alpha"].message_id
+
+    def due() -> None:
+        target.now = START + timedelta(seconds=120)
+
+    prompts = held_while_muted(target, due)
+    assert reserved in target.log.state.messages
+    assert len(prompts) == 1 and "your scheduled wake, due" in prompts[0]
 
 
 def test_a_muted_line_runs_no_turn_for_a_task_note(make_world: MakeWorld) -> None:
@@ -425,6 +657,14 @@ def test_operator_priority_mail_ends_a_running_turn_and_leads_the_next(
     assert message.priority and message.delivered
     events = [entry.event for entry in read_entries(target.path)]
     assert MessagePrioritized(urgent) in events
+    # Live check item 5. The recent turn says why it was interrupted, since its
+    # engine subtype reads as an error.
+    status = target.scheduler.line_status("alpha")
+    turns = cast(list[dict[str, object]], status["recent_turns"])
+    assert [(turn["outcome"], turn["interrupted_for"]) for turn in turns] == [
+        ("interrupted", reason),
+        ("completed", None),
+    ]
 
 
 def test_priority_mail_leads_the_delivery(make_world: MakeWorld) -> None:

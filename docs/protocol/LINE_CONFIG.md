@@ -128,8 +128,9 @@ no message body.
 the newest sequence number, `bytes`, the size of the log's database file with any
 SQLite write ahead log or journal beside it, and `since_start`, with the `events` and
 `bytes` added and the whole `seconds` passed since this daemon opened the log. It
-gives `events_per_hour` and `bytes_per_hour` once the daemon has had the log for 60
-seconds, and `null` before. A size that cannot be read is `null`, never zero, and so
+gives `events_per_hour` and `bytes_per_hour`, each rounded to a whole number since the
+client protocol carries no floats, once the daemon has had the log for 60 seconds, and
+`null` before. A size that cannot be read is `null`, never zero, and so
 is any growth derived from it. `compaction` is `none`, since nothing compacts the log
 yet, so it only grows. The daemon's `status` carries the same fields in its
 `event_log`, as [`CLIENT.md`](CLIENT.md) specifies.
@@ -164,7 +165,10 @@ turn that failed before it began was recorded only in the line's activity log, a
 operator learned of it for hours. Each entry of
 `recent_turns` for a turn gives its `outcome`, `completed` only for the subtype
 `success`, `interrupted` when its driver interrupted it, and `failed` for every other
-subtype, with the `subtype` itself. `processes` adds the line's `stop_policy`, as
+subtype, with the `subtype` itself. `interrupted_for` gives why the driver interrupted
+it, such as `priority mail m-1 from @ana` or `a daemon restart`, and is `null` for a
+turn it did not interrupt, since the engine's subtype for such a turn, such as
+`error_during_execution`, reads as an error. `processes` adds the line's `stop_policy`, as
 `left` the latest record of processes left running, as `stop_unverified` the note of
 the latest stop Dromon could not verify was complete, and as `walk_limit` what the
 daemon's platform keeps the launcher's walk from reaching, each or `null`, as the stop

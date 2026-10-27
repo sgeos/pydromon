@@ -9,7 +9,7 @@ import asyncio
 import json
 import shutil
 from collections import deque
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -38,6 +38,7 @@ from dromon.antigravity import (
 )
 from dromon.driver import ENGINE_OF, Action, ActionTag, Credential, Driver, Event
 from dromon.driver import Strategy
+from dromon.priority import SteeredDriver
 from dromon.engine import EngineRefused, TurnReport
 from dromon.jsonlines import Connection, ConnectionFactory, NotJsonLine
 from dromon.lineconfig import LineConfig, McpServer
@@ -1498,3 +1499,29 @@ def test_the_probe_runs_the_runtime_with_both_flags(
     shown = capsys.readouterr().out
     assert server.started and located == [str(executable)]
     assert "credential unverified" in shown and "turn success" in shown
+
+
+# The safe point of priority mail, decided by the operator on 2026-10-27. A turn ends
+# once a tool result is delivered and not at the text before the tool use.
+
+type Steered = Callable[[str, Strategy], tuple[SteeredDriver, list[int]]]
+REASON = "priority mail m-1 from @ana"
+
+
+def test_priority_mail_ends_the_turn_at_the_tool_result_and_not_the_text(
+    home: Path, runtime: Path, steered: Steered
+) -> None:
+    driver, asked = steered(AGY, Strategy.SUBSCRIPTION)
+    events = [
+        said("I will send it"),
+        own(),
+        permission(RUNNING, tool_name=OWN),
+        changed(status="in_progress"),
+        changed(status="completed", title=RUNNING, kind="other", toolName=OWN),
+        said("sent"),
+    ]
+    server = FakeRuntime(events, stop=None)
+    report = run(line(server, home, runtime, tools=True, loaded=driver))
+    assert asked == [1]
+    assert report.interrupted_for == REASON
+    assert server.methods().count("session/cancel") == 1

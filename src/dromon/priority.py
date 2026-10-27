@@ -8,26 +8,45 @@ the priority mail and starts without waiting for the line's cooldown or wake tic
 
 Safe point. Every engine adapter feeds the events of a turn to the line's Keleusma
 driver, and ends the turn gracefully when the driver answers ``interrupt``, so the
-engine reports the turn and keeps its session. ``SteeredDriver`` answers ``interrupt``
-at the first ``text`` or ``thinking`` event after the priority mail arrives, at which
-the model is writing or reasoning. It never interrupts at a ``tool_use`` event, since
-the tool may already be starting. What that means on each engine is in
-``docs/protocol/PRIORITY.md``, and in short it is this.
+engine reports the turn and keeps its session. **Decided by the operator on
+2026-10-27, after the review of the first version.** A turn may end at one of two
+points, and nowhere else.
 
-- Claude Code. A text or thinking block, after which the adapter sends the SDK's
-  interrupt request. **Hypothesis, not verified live.** Claude Code streams each
-  content block as it completes, so a text block arrives before a tool call that
-  follows it in the same message has started.
-- Codex. A completed agent message or a started reasoning item, then
-  ``turn/interrupt``.
-- Grok and Antigravity over ACP. A message or thought chunk, then ``session/cancel``.
-- Pi. A text delta, or reasoning as it starts, then Pi's ``abort`` command.
-- Cursor Agent. A text or thinking event, after which the adapter ends the process,
-  because Cursor takes no command once it starts.
+- After a tool result is delivered and before the next model call, which an adapter
+  reports as a ``tool_result`` event once a tool the turn used has finished. It is a
+  safe point only when every tool use the turn reported has its result, so a turn with
+  calls running in parallel, or a subagent's calls inside a task, is not ended while
+  any of them runs.
+- At the end of an assistant message that holds no tool use, which an adapter reports
+  as a ``message_end`` event whose number is the message's count of tool uses.
 
-A turn that reaches no such event, such as one long tool call to its end, is not
-interrupted. Its priority mail then leads the next turn. A muted line is never
-interrupted by priority mail, which waits with its other mail.
+A ``text`` or ``thinking`` event is never a safe point, because the same model message
+can hold a tool use after it, and the engine may start that tool before the interrupt
+lands. The first version ended turns there, and the live check of 2026-10-27 passed
+only because the text came in its own message. ``SteeredDriver`` counts the tool uses
+still waiting for a result, from the turn's ``turn_start`` on, and asks its steer only
+at the two points. The packaged drivers answer ``continue`` to both events, so their
+state is unchanged. What each engine reports is in ``docs/protocol/PRIORITY.md``, and in
+short it is this.
+
+- Claude Code. A tool result block in the user message the engine echoes once it has
+  delivered the result, then the SDK's interrupt request. **Inference, not verified
+  live.** The engine echoes the result as it sends the next model call, so the
+  interrupt ends that call before it can start a tool.
+- Codex. A tool item's completion, then ``turn/interrupt``.
+- Grok and Antigravity over ACP. A tool call's update to ``completed`` or ``failed``,
+  then ``session/cancel``.
+- Pi. ``tool_execution_end``, or a ``message_end`` without tool calls, then Pi's
+  ``abort`` command.
+- Cursor Agent. A tool call's ``completed`` record, after which the adapter ends the
+  process, because Cursor takes no command once it starts.
+
+Only Pi reports the end of a message that holds no tool use. On the other engines such
+a message ends the turn, so its end is no point to interrupt at.
+
+A turn that reaches no safe point, such as one that makes no tool call or one long tool
+call to its end, is not interrupted. Its priority mail then leads the next turn. A
+muted line is never interrupted by priority mail, which waits with its other mail.
 
 Rate limit. Priority mail from lines is limited, so that one line cannot keep another
 from working. A line may send at most ``MAX_PER_SENDER`` priority notes, and a line may
@@ -47,6 +66,8 @@ from typing import Final
 
 from dromon.driver import (
     INITIAL_STATE,
+    MESSAGE_END,
+    TOOL_RESULT,
     Action,
     ActionTag,
     Driver,
@@ -67,9 +88,6 @@ MAX_PER_RECIPIENT: Final = 2
 CAPACITY: Final = max(MAX_PER_SENDER, MAX_PER_RECIPIENT)
 """How many times a party's deque keeps, enough for either limit."""
 
-SAFE_POINT_EVENTS: Final = frozenset({"text", "thinking"})
-"""The driver events at which a turn may end for priority mail."""
-
 REASON: Final = "priority mail {message_id} from {sender}"
 """Why a turn ended for priority mail, as its report's ``interrupted_for`` says."""
 
@@ -81,22 +99,42 @@ def _no_redirect() -> str | None:
 class SteeredDriver(Driver):
     """A line's driver that also ends the turn for priority mail at a safe point.
 
-    ``redirect`` is asked at each safe point event the real driver lets continue. It
+    ``redirect`` is asked only at a safe point that the real driver lets continue. It
     returns the reason to end the turn, or ``None``. The real driver sees every event
-    first, so its state advances exactly as it would without the override."""
+    first, so its state advances exactly as it would without the override.
+
+    ``pending`` counts the turn's tool uses still waiting for a result. A result that
+    no tool use announced cannot take it below zero. A tool use whose result never
+    arrives keeps every later point unsafe, so the turn is not ended, which errs on
+    the side of the tool."""
 
     def __init__(self, source: str, *, state: DriverState = INITIAL_STATE) -> None:
         super().__init__(source, state=state)
         self.redirect: Callable[[], str | None] = _no_redirect
+        self.pending = 0
 
     def step(self, event: Event) -> Action:
         action = super().step(event)
-        if action.tag is not ActionTag.CONTINUE or event.tag not in SAFE_POINT_EVENTS:
+        if event.tag == "turn_start":
+            self.pending = 0
+        elif event.tag == "tool_use":
+            self.pending += 1
+        elif event.tag == TOOL_RESULT:
+            self.pending = max(0, self.pending - 1)
+        if action.tag is not ActionTag.CONTINUE or not self._safe(event):
             return action
         reason = self.redirect()
         if reason is None:
             return action
         return Action(ActionTag.INTERRUPT, reason, 0)
+
+    def _safe(self, event: Event) -> bool:
+        """Whether the turn may end at ``event``, with ``pending`` already updated."""
+        if self.pending != 0:
+            return False
+        if event.tag == TOOL_RESULT:
+            return True
+        return event.tag == MESSAGE_END and event.number == 0
 
 
 def steered(

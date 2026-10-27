@@ -1101,7 +1101,7 @@ class Daemon:
             **lost,
         }
 
-    async def _watch_restart(self, wait_seconds: float) -> None:
+    async def _watch_restart(self, wait_seconds: int) -> None:
         """Stop the daemon for its successor once the draining restart is ready, or
         return once it is abandoned. Bounded by ``restart.polls``."""
         for _ in range(restart.polls(wait_seconds)):
@@ -1213,7 +1213,22 @@ def _text_args(args: dict[str, object], names: tuple[str, ...]) -> tuple[str, ..
 
 
 async def _write(writer: asyncio.StreamWriter, response: Response) -> None:
-    writer.write(encode_response(response))
+    """Write ``response``, or, when it cannot be encoded, such as a result over the
+    line limit or one holding a float, an internal error that names the request, so
+    the client learns why instead of finding the connection closed."""
+    try:
+        encoded = encode_response(response)
+    except ProtocolError as error:
+        print(f"dromond: a response could not be encoded: {error}", file=sys.stderr)
+        encoded = encode_response(
+            Response(
+                response.request_id,
+                ok=False,
+                error_code=ErrorCode.INTERNAL,
+                error_message=f"the daemon could not encode its response: {error}",
+            )
+        )
+    writer.write(encoded)
     await writer.drain()
 
 
