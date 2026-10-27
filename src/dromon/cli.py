@@ -72,6 +72,8 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "rebind": "move a line to another model and strategy, keeping its identity",
     "settings": "show the project's settings, and a line's, with where each comes from",
     "set": "change a project or line setting, or return it to the layers below",
+    "role": "show roles and their journals, or give, vacate or ask to hand over one",
+    "budget": "list the providers' stated budgets, or state one",
     "reload": "read the project file again and apply its lines, limits and wake policy",
     "config": "check the project file and show what it declares",
     "probe": "run one short turn on the engine and report its capabilities",
@@ -1085,6 +1087,163 @@ def _read(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
+def _role(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Show roles, read a journal entry, or change or ask for a change of owner."""
+    action: str = arguments.action
+    name: str | None = arguments.name
+    command = f"role {action}"
+    operator: str = arguments.operator
+    if action != "status" and name is None:
+        what = "the journal entry" if action == "entry" else "the role"
+        print(f"dromon {command}: name {what}", file=sys.stderr)
+        return exits.USAGE
+    needed = {"take": "seat", "handoff": "to"}.get(action)
+    if needed is not None and getattr(arguments, needed) is None:
+        print(f"dromon {command}: give --{needed}", file=sys.stderr)
+        return exits.USAGE
+    match action:
+        case "status":
+            operation = Operation.ROLES
+            args: dict[str, object] = {} if name is None else {"role_id": name}
+        case "entry":
+            operation = Operation.ROLE_ENTRY
+            args = {"entry_id": name}
+        case "take":
+            operation = Operation.ROLE_TAKE
+            args = {"role_id": name, "seat": arguments.seat, "operator": operator}
+        case "vacate":
+            operation = Operation.ROLE_VACATE
+            args = {"role_id": name, "operator": operator}
+        case _:
+            operation = Operation.ROLE_HANDOFF
+            args = {"role_id": name, "to": arguments.to, "operator": operator}
+    result = _call(paths, command, operation, args)
+    if isinstance(result, int):
+        return result
+    match action:
+        case "status":
+            roles = cast(list[dict[str, object]], result["roles"])
+            if not roles:
+                print("no roles are declared")
+            for role in roles:
+                _print_role(role)
+        case "entry":
+            print(
+                f"entry {result['entry_id']} of role {result['role_id']}, a"
+                f" {result['kind']} by {result['line_id']} at {result['noted_at']},"
+                f" worktree {result['workdir_commit'] or 'unknown'}, daemon"
+                f" {result['daemon_commit'] or 'unknown'}"
+            )
+            print(result["body"])
+        case "take" | "vacate":
+            owner = result["owner"] or "no seat"
+            print(
+                f"role {result['role_id']} passed from"
+                f" {result['previous'] or 'no seat'} to {owner}"
+            )
+            if "warning" in result:
+                print(f"warning: {result['warning']}")
+        case _:
+            print(
+                f"asked {result['owner']} to hand role {result['role_id']} to"
+                f" {result['to']}, in priority mail {result['message_id']}"
+            )
+            if result["owner_muted"] is True:
+                print(
+                    f"{result['owner']} is muted, so it reads the request once unmuted"
+                )
+    return exits.OK
+
+
+def _print_role(role: Mapping[str, object]) -> None:
+    """One role of ``roles``, with its seats and the latest journal entries."""
+    print(
+        f"role {role['role_id']} in {role['workdir']}, owner"
+        f" {role['owner'] or 'none, vacant'}, handoff within"
+        f" {role['handoff_seconds']} seconds"
+    )
+    change = cast(Mapping[str, object] | None, role["last_change"])
+    if change is not None:
+        back = f", back to {change['back_to']}" if change["back_to"] else ""
+        print(
+            f"  last change {change['cause']} by {change['by']} at"
+            f" {change['changed_at']}, from {change['previous'] or 'no seat'} to"
+            f" {change['owner'] or 'no seat'}{back}"
+        )
+    for seat in cast(list[Mapping[str, object]], role["seats"]):
+        marks = [str(seat["condition"])]
+        if seat["owner"] is True:
+            marks.insert(0, "owner")
+        if seat["may_own"] is not True:
+            marks.append("may not own")
+        if seat["muted"] is True:
+            marks.append("muted")
+        if seat["waits_unconfined"] is True:
+            marks.append("waits, its engine cannot confine it")
+        budget = cast(Mapping[str, object] | None, seat["budget"])
+        if budget is not None:
+            marks.append(f"budget {_budget_text(budget)}")
+        print(
+            f"  seat {seat['line_id']} on {seat['model']}, {', '.join(marks)},"
+            f" at {seat['workdir_commit'] or 'no commit'}"
+        )
+    for entry in cast(list[Mapping[str, object]], role["journal"]):
+        print(
+            f"  entry {entry['entry_id']}, a {entry['kind']} by {entry['line_id']} at"
+            f" {entry['noted_at']}, {entry['chars']} characters"
+        )
+
+
+def _budget_text(budget: Mapping[str, object]) -> str:
+    """A stated budget, with its source and time, since it is a snapshot."""
+    parts: list[str] = []
+    if budget["remaining_percent"] is not None:
+        parts.append(f"{budget['remaining_percent']} percent")
+    if budget["resets_at"] is not None:
+        parts.append(f"resets {budget['resets_at']}")
+    parts.append(f"stated by {budget['source']} at {budget['stated_at']}")
+    return ", ".join(parts)
+
+
+def _budget(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """List the providers' stated budgets, or state one as an operator."""
+    action: str = arguments.action
+    command = f"budget {action}"
+    if action == "list":
+        result = _call(paths, command, Operation.BUDGETS, {})
+        if isinstance(result, int):
+            return result
+        budgets = cast(list[Mapping[str, object]], result["budgets"])
+        if not budgets:
+            print("no budget is stated")
+        for budget in budgets:
+            spent = ", spent now" if budget["spent"] is True else ""
+            note = f", {budget['note']}" if budget["note"] else ""
+            print(f"{budget['provider']}: {_budget_text(budget)}{spent}{note}")
+        providers = cast(list[str], result["providers"])
+        print(f"providers {', '.join(providers)}")
+        return exits.OK
+    provider: str | None = arguments.provider
+    percent: int | None = arguments.percent
+    resets_at: str | None = arguments.resets_at
+    if provider is None:
+        print(f"dromon {command}: name the provider", file=sys.stderr)
+        return exits.USAGE
+    if percent is None and resets_at is None:
+        print(f"dromon {command}: give --percent, --resets-at or both", file=sys.stderr)
+        return exits.USAGE
+    args: dict[str, object] = {"provider": provider, "note": arguments.note}
+    if percent is not None:
+        args["remaining_percent"] = percent
+    if resets_at is not None:
+        args["resets_at"] = resets_at
+    result = _call(paths, command, Operation.BUDGET_SET, args)
+    if isinstance(result, int):
+        return result
+    print(f"{result['provider']}: {_budget_text(result)}")
+    return exits.OK
+
+
 def _call(
     paths: ProjectPaths, command: str, operation: Operation, args: dict[str, object]
 ) -> dict[str, object] | int:
@@ -1138,6 +1297,8 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "attach": _attach,
     "config": _config,
     "teacher": _teacher,
+    "role": _role,
+    "budget": _budget,
     "agent": _agent,
     "mcp": _mcp,
 }
@@ -1510,6 +1671,52 @@ def build_parser() -> argparse.ArgumentParser:
                 choices=[level.value for level in AgentAccess],
                 default=AgentAccess.MESSAGE.value,
                 help="what the agent may do, for add, default %(default)s",
+            )
+        if name == "role":
+            command.add_argument(
+                "action",
+                choices=["status", "entry", "take", "vacate", "handoff"],
+                nargs="?",
+                default="status",
+                help="default %(default)s",
+            )
+            command.add_argument(
+                "name",
+                nargs="?",
+                help="the role, which status may omit for every role, or for entry"
+                " the journal entry",
+            )
+            command.add_argument("--seat", help="for take, the seat given the role")
+            command.add_argument(
+                "--to", help="for handoff, the seat the owner is asked to hand it to"
+            )
+            command.add_argument(
+                "--operator",
+                default=default_operator(),
+                help="who makes the change or the request, default %(default)s",
+            )
+        if name == "budget":
+            command.add_argument(
+                "action",
+                choices=["list", "set"],
+                nargs="?",
+                default="list",
+                help="default %(default)s",
+            )
+            command.add_argument("provider", nargs="?", help="for set, the provider")
+            command.add_argument(
+                "--percent",
+                type=int,
+                default=None,
+                help="for set, the whole percentage of the plan that remains",
+            )
+            command.add_argument(
+                "--resets-at",
+                default=None,
+                help="for set, when the plan resets, as YYYY-MM-DDTHH:MM:SSZ",
+            )
+            command.add_argument(
+                "--note", default="", help="for set, a note kept with the statement"
             )
         if name == "mcp":
             party = command.add_mutually_exclusive_group(required=True)

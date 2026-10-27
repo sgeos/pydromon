@@ -178,13 +178,19 @@ from dromon.processes import (
 )
 from dromon.workdir import git_write_guards, read_head_commit, resolve_workdir
 from dromon.roles import (
+    CONFINING_ENGINES,
     Plan,
     RoleConflict,
     Stamp,
+    budget_spent,
+    check_handoff_request,
+    plan_give,
     plan_note,
     plan_relinquish,
     plan_take,
     recovery_ground,
+    seat_access,
+    waits_unconfined,
 )
 from dromon.mailbox import (
     MAX_PAGE,
@@ -206,6 +212,7 @@ from dromon.lineconfig import (
 )
 from dromon.model import (
     Address,
+    BudgetSource,
     BudgetStated,
     RoleNoted,
     RoleNoteKind,
@@ -407,6 +414,14 @@ RECORD_ROLE_NOTE_TOOL_NAME: Final = "record_role_note"
 RELINQUISH_OWNERSHIP_TOOL_NAME: Final = "relinquish_ownership"
 TAKE_OWNERSHIP_TOOL_NAME: Final = "take_ownership"
 MAX_TAKE_REASON_BYTES: Final = 4096
+
+HANDOFF_TEMPLATE: Final = (
+    "The note gives the commit it describes, git status, each uncommitted change and"
+    " whose it is, the gate run and its coverage, mail sent and not answered, open"
+    " items, the checks not performed, and the next step."
+)
+"""The handoff note's template, from ``docs/architecture/ROLES.md``, so a seat on any
+provider writes and reads the same seam."""
 
 RECORD_ROLE_NOTE_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
@@ -1162,6 +1177,7 @@ class Scheduler:
         report_dir: Path | None = None,
         walk_check: Callable[[], str | None] | None = None,
         sweep_read: Callable[[], list[TreeRow] | str] = launcher.read_rows,
+        confining_engines: frozenset[str] = CONFINING_ENGINES,
     ) -> None:
         if not 1 <= wake_every_ticks <= MAX_WAKE_EVERY_TICKS:
             raise ValueError(f"wake_every_ticks must be in [1, {MAX_WAKE_EVERY_TICKS}]")
@@ -1179,6 +1195,10 @@ class Scheduler:
         self._daemon_checkout = daemon_checkout
         """A directory in the daemon's own checkout, whose HEAD ``line_status`` reads
         again at each call, or ``None``."""
+        self._confining = confining_engines
+        """The engines that can make a role's worktree read only to a seat, as
+        ``roles.CONFINING_ENGINES`` says. A seat on any other engine waits while
+        another seat owns its role."""
         self._retiring: set[asyncio.Task[None]] = set()
         """Kept engine connections being closed after their engine was discarded."""
         self._repeat_of: dict[str, str] = {}
@@ -2841,7 +2861,12 @@ class Scheduler:
         """The configuration ``line_id``'s engine is built with, which is the
         effective one with its instruction paths resolved against the project root,
         as ``rooted_instructions`` says. The effective configuration keeps the paths
-        as written, so a client shows and stores them unchanged."""
+        as written, so a client shows and stores them unchanged.
+
+        **Technical debt.** Once ``feat/read-only-seats`` merges, a seat's engine is
+        built with its ``workdir_access`` set from ``roles.seat_access``, and the
+        engines that apply it join ``roles.CONFINING_ENGINES``. Until then a seat that
+        does not own its role is not woken beside an owner at all."""
         config = self.effective_config(line_id)
         return config if self._root is None else rooted_instructions(config, self._root)
 
@@ -3070,9 +3095,24 @@ class Scheduler:
         if seat is None:
             raise LineToolRefused(f"line {line_id} is a seat of no role")
         role = state.roles[seat.role_id]
+        return {
+            **self.role_view(seat.role_id),
+            "you_own": role.owner == line_id,
+            "you_may_own": seat.may_own,
+        }
+
+    def role_view(self, role_id: str) -> dict[str, object]:
+        """A role as a seat and an operator see it: the worktree, the owner and the
+        latest change of owner, each seat's condition, engine and its provider's
+        stated budget, and the latest journal entries, the newest with its body.
+        Raises ``EventRejected`` for an unknown role."""
+        state = self._log.state
+        role = state.roles.get(role_id)
+        if role is None:
+            raise EventRejected(f"no role {role_id}")
         seats: list[dict[str, object]] = []
         for seat_id, other in sorted(state.seats.items()):
-            if other.role_id != seat.role_id:
+            if other.role_id != role_id:
                 continue
             engine = ENGINE_OF.get(self.model_of(seat_id))
             budget = self._budget_of(seat_id)
@@ -3083,6 +3123,8 @@ class Scheduler:
                     "owner": role.owner == seat_id,
                     "condition": self.condition(seat_id),
                     "muted": state.lines[seat_id].muted,
+                    "access": seat_access(state, seat_id),
+                    "waits_unconfined": self.waits_unconfined(seat_id),
                     "model": self.model_of(seat_id),
                     "provider": engine,
                     "budget": None if budget is None else _budget_view(budget),
@@ -3090,18 +3132,14 @@ class Scheduler:
                 }
             )
         entries = [
-            entry
-            for entry in state.role_entries.values()
-            if entry.role_id == seat.role_id
+            entry for entry in state.role_entries.values() if entry.role_id == role_id
         ][-ROLE_STATUS_ENTRIES:]
         change = role.changed
         return {
-            "role_id": seat.role_id,
+            "role_id": role_id,
             "workdir": role.workdir,
             "handoff_seconds": role.handoff_seconds,
             "owner": role.owner,
-            "you_own": role.owner == line_id,
-            "you_may_own": seat.may_own,
             "last_change": None
             if change is None
             else {
@@ -3274,6 +3312,127 @@ class Scheduler:
         self._ownership_moved(plan)
         return plan, cast(str, ground)
 
+    # The operator's ownership commands, roles step 2 of ``docs/architecture/ROLES.md``.
+
+    def roles_view(self, role_id: str | None) -> list[dict[str, object]]:
+        """Every role as ``role_view`` gives it, by identifier, or only ``role_id``.
+        Raises ``EventRejected`` for an unknown role."""
+        if role_id is not None:
+            return [self.role_view(role_id)]
+        return [self.role_view(found) for found in sorted(self._log.state.roles)]
+
+    def role_entry(self, entry_id: str) -> dict[str, object]:
+        """One journal entry with its body and its role, which ``role_view`` gives
+        only for the newest. Raises ``EventRejected`` for an unknown entry."""
+        entry = self._log.state.role_entries.get(entry_id)
+        if entry is None:
+            raise EventRejected(f"no journal entry {entry_id}")
+        return {"role_id": entry.role_id, **_entry_view(entry, with_body=True)}
+
+    def give_ownership(
+        self, operator: OperatorAddress, role_id: str, seat: str | None
+    ) -> Plan:
+        """``operator`` gives ``role_id`` to ``seat``, or leaves it vacant, as
+        ``roles.plan_give`` decides, refused while the owner has a turn in flight. A
+        seat given the role is unmuted, since an alternate seat is muted until it
+        comes to own, and is sent a note from the operator, which wakes it once no
+        former writer's turn is in flight. Its turn leads with the recovery
+        checklist. Raises ``EventRejected``, recording nothing."""
+        role = self._log.state.roles.get(role_id)
+        owner = None if role is None else role.owner
+        try:
+            plan = plan_give(
+                self._log.state,
+                role_id,
+                seat,
+                operator,
+                format_due(self._wall_clock()),
+                owner_running=owner is not None and owner in self._running,
+            )
+        except RoleConflict as error:
+            raise EventRejected(str(error)) from error
+        self._append_plan(plan)
+        self._ownership_moved(plan)
+        if plan.owner is not None:
+            self.unmute(plan.owner)
+            self.send(
+                operator,
+                LineAddress(plan.owner),
+                f"{operator} gave you role {role_id}, which you own from now. Your"
+                " next turn leads with the recovery checklist. Follow it before you"
+                " change anything.",
+            )
+        return plan
+
+    def request_handoff(
+        self, operator: OperatorAddress, role_id: str, to: str
+    ) -> tuple[str, str]:
+        """Ask ``role_id``'s owner, by priority mail from ``operator``, to hand the
+        role to ``to``, and return the owner and the message's identifier. The
+        handoff is the owner's, made with ``relinquish_ownership``. A muted owner's
+        mail waits for its unmute. **Not yet built.** ``ROLES.md`` asks the operator
+        whether to recover the role when the owner has not relinquished within the
+        role's ``handoff_seconds``, which needs the request kept across a restart.
+        Raises ``EventRejected``, recording nothing."""
+        try:
+            owner = check_handoff_request(self._log.state, role_id, to)
+        except RoleConflict as error:
+            raise EventRejected(str(error)) from error
+        self.check_priority(operator, LineAddress(owner))
+        self.ensure_operator(operator.operator_id)
+        body = (
+            f"{operator} asks you to hand role {role_id} to {to}. Leave the work in"
+            " order and run the gate, then call relinquish_ownership with to set to"
+            f" {to} and a handoff note. {HANDOFF_TEMPLATE} If you cannot hand it over"
+            " now, reply to say why."
+        )
+        return owner, self.send(operator, LineAddress(owner), body, priority=True)
+
+    def state_budget(
+        self,
+        provider: str,
+        remaining_percent: int | None,
+        resets_at: str | None,
+        note: str,
+    ) -> dict[str, object]:
+        """Record an operator's statement of ``provider``'s budget, which replaces
+        the provider's earlier statement, and return it as ``budgets_view`` gives
+        it. Until the budget step each
+        engine is its own provider, so a provider no engine is would ground nothing
+        and is refused. Raises ``EventRejected`` or ``InvalidField``."""
+        known = sorted(set(ENGINE_OF.values()))
+        if provider not in known:
+            raise EventRejected(
+                f"no provider {provider}. Each engine is its own provider until the"
+                f" budget step, one of {', '.join(known)}"
+            )
+        event = BudgetStated(
+            provider,
+            remaining_percent,
+            resets_at,
+            BudgetSource.OPERATOR,
+            note,
+            format_due(self._wall_clock()),
+        )
+        self._log.append(event)
+        return {"provider": provider, **_budget_view(event)}
+
+    def budgets_view(self) -> dict[str, object]:
+        """Each provider's stated budget, with whether it shows the provider spent
+        now, and the providers a budget may be stated for."""
+        now = self._wall_clock()
+        return {
+            "providers": sorted(set(ENGINE_OF.values())),
+            "budgets": [
+                {
+                    "provider": provider,
+                    **_budget_view(budget),
+                    "spent": budget_spent(budget, now),
+                }
+                for provider, budget in sorted(self._log.state.budgets.items())
+            ],
+        }
+
     def _waits_for_writer(self, line_id: str) -> bool:
         """Whether ``line_id`` owns its role while a former writer of it has not
         finished, which is another seat whose turn in flight started as the owner,
@@ -3395,11 +3554,11 @@ class Scheduler:
         return SdkMcpTool(
             name=RELINQUISH_OWNERSHIP_TOOL_NAME,
             description=(
-                "Give up ownership of your role, with a handoff note on the template in"
-                " ROLES.md, to the seat to, or with no to to the seat your handoff"
-                " said, or else leaving the role vacant. Leave the work in order and"
-                " run the gate first. back_to, with to, returns the role to that seat"
-                " when the successor next relinquishes."
+                "Give up ownership of your role, with a handoff note, to the seat to,"
+                " or with no to to the seat your handoff said, or else leaving the"
+                " role vacant. Leave the work in order and run the gate first."
+                " back_to, with to, returns the role to that seat when the successor"
+                f" next relinquishes. {HANDOFF_TEMPLATE}"
             ),
             input_schema=RELINQUISH_OWNERSHIP_SCHEMA,
             handler=handler,
@@ -4026,7 +4185,16 @@ class Scheduler:
             and line_id not in self._failed
             and self._restart is None
             and not self._waits_for_writer(line_id)
+            and not self.waits_unconfined(line_id)
         )
+
+    def waits_unconfined(self, line_id: str) -> bool:
+        """Whether ``line_id`` is a seat that does not start a turn while another
+        seat owns its role, because its engine cannot confine it, as
+        ``roles.waits_unconfined`` decides. An unknown model counts as an engine that
+        cannot confine."""
+        engine = ENGINE_OF.get(self.model_of(line_id), "")
+        return waits_unconfined(self._log.state, line_id, engine, self._confining)
 
     def _cooling(self, line_id: str) -> bool:
         ended = self._last_turn_end.get(line_id)

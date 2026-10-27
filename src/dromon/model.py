@@ -847,7 +847,12 @@ def check_instant(name: str, value: object) -> None:
     check_text(name, value, len("YYYY-MM-DDTHH:MM:SSZ"))
     if not isinstance(value, str):  # Unreachable, since check_text refuses it.
         raise InvalidField(f"{value!r} is not text")
-    parse_due(value)
+    try:
+        parse_due(value)
+    except InvalidField as error:
+        raise InvalidField(
+            f"{name} is not a valid time of the form YYYY-MM-DDTHH:MM:SSZ: {value!r}"
+        ) from error
 
 
 def check_workdir(value: object) -> None:

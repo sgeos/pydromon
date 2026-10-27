@@ -7,10 +7,12 @@ of the iteration brief makes roles first class. A role has seats on several prov
 and one seat at a time holds write ownership. This document gives the data model, the
 two flows the brief requires, and how the existing lines map onto roles. The events,
 their model checks and codec, the `role_status` tool, the project file's roles
-recorded at start and on reload, and the seat tools `record_role_note`,
-`relinquish_ownership` and `take_ownership` are implemented. The client operations,
-the `dromon role` and `dromon budget` commands and the read-only sandbox are not yet
-built. Facts about the present code are marked as such.
+recorded at start and on reload, the seat tools `record_role_note`,
+`relinquish_ownership` and `take_ownership`, and the client operations with the
+`dromon role` and `dromon budget` commands are implemented, as is the rule that a seat
+whose engine cannot confine it waits while another seat owns its role. The read-only
+sandbox itself, the question at an owner that does not hand over and budgets from plan
+limits are not yet built. Facts about the present code are marked as such.
 
 ## Terms
 
@@ -89,6 +91,12 @@ directory read only. A seat on such an engine is not woken while another seat ow
 role. Its mail waits, as a muted line's does, until it owns the role or the operator
 lets it run unconfined. This is default deny. Which adapters can confine a seat is for
 the engines role to establish, and the capability table is where it is recorded.
+**Implemented,** except the operator's leave to run unconfined, which is not built.
+**Fact.** The engines role's read-only seats are on a branch not yet merged, so the
+daemon counts no engine as able to confine a seat, and a seat runs only while it owns
+its role or the role is vacant. A seat of a vacant role runs so that it can take the
+role. Once the branch merges, the engines whose capability table entry says they can
+make the worktree read only are counted, and their seats are built with read access.
 
 **Never two writers.** A take while the owner runs is refused, and the operator who
 must take it now sends `interrupt` first. **Implemented.** A seat's own tools change
@@ -96,7 +104,7 @@ ownership during its own turn, so the rule as built is that the change is record
 once, every turn goes on with the engine it started with, and no seat's turn as the
 owner starts while another seat's turn that started as the owner is in flight, or
 while that seat's kept connection is still closing. A seat that does not own the role
-runs beside the owner. The former owner's engine is dropped and its kept connection closed,
+runs beside the owner where its engine can confine it. The former owner's engine is dropped and its kept connection closed,
 by the line's stop policy, before the new owner's first turn starts. Processes the
 former owner left are recorded as `processes_left` records them today. **Fact.** On macOS the
 daemon cannot identify a line's processes, as `line_status` says, so a process that
@@ -134,7 +142,13 @@ list has no order, and any seat with `may_own` can receive a role.
 
 **An owner that does not hand over.** If the owner has not relinquished within the
 role's `handoff_seconds` of the request, an hour unless the role declares otherwise, the
-operator is asked whether to recover the role instead.
+operator is asked whether to recover the role instead. **Not yet built.** The request
+is ordinary priority mail, and the daemon keeps no record of it that a restart would
+keep, so the question waits for an event that records a handoff request.
+
+**Implemented.** `dromon role handoff` checks that the successor is a live seat that
+may own the role, then sends the request with the handoff note's template. An owner
+that is muted reads it once unmuted, and the command says so.
 
 ## Recovery
 
@@ -144,6 +158,13 @@ allowed, since ownership must pass when the owner's provider is out of tokens, b
 only when the harness itself shows that the owner cannot act, by the first three rows
 below, so a line cannot take a role from a working seat by claiming otherwise. An
 operator can always take.
+
+**Implemented.** `dromon role take ROLE --seat SEAT` gives the role and `dromon role
+vacate ROLE` leaves it vacant, each with cause `operator`. Either is refused while the
+owner has a turn in flight, and says to interrupt it first. A seat given the role is
+unmuted and sent a note from the operator, which wakes it once no former writer's turn
+is in flight, and its turn leads with the recovery checklist. An operator's take has no
+journal entry, since the model takes entries only from seats.
 
 | Owner's state | A seat may take | The operator may take |
 |---|---|---|
@@ -198,6 +219,10 @@ and Codex sometimes reports a reset time with it. That becomes `budget_stated` w
 `remaining_percent` 0, `source` `engine`, and the reset time where one was given. A
 stated budget is not adjusted by the cost of later turns, since a per-turn cost does
 not convert reliably to a plan's percentage, so a statement is a snapshot with its time.
+**Implemented** for an operator. `dromon budget set` accepts only an engine's name as
+the provider until the budget step, since a statement for any other name would ground
+nothing, and `dromon budget` and `dromon role status` show each statement with its
+source and time. The engine's report at a plan limit is not built yet.
 
 **Use.** `role_status` and `dromon status` show each seat's provider budget and its
 source and age. The harness does not move ownership by budget alone. When an owner is
@@ -258,10 +283,11 @@ them.
 
 1. The events, model checks and codec, and `role_status`, then the project file's
    roles, recorded at the daemon's start and on reload. Both are done.
-2. `relinquish_ownership`, `take_ownership` and `record_role_note`, which are done,
-   then the client operations and the `dromon role` and `dromon budget` commands.
+2. `relinquish_ownership`, `take_ownership` and `record_role_note`, then the client
+   operations and the `dromon role` and `dromon budget` commands. All are done.
 3. Read-only seats in each adapter's sandbox profile, which is the engines role's work,
-   and the rule for seats that cannot be confined until then.
+   and the rule for seats that cannot be confined until then. The rule is done, and the
+   profiles wait for the engines role's branch to merge.
 4. `budget_stated` from operators and from plan limits, and the operator question at a
    held owner.
 

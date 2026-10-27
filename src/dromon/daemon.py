@@ -451,6 +451,13 @@ class Daemon:
                 | Operation.CLEAR_SESSION
                 | Operation.REBIND_LINE
                 | Operation.RELOAD_PROJECT
+                | Operation.ROLES
+                | Operation.ROLE_ENTRY
+                | Operation.ROLE_TAKE
+                | Operation.ROLE_VACATE
+                | Operation.ROLE_HANDOFF
+                | Operation.BUDGETS
+                | Operation.BUDGET_SET
                 | Operation.AGENT_ADD
                 | Operation.AGENT_REVOKE
                 | Operation.AGENT_LIST
@@ -515,6 +522,43 @@ class Daemon:
                     result = self._rebind_line(request.args)
                 case Operation.RELOAD_PROJECT:
                     result = self._reload_project(request.args)
+                case Operation.ROLES:
+                    names = ("role_id",) if "role_id" in request.args else ()
+                    values = _text_args(request.args, names)
+                    roles = self.scheduler.roles_view(values[0] if values else None)
+                    result = {"roles": cast(object, roles)}
+                case Operation.ROLE_ENTRY:
+                    (entry_id,) = _text_args(request.args, ("entry_id",))
+                    result = self.scheduler.role_entry(entry_id)
+                case Operation.ROLE_TAKE:
+                    role_id, seat, operator = _text_args(
+                        request.args, ("role_id", "seat", "operator")
+                    )
+                    result = self._give(role_id, seat, operator)
+                case Operation.ROLE_VACATE:
+                    role_id, operator = _text_args(
+                        request.args, ("role_id", "operator")
+                    )
+                    result = self._give(role_id, None, operator)
+                case Operation.ROLE_HANDOFF:
+                    role_id, to, operator = _text_args(
+                        request.args, ("role_id", "to", "operator")
+                    )
+                    owner, message_id = self.scheduler.request_handoff(
+                        OperatorAddress(operator), role_id, to
+                    )
+                    result = {
+                        "role_id": role_id,
+                        "owner": owner,
+                        "to": to,
+                        "message_id": message_id,
+                        "owner_muted": self.log.state.lines[owner].muted,
+                    }
+                case Operation.BUDGETS:
+                    _text_args(request.args, ())
+                    result = self.scheduler.budgets_view()
+                case Operation.BUDGET_SET:
+                    result = self._budget_set(request.args)
                 case Operation.AGENT_ADD:
                     result = self._agent_add(request.args)
                 case Operation.AGENT_REVOKE:
@@ -619,6 +663,45 @@ class Daemon:
             "strategy": chosen.value,
             **lost,
         }
+
+    def _give(self, role_id: str, seat: str | None, operator: str) -> dict[str, object]:
+        """An operator's take of ``role_id`` for ``seat``, or its vacating. The
+        response warns of the background tasks the former owner's kept engine
+        connection closes with, read before the change, as ``tasks_lost`` says."""
+        role = self.log.state.roles.get(role_id)
+        owner = None if role is None else role.owner
+        lost = self.tasks_lost([owner]) if owner is not None else {}
+        plan = self.scheduler.give_ownership(OperatorAddress(operator), role_id, seat)
+        return {
+            "role_id": role_id,
+            "owner": plan.owner,
+            "previous": plan.previous,
+            **lost,
+        }
+
+    def _budget_set(self, args: dict[str, object]) -> dict[str, object]:
+        """An operator's statement of a provider's budget, with ``provider`` and
+        optionally ``remaining_percent``, a whole number, ``resets_at``, a time in
+        the model's due-time format, and ``note``, at least one of the first two."""
+        allowed = {"provider", "remaining_percent", "resets_at", "note"}
+        if "provider" not in args or not set(args) <= allowed:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST,
+                f"budget_set takes {sorted(allowed)}, with provider",
+            )
+        texts = {
+            key: args[key] for key in ("provider", "resets_at", "note") if key in args
+        }
+        names = tuple(sorted(texts))
+        values = dict(zip(names, _text_args(texts, names), strict=True))
+        percent = args.get("remaining_percent")
+        if percent is not None and type(percent) is not int:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST, "remaining_percent is not a whole number"
+            )
+        return self.scheduler.state_budget(
+            values["provider"], percent, values.get("resets_at"), values.get("note", "")
+        )
 
     def tasks_lost(self, line_ids: Sequence[str]) -> dict[str, object]:
         """What a response says of the background tasks an action closes with the

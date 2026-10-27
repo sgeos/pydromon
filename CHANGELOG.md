@@ -7,6 +7,8 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- A malformed time in a role or budget event named the field `due`, and now names
+  its own field, such as `resets_at`.
 - `dromon send` prints the message identifier alone again. Since priority mail it had
   printed every key of the result, so a plain note ended with `priority False`. It now
   adds `priority mail` on a second line only when the note is priority mail. Found by
@@ -33,6 +35,13 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- A seat that does not own its role is not woken while another seat owns the role,
+  unless its engine can make the role's worktree read only to it. Its mail waits, as a
+  muted line's does. No engine counts as able to yet, because the engines role's
+  read-only seats are on an unmerged branch, so until that merges a seat runs only
+  while it owns its role or the role is vacant. `role_status`, `roles` and
+  `dromon role` show each seat's access and whether it waits. This is default deny, as
+  `docs/architecture/ROLES.md` requires.
 - Roles with seats on several providers, approved by the operator on 2026-10-27, as
   `docs/architecture/ROLES.md` describes, first step. The events `role_declared`,
   `seat_bound`, `ownership_changed`, `role_noted` and `budget_stated` are in the model
@@ -54,8 +63,20 @@ All notable changes are recorded here. The format follows
   until the former owner's turn has ended and its kept connection has closed. Each
   seat's next turn is told of a change it did not make, and a new owner by recovery is
   given the recovery checklist. `ownership_changed` gains `back_to`, for a short
-  alternation between two seats. The client operations and commands are the next
-  step.
+  alternation between two seats.
+- The operator's role and budget commands, as `docs/protocol/CLIENT.md` specifies.
+  `dromon role status [ROLE]` and `dromon role entry ENTRY` show roles, seats, the
+  last change of owner and the journal. `dromon role take ROLE --seat SEAT` and
+  `dromon role vacate ROLE` change the owner with cause `operator`, refused while the
+  owner has a turn in flight, and a seat given the role is unmuted and woken by a note
+  whose turn leads with the recovery checklist. `dromon role handoff ROLE --to SEAT`
+  asks the owner in priority mail to hand the role over with the handoff note's
+  template. `dromon budget set PROVIDER` records `budget_stated` from an operator, and
+  `dromon budget` lists each provider's statement and whether it shows the provider
+  spent. The operations are `roles`, `role_entry`, `role_take`, `role_vacate`,
+  `role_handoff`, `budgets` and `budget_set`, and none is offered to external agents.
+  The question to the operator when an owner has not relinquished within the role's
+  `handoff_seconds` is not built yet.
 - Restart to upgrade, by the operator's decision of 2026-10-27, as
   `docs/protocol/RESTART.md` specifies.
   - `dromon restart [--interrupt] [--wait-seconds S] [--end-tasks]` and the client

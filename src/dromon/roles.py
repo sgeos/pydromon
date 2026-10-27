@@ -16,14 +16,18 @@ retires a role, so a seat or a role dropped from the file stays in the log as it
 **Technical debt.** An unbinding event is for a later step, once the operator decides
 what becomes of a removed seat's ownership.
 
-The ownership tools are planned here too, as plain functions of the state and of the
-facts the scheduler observes, which a port carries unchanged. The model checks that a
+The ownership tools and the operator's ownership commands are planned here too, as
+plain functions of the state and of the facts the scheduler observes, which a port
+carries unchanged. The model checks that a
 change is consistent, and ``recovery_ground`` decides whether a seat had the authority
-to take a role itself, which the model leaves to the daemon.
+to take a role itself, which the model leaves to the daemon. A seat's access to the
+worktree, and whether a seat whose engine cannot confine it may run, are decided here
+as well.
 """
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Final, Literal
 
 from dromon.model import (
     BudgetStated,
@@ -32,6 +36,7 @@ from dromon.model import (
     InvalidField,
     LineAddress,
     LineCreated,
+    LineState,
     OperatorAddress,
     OperatorRegistered,
     OwnershipCause,
@@ -345,3 +350,105 @@ def plan_take(
     )
     events = _checked(state, [entry, change])
     return Plan(events, role_id, line_id, role.owner, entry_id, "")
+
+
+def plan_give(
+    state: State,
+    role_id: str,
+    seat: str | None,
+    by: OperatorAddress,
+    at: str,
+    *,
+    owner_running: bool,
+) -> Plan:
+    """The operator ``by`` gives ``role_id`` to ``seat``, or leaves it vacant when
+    ``seat`` is ``None``, registered first if the log does not know it. An operator
+    may always take a role, but never while its owner has a turn in flight, since a
+    turn keeps the access it started with, so the operator who must take it now
+    interrupts the owner first. Whether the owner runs is the scheduler's fact."""
+    role = state.roles.get(role_id)
+    if role is None:
+        raise RoleConflict(f"no role {role_id}")
+    if seat == role.owner:
+        held = "vacant" if seat is None else f"owned by {seat}"
+        raise RoleConflict(f"role {role_id} is {held} already")
+    if owner_running:
+        raise RoleConflict(
+            f"role {role_id}'s owner {role.owner} has a turn in flight. Interrupt it"
+            " first, then take the role"
+        )
+    events: list[Event] = []
+    if by.operator_id not in state.operators:
+        events.append(OperatorRegistered(by.operator_id))
+    try:
+        change = OwnershipChanged(
+            role_id, seat, role.owner, OwnershipCause.OPERATOR, by, None, at
+        )
+    except InvalidField as error:
+        raise RoleConflict(str(error)) from error
+    events.append(change)
+    return Plan(_checked(state, events), role_id, seat, role.owner, None, "")
+
+
+def check_handoff_request(state: State, role_id: str, to: str) -> str:
+    """The owner an operator asks to hand ``role_id`` to ``to``, or ``RoleConflict``
+    when the handoff asked for could not apply, because the role is vacant, or ``to``
+    owns it already, is not a seat of it, may not own it or is stopped. The handoff
+    itself is the owner's, so this checks the request and changes nothing."""
+    role = state.roles.get(role_id)
+    if role is None:
+        raise RoleConflict(f"no role {role_id}")
+    if role.owner is None:
+        raise RoleConflict(
+            f"role {role_id} is vacant, so no owner can hand it over. Take it for"
+            " the seat instead"
+        )
+    if to == role.owner:
+        raise RoleConflict(f"line {to} owns role {role_id} already")
+    seat = state.seats.get(to)
+    if seat is None or seat.role_id != role_id:
+        raise RoleConflict(f"line {to} is not a seat of role {role_id}")
+    if not seat.may_own:
+        raise RoleConflict(f"line {to} may not own role {role_id}")
+    if state.lines[to].state is LineState.STOPPED:
+        raise RoleConflict(f"line {to} is stopped")
+    return role.owner
+
+
+type Access = Literal["write", "read"]
+"""A seat's access to its role's worktree. The values are those of the engines role's
+``WorkdirAccess``, a string enumeration on the unmerged ``feat/read-only-seats``
+branch, so the merge can pass one where the other is read."""
+
+CONFINING_ENGINES: Final[frozenset[str]] = frozenset()
+"""The engines whose adapter can make a role's worktree read only to a seat.
+**Technical debt.** It is empty until ``feat/read-only-seats`` merges, since no engine
+here applies a read-only access yet, and then becomes the engines whose capability
+table entry gives ``read_only_workdir`` as yes. Empty is default deny, so a seat that
+does not own its role does not run beside an owner until its engine can confine it."""
+
+
+def seat_access(state: State, line_id: str) -> Access | None:
+    """``line_id``'s access to its role's worktree, which is write while it owns the
+    role and read otherwise, also while the role is vacant, or ``None`` for a line that
+    is not a seat. Ownership is read as a turn starts, so a turn keeps the access its
+    engine was built with."""
+    seat = state.seats.get(line_id)
+    if seat is None:
+        return None
+    return "write" if state.roles[seat.role_id].owner == line_id else "read"
+
+
+def waits_unconfined(
+    state: State, line_id: str, engine: str, confining: frozenset[str]
+) -> bool:
+    """Whether ``line_id`` may not start a turn because it is a seat of a role that
+    another seat owns and its ``engine`` is not in ``confining``, so nothing would
+    keep it from writing the owner's worktree. **Default deny.** Its mail waits, as a
+    muted line's does, until it owns the role, the role is vacant, or its engine can
+    confine it. A seat of a vacant role runs, so that it can take the role."""
+    seat = state.seats.get(line_id)
+    if seat is None:
+        return False
+    owner = state.roles[seat.role_id].owner
+    return owner is not None and owner != line_id and engine not in confining

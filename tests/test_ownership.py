@@ -7,7 +7,7 @@ import asyncio
 from collections.abc import Callable, Coroutine, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
@@ -33,7 +33,15 @@ from dromon.model import (
     SeatBound,
     format_due,
 )
-from dromon.roles import RoleConflict, Stamp, plan_relinquish, recovery_ground
+from dromon.roles import (
+    CONFINING_ENGINES,
+    RoleConflict,
+    Stamp,
+    plan_relinquish,
+    recovery_ground,
+    seat_access,
+    waits_unconfined,
+)
 from dromon.scheduler import (
     MAX_TAKE_REASON_BYTES,
     RECORD_ROLE_NOTE_TOOL_NAME,
@@ -112,9 +120,13 @@ class Kept(Scripted):
 class World:
     """A scheduler over a real event log in a project whose root is a checkout, with
     role core on the root, seats alpha, beta and gamma, alpha its owner and gamma
-    unable to own, and a line delta that is a seat of no role."""
+    unable to own, and a line delta that is a seat of no role. Its engine counts as
+    one that can confine a seat, as Claude Code's will once read-only seats merge,
+    unless ``confining`` says otherwise."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self, root: Path, confining: frozenset[str] = frozenset({PROVIDER})
+    ) -> None:
         (root / ".git").mkdir(parents=True)
         (root / ".git" / "HEAD").write_text(WORKTREE_COMMIT + "\n")
         self.log = EventLog(root / "events.sqlite")
@@ -134,6 +146,7 @@ class World:
             wall_clock=lambda: self.now,
             root=root,
             daemon_commit=DAEMON_COMMIT,
+            confining_engines=confining,
         )
         self.scheduler.ensure_operator("ana")
         for line_id in ("alpha", "beta", "gamma", "delta"):
@@ -593,6 +606,42 @@ def test_a_take_is_refused_while_the_owner_runs(world: World) -> None:
     assert world.role().owner == "alpha"
 
 
+def test_an_operator_take_waits_for_the_owners_turn_and_wakes_the_new_owner(
+    world: World,
+) -> None:
+    """An operator may always take, but not while the owner has a turn in flight.
+    Once it has ended, the take succeeds, the seat given the role is unmuted and
+    woken by the operator's note, and its turn leads with the recovery checklist."""
+    world.scheduler.mute("beta")
+    world.gates["alpha"] = asyncio.Event()
+    world.scripts["alpha"].append([{"tool": "gate"}])
+    refusals: list[str] = []
+
+    async def act() -> None:
+        world.scheduler.send(ANA, ALPHA, "go on")
+        await until(lambda: bool(world.prompts("alpha")))
+        try:
+            world.scheduler.give_ownership(ANA, "core", "beta")
+        except EventRejected as error:
+            refusals.append(str(error))
+        world.gates["alpha"].set()
+        await until(lambda: world.order[-1:] == ["end alpha"])
+        await world.scheduler.idle()
+        world.scheduler.give_ownership(ANA, "core", "beta")
+
+    run(world, act)
+    assert refusals and "turn in flight. Interrupt it first" in refusals[0]
+    change = world.role().changed
+    assert change is not None and (change.owner, change.cause) == (
+        "beta",
+        OwnershipCause.OPERATOR,
+    )
+    assert not world.log.state.lines["beta"].muted
+    assert world.order == ["start alpha", "end alpha", "start beta", "end beta"]
+    (prompt,) = world.prompts("beta")
+    assert RECOVERY_CHECKLIST in prompt
+
+
 # What follows a change of owner.
 
 
@@ -658,6 +707,81 @@ def test_a_seat_that_does_not_own_runs_beside_the_owner(world: World) -> None:
 
     run(world, act)
     assert world.order.index("start beta") < world.order.index("end alpha")
+
+
+@pytest.fixture
+def unconfined(tmp_path: Path) -> Iterator[World]:
+    """The world as it is until read-only seats merge, with no engine that can
+    confine a seat."""
+    target = World(tmp_path / "project", frozenset())
+    yield target
+    target.log.close()
+
+
+def seats_waiting(world: World) -> dict[str, object]:
+    seats = cast(list[dict[str, object]], world.scheduler.role_view("core")["seats"])
+    return {str(seat["line_id"]): seat["waits_unconfined"] for seat in seats}
+
+
+def test_a_seat_that_cannot_be_confined_waits_while_another_owns(
+    unconfined: World,
+) -> None:
+    wake(unconfined, "alpha", "beta", "gamma", "delta")
+    assert unconfined.prompts("alpha") and unconfined.prompts("delta")
+    assert not unconfined.prompts("beta") and not unconfined.prompts("gamma")
+    waiting = [
+        message
+        for message in unconfined.log.state.messages.values()
+        if message.recipient in (LineAddress("beta"), LineAddress("gamma"))
+    ]
+    assert len(waiting) == 2 and not any(message.delivered for message in waiting)
+    assert seats_waiting(unconfined) == {"alpha": False, "beta": True, "gamma": True}
+    # Its mail waits until it owns the role, and then it runs.
+    unconfined.scheduler.give_ownership(ANA, "core", "beta")
+    wake(unconfined)
+    assert unconfined.prompts("beta") and not unconfined.prompts("gamma")
+    assert seats_waiting(unconfined) == {"alpha": True, "beta": False, "gamma": True}
+
+
+def test_every_seat_of_a_vacant_role_runs_so_that_one_can_take_it(
+    unconfined: World,
+) -> None:
+    unconfined.scheduler.give_ownership(ANA, "core", None)
+    wake(unconfined, "alpha", "beta", "gamma")
+    assert all(unconfined.prompts(line_id) for line_id in ("alpha", "beta", "gamma"))
+    assert set(seats_waiting(unconfined).values()) == {False}
+
+
+def test_a_seat_on_a_confining_engine_does_not_wait(world: World) -> None:
+    assert set(seats_waiting(world).values()) == {False}
+    assert not world.scheduler.waits_unconfined("delta")
+
+
+def test_a_seats_access_follows_ownership_and_its_engine_decides_the_wait(
+    world: World,
+) -> None:
+    state = world.log.state
+    assert [seat_access(state, line) for line in ("alpha", "beta", "delta")] == [
+        "write",
+        "read",
+        None,
+    ]
+    assert waits_unconfined(state, "beta", PROVIDER, frozenset())
+    assert not waits_unconfined(state, "beta", PROVIDER, frozenset({PROVIDER}))
+    assert not waits_unconfined(state, "beta", "codex", frozenset({"codex"}))
+    assert waits_unconfined(state, "beta", "codex", frozenset({PROVIDER}))
+    # The owner and a line that is not a seat never wait.
+    assert not waits_unconfined(state, "alpha", PROVIDER, frozenset())
+    assert not waits_unconfined(state, "delta", PROVIDER, frozenset())
+    world.scheduler.give_ownership(ANA, "core", None)
+    state = world.log.state
+    assert seat_access(state, "alpha") == "read"
+    assert not waits_unconfined(state, "beta", PROVIDER, frozenset())
+
+
+def test_no_engine_confines_a_seat_until_read_only_seats_merge() -> None:
+    """**Technical debt.** This changes when ``feat/read-only-seats`` merges."""
+    assert not CONFINING_ENGINES
 
 
 def test_the_former_and_the_new_owner_are_told_at_their_next_turn(
