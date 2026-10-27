@@ -7,7 +7,8 @@ are derived from it. A port carries the tables across as data.
 
 Unknown is not empty. Each capability is ``YES``, ``NO`` or ``UNKNOWN``, and a minimum
 version is ``None`` when Dromon was never run against a live engine of that kind, so no
-version can be named as tested. An unknown capability is refused wherever Dromon needs
+version can be named as tested, or when its adapter reads no version. An unknown
+capability is refused wherever Dromon needs
 it, as an absent one is, but it is reported as unknown, so an operator can tell a
 limit of the engine from a gap in what Dromon has observed.
 
@@ -21,8 +22,12 @@ but whose report holds no version that can be read is refused, since Dromon cann
 tell it was tested.
 
 Grok, Codex and Antigravity. Their adapters were being changed on another branch when
-this module was written, so their tables hold only what this branch can state, and
-their rows are to be filled once that branch is merged. Their tables say so.
+this module was written, and their tables were filled on 2026-10-27, after it was
+merged, under the rule of review finding C1. ``own_tools``, ``deny_before_run`` and
+``sign_in_check`` are ``yes`` only where a live run showed them. The other capabilities
+are as the adapter's code states them, which for an engine never run live no run has
+confirmed either, and ``unknown`` where the code itself names its reading an inference.
+Each table's docstring says which is which.
 """
 
 import re
@@ -60,9 +65,11 @@ class EngineTable:
     display: str
     """The engine's name in prose, as a refusal names it."""
     minimum_version: str | None
-    """The lowest version Dromon was run against live, or ``None`` when it never was."""
+    """The lowest version Dromon was run against live and its adapter enforces, or
+    ``None`` when it never was run live or its adapter reads no version."""
     tested_on: str | None
-    """The calendar date of that run, ``YYYY-MM-DD``, or ``None``."""
+    """The calendar date of the live run, ``YYYY-MM-DD``, or ``None`` when there was
+    none. Set whenever ``minimum_version`` is."""
     resume: Known
     """Whether a line's engine session can be continued in a later turn."""
     kept_session: Known
@@ -80,8 +87,10 @@ class EngineTable:
     """Whether Dromon can tell from the engine which credential a turn uses."""
     sign_in_check: Known
     """Whether the engine offers a way to check its sign-in without a turn."""
-    pending: str | None = None
-    """What is yet to be filled in, for a table this branch could not complete."""
+
+    def __post_init__(self) -> None:
+        if self.minimum_version is not None and self.tested_on is None:
+            raise ValueError(f"{self.engine} names a minimum version without its run")
 
     def capabilities(self) -> dict[str, str]:
         """Each capability by name, in ``CAPABILITY_NAMES`` order."""
@@ -198,40 +207,101 @@ CURSOR: Final = EngineTable(
 ``CURSOR.md`` says. Resume is refused, some tools are stopped only after they start,
 it reports no cost, and a turn is bounded by time instead of by model calls."""
 
-_PENDING: Final = (
-    "to be filled once the branch that changes this adapter is merged, and unknown"
-    " until then"
+CODEX: Final = EngineTable(
+    engine="codex",
+    display="Codex",
+    minimum_version=None,
+    tested_on="2026-10-25",
+    resume=Known.YES,
+    kept_session=Known.YES,
+    own_tools=Known.YES,
+    deny_before_run=Known.YES,
+    cost_report=Known.NO,
+    max_turns=Known.NO,
+    credential_visible=Known.YES,
+    sign_in_check=Known.UNKNOWN,
 )
+"""Codex, run live with Codex 0.164.0 and GPT-6-Luna on the ChatGPT plan on
+2026-10-25, as ``CODEX.md`` records. A resumed thread and Dromon's own tools, as
+dynamic tools, were observed then, and the account type is read from ``account/read``.
 
+**Kept sessions, observed live.** At the operator's decision of 2026-10-27 after the
+review's T1, the evidence is named here. The luna line has run with ``keep_session`` on
+throughout since round 3, decided on 2026-10-26, and the ``codexkept`` line in the
+operator's scratch project ran the live probes of round 7, of the hold and of
+compaction, on 2026-10-26, each on a kept app-server and thread.
 
-def _pending(engine: str, display: str) -> EngineTable:
-    return EngineTable(
-        engine=engine,
-        display=display,
-        minimum_version=None,
-        tested_on=None,
-        resume=Known.UNKNOWN,
-        kept_session=Known.UNKNOWN,
-        own_tools=Known.UNKNOWN,
-        deny_before_run=Known.UNKNOWN,
-        cost_report=Known.UNKNOWN,
-        max_turns=Known.UNKNOWN,
-        credential_visible=Known.UNKNOWN,
-        sign_in_check=Known.UNKNOWN,
-        pending=_PENDING,
-    )
+**Denial before running, observed for some tool classes only.** At the operator's
+decision of 2026-10-27 after the review's T2, yes rests on these observations of
+2026-10-25 with Codex 0.164.0 on macOS, as ``CODEX.md`` records. Every tool the line
+was not given is switched off before the thread starts, which ``config/read`` and the
+MCP server listing showed. Under the permission profile, edits to ``.dromon`` and
+``.git`` were rejected before they were written, a shell read of ``.dromon`` failed,
+and writing the home directory, reaching the network, and renaming, linking or
+changing the mode of ``.dromon`` failed through ``codex sandbox``. Every other tool
+class, such as a read outside the workspace or a web search, was not observed, and its
+denial rests on the permission profile's documented behaviour. Codex emits no item for
+a call it refuses, so Dromon cannot count such a call. An item of a kind no one
+expected still interrupts the turn, as a second guard.
+Codex reports no cost and has no turn limit, so the driver's ``max_turns`` is not
+enforced. No check of the sign-in without a turn is known.
+
+**No minimum version.** The adapter reads no version from the app-server, so none can
+be enforced, although 0.164.0 is the version run live. A probe recording shows where
+the app-server reports its version, and the minimum follows from it."""
+
+GROK: Final = EngineTable(
+    engine="grok-build",
+    display="Grok",
+    minimum_version=None,
+    tested_on=None,
+    resume=Known.YES,
+    kept_session=Known.NO,
+    own_tools=Known.UNKNOWN,
+    deny_before_run=Known.UNKNOWN,
+    cost_report=Known.NO,
+    max_turns=Known.NO,
+    credential_visible=Known.UNKNOWN,
+    sign_in_check=Known.UNKNOWN,
+)
+"""Grok Build, never run for a turn, as ``GROK.md`` records. An ``initialize`` answer
+from Grok Build 1.0.70, which runs no model, was observed, and it advertised
+``loadSession``, which the adapter uses to resume. Kept sessions are refused, and Grok
+reports no cost and the driver's ``max_turns`` is not enforced. Whether Dromon's tools
+reach Grok under the ``toolName`` the adapter requires is the first step of
+``GROK.md``'s verify-first list, so ``own_tools`` is unknown, as for Pi. Whether every
+built-in tool asks before it runs in the ``default`` mode is not documented, so
+``deny_before_run`` is unknown. Grok names its cached sign-in, and that it is a
+subscription is an inference, so ``credential_visible`` is unknown."""
+
+ANTIGRAVITY: Final = EngineTable(
+    engine="antigravity",
+    display="Antigravity",
+    minimum_version=None,
+    tested_on=None,
+    resume=Known.YES,
+    kept_session=Known.NO,
+    own_tools=Known.UNKNOWN,
+    deny_before_run=Known.NO,
+    cost_report=Known.UNKNOWN,
+    max_turns=Known.NO,
+    credential_visible=Known.NO,
+    sign_in_check=Known.UNKNOWN,
+)
+"""Antigravity's ACP runtime, never run live and not installed, as
+``ANTIGRAVITY.md`` records. The adapter resumes a session the runtime offers to
+resume, and refuses kept sessions. A built-in tool that the runtime runs without asking
+is stopped only after it starts, which is why a daemon refuses Antigravity lines.
+Whether Dromon's tools reach it is unknown, as for Pi. A cost from ``usage_update`` is
+counted but was never observed, so ``cost_report`` is unknown. No bound on model calls
+is enforced. The runtime does not report which credential it uses, so the credential
+is ``unverified``. The adapter's own floor, ``antigravity.MINIMUM_VERSION``, was taken
+from a second implementation, not from a live run, so it is not this table's
+minimum."""
 
 
 TABLES: Final = {
-    table.engine: table
-    for table in (
-        CLAUDE_CODE,
-        PI,
-        CURSOR,
-        _pending("grok-build", "Grok"),
-        _pending("codex", "Codex"),
-        _pending("antigravity", "Antigravity"),
-    )
+    table.engine: table for table in (CLAUDE_CODE, PI, CURSOR, GROK, CODEX, ANTIGRAVITY)
 }
 """Every engine's table, by its engine name."""
 
@@ -261,22 +331,21 @@ def isolation_of(table: EngineTable) -> str:
 
 def report_lines(table: EngineTable) -> list[str]:
     """What the probe reports of ``table``, derived from it alone."""
+    # Review of 2026-10-27, C2. The absence of a minimum is said plainly, so no
+    # operator reads it as a check that passed.
+    unenforced = (
+        "no minimum version is enforced and any version the engine reports runs"
+    )
     if table.minimum_version is not None:
         tested = f"tested from {table.minimum_version} on {table.tested_on}"
-    elif table.pending is None:
-        # Review of 2026-10-27, C2. Said plainly, so no operator reads the absence
-        # of a minimum as a check that passed.
+    elif table.tested_on is not None:
         tested = (
-            "never run live, so no minimum version is enforced and any version the"
-            " engine reports runs"
+            f"run live on {table.tested_on}, but no version is read, so {unenforced}"
         )
     else:
-        tested = "never run live, so no minimum version"
-    lines = [f"table {table.engine}, {tested}"]
-    lines.append(
+        tested = f"never run live, so {unenforced}"
+    return [
+        f"table {table.engine}, {tested}",
         "table "
-        + ", ".join(f"{name} {value}" for name, value in table.capabilities().items())
-    )
-    if table.pending is not None:
-        lines.append(f"table {table.pending}")
-    return lines
+        + ", ".join(f"{name} {value}" for name, value in table.capabilities().items()),
+    ]

@@ -53,7 +53,7 @@ from typing import Any, Final, Protocol, cast
 
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import acp
+from dromon import acp, evidence
 from dromon.acp import bridge_command as bridge_command
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
@@ -321,8 +321,13 @@ type ConnectionFactory = Callable[
 
 
 class _Process:
-    def __init__(self, process: asyncio.subprocess.Process) -> None:
+    def __init__(
+        self,
+        process: asyncio.subprocess.Process,
+        recording: evidence.Recording | None = None,
+    ) -> None:
         self._process = process
+        self._recording = recording
 
     async def send(self, message: Mapping[str, object]) -> None:
         stdin = self._process.stdin
@@ -330,6 +335,8 @@ class _Process:
             raise EngineRefused("the engine was started without a standard input")
         stdin.write((json.dumps(message) + "\n").encode())
         await stdin.drain()
+        if self._recording is not None:
+            self._recording.frame(evidence.OUT, message)
 
     async def receive(self) -> dict[str, Any] | None:
         stdout = self._process.stdout
@@ -341,7 +348,10 @@ class _Process:
         decoded: object = json.loads(line)
         if not isinstance(decoded, dict):
             raise EngineRefused("the engine sent a message that is not an object")
-        return cast(dict[str, Any], decoded)
+        record = cast(dict[str, Any], decoded)
+        if self._recording is not None:
+            self._recording.frame(evidence.IN, record)
+        return record
 
 
 @asynccontextmanager
@@ -352,22 +362,25 @@ async def _grok_agent(
     if found is None:
         raise EngineRefused("the grok command is not installed or not on PATH")
     command, launched, policy = launcher.wrap([found, *arguments], environment)
+    recording = evidence.RECORDING.get()
     process = await asyncio.create_subprocess_exec(
         *command,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=evidence.STDERR_TARGET,
         cwd=cwd,
         env=launched,
         limit=MAX_LINE,
         start_new_session=True,
     )
+    draining = evidence.start_draining(process, recording)
     try:
-        yield _Process(process)
+        yield _Process(process, recording)
     finally:
         # The launcher ends the agent and, by the line's stop policy, its group and
         # every descendant, which Grok's detached tool groups need.
         await launcher.end(process, policy, close_input=False)
+        await evidence.stop_draining(draining)
 
 
 @dataclass(slots=True)

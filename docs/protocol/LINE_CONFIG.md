@@ -148,7 +148,8 @@ Code and `none` for Pi, and `isolation`, `full` where the engine's table says ev
 built-in tool is denied before it runs, `partial` where it says not, and `unknown`
 where the table does not know, as [`ENGINES.md`](ENGINES.md) specifies. Each is `null`
 where the engine did not say, never a default. The Codex, Grok and Antigravity adapters
-do not yet report a sandbox, and their tables are pending.
+do not yet report a sandbox. Their tables were filled on 2026-10-27, so a Codex turn's
+isolation is `full`, a Grok turn's `unknown` and an Antigravity turn's `partial`.
 
 **Row 5 of the T3 Code review, 2026-10-26.** `condition` names where the line stands,
 in this order of precedence, `running`, `held` for an operator, `failed` by its last

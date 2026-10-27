@@ -26,9 +26,9 @@ from dromon.client import (
     start,
     stop,
 )
-from dromon.paths import PathError, ProjectPaths, project_paths
+from dromon.paths import PathError, ProjectPaths, ensure_private_dir, project_paths
 from dromon.driver import MODELS, Credential, Driver, DriverError, Strategy
-from dromon import antigravity, capabilities, cursor, evidence, pi
+from dromon import antigravity, capabilities, codex, cursor, evidence, grok, pi
 from dromon.engine import ENGINE_NAME as CLAUDE_CODE_ENGINE
 from dromon.engine import EngineRefused
 from dromon.agents import LINE_TOKEN_ENV, TOKEN_ENV
@@ -170,9 +170,6 @@ PARTIAL_ISOLATION_ENGINES: Final = frozenset(
         for name, table in capabilities.TABLES.items()
         if capabilities.isolation_of(table) == "partial"
     }
-    # Antigravity's table is pending the merge of the branch that changes its
-    # adapter, which isolates it partially, as ANTIGRAVITY.md records.
-    | {antigravity.ENGINE_NAME}
 )
 """Engines ``dromon probe --accept-partial-isolation`` lets run, by the operator's
 decision of 2026-10-26. A daemon refuses lines on either."""
@@ -183,7 +180,14 @@ confirmation of the credential by hand, by the operator's decision of 2026-10-26
 
 
 RECORDING_ENGINES: Final = frozenset(
-    {CLAUDE_CODE_ENGINE, pi.ENGINE_NAME, cursor.ENGINE_NAME, antigravity.ENGINE_NAME}
+    {
+        CLAUDE_CODE_ENGINE,
+        pi.ENGINE_NAME,
+        cursor.ENGINE_NAME,
+        antigravity.ENGINE_NAME,
+        codex.ENGINE_NAME,
+        grok.ENGINE_NAME,
+    }
 )
 """Engines whose probe ``--record`` can record, as ``dromon.evidence`` says."""
 
@@ -197,7 +201,7 @@ def _probe(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     """
     scrubbed: Path | None = arguments.scrub
     if scrubbed is not None:
-        return _scrub(scrubbed, arguments.scrub_to)
+        return _scrub(paths, scrubbed, arguments.scrub_to)
     if arguments.scrub_to is not None:
         print("dromon probe: --scrub-to is accepted only with --scrub", file=sys.stderr)
         return exits.FAILURE
@@ -239,9 +243,11 @@ def _probe(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
                 "--record-stderr is accepted only together with --record"
             )
         if recorded and driver.settings.engine not in RECORDING_ENGINES:
+            # Every engine records since 2026-10-27. The refusal is kept for an
+            # engine added later whose adapter does not record yet.
             raise EngineRefused(
                 f"--record is not yet supported for {driver.settings.engine}, whose"
-                " adapter frames its own traffic"
+                " adapter does not record its frames"
             )
         line = engine_factory(
             str(paths.root),
@@ -249,12 +255,7 @@ def _probe(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             accept_unverified_credential=unverified,
         )(LineSpec("probe", model, strategy), [])
         recording = (
-            evidence.Recording(
-                evidence.probe_path(paths.root, driver.settings.engine),
-                driver.settings.engine,
-                model,
-                stderr=with_stderr,
-            )
+            _recording(paths, driver.settings.engine, model, with_stderr)
             if recorded
             else None
         )
@@ -265,13 +266,14 @@ def _probe(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             evidence.RECORDING.reset(token)
             if recording is not None:
                 recording.close()
-                print(f"dromon probe: frames recorded to {recording.path}")
+                _report_recording(recording)
     except (DriverError, EngineRefused) as error:
         print(f"dromon probe: {error}", file=sys.stderr)
         return exits.FAILURE
-    except OSError as error:
+    except (OSError, PathError) as error:
         print(f"dromon probe: cannot record the frames: {error}", file=sys.stderr)
         return exits.FAILURE
+    incomplete = recording is not None and recording.failure is not None
     settings = driver.settings
     print(
         f"driver {settings.model} {settings.strategy},"
@@ -300,7 +302,36 @@ def _probe(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         )
         print("capabilities " + ", ".join(found.capabilities))
     print(f"turn {report.subtype} in {report.num_turns}, reply {report.text!r}")
-    return exits.OK if report.subtype == "success" else exits.FAILURE
+    return exits.OK if report.subtype == "success" and not incomplete else exits.FAILURE
+
+
+def _recording(
+    paths: ProjectPaths, engine: str, model: str, with_stderr: bool
+) -> evidence.Recording:
+    """A new recording under the daemon's state directory, which every line's sandbox
+    closes. Raises ``PathError`` or ``OSError`` when the directory or the file cannot
+    be made."""
+    ensure_private_dir(paths.state_dir)
+    ensure_private_dir(paths.state_dir / evidence.PROBES_DIRECTORY)
+    return evidence.Recording(
+        evidence.probe_path(paths.state_dir, engine), engine, model, stderr=with_stderr
+    )
+
+
+def _report_recording(recording: evidence.Recording) -> None:
+    """Say where the raw recording is, how to scrub it, and whether a write failed,
+    in which case the turn went on and the file is incomplete."""
+    print(f"dromon probe: frames recorded to {recording.path}")
+    print(
+        "dromon probe: scrub a copy for lines and tests to read with"
+        f" dromon probe --scrub {recording.path.name}"
+    )
+    if recording.failure is not None:
+        print(
+            "dromon probe: a write to the recording failed, so it stops early and is"
+            f" incomplete: {recording.failure}",
+            file=sys.stderr,
+        )
 
 
 def default_operator() -> str:
@@ -968,11 +999,17 @@ def _sign_in(driver: Driver, unverified: bool = False) -> int:
     return exits.OK
 
 
-def _scrub(source: Path, destination: Path | None) -> int:
+def _scrub(paths: ProjectPaths, source: Path, destination: Path | None) -> int:
     """Scrub the recording at ``source`` into a file that may become a fixture, as
-    ``dromon.evidence.scrub_file`` says, without running a turn."""
-    target = destination or source.with_name(
-        source.name.removesuffix(".jsonl") + ".scrubbed.jsonl"
+    ``dromon.evidence.scrub_file`` says, without running a turn. A relative ``source``
+    is read from the state directory's probes, where ``--record`` writes, and the copy
+    goes by default to the project's ``tmp/probes``, where lines can read it."""
+    if not source.is_absolute():
+        source = paths.state_dir / evidence.PROBES_DIRECTORY / source
+    target = destination or (
+        paths.root
+        / evidence.FIXTURES_DIRECTORY
+        / (source.name.removesuffix(".jsonl") + ".scrubbed.jsonl")
     )
     try:
         written = evidence.scrub_file(source, target)
@@ -1161,10 +1198,10 @@ def build_parser() -> argparse.ArgumentParser:
                 "--record",
                 action="store_true",
                 help="record every frame the adapter exchanged with the engine to a"
-                " new file under tmp/probes, readable by its owner alone, which a test"
-                " can replay through the adapter. Prompts and replies are recorded as"
-                " they were exchanged. Claude Code, Pi, Cursor Agent and Antigravity"
-                " record, and Codex and Grok do not yet",
+                " new file under .dromon/probes, readable by its owner alone and"
+                " closed to every line, which --scrub copies for a test to replay"
+                " through the adapter. Prompts and replies are recorded as they were"
+                " exchanged. Every engine records",
             )
             command.add_argument(
                 "--no-turn",
@@ -1188,7 +1225,8 @@ def build_parser() -> argparse.ArgumentParser:
                 help="run no turn. Write a copy of the recording FILE with the account"
                 " values, the home directory, session ids and uuids replaced by stable"
                 " placeholders, which still replays, and refuse it if the home"
-                " directory, the user name or an email address remains",
+                " directory, the user name or an email address remains. A relative"
+                " FILE is read from .dromon/probes",
             )
             command.add_argument(
                 "--scrub-to",
@@ -1196,7 +1234,8 @@ def build_parser() -> argparse.ArgumentParser:
                 default=None,
                 metavar="PATH",
                 help="with --scrub, where to write the copy, which must not exist."
-                " Default FILE with .scrubbed.jsonl in place of .jsonl",
+                " Default tmp/probes and FILE's name with .scrubbed.jsonl in place of"
+                " .jsonl",
             )
             command.add_argument(
                 "--record-stderr",

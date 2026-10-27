@@ -3,9 +3,9 @@
 **Row 7 of the T3 Code review, 2026-10-27.** Pi, Cursor and Antigravity were tested
 only against hand-written fakes. ``dromon probe --record`` writes every frame the
 adapter sent and received during its turn, and optionally a bounded, redacted copy of
-the engine's standard error, to a file under ``tmp/probes``. A test replays such a file
-through the real adapter, so each live probe becomes regression evidence that costs no
-subscription in continuous integration.
+the engine's standard error, to a file under ``.dromon/probes``. A test replays a
+scrubbed copy of such a file through the real adapter, so each live probe becomes
+regression evidence that costs no subscription in continuous integration.
 
 File format, version 1, JSON lines.
 - The first line is ``{"v": 1, "kind": "header", "engine": ..., "model": ...,
@@ -17,18 +17,32 @@ File format, version 1, JSON lines.
 - ``{"kind": "stderr", "text": ..., "cut": bool}`` last, when standard error was
   asked for.
 
-What it holds. Frames are recorded as exchanged, prompts and replies included, so the
-file is written with owner-only permissions under the project's ignored ``tmp/``
-directory and is never committed. Standard error is masked by ``dromon.redact`` and cut
-to ``MAX_STDERR_BYTES``, since a harness may print text near a credential there.
-Masking is by pattern, as that module states, so a reviewer still reads the file
-before it is kept as a fixture.
+What it holds. Frames are recorded as exchanged, prompts and replies included, and
+the account's email address and organization with them. **Review of 2026-10-27, R1.**
+The raw file is therefore written with owner-only permissions under the daemon's state
+directory, in ``PROBES_DIRECTORY``, which the sandbox closes to every line, and never
+under the shared ``tmp/``, where a line could read the operator's account. Only a
+scrubbed copy, which ``dromon probe --scrub`` writes to ``FIXTURES_DIRECTORY``, is put
+where lines can see it. Standard error is masked by ``dromon.redact`` and cut to
+``MAX_STDERR_BYTES``, since a harness may print text near a credential there. Masking
+is by pattern, as that module states, so a reviewer still reads the file before it is
+kept as a fixture.
+
+Failure mode, at the review's R3. A write that fails, such as on a full disk, is noted
+in ``Recording.failure`` and ends the recording, and the turn goes on, so a probe still
+reports what the engine did. The probe then says the recording is incomplete.
 
 Where it hooks in. The Pi, Cursor and Antigravity adapters start their engine through
 ``dromon.jsonlines``, which records while ``RECORDING`` holds a recording. The Claude
 Code adapter records through ``recording_transport``. Codex and Grok frame their own
-traffic and do not record yet. Porting note, ``RECORDING`` is a context variable, an
-ambient value a port passes explicitly instead.
+traffic, and their own process wrappers record it the same way, from 2026-10-27, with
+``start_draining`` and ``stop_draining`` shared by all three. **Review of 2026-10-27,
+R2.** Those three always pipe the engine's standard error and read it to its end,
+recording or not, so a probe's engine and a daemon line's engine run alike. Only what
+is kept differs.
+Codex's ``codex mcp list`` before the turn is a separate command, not a frame, and is
+not recorded. Porting note, ``RECORDING`` is a context variable, an ambient value a
+port passes explicitly instead.
 
 Replay. ``Replay`` hands the adapter each recorded ``in`` frame only once the adapter
 has sent as many frames as preceded it in the recording, so the order of the exchange
@@ -43,20 +57,26 @@ fixture. ``scrub`` replaces the values of every ``account`` block, except the ``
 an adapter reads, and those values wherever else they occur, the home directory and
 its dashed form in Claude Code's project directories, every uuid and every session id,
 and the account's usage in ``rate_limit_info``, at the operator's further instruction,
-with stable placeholders, the same value always by the same placeholder, so the frames
-still replay. ``scrub_file`` then refuses a fixture in which the home directory, the
-user name, an email address or an account value is still found. The check is by
-pattern, so a person still reads a fixture before it is committed, and the repository's
-disclosure scan runs over it once it is tracked.
+and in Codex's ``rateLimits``, with stable placeholders, the same value always by the
+same placeholder, so the frames still replay. **Review of 2026-10-27, S2.** At the
+operator's decision the account scrub also covers any key whose name says it holds an
+account, an organization, an email address or a plan, wherever it stands, as
+``IDENTITY_BLOCK_WORDS`` and ``IDENTITY_VALUE_WORDS`` say, with each value replaced by
+one of its own type. ``scrub_file`` then refuses a fixture in which the home
+directory, the user name, an email address anywhere or an account value is still
+found. The check is by pattern, so a person still reads a fixture before it is
+committed, and the repository's disclosure scan runs over it once it is tracked.
 
 Review of 2026-10-27. Account values are replaced as whole words whatever their length,
 and ``rate_limit_info`` keeps only what a reader needs, so a field nobody listed is
 replaced rather than passed through. The probe turn's own token counts and cost are
 kept, at the operator's decision, since they describe that one turn and not the
-account, and the adapter reads them on replay as it does live.
+account, and the adapter reads them on replay as it does live. The same decision covers
+Codex's ``thread/tokenUsage/updated``, at the operator's instruction of 2026-10-27.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -85,7 +105,12 @@ REPLAY_WAIT_SECONDS: Final = 5.0
 before the next frame, before it says the adapter diverged."""
 OUT: Final = "out"
 IN: Final = "in"
-PROBES_DIRECTORY: Final = Path("tmp") / "probes"
+PROBES_DIRECTORY: Final = Path("probes")
+"""Where raw recordings are written, relative to the daemon's state directory, which
+the sandbox closes to every line."""
+FIXTURES_DIRECTORY: Final = Path("tmp") / "probes"
+"""Where scrubbed copies are written by default, relative to the project root, where
+lines and tests can read them."""
 
 
 class RecordingError(ValueError):
@@ -112,6 +137,8 @@ class Recording:
         self._truncated = False
         self._stderr = bytearray()
         self._stderr_cut = False
+        self.failure: str | None = None
+        """Why recording stopped early, when a write failed, and ``None`` otherwise."""
         self._write(
             {
                 "v": FORMAT_VERSION,
@@ -128,23 +155,33 @@ class Recording:
         self._file.flush()
         return len(line.encode("utf-8"))
 
+    def _fail(self, error: OSError) -> None:
+        """Note a failed write and record nothing more, so the turn goes on."""
+        if self.failure is None:
+            self.failure = str(error)
+
     def frame(self, direction: str, frame: Mapping[str, object]) -> None:
-        """Record one frame, or nothing once the bounds were reached."""
+        """Record one frame, or nothing once the bounds were reached or a write
+        failed. A failed write is noted in ``failure``, never raised."""
         if direction not in (OUT, IN):
             raise ValueError(f"a frame goes out or in, not {direction!r}")
-        if self._truncated or self._file.closed:
+        if self._truncated or self.failure is not None or self._file.closed:
             return
         line = json.dumps(
             {"kind": "frame", "dir": direction, "frame": dict(frame)},
             ensure_ascii=False,
         )
         size = len(line.encode("utf-8")) + 1
-        if self._frames >= MAX_FRAMES or self._bytes + size > MAX_RECORD_BYTES:
-            self._truncated = True
-            self._write({"kind": "truncated", "frames": self._frames})
+        try:
+            if self._frames >= MAX_FRAMES or self._bytes + size > MAX_RECORD_BYTES:
+                self._truncated = True
+                self._write({"kind": "truncated", "frames": self._frames})
+                return
+            self._file.write(line + "\n")
+            self._file.flush()
+        except OSError as error:
+            self._fail(error)
             return
-        self._file.write(line + "\n")
-        self._file.flush()
         self._frames += 1
         self._bytes += size
 
@@ -158,24 +195,31 @@ class Recording:
         self._stderr.extend(data[: max(0, room)])
 
     def close(self) -> None:
-        """Write the masked standard error, if asked for, and close the file."""
+        """Write the masked standard error, if asked for and no write failed, and
+        close the file. A failed write is noted in ``failure``, never raised."""
         if self._file.closed:
             return
-        if self.wants_stderr:
-            text = redact.mask(self._stderr.decode("utf-8", "replace"))
-            self._write({"kind": "stderr", "text": text, "cut": self._stderr_cut})
-        self._file.close()
+        try:
+            if self.wants_stderr and self.failure is None:
+                text = redact.mask(self._stderr.decode("utf-8", "replace"))
+                self._write({"kind": "stderr", "text": text, "cut": self._stderr_cut})
+        except OSError as error:
+            self._fail(error)
+        try:
+            self._file.close()
+        except OSError as error:
+            self._fail(error)
 
 
 RECORDING: ContextVar[Recording | None] = ContextVar("dromon_recording", default=None)
 """The recording the frames of this context go to, set only by ``dromon probe``."""
 
 
-def probe_path(root: Path, engine: str, now: datetime | None = None) -> Path:
-    """Where a probe of ``engine`` records, under the project's ``tmp/probes``."""
+def probe_path(state_dir: Path, engine: str, now: datetime | None = None) -> Path:
+    """Where a probe of ``engine`` records, under the daemon's state directory."""
     moment = now or datetime.now(UTC)
     stamp = moment.strftime("%Y%m%dT%H%M%S%fZ")
-    return root / PROBES_DIRECTORY / f"{engine}-{stamp}.jsonl"
+    return state_dir / PROBES_DIRECTORY / f"{engine}-{stamp}.jsonl"
 
 
 def record(direction: str, frame: Mapping[str, object]) -> None:
@@ -185,14 +229,51 @@ def record(direction: str, frame: Mapping[str, object]) -> None:
         recording.frame(direction, frame)
 
 
-async def drain_stderr(stream: asyncio.StreamReader, recording: Recording) -> None:
+async def drain_stderr(
+    stream: asyncio.StreamReader, recording: Recording | None
+) -> None:
     """Read an engine's standard error to its end, so the engine never blocks on
-    it, keeping what the recording's bound allows."""
+    it, keeping what a recording's bound allows, and nothing without one."""
     while True:
         chunk = await stream.read(4096)
         if not chunk:
             return
-        recording.stderr(chunk)
+        if recording is not None:
+            recording.stderr(chunk)
+
+
+DRAIN_SECONDS: Final = 10
+"""How long an ended engine's standard error is read before it is left. A descendant
+left running may hold it open."""
+
+
+STDERR_TARGET: Final = asyncio.subprocess.PIPE
+"""Where every recorded adapter's engine sends its standard error, a pipe read to its
+end whether or not a probe records, so that recording never changes what the engine
+sees. **Review of 2026-10-27, R2.** It once went to the null device unless a recording
+kept it."""
+
+
+def start_draining(
+    process: asyncio.subprocess.Process, recording: Recording | None
+) -> asyncio.Task[None] | None:
+    """A task that reads ``process``'s standard error to its end, into ``recording``
+    when one is active, or ``None`` when the process has no piped standard error."""
+    if process.stderr is None:
+        return None
+    return asyncio.create_task(drain_stderr(process.stderr, recording))
+
+
+async def stop_draining(
+    draining: asyncio.Task[None] | None, seconds: float = DRAIN_SECONDS
+) -> None:
+    """Let ``draining`` finish once its engine has ended, for at most ``seconds``,
+    then cancel it."""
+    if draining is None:
+        return
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(draining, seconds)
+    draining.cancel()
 
 
 @dataclass(slots=True)
@@ -356,6 +437,29 @@ SCRUBBED_HOME: Final = "/home/operator"
 ACCOUNT_KEPT: Final = frozenset({"type"})
 """Account fields a scrub keeps, which name a kind of account, not a person, and
 which an adapter reads, as the Codex adapter reads ``type``."""
+IDENTITY_BLOCK_WORDS: Final = frozenset(
+    {
+        "account",
+        "accounts",
+        "org",
+        "orgs",
+        "organisation",
+        "organisations",
+        "organization",
+        "organizations",
+    }
+)
+"""Words that, as a word of a key's name, mark its whole value as the account's, as
+in ``account``, ``organization`` or ``orgId``. Every value inside is replaced by one of
+its own type, except the fields of ``ACCOUNT_KEPT``."""
+IDENTITY_VALUE_WORDS: Final = frozenset({"email", "emails", "plan", "plans"})
+"""Words that, as a word of a key's name, mark its value as the account's when the
+value is a string, number or boolean, as in ``email`` or ``planType``. A list or object
+under such a key is scrubbed as any other value, because Codex's ``plan`` notice holds
+the agent's plan steps, whose status words would otherwise become account values and
+be replaced in every frame, which would stop the frames from replaying."""
+_KEY_WORD: Final = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
+"""One word of a key's name, in camel case, snake case or kebab case."""
 SESSION_KEYS: Final = frozenset({"session_id", "sessionId"})
 MIN_SECRET_LENGTH: Final = 4
 """Account values at least this long are also refused where they remain inside a
@@ -370,6 +474,21 @@ _UUID: Final = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
 _EMAIL: Final = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def _key_words(key: str) -> frozenset[str]:
+    """The words of a key's name, in lower case, so ``planType`` gives ``plan`` and
+    ``type`` and ``explanation`` gives only itself."""
+    return frozenset(word.lower() for word in _KEY_WORD.findall(key))
+
+
+def _identifying(key: str, value: object) -> bool:
+    """Whether ``value``, found under ``key``, is the account's, as
+    ``IDENTITY_BLOCK_WORDS`` and ``IDENTITY_VALUE_WORDS`` say."""
+    words = _key_words(key)
+    if words & IDENTITY_BLOCK_WORDS:
+        return True
+    return bool(words & IDENTITY_VALUE_WORDS) and isinstance(value, str | int | float)
 
 
 def _word(value: str) -> re.Pattern[str]:
@@ -391,6 +510,8 @@ class Scrubber:
             raise ValueError(f"the home directory {home!r} is not an absolute path")
         self.home = home.rstrip("/")
         self.secrets = dict(secrets)
+        self.found: dict[str, str] = {}
+        """Each account string replaced so far, by its placeholder."""
         self._uuids: dict[str, str] = {}
         self._sessions: dict[str, str] = {}
 
@@ -416,6 +537,37 @@ class Scrubber:
             self._sessions[value] = f"session-{len(self._sessions) + 1}"
         return self._sessions[value]
 
+    def identity(self, key: str, value: object, depth: int) -> object:
+        """``value``, the account's, found under ``key``, replaced by a value of its
+        own type, through each object and list it nests, with each string noted in
+        ``found``. ``None`` says only that a value is absent, and is kept."""
+        if depth > MAX_SCRUB_DEPTH:
+            raise RecordingError(f"a frame nests deeper than {MAX_SCRUB_DEPTH}")
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, int | float):
+            return SCRUBBED_NUMBER
+        if isinstance(value, str):
+            placeholder = f"scrubbed-account-{key}"
+            if value:
+                self.found.setdefault(value, placeholder)
+            return placeholder
+        if isinstance(value, list):
+            return [
+                self.identity(key, item, depth + 1)
+                for item in cast(list[object], value)
+            ]
+        if isinstance(value, dict):
+            return {
+                name: item
+                if name in ACCOUNT_KEPT
+                else self.identity(name, item, depth + 1)
+                for name, item in cast(dict[str, object], value).items()
+            }
+        return value
+
     def value(self, value: object, depth: int = 0) -> object:
         """``value``, a decoded JSON value, scrubbed."""
         if depth > MAX_SCRUB_DEPTH:
@@ -428,10 +580,10 @@ class Scrubber:
             return value
         scrubbed: dict[str, object] = {}
         for key, item in cast(dict[str, object], value).items():
-            if key == "account" and isinstance(item, dict):
-                scrubbed[key] = _account(cast(dict[str, object], item))
-            elif key == "rate_limit_info":
+            if key in RATE_LIMIT_KEYS:
                 scrubbed[key] = _rate_limits(item, depth + 1)
+            elif _identifying(key, item):
+                scrubbed[key] = self.identity(key, item, depth + 1)
             elif key in SESSION_KEYS and isinstance(item, str):
                 scrubbed[key] = self.session(item)
             else:
@@ -467,6 +619,13 @@ RATE_LIMIT_WINDOWS: Final = frozenset(
 )
 """The values of ``rateLimitType`` kept, the windows the SDK names, which say which
 limit applies and nothing of its use. Any other value is replaced."""
+RATE_LIMIT_KEYS: Final = frozenset({"rate_limit_info", "rateLimits"})
+"""The keys whose values report an account's usage. ``rate_limit_info`` is Claude
+Code's. ``rateLimits`` is Codex's, in its rate limit read and notice. **Inference, not
+yet seen in a recording.** That Codex names it so is taken from its app-server
+protocol, and the Codex adapter reads nothing in it, so every value but a reset time
+becomes a placeholder of its type. A person reads the first Codex recording before it
+becomes a fixture, as for any engine."""
 
 
 def _rate_limit_value(key: str, value: object) -> object:
@@ -513,33 +672,14 @@ def _dashed(path: str) -> str:
     return path.replace("/", "-")
 
 
-def _account(block: Mapping[str, object]) -> dict[str, object]:
-    return {
-        key: value if key in ACCOUNT_KEPT else f"scrubbed-account-{key}"
-        for key, value in block.items()
-    }
-
-
-def _account_values(recorded: Recorded) -> dict[str, str]:
-    """Every string in an ``account`` block of ``recorded``, by its placeholder,
-    found by walking each frame with an explicit, bounded stack."""
-    found: dict[str, str] = {}
-    stack: list[tuple[object, int]] = [(frame, 0) for _, frame in recorded.frames]
-    while stack:
-        value, depth = stack.pop()
-        if depth > MAX_SCRUB_DEPTH:
-            raise RecordingError(f"a frame nests deeper than {MAX_SCRUB_DEPTH}")
-        if isinstance(value, list):
-            stack.extend((item, depth + 1) for item in cast(list[object], value))
-        elif isinstance(value, dict):
-            for key, item in cast(dict[str, object], value).items():
-                child: object = item
-                if key == "account" and isinstance(item, dict):
-                    for name, field_value in cast(dict[str, object], item).items():
-                        if name not in ACCOUNT_KEPT and isinstance(field_value, str):
-                            found[field_value] = f"scrubbed-account-{name}"
-                stack.append((child, depth + 1))
-    return found
+def _account_values(recorded: Recorded, home: str) -> dict[str, str]:
+    """Every account string of ``recorded``, by its placeholder, found by a first
+    scrub whose output is discarded, so both passes judge a key alike."""
+    collector = Scrubber(home, {})
+    collector.value(recorded.header)
+    for _, frame in recorded.frames:
+        collector.value(frame)
+    return collector.found
 
 
 def scrub(recorded: Recorded, home: str) -> tuple[Recorded, frozenset[str]]:
@@ -550,7 +690,7 @@ def scrub(recorded: Recorded, home: str) -> tuple[Recorded, frozenset[str]]:
     secrets = {
         secret: placeholder
         for secret, placeholder in sorted(
-            _account_values(recorded).items(), key=lambda item: -len(item[0])
+            _account_values(recorded, home).items(), key=lambda item: -len(item[0])
         )
         if secret
     }

@@ -29,7 +29,6 @@ Porting note. Each record is read whole up to ``MAX_LINE`` bytes, a bound a port
 """
 
 import asyncio
-import contextlib
 import json
 import shutil
 import signal
@@ -192,35 +191,25 @@ def json_lines_factory(command: str, *, keep_input: bool) -> ConnectionFactory:
             )
         argv, launched, policy = launcher.wrap([found, *arguments], environment)
         recording = evidence.RECORDING.get()
-        keep_stderr = recording is not None and recording.wants_stderr
         process = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE if keep_input else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-            if keep_stderr
-            else asyncio.subprocess.DEVNULL,
+            stderr=evidence.STDERR_TARGET,
             cwd=cwd,
             env=launched,
             limit=MAX_LINE,
             start_new_session=True,
         )
-        draining = (
-            asyncio.create_task(evidence.drain_stderr(process.stderr, recording))
-            if recording is not None and process.stderr is not None
-            else None
-        )
+        draining = evidence.start_draining(process, recording)
         try:
             yield Process(process, policy, recording)
         finally:
             await launcher.end(
                 process, policy, close_input=True, input_seconds=EXIT_SECONDS
             )
-            if draining is not None:
-                # The harness has ended, so its standard error ends too, unless a
-                # descendant left running holds it, which the bound covers.
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(draining, EXIT_SECONDS)
-                draining.cancel()
+            # The harness has ended, so its standard error ends too, unless a
+            # descendant left running holds it, which the bound covers.
+            await evidence.stop_draining(draining, EXIT_SECONDS)
 
     return start

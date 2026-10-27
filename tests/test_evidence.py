@@ -3,17 +3,18 @@ versions. Every engine here is a scripted fake or a recording, so no subscriptio
 spent."""
 
 import asyncio
+import dataclasses
 import json
 import stat
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 from claude_agent_sdk._internal.transport import Transport
 
-from dromon import cli, evidence, exits
+from dromon import cli, codex, evidence, exits, grok
 from dromon.capabilities import (
     CAPABILITY_NAMES,
     CLAUDE_CODE,
@@ -27,8 +28,11 @@ from dromon.capabilities import (
     version_numbers,
     version_refusal,
 )
+from dromon.antigravity import unsupported as unsupported_antigravity
+from dromon.codex import unsupported as unsupported_codex
 from dromon.cursor import CursorLine
 from dromon.cursor import unsupported as unsupported_cursor
+from dromon.grok import unsupported as unsupported_grok
 from dromon.pi import unsupported as unsupported_pi
 from dromon.driver import Credential, Driver, Strategy
 from dromon.engine import (
@@ -52,6 +56,7 @@ from dromon.evidence import (
 )
 from dromon.jsonlines import json_lines_factory
 from dromon.lineconfig import LineConfig
+from dromon.paths import PathError, project_paths
 
 HAIKU = "claude-haiku-5-5"
 CURSOR = "cursor-agent:gpt-5.6-luna-medium"
@@ -167,10 +172,87 @@ def test_a_missing_recording_is_refused(tmp_path: Path) -> None:
         read_recording(tmp_path / "absent.jsonl")
 
 
-def test_the_probe_path_is_under_tmp_probes(tmp_path: Path) -> None:
-    path = evidence.probe_path(tmp_path, "pi")
-    assert path.parent == tmp_path / "tmp" / "probes"
+def test_the_probe_path_is_under_the_state_directory(tmp_path: Path) -> None:
+    """Review of 2026-10-27, R1. A raw recording holds the account, so it is written
+    where no line can read it, and never under the shared ``tmp``."""
+    path = evidence.probe_path(tmp_path / ".dromon", "pi")
+    assert path.parent == tmp_path / ".dromon" / "probes"
     assert path.name.startswith("pi-") and path.suffix == ".jsonl"
+    assert Path("tmp") / "probes" == evidence.FIXTURES_DIRECTORY
+
+
+def test_a_probe_recording_is_private_in_a_private_directory(
+    tmp_path: Path, short_runtime: Path
+) -> None:
+    paths = project_paths(tmp_path, short_runtime)
+    recording = cli._recording(paths, "pi", "m", False)  # pyright: ignore[reportPrivateUsage]
+    recording.close()
+    probes = paths.state_dir / evidence.PROBES_DIRECTORY
+    assert recording.path.parent == probes
+    assert stat.S_IMODE(probes.stat().st_mode) == 0o700
+    assert stat.S_IMODE(paths.state_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(recording.path.stat().st_mode) == 0o600
+    assert not (tmp_path / "tmp").exists()
+
+
+def test_a_probe_refuses_a_state_directory_others_can_read(
+    tmp_path: Path, short_runtime: Path
+) -> None:
+    paths = project_paths(tmp_path, short_runtime)
+    paths.state_dir.mkdir(mode=0o755)
+    paths.state_dir.chmod(0o755)
+    with pytest.raises(PathError, match="group or others"):
+        cli._recording(paths, "pi", "m", False)  # pyright: ignore[reportPrivateUsage]
+    assert not (paths.state_dir / evidence.PROBES_DIRECTORY).exists()
+
+
+class FailingFile:
+    """A file whose every write fails, as on a full disk."""
+
+    closed = False
+
+    def write(self, text: str) -> int:
+        raise OSError(28, "No space left on device")
+
+    def flush(self) -> None:
+        raise OSError(28, "No space left on device")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_a_failed_write_is_noted_and_never_raised(tmp_path: Path) -> None:
+    """Review of 2026-10-27, R3. The turn goes on when the recording cannot be
+    written, and the probe says the file is incomplete."""
+    path = tmp_path / "probe.jsonl"
+    recording = Recording(path, "e", "m", stderr=True)
+    recording.frame(OUT, {"kept": 1})
+    recording._file.close()  # pyright: ignore[reportPrivateUsage]
+    recording._file = FailingFile()  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+    recording.frame(IN, {"lost": 1})
+    recording.frame(OUT, {"lost": 2})
+    recording.stderr(b"anything")
+    recording.close()
+    assert recording.failure is not None and "No space" in recording.failure
+    lines = path.read_text().splitlines()
+    assert [json.loads(line)["kind"] for line in lines] == ["header", "frame"]
+    assert read_recording(path).frames == [(OUT, {"kept": 1})]
+    with pytest.raises(ValueError, match="out or in"):
+        recording.frame("sideways", {})
+
+
+def test_a_failed_recording_is_reported_by_the_probe(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    recording = Recording(tmp_path / "probe.jsonl", "e", "m")
+    recording._file.close()  # pyright: ignore[reportPrivateUsage]
+    recording._file = FailingFile()  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+    recording.frame(OUT, {"lost": 1})
+    recording.close()
+    cli._report_recording(recording)  # pyright: ignore[reportPrivateUsage]
+    captured = capsys.readouterr()
+    assert "dromon probe --scrub probe.jsonl" in captured.out
+    assert "incomplete" in captured.err and "No space" in captured.err
 
 
 # Replay keeps the order of the exchange.
@@ -254,6 +336,92 @@ def test_a_json_lines_engine_is_recorded_with_its_standard_error(
     assert found.frames == [(OUT, {"ask": 42}), (IN, {"answer": 42})]
     assert found.stderr is not None
     assert "token=***" in found.stderr and "abc123" not in found.stderr
+
+
+@pytest.mark.parametrize(
+    ("command", "start"),
+    [
+        ("codex", codex._app_server),  # pyright: ignore[reportPrivateUsage]
+        ("grok", grok._grok_agent),  # pyright: ignore[reportPrivateUsage]
+    ],
+)
+def test_codex_and_grok_are_recorded_with_their_standard_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    start: codex.ConnectionFactory,
+) -> None:
+    """Codex and Grok frame their own traffic, so their own process wrappers record,
+    as ``dromon.jsonlines`` does for the others."""
+    directory = tmp_path / "bin"
+    directory.mkdir()
+    script = directory / command
+    script.write_text(f"#!{sys.executable}\n{HARNESS}")
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", str(directory))
+    path = tmp_path / "probe.jsonl"
+    recording = Recording(path, command, "m", stderr=True)
+
+    async def go() -> dict[str, Any] | None:
+        async with start([], tmp_path, {"PATH": str(directory)}) as engine:
+            await engine.send({"ask": 7})
+            return await engine.receive()
+
+    token = evidence.RECORDING.set(recording)
+    try:
+        assert asyncio.run(go()) == {"answer": 7}
+    finally:
+        evidence.RECORDING.reset(token)
+        recording.close()
+    found = read_recording(path)
+    assert found.frames == [(OUT, {"ask": 7}), (IN, {"answer": 7})]
+    assert found.stderr is not None
+    assert "token=***" in found.stderr and "abc123" not in found.stderr
+
+
+LOUD_HARNESS = (
+    "import json, sys\n"
+    "sys.stderr.write('x' * 262144)\n"
+    "sys.stderr.flush()\n"
+    "request = json.loads(sys.stdin.readline())\n"
+    "sys.stdout.write(json.dumps({'answer': request['ask']}) + '\\n')\n"
+    "sys.stdout.flush()\n"
+)
+"""An engine that writes more standard error than a pipe holds before it answers,
+so it answers only if its standard error is read."""
+
+
+@pytest.mark.parametrize(
+    "start",
+    [
+        codex._app_server,  # pyright: ignore[reportPrivateUsage]
+        grok._grok_agent,  # pyright: ignore[reportPrivateUsage]
+        json_lines_factory("harness", keep_input=True),
+    ],
+)
+def test_standard_error_is_drained_alike_without_a_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, start: codex.ConnectionFactory
+) -> None:
+    """Review of 2026-10-27, R2. Standard error is a pipe read to its end whether or
+    not a probe records, so a probe's engine and a daemon line's run alike. The
+    engine here blocks unless it is read, and nothing is written to disk."""
+    directory = tmp_path / "bin"
+    directory.mkdir()
+    for command in ("codex", "grok", "harness"):
+        script = directory / command
+        script.write_text(f"#!{sys.executable}\n{LOUD_HARNESS}")
+        script.chmod(0o755)
+    monkeypatch.setenv("PATH", str(directory))
+
+    async def go() -> dict[str, Any] | None:
+        async with start([], tmp_path, {"PATH": str(directory)}) as engine:
+            await engine.send({"ask": 8})
+            return await engine.receive()
+
+    assert evidence.RECORDING.get() is None
+    assert evidence.STDERR_TARGET == asyncio.subprocess.PIPE
+    assert asyncio.run(asyncio.wait_for(go(), 20)) == {"answer": 8}
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["bin"]
 
 
 def test_nothing_is_recorded_without_a_recording(tmp_path: Path) -> None:
@@ -533,30 +701,77 @@ def test_every_engine_has_a_complete_table() -> None:
     for table in TABLES.values():
         assert list(table.capabilities()) == list(CAPABILITY_NAMES)
         assert all(Known(value) for value in table.capabilities().values())
-        assert (table.minimum_version is None) == (table.tested_on is None)
-    for engine in ("grok-build", "codex", "antigravity"):
-        table = table_of(engine)
-        assert table.pending is not None
-        assert set(table.capabilities().values()) == {"unknown"}
+        assert table.minimum_version is None or table.tested_on is not None
     with pytest.raises(KeyError):
         table_of("no-such-engine")
 
 
+def test_a_minimum_version_needs_the_date_of_its_run() -> None:
+    with pytest.raises(ValueError, match="without its run"):
+        dataclasses.replace(CLAUDE_CODE, tested_on=None)
+
+
+@pytest.mark.parametrize(
+    ("engine", "refusal"),
+    [
+        ("codex", unsupported_codex),
+        ("grok-build", unsupported_grok),
+        ("antigravity", unsupported_antigravity),
+    ],
+)
+def test_the_filled_tables_match_what_their_adapters_refuse(
+    engine: str, refusal: Callable[[LineConfig], str | None]
+) -> None:
+    """The Grok, Codex and Antigravity tables were filled after their adapters
+    changed on another branch. A kept session is refused by the adapter exactly where
+    the table says it is not kept."""
+    refused = refusal(LineConfig(keep_session=True)) is not None
+    assert refused == (table_of(engine).kept_session is not Known.YES)
+
+
+def test_the_filled_tables_say_what_was_never_observed() -> None:
+    """Review of 2026-10-27, C1, applied to the filled tables. Only Codex was run
+    live for a turn, so only its own tools and isolation are known."""
+    codex_table, grok_table, antigravity_table = (
+        table_of("codex"),
+        table_of("grok-build"),
+        table_of("antigravity"),
+    )
+    assert (codex_table.own_tools, codex_table.deny_before_run) == (Known.YES,) * 2
+    assert codex_table.tested_on is not None and codex_table.minimum_version is None
+    for table in (grok_table, antigravity_table):
+        assert table.own_tools is Known.UNKNOWN
+        assert table.tested_on is None
+    assert grok_table.deny_before_run is Known.UNKNOWN
+    assert antigravity_table.deny_before_run is Known.NO
+    for table in (codex_table, grok_table, antigravity_table):
+        assert table.sign_in_check is Known.UNKNOWN
+
+
 # The probe's options.
+
+
+def test_every_engine_with_a_table_records() -> None:
+    assert set(TABLES) == cli.RECORDING_ENGINES
 
 
 def test_the_probe_records_only_where_it_can(
     tmp_path: Path,
     short_runtime: Path,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Every engine records, so an engine whose adapter does not is made here, by
+    taking Codex out of the engines that record."""
     base = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime), "probe"]
     assert cli.main([*base, "--record-stderr"]) == exits.FAILURE
     assert "only together with --record" in capsys.readouterr().err
+    monkeypatch.setattr(cli, "RECORDING_ENGINES", cli.RECORDING_ENGINES - {"codex"})
     codex = [*base, "--model", "gpt-6-luna", "--record"]
     assert cli.main(codex) == exits.FAILURE
     assert "not yet supported for codex" in capsys.readouterr().err
     assert not (tmp_path / "tmp" / "probes").exists()
+    assert not (tmp_path / ".dromon" / "probes").exists()
 
 
 def test_an_init_without_its_tools_is_unknown_and_refused() -> None:
@@ -580,9 +795,12 @@ def test_refusals_and_isolation_are_derived_from_the_tables() -> None:
     )
     assert isolation_of(CLAUDE_CODE) == "full"
     assert isolation_of(table_of("cursor-agent")) == "partial"
-    assert isolation_of(table_of("codex")) == "unknown"
-    # Review of 2026-10-27, C1. Pi was never run live.
+    assert isolation_of(table_of("codex")) == "full"
+    assert isolation_of(table_of("antigravity")) == "partial"
+    # Review of 2026-10-27, C1. Pi and Grok were never run live for a turn.
     assert isolation_of(table_of("pi")) == "unknown"
+    assert isolation_of(table_of("grok-build")) == "unknown"
+    # Antigravity is partial by its table now, not by name.
     assert {"cursor-agent", "antigravity"} == cli.PARTIAL_ISOLATION_ENGINES
 
 
@@ -591,7 +809,7 @@ def test_the_probe_reports_each_table_as_it_stands() -> None:
     assert claude[0] == "table claude-code, tested from 2.1.310 on 2026-10-26"
     assert "kept_session yes" in claude[1] and "sign_in_check unknown" in claude[1]
     assert len(claude) == 2
-    for engine in ("pi", "cursor-agent"):
+    for engine in ("pi", "cursor-agent", "grok-build", "antigravity"):
         assert report_lines(table_of(engine))[0] == (
             f"table {engine}, never run live, so no minimum version is enforced and"
             " any version the engine reports runs"
@@ -599,8 +817,13 @@ def test_the_probe_reports_each_table_as_it_stands() -> None:
     pi = report_lines(table_of("pi"))
     assert "own_tools unknown, deny_before_run unknown" in pi[1]
     assert "sign_in_check unknown" in pi[1]
-    grok = report_lines(table_of("grok-build"))
-    assert "to be filled" in grok[2]
+    codex_report = report_lines(table_of("codex"))
+    assert codex_report[0] == (
+        "table codex, run live on 2026-10-25, but no version is read, so no minimum"
+        " version is enforced and any version the engine reports runs"
+    )
+    assert "deny_before_run yes" in codex_report[1]
+    assert all(len(report_lines(table)) == 2 for table in TABLES.values())
 
 
 # Scrubbing. Every value below is invented, in the shapes of the first live Claude Code
@@ -662,21 +885,21 @@ def identifying(tmp_path: Path, extra: dict[str, Any] | None = None) -> Path:
                 "status": "allowed_warning",
                 "resetsAt": 1798000123,
                 "rateLimitType": "seven_day",
-                "utilization": 0.87,
+                "utilization": 0.871931,
                 "overageStatus": "rejected",
                 "overageDisabledReason": "out_of_credits",
                 "isUsingOverage": True,
-                "surpassedThreshold": 0.75,
-                "remainingRequests": 4321,
+                "surpassedThreshold": 0.758263,
+                "remainingRequests": 864213,
                 "windowLabel": "a label no reader lists",
                 "overageResetsAt": None,
                 "unifiedWindows": {
                     "five_hour": {
-                        "utilization": 0.31,
+                        "utilization": 0.314927,
                         "resetsAt": 1798000456,
                         "status": "allowed",
                         "rateLimitType": "a window no one named",
-                        "usedRequests": [57, 58],
+                        "usedRequests": [735791, 735792],
                     },
                 },
             },
@@ -734,22 +957,148 @@ def test_a_scrubbed_recording_keeps_its_shape_with_stable_placeholders(
             },
         },
     }
+    # The invented values are long and unusual, so no timestamp, identifier or
+    # placeholder in the scrubbed text can hold one by chance. A value of 57 once
+    # failed this check when the recording's own clock read 01:57.
     for usage in (
-        "0.87",
-        "0.31",
-        "0.75",
+        "0.871931",
+        "0.314927",
+        "0.758263",
         "1798000123",
         "out_of_credits",
-        "4321",
+        "864213",
         "no reader lists",
         "no one named",
-        "57",
+        "735791",
+        "735792",
     ):
         assert usage not in text
     assert clean.frames[5][1]["session_id"] == init["session_id"] != init["uuid"]
     assert clean.frames[2][1]["session_id"] == "session-1"
     assert clean.stderr is not None and init["uuid"] in clean.stderr
     assert evidence.SCRUBBED_HOME in clean.stderr
+
+
+def test_a_codex_recording_loses_its_account_and_plan_usage(tmp_path: Path) -> None:
+    """Codex reports its account in ``account/read`` and its plan's use in
+    ``rateLimits``, in the shapes of its app-server protocol, which no recording has
+    shown yet. Every value here is invented."""
+    path = tmp_path / "codex.jsonl"
+    recording = Recording(path, "codex", "gpt-6-luna")
+    recording.frame(OUT, {"id": 2, "method": "account/read", "params": {}})
+    recording.frame(
+        IN,
+        {
+            "id": 2,
+            "result": {
+                "account": {"type": "chatgpt", "email": EMAIL, "planType": "pro"},
+                "requiresOpenaiAuth": True,
+            },
+        },
+    )
+    recording.frame(
+        IN,
+        {
+            "method": "account/rateLimits/updated",
+            "params": {
+                "rateLimits": {
+                    "primary": {
+                        "usedPercent": 37.518,
+                        "windowDurationMins": 29983,
+                        "resetsAt": 1798000789,
+                    },
+                    "secondary": None,
+                    "planType": "pro",
+                }
+            },
+        },
+    )
+    recording.close()
+    written = evidence.scrub_file(path, tmp_path / "clean.jsonl", HOME)
+    text = written.read_text()
+    for value in (EMAIL, "37.518", "29983", "1798000789", '"pro"'):
+        assert value not in text
+    clean = read_recording(written)
+    assert clean.frames[1][1]["result"]["account"]["type"] == "chatgpt"
+    assert clean.frames[2][1]["params"]["rateLimits"] == {
+        "primary": {
+            "usedPercent": evidence.SCRUBBED_NUMBER,
+            "windowDurationMins": evidence.SCRUBBED_NUMBER,
+            "resetsAt": evidence.SCRUBBED_EPOCH,
+        },
+        "secondary": None,
+        "planType": evidence.SCRUBBED_REASON,
+    }
+
+
+def test_any_key_naming_an_account_organization_email_or_plan_is_scrubbed(
+    tmp_path: Path,
+) -> None:
+    """Review of 2026-10-27, S2. A key is judged by the words of its name, wherever it
+    stands, and each value is replaced by one of its own type. A list or object under
+    an email or plan key is scrubbed as any other value, so Codex's plan steps keep
+    their status words, which other frames share."""
+    source = recorded(
+        tmp_path,
+        [
+            (
+                IN,
+                {
+                    "method": "account/updated",
+                    "params": {
+                        "userEmail": EMAIL,
+                        "orgId": "org-8c1f4e2a",
+                        "organization": {
+                            "name": ORGANIZATION,
+                            "type": "team",
+                            "seats": 12,
+                            "active": True,
+                            "parent": None,
+                        },
+                        "chatgptPlanType": "prolific",
+                        "explanation": "the prolific plan",
+                    },
+                },
+            ),
+            (
+                IN,
+                {
+                    "method": "turn/plan/updated",
+                    "params": {
+                        "plan": [{"step": "read files", "status": "completed"}],
+                    },
+                },
+            ),
+            (IN, {"method": "item/completed", "params": {"status": "completed"}}),
+        ],
+    )
+    clean = read_recording(evidence.scrub_file(source, tmp_path / "c.jsonl", HOME))
+    params = clean.frames[0][1]["params"]
+    assert params == {
+        "userEmail": "scrubbed-account-userEmail",
+        "orgId": "scrubbed-account-orgId",
+        "organization": {
+            "name": "scrubbed-account-name",
+            "type": "team",
+            "seats": evidence.SCRUBBED_NUMBER,
+            "active": False,
+            "parent": None,
+        },
+        "chatgptPlanType": "scrubbed-account-chatgptPlanType",
+        "explanation": "the scrubbed-account-chatgptPlanType plan",
+    }
+    assert clean.frames[1][1] == read_recording(source).frames[1][1]
+    assert clean.frames[2][1] == read_recording(source).frames[2][1]
+
+
+def test_key_words_split_every_naming_style() -> None:
+    words = evidence._key_words  # pyright: ignore[reportPrivateUsage]
+    assert words("planType") == {"plan", "type"}
+    assert words("chatgpt_plan_type") == {"chatgpt", "plan", "type"}
+    assert words("OrgID") == {"org", "id"}
+    assert words("organizationUUID") == {"organization", "uuid"}
+    assert words("explanation") == {"explanation"}
+    assert words("user-email") == {"user", "email"}
 
 
 def test_a_scrubbed_recording_replays_as_its_original_would(tmp_path: Path) -> None:
@@ -849,35 +1198,45 @@ def test_every_account_value_is_replaced_as_a_word_whatever_its_length(
 ) -> None:
     """Review of 2026-10-27, E2. The plan name ``max`` is three characters, once too
     short to be replaced outside the account block."""
-    source = identifying(tmp_path, {"plan": "on the max plan, at maximum"})
+    source = identifying(tmp_path, {"remark": "on the max plan, at maximum"})
     clean = read_recording(evidence.scrub_file(source, tmp_path / "c.jsonl", HOME))
-    assert clean.frames[3][1]["plan"] == (
+    assert clean.frames[3][1]["remark"] == (
         "on the scrubbed-account-subscriptionType plan, at maximum"
     )
 
 
 def test_probe_scrub_writes_a_copy_without_running_a_turn(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    short_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Review of 2026-10-27, R1. A relative name is read from the state directory's
+    probes, where ``--record`` writes, and the copy goes to the project's
+    ``tmp/probes``, where lines can read it."""
     monkeypatch.setenv("HOME", HOME)
-    source = identifying(tmp_path)
-    assert cli.main(["probe", "--scrub", str(source)]) == exits.OK
-    target = tmp_path / "raw.scrubbed.jsonl"
+    base = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime), "probe"]
+    probes = tmp_path / ".dromon" / "probes"
+    probes.mkdir(parents=True)
+    source = identifying(probes)
+    assert cli.main([*base, "--scrub", source.name]) == exits.OK
+    target = tmp_path / "tmp" / "probes" / "raw.scrubbed.jsonl"
     assert str(target) in capsys.readouterr().out
     assert EMAIL not in target.read_text()
-    assert cli.main(["probe", "--scrub", str(source)]) == exits.FAILURE
+    assert cli.main([*base, "--scrub", source.name]) == exits.FAILURE
     assert "cannot write" in capsys.readouterr().err
     chosen = tmp_path / "chosen.jsonl"
     assert (
-        cli.main(["probe", "--scrub", str(source), "--scrub-to", str(chosen)])
-        == exits.OK
+        cli.main([*base, "--scrub", str(source), "--scrub-to", str(chosen)]) == exits.OK
     )
     assert chosen.exists()
-    assert cli.main(["probe", "--scrub-to", str(chosen)]) == exits.FAILURE
+    assert cli.main([*base, "--scrub-to", str(chosen)]) == exits.FAILURE
     assert "only with --scrub" in capsys.readouterr().err
     leaky = identifying(tmp_path / "leaky", {"contact": "other@example.net"})
-    assert cli.main(["probe", "--scrub", str(leaky)]) == exits.FAILURE
+    assert cli.main([*base, "--scrub", str(leaky)]) == exits.FAILURE
     assert "an email address" in capsys.readouterr().err
+    assert cli.main([*base, "--scrub", "absent.jsonl"]) == exits.FAILURE
+    assert "cannot read" in capsys.readouterr().err
 
 
 def test_the_live_fixture_is_scrubbed_and_replays_through_the_real_adapter() -> None:
