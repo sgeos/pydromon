@@ -474,9 +474,10 @@ def test_successor_args_read_back_as_the_same_command_line() -> None:
 
 
 def test_start_successor_reports_a_successor_that_does_not_start(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    paths: ProjectPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    paths = project_paths(tmp_path, tmp_path / "run")
     started: list[Sequence[str]] = []
 
     def start(paths: ProjectPaths, args: Sequence[str]) -> int:
@@ -506,8 +507,15 @@ def respond(target: Daemon, op: str, args: dict[str, object]) -> Response:
     return target.respond(line)
 
 
-def make_daemon(target: World, tmp_path: Path) -> Daemon:
-    paths = project_paths(tmp_path, tmp_path / "run")
+@pytest.fixture
+def paths(tmp_path: Path, short_runtime: Path) -> ProjectPaths:
+    """The project's paths. Their runtime directory is the shared short one, because
+    ``project_paths`` refuses a socket path over macOS's limit, which a runtime
+    directory under pytest's own temporary path can pass."""
+    return project_paths(tmp_path, short_runtime)
+
+
+def make_daemon(target: World, paths: ProjectPaths) -> Daemon:
     return Daemon(
         paths,
         target.log,
@@ -519,10 +527,10 @@ def make_daemon(target: World, tmp_path: Path) -> Daemon:
 
 
 def test_restart_drains_then_stops_for_a_successor_with_the_same_options(
-    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    world: World, paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(restart, "POLL_SECONDS", 1e-6)
-    target = make_daemon(world, tmp_path)
+    target = make_daemon(world, paths)
     gate = asyncio.Event()
     world.gates["alpha"] = [gate]
 
@@ -550,10 +558,10 @@ def test_restart_drains_then_stops_for_a_successor_with_the_same_options(
 
 
 def test_an_abandoned_restart_does_not_stop_the_daemon(
-    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    world: World, paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(restart, "POLL_SECONDS", 1e-6)
-    target = make_daemon(world, tmp_path)
+    target = make_daemon(world, paths)
     gate = asyncio.Event()
     world.gates["alpha"] = [gate]
     world.safe_points = 0
@@ -597,12 +605,12 @@ def test_an_abandoned_restart_does_not_stop_the_daemon(
 )
 def test_a_bad_restart_is_refused_and_changes_nothing(
     world: World,
-    tmp_path: Path,
+    paths: ProjectPaths,
     args: dict[str, object],
     code: ErrorCode,
     text: str,
 ) -> None:
-    target = make_daemon(world, tmp_path)
+    target = make_daemon(world, paths)
 
     async def go() -> Response:
         return respond(target, "restart", args)
@@ -613,8 +621,10 @@ def test_a_bad_restart_is_refused_and_changes_nothing(
     assert world.scheduler.restart_status() is None
 
 
-def test_a_restart_while_one_drains_is_rejected(world: World, tmp_path: Path) -> None:
-    target = make_daemon(world, tmp_path)
+def test_a_restart_while_one_drains_is_rejected(
+    world: World, paths: ProjectPaths
+) -> None:
+    target = make_daemon(world, paths)
 
     async def go() -> tuple[Response, Response]:
         first = respond(target, "restart", {"operator": "ana"})
@@ -679,10 +689,10 @@ def no_sleep(seconds: float) -> None:
 
 
 @pytest.fixture
-def cli_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ProjectPaths:
+def cli_paths(paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch) -> ProjectPaths:
     monkeypatch.setattr(cli, "RESTART_POLL_SECONDS", 0.0)
     monkeypatch.setattr(cli, "_preflight", lambda: None)
-    return project_paths(tmp_path, tmp_path / "run")
+    return paths
 
 
 def test_dromon_restart_waits_for_a_new_pid_and_names_both_commits(
@@ -846,14 +856,14 @@ def test_the_restart_subcommand_parses_its_options() -> None:
 
 def test_dromon_restart_crosses_the_wire_to_a_daemon_whose_rates_are_known(
     world: World,
-    tmp_path: Path,
+    paths: ProjectPaths,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(restart, "POLL_SECONDS", 1e-6)
     monkeypatch.setattr(cli, "RESTART_POLL_SECONDS", 0.0)
     monkeypatch.setattr(cli, "_preflight", lambda: None)
-    target = make_daemon(world, tmp_path)
+    target = make_daemon(world, paths)
     world.monotonic = 67.0
     events = world.log.last_seq - world.log.opened_seq
     assert events * 3600 % 67 != 0, "the rate must have a fraction"
