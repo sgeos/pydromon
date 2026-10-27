@@ -15,7 +15,7 @@ from claude_agent_sdk import SdkMcpTool
 
 from dromon.activity import ActivityKind
 from dromon.driver import DriverError, Strategy
-from dromon.engine import TurnReport
+from dromon.engine import EnginePlanLimit, TurnReport
 from dromon.eventlog import EventLog, read_entries
 from dromon.lineconfig import ConfigError, LineConfig, ToolPolicy, encode_config
 from dromon.overrides import OverrideError
@@ -65,6 +65,7 @@ class Scripted:
         self.results: list[dict[str, Any]] = []
         self.gate: asyncio.Event | None = None
         self.fail = False
+        self.plan_limit: str | None = None
         self.cost: float | None = None
 
     async def run_turn(self, prompt: str) -> TurnReport:
@@ -73,6 +74,8 @@ class Scripted:
             await self.gate.wait()
         if self.fail:
             raise RuntimeError("the engine broke")
+        if self.plan_limit is not None:
+            raise EnginePlanLimit(self.plan_limit)
         calls = self.turns.pop(0) if self.turns else []
         # Like a real engine, a new session gets an identifier and a resumed one
         # keeps it.
@@ -426,6 +429,18 @@ def test_an_engine_failure_holds_the_line_and_asks_an_operator(
     # The answer released the line, and the mail that waited is delivered.
     assert len(target.engines["alpha"].prompts) > 1
     assert target.log.state.lines["alpha"].held_by is None
+
+
+def test_a_plan_limit_holds_the_line_until_operator_release(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": [[], []]})
+    target.engine("alpha").plan_limit = "Codex plan limit reached; reset time tomorrow"
+    run(target, send(target, "alpha", "hello"))
+    question_id = target.log.state.lines["alpha"].held_by
+    assert question_id is not None
+    assert "reset time tomorrow" in target.log.state.messages[question_id].body
+    assert len(target.engines["alpha"].prompts) == 1
 
 
 def test_an_open_question_never_stops_its_line(make_world: MakeWorld) -> None:

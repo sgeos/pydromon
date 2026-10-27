@@ -85,6 +85,7 @@ from dromon.engine import (
     DIED_NOTE,
     HALT_REASON,
     CompactionRequest,
+    EnginePlanLimit,
     MAX_CALLS,
     BackgroundEnd,
     add_usage,
@@ -183,6 +184,8 @@ takes three parameters and termination two, whose names beyond ``threadId`` and
 ``processId`` are an inference. Not run, since a line may not start Codex."""
 
 MAX_TERMINALS: Final = 64
+MAX_TERMINAL_PAGES: Final = 16
+"""Bound a cursor walk and fail closed if Codex still has another page."""
 
 TERMINAL_POLL_SECONDS: Final = 15.0
 """How often, between turns, a kept connection lists the line's own terminals to
@@ -197,6 +200,8 @@ MAX_OWN_COMMANDS: Final = 1024
 """The most background terminals a listing returns."""
 
 REQUEST_TIMEOUT_SECONDS: Final = 30.0
+OUTPUT_CLOSE_SECONDS: Final = 2.0
+"""Bound the wait for a live app-server whose output pipe has closed."""
 
 TOKEN_USAGE_UPDATED: Final = "thread/tokenUsage/updated"  # noqa: S105
 COMPACT_START: Final = "thread/compact/start"
@@ -472,6 +477,9 @@ class _Process:
             raise EngineRefused("the engine was started without a standard output")
         line = await stdout.readline()
         if not line:
+            if self._process.returncode is None:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._process.wait(), OUTPUT_CLOSE_SECONDS)
             return None
         decoded: object = json.loads(line)
         if not isinstance(decoded, dict):
@@ -552,6 +560,86 @@ def identifier(value: object) -> str | None:
 
 class _RpcError(Exception):
     pass
+
+
+PLAN_LIMIT_CODES: Final = frozenset(
+    {
+        "plan_limit_reached",
+        "plan_limit_exceeded",
+        "usage_limit_reached",
+        "usage_limit_exceeded",
+    }
+)
+"""Inferred app-server limit codes, unverified against a live error."""
+
+
+def _plan_limit(error: object) -> str | None:
+    """Recognize a structured limit code or specific limit wording.
+
+    **Inference, not observed live.** The words below are plausible app-server
+    representations. A live error is needed to confirm the vocabulary.
+    """
+    if not isinstance(error, dict):
+        return None
+    fields = cast(dict[str, object], error)
+    raw_code = fields.get("code")
+    if isinstance(raw_code, str) and raw_code:
+        if raw_code.strip().lower() not in PLAN_LIMIT_CODES:
+            return None
+        return _plan_limit_message(fields)
+    raw_message = fields.get("message")
+    if not isinstance(raw_message, str):
+        return None
+    message = " ".join(raw_message.lower().replace("_", " ").split())
+    terms = (
+        "plan limit",
+        "usage limit",
+        "reached your limit",
+        "reached the usage limit",
+        "quota exceeded",
+    )
+    if not any(term in message for term in terms):
+        return None
+    return _plan_limit_message(fields)
+
+
+def _plan_limit_message(fields: Mapping[str, object]) -> str:
+    """Format the limit and its structured reset time, where reported."""
+    reset: object = None
+    data = fields.get("data")
+    if isinstance(data, dict):
+        detail = cast(dict[str, object], data)
+        reset = next(
+            (
+                detail[key]
+                for key in (
+                    "reset_at",
+                    "resets_at",
+                    "reset_time",
+                    "resetsAt",
+                    "resetTime",
+                )
+                if key in detail
+            ),
+            None,
+        )
+    if reset is None:
+        reset = next(
+            (
+                fields[key]
+                for key in (
+                    "reset_at",
+                    "resets_at",
+                    "reset_time",
+                    "resetsAt",
+                    "resetTime",
+                )
+                if key in fields
+            ),
+            None,
+        )
+    suffix = f"; reset time {reset}" if isinstance(reset, (str, int, float)) else ""
+    return f"Codex subscription plan limit reached{suffix}"
 
 
 def breakdown(value: object) -> dict[str, int]:
@@ -646,7 +734,10 @@ class _Routed:
             for future in self.pending.values():
                 if not future.done():
                     future.set_exception(
-                        EngineRefused("the engine closed its connection")
+                        EngineRefused(
+                            "the Codex app-server output closed; pending requests "
+                            "failed"
+                        )
                     )
             self.pending.clear()
 
@@ -664,6 +755,8 @@ class _Kept:
     terminals: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
     """The line's own background terminals in the last listing. The one source of
     both ``list_background`` and the status, and of the ceiling."""
+    terminals_unknown: bool = False
+    """A failed listing means the last known terminal set may be incomplete."""
     listed_at: float | None = None
     """When ``terminals`` was listed, on the monotonic clock."""
     engine_listed: int = 0
@@ -951,7 +1044,11 @@ class CodexLine:
             message = await self._receive()
             if message.get("id") == request_id and "method" not in message:
                 if "error" in message:
-                    raise _RpcError(f"{method}: {message['error']}")
+                    error = message["error"]
+                    limit = _plan_limit(error)
+                    if limit is not None:
+                        raise EnginePlanLimit(limit)
+                    raise _RpcError(f"{method}: {error}")
                 result: object = message.get("result")
                 return cast(dict[str, Any], result) if isinstance(result, dict) else {}
             await self._dispatch(message, turn)
@@ -1304,6 +1401,8 @@ class CodexLine:
         kept = self._kept
         if kept is None or not kept.routed.alive or self._in_turn:
             return None
+        if kept.terminals_unknown:
+            return kept.last_end + self.config.keep_session_hard_seconds - self._clock()
         deadline = self._ceiling_of(kept).deadline(kept.last_end, bool(kept.terminals))
         return deadline - self._clock()
 
@@ -1323,6 +1422,9 @@ class CodexLine:
             "kept": alive,
             "seconds_to_close": self.seconds_to_close(),
             "background_tasks": len(terminals),
+            "background_tasks_unknown": bool(
+                kept is not None and alive and kept.terminals_unknown
+            ),
             "tasks": [
                 {"task_id": str(t.get("process_id")), "command": str(t.get("command"))}
                 for t in terminals
@@ -1341,6 +1443,13 @@ class CodexLine:
         kept = self._kept
         if kept is None or not kept.routed.alive or self._in_turn:
             return False
+        if kept.terminals_unknown:
+            if self._clock() < (kept.last_end + self.config.keep_session_hard_seconds):
+                return False
+            await self.close(
+                "its background terminal listing remained unknown until the hard bound"
+            )
+            return True
         reason = self._ceiling_of(kept).due(
             kept.last_end, len(kept.terminals), self._clock()
         )
@@ -1511,7 +1620,7 @@ class CodexLine:
             self._post_ends(kept)
         if (
             self._in_turn
-            or not kept.terminals
+            or (not kept.terminals and not kept.terminals_unknown)
             or kept.poll_failures >= MAX_POLL_FAILURES
         ):
             return
@@ -1522,6 +1631,8 @@ class CodexLine:
             return
         try:
             await self.list_background()
+        except EnginePlanLimit:
+            raise
         except EngineRefused:
             kept.poll_failures += 1
             return
@@ -1551,6 +1662,9 @@ class CodexLine:
         finally:
             kept.routed.pending.pop(request_id, None)
         if "error" in message:
+            limit = _plan_limit(message["error"])
+            if limit is not None:
+                raise EnginePlanLimit(limit)
             raise EngineRefused(f"the engine refused {method}: {message['error']}")
         result: object = message.get("result")
         return cast(dict[str, Any], result) if isinstance(result, dict) else {}
@@ -1614,13 +1728,47 @@ class CodexLine:
     async def list_background(self) -> list[dict[str, object]]:
         """The background terminals of the line's own thread. Raises
         ``EngineRefused``."""
-        result = await self.request(LIST_TERMINALS, {"threadId": self._thread_id})
-        # The listing's field name was not read, so its one list is taken.
+        try:
+            return await self._list_background()
+        except EngineRefused:
+            if self._kept is not None:
+                self._kept.terminals_unknown = True
+            raise
+
+    async def _list_background(self) -> list[dict[str, object]]:
+        """Complete a cursor walk before changing the last known terminal state."""
         listed: list[object] = []
-        for value in result.values():
-            if isinstance(value, list):
-                listed = cast(list[object], value)
+        cursor: object = None
+        for _page in range(MAX_TERMINAL_PAGES):
+            params: dict[str, object] = {"threadId": self._thread_id}
+            if cursor is not None:
+                params["cursor"] = cursor
+            result = await self.request(LIST_TERMINALS, params)
+            data = result.get("data")
+            if not isinstance(data, list):
+                raise EngineRefused("the engine returned no background terminal page")
+            page_data = cast(list[object], data)
+            cursor = result.get("nextCursor")
+            if len(listed) + len(page_data) > MAX_TERMINALS:
+                raise EngineRefused(
+                    "the background terminal listing exceeds its 64-terminal "
+                    "bound, so terminal state is unknown"
+                )
+            listed.extend(page_data)
+            if cursor is None:
                 break
+            if not isinstance(cursor, str) or not cursor:
+                raise EngineRefused("the engine returned an invalid terminal cursor")
+            if len(listed) == MAX_TERMINALS:
+                raise EngineRefused(
+                    "the background terminal listing reached its 64-terminal bound "
+                    "with another page, so terminal state is unknown"
+                )
+        else:
+            raise EngineRefused(
+                "the background terminal listing is unfinished after "
+                f"{MAX_TERMINAL_PAGES} pages, so terminal state is unknown"
+            )
         terminals: list[dict[str, object]] = []
         for entry in listed[:MAX_TERMINALS]:
             if not isinstance(entry, dict):
@@ -1653,6 +1801,7 @@ class CodexLine:
         if kept is not None:
             self._note_ends(kept, terminals)
             kept.terminals = terminals
+            kept.terminals_unknown = False
             kept.listed_at = self._clock()
             kept.engine_listed = min(len(listed), MAX_TERMINALS)
         return terminals
@@ -1734,8 +1883,12 @@ class CodexLine:
         await self.request(
             TERMINATE_TERMINAL, {"threadId": self._thread_id, "processId": process_id}
         )
-        with contextlib.suppress(EngineRefused):
+        try:
             await self.list_background()
+        except EnginePlanLimit:
+            raise
+        except EngineRefused:
+            pass
         return f"terminated background terminal {process_id}"
 
     async def _kept_turn(
@@ -1812,10 +1965,15 @@ class CodexLine:
         if turn.refusal is not None:
             await self.close()
             raise EngineRefused(turn.refusal)
-        # A listing that fails leaves the count empty, so the shorter idle time
-        # applies.
-        with contextlib.suppress(EngineRefused):
+        try:
             await self.list_background()
+        except EnginePlanLimit:
+            await self.close("Codex reported a subscription plan limit")
+            raise
+        except EngineRefused:
+            # Keep the last known state marked unknown. The idle deadline must not
+            # treat a failed listing as an empty set of background terminals.
+            pass
         return self._report(turn, credential, thread_id, compaction)
 
     async def _interrupt_kept(self, kept: _Kept, turn_id: str) -> None:

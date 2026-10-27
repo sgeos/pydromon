@@ -131,6 +131,12 @@ SIGN_IN_REQUIRED: Final = -32000
 """The error code the runtime answers with when it needs a sign-in, as a second
 implementation reads it."""
 
+FIRST_OUTPUT_SECONDS: Final = 180.0
+"""Maximum time before Antigravity's first model message, including sign-in."""
+
+ABSOLUTE_TURN_SECONDS: Final = 4 * 60 * 60
+"""Absolute four hour cap for one Antigravity turn, including active streams."""
+
 SIGN_IN_REFUSAL: Final = (
     "the Antigravity ACP runtime is not signed in. Sign it in by hand with its Google"
     " account sign-in, as docs/protocol/ANTIGRAVITY.md describes, since Dromon never"
@@ -529,6 +535,8 @@ class _Turn:
     """The tokens in context, from the latest ``usage_update``."""
     uncounted_compaction: bool = False
     """Whether the runtime compacted with no cost reported since."""
+    first_output_seen: bool = False
+    absolute_deadline: float | None = None
 
 
 class AntigravityLine:
@@ -552,6 +560,8 @@ class AntigravityLine:
         partial_isolation: bool = False,
         unverified_credential: bool = False,
         turn_seconds: float = TURN_SECONDS,
+        first_output_seconds: float = FIRST_OUTPUT_SECONDS,
+        absolute_turn_seconds: float = ABSOLUTE_TURN_SECONDS,
         cost_mark: CostMark | None = None,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
@@ -581,6 +591,7 @@ class AntigravityLine:
         a plan and does not bill per token, so the driver is given the subscription in
         place of the unverified credential. Until then every turn is refused."""
         self.turn_seconds = turn_seconds
+        self.absolute_turn_seconds = absolute_turn_seconds
         """How long a turn may run before the runtime is stopped and the turn
         refused."""
         self.cost_mark = cost_mark
@@ -588,6 +599,8 @@ class AntigravityLine:
         turn's cost is the difference."""
         self._client: acp.Client | None = None
         self._session: str | None = None
+        self._stage = "startup"
+        self.first_output_seconds = first_output_seconds
 
     async def run_turn(self, prompt: str) -> TurnReport:
         """Run one turn for ``prompt`` and return what happened."""
@@ -671,20 +684,39 @@ class AntigravityLine:
         )
 
     async def _run(self, connection: Connection, prompt: str, turn: _Turn) -> None:
+        self._stage = "initialize"
+
         async def dispatch(message: dict[str, Any]) -> None:
             await self._dispatch(message, turn)
 
         client = acp.Client(connection, dispatch)
-        client.deadline = asyncio.get_running_loop().time() + self.turn_seconds
+        client.deadline = asyncio.get_running_loop().time() + self.first_output_seconds
         self._client = client
         try:
             await self._converse(prompt, turn)
         except TimeoutError:
             if not turn.cancelled:
-                await self._cancel(
-                    turn,
-                    f"the turn passed its deadline of {self.turn_seconds:g} seconds",
-                )
+                if not turn.first_output_seen:
+                    turn.refusal = (
+                        "Antigravity timed out during "
+                        f"{self._stage} before its first output after "
+                        f"{self.first_output_seconds:g} seconds"
+                    )
+                else:
+                    absolute = (
+                        turn.absolute_deadline is not None
+                        and asyncio.get_running_loop().time() >= turn.absolute_deadline
+                    )
+                    await self._cancel(
+                        turn,
+                        (
+                            "the turn reached its absolute cap of "
+                            f"{self.absolute_turn_seconds:g} seconds"
+                            if absolute
+                            else "the turn had no activity for "
+                            f"{self.turn_seconds:g} seconds"
+                        ),
+                    )
             elif turn.refusal is None and turn.interrupted_for is None:
                 turn.refusal = "the engine did not finish cancelling its turn"
             await connection.stop()
@@ -702,6 +734,7 @@ class AntigravityLine:
 
     async def _converse(self, prompt: str, turn: _Turn) -> None:
         client = self._rpc()
+        self._stage = "initialize"
         start = await client.call(
             "initialize",
             {
@@ -714,7 +747,9 @@ class AntigravityLine:
         if refusal is not None:
             turn.refusal = refusal
             return
+        self._stage = "sign-in"
         await client.call("authenticate", {"methodId": SIGN_IN_METHOD})
+        self._stage = "session setup"
         result = await self._open_session(start, turn)
         if turn.refusal is not None or self._session is None:
             return
@@ -736,6 +771,10 @@ class AntigravityLine:
             instructions = read_instructions(self.config.instructions, self.cwd)
             text = f"{instructions}\n\n{prompt}" if instructions else prompt
         self.driver.step(Event("turn_start"))
+        turn.absolute_deadline = (
+            asyncio.get_running_loop().time() + self.absolute_turn_seconds
+        )
+        self._stage = "first model output"
         answer = await client.call(
             "session/prompt",
             {"sessionId": self._session, "prompt": [{"type": "text", "text": text}]},
@@ -900,6 +939,17 @@ class AntigravityLine:
                 turn, f"the engine sent an update Dromon does not know: {kind!r}"
             )
             return
+        if kind in (
+            "agent_message_chunk",
+            "agent_thought_chunk",
+            "tool_call",
+            "tool_call_update",
+        ):
+            turn.first_output_seen = True
+            if self._client is not None:
+                now = asyncio.get_running_loop().time()
+                absolute = turn.absolute_deadline or (now + self.turn_seconds)
+                self._client.deadline = min(now + self.turn_seconds, absolute)
         if kind == "agent_message_chunk":
             content = cast(dict[str, Any], update.get("content") or {})
             text = content.get("text")

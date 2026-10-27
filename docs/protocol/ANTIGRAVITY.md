@@ -183,8 +183,14 @@ with `DROMON_ANTIGRAVITY_RUNTIME`.
 16. **End.** `end_turn` is success, `cancelled` interrupted, and the other ACP stop
     reasons an error. Any other reason refuses the turn. A cancelled turn waits at most
     60 seconds for the prompt's answer before the runtime is stopped. A turn that has
-    not ended an hour after it started is cancelled, stopped and refused. Its
-    credential is `unverified` whatever the flags.
+    before its first activity has a 180 second deadline and its error names the stage,
+    including sign-in and first model output. After activity, the sliding inactivity
+    deadline is `TURN_SECONDS`, 3600 seconds, reset by model or tool activity. The
+    absolute `ABSOLUTE_TURN_SECONDS` cap is four hours. Reaching either bound cancels,
+    stops and refuses the turn. Its credential is `unverified` whatever the flags.
+    Before the first agent message, each wait has a 180 second deadline and its error
+    names the stage, including sign-in and first model output. Once output arrives, the
+    ordinary one hour turn deadline applies.
 17. **Usage.** **Antigravity review, F9.** A `usage_update` is counted where its shape
     allows. A whole, non-negative `used` becomes the context, and a finite,
     non-negative `cost.amount` in `USD` becomes the session's running total, from

@@ -37,6 +37,12 @@ and its `README.md`.
   sandbox, the permission mode or MCP servers.
 - Grok resolves a credential from its cached sign-in before `XAI_API_KEY`.
 
+**Fact, observed on 2026-10-26** from installed Grok Build 1.0.70, commit
+`f50904eaee6c`. `grok agent --help` lists `--always-approve`, but neither it nor
+`grok agent stdio --help` lists a permission-mode flag. Dromon therefore does not pass
+one. It sets both `yoloMode` and `autoMode` to false and checks or switches the session
+mode to `default` through ACP before the prompt.
+
 **Facts, observed on 2026-10-25.** An `initialize` request, which runs no model,
 answered with protocol version 1, `loadSession`, MCP over HTTP and SSE, the
 authentication methods `cached_token` and `grok.com` with `defaultAuthMethodId` set to
@@ -80,6 +86,11 @@ declares MCP servers for mail and documents.
    connection, which stops Grok. An interrupted turn is reported as cancelled, and a
    refused one keeps its reason. Before, a Grok that ignored the cancel held the line
    without bound.
+9. **Wait bounds.** Initialization, sign-in and session opening have a 180 second
+   deadline, with the failed stage named. A turn has a sliding inactivity deadline of
+   `TURN_SECONDS`, 3600 seconds, reset by model or tool activity. Its absolute deadline
+   is `ABSOLUTE_TURN_SECONDS`, four hours, so a continuous stream cannot hold the line
+   forever. The error names inactivity or the absolute cap.
 
 | ACP tool kind | Permitted by |
 |---|---|

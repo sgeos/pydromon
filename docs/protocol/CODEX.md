@@ -48,6 +48,19 @@ from the engine before reading on. The process is stopped when the turn ends.
 8. `item/tool/call` requests run Dromon's tool and answer with `success` and text
    `contentItems`. Approval requests are declined, and any other request is answered
    with an error.
+9. A subscription limit with a recognized structured error code is classified
+   separately. Dromon includes a reset time when Codex reports one and holds the line
+   for operator release, so the next tick does not retry against the same limit.
+
+## Plan limits
+
+**Inference, not observed in a live app-server error.** The structured codes
+`plan_limit_reached`, `plan_limit_exceeded`, `usage_limit_reached` and
+`usage_limit_exceeded` identify subscription limits. When Codex supplies no recognized
+structured code, Dromon uses the specific phrases `plan limit`, `usage limit`,
+`reached your limit`, `reached the usage limit` and `quota exceeded`. The generic word
+`quota` does not classify an error. A live app-server error is needed to confirm this
+vocabulary. A reported reset time is kept in the operator question that holds the line.
 
 ## Tools across threads
 
@@ -266,6 +279,17 @@ turn. `dromon probe --model gpt-6-luna` reported the subscription credential.
     and is looked for as `command`, `commandLine` or `cmd`. The second takes a
     `process_id` of 1 to 128 characters, which must be in a fresh listing of the same
     thread, and terminates it. Both refuse when no Codex session is kept.
+    Listings follow `nextCursor` for at most 16 pages. A malformed cursor, a walk that
+    remains unfinished, or a result over 64 terminals is an error and the terminal
+    state is treated as unknown. A failed listing preserves the last known terminal
+    set and cannot trigger the idle deadline. The connection stays open until its hard
+    bound or a later successful listing resolves the state.
+  - **Closed output.** If the app-server closes standard output while its process stays
+    alive, Dromon waits at most two seconds for process exit, then marks the connection
+    dead and fails pending requests.
+  - **Inherited usage.** On a resumed thread the first usage notice may include totals
+    from earlier turns. Dromon subtracts that notice's latest call to establish the
+    inherited baseline, so the current turn reports only its own usage.
   - **One lifecycle.** **Decided by the operator on 2026-10-26** in round 4. The last
     listing of the line's own terminals is the one source of both `list_background`
     and the status's task list, which also gives how many seconds ago it was listed and

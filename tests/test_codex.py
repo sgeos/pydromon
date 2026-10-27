@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
+from dromon import codex as codex_module
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon.codex import (
     DISABLED_FEATURES,
@@ -26,11 +27,12 @@ from dromon.codex import (
     engine_environment,
     server_arguments,
     tool_output,
+    turn_usage,
     unsupported,
 )
 from dromon.daemon import check_engines
 from dromon.driver import Credential, Driver, Strategy
-from dromon.engine import EngineRefused, TurnReport
+from dromon.engine import EnginePlanLimit, EngineRefused, TurnReport
 from dromon.launcher import (
     LAUNCH_MARK_VARIABLE,
     LAUNCH_VARIABLES,
@@ -43,6 +45,52 @@ from dromon.scheduler import LineSpec, engine_factory
 from dromon.settings import parse_settings, reserved_variable
 
 LUNA = "gpt-6-luna"
+
+
+def test_first_usage_notice_on_resumed_thread_excludes_inherited_totals() -> None:
+    turn = codex_module._Turn()  # pyright: ignore[reportPrivateUsage]
+    engine = CodexLine(luna(), CWD)
+    engine._usage_seen(  # pyright: ignore[reportPrivateUsage]
+        {
+            "tokenUsage": {
+                "last": {
+                    "totalTokens": 100,
+                    "inputTokens": 80,
+                    "outputTokens": 20,
+                },
+                "total": {
+                    "totalTokens": 1300,
+                    "inputTokens": 1080,
+                    "outputTokens": 220,
+                },
+            }
+        },
+        turn,
+    )
+    engine._usage_seen(  # pyright: ignore[reportPrivateUsage]
+        {
+            "tokenUsage": {
+                "last": {
+                    "totalTokens": 100,
+                    "inputTokens": 70,
+                    "outputTokens": 30,
+                },
+                "total": {
+                    "totalTokens": 1400,
+                    "inputTokens": 1150,
+                    "outputTokens": 250,
+                },
+            }
+        },
+        turn,
+    )
+    assert turn_usage(turn) == {
+        "input_tokens": 150,
+        "output_tokens": 50,
+        "total_tokens": 200,
+    }
+
+
 CWD = Path("/work")
 
 
@@ -98,6 +146,7 @@ class FakeServer:
         servers: Sequence[tuple[str, str, int]] = (("gmail", "disabled", 0),),
         apps: Sequence[object] = (),
         failing: str | None = None,
+        failing_error: dict[str, object] | None = None,
     ) -> None:
         self.turn = list(turn)
         self.account = account
@@ -107,6 +156,7 @@ class FakeServer:
         self.servers = servers
         self.apps = list(apps)
         self.failing = failing
+        self.failing_error = failing_error or {"code": -1, "message": "no"}
         self.sent: list[dict[str, Any]] = []
         self.queue: deque[dict[str, Any]] = deque()
         self.arguments: list[str] = []
@@ -128,9 +178,7 @@ class FakeServer:
         if not isinstance(method, str) or "id" not in sent:
             return
         if method == self.failing:
-            self.queue.append(
-                {"id": sent["id"], "error": {"code": -1, "message": "no"}}
-            )
+            self.queue.append({"id": sent["id"], "error": self.failing_error})
             return
         result = self.result(method)
         self.queue.append({"id": sent["id"], "result": result})
@@ -205,6 +253,67 @@ def line(
 
 def run(target: CodexLine, prompt: str = "hello") -> TurnReport:
     return asyncio.run(target.run_turn(prompt))
+
+
+def test_plan_limit_is_classified_with_reset_and_stops_before_turn() -> None:
+    server = FakeServer(
+        failing="thread/start",
+        failing_error={
+            "code": "usage_limit_reached",
+            "message": "retry later",
+            "data": {"resetsAt": "2026-10-27T08:00:00Z"},
+        },
+    )
+    with pytest.raises(EnginePlanLimit, match="2026-10-27T08:00:00Z"):
+        run(line(server))
+    assert "turn/start" not in server.methods()
+
+
+def test_an_unrelated_quota_error_does_not_hold_the_line() -> None:
+    server = FakeServer(
+        failing="thread/start",
+        failing_error={
+            "code": -32000,
+            "message": "The required parameter quota is missing",
+        },
+    )
+    with pytest.raises(EngineRefused) as raised:
+        run(line(server))
+    assert not isinstance(raised.value, EnginePlanLimit)
+
+
+def test_plan_limit_fallback_uses_specific_wording() -> None:
+    server = FakeServer(
+        failing="thread/start",
+        failing_error={"code": -32000, "message": "You have reached your limit"},
+    )
+    with pytest.raises(EnginePlanLimit):
+        run(line(server))
+
+
+def test_app_server_output_close_is_bounded_even_while_process_lives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(codex_module, "OUTPUT_CLOSE_SECONDS", 0.01)
+
+    class Stdout:
+        async def readline(self) -> bytes:
+            return b""
+
+    class LiveProcess:
+        stdout = Stdout()
+        returncode = None
+
+        async def wait(self) -> int:
+            await asyncio.Event().wait()
+            return 0
+
+    async def go() -> None:
+        from dromon.codex import _Process  # pyright: ignore[reportPrivateUsage]
+
+        assert await _Process(LiveProcess()).receive() is None  # pyright: ignore[reportArgumentType]
+
+    asyncio.run(go())
 
 
 # A plain turn.

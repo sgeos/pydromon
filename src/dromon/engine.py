@@ -263,6 +263,10 @@ class EngineRefused(Exception):
     """The credential policy or the driver refused to run the turn."""
 
 
+class EnginePlanLimit(EngineRefused):
+    """The subscription reached a plan limit and needs operator release."""
+
+
 MAX_INSTRUCTION_BYTES: Final = 256 * 1024
 """The largest instruction file a line reads, so a stray file cannot flood a turn."""
 

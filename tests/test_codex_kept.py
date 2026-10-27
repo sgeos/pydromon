@@ -24,6 +24,7 @@ from dromon.engine import (
     DIED_NOTE,
     HALT_REASON,
     BackgroundEnd,
+    EnginePlanLimit,
     EngineRefused,
     closed_note,
 )
@@ -62,7 +63,8 @@ class Server:
         if not isinstance(method, str) or "id" not in sent:
             return
         if method in self.world.failing:
-            self.out.put_nowait({"id": sent["id"], "error": {"message": "no"}})
+            error = self.world.errors.get(method, {"message": "no"})
+            self.out.put_nowait({"id": sent["id"], "error": error})
             return
         self.out.put_nowait({"id": sent["id"], "result": self.result(method, sent)})
         if method == "turn/start":
@@ -97,6 +99,13 @@ class Server:
         if method == "turn/start":
             return {"turn": {"id": f"t{self.turns + 1}"}}
         if method == LIST_TERMINALS:
+            if world.terminal_pages is not None:
+                params = cast(dict[str, Any], sent["params"])
+                page = int(params.get("cursor", "0"))
+                next_cursor = (
+                    str(page + 1) if page + 1 < len(world.terminal_pages) else None
+                )
+                return {"data": world.terminal_pages[page], "nextCursor": next_cursor}
             return {"data": list(world.terminals), "nextCursor": None}
         if method == TERMINATE_TERMINAL:
             params = cast(dict[str, Any], sent["params"])
@@ -139,7 +148,9 @@ class World:
         self.account = "chatgpt"
         self.profile = "dromon-line"
         self.terminals: list[dict[str, object]] = []
+        self.terminal_pages: list[list[dict[str, object]]] | None = None
         self.failing: set[str] = set()
+        self.errors: dict[str, object] = {}
         self.instructions = ""
 
     def line(
@@ -373,6 +384,100 @@ def test_background_terminals_are_listed_and_stopped_on_the_own_thread(
     assert listing["params"] == {"threadId": "th"}
 
 
+def test_background_terminal_listing_follows_cursors(tmp_path: Path) -> None:
+    world = World([[ran("i1", "p1"), ran("i2", "p2"), done()]])
+    world.terminal_pages = [
+        [{"itemId": "i1", "processId": "p1", "command": "first"}],
+        [{"itemId": "i2", "processId": "p2", "command": "second"}],
+    ]
+    engine = world.line(tmp_path)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        listed = await engine.list_background()
+        assert [entry["process_id"] for entry in listed] == ["p1", "p2"]
+        requests = [
+            item
+            for item in world.servers[0].sent
+            if item.get("method") == LIST_TERMINALS
+        ]
+        assert requests[-2]["params"] == {"threadId": "th"}
+        assert requests[-1]["params"] == {"threadId": "th", "cursor": "1"}
+
+    asyncio.run(go())
+
+
+def test_an_unfinished_terminal_cursor_walk_is_unknown(tmp_path: Path) -> None:
+    world = World([[done()]])
+    engine = world.line(tmp_path)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        world.terminal_pages = [[] for _ in range(17)]
+        with pytest.raises(EngineRefused, match="unfinished.*state is unknown"):
+            await engine.list_background()
+        await engine.close()
+
+    asyncio.run(go())
+
+
+def test_a_limit_from_the_end_of_turn_listing_propagates_to_the_scheduler(
+    tmp_path: Path,
+) -> None:
+    world = World([[ran("i1", "p1"), done()]])
+    world.failing = {LIST_TERMINALS}
+    world.errors[LIST_TERMINALS] = {
+        "code": "usage_limit_reached",
+        "message": "retry later",
+        "data": {"resetsAt": "tomorrow"},
+    }
+    engine = world.line(tmp_path)
+
+    async def go() -> None:
+        with pytest.raises(EnginePlanLimit, match="reset time tomorrow"):
+            await engine.run_turn("start command")
+        assert engine._kept is None  # pyright: ignore[reportPrivateUsage]
+
+    asyncio.run(go())
+
+
+def test_a_failed_terminal_listing_preserves_unknown_as_busy(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    world = World([[ran("i1", "p1"), done()]])
+    world.failing = {LIST_TERMINALS}
+    engine = world.line(tmp_path, clock=clock)
+
+    async def go() -> None:
+        await engine.run_turn("start command")
+        status = engine.kept_status()
+        assert status["background_tasks"] == 0
+        assert status["background_tasks_unknown"] is True
+        assert engine.seconds_to_close() == engine.config.keep_session_hard_seconds
+        clock.now += engine.config.keep_session_idle_seconds + 1
+        assert await engine.expire() is False
+        assert engine.kept_status()["kept"] is True
+        await engine.close()
+
+    asyncio.run(go())
+
+
+def test_terminal_pages_over_the_cap_are_unknown(tmp_path: Path) -> None:
+    world = World([[done()]])
+    engine = world.line(tmp_path)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        world.terminal_pages = [[{} for _ in range(64)], [{}]]
+        with pytest.raises(EngineRefused, match="64-terminal bound.*unknown"):
+            await engine.list_background()
+        assert engine.kept_status()["background_tasks_unknown"] is True
+        await engine.close()
+
+    asyncio.run(go())
+
+
 def test_a_tool_may_list_terminals_during_a_turn_without_deadlock(
     tmp_path: Path,
 ) -> None:
@@ -548,6 +653,30 @@ def test_writes_on_a_kept_connection_are_never_interleaved() -> None:
 
     asyncio.run(go())
     assert events == ["start 0", "end 0", "start 1", "end 1", "start 2", "end 2"]
+
+
+def test_closed_app_server_output_fails_pending_requests() -> None:
+    from dromon.codex import _Routed  # pyright: ignore[reportPrivateUsage]
+
+    class Closed:
+        async def send(self, message: Mapping[str, object]) -> None:
+            del message
+
+        async def receive(self) -> dict[str, Any] | None:
+            return None
+
+    async def between(message: dict[str, Any]) -> None:
+        del message
+
+    async def go() -> None:
+        routed = _Routed(Closed(), between)
+        future = asyncio.get_running_loop().create_future()
+        routed.pending[7] = future
+        await routed.pump()
+        with pytest.raises(EngineRefused, match="Codex app-server output closed"):
+            future.result()
+
+    asyncio.run(go())
 
 
 # Round 4. G, one lifecycle for the line's own terminals.
