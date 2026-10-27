@@ -16,6 +16,7 @@ from dromon.eventlog import EventLog
 from dromon.model import LineCreated, OperatorRegistered
 from dromon.configview import Overrides
 from dromon.paths import ProjectPaths, project_paths
+from dromon.protocol import Response, decode_response, encode_response
 from dromon.projectconfig import ProjectConfig
 from dromon.scheduler import MIN_RATE_SECONDS, LineSpec, Scheduler
 
@@ -82,7 +83,8 @@ def test_growth_is_counted_from_the_daemon_s_start(tmp_path: Path) -> None:
         clock.now += MIN_RATE_SECONDS * 60
         later = scheduler.event_log_status()
         hours = MIN_RATE_SECONDS * 60 / 3600
-        assert later["events_per_hour"] == round((log.last_seq - 1) / hours, 1)
+        assert later["events_per_hour"] == round((log.last_seq - 1) / hours)
+        assert type(later["events_per_hour"]) is int
         grown = cast(dict[str, object], later["since_start"])
         assert grown["seconds"] == MIN_RATE_SECONDS * 60
         assert grown["bytes"] == cast(int, later["bytes"]) - cast(int, log.opened_bytes)
@@ -98,7 +100,7 @@ def test_an_unknown_size_gives_no_growth_in_bytes(tmp_path: Path) -> None:
         assert status["bytes"] is None
         assert cast(dict[str, object], status["since_start"])["bytes"] is None
         assert status["bytes_per_hour"] is None
-        assert status["events_per_hour"] == 0.0
+        assert status["events_per_hour"] == 0
 
 
 def test_line_status_shows_the_log(tmp_path: Path) -> None:
@@ -148,11 +150,11 @@ def test_daemon_status_shows_the_log_s_size_and_growth(paths: ProjectPaths) -> N
             {
                 "bytes": 3 * 1024 * 1024,
                 "since_start": {"events": 12, "bytes": 2048},
-                "events_per_hour": 40.0,
+                "events_per_hour": 40,
                 "compaction": "none",
             },
             "event log 3.0 MiB, 12 events and 2.0 KiB since the daemon started,"
-            " 40.0 events an hour, compaction none",
+            " 40 events an hour, compaction none",
         ),
         (
             {
@@ -175,3 +177,33 @@ def test_dromon_status_prints_unknown_as_unknown(
     log: dict[str, object], expected: str
 ) -> None:
     assert cli._log_growth(log) == expected  # pyright: ignore[reportPrivateUsage]
+
+
+def test_daemon_status_with_a_fractional_rate_crosses_the_wire(
+    paths: ProjectPaths,
+) -> None:
+    """The live check of 2026-10-27. A rate of 805.2 events an hour was sent as a
+    float, which the client's decoder refuses, so ``dromon status`` failed once the
+    daemon had run for a minute."""
+    clock = Clock()
+    with EventLog(paths.event_log) as log:
+        scheduler = Scheduler(log, no_engine, clock=clock, hold_wakes=True)
+        target = Daemon(
+            paths,
+            log,
+            "2026-10-27T00:00:00Z",
+            scheduler,
+            project=ProjectConfig(),
+            command_line=Overrides(),
+            project_file_present=False,
+        )
+        for name in ("alpha", "beta", "gamma"):
+            scheduler.create_line(name, HAIKU, Strategy.SUBSCRIPTION)
+        clock.now += 67
+        events = log.last_seq - log.opened_seq
+        assert events * 3600 % 67 != 0, "the rate must have a fraction"
+        status = target.status()
+        decoded = decode_response(encode_response(Response("r", True, status)))
+        assert decoded.result is not None
+        shown = cast(dict[str, object], decoded.result["event_log"])
+        assert shown["events_per_hour"] == round(events * 3600 / 67)

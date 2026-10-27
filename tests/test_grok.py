@@ -7,7 +7,7 @@ script follows Grok Build 1.0.70's documentation and its ``initialize`` answer.
 import asyncio
 import json
 from collections import deque
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -20,6 +20,7 @@ from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon.agents import AgentError, LineTokens
 from dromon.daemon import Daemon
 from dromon.driver import Credential, Driver, Strategy
+from dromon.priority import SteeredDriver
 from dromon.engine import EngineRefused, TurnReport
 from dromon.eventlog import EventLog
 from dromon.evidence import IN, OUT, Recording, Replay, read_recording, replay_factory
@@ -969,6 +970,7 @@ def test_the_line_socket_serves_only_the_lines_own_tools(
             "line_status",
             "read_instructions",
             "write_scratch",
+            "propose_change",
             "list_processes",
             "stop_process",
             "list_mail",
@@ -1016,3 +1018,32 @@ def test_a_grok_line_carries_its_process_mark(
     target.mark = "alpha.token"
     run(target)
     assert server.environment["DROMON_LINE_MARK"] == "alpha.token"
+
+
+# The safe point of priority mail, decided by the operator on 2026-10-27. A turn ends
+# once a tool result is delivered and not at the text before the tool use.
+
+type Steered = Callable[[str, Strategy], tuple[SteeredDriver, list[int]]]
+REASON = "priority mail m-1 from @ana"
+
+
+def test_priority_mail_ends_the_turn_at_the_tool_result_and_not_the_text(
+    project: tuple[Path, Path, Path], steered: Steered
+) -> None:
+    driver, asked = steered(GROK, Strategy.SUBSCRIPTION)
+    server = FakeGrok(
+        [
+            chunk("I will read it"),
+            tool_call("read", ident="t1"),
+            call_update("t1", status="in_progress"),
+            call_update("t1", status="completed"),
+            call_update("t1", status="completed"),
+            chunk("done"),
+        ]
+    )
+    config = LineConfig(builtin_tools=("Read",))
+    report = run(line(server, project, config=config, driver=driver))
+    # A second update that the call completed is not a second result.
+    assert asked == [1]
+    assert report.interrupted_for == REASON
+    assert server.methods().count("session/cancel") == 1

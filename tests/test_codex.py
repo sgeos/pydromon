@@ -8,7 +8,7 @@ import asyncio
 import os
 import sys
 from collections import deque
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -34,6 +34,7 @@ from dromon.codex import (
 )
 from dromon.daemon import check_engines
 from dromon.driver import Credential, Driver, Strategy
+from dromon.priority import SteeredDriver
 from dromon.engine import EnginePlanLimit, EngineRefused, TurnReport
 from dromon.evidence import IN, OUT, Recording, Replay, read_recording, replay_factory
 from dromon.launcher import (
@@ -1037,3 +1038,36 @@ def test_the_mark_reaches_codexs_shell_commands_and_not_codex_itself() -> None:
         "-c",
         'shell_environment_policy.set.DROMON_LINE_MARK="a.b"',
     ]
+
+
+# The safe point of priority mail, decided by the operator on 2026-10-27. A turn ends
+# once a tool result is delivered and not at the text before the tool use.
+
+type Steered = Callable[[str, Strategy], tuple[SteeredDriver, list[int]]]
+REASON = "priority mail m-1 from @ana"
+
+
+def test_priority_mail_ends_the_turn_at_the_tool_result_and_not_the_text(
+    steered: Steered,
+) -> None:
+    driver, asked = steered(LUNA, Strategy.SUBSCRIPTION)
+    finished = notice(
+        "item/completed", item={"type": "dynamicToolCall", "id": "i", "tool": "record"}
+    )
+    server = FakeServer(
+        [message("I will record it"), item("dynamicToolCall", tool="record"), finished]
+    )
+    report = run(line(server, driver=driver))
+    assert asked == [1]
+    assert report.interrupted_for == REASON
+    assert server.methods().count("turn/interrupt") == 1
+
+
+def test_a_finished_item_that_is_no_tool_is_not_a_safe_point(steered: Steered) -> None:
+    driver, asked = steered(LUNA, Strategy.SUBSCRIPTION)
+    server = FakeServer(
+        [item("reasoning"), message("one"), message("two"), completed()]
+    )
+    report = run(line(server, driver=driver))
+    assert asked == []
+    assert report.interrupted_for is None

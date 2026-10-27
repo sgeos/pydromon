@@ -14,9 +14,22 @@ later turn.
 Mail. Every message is a ``message_sent`` event in the log. A message sent during a
 tick, by a line in a turn or by an operator, goes to the sent queue. At the end of each
 tick the sent queue moves to the post office, and only post office mail is delivered,
-so a message is received no sooner than the next tick. Messages are not interrupts.
-After a restart, every undelivered message in the log was sent in an earlier tick, so
-it starts in the post office.
+so a message is received no sooner than the next tick. Messages are not interrupts,
+except priority mail, which ``dromon.priority`` describes. After a restart, every
+undelivered message in the log was sent in an earlier tick, so it starts in the post
+office. A line may send itself a note, which wakes it in a later turn like other mail.
+
+Mute. An operator may mute a line, recorded as ``line_muted``, so that it starts no
+turn, by mail, a scheduled wake, a task note or a ceiling answer, until it is
+unmuted. Its mail waits, its session is kept, and its scheduled wake stays pending
+and fires once the line is unmuted. A turn running when the line is muted finishes,
+unless an operator also interrupts it.
+
+Restart. An operator may restart the daemon to upgrade it, as ``dromon.restart``
+describes. While a restart drains, no turn starts and no scheduled wake fires, and in
+its ``interrupt`` mode each running turn is asked to end at its next safe point. A turn
+the restart ended leaves the line a ``restart_noted`` note, so the restarted daemon
+wakes it.
 
 Cadence. While anything is in flight, ticks follow one another every ``tick_seconds``.
 When nothing is, the loop rests until a message arrives or a scheduled wake falls due.
@@ -25,12 +38,13 @@ Scheduled wakes. A line's ``wake_after`` tool schedules one wake, recorded as
 ``wake_scheduled`` with its due time in Coordinated Universal Time and the identifier
 its note will carry. A new call replaces the line's pending wake. The first tick at or
 after the due time records the note as a ``message_sent`` from the line to itself,
-which the event model permits only for that reserved identifier, so the note is never
-mistaken for operator mail. It then wakes the line through the post office like any
-mail and counts toward the line's autonomous-turn limit. Firing is that one append, so
-a crash leaves a wake either pending or fired, and a wake that fell due while the
-daemon was down fires at its first tick. The wall clock is injected, so tests control
-it, and it is distinct from the monotonic clock that measures cooldowns.
+so the note is never mistaken for operator mail. It then wakes the line through the
+post office like any mail and counts toward the line's autonomous-turn limit. Firing
+is that one append, so a crash leaves a wake either pending or fired, and a wake that
+fell due while the daemon was down fires at its first tick. The wall clock is
+injected, so tests control it, and it is distinct from the monotonic clock that
+measures cooldowns. A fired note is the reserved message's one firing, and any other
+note a line sends itself is ordinary self mail.
 
 Leases. A project may declare named leases, such as ``full-gate``, so that its lines
 take turns at a shared resource. ``acquire_lease`` succeeds only while no line holds
@@ -73,6 +87,7 @@ schedules, so the Keleusma version can keep these semantics exactly.
 """
 
 import asyncio
+import math
 import tempfile
 import stat
 import hashlib
@@ -108,6 +123,8 @@ from dromon.overrides import decode as decode_override
 from dromon.overrides import encode as encode_override_document
 from dromon.overrides import encode as encode_override
 from dromon.driver import ENGINE_OF, MODELS, Driver, DriverError, Strategy
+from dromon import priority, restart
+from dromon.priority import PriorityLimiter, PriorityRefused
 from dromon import acp, antigravity, codex, cursor, grok, pi
 from dromon.agents import LineTokens
 from dromon import capabilities, launcher, redact
@@ -145,6 +162,7 @@ from dromon.engine import (
     resolve_plugin,
 )
 from dromon.eventlog import EventLog
+from dromon import proposals as proposal_store
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, effective, merge, parse_sandbox
@@ -187,8 +205,10 @@ from dromon.model import (
     LineConfigured,
     LineCreated,
     LineHeld,
+    LineMuted,
     LineOverridden,
     LineReleased,
+    LineUnmuted,
     LineSession,
     LineSessionCleared,
     LineRebound,
@@ -199,6 +219,7 @@ from dromon.model import (
     MessageDelivered,
     MessageAcknowledged,
     MessageKind,
+    MessagePrioritized,
     MessageRead,
     MessageSent,
     OperatorAddress,
@@ -212,6 +233,7 @@ from dromon.model import (
     WakeScheduled,
     WakeWithdrawn,
     TaskNoted,
+    RestartNoted,
     LineCostMarked,
     ProcessesLeft,
     QuestionWithdrawn,
@@ -249,6 +271,15 @@ SEND_TOOL_SCHEMA: Final[dict[str, object]] = {
         "reply_to": {
             "type": "string",
             "description": "The identifier of the message this one answers, if any",
+        },
+        "priority": {
+            "type": "boolean",
+            "description": (
+                "Optional, default false. Priority mail to another line ends its"
+                " running turn at a safe point and leads its next turn. Use it only"
+                " when the recipient's current work must change now. It is rate"
+                " limited, and a refused one is not sent"
+            ),
         },
         REQUEST_KEY: REQUEST_KEY_PROPERTY,
     },
@@ -341,7 +372,9 @@ MAX_SCRATCH_BYTES: Final = 256 * 1024
 SCRATCH_DIRECTORY: Final = "tmp"
 
 LINE_STATUS_TOOL_NAME: Final = "line_status"
+MAX_LINE_STATUS_DEFAULT_BYTES: Final = 8192
 WRITE_SCRATCH_TOOL_NAME: Final = "write_scratch"
+PROPOSE_CHANGE_TOOL_NAME: Final = "propose_change"
 READ_INSTRUCTIONS_TOOL_NAME: Final = "read_instructions"
 
 NO_ARGUMENTS_SCHEMA: Final[dict[str, object]] = {
@@ -358,6 +391,37 @@ READ_INSTRUCTIONS_SCHEMA: Final[dict[str, object]] = {
             "description": "Return the whole text. Default false, a summary",
         },
     },
+    "additionalProperties": False,
+}
+
+LINE_STATUS_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "detail": {
+            "type": "boolean",
+            "description": "Include diagnostic fields. Default false",
+        },
+        "lists": {
+            "type": "boolean",
+            "description": "Include long lists such as other lines and recent turns",
+        },
+    },
+    "additionalProperties": False,
+}
+
+PROPOSE_CHANGE_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "message": {"type": "string", "minLength": 1, "maxLength": 8192},
+        "files": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "minItems": 1,
+            "maxItems": 64,
+        },
+        "patch": {"type": "string", "minLength": 1, "maxLength": 196608},
+    },
+    "required": ["message", "files", "patch"],
     "additionalProperties": False,
 }
 
@@ -399,6 +463,8 @@ OUTPUT_HEAD_BYTES: Final = 2048
 """How many noted task identifiers each line remembers, so no task is noted twice."""
 
 STOPPED_REASON: Final = "was stopped by an operator"
+RESTART_HEADER: Final = "a daemon restart ended your last turn at a safe point"
+"""The header note of a ``restart_noted`` note, as ``dromon.restart`` describes."""
 """Why an operator's stop holds a line, as ``Scheduler.interrupt`` describes."""
 
 DETACHED_CAUSE: Final = "detached"
@@ -462,6 +528,10 @@ STOP_PROCESS_TOOL_NAME: Final = "stop_process"
 
 LIST_BACKGROUND_TOOL_NAME: Final = "list_background"
 COMPACT_SESSION_TOOL_NAME: Final = "compact_session"
+COMPACTION_CONTEXT_WARNING: Final = "context_warning"
+CONTEXT_COMPACTION_NOTE: Final = (
+    "Dromon requests a context compaction before your next turn."
+)
 STOP_BACKGROUND_TOOL_NAME: Final = "stop_background"
 
 DEFAULT_COMPACT_WAKE_SECONDS: Final = 60
@@ -766,6 +836,9 @@ class LineSpec:
     )
     """Where a Claude Code engine puts a consent fallback to an operator, with the
     question's text after the line's name. **Review F16.**"""
+    redirect: Callable[[], str | None] = field(default=lambda: None, compare=False)
+    """Asked at each safe point of a turn, as ``dromon.priority`` describes. A reason
+    ends the turn there, as a driver's interrupt does, and ``None`` lets it go on."""
 
 
 type EngineFactory = Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], LineEngine]
@@ -836,7 +909,9 @@ def engine_factory(
         return acp.bridge_command(Path(root), line_socket.parent, line_id), token
 
     def build(spec: LineSpec, own_tools: Sequence[SdkMcpTool[Any]]) -> LineEngine:
-        driver = Driver.for_model(spec.model, spec.strategy)
+        # Every adapter ends a turn gracefully when its driver answers interrupt, so
+        # priority mail steers the driver rather than each engine.
+        driver: Driver = priority.steered(spec.model, spec.strategy, spec.redirect)
         workdir = resolve_workdir(spec.config.workdir, Path(root), protected)
         if driver.settings.engine == codex.ENGINE_NAME:
             if project_sandbox is not None or project_settings is not None:
@@ -1124,6 +1199,8 @@ class Scheduler:
         """Each line's latest delivered task-end note, with its lateness."""
         self._compact_requests: set[str] = set()
         """Lines whose next turn begins by compacting their session."""
+        self._context_compaction_wakes: set[str] = set()
+        """Lines woken for compaction at the context warning, until dispatch."""
         self._context: dict[str, int] = {}
         """Each line's context estimate after its last turn that reported one."""
         self._last_compaction: dict[str, dict[str, object]] = {}
@@ -1239,6 +1316,24 @@ class Scheduler:
         """When the scheduler took the log, on its own clock, for the log's growth."""
         self._request_keys = RequestKeys()
         """Results of keyed mutating tool calls, so a retry acts once. Row 11."""
+        self._priority = PriorityLimiter(clock)
+        """Lines' priority mail over the rate limit's window, in memory, so a restart
+        starts the count again."""
+        self._redirect_for: dict[str, str] = {}
+        """The priority note each running line's turn is to end for at its next safe
+        point, until the turn ends."""
+        self._redirected: dict[str, str] = {}
+        """The reason each running line's turn was asked to end for priority mail."""
+        self._ended_by: set[str] = set()
+        """Priority notes that ended a turn, until they are delivered."""
+        self._restart: restart.Plan | None = None
+        """The restart draining now, as ``dromon.restart`` describes, or ``None``."""
+        self._restart_asked: set[str] = set()
+        self._restart_by: str | None = None
+        """The operator who asked for the last restart, for its note."""
+        """Lines whose turn the draining restart has asked to end at a safe point."""
+        self._last_restart: dict[str, object] | None = None
+        """What became of the last restart this daemon abandoned, for its status."""
 
     # Commands from the client and from lines.
 
@@ -1369,8 +1464,17 @@ class Scheduler:
         recipient: Address,
         body: str,
         reply_to: str | None = None,
+        *,
+        priority: bool = False,
     ) -> str:
-        """Record a note from ``sender``. It is delivered in a later tick."""
+        """Record a note from ``sender``. It is delivered in a later tick.
+
+        Priority mail is also marked ``message_prioritized``, and asks the
+        recipient's running turn to end at its next safe point. Raises
+        ``EventRejected`` for priority mail ``check_priority`` refuses, recording
+        nothing. A crash between the two appends leaves an ordinary note."""
+        if priority:
+            self.check_priority(sender, recipient)
         message_id = new_id("m")
         sent_at = self._wall_clock()
         self._log.append(
@@ -1378,6 +1482,12 @@ class Scheduler:
                 message_id, sender, recipient, MessageKind.NOTE, body, reply_to=reply_to
             )
         )
+        if priority and isinstance(recipient, LineAddress):
+            self._log.append(MessagePrioritized(message_id))
+            if isinstance(sender, LineAddress):
+                self._priority.record(sender.line_id, recipient.line_id)
+            if recipient.line_id in self._running:
+                self._redirect_for.setdefault(recipient.line_id, message_id)
         if isinstance(recipient, LineAddress):
             self._remember(message_id, sender, recipient, body, sent_at)
         self._sent.append(message_id)
@@ -1391,6 +1501,239 @@ class Scheduler:
             self._failed.discard(recipient.line_id)
         self._work.set()
         return message_id
+
+    def check_priority(self, sender: Address, recipient: Address) -> None:
+        """Refuse priority mail that is not to a line, that a line sends itself, that
+        an external agent sends, or that a line sends over the rate limit, by raising
+        ``EventRejected``. An operator's is unlimited."""
+        if not isinstance(recipient, LineAddress):
+            raise EventRejected("priority mail goes to a line, not to an operator")
+        if recipient.line_id not in self._log.state.lines:
+            raise EventRejected(f"no line {recipient.line_id}")
+        if isinstance(sender, AgentAddress):
+            raise EventRejected(
+                "an external agent may not send priority mail, which only operators"
+                " and lines may send"
+            )
+        if sender == recipient:
+            raise EventRejected(
+                "priority mail to yourself would end your own turn, so send the note"
+                " without priority"
+            )
+        if isinstance(sender, LineAddress):
+            try:
+                self._priority.check(sender.line_id, recipient.line_id)
+            except PriorityRefused as error:
+                raise EventRejected(str(error)) from error
+
+    def redirect_reason(self, line_id: str) -> str | None:
+        """Why ``line_id``'s running turn should end at this safe point, once, or
+        ``None``. Asked by the line's driver, as ``dromon.priority`` describes, for
+        priority mail and then for a restart in its ``interrupt`` mode."""
+        reason = self._priority_redirect(line_id)
+        if reason is not None:
+            return reason
+        return self._restart_redirect(line_id)
+
+    def _restart_redirect(self, line_id: str) -> str | None:
+        """``restart.REASON`` once for a running line while a restart drains in its
+        ``interrupt`` mode, muted or not, since the operator asked for it."""
+        plan = self._restart
+        if (
+            plan is None
+            or plan.mode is not restart.Mode.INTERRUPT
+            or line_id not in self._running
+            or line_id in self._restart_asked
+        ):
+            return None
+        self._restart_asked.add(line_id)
+        self._redirected[line_id] = restart.REASON
+        self.activity.record(
+            line_id,
+            ActivityKind.NOTICE,
+            f"its turn is ending at a safe point for {restart.REASON}",
+        )
+        return restart.REASON
+
+    def _priority_redirect(self, line_id: str) -> str | None:
+        """The priority note's reason to end ``line_id``'s turn, once, or ``None``. A
+        muted line's turn is not ended, and its priority note waits."""
+        message_id = self._redirect_for.get(line_id)
+        if message_id is None or line_id not in self._running:
+            return None
+        state = self._log.state
+        line = state.lines.get(line_id)
+        message = state.messages.get(message_id)
+        if line is None or message is None or message.delivered:
+            self._redirect_for.pop(line_id, None)
+            return None
+        if line.muted:
+            return None
+        del self._redirect_for[line_id]
+        reason = priority.REASON.format(message_id=message_id, sender=message.sender)
+        self._redirected[line_id] = reason
+        self._ended_by.add(message_id)
+        self.activity.record(
+            line_id,
+            ActivityKind.NOTICE,
+            f"its turn is ending at a safe point for {reason}",
+        )
+        return reason
+
+    # Wake mute, decided by the operator on 2026-10-27.
+
+    def mute(self, line_id: str) -> bool:
+        """Mute ``line_id``'s wakes, and say whether it was not muted already. A turn
+        in flight finishes. Raises ``EventRejected`` for an unknown line."""
+        line = self._log.state.lines.get(line_id)
+        if line is None:
+            raise EventRejected(f"no line {line_id}")
+        if line.muted:
+            return False
+        self._log.append(LineMuted(line_id))
+        return True
+
+    def unmute(self, line_id: str) -> bool:
+        """Unmute ``line_id``, and say whether it was muted. Its kept mail and any
+        scheduled wake that fell due wake it from the next tick. A hold stays."""
+        line = self._log.state.lines.get(line_id)
+        if line is None:
+            raise EventRejected(f"no line {line_id}")
+        if not line.muted:
+            return False
+        self._log.append(LineUnmuted(line_id))
+        self._work.set()
+        return True
+
+    # Restart to upgrade, decided by the operator on 2026-10-27.
+
+    def begin_restart(
+        self,
+        mode: restart.Mode,
+        operator: str,
+        wait_seconds: int,
+        *,
+        end_tasks: bool = False,
+    ) -> list[str]:
+        """Begin draining for a restart, and return the lines with a turn running.
+        From now no turn starts and no scheduled wake fires, and in the ``interrupt``
+        mode each running turn is asked to end at its next safe point. Raises
+        ``RestartRefused``, changing nothing, while a restart drains already, or while
+        kept engine sessions run background tasks and ``end_tasks`` is false."""
+        if self._restart is not None:
+            raise restart.RestartRefused("a restart is draining already")
+        if not end_tasks:
+            self._check_restart_tasks()
+        self._restart = restart.Plan(
+            mode, operator, wait_seconds, self._clock() + wait_seconds, end_tasks
+        )
+        self._restart_by = operator
+        self._last_restart = None
+        running = self.running_lines()
+        what = (
+            "asked its turn to end at its next safe point"
+            if mode is restart.Mode.INTERRUPT
+            else "is waiting for its turn to end"
+        )
+        for line_id in running:
+            self.activity.record(
+                line_id, ActivityKind.NOTICE, f"a daemon restart {what}"
+            )
+        return running
+
+    def _check_restart_tasks(self) -> None:
+        """Refuse a restart that would stop background tasks of kept sessions."""
+        busy = {
+            line_id: count
+            for line_id in sorted(self._log.state.lines)
+            if (count := self.kept_tasks(line_id))
+        }
+        if busy:
+            raise restart.RestartRefused(
+                f"{sum(busy.values())} background tasks run in the kept engine"
+                f" sessions of lines {', '.join(busy)}, and a restart stops them. Wait"
+                " for them to end, or restart with end_tasks to stop them"
+            )
+
+    def running_lines(self) -> list[str]:
+        """The lines with a turn in flight, in a fixed order."""
+        return sorted(
+            line_id
+            for line_id, line in self._log.state.lines.items()
+            if line_id in self._running or line.state is LineState.RUNNING
+        )
+
+    def restart_progress(self) -> restart.Outcome:
+        """Where the draining restart stands. It is ready once no turn runs. It is
+        abandoned at its deadline with a turn still running, whose interrupt could
+        not be honoured, or when background tasks it may not stop began meanwhile."""
+        plan = self._restart
+        if plan is None:
+            return restart.Outcome.ABANDONED
+        running = self.running_lines()
+        if not running:
+            if not plan.end_tasks:
+                try:
+                    self._check_restart_tasks()
+                except restart.RestartRefused as error:
+                    self.abandon_restart(str(error))
+                    return restart.Outcome.ABANDONED
+            return restart.Outcome.READY
+        if self._clock() >= plan.deadline:
+            self.abandon_restart(
+                f"the turns of lines {', '.join(running)} did not end within"
+                f" {plan.wait_seconds} seconds, so their interrupt could not be"
+                " honoured, and no turn was cut part way"
+            )
+            return restart.Outcome.ABANDONED
+        return restart.Outcome.WAITING
+
+    def abandon_restart(self, reason: str) -> None:
+        """End the draining restart without stopping, so turns start again."""
+        plan = self._restart
+        if plan is None:
+            return
+        self._restart = None
+        self._last_restart = {
+            "state": restart.Outcome.ABANDONED.value,
+            "mode": plan.mode.value,
+            "operator": plan.operator,
+            "reason": reason,
+        }
+        for line_id in self.running_lines():
+            self.activity.record(
+                line_id,
+                ActivityKind.NOTICE,
+                f"the daemon restart was abandoned: {reason}",
+            )
+        print(f"dromond: the restart was abandoned: {reason}", file=sys.stderr)
+        self._work.set()
+
+    def restart_status(self) -> dict[str, object] | None:
+        """The draining restart, or the last one abandoned, or ``None``."""
+        plan = self._restart
+        if plan is None:
+            return self._last_restart
+        return {
+            "state": restart.Outcome.WAITING.value,
+            "mode": plan.mode.value,
+            "operator": plan.operator,
+            "wait_seconds": plan.wait_seconds,
+            "seconds_left": max(0, math.ceil(plan.deadline - self._clock())),
+            "running": cast(object, self.running_lines()),
+            "end_tasks": plan.end_tasks,
+        }
+
+    def _note_restart(self, line_id: str) -> None:
+        """Leave ``line_id`` a note that a restart ended its turn, which wakes it once
+        the restarted daemon runs, or in this daemon when the restart was abandoned."""
+        template = restart.NOTE if self._restart is not None else restart.ABANDONED_NOTE
+        body = template.format(operator=self._restart_by)
+        message_id = new_id("m")
+        self._log.append(RestartNoted(line_id, message_id, body))
+        self._sent.append(message_id)
+        self._failed.discard(line_id)
+        self._work.set()
 
     def send_tool(self, owner: str | Address) -> SdkMcpTool[Any]:
         """The ``send_message`` tool for ``owner``, a line or an agent, whose sender it
@@ -1410,25 +1753,36 @@ class Scheduler:
             to: object = args.get("to")
             body: object = args.get("body")
             reply_to: object = args.get("reply_to")
+            urgent: object = args.get("priority", False)
             if not isinstance(to, str) or not isinstance(body, str):
                 return _tool_error("to and body must be text")
             if reply_to is not None and not isinstance(reply_to, str):
                 return _tool_error("reply_to must be text")
+            if not isinstance(urgent, bool):
+                return _tool_error("priority must be true or false")
             if self.discloses(body):
                 return _tool_error(disclosure.REFUSAL)
             try:
-                message_id = self.send(sender, parse_address(to), body, reply_to)
+                message_id = self.send(
+                    sender, parse_address(to), body, reply_to, priority=urgent
+                )
             except (InvalidField, EventRejected) as error:
                 return _tool_error(str(error))
-            result = _tool_text(f"sent as {message_id}")
+            result = _tool_text(
+                f"sent as {message_id}, with priority"
+                if urgent
+                else f"sent as {message_id}"
+            )
             self._request_keys.remember(str(sender), SEND_TOOL_NAME, args, result)
             return result
 
         return SdkMcpTool(
             name=SEND_TOOL_NAME,
             description=(
-                "Send a message to another Dromon session line or to an operator."
-                " The recipient reads it in its next turn, never in this one."
+                "Send a message to another Dromon session line, to an operator, or to"
+                " yourself as a note to your next turn. The recipient reads it in its"
+                " next turn, never in this one. Priority mail to another line also"
+                " ends that line's running turn at a safe point."
             ),
             input_schema=SEND_TOOL_SCHEMA,
             handler=handler,
@@ -1575,12 +1929,18 @@ class Scheduler:
         """The lines whose scheduled wake has fallen due, in a fixed order. A
         ``compact_session`` wake is held back while a running turn is making the
         compaction it was for, since that compaction withdraws it. The hold ends
-        with the turn, so it is bounded by the turn's own length."""
+        with the turn, so it is bounded by the turn's own length. While a restart
+        drains, no wake fires, so each stays pending for the restarted daemon."""
+        if self._restart is not None:
+            return []
         now = self._wall_clock()
+        lines = self._log.state.lines
         return [
             line_id
             for line_id, pending in sorted(self._log.state.scheduled.items())
-            if parse_due(pending.due) <= now and not self._compacting_for(line_id)
+            if parse_due(pending.due) <= now
+            and not self._compacting_for(line_id)
+            and not lines[line_id].muted
         ]
 
     def _compacting_for(self, line_id: str) -> bool:
@@ -1635,8 +1995,16 @@ class Scheduler:
 
     def seconds_until_next_wake(self) -> float | None:
         """How long until the earliest pending scheduled wake falls due, at least 0,
-        or ``None`` when no wake is pending."""
-        pending = self._log.state.scheduled.values()
+        or ``None`` when no wake is pending. A muted line's wake is left out, since it
+        fires only once the line is unmuted, and none is due while a restart drains."""
+        if self._restart is not None:
+            return None
+        lines = self._log.state.lines
+        pending = [
+            wake
+            for line_id, wake in self._log.state.scheduled.items()
+            if not lines[line_id].muted
+        ]
         if not pending:
             return None
         earliest = min(parse_due(wake.due) for wake in pending)
@@ -1883,7 +2251,10 @@ class Scheduler:
             "warn_at": self.effective_config(line_id).context_warn_tokens,
             "note": note,
             "compact_session": self._may_compact(line_id),
-            "compaction_pending": line_id in self._compact_requests,
+            "compaction_pending": (
+                line_id in self._compact_requests
+                or line_id in self._context_compaction_wakes
+            ),
             "last_compaction": self._last_compaction.get(line_id),
             "auto_compact_held": line_id in self._auto_held,
         }
@@ -1919,11 +2290,11 @@ class Scheduler:
         self._last_compaction[line_id] = record
         after = compaction.get("after_tokens")
         estimate = compaction.get("after_estimate_tokens")
-        threshold = self.effective_config(line_id).auto_compact_tokens
+        threshold = self._auto_compact_threshold(line_id)
         if isinstance(after, int):
-            self._context_reported(line_id, after, CONTEXT_FROM_COMPACTION)
             if threshold is not None and after >= threshold:
                 self._auto_held.add(line_id)
+            self._context_reported(line_id, after, CONTEXT_FROM_COMPACTION)
         elif type(estimate) is int and estimate > 0:
             # An engine that estimates the size itself, as Pi does, gives it here.
             note = compaction.get("after_estimate_note")
@@ -1931,9 +2302,9 @@ class Scheduler:
             record["after_estimate_note"] = (
                 note if isinstance(note, str) else AFTER_ESTIMATE_NOTE
             )
-            self._context_reported(line_id, estimate, CONTEXT_FROM_ENGINE_ESTIMATE)
             if threshold is not None and estimate >= threshold:
                 self._auto_held.add(line_id)
+            self._context_reported(line_id, estimate, CONTEXT_FROM_ENGINE_ESTIMATE)
         else:
             self._context.pop(line_id, None)
             self._context_source.pop(line_id, None)
@@ -1971,10 +2342,10 @@ class Scheduler:
             return
         last["after_estimate_tokens"] = tokens
         last["after_estimate_note"] = AFTER_ESTIMATE_NOTE
-        self._context_reported(line_id, tokens, CONTEXT_FROM_ESTIMATE)
-        threshold = self.effective_config(line_id).auto_compact_tokens
+        threshold = self._auto_compact_threshold(line_id)
         if threshold is not None and tokens >= threshold:
             self._auto_held.add(line_id)
+        self._context_reported(line_id, tokens, CONTEXT_FROM_ESTIMATE)
 
     def _context_reported(self, line_id: str, tokens: int, source: str) -> None:
         """Record a context estimate the engine reported and where it came from,
@@ -1984,9 +2355,12 @@ class Scheduler:
         size a compaction left or its estimate, and with each turn's estimate."""
         self._context[line_id] = tokens
         self._context_source[line_id] = source
-        threshold = self.effective_config(line_id).auto_compact_tokens
+        threshold = self._auto_compact_threshold(line_id)
         if threshold is None or tokens < threshold:
             self._auto_held.discard(line_id)
+            self._context_compaction_wakes.discard(line_id)
+        else:
+            self._ensure_context_compaction_wake(line_id)
 
     def _may_compact(self, line_id: str) -> bool:
         """Whether the line has ``compact_session``: a Claude Code or Codex line
@@ -1997,6 +2371,53 @@ class Scheduler:
         on_compacting = engine in (ENGINE_NAME_CLAUDE, codex.ENGINE_NAME)
         return on_compacting and self.effective_config(line_id).allow_compact
 
+    def _auto_compact_threshold(self, line_id: str) -> int | None:
+        """The earlier of the configured warning and optional automatic threshold."""
+        if not self._may_compact(line_id):
+            return None
+        config = self.effective_config(line_id)
+        configured = config.auto_compact_tokens
+        return (
+            config.context_warn_tokens
+            if configured is None
+            else min(config.context_warn_tokens, configured)
+        )
+
+    def _line_muted(self, line_id: str) -> bool:
+        """Whether the event-model line is muted."""
+        line = self._log.state.lines.get(line_id)
+        return line is not None and line.muted
+
+    def _ensure_context_compaction_wake(self, line_id: str) -> None:
+        """Queue one self-note to compact before the next turn at the context warning.
+
+        A muted line keeps the need in its context estimate and gets no note until an
+        unmuted scheduling pass.
+        """
+        threshold = self.effective_config(line_id).context_warn_tokens
+        context = self._context.get(line_id)
+        if (
+            not self._may_compact(line_id)
+            or self._log.state.lines[line_id].held_by is not None
+            or context is None
+            or context < threshold
+            or line_id in self._auto_held
+            or line_id in self._context_compaction_wakes
+            or self._line_muted(line_id)
+        ):
+            return
+        self._context_compaction_wakes.add(line_id)
+        note = CONTEXT_COMPACTION_NOTE
+        if self.discloses(note):
+            note = WITHHELD_WAKE_NOTE
+        if line_id in self._log.state.scheduled:
+            return
+        message_id = new_id("m")
+        self._log.append(
+            WakeScheduled(line_id, message_id, format_due(self._wall_clock()), note)
+        )
+        self._work.set()
+
     def _compaction_reason(self, line_id: str) -> str | None:
         """Why the line's next turn begins with a compaction, or ``None`` when it
         does not: a request the line made, or its context at or past its
@@ -2006,20 +2427,26 @@ class Scheduler:
         threshold is reported, since compacting again would not bring it below and
         would cost every turn. The warning still shows meanwhile."""
         requested = line_id in self._compact_requests
+        warning_wake = line_id in self._context_compaction_wakes
         self._compact_requests.discard(line_id)
+        self._context_compaction_wakes.discard(line_id)
         if not self._may_compact(line_id):
             return None
         if requested:
             return COMPACTION_REQUESTED
-        threshold = self.effective_config(line_id).auto_compact_tokens
         context = self._context.get(line_id)
-        if threshold is None or context is None or context < threshold:
+        if context is None:
             return None
         if line_id in self._auto_held:
             return None
+        if warning_wake:
+            return COMPACTION_CONTEXT_WARNING
+        threshold = self._auto_compact_threshold(line_id)
+        if threshold is None or context < threshold:
+            return None
         return (
             f"automatically, because its context of about {context} tokens reached"
-            f" this line's auto_compact_tokens of {threshold}"
+            f" the automatic compaction threshold of {threshold}"
         )
 
     def spent_between(
@@ -2086,6 +2513,15 @@ class Scheduler:
         fired = self._log.state.fired_dues
         for message_id, message in messages:
             parts: list[str] = []
+            if message.priority:
+                parts.append(
+                    "priority, which ended your last turn at a safe point"
+                    if message_id in self._ended_by
+                    else "priority"
+                )
+                self._ended_by.discard(message_id)
+            if message.restart_note:
+                parts.append(RESTART_HEADER)
             repeated = self._repeats.pop(message_id, None)
             if repeated is not None:
                 parts.append(f"a repeat of {repeated}")
@@ -2120,9 +2556,15 @@ class Scheduler:
         return notes
 
     def mail_notes(self, message_id: str) -> str:
-        """What ``list_mail`` adds to a message's header: the message it repeated,
-        and for a fired wake when it was due and when it was delivered."""
+        """What ``list_mail`` adds to a message's header: whether it is priority
+        mail, the message it repeated, and for a fired wake when it was due and when
+        it was delivered."""
         parts: list[str] = []
+        message = self._log.state.messages.get(message_id)
+        if message is not None and message.priority:
+            parts.append("priority")
+        if message is not None and message.restart_note:
+            parts.append(RESTART_HEADER)
         repeated = self._repeat_of.get(message_id)
         if repeated is not None:
             parts.append(f"repeat_of {repeated}")
@@ -2146,9 +2588,60 @@ class Scheduler:
         except ConfigError as error:
             raise LineToolRefused(str(error)) from error
 
-    def line_status(self, line_id: str) -> dict[str, object]:
-        """What ``line_id`` may know of itself, its daemon and the other lines. It
-        holds no configuration document and no message body."""
+    def line_status(
+        self, line_id: str, *, detail: bool = True, lists: bool = True
+    ) -> dict[str, object]:
+        """Build status for internal callers. The line tool explicitly chooses the
+        compact default and only returns details or long lists when requested."""
+        full = self._detailed_line_status(line_id)
+        if detail and lists:
+            return full
+        if detail:
+            status = dict(full)
+            leases = cast(list[dict[str, object]], status.pop("leases"))
+            turns = cast(list[dict[str, object]], status.pop("recent_turns"))
+            others = cast(list[dict[str, object]], status.pop("other_lines"))
+            status["lease_count"] = len(leases)
+            status["recent_turn_count"] = len(turns)
+            status["other_line_count"] = len(others)
+            kept = cast(dict[str, object], status["kept_session"])
+            tasks = cast(list[dict[str, object]], kept.pop("tasks"))
+            kept["background_task_count"] = len(tasks)
+            processes = cast(dict[str, object], status["processes"])
+            left = processes.get("left")
+            if isinstance(left, dict):
+                left_status = cast(dict[str, object], left)
+                left_processes = cast(
+                    list[dict[str, object]], left_status.pop("processes")
+                )
+                left_status["process_count"] = len(left_processes)
+            return status
+        compact = _compact_line_status(full)
+        if lists:
+            kept = cast(dict[str, object], full["kept_session"])
+            processes = cast(dict[str, object], full["processes"])
+            left = processes.get("left")
+            left_processes: list[dict[str, object]] = []
+            if isinstance(left, dict):
+                left_processes = cast(
+                    list[dict[str, object]], cast(dict[str, object], left)["processes"]
+                )
+            compact["lists"] = {
+                "leases": full["leases"],
+                "recent_turns": full["recent_turns"],
+                "other_lines": full["other_lines"],
+                "background_tasks": kept["tasks"],
+                "left_processes": left_processes,
+            }
+            if _status_size(compact) > MAX_LINE_STATUS_DEFAULT_BYTES:
+                return _truncated_line_status(full, lists_truncated=True)
+            return compact
+        if _status_size(compact) <= MAX_LINE_STATUS_DEFAULT_BYTES:
+            return compact
+        return _truncated_line_status(full, lists_truncated=False)
+
+    def _detailed_line_status(self, line_id: str) -> dict[str, object]:
+        """The full status before the caller selects compact, detail or list fields."""
         state = self._log.state
         line = state.lines[line_id]
         limits = self.limits_for(line_id)
@@ -2163,6 +2656,8 @@ class Scheduler:
                 "line_id": other_id,
                 "state": other.state.value,
                 "held": other.held_by is not None,
+                "muted": other.muted,
+                "workdir_commit": self._workdir_commit(other_id),
                 "leases": [str(lease["name"]) for lease in self.leases_of(other_id)],
             }
             for other_id, other in sorted(state.lines.items())
@@ -2175,6 +2670,7 @@ class Scheduler:
             "state": line.state.value,
             "condition": self.condition(line_id),
             "held_by": line.held_by,
+            "muted": line.muted,
             "autonomous_turns": {
                 "used": self._autonomous.get(line_id, 0),
                 "allowed": limits.max_autonomous_turns,
@@ -2202,6 +2698,7 @@ class Scheduler:
             "last_task_note": self._last_task_note.get(line_id),
             "context": self.context_status(line_id),
             "daemon": self.daemon_status(),
+            "commits": self.commits(line_id),
             "event_log": self.event_log_status(),
             "processes": {
                 "identifiable": self._processes_identifiable,
@@ -2261,11 +2758,14 @@ class Scheduler:
         """**Row 5 of the T3 Code review.** One word for where a line stands, which
         keeps apart a line that is running, held for an operator, stopped by a failed
         turn, waiting on a question it asked an operator, and idle, in that order of
-        precedence."""
+        precedence. A muted line that is not running is ``muted``, before all but
+        ``running``, since nothing else wakes it."""
         state = self._log.state
         line = state.lines[line_id]
         if line_id in self._running or line.state is LineState.RUNNING:
             return "running"
+        if line.muted:
+            return "muted"
         if line.held_by is not None:
             return "held"
         if line_id in self._failed:
@@ -2297,13 +2797,47 @@ class Scheduler:
                 "bytes": None if size is None or opened is None else size - opened,
                 "seconds": int(seconds),
             },
-            "events_per_hour": round(events / hours, 1)
+            # Whole numbers, because the client protocol carries no floats.
+            "events_per_hour": round(events / hours)
             if seconds >= MIN_RATE_SECONDS
             else None,
             "bytes_per_hour": round((size - opened) / hours)
             if seconds >= MIN_RATE_SECONDS and size is not None and opened is not None
             else None,
             "compaction": "none",
+        }
+
+    def _workdir_commit(self, line_id: str) -> str | None:
+        """The commit checked out where ``line_id`` works, or ``None`` when its
+        working directory is not allowed or not in a checkout."""
+        try:
+            return read_head_commit(self._workdir_of(line_id))
+        except LineToolRefused:
+            return None
+
+    def commits(self, line_id: str) -> dict[str, object]:
+        """The commits a review or report by ``line_id`` names, read now, with one
+        sentence that cites both. The worktree's commit is ``HEAD`` and says nothing
+        of uncommitted changes, which only ``git status`` shows."""
+        daemon = self.daemon_status()
+        workdir = self._workdir_commit(line_id)
+        started = daemon["commit"]
+        cite = (
+            f"line {line_id} read its worktree at commit {workdir or 'unknown'},"
+            f" under the daemon at commit {started or 'unknown'}"
+        )
+        if daemon["stale"]:
+            cite += f", whose checkout has since moved to {daemon['checkout_commit']}"
+        return {
+            "workdir": workdir,
+            "daemon": started,
+            "daemon_checkout": daemon["checkout_commit"],
+            "stale": daemon["stale"],
+            "cite": cite + ".",
+            "note": (
+                "commits are read from HEAD, and uncommitted changes in the worktree"
+                " are not part of either"
+            ),
         }
 
     def daemon_status(self) -> dict[str, object]:
@@ -2594,15 +3128,31 @@ class Scheduler:
 
     def line_status_tool(self, line_id: str) -> SdkMcpTool[Any]:
         """The ``line_status`` tool for ``line_id``."""
-        return self._view_tool(
-            LINE_STATUS_TOOL_NAME,
-            "Show your own state: your hold, autonomous turns and estimated cost with"
-            " their limits, leases, scheduled wake, unread mail, model, working"
-            " directory, engine session and whether it is kept with its background"
-            " tasks, the cost of your last ten turns, your last wake's lateness, the"
-            " daemon's version and commit and whether its checkout has moved since it"
-            " started, and the other lines' state, read only.",
-            lambda: json.dumps(self.line_status(line_id), indent=2, sort_keys=True),
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, LINE_STATUS_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            detail = args.get("detail", False)
+            lists = args.get("lists", False)
+            if type(detail) is not bool:
+                return _tool_error("detail must be true or false")
+            if type(lists) is not bool:
+                return _tool_error("lists must be true or false")
+            status = self.line_status(line_id, detail=detail, lists=lists)
+            if lists and _status_size(status) > MAX_LINE_STATUS_DEFAULT_BYTES:
+                status = _truncated_line_status(status, lists_truncated=True)
+            return _tool_text(json.dumps(status, indent=2, sort_keys=True))
+
+        return SdkMcpTool(
+            name=LINE_STATUS_TOOL_NAME,
+            description=(
+                "Show a compact read-only summary of your state by default. Set detail"
+                " to true for diagnostics, and lists to true for recent turns, other"
+                " lines, leases and background processes."
+            ),
+            input_schema=LINE_STATUS_SCHEMA,
+            handler=handler,
         )
 
     def read_instructions_tool(self, line_id: str) -> SdkMcpTool[Any]:
@@ -2664,6 +3214,72 @@ class Scheduler:
             handler=handler,
         )
 
+    def propose_change_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The propose_change tool, which leaves changes for operator review."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, PROPOSE_CHANGE_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            message = args.get("message")
+            files = args.get("files")
+            patch = args.get("patch")
+            if not isinstance(message, str):
+                return _tool_error("message must be text")
+            if not isinstance(files, list) or not all(
+                isinstance(path, str) for path in cast(list[object], files)
+            ):
+                return _tool_error("files must be a list of paths")
+            if not isinstance(patch, str):
+                return _tool_error("patch must be text")
+            try:
+                proposal = self.propose_change(
+                    line_id, message, cast(list[str], files), patch
+                )
+            except (LineToolRefused, proposal_store.ProposalError) as error:
+                return _tool_error(str(error))
+            return _tool_text(
+                f"recorded proposal {proposal.proposal_id}. The operator can review it"
+                " with dromon proposal show "
+                f"{proposal.proposal_id}; it has not changed any project files."
+            )
+
+        return SdkMcpTool(
+            name=PROPOSE_CHANGE_TOOL_NAME,
+            description=(
+                "Record a proposed change for the operator to review. Provide a short"
+                " message, the changed file paths relative to your worktree, and a"
+                " unified diff as patch text. This records a suggestion only and does"
+                " not edit project files or commit."
+            ),
+            input_schema=PROPOSE_CHANGE_SCHEMA,
+            handler=handler,
+        )
+
+    def propose_change(
+        self, line_id: str, message: str, files: list[str], patch: str
+    ) -> proposal_store.Proposal:
+        """Store a bounded, disclosure-checked patch for operator review."""
+        if self._root is None:
+            raise LineToolRefused("this daemon does not know its project root")
+        if self.discloses(message, patch, *files):
+            raise LineToolRefused(disclosure.REFUSAL)
+        workdir = str(self._workdir_of(line_id))
+        proposal = proposal_store.Proposal(
+            proposal_id=new_id("p"),
+            created_at=format_due(self._wall_clock()),
+            line_id=line_id,
+            workdir=workdir,
+            message=message,
+            files=tuple(files),
+            patch=patch,
+        )
+        try:
+            proposal_store.write(self._root, proposal)
+        except proposal_store.ProposalError as error:
+            raise LineToolRefused(str(error)) from error
+        return proposal
+
     def own_tools(self, line_id: str) -> list[SdkMcpTool[Any]]:
         """A line's own Dromon tools, whose sender each fixes to the line."""
         return [
@@ -2675,6 +3291,7 @@ class Scheduler:
             self.line_status_tool(line_id),
             self.read_instructions_tool(line_id),
             self.write_scratch_tool(line_id),
+            self.propose_change_tool(line_id),
             self.list_processes_tool(line_id),
             self.stop_process_tool(line_id),
             self.list_mail_tool(line_id),
@@ -3156,12 +3773,18 @@ class Scheduler:
         self._work.set()
 
     def _can_start(self, line_id: str) -> bool:
+        """Whether a tick may start the line's turn. Priority mail starts it without
+        waiting for its cooldown or its wake tick, which the rate limit on lines'
+        priority mail keeps from spinning."""
+        if not self._eligible(line_id):
+            return False
+        if self._priority_waiting(line_id):
+            return True
         every = self.wake_every_for(line_id)
-        return (
-            self._eligible(line_id)
-            and not self._cooling(line_id)
-            and self.tick % every == 0
-        )
+        return not self._cooling(line_id) and self.tick % every == 0
+
+    def _priority_waiting(self, line_id: str) -> bool:
+        return any(message.priority for _, message in self.deliverable(line_id))
 
     def _eligible(self, line_id: str) -> bool:
         """Whether a line could start a turn, apart from its cooldown."""
@@ -3171,7 +3794,9 @@ class Scheduler:
             and line_id not in self._running
             and line.state is LineState.IDLE
             and line.held_by is None
+            and not line.muted
             and line_id not in self._failed
+            and self._restart is None
         )
 
     def _cooling(self, line_id: str) -> bool:
@@ -3185,8 +3810,11 @@ class Scheduler:
 
         A line in its cooldown, or waiting for its wake tick, with mail waiting keeps
         the loop ticking, so its turn starts on time rather than when more mail
-        arrives.
+        arrives. A compactable line past its context warning is also queued here,
+        unless it is muted, so it compacts before any later work is delivered.
         """
+        for line_id in sorted(self._log.state.lines):
+            self._ensure_context_compaction_wake(line_id)
         if self._running or self._sent or self._due_wakes():
             return True
         return any(
@@ -3321,7 +3949,9 @@ class Scheduler:
                     return
 
     def _begin_turn(self, line_id: str, messages: list[tuple[str, Message]]) -> None:
-        """Wake ``line_id`` and deliver its mail now, then run the turn as a task."""
+        """Wake ``line_id`` and deliver its mail now, then run the turn as a task.
+        Priority mail leads, in the order sent, and the rest follows in its order."""
+        messages = sorted(messages, key=lambda item: not item[1].priority)
         wake_id = new_id("w")
         self._log.append(WakeRequested(wake_id, line_id, messages[0][0]))
         self._log.append(WakeIssued(wake_id))
@@ -3353,6 +3983,8 @@ class Scheduler:
                 self._compaction_cause[line_id] = (
                     COMPACT_SESSION_TOOL_NAME
                     if compaction == COMPACTION_REQUESTED
+                    else COMPACTION_CONTEXT_WARNING
+                    if compaction == COMPACTION_CONTEXT_WARNING
                     else "auto_compact_tokens"
                 )
             prompt = compose_prompt(
@@ -3424,7 +4056,12 @@ class Scheduler:
             if report.session_id and report.session_id != recorded and not moved:
                 self._log.append(LineSession(line_id, report.session_id))
             ending = report.subtype
-            if report.interrupted_for is not None:
+            redirected = self._redirected.get(line_id)
+            if redirected is not None and report.interrupted_for == redirected:
+                ending += f", ended at a safe point for {redirected}"
+                if redirected == restart.REASON:
+                    self._note_restart(line_id)
+            elif report.interrupted_for is not None:
                 ending += f", interrupted by its driver: {report.interrupted_for}"
             elif turn_outcome(report) == FAILED:
                 ending = f"failed: the engine ended the turn as {report.subtype}"
@@ -3451,6 +4088,10 @@ class Scheduler:
             self._spawn_check(line_id)
             self._interrupted.discard(line_id)
             self._moved.discard(line_id)
+            # Priority mail the turn did not end for leads the next turn instead.
+            self._redirect_for.pop(line_id, None)
+            self._redirected.pop(line_id, None)
+            self._restart_asked.discard(line_id)
             # A compaction the engine did not report leaves no cause for a later one.
             self._compaction_cause.pop(line_id, None)
             self.activity.record(line_id, ActivityKind.TURN_ENDED, ending)
@@ -4235,6 +4876,7 @@ class Scheduler:
                 lambda tasks: self.ceiling_reached(line_id, tasks),
                 self.ceiling_settled,
                 lambda text: self.consent_fallback(line_id, text),
+                lambda: self.redirect_reason(line_id),
             )
             engine = self._engine_factory(spec, self.own_tools(line_id))
             self._engines[line_id] = engine
@@ -4249,6 +4891,8 @@ class Scheduler:
                 "engine": self.model_of(line_id),
                 "strategy": line.strategy,
                 "state": line.state.value,
+                "condition": self.condition(line_id),
+                "muted": line.muted,
                 "pending": len(self.pending(line_id)),
                 "turns": self._turns.get(line_id, 0),
                 "autonomous_turns": self._autonomous.get(line_id, 0),
@@ -4410,6 +5054,9 @@ def _turn_entry(
     return {
         "kind": "turn",
         "outcome": turn_outcome(report),
+        # Why the driver ended the turn, such as priority mail or a restart, since
+        # the engine's own subtype for such a turn reads as an error.
+        "interrupted_for": report.interrupted_for,
         "subtype": report.subtype,
         **(posture or {}),
         "compaction": _compaction_entry(report),
@@ -4454,6 +5101,113 @@ def _left_summary(left: ProcessesLeft | None) -> dict[str, object] | None:
             " its executable's name and its arguments with secrets masked"
         ),
     }
+
+
+def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
+    """Select the bounded, list-free fields shown by ``line_status`` by default."""
+    autonomous = cast(dict[str, object], full["autonomous_turns"])
+    cost = cast(dict[str, object], full["cost_usd"])
+    context = cast(dict[str, object], full["context"])
+    daemon = cast(dict[str, object], full["daemon"])
+    commits = cast(dict[str, object], full["commits"])
+    kept = cast(dict[str, object], full["kept_session"])
+    workdir_commit = _commit_name(commits.get("workdir"))
+    daemon_commit = _commit_name(commits.get("daemon"))
+    checkout_commit = _commit_name(commits.get("daemon_checkout"))
+    stale = commits.get("stale")
+    cite = (
+        f"line {full['line_id']} read its worktree at commit"
+        f" {workdir_commit or 'unknown'}, under the daemon at commit"
+        f" {daemon_commit or 'unknown'}"
+    )
+    if stale is True and checkout_commit is not None:
+        cite += f", whose checkout has since moved to {checkout_commit}"
+    return {
+        "line_id": full["line_id"],
+        "state": full["state"],
+        "condition": full["condition"],
+        "held_by": full["held_by"],
+        "autonomous_turns": {
+            "used": autonomous["used"],
+            "allowed": autonomous["allowed"],
+        },
+        "cost_usd": {
+            "estimate": cost["estimate"],
+            "basis": cost["basis"],
+            "limit": cost["limit"],
+        },
+        "leases": len(cast(list[dict[str, object]], full["leases"])),
+        "scheduled_wake": full["scheduled_wake"],
+        "unread": full["unread"],
+        "pending": full["pending"],
+        "model": full["model"],
+        "strategy": full["strategy"],
+        "context": {
+            "estimated_tokens": context["estimated_tokens"],
+            "warn_at": context["warn_at"],
+            "compact_session": context["compact_session"],
+            "compaction_pending": context["compaction_pending"],
+            "auto_compact_held": context["auto_compact_held"],
+        },
+        "daemon": {
+            "version": daemon["version"],
+            "commit": daemon["commit"],
+            "checkout_commit": daemon["checkout_commit"],
+            "stale": daemon["stale"],
+        },
+        "commits": {
+            "workdir": workdir_commit,
+            "daemon": daemon_commit,
+            "daemon_checkout": checkout_commit,
+            "stale": stale if type(stale) is bool else None,
+            "cite": cite + ".",
+            "note": commits.get("note"),
+        },
+        "background_task_count": len(cast(list[dict[str, object]], kept["tasks"])),
+        "recent_turn_count": len(cast(list[dict[str, object]], full["recent_turns"])),
+        "other_line_count": len(cast(list[dict[str, object]], full["other_lines"])),
+    }
+
+
+def _commit_name(value: object) -> str | None:
+    """A bounded hexadecimal Git object name from commit status, or ``None``."""
+    if (
+        isinstance(value, str)
+        and len(value) in (40, 64)
+        and all(character in "0123456789abcdefABCDEF" for character in value)
+    ):
+        return value
+    return None
+
+
+def _status_size(status: dict[str, object]) -> int:
+    """The UTF-8 size of status as the line tool formats its JSON response."""
+    return len(json.dumps(status, indent=2, sort_keys=True).encode("utf-8"))
+
+
+def _truncated_line_status(
+    full: dict[str, object], *, lists_truncated: bool
+) -> dict[str, object]:
+    """A bounded status response that says which shorter request to make."""
+    compact = _compact_line_status(full)
+    result: dict[str, object] = {
+        "line_id": compact["line_id"],
+        "state": compact["state"],
+        "status_truncated": True,
+        "detail_available": True,
+        "lists_available": True,
+        "lists_truncated": lists_truncated,
+        "commits": compact["commits"],
+        "suggested_arguments": {"detail": True, "lists": False},
+    }
+    if _status_size(result) > MAX_LINE_STATUS_DEFAULT_BYTES:
+        return {
+            "line_id": compact["line_id"],
+            "state": compact["state"],
+            "status_truncated": True,
+            "commits": compact["commits"],
+        }
+    return result
 
 
 def engine_output_roots() -> list[Path]:

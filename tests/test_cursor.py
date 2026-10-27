@@ -7,7 +7,7 @@ follow the shapes Cursor Agent 2026.10.01's installed code writes in stream-json
 import asyncio
 import json
 from collections import deque
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -42,6 +42,7 @@ from dromon.driver import (
     harness_id,
 )
 from dromon.engine import EngineRefused, TurnReport
+from dromon.priority import SteeredDriver
 from dromon.grok import bridge_command
 from dromon.jsonlines import Connection
 from dromon.lineconfig import LineConfig, WorkdirAccess
@@ -662,3 +663,23 @@ def test_the_probe_refuses_cursor_without_the_flag_and_the_flag_elsewhere(
     with pytest.raises(SystemExit):
         cli.main([*base, "--help"])
     assert "stopped only after they start" in " ".join(capsys.readouterr().out.split())
+
+
+# The safe point of priority mail, decided by the operator on 2026-10-27. A turn ends
+# once a tool result is delivered and not at the text before the tool use.
+
+type Steered = Callable[[str, Strategy], tuple[SteeredDriver, list[int]]]
+REASON = "priority mail m-1 from @ana"
+
+
+def test_priority_mail_ends_the_turn_at_the_tool_result_and_not_the_text(
+    home: Path, steered: Steered
+) -> None:
+    completed = {**mcp_call(), "subtype": "completed"}
+    server = FakeCursor([init(), said("I will send it"), mcp_call(), completed])
+    target = line(server, home)
+    target.driver, asked = steered(CURSOR, Strategy.SUBSCRIPTION)
+    report = run(target)
+    assert asked == [1]
+    assert report.interrupted_for == REASON
+    assert server.stops == 1

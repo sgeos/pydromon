@@ -45,8 +45,9 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | Operation | Result |
 |---|---|
 | `ping` | An empty object |
-| `status` | `daemon_version`, `protocol_version`, `pid`, `project`, `started_at`, and `event_log` with `last_seq`, `lines`, `operators`, `open_questions`, and the log's size and growth, `events`, `bytes`, `since_start`, `events_per_hour`, `bytes_per_hour` and `compaction`, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies for `line_status`, where an unknown size is `null` and never zero |
+| `status` | `daemon_version`, `protocol_version`, `pid`, `project`, `started_at`, `daemon`, the object `line_status` gives, with the commit the daemon started from, `restart`, the draining restart or the last one abandoned or `null`, as [`RESTART.md`](RESTART.md) specifies, and `event_log` with `last_seq`, `lines`, `operators`, `open_questions`, and the log's size and growth, `events`, `bytes`, `since_start`, `events_per_hour`, `bytes_per_hour` and `compaction`, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies for `line_status`, where an unknown size is `null` and never zero |
 | `stop` | `{"stopping": true}`, after which the daemon closes its connections, removes its socket and exits |
+| `restart` | Arguments `operator`, and optionally `mode`, `wait` or `interrupt` with `wait` the default, `wait_seconds`, a whole number from 1 to 3,600 with 600 the default, and `end_tasks`, a boolean with false the default. Begins a restart to upgrade, as [`RESTART.md`](RESTART.md) specifies. Returns `restarting`, true, `mode`, `wait_seconds`, `running`, the lines with a turn in flight, `pid` and `commit`, the daemon's, and with `end_tasks` the warning `stop` gives about background tasks. Refused while a restart drains, and while kept engine sessions run background tasks without `end_tasks`. Operator only, and not offered to external agents |
 | `create_line` | Arguments `line_id`, `model`, `strategy`, and optionally `config`, an object of [`LINE_CONFIG.md`](LINE_CONFIG.md), and `engine_session`, an existing engine session to continue, recorded as `line_session` right after `line_created` and checked as that event is. Result `{"line_id": ...}`. Refused when no packaged driver serves the model and strategy, when the configuration's `workdir` is not allowed, or when the project requires a sandbox and the line would run on Claude Code without one |
 | `configure_line` | Arguments `line_id` and `config`. Replaces the line's configuration from its next turn. A changed `workdir` also appends `line_session_cleared`. Refused when the `workdir` is not allowed, or when the project requires a sandbox and the line would run on Claude Code without one |
 | `questions` | Optionally `operator`. Result `{"questions": [...]}`, the open questions for that operator, or for all when omitted, oldest first, each with `question_id`, `line`, `operator`, `text` and `choices`. Listing marks each question delivered, because the client has shown it |
@@ -63,14 +64,17 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `reload_project` | No arguments. Reads `.dromon/dromon.toml` again and applies its lines, limits, wake policy, operator, tick cadence, sandbox requirement and disclosure list, which it reads again. Returns `file`, `present` and `lines`, the lines it declares. Refused, applying nothing, for an invalid file, a file that changes a line's model or strategy, one that changes the sandbox, the engine settings, the teacher or the external agent policy, which apply only when the daemon restarts, one whose disclosure list cannot be read, or one that requires a sandbox a line lacks |
 | `interrupt` | Argument `line_id`. Stops the line's turn in flight, as the interrupt paragraph below specifies. Returns `line_id` and `interrupted`, false when no turn was in flight, in which case nothing changes. Refused for an unknown line |
 | `release` | Argument `line_id`. Releases a line held at a conversation limit and resets its counts |
+| `mute` | Argument `line_id`. Mutes the line, recorded as `line_muted`, so it starts no turn until unmuted, as [`PRIORITY.md`](PRIORITY.md) specifies. A turn in flight finishes. Returns `line_id`, `muted`, true, `changed`, false when the line was muted already, in which case nothing is recorded, and `running`, whether a turn is in flight. Refused for an unknown line. Operator only, and not offered to external agents |
+| `unmute` | Argument `line_id`. Ends the mute, recorded as `line_unmuted`. Returns `line_id`, `muted`, false, and `changed`, false when the line was not muted. Refused for an unknown line. Operator only |
 | `agent_add` | Arguments `agent` and `access`. Registers an external agent, or replaces its access and token. Returns `agent`, `access`, `effective_access` under the policy's ceiling, `token`, shown only here, and `listening` |
 | `agent_revoke` | Argument `agent`. Revokes it |
 | `agent_list` | No arguments. Returns `policy`, with `listen`, `anonymous` and `max_access`, and `agents`, each with `agent`, `access`, `token` and `revoked` |
 | `answer` | Arguments `question_id`, `body` and `operator`. Records the operator's reply, which must come from the operator the question was asked of. Result `{"message_id": ...}`. The answer wakes the asking line in a later tick |
-| `send` | Arguments `recipient`, a line or `@operator`, `body`, `operator`, and optionally `reply_to`. Registers the operator if new and records a note from them. Result `{"message_id": ...}` |
+| `send` | Arguments `recipient`, a line or `@operator`, `body`, `operator`, and optionally `reply_to` and `priority`, a boolean, default false. Registers the operator if new and records a note from them. With `priority` true the note is priority mail, as [`PRIORITY.md`](PRIORITY.md) specifies, which must go to a line and which for an operator is unlimited. Result `message_id` and `priority`. A refused priority note records nothing and registers no operator |
 
 `status` also returns `tick`, the ticks run in this daemon's lifetime, and `lines`, one
-entry per line with `line_id`, `engine`, `strategy`, `state`, `pending`, the count of
+entry per line with `line_id`, `engine`, `strategy`, `state`, `condition`, as
+`line_status` gives it, `muted`, `pending`, the count of
 undelivered messages, `turns`, the turns run in this daemon's lifetime,
 `tool_policy`, `autonomous_turns`, the turns in a row without operator mail,
 `cost_estimate_usd`, a decimal string, or `null` when no turn since the line's release
@@ -117,10 +121,14 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 |---|---|---|
 | `dromon start` | Starts a detached `dromond` in a new session and waits for it to answer `ping`, up to 60 seconds or the `--wait` seconds given, above 0 and at most 600. On a loaded host the daemon was observed still starting after 10 seconds. Succeeds without action when a daemon already answers | 0, or 1 on failure |
 | `dromon status` | Prints the `status` result | 0, 4 when no daemon answers, or 1 |
+| `dromon proposal list` | Lists proposed changes recorded by lines | 0, or 1 on a read error |
+| `dromon proposal show PROPOSAL_ID` | Shows a proposal's message, file list and patch as untrusted text | 0, or 1 when missing or invalid |
+| `dromon status` | Prints the `status` result, with one row per line giving its condition, its pending mail, and a mute or hold its condition does not already name | 0, 4 when no daemon answers, or 1 |
 | `dromon stop` | Sends `stop` and waits up to 10 seconds for the socket to disappear | 0, 4 when no daemon answers, or 1 |
+| `dromon restart [--interrupt] [--wait-seconds S] [--end-tasks]` | Checks that the installed daemon imports, by running it with `--version`, and stops nothing if it does not. Sends `restart`, then polls `status` until a daemon with another `pid` answers, and prints its commit and the commit before. Fails if the restart is abandoned or no successor answers within the wait and 70 seconds more | 0, 4, or 1 |
 | `dromon create LINE` | Sends `create_line`, with `--model`, default `claude-haiku-5-5`, `--strategy`, default `subscription`, `--session`, an engine session to continue, which must have been started in the line's working directory, and the tool options below | 0, 4, or 1 |
 | `dromon configure LINE` | Sends `configure_line` with the tool options below. No option means the default configuration | 0, 4, or 1 |
-| `dromon send RECIPIENT BODY` | Sends `send`, with `--operator`, default the login name, and `--reply-to` | 0, 4, or 1 |
+| `dromon send RECIPIENT BODY` | Sends `send`, with `--operator`, default the login name, `--reply-to`, and `--priority`, which sends priority mail | 0, 4, or 1 |
 | `dromon questions` | Sends `questions` for `--operator`, default the login name, or for every operator with `--all`, and prints each question with its choices | 0, 4, or 1 |
 | `dromon mail` | Sends `mail`, with `--operator`, `--unread`, `--from ADDRESS`, `--offset N` and `--limit N`, default 20 | 0, 4, or 1 |
 | `dromon read MESSAGE` | Sends `read` and prints the message | 0, 4, or 1 |
@@ -129,6 +137,8 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromon attach LINE` | Opens an interactive client attached to the line, in the terminal or in a Tk window with `--gui`, speaking for `--operator` and refreshing every `--poll-seconds`, default 1, and four times as often while the line runs a turn. Text sends a message. The commands, keys and panes are those of the attached client section below. Any number may attach at once | 0, or 2 on a poll interval that is not positive |
 | `dromon release LINE` | Sends `release` | 0, 4, or 1 |
 | `dromon interrupt LINE` | Sends `interrupt`, as Escape does in an attached client, and prints whether a turn was in flight. A line with none is not a failure, since its turn may have ended as the request was made | 0, 4, or 1 |
+| `dromon mute LINE` | Sends `mute`, and says whether a turn in flight finishes first | 0, 4, or 1 |
+| `dromon unmute LINE` | Sends `unmute`, and says whether the line was muted | 0, 4, or 1 |
 | `dromon rebind LINE` | Sends `rebind_line`, with `--model` and `--strategy`, both required | 0, 2, 4, or 1 |
 | `dromon settings [LINE]` | Sends `settings` and prints the project's settings, and the line's when given, each with its layer | 0, 4, or 1 |
 | `dromon set KEY [VALUE...]` | Checks the value against `settings` as the attached client does, then sends `set_setting`. A line key needs `--line LINE`, and a project key is written with the `project.` prefix. `--unset` removes the override instead | 0, 2, 4, or 1 |
@@ -166,7 +176,7 @@ not part of the event log, is not persisted, and is lost when the daemon stops.
 | `text` | Text the engine wrote |
 | `thinking` | Empty. The engine reasoned, and reasoning is not shown |
 | `tool` | The name of the tool the engine called |
-| `turn_ended` | How the turn ended. The engine's result subtype `success`, another subtype with the reason when its driver interrupted it, `failed: the engine ended the turn as` and any other subtype, `failed:` and the error, `interrupted by an operator`, or `cancelled` at shutdown |
+| `turn_ended` | How the turn ended. The engine's result subtype `success`, another subtype with the reason when its driver interrupted it, or with `ended at a safe point for` and the priority note when priority mail ended it, `failed: the engine ended the turn as` and any other subtype, `failed:` and the error, `interrupted by an operator`, or `cancelled` at shutdown |
 | `notice` | Dromon's own remark on the turn, such as that the engine's start timed out at its initialize request and was tried once more. **Fact, read from Agent SDK 0.2.174 and tested.** The client's failed connect disconnects before it raises, which ends the first engine process before the second start |
 
 Each entry has an `entry_id`, which never changes, and a `seq`, the daemon-wide revision

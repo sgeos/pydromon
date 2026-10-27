@@ -906,3 +906,97 @@ def test_several_clients_attach_to_lines_at_once(paths: ProjectPaths) -> None:
     finally:
         client.stop(paths)
         reap(pid)
+
+
+def test_mute_and_unmute_record_the_change_once_and_show_in_status(
+    paths: ProjectPaths,
+) -> None:
+    request(
+        paths, "create_line", {"line_id": "alpha", "model": HAIKU, "strategy": "api"}
+    )
+    first = request(paths, "mute", {"line_id": "alpha"})
+    assert first.ok and first.result == {
+        "line_id": "alpha",
+        "muted": True,
+        "changed": True,
+        "running": False,
+    }
+    again = request(paths, "mute", {"line_id": "alpha"})
+    assert again.ok and again.result is not None and again.result["changed"] is False
+    status = request(paths, "status", {})
+    assert status.result is not None
+    (line,) = cast(list[dict[str, object]], status.result["lines"])
+    assert (line["muted"], line["condition"]) == (True, "muted")
+    off = request(paths, "unmute", {"line_id": "alpha"})
+    assert off.ok and off.result == {
+        "line_id": "alpha",
+        "muted": False,
+        "changed": True,
+    }
+    with EventLog(paths.event_log) as log:
+        assert not log.state.lines["alpha"].muted
+
+
+@pytest.mark.parametrize(
+    ("op", "args", "code"),
+    [
+        ("mute", {"line_id": "nobody"}, ErrorCode.REJECTED),
+        ("unmute", {"line_id": "nobody"}, ErrorCode.REJECTED),
+        ("mute", {}, ErrorCode.BAD_REQUEST),
+        ("mute", {"line_id": "alpha", "extra": "x"}, ErrorCode.BAD_REQUEST),
+    ],
+)
+def test_mute_refuses_a_bad_request(
+    paths: ProjectPaths, op: str, args: dict[str, object], code: ErrorCode
+) -> None:
+    request(
+        paths, "create_line", {"line_id": "alpha", "model": HAIKU, "strategy": "api"}
+    )
+    response = request(paths, op, args)
+    assert (response.ok, response.error_code) == (False, code)
+
+
+def test_send_with_priority_marks_the_note(paths: ProjectPaths) -> None:
+    request(
+        paths, "create_line", {"line_id": "alpha", "model": HAIKU, "strategy": "api"}
+    )
+    args: dict[str, object] = {
+        "recipient": "alpha",
+        "body": "stop that",
+        "operator": "ana",
+        "priority": True,
+    }
+    response = request(paths, "send", args)
+    assert response.ok and response.result is not None
+    assert response.result["priority"] is True
+    with EventLog(paths.event_log) as log:
+        assert log.state.messages[str(response.result["message_id"])].priority
+
+
+@pytest.mark.parametrize(
+    ("args", "code", "reason"),
+    [
+        (
+            {"recipient": "@ben", "body": "x", "operator": "ana", "priority": True},
+            ErrorCode.REJECTED,
+            "goes to a line",
+        ),
+        (
+            {"recipient": "alpha", "body": "x", "operator": "ana", "priority": "yes"},
+            ErrorCode.BAD_REQUEST,
+            "priority is not a boolean",
+        ),
+    ],
+)
+def test_send_with_priority_refuses_and_records_nothing(
+    paths: ProjectPaths, args: dict[str, object], code: ErrorCode, reason: str
+) -> None:
+    request(
+        paths, "create_line", {"line_id": "alpha", "model": HAIKU, "strategy": "api"}
+    )
+    response = request(paths, "send", args)
+    assert (response.ok, response.error_code) == (False, code)
+    assert reason in (response.error_message or "")
+    with EventLog(paths.event_log) as log:
+        assert log.state.messages == {}
+        assert "ana" not in log.state.operators

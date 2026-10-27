@@ -590,7 +590,7 @@ def test_the_model_accepts_only_the_note_or_the_fixed_withheld_text() -> None:
     state = State()
     state.apply(LineCreated("alpha", HAIKU, "subscription"))
     state.apply(WakeScheduled("alpha", "s1", "2026-10-26T09:30:00Z", "secret note"))
-    with pytest.raises(EventRejected, match="cannot message itself"):
+    with pytest.raises(EventRejected, match="reserved by line alpha's scheduled wake"):
         state.check(MessageSent("s1", alpha, alpha, MessageKind.NOTE, "redacted"))
     state.apply(MessageSent("s1", alpha, alpha, MessageKind.NOTE, WITHHELD_WAKE_NOTE))
     assert "alpha" not in state.scheduled

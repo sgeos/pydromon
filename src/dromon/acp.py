@@ -197,6 +197,22 @@ def identity(fields: Mapping[str, Any]) -> dict[str, object]:
     return {key: fields[key] for key in IDENTITY_FIELDS if key in fields}
 
 
+FINISHED_STATUSES: Final = frozenset({"completed", "failed"})
+"""The tool call statuses after which the call's result has gone to the model."""
+
+
+def newly_finished(
+    identifier: str, update: Mapping[str, Any], finished: set[str]
+) -> bool:
+    """Whether ``update`` first reports the recorded call ``identifier`` finished,
+    adding it to ``finished``, so a turn feeds each result to its driver once, as the
+    safe point of priority mail needs."""
+    if update.get("status") not in FINISHED_STATUSES or identifier in finished:
+        return False
+    finished.add(identifier)
+    return True
+
+
 def identity_refusal(
     identifier: object,
     fields: Mapping[str, Any],

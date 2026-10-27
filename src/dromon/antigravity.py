@@ -69,7 +69,15 @@ from claude_agent_sdk import SdkMcpTool
 
 from dromon import __version__, acp
 from dromon.activity import ActivityKind, Observer, ignore
-from dromon.driver import ActionTag, Credential, Driver, Event, Strategy, harness_id
+from dromon.driver import (
+    TOOL_RESULT,
+    ActionTag,
+    Credential,
+    Driver,
+    Event,
+    Strategy,
+    harness_id,
+)
 from dromon.engine import (
     DIFFERENCE_SOURCE,
     CostMark,
@@ -527,6 +535,9 @@ class _Turn:
         default_factory=dict[str, dict[str, object]]
     )
     """Each tool call's identity as first recorded, by its identifier."""
+    finished: set[str] = field(default_factory=set[str])
+    """Tool calls whose update reported them finished, so each result is fed to the
+    driver once."""
     subtype: str | None = None
     interrupted_for: str | None = None
     refusal: str | None = None
@@ -995,6 +1006,10 @@ class AntigravityLine:
         await self._record(str(identifier), update, turn)
         recorded = turn.calls[str(identifier)]
         if acp.tool_name(recorded) in self.own_tools:
+            if acp.newly_finished(str(identifier), update, turn.finished):
+                # The safe point before the next model call that priority mail
+                # takes, as ``dromon.priority`` describes.
+                await self._act(Event(TOOL_RESULT), turn)
             return
         started = update.get("status") in STARTED_STATUSES or "status" not in update
         when = "after it started" if started else "before it ran"

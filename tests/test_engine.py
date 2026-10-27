@@ -9,7 +9,13 @@ deselection, and the variable keeps such a run from calling the engine by accide
 import asyncio
 import re
 import os
-from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Mapping,
+    Sequence,
+)
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from importlib import resources
 from pathlib import Path
@@ -27,12 +33,15 @@ from claude_agent_sdk import (
     ResultMessage,
     SystemMessage,
     TextBlock,
+    ToolResultBlock,
+    UserMessage,
     ThinkingBlock,
     ToolUseBlock,
 )
 
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon.driver import Credential, Driver, Strategy, driver_resource
+from dromon.priority import SteeredDriver
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, McpServer, ToolPolicy
 from dromon.engine import (
     API_ENVIRONMENT,
@@ -463,3 +472,29 @@ def test_the_gate_applies_the_line_policy() -> None:
     assert isinstance(
         asyncio.run(allow_all("Bash", {}, CONTEXT)), PermissionResultAllow
     )
+
+
+# The safe point of priority mail, decided by the operator on 2026-10-27. A turn ends
+# once a tool result is delivered and not at the text before the tool use.
+
+type Steered = Callable[[str, Strategy], tuple[SteeredDriver, list[int]]]
+REASON = "priority mail m-1 from @ana"
+
+
+def test_priority_mail_ends_the_turn_at_the_tool_result_and_not_the_text(
+    steered: Steered,
+) -> None:
+    driver, asked = steered(MODEL, Strategy.SUBSCRIPTION)
+    session = Scripted(
+        [
+            init(),
+            say(TextBlock("I will read it"), tool("Read")),
+            UserMessage(content=[ToolResultBlock(tool_use_id="t-Read", content="ok")]),
+            say(TextBlock("done")),
+            result("error_during_execution"),
+        ]
+    )
+    report = run(line(session, driver))
+    assert asked == [1]
+    assert report.interrupted_for == REASON
+    assert session.interrupts == 1

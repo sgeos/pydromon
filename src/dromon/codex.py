@@ -79,7 +79,7 @@ from claude_agent_sdk import SdkMcpTool
 
 from dromon import __version__
 from dromon.activity import ActivityKind, Observer, ignore
-from dromon.driver import ActionTag, Credential, Driver, Event, Strategy
+from dromon.driver import TOOL_RESULT, ActionTag, Credential, Driver, Event, Strategy
 from dromon.engine import (
     COMPACTION_REQUESTED,
     DIED_NOTE,
@@ -1141,6 +1141,10 @@ class CodexLine:
                 turn.text.append(text)
                 self._observe(ActivityKind.TEXT, text)
                 await self._act(Event("text", "", len(text)), turn)
+            elif self._tool_name(item) is not None:
+                # The safe point before the next model call that priority mail takes,
+                # as ``dromon.priority`` describes.
+                await self._act(Event(TOOL_RESULT), turn)
         elif method == "model/rerouted":
             model = str(params.get("toModel") or "")
             verdict = self.driver.step(Event("init", model))
@@ -1222,13 +1226,8 @@ class CodexLine:
                 self._observe(ActivityKind.THINKING, "")
                 await self._act(Event("thinking"), turn)
             return
-        if kind == "dynamicToolCall" and str(item.get("tool")) in self.mcp_tools:
-            name = str(item.get("tool"))
-        elif kind == "commandExecution" and "Bash" in self.config.builtin_tools:
-            name = "Bash"
-        elif kind == "fileChange" and WRITE_TOOLS & set(self.config.builtin_tools):
-            name = "Edit"
-        else:
+        name = self._tool_name(item)
+        if name is None:
             await self._interrupt(
                 turn, f"the engine used a tool the line was not given: {kind}"
             )
@@ -1236,6 +1235,18 @@ class CodexLine:
         turn.tool_uses.append(name)
         self._observe(ActivityKind.TOOL, name)
         await self._act(Event("tool_use", name), turn)
+
+    def _tool_name(self, item: Mapping[str, Any]) -> str | None:
+        """The tool an item is a use of, as the driver counts it, or ``None`` for an
+        item that is no tool the line was given."""
+        kind = str(item.get("type") or "")
+        if kind == "dynamicToolCall" and str(item.get("tool")) in self.mcp_tools:
+            return str(item.get("tool"))
+        if kind == "commandExecution" and "Bash" in self.config.builtin_tools:
+            return "Bash"
+        if kind == "fileChange" and WRITE_TOOLS & set(self.config.builtin_tools):
+            return "Edit"
+        return None
 
     async def _act(self, event: Event, turn: _Turn) -> None:
         action = self.driver.step(event)

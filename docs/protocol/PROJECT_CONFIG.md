@@ -13,6 +13,12 @@ and its wake policy in `.dromon/dromon.toml`. The daemon reads the file when it 
 operator's direction, the format is expected to grow as large as a multi-agent project
 needs, so it is strict and versioned from the start.
 
+After printing the summary, `dromon config` warns when multiple lines with a shell,
+file-write or Model Context Protocol (MCP) tool resolve to the same workdir, or when
+their tool policy allows every tool. Assign writing lines separate worktrees to avoid
+concurrent edits to one checkout. This is a warning only because tool names do not
+establish the full write capability of an engine or remote tool.
+
 ## Format
 
 The file is TOML version 1.0, encoded in UTF-8, at most 4 MiB.

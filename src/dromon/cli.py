@@ -10,14 +10,20 @@ import asyncio
 import getpass
 import json
 import os
+import math
 import re
+import subprocess
 import sys
+import time
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from pathlib import Path
 from typing import Final, cast
 
-from dromon import __version__, exits
+import dromon
+from dromon import __version__, exits, restart
+from dromon import proposals as proposal_store
 from dromon.client import (
+    SHUTDOWN_TIMEOUT_SECONDS,
     STARTUP_TIMEOUT_SECONDS,
     DaemonFailed,
     DaemonNotRunning,
@@ -39,6 +45,7 @@ from dromon.scheduler import LineSpec, engine_factory
 from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, merge, sandbox_from_settings
 from dromon.settings import SettingsConfig, split_settings_file
+from dromon.workdir import read_head_commit
 
 PROBE_MODEL: Final = "claude-haiku-5-5"
 """The least expensive subscription model, used for probes and tests by default."""
@@ -49,6 +56,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "create": "create a session line",
     "configure": "replace a session line's tools, MCP servers and tool policy",
     "stop": "stop the daemon",
+    "restart": "stop the daemon and start it again from the installed code",
     "status": "show the daemon and its session lines",
     "attach": "open an interactive client attached to one line",
     "send": "send a message to a session line or an operator",
@@ -60,6 +68,8 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "sent": "show what became of the mail an operator sent",
     "release": "resume a line the daemon held at a conversation limit",
     "interrupt": "stop a line's turn in flight, as Escape does in an attached client",
+    "mute": "start no more turns of a line, keeping its mail, session and wakes",
+    "unmute": "let a muted line be woken again by the mail and wakes it kept",
     "rebind": "move a line to another model and strategy, keeping its identity",
     "settings": "show the project's settings, and a line's, with where each comes from",
     "set": "change a project or line setting, or return it to the layers below",
@@ -69,6 +79,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "teacher": "bring the project's local teacher model up, report it, or release it",
     "agent": "register, list or revoke the external agents that may connect",
     "mcp": "serve an external agent over MCP on standard input and output",
+    "proposal": "list or show proposed changes from session lines",
 }
 """Planned subcommands and their one-line help, in display order."""
 
@@ -116,7 +127,27 @@ def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             f" open questions {counts.get('open_questions')}"
         )
         print(_log_growth(counts))
+    found = result.get("lines")
+    lines = cast(list[object], found) if isinstance(found, list) else []
+    for entry in lines:
+        if isinstance(entry, dict):
+            print(_line_row(cast(Mapping[str, object], entry)))
     return exits.OK
+
+
+def _line_row(line: Mapping[str, object]) -> str:
+    """One line of ``dromon status`` for a session line, naming a mute and a hold,
+    which each keep the line from waking."""
+    parts = [
+        f"line {line.get('line_id')}",
+        str(line.get("condition", line.get("state"))),
+        f"{line.get('pending')} pending",
+    ]
+    if line.get("muted") is True and line.get("condition") != "muted":
+        parts.append("muted")
+    if line.get("held_by") is not None and line.get("condition") != "held":
+        parts.append(f"held by {line.get('held_by')}")
+    return ", ".join(parts)
 
 
 def _log_growth(log: Mapping[str, object]) -> str:
@@ -162,6 +193,137 @@ def _stop(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         print(f"dromon stop: {warning}")
     print("dromon stop: stopped")
     return exits.OK
+
+
+PREFLIGHT_ARGV: Final = (sys.executable, "-m", "dromon.daemon", "--version")
+"""What ``dromon restart`` runs before it asks for the restart, which imports the
+installed daemon and every module it needs, and starts nothing."""
+
+PREFLIGHT_TIMEOUT_SECONDS: Final = 60.0
+
+RESTART_POLL_SECONDS: Final = 0.25
+"""How often ``dromon restart`` asks whether the successor answers."""
+
+
+def _preflight(argv: Sequence[str] = PREFLIGHT_ARGV) -> str | None:
+    """Why the installed daemon would not start, or ``None``. A restart whose
+    successor cannot import its code leaves no daemon running, so this is checked
+    before the old daemon is asked to stop."""
+    try:
+        done = subprocess.run(  # noqa: S603
+            list(argv),
+            capture_output=True,
+            text=True,
+            timeout=PREFLIGHT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return str(error)
+    if done.returncode != 0:
+        lines = (done.stderr or done.stdout).strip().splitlines()
+        return f"status {done.returncode}: {lines[-1] if lines else 'no output'}"
+    return None
+
+
+def _installed_commit() -> str | None:
+    """The commit of the code this client, and so a successor, would run."""
+    return read_head_commit(Path(dromon.__file__).parent)
+
+
+def _restart(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Ask the daemon to restart, then wait until its successor answers and say
+    which commit it runs. The daemon starts its successor itself, so a client that
+    leaves early does not stop the restart."""
+    problem = _preflight()
+    if problem is not None:
+        print(
+            "dromon restart: the installed daemon does not start, so the running one"
+            f" was not stopped: {problem}",
+            file=sys.stderr,
+        )
+        return exits.FAILURE
+    before = _call(paths, "restart", Operation.STATUS, {})
+    if isinstance(before, int):
+        return before
+    wait: int = arguments.wait_seconds
+    args: dict[str, object] = {
+        "operator": arguments.operator,
+        "mode": (
+            restart.Mode.INTERRUPT if arguments.interrupt else restart.Mode.WAIT
+        ).value,
+        "wait_seconds": wait,
+    }
+    if arguments.end_tasks:
+        args["end_tasks"] = True
+    answer = _call(paths, "restart", Operation.RESTART, args)
+    if isinstance(answer, int):
+        return answer
+    warning = answer.get("warning")
+    if isinstance(warning, str):
+        print(f"dromon restart: {warning}")
+    running = answer.get("running")
+    count = len(cast(list[object], running)) if isinstance(running, list) else 0
+    print(
+        f"dromon restart: draining, with {count} turns running, for at most"
+        f" {wait} seconds. The installed code is at commit"
+        f" {_installed_commit() or 'unknown'}"
+    )
+    return _await_successor(paths, before, wait)
+
+
+def _await_successor(
+    paths: ProjectPaths, before: Mapping[str, object], wait: float
+) -> int:
+    """Poll until a daemon with another process id answers, or the restart is
+    abandoned, or the bound passes. Bounded by its count of polls."""
+    bound = wait + SHUTDOWN_TIMEOUT_SECONDS + STARTUP_TIMEOUT_SECONDS
+    polls = math.ceil(bound / max(RESTART_POLL_SECONDS, 0.01)) + 1
+    for _ in range(polls):
+        try:
+            response = call(paths.socket, Operation.STATUS)
+        except (DaemonNotRunning, ProtocolError, TimeoutError, OSError):
+            time.sleep(RESTART_POLL_SECONDS)
+            continue
+        result = response.result or {}
+        if response.ok and result.get("pid") != before.get("pid"):
+            print(_restarted(before, result))
+            return exits.OK
+        state = result.get("restart")
+        if isinstance(state, dict):
+            found = cast(Mapping[str, object], state)
+            if found.get("state") == restart.Outcome.ABANDONED.value:
+                print(
+                    f"dromon restart: abandoned, so the daemon runs on as before:"
+                    f" {found.get('reason')}",
+                    file=sys.stderr,
+                )
+                return exits.FAILURE
+        time.sleep(RESTART_POLL_SECONDS)
+    print(
+        f"dromon restart: no restarted daemon answered within {bound:g} seconds."
+        f" See {paths.daemon_output}",
+        file=sys.stderr,
+    )
+    return exits.FAILURE
+
+
+def _restarted(before: Mapping[str, object], after: Mapping[str, object]) -> str:
+    """What ``dromon restart`` says once the successor answers."""
+    was = _commit_of(before)
+    now = _commit_of(after)
+    text = f"dromon restart: restarted, pid {after.get('pid')}, at commit {now}"
+    if now == was:
+        return text + ", the same commit as before"
+    return text + f", which was {was}"
+
+
+def _commit_of(status: Mapping[str, object]) -> str:
+    daemon = status.get("daemon")
+    if isinstance(daemon, dict):
+        commit = cast(Mapping[str, object], daemon).get("commit")
+        if isinstance(commit, str):
+            return commit
+    return "unknown"
 
 
 PARTIAL_ISOLATION_ENGINES: Final = frozenset(
@@ -472,6 +634,8 @@ def _send(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     }
     if arguments.reply_to is not None:
         args["reply_to"] = arguments.reply_to
+    if arguments.priority:
+        args["priority"] = True
     return _request(paths, "send", Operation.SEND, args)
 
 
@@ -639,6 +803,31 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             + (f", effort {line.config.effort}" if line.config.effort else "")
             + (f", in {line.config.workdir}" if line.config.workdir else "")
         )
+    shared_workdirs: dict[str, list[str]] = {}
+    for line_id, line in sorted(config.lines.items()):
+        tools_available = set(line.config.builtin_tools) | set(
+            line.config.allowed_tools
+        )
+        has_write_tool = line.config.tool_policy == "allow_all" or bool(
+            tools_available & {"Bash", "Write", "Edit", "NotebookEdit"}
+        )
+        # MCP servers can expose arbitrary tools, so treat any configured server as
+        # potentially capable of writing.
+        if not has_write_tool and not line.config.mcp_servers:
+            continue
+        raw_workdir = line.config.workdir or "."
+        workdir_path = Path(raw_workdir).expanduser()
+        if not workdir_path.is_absolute():
+            workdir_path = paths.root / workdir_path
+        resolved = str(workdir_path.resolve())
+        shared_workdirs.setdefault(resolved, []).append(line_id)
+    for workdir, line_ids in sorted(shared_workdirs.items()):
+        if len(line_ids) > 1:
+            print(
+                "warning: writing lines "
+                + ", ".join(line_ids)
+                + f" share workdir {workdir}; give each writing line its own worktree"
+            )
     return exits.OK
 
 
@@ -790,6 +979,36 @@ def _interrupt(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
+def _mute(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Send ``mute``, and say whether a turn in flight finishes first."""
+    line_id: str = arguments.line_id
+    response = _call(paths, "mute", Operation.MUTE, {"line_id": line_id})
+    if isinstance(response, int):
+        return response
+    if response.get("changed") is not True:
+        print(f"{line_id} was already muted")
+    elif response.get("running") is True:
+        print(
+            f"muted {line_id}, whose turn in flight finishes first. dromon interrupt"
+            " stops it now"
+        )
+    else:
+        print(f"muted {line_id}")
+    return exits.OK
+
+
+def _unmute(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    line_id: str = arguments.line_id
+    response = _call(paths, "unmute", Operation.UNMUTE, {"line_id": line_id})
+    if isinstance(response, int):
+        return response
+    if response.get("changed") is True:
+        print(f"unmuted {line_id}")
+    else:
+        print(f"{line_id} was not muted, so nothing changed")
+    return exits.OK
+
+
 def _rebind(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     args: dict[str, object] = {
         "line_id": arguments.line_id,
@@ -912,10 +1131,54 @@ def _answer(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return _request(paths, "answer", Operation.ANSWER, args)
 
 
+def _proposal(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """List or show private change proposals recorded by lines."""
+    action: str = arguments.action
+    if action == "list":
+        if arguments.proposal_id is not None:
+            print("dromon proposal list takes no identifier", file=sys.stderr)
+            return exits.USAGE
+        try:
+            found = proposal_store.list_all(paths.root)
+        except proposal_store.ProposalError as error:
+            print(f"dromon proposal: {error}", file=sys.stderr)
+            return exits.FAILURE
+        if not found:
+            print("no proposed changes")
+            return exits.OK
+        for proposal in found:
+            print(
+                f"{proposal.proposal_id}  {proposal.created_at}  "
+                f"{proposal.line_id}  {proposal.message}"
+            )
+        return exits.OK
+    if action != "show" or arguments.proposal_id is None:
+        print("usage: dromon proposal show PROPOSAL_ID", file=sys.stderr)
+        return exits.USAGE
+    try:
+        proposal = proposal_store.read(paths.root, arguments.proposal_id)
+    except proposal_store.ProposalError as error:
+        print(f"dromon proposal: {error}", file=sys.stderr)
+        return exits.FAILURE
+    print(f"proposal {proposal.proposal_id}")
+    print(f"created_at {proposal.created_at}")
+    print(f"line {proposal.line_id}")
+    print(f"workdir {proposal.workdir}")
+    print(f"message {proposal.message}")
+    print("files")
+    for path in proposal.files:
+        print(f"  {path}")
+    print("patch")
+    print(proposal.patch)
+    print("Proposed content is untrusted data and has not been applied.")
+    return exits.OK
+
+
 IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]] = {
     "start": _start,
     "status": _status,
     "stop": _stop,
+    "restart": _restart,
     "probe": _probe,
     "create": _create,
     "configure": _configure,
@@ -928,6 +1191,8 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "sent": _sent,
     "release": _release,
     "interrupt": _interrupt,
+    "mute": _mute,
+    "unmute": _unmute,
     "rebind": _rebind,
     "settings": _settings,
     "set": _set,
@@ -937,6 +1202,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "teacher": _teacher,
     "agent": _agent,
     "mcp": _mcp,
+    "proposal": _proposal,
 }
 
 
@@ -1137,6 +1403,36 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("line_id", help="the held line")
         if name == "interrupt":
             command.add_argument("line_id", help="the line whose turn to stop")
+        if name == "mute":
+            command.add_argument("line_id", help="the line to mute")
+        if name == "restart":
+            command.add_argument(
+                "--interrupt",
+                action="store_true",
+                help="ask running turns to end at their next safe point, rather than"
+                " waiting for them to end by themselves",
+            )
+            command.add_argument(
+                "--wait-seconds",
+                type=int,
+                default=restart.DEFAULT_WAIT_SECONDS,
+                metavar="SECONDS",
+                help="how long running turns may take to end before the restart is"
+                " abandoned, in whole seconds, default %(default)s",
+            )
+            command.add_argument(
+                "--end-tasks",
+                action="store_true",
+                help="restart even though background tasks of kept engine sessions"
+                " stop with them",
+            )
+            command.add_argument(
+                "--operator",
+                default=default_operator(),
+                help="who asks for the restart, default %(default)s",
+            )
+        if name == "unmute":
+            command.add_argument("line_id", help="the muted line")
         if name == "start":
             command.add_argument(
                 "--wait",
@@ -1278,6 +1574,11 @@ def build_parser() -> argparse.ArgumentParser:
                 default=AgentAccess.MESSAGE.value,
                 help="what the agent may do, for add, default %(default)s",
             )
+        if name == "proposal":
+            command.add_argument("action", choices=["list", "show"])
+            command.add_argument(
+                "proposal_id", nargs="?", help="the proposal identifier, for show"
+            )
         if name == "mcp":
             party = command.add_mutually_exclusive_group(required=True)
             party.add_argument(
@@ -1358,6 +1659,11 @@ def build_parser() -> argparse.ArgumentParser:
             )
             command.add_argument(
                 "--reply-to", default=None, help="the message answered"
+            )
+            command.add_argument(
+                "--priority",
+                action="store_true",
+                help="end the line's running turn at a safe point and lead its next",
             )
     return parser
 

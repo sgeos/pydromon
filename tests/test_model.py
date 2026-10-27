@@ -6,7 +6,9 @@ from typing import get_args
 import pytest
 
 from dromon.model import (
+    AgentAccess,
     AgentAddress,
+    AgentRegistered,
     LINE_TRANSITIONS,
     MAX_CHOICE_BYTES,
     MAX_CHOICES,
@@ -16,12 +18,15 @@ from dromon.model import (
     InvalidField,
     LineAddress,
     LineCreated,
+    LineMuted,
+    LineUnmuted,
     LineState,
     LineStateChanged,
     MessageAcknowledged,
     MessageDelivered,
     MessageRead,
     MessageKind,
+    MessagePrioritized,
     MessageSent,
     OperatorAddress,
     OperatorRegistered,
@@ -322,7 +327,54 @@ REJECTIONS: list[tuple[str, list[Event], Event, str]] = [
         MessageSent("m", LineAddress("x"), BETA, NOTE, ""),
         "no line",
     ),
-    ("self message", parties(), MessageSent("m", ALPHA, ALPHA, NOTE, ""), "itself"),
+    (
+        "operator self message",
+        parties(),
+        MessageSent("m", ANA, ANA, NOTE, ""),
+        "cannot message itself",
+    ),
+    (
+        "agent self message",
+        [*parties(), AgentRegistered("probe", AgentAccess.MESSAGE, "")],
+        MessageSent("m", AgentAddress("probe"), AgentAddress("probe"), NOTE, ""),
+        "cannot message itself",
+    ),
+    ("mute twice", [*parties(), LineMuted("alpha")], LineMuted("alpha"), "is muted"),
+    ("unmute unmuted", parties(), LineUnmuted("alpha"), "is not muted"),
+    ("mute no line", parties(), LineMuted("x"), "no line"),
+    ("prioritize nothing", parties(), MessagePrioritized("m"), "no message m"),
+    (
+        "prioritize twice",
+        [
+            *parties(),
+            MessageSent("m", ANA, ALPHA, NOTE, "now"),
+            MessagePrioritized("m"),
+        ],
+        MessagePrioritized("m"),
+        "is priority mail",
+    ),
+    (
+        "prioritize a question",
+        [*parties(), MessageSent("m", ALPHA, ANA, QUESTION, "?")],
+        MessagePrioritized("m"),
+        "not a note",
+    ),
+    (
+        "prioritize operator mail",
+        [*parties(), MessageSent("m", ALPHA, ANA, NOTE, "hi")],
+        MessagePrioritized("m"),
+        "not to a line",
+    ),
+    (
+        "prioritize delivered mail",
+        [
+            *parties(),
+            MessageSent("m", ANA, ALPHA, NOTE, "now"),
+            MessageDelivered("m"),
+        ],
+        MessagePrioritized("m"),
+        "was delivered",
+    ),
     (
         "question from an operator",
         parties(),
@@ -543,3 +595,22 @@ def test_check_never_mutates(scenario: tuple[Event, ...]) -> None:
         state.check(event)
         assert state == before
         state.apply(event)
+
+
+def test_a_line_may_send_itself_a_note_that_waits_undelivered() -> None:
+    state = build(*parties(), MessageSent("m", ALPHA, ALPHA, NOTE, "later"))
+    note = state.messages["m"]
+    assert note.sender == note.recipient == ALPHA
+    assert not note.delivered and not note.priority
+
+
+def test_mute_and_priority_change_only_their_own_flags() -> None:
+    state = build(*parties(), MessageSent("m", ANA, ALPHA, NOTE, "now"))
+    before = state.lines["alpha"]
+    state.apply(LineMuted("alpha"))
+    assert state.lines["alpha"].muted
+    state.apply(LineUnmuted("alpha"))
+    assert state.lines["alpha"] == before
+    state.apply(MessagePrioritized("m"))
+    assert state.messages["m"].priority
+    assert not state.messages["m"].delivered

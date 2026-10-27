@@ -33,10 +33,12 @@ from dromon.driver import (
     driver_resource,
 )
 from dromon.engine import EngineRefused, TurnReport
+from dromon.priority import SteeredDriver
 from dromon.grok import bridge_command
 from dromon.jsonlines import Connection, json_lines_factory
 from dromon.lineconfig import LineConfig, WorkdirAccess
 from dromon.pi import (
+    tool_calls_in,
     DIALOG_REFUSED,
     AGENT_DIR,
     PiLine,
@@ -949,3 +951,64 @@ def test_a_cancelled_turn_keeps_the_cost_pi_reported_for_it(home: Path) -> None:
     asyncio.run(go())
     assert target.take_interrupted_cost() == pytest.approx(0.2)
     assert target.take_interrupted_cost() is None
+
+
+# The safe point of priority mail, decided by the operator on 2026-10-27. A turn ends
+# once a tool result is delivered and not at the text before the tool use.
+
+type Steered = Callable[[str, Strategy], tuple[SteeredDriver, list[int]]]
+REASON = "priority mail m-1 from @ana"
+
+
+def finished(name: str) -> dict[str, Any]:
+    return {
+        "type": "tool_execution_end",
+        "toolCallId": "call-1",
+        "toolName": name,
+        "result": {},
+        "isError": False,
+    }
+
+
+def test_priority_mail_ends_the_turn_at_the_tool_result_and_not_the_text(
+    home: Path, steered: Steered
+) -> None:
+    server = FakePi(
+        [
+            TURN_START,
+            text_delta("I will send it"),
+            assistant("I will send it", stop="toolUse"),
+            tool(OWN),
+            finished(OWN),
+            *reply(),
+        ]
+    )
+    target = line(server, home)
+    target.driver, asked = steered(PI, Strategy.SUBSCRIPTION)
+    report = run(target)
+    # The message that stopped for a tool use was not asked, its result was. The
+    # fake plays on after the abort, where the steer may be asked again, as the
+    # scheduler's steer answers only once.
+    assert asked[0] == 1
+    assert report.interrupted_for == REASON
+    assert server.commands().count("abort") == 1
+
+
+def test_priority_mail_ends_the_turn_at_a_message_without_a_tool_call(
+    home: Path, steered: Steered
+) -> None:
+    server = FakePi(reply())
+    target = line(server, home)
+    target.driver, asked = steered(PI, Strategy.SUBSCRIPTION)
+    report = run(target)
+    assert asked == [0]
+    assert report.interrupted_for == REASON
+
+
+def test_a_message_counts_its_tool_calls_by_block_and_by_stop_reason() -> None:
+    call: dict[str, object] = {"type": "toolCall", "id": "c1", "name": OWN}
+    text = {"type": "text", "text": "x"}
+    assert tool_calls_in({"content": [text]}) == 0
+    assert tool_calls_in({"content": [text, call, call]}) == 2
+    assert tool_calls_in({"content": [text], "stopReason": "toolUse"}) == 1
+    assert tool_calls_in({"content": "not a list"}) == 0

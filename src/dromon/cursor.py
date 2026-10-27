@@ -47,7 +47,15 @@ from claude_agent_sdk import SdkMcpTool
 
 from dromon import capabilities
 from dromon.activity import ActivityKind, Observer, ignore
-from dromon.driver import ActionTag, Credential, Driver, Event, Strategy, harness_id
+from dromon.driver import (
+    TOOL_RESULT,
+    ActionTag,
+    Credential,
+    Driver,
+    Event,
+    Strategy,
+    harness_id,
+)
 from dromon.engine import EngineRefused, TurnReport, read_instructions
 from dromon.jsonlines import (
     TURN_SECONDS,
@@ -527,6 +535,7 @@ class CursorLine:
                 cast(dict[str, Any], record.get("tool_call") or {}),
                 turn,
                 started=record.get("subtype") == "started",
+                completed=record.get("subtype") == "completed",
             )
         elif kind == "result":
             turn.result = {
@@ -587,10 +596,17 @@ class CursorLine:
             await self._act(Event("text", "", len(text)), turn)
 
     async def _tool(
-        self, tool_call: dict[str, Any], turn: _Turn, *, started: bool
+        self,
+        tool_call: dict[str, Any],
+        turn: _Turn,
+        *,
+        started: bool,
+        completed: bool = False,
     ) -> None:
         """A tool call. Every subtype is checked, so a tool reported only when it
-        completes is still refused, and only a ``started`` one is counted."""
+        completes is still refused, and only a ``started`` one is counted. A
+        ``completed`` one is the safe point before the next model call that priority
+        mail takes, as ``dromon.priority`` describes."""
         kind, value = tool_of(tool_call)
         name = kind or "an unnamed tool"
         if kind == "mcpToolCall":
@@ -604,6 +620,8 @@ class CursorLine:
             )
             return
         if not started:
+            if completed:
+                await self._act(Event(TOOL_RESULT), turn)
             return
         turn.tool_uses.append(name)
         self._observe(ActivityKind.TOOL, name)

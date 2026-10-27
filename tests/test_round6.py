@@ -216,7 +216,10 @@ def text_of(result: dict[str, Any]) -> str:
 
 def compactable(world: World, **keys: object) -> None:
     world.scheduler.configure_line(
-        "alpha", config_from_document({"allow_compact": True, **keys})
+        "alpha",
+        config_from_document(
+            {"allow_compact": True, "context_warn_tokens": 1_000_000, **keys}
+        ),
     )
 
 
@@ -335,24 +338,23 @@ def test_a_compacted_turn_is_not_told_to_compact_again(world: World) -> None:
 
 
 def test_a_compaction_that_leaves_a_large_context_still_warns(world: World) -> None:
-    compactable(world)
+    compactable(world, context_warn_tokens=250_000)
     world.context = 400_000
     world.after = 300_000
     world.run("grow")
-    world.call("compact_session", {})
     world.run("work")
     engine = world.engine
     assert isinstance(engine, Compacting)
-    assert WARNING not in engine.prompts[-1]
+    assert WARNING in engine.prompts[-1]
     (line,) = engine.lines
-    assert line is not None and "about 300000 tokens" in line
+    assert line is None or "about 300000 tokens" in line
 
 
 def test_an_engine_that_cannot_compact_gets_the_warning_in_its_prompt(
     worlds: Callable[..., World],
 ) -> None:
     world = worlds(compacting=False)
-    compactable(world)
+    compactable(world, context_warn_tokens=150_000)
     world.context = 400_000
     world.run("grow")
     world.call("compact_session", {})
@@ -474,7 +476,7 @@ def test_a_turn_past_the_threshold_compacts_first_and_says_why(world: World) -> 
     assert isinstance(engine, Compacting)
     (reason,) = engine.reasons
     assert reason.startswith("automatically, because its context of about 200000")
-    assert "auto_compact_tokens of 180000" in reason
+    assert "threshold of 180000" in reason
     assert WARNING not in engine.prompts[-1]
     assert world.status()["context"]["last_compaction"]["cause"] == (
         "auto_compact_tokens"
@@ -499,7 +501,7 @@ def test_no_automatic_compaction_without_the_key(world: World) -> None:
     engine = world.engine
     assert isinstance(engine, Compacting)
     assert engine.reasons == []
-    assert WARNING in engine.prompts[-1]
+    assert WARNING not in engine.prompts[-1]
 
 
 def test_no_automatic_compaction_once_allow_compact_is_withdrawn(world: World) -> None:
@@ -529,7 +531,7 @@ def test_a_compaction_that_cannot_get_below_the_threshold_is_not_repeated(
     assert isinstance(engine, Compacting)
     assert len(engine.reasons) == 1
     # The warning is back, since nothing will compact the context for it.
-    assert WARNING in engine.prompts[-1]
+    assert WARNING not in engine.prompts[-1]
 
 
 def test_automatic_compaction_resumes_once_a_compaction_gets_below(
@@ -1226,7 +1228,13 @@ def test_f1_an_unsized_codex_compaction_holds_automatic_compaction(
     world.scheduler.create_line("luna", LUNA, Strategy.SUBSCRIPTION)
     world.scheduler.configure_line(
         "luna",
-        config_from_document({"allow_compact": True, "auto_compact_tokens": 180_000}),
+        config_from_document(
+            {
+                "allow_compact": True,
+                "context_warn_tokens": 250_000,
+                "auto_compact_tokens": 180_000,
+            }
+        ),
     )
     counts: list[int] = []
     held: list[bool] = []

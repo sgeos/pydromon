@@ -99,8 +99,11 @@ def test_a_new_wake_replaces_the_pending_one_and_its_note_fires_once() -> None:
     state.apply(WakeScheduled("alpha", "s1", "2026-10-26T09:30:00Z", "first"))
     state.apply(WakeScheduled("alpha", "s2", "2026-10-26T10:00:00Z", "second"))
     assert state.scheduled["alpha"].message_id == "s2"
-    with pytest.raises(EventRejected, match="cannot message itself"):
-        state.check(MessageSent("s1", ALPHA, ALPHA, MessageKind.NOTE, "first"))
+    # The replaced wake's note is no firing. Since 2026-10-27 a line may send itself
+    # a note, so it applies, as plain self mail that leaves the pending wake alone.
+    copy = state.copy()
+    copy.apply(MessageSent("s1", ALPHA, ALPHA, MessageKind.NOTE, "first"))
+    assert copy.scheduled["alpha"].message_id == "s2"
     state.apply(MessageSent("s2", ALPHA, ALPHA, MessageKind.NOTE, "second"))
     assert "alpha" not in state.scheduled
     assert state.messages["s2"].sender == ALPHA == state.messages["s2"].recipient
@@ -113,11 +116,11 @@ def test_a_new_wake_replaces_the_pending_one_and_its_note_fires_once() -> None:
     [
         (
             MessageSent("s1", ALPHA, ALPHA, MessageKind.NOTE, "other text"),
-            "cannot message itself",
+            "reserved by line alpha's scheduled wake",
         ),
         (
-            MessageSent("m9", ALPHA, ALPHA, MessageKind.NOTE, "first"),
-            "cannot message itself",
+            MessageSent("s1", ALPHA, ALPHA, MessageKind.NOTE, "first", reply_to="m0"),
+            "reserved by line alpha's scheduled wake",
         ),
         (
             MessageSent("s1", LineAddress("beta"), ALPHA, MessageKind.NOTE, "first"),
@@ -152,7 +155,7 @@ def test_a_reply_to_the_note_is_not_a_firing() -> None:
     state.apply(WakeScheduled("alpha", "s1", "2026-10-26T09:30:00Z", "first"))
     state.apply(MessageSent("s1", ALPHA, ALPHA, MessageKind.NOTE, "first"))
     state.apply(WakeScheduled("alpha", "s2", "2026-10-26T09:40:00Z", "again"))
-    with pytest.raises(EventRejected, match="cannot message itself"):
+    with pytest.raises(EventRejected, match="reserved by line alpha's scheduled wake"):
         state.check(
             MessageSent("s2", ALPHA, ALPHA, MessageKind.NOTE, "again", reply_to="s1")
         )
@@ -416,6 +419,7 @@ def test_every_line_has_the_tool_and_status_shows_the_pending_wake(
         "line_status",
         "read_instructions",
         "write_scratch",
+        "propose_change",
         "list_processes",
         "stop_process",
         "list_mail",

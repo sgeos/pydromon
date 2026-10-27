@@ -24,6 +24,7 @@ live and merged pull requests 35 to 38.
 | Gap | Status |
 |---|---|
 | Each line works in its own worktree | Done. `workdir`, verified live, with session adoption and a guard on git hooks and config |
+| Shared workdirs among writing lines | `dromon config` warns when writing lines resolve to the same directory. Give each writing line a distinct worktree and set its `workdir` to that worktree. Read-only lines may share a directory. The check treats shell, file-write and MCP tools, and an allow-all tool policy, as writing capability. |
 | Commits from a linked worktree | Done for Claude Code lines, through an `allowWrite` on the common git directory, verified live |
 | Long gates and continuation | Done. `wake_after`, verified live. A command started with `nohup` outlives its turn, observed live |
 | A mandatory sandbox | Done. `[daemon] require_sandbox`, verified live: a line without a sandbox was refused |
