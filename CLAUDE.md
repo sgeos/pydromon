@@ -27,8 +27,8 @@ easy is a porting hazard and should be noted where it is introduced.
 
 **Relationship to Keleusma and pykeleusma.** Keleusma is the target language of the final
 implementation. The Python bindings live in the separate `pykeleusma` repository, which
-on 2026-10-24 could not yet run a script. Do not edit either repository. Add `pykeleusma`
-as a dependency only when a roadmap task needs it and it supports that task.
+is published on PyPI. Dromon pins its release `0.2.2.0` exactly, and runs its drivers
+through it. Do not edit either repository.
 
 ## Development Process
 

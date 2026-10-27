@@ -145,6 +145,16 @@ as a deficiency and requests shared data support. The reply
 `shared=` buffer to `call`, `resume` and `stream`, and corrects the request's premise
 about private data, which this line then confirmed.
 
+**Fact, 2026-10-26.** Dromon now pins the PyPI release `0.2.2.0` in place of `19d4558`.
+The release keeps every call Dromon makes, `compile`, `VM`, `call`, `resume`,
+`wcet_per_iteration`, `Yielded`, `Reset` and the three error types, and adds to them,
+including the `shared=` buffer of task 11. The packaged drivers compile and pass their
+tests unchanged, and one decision still has a worst-case time of 81 nominal cycles.
+Its README lists the limitations of Keleusma 0.2.2. Private data still
+starts as unit, a yield whose type it cannot check is refused, and bytecode saved now
+will not load under Keleusma 0.2.3. Dromon compiles each driver from source and saves
+no bytecode, so the last does not touch it.
+
 **Fact.** One decision of each packaged driver has a worst-case time of 81 nominal
 cycles, measured on 2026-10-25 for driver interface 2.
 
