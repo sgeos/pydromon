@@ -60,6 +60,8 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "sent": "show what became of the mail an operator sent",
     "release": "resume a line the daemon held at a conversation limit",
     "interrupt": "stop a line's turn in flight, as Escape does in an attached client",
+    "mute": "start no more turns of a line, keeping its mail, session and wakes",
+    "unmute": "let a muted line be woken again by the mail and wakes it kept",
     "rebind": "move a line to another model and strategy, keeping its identity",
     "settings": "show the project's settings, and a line's, with where each comes from",
     "set": "change a project or line setting, or return it to the layers below",
@@ -116,7 +118,27 @@ def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             f" open questions {counts.get('open_questions')}"
         )
         print(_log_growth(counts))
+    found = result.get("lines")
+    lines = cast(list[object], found) if isinstance(found, list) else []
+    for entry in lines:
+        if isinstance(entry, dict):
+            print(_line_row(cast(Mapping[str, object], entry)))
     return exits.OK
+
+
+def _line_row(line: Mapping[str, object]) -> str:
+    """One line of ``dromon status`` for a session line, naming a mute and a hold,
+    which each keep the line from waking."""
+    parts = [
+        f"line {line.get('line_id')}",
+        str(line.get("condition", line.get("state"))),
+        f"{line.get('pending')} pending",
+    ]
+    if line.get("muted") is True and line.get("condition") != "muted":
+        parts.append("muted")
+    if line.get("held_by") is not None and line.get("condition") != "held":
+        parts.append(f"held by {line.get('held_by')}")
+    return ", ".join(parts)
 
 
 def _log_growth(log: Mapping[str, object]) -> str:
@@ -472,6 +494,8 @@ def _send(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     }
     if arguments.reply_to is not None:
         args["reply_to"] = arguments.reply_to
+    if arguments.priority:
+        args["priority"] = True
     return _request(paths, "send", Operation.SEND, args)
 
 
@@ -790,6 +814,36 @@ def _interrupt(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
+def _mute(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Send ``mute``, and say whether a turn in flight finishes first."""
+    line_id: str = arguments.line_id
+    response = _call(paths, "mute", Operation.MUTE, {"line_id": line_id})
+    if isinstance(response, int):
+        return response
+    if response.get("changed") is not True:
+        print(f"{line_id} was already muted")
+    elif response.get("running") is True:
+        print(
+            f"muted {line_id}, whose turn in flight finishes first. dromon interrupt"
+            " stops it now"
+        )
+    else:
+        print(f"muted {line_id}")
+    return exits.OK
+
+
+def _unmute(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    line_id: str = arguments.line_id
+    response = _call(paths, "unmute", Operation.UNMUTE, {"line_id": line_id})
+    if isinstance(response, int):
+        return response
+    if response.get("changed") is True:
+        print(f"unmuted {line_id}")
+    else:
+        print(f"{line_id} was not muted, so nothing changed")
+    return exits.OK
+
+
 def _rebind(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     args: dict[str, object] = {
         "line_id": arguments.line_id,
@@ -928,6 +982,8 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "sent": _sent,
     "release": _release,
     "interrupt": _interrupt,
+    "mute": _mute,
+    "unmute": _unmute,
     "rebind": _rebind,
     "settings": _settings,
     "set": _set,
@@ -1137,6 +1193,10 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("line_id", help="the held line")
         if name == "interrupt":
             command.add_argument("line_id", help="the line whose turn to stop")
+        if name == "mute":
+            command.add_argument("line_id", help="the line to mute")
+        if name == "unmute":
+            command.add_argument("line_id", help="the muted line")
         if name == "start":
             command.add_argument(
                 "--wait",
@@ -1358,6 +1418,11 @@ def build_parser() -> argparse.ArgumentParser:
             )
             command.add_argument(
                 "--reply-to", default=None, help="the message answered"
+            )
+            command.add_argument(
+                "--priority",
+                action="store_true",
+                help="end the line's running turn at a safe point and lead its next",
             )
     return parser
 

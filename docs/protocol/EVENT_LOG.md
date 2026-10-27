@@ -69,12 +69,15 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `project_overridden` | `overrides` text of at most 262,144 bytes | Always. The project's override document, replacing any earlier one |
 | `line_held` | `line_id`, `question_id` | The line exists and is not held, and the question is open and from the line. The daemon wakes the line no more until it is released |
 | `line_released` | `line_id` | The line is held |
+| `line_muted` | `line_id` | The line exists and is not muted. The daemon starts no turn of the line until it is unmuted, and its mail, session and pending scheduled wake are kept, as [`PRIORITY.md`](PRIORITY.md) specifies. Only an operator's `mute` records it. Added on 2026-10-27 |
+| `line_unmuted` | `line_id` | The line exists and is muted. Ends the mute. Only an operator's `unmute` records it. Added on 2026-10-27 |
 | `operator_registered` | `operator_id` | The operator does not exist |
 | `agent_registered` | `agent_id`, `access`, `token_sha256` | Always. Registers the agent, or replaces its access and digest and restores it if revoked. A token itself is never stored |
 | `agent_revoked` | `agent_id` | The agent exists and is not revoked |
 | `message_sent` | `message_id`, `sender` and `recipient` addresses, `kind`, `body` text, `choices`, `reply_to` message identifier or `null` | See the message rules below |
 | `message_read` | `message_id` | The message was delivered and not yet read. Its recipient opened it, which obliges nothing |
 | `message_acknowledged` | `message_id` | The message was delivered and not yet acknowledged. Its recipient marked it dealt with without a reply. Its sender sees the acknowledgement as distinct from a reply. A question stays open |
+| `message_prioritized` | `message_id` | The message exists, is a note to a line, is not delivered and is not priority mail. Marks it priority mail, as [`PRIORITY.md`](PRIORITY.md) specifies. The daemon appends it right after the note's `message_sent`. Added on 2026-10-27 |
 | `message_delivered` | `message_id` | The message exists and was not delivered. For a line, delivery is into a turn. For an operator, delivery is acceptance by the operator's relay or display in a client |
 | `wake_requested` | `wake_id`, `line_id`, `message_id` | The wake does not exist, the line exists and is not stopped, and the message exists with the line as its recipient |
 | `wake_issued` | `wake_id` | The wake exists and was not issued, and its line is idle |
@@ -91,10 +94,13 @@ Each event has a kind and fields, all required. An optional value is written as 
 
 **Message rules.** A `message_sent` applies when every one of these holds.
 
-1. The message does not exist, and the sender and recipient both exist and differ. The
-   one exception is the firing of a scheduled wake, below. A `task_noted` event is the
-   other way a line receives a note from itself, and it is not a `message_sent`. A message whose identifier a
-   pending scheduled wake reserves is refused unless it is that firing.
+1. The message does not exist, and the sender and recipient both exist. They differ,
+   unless the sender is a line, which may send itself a note, as
+   [`PRIORITY.md`](PRIORITY.md) specifies since 2026-10-27. An operator or an agent
+   may not. The firing of a scheduled wake, below, is one such note, and a
+   `task_noted` event is another way a line receives a note from itself, which is not
+   a `message_sent`. A message whose identifier a pending scheduled wake reserves is
+   refused unless it is that firing.
 2. A note has no choices.
 3. A question comes from a line that is not stopped and goes to an operator. A new
    question is open.
@@ -112,7 +118,7 @@ the daemon fires it by appending one `message_sent` whose `message_id` is the re
 identifier, whose sender and recipient are both the line, whose kind is `note`, whose
 body is the note or the fixed withheld text below, and which has no choices and no
 `reply_to`. Applying it clears the
-pending wake. That is the only message a party may send itself.
+pending wake. It is the only message to itself that clears a scheduled wake.
 
 - **Sender.** The model has no address for the daemon, an operator sender would make
   the note operator mail, which carries authority and resets a line's autonomous-turn

@@ -430,6 +430,8 @@ class Daemon:
                 | Operation.LINE_VIEW
                 | Operation.LINE_ACTIVITY
                 | Operation.INTERRUPT
+                | Operation.MUTE
+                | Operation.UNMUTE
                 | Operation.SETTINGS
                 | Operation.SET_SETTING
                 | Operation.CLEAR_SESSION
@@ -471,6 +473,19 @@ class Daemon:
                     (line_id,) = _text_args(request.args, ("line_id",))
                     interrupted = self.scheduler.interrupt(line_id)
                     result = {"line_id": line_id, "interrupted": interrupted}
+                case Operation.MUTE:
+                    (line_id,) = _text_args(request.args, ("line_id",))
+                    changed = self.scheduler.mute(line_id)
+                    result = {
+                        "line_id": line_id,
+                        "muted": True,
+                        "changed": changed,
+                        "running": self.scheduler.condition(line_id) == "running",
+                    }
+                case Operation.UNMUTE:
+                    (line_id,) = _text_args(request.args, ("line_id",))
+                    changed = self.scheduler.unmute(line_id)
+                    result = {"line_id": line_id, "muted": False, "changed": changed}
                 case Operation.SETTINGS:
                     result = self._settings(request.args)
                 case Operation.SET_SETTING:
@@ -1001,15 +1016,27 @@ class Daemon:
         }
 
     def _send(self, args: dict[str, object]) -> dict[str, object]:
-        optional = ("reply_to",) if "reply_to" in args else ()
-        values = _text_args(args, ("recipient", "body", "operator", *optional))
+        """Record an operator's note. ``priority``, optional and default false, makes
+        it priority mail, which only a line may receive, and which for an operator
+        is unlimited."""
+        urgent = args.get("priority", False)
+        if not isinstance(urgent, bool):
+            raise ProtocolError(ErrorCode.BAD_REQUEST, "priority is not a boolean")
+        texts = {key: value for key, value in args.items() if key != "priority"}
+        optional = ("reply_to",) if "reply_to" in texts else ()
+        values = _text_args(texts, ("recipient", "body", "operator", *optional))
         recipient, body, operator = values[:3]
         reply_to = values[3] if optional else None
-        self.scheduler.ensure_operator(OperatorAddress(operator).operator_id)
+        sender = OperatorAddress(operator)
+        address = parse_address(recipient)
+        if urgent:
+            # Checked before the operator is registered, so a refusal records nothing.
+            self.scheduler.check_priority(sender, address)
+        self.scheduler.ensure_operator(sender.operator_id)
         message_id = self.scheduler.send(
-            OperatorAddress(operator), parse_address(recipient), body, reply_to
+            sender, address, body, reply_to, priority=urgent
         )
-        return {"message_id": message_id}
+        return {"message_id": message_id, "priority": urgent}
 
     def status(self) -> dict[str, object]:
         state = self.log.state

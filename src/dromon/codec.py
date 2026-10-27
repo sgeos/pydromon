@@ -28,6 +28,8 @@ from dromon.model import (
     LineCreated,
     LineHeld,
     LineReleased,
+    LineMuted,
+    LineUnmuted,
     LineOverridden,
     LineSession,
     LineSessionCleared,
@@ -38,6 +40,7 @@ from dromon.model import (
     LineStateChanged,
     MessageDelivered,
     MessageAcknowledged,
+    MessagePrioritized,
     MessageKind,
     MessageRead,
     MessageSent,
@@ -73,6 +76,8 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "project_overridden": ("overrides",),
     "line_held": ("line_id", "question_id"),
     "line_released": ("line_id",),
+    "line_muted": ("line_id",),
+    "line_unmuted": ("line_id",),
     "operator_registered": ("operator_id",),
     "agent_registered": ("agent_id", "access", "token_sha256"),
     "agent_revoked": ("agent_id",),
@@ -88,6 +93,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "message_delivered": ("message_id",),
     "message_read": ("message_id",),
     "message_acknowledged": ("message_id",),
+    "message_prioritized": ("message_id",),
     "wake_requested": ("wake_id", "line_id", "message_id"),
     "wake_issued": ("wake_id",),
     "wake_scheduled": ("line_id", "message_id", "due", "note"),
@@ -187,6 +193,10 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
             }
         case LineReleased():
             return "line_released", {"line_id": event.line_id}
+        case LineMuted():
+            return "line_muted", {"line_id": event.line_id}
+        case LineUnmuted():
+            return "line_unmuted", {"line_id": event.line_id}
         case LineSession():
             return "line_session", {
                 "line_id": event.line_id,
@@ -233,6 +243,8 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
             return "message_read", {"message_id": event.message_id}
         case MessageAcknowledged():
             return "message_acknowledged", {"message_id": event.message_id}
+        case MessagePrioritized():
+            return "message_prioritized", {"message_id": event.message_id}
         case WakeRequested():
             return "wake_requested", {
                 "wake_id": event.wake_id,
@@ -315,6 +327,10 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
             return LineHeld(_str(data, "line_id"), _str(data, "question_id"))
         case "line_released":
             return LineReleased(_str(data, "line_id"))
+        case "line_muted":
+            return LineMuted(_str(data, "line_id"))
+        case "line_unmuted":
+            return LineUnmuted(_str(data, "line_id"))
         case "line_session":
             return LineSession(_str(data, "line_id"), _str(data, "engine_session"))
         case "line_session_cleared":
@@ -353,6 +369,8 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
             return MessageRead(_str(data, "message_id"))
         case "message_acknowledged":
             return MessageAcknowledged(_str(data, "message_id"))
+        case "message_prioritized":
+            return MessagePrioritized(_str(data, "message_id"))
         case "wake_requested":
             return WakeRequested(
                 _str(data, "wake_id"), _str(data, "line_id"), _str(data, "message_id")

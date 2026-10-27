@@ -14,9 +14,16 @@ later turn.
 Mail. Every message is a ``message_sent`` event in the log. A message sent during a
 tick, by a line in a turn or by an operator, goes to the sent queue. At the end of each
 tick the sent queue moves to the post office, and only post office mail is delivered,
-so a message is received no sooner than the next tick. Messages are not interrupts.
-After a restart, every undelivered message in the log was sent in an earlier tick, so
-it starts in the post office.
+so a message is received no sooner than the next tick. Messages are not interrupts,
+except priority mail, which ``dromon.priority`` describes. After a restart, every
+undelivered message in the log was sent in an earlier tick, so it starts in the post
+office. A line may send itself a note, which wakes it in a later turn like other mail.
+
+Mute. An operator may mute a line, recorded as ``line_muted``, so that it starts no
+turn, by mail, a scheduled wake, a task note or a ceiling answer, until it is
+unmuted. Its mail waits, its session is kept, and its scheduled wake stays pending
+and fires once the line is unmuted. A turn running when the line is muted finishes,
+unless an operator also interrupts it.
 
 Cadence. While anything is in flight, ticks follow one another every ``tick_seconds``.
 When nothing is, the loop rests until a message arrives or a scheduled wake falls due.
@@ -25,12 +32,13 @@ Scheduled wakes. A line's ``wake_after`` tool schedules one wake, recorded as
 ``wake_scheduled`` with its due time in Coordinated Universal Time and the identifier
 its note will carry. A new call replaces the line's pending wake. The first tick at or
 after the due time records the note as a ``message_sent`` from the line to itself,
-which the event model permits only for that reserved identifier, so the note is never
-mistaken for operator mail. It then wakes the line through the post office like any
-mail and counts toward the line's autonomous-turn limit. Firing is that one append, so
-a crash leaves a wake either pending or fired, and a wake that fell due while the
-daemon was down fires at its first tick. The wall clock is injected, so tests control
-it, and it is distinct from the monotonic clock that measures cooldowns.
+so the note is never mistaken for operator mail. It then wakes the line through the
+post office like any mail and counts toward the line's autonomous-turn limit. Firing
+is that one append, so a crash leaves a wake either pending or fired, and a wake that
+fell due while the daemon was down fires at its first tick. The wall clock is
+injected, so tests control it, and it is distinct from the monotonic clock that
+measures cooldowns. A fired note is the reserved message's one firing, and any other
+note a line sends itself is ordinary self mail.
 
 Leases. A project may declare named leases, such as ``full-gate``, so that its lines
 take turns at a shared resource. ``acquire_lease`` succeeds only while no line holds
@@ -108,6 +116,8 @@ from dromon.overrides import decode as decode_override
 from dromon.overrides import encode as encode_override_document
 from dromon.overrides import encode as encode_override
 from dromon.driver import ENGINE_OF, MODELS, Driver, DriverError, Strategy
+from dromon import priority
+from dromon.priority import PriorityLimiter, PriorityRefused
 from dromon import acp, antigravity, codex, cursor, grok, pi
 from dromon.agents import LineTokens
 from dromon import capabilities, launcher, redact
@@ -186,8 +196,10 @@ from dromon.model import (
     LineConfigured,
     LineCreated,
     LineHeld,
+    LineMuted,
     LineOverridden,
     LineReleased,
+    LineUnmuted,
     LineSession,
     LineSessionCleared,
     LineRebound,
@@ -198,6 +210,7 @@ from dromon.model import (
     MessageDelivered,
     MessageAcknowledged,
     MessageKind,
+    MessagePrioritized,
     MessageRead,
     MessageSent,
     OperatorAddress,
@@ -248,6 +261,15 @@ SEND_TOOL_SCHEMA: Final[dict[str, object]] = {
         "reply_to": {
             "type": "string",
             "description": "The identifier of the message this one answers, if any",
+        },
+        "priority": {
+            "type": "boolean",
+            "description": (
+                "Optional, default false. Priority mail to another line ends its"
+                " running turn at a safe point and leads its next turn. Use it only"
+                " when the recipient's current work must change now. It is rate"
+                " limited, and a refused one is not sent"
+            ),
         },
         REQUEST_KEY: REQUEST_KEY_PROPERTY,
     },
@@ -765,6 +787,9 @@ class LineSpec:
     )
     """Where a Claude Code engine puts a consent fallback to an operator, with the
     question's text after the line's name. **Review F16.**"""
+    redirect: Callable[[], str | None] = field(default=lambda: None, compare=False)
+    """Asked at each safe point of a turn, as ``dromon.priority`` describes. A reason
+    ends the turn there, as a driver's interrupt does, and ``None`` lets it go on."""
 
 
 type EngineFactory = Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], LineEngine]
@@ -812,7 +837,9 @@ def engine_factory(
         return acp.bridge_command(Path(root), line_socket.parent, line_id), token
 
     def build(spec: LineSpec, own_tools: Sequence[SdkMcpTool[Any]]) -> LineEngine:
-        driver = Driver.for_model(spec.model, spec.strategy)
+        # Every adapter ends a turn gracefully when its driver answers interrupt, so
+        # priority mail steers the driver rather than each engine.
+        driver: Driver = priority.steered(spec.model, spec.strategy, spec.redirect)
         workdir = resolve_workdir(spec.config.workdir, Path(root), protected)
         if driver.settings.engine == codex.ENGINE_NAME:
             if project_sandbox is not None or project_settings is not None:
@@ -1194,6 +1221,16 @@ class Scheduler:
         """When the scheduler took the log, on its own clock, for the log's growth."""
         self._request_keys = RequestKeys()
         """Results of keyed mutating tool calls, so a retry acts once. Row 11."""
+        self._priority = PriorityLimiter(clock)
+        """Lines' priority mail over the rate limit's window, in memory, so a restart
+        starts the count again."""
+        self._redirect_for: dict[str, str] = {}
+        """The priority note each running line's turn is to end for at its next safe
+        point, until the turn ends."""
+        self._redirected: dict[str, str] = {}
+        """The reason each running line's turn was asked to end for priority mail."""
+        self._ended_by: set[str] = set()
+        """Priority notes that ended a turn, until they are delivered."""
 
     # Commands from the client and from lines.
 
@@ -1324,8 +1361,17 @@ class Scheduler:
         recipient: Address,
         body: str,
         reply_to: str | None = None,
+        *,
+        priority: bool = False,
     ) -> str:
-        """Record a note from ``sender``. It is delivered in a later tick."""
+        """Record a note from ``sender``. It is delivered in a later tick.
+
+        Priority mail is also marked ``message_prioritized``, and asks the
+        recipient's running turn to end at its next safe point. Raises
+        ``EventRejected`` for priority mail ``check_priority`` refuses, recording
+        nothing. A crash between the two appends leaves an ordinary note."""
+        if priority:
+            self.check_priority(sender, recipient)
         message_id = new_id("m")
         sent_at = self._wall_clock()
         self._log.append(
@@ -1333,6 +1379,12 @@ class Scheduler:
                 message_id, sender, recipient, MessageKind.NOTE, body, reply_to=reply_to
             )
         )
+        if priority and isinstance(recipient, LineAddress):
+            self._log.append(MessagePrioritized(message_id))
+            if isinstance(sender, LineAddress):
+                self._priority.record(sender.line_id, recipient.line_id)
+            if recipient.line_id in self._running:
+                self._redirect_for.setdefault(recipient.line_id, message_id)
         if isinstance(recipient, LineAddress):
             self._remember(message_id, sender, recipient, body, sent_at)
         self._sent.append(message_id)
@@ -1346,6 +1398,81 @@ class Scheduler:
             self._failed.discard(recipient.line_id)
         self._work.set()
         return message_id
+
+    def check_priority(self, sender: Address, recipient: Address) -> None:
+        """Refuse priority mail that is not to a line, that a line sends itself, that
+        an external agent sends, or that a line sends over the rate limit, by raising
+        ``EventRejected``. An operator's is unlimited."""
+        if not isinstance(recipient, LineAddress):
+            raise EventRejected("priority mail goes to a line, not to an operator")
+        if recipient.line_id not in self._log.state.lines:
+            raise EventRejected(f"no line {recipient.line_id}")
+        if isinstance(sender, AgentAddress):
+            raise EventRejected(
+                "an external agent may not send priority mail, which only operators"
+                " and lines may send"
+            )
+        if sender == recipient:
+            raise EventRejected(
+                "priority mail to yourself would end your own turn, so send the note"
+                " without priority"
+            )
+        if isinstance(sender, LineAddress):
+            try:
+                self._priority.check(sender.line_id, recipient.line_id)
+            except PriorityRefused as error:
+                raise EventRejected(str(error)) from error
+
+    def redirect_reason(self, line_id: str) -> str | None:
+        """Why ``line_id``'s running turn should end at this safe point, once, or
+        ``None``. Asked by the line's driver, as ``dromon.priority`` describes. A
+        muted line's turn is not ended, and its priority note waits."""
+        message_id = self._redirect_for.get(line_id)
+        if message_id is None or line_id not in self._running:
+            return None
+        state = self._log.state
+        line = state.lines.get(line_id)
+        message = state.messages.get(message_id)
+        if line is None or message is None or message.delivered:
+            self._redirect_for.pop(line_id, None)
+            return None
+        if line.muted:
+            return None
+        del self._redirect_for[line_id]
+        reason = priority.REASON.format(message_id=message_id, sender=message.sender)
+        self._redirected[line_id] = reason
+        self._ended_by.add(message_id)
+        self.activity.record(
+            line_id,
+            ActivityKind.NOTICE,
+            f"its turn is ending at a safe point for {reason}",
+        )
+        return reason
+
+    # Wake mute, decided by the operator on 2026-10-27.
+
+    def mute(self, line_id: str) -> bool:
+        """Mute ``line_id``'s wakes, and say whether it was not muted already. A turn
+        in flight finishes. Raises ``EventRejected`` for an unknown line."""
+        line = self._log.state.lines.get(line_id)
+        if line is None:
+            raise EventRejected(f"no line {line_id}")
+        if line.muted:
+            return False
+        self._log.append(LineMuted(line_id))
+        return True
+
+    def unmute(self, line_id: str) -> bool:
+        """Unmute ``line_id``, and say whether it was muted. Its kept mail and any
+        scheduled wake that fell due wake it from the next tick. A hold stays."""
+        line = self._log.state.lines.get(line_id)
+        if line is None:
+            raise EventRejected(f"no line {line_id}")
+        if not line.muted:
+            return False
+        self._log.append(LineUnmuted(line_id))
+        self._work.set()
+        return True
 
     def send_tool(self, owner: str | Address) -> SdkMcpTool[Any]:
         """The ``send_message`` tool for ``owner``, a line or an agent, whose sender it
@@ -1365,25 +1492,36 @@ class Scheduler:
             to: object = args.get("to")
             body: object = args.get("body")
             reply_to: object = args.get("reply_to")
+            urgent: object = args.get("priority", False)
             if not isinstance(to, str) or not isinstance(body, str):
                 return _tool_error("to and body must be text")
             if reply_to is not None and not isinstance(reply_to, str):
                 return _tool_error("reply_to must be text")
+            if not isinstance(urgent, bool):
+                return _tool_error("priority must be true or false")
             if self.discloses(body):
                 return _tool_error(disclosure.REFUSAL)
             try:
-                message_id = self.send(sender, parse_address(to), body, reply_to)
+                message_id = self.send(
+                    sender, parse_address(to), body, reply_to, priority=urgent
+                )
             except (InvalidField, EventRejected) as error:
                 return _tool_error(str(error))
-            result = _tool_text(f"sent as {message_id}")
+            result = _tool_text(
+                f"sent as {message_id}, with priority"
+                if urgent
+                else f"sent as {message_id}"
+            )
             self._request_keys.remember(str(sender), SEND_TOOL_NAME, args, result)
             return result
 
         return SdkMcpTool(
             name=SEND_TOOL_NAME,
             description=(
-                "Send a message to another Dromon session line or to an operator."
-                " The recipient reads it in its next turn, never in this one."
+                "Send a message to another Dromon session line, to an operator, or to"
+                " yourself as a note to your next turn. The recipient reads it in its"
+                " next turn, never in this one. Priority mail to another line also"
+                " ends that line's running turn at a safe point."
             ),
             input_schema=SEND_TOOL_SCHEMA,
             handler=handler,
@@ -1532,10 +1670,13 @@ class Scheduler:
         compaction it was for, since that compaction withdraws it. The hold ends
         with the turn, so it is bounded by the turn's own length."""
         now = self._wall_clock()
+        lines = self._log.state.lines
         return [
             line_id
             for line_id, pending in sorted(self._log.state.scheduled.items())
-            if parse_due(pending.due) <= now and not self._compacting_for(line_id)
+            if parse_due(pending.due) <= now
+            and not self._compacting_for(line_id)
+            and not lines[line_id].muted
         ]
 
     def _compacting_for(self, line_id: str) -> bool:
@@ -1590,8 +1731,14 @@ class Scheduler:
 
     def seconds_until_next_wake(self) -> float | None:
         """How long until the earliest pending scheduled wake falls due, at least 0,
-        or ``None`` when no wake is pending."""
-        pending = self._log.state.scheduled.values()
+        or ``None`` when no wake is pending. A muted line's wake is left out, since it
+        fires only once the line is unmuted."""
+        lines = self._log.state.lines
+        pending = [
+            wake
+            for line_id, wake in self._log.state.scheduled.items()
+            if not lines[line_id].muted
+        ]
         if not pending:
             return None
         earliest = min(parse_due(wake.due) for wake in pending)
@@ -2041,6 +2188,13 @@ class Scheduler:
         fired = self._log.state.fired_dues
         for message_id, message in messages:
             parts: list[str] = []
+            if message.priority:
+                parts.append(
+                    "priority, which ended your last turn at a safe point"
+                    if message_id in self._ended_by
+                    else "priority"
+                )
+                self._ended_by.discard(message_id)
             repeated = self._repeats.pop(message_id, None)
             if repeated is not None:
                 parts.append(f"a repeat of {repeated}")
@@ -2075,9 +2229,13 @@ class Scheduler:
         return notes
 
     def mail_notes(self, message_id: str) -> str:
-        """What ``list_mail`` adds to a message's header: the message it repeated,
-        and for a fired wake when it was due and when it was delivered."""
+        """What ``list_mail`` adds to a message's header: whether it is priority
+        mail, the message it repeated, and for a fired wake when it was due and when
+        it was delivered."""
         parts: list[str] = []
+        message = self._log.state.messages.get(message_id)
+        if message is not None and message.priority:
+            parts.append("priority")
         repeated = self._repeat_of.get(message_id)
         if repeated is not None:
             parts.append(f"repeat_of {repeated}")
@@ -2118,6 +2276,7 @@ class Scheduler:
                 "line_id": other_id,
                 "state": other.state.value,
                 "held": other.held_by is not None,
+                "muted": other.muted,
                 "leases": [str(lease["name"]) for lease in self.leases_of(other_id)],
             }
             for other_id, other in sorted(state.lines.items())
@@ -2130,6 +2289,7 @@ class Scheduler:
             "state": line.state.value,
             "condition": self.condition(line_id),
             "held_by": line.held_by,
+            "muted": line.muted,
             "autonomous_turns": {
                 "used": self._autonomous.get(line_id, 0),
                 "allowed": limits.max_autonomous_turns,
@@ -2216,11 +2376,14 @@ class Scheduler:
         """**Row 5 of the T3 Code review.** One word for where a line stands, which
         keeps apart a line that is running, held for an operator, stopped by a failed
         turn, waiting on a question it asked an operator, and idle, in that order of
-        precedence."""
+        precedence. A muted line that is not running is ``muted``, before all but
+        ``running``, since nothing else wakes it."""
         state = self._log.state
         line = state.lines[line_id]
         if line_id in self._running or line.state is LineState.RUNNING:
             return "running"
+        if line.muted:
+            return "muted"
         if line.held_by is not None:
             return "held"
         if line_id in self._failed:
@@ -3111,12 +3274,18 @@ class Scheduler:
         self._work.set()
 
     def _can_start(self, line_id: str) -> bool:
+        """Whether a tick may start the line's turn. Priority mail starts it without
+        waiting for its cooldown or its wake tick, which the rate limit on lines'
+        priority mail keeps from spinning."""
+        if not self._eligible(line_id):
+            return False
+        if self._priority_waiting(line_id):
+            return True
         every = self.wake_every_for(line_id)
-        return (
-            self._eligible(line_id)
-            and not self._cooling(line_id)
-            and self.tick % every == 0
-        )
+        return not self._cooling(line_id) and self.tick % every == 0
+
+    def _priority_waiting(self, line_id: str) -> bool:
+        return any(message.priority for _, message in self.deliverable(line_id))
 
     def _eligible(self, line_id: str) -> bool:
         """Whether a line could start a turn, apart from its cooldown."""
@@ -3126,6 +3295,7 @@ class Scheduler:
             and line_id not in self._running
             and line.state is LineState.IDLE
             and line.held_by is None
+            and not line.muted
             and line_id not in self._failed
         )
 
@@ -3276,7 +3446,9 @@ class Scheduler:
                     return
 
     def _begin_turn(self, line_id: str, messages: list[tuple[str, Message]]) -> None:
-        """Wake ``line_id`` and deliver its mail now, then run the turn as a task."""
+        """Wake ``line_id`` and deliver its mail now, then run the turn as a task.
+        Priority mail leads, in the order sent, and the rest follows in its order."""
+        messages = sorted(messages, key=lambda item: not item[1].priority)
         wake_id = new_id("w")
         self._log.append(WakeRequested(wake_id, line_id, messages[0][0]))
         self._log.append(WakeIssued(wake_id))
@@ -3379,7 +3551,10 @@ class Scheduler:
             if report.session_id and report.session_id != recorded and not moved:
                 self._log.append(LineSession(line_id, report.session_id))
             ending = report.subtype
-            if report.interrupted_for is not None:
+            redirected = self._redirected.get(line_id)
+            if redirected is not None and report.interrupted_for == redirected:
+                ending += f", ended at a safe point for {redirected}"
+            elif report.interrupted_for is not None:
                 ending += f", interrupted by its driver: {report.interrupted_for}"
             elif turn_outcome(report) == FAILED:
                 ending = f"failed: the engine ended the turn as {report.subtype}"
@@ -3406,6 +3581,9 @@ class Scheduler:
             self._spawn_check(line_id)
             self._interrupted.discard(line_id)
             self._moved.discard(line_id)
+            # Priority mail the turn did not end for leads the next turn instead.
+            self._redirect_for.pop(line_id, None)
+            self._redirected.pop(line_id, None)
             # A compaction the engine did not report leaves no cause for a later one.
             self._compaction_cause.pop(line_id, None)
             self.activity.record(line_id, ActivityKind.TURN_ENDED, ending)
@@ -4190,6 +4368,7 @@ class Scheduler:
                 lambda tasks: self.ceiling_reached(line_id, tasks),
                 self.ceiling_settled,
                 lambda text: self.consent_fallback(line_id, text),
+                lambda: self.redirect_reason(line_id),
             )
             engine = self._engine_factory(spec, self.own_tools(line_id))
             self._engines[line_id] = engine
@@ -4204,6 +4383,8 @@ class Scheduler:
                 "engine": self.model_of(line_id),
                 "strategy": line.strategy,
                 "state": line.state.value,
+                "condition": self.condition(line_id),
+                "muted": line.muted,
                 "pending": len(self.pending(line_id)),
                 "turns": self._turns.get(line_id, 0),
                 "autonomous_turns": self._autonomous.get(line_id, 0),

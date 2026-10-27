@@ -232,3 +232,124 @@ def test_interrupt_without_a_daemon_reports_not_running(
     runtime = ["--runtime-dir", str(short_runtime)]
     argv = ["--project", str(tmp_path), *runtime, "interrupt", "alpha"]
     assert cli.main(argv) == exits.NOT_RUNNING
+
+
+type Answer = Callable[[Path, Operation, dict[str, object] | None], Response]
+
+
+def answering(
+    sent: list[tuple[Operation, dict[str, object] | None]], result: dict[str, object]
+) -> Answer:
+    def answer(
+        socket: Path, operation: Operation, args: dict[str, object] | None = None
+    ) -> Response:
+        del socket
+        sent.append((operation, args))
+        return Response("r", True, result=result)
+
+    return answer
+
+
+@pytest.mark.parametrize(
+    ("command", "result", "printed"),
+    [
+        (
+            "mute",
+            {"line_id": "alpha", "muted": True, "changed": True, "running": False},
+            "muted alpha\n",
+        ),
+        (
+            "mute",
+            {"line_id": "alpha", "muted": True, "changed": True, "running": True},
+            "muted alpha, whose turn in flight finishes first",
+        ),
+        (
+            "mute",
+            {"line_id": "alpha", "muted": True, "changed": False, "running": False},
+            "alpha was already muted",
+        ),
+        ("unmute", {"line_id": "alpha", "changed": True}, "unmuted alpha"),
+        ("unmute", {"line_id": "alpha", "changed": False}, "alpha was not muted"),
+    ],
+)
+def test_mute_and_unmute_send_their_operation_and_say_what_changed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    short_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    result: dict[str, object],
+    printed: str,
+) -> None:
+    sent: list[tuple[Operation, dict[str, object] | None]] = []
+    monkeypatch.setattr(cli, "call", answering(sent, result))
+    runtime = ["--runtime-dir", str(short_runtime)]
+    assert cli.main(["--project", str(tmp_path), *runtime, command, "alpha"]) == 0
+    assert sent == [(Operation(command), {"line_id": "alpha"})]
+    assert printed in capsys.readouterr().out
+
+
+def test_mute_reports_a_refusal_and_a_missing_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    short_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = ["--runtime-dir", str(short_runtime)]
+    argv = ["--project", str(tmp_path), *runtime, "mute", "nobody"]
+    assert cli.main(argv) == exits.NOT_RUNNING
+
+    def refuse(
+        socket: Path, operation: Operation, args: dict[str, object] | None = None
+    ) -> Response:
+        del socket, operation, args
+        return Response("r", False, error_message="no line nobody")
+
+    monkeypatch.setattr(cli, "call", refuse)
+    assert cli.main(argv) == exits.FAILURE
+    assert "dromon mute: no line nobody" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("flag", "expected"), [([], None), (["--priority"], True)])
+def test_send_passes_priority_only_when_asked(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    short_runtime: Path,
+    flag: list[str],
+    expected: bool | None,
+) -> None:
+    sent: list[tuple[Operation, dict[str, object] | None]] = []
+    monkeypatch.setattr(cli, "call", answering(sent, {"message_id": "m-1"}))
+    runtime = ["--runtime-dir", str(short_runtime)]
+    argv = ["--project", str(tmp_path), *runtime, "send", "alpha", "stop", *flag]
+    assert cli.main([*argv, "--operator", "ana"]) == exits.OK
+    ((operation, args),) = sent
+    assert operation is Operation.SEND and args is not None
+    assert args.get("priority") is expected
+
+
+def test_status_lists_each_line_with_its_mute_and_hold(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    short_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    lines: list[dict[str, object]] = [
+        {"line_id": "alpha", "condition": "muted", "muted": True, "pending": 2},
+        {
+            "line_id": "beta",
+            "condition": "running",
+            "muted": True,
+            "pending": 0,
+            "held_by": "q-1",
+        },
+        {"line_id": "gamma", "condition": "idle", "muted": False, "pending": 0},
+    ]
+    sent: list[tuple[Operation, dict[str, object] | None]] = []
+    monkeypatch.setattr(cli, "call", answering(sent, {"pid": 1, "lines": lines}))
+    runtime = ["--runtime-dir", str(short_runtime)]
+    assert cli.main(["--project", str(tmp_path), *runtime, "status"]) == exits.OK
+    out = capsys.readouterr().out
+    assert "line alpha, muted, 2 pending\n" in out
+    assert "line beta, running, 0 pending, muted, held by q-1\n" in out
+    assert "line gamma, idle, 0 pending\n" in out

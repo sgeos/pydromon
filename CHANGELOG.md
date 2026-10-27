@@ -7,6 +7,26 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Wake mute, priority mail and self mail, by the operator's decision of 2026-10-27, as
+  `docs/protocol/PRIORITY.md` specifies.
+  - `dromon mute LINE` and `dromon unmute LINE`, the client operations `mute` and
+    `unmute`, and the events `line_muted` and `line_unmuted`. A muted line starts no
+    turn, by mail, self mail, a scheduled wake, a task note or an answer, and keeps
+    its mail, session and pending scheduled wake, which fires once it is unmuted. A
+    turn in flight finishes. `line_status`, the daemon's `status` and `dromon status`
+    show the mute, and `condition` is `muted`.
+  - `dromon send --priority`, `priority` on `send`, and `priority` on `send_message`,
+    recorded as `message_prioritized`. Priority mail ends the recipient's running turn
+    at its next text or reasoning event, through the line's driver, which every
+    adapter already honours, and leads the next turn, which skips the cooldown. Lines'
+    priority mail is limited to 3 sent and 2 received per 10 minutes, operators' is
+    unlimited, and external agents may not send it. Whether Claude Code's text block
+    always precedes the start of a following tool call is a hypothesis owed a live
+    check.
+  - A line may send itself a note with `send_message`. Operators and agents still may
+    not.
+  - `dromon status` prints one row per line.
+
 - Grok, Codex and Antigravity capability tables, and probe recording for Codex and
   Grok, after the bounded-waits branch was merged.
   - Their tables are filled under the rule of finding C1. Codex, run live on

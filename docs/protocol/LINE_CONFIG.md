@@ -99,7 +99,7 @@ argument outside a tool's schema is refused.
 
 | Tool | Effect |
 |---|---|
-| `send_message` | Sends a note to a line or an operator, delivered in a later tick |
+| `send_message` | Sends a note to a line, an operator or the line itself, delivered in a later tick. With `priority` true, a note to another line is priority mail, rate limited, as [`PRIORITY.md`](PRIORITY.md) specifies |
 | `ask_operator` | Asks an operator a question, which never pauses the line |
 | `wake_after` | Schedules one wake for the line, as below |
 | `list_mail`, `read_mail`, `acknowledge_mail` | Page through, open and acknowledge the line's mailbox |
@@ -114,13 +114,13 @@ argument outside a tool's schema is refused.
 in this section.
 
 **`line_status`.** No arguments. It returns JSON for the calling line: its `state`, the
-question holding it as `held_by`, its `autonomous_turns` used and allowed, its estimated
+question holding it as `held_by`, whether an operator `muted` it, its `autonomous_turns` used and allowed, its estimated
 `cost_usd` since its last release and its limit, its `leases` with their ends, its
 `scheduled_wake`, its `unread` mail and `pending` deliveries, its `model` and
 `strategy`, its `workdir` as configured and as `workdir_path` resolved, its
 `engine_session`, and its `kept_session`, as the kept sessions section below specifies.
 It adds a `daemon` object, an `event_log` object and, for every other line, its
-`line_id`, `state`, whether it is `held`, and the names of its `leases`. It holds no
+`line_id`, `state`, whether it is `held` and `muted`, and the names of its `leases`. It holds no
 configuration document and no message body.
 
 **Row 14 of the T3 Code review, 2026-10-27.** The `event_log` object holds `events`,

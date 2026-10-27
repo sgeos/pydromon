@@ -198,7 +198,13 @@ def test_line_status_shows_the_line_its_daemon_and_the_others(world: World) -> N
     }
     assert status["leases"] == []
     assert status["other_lines"] == [
-        {"line_id": "beta", "state": "idle", "held": False, "leases": ["gate"]}
+        {
+            "line_id": "beta",
+            "state": "idle",
+            "held": False,
+            "muted": False,
+            "leases": ["gate"],
+        }
     ]
     for secret in ("a private body", "notes", "s3", "was held for this test"):
         assert secret not in text

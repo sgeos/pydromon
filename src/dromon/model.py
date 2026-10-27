@@ -422,6 +422,40 @@ class LineReleased:
 
 
 @dataclass(frozen=True, slots=True)
+class LineMuted:
+    """An operator muted the line's wakes. **Decided by the operator on 2026-10-27.**
+    The line keeps its mail, its session and its pending scheduled wake, and starts
+    no turn until it is unmuted. A turn already running finishes."""
+
+    line_id: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+
+
+@dataclass(frozen=True, slots=True)
+class LineUnmuted:
+    """A muted line may be woken again, by the mail and wakes it kept."""
+
+    line_id: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+
+
+@dataclass(frozen=True, slots=True)
+class MessagePrioritized:
+    """A note to a line is priority mail, which ends the line's running turn at its
+    next safe point and leads the turn that follows. Appended right after the
+    ``message_sent`` it marks, while the note is undelivered."""
+
+    message_id: str
+
+    def __post_init__(self) -> None:
+        check_id("message_id", self.message_id)
+
+
+@dataclass(frozen=True, slots=True)
 class OperatorRegistered:
     operator_id: str
 
@@ -753,6 +787,8 @@ type Event = (
     | ProjectOverridden
     | LineHeld
     | LineReleased
+    | LineMuted
+    | LineUnmuted
     | OperatorRegistered
     | AgentRegistered
     | AgentRevoked
@@ -760,6 +796,7 @@ type Event = (
     | MessageDelivered
     | MessageRead
     | MessageAcknowledged
+    | MessagePrioritized
     | WakeRequested
     | WakeIssued
     | WakeScheduled
@@ -805,6 +842,9 @@ class Line:
     handoff: str | None = None
     """Why the line's next turn starts a new engine session and is owed a context
     handoff, ``rebound`` or ``cleared``, until ``context_handed_off`` ends it."""
+    muted: bool = False
+    """Whether an operator muted the line's wakes, from ``line_muted`` until
+    ``line_unmuted``."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -830,6 +870,8 @@ class Message:
     """The question's lifecycle, or ``None`` for a note."""
     answered_by: str | None = None
     superseded_by: str | None = None
+    priority: bool = False
+    """Whether ``message_prioritized`` marked the note as priority mail."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -944,6 +986,12 @@ class State:
             case LineReleased():
                 if self._line(event.line_id).held_by is None:
                     raise EventRejected(f"line {event.line_id} is not held")
+            case LineMuted():
+                if self._line(event.line_id).muted:
+                    raise EventRejected(f"line {event.line_id} is muted")
+            case LineUnmuted():
+                if not self._line(event.line_id).muted:
+                    raise EventRejected(f"line {event.line_id} is not muted")
             case OperatorRegistered():
                 if event.operator_id in self.operators:
                     raise EventRejected(f"operator {event.operator_id} exists")
@@ -970,6 +1018,8 @@ class State:
                     raise EventRejected(f"message {event.message_id} was not delivered")
                 if message.read:
                     raise EventRejected(f"message {event.message_id} was read")
+            case MessagePrioritized():
+                self._check_prioritized(event)
             case WakeRequested():
                 self._check_wake_requested(event)
             case WakeIssued():
@@ -1026,6 +1076,12 @@ class State:
             case LineReleased():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, held_by=None)
+            case LineMuted():
+                line = self.lines[event.line_id]
+                self.lines[event.line_id] = replace(line, muted=True)
+            case LineUnmuted():
+                line = self.lines[event.line_id]
+                self.lines[event.line_id] = replace(line, muted=False)
             case LineSession():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(
@@ -1072,6 +1128,9 @@ class State:
             case MessageAcknowledged():
                 message = self.messages[event.message_id]
                 self.messages[event.message_id] = replace(message, acknowledged=True)
+            case MessagePrioritized():
+                message = self.messages[event.message_id]
+                self.messages[event.message_id] = replace(message, priority=True)
             case WakeRequested():
                 self.wakes[event.wake_id] = Wake(
                     event.line_id, event.message_id, issued=False
@@ -1174,8 +1233,8 @@ class State:
         return None
 
     def _is_firing(self, event: MessageSent) -> bool:
-        """Whether ``event`` is the note of its sender's pending scheduled wake, the
-        only message a party may send itself."""
+        """Whether ``event`` is the note of its sender's pending scheduled wake, which
+        clears the wake when it applies."""
         if not isinstance(event.sender, LineAddress) or event.sender != event.recipient:
             return False
         pending = self.scheduled.get(event.sender.line_id)
@@ -1194,7 +1253,12 @@ class State:
         self._require_party(event.sender)
         self._require_party(event.recipient)
         firing = self._is_firing(event)
-        if event.sender == event.recipient and not firing:
+        # Decided by the operator on 2026-10-27. A line may send itself a note, for a
+        # note to a later turn or to test a tool. No operator or agent may, since no
+        # turn of theirs would receive it.
+        if event.sender == event.recipient and not isinstance(
+            event.sender, LineAddress
+        ):
             raise EventRejected(f"{event.sender} cannot message itself")
         reserver = self._reserver(event.message_id)
         if reserver is not None and not firing:
@@ -1210,6 +1274,17 @@ class State:
             self._live_line(event.sender.line_id)
         if event.reply_to is not None:
             self._check_reply(event, event.reply_to)
+
+    def _check_prioritized(self, event: MessagePrioritized) -> None:
+        message = self._message(event.message_id)
+        if message.priority:
+            raise EventRejected(f"message {event.message_id} is priority mail")
+        if message.kind is not MessageKind.NOTE:
+            raise EventRejected(f"message {event.message_id} is not a note")
+        if not isinstance(message.recipient, LineAddress):
+            raise EventRejected(f"message {event.message_id} is not to a line")
+        if message.delivered:
+            raise EventRejected(f"message {event.message_id} was delivered")
 
     def _check_reply(self, event: MessageSent, reply_to: str) -> None:
         parent = self._message(reply_to)

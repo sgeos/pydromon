@@ -34,8 +34,9 @@ and `agent_revoked`, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies.
 Each level includes every level before it. The mail tools are the same tools a line
 has, with the same schemas and results, fixed to the agent's address, and an agent's
 mail is delivered when it lists it. An agent's `send_message` is held to the project's
-disclosure list, and its `create_line` and `configure_line` to the project's sandbox
-requirement, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. It has no
+disclosure list, and refuses `priority`, which only operators and lines may send, as
+[`PRIORITY.md`](PRIORITY.md) specifies. Its `create_line` and `configure_line` are
+held to the project's sandbox requirement, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. It has no
 `wake_after`, `acquire_lease` or `release_lease`, which only lines have, and no
 `rebind_line`, which only an operator has through a client. Nor has it `line_status`,
 `read_instructions`, `write_scratch`, `list_processes` or `stop_process`, which
