@@ -11,7 +11,9 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import sys
+import tempfile
 from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -147,6 +149,25 @@ async def until(condition: Callable[[], bool]) -> None:
             return
         await asyncio.sleep(0.0005)
     raise AssertionError("the condition never held")
+
+
+# Pytest's own temporary paths can exceed macOS's 103-byte socket path limit, so each
+# test gets a short runtime directory of its own, removed when the test ends.
+_SHORT: list[Path] = []
+
+
+@pytest.fixture(autouse=True)
+def _short_runtime_directory() -> Iterator[None]:
+    parent = Path(tempfile.mkdtemp(prefix="dr"))
+    _SHORT.append(parent)
+    yield
+    _SHORT.remove(parent)
+    shutil.rmtree(parent, ignore_errors=True)
+
+
+def _short_run() -> Path:
+    """The current test's short runtime directory, which does not exist yet."""
+    return _SHORT[-1] / "run"
 
 
 def run(target: World, act: Callable[[], Coroutine[Any, Any, None]]) -> None:
@@ -476,7 +497,7 @@ def test_successor_args_read_back_as_the_same_command_line() -> None:
 def test_start_successor_reports_a_successor_that_does_not_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    paths = project_paths(tmp_path, tmp_path / "run")
+    paths = project_paths(tmp_path, _short_run())
     started: list[Sequence[str]] = []
 
     def start(paths: ProjectPaths, args: Sequence[str]) -> int:
@@ -507,7 +528,7 @@ def respond(target: Daemon, op: str, args: dict[str, object]) -> Response:
 
 
 def make_daemon(target: World, tmp_path: Path) -> Daemon:
-    paths = project_paths(tmp_path, tmp_path / "run")
+    paths = project_paths(tmp_path, _short_run())
     return Daemon(
         paths,
         target.log,
@@ -682,7 +703,7 @@ def no_sleep(seconds: float) -> None:
 def cli_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ProjectPaths:
     monkeypatch.setattr(cli, "RESTART_POLL_SECONDS", 0.0)
     monkeypatch.setattr(cli, "_preflight", lambda: None)
-    return project_paths(tmp_path, tmp_path / "run")
+    return project_paths(tmp_path, _short_run())
 
 
 def test_dromon_restart_waits_for_a_new_pid_and_names_both_commits(
