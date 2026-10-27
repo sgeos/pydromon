@@ -15,6 +15,7 @@ import contextlib
 import json
 import logging
 import os
+import select
 import signal
 import socket
 import subprocess
@@ -126,6 +127,11 @@ def gone(pid: int) -> bool:
     return False
 
 
+RECORD_SECONDS = 30
+"""How long a test harness may take to write its first record, well under any sleep a
+test harness's processes run."""
+
+
 class Launched:
     """A launcher started as the daemon starts one, with its harness's first record."""
 
@@ -162,6 +168,9 @@ class Launched:
             start_new_session=True,
         )
         assert self.process.stdout is not None
+        # A harness that never reports fails here, rather than hanging the run.
+        ready, _, _ = select.select([self.process.stdout], [], [], RECORD_SECONDS)
+        assert ready, f"the harness wrote no record within {RECORD_SECONDS} seconds"
         self.record: dict[str, object] = json.loads(self.process.stdout.readline())
 
     def pid(self, name: str) -> int:
@@ -456,8 +465,9 @@ ORPHANING = (
     "import json, os, subprocess, sys, time\n"
     "middle = subprocess.Popen([sys.executable, '-c',"
     ' \'import subprocess, sys; away = subprocess.Popen(["/bin/sleep", "60"],'
-    " start_new_session=True); sys.stdout.write(str(away.pid)); sys.stdout.flush()'],"
-    " stdout=subprocess.PIPE)\n"
+    " start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,"
+    " stderr=subprocess.DEVNULL); sys.stdout.write(str(away.pid));"
+    " sys.stdout.flush()'], stdout=subprocess.PIPE)\n"
     "away = int(middle.stdout.read())\n"
     "middle.wait()\n"
     "sys.stdout.write(json.dumps({'stay': away, 'away': away}) + '\\n')\n"
@@ -465,7 +475,11 @@ ORPHANING = (
     "time.sleep(60)\n"
 )
 """A harness whose child starts a grandchild in a session of its own and exits, so the
-grandchild has lost its parent and left the harness's group before any stop."""
+grandchild has lost its parent and left the harness's group before any stop. The
+grandchild must not inherit the child's output, which the harness reads to its end, or
+the harness waits out the grandchild's sleep before it reports, and the grandchild is
+by then a zombie of the launcher that adopted it. That was the Linux failure of
+2026-10-27, on the first run of this test anywhere."""
 
 
 @NEEDS_PS
