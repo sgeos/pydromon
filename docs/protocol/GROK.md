@@ -4,14 +4,16 @@
 
 **Status.** Draft, written on 2026-10-25. Normative for Dromon's side. The Python module
 `dromon.grok` implements it against Grok Build 1.0.70. **Not verified against a live
-turn.** The operator's Grok usage was exhausted, so no session was created and no
-prompt was sent.
+turn.** An operator probe on 2026-10-27 created a session, which Dromon refused before
+any prompt was sent, as the probe section below records.
 
 ## Purpose
 
-With `workdir_access: read`, Dromon selects the `read-only` sandbox profile, even when
-the line has file-write tools configured. Dromon's `write_scratch` tool remains the
-supported way to write under `tmp`.
+With `workdir_access: read`, Dromon selects the `dromon-reader` sandbox profile, even
+when the line has file-write tools configured. Dromon's `write_scratch` tool remains the
+supported way to write under `tmp`. **Review of read-only seats, finding 3.** No live
+run has shown that profile deny a write to the worktree, so the capability table
+records Grok's `read_only_workdir` as unknown.
 
 **Directed by the operator on 2026-10-25.** Nominal support for Grok, without testing
 until Grok usage is available. A line whose driver names the `grok-build` engine runs
@@ -55,11 +57,62 @@ default context of 256,000 tokens and the efforts `low`, `medium`, `high` and `x
 The operator's Grok configuration sets `permission_mode` to `always-approve` and
 declares MCP servers for mail and documents.
 
+## The first live probe
+
+**Facts, observed in the operator's probe on 2026-10-27** against Grok Build 1.0.70
+with `grok-4.7`. The raw recording is private, and no part of it is tracked. The
+fixtures in `tests/test_grok.py` and `tests/test_evidence.py` are invented in the same
+shapes.
+
+- `initialize` answered as before, with `defaultAuthMethodId` `cached_token`. Its
+  `_meta` also names the agent's version, its ids and the machine's host name.
+- `session/new` answered with `sessionId`, `models` and `configOptions`, whose ids are
+  `model` with the category `model` and `reasoning_effort` with the category
+  `thought_level`. It had no `modes`, so Dromon refused the turn with "the engine does
+  not report its permission mode" before the prompt. Its `_meta` holds
+  `x.ai/sessionConfig`, whose options list the models and, under the category `mode`,
+  the reasoning efforts. That category is therefore not a permission mode.
+- Before that answer Grok sent `_x.ai/session/setup` in phases from `auth` to
+  `tool_overrides`, `_x.ai/mcp/servers_updated`, `_x.ai/models/update`,
+  `_x.ai/settings/update`, `_x.ai/announcements/update` twice, `_x.ai/mcp/init_progress`,
+  `session/update` with `available_commands_update` twice, and
+  `_x.ai/session_notification` with `model_changed`. Grok sends the extension methods
+  with ACP's `_` prefix, which its guide omits.
+- `_x.ai/mcp/servers_updated` listed eleven MCP servers from the operator's own
+  configuration, ten over HTTP and one over stdio, although Dromon passed
+  `mcpServers` empty. `_x.ai/mcp/init_progress` then gave a `total` of twelve, one more
+  than the list. **Inference.** A server outside that list, such as one a plugin
+  brings, was counting, so the list alone does not show every server.
+- `_x.ai/settings/update` carried `permission_mode` null while the operator's
+  `config.toml` sets `always-approve`. **Inference.** That notice holds the account's
+  settings from Grok's service, not the session's mode.
+
+**Facts, read on 2026-10-27** in Grok's bundled guide and shell completions, without
+running Grok. `grok agent` takes no `--permission-mode` and no flag that skips MCP
+servers. The mode is set by `[ui] permission_mode` or `yolo` in `~/.grok/config.toml`,
+by a Claude Code `defaultMode`, by `--always-approve`, or by `yoloMode` and `autoMode`
+in `session/new`, which can turn approval on but are not documented to turn it off.
+The `GROK_CONFIG` overlay can set neither the mode nor MCP servers. MCP servers load
+from the user's and the project's `config.toml`, from plugins, and from Claude Code's
+and Cursor's files, the last two of which `GROK_CLAUDE_MCPS_ENABLED` and
+`GROK_CURSOR_MCPS_ENABLED` turn off. An allow list in `requirements.toml` can block
+servers, but it binds the operator's own Grok as well. `GROK_HOME` moves the whole
+configuration, sign-in included.
+
+**What follows for Dromon.** Nothing in Grok 1.0.70 lets Dromon confirm or set the
+permission mode, or keep the user's MCP servers out, from the client side alone, so a
+Grok turn is refused at both checks below. The way that appears open is a Grok home
+that Dromon owns, with a `config.toml` that sets the ask mode and declares no MCP
+servers, signed in once by the operator. **Not built.** It needs the operator's
+decision, since it moves Grok's sign-in.
+
 ## A turn
 
 1. **Environment.** `XAI_API_KEY`, `GROK_AUTH`, `GROK_CODE_XAI_API_KEY`,
    `GROK_AUTH_PATH`, `GROK_CONFIG` and `GROK_CONFIG_PATH` are removed. `GROK_HOME` and
    `XAI_API_BASE_URL` are refused. `GROK_SANDBOX` names Dromon's profile.
+   `GROK_CLAUDE_MCPS_ENABLED` and `GROK_CURSOR_MCPS_ENABLED` are set to `0`.
+   **Inference.** That `0` turns those scans off.
 2. **Profile.** The profile below must exist and pass its checks, or the turn is
    refused with the table to add.
 3. **`initialize`**, advertising no file system and no terminal, so Grok uses its own
@@ -70,27 +123,41 @@ declares MCP servers for mail and documents.
    [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies or the project root, Dromon's MCP
    server, and `_meta` with `yoloMode` and `autoMode` false
    and the line's instructions as `rules`.
-5. **Model and mode.** The response's `models.currentModelId`, or its `model` config
-   option, is handed to the driver. Its `modes.currentModeId` must be `default` or
-   `ask`. Otherwise Dromon sends `session/set_mode` with `default` if Grok offers it, and
-   refuses the turn if not or if no mode is reported.
-6. **`session/prompt`** with the wake prompt. Message chunks are text and thought
+5. **MCP servers.** Grok must have sent `x.ai/mcp/servers_updated` before its answer,
+   listing no server but Dromon's own, which is none without a bridge. An
+   `x.ai/mcp/init_progress` whose `total` exceeds Dromon's servers refuses the turn
+   too, as does a server list at any later point that names another server. A refusal
+   counts the other servers and never names them.
+6. **Model and mode.** The response's `models.currentModelId`, or its `model` config
+   option, is handed to the driver. When the answer has `modes`, `currentModeId` must
+   be `default` or `ask`, and otherwise Dromon sends `session/set_mode` with `default`
+   if Grok offers it. Without `modes`, a `configOptions` entry of the category `mode`
+   must have one of those values. With neither, the turn is refused, and the refusal
+   names the mode `~/.grok/config.toml` sets, if it sets another. A
+   `current_mode_update` to another mode during the turn cancels it.
+7. **Grok's notices.** An `x.ai/models/update` with a `currentModelId`, or an
+   `x.ai/session_notification` of `model_changed`, that is not the driver's model
+   refuses the turn. An `x.ai/settings/update` whose `permission_mode` is set and is
+   not an asking mode refuses it. `x.ai/session/setup` and `x.ai/announcements/update`
+   are passed over, as is any notice not named here. A request not named here is
+   answered with an error.
+8. **`session/prompt`** with the wake prompt. Message chunks are text and thought
    chunks are thinking. A tool call is judged against the line's tools when it is first
    seen, in a `tool_call`, a `tool_call_update` or a permission request, and its
    `toolName`, `title` and `kind` are recorded then. A later update or request that
    gives any of them another value, or one the call did not have, refuses the turn, as
    does a call without an identifier.
-7. **Permission requests** are answered with an `allow_once` option for a permitted call
+9. **Permission requests** are answered with an `allow_once` option for a permitted call
    and a `reject` option otherwise. A tool call the line was not given, a refused
    permission request, or the driver's tool budget, sends `session/cancel`, and every
    permission request after it is answered as cancelled. Other requests from the agent
    are answered with an error.
-8. **Cancel.** **Re-review, N2.** After `session/cancel` Dromon waits at most
+10. **Cancel.** **Re-review, N2.** After `session/cancel` Dromon waits at most
    `ABORT_SECONDS`, 60 seconds, for Grok to answer its prompt, and then leaves the
    connection, which stops Grok. An interrupted turn is reported as cancelled, and a
    refused one keeps its reason. Before, a Grok that ignored the cancel held the line
    without bound.
-9. **Wait bounds.** Initialization, sign-in and session opening have a 180 second
+11. **Wait bounds.** Initialization, sign-in and session opening have a 180 second
    deadline, with the failed stage named. A turn has a sliding inactivity deadline of
    `TURN_SECONDS`, 3600 seconds, reset by model or tool activity. Its absolute deadline
    is `ABSOLUTE_TURN_SECONDS`, four hours, so a continuous stream cannot hold the line
@@ -171,14 +238,14 @@ specifies the stop policy.
 
 ## Not verified
 
-- That Grok honours `yoloMode` false, reports `modes` and `models` in the shapes
-  above, accepts `session/set_mode`, and names MCP tools as `server__tool` in
-  `toolName`.
+- That Grok honours `yoloMode` false, accepts `session/set_mode`, and names MCP tools
+  as `server__tool` in `toolName`. Grok 1.0.70 reports `models` and `configOptions`
+  and no `modes`, as the probe showed.
 - That a cached sign-in is a subscription rather than usage billed per token. Dromon
   treats it as a subscription, and refuses the API strategy.
-- That the operator's MCP servers stay out of a line's reach, which rests on Grok asking
-  before an MCP call and Dromon refusing it, and on Dromon cancelling a turn that uses
-  one.
+- That `x.ai/mcp/servers_updated` and `x.ai/mcp/init_progress` together report
+  every server a session loads, and that Grok sends the list on `session/load` as on
+  `session/new`. A Grok that does not is refused.
 - That Grok's permission grants remembered for a project do not approve calls Dromon
   would refuse.
 
@@ -187,6 +254,14 @@ specifies the stop policy.
 **Re-review, N1, at the operator's direction on 2026-10-26.** These are the checks for
 the first live Grok turn, in order. Each rule they test fails closed, so a wrong guess
 refuses turns rather than permits them.
+
+**Established by the probe of 2026-10-27.** Grok's answer shapes for `initialize` and
+`session/new`, the notices it sends while a session opens, and that it loads the
+user's MCP servers and reports no permission mode. A turn cannot reach the steps below
+until Grok's mode and servers can be confirmed, as the probe section says. The next
+probe should show that Dromon refuses at the server check with a count, and, with
+`GROK_CLAUDE_MCPS_ENABLED` and `GROK_CURSOR_MCPS_ENABLED` set, whether the count of
+servers falls.
 
 1. **Tool names.** Run a turn that calls one of Dromon's tools, such as
    `send_message`, and record its `tool_call`, its `tool_call_update` messages and any

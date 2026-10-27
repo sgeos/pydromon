@@ -7,6 +7,28 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- A read-only Claude Code line could leave its sandbox. A sandbox layer that set
+  `allowUnsandboxedCommands` true or `failIfUnavailable` false let a shell command run
+  outside the Seatbelt sandbox that denies writes to the working directory. The read
+  sandbox now sets both keys itself, after every other layer, and a line whose project
+  or own sandbox sets either the other way, or sets `excludedCommands` or
+  `filesystem.disabled`, is refused. Each refusal of a read-only Claude line now has a
+  test. Found by the review of read-only seats, findings 1 and 2.
+- Grok's `read_only_workdir` capability is unknown rather than yes, since no live run
+  has shown its reader profile deny a write. Review of read-only seats, finding 3.
+- A Grok turn is refused when Grok loads any MCP server but Dromon's, which the
+  operator's first live probe of 2026-10-27 showed it does from the user's own
+  configuration, and when Grok does not list its servers. Grok's own notices for its
+  servers, models and settings are read, and one that shows another server, another
+  model or a mode that does not ask refuses the turn. A permission mode reported as a
+  `configOptions` entry of the category `mode` is accepted, and the refusal when none
+  is reported names the mode the user's Grok configuration sets. Grok's scans of
+  Claude Code's and Cursor's MCP files are turned off.
+- `dromon probe --scrub` also replaces MCP server names, addresses, commands and
+  arguments, slash command and skill names with their descriptions, host names,
+  agent ids and a subscription tier, so a scrubbed Grok recording holds none of the
+  operator's configuration.
+
 - The client protocol carries no floats, and the daemon sent two. `dromon status`
   failed once the daemon had run for a minute, because `events_per_hour` was a
   fraction, and `dromon restart` failed at once, because its `--wait-seconds` went out

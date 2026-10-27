@@ -79,9 +79,14 @@ or a settings file whose `sandbox` key is taken and whose other keys are ignored
 
 For a line configured with `workdir_access: read`, Dromon requires Claude Code's
 sandbox and adds a deny-write rule for the complete working directory, together with
-permission denials for direct file-editing tools. The line is refused when configured
-MCP servers, account MCP inheritance, allow-all tools, project settings or plugins,
-or command hooks could bypass those controls. Dromon's `write_scratch` tool remains
+permission denials for direct file-editing tools. It sets `failIfUnavailable` true and
+`allowUnsandboxedCommands` false after every other layer, since a shell command run
+outside the sandbox is not held by the deny-write rule. The line is refused when
+configured MCP servers, account MCP inheritance, allow-all tools, project settings or
+plugins, or command hooks could bypass those controls, and when the project's or the
+line's sandbox sets `allowUnsandboxedCommands` true, `failIfUnavailable` false,
+`excludedCommands`, which run outside the sandbox, or `filesystem.disabled`. Review of
+read-only seats, findings 1 and 2. Dromon's `write_scratch` tool remains
 available for scratch files under `tmp`.
 
 When a line's turn starts, Dromon merges the layers and derives the settings it hands to

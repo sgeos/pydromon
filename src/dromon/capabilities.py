@@ -266,7 +266,7 @@ GROK: Final = EngineTable(
     kept_session=Known.NO,
     own_tools=Known.UNKNOWN,
     deny_before_run=Known.UNKNOWN,
-    read_only_workdir=Known.YES,
+    read_only_workdir=Known.UNKNOWN,
     cost_report=Known.NO,
     max_turns=Known.NO,
     credential_visible=Known.UNKNOWN,
@@ -280,7 +280,10 @@ reach Grok under the ``toolName`` the adapter requires is the first step of
 ``GROK.md``'s verify-first list, so ``own_tools`` is unknown, as for Pi. Whether every
 built-in tool asks before it runs in the ``default`` mode is not documented, so
 ``deny_before_run`` is unknown. Grok names its cached sign-in, and that it is a
-subscription is an inference, so ``credential_visible`` is unknown."""
+subscription is an inference, so ``credential_visible`` is unknown. The adapter
+selects the ``dromon-reader`` profile for a read-only workdir, but no live run has shown
+that profile deny a write to the worktree, so ``read_only_workdir`` is unknown. **Review
+of read-only seats, finding 3.**"""
 
 ANTIGRAVITY: Final = EngineTable(
     engine="antigravity",

@@ -26,7 +26,9 @@ process's network access under any profile.
 
 Tools and permissions. Grok loads the operator's configuration, including MCP servers
 and a permission mode. Dromon asks for Grok's ask mode, refuses a session that reports
-any other mode, answers every permission request from the line's configuration, and
+any other mode or none, refuses one that loads any MCP server but Dromon's, as the
+operator's probe of 2026-10-27 showed Grok 1.0.70 does and reports no mode, answers
+every permission request from the line's configuration, and
 interrupts and refuses a turn in which Grok uses a tool the line was not given. Each
 tool call is judged when first seen, and a later update or request that changes its
 name, title or kind refuses the turn. Dromon's
@@ -106,8 +108,72 @@ DROMON_CONTROLLED: Final = ("GROK_SANDBOX", "GROK_CONFIG", "GROK_CONFIG_PATH")
 REFUSED_ENVIRONMENT: Final = ("GROK_HOME", "XAI_API_BASE_URL")
 """Variables that would move Grok's configuration or send its requests elsewhere."""
 
+COMPAT_MCP_ENVIRONMENT: Final[Mapping[str, str]] = {
+    "GROK_CLAUDE_MCPS_ENABLED": "0",
+    "GROK_CURSOR_MCPS_ENABLED": "0",
+}
+"""Variables Grok documents as turning off its scan of Claude Code's and Cursor's MCP
+server files. **Probe of 2026-10-27.** They narrow what Grok loads, but Grok's own
+``config.toml`` servers still load, so the servers Grok reports are checked as well.
+**Inference, not verified.** That ``0`` turns a scan off, which Grok's guide implies
+without giving the value."""
+
 ASK_MODES: Final = frozenset({"default", "ask"})
 """Session modes in which Grok asks before a tool call that is not read-only."""
+
+MODE_CATEGORY: Final = "mode"
+"""The ACP ``configOptions`` category of a session's permission mode. **Inference.**
+ACP names it so. Grok 1.0.70 sends no such option, and its ``x.ai/sessionConfig``
+uses the category ``mode`` for reasoning efforts, so that list is never read."""
+
+SERVERS_UPDATED: Final = "x.ai/mcp/servers_updated"
+"""Grok's list of the MCP servers a session loaded, as ``mcpServers`` of ``name``,
+``source`` and ``type``. **Probe of 2026-10-27.** Grok 1.0.70 sent it before its
+``session/new`` answer, with the servers of the user's own configuration, although
+Dromon passed none."""
+MCP_PROGRESS: Final = "x.ai/mcp/init_progress"
+"""Grok's count of the MCP servers a session is connecting, as ``total``."""
+MODELS_UPDATE: Final = "x.ai/models/update"
+"""Grok's models, as ``currentModelId`` and ``availableModels``."""
+SESSION_NOTIFICATION: Final = "x.ai/session_notification"
+"""Grok's session notices, of which Dromon reads ``model_changed``."""
+SETTINGS_UPDATE: Final = "x.ai/settings/update"
+"""Grok's account settings from its service, with a ``permission_mode`` that was
+null on 2026-10-27 while the user's ``config.toml`` set ``always-approve``, so it is
+not the session's mode and is read only as a reason to refuse."""
+IGNORED_NOTIFICATIONS: Final = frozenset(
+    {"x.ai/session/setup", "x.ai/announcements/update"}
+)
+"""Grok notices identified in the probe of 2026-10-27 that carry nothing Dromon acts
+on, the phases of opening a session and the product's announcements."""
+
+
+def extension_method(method: str) -> str:
+    """A Grok extension method's name without ACP's ``_`` prefix for extensions,
+    which Grok 1.0.70 sends and its guide omits, so both spellings are read alike."""
+    return method.removeprefix("_")
+
+
+def configured_mode(home: Path) -> str | None:
+    """The permission mode the user's ``~/.grok/config.toml`` sets in ``[ui]``, with
+    ``yolo`` read as ``always-approve``, or ``None`` when it sets none or cannot be
+    read. Used only to say why a turn is refused, never to permit one, since a
+    project, a managed file or a Claude Code settings file may also set it."""
+    try:
+        document = tomllib.loads(
+            (home / ".grok" / "config.toml").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    ui = document.get("ui")
+    if not isinstance(ui, dict):
+        return None
+    table = cast(dict[str, object], ui)
+    if table.get("yolo") is True:
+        return "always-approve"
+    mode = table.get("permission_mode")
+    return mode if isinstance(mode, str) else None
+
 
 EFFORTS: Final[dict[str, str]] = {
     "low": "low",
@@ -181,7 +247,8 @@ def engine_environment(
             "the environment conflicts with a Grok line: " + ", ".join(present)
         )
     removed = set(API_ENVIRONMENT) | set(DROMON_CONTROLLED)
-    return {k: v for k, v in environment.items() if k not in removed}
+    kept = {k: v for k, v in environment.items() if k not in removed}
+    return {**kept, **COMPAT_MCP_ENVIRONMENT}
 
 
 # The sandbox profile.
@@ -403,6 +470,8 @@ class _Turn:
     refusal: str | None = None
     cancelled: bool = False
     absolute_deadline: float | None = None
+    servers_reported: bool = False
+    """Whether Grok listed the session's MCP servers, which a prompt requires."""
 
 
 def grok_arguments(model: str, effort: str) -> list[str]:
@@ -556,6 +625,112 @@ class GrokLine:
             await self._answer(message["id"], method, params, turn)
         elif method == "session/update":
             await self._update(cast(dict[str, Any], params.get("update") or {}), turn)
+        else:
+            refusal = self._notice_refusal(extension_method(method), params, turn)
+            if refusal is not None:
+                await self._cancel(turn, refusal)
+
+    def _allowed_servers(self) -> frozenset[str]:
+        return frozenset(
+            str(server["name"])
+            for server in acp.mcp_servers(self.bridge, self.line_token)
+        )
+
+    def _notice_refusal(
+        self, method: str, params: Mapping[str, Any], turn: _Turn
+    ) -> str | None:
+        """Why one of Grok's own notifications refuses the turn, or ``None``.
+        **Probe of 2026-10-27.** A notice not identified here is passed over, as
+        before, since a notification cannot be refused, and a request not identified
+        is still answered with an error."""
+        if method == SERVERS_UPDATED:
+            turn.servers_reported = True
+            return self._servers_refusal(params.get("mcpServers"))
+        if method == MCP_PROGRESS:
+            total = params.get("total")
+            allowed = len(self._allowed_servers())
+            if total is not None and (type(total) is not int or total > allowed):
+                return (
+                    f"Grok is connecting {total!r} MCP servers, and a Grok line has"
+                    f" only Dromon's, {allowed}"
+                )
+            return None
+        if method == MODELS_UPDATE:
+            if "currentModelId" in params:
+                return self._model_refusal(params.get("currentModelId"))
+            return None
+        if method == SESSION_NOTIFICATION:
+            update = params.get("update")
+            if (
+                isinstance(update, dict)
+                and cast(dict[str, Any], update).get("sessionUpdate") == "model_changed"
+            ):
+                return self._model_refusal(cast(dict[str, Any], update).get("model_id"))
+            return None
+        if method == SETTINGS_UPDATE:
+            mode = params.get("permission_mode")
+            if mode is not None and mode not in ASK_MODES:
+                return f"Grok's settings name the permission mode {mode!r}"
+            return None
+        return None
+
+    def _servers_refusal(self, servers: object) -> str | None:
+        """Why a list of loaded MCP servers refuses the turn, or ``None`` when it
+        holds Dromon's own server at most. Other servers are counted and never
+        named, since their names are the operator's configuration."""
+        if not isinstance(servers, list):
+            return "Grok reported its MCP servers in a shape Dromon does not read"
+        allowed = self._allowed_servers()
+        others = 0
+        for server in cast(list[object], servers):
+            name = (
+                cast(dict[str, Any], server).get("name")
+                if isinstance(server, dict)
+                else None
+            )
+            if not isinstance(name, str) or name not in allowed:
+                others += 1
+        if others:
+            return (
+                f"Grok loaded {others} MCP servers besides Dromon's, from the user's"
+                " own configuration, and a Grok line may have only Dromon's tools"
+            )
+        return None
+
+    def _model_refusal(self, model: object) -> str | None:
+        """Why a model Grok reports during the session refuses the turn. The driver
+        runs Grok with ``--model``, so any other model, or one that is not a name,
+        is not the model the driver accepted."""
+        expected = self.driver.settings.model
+        if model != expected:
+            return f"Grok switched the session's model to {model!r}, not {expected!r}"
+        return None
+
+    def _mode_refusal(self, result: Mapping[str, Any]) -> str | None:
+        """Why the session's permission mode refuses the turn, read from ACP's
+        ``modes`` or a ``configOptions`` entry of the category ``mode``, or ``None``
+        once it is shown to ask before acting. **Probe of 2026-10-27.** Grok 1.0.70
+        reports neither, and no ACP field, flag or overlay sets the mode, so its
+        turns are refused, naming the mode the user's configuration sets."""
+        for option in cast(list[Any], result.get("configOptions") or []):
+            if not isinstance(option, dict):
+                continue
+            entry = cast(dict[str, Any], option)
+            if entry.get("category") == MODE_CATEGORY:
+                current = entry.get("currentValue")
+                if current in ASK_MODES:
+                    return None
+                return f"the engine runs in the permission mode {current!r}"
+        reason = (
+            "Grok does not report its permission mode over ACP, so Dromon cannot"
+            " confirm that it asks before acting"
+        )
+        configured = configured_mode(self._home)
+        if configured is not None and configured not in ASK_MODES:
+            reason += (
+                f", and ~/.grok/config.toml sets [ui] permission_mode to {configured!r}"
+            )
+        return reason
 
     def _permits(self, tool_call: Mapping[str, Any]) -> tuple[bool, str]:
         """Whether the line may make ``tool_call``, and the tool name to count it as.
@@ -616,6 +791,13 @@ class GrokLine:
         elif kind == "agent_thought_chunk":
             self._observe(ActivityKind.THINKING, "")
             await self._act(Event("thinking"), turn)
+        elif kind == "current_mode_update":
+            # A session that leaves the asking modes mid-turn no longer asks Dromon.
+            mode = update.get("currentModeId")
+            if mode not in ASK_MODES:
+                await self._cancel(
+                    turn, f"the engine switched to the permission mode {mode!r}"
+                )
         elif kind in ("tool_call", "tool_call_update"):
             # Antigravity review, F1 to F3, applied to Grok on 2026-10-26. No kind is
             # exempt, and every update to a call is compared with its record.
@@ -720,6 +902,14 @@ class GrokLine:
         if not session_id:
             raise EngineRefused("the engine started a session without an identifier")
         self.session_id_in_use = session_id
+        if turn.refusal is not None:
+            return session_id
+        if not turn.servers_reported:
+            turn.refusal = (
+                "Grok did not report its MCP servers, so Dromon cannot confirm that"
+                " a Grok line has only Dromon's tools"
+            )
+            return session_id
         model = acp.reported_model(result)
         verdict = self.driver.step(Event("init", model or ""))
         if verdict.tag is ActionTag.REFUSE:
@@ -728,10 +918,13 @@ class GrokLine:
             )
             return session_id
         # Refuse the turn unless the session asks before acting, switching to
-        # ``default`` when Grok offers it.
-        refusal = await acp.ensure_mode(
-            self._rpc(), session_id, result, ASK_MODES, "default"
-        )
+        # ``default`` when Grok offers it through ACP's ``modes``.
+        if isinstance(result.get("modes"), dict):
+            refusal = await acp.ensure_mode(
+                self._rpc(), session_id, result, ASK_MODES, "default"
+            )
+        else:
+            refusal = self._mode_refusal(result)
         if refusal is not None:
             turn.refusal = refusal
         return session_id

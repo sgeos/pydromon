@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 from claude_agent_sdk._internal.transport import Transport
 
-from dromon import cli, codex, evidence, exits, grok
+from dromon import acp, cli, codex, evidence, exits, grok
 from dromon.capabilities import (
     CAPABILITY_NAMES,
     CLAUDE_CODE,
@@ -1266,3 +1266,176 @@ def test_the_live_fixture_is_scrubbed_and_replays_through_the_real_adapter() -> 
     assert [frame.get("type") for frame in replay.sent] == [
         frame.get("type") for frame in replay.recorded_out
     ]
+
+
+# The operator's configuration in a Grok recording. Every value here is invented, in
+# the shapes Grok Build 1.0.70 sent on 2026-10-27.
+
+INVENTED_SERVERS: list[dict[str, Any]] = [
+    {
+        "name": "notes-keeper",
+        "source": "local",
+        "type": "http",
+        "url": "https://notes.example.net/mcp",
+    },
+    {
+        "name": "ledger",
+        "source": "local",
+        "type": "stdio",
+        "command": f"{HOME}/bin/ledger-mcp",
+        "args": ["--vault", "household"],
+    },
+]
+
+
+def grok_configuration_recording(tmp_path: Path) -> Path:
+    path = tmp_path / "grok.jsonl"
+    recording = Recording(path, grok.ENGINE_NAME, "grok-4.7")
+    recording.frame(
+        OUT,
+        {
+            "id": 2,
+            "method": "session/new",
+            "params": {
+                "mcpServers": [
+                    {
+                        "name": "dromon",
+                        "command": "python",
+                        "args": ["-m", "dromon.cli"],
+                        "env": [{"name": "DROMON_LINE_TOKEN", "value": "tok-secret"}],
+                    }
+                ]
+            },
+        },
+    )
+    recording.frame(
+        IN,
+        {
+            "id": 1,
+            "result": {
+                "_meta": {
+                    "hostname": "workbench-seven.lan",
+                    "agentId": "agent-kestrel",
+                    "agentInstanceId": "0f0e0d0c-0b0a-4908-8706-050403020100",
+                }
+            },
+        },
+    )
+    recording.frame(
+        IN,
+        {
+            "method": "_x.ai/mcp/servers_updated",
+            "params": {"mcpServers": INVENTED_SERVERS},
+        },
+    )
+    recording.frame(
+        IN,
+        {
+            "method": "_x.ai/settings/update",
+            "params": {
+                "subscription_tier_display": "Gold Circle",
+                "slash_command_tags": {"tidy-garden": "new"},
+            },
+        },
+    )
+    recording.frame(
+        IN,
+        {
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [
+                        {
+                            "name": "tidy-garden",
+                            "description": "Weed the plots behind the shed.",
+                            "input": {"hint": "which bed"},
+                            "_meta": {
+                                "scope": "user",
+                                "path": f"{HOME}/.grok/skills/tidy-garden/SKILL.md",
+                            },
+                        }
+                    ],
+                }
+            },
+        },
+    )
+    recording.frame(
+        IN,
+        {
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "t1",
+                    "toolName": "ledger__balance",
+                    "title": "Ask notes-keeper on workbench-seven.lan",
+                }
+            },
+        },
+    )
+    recording.close()
+    return path
+
+
+def test_a_scrub_replaces_the_operators_mcp_servers_commands_and_host(
+    tmp_path: Path,
+) -> None:
+    written = evidence.scrub_file(
+        grok_configuration_recording(tmp_path), tmp_path / "clean.jsonl", HOME
+    )
+    text = written.read_text()
+    for value in (
+        "notes-keeper",
+        "notes.example.net",
+        "ledger",
+        "household",
+        "workbench-seven",
+        "agent-kestrel",
+        "tidy-garden",
+        "Weed the plots",
+        "which bed",
+        "Gold Circle",
+        "tok-secret",
+    ):
+        assert value not in text, value
+    clean = read_recording(written)
+    frames = [frame for _, frame in clean.frames]
+    dromon = frames[0]["params"]["mcpServers"][0]
+    assert dromon["name"] == evidence.DROMON_SERVER == acp.MCP_SERVER_NAME
+    assert dromon["env"] == [
+        {"name": evidence.SCRUBBED_TEXT, "value": evidence.SCRUBBED_TEXT}
+    ]
+    meta = frames[1]["result"]["_meta"]
+    assert meta["hostname"].startswith("host-")
+    assert meta["agentId"].startswith("agent-")
+    assert meta["agentInstanceId"] == "00000000-0000-4000-8000-000000000001"
+    servers = frames[2]["params"]["mcpServers"]
+    # The kind of each server is kept, so the adapter still reads the same shape.
+    assert [(s["source"], s["type"]) for s in servers] == [
+        (s["source"], s["type"]) for s in INVENTED_SERVERS
+    ]
+    names = [s["name"] for s in servers]
+    assert all(name.startswith("mcp-server-") for name in names)
+    assert servers[0]["url"].endswith(".example.invalid/mcp")
+    assert servers[1]["args"] == [evidence.SCRUBBED_TEXT] * 2
+    command = frames[4]["params"]["update"]["availableCommands"][0]
+    assert command["_meta"]["scope"] == "user"
+    assert frames[3]["params"]["slash_command_tags"] == {command["name"]: "new"}
+    # A tool of a server is renamed with its server, and the server's name and the
+    # host are replaced in free text too.
+    call = frames[5]["params"]["update"]
+    assert call["toolName"] == f"{names[1]}__balance"
+    assert call["title"] == f"Ask {names[0]} on {meta['hostname']}"
+
+
+def test_a_scrub_refuses_a_configuration_name_it_left(tmp_path: Path) -> None:
+    found = evidence.leaks(
+        "still mentions notes-keeper", HOME, frozenset({"notes-keeper"})
+    )
+    assert found == ["an account value"]
+    recorded, replaced = evidence.scrub(
+        read_recording(grok_configuration_recording(tmp_path)), HOME
+    )
+    assert {"notes-keeper", "workbench-seven.lan", "agent-kestrel"} <= replaced
+    assert evidence.leaks(json.dumps(recorded.frames), HOME, replaced) == []

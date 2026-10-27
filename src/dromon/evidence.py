@@ -67,6 +67,17 @@ directory, the user name, an email address anywhere or an account value is still
 found. The check is by pattern, so a person still reads a fixture before it is
 committed, and the repository's disclosure scan runs over it once it is tracked.
 
+The operator's configuration, at the operator's instruction of 2026-10-27, after the
+first live Grok recording. MCP server names and addresses, host names and agent ids
+that are not uuids are replaced with stable placeholders wherever they stand as a
+word, and a server's name also where it prefixes a tool's name. A server's command,
+arguments, variables and headers, and each slash command's or skill's name,
+description, input hint and ``_meta`` but its ``scope``, are replaced where they
+stand. Command names are not replaced elsewhere, since many are common words, so a
+custom command named in free text such as a tip would pass, which a reader checks.
+Dromon's own server keeps its name. ``leaks`` looks for every replaced name as it
+looks for an account value.
+
 Review of 2026-10-27. Account values are replaced as whole words whatever their length,
 and ``rate_limit_info`` keeps only what a reader needs, so a field nobody listed is
 replaced rather than passed through. The probe turn's own token counts and cost are
@@ -452,7 +463,9 @@ IDENTITY_BLOCK_WORDS: Final = frozenset(
 """Words that, as a word of a key's name, mark its whole value as the account's, as
 in ``account``, ``organization`` or ``orgId``. Every value inside is replaced by one of
 its own type, except the fields of ``ACCOUNT_KEPT``."""
-IDENTITY_VALUE_WORDS: Final = frozenset({"email", "emails", "plan", "plans"})
+IDENTITY_VALUE_WORDS: Final = frozenset(
+    {"email", "emails", "plan", "plans", "tier", "tiers"}
+)
 """Words that, as a word of a key's name, mark its value as the account's when the
 value is a string, number or boolean, as in ``email`` or ``planType``. A list or object
 under such a key is scrubbed as any other value, because Codex's ``plan`` notice holds
@@ -474,6 +487,39 @@ _UUID: Final = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
 _EMAIL: Final = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+# The operator's configuration, at the operator's instruction of 2026-10-27. The first
+# live Grok recording named the operator's MCP servers with their addresses, every
+# skill and slash command, the machine's host name and the agent's ids. None of it is
+# the account, so the account scrub above passed it through.
+
+DROMON_SERVER: Final = "dromon"
+"""The name of Dromon's own MCP server, ``dromon.acp.MCP_SERVER_NAME``, kept so a
+replayed recording still shows which server is Dromon's. Repeated here because
+``dromon.acp`` imports the engine module, which imports this one."""
+MCP_SERVER_KEYS: Final = frozenset({"mcpServers", "mcp_servers"})
+"""Keys whose value lists MCP servers, or maps their names to them."""
+MCP_KEPT: Final = frozenset({"type", "source", "transport", "enabled", "status"})
+"""Fields of an MCP server that name a kind and not the operator's choice."""
+COMMAND_LIST_KEYS: Final = frozenset({"availableCommands"})
+"""Keys whose value lists the agent's slash commands and skills by ``name``."""
+COMMAND_TABLE_KEYS: Final = frozenset({"slash_command_tags"})
+"""Keys whose value is a table keyed by slash command or skill names."""
+COMMAND_KEPT: Final = frozenset({"scope"})
+"""Fields of a command's ``_meta`` that name a kind, as ``bundled`` or ``user``."""
+SCRUBBED_TEXT: Final = "scrubbed"
+"""What free text from the operator's configuration becomes."""
+
+
+def _host_key(key: str) -> bool:
+    """Whether ``key`` names a host name, as ``hostname`` or ``host_name``."""
+    words = _key_words(key)
+    return "hostname" in words or {"host", "name"} <= words
+
+
+def _agent_id_key(key: str) -> bool:
+    """Whether ``key`` names an agent's id, as ``agentId`` or ``agentInstanceId``."""
+    return {"agent", "id"} <= _key_words(key)
 
 
 def _key_words(key: str) -> frozenset[str]:
@@ -505,13 +551,25 @@ def _replace_word(text: str, word: str, placeholder: str) -> str:
 class Scrubber:
     """Stable placeholders for one recording's identifying values."""
 
-    def __init__(self, home: str, secrets: Mapping[str, str]) -> None:
+    def __init__(
+        self,
+        home: str,
+        secrets: Mapping[str, str],
+        names: Mapping[str, str] | None = None,
+    ) -> None:
         if not home.startswith("/") or home.rstrip("/") == "":
             raise ValueError(f"the home directory {home!r} is not an absolute path")
         self.home = home.rstrip("/")
         self.secrets = dict(secrets)
         self.found: dict[str, str] = {}
         """Each account string replaced so far, by its placeholder."""
+        self.names: dict[str, str] = dict(names or {})
+        """Each configuration name replaced so far, by its placeholder: MCP server
+        names and addresses, host names and agent ids. Replaced wherever they stand
+        as a word, and a server name also as the ``server__`` prefix of a tool's
+        name."""
+        self._replacing = sorted(self.names.items(), key=lambda item: -len(item[0]))
+        self._commands: dict[str, str] = {}
         self._uuids: dict[str, str] = {}
         self._sessions: dict[str, str] = {}
 
@@ -521,10 +579,96 @@ class Scrubber:
             self._uuids[key] = f"00000000-0000-4000-8000-{len(self._uuids) + 1:012x}"
         return self._uuids[key]
 
+    def _named(self, value: str, kind: str) -> str:
+        """The stable placeholder of a configuration name of ``kind``. One count runs
+        over every kind, so a placeholder is unique even where a scrubber is given
+        the names a first pass found."""
+        if not value:
+            return value
+        if value not in self.names:
+            count = len(self.names) + 1
+            self.names[value] = (
+                f"https://{kind}-{count}.example.invalid/mcp"
+                if kind == "mcp-url"
+                else f"{kind}-{count}"
+            )
+        return self.names[value]
+
+    def _servers(self, value: object, depth: int) -> object:
+        """A list or table of MCP servers, with each name, address, command,
+        argument, variable and header replaced, except Dromon's own name."""
+        if depth > MAX_SCRUB_DEPTH:
+            raise RecordingError(f"a frame nests deeper than {MAX_SCRUB_DEPTH}")
+        if isinstance(value, list):
+            return [self._server(item, depth + 1) for item in cast(list[object], value)]
+        if isinstance(value, dict):
+            return {
+                self._server_name(name): self._server(item, depth + 1)
+                for name, item in cast(dict[str, object], value).items()
+            }
+        return self.value(value, depth)
+
+    def _server_name(self, name: str) -> str:
+        return name if name == DROMON_SERVER else self._named(name, "mcp-server")
+
+    def _server(self, value: object, depth: int) -> object:
+        if not isinstance(value, dict):
+            return self.value(value, depth)
+        scrubbed: dict[str, object] = {}
+        for key, item in cast(dict[str, object], value).items():
+            if key in MCP_KEPT:
+                scrubbed[key] = self.value(item, depth + 1)
+            elif key == "name" and isinstance(item, str):
+                scrubbed[key] = self._server_name(item)
+            elif key in ("url", "serverUrl") and isinstance(item, str):
+                scrubbed[key] = self._named(item, "mcp-url")
+            else:
+                scrubbed[key] = _placeholders(item, depth + 1)
+        return scrubbed
+
+    def _command_entries(self, value: object, depth: int) -> object:
+        """Slash commands and skills, each name replaced in its entry and in a
+        command table, and its description, input hints and ``_meta`` replaced but
+        for the kind of each. Names are not replaced elsewhere, since many are
+        common words, such as ``compact`` or ``memory``."""
+        if depth > MAX_SCRUB_DEPTH:
+            raise RecordingError(f"a frame nests deeper than {MAX_SCRUB_DEPTH}")
+        if not isinstance(value, list):
+            return self.value(value, depth)
+        entries: list[object] = []
+        for item in cast(list[object], value):
+            if not isinstance(item, dict):
+                entries.append(self.value(item, depth + 1))
+                continue
+            entry: dict[str, object] = {}
+            for key, field_value in cast(dict[str, object], item).items():
+                if key == "name" and isinstance(field_value, str):
+                    entry[key] = self._command(field_value)
+                elif key == "_meta" and isinstance(field_value, dict):
+                    entry[key] = {
+                        name: self.value(meta, depth + 2)
+                        if name in COMMAND_KEPT
+                        else _placeholders(meta, depth + 2)
+                        for name, meta in cast(dict[str, object], field_value).items()
+                    }
+                else:
+                    entry[key] = _placeholders(field_value, depth + 1)
+            entries.append(entry)
+        return entries
+
+    def _command(self, name: str) -> str:
+        if name not in self._commands:
+            self._commands[name] = f"command-{len(self._commands) + 1}"
+        return self._commands[name]
+
     def text(self, value: str) -> str:
-        """``value`` with every account value, home directory and uuid replaced."""
+        """``value`` with every account value, configuration name, home directory and
+        uuid replaced."""
         for secret, placeholder in self.secrets.items():
             value = _replace_word(value, secret, placeholder)
+        for name, placeholder in self._replacing:
+            value = value.replace(f"{name}__", f"{placeholder}__")
+            value = _replace_word(value, name, placeholder)
         value = value.replace(self.home, SCRUBBED_HOME)
         value = value.replace(_dashed(self.home), _dashed(SCRUBBED_HOME))
         return _UUID.sub(self._uuid, value)
@@ -582,6 +726,23 @@ class Scrubber:
         for key, item in cast(dict[str, object], value).items():
             if key in RATE_LIMIT_KEYS:
                 scrubbed[key] = _rate_limits(item, depth + 1)
+            elif key in MCP_SERVER_KEYS:
+                scrubbed[key] = self._servers(item, depth + 1)
+            elif key in COMMAND_LIST_KEYS:
+                scrubbed[key] = self._command_entries(item, depth + 1)
+            elif key in COMMAND_TABLE_KEYS and isinstance(item, dict):
+                scrubbed[key] = {
+                    self._command(name): self.value(tag, depth + 2)
+                    for name, tag in cast(dict[str, object], item).items()
+                }
+            elif _host_key(key) and isinstance(item, str):
+                scrubbed[key] = self._named(item, "host")
+            elif _agent_id_key(key) and isinstance(item, str):
+                scrubbed[key] = (
+                    self.text(item)
+                    if _UUID.fullmatch(item)
+                    else self._named(item, "agent")
+                )
             elif _identifying(key, item):
                 scrubbed[key] = self.identity(key, item, depth + 1)
             elif key in SESSION_KEYS and isinstance(item, str):
@@ -667,34 +828,53 @@ def _rate_limits(value: object, depth: int, key: str = "") -> object:
     }
 
 
+def _placeholders(value: object, depth: int) -> object:
+    """``value`` from the operator's configuration with every string replaced by
+    ``SCRUBBED_TEXT``, through each object and list it nests, keys and other types
+    kept, so the shape replays and none of the text passes through."""
+    if depth > MAX_SCRUB_DEPTH:
+        raise RecordingError(f"a frame nests deeper than {MAX_SCRUB_DEPTH}")
+    if isinstance(value, str):
+        return SCRUBBED_TEXT
+    if isinstance(value, list):
+        return [_placeholders(item, depth + 1) for item in cast(list[object], value)]
+    if isinstance(value, dict):
+        return {
+            name: _placeholders(item, depth + 1)
+            for name, item in cast(dict[str, object], value).items()
+        }
+    return value
+
+
 def _dashed(path: str) -> str:
     """``path`` as Claude Code names a project's directory, ``/`` turned to ``-``."""
     return path.replace("/", "-")
 
 
-def _account_values(recorded: Recorded, home: str) -> dict[str, str]:
-    """Every account string of ``recorded``, by its placeholder, found by a first
-    scrub whose output is discarded, so both passes judge a key alike."""
+def _first_pass(recorded: Recorded, home: str) -> Scrubber:
+    """A scrub of ``recorded`` whose output is discarded, which finds every account
+    string and configuration name, so both passes judge a key alike."""
     collector = Scrubber(home, {})
     collector.value(recorded.header)
     for _, frame in recorded.frames:
         collector.value(frame)
-    return collector.found
+    return collector
 
 
 def scrub(recorded: Recorded, home: str) -> tuple[Recorded, frozenset[str]]:
     """``recorded`` with identifying values replaced by stable placeholders, and the
-    original account values, every one of which is replaced wherever it stands as a
-    word, and which ``leaks`` looks for afterwards. The longest are replaced first,
-    so a value inside another is not replaced in part."""
+    original account values and configuration names, every one of which is replaced
+    wherever it stands as a word, and which ``leaks`` looks for afterwards. The
+    longest are replaced first, so a value inside another is not replaced in part."""
+    collector = _first_pass(recorded, home)
     secrets = {
         secret: placeholder
         for secret, placeholder in sorted(
-            _account_values(recorded, home).items(), key=lambda item: -len(item[0])
+            collector.found.items(), key=lambda item: -len(item[0])
         )
         if secret
     }
-    scrubber = Scrubber(home, secrets)
+    scrubber = Scrubber(home, secrets, collector.names)
     frames = [
         (direction, cast(dict[str, Any], scrubber.value(frame)))
         for direction, frame in recorded.frames
@@ -702,7 +882,7 @@ def scrub(recorded: Recorded, home: str) -> tuple[Recorded, frozenset[str]]:
     header = cast(dict[str, Any], scrubber.value(recorded.header))
     stderr = None if recorded.stderr is None else scrubber.text(recorded.stderr)
     scrubbed = Recorded(header, frames, recorded.truncated, stderr, recorded.stderr_cut)
-    return scrubbed, frozenset(secrets)
+    return scrubbed, frozenset(secrets) | frozenset(collector.names)
 
 
 def leaks(text: str, home: str, secrets: frozenset[str] = frozenset()) -> list[str]:

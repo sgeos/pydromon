@@ -10,7 +10,7 @@ from collections import deque
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Final, cast
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
@@ -25,6 +25,7 @@ from dromon.engine import EngineRefused, TurnReport
 from dromon.eventlog import EventLog
 from dromon.evidence import IN, OUT, Recording, Replay, read_recording, replay_factory
 from dromon.grok import (
+    COMPAT_MCP_ENVIRONMENT,
     READER_PROFILE,
     WRITER_PROFILE,
     Connection,
@@ -133,6 +134,18 @@ def permission(
     }
 
 
+def grok_notice(name: str, params: dict[str, Any]) -> dict[str, Any]:
+    """One of Grok's own notices, with the ``_x.ai/`` prefix Grok 1.0.70 sent."""
+    return {"jsonrpc": "2.0", "method": f"_x.ai/{name}", "params": params}
+
+
+DROMON_ONLY: Final = [{"name": "dromon", "source": "acp", "type": "stdio"}]
+"""The servers a Grok line may load, Dromon's alone, in the shape of the probe."""
+
+ABSENT: Final = object()
+"""A session answer without ``modes``, as Grok 1.0.70 gave."""
+
+
 class FakeGrok:
     """A scripted ``grok agent stdio``."""
 
@@ -144,8 +157,17 @@ class FakeGrok:
         model: object = GROK,
         modes: object = None,
         stop: str = "end_turn",
+        servers: object = DROMON_ONLY,
+        notices: Sequence[dict[str, Any]] = (),
     ) -> None:
         self.turn = list(turn)
+        self.servers = servers
+        """What ``servers_updated`` lists before the session opens, or ``None`` for
+        no such notice."""
+        self.notices = list(notices)
+        """Grok's own notices, sent before the session opens."""
+        self.extra: dict[str, object] = {}
+        """More fields of the session's answer."""
         self.auth = auth
         self.model = model
         self.modes: object = (
@@ -208,11 +230,19 @@ class FakeGrok:
                 }
             )
         elif method in ("session/new", "session/load"):
-            result: dict[str, object] = {"modes": self.modes}
+            self.queue.extend(self.notices)
+            if self.servers is not None:
+                self.queue.append(
+                    grok_notice("mcp/servers_updated", {"mcpServers": self.servers})
+                )
+            result: dict[str, object] = {}
+            if self.modes is not ABSENT:
+                result["modes"] = self.modes
             if method == "session/new":
                 result["sessionId"] = "s1"
             if self.model is not None:
                 result["models"] = {"currentModelId": self.model}
+            result.update(self.extra)
             self.queue.append({**reply, "result": result})
         elif method == "session/set_mode":
             self.queue.append({**reply, "result": {}})
@@ -296,8 +326,9 @@ def test_the_environment_drops_credentials_and_refuses_redirection() -> None:
         "GROK_CONFIG": "{}",
         "GROK_SANDBOX": "off",
     }
-    assert engine_environment(environment, Strategy.SUBSCRIPTION) == {"PATH": "/bin"}
-    assert engine_environment(environment, Strategy.FLEXIBLE) == {"PATH": "/bin"}
+    kept = {"PATH": "/bin", **COMPAT_MCP_ENVIRONMENT}
+    assert engine_environment(environment, Strategy.SUBSCRIPTION) == kept
+    assert engine_environment(environment, Strategy.FLEXIBLE) == kept
     with pytest.raises(EngineRefused, match="api strategy"):
         engine_environment(environment, Strategy.API)
     for name in ("GROK_HOME", "XAI_API_BASE_URL"):
@@ -477,8 +508,10 @@ def test_a_recorded_turn_replays_through_the_real_adapter(
     workspace, home, state = project
     path = tmp_path / "probe.jsonl"
     recording = Recording(path, grok_module.ENGINE_NAME, GROK)
+    # Without a bridge Dromon passes no server, so Grok must report none.
     server = FakeGrok(
-        [chunk("hel"), tool_call("other", "dromon__send_message"), chunk("lo")]
+        [chunk("hel"), tool_call("other", "dromon__send_message"), chunk("lo")],
+        servers=[],
     )
 
     @asynccontextmanager
@@ -1047,3 +1080,286 @@ def test_priority_mail_ends_the_turn_at_the_tool_result_and_not_the_text(
     assert asked == [1]
     assert report.interrupted_for == REASON
     assert server.methods().count("session/cancel") == 1
+
+
+# The probe of 2026-10-27, Grok Build 1.0.70. Every value is invented, in the shapes
+# the probe recorded.
+
+EFFORT_OPTION: Final = {
+    "id": "reasoning_effort",
+    "name": "Reasoning Effort",
+    "category": "thought_level",
+    "type": "select",
+    "currentValue": "high",
+    "options": [{"value": "high", "name": "High"}],
+}
+
+
+def probed_grok(turn: Sequence[dict[str, Any]] = (chunk("done"),)) -> FakeGrok:
+    """A Grok that answers ``session/new`` as 1.0.70 did, with ``models`` and
+    ``configOptions`` for the model and effort, and no ``modes``. Its own session
+    config lists efforts under the category ``mode``, which is not a permission
+    mode."""
+    server = FakeGrok(turn, modes=ABSENT)
+    server.extra = {
+        "configOptions": [
+            {
+                "id": "model",
+                "category": "model",
+                "type": "select",
+                "currentValue": GROK,
+                "options": [{"value": GROK, "name": "Grok"}],
+            },
+            EFFORT_OPTION,
+        ],
+        "_meta": {
+            "x.ai/sessionConfig": {
+                "options": [{"id": "default", "category": "mode", "selected": True}]
+            }
+        },
+    }
+    return server
+
+
+def mode_option(value: str) -> dict[str, object]:
+    return {
+        "id": "permission_mode",
+        "category": "mode",
+        "type": "select",
+        "currentValue": value,
+        "options": [{"value": "default"}, {"value": value}],
+    }
+
+
+def test_a_session_shaped_as_grok_1_0_70_is_refused_for_its_unreported_mode(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = probed_grok()
+    with pytest.raises(EngineRefused) as refused:
+        run(line(server, project))
+    assert "does not report its permission mode" in str(refused.value)
+    assert "config.toml" not in str(refused.value)
+    assert "session/prompt" not in server.methods()
+    assert "session/set_mode" not in server.methods()
+
+
+def test_the_refusal_names_the_mode_the_users_configuration_sets(
+    project: tuple[Path, Path, Path],
+) -> None:
+    _, home, _ = project
+    for document, named in (
+        ('[ui]\npermission_mode = "always-approve"\n', "'always-approve'"),
+        ("[ui]\nyolo = true\n", "'always-approve'"),
+        ('[ui]\npermission_mode = "auto"\n', "'auto'"),
+    ):
+        (home / ".grok" / "config.toml").write_text(document)
+        with pytest.raises(EngineRefused, match=f"permission_mode to {named}"):
+            run(line(probed_grok(), project))
+
+
+def test_the_configured_mode_is_read_only_from_a_readable_ui_table(
+    tmp_path: Path,
+) -> None:
+    assert grok_module.configured_mode(tmp_path) is None
+    (tmp_path / ".grok").mkdir()
+    config = tmp_path / ".grok" / "config.toml"
+    for document, expected in (
+        ("not toml [", None),
+        ("ui = 3\n", None),
+        ("[ui]\npermission_mode = 4\n", None),
+        ('[ui]\npermission_mode = "default"\n', "default"),
+        ('[ui]\nyolo = false\npermission_mode = "ask"\n', "ask"),
+    ):
+        config.write_text(document)
+        assert grok_module.configured_mode(tmp_path) == expected
+
+
+def test_a_permission_mode_config_option_is_read_and_confirmed(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = probed_grok()
+    server.extra["configOptions"] = [EFFORT_OPTION, mode_option("default")]
+    assert run(line(server, project)).text == "done"
+    refused = probed_grok()
+    refused.extra["configOptions"] = [mode_option("bypassPermissions")]
+    with pytest.raises(EngineRefused, match="permission mode 'bypassPermissions'"):
+        run(line(refused, project))
+    assert "session/prompt" not in refused.methods()
+
+
+INVENTED_SERVER: Final = {
+    "name": "garden-notes",
+    "source": "local",
+    "type": "http",
+    "url": "https://notes.example.invalid/mcp",
+}
+
+
+@pytest.mark.parametrize(
+    ("servers", "reason"),
+    [
+        pytest.param(
+            [*DROMON_ONLY, INVENTED_SERVER], "loaded 1 MCP servers", id="one-more"
+        ),
+        pytest.param([INVENTED_SERVER] * 3, "loaded 3 MCP servers", id="others"),
+        pytest.param([{"type": "stdio"}], "loaded 1 MCP servers", id="unnamed"),
+        pytest.param("all", "shape Dromon does not read", id="malformed"),
+        pytest.param(None, "did not report its MCP servers", id="unreported"),
+    ],
+)
+def test_servers_other_than_dromons_refuse_the_turn(
+    project: tuple[Path, Path, Path], servers: object, reason: str
+) -> None:
+    server = FakeGrok(servers=servers)
+    with pytest.raises(EngineRefused, match=reason) as refused:
+        run(line(server, project))
+    # The operator's servers are counted, never named.
+    assert "garden-notes" not in str(refused.value)
+    assert "session/prompt" not in server.methods()
+
+
+def test_a_server_list_during_the_turn_cancels_it(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok(
+        [
+            grok_notice("mcp/servers_updated", {"mcpServers": [INVENTED_SERVER]}),
+            chunk("late"),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="besides Dromon's"):
+        run(line(server, project))
+    assert "session/cancel" in server.methods()
+
+
+def test_without_a_bridge_even_a_server_named_dromon_is_refused(
+    project: tuple[Path, Path, Path],
+) -> None:
+    workspace, home, state = project
+    server = FakeGrok()
+
+    @asynccontextmanager
+    async def connect(
+        arguments: list[str], cwd: Path, env: Mapping[str, str]
+    ) -> AsyncGenerator[Connection]:
+        del arguments, cwd, env
+        yield server
+
+    target = GrokLine(
+        grok(),
+        workspace,
+        protected=(state,),
+        environment={},
+        home=home,
+        connection_factory=connect,
+    )
+    with pytest.raises(EngineRefused, match="loaded 1 MCP servers"):
+        run(target)
+
+
+@pytest.mark.parametrize(
+    ("notice", "reason"),
+    [
+        pytest.param(
+            grok_notice("mcp/init_progress", {"total": 12, "connected": 0}),
+            "connecting 12 MCP servers",
+            id="progress",
+        ),
+        pytest.param(
+            grok_notice("mcp/init_progress", {"total": "many"}),
+            "connecting 'many' MCP servers",
+            id="progress-malformed",
+        ),
+        pytest.param(
+            grok_notice("models/update", {"currentModelId": "grok-other"}),
+            "model to 'grok-other'",
+            id="models",
+        ),
+        pytest.param(
+            grok_notice(
+                "session_notification",
+                {
+                    "sessionId": "s1",
+                    "update": {"sessionUpdate": "model_changed", "model_id": None},
+                },
+            ),
+            "model to None",
+            id="model-changed",
+        ),
+        pytest.param(
+            grok_notice("settings/update", {"permission_mode": "always-approve"}),
+            "settings name the permission mode 'always-approve'",
+            id="settings",
+        ),
+    ],
+)
+def test_groks_own_notices_refuse_what_dromon_did_not_choose(
+    project: tuple[Path, Path, Path], notice: dict[str, Any], reason: str
+) -> None:
+    server = FakeGrok(notices=[notice])
+    with pytest.raises(EngineRefused, match=reason):
+        run(line(server, project))
+    assert "session/prompt" not in server.methods()
+
+
+def test_groks_identified_notices_that_agree_let_the_turn_run(
+    project: tuple[Path, Path, Path],
+) -> None:
+    notices: list[dict[str, Any]] = [
+        grok_notice("session/setup", {"method": "session/new", "phase": "auth"}),
+        grok_notice("announcements/update", {"gen": 1, "announcements": []}),
+        grok_notice("mcp/init_progress", {"total": 1, "connected": 0}),
+        grok_notice("models/update", {"currentModelId": GROK}),
+        grok_notice("models/update", {"availableModels": []}),
+        grok_notice("settings/update", {"permission_mode": None, "tips": ["a tip"]}),
+        grok_notice(
+            "session_notification",
+            {"update": {"sessionUpdate": "model_changed", "model_id": GROK}},
+        ),
+        grok_notice("session_notification", {"update": {"sessionUpdate": "retry"}}),
+        # The guide's spelling, without ACP's extension prefix, is read alike.
+        {"jsonrpc": "2.0", "method": "x.ai/models/update", "params": {}},
+        {"jsonrpc": "2.0", "method": "_x.ai/unknown/notice", "params": {}},
+    ]
+    server = FakeGrok(notices=notices)
+    assert run(line(server, project)).text == "done"
+
+
+def test_an_unknown_grok_request_is_answered_with_an_error(
+    project: tuple[Path, Path, Path],
+) -> None:
+    request = {"jsonrpc": "2.0", "id": "q", "method": "_x.ai/fs/write_file"}
+    server = FakeGrok([request, chunk("done")])
+    assert run(line(server, project)).text == "done"
+    answer = next(a for a in server.answers() if a["id"] == "q")
+    assert answer["error"]["code"] == -32601
+
+
+def test_a_switch_out_of_the_ask_modes_during_the_turn_cancels_it(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok(
+        [
+            note({"sessionUpdate": "current_mode_update", "currentModeId": "default"}),
+            note(
+                {
+                    "sessionUpdate": "current_mode_update",
+                    "currentModeId": "bypassPermissions",
+                }
+            ),
+            chunk("late"),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="switched to the permission mode"):
+        run(line(server, project))
+    assert "session/cancel" in server.methods()
+
+
+def test_extension_methods_are_read_with_or_without_the_prefix() -> None:
+    assert grok_module.extension_method("_x.ai/models/update") == (
+        grok_module.MODELS_UPDATE
+    )
+    assert grok_module.extension_method("x.ai/models/update") == (
+        grok_module.MODELS_UPDATE
+    )
+    assert grok_module.extension_method("session/update") == "session/update"
