@@ -32,9 +32,10 @@ from dromon.grok import (
     check_profile,
     engine_environment,
     grok_arguments,
+    profile_name,
     unsupported,
 )
-from dromon.lineconfig import LineConfig
+from dromon.lineconfig import LineConfig, WorkdirAccess
 from dromon.mcp import Bridge
 from dromon.protocol import Response
 from dromon.model import LineAddress, LineCreated, OperatorRegistered
@@ -330,6 +331,14 @@ def test_a_reader_and_a_writer_get_their_own_profiles(
         LineConfig(builtin_tools=("Edit",)), workspace, (state,), home
     )
     assert (reader, writer) == (READER_PROFILE, WRITER_PROFILE)
+
+
+def test_read_only_workdir_uses_the_grok_reader_profile() -> None:
+    config = LineConfig(
+        builtin_tools=("Bash", "Edit", "Write"),
+        workdir_access=WorkdirAccess.READ,
+    )
+    assert profile_name(config) == READER_PROFILE
 
 
 def test_a_missing_profile_is_refused_with_the_table_to_add(tmp_path: Path) -> None:

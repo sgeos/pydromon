@@ -90,6 +90,7 @@ TOOL_KEYS: Final = frozenset(
         "claude_code_prompt",
         "instructions",
         "workdir",
+        "workdir_access",
         "project_settings",
         "plugins",
         "keep_session",

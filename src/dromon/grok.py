@@ -61,7 +61,7 @@ from dromon.engine import EngineRefused, TurnReport, read_instructions
 from dromon import launcher
 from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
-from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
+from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
 
 ENGINE_NAME: Final = "grok-build"
 """The engine this adapter runs, as drivers name it."""
@@ -188,7 +188,12 @@ def engine_environment(
 
 
 def profile_name(config: LineConfig) -> str:
-    return WRITER_PROFILE if WRITE_TOOLS & set(config.builtin_tools) else READER_PROFILE
+    return (
+        WRITER_PROFILE
+        if config.workdir_access is WorkdirAccess.WRITE
+        and WRITE_TOOLS & set(config.builtin_tools)
+        else READER_PROFILE
+    )
 
 
 def _load_profiles(file: Path) -> dict[str, dict[str, object]]:

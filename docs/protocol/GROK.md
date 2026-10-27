@@ -9,6 +9,10 @@ prompt was sent.
 
 ## Purpose
 
+With `workdir_access: read`, Dromon selects the `read-only` sandbox profile, even when
+the line has file-write tools configured. Dromon's `write_scratch` tool remains the
+supported way to write under `tmp`.
+
 **Directed by the operator on 2026-10-25.** Nominal support for Grok, without testing
 until Grok usage is available. A line whose driver names the `grok-build` engine runs
 its turns through `grok agent --no-leader stdio`, which speaks the Agent Client

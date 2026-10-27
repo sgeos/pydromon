@@ -44,7 +44,7 @@ from dromon.driver import (
 from dromon.engine import EngineRefused, TurnReport
 from dromon.grok import bridge_command
 from dromon.jsonlines import Connection
-from dromon.lineconfig import LineConfig
+from dromon.lineconfig import LineConfig, WorkdirAccess
 from dromon.sandbox import parse_sandbox
 from dromon.scheduler import LineEngine, LineSpec, engine_factory
 
@@ -252,6 +252,9 @@ def test_every_cursor_turn_is_refused_without_partial_isolation(
 
 def test_a_cursor_line_takes_no_builtin_tools_or_claude_code_features() -> None:
     assert unsupported(LineConfig()) is None
+    assert "read-only working directory" in (
+        unsupported(LineConfig(workdir_access=WorkdirAccess.READ)) or ""
+    )
     assert "no built-in tools" in (
         unsupported(LineConfig(builtin_tools=("Read",))) or ""
     )

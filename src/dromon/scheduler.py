@@ -147,7 +147,7 @@ from dromon.engine import (
 from dromon.eventlog import EventLog
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon import settings as engine_settings
-from dromon.sandbox import SandboxConfig, effective, merge
+from dromon.sandbox import SandboxConfig, effective, merge, parse_sandbox
 from dromon.settings import SettingsConfig
 from dromon.processes import (
     ProcessRefused,
@@ -173,6 +173,7 @@ from dromon.lineconfig import (
     DEFAULT_CONFIG,
     ConfigError,
     LineConfig,
+    WorkdirAccess,
     check_instructions,
     decode_config,
     encode_config,
@@ -771,6 +772,29 @@ type EngineFactory = Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], LineEngine]
 """Builds a line's engine, given the line and Dromon's own tools for it."""
 
 
+def _claude_read_access_refusal(
+    config: LineConfig, settings: SettingsConfig | None
+) -> str | None:
+    """Reject Claude settings and tools that could write outside the sandbox."""
+    if config.mcp_servers or config.inherit_account_mcp:
+        return (
+            "Claude Code cannot confine configured MCP servers to a read-only"
+            " working directory"
+        )
+    if config.tool_policy.value == "allow_all" or any(
+        pattern.startswith("mcp__") for pattern in config.allowed_tools
+    ):
+        return (
+            "Claude Code read-only workdirs do not allow an allow-all policy or"
+            " additional MCP tools"
+        )
+    if config.project_settings or config.plugins:
+        return "Claude Code read-only workdirs do not allow project settings or plugins"
+    if settings is not None and settings.document().get("hooks"):
+        return "Claude Code read-only workdirs do not allow command hooks"
+    return None
+
+
 def engine_factory(
     root: str,
     *,
@@ -914,6 +938,31 @@ def engine_factory(
                 cost_mark=spec.cost_mark,
             )
         merged = merge([project_sandbox, spec.config.sandbox])
+        settings = engine_settings.merge([project_settings, spec.config.settings])
+        if spec.config.workdir_access is WorkdirAccess.READ:
+            refusal = _claude_read_access_refusal(spec.config, settings)
+            if refusal is not None:
+                raise EngineRefused(refusal)
+            read_sandbox = parse_sandbox(
+                {
+                    "enabled": True,
+                    "filesystem": {"denyWrite": [str(workdir)]},
+                },
+                operator=True,
+            )
+            merged = merge([merged, read_sandbox])
+            restrictions = engine_settings.parse_settings(
+                {
+                    "permissions": {
+                        "deny": [
+                            "Write",
+                            "NotebookEdit",
+                            f"Edit(/{workdir}/**)",
+                        ]
+                    }
+                }
+            )
+            settings = engine_settings.merge([settings, restrictions])
         enabled = merged is not None and merged.enabled
         guarded = git_write_guards(workdir) if enabled else ()
         # A line that loads project settings or plugins must not write what it loads.
@@ -928,11 +977,7 @@ def engine_factory(
             mcp_tools=list(own_tools),
             session_id=spec.session_id,
             sandbox=effective(merged, workdir, protected, guarded),
-            settings=engine_settings.effective(
-                engine_settings.merge([project_settings, spec.config.settings]),
-                protected,
-                write_protected,
-            ),
+            settings=engine_settings.effective(settings, protected, write_protected),
             observe=spec.observe,
             mark=spec.mark,
             task_ended=spec.task_ended,

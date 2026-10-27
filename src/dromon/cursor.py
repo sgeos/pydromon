@@ -56,7 +56,7 @@ from dromon.jsonlines import (
     is_cloud_or_credential,
     json_lines_factory,
 )
-from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
+from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
 from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
 
@@ -149,6 +149,8 @@ LINE_REFUSAL: Final = (
 
 def unsupported(config: LineConfig) -> str | None:
     """Why a Cursor line cannot run ``config``, or ``None`` if it can."""
+    if config.workdir_access is WorkdirAccess.READ:
+        return "Cursor cannot confine a line to a read-only working directory"
     if config.builtin_tools:
         return (
             "Cursor lines take no built-in tools, because Dromon denies Cursor's own"

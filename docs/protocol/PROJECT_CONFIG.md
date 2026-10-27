@@ -75,7 +75,7 @@ every_ticks = 5
 | `lines.ID.strategy` | strategy | `subscription` | `subscription`, `api` or `flexible` |
 | `lines.ID.limits` | table | the file's | Limits for this line, each key defaulting to the file's |
 | `lines.ID.wake` | table | the file's | The wake policy for this line |
-| tool keys | as in `LINE_CONFIG.md` | as there | `builtin_tools`, `mcp_servers`, `tool_policy`, `allowed_tools`, `inherit_account_mcp`, `effort`, `claude_code_prompt`, `instructions`, `workdir`, `project_settings` |
+| tool keys | as in `LINE_CONFIG.md` | as there | `builtin_tools`, `mcp_servers`, `tool_policy`, `allowed_tools`, `inherit_account_mcp`, `effort`, `claude_code_prompt`, `instructions`, `workdir`, `workdir_access`, `project_settings` |
 | `lines.ID.session` | text | none | An existing engine session the line adopts when the daemon creates it, checked as `line_session` is in [`EVENT_LOG.md`](EVENT_LOG.md). Ignored for a line that exists |
 | `teacher` | table | none | The project's local teacher model, as [`TEACHER.md`](TEACHER.md) specifies |
 | `agents` | table | off | Which external agents may connect, and with what access, as [`AGENTS.md`](AGENTS.md) specifies |

@@ -113,7 +113,7 @@ from dromon.ceiling import (
 )
 from dromon.launcher import STOP_POLICY_VARIABLE, StopPolicy
 from dromon.processes import MARK_VARIABLE
-from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
+from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
 
 ENGINE_NAME: Final = "codex"
 """The engine this adapter runs, as drivers name it."""
@@ -348,9 +348,15 @@ def permission_profile(config: LineConfig, protected: Sequence[Path]) -> str:
     writable, and each ``protected`` directory that exists is denied, as its real path,
     since Codex enforces the path the operating system sees.
     """
-    workspace = "write" if WRITE_TOOLS & set(config.builtin_tools) else "read"
+    workspace = (
+        "write"
+        if config.workdir_access is WorkdirAccess.WRITE
+        and WRITE_TOOLS & set(config.builtin_tools)
+        else "read"
+    )
+    scratch = ', "tmp"="write"' if config.workdir_access is WorkdirAccess.READ else ""
     entries = [
-        f'":workspace_roots"={{"."="{workspace}", ".git"="read"}}',
+        f'":workspace_roots"={{"."="{workspace}", ".git"="read"{scratch}}}',
         *(
             f'{_toml_string(os.path.realpath(directory))}="deny"'
             for directory in protected
@@ -1359,7 +1365,7 @@ class CodexLine:
     def tools_fingerprint(self) -> str:
         """A short digest of the names of Dromon's tools for this line, stored with
         the thread so a resumed thread can be checked against today's tools."""
-        names = "\n".join(sorted(self.mcp_tools))
+        names = "\n".join([self.config.workdir_access.value, *sorted(self.mcp_tools)])
         return hashlib.sha256(names.encode("utf-8")).hexdigest()[:16]
 
     async def _run(self, thread_id: str, prompt: str, turn: _Turn) -> None:

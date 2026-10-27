@@ -41,7 +41,7 @@ from dromon.projectconfig import ConfigFileError, ProjectConfig, config_path, pa
 from dromon.protocol import ErrorCode, Response
 from dromon.sandbox import SandboxError, effective, parse_sandbox
 from dromon.scheduler import LineEngine, LineSpec, Scheduler, engine_factory
-from dromon.engine import TurnReport
+from dromon.engine import EngineRefused, TurnReport
 from dromon.workdir import MAX_POINTER_BYTES, git_write_guards, resolve_workdir
 
 HAIKU = "claude-haiku-5-5"
@@ -348,6 +348,41 @@ def test_a_claude_line_runs_in_its_workdir_with_its_paths_resolved_there(
     assert str(root / ".dromon") in sandbox["filesystem"]["denyRead"]
     default = build(haiku_spec(DEFAULT_CONFIG), [])
     assert isinstance(default, ClaudeCodeLine) and default.cwd == root
+
+
+def test_read_access_forces_claude_confinement_and_denies_file_writes(
+    tmp_path: Path,
+) -> None:
+    root = real(tmp_path)
+    config = config_from_document(
+        {
+            "workdir_access": "read",
+            "builtin_tools": ["Bash", "Edit", "Write"],
+        }
+    )
+    engine = engine_factory(str(root))(haiku_spec(config), [])
+    assert isinstance(engine, ClaudeCodeLine)
+    sandbox = cast(dict[str, object], engine.sandbox)
+    assert sandbox["enabled"] is True
+    filesystem = cast(dict[str, list[str]], sandbox["filesystem"])
+    assert str(root) in filesystem["denyWrite"]
+    settings = cast(dict[str, object], engine.settings)
+    permissions = cast(dict[str, list[str]], settings["permissions"])
+    assert "Write" in permissions["deny"]
+    assert "NotebookEdit" in permissions["deny"]
+    assert f"Edit(/{root}/**)" in permissions["deny"]
+
+
+def test_read_access_refuses_unconfined_claude_mcp_tools(tmp_path: Path) -> None:
+    root = real(tmp_path)
+    config = config_from_document(
+        {
+            "workdir_access": "read",
+            "mcp_servers": {"files": {"command": "file-server"}},
+        }
+    )
+    with pytest.raises(EngineRefused, match="cannot confine configured MCP"):
+        engine_factory(str(root))(haiku_spec(config), [])
 
 
 def test_an_unsandboxed_line_does_not_read_the_git_pointers(tmp_path: Path) -> None:

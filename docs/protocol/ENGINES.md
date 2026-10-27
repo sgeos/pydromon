@@ -19,6 +19,7 @@ operator can tell a limit of the engine from a gap in what Dromon has observed.
 | `kept_session` | yes | no | no | yes | no | no | A connection can be kept between turns |
 | `own_tools` | yes | unknown | yes | yes | unknown | unknown | Dromon's own tools reach the model, through MCP or an extension |
 | `deny_before_run` | yes | unknown | no | yes | unknown | no | Every built-in tool is denied before it runs |
+| `read_only_workdir` | yes | no | no | yes | yes | no | The adapter confines a read-only workdir while preserving the scratch exception |
 | `cost_report` | yes | yes | no | no | no | unknown | The engine reports a cost for each turn |
 | `max_turns` | yes | yes | no | no | no | no | Model calls in a turn are bounded, by the engine or by Dromon's count |
 | `credential_visible` | yes | yes | yes | yes | unknown | no | Dromon can tell which credential a turn uses |

@@ -49,6 +49,7 @@ CAPABILITY_NAMES: Final = (
     "kept_session",
     "own_tools",
     "deny_before_run",
+    "read_only_workdir",
     "cost_report",
     "max_turns",
     "credential_visible",
@@ -78,6 +79,8 @@ class EngineTable:
     """Whether Dromon's own tools reach the model, through MCP or an extension."""
     deny_before_run: Known
     """Whether every built-in tool is denied before it runs, not stopped after."""
+    read_only_workdir: Known
+    """Whether the adapter can confine a read-only workdir with a scratch exception."""
     cost_report: Known
     """Whether the engine reports a cost for each turn."""
     max_turns: Known
@@ -159,6 +162,7 @@ CLAUDE_CODE: Final = EngineTable(
     kept_session=Known.YES,
     own_tools=Known.YES,
     deny_before_run=Known.YES,
+    read_only_workdir=Known.YES,
     cost_report=Known.YES,
     max_turns=Known.YES,
     credential_visible=Known.YES,
@@ -175,6 +179,7 @@ PI: Final = EngineTable(
     kept_session=Known.NO,
     own_tools=Known.UNKNOWN,
     deny_before_run=Known.UNKNOWN,
+    read_only_workdir=Known.NO,
     cost_report=Known.YES,
     max_turns=Known.YES,
     credential_visible=Known.YES,
@@ -198,6 +203,7 @@ CURSOR: Final = EngineTable(
     kept_session=Known.NO,
     own_tools=Known.YES,
     deny_before_run=Known.NO,
+    read_only_workdir=Known.NO,
     cost_report=Known.NO,
     max_turns=Known.NO,
     credential_visible=Known.YES,
@@ -216,6 +222,7 @@ CODEX: Final = EngineTable(
     kept_session=Known.YES,
     own_tools=Known.YES,
     deny_before_run=Known.YES,
+    read_only_workdir=Known.YES,
     cost_report=Known.NO,
     max_turns=Known.NO,
     credential_visible=Known.YES,
@@ -259,6 +266,7 @@ GROK: Final = EngineTable(
     kept_session=Known.NO,
     own_tools=Known.UNKNOWN,
     deny_before_run=Known.UNKNOWN,
+    read_only_workdir=Known.YES,
     cost_report=Known.NO,
     max_turns=Known.NO,
     credential_visible=Known.UNKNOWN,
@@ -283,6 +291,7 @@ ANTIGRAVITY: Final = EngineTable(
     kept_session=Known.NO,
     own_tools=Known.UNKNOWN,
     deny_before_run=Known.NO,
+    read_only_workdir=Known.NO,
     cost_report=Known.UNKNOWN,
     max_turns=Known.NO,
     credential_visible=Known.NO,

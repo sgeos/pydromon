@@ -7,6 +7,11 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Per-line `workdir_access` supports `write` and `read`. Claude Code, Codex and Grok
+  confine read-mode writes with their sandbox or permission profile, while Pi, Cursor
+  Agent and Antigravity refuse read mode. Codex replaces a kept thread when the access
+  mode changes. Capability and protocol documentation records the support matrix.
+
 - Grok, Codex and Antigravity capability tables, and probe recording for Codex and
   Grok, after the bounded-waits branch was merged.
   - Their tables are filled under the rule of finding C1. Codex, run live on
