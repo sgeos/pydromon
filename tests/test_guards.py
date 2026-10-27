@@ -100,6 +100,12 @@ def test_terms_are_read_without_blanks_or_comments_and_case_folded(
     assert load_terms(file) == ("hidden codename", "strasse")
 
 
+def test_terms_are_stripped_before_matching(tmp_path: Path) -> None:
+    terms = load_terms(write_terms(tmp_path / "terms.txt", "  Private Name  \n"))
+    assert terms == ("private name",)
+    assert discloses(terms, ["PRIVATE NAME"])
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
