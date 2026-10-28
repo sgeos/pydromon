@@ -97,10 +97,12 @@ TRANSPORT_TLS: Final = "tls"
 UNIX_ONLY_KEYS: Final = frozenset({"socket", "project"})
 MAX_INBOUND_TLS: Final = 1
 """The inbound ``tls`` peers a daemon may declare. **Fact,** found by test on
-2026-10-28. Every certificate ``dromon.federation_tls`` makes has one subject name and
-no key identifier, so OpenSSL, given several to trust in one server context, looks up
-the first by name and refuses a client that presents another. The limit is lifted
-when certificates carry distinct names, which is the engines role's module."""
+2026-10-28. Certificates ``dromon.federation_tls`` made then had one subject name and
+no key identifier, so OpenSSL, given several to trust in one server context, looked up
+the first by name and refused a client that presented another. Certificates now name
+their own key and carry a key identifier, and a test shows one context trusting two.
+The limit stays until core lifts it. Two identities made before the change still
+share the old name, so one of them must be made again before a listener trusts both."""
 TLS_ONLY_KEYS: Final = frozenset({"address", "pin_sha256", "certificate"})
 MAX_HOST_BYTES: Final = 253
 """The longest host name the Domain Name System allows."""

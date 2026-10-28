@@ -458,11 +458,15 @@ outbox in `State.outbox`. Choices the design left open, for the operator's revie
   - **Fact.** The server context is built at start and trusts each inbound peer's
     certificate. A peer added or a certificate replaced by a reload is trusted only
     after a restart.
-  - **Fact, found by test.** Every certificate that `dromon.federation_tls` makes has
-    the subject name `Dromon federation peer` and no key identifier, so one context
-    trusting two of them refuses the second. **Decided by core, for review.** At most
-    one `tls` peer may be inbound until certificates carry distinct names, which is the
-    engines role's module. A test fails when that changes.
+  - **Fact, found by test.** Every certificate that `dromon.federation_tls` made at
+    first had the subject name `Dromon federation peer` and no key identifier, so one
+    context trusting two of them refused the second. **Decided by core, for review.**
+    At most one `tls` peer may be inbound until certificates carry distinct names.
+  - **Fact, found by test.** Certificates now name the digest of their own key in the
+    subject and carry a subject key identifier, and one listener's context trusts two
+    of them. The limit of one inbound peer remains until core lifts it. Two
+    identities made before this change still share the old name, so one of them must
+    be made again before one listener trusts both.
   - **Decided by core, for review.** A listener whose context or address fails is said
     on standard error, and the rest of the daemon still serves. Refusing the start
     would be louder, at the cost of every other service.
