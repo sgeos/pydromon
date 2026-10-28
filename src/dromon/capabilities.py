@@ -54,6 +54,7 @@ CAPABILITY_NAMES: Final = (
     "max_turns",
     "credential_visible",
     "sign_in_check",
+    "mcp_http_sse_headers",
 )
 """The capabilities each table states, in the order a report lists them."""
 
@@ -90,6 +91,8 @@ class EngineTable:
     """Whether Dromon can tell from the engine which credential a turn uses."""
     sign_in_check: Known
     """Whether the engine offers a way to check its sign-in without a turn."""
+    mcp_http_sse_headers: Known
+    """Whether Dromon's adapter accepts HTTP or SSE MCP server headers."""
 
     def __post_init__(self) -> None:
         if self.minimum_version is not None and self.tested_on is None:
@@ -167,6 +170,7 @@ CLAUDE_CODE: Final = EngineTable(
     max_turns=Known.YES,
     credential_visible=Known.YES,
     sign_in_check=Known.UNKNOWN,
+    mcp_http_sse_headers=Known.YES,
 )
 """Claude Code, run live through the Agent SDK 0.2.174 on 2026-10-26."""
 
@@ -184,6 +188,7 @@ PI: Final = EngineTable(
     max_turns=Known.YES,
     credential_visible=Known.YES,
     sign_in_check=Known.UNKNOWN,
+    mcp_http_sse_headers=Known.NO,
 )
 """Pi, read from its documentation and source, never run live, as ``PI.md`` says.
 Its turns are bounded by Dromon's count, and its credential is told by ``pi auth
@@ -208,6 +213,7 @@ CURSOR: Final = EngineTable(
     max_turns=Known.NO,
     credential_visible=Known.YES,
     sign_in_check=Known.UNKNOWN,
+    mcp_http_sse_headers=Known.NO,
 )
 """Cursor Agent, read from its documentation and installed code, never run live, as
 ``CURSOR.md`` says. Resume is refused, some tools are stopped only after they start,
@@ -227,6 +233,7 @@ CODEX: Final = EngineTable(
     max_turns=Known.NO,
     credential_visible=Known.YES,
     sign_in_check=Known.UNKNOWN,
+    mcp_http_sse_headers=Known.NO,
 )
 """Codex, run live with Codex 0.164.0 and GPT-6-Luna on the ChatGPT plan on
 2026-10-25, as ``CODEX.md`` records. A resumed thread and Dromon's own tools, as
@@ -271,6 +278,7 @@ GROK: Final = EngineTable(
     max_turns=Known.NO,
     credential_visible=Known.UNKNOWN,
     sign_in_check=Known.UNKNOWN,
+    mcp_http_sse_headers=Known.NO,
 )
 """Grok Build, never run for a turn, as ``GROK.md`` records. An ``initialize`` answer
 from Grok Build 1.0.70, which runs no model, was observed, and it advertised
@@ -301,6 +309,7 @@ ANTIGRAVITY: Final = EngineTable(
     max_turns=Known.NO,
     credential_visible=Known.NO,
     sign_in_check=Known.UNKNOWN,
+    mcp_http_sse_headers=Known.NO,
 )
 """Antigravity's ACP runtime, never run live and not installed, as
 ``ANTIGRAVITY.md`` records. The adapter resumes a session the runtime offers to

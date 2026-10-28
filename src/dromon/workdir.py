@@ -149,6 +149,16 @@ def git_write_guards(directory: Path) -> tuple[Path, ...]:
     return tuple(sorted(guards))
 
 
+def git_common_directory(directory: Path) -> Path | None:
+    """The checkout's shared git directory, or ``None`` outside a checkout.
+
+    For a linked worktree this is the common directory shared by all worktrees.
+    Pointer files are read with the same bounds and validation as ``git_write_guards``.
+    """
+    found = _git_dirs(directory)
+    return None if found is None else found[1]
+
+
 OBJECT_NAME: Final = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 """A commit's object name, SHA-1 or SHA-256, in lowercase hexadecimal."""
 

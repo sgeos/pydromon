@@ -75,6 +75,7 @@ from dromon.engine import EngineRefused, TurnReport, read_instructions
 from dromon import launcher
 from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
+from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
 
 ENGINE_NAME: Final = "grok-build"
@@ -618,8 +619,7 @@ def engine_environment(
         raise EngineRefused(
             "the environment conflicts with a Grok line: " + ", ".join(present)
         )
-    removed = set(API_ENVIRONMENT) | set(DROMON_CONTROLLED)
-    kept = {k: v for k, v in environment.items() if k not in removed}
+    kept = allowlisted(environment, BASE_ENVIRONMENT)
     return {**kept, **COMPAT_ENVIRONMENT}
 
 

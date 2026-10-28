@@ -109,6 +109,54 @@ def test_a_minimal_file_takes_the_defaults() -> None:
     assert config.limits == DEFAULT_LIMITS
 
 
+def test_a_project_grants_only_named_mcp_secrets_to_each_line() -> None:
+    config = parse(
+        """\
+version = 1
+
+[lines.alpha]
+model = "claude-haiku-5-5"
+secrets = ["ALPHA_TOKEN"]
+
+[lines.alpha.mcp_servers.docs]
+type = "http"
+url = "https://docs.example/mcp"
+headers = { Authorization = "Bearer ${ALPHA_TOKEN}" }
+
+[lines.beta]
+model = "claude-haiku-5-5"
+secrets = ["BETA_TOKEN"]
+
+[lines.beta.mcp_servers.docs]
+type = "http"
+url = "https://docs.example/mcp"
+headers = { Authorization = "Bearer ${BETA_TOKEN}" }
+"""
+    )
+    assert config.lines["alpha"].secret_names == ("ALPHA_TOKEN",)
+    assert config.lines["beta"].secret_names == ("BETA_TOKEN",)
+
+
+def test_a_line_cannot_reference_a_secret_not_granted_by_the_project() -> None:
+    with pytest.raises(
+        ConfigFileError, match="does not grant MCP variable.*BETA_TOKEN"
+    ):
+        parse(
+            """\
+version = 1
+
+[lines.alpha]
+model = "claude-haiku-5-5"
+secrets = ["ALPHA_TOKEN"]
+
+[lines.alpha.mcp_servers.docs]
+type = "http"
+url = "https://docs.example/mcp"
+headers = { Authorization = "Bearer ${BETA_TOKEN}" }
+"""
+        )
+
+
 BAD: list[tuple[str, str, str, int | None]] = [
     ("syntax", "version = 1\nlines = = 2\n", "Invalid value", 2),
     ("no version", "[daemon]\noperator = 'ana'\n", "version: must be 1", None),

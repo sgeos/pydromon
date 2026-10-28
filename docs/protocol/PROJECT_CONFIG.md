@@ -94,6 +94,7 @@ handoff_below_percent = 10  # the default, or 0 for never
 | `lines.ID.limits` | table | the file's | Limits for this line, each key defaulting to the file's |
 | `lines.ID.wake` | table | the file's | The wake policy for this line |
 | tool keys | as in `LINE_CONFIG.md` | as there | `builtin_tools`, `mcp_servers`, `tool_policy`, `allowed_tools`, `inherit_account_mcp`, `effort`, `claude_code_prompt`, `instructions`, `workdir`, `workdir_access`, `project_settings` |
+| `lines.ID.secrets` | list of environment variable names | none | Names this project grants that line to reference in its MCP configuration. Values are read from the daemon environment only for that line's MCP configuration and are never added to its engine process environment. A profile may grant names to its lines. |
 | `lines.ID.may_own` | boolean | `true` | Whether the line, as a seat of a role, may own the role. A profile may set it |
 | `roles.ID` | table | none | A role, named by an identifier, as [`ROLES.md`](../architecture/ROLES.md) designs it |
 | `roles.ID.workdir` | relative path | required | The role's worktree, relative to the project root, with `/` between steps and no empty, `.` or `..` step, or `.` for the root |

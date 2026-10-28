@@ -30,7 +30,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from dromon.driver import Driver, Strategy
+from dromon.driver import Action, Driver, Event, Strategy
 from dromon import launcher, redact
 from dromon.activity import ActivityKind, ActivityLog
 from dromon.ceiling import HARD_REASON, STOP_REASON, Choice
@@ -111,7 +111,7 @@ def init(source: str = "none", tools: Sequence[str] = ()) -> SystemMessage:
     )
 
 
-def result(session: str = "session-1") -> ResultMessage:
+def result(session: str = "session-1", message: str | None = None) -> ResultMessage:
     return ResultMessage(
         subtype="success",
         duration_ms=1,
@@ -120,6 +120,7 @@ def result(session: str = "session-1") -> ResultMessage:
         num_turns=1,
         session_id=session,
         total_cost_usd=0.001,
+        result=message,
     )
 
 
@@ -314,6 +315,31 @@ def test_a_reused_connection_that_does_not_report_its_init_is_refused(
     assert len(factory.connections) == 2
     assert factory.connections[0].interrupts == 1
     assert factory.connections[0].closed
+
+
+def test_a_kept_turn_reporting_missing_sign_in_is_refused_and_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factory = Factory([[say("Not logged in · Please run /login"), result()]])
+    engine = line(factory, tmp_path)
+    result_events: list[Event] = []
+    original_step = Driver.step
+
+    def record_step(driver: Driver, event: Event) -> Action:
+        if event.tag == "result":
+            result_events.append(event)
+        return original_step(driver, event)
+
+    monkeypatch.setattr(Driver, "step", record_step)
+
+    async def go() -> None:
+        with pytest.raises(EngineRefused, match="not signed in"):
+            await engine.run_turn("prompt")
+
+    asyncio.run(go())
+    assert factory.connections[0].closed
+    assert factory.connections[0].interrupts == 1
+    assert not result_events
 
 
 def test_a_reused_connection_runs_the_tool_check_again(tmp_path: Path) -> None:
@@ -2678,7 +2704,10 @@ def test_the_gate_refuses_every_request_for_a_human_decision() -> None:
     for name in sorted(HUMAN_DECISION_TOOLS):
         verdict = asyncio.run(gate(name, {}, CONTEXT))
         assert isinstance(verdict, PermissionResultDeny)
-        assert verdict.message == HUMAN_DECISION_REFUSAL
+        assert verdict.message.startswith(
+            f"Dromon's human-decision rule refuses {name}. "
+        )
+        assert verdict.message.endswith(HUMAN_DECISION_REFUSAL)
         assert "ask_operator" in verdict.message
     allowed = asyncio.run(gate("Read", {}, CONTEXT))
     assert isinstance(allowed, PermissionResultAllow)

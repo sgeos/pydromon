@@ -546,6 +546,7 @@ def test_the_environment_carries_no_key_profile_or_sign_in_method(
         "DROMON_LINE_TOKEN": "t",
         "BROWSER": "open",
         "TMPDIR": "/shared",
+        "DAEMON_ONLY_SENTINEL": "not-allowlisted",
         "HOME": "/elsewhere/home",
         "XDG_CONFIG_HOME": "/elsewhere/home/.config",
         "XDG_DATA_HOME": "/elsewhere/home/.local/share",
@@ -562,6 +563,7 @@ def test_the_environment_carries_no_key_profile_or_sign_in_method(
     for name in ("AWS_SECRET_ACCESS_KEY", "SOME_API_KEY", "DROMON_LINE_TOKEN"):
         assert name not in env
     assert "GOOGLE_GENAI_USE_VERTEXAI" not in env
+    assert "DAEMON_ONLY_SENTINEL" not in env
     assert RUNTIME_VARIABLE not in env
     # Antigravity review, F7. The operator's home is out of reach through HOME and
     # the XDG variables, and the sign-in is a file in the profile.

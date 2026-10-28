@@ -373,7 +373,7 @@ def test_the_environment_drops_credentials_and_refuses_redirection() -> None:
         "XDG_CACHE_HOME": "/home/operator/.cache",
     }
     assert set(grok_module.HOME_VARIABLES) < set(environment)
-    kept = {"PATH": "/bin", **COMPAT_ENVIRONMENT}
+    kept = {"PATH": "/bin", "HOME": "/home/operator", **COMPAT_ENVIRONMENT}
     assert engine_environment(environment, Strategy.SUBSCRIPTION) == kept
     assert engine_environment(environment, Strategy.FLEXIBLE) == kept
     with pytest.raises(EngineRefused, match="api strategy"):
@@ -822,7 +822,11 @@ def test_a_plain_turn_reports_text_credential_and_session(
     project: tuple[Path, Path, Path],
 ) -> None:
     server = FakeGrok([chunk("hello "), chunk("there")])
-    target = line(server, project)
+    target = line(
+        server,
+        project,
+        environment={"PATH": "/bin", "DAEMON_ONLY_SENTINEL": "not-allowlisted"},
+    )
     report = run(target)
     assert (report.subtype, report.text, report.session_id) == (
         "success",
@@ -831,6 +835,7 @@ def test_a_plain_turn_reports_text_credential_and_session(
     )
     assert report.credential is Credential.SUBSCRIPTION
     assert target.session_id == "s1"
+    assert "DAEMON_ONLY_SENTINEL" not in server.environment
     assert server.environment["GROK_SANDBOX"] == READER_PROFILE
     init = server.params("initialize")
     assert init["clientCapabilities"] == {

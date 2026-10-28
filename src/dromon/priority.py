@@ -124,6 +124,11 @@ class SteeredDriver(Driver):
         self.redirect: Callable[[], str | None] = _no_redirect
         self.pending = 0
 
+    def close(self) -> None:
+        """Break the scheduler callback edge before releasing the thread-affine VM."""
+        self.redirect = _no_redirect
+        super().close()
+
     def step(self, event: Event) -> Action:
         action = super().step(event)
         if event.tag == "turn_start":

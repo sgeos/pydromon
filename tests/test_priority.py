@@ -568,9 +568,13 @@ def test_a_hibernated_line_keeps_its_compaction_wake_pending_until_awakened(
 ) -> None:
     target = make_world(["alpha"])
     target.scheduler.configure_line("alpha", LineConfig(allow_compact=True))
+    target.scheduler._context["alpha"] = (  # pyright: ignore[reportPrivateUsage]
+        target.scheduler.effective_config("alpha").context_warn_tokens
+    )
     tool = target.scheduler.compact_session_tool("alpha")
     asyncio.run(call(tool, {"seconds": 60}))
     reserved = target.log.state.scheduled["alpha"].message_id
+    target.scheduler._context.pop("alpha", None)  # pyright: ignore[reportPrivateUsage]
 
     def due() -> None:
         target.now = START + timedelta(seconds=120)
