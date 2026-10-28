@@ -5,7 +5,7 @@ import ssl
 from contextlib import suppress
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
 
 import pytest
 
@@ -13,13 +13,18 @@ from dromon.federation_tls import (
     CERTIFICATE_FILENAME,
     KEY_FILENAME,
     FrameError,
+    FrameTimeout,
     FrameReader,
+    HandshakeTimeout,
     OversizedFrame,
+    PeerClosed,
     PeerPinError,
     TruncatedFrame,
     TransportError,
     client_context,
     generate_identity,
+    new_connection_deadline,
+    read_first_response,
     send_frame,
     server_context,
     verify_peer_pin,
@@ -56,6 +61,32 @@ def test_identity_generation_does_not_replace_existing_files(tmp_path: Path) -> 
     assert original.certificate.is_file()
 
 
+def test_every_directory_created_for_an_identity_is_private(tmp_path: Path) -> None:
+    identity_dir = tmp_path / "new-parent" / "nested" / "peer"
+
+    generate_identity(identity_dir)
+
+    for directory in (
+        identity_dir,
+        identity_dir.parent,
+        identity_dir.parent.parent,
+    ):
+        assert directory.stat().st_mode & 0o777 == 0o700
+
+
+def test_identity_key_is_opened_without_following_a_replaced_symlink(
+    tmp_path: Path,
+) -> None:
+    identity = generate_identity(tmp_path / "local")
+    attacker = generate_identity(tmp_path / "attacker")
+    peer = generate_identity(tmp_path / "peer")
+    identity.private_key.unlink()
+    identity.private_key.symlink_to(attacker.private_key)
+
+    with pytest.raises(TransportError, match="safely open identity file"):
+        client_context(identity, peer.certificate)
+
+
 def test_tls_contexts_use_only_tls_13_and_disable_session_tickets(
     tmp_path: Path,
 ) -> None:
@@ -84,6 +115,10 @@ def test_python_ssl_pins_self_signed_peer_certificates_and_exchanges_frames(
 
     verify_peer_pin(tls.client, peer.pin_sha256)
     verify_peer_pin(tls.server, local.pin_sha256)
+    assert tls.client.session is not None
+    assert not tls.client.session.has_ticket
+    assert not tls.client.session_reused
+    assert not tls.server.session_reused
     frame = b'{"operation":"deliver"}\n'
     assert tls.client.write(frame) == len(frame)
     tls.transfer_client_to_server()
@@ -135,6 +170,132 @@ def test_python_ssl_refuses_a_tls_12_only_client(tmp_path: Path) -> None:
 
     with pytest.raises(ssl.SSLError):
         _memory_handshake(client, server_context(peer, local.certificate))
+
+
+def test_frame_reader_scans_each_byte_once() -> None:
+    frame = b"x" * 2048 + b"\n"
+    connection = _FakeSocket([bytes((byte,)) for byte in frame])
+    reader = FrameReader(cast(socket.socket, connection))
+
+    assert reader.read_frame() == frame
+    assert reader.bytes_scanned == len(frame)
+
+
+def test_frame_reader_cuts_off_a_slow_sender_with_an_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr("dromon.federation_tls.time.monotonic", lambda: clock[0])
+    connection = _FakeSocket([b"x"] * 8, clock=clock, step_seconds=0.6)
+    reader = FrameReader(cast(socket.socket, connection), frame_timeout_seconds=1.0)
+
+    with pytest.raises(FrameTimeout):
+        reader.read_frame()
+
+    assert connection.closed
+    assert connection.receive_count == 2
+
+
+def test_overall_connection_deadline_bounds_later_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr("dromon.federation_tls.time.monotonic", lambda: clock[0])
+    connection = _FakeSocket([b"first\n", b"second\n"])
+    reader = FrameReader(
+        cast(socket.socket, connection),
+        frame_timeout_seconds=30.0,
+        connection_deadline=1.0,
+    )
+
+    assert reader.read_frame() == b"first\n"
+    clock[0] = 1.1
+    with pytest.raises(FrameTimeout):
+        reader.read_frame()
+
+    assert connection.closed
+    assert connection.receive_count == 1
+
+
+def test_new_connection_deadline_is_absolute_and_uses_the_given_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("dromon.federation_tls.time.monotonic", lambda: 42.0)
+
+    assert new_connection_deadline(2.5) == 44.5
+
+
+def test_send_frame_closes_a_connection_when_the_write_deadline_expires() -> None:
+    clock = [0.0]
+    connection = _FakeSocket([], clock=clock, step_seconds=1.1)
+
+    with pytest.raises(TimeoutError):
+        send_frame(
+            cast(socket.socket, connection),
+            b"{}\n",
+            frame_timeout_seconds=1.0,
+        )
+
+    assert connection.closed
+    assert connection.send_count == 1
+
+
+@pytest.mark.socket
+def test_first_response_is_read_before_the_caller_accepts_a_connection() -> None:
+    client, server = socket.socketpair()
+    reader = FrameReader(client)
+    server.sendall(b'{"hello":"accepted"}\n{"next":true}\n')
+
+    assert read_first_response(reader) == b'{"hello":"accepted"}\n'
+    assert reader.read_frame() == b'{"next":true}\n'
+
+    client.close()
+    server.close()
+
+
+@pytest.mark.socket
+def test_first_response_closes_when_the_peer_sends_nothing() -> None:
+    client, server = socket.socketpair()
+    reader = FrameReader(client)
+    server.shutdown(socket.SHUT_WR)
+
+    with pytest.raises(PeerClosed):
+        read_first_response(reader)
+
+    assert server.recv(1) == b""
+    server.close()
+
+
+@pytest.mark.socket
+def test_tls_handshake_deadline_closes_the_socket(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    local = generate_identity(tmp_path / "local")
+    peer = generate_identity(tmp_path / "peer")
+    context = server_context(local, peer.certificate)
+    server, stalled_client = socket.socketpair()
+    monkeypatch.setattr("dromon.federation_tls.TLS_HANDSHAKE_TIMEOUT_SECONDS", 0.01)
+
+    with pytest.raises(HandshakeTimeout):
+        wrap_server(server, context, peer.pin_sha256)
+
+    assert stalled_client.recv(1) == b""
+    stalled_client.close()
+
+
+@pytest.mark.socket
+def test_invalid_pin_closes_the_unwrapped_socket(tmp_path: Path) -> None:
+    local = generate_identity(tmp_path / "local")
+    peer = generate_identity(tmp_path / "peer")
+    context = client_context(local, peer.certificate)
+    client, server = socket.socketpair()
+
+    with pytest.raises(TransportError, match="64 lowercase hexadecimal"):
+        wrap_client(client, context, "bad pin")
+
+    assert client.fileno() == -1
+    assert server.recv(1) == b""
+    server.close()
 
 
 @pytest.mark.socket
@@ -258,7 +419,8 @@ def test_framing_rejects_a_truncated_line() -> None:
     with pytest.raises(TruncatedFrame):
         reader.read_frame()
 
-    left.close()
+    assert left.fileno() == -1
+    assert right.recv(1) == b""
     right.close()
 
 
@@ -272,7 +434,8 @@ def test_framing_rejects_an_oversized_line(monkeypatch: pytest.MonkeyPatch) -> N
     with pytest.raises(OversizedFrame):
         reader.read_frame()
 
-    left.close()
+    assert left.fileno() == -1
+    assert right.recv(1) == b""
     right.close()
 
 
@@ -280,15 +443,20 @@ def test_framing_rejects_an_oversized_line(monkeypatch: pytest.MonkeyPatch) -> N
 def test_sending_rejects_unbounded_or_multi_line_frames(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    left, right = socket.socketpair()
     monkeypatch.setattr("dromon.federation_tls.MAX_FRAME_BYTES", 8)
+    left, right = socket.socketpair()
 
     with pytest.raises(OversizedFrame):
         send_frame(left, b"12345678\n")
+    assert left.fileno() == -1
+    assert right.recv(1) == b""
+    right.close()
+
+    left, right = socket.socketpair()
     with pytest.raises(FrameError, match="exactly one final"):
         send_frame(left, b"{}\n{}\n")
-
-    left.close()
+    assert left.fileno() == -1
+    assert right.recv(1) == b""
     right.close()
 
 
@@ -390,3 +558,48 @@ def _memory_handshake(
                 client, server, client_in, client_out, server_in, server_out
             )
     raise AssertionError("TLS handshake did not complete within 100 turns")
+
+
+class _FakeSocket:
+    def __init__(
+        self,
+        chunks: list[bytes],
+        *,
+        clock: list[float] | None = None,
+        step_seconds: float = 0.0,
+    ) -> None:
+        self._chunks = chunks
+        self._clock = clock
+        self._step_seconds = step_seconds
+        self._timeout: float | None = None
+        self.closed = False
+        self.receive_count = 0
+        self.send_count = 0
+
+    def gettimeout(self) -> float | None:
+        return self._timeout
+
+    def settimeout(self, timeout: float | None) -> None:
+        self._timeout = timeout
+
+    def recv(self, size: int) -> bytes:
+        self.receive_count += 1
+        if self._clock is not None:
+            self._clock[0] += self._step_seconds
+        if not self._chunks:
+            return b""
+        chunk = self._chunks.pop(0)
+        if len(chunk) <= size:
+            return chunk
+        self._chunks.insert(0, chunk[size:])
+        return chunk[:size]
+
+    def sendall(self, data: bytes) -> None:
+        self.send_count += 1
+        if self._clock is not None:
+            self._clock[0] += self._step_seconds
+        if self._timeout is not None and self._step_seconds > self._timeout:
+            raise TimeoutError("fake send exceeded its socket deadline")
+
+    def close(self) -> None:
+        self.closed = True
