@@ -24,7 +24,7 @@ live and merged pull requests 35 to 38.
 | Gap | Status |
 |---|---|
 | Each line works in its own worktree | Done. `workdir`, verified live, with session adoption and a guard on git hooks and config |
-| Shared workdirs among writing lines | `dromon config` warns when writing lines resolve to the same directory. Give each writing line a distinct worktree and set its `workdir` to that worktree. Read-only lines may share a directory. The check treats shell, file-write and MCP tools, and an allow-all tool policy, as writing capability. |
+| Shared workdirs among writing lines | `dromon config` warns when writing lines resolve to the same directory and prints each line's effective sandbox `allowWrite` paths. The template gives each line only its own worktree and cache directory, plus shared Git and Cargo directories. It keeps the four worktrees independent and declares no shared role. If lines later share a worktree, declare them as seats of one role. Its owner receives write access and a non-owner must use a read-only capable engine and `workdir_access = "read"`. |
 | Commits from a linked worktree | Done for Claude Code lines, through an `allowWrite` on the common git directory, verified live |
 | Long gates and continuation | Done. `wake_after`, verified live. A command started with `nohup` outlives its turn, observed live |
 | A mandatory sandbox | Done. `[daemon] require_sandbox`, verified live: a line without a sandbox was refused |
@@ -56,6 +56,17 @@ linked worktree, pushed the branch, and released the lease. The first build fail
 because the sandbox refuses `sccache`, and succeeded with `RUSTC_WRAPPER` unset, which
 the project file below therefore sets.
 
+**Fact, reported by the operator on 2026-10-28.** In a trial under a Dromon line's
+sandbox with `enableWeakerNetworkIsolation = true`, `gh pr view`, `gh run list` and
+`gh run view --log` succeeded, so the reported TLS failure was gone. At the operator's
+direction, a real push of a throwaway branch to pydromon and its deletion also succeeded.
+Every Git call printed `fatal: failed to store: 100001` and still exited zero. The
+MacPorts system Git configuration at `/opt/local/etc/gitconfig` selects `osxkeychain`
+before the repository's `gh` helper, and that helper cannot write the keychain in the
+sandbox. The successful push marks the push check below as passed, though the helper
+configuration still needs attention. The Keleusma repository's SSH remote and its own
+line sandbox remain untested.
+
 ## Established facts and remaining live checks
 
 The statements below distinguish facts from inferences and recommendations. They do not
@@ -81,9 +92,17 @@ filesystem permissions or installed tools.
   Cargo credentials through both the sandbox and Claude Code permission rules.
   **Recommendation.** Verify shell reads fail in a live line sandbox using the check
   below.
-- **Fact.** Each line's write grant names its own worktree and the shared Git directory.
+- **Fact.** Each line's write grant names its own worktree and cache directory. The
+  profile grants the shared Git directory and the two Cargo directories.
   **Inference.** This confines worktree writes to the owning line, subject to confirming
   the resolved paths and sandbox enforcement on the host.
+- **Fact, from the Claude Code changelog.** On macOS,
+  `sandbox.enableWeakerNetworkIsolation` allows Go programs such as `gh`, `gcloud` and
+  `terraform` to verify certificates when they use a custom man-in-the-middle proxy
+  through `httpProxyPort`. It widens the sandbox's network isolation for those tools.
+  The template enables it for the Keleusma profile. **Not verified in a Dromon line.**
+  The setting's effect on the reported `gh` failure remains unknown until the operator
+  repeats the trial.
 - **Fact.** Dromon's engine table and adapters identify the engines implemented in this
   version. **Inference.** Claude Code is the suitable engine for these configured
   writes and network access. The Codex sandbox in this deployment has no network, so it
@@ -125,10 +144,11 @@ command could not write its cache under `~/.cache/gh`, which the sandbox denies.
 `XDG_CACHE_HOME` pointed inside `TMPDIR`, it printed the workflow log. This observation
 was in a Claude Code sandbox, not a Dromon line sandbox.
 
-The next check is an operator-run scratch-project trial line with the Keleusma profile's
-network allowlist. That trial should check fetch and push, pull request viewing and log
-retrieval in the Dromon line sandbox. Pull request creation should use a disposable draft
-on pydromon. A merge check requires the operator's confirmation in session.
+Repeat the checks below in an operator-run scratch-project trial line using the updated
+Keleusma profile. Check fetch, pull request viewing and log retrieval in the Dromon line
+sandbox. The pydromon throwaway push and branch deletion passed on 2026-10-28. Pull
+request creation should use a disposable draft on pydromon. A merge check requires the
+operator's confirmation in session.
 
 1. From each line's worktree, run `git -c http.followRedirects=true fetch
    https://github.com/sgeos/keleusma.git <branch>` and confirm it fetches the intended
@@ -137,7 +157,10 @@ on pydromon. A merge check requires the operator's confirmation in session.
 2. From a disposable local commit, run `git push --dry-run
    https://github.com/sgeos/keleusma.git HEAD:refs/heads/dromon-sandbox-check`.
    This checks the configured `gh` credential helper without changing the remote. It
-   needs `github.com` and `api.github.com` for helper authentication.
+   needs `github.com` and `api.github.com` for helper authentication. **Passed for
+   pydromon on 2026-10-28.** A real throwaway-branch push and deletion succeeded, but Git
+   still printed the credential-helper error despite exit status zero. The Keleusma
+   repository and Dromon-line helper configuration have not been verified.
 3. On pydromon's disposable remote, run `gh pr create --draft --title "sandbox check"
    --body "temporary check"` from a disposable pushed branch, then `gh pr view --json
    url,state` and close the draft with `gh pr close <number>`. Do not use Keleusma for
@@ -149,10 +172,12 @@ on pydromon. A merge check requires the operator's confirmation in session.
 4. Run `gh run view <run-id> --log` for a disposable completed workflow. This downloads
    logs and needs `github.com`, `api.github.com`, `objects.githubusercontent.com`,
    `results-receiver.actions.githubusercontent.com` and `*.blob.core.windows.net`.
-   The template sets `XDG_CACHE_HOME` to a cache directory inside each line's own
-   worktree, avoiding a write grant to `~/.cache/gh`.
-5. In the Claude Code sandbox, run `test -w "$TMPDIR" && p=$(mktemp "$TMPDIR/dromon-check.XXXXXX") && rm "$p"`.
-   This establishes whether the per-process temporary directory is writable.
+   The template sets `XDG_CACHE_HOME` to a per-line directory outside the worktrees.
+   `dromon config` prints the resolved effective write grants for comparison.
+5. In a Dromon line, verify that `XDG_CACHE_HOME` points to that line's cache directory
+   and that the line can write there. Then run `test -w "$TMPDIR" && p=$(mktemp
+   "$TMPDIR/dromon-check.XXXXXX") && rm "$p"` to confirm the per-process temporary
+   directory is writable.
 6. Outside the sandbox, first confirm that each credential file exists with `test -f`
    and do not print or open its contents. Then, inside a Dromon line with this sandbox
    profile, run `for p in ~/.codex/auth.json
@@ -170,6 +195,11 @@ on pydromon. A merge check requires the operator's confirmation in session.
 9. In a throwaway proof worktree, run the project's documented proof-target build
    command inside the sandbox with `RUSTC_WRAPPER` unset. Record the exact command,
    target and result.
+10. Repeat the `gh` certificate check on macOS with
+    `enableWeakerNetworkIsolation = true` and the template's network allowlist. Confirm
+    whether `gh` verifies the certificate and whether the allowlist still blocks an
+    unlisted host. Record command output and the setting's effect. The result remains
+    unverified until this check passes.
 
 The first four checks require outbound HTTPS to the hosts named beside each command.
 Checks 5 and 6 exercise local filesystem behavior. Checks 7 to 9 exercise engine or
@@ -207,15 +237,34 @@ kaizen line, is installed as Keleusma's `.dromon/dromon.toml`, with `.dromon/` i
 kaizen line's own live session was still running, and the operator starts it once that
 session ends:
 
+The installed file is older than the template below. Before starting the daemon,
+replace `.dromon/dromon.toml` with the current template. Run `dromon config` against
+the real project paths. Its per-line `effective sandbox allowWrite` output must name
+that line's worktree and cache directory, the shared Git directory and the Cargo
+directories, and must omit every other line's worktree and cache directory.
+
 ```sh
 cd /PATH/TO/keleusma
 CLAUDE_CODE_STREAM_CLOSE_TIMEOUT=300000 uv run --project /PATH/TO/pydromon dromon start
 uv run --project /PATH/TO/pydromon dromon attach kaizen
 ```
 
-The remote currently stays on SSH. Before enabling push from a line, the operator must
-choose and configure the HTTPS remote and confirm that the `gh` credential helper works
-in the sandbox. The other three lines join by adding their sections from the file below.
+The Keleusma remote currently stays on SSH. Before enabling push from a line, the
+operator must choose and configure an HTTPS remote and confirm that the `gh` credential
+helper works in that sandbox. The other three lines join by adding their sections from
+the file below.
+
+**Recommendation, unverified.** In the Keleusma repository, reset inherited credential
+helpers before adding GitHub CLI's helper. Run this from the repository root.
+
+```sh
+git config --local --replace-all credential.helper ""
+git config --local --add credential.helper '!gh auth git-credential'
+```
+
+The empty helper resets helpers from system configuration, including MacPorts'
+`osxkeychain` helper. This repository-local configuration has not been tried in the
+sandbox.
 
 ## The project file
 
@@ -254,9 +303,13 @@ plugins = ["~/.claude/plugins/cache/typesafe-ai/typesafe/VERSION"]
 
 [profiles.keleusma.sandbox]
 enabled = true
+# Claude Code's changelog says this widens macOS network isolation for Go tools
+# using the sandbox HTTP proxy, so they can verify TLS certificates. The Dromon
+# trial has not confirmed that this fixes gh's certificate failure.
+enableWeakerNetworkIsolation = true
 
 [profiles.keleusma.sandbox.filesystem]
-allowWrite = ["/PATH/TO/keleusma/.git", "/PATH/TO/keleusma/.worktrees/kaizen", "/PATH/TO/keleusma-worktrees/v0.2.x", "/PATH/TO/keleusma-worktrees/arena-composites", "/PATH/TO/keleusma-worktrees/proofs", "~/.cargo/registry", "~/.cargo/git"]
+allowWrite = ["/PATH/TO/keleusma/.git", "~/.cargo/registry", "~/.cargo/git"]
 denyWrite = ["/PATH/TO/keleusma/secret/notes"]
 denyRead = ["~/.ssh", "~/.aws", "~/.codex/auth.json", "~/.grok/auth.json", "~/.cargo/credentials.toml"]
 
@@ -277,7 +330,10 @@ instructions = ["CLAUDE.md", "~/.claude/CLAUDE.md"]
 
 [lines."kaizen".settings.env]
 CARGO_TARGET_DIR = "/PATH/TO/keleusma/.worktrees/kaizen/target"
-XDG_CACHE_HOME = "/PATH/TO/keleusma/.worktrees/kaizen/.cache"
+XDG_CACHE_HOME = "/PATH/TO/keleusma-cache/kaizen"
+
+[lines."kaizen".sandbox.filesystem]
+allowWrite = ["/PATH/TO/keleusma/.worktrees/kaizen", "/PATH/TO/keleusma-cache/kaizen"]
 
 [lines."v0.2.3"]
 profile = "keleusma"
@@ -286,7 +342,10 @@ instructions = ["CLAUDE.md", "~/.claude/CLAUDE.md"]
 
 [lines."v0.2.3".settings.env]
 CARGO_TARGET_DIR = "/PATH/TO/keleusma-worktrees/v0.2.x/target"
-XDG_CACHE_HOME = "/PATH/TO/keleusma-worktrees/v0.2.x/.cache"
+XDG_CACHE_HOME = "/PATH/TO/keleusma-cache/v0.2.3"
+
+[lines."v0.2.3".sandbox.filesystem]
+allowWrite = ["/PATH/TO/keleusma-worktrees/v0.2.x", "/PATH/TO/keleusma-cache/v0.2.3"]
 
 [lines."v0.3.0"]
 profile = "keleusma"
@@ -295,7 +354,10 @@ instructions = ["CLAUDE.md", "~/.claude/CLAUDE.md"]
 
 [lines."v0.3.0".settings.env]
 CARGO_TARGET_DIR = "/PATH/TO/keleusma-worktrees/arena-composites/target"
-XDG_CACHE_HOME = "/PATH/TO/keleusma-worktrees/arena-composites/.cache"
+XDG_CACHE_HOME = "/PATH/TO/keleusma-cache/v0.3.0"
+
+[lines."v0.3.0".sandbox.filesystem]
+allowWrite = ["/PATH/TO/keleusma-worktrees/arena-composites", "/PATH/TO/keleusma-cache/v0.3.0"]
 
 [lines."proofs"]
 profile = "keleusma"
@@ -304,8 +366,15 @@ instructions = ["CLAUDE.md", "~/.claude/CLAUDE.md"]
 
 [lines."proofs".settings.env]
 CARGO_TARGET_DIR = "/PATH/TO/keleusma-worktrees/proofs/target"
-XDG_CACHE_HOME = "/PATH/TO/keleusma-worktrees/proofs/.cache"
+XDG_CACHE_HOME = "/PATH/TO/keleusma-cache/proofs"
+
+[lines."proofs".sandbox.filesystem]
+allowWrite = ["/PATH/TO/keleusma-worktrees/proofs", "/PATH/TO/keleusma-cache/proofs"]
 
 [lines.proofs.wake]
 every_ticks = 10
 ```
+
+Create the four cache directories under `/PATH/TO/keleusma-cache` before starting the
+daemon. They sit outside the worktrees and each is writable only through its line's
+sandbox grant.
