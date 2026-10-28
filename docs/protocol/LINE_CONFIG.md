@@ -67,9 +67,10 @@ at most 4,096 characters.
 
 Any text of an MCP server, its command, arguments, `env` values, url and header values,
 may hold `${NAME}`, or `${NAME:-default}` for a default used when `NAME` is unset, as
-Claude Code's `.mcp.json` does. The configuration stores the reference, and the engine
-replaces it from the daemon's environment at the start of each turn, so a token can stay
-out of the event log.
+Claude Code's `.mcp.json` does. The project file must grant each referenced name to the
+line through its `secrets` list. At the start of a turn, Dromon resolves references only
+from those names, and only into the MCP configuration. The values never enter the
+engine process environment or the event log.
 
 - A `${` that does not begin a well-formed reference is refused when the configuration
   is accepted. So is a reference to a variable `SETTINGS.md` reserves for the engine's

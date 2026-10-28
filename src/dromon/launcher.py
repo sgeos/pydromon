@@ -127,6 +127,13 @@ from pathlib import Path
 from typing import Final, cast
 
 from dromon.processes import MARK_VARIABLE, TreeRow, descendants, tree_or_reason
+from dromon.engine_environment import (
+    BASE_ENVIRONMENT,
+    CLAUDE_ENGINE_ENVIRONMENT,
+    TOOL_SEARCH_PINNED,
+    TOOL_SEARCH_VARIABLE,
+    allowlisted,
+)
 
 
 class StopPolicy(StrEnum):
@@ -145,6 +152,7 @@ daemon's side of the launch. The harness never sees it."""
 TARGET_VARIABLE: Final = "DROMON_LAUNCH_TARGET"
 PARENT_VARIABLE: Final = "DROMON_LAUNCH_PARENT"
 REPORT_VARIABLE: Final = "DROMON_LAUNCH_REPORT"
+FILTER_ENVIRONMENT_VARIABLE: Final = "DROMON_LAUNCH_FILTER_ENVIRONMENT"
 LAUNCH_MARK_VARIABLE: Final = "DROMON_LAUNCH_MARK"
 """The line's process mark for the launcher alone, for a harness that must not carry
 the mark itself, as Codex does not. A report names its line by the mark."""
@@ -153,6 +161,7 @@ LAUNCH_VARIABLES: Final = (
     TARGET_VARIABLE,
     PARENT_VARIABLE,
     REPORT_VARIABLE,
+    FILTER_ENVIRONMENT_VARIABLE,
     LAUNCH_MARK_VARIABLE,
 )
 """Variables for the launcher alone, removed before the harness starts."""
@@ -369,6 +378,13 @@ def version_target(arguments: Sequence[str]) -> str | None:
         return claude_command()
     except Exception:  # noqa: BLE001
         return None
+
+
+def version_environment(environment: Mapping[str, str]) -> dict[str, str]:
+    """The short-lived environment for the Agent SDK's version-only CLI check."""
+    selected = allowlisted(environment, BASE_ENVIRONMENT)
+    selected[TOOL_SEARCH_VARIABLE] = TOOL_SEARCH_PINNED
+    return selected
 
 
 # The daemon's side.
@@ -1278,9 +1294,39 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 127
         # A version query starts nothing that lasts, so it needs no watcher.
         try:
-            os.execv(version, [version, *arguments])  # noqa: S606
+            os.execve(  # noqa: S606
+                version,
+                [version, *arguments],
+                version_environment(os.environ),
+            )
         except OSError as error:
             print(f"dromon-launch: cannot start {version}: {error}", file=sys.stderr)
+            return 127
+    if os.environ.get(FILTER_ENVIRONMENT_VARIABLE) == "1":
+        # The Agent SDK merges its host environment into options.env. Replace this
+        # launcher image with one carrying only the inputs its watcher and Claude
+        # Code need, before it creates any child process.
+        environment = allowlisted(
+            os.environ,
+            (
+                *BASE_ENVIRONMENT,
+                *CLAUDE_ENGINE_ENVIRONMENT,
+                MARK_VARIABLE,
+                *LAUNCH_VARIABLES,
+            ),
+        )
+        environment.pop(FILTER_ENVIRONMENT_VARIABLE, None)
+        try:
+            os.execve(  # noqa: S606
+                sys.executable,
+                [sys.executable, "-I", "-m", "dromon.launcher", *arguments],
+                environment,
+            )
+        except OSError as error:
+            print(
+                f"dromon-launch: cannot re-exec with the filtered environment: {error}",
+                file=sys.stderr,
+            )
             return 127
     policy = policy_of(os.environ)
     parent_text = os.environ.get(PARENT_VARIABLE, "")

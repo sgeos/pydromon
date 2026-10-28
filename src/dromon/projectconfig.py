@@ -38,6 +38,7 @@ from dromon.lineconfig import (
     LineConfig,
     check_instructions,
     config_from_document,
+    references,
 )
 from dromon.model import (
     DEFAULT_HANDOFF_BELOW_PERCENT,
@@ -127,6 +128,7 @@ TOOL_KEYS: Final = frozenset(
         "allow_compact",
         "auto_compact_tokens",
         "context_handoff",
+        "secrets",
     }
 )
 LAYERED_KEYS: Final = frozenset({"sandbox", "settings"})
@@ -181,6 +183,9 @@ class LineDefinition:
     may_own: bool = True
     """Whether the line, as a seat of a role, may own the role. Meaningless for a line
     that is a seat of no role."""
+    secret_names: tuple[str, ...] = ()
+    """Environment variable names this project grants the line to reference in its
+    MCP configuration. Values are read from the daemon environment at turn time."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -597,7 +602,7 @@ class _Reader:
         except ValueError as error:
             choices = [s.value for s in Strategy]
             raise self.fail(f"{key}.strategy", f"must be one of {choices}") from error
-        tools = {k: v for k, v in merged.items() if k in TOOL_KEYS}
+        tools = {k: v for k, v in merged.items() if k in TOOL_KEYS and k != "secrets"}
         try:
             config = config_from_document(tools)
         except ConfigError as error:
@@ -610,6 +615,43 @@ class _Reader:
                 if "instructions" not in own:
                     where = f"profiles.{profile_name}.instructions"
                 raise self.fail(where, f"for line {line_id}, {error}") from error
+        raw_secrets = merged.get("secrets", [])
+        if (
+            not isinstance(raw_secrets, list)
+            or len(cast(list[object], raw_secrets)) > 256
+        ):
+            raise self.fail(f"{key}.secrets", "must be a list of at most 256 names")
+        secret_names: list[str] = []
+        for name in cast(list[object], raw_secrets):
+            if (
+                not isinstance(name, str)
+                or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", name) is None
+            ):
+                raise self.fail(
+                    f"{key}.secrets",
+                    f"{name!r} is not an environment variable name",
+                )
+            if name in secret_names:
+                raise self.fail(f"{key}.secrets", f"names {name!r} twice")
+            secret_names.append(name)
+        used_secrets = {
+            name
+            for _, server in config.mcp_servers
+            for text in (
+                server.command,
+                *server.args,
+                *(value for _, value in server.env),
+                server.url,
+                *(value for _, value in server.headers),
+            )
+            for name in references(text)
+        }
+        denied_secrets = sorted(used_secrets - set(secret_names))
+        if denied_secrets:
+            raise self.fail(
+                f"{key}.secrets",
+                "does not grant MCP variable(s) " + ", ".join(denied_secrets),
+            )
         # Unlike the tool keys, sandbox and settings tables merge as Claude Code's
         # scopes do, so a line cannot drop a deny entry its profile adds.
         own_sandbox = self.sandbox(own.get("sandbox"), f"{key}.sandbox")
@@ -643,4 +685,5 @@ class _Reader:
             else self.wake(merged["wake"], f"{key}.wake", wake),
             session=session,
             may_own=may_own,
+            secret_names=tuple(sorted(secret_names)),
         )

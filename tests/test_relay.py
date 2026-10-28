@@ -148,6 +148,32 @@ def test_the_command_relay_passes_the_notice_on_standard_input(
     assert received["body"] == "For Ana?"
 
 
+def test_the_command_relay_receives_only_its_base_environment(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "environment.json"
+    body = (
+        "import json, os, pathlib; pathlib.Path(__import__('sys').argv[1]).write_text("
+        "json.dumps(dict(os.environ)))"
+    )
+    relay = CommandRelay(
+        [sys.executable, "-I", "-c", body, str(out)],
+        environment={
+            "PATH": "/usr/bin",
+            "HOME": "/home/relay",
+            "DAEMON_ONLY_SECRET": "must-not-reach-relay",
+        },
+    )
+    relay.forward(Notice("q", "alpha", "ana", QUESTION, "?", (), None))
+    received = json.loads(out.read_text(encoding="utf-8"))
+    assert {
+        name: value
+        for name, value in received.items()
+        if name not in {"LC_CTYPE", "__CF_USER_TEXT_ENCODING"}
+    } == {"PATH": "/usr/bin", "HOME": "/home/relay"}
+    assert "DAEMON_ONLY_SECRET" not in received
+
+
 def test_a_nonzero_exit_is_a_relay_error_with_detail() -> None:
     relay = CommandRelay(
         [sys.executable, "-I", "-c", "import sys; sys.exit('no route')"]

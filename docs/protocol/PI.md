@@ -96,16 +96,12 @@ on a plan uncounted. Dromon never opens its `auth.json`.
 
 1. **Configuration.** The line must have no built-in tools and none of the
    configurations the next section refuses.
-2. **Environment.** `PI_PACKAGE_DIR` is refused. Dromon's own variables are replaced.
-   For a subscription, every variable Pi reads a credential from is removed, as is any
-   variable whose name ends in `_API_KEY`, `_TOKEN`, `_SECRET`, `_SECRET_KEY`,
-   `_ACCESS_KEY`, `_CREDENTIALS` or `_PASSWORD`, every variable of a cloud provider by
-   its prefix, such as `AWS_`, `AZURE_` or `GOOGLE_`, as the Cursor review asked of all
-   three engines, and, **review F5**, the variables that name an endpoint, a credential store or a
-   credential's account, among them `CLOUDSDK_CONFIG`,
-   `AWS_EC2_METADATA_SERVICE_ENDPOINT`, `AZURE_OPENAI_ENDPOINT` and `LLAMA_BASE_URL`.
-   `PI_CODING_AGENT_DIR` names the dedicated directory, and `PI_OFFLINE` and
-   `PI_TELEMETRY` switch off startup network operations and install telemetry.
+2. **Environment.** `PI_PACKAGE_DIR` is refused. Pi starts with only the common
+   operating-system allowlist. A metered `pi:openai/...` line also receives
+   `OPENAI_API_KEY`, when present. Subscription lines receive no provider credential,
+   and other provider keys and endpoint variables are never inherited. Dromon's Pi
+   directory, bridge and tools are set separately. `PI_OFFLINE` and `PI_TELEMETRY`
+   switch off startup network operations and install telemetry.
 3. **Credential.** `pi auth check` runs for the model's provider in that environment. A
    status other than ready refuses the turn. An `oauth` answer for a provider whose
    sign-in Pi marks as a subscription is a subscription, an `api_key` answer is usage

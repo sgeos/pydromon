@@ -53,6 +53,7 @@ from dromon.launcher import (
     relayable,
     sweep_launches,
     version_target,
+    version_environment,
     walk_gap,
     walk_unavailable,
     wrap,
@@ -67,7 +68,13 @@ HARNESS = (
     "away = subprocess.Popen(['/bin/sleep', '60'], start_new_session=True)\n"
     "names = sorted(k for k in os.environ if k.startswith('DROMON_'))\n"
     "sys.stdout.write(json.dumps({'stay': stay.pid, 'away': away.pid,"
-    " 'names': names}) + '\\n')\n"
+    " 'unapproved': os.environ.get('DAEMON_ONLY_SENTINEL'),"
+    " 'names': names, 'engine_environment': {name: os.environ.get(name) for name in ("
+    "'USER', 'LOGNAME', 'ENABLE_TOOL_SEARCH', 'CLAUDE_CODE_ENTRYPOINT',"
+    "'CLAUDE_AGENT_SDK_VERSION',"
+    "'CLAUDE_CODE_SDK_READS_SESSION_STATE', "
+    "'CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING', 'CLAUDE_CONFIG_DIR')}}"
+    ") + '\\n')\n"
     "sys.stdout.flush()\n"
 )
 """A harness that starts one child in its own group and one that leaves it, reports
@@ -145,6 +152,8 @@ class Launched:
         report: Path | None = None,
         stdin: int = subprocess.DEVNULL,
         path: str = "/bin:/usr/bin",
+        extra_environment: dict[str, str] | None = None,
+        filter_environment: bool = False,
     ) -> None:
         script = tmp_path / "harness"
         script.write_text(f"#!{sys.executable}\n{body}")
@@ -159,6 +168,9 @@ class Launched:
         }
         if report is not None:
             environment[REPORT_VARIABLE] = str(report)
+        if filter_environment:
+            environment[launcher.FILTER_ENVIRONMENT_VARIABLE] = "1"
+        environment.update(extra_environment or {})
         self.process = subprocess.Popen(  # noqa: S603
             [sys.executable, "-I", "-m", "dromon.launcher"],
             env=environment,
@@ -332,6 +344,40 @@ def test_the_harness_sees_no_launch_variable_but_its_mark(
     started.append(launched)
     assert launched.record["names"] == [MARK_VARIABLE]
     assert not set(LAUNCH_VARIABLES) & set(launched.record["names"])  # type: ignore[arg-type]
+
+
+def test_the_launcher_drops_daemon_variables_before_starting_its_command(
+    tmp_path: Path, started: list[Launched]
+) -> None:
+    launched = Launched(
+        tmp_path,
+        HARNESS,
+        StopPolicy.KILL_ALL,
+        extra_environment={
+            "DAEMON_ONLY_SENTINEL": "must-not-reach-child",
+            "USER": "dromon-user",
+            "LOGNAME": "dromon-login",
+            "CLAUDE_CONFIG_DIR": "/operator/claude-config",
+            "ENABLE_TOOL_SEARCH": "true",
+            "CLAUDE_CODE_ENTRYPOINT": "sdk-py",
+            "CLAUDE_AGENT_SDK_VERSION": "0.2.174",
+            "CLAUDE_CODE_SDK_READS_SESSION_STATE": "1",
+            "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING": "true",
+        },
+        filter_environment=True,
+    )
+    started.append(launched)
+    assert launched.record["unapproved"] is None
+    assert launched.record["engine_environment"] == {
+        "USER": "dromon-user",
+        "LOGNAME": "dromon-login",
+        "ENABLE_TOOL_SEARCH": "true",
+        "CLAUDE_CODE_ENTRYPOINT": "sdk-py",
+        "CLAUDE_AGENT_SDK_VERSION": "0.2.174",
+        "CLAUDE_CODE_SDK_READS_SESSION_STATE": "1",
+        "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING": "true",
+        "CLAUDE_CONFIG_DIR": None,
+    }
 
 
 def test_a_stop_under_kill_all_ends_the_harness_and_its_group(
@@ -698,6 +744,21 @@ def test_a_version_query_without_a_target_names_the_sdk_s_claude_code(
 
     monkeypatch.setattr(launcher, "claude_command", missing)
     assert version_target(["-v"]) is None
+
+
+def test_a_version_query_receives_only_the_base_environment() -> None:
+    assert version_environment(
+        {
+            "PATH": "/bin",
+            "HOME": "/home/line",
+            "ANTHROPIC_API_KEY": "must-not-reach-cli",
+            "DAEMON_ONLY_SENTINEL": "must-not-reach-cli",
+        }
+    ) == {
+        "PATH": "/bin",
+        "HOME": "/home/line",
+        "ENABLE_TOOL_SEARCH": "true",
+    }
 
 
 # Item 7 of the live check of 2026-10-26, a harness that ends its own work.

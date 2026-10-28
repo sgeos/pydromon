@@ -1055,6 +1055,7 @@ def engine_factory(
     line_socket: Path | None = None,
     accept_partial_isolation: bool = False,
     accept_unverified_credential: bool = False,
+    line_secrets: Mapping[str, Sequence[str]] | None = None,
 ) -> EngineFactory:
     """The production factory: each line on its packaged driver's engine.
 
@@ -1246,6 +1247,7 @@ def engine_factory(
             ceiling_reached=spec.ceiling_reached,
             ceiling_settled=spec.ceiling_settled,
             consent_asked=spec.consent_asked,
+            secret_names=lambda: tuple((line_secrets or {}).get(spec.line_id, ())),
         )
 
     return build
@@ -6160,23 +6162,64 @@ class Scheduler:
         if self._line_tokens is not None and line_id not in self._running:
             # The engine's process, if it kept one, ends with it.
             self._line_tokens.revoke(line_id)
-        if not isinstance(engine, KeptEngine):
+
+        def close_driver() -> None:
+            driver = getattr(engine, "driver", None)
+            if isinstance(driver, Driver):
+                driver.close()
+
+        turn = self._running.get(line_id)
+        if not isinstance(engine, KeptEngine) and turn is None:
+            close_driver()
             return None
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            # Without a running loop no connection can have been opened.
+            # This caller may be outside the turn's loop. Do not release its VM
+            # while the turn can still use it. Queue the close on that loop after
+            # completion, using the thread-safe scheduling entry point.
+            if turn is None:
+                close_driver()
+            else:
+                turn_loop = turn.get_loop()
+
+                def close_when_done(_: asyncio.Future[None]) -> None:
+                    close_driver()
+
+                try:
+                    turn_loop.call_soon_threadsafe(
+                        turn.add_done_callback, close_when_done
+                    )
+                except RuntimeError:
+                    # A closed loop cannot still be running the turn. If it has
+                    # completed, release immediately; otherwise leave its VM open.
+                    if turn.done():
+                        close_driver()
             return None
-        task = loop.create_task(engine.retire())
+
+        async def retire() -> None:
+            try:
+                if isinstance(engine, KeptEngine):
+                    await engine.retire()
+                if turn is not None:
+                    await asyncio.gather(turn, return_exceptions=True)
+            finally:
+                close_driver()
+
+        task = loop.create_task(retire())
         self._retiring.add(task)
         task.add_done_callback(self._retiring.discard)
         return task
 
     async def close_engines(self) -> None:
-        """Close every kept engine connection, as the daemon stops. Engines that
-        keep nothing stay built."""
-        for line_id, engine in sorted(self._engines.items()):
-            if isinstance(engine, KeptEngine):
+        """Close engine connections and release every line's driver on shutdown."""
+        for line_id, engine in sorted(tuple(self._engines.items())):
+            # Scripted engines used by scheduler clients do not own a native driver,
+            # and may be reused if a test restarts the scheduler loop. Production
+            # adapters and kept engines are retired at this shutdown boundary.
+            if isinstance(engine, KeptEngine) or isinstance(
+                getattr(engine, "driver", None), Driver
+            ):
                 self._drop_engine(line_id)
         if self._retiring:
             await asyncio.gather(*self._retiring, return_exceptions=True)

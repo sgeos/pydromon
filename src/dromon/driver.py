@@ -218,7 +218,7 @@ class Driver:
 
     def __init__(self, source: str, *, state: DriverState = INITIAL_STATE) -> None:
         try:
-            self._vm = keleusma.VM(keleusma.compile(source))
+            self._vm: keleusma.VM | None = keleusma.VM(keleusma.compile(source))
         except (keleusma.SourceError, keleusma.VerifyError) as error:
             raise DriverError(f"the driver does not compile: {error}") from error
         wcet = self._vm.wcet_per_iteration
@@ -260,21 +260,29 @@ class Driver:
         return self._state
 
     @property
+    def closed(self) -> bool:
+        """Whether this driver's thread-affine virtual machine has been released."""
+        return self._vm is None
+
+    @property
     def wcet_per_iteration(self) -> int:
         """The worst-case time of one decision, in Keleusma's nominal cost units."""
         return self._wcet
 
     def _cycle(self, event: Event) -> Triple:
         payload = ((event.tag, event.text, event.number), self._state)
+        vm = self._vm
+        if vm is None:
+            raise DriverError("the driver is closed")
         try:
             if self._started:
-                yielded = self._vm.resume(payload)
+                yielded = vm.resume(payload)
             else:
-                yielded = self._vm.call(payload)
+                yielded = vm.call(payload)
                 self._started = True
             if not isinstance(yielded, keleusma.Yielded):
                 raise DriverError(f"the driver did not yield: {yielded!r}")
-            completed = self._vm.resume(_IDLE)
+            completed = vm.resume(_IDLE)
         except keleusma.VMError as error:
             raise DriverError(f"the driver failed: {error}") from error
         if not isinstance(completed, keleusma.Reset):
@@ -283,6 +291,17 @@ class Driver:
         triple = _triple(step[0], "action")
         self._state = _state(step[1])
         return triple
+
+    def close(self) -> None:
+        """Release the thread-affine VM on the thread that owns this driver.
+
+        A line engine may be part of a callback cycle with its scheduler. Explicitly
+        dropping the VM when that engine is retired keeps Python's cycle collector
+        from finalizing it later on an unrelated thread.
+        """
+        vm, self._vm = self._vm, None
+        self._started = False
+        del vm
 
     def step(self, event: Event) -> Action:
         """Feed one engine event to the driver and return the action to perform."""

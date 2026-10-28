@@ -910,14 +910,23 @@ KEYS = {"OPENAI_API_KEY": "k", "CODEX_API_KEY": "k", "CODEX_ACCESS_TOKEN": "k"}
 
 
 def test_a_subscription_lines_codex_never_sees_an_api_key() -> None:
-    environment = {**KEYS, "PATH": "/bin"}
+    environment = {
+        **KEYS,
+        "PATH": "/bin",
+        "DAEMON_ONLY_SENTINEL": "must-not-reach-engine",
+    }
     cache = {"XDG_CACHE_HOME": default_cache_home()}
     expected = {"PATH": "/bin", **cache}
     assert engine_environment(environment, Strategy.SUBSCRIPTION) == expected
     for metered in (Strategy.API, Strategy.FLEXIBLE):
-        assert engine_environment(environment, metered) == {**environment, **cache}
+        assert engine_environment(environment, metered) == {
+            **KEYS,
+            "PATH": "/bin",
+            **cache,
+        }
     server = FakeServer()
     run(line(server, environment=environment))
+    assert "DAEMON_ONLY_SENTINEL" not in server.environment
     # The launcher's own variables, which it removes before Codex starts.
     assert server.environment[STOP_POLICY_VARIABLE] == "kill_all"
     launched = {

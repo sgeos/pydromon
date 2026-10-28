@@ -225,11 +225,13 @@ pass "shellcheck is clean on ${#shell_files[@]} shell files"
 
 # Optional disclosure scan. If secret/disclosure-terms.txt exists, no tracked file may
 # contain any of its terms, matched as fixed strings without regard to case. Blank
-# lines and lines starting with # are ignored. The scan prints only the file and line
-# of each match, never the matched text, so that the gate's own output does not
-# disclose a term. The list lives under secret/, so the scan cannot run in a clone or
-# in continuous integration, and it says so rather than passing silently.
+# lines and lines starting with # are ignored. An accepted match must name its path,
+# line number and exact line text, so an edited line is checked again. The scan prints
+# only the file and line of each unaccepted match, never its text. The list lives under
+# secret/, so the scan cannot run in a clone or in continuous integration, and it says
+# so rather than passing silently.
 terms_file="secret/disclosure-terms.txt"
+accepted_file="secret/disclosure-accepted.txt"
 if [[ -f "$terms_file" ]]; then
     patterns=()
     while IFS= read -r term || [[ -n "$term" ]]; do
@@ -237,12 +239,58 @@ if [[ -f "$terms_file" ]]; then
         patterns+=(-e "$term")
     done < "$terms_file"
     if ((${#patterns[@]} > 0)); then
-        hits="$(git grep -n -I -i -F "${patterns[@]}" -- . | cut -d: -f1,2 || true)"
-        if [[ -n "$hits" ]]; then
-            printf '%s\n' "$hits" >&2
-            fail "tracked files contain terms from $terms_file, at the lines listed above"
+        hits="$(git grep -n -I -i -F "${patterns[@]}" -- . || true)"
+        accepted_pairs=()
+        if [[ -f "$accepted_file" ]]; then
+            accepted_line=0
+            while IFS= read -r accepted_entry || [[ -n "$accepted_entry" ]]; do
+                ((accepted_line += 1))
+                [[ "$accepted_entry" =~ ^[[:space:]]*(#|$) ]] && continue
+                if [[ "$accepted_entry" != *$'\t'* ]]; then
+                    fail "$accepted_file:$accepted_line must contain a path, a line number, and exact line text separated by tabs"
+                fi
+                accepted_path="${accepted_entry%%$'\t'*}"
+                accepted_rest="${accepted_entry#*$'\t'}"
+                if [[ "$accepted_rest" != *$'\t'* ]]; then
+                    fail "$accepted_file:$accepted_line must contain a path, a line number, and exact line text separated by tabs"
+                fi
+                accepted_number="${accepted_rest%%$'\t'*}"
+                accepted_text="${accepted_rest#*$'\t'}"
+                if [[ -z "$accepted_path" || ! "$accepted_number" =~ ^[1-9][0-9]*$ || -z "$accepted_text" ]]; then
+                    fail "$accepted_file:$accepted_line must contain a path, a positive line number, and non-empty exact line text"
+                fi
+                accepted_pairs+=("$accepted_path:$accepted_number:$accepted_text")
+            done < "$accepted_file"
         fi
-        pass "disclosure scan found no listed term in tracked files"
+        if [[ -n "$hits" ]]; then
+            remaining_hits=()
+            accepted_hits=0
+            while IFS= read -r hit; do
+                hit_path="${hit%%:*}"
+                hit_rest="${hit#*:}"
+                hit_number="${hit_rest%%:*}"
+                hit_text="${hit_rest#*:}"
+                hit_key="$hit_path:$hit_number:$hit_text"
+                is_accepted=false
+                for accepted_pair in "${accepted_pairs[@]}"; do
+                    if [[ "$hit_key" == "$accepted_pair" ]]; then
+                        is_accepted=true
+                        ((accepted_hits += 1))
+                        break
+                    fi
+                done
+                [[ "$is_accepted" == true ]] ||
+                    remaining_hits+=("$hit_path:$hit_number")
+            done <<< "$hits"
+            if ((${#remaining_hits[@]} > 0)); then
+                printf '%s\n' "${remaining_hits[@]}" >&2
+                fail "tracked files contain terms from $terms_file, at the lines listed above"
+            fi
+            pass "disclosure scan skipped $accepted_hits accepted path and line match(es) from $accepted_file"
+        else
+            pass "disclosure scan found no listed term in tracked files"
+            pass "disclosure scan skipped 0 accepted path and line match(es) from $accepted_file"
+        fi
     else
         printf 'check.sh: note: %s lists no terms, so the disclosure scan did nothing\n' "$terms_file"
     fi

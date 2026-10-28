@@ -49,8 +49,11 @@ The general adapter runs a command once per notice. The command is an argument v
 from operator configuration and runs without a shell. The notice arrives on standard
 input followed by a newline. Exit status 0 means the channel accepted the notice. Any
 other status, a failure to start, or exceeding the configured timeout of at most 3,600
-seconds is a failure. A short script behind this adapter can send email, post to a chat
-service or write to a file.
+seconds is a failure. Its process receives only the common operating-system environment
+allowlist `PATH`, `HOME`, `LANG`, `TERM` and `TMPDIR`, when present. Other daemon
+variables, including credentials, are omitted. A short script behind this adapter can
+send email, post to a chat service or write to a file, but must obtain any credential
+through its own explicit mechanism.
 
 ## Trust
 

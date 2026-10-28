@@ -313,7 +313,9 @@ def test_the_subscription_environment_has_no_cloud_credential() -> None:
     assert engine_environment(environment, Strategy.SUBSCRIPTION) == {
         "PATH": "/usr/bin"
     }
-    assert set(names) <= set(engine_environment(environment, Strategy.API))
+    metered = engine_environment(environment, Strategy.API)
+    assert not set(names) & set(metered)
+    assert "PATH" in metered
 
 
 @pytest.mark.parametrize(
@@ -428,7 +430,14 @@ def test_both_shapes_of_a_tool_call_are_read() -> None:
 
 def test_a_plain_turn_reports_text_credential_and_chat(home: Path) -> None:
     server = FakeCursor()
-    target = line(server, home)
+    target = line(
+        server,
+        home,
+        environment={
+            "PATH": "/usr/bin:/bin",
+            "DAEMON_ONLY_SENTINEL": "not-allowlisted",
+        },
+    )
     report = run(target, "the wake prompt")
     assert report.subtype == "success"
     assert report.text == "done"
@@ -441,6 +450,7 @@ def test_a_plain_turn_reports_text_credential_and_chat(home: Path) -> None:
     ]
     assert "plugin/mcp.json" in server.files
     assert server.environment["DROMON_LINE_TOKEN"] == "tok"  # noqa: S105, a test token
+    assert "DAEMON_ONLY_SENTINEL" not in server.environment
 
 
 def test_the_configuration_directory_is_removed_after_the_turn(home: Path) -> None:

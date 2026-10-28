@@ -67,6 +67,7 @@ from dromon.jsonlines import (
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
 from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
+from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 
 ENGINE_NAME: Final = "cursor-agent"
 """The engine this adapter runs, as drivers name it."""
@@ -199,11 +200,11 @@ def engine_environment(
             "the environment conflicts with a Cursor line: " + ", ".join(present)
         )
     subscription = strategy is Strategy.SUBSCRIPTION
+    chosen = allowlisted(environment, (*BASE_ENVIRONMENT, *API_ENVIRONMENT))
     return {
         k: v
-        for k, v in environment.items()
-        if k not in DROMON_CONTROLLED
-        and not (subscription and (k in API_ENVIRONMENT or is_cloud_or_credential(k)))
+        for k, v in chosen.items()
+        if not (subscription and (k in API_ENVIRONMENT or is_cloud_or_credential(k)))
     }
 
 
