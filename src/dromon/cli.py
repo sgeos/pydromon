@@ -831,8 +831,17 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             workdir_path = paths.root / workdir_path
         resolved = str(workdir_path.resolve())
         shared_workdirs.setdefault(resolved, []).append(line_id)
+    # The seats of one role share its worktree by design, since only its owner writes
+    # there, so they count as one writer. A line of another role, or of none, beside
+    # them is still warned about.
+    role_of = {
+        line_id: f"role {role_id}"
+        for role_id, role in config.roles.items()
+        for line_id in role.seats
+    }
     for workdir, line_ids in sorted(shared_workdirs.items()):
-        if len(line_ids) > 1:
+        writers = {role_of.get(line_id, f"line {line_id}") for line_id in line_ids}
+        if len(writers) > 1:
             print(
                 "warning: writing lines "
                 + ", ".join(line_ids)

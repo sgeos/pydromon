@@ -105,6 +105,19 @@ handoff_below_percent = 10  # the default, or 0 for never
 | `lines.ID.session` | text | none | An existing engine session the line adopts when the daemon creates it, checked as `line_session` is in [`EVENT_LOG.md`](EVENT_LOG.md). Ignored for a line that exists |
 | `teacher` | table | none | The project's local teacher model, as [`TEACHER.md`](TEACHER.md) specifies |
 | `agents` | table | off | Which external agents may connect, and with what access, as [`AGENTS.md`](AGENTS.md) specifies |
+| `federation.listen` | boolean | `false` | Whether the daemon opens its peer socket. Validated, with no effect until the peer socket is built |
+| `federation.accept_unconfined` | boolean | `false` | Whether lines on an engine Dromon cannot confine may run in a project with peers, as below |
+| `federation.waiting_per_recipient` | integer in [1, 100000] | 200 | The bound on mail from all peers waiting for one local party. Validated, with no effect until peer mail is built |
+| `peers.ID` | table | none | Another Dromon daemon on this machine, named by an identifier, as [`FEDERATION.md`](../architecture/FEDERATION.md) designs it. At most 64 |
+| `peers.ID.transport` | `unix` | `unix` | `tls` belongs to the second phase and is refused until it is built |
+| `peers.ID.socket` | absolute path | required | The peer's `peers.sock`, at most 103 bytes, without `.` or `..` steps. Its directory is the peer's runtime directory |
+| `peers.ID.project` | absolute path | none | The peer's project root, whose `.dromon` is then denied to local lines |
+| `peers.ID.inbound`, `outbound`, `priority_in`, `priority_out` | boolean | `false` | The peer's directions and priority, as the design specifies |
+| `peers.ID.reach`, `senders`, `remote` | list of at most 256 local addresses | empty | The local parties the peer may send to, the local parties that may send to it, and its parties that may be addressed, each named once. A remote address is refused |
+| `peers.ID.max_body_bytes` | integer in [1, 1048576] | 65536 | The largest body sent to or accepted from the peer |
+| `peers.ID.expire_hours` | integer in [1, 2160] | 168 | How long mail to the peer waits before it expires |
+| `peers.ID.turns_per_hour` | integer in [1, 60] | 6 | Turns the peer's mail may start for one local line in an hour |
+| `peers.ID.waiting` | integer in [1, 100000] | 500 | The bound on mail from the peer waiting for all local parties |
 | `sandbox` | table | none | The project's sandbox, merged under every line's, as [`SANDBOX.md`](SANDBOX.md) specifies |
 | `profiles.NAME.sandbox`, `lines.ID.sandbox` | table | none | A profile's or a line's sandbox. These merge rather than replace |
 | `settings` | table | none | The project's engine settings, merged under every line's, as [`SETTINGS.md`](SETTINGS.md) specifies |
@@ -157,8 +170,8 @@ handoff_below_percent = 10  # the default, or 0 for never
   created through the client and absent from the file are left as they are.
 - **Reload.** `reload_project` applies the file again without a restart, with the same
   rules, after checking all of it, so a refused reload applies nothing. It refuses a
-  change to the sandbox, the engine settings, the teacher or the external agent policy,
-  which apply only at start. Its roles are recorded as above. A line the file no longer declares returns to the
+  change to the sandbox, the engine settings, the teacher, the external agent policy or
+  the federation and peer tables, which apply only at start. Its roles are recorded as above. A line the file no longer declares returns to the
   project's limits and wake policy. The leases table is applied again, and a held lease
   whose name the file no longer declares ends.
 - **Lines on other engines.** A project file whose own `[sandbox]` or `[settings]`
@@ -182,6 +195,22 @@ changes nothing. Codex and Grok lines run under their own permission profiles, a
 tool, as [`PI.md`](PI.md) specifies, so all three satisfy it. **Why.** A
 line without an enabled sandbox can reach the daemon's socket from its shell and act
 with operator authority, as [`SANDBOX.md`](SANDBOX.md) records.
+
+**Peers.** **Added on 2026-10-28, step 2 of phase 1 of
+[`FEDERATION.md`](../architecture/FEDERATION.md).** Each declared peer's runtime
+directory, the directory of its `socket`, and the `.dromon` of its `project` when one is
+named, are protected as the project's own state and runtime directories are. Every
+enabled sandbox denies them, the Codex profile denies those that exist, the check of
+the Grok profiles requires them, and no `workdir` may lie in or contain one, as
+[`SANDBOX.md`](SANDBOX.md) specifies. A peer whose directory is one of the project's
+own, or two peers that share one, are refused. While the project declares any peer,
+the daemon refuses a line on Pi, Cursor Agent or Antigravity, which Dromon cannot
+confine, unless `federation.accept_unconfined` is true. The check runs where the
+required sandbox's does. **Why.** A line that is not confined runs as the operator's
+user and could read the peer tokens of a later step and act as a peer, and the
+operator decided on 2026-10-28 that peers need the operator's explicit acceptance of
+that. **Open.** Whether a Claude Code line without an enabled sandbox is refused too
+awaits the operator.
 
 **Disclosure list.** `daemon.disclosure_terms` names a file of terms that must not leave
 the machine through Dromon, such as private context or code names, resolved against

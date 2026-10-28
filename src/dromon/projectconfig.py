@@ -56,6 +56,12 @@ from dromon.sandbox import SandboxConfig, SandboxError, merge, parse_sandbox
 from dromon.settings import SettingsConfig, SettingsError, parse_settings
 from dromon.agents import OFF as AGENTS_OFF
 from dromon.agents import AgentError, AgentPolicy, parse_policy
+from dromon.federation import (
+    NO_FEDERATION,
+    FederationConfig,
+    FederationError,
+    parse_federation,
+)
 from dromon.teacher import TeacherConfig, TeacherError, parse_teacher
 
 CONFIG_FILE_NAME: Final = "dromon.toml"
@@ -73,6 +79,8 @@ TOP_KEYS: Final = frozenset(
         "settings",
         "teacher",
         "agents",
+        "federation",
+        "peers",
         "leases",
         "profiles",
         "lines",
@@ -218,6 +226,8 @@ class ProjectConfig:
     """The project's local teacher model, if it declares one."""
     agents: AgentPolicy = AGENTS_OFF
     """Which external agents may connect, and with what access. Off by default."""
+    federation: FederationConfig = NO_FEDERATION
+    """The project's peers, other Dromon daemons, none by default."""
     require_sandbox: bool = False
     """Whether every Claude Code line must run with its merged sandbox enabled."""
     disclosure_terms: str | None = None
@@ -357,6 +367,11 @@ class _Reader:
                 agents = parse_policy(top["agents"])
             except AgentError as error:
                 raise self.fail("agents", str(error)) from error
+        try:
+            federation = parse_federation(top.get("federation"), top.get("peers"))
+        except FederationError as error:
+            # Each message begins with the key it is about, which places the line.
+            raise self.fail(str(error).split(" ", 1)[0], str(error)) from error
         lease_names, lease_ttl = self.leases(top.get("leases", {}))
         profiles = self.profiles(top.get("profiles", {}))
         lines_table = top.get("lines", {})
@@ -375,6 +390,7 @@ class _Reader:
             settings=settings,
             teacher=teacher,
             agents=agents,
+            federation=federation,
             require_sandbox=require_sandbox,
             disclosure_terms=terms,
             lease_names=lease_names,

@@ -46,7 +46,14 @@ from typing import Any, Final, cast
 
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import __version__, exits, restart
+from dromon import __version__, exits, peercred, restart
+from dromon.federation import (
+    NO_FEDERATION,
+    FederationError,
+    FederationConfig,
+    peer_directories,
+    unconfined_refusal,
+)
 from dromon import client
 from dromon.agents import (
     OFF as AGENTS_OFF,
@@ -728,7 +735,11 @@ class Daemon:
         """Refuse a working directory that does not exist or is not allowed, a
         plugin that would not load, and instructions ``check_instructions`` refuses,
         before anything is recorded. Raises ``ConfigError``."""
-        resolve_workdir(config.workdir, self.paths.root, protected_dirs(self.paths))
+        resolve_workdir(
+            config.workdir,
+            self.paths.root,
+            protected_dirs(self.paths, self.project.federation),
+        )
         check_plugins(config)
         check_instructions(config.instructions, self.paths.root)
 
@@ -983,7 +994,7 @@ class Daemon:
             check_engines(config)
         except ValueError as error:
             raise OverrideError(str(error)) from error
-        fixed = ("sandbox", "settings", "teacher", "agents")
+        fixed = ("sandbox", "settings", "teacher", "agents", "federation")
         moved = [
             name
             for name in fixed
@@ -1378,9 +1389,45 @@ async def _connection(
             await writer.wait_closed()
 
 
+async def _guarded(
+    writer: asyncio.StreamWriter,
+    own_uid: int,
+    serving: Callable[[], Awaitable[None]],
+) -> None:
+    """Serve a connection only when its peer runs as ``own_uid``, read by ``peercred``.
+
+    A refused connection receives one rejected response and is closed, and the refusal
+    is written to standard error, so an operator can see who was turned away.
+    """
+    reason = peercred.refusal(
+        cast(peercred.CredentialSocket, writer.get_extra_info("socket")), own_uid
+    )
+    if reason is None:
+        await serving()
+        return
+    print(f"dromond: refused a connection, {reason}", file=sys.stderr)
+    try:
+        await _write(
+            writer,
+            Response(
+                "",
+                ok=False,
+                error_code=ErrorCode.REJECTED,
+                error_message=f"the daemon refused the connection, {reason}",
+            ),
+        )
+    except (ConnectionError, BrokenPipeError):
+        pass
+    finally:
+        writer.close()
+        with contextlib.suppress(ConnectionError, BrokenPipeError):
+            await writer.wait_closed()
+
+
 async def serve(daemon: Daemon) -> None:
     """Listen on the project's socket until a stop is requested."""
     loop = asyncio.get_running_loop()
+    own_uid = os.getuid()
     for signum in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(signum, daemon.stop_requested.set)
     writers: set[asyncio.StreamWriter] = set()
@@ -1396,7 +1443,13 @@ async def serve(daemon: Daemon) -> None:
         ) -> None:
             writers.add(writer)
             try:
-                await _connection(daemon, reader, writer, responder)
+                # Every socket goes through here, the operator's, the lines' and the
+                # agents', so none of them serves a process of another user.
+                await _guarded(
+                    writer,
+                    own_uid,
+                    lambda: _connection(daemon, reader, writer, responder),
+                )
             finally:
                 writers.discard(writer)
 
@@ -1505,10 +1558,18 @@ class ProjectMismatch(Exception):
     """The project file and the event log disagree on something that cannot change."""
 
 
-def protected_dirs(paths: ProjectPaths) -> tuple[Path, ...]:
+def protected_dirs(
+    paths: ProjectPaths, federation: FederationConfig = NO_FEDERATION
+) -> tuple[Path, ...]:
     """The directories every enabled sandbox denies, which hold the event log, the
-    project file and the daemon's socket."""
-    return (paths.state_dir.resolve(), paths.runtime_dir.resolve())
+    project file and the daemon's socket, followed by each declared peer's, which hold
+    the same for another project. Raises ``ConfigError`` when a peer names this
+    project's own directories, or two peers share one."""
+    own = (paths.state_dir.resolve(), paths.runtime_dir.resolve())
+    try:
+        return own + peer_directories(federation, own)
+    except FederationError as error:
+        raise ConfigError(str(error)) from error
 
 
 def check_plugins(config: LineConfig) -> None:
@@ -1525,7 +1586,7 @@ def check_sandboxes(config: ProjectConfig, paths: ProjectPaths) -> None:
     """Refuse a project file whose working directories are not allowed, or whose
     sandboxes cannot be made safe in them, before anything starts, rather than at
     each line's first turn. Raises ``ConfigError`` or ``SandboxError``."""
-    protected = protected_dirs(paths)
+    protected = protected_dirs(paths, config.federation)
     effective(config.sandbox, paths.root, protected)
     for line in config.lines.values():
         check_plugins(line.config)
@@ -1552,7 +1613,12 @@ def check_sandbox_required(
     project requires one. Codex and Grok lines run under their own permission
     profiles, Pi lines take no built-in tool that could run a command or touch a
     file, and Cursor and Antigravity lines are refused, so they satisfy the
-    requirement. Raises ``SandboxError``."""
+    requirement. Also refuse a line on an engine Dromon cannot confine while the
+    project declares peers and does not accept it, by decision 9 of the federation
+    design. Raises ``SandboxError``."""
+    refusal = unconfined_refusal(project.federation, line_id, ENGINE_OF.get(model))
+    if refusal is not None:
+        raise SandboxError(refusal)
     if not project.require_sandbox or ENGINE_OF.get(model) != CLAUDE_CODE_ENGINE:
         return
     merged: SandboxConfig | None = merge([project.sandbox, config.sandbox])
@@ -1745,6 +1811,7 @@ def run(
     os.umask(0o077)
     given = overrides or Overrides()
     try:
+        peercred.check_supported()
         ensure_private_dir(paths.state_dir)
         ensure_private_dir(paths.runtime_dir)
         ensure_private_dir(paths.left_reports)
@@ -1758,7 +1825,13 @@ def run(
     except AlreadyRunning as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.ALREADY_RUNNING
-    except (PathError, ConfigFileError, ValueError, InvalidField) as error:
+    except (
+        PathError,
+        ConfigFileError,
+        ValueError,
+        InvalidField,
+        peercred.PeerCredentialError,
+    ) as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
     line_tokens = LineTokens()
@@ -1772,7 +1845,7 @@ def run(
                     str(paths.root),
                     project_sandbox=config.sandbox,
                     project_settings=config.settings,
-                    protected=protected_dirs(paths),
+                    protected=protected_dirs(paths, config.federation),
                     line_tokens=line_tokens,
                     line_socket=paths.line_socket,
                 ),
@@ -1782,7 +1855,7 @@ def run(
                 tick_seconds=tick,
                 wake_every_ticks=config.wake_every_ticks,
                 root=paths.root,
-                protected=protected_dirs(paths),
+                protected=protected_dirs(paths, config.federation),
                 daemon_commit=read_head_commit(Path(__file__).parent),
                 daemon_checkout=Path(__file__).parent,
                 processes_identifiable=environment_reading_works(),

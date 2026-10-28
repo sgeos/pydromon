@@ -329,10 +329,18 @@ through their `send_message` tool, and the daemon fixes each tool's sender to it
 
 The socket's access control is the runtime directory, which must be owned by the
 current user with mode 0700. The daemon refuses to start otherwise and never changes an
-existing directory's mode. The socket and the event log are created with mode 0600. Any
-process running as the same user can connect, so the protocol treats every request as
-untrusted input and checks it strictly. A peer credential check on each connection is
-not yet implemented, because its interface differs between macOS and Linux. External
+existing directory's mode. The socket and the event log are created with mode 0600.
+
+**Peer credentials, since 2026-10-28.** Every socket the daemon serves, this one, the
+line socket and the agent socket, reads the user of each connecting process from its
+peer credentials, `LOCAL_PEERCRED` on macOS and `SO_PEERCRED` on Linux, and refuses a
+process of another user with one `rejected` response whose identifier is empty, then
+closes the connection and writes the refusal to standard error. A connection whose
+credentials cannot be read is refused in the same way, and a platform that offers
+neither interface refuses to start the daemon. The check proves only the user. Any
+process running as the same user can still connect, a line's shell included when its
+sandbox does not deny the runtime directory, so the protocol treats every request as
+untrusted input and checks it strictly. External
 agents never use this socket. They reach the separate agent socket, whose requests are
 authorized by agent and access level.
 

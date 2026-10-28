@@ -7,6 +7,10 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- `dromon config` no longer warns that the seats of one role share a workdir, which
+  they do by design, since only the role's owner writes there. A writing line outside
+  the role in the same workdir is still warned about. Found by the operator on
+  2026-10-28.
 - A malformed time in a role or budget event named the field `due`, and now names
   its own field, such as `resets_at`.
 - `dromon send` prints the message identifier alone again. Since priority mail it had
@@ -35,6 +39,33 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- The design of federation between Dromon daemons, `docs/architecture/FEDERATION.md`,
+  approved by the operator on 2026-10-28. A line or an operator in one project can
+  message and wake a party in another, addressed as `keleusma:kaizen`, with the peer
+  named by local configuration. Mail from a peer is untrusted data and never operator
+  authority, peers are default deny per direction, and each daemon's disclosure list
+  applies to mail leaving it, operator mail included. Phase 1 is the same machine over
+  Unix domain sockets with a peer credential check and a token per peer. Phase 2 is
+  different machines over Transport Layer Security version 1.3 with pinned keys.
+  Amended the same day with the operator's decisions on the review. The receiver
+  enforces which local parties a peer may reach, peers are refused while a line runs
+  unconfined unless the project accepts it, peer mail neither counts toward nor resets
+  a line's autonomous turns, waiting mail is bounded, mail that expires after it may
+  have arrived is recorded as unconfirmed, and outbound mail is default deny.
+- Every socket the daemon serves, the operator socket, the line socket and the agent
+  socket, refuses a connection from a process of another user, read from the peer's
+  credentials, `LOCAL_PEERCRED` on macOS and `SO_PEERCRED` on Linux. A connection
+  whose credentials cannot be read is refused too, and a platform with neither
+  interface refuses to start the daemon. This is step 1 of federation phase 1, and
+  closes debt that `CLIENT.md` recorded.
+- The project file's `[federation]` and `[peers]` tables, validated strictly, with
+  both directions of a peer off and every list empty by default. Each declared peer's
+  runtime directory, and its `.dromon` when its project is named, are protected from
+  local lines as the project's own are, through the Claude Code sandbox, the Codex
+  profile and the Grok profile check. While peers are declared, a line on Pi, Cursor
+  Agent or Antigravity is refused unless `federation.accept_unconfined` is true. A
+  reload that changes either table needs a restart. This is step 2 of federation
+  phase 1, and peer mail itself comes in later steps.
 - Automatic switching of a role's owner, roles step 3, at the operator's instruction
   of 2026-10-27, as `docs/architecture/ROLES.md` describes. A role declares its seats'
   order, a failover policy, `automatic` by default or `ask`, and

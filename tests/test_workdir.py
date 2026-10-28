@@ -880,6 +880,34 @@ def test_dromon_config_warns_when_writing_lines_share_workdir(
     assert "reader" not in output.split("warning:", maxsplit=1)[1]
 
 
+def test_dromon_config_does_not_warn_about_seats_of_one_role(
+    tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Seats of one role share its worktree by design, and only the owner writes there.
+    # A writing line outside the role in the same worktree is still a second writer.
+    state = tmp_path / ".dromon"
+    state.mkdir()
+    (tmp_path / "wt").mkdir()
+    seats = (
+        "version = 1\n"
+        "[lines.core]\nmodel = 'claude-opus-5-5'\nbuiltin_tools = ['Bash']\n"
+        "[lines.core-luna]\nmodel = 'claude-haiku-5-5'\nbuiltin_tools = ['Write']\n"
+        "[roles.core]\nworkdir = 'wt'\nseats = ['core', 'core-luna']\n"
+    )
+    (state / "dromon.toml").write_text(seats)
+    runtime = ["--runtime-dir", str(short_runtime)]
+    assert cli.main(["--project", str(tmp_path), *runtime, "config"]) == 0
+    assert "warning:" not in capsys.readouterr().out
+
+    (state / "dromon.toml").write_text(
+        seats + "[lines.other]\nmodel = 'claude-haiku-5-5'\n"
+        "builtin_tools = ['Edit']\nworkdir = 'wt'\n"
+    )
+    assert cli.main(["--project", str(tmp_path), *runtime, "config"]) == 0
+    output = capsys.readouterr().out
+    assert "warning: writing lines core, core-luna, other share workdir" in output
+
+
 def test_dromon_config_resolves_workdir_symlinks_for_shared_writer_warning(
     tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

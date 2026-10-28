@@ -124,8 +124,10 @@ next call.
 The agent socket, like the operator socket, is protected by the runtime directory and
 the operating system's user account, and any process of the operator's user can reach
 it. Tokens separate one user's agents from each other and give each its own level. They
-do not defend against a process that can read the agent's MCP configuration, and the
-daemon still has no peer credential check.
+do not defend against a process that can read the agent's MCP configuration. Since
+2026-10-28 the daemon refuses a connection from a process of another user, read from
+its peer credentials, as [`CLIENT.md`](CLIENT.md) specifies, which proves the user and
+not the agent.
 
 **Fact, verified on 2026-10-25 with Claude Code 2.1.310 and Claude Haiku 5.5.** A Claude
 Code session given `dromon mcp` with a registered token at `message` access was offered
