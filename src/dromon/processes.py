@@ -37,6 +37,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Protocol
 
+from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
+
 MARK_VARIABLE: Final = "DROMON_LINE_MARK"
 """The environment variable that names the line a process belongs to."""
 
@@ -207,14 +209,15 @@ def environment_reading_works() -> bool:
     """Whether this platform lets the daemon read another process's environment, as
     the process tools need. A short child is started with a known variable, and both
     readers, the listing's and the stop's, must see it within about a second. The
-    child is always stopped. Any failure means the readers cannot be trusted, which
-    the tools then report rather than returning an empty listing."""
+    child receives only the common engine environment and that variable, and is always
+    stopped. Any failure means the readers cannot be trusted, which the tools then
+    report rather than returning an empty listing."""
     token = secrets.token_hex(16)
     assignment = f"{PROBE_VARIABLE}={token}"
     try:
         child = subprocess.Popen(  # noqa: S603
             ["/bin/sleep", "5"],  # noqa: S607
-            env={**os.environ, PROBE_VARIABLE: token},
+            env={**allowlisted(os.environ, BASE_ENVIRONMENT), PROBE_VARIABLE: token},
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

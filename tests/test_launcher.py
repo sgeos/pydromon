@@ -70,9 +70,10 @@ HARNESS = (
     "sys.stdout.write(json.dumps({'stay': stay.pid, 'away': away.pid,"
     " 'unapproved': os.environ.get('DAEMON_ONLY_SENTINEL'),"
     " 'names': names, 'engine_environment': {name: os.environ.get(name) for name in ("
-    "'ENABLE_TOOL_SEARCH', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_AGENT_SDK_VERSION',"
+    "'USER', 'LOGNAME', 'ENABLE_TOOL_SEARCH', 'CLAUDE_CODE_ENTRYPOINT',"
+    "'CLAUDE_AGENT_SDK_VERSION',"
     "'CLAUDE_CODE_SDK_READS_SESSION_STATE', "
-    "'CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING')}}"
+    "'CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING', 'CLAUDE_CONFIG_DIR')}}"
     ") + '\\n')\n"
     "sys.stdout.flush()\n"
 )
@@ -354,6 +355,9 @@ def test_the_launcher_drops_daemon_variables_before_starting_its_command(
         StopPolicy.KILL_ALL,
         extra_environment={
             "DAEMON_ONLY_SENTINEL": "must-not-reach-child",
+            "USER": "dromon-user",
+            "LOGNAME": "dromon-login",
+            "CLAUDE_CONFIG_DIR": "/operator/claude-config",
             "ENABLE_TOOL_SEARCH": "true",
             "CLAUDE_CODE_ENTRYPOINT": "sdk-py",
             "CLAUDE_AGENT_SDK_VERSION": "0.2.174",
@@ -365,11 +369,14 @@ def test_the_launcher_drops_daemon_variables_before_starting_its_command(
     started.append(launched)
     assert launched.record["unapproved"] is None
     assert launched.record["engine_environment"] == {
+        "USER": "dromon-user",
+        "LOGNAME": "dromon-login",
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_ENTRYPOINT": "sdk-py",
         "CLAUDE_AGENT_SDK_VERSION": "0.2.174",
         "CLAUDE_CODE_SDK_READS_SESSION_STATE": "1",
         "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING": "true",
+        "CLAUDE_CONFIG_DIR": None,
     }
 
 

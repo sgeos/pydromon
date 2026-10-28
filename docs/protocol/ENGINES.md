@@ -120,7 +120,7 @@ only the common entries and pinned `ENABLE_TOOL_SEARCH`.
 
 | Adapter | Additional inherited entries | Scope |
 |---|---|---|
-| Claude Code | `ENABLE_TOOL_SEARCH`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_AGENT_SDK_VERSION`, `CLAUDE_CODE_SDK_READS_SESSION_STATE`, `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING`, `PWD`, `TRACEPARENT`, `TRACESTATE`, `BAGGAGE`, `DROMON_LINE_MARK` | Tool search is pinned on. The Agent SDK sets the entry point, its version and session-state behavior. Checkpointing and trace values are present only when the SDK sets them. The process mark is for tracking. Launcher target, parent, report, stop-policy and filter entries do not reach Claude Code. |
+| Claude Code | `USER`, `LOGNAME`, `ENABLE_TOOL_SEARCH`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_AGENT_SDK_VERSION`, `CLAUDE_CODE_SDK_READS_SESSION_STATE`, `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING`, `PWD`, `TRACEPARENT`, `TRACESTATE`, `BAGGAGE`, `DROMON_LINE_MARK` | Claude Code uses the account names to find its macOS Keychain sign-in, confirmed by the operator's live check. Tool search is pinned on. The Agent SDK sets the entry point, its version and session-state behavior. Checkpointing and trace values are present only when the SDK sets them. The process mark is for tracking. Launcher target, parent, report, stop-policy and filter entries do not reach Claude Code. |
 | Codex | `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, `XDG_CACHE_HOME` | Credentials are allowed only for `api` and `flexible` strategies. Subscription lines omit them. Dromon uses a supplied cache path or sets its private cache directory. |
 | Pi | `OPENAI_API_KEY` | Only for `pi:openai/...` lines with `api` or `flexible` strategy. Subscription lines omit it. Other provider variables and endpoint selectors are not inherited. Dromon's Pi directory, bridge and tool values are set separately. |
 | Cursor Agent | `CURSOR_API_KEY`, `CURSOR_AUTH_TOKEN`, `CURSOR_AUTH_TOKEN_EXPIRES_AT` | Only for metered strategies. Subscription lines omit them. Dromon sets the config and data directories separately. |
@@ -179,6 +179,12 @@ table itself checks.
 from a second implementation and was not run live, so it is not yet a tested minimum.
 
 ## Sign-in check without a turn
+
+**Claude Code's turn result.** When a result contains both `Not logged in` and
+`Please run /login`, Dromon refuses the turn even if Claude Code labels it `success`.
+The result is not sent to the driver's success event. The scheduler records the
+exception as a failed turn, holds the line and asks the operator to sign it in before
+resuming.
 
 **Row 16 of the T3 Code review, 2026-10-27.** `dromon probe --no-turn` checks the
 engine's sign-in for the given model and strategy, and runs no turn. It runs for an

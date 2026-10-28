@@ -7,6 +7,7 @@ line sends travels the same path as one sent by a model.
 import asyncio
 import gc
 import re
+import threading
 from collections.abc import Callable, Coroutine, Iterator, Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -17,7 +18,7 @@ from claude_agent_sdk import SdkMcpTool
 
 from dromon.activity import ActivityKind
 from dromon.driver import Driver, DriverError, Event, Strategy
-from dromon.engine import EnginePlanLimit, TurnReport
+from dromon.engine import ClaudeCodeLine, EnginePlanLimit, TurnReport
 from dromon.eventlog import EventLog, read_entries
 from dromon.lineconfig import ConfigError, LineConfig, ToolPolicy, encode_config
 from dromon.overrides import OverrideError
@@ -41,7 +42,7 @@ from dromon.model import (
 )
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.mailbox import MailSummary, summary
-from dromon.scheduler import LineSpec, Scheduler, compose_prompt
+from dromon.scheduler import LineEngine, LineSpec, Scheduler, compose_prompt
 from dromon import priority
 
 HAIKU = "claude-haiku-5-5"
@@ -236,6 +237,81 @@ def test_a_finished_lines_vm_is_released_before_python_gc(
     assert driver.closed
     assert vm_count() == baseline
     log.close()
+
+
+def test_dropping_an_engine_without_a_loop_waits_for_its_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unused_engine(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> LineEngine:
+        del spec, tools
+        raise AssertionError("the test inserts its engine directly")
+
+    log = EventLog(tmp_path / "driver-no-loop-drop.sqlite")
+    scheduler = Scheduler(log, unused_engine)
+    loop = asyncio.new_event_loop()
+    entered = threading.Event()
+    release = threading.Event()
+    registered = threading.Event()
+    finished = threading.Event()
+    closed = threading.Event()
+    thread_errors: list[BaseException] = []
+    active_driver: list[Driver] = []
+    original_close = Driver.close
+
+    def observed_close(driver: Driver) -> None:
+        original_close(driver)
+        if active_driver and driver is active_driver[0]:
+            closed.set()
+
+    monkeypatch.setattr(Driver, "close", observed_close)
+
+    async def active_turn() -> None:
+        driver = Driver.for_model(HAIKU, Strategy.SUBSCRIPTION)
+        active_driver.append(driver)
+        engine = ClaudeCodeLine(driver, Path("/work"))
+        scheduler._engines["alpha"] = engine  # pyright: ignore[reportPrivateUsage]
+        task = asyncio.current_task()
+        assert task is not None
+        scheduler._running["alpha"] = cast(asyncio.Task[None], task)  # pyright: ignore[reportPrivateUsage]
+        entered.set()
+        await asyncio.to_thread(release.wait)
+        driver.step(Event("turn_start"))
+
+    def run_loop() -> None:
+        asyncio.set_event_loop(loop)
+        task = loop.create_task(active_turn())
+
+        def collect(error_task: asyncio.Task[None]) -> None:
+            try:
+                error_task.result()
+            except BaseException as error:
+                thread_errors.append(error)
+            finally:
+                finished.set()
+
+        task.add_done_callback(collect)
+        loop.run_forever()
+
+    thread = threading.Thread(target=run_loop)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        scheduler._drop_engine("alpha")  # pyright: ignore[reportPrivateUsage]
+        assert not active_driver[0].closed
+
+        loop.call_soon_threadsafe(registered.set)
+        assert registered.wait(5)
+        release.set()
+        assert finished.wait(5)
+        assert closed.wait(5)
+        assert not thread_errors
+        assert active_driver[0].closed
+    finally:
+        release.set()
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        loop.close()
+        log.close()
 
 
 def send(

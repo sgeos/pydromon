@@ -5885,8 +5885,26 @@ class Scheduler:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            # Without a running loop no connection can have been opened.
-            close_driver()
+            # This caller may be outside the turn's loop. Do not release its VM
+            # while the turn can still use it. Queue the close on that loop after
+            # completion, using the thread-safe scheduling entry point.
+            if turn is None:
+                close_driver()
+            else:
+                turn_loop = turn.get_loop()
+
+                def close_when_done(_: asyncio.Future[None]) -> None:
+                    close_driver()
+
+                try:
+                    turn_loop.call_soon_threadsafe(
+                        turn.add_done_callback, close_when_done
+                    )
+                except RuntimeError:
+                    # A closed loop cannot still be running the turn. If it has
+                    # completed, release immediately; otherwise leave its VM open.
+                    if turn.done():
+                        close_driver()
             return None
 
         async def retire() -> None:

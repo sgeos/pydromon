@@ -17,6 +17,8 @@ TOOL_SEARCH_PINNED = "true"
 """Stable tool search keeps the tool schemas from changing between requests."""
 
 CLAUDE_ENGINE_ENVIRONMENT: tuple[str, ...] = (
+    "USER",
+    "LOGNAME",
     TOOL_SEARCH_VARIABLE,
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_AGENT_SDK_VERSION",
@@ -28,7 +30,8 @@ CLAUDE_ENGINE_ENVIRONMENT: tuple[str, ...] = (
     "BAGGAGE",
 )
 """Claude Code inputs set by Dromon or the pinned Agent SDK before it starts the
-engine. The adapter does not forward other daemon variables."""
+engine, plus the account names Claude Code uses to find its macOS Keychain sign-in.
+The adapter does not forward other daemon variables."""
 
 
 def allowlisted(environment: Mapping[str, str], names: Sequence[str]) -> dict[str, str]:

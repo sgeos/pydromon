@@ -43,7 +43,7 @@ from claude_agent_sdk import (
 
 from claude_agent_sdk.types import RateLimitStatus
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
-from dromon.driver import Credential, Driver, Strategy, driver_resource
+from dromon.driver import Action, Credential, Driver, Event, Strategy, driver_resource
 from dromon.priority import SteeredDriver
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, McpServer, ToolPolicy
 from dromon.engine import (
@@ -93,7 +93,9 @@ def init(
     )
 
 
-def result(subtype: str = "success", turns: int = 1) -> ResultMessage:
+def result(
+    subtype: str = "success", turns: int = 1, message: str | None = None
+) -> ResultMessage:
     return ResultMessage(
         subtype=subtype,
         duration_ms=1,
@@ -102,6 +104,7 @@ def result(subtype: str = "success", turns: int = 1) -> ResultMessage:
         num_turns=turns,
         session_id="session-1",
         total_cost_usd=0.001,
+        result=message,
     )
 
 
@@ -349,6 +352,35 @@ def test_an_engine_running_another_model_is_refused_by_the_driver() -> None:
 def test_a_turn_without_a_result_is_refused() -> None:
     with pytest.raises(EngineRefused, match="without a result"):
         run(line(Scripted([init(), say(TextBlock("x"))])))
+
+
+@pytest.mark.parametrize("reported_in", ["assistant", "result"])
+def test_a_success_result_reporting_missing_sign_in_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    reported_in: str,
+) -> None:
+    message = "Not logged in · Please run /login"
+    messages: list[Message] = [init()]
+    if reported_in == "assistant":
+        messages.extend([say(TextBlock(message)), result()])
+    else:
+        messages.append(result(turns=0, message=message))
+    session = Scripted(messages)
+    result_events: list[Event] = []
+    original_step = Driver.step
+
+    def record_step(driver: Driver, event: Event) -> Action:
+        if event.tag == "result":
+            result_events.append(event)
+        return original_step(driver, event)
+
+    monkeypatch.setattr(Driver, "step", record_step)
+    target = line(session)
+    with pytest.raises(EngineRefused, match="not signed in"):
+        run(target)
+    assert session.interrupts == (1 if reported_in == "assistant" else 0)
+    assert len(session.prompts) == 1
+    assert not result_events
 
 
 @pytest.mark.live

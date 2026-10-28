@@ -158,6 +158,20 @@ from dromon.sandbox import blocks_unsandboxed
 ENGINE_NAME: Final = "claude-code"
 """The engine this adapter runs, as drivers name it."""
 
+SIGN_IN_FAILURE: Final = (
+    "Claude Code reports that it is not signed in. Sign it in, then release the line."
+)
+"""The hold reason when Claude Code reports that its user must run ``/login``."""
+
+
+def reports_missing_sign_in(text: str | None) -> bool:
+    """Whether Claude Code's report names its exact missing-login instruction."""
+    if text is None:
+        return False
+    lowered = text.casefold()
+    return "not logged in" in lowered and "please run /login" in lowered
+
+
 PROJECT_SETTINGS_FILE: Final = Path(".claude") / "settings.json"
 """The project settings file Claude Code's ``project`` source reads, under the line's
 working directory."""
@@ -2040,6 +2054,7 @@ class ClaudeCodeLine:
                     async for message in session.receive_response():
                         if isinstance(message, ResultMessage):
                             result = message
+                            self._refuse_missing_sign_in(message.result, turn)
                             break
                         answered = answered or isinstance(
                             message, AssistantMessage | StreamEvent
@@ -2050,7 +2065,7 @@ class ClaudeCodeLine:
                     ):
                         break
                     result = None
-                if result is not None:
+                if result is not None and turn.refusal is None:
                     self.driver.step(Event("result", result.subtype, result.num_turns))
         finally:
             self._turn = None
@@ -2072,6 +2087,11 @@ class ClaudeCodeLine:
             raise EnginePlanLimit(
                 str(self._limit), self._limit.resets_at, may_move_role=True
             )
+
+    @staticmethod
+    def _refuse_missing_sign_in(text: str | None, turn: _Turn) -> None:
+        if turn.refusal is None and reports_missing_sign_in(text):
+            turn.refusal = SIGN_IN_FAILURE
 
     async def _enter[S](
         self,
@@ -2241,6 +2261,13 @@ class ClaudeCodeLine:
         elif isinstance(message, AssistantMessage):
             if message.error == BILLING_ERROR:
                 turn.billing = True
+            text = "".join(
+                block.text for block in message.content if isinstance(block, TextBlock)
+            )
+            if turn.refusal is None and reports_missing_sign_in(text):
+                turn.refusal = SIGN_IN_FAILURE
+                await session.interrupt()
+                return
             if turn.require_init and turn.capabilities is None:
                 if turn.refusal is None:
                     turn.refusal = (
@@ -2916,6 +2943,7 @@ class ClaudeCodeLine:
                 if message is None:
                     break
                 if isinstance(message, ResultMessage):
+                    self._refuse_missing_sign_in(message.result, turn)
                     if self._handed_off(message, turn, answered, resends):
                         resends += 1
                         # The pump let go of the inbox at the result.
@@ -2923,9 +2951,10 @@ class ClaudeCodeLine:
                         await connection.session.query(prompt)
                         continue
                     result = message
-                    self.driver.step(
-                        Event("result", message.subtype, message.num_turns)
-                    )
+                    if turn.refusal is None:
+                        self.driver.step(
+                            Event("result", message.subtype, message.num_turns)
+                        )
                     break
                 answered = answered or isinstance(
                     message, AssistantMessage | StreamEvent
@@ -2953,6 +2982,8 @@ class ClaudeCodeLine:
         if result is None:
             await self.close()
             self._notes.append(DIED_NOTE)
+            if turn.refusal is not None:
+                raise EngineRefused(turn.refusal)
             raise EngineRefused("the engine's process ended during the turn")
         cost = self._measure(result)
         if turn.refusal is not None:
