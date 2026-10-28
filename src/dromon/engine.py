@@ -1550,18 +1550,33 @@ def permission_gate(
         del context
         if admits is not None and not admits():
             return PermissionResultDeny(
-                message="Dromon has not started and checked a turn on this session"
+                message=(
+                    "Dromon's session permission gate refuses this call because "
+                    "Dromon has not started and checked a turn on this session"
+                )
             )
         if blocks_unsandboxed(sandbox, tool_name, tool_input):
             return PermissionResultDeny(
-                message="this line's sandbox does not allow unsandboxed commands"
+                message=(
+                    "Dromon's sandbox rule sandbox.allowUnsandboxedCommands is not"
+                    f" true, so it refuses the unsandboxed {tool_name} call because"
+                    " dangerouslyDisableSandbox=true"
+                )
             )
         if tool_name in HUMAN_DECISION_TOOLS:
-            return PermissionResultDeny(message=HUMAN_DECISION_REFUSAL)
+            return PermissionResultDeny(
+                message=(
+                    f"Dromon's human-decision rule refuses {tool_name}. "
+                    f"{HUMAN_DECISION_REFUSAL}"
+                )
+            )
         if config.allows(tool_name, own_tools):
             return PermissionResultAllow()
         return PermissionResultDeny(
-            message=f"{tool_name} is not available to this line"
+            message=(
+                f"{tool_name} is not available to this line because its "
+                f"tool_policy={config.tool_policy.value!r} does not allow it"
+            )
         )
 
     return gate

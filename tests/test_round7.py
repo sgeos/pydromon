@@ -241,6 +241,7 @@ def test_the_wakes_own_turn_compacts_and_withdraws_nothing(world: World) -> None
     assert message_id in world.log.state.messages
     assert withdrawn(world) == []
     assert world.status()["context"]["last_compaction"]["withdrawn_wake"] is None
+    assert world.status()["autonomous_turns"]["used"] == 0
 
 
 def test_context_warning_wakes_compactable_line_without_mail(world: World) -> None:
@@ -251,6 +252,33 @@ def test_context_warning_wakes_compactable_line_without_mail(world: World) -> No
     world.run()
     assert world.engine.reasons == [COMPACTION_CONTEXT_WARNING]
     assert world.status()["context"]["estimated_tokens"] == 5_000
+    assert world.status()["autonomous_turns"]["used"] == 0
+
+
+def test_context_warning_wakes_are_coalesced_and_withdrawn_below_warning(
+    world: World,
+) -> None:
+    world.scheduler._context_reported(  # pyright: ignore[reportPrivateUsage]
+        "alpha", 150_001, CONTEXT_FROM_CALL
+    )
+    first = world.log.state.scheduled["alpha"].message_id
+    world.scheduler._context_reported(  # pyright: ignore[reportPrivateUsage]
+        "alpha", 151_000, CONTEXT_FROM_CALL
+    )
+    assert world.log.state.scheduled["alpha"].message_id == first
+    assert (
+        sum(
+            isinstance(entry.event, WakeScheduled) for entry in read_entries(world.path)
+        )
+        == 1
+    )
+
+    world.scheduler._context_reported(  # pyright: ignore[reportPrivateUsage]
+        "alpha", 149_999, CONTEXT_FROM_CALL
+    )
+    assert "alpha" not in world.log.state.scheduled
+    assert withdrawn(world) == [WakeWithdrawn("alpha", first)]
+    assert "alpha" not in world.scheduler._context_compaction_wakes  # pyright: ignore[reportPrivateUsage]
 
 
 def test_context_warning_does_not_queue_a_note_for_a_held_line(world: World) -> None:

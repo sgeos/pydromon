@@ -42,7 +42,12 @@ from dromon.protocol import ErrorCode, Response
 from dromon.sandbox import SandboxError, blocks_unsandboxed, effective, parse_sandbox
 from dromon.scheduler import LineEngine, LineSpec, Scheduler, engine_factory
 from dromon.engine import EngineRefused, TurnReport
-from dromon.workdir import MAX_POINTER_BYTES, git_write_guards, resolve_workdir
+from dromon.workdir import (
+    MAX_POINTER_BYTES,
+    git_common_directory,
+    git_write_guards,
+    resolve_workdir,
+)
 
 HAIKU = "claude-haiku-5-5"
 ANA = OperatorAddress("ana")
@@ -189,6 +194,7 @@ def test_a_linked_worktree_guards_the_common_directory_and_its_pointers(
     tmp_path: Path,
 ) -> None:
     common, gitdir, tree = linked_worktree(tmp_path)
+    assert git_common_directory(tree) == common
     assert git_write_guards(tree) == tuple(
         sorted(
             {

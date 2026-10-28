@@ -2678,7 +2678,10 @@ def test_the_gate_refuses_every_request_for_a_human_decision() -> None:
     for name in sorted(HUMAN_DECISION_TOOLS):
         verdict = asyncio.run(gate(name, {}, CONTEXT))
         assert isinstance(verdict, PermissionResultDeny)
-        assert verdict.message == HUMAN_DECISION_REFUSAL
+        assert verdict.message.startswith(
+            f"Dromon's human-decision rule refuses {name}. "
+        )
+        assert verdict.message.endswith(HUMAN_DECISION_REFUSAL)
         assert "ask_operator" in verdict.message
     allowed = asyncio.run(gate("Read", {}, CONTEXT))
     assert isinstance(allowed, PermissionResultAllow)

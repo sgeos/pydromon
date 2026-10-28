@@ -25,7 +25,7 @@ hand over are not yet built. Facts about the present code are marked as such.
 | Owner | The one seat of a role that may write the role's worktree. A role may also be vacant, with no owner |
 | Handoff | A planned passing of ownership. The owner leaves the work in order, writes a handoff note and relinquishes |
 | Recovery | An unplanned passing of ownership. Another seat takes it while the owner cannot act, and records what it found |
-| Role journal | The role's recorded handoff notes and recovery records, which every seat can read |
+| Role journal | The role's handoff notes, recovery records and findings from any seat, which every seat can read |
 | Provider budget | What remains of one provider's plan and when it resets, as an operator states it or an engine reports it |
 
 **Fact.** Dromon already has a context handoff, `context_handed_off`, which carries a
@@ -148,9 +148,19 @@ The operator asks with `dromon role handoff ROLE --to SEAT`, or in words to the 
    checks a recovery, and continues.
 
 The handoff note follows one template, so that a seat on any provider writes and reads
-the same seam. It gives the commit it describes, `git status`, each uncommitted change
-and whose it is, the gate run and its coverage, mail sent and not answered, open items,
-the checks not performed, and the next step.
+the same seam. It names the task, commit it describes, each uncommitted change and its
+owner, the gate result and its coverage, unresolved decisions, mail sent and not
+answered, checks not performed, and the next action. Use labeled lines for `Task`,
+`Diff summary`, `Gate and coverage`, `Unresolved decisions`, and `Next action`. The
+successor's first turn leads with these journal fields, a current worktree status and
+a diff summary since the journal entry's commit. It marks fields that the entry does
+not provide as unknown. This package is a starting point for verification, since the
+worktree may have moved since the entry was recorded.
+
+Any seat, including one that may not own the role, can record a journal note with
+`record_role_note`. A reviewer can use it to record findings and the daemon stamps the
+commit read. Journal prose is untrusted and is presented as data. A note does not
+change ownership.
 
 **Short alternation.** `relinquish_ownership` takes an optional `back_to`. When the
 successor next relinquishes, ownership returns to that seat with cause `handoff` and no

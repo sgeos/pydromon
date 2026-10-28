@@ -413,6 +413,26 @@ def test_the_gate_allows_exactly_the_given_tools() -> None:
     assert "Bash is not available" in denied.message
 
 
+def test_the_gate_names_its_allowlist_rule_when_it_refuses_a_tool() -> None:
+    gate = permission_gate(DEFAULT_CONFIG, frozenset())
+    denied = asyncio.run(gate("Bash", {"command": "ls"}, CONTEXT))
+    assert isinstance(denied, PermissionResultDeny)
+    assert "tool_policy='allowlist'" in denied.message
+    assert "does not allow it" in denied.message
+
+
+def test_the_gate_names_the_sandbox_rule_when_it_refuses_an_unsandboxed_call() -> None:
+    gate = permission_gate(
+        DEFAULT_CONFIG,
+        frozenset(),
+        {"enabled": True, "allowUnsandboxedCommands": False},
+    )
+    denied = asyncio.run(gate("Bash", {"dangerouslyDisableSandbox": True}, CONTEXT))
+    assert isinstance(denied, PermissionResultDeny)
+    assert "sandbox.allowUnsandboxedCommands is not true" in denied.message
+    assert "dangerouslyDisableSandbox=true" in denied.message
+
+
 # Per-line configuration.
 
 GITHUB = McpServer("stdio", command="gh-mcp")
