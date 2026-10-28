@@ -40,9 +40,10 @@ as the adapter's code states them, and `unknown` where the code names its readin
 inference. A test checks each column's `kept_session` against what its adapter refuses.
 
 **Grok's read-only workdir is unknown.** Review of read-only seats, finding 3. The
-adapter selects Grok's own `dromon-reader` sandbox profile for a read-only line and
-checks the profile before each turn, but no live run has shown that the profile denies
-writes to the worktree. It stays `unknown` until an operator probe shows it. Codex's
+`dromon-reader` profile rests on Grok's built-in `read-only` base, which Dromon names but
+cannot inspect, and no live run has shown that the profile denies writes to the
+worktree. It stays `unknown` until an operator probe shows it, and the adapter refuses a
+read-only line while it is anything but `yes`. Second round, findings 1 and 2. Codex's
 `yes` rests on its adapter's code and its profile check, with no live observation of a
 refused write recorded in `CODEX.md`.
 

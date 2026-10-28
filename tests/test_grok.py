@@ -5,7 +5,10 @@ script follows Grok Build 1.0.70's documentation and its ``initialize`` answer.
 """
 
 import asyncio
+import dataclasses
 import json
+import re
+import shutil
 import tomllib
 from collections import deque
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
@@ -31,12 +34,16 @@ from dromon.grok import (
     HOME_DIR,
     SIGN_IN,
     READER_PROFILE,
+    USER_HOME,
+    USER_HOME_HARNESS_ENTRIES,
     WRITER_PROFILE,
     Connection,
     GrokLine,
     bridge_command,
     check_home,
     check_profile,
+    check_project,
+    check_user_home,
     claude_mode_refusal,
     engine_environment,
     grok_arguments,
@@ -44,6 +51,7 @@ from dromon.grok import (
     profile_name,
     unsupported,
 )
+from dromon.capabilities import Known
 from dromon.lineconfig import LineConfig, WorkdirAccess
 from dromon.mcp import Bridge
 from dromon.protocol import Response
@@ -325,6 +333,30 @@ def test_a_grok_line_takes_its_supported_tools_and_nothing_else() -> None:
     assert "Grok sandbox profile" in (unsupported(sandboxed) or "")
 
 
+def test_a_read_only_grok_line_is_refused_until_the_capability_is_known(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader = LineConfig(builtin_tools=("Bash",), workdir_access=WorkdirAccess.READ)
+    assert grok_module.GROK_CAPABILITIES.read_only_workdir is not Known.YES
+    assert "read-only working directory" in (unsupported(reader) or "")
+    assert unsupported(LineConfig(builtin_tools=("Bash",))) is None
+    confirmed = dataclasses.replace(
+        grok_module.GROK_CAPABILITIES, read_only_workdir=Known.YES
+    )
+    monkeypatch.setattr(grok_module, "GROK_CAPABILITIES", confirmed)
+    assert unsupported(reader) is None
+
+
+def test_a_read_only_grok_line_refuses_the_turn_before_grok_starts(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = probed_grok()
+    reader = LineConfig(workdir_access=WorkdirAccess.READ)
+    with pytest.raises(EngineRefused, match="read-only working directory"):
+        run(line(server, project, config=reader))
+    assert server.methods() == []
+
+
 def test_the_environment_drops_credentials_and_refuses_redirection() -> None:
     environment = {
         "PATH": "/bin",
@@ -334,7 +366,13 @@ def test_the_environment_drops_credentials_and_refuses_redirection() -> None:
         "GROK_CONFIG": "{}",
         "GROK_HOME": "/elsewhere",
         "GROK_SANDBOX": "off",
+        "HOME": "/Users/operator",
+        "XDG_CONFIG_HOME": "/Users/operator/.config",
+        "XDG_DATA_HOME": "/Users/operator/.local/share",
+        "XDG_STATE_HOME": "/Users/operator/.local/state",
+        "XDG_CACHE_HOME": "/Users/operator/.cache",
     }
+    assert set(grok_module.HOME_VARIABLES) < set(environment)
     kept = {"PATH": "/bin", **COMPAT_ENVIRONMENT}
     assert engine_environment(environment, Strategy.SUBSCRIPTION) == kept
     assert engine_environment(environment, Strategy.FLEXIBLE) == kept
@@ -371,9 +409,11 @@ def prepared(tmp_path: Path) -> tuple[Path, Path, Path]:
     return workspace, workspace / ".dromon", grok_home
 
 
-def test_the_sign_in_command_names_dromons_grok_home() -> None:
-    assert f'GROK_HOME="$HOME/{HOME_DIR.as_posix()}"' in SIGN_IN
-    assert SIGN_IN.endswith(" grok login")
+def test_the_sign_in_command_names_dromons_grok_home_and_its_home() -> None:
+    grok_home = f"$HOME/{HOME_DIR.as_posix()}"
+    user_home = f"{grok_home}/{USER_HOME}"
+    assert SIGN_IN.startswith(f'mkdir -p -m 700 "{user_home}" && ')
+    assert SIGN_IN.endswith(f' GROK_HOME="{grok_home}" HOME="{user_home}" grok login')
     assert HOME_DIR.parts == (".grok", "dromon-home")
     protocol = Path(__file__).parents[1] / "docs" / "protocol" / "GROK.md"
     assert SIGN_IN in protocol.read_text(encoding="utf-8")
@@ -427,6 +467,55 @@ def test_a_linked_or_shared_home_is_refused(tmp_path: Path) -> None:
     file.write_text("")
     with pytest.raises(EngineRefused, match="cannot create|not a directory"):
         prepare_home(file, workspace, (state,))
+
+
+def test_a_prepared_home_holds_the_lines_own_empty_home_directory(
+    tmp_path: Path,
+) -> None:
+    _, _, grok_home = prepared(tmp_path)
+    user_home = grok_home / USER_HOME
+    assert user_home.is_dir() and not user_home.is_symlink()
+    assert user_home.stat().st_mode & 0o077 == 0
+    assert list(user_home.iterdir()) == []
+    check_user_home(user_home)
+
+
+def test_a_linked_or_shared_line_home_directory_is_refused(tmp_path: Path) -> None:
+    workspace, state, grok_home = prepared(tmp_path)
+    user_home = grok_home / USER_HOME
+    user_home.chmod(0o777)
+    with pytest.raises(EngineRefused, match="home directory .* other users"):
+        prepare_home(grok_home, workspace, (state,))
+    user_home.rmdir()
+    user_home.symlink_to(tmp_path / "home")
+    with pytest.raises(EngineRefused, match="home directory .* symbolic link"):
+        prepare_home(grok_home, workspace, (state,))
+
+
+@pytest.mark.parametrize("name", USER_HOME_HARNESS_ENTRIES)
+def test_another_harness_in_the_line_home_directory_is_refused(
+    tmp_path: Path, name: str
+) -> None:
+    _, _, grok_home = prepared(tmp_path)
+    user_home = grok_home / USER_HOME
+    (user_home / name).mkdir()
+    check_user_home(user_home)
+    (user_home / name / "settings.json").write_text("{}")
+    with pytest.raises(EngineRefused, match=f"holds {re.escape(name)},"):
+        check_user_home(user_home)
+    shutil.rmtree(user_home / name)
+    (user_home / name).write_text("{}")
+    with pytest.raises(EngineRefused, match=f"holds {re.escape(name)},"):
+        check_user_home(user_home)
+
+
+def test_the_line_home_directory_names_the_harnesses_grok_reads() -> None:
+    assert set(USER_HOME_HARNESS_ENTRIES) >= {".claude", ".cursor", ".claude.json"}
+    guide = (Path(__file__).parents[1] / "docs" / "protocol" / "GROK.md").read_text(
+        encoding="utf-8"
+    )
+    for name in USER_HOME_HARNESS_ENTRIES:
+        assert f"`~/{name}`" in guide
 
 
 @pytest.mark.parametrize(
@@ -1434,13 +1523,95 @@ def test_a_drifted_home_refuses_the_turn_before_grok_starts(
     assert server.methods() == []
 
 
-def test_a_claude_settings_mode_refuses_the_turn_before_grok_starts(
+def test_grok_runs_with_its_own_home_directory_not_the_operators(
     project: tuple[Path, Path, Path],
 ) -> None:
     _, home, _ = project
     settings(home, {"permissions": {"defaultMode": "auto"}})
+    environment = {
+        "PATH": "/bin",
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+    }
+    server = probed_grok()
+    assert run(line(server, project, environment=environment)).text == "done"
+    assert server.environment["HOME"] == str(home / HOME_DIR / USER_HOME)
+    assert "XDG_CONFIG_HOME" not in server.environment
+
+
+def test_a_claude_settings_mode_in_grok_home_directory_refuses_the_turn(
+    project: tuple[Path, Path, Path],
+) -> None:
+    _, home, _ = project
+    run(line(probed_grok(), project))
+    settings(home / HOME_DIR / USER_HOME, {"permissions": {"defaultMode": "auto"}})
     server = probed_grok()
     with pytest.raises(EngineRefused, match="defaultMode to 'auto'"):
+        run(line(server, project))
+    assert server.methods() == []
+
+
+def test_a_claude_settings_mode_in_the_project_still_refuses_the_turn(
+    project: tuple[Path, Path, Path],
+) -> None:
+    workspace, _, _ = project
+    settings(workspace, {"permissions": {"defaultMode": "bypassPermissions"}})
+    server = probed_grok()
+    with pytest.raises(EngineRefused, match="defaultMode to 'bypassPermissions'"):
+        run(line(server, project))
+    assert server.methods() == []
+
+
+@pytest.mark.parametrize("level", ["workspace", "repository"])
+def test_a_projects_own_grok_directory_is_refused(tmp_path: Path, level: str) -> None:
+    repository = tmp_path / "repo"
+    workspace = repository / "packages" / "one"
+    workspace.mkdir(parents=True)
+    (repository / ".git").mkdir()
+    directory = (workspace if level == "workspace" else repository) / ".grok"
+    check_project(workspace)
+    directory.mkdir()
+    check_project(workspace)
+    (directory / "config.toml").write_text("[mcp_servers.x]\ncommand = 'x'\n")
+    with pytest.raises(EngineRefused, match=re.escape(str(directory))):
+        check_project(workspace)
+    shutil.rmtree(directory)
+    directory.write_text("")
+    with pytest.raises(EngineRefused, match="has not read"):
+        check_project(workspace)
+
+
+def test_a_grok_directory_outside_the_project_is_not_read(tmp_path: Path) -> None:
+    repository = tmp_path / "outer" / "repo"
+    (repository / ".git").mkdir(parents=True)
+    (tmp_path / "outer" / ".grok").mkdir()
+    (tmp_path / "outer" / ".grok" / "sandbox.toml").write_text("")
+    check_project(repository)
+    workspace = tmp_path / "outer" / "work"
+    workspace.mkdir()
+    check_project(workspace)
+
+
+def test_a_projects_grok_directory_refuses_the_turn_before_grok_starts(
+    project: tuple[Path, Path, Path],
+) -> None:
+    workspace, _, _ = project
+    (workspace / ".grok").mkdir()
+    (workspace / ".grok" / "sandbox.toml").write_text("[profiles.dromon-reader]\n")
+    server = probed_grok()
+    with pytest.raises(EngineRefused, match="project configuration"):
+        run(line(server, project))
+    assert server.methods() == []
+
+
+def test_another_harness_in_grok_home_directory_refuses_the_turn(
+    project: tuple[Path, Path, Path],
+) -> None:
+    _, home, _ = project
+    run(line(probed_grok(), project))
+    (home / HOME_DIR / USER_HOME / ".claude.json").write_text("{}")
+    server = probed_grok()
+    with pytest.raises(EngineRefused, match=r"holds \.claude\.json,"):
         run(line(server, project))
     assert server.methods() == []
 

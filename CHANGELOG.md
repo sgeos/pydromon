@@ -15,7 +15,10 @@ All notable changes are recorded here. The format follows
   `filesystem.disabled`, is refused. Each refusal of a read-only Claude line now has a
   test. Found by the review of read-only seats, findings 1 and 2.
 - Grok's `read_only_workdir` capability is unknown rather than yes, since no live run
-  has shown its reader profile deny a write. Review of read-only seats, finding 3.
+  has shown its reader profile deny a write. Review of read-only seats, finding 3. A
+  Grok line with `workdir_access: read` is now refused until that capability is
+  known, since the reader profile rests on Grok's built-in `read-only` base, which
+  Dromon cannot inspect. Second round, findings 1 and 2.
 - A Grok turn is refused when Grok loads any MCP server but Dromon's, which the
   operator's first live probe of 2026-10-27 showed it does from the user's own
   configuration, and when Grok does not list its servers. Grok's own notices for its
@@ -58,15 +61,23 @@ All notable changes are recorded here. The format follows
   every turn it refuses any drift in that `config.toml`, a policy or trust file that
   sets anything, agents, hooks, plugins, rules, skills or workflows in the home, a
   profile key such as `read_write`, and a Claude Code settings file whose
-  `defaultMode` is not `default`, since Grok reads that too. It never writes, reads or
-  copies a credential. The operator signs Grok in to the home once with
-  `GROK_HOME="$HOME/.grok/dromon-home" grok login`. A session that reports no mode
-  then rests on these checks rather than being refused. Variables that would sign
-  Grok in through another flow or send its requests elsewhere are refused.
-- Per-line `workdir_access` supports `write` and `read`. Claude Code, Codex and Grok
-  confine read-mode writes with their sandbox or permission profile, while Pi, Cursor
-  Agent and Antigravity refuse read mode. Codex replaces a kept thread when the access
-  mode changes. Capability and protocol documentation records the support matrix.
+  `defaultMode` is not `default`, since Grok reads that too. Grok runs with `HOME` set
+  to `~/.grok/dromon-home/home` and the `XDG_` home variables removed, as an
+  Antigravity line runs, so it cannot read the operator's Claude Code or Cursor files,
+  and a turn is refused when that directory holds `.claude`, `.claude.json`,
+  `.cursor`, `.agents` or `.grok`. A turn is also refused when the workspace or any
+  level up to its repository's root holds a project `.grok` with anything in it,
+  which could add servers, plugins, permission rules or sandbox profiles. It never
+  writes, reads or copies a credential. The operator signs Grok in to the home once
+  with the command in `docs/protocol/GROK.md`, which sets both `GROK_HOME` and
+  `HOME`. A session that reports no mode then rests on these checks rather than being
+  refused. Variables that would sign Grok in through another flow or send its
+  requests elsewhere are refused.
+- Per-line `workdir_access` supports `write` and `read`. Claude Code and Codex confine
+  read-mode writes with their sandbox or permission profile. Pi, Cursor Agent and
+  Antigravity refuse read mode, and Grok refuses it until a probe confirms its reader
+  profile. Codex replaces a kept thread when the access mode changes. Capability and
+  protocol documentation records the support matrix.
 - Compact `line_status` responses by default, with bounded output and explicit requests
   for diagnostic fields and long lists. List responses are bounded too. Lines with
   context compaction enabled wake at their context warning so compaction can happen

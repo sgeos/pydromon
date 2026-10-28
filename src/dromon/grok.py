@@ -21,6 +21,9 @@ Grok's home. A Grok line runs with ``GROK_HOME`` set to Dromon's own Grok home,
 sets the asking mode and declares no MCP server or hook, and its ``sandbox.toml`` when
 either is missing, and before every turn refuses any drift, any policy or trust file
 that sets something, and any agents, hooks, plugins, rules, skills or workflows there.
+Grok runs with ``HOME`` set to ``USER_HOME`` inside that home, so it cannot read the
+operator's Claude Code, Cursor or other harness files, and Dromon refuses a turn when
+that directory holds any or a Claude Code settings file there names another mode.
 The operator signs Grok in to that home once, by hand, with ``SIGN_IN``.
 
 Sandbox. Grok's custom sandbox profiles live only in ``sandbox.toml`` files, which an
@@ -65,6 +68,8 @@ from claude_agent_sdk import SdkMcpTool
 from dromon import acp, evidence
 from dromon.acp import bridge_command as bridge_command
 from dromon.activity import ActivityKind, Observer, ignore
+from dromon.capabilities import GROK as GROK_CAPABILITIES
+from dromon.capabilities import Known
 from dromon.driver import TOOL_RESULT, ActionTag, Credential, Driver, Event, Strategy
 from dromon.engine import EngineRefused, TurnReport, read_instructions
 from dromon import launcher
@@ -109,14 +114,26 @@ API_ENVIRONMENT: Final = (
 )
 """Variables that may give Grok a credential other than its cached sign-in."""
 
+HOME_VARIABLES: Final = (
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+)
+"""Variables through which Grok could find files under the operator's home directory,
+as the Antigravity adapter names them. ``HOME`` is replaced with the line's own, and the
+others are removed."""
+
 DROMON_CONTROLLED: Final = (
     "GROK_HOME",
     "GROK_SANDBOX",
     "GROK_CONFIG",
     "GROK_CONFIG_PATH",
+    *HOME_VARIABLES,
 )
-"""Variables Dromon sets or clears itself. An inherited ``GROK_HOME`` is replaced by
-Dromon's own Grok home, never honoured."""
+"""Variables Dromon sets or clears itself. An inherited ``GROK_HOME`` or ``HOME`` is
+replaced by Dromon's own, never honoured."""
 
 REFUSED_ENVIRONMENT: Final = (
     "XAI_API_BASE_URL",
@@ -135,7 +152,7 @@ COMPAT_ENVIRONMENT: Final[Mapping[str, str]] = {
     "GROK_CURSOR_HOOKS_ENABLED": "0",
 }
 """Variables Grok documents as turning off its scans of Claude Code's and Cursor's MCP
-server and hook files, which read the operator's own homes whatever ``GROK_HOME`` is.
+server and hook files, which read the home directory whatever ``GROK_HOME`` is.
 Dromon's Grok home sets the same cells to false. **Probe of 2026-10-27.** They narrow
 what Grok loads, but the servers Grok reports are checked as well. **Inference, not
 verified.** That ``0`` turns a scan off, which Grok's guide implies without giving the
@@ -186,11 +203,30 @@ HOME_DIR: Final = Path(".grok") / "dromon-home"
 home loads the operator's MCP servers and permission mode, which no flag, overlay or
 ACP field overrides, so a Grok line never reads that home."""
 
-SIGN_IN: Final = f'GROK_HOME="$HOME/{HOME_DIR.as_posix()}" grok login'
+USER_HOME: Final = "home"
+"""The directory inside Dromon's Grok home that a Grok line reads as ``HOME``, as an
+Antigravity line reads one of its own. **Operator's decision of 2026-10-27.** Grok's
+permissions guide says it reads ``defaultMode`` from ``~/.claude/settings.json`` with
+no setting to stop it, and its rules, skills and hook guides name ``~/.claude``,
+``~/.claude.json``, ``~/.cursor`` and ``~/.agents``, so a Grok line never sees the
+operator's home through ``HOME``. **Inference from Grok's authentication guide.** The
+sign-in is the file ``auth.json`` under ``GROK_HOME``, and the guide names no keychain,
+so the sign-in does not depend on ``HOME``. **Not verified.** That Grok finds the home
+directory through ``HOME`` rather than the account database."""
+
+_GROK_HOME_TEXT: Final = f"$HOME/{HOME_DIR.as_posix()}"
+
+SIGN_IN: Final = (
+    f'mkdir -p -m 700 "{_GROK_HOME_TEXT}/{USER_HOME}" &&'
+    f' GROK_HOME="{_GROK_HOME_TEXT}" HOME="{_GROK_HOME_TEXT}/{USER_HOME}" grok login'
+)
 """The command with which the operator signs Grok in to Dromon's home, once, by hand.
 ``grok login`` is the sign-in of Grok's authentication guide, and ``GROK_HOME`` is the
-variable its configuration guide documents for moving its directory. Dromon never
-writes, reads or copies the credential this stores."""
+variable its configuration guide documents for moving its directory. ``HOME`` is set as
+a turn sets it, so the sign-in reads none of the operator's other harness files and
+keeps anything it may write under ``HOME`` where a turn finds it. ``GROK_HOME`` comes
+first, so both expand the operator's ``HOME`` in any POSIX shell. Dromon never writes,
+reads or copies the credential this stores."""
 
 HOME_CONFIG: Final = (
     "# Dromon's Grok home. Dromon wrote this file and refuses a Grok turn when it\n"
@@ -240,6 +276,22 @@ REFUSED_HOME_ENTRIES: Final = (
 servers, rules, skills or workflows it was not given, as Grok's guide lists them. A
 file is refused when present, a directory when it holds anything, since Grok may
 create an empty one."""
+
+USER_HOME_HARNESS_ENTRIES: Final = (
+    ".agents",
+    ".claude",
+    ".claude.json",
+    ".cursor",
+    ".grok",
+)
+"""Entries of the line's ``HOME`` through which Grok's guide says it loads another
+harness's settings, permission mode, MCP servers, hooks, rules or skills, or its own
+home when ``GROK_HOME`` is unset. Refused as ``REFUSED_HOME_ENTRIES`` are, after
+``claude_mode_refusal`` has read the Claude Code settings there."""
+
+PROJECT_DIRECTORY: Final = ".grok"
+"""A project's own Grok directory, refused at every project level by
+``check_project``."""
 
 MAX_HOME_FILE: Final = 1024 * 1024
 """The largest home or settings file Dromon reads."""
@@ -296,31 +348,37 @@ def _write_new(file: Path, text: str) -> None:
         handle.write(text)
 
 
-def prepare_home(grok_home: Path, workspace: Path, protected: Sequence[Path]) -> None:
-    """Create Dromon's Grok home, owner-only, and write its ``config.toml`` and its
-    ``sandbox.toml`` when either is missing. An existing file is never replaced, so
-    drift is refused by ``check_home`` and ``check_profile`` rather than repaired.
-    Nothing here writes, reads or copies a credential.
-
-    Porting note. ``O_NOFOLLOW`` and the mode bits are POSIX, as Grok's sandbox is."""
-    if grok_home.is_symlink():
+def _own_directory(directory: Path, label: str) -> None:
+    """Create ``directory`` owner-only if missing, and refuse a link, a file, or one
+    other users may write."""
+    if directory.is_symlink():
         raise EngineRefused(
-            f"Dromon's Grok home {grok_home} is a symbolic link, which Grok's sandbox"
-            " refuses and Dromon does not follow"
+            f"{label} {directory} is a symbolic link, which Grok's sandbox refuses and"
+            " Dromon does not follow"
         )
     try:
-        grok_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     except OSError as error:
+        raise EngineRefused(f"cannot create {label} {directory}: {error}") from error
+    if not directory.is_dir():
+        raise EngineRefused(f"{label} {directory} is not a directory")
+    if directory.stat().st_mode & 0o022:
         raise EngineRefused(
-            f"cannot create Dromon's Grok home {grok_home}: {error}"
-        ) from error
-    if not grok_home.is_dir():
-        raise EngineRefused(f"Dromon's Grok home {grok_home} is not a directory")
-    if grok_home.stat().st_mode & 0o022:
-        raise EngineRefused(
-            f"Dromon's Grok home {grok_home} may be written by other users. Make it"
-            " owner-only, as Grok's guide asks of a home that holds a sign-in."
+            f"{label} {directory} may be written by other users. Make it owner-only,"
+            " as Grok's guide asks of a home that holds a sign-in."
         )
+
+
+def prepare_home(grok_home: Path, workspace: Path, protected: Sequence[Path]) -> None:
+    """Create Dromon's Grok home and the line's ``HOME`` inside it, owner-only, and
+    write the Grok home's ``config.toml`` and ``sandbox.toml`` when either is missing.
+    An existing file is never replaced, so drift is refused by ``check_home``,
+    ``check_user_home`` and ``check_profile`` rather than repaired. Nothing here
+    writes, reads or copies a credential.
+
+    Porting note. ``O_NOFOLLOW`` and the mode bits are POSIX, as Grok's sandbox is."""
+    _own_directory(grok_home, "Dromon's Grok home")
+    _own_directory(grok_home / USER_HOME, "a Grok line's home directory")
     _write_new(grok_home / "config.toml", HOME_CONFIG)
     _write_new(
         grok_home / "sandbox.toml",
@@ -357,14 +415,7 @@ def check_home(grok_home: Path, system: Path = SYSTEM_POLICY_DIR) -> None:
             f"{grok_home / TRUST_FILE} trusts a folder, which would let a project's"
             " hooks, MCP servers and permission rules load for a Grok line"
         )
-    found: list[str] = []
-    for name in REFUSED_HOME_ENTRIES:
-        entry = grok_home / name
-        if entry.is_dir() and not entry.is_symlink():
-            if any(True for _ in entry.iterdir()):
-                found.append(name)
-        elif os.path.lexists(entry):
-            found.append(name)
+    found = _loading_entries(grok_home, REFUSED_HOME_ENTRIES)
     if found:
         raise EngineRefused(
             f"Dromon's Grok home {grok_home} holds " + ", ".join(found) + ", which"
@@ -373,26 +424,78 @@ def check_home(grok_home: Path, system: Path = SYSTEM_POLICY_DIR) -> None:
         )
 
 
+def check_user_home(user_home: Path) -> None:
+    """Refuse the line's ``HOME`` when it holds another harness's files, which Grok
+    would load. Run after ``claude_mode_refusal``, which names a mode there first."""
+    found = _loading_entries(user_home, USER_HOME_HARNESS_ENTRIES)
+    if found:
+        raise EngineRefused(
+            f"a Grok line's home directory {user_home} holds " + ", ".join(found) + ","
+            " from which Grok would load another harness's settings, servers, hooks,"
+            " rules or skills"
+        )
+
+
+def _loading_entries(directory: Path, names: Sequence[str]) -> list[str]:
+    """Which of ``names`` in ``directory`` are a file or link, or a directory that
+    holds anything. An empty directory is allowed, since Grok may create one."""
+    found: list[str] = []
+    for name in names:
+        entry = directory / name
+        if entry.is_dir() and not entry.is_symlink():
+            if any(True for _ in entry.iterdir()):
+                found.append(name)
+        elif os.path.lexists(entry):
+            found.append(name)
+    return found
+
+
 def _claude_settings_files(home: Path, workspace: Path) -> list[Path]:
     """The Claude Code settings files Grok's guide says it reads a mode from, the
-    user's, the managed ones, and each project level from the workspace up to its
-    repository's root, or the workspace alone outside a repository."""
+    user's under ``home``, the managed ones, and each project level from the workspace
+    up to its repository's root, or the workspace alone outside a repository. ``home``
+    is the ``HOME`` Grok runs with, the line's own, not the operator's."""
     files = [
         home / ".claude" / "settings.json",
         home / ".claude" / "settings.local.json",
         *CLAUDE_MANAGED_SETTINGS,
     ]
+    for directory in _project_levels(workspace):
+        files.append(directory / ".claude" / "settings.json")
+        files.append(directory / ".claude" / "settings.local.json")
+    return files
+
+
+def _project_levels(workspace: Path) -> list[Path]:
+    """Each directory from the workspace up to its repository's root, or the
+    workspace alone outside a repository, as Grok's guides say it reads project
+    files. The walk is bounded by the depth of the path."""
     levels: list[Path] = []
     for directory in (workspace, *workspace.parents):
         levels.append(directory)
         if os.path.lexists(directory / ".git"):
-            break
-    else:
-        levels = [workspace]
-    for directory in levels:
-        files.append(directory / ".claude" / "settings.json")
-        files.append(directory / ".claude" / "settings.local.json")
-    return files
+            return levels
+    return [workspace]
+
+
+def check_project(workspace: Path) -> None:
+    """Refuse a turn when any project level holds a ``.grok`` file, or a ``.grok``
+    directory with anything in it. **Review of read-only seats, second round, finding
+    3.** Grok's configuration guide says a project's ``.grok/config.toml`` adds MCP
+    servers, plugins and permission rules, and its other guides read a project's
+    ``.grok`` for hooks, rules, skills and a sandbox file, which a worktree could
+    supply. Dromon refuses them whole rather than read them, as the Antigravity
+    adapter refuses its workspace directories."""
+    found = [
+        str(directory / PROJECT_DIRECTORY)
+        for directory in _project_levels(workspace)
+        if _loading_entries(directory, (PROJECT_DIRECTORY,))
+    ]
+    if found:
+        raise EngineRefused(
+            "Grok would load project configuration Dromon has not read from "
+            + ", ".join(found)
+        )
 
 
 def claude_mode_refusal(home: Path, workspace: Path) -> str | None:
@@ -454,7 +557,21 @@ ABSOLUTE_TURN_SECONDS: Final = 4 * 60 * 60
 
 
 def unsupported(config: LineConfig) -> str | None:
-    """Why a Grok line cannot run ``config``, or ``None`` if it can."""
+    """Why a Grok line cannot run ``config``, or ``None`` if it can.
+
+    **Review of read-only seats, second round, findings 1 and 2.** A read-only working
+    directory is refused until a live probe shows the ``dromon-reader`` profile deny a
+    write to the worktree and ``capabilities.GROK`` records ``read_only_workdir`` as
+    known. The profile rests on Grok's built-in ``read-only`` base, which Dromon names
+    but cannot inspect."""
+    if (
+        config.workdir_access is WorkdirAccess.READ
+        and GROK_CAPABILITIES.read_only_workdir is not Known.YES
+    ):
+        return (
+            "Grok cannot yet confine a line to a read-only working directory, because"
+            " no live probe has shown its read-only sandbox base deny a write there"
+        )
     extra = sorted(set(config.builtin_tools) - SUPPORTED_BUILTINS)
     if extra:
         return (
@@ -595,9 +712,13 @@ def check_profile(
     every ``protected`` directory and, for a writer, keeps ``.git`` read-only. Raises
     ``EngineRefused`` naming the table to add when it does not.
 
-    The profile is read from Dromon's Grok home alone. Grok uses the user's definition
-    when the user's and the project's files differ, so a project's file cannot replace
-    it. ``home`` resolves a ``~`` in a ``deny`` entry. **Inference, not verified.**
+    The profile is read from Dromon's Grok home alone. A project's ``.grok``, where a
+    project's ``sandbox.toml`` would live, is refused by ``check_project``, so no
+    project file can replace it. The reader's ``extends`` names Grok's built-in
+    ``read-only`` base, whose denial of writes Dromon cannot inspect, which is why a
+    read-only working directory is refused by ``unsupported``. ``home`` resolves a
+    ``~`` in a ``deny`` entry, and is the line's own ``HOME``, at which Grok's sandbox
+    guide anchors ``~``. **Inference, not verified.**
     That Grok reads ``sandbox.toml`` from ``GROK_HOME``, as it does ``config.toml``.
     """
     name = profile_name(config)
@@ -806,14 +927,18 @@ class GrokLine:
         if reason is not None:
             raise EngineRefused(reason)
         grok_home = self._home / HOME_DIR
+        user_home = grok_home / USER_HOME
         prepare_home(grok_home, self.cwd, self.protected)
         check_home(grok_home)
-        claude_mode = claude_mode_refusal(self._home, self.cwd)
+        claude_mode = claude_mode_refusal(user_home, self.cwd)
         if claude_mode is not None:
             raise EngineRefused(claude_mode)
+        check_user_home(user_home)
+        check_project(self.cwd)
         environment["GROK_HOME"] = str(grok_home)
+        environment["HOME"] = str(user_home)
         environment["GROK_SANDBOX"] = check_profile(
-            self.config, self.cwd, self.protected, self._home, grok_home
+            self.config, self.cwd, self.protected, user_home, grok_home
         )
         effort = self.config.effort or self.driver.settings.effort
         if effort not in EFFORTS:

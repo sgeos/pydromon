@@ -283,7 +283,9 @@ built-in tool asks before it runs in the ``default`` mode is not documented, so
 subscription is an inference, so ``credential_visible`` is unknown. The adapter
 selects the ``dromon-reader`` profile for a read-only workdir, but no live run has shown
 that profile deny a write to the worktree, so ``read_only_workdir`` is unknown. **Review
-of read-only seats, finding 3.**"""
+of read-only seats, finding 3.** The adapter refuses a read-only working directory while
+this is not ``YES``, so a probe that confirms the profile lifts the refusal here.
+**Second round, findings 1 and 2.**"""
 
 ANTIGRAVITY: Final = EngineTable(
     engine="antigravity",
