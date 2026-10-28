@@ -118,6 +118,15 @@ next call.
   and forwards the last two to the agent socket. It reads the token from
   `DROMON_AGENT_TOKEN`, never from its arguments, which other processes can read. It
   holds no authority of its own.
+- **`dromon agent send --agent NAME --to PARTY BODY`.** Sends one note as the agent,
+  for a service that is not an MCP client, such as one that tells a line when its turn
+  in an external task has come. It calls the agent's `send_message` tool through the
+  agent socket, so it is authenticated and limited exactly as a call through `dromon
+  mcp` is, and it reads the token from `DROMON_AGENT_TOKEN` in the same way. It prints
+  the tool's text, `sent as` and the message identifier, and exits 0, or prints the
+  refusal and exits 1, or exits 4 when no daemon lets agents connect. A service should
+  use this command or `dromon mcp` rather than the socket's framing, which may change
+  with the daemon. **Added on 2026-10-28.**
 
 ## Trust
 
@@ -136,8 +145,46 @@ line acknowledged it rather than doing what it asked, which a line may, since an
 has no operator authority. Directed by an operator, the line sent a reply that reached
 the agent's mailbox.
 
+## Work paced by an external agent
+
+An external agent may pace a line's work, as a game table served over MCP does when it
+sends each line a note when the line is to act. **Fact, shown by a test on
+2026-10-28.** Such a note wakes an idle line for exactly one turn, and that turn counts
+as autonomous, as a line's own notes do, so a long task paced by an agent reaches
+`max_autonomous_turns` and holds the line unless an operator writes to it.
+
+- **Raise the limits in a profile.** Raising `max_autonomous_turns` and `max_cost_usd`
+  in the profile of the lines an agent paces is the intended practice. The agent's own
+  bound on the task, such as the number of rounds a game table plays, is the backstop,
+  and the cost limit still holds a line whose turns cost more than the task should.
+- **Wake on every tick, with a short tick.** A profile for such lines should set `wake`
+  `every_ticks` to 1, and the project's `tick_seconds` should be short, such as the
+  default of 1 second, so that a line acts soon after the agent's note.
+- **No private channel between lines.** A profile's `recipients`, as
+  [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies, may list only the agent, so that the
+  lines it seats cannot message each other.
+- **Words.** A seat is a line's place in a role, as `docs/architecture/ROLES.md`
+  defines it. A place an external agent gives a line, such as a seat at a game table, is
+  called a player, so the two are not confused.
+
+A sketch of such a profile, with the agent registered as `table`.
+
+```toml
+[profiles.player]
+model = "claude-haiku-5-5"
+recipients = ["&table"]
+
+[profiles.player.limits]
+max_autonomous_turns = 200
+max_cost_usd = 20.0
+
+[profiles.player.wake]
+every_ticks = 1
+```
+
 ## Not yet specified
 
 - Pushed notifications to an agent, which polls its mailbox.
 - Agents reaching the daemon from another machine.
-- A per-agent allowlist of lines it may message.
+- A per-agent allowlist of lines it may message. A line's own `recipients` limits the
+  other direction.

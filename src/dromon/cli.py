@@ -901,6 +901,8 @@ def _agent(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     """Register, list or revoke external agents, through the daemon."""
     action: str = arguments.action
     name: str | None = arguments.name
+    if action == "send":
+        return _agent_send(paths, arguments)
     if action != "list" and name is None:
         print(f"dromon agent {action}: name the agent", file=sys.stderr)
         return exits.USAGE
@@ -952,6 +954,62 @@ def _agent(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         "env": {TOKEN_ENV: result["token"]},
     }
     print(json.dumps({"mcpServers": {"dromon": server}}, indent=2))
+    return exits.OK
+
+
+AGENT_SEND_TIMEOUT_SECONDS: Final = 60.0
+"""How long ``dromon agent send`` waits for the daemon, as ``dromon mcp`` does."""
+
+
+def _agent_send(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Send one note as an external agent, through the agent socket, for a service
+    that is not an MCP client. The note goes through the agent's ``send_message``
+    tool, so the daemon authenticates the agent and applies its access as it does for
+    ``dromon mcp``. The token is read from ``DROMON_AGENT_TOKEN``, never from an
+    argument, which other processes could read."""
+    agent: str | None = arguments.agent
+    to: str | None = arguments.to
+    body: str | None = arguments.name
+    if agent is None or to is None or body is None:
+        print(
+            "dromon agent send: give --agent NAME, --to PARTY and the body",
+            file=sys.stderr,
+        )
+        return exits.USAGE
+    args: dict[str, object] = {
+        "agent": agent,
+        "tool": "send_message",
+        "arguments": {"to": to, "body": body},
+    }
+    token = os.environ.get(TOKEN_ENV) or None
+    if token is not None:
+        args["token"] = token
+    try:
+        response = call(
+            paths.agent_socket, Operation.AGENT_CALL, AGENT_SEND_TIMEOUT_SECONDS, args
+        )
+    except DaemonNotRunning:
+        print(
+            f"dromon agent send: no daemon for {paths.root} lets agents connect",
+            file=sys.stderr,
+        )
+        return exits.NOT_RUNNING
+    except (ProtocolError, TimeoutError, OSError) as error:
+        print(f"dromon agent send: {error}", file=sys.stderr)
+        return exits.FAILURE
+    if not response.ok or response.result is None:
+        print(f"dromon agent send: {response.error_message}", file=sys.stderr)
+        return exits.FAILURE
+    result = response.result
+    texts = [
+        str(item.get("text", ""))
+        for item in cast(list[dict[str, object]], result.get("content", []))
+    ]
+    if result.get("is_error"):
+        print(f"dromon agent send: {' '.join(texts)}", file=sys.stderr)
+        return exits.FAILURE
+    for text in texts:
+        print(text)
     return exits.OK
 
 
@@ -1869,9 +1927,20 @@ def build_parser() -> argparse.ArgumentParser:
                 " change the strategy",
             )
         if name == "agent":
-            command.add_argument("action", choices=["add", "list", "revoke"])
+            command.add_argument("action", choices=["add", "list", "revoke", "send"])
             command.add_argument(
-                "name", nargs="?", help="the agent, for add and revoke"
+                "name",
+                nargs="?",
+                metavar="NAME_OR_BODY",
+                help="the agent, for add and revoke, or the note's body, for send",
+            )
+            command.add_argument(
+                "--agent",
+                help="for send, the agent that sends. Its token is read from"
+                " DROMON_AGENT_TOKEN",
+            )
+            command.add_argument(
+                "--to", help="for send, the party the note is for, such as a line"
             )
             command.add_argument(
                 "--access",

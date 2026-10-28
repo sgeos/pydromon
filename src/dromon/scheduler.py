@@ -1626,6 +1626,8 @@ class Scheduler:
         harness sends only ordinary notes to this daemon's own parties."""
         if isinstance(sender, HarnessAddress):
             return self._harness_note(recipient, body)
+        if isinstance(sender, LineAddress):
+            self.check_recipient(sender.line_id, recipient)
         if isinstance(recipient, RemoteAddress):
             check_outbound(
                 self._log.state,
@@ -1800,6 +1802,22 @@ class Scheduler:
             return
         self._sent.append(note_id)
         self._work.set()
+
+    def check_recipient(self, line_id: str, recipient: Address) -> None:
+        """Refuse mail from ``line_id`` to a party its configuration's ``recipients``
+        does not list, by raising ``EventRejected``. Without the key every party is
+        allowed. A line's note to itself always is, since it opens no channel, so a
+        line limited to an external agent still schedules its own wakes."""
+        if line_id not in self._log.state.lines or recipient == LineAddress(line_id):
+            return
+        allowed = self.effective_config(line_id).recipients
+        if allowed is None or str(recipient) in allowed:
+            return
+        listed = ", ".join(allowed) if allowed else "itself"
+        raise EventRejected(
+            f"line {line_id} may send mail only to {listed}, by its configuration's"
+            f" recipients, so not to {recipient}"
+        )
 
     def check_priority(self, sender: Address, recipient: Address) -> None:
         """Refuse priority mail that is not to a line, that a line sends itself, that

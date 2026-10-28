@@ -50,6 +50,35 @@ def test_the_encoding_is_canonical_and_versioned() -> None:
     )
 
 
+def test_recipients_are_canonical_distinct_sorted_and_round_trip() -> None:
+    config = config_from_document(
+        {"recipients": ["&table", "@ana", "beta", "&table", "kaizen:@bo"]}
+    )
+    assert config.recipients == tuple(sorted({"&table", "@ana", "beta", "kaizen:@bo"}))
+    assert decode_config(encode_config(config)) == config
+    # An empty list is kept, and differs from no list, which allows every party.
+    empty = config_from_document({"recipients": []})
+    assert empty.recipients == ()
+    assert decode_config(encode_config(empty)).recipients == ()
+    assert DEFAULT_CONFIG.recipients is None
+    assert "recipients" not in json.loads(encode_config(DEFAULT_CONFIG))
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("&table", "recipients is not an array"),
+        (["!dromon"], "reserved to the harness"),
+        (["@"], "is not an address"),
+        ([""], "recipients must be text"),
+        ([3], "recipients must be text"),
+    ],
+)
+def test_bad_recipients_are_refused(value: object, message: str) -> None:
+    with pytest.raises(ConfigError, match=message):
+        config_from_document({"recipients": value})
+
+
 def test_the_default_allows_only_dromon_tools() -> None:
     assert DEFAULT_CONFIG.tool_policy is ToolPolicy.ALLOWLIST
     assert DEFAULT_CONFIG.allows("mcp__dromon__send_message", OWN)

@@ -21,6 +21,7 @@ from dromon import cli, client, exits
 from dromon.agents import (
     DAEMON_TOOLS,
     MAIL_TOOLS,
+    TOKEN_ENV,
     AgentError,
     AgentPolicy,
     parse_policy,
@@ -610,6 +611,92 @@ def test_dromon_agent_needs_a_name_for_add_and_revoke(
     assert cli.main([*argv, "agent", "list"]) == exits.NOT_RUNNING
 
 
+def through_agent_socket(
+    daemon: Daemon, monkeypatch: pytest.MonkeyPatch
+) -> list[tuple[Path, Operation, dict[str, object]]]:
+    """Answer the client's calls with ``daemon``'s agent socket handling, without a
+    socket, and record each call."""
+    calls: list[tuple[Path, Operation, dict[str, object]]] = []
+
+    def answer(
+        socket_path: Path,
+        operation: Operation,
+        timeout_seconds: float = 0.0,
+        args: dict[str, object] | None = None,
+    ) -> Response:
+        given = dict(args or {})
+        calls.append((socket_path, operation, given))
+        return asyncio.run(daemon.respond_agent(agent_line(operation.value, given)))
+
+    monkeypatch.setattr(cli, "call", answer)
+    return calls
+
+
+def test_dromon_agent_send_sends_one_note_as_the_agent(
+    tmp_path: Path,
+    short_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    argv = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime)]
+    with daemon_for(
+        tmp_path,
+        short_runtime,
+        AgentPolicy(True, AgentAccess.NONE, AgentAccess.MESSAGE),
+    ) as daemon:
+        token = register(daemon, "table", AgentAccess.MESSAGE)
+        calls = through_agent_socket(daemon, monkeypatch)
+        monkeypatch.setenv(TOKEN_ENV, token)
+        send = ["agent", "send", "--agent", "table", "--to", "alpha", "your move"]
+        assert cli.main([*argv, *send]) == exits.OK
+        sent = daemon.log.state.messages
+        assert [(m.sender, m.recipient, m.kind, m.body) for m in sent.values()] == [
+            (AgentAddress("table"), LineAddress("alpha"), MessageKind.NOTE, "your move")
+        ]
+        assert capsys.readouterr().out == f"sent as {next(iter(sent))}\n"
+        # The command goes to the agent socket, and the token never to an argument.
+        [(socket_path, operation, args)] = calls
+        assert socket_path == daemon.paths.agent_socket
+        assert operation is Operation.AGENT_CALL
+        assert token not in send and args["token"] == token
+
+
+def test_dromon_agent_send_reports_a_refusal_and_needs_its_arguments(
+    tmp_path: Path,
+    short_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    argv = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime)]
+    for partial in (
+        ["--to", "alpha", "body"],
+        ["--agent", "table", "body"],
+        ["--agent", "table", "--to", "alpha"],
+    ):
+        assert cli.main([*argv, "agent", "send", *partial]) == exits.USAGE
+        assert "give --agent NAME, --to PARTY and the body" in capsys.readouterr().err
+    monkeypatch.delenv(TOKEN_ENV, raising=False)
+    send = ["agent", "send", "--agent", "table", "--to", "alpha", "hello"]
+    assert cli.main([*argv, *send]) == exits.NOT_RUNNING
+    assert "lets agents connect" in capsys.readouterr().err
+    with daemon_for(
+        tmp_path,
+        short_runtime,
+        AgentPolicy(True, AgentAccess.NONE, AgentAccess.MESSAGE),
+    ) as daemon:
+        token = register(daemon, "table", AgentAccess.MESSAGE)
+        through_agent_socket(daemon, monkeypatch)
+        # Without its token a registered agent is refused by the daemon.
+        assert cli.main([*argv, *send]) == exits.FAILURE
+        assert "needs its token" in capsys.readouterr().err
+        # A refusal by the tool is a failure, and sends nothing.
+        monkeypatch.setenv(TOKEN_ENV, token)
+        nowhere = ["agent", "send", "--agent", "table", "--to", "omega", "hello"]
+        assert cli.main([*argv, *nowhere]) == exits.FAILURE
+        assert "omega" in capsys.readouterr().err
+        assert daemon.log.state.messages == {}
+
+
 # Through the real daemon and its sockets.
 
 
@@ -685,6 +772,29 @@ def test_an_agent_reaches_the_daemon_through_its_private_socket(
     finally:
         stop_daemon(paths, pid)
     assert not paths.agent_socket.exists()
+
+
+@pytest.mark.socket
+def test_dromon_agent_send_reaches_a_line_through_the_agent_socket(
+    tmp_path: Path,
+    short_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths, pid = start_daemon(
+        tmp_path,
+        short_runtime,
+        '[agents]\nlisten = true\nanonymous = "message"\n'
+        '[lines.alpha]\nmodel = "claude-haiku-5-5"\n',
+    )
+    monkeypatch.delenv(TOKEN_ENV, raising=False)
+    argv = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime)]
+    try:
+        send = ["agent", "send", "--agent", "table", "--to", "alpha", "your move"]
+        assert cli.main([*argv, *send]) == exits.OK
+        assert capsys.readouterr().out.startswith("sent as m-")
+    finally:
+        stop_daemon(paths, pid)
 
 
 @pytest.mark.live

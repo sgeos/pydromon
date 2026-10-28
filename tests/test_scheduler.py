@@ -21,6 +21,9 @@ from dromon.eventlog import EventLog, read_entries
 from dromon.lineconfig import ConfigError, LineConfig, ToolPolicy, encode_config
 from dromon.overrides import OverrideError
 from dromon.model import (
+    AgentAccess,
+    AgentAddress,
+    AgentRegistered,
     EventRejected,
     LineAddress,
     LineOverridden,
@@ -227,6 +230,76 @@ def test_a_message_wakes_an_idle_line_and_is_delivered(make_world: MakeWorld) ->
     assert f"  {message_id} from @ana, note, unread" in prompt
     assert "hello" not in prompt
     assert received(target, prompt) == [("@ana", "hello")]
+
+
+def test_a_registered_agents_note_wakes_an_idle_line_for_exactly_one_turn(
+    make_world: MakeWorld,
+) -> None:
+    # An external service, such as a game table, tells a line its turn has come
+    # through the same send_message tool the agent socket serves.
+    target = make_world({"alpha": [[], [], []]})
+    table = AgentAddress("table")
+    target.log.append(AgentRegistered(table.agent_id, AgentAccess.MESSAGE, ""))
+    assert target.log.state.lines["alpha"].state is LineState.IDLE
+
+    async def act() -> None:
+        result = await call_tool(
+            target.scheduler.send_tool(table), {"to": "alpha", "body": "your move"}
+        )
+        assert result.get("is_error") is not True
+
+    run(target, act)
+    sent = [e for e in target.events() if isinstance(e, MessageSent)]
+    assert [(m.sender, m.recipient) for m in sent] == [(table, LineAddress("alpha"))]
+    assert [w.message_id for w in wakes_for(target, "alpha")] == [sent[0].message_id]
+    prompts = target.engines["alpha"].prompts
+    assert len(prompts) == 1
+    assert received(target, prompts[0]) == [("&table", "your move")]
+    assert target.log.state.lines["alpha"].state is LineState.IDLE
+    assert target.log.state.messages[sent[0].message_id].delivered
+    turns = target.scheduler.line_status("alpha")["autonomous_turns"]
+    assert isinstance(turns, dict)
+    assert (turns["allowed"], turns["used"]) == (
+        DEFAULT_LIMITS.max_autonomous_turns,
+        1,
+    )
+
+
+def test_a_line_sends_only_to_its_recipients_and_itself(
+    make_world: MakeWorld,
+) -> None:
+    # A player at a game table may answer the table but has no private channel to
+    # another player, or to an operator.
+    turn: Turn = [
+        {"to": "&table", "body": "I pass"},
+        {"to": "beta", "body": "psst"},
+        {"to": "@ana", "body": "hello"},
+        {"to": "alpha", "body": "a note to myself"},
+    ]
+    target = make_world({"beta": [], "alpha": [turn]})
+    table = AgentAddress("table")
+    target.log.append(AgentRegistered(table.agent_id, AgentAccess.MESSAGE, ""))
+    target.scheduler.configure_line("alpha", LineConfig(recipients=(str(table),)))
+
+    async def act() -> None:
+        await call_tool(
+            target.scheduler.send_tool(table), {"to": "alpha", "body": "your move"}
+        )
+
+    run(target, act)
+    results = target.engines["alpha"].results
+    assert [r.get("is_error") is True for r in results] == [False, True, True, False]
+    refusal = results[1]["content"][0]["text"]
+    assert refusal == (
+        "line alpha may send mail only to &table, by its configuration's recipients,"
+        " so not to beta"
+    )
+    sent = [
+        (m.recipient, m.body)
+        for m in target.events()
+        if isinstance(m, MessageSent) and m.sender == LineAddress("alpha")
+    ]
+    assert sent == [(table, "I pass"), (LineAddress("alpha"), "a note to myself")]
 
 
 def test_two_lines_exchange_messages_and_each_recipient_is_woken(

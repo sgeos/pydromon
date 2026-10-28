@@ -39,6 +39,16 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- `dromon agent send --agent NAME --to PARTY BODY` sends one note as a registered
+  external agent through the agent socket, with the token from `DROMON_AGENT_TOKEN`, so
+  a service that is not an MCP client can tell a line that its turn has come. A test
+  shows that such a note wakes an idle line for exactly one turn, which counts as
+  autonomous.
+- A line's configuration may list its `recipients`, the parties it may send mail to,
+  enforced by the daemon. Without the key every party is allowed, as before. A line may
+  always send itself a note, and its questions to an operator are not limited, so an
+  operator can seat several lines at an external task with no private channel between
+  them.
 - The design of federation between Dromon daemons, `docs/architecture/FEDERATION.md`,
   approved by the operator on 2026-10-28. A line or an operator in one project can
   message and wake a party in another, addressed as `keleusma:kaizen`, with the peer

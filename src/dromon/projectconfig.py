@@ -134,6 +134,7 @@ TOOL_KEYS: Final = frozenset(
         "allow_compact",
         "auto_compact_tokens",
         "context_handoff",
+        "recipients",
     }
 )
 LAYERED_KEYS: Final = frozenset({"sandbox", "settings"})
