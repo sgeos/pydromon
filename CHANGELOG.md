@@ -58,6 +58,12 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Claude Code turns that start after a background task ends now run under the
+  scheduler's normal admission, tool checks, autonomous-turn count and cost hold. A
+  self-start that cannot be admitted stays interrupted and its task note wakes a later
+  turn. Task ends reported during a turn and ends of tasks the line stopped are
+  recorded without creating another wake.
+
 - Dromon's own Grok home. A Grok line runs with `GROK_HOME` at `~/.grok/dromon-home`,
   never the operator's Grok home, whose MCP servers and permission mode the first
   live probe showed Grok loads. Dromon writes the home's `config.toml`, which sets

@@ -478,14 +478,25 @@ def _wrap_tls(
 
 def _self_signed_certificate(private_key: Ed25519PrivateKey) -> x509.Certificate:
     now = datetime.now(UTC)
+    public_key = private_key.public_key()
+    public_key_der = public_key.public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    subject_pin = hashlib.sha256(public_key_der).hexdigest()
     subject = x509.Name(
-        [x509.NameAttribute(NameOID.COMMON_NAME, "Dromon federation peer")]
+        [
+            x509.NameAttribute(
+                NameOID.COMMON_NAME,
+                f"Dromon federation peer {subject_pin}",
+            )
+        ]
     )
     return (
         x509.CertificateBuilder()
         .subject_name(subject)
         .issuer_name(subject)
-        .public_key(private_key.public_key())
+        .public_key(public_key)
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - timedelta(minutes=5))
         .not_valid_after(now + timedelta(days=CERTIFICATE_VALIDITY_DAYS))

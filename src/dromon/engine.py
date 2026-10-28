@@ -1026,7 +1026,7 @@ MAX_COMMAND_CHARACTERS: Final = 200
 
 @dataclass(frozen=True, slots=True)
 class BackgroundEnd:
-    """A background task the engine reported finished between turns."""
+    """A background task the engine reported finished."""
 
     task_id: str
     command: str
@@ -1037,11 +1037,16 @@ class BackgroundEnd:
     output_file: str | None = None
     """The file the engine wrote the task's output to, as it named it."""
     self_started: bool = False
-    """Whether the end also made the engine begin a turn by itself, which Dromon
-    interrupted, so one note can say both."""
+    """Whether the end also made the engine begin a turn by itself."""
     output: str | None = None
     """The task's output as the engine reported it inline, where it does, as Codex
     does for a completed command execution."""
+    self_started_admitted: bool = False
+    """Whether Dromon admitted that engine-started turn."""
+    during_turn: bool = False
+    """Whether the engine reported the end while a Dromon turn was running."""
+    stopped_by_line: bool = False
+    """Whether the line asked the engine to stop this task."""
 
 
 SELF_START_GRACE_SECONDS: Final = 2.0
@@ -1316,6 +1321,20 @@ type SpentBetween = Callable[[str, float | None, Mapping[str, int] | None], obje
 """Where an engine reports what a turn outside Dromon's own cost: its kind, its cost
 and its tokens, where the engine reports them."""
 
+type SelfStartedFinish = Callable[[TurnReport | None, Exception | None], object]
+"""Where a Dromon scheduler settles a turn the engine began after a task ended."""
+
+type BeginSelfStarted = Callable[[tuple[BackgroundEnd, ...]], SelfStartedFinish | None]
+"""Whether the scheduler can admit an engine-started turn, and how it is settled."""
+
+
+def refuse_self_started(
+    ends: tuple[BackgroundEnd, ...],
+) -> SelfStartedFinish | None:
+    """The default. Engines without a scheduler keep refusing their own turns."""
+    del ends
+    return None
+
 
 def ignore_spent(
     kind: str, cost: float | None, usage: Mapping[str, int] | None
@@ -1375,6 +1394,12 @@ class _Connection:
     pump: "asyncio.Task[None] | None" = None
     watch: "asyncio.Task[None] | None" = None
     inbox: "asyncio.Queue[Message | None] | None" = None
+    capabilities: "Capabilities | None" = None
+    """The engine state checked on its last ordinary Dromon turn."""
+    self_started_turn: "_Turn | None" = None
+    """A turn the kept engine began after a task ended, admitted by Dromon."""
+    self_started_finish: SelfStartedFinish | None = None
+    """Where Dromon records the outcome of its admitted self-started turn."""
     tasks: dict[str, str] = field(default_factory=dict[str, str])
     """Running background tasks, by identifier, with their commands."""
     commands: dict[str, str] = field(default_factory=dict[str, str])
@@ -1843,6 +1868,7 @@ class ClaudeCodeLine:
         clock: Callable[[], float] = time.monotonic,
         poll_seconds: float = KEEP_POLL_SECONDS,
         task_ended: Callable[[BackgroundEnd], object] = ignore_end,
+        begin_self_started: BeginSelfStarted = refuse_self_started,
         cost_mark: CostMark | None = None,
         compacted: Callable[
             [Mapping[str, int | str | None]], object
@@ -1875,6 +1901,7 @@ class ClaudeCodeLine:
         """The process mark every process of this line inherits, if issued."""
         self._kept_factory = kept_factory
         self._task_ended = task_ended
+        self._begin_self_started_callback = begin_self_started
         self._compacted = compacted
         """Called the moment the engine reports a compaction of the session."""
         self.cost_mark = cost_mark
@@ -2634,10 +2661,27 @@ class ClaudeCodeLine:
             return False
         return True
 
+    async def interrupt_self_started(self) -> None:
+        """Interrupt a task-triggered turn that Dromon had admitted, then discard
+        its tail while still accounting for any cost the result reports."""
+        connection = self._kept
+        if connection is None or connection.self_started_turn is None:
+            return
+        connection.self_started_turn = None
+        connection.self_started_finish = None
+        self._turn = None
+        connection.draining = True
+        connection.drained = INTERRUPTED_KIND
+        connection.last_end = self._clock()
+        self._ceiling_of(connection).turn_ended()
+        if not await self._interrupt(connection):
+            await self.close("Dromon could not interrupt its self-started turn")
+
     async def _pump(self, connection: _Connection) -> None:
         """Read every message of the connection. During a turn each goes to the
-        turn. Between turns a background task's report is tracked, and the start of
-        a turn the engine began by itself is interrupted and noted."""
+        turn. Between turns a background task's report is tracked. A turn the engine
+        starts after a task end is admitted only when the scheduler can account for
+        it as an ordinary turn; other self-starts are interrupted and noted."""
         try:
             async for message in connection.session.receive_messages():
                 self._track(connection, message)
@@ -2646,6 +2690,19 @@ class ClaudeCodeLine:
                     inbox.put_nowait(message)
                     if isinstance(message, ResultMessage):
                         connection.inbox = None
+                    continue
+                if connection.self_started_turn is not None:
+                    if isinstance(message, ResultMessage):
+                        await self._finish_self_started(connection, message, None)
+                    else:
+                        try:
+                            await self._handle(
+                                connection.session,
+                                message,
+                                connection.self_started_turn,
+                            )
+                        except Exception as error:  # noqa: BLE001
+                            await self._finish_self_started(connection, None, error)
                     continue
                 if connection.draining:
                     if isinstance(message, ResultMessage):
@@ -2663,14 +2720,17 @@ class ClaudeCodeLine:
                     continue
                 connection.draining = not isinstance(message, ResultMessage)
                 connection.drained = SELF_STARTED_KIND
-                if isinstance(message, ResultMessage):
-                    self._spent_alone(message, SELF_STARTED_KIND)
                 if connection.pending:
                     # The turn is the engine's answer to those ends, so their notes
-                    # say so, and no separate note is added.
+                    # say so. If the scheduler admits it, its ordinary accounting
+                    # replaces the separate wake.
+                    if await self._admit_self_started(connection, message):
+                        continue
                     self._flush(connection, self_started=True)
                 elif SELF_STARTED_NOTE not in self._notes:
                     self._notes.append(SELF_STARTED_NOTE)
+                if isinstance(message, ResultMessage):
+                    self._spent_alone(message, SELF_STARTED_KIND)
                 if not await self._interrupt(connection):
                     return
         except Exception:  # noqa: BLE001, S110
@@ -2678,12 +2738,103 @@ class ClaudeCodeLine:
             # marked dead below, and the next turn resumes in a new process.
             pass
         finally:
+            if connection.self_started_finish is not None:
+                await self._finish_self_started(
+                    connection,
+                    None,
+                    EngineRefused("the engine ended during its self-started turn"),
+                )
             connection.alive = False
             if connection.inbox is not None:
                 connection.inbox.put_nowait(None)
             # Review F12. A connection that dies without a close withdraws its
             # ceiling question here, since nothing can act on an answer now.
             self._withdraw_ceiling(connection)
+
+    async def _admit_self_started(
+        self, connection: _Connection, first: Message
+    ) -> bool:
+        """Ask the scheduler to own the engine's task-triggered turn before its
+        output or tools can proceed."""
+        ends = tuple(
+            replace(end, self_started=True) for end in connection.pending.values()
+        )
+        try:
+            finish = self._begin_self_started_callback(ends)
+        except Exception as error:  # noqa: BLE001
+            print(
+                f"dromond: the scheduler could not admit a self-started turn: {error}",
+                file=sys.stderr,
+            )
+            return False
+        if finish is None:
+            return False
+        connection.pending.clear()
+        connection.draining = False
+        connection.self_started_turn = _Turn(
+            capabilities=connection.capabilities,
+            require_init=connection.capabilities is None,
+        )
+        connection.self_started_finish = finish
+        self._turn = connection.self_started_turn
+        self.driver.step(Event("turn_start"))
+        try:
+            await self._handle(connection.session, first, connection.self_started_turn)
+        except Exception as error:  # noqa: BLE001
+            await self._finish_self_started(connection, None, error)
+        return True
+
+    async def _finish_self_started(
+        self,
+        connection: _Connection,
+        result: ResultMessage | None,
+        error: Exception | None,
+    ) -> None:
+        """Finish and report an admitted turn, including its checked tool calls and
+        measured result, so the scheduler applies its ordinary limits."""
+        turn = connection.self_started_turn
+        finish = connection.self_started_finish
+        if turn is None or finish is None:
+            return
+        report: TurnReport | None = None
+        if error is None:
+            try:
+                if result is None:
+                    raise EngineRefused(
+                        "the engine ended its self-started turn without a result"
+                    )
+                self._refuse_missing_sign_in(result.result, turn)
+                if turn.refusal is not None:
+                    raise EngineRefused(turn.refusal)
+                if turn.capabilities is None:
+                    raise EngineRefused(
+                        "the engine did not report its tools and credential before"
+                        " the self-started turn"
+                    )
+                self.driver.step(Event("result", result.subtype, result.num_turns))
+                cost = self._measure(result)
+                self._check_limit(result, turn)
+                report = self._report(result, turn, cost)
+            except Exception as caught:  # noqa: BLE001
+                error = caught
+        connection.self_started_turn = None
+        connection.self_started_finish = None
+        connection.last_end = self._clock()
+        connection.draining = False
+        self._turn = None
+        self._ceiling_of(connection).turn_ended()
+        try:
+            finish(report, error)
+        except Exception as callback_error:  # noqa: BLE001
+            print(
+                f"dromond: the self-started turn outcome could not be recorded:"
+                f" {callback_error}",
+                file=sys.stderr,
+            )
+        if error is not None:
+            await self.close()
+        elif self._retired:
+            self._spawn(self.close())
 
     def _handed_off(
         self, result: ResultMessage, turn: _Turn, answered: bool, resends: int
@@ -2720,8 +2871,9 @@ class ClaudeCodeLine:
 
     def _track(self, connection: _Connection, message: Message) -> None:
         """Follow the connection's background tasks: the command each tool call
-        runs, each task's start, a stop the line asked for, and each end, which
-        between turns is passed to ``task_ended`` once per task."""
+        runs, each task's start, a stop the line asked for, and every end, which is
+        passed to ``task_ended`` once per task unless it waits briefly to see whether
+        the engine starts a turn on it."""
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if not isinstance(block, ToolUseBlock):
@@ -2767,10 +2919,28 @@ class ClaudeCodeLine:
         command = connection.tasks.pop(ended, None)
         departed = connection.departed.pop(ended, None)
         command = command or departed
-        between = connection.inbox is None
+        between = connection.inbox is None and connection.self_started_turn is None
         asked = ended in connection.stopped
         connection.stopped.discard(ended)
-        if command is None or not between or asked:
+        if command is None:
+            command = "a background task"
+        if not between or asked:
+            end = BackgroundEnd(
+                ended,
+                command,
+                task_status(message),
+                exit_code,
+                output,
+                during_turn=not between,
+                stopped_by_line=asked,
+            )
+            try:
+                self._task_ended(end)
+            except Exception as error:  # noqa: BLE001
+                print(
+                    f"dromond: a background task's end could not be recorded: {error}",
+                    file=sys.stderr,
+                )
             return
         connection.pending[ended] = BackgroundEnd(
             ended, command, task_status(message), exit_code, output
@@ -2990,4 +3160,6 @@ class ClaudeCodeLine:
             await self.close()
             raise EngineRefused(turn.refusal)
         self._check_limit(result, turn)
+        if turn.capabilities is not None:
+            connection.capabilities = turn.capabilities
         return self._report(result, turn, cost)

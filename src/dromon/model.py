@@ -622,10 +622,12 @@ MAX_TASK_ID_BYTES: Final = 128
 @dataclass(frozen=True, slots=True)
 class TaskNoted:
     """A note from a line to itself saying that a background task of its engine
-    ended between turns, which wakes the line as any mail does. Only the daemon
-    records it, when the line's engine reports the end, and recording it is the
-    whole of sending, so it needs no separate ``message_sent``. A line may also send
-    itself a note with ``message_sent``, and the daemon records ``restart_noted``."""
+    ended. An end between turns wakes the line unless its engine has already begun
+    an admitted turn on it. An end during a turn or for a task the line stopped is
+    recorded as delivered without a wake. Only the daemon records it, when the line's
+    engine reports the end, and recording it is the whole of sending, so it needs no
+    separate ``message_sent``. A line may also send itself a note with
+    ``message_sent``, and the daemon records ``restart_noted``."""
 
     line_id: str
     message_id: str

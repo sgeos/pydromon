@@ -165,6 +165,17 @@ def test_a_task_is_noted_once(world: World) -> None:
     assert len(world.notes()) == 1
 
 
+def test_task_ends_during_a_turn_are_recorded_without_waking(world: World) -> None:
+    end = BackgroundEnd("t1", "make gate", "completed", during_turn=True)
+    message_id = world.scheduler.background_ended("alpha", end)
+    assert message_id is not None
+    message = world.log.state.messages[message_id]
+    assert message.delivered
+    assert world.scheduler.line_summaries()[0]["pending"] == 0
+    (note,) = world.notes()
+    assert "ended while a Dromon turn was running" in note
+
+
 def test_task_notes_are_limited_per_minute(world: World) -> None:
     limit = scheduler_module.MAX_TASK_NOTES
     for index in range(limit):
@@ -190,6 +201,52 @@ def test_task_notes_are_limited_per_minute(world: World) -> None:
         " notes."
     )
     assert len(world.notes()) == limit + 1
+
+
+def test_a_task_triggered_turn_uses_ordinary_turn_and_cost_limits(
+    world: World,
+) -> None:
+    async def go() -> None:
+        stop = asyncio.Event()
+        loop = asyncio.create_task(world.scheduler.run(stop))
+        world.scheduler.set_project(
+            Limits(max_autonomous_turns=2, max_cost_usd=0.2), "ana", 0, 1
+        )
+        world.scheduler.send(LineAddress("alpha"), LineAddress("alpha"), "start")
+        await world.scheduler.idle()
+        finish = world.scheduler.begin_self_started("alpha", (END,))
+        assert finish is not None
+        report = TurnReport(
+            "success", 1, "finished", (), None, None, "session-1", None, 0.125
+        )
+        finish(report, None)
+        await world.scheduler.idle()
+        status = world.status()
+        assert status["autonomous_turns"]["used"] == 2
+        assert status["cost_usd"]["estimate"] == "0.2500"
+        assert status["held_by"] is not None
+        notes = world.notes()
+        assert any("ordinary Dromon turn" in note for note in notes)
+        stop.set()
+        await loop
+
+    asyncio.run(go())
+
+
+def test_a_task_triggered_turn_waits_for_already_sent_mail(world: World) -> None:
+    async def go() -> None:
+        stop = asyncio.Event()
+        loop = asyncio.create_task(world.scheduler.run(stop))
+        world.scheduler.send(LineAddress("alpha"), LineAddress("alpha"), "start")
+        await world.scheduler.idle()
+        world.scheduler.send(ANA, LineAddress("alpha"), "operator message")
+        finish = world.scheduler.begin_self_started("alpha", (END,))
+        assert finish is None
+        assert world.notes() == ["start"]
+        stop.set()
+        await loop
+
+    asyncio.run(go())
 
 
 def test_a_task_note_withholds_a_disclosed_command(world: World) -> None:

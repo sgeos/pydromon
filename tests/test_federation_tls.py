@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Final, cast
 
 import pytest
+from cryptography import x509
 
 from dromon.federation_tls import (
     CERTIFICATE_FILENAME,
@@ -47,6 +48,25 @@ def test_generated_identity_files_are_owner_only_and_pin_its_public_key(
     assert identity.private_key.parent.stat().st_mode & 0o777 == 0o700
     assert len(identity.pin_sha256) == 64
     assert identity.pin_sha256 == identity.pin_sha256.lower()
+
+
+def test_generated_certificates_have_distinct_subjects_bound_to_their_pins(
+    tmp_path: Path,
+) -> None:
+    first = generate_identity(tmp_path / "first")
+    second = generate_identity(tmp_path / "second")
+    first_certificate = x509.load_pem_x509_certificate(first.certificate.read_bytes())
+    second_certificate = x509.load_pem_x509_certificate(second.certificate.read_bytes())
+
+    assert first_certificate.subject != second_certificate.subject
+    assert first_certificate.subject == first_certificate.issuer
+    assert second_certificate.subject == second_certificate.issuer
+    assert first_certificate.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME) == [
+        f"Dromon federation peer {first.pin_sha256}"
+    ]
+    assert second_certificate.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME) == [
+        f"Dromon federation peer {second.pin_sha256}"
+    ]
 
 
 def test_identity_generation_does_not_replace_existing_files(tmp_path: Path) -> None:
