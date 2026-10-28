@@ -425,6 +425,7 @@ def test_every_line_has_the_tool_and_status_shows_the_pending_wake(
         "line_status",
         "read_instructions",
         "write_scratch",
+        "check_disclosure",
         "propose_change",
         "list_processes",
         "stop_process",

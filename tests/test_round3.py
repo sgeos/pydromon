@@ -3,6 +3,7 @@ background tasks that end between turns, the new ``line_status`` fields, and the
 warning that an operator's action stops a kept session's tasks."""
 
 import asyncio
+import hashlib
 import os
 import json
 from collections.abc import Callable, Generator, Sequence
@@ -20,7 +21,14 @@ from dromon.driver import Strategy
 from dromon.engine import BackgroundEnd, TurnReport
 from dromon.eventlog import EventLog, read_entries
 from dromon.limits import Limits
-from dromon.model import LineAddress, OperatorAddress
+from dromon.model import (
+    InvalidField,
+    LineAddress,
+    OperatorAddress,
+    RoleDeclared,
+    SeatBound,
+    TaskRecorded,
+)
 from dromon.paths import ProjectPaths, project_paths
 from dromon.projectconfig import ProjectConfig
 from dromon.protocol import Response
@@ -211,6 +219,67 @@ def test_a_long_command_is_cut(world: World) -> None:
     world.scheduler.background_ended("alpha", BackgroundEnd("t1", long, "completed"))
     (note,) = world.notes()
     assert '"' + "x" * 200 + '".' in note and "x" * 201 not in note
+
+
+# Item B1 of 2026-10-28, a turn left with tasks running and no mail sent.
+
+QUIET = "Your last turn ended with"
+
+
+class Mailing(Engine):
+    """An engine whose line mails an operator in every turn."""
+
+    def __init__(self, spec: LineSpec, tasks: int, scheduler: Scheduler) -> None:
+        super().__init__(spec, tasks)
+        self.scheduler = scheduler
+
+    async def run_turn(self, prompt: str) -> TurnReport:
+        self.scheduler.send(LineAddress("alpha"), ANA, "the build goes on")
+        return await super().run_turn(prompt)
+
+
+class MailingWorld(World):
+    def build(self, spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> Engine:
+        del tools
+        engine = Mailing(spec, self.tasks, self.scheduler)
+        self.engines[spec.line_id] = engine
+        return engine
+
+
+@pytest.mark.parametrize(
+    ("tasks", "counted"), [(1, "1 background task"), (3, "3 background tasks")]
+)
+def test_a_turn_left_with_tasks_and_no_mail_is_told_once(
+    tmp_path: Path, tasks: int, counted: str
+) -> None:
+    world = World(tmp_path / "events.sqlite", tasks=tasks)
+    first = turns(world, "start")
+    world.tasks = 0
+    second = turns(world, "next")
+    third = turns(world, "again")
+    assert QUIET not in first and QUIET not in third
+    assert second.startswith(f"{QUIET} {counted} of your kept session still running,")
+    world.log.close()
+
+
+def turns(world: World, body: str) -> str:
+    """Run one turn for ``body`` and return its prompt. Each run builds the line's
+    engine anew, while the scheduler and what it remembers persist."""
+    world.run(body)
+    (prompt,) = world.engines["alpha"].prompts
+    return prompt
+
+
+def test_a_turn_that_mailed_is_not_told_of_its_tasks(tmp_path: Path) -> None:
+    world = MailingWorld(tmp_path / "events.sqlite", tasks=2)
+    prompts = [turns(world, "start"), turns(world, "next")]
+    assert all(QUIET not in prompt for prompt in prompts)
+    world.log.close()
+
+
+def test_a_turn_without_kept_tasks_is_not_told_of_them(world: World) -> None:
+    prompts = [turns(world, "start"), turns(world, "next")]
+    assert all(QUIET not in prompt for prompt in prompts)
 
 
 # C. line_status: recent turn costs and the last fired wake.
@@ -661,6 +730,17 @@ def test_a_lines_notes_to_itself_are_not_counted_unanswered(world: World) -> Non
         world.log.append(MessageDelivered(cast(str, message_id)))
     counts = summary(world.log.state, LineAddress("alpha"), 0)
     assert (counts.unread, counts.unanswered) == (2, 1)
+
+
+def test_a_note_from_the_harness_is_not_counted_unanswered(world: World) -> None:
+    """Nothing can reply to the harness, so its notes ask no reply of a line."""
+    from dromon.mailbox import summary
+    from dromon.model import HARNESS, MessageDelivered
+
+    note = world.scheduler.send(HARNESS, LineAddress("alpha"), "Dromon failed over")
+    world.log.append(MessageDelivered(note))
+    counts = summary(world.log.state, LineAddress("alpha"), 0)
+    assert (counts.unread, counts.unanswered) == (1, 0)
 
 
 # E, each recent turn explains its cost.
@@ -1225,3 +1305,123 @@ def test_a_pending_compaction_is_checked_again_at_the_turn(world: World) -> None
     world.run("work")
     assert asked == []
     assert world.status()["context"]["compaction_pending"] is False
+
+
+# Item B3 of 2026-10-28, a record of each background task's end.
+
+
+def records(world: World) -> list[TaskRecorded]:
+    return list(world.log.state.task_records.get("alpha", ()))
+
+
+def test_every_task_end_is_recorded_with_its_output_digest(rooted: World) -> None:
+    root = cast(Path, rooted.scheduler._root)  # pyright: ignore[reportPrivateUsage]
+    text = "".join(f"line {n}\n" for n in range(40))
+    output = task_output(root, "b1.output", text)
+    ends = [
+        BackgroundEnd("t1", "./scripts/check.sh", "completed", 0, str(output)),
+        BackgroundEnd("t2", "codex exec", "completed", output="hello"),
+        BackgroundEnd("t3", "make", "failed", 2),
+        BackgroundEnd("t4", "make", "failed", 2),
+    ]
+    for end in ends:
+        rooted.scheduler.background_ended("alpha", end)
+    rooted.scheduler.background_ended("alpha", ends[0])
+    # The rate limit noted three of the four ends, and every end was recorded once.
+    assert len(rooted.notes()) == scheduler_module.MAX_TASK_NOTES
+    first, second, third, _ = records(rooted)
+    assert [record.task_id for record in records(rooted)] == ["t1", "t2", "t3", "t4"]
+    data = text.encode()
+    assert (first.output_digest, first.output_bytes) == (
+        hashlib.sha256(data).hexdigest(),
+        len(data),
+    )
+    assert (first.command, first.status, first.exit_code) == (
+        "./scripts/check.sh",
+        "completed",
+        0,
+    )
+    assert (first.output_file, first.ended_at) == (str(output), "2026-10-26T09:00:00Z")
+    assert first.workdir_commit == ""
+    assert second.output_digest == hashlib.sha256(b"hello").hexdigest()
+    assert (third.output_digest, third.output_bytes, third.exit_code) == (None, None, 2)
+
+
+def test_a_task_record_withholds_disclosed_names_and_skips_a_large_output(
+    rooted: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = cast(Path, rooted.scheduler._root)  # pyright: ignore[reportPrivateUsage]
+    rooted.scheduler.set_disclosure_terms(["codename"])
+    named = task_output(root, "codename.output", "x")
+    rooted.scheduler.background_ended(
+        "alpha", BackgroundEnd("t1", "grep codename", "completed", 0, str(named))
+    )
+    monkeypatch.setattr(scheduler_module, "MAX_DIGEST_BYTES", 4)
+    big = task_output(root, "b2.output", "y" * 10)
+    rooted.scheduler.background_ended(
+        "alpha", BackgroundEnd("t2", "make", "completed", 0, str(big))
+    )
+    outside = tmp_path / "elsewhere" / "tasks" / "b3.output"
+    rooted.scheduler.background_ended(
+        "alpha", BackgroundEnd("t3", "make", "completed", 0, str(outside))
+    )
+    first, second, third = records(rooted)
+    withheld = scheduler_module.WITHHELD_COMMAND
+    assert (first.command, first.output_file) == (withheld, withheld)
+    assert first.output_digest == hashlib.sha256(b"x").hexdigest()
+    assert (second.output_digest, second.output_bytes) == (None, None)
+    assert (third.output_digest, third.output_file) == (None, str(outside))
+
+
+def test_a_roles_seats_see_each_seats_latest_task_ends(rooted: World) -> None:
+    rooted.log.append(RoleDeclared("core", "."))
+    rooted.log.append(SeatBound("alpha", "core", True))
+    for number in range(scheduler_module.ROLE_STATUS_TASKS + 1):
+        rooted.scheduler.background_ended(
+            "alpha", BackgroundEnd(f"t{number}", "make", "completed", number)
+        )
+    (seat,) = cast(list[dict[str, Any]], rooted.scheduler.role_view("core")["seats"])
+    shown = cast(list[dict[str, object]], seat["recent_tasks"])
+    assert [task["task_id"] for task in shown] == [
+        f"t{number}" for number in range(1, scheduler_module.ROLE_STATUS_TASKS + 1)
+    ]
+    assert shown[-1] == {
+        "task_id": f"t{scheduler_module.ROLE_STATUS_TASKS}",
+        "command": "make",
+        "status": "completed",
+        "exit_code": scheduler_module.ROLE_STATUS_TASKS,
+        "output_file": None,
+        "output_sha256": None,
+        "output_bytes": None,
+        "workdir_commit": None,
+        "ended_at": "2026-10-26T09:00:00Z",
+    }
+
+
+@pytest.mark.parametrize(
+    ("change", "match"),
+    [
+        ({"exit_code": 2**31}, "exit_code"),
+        ({"output_digest": "A" * 64, "output_bytes": 1}, "output_digest"),
+        ({"output_digest": "a" * 64}, "given together"),
+        ({"output_bytes": -1, "output_digest": "a" * 64}, "output_bytes"),
+        ({"workdir_commit": "not a commit"}, "workdir_commit"),
+        ({"ended_at": "today"}, "ended_at"),
+    ],
+)
+def test_a_bad_task_record_is_refused(change: dict[str, object], match: str) -> None:
+    fields: dict[str, object] = {
+        "line_id": "alpha",
+        "task_id": "t1",
+        "command": "make",
+        "status": "completed",
+        "exit_code": 0,
+        "output_file": None,
+        "output_digest": None,
+        "output_bytes": None,
+        "workdir_commit": "",
+        "ended_at": "2026-10-26T09:00:00Z",
+        **change,
+    }
+    with pytest.raises(InvalidField, match=match):
+        TaskRecorded(**cast(dict[str, Any], fields))

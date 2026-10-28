@@ -41,8 +41,15 @@ from dromon.model import (
     MessageDelivered,
     MessageAcknowledged,
     MessagePrioritized,
+    MessageCorrelated,
+    TurnCorrelated,
+    DisclosureChecked,
+    TaskRecorded,
     MessageKind,
     MessageRead,
+    MessageReceived,
+    MessageReturned,
+    MessageUnconfirmed,
     MessageSent,
     OperatorRegistered,
     QuestionSuperseded,
@@ -67,7 +74,16 @@ from dromon.model import (
     RoleNoteKind,
     BudgetStated,
     BudgetSource,
+    PeerDeclared,
+    PeerKeyed,
+    PeerRemoved,
+    LocalAddress,
+    RemoteAddress,
+    ReturnCode,
+    Sender,
     parse_address,
+    parse_any_address,
+    parse_sender,
 )
 
 FORMAT_VERSION: Final = 1
@@ -101,15 +117,42 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "choices",
         "reply_to",
     ),
+    "message_received": (
+        "message_id",
+        "sender",
+        "recipient",
+        "body",
+        "reply_to",
+        "origin_id",
+        "received_at",
+        "priority_asked",
+    ),
     "message_delivered": ("message_id",),
+    "message_returned": ("message_id", "code", "note_id"),
+    "message_unconfirmed": ("message_id", "note_id"),
     "message_read": ("message_id",),
     "message_acknowledged": ("message_id",),
     "message_prioritized": ("message_id",),
+    "message_correlated": ("message_id", "key"),
+    "turn_correlated": ("line_id", "keys", "key_count", "cost_micro_usd"),
+    "disclosure_checked": ("line_id", "checked_at", "matched_lines"),
     "wake_requested": ("wake_id", "line_id", "message_id"),
     "wake_issued": ("wake_id",),
     "wake_scheduled": ("line_id", "message_id", "due", "note"),
     "wake_withdrawn": ("line_id", "message_id"),
     "task_noted": ("line_id", "message_id", "task_id", "status", "body"),
+    "task_recorded": (
+        "line_id",
+        "task_id",
+        "command",
+        "status",
+        "exit_code",
+        "output_file",
+        "output_digest",
+        "output_bytes",
+        "workdir_commit",
+        "ended_at",
+    ),
     "restart_noted": ("line_id", "message_id", "body"),
     "line_cost_marked": ("line_id", "engine_session", "total_micro_usd"),
     "processes_left": ("line_id", "cause", "pids", "commands", "more"),
@@ -162,6 +205,9 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "note",
         "stated_at",
     ),
+    "peer_declared": ("peer_id", "transport", "policy"),
+    "peer_removed": ("peer_id",),
+    "peer_keyed": ("peer_id", "token_sha256"),
 }
 """The wire name of each event kind and its fields, in declaration order."""
 
@@ -321,14 +367,67 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "choices": list(event.choices),
                 "reply_to": event.reply_to,
             }
+        case MessageReceived():
+            return "message_received", {
+                "message_id": event.message_id,
+                "sender": str(event.sender),
+                "recipient": str(event.recipient),
+                "body": event.body,
+                "reply_to": event.reply_to,
+                "origin_id": event.origin_id,
+                "received_at": event.received_at,
+                "priority_asked": event.priority_asked,
+            }
         case MessageDelivered():
             return "message_delivered", {"message_id": event.message_id}
+        case MessageReturned():
+            return "message_returned", {
+                "message_id": event.message_id,
+                "code": event.code.value,
+                "note_id": event.note_id,
+            }
+        case MessageUnconfirmed():
+            return "message_unconfirmed", {
+                "message_id": event.message_id,
+                "note_id": event.note_id,
+            }
         case MessageRead():
             return "message_read", {"message_id": event.message_id}
         case MessageAcknowledged():
             return "message_acknowledged", {"message_id": event.message_id}
         case MessagePrioritized():
             return "message_prioritized", {"message_id": event.message_id}
+        case MessageCorrelated():
+            return "message_correlated", {
+                "message_id": event.message_id,
+                "key": event.key,
+            }
+        case TurnCorrelated():
+            return "turn_correlated", {
+                "line_id": event.line_id,
+                "keys": list(event.keys),
+                "key_count": event.key_count,
+                "cost_micro_usd": event.cost_micro_usd,
+            }
+        case TaskRecorded():
+            return "task_recorded", {
+                "line_id": event.line_id,
+                "task_id": event.task_id,
+                "command": event.command,
+                "status": event.status,
+                "exit_code": event.exit_code,
+                "output_file": event.output_file,
+                "output_digest": event.output_digest,
+                "output_bytes": event.output_bytes,
+                "workdir_commit": event.workdir_commit,
+                "ended_at": event.ended_at,
+            }
+        case DisclosureChecked():
+            return "disclosure_checked", {
+                "line_id": event.line_id,
+                "checked_at": event.checked_at,
+                "matched_lines": event.matched_lines,
+            }
         case WakeRequested():
             return "wake_requested", {
                 "wake_id": event.wake_id,
@@ -443,6 +542,19 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "note": event.note,
                 "stated_at": event.stated_at,
             }
+        case PeerDeclared():
+            return "peer_declared", {
+                "peer_id": event.peer_id,
+                "transport": event.transport,
+                "policy": event.policy,
+            }
+        case PeerRemoved():
+            return "peer_removed", {"peer_id": event.peer_id}
+        case PeerKeyed():
+            return "peer_keyed", {
+                "peer_id": event.peer_id,
+                "token_sha256": event.token_sha256,
+            }
         case _:
             assert_never(event)
 
@@ -492,21 +604,70 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
         case "message_sent":
             return MessageSent(
                 _str(data, "message_id"),
-                _address(data, "sender"),
-                _address(data, "recipient"),
+                _sender(data, "sender"),
+                _any_address(data, "recipient"),
                 _member(data, "kind", MessageKind),
                 _str(data, "body"),
                 _choices(data),
                 _optional_str(data, "reply_to"),
             )
+        case "message_received":
+            return MessageReceived(
+                _str(data, "message_id"),
+                _remote_address(data, "sender"),
+                _address(data, "recipient"),
+                _str(data, "body"),
+                _optional_str(data, "reply_to"),
+                _str(data, "origin_id"),
+                _str(data, "received_at"),
+                _bool(data, "priority_asked"),
+            )
         case "message_delivered":
             return MessageDelivered(_str(data, "message_id"))
+        case "message_returned":
+            return MessageReturned(
+                _str(data, "message_id"),
+                _member(data, "code", ReturnCode),
+                _optional_str(data, "note_id"),
+            )
+        case "message_unconfirmed":
+            return MessageUnconfirmed(
+                _str(data, "message_id"), _optional_str(data, "note_id")
+            )
         case "message_read":
             return MessageRead(_str(data, "message_id"))
         case "message_acknowledged":
             return MessageAcknowledged(_str(data, "message_id"))
         case "message_prioritized":
             return MessagePrioritized(_str(data, "message_id"))
+        case "message_correlated":
+            return MessageCorrelated(_str(data, "message_id"), _str(data, "key"))
+        case "turn_correlated":
+            return TurnCorrelated(
+                _str(data, "line_id"),
+                tuple(_list(data, "keys", str)),
+                _int(data, "key_count"),
+                _optional_int(data, "cost_micro_usd"),
+            )
+        case "task_recorded":
+            return TaskRecorded(
+                _str(data, "line_id"),
+                _str(data, "task_id"),
+                _str(data, "command"),
+                _str(data, "status"),
+                _optional_int(data, "exit_code"),
+                _optional_str(data, "output_file"),
+                _optional_str(data, "output_digest"),
+                _optional_int(data, "output_bytes"),
+                _str(data, "workdir_commit"),
+                _str(data, "ended_at"),
+            )
+        case "disclosure_checked":
+            return DisclosureChecked(
+                _str(data, "line_id"),
+                _str(data, "checked_at"),
+                _int(data, "matched_lines"),
+            )
         case "wake_requested":
             return WakeRequested(
                 _str(data, "wake_id"), _str(data, "line_id"), _str(data, "message_id")
@@ -611,6 +772,14 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "note"),
                 _str(data, "stated_at"),
             )
+        case "peer_declared":
+            return PeerDeclared(
+                _str(data, "peer_id"), _str(data, "transport"), _str(data, "policy")
+            )
+        case "peer_removed":
+            return PeerRemoved(_str(data, "peer_id"))
+        case "peer_keyed":
+            return PeerKeyed(_str(data, "peer_id"), _str(data, "token_sha256"))
         case _:
             raise DecodeError(f"unknown event kind {kind!r}")
 
@@ -668,8 +837,25 @@ def _optional_str(data: dict[str, object], name: str) -> str | None:
     return value
 
 
-def _address(data: dict[str, object], name: str) -> Address:
+def _address(data: dict[str, object], name: str) -> LocalAddress:
     return parse_address(_str(data, name))
+
+
+def _any_address(data: dict[str, object], name: str) -> Address:
+    return parse_any_address(_str(data, name))
+
+
+def _sender(data: dict[str, object], name: str) -> Sender:
+    """A sender as the log records it, which may be the harness. The log is the
+    daemon's own, so this is the one decoding that may construct the harness."""
+    return parse_sender(_str(data, name))
+
+
+def _remote_address(data: dict[str, object], name: str) -> RemoteAddress:
+    address = parse_any_address(_str(data, name))
+    if not isinstance(address, RemoteAddress):
+        raise DecodeError(f"{name} is not a remote address")
+    return address
 
 
 def _member[
@@ -681,6 +867,7 @@ def _member[
         RoleNoteKind,
         BudgetSource,
         FailoverPolicy,
+        ReturnCode,
     )
 ](data: dict[str, object], name: str, kind: type[T]) -> T:
     value = _str(data, name)

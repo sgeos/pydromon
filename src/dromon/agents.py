@@ -290,8 +290,19 @@ DAEMON_TOOLS: Final = (
     ToolSpec(
         "dromon_status",
         AgentAccess.OBSERVE,
-        "The daemon's status and a summary of every session line.",
-        _schema({}, []),
+        "The daemon's status and a summary of every session line, with the totals"
+        " of one correlation key if given.",
+        _schema(
+            {
+                "correlation": {
+                    "type": "string",
+                    "description": (
+                        "Optional. A correlation key whose turns and cost to total"
+                    ),
+                }
+            },
+            [],
+        ),
     ),
     ToolSpec(
         "view_line",

@@ -403,3 +403,27 @@ def test_status_lists_each_line_with_its_hibernate_and_hold(
     assert "line alpha, hibernated, 2 pending\n" in out
     assert "line beta, running, 0 pending, hibernated, held by q-1\n" in out
     assert "line gamma, idle, 0 pending\n" in out
+
+
+def test_peer_key_prints_the_pin_and_takes_no_name(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    short_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sent: list[tuple[Operation, dict[str, object] | None]] = []
+    pin = "ab" * 32
+    result: dict[str, object] = {
+        "pin_sha256": pin,
+        "certificate": "/p/.dromon/peers/identity-certificate.pem",
+        "made": True,
+    }
+    monkeypatch.setattr(cli, "call", answering(sent, result))
+    base = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime), "peer"]
+    assert cli.main([*base, "key"]) == exits.OK
+    assert sent == [(Operation.PEER_KEY, {})]
+    out = capsys.readouterr().out
+    assert f"pin_sha256 {pin}" in out and "made now" in out
+    assert cli.main([*base, "key", "studio"]) == exits.USAGE
+    assert "takes no peer name" in capsys.readouterr().err
+    assert len(sent) == 1

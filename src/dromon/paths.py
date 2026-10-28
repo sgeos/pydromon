@@ -58,6 +58,12 @@ class ProjectPaths:
         return self.runtime_dir / "lines.sock"
 
     @property
+    def peer_socket(self) -> Path:
+        """The socket peer daemons deliver mail on, which exists only when the
+        project's ``[federation] listen`` is true."""
+        return self.runtime_dir / "peers.sock"
+
+    @property
     def left_reports(self) -> Path:
         """Where each harness's launcher reports what it left running, which the
         daemon records and removes. In the state directory, so that a report written

@@ -55,6 +55,13 @@ over either is refused, and nothing is recorded, so the line can send it without
 priority. Operator priority mail is unlimited. External agents may not send priority
 mail, by default deny, since they have no operator authority.
 
+Peers. Priority mail to a line of a peer counts toward its sender's limit here, and the
+peer applies the recipient's limit. Priority mail from a peer follows the rules for a
+line whatever the remote sender is, with the whole peer counted as one sender under
+``peer_key``, so many sender names cannot multiply the limit. Past either limit the
+receiver records the note as ordinary mail rather than refusing it, as
+``docs/architecture/FEDERATION.md`` decides.
+
 Porting note. The limiter holds two bounded deques of monotonic times per party, and the
 driver override is one comparison per event, so both map onto fixed-capacity rings and
 a branch in a Keleusma stream processor.
@@ -87,6 +94,10 @@ MAX_PER_RECIPIENT: Final = 2
 
 CAPACITY: Final = max(MAX_PER_SENDER, MAX_PER_RECIPIENT)
 """How many times a party's deque keeps, enough for either limit."""
+
+PEER_KEY: Final = "peer:{peer_id}"
+"""The sender a peer is counted as. A line identifier holds no colon, so no line
+shares it."""
 
 REASON: Final = "priority mail {message_id} from {sender}"
 """Why a turn ended for priority mail, as its report's ``interrupted_for`` says."""
@@ -177,9 +188,10 @@ class PriorityLimiter:
         """Whole seconds until the oldest counted note leaves the window."""
         return max(1, int(WINDOW_SECONDS - (self._clock() - times[0]) + 0.999))
 
-    def check(self, sender: str, recipient: str) -> None:
+    def check(self, sender: str, recipient: str | None) -> None:
         """Raise ``PriorityRefused`` when line ``sender`` may not send line
-        ``recipient`` priority mail now."""
+        ``recipient`` priority mail now. ``None`` is a line of a peer, whose limit
+        the peer applies."""
         sent = self._recent(self._sent, sender)
         if len(sent) >= MAX_PER_SENDER:
             raise PriorityRefused(
@@ -188,6 +200,8 @@ class PriorityLimiter:
                 f" not sent. Send it without priority, or again in {self._wait(sent)}"
                 " seconds"
             )
+        if recipient is None:
+            return
         received = self._recent(self._received, recipient)
         if len(received) >= MAX_PER_RECIPIENT:
             raise PriorityRefused(
@@ -197,7 +211,21 @@ class PriorityLimiter:
                 f" {self._wait(received)} seconds"
             )
 
-    def record(self, sender: str, recipient: str) -> None:
-        """Count a priority note that was sent."""
+    def allows(self, sender: str, recipient: str) -> bool:
+        """Whether ``sender`` may send line ``recipient`` priority mail now, as
+        ``check`` decides, for a receiver that declines rather than refuses."""
+        return (
+            len(self._recent(self._sent, sender)) < MAX_PER_SENDER
+            and len(self._recent(self._received, recipient)) < MAX_PER_RECIPIENT
+        )
+
+    def record(self, sender: str, recipient: str | None) -> None:
+        """Count a priority note that was sent. ``None`` is a line of a peer."""
         self._recent(self._sent, sender).append(self._clock())
-        self._recent(self._received, recipient).append(self._clock())
+        if recipient is not None:
+            self._recent(self._received, recipient).append(self._clock())
+
+
+def peer_key(peer_id: str) -> str:
+    """The sender ``peer_id`` is counted as."""
+    return PEER_KEY.format(peer_id=peer_id)

@@ -18,7 +18,9 @@ from dromon.driver import Strategy
 from dromon.engine import EnginePlanLimit, TurnReport
 from dromon.eventlog import EventLog
 from dromon.model import (
+    HARNESS,
     MAX_ROLE_NOTE_BYTES,
+    HarnessAddress,
     BudgetSource,
     BudgetStated,
     EventRejected,
@@ -197,12 +199,14 @@ class World:
         result = asyncio.run(invoke())
         return str(result["content"][0]["text"]), result.get("is_error") is True
 
-    def mail(self, sender: str, recipient: str) -> list[str]:
-        """The bodies of the delivered notes from ``sender`` to ``recipient``."""
+    def mail(self, sender: str | HarnessAddress, recipient: str) -> list[str]:
+        """The bodies of the delivered notes from ``sender``, a line or the harness,
+        to ``recipient``."""
+        source = LineAddress(sender) if isinstance(sender, str) else sender
         return [
             message.body
             for message in self.log.state.messages.values()
-            if message.sender == LineAddress(sender)
+            if message.sender == source
             and message.recipient == LineAddress(recipient)
             and message.delivered
         ]
@@ -411,8 +415,10 @@ def test_a_handoff_records_the_note_and_the_change_and_wakes_the_successor(
     assert not world.log.state.lines["beta"].hibernated
     wake(world)
     assert len(world.prompts("beta")) == 1
-    (note,) = world.mail("alpha", "beta")
+    (note,) = world.mail(HARNESS, "beta")
     assert f"handed role core to you, with handoff entry {entry.entry_id}" in note
+    # The harness wrote it, so it is not recorded as from the line that handed over.
+    assert world.mail("alpha", "beta") == []
 
 
 def test_a_relinquish_with_no_successor_leaves_the_role_vacant(world: World) -> None:
@@ -741,7 +747,7 @@ def test_a_waiting_relinquish_that_no_longer_applies_keeps_the_role_and_says_so(
     (told,) = [
         message.body
         for message in world.log.state.messages.values()
-        if message.sender == ALPHA
+        if message.sender == HARNESS
         and message.recipient == ANA
         and "did not make the handoff" in message.body
     ]
@@ -891,7 +897,7 @@ def test_a_handoff_tells_the_successor_by_mail_not_by_the_checklist(
     wake(world, "alpha")
     (beta,) = world.prompts("beta")
     assert RECOVERY_CHECKLIST not in beta
-    (note,) = world.mail("alpha", "beta")
+    (note,) = world.mail(HARNESS, "beta")
     assert "handed role core to you" in note
     # The relinquishing seat made the change, so its own next turn is not told of it.
     (alpha,) = world.prompts("alpha")

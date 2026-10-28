@@ -172,8 +172,8 @@ with `may_own` can receive a role by a handoff, whatever its place in the order.
 `handoff_below_percent`, 10 percent unless the role declares otherwise, and the role's
 owner runs on that provider, the daemon asks the owner to prepare a handoff to the seat
 a failover would choose, with the handoff note's template. The request is a note from
-the owner's own address, as a scheduled wake is, since the harness has no address of
-its own and must not claim an operator's. It is not priority mail, so the owner's work
+the harness, `!dromon`, from 2026-10-28, which claims no operator's authority, and
+before that date was a note from the owner's own address. It is not priority mail, so the owner's work
 in flight is not cut short. With no usable seat the owner is not asked, and the
 statement's output says so. A threshold of 0 never asks.
 
@@ -204,10 +204,17 @@ spent. **Decided by the operator on 2026-10-27.** A seat with a turn in flight i
 usable. It becomes the owner at once, but that turn goes on with the read access it
 started with, and the seat gains write access only from its next turn, which is
 built as the owner. The change is recorded with cause `failover` and rests on a note entry that says
-the harness wrote it, why, and from whom to whom. The new owner is woken by a note to
-itself, and its turn leads with the recovery checklist. The operator who last wrote to
-the former owner is told in a note recorded as from the former owner, as a hold's
-question is. With no usable seat nothing changes, and the operator is told once until
+the harness wrote it, why, and from whom to whom. The new owner is woken by a note from
+the harness, and its turn leads with the recovery checklist. The operator who last wrote
+to the former owner is told in a note from the harness. **Decided by the operator on
+2026-10-28.** These notes, and a request to prepare a handoff, were recorded as from a
+line that did not write them until the log gained the harness's sender address
+`!dromon`, as [`EVENT_LOG.md`](../protocol/EVENT_LOG.md) specifies. **Decided by the
+operator on 2026-10-28.** The questions that a plan-limit hold, a ceiling and a consent
+ask stay questions from the line they concern, since their bodies say that Dromon asked
+them and the operator's answer is routed back to that line. Asking them from the harness
+is deferred, because it would change the rule that a hold's question comes from the held
+line and the path by which an answer reaches the line. With no usable seat nothing changes, and the operator is told once until
 what it would be told changes.
 
 Under `ask` no owner changes. A plan limit holds the owner and asks the operator as it
@@ -279,7 +286,7 @@ each other today. **Implemented.** `role_status`, a tool offered only to a seat,
 lists the role's worktree and handoff bound, the owner and the latest change of owner,
 each seat's condition, hibernation, model, provider, stated budget and worktree commit, and
 the role's latest five journal entries, the newest with its body, so a seat can find
-its peers. Until the budget step, each engine counts as its own provider. A note between seats is ordinary line mail, data from its
+its peers. Until the budget step, each engine counts as its own provider. **Item B3 of 2026-10-28.** Each seat also lists `recent_tasks`, its latest three background task ends from `task_recorded`, each with its command, status, exit code, output file, the SHA-256 digest and size of its output and the worktree commit, so a reviewing seat can check a gate the owner ran without running it again. The commit says nothing of uncommitted changes, and an end the engine reports during a turn is not recorded. A note between seats is ordinary line mail, data from its
 sender like any other, and counts toward the autonomous limits as mail between lines
 does. No role-wide broadcast is proposed, because a broadcast multiplies turns across
 providers whose budgets are short.

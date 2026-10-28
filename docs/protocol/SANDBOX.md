@@ -105,7 +105,9 @@ project settings.
    a Dromon line has nobody at the prompt.
 3. **Protected directories.** An enabled sandbox denies reading and writing the
    project's state directory and runtime directory, which hold the event log, the
-   project file and the daemon's socket. A document whose `allowRead` or `allowWrite`
+   project file and the daemon's socket, and since 2026-10-28 each declared peer's
+   directories, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies under guards.
+   A document whose `allowRead` or `allowWrite`
    reopens one of them, or whose `allowUnixSockets` names a socket inside one, is
    refused, after `~` expansion and symbolic link resolution. `dromond` checks the
    project file's documents before it starts, and a line whose document fails the check
@@ -153,8 +155,8 @@ succeeded and the one that wrote in the home directory was refused.
 - As in Claude Code, Dromon's own tools, MCP servers and hooks run outside the sandbox.
   Dromon's tools run inside the daemon.
 - A line without an enabled sandbox can still reach the daemon's socket through its
-  shell, because the daemon does not check peer credentials. This is recorded as debt
-  in `CLIENT.md`. A project can require an enabled sandbox for every Claude Code line
+  shell. The daemon's peer credential check, as `CLIENT.md` specifies, refuses only a
+  process of another user, and a line runs as the operator's user. A project can require an enabled sandbox for every Claude Code line
   with `daemon.require_sandbox`, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies.
 - The git guard protects only the files of its set, the hooks directory, `config`,
   `config.worktree` and a linked worktree's two pointers. Every other file under the

@@ -1,14 +1,20 @@
 """The data model's field validation, state transitions and rejections."""
 
+from collections.abc import Callable
 from dataclasses import fields
 from typing import get_args
 
 import pytest
 
+from dromon import model
 from dromon.model import (
+    HARNESS,
+    HARNESS_TEXT,
+    HarnessAddress,
     AgentAccess,
     AgentAddress,
     AgentRegistered,
+    RemoteAddress,
     LINE_TRANSITIONS,
     MAX_CHOICE_BYTES,
     MAX_CHOICES,
@@ -27,6 +33,12 @@ from dromon.model import (
     MessageRead,
     MessageKind,
     MessagePrioritized,
+    MessageCorrelated,
+    TurnCorrelated,
+    DisclosureChecked,
+    Correlation,
+    MAX_COST_MICRO_USD,
+    MAX_TURN_KEYS,
     MessageSent,
     OperatorAddress,
     OperatorRegistered,
@@ -37,6 +49,8 @@ from dromon.model import (
     WakeIssued,
     WakeRequested,
     parse_address,
+    parse_any_address,
+    parse_sender,
 )
 
 ENGINE = "claude-opus-5-5"
@@ -82,8 +96,10 @@ def test_the_scenario_uses_every_kind_of_party_and_message(
     sent = [e for e in scenario if isinstance(e, MessageSent)]
     assert {m.kind for m in sent} == set(MessageKind)
     parties = {LineAddress, OperatorAddress, AgentAddress}
-    assert {type(m.sender) for m in sent} == parties
-    assert {type(m.recipient) for m in sent} == parties
+    # The harness sends but is never a party anyone addresses.
+    assert {type(m.sender) for m in sent} == parties | {HarnessAddress}
+    # Only a recipient may be remote, since mail from a peer is message_received.
+    assert {type(m.recipient) for m in sent} == parties | {RemoteAddress}
     assert (
         len({m.recipient for m in sent if isinstance(m.recipient, OperatorAddress)}) > 1
     )
@@ -144,6 +160,58 @@ def test_a_line_and_an_operator_with_one_identifier_are_different_addresses() ->
 def test_malformed_address_text_is_refused(text: str) -> None:
     with pytest.raises(InvalidField):
         parse_address(text)
+
+
+@pytest.mark.parametrize("parse", [parse_address, parse_any_address])
+def test_no_input_can_name_the_harness(parse: Callable[[str], object]) -> None:
+    """The operator's decision of 2026-10-28. Clients, lines, agents and peers name
+    addresses through these two, so none of them can claim the harness's address,
+    and a peer cannot write it as its party."""
+    for text in (HARNESS_TEXT, f"keleusma:{HARNESS_TEXT}"):
+        with pytest.raises(InvalidField):
+            parse(text)
+
+
+def test_only_the_log_reads_the_harness_as_a_sender() -> None:
+    assert parse_sender(HARNESS_TEXT) == HARNESS == HarnessAddress()
+    assert parse_sender(str(HARNESS)) is HARNESS
+    assert parse_sender("alpha") == ALPHA
+    assert parse_sender("keleusma:@ana") == RemoteAddress("keleusma", ANA)
+
+
+@pytest.mark.parametrize("recipient", [ALPHA, ANA])
+def test_the_harness_sends_a_note_to_a_line_or_an_operator(
+    recipient: LineAddress | OperatorAddress,
+) -> None:
+    state = build(*parties(), MessageSent("h", HARNESS, recipient, NOTE, "failed over"))
+    assert state.messages["h"].sender == HARNESS
+
+
+@pytest.mark.parametrize(
+    ("event", "reason"),
+    [
+        (MessageSent("h", HARNESS, ANA, QUESTION, "?"), "only notes"),
+        (MessageSent("h", HARNESS, ANA, NOTE, "", reply_to="m"), "replies to nothing"),
+        (
+            MessageSent("h", HARNESS, AgentAddress("probe"), NOTE, ""),
+            "only to a line or an operator",
+        ),
+        (
+            MessageSent("h", HARNESS, RemoteAddress("keleusma", ALPHA), NOTE, ""),
+            "only to a line or an operator",
+        ),
+    ],
+)
+def test_the_harness_asks_answers_and_forwards_nothing(
+    event: MessageSent, reason: str
+) -> None:
+    state = build(
+        *parties(),
+        AgentRegistered("probe", AgentAccess.MESSAGE, "0" * 64),
+        MessageSent("m", ANA, ALPHA, NOTE, "hello"),
+    )
+    with pytest.raises(EventRejected, match=reason):
+        state.check(event)
 
 
 def test_operators_are_addressed_separately() -> None:
@@ -619,3 +687,140 @@ def test_hibernate_and_priority_change_only_their_own_flags() -> None:
     state.apply(MessagePrioritized("m"))
     assert state.messages["m"].priority
     assert not state.messages["m"].delivered
+
+
+# Correlation keys. Queue of 2026-10-28, item A4.
+
+TABLE = AgentAddress("table")
+
+
+def correlated_parties() -> list[Event]:
+    return [*parties(), AgentRegistered("table", AgentAccess.MESSAGE, "")]
+
+
+def test_an_agents_note_to_a_line_takes_one_correlation_key() -> None:
+    state = build(*correlated_parties(), MessageSent("m", TABLE, ALPHA, NOTE, "go"))
+    state.apply(MessageCorrelated("m", "game-7"))
+    assert state.messages["m"].correlation == "game-7"
+    with pytest.raises(EventRejected, match="has a correlation key"):
+        state.apply(MessageCorrelated("m", "game-8"))
+    state.apply(MessageDelivered("m"))
+    assert state.messages["m"].correlation == "game-7"
+
+
+@pytest.mark.parametrize(
+    ("sent", "delivered", "match"),
+    [
+        (MessageSent("m", ANA, ALPHA, NOTE, "go"), False, "not from an agent"),
+        (MessageSent("m", ALPHA, ALPHA, NOTE, "go"), False, "not from an agent"),
+        (MessageSent("m", TABLE, ANA, NOTE, "go"), False, "not to a line"),
+        (MessageSent("m", TABLE, ALPHA, NOTE, "go"), True, "was delivered"),
+    ],
+)
+def test_a_correlation_key_is_refused_off_an_agents_undelivered_note(
+    sent: MessageSent, delivered: bool, match: str
+) -> None:
+    state = build(*correlated_parties(), sent)
+    if delivered:
+        state.apply(MessageDelivered("m"))
+    before = state.messages["m"]
+    with pytest.raises(EventRejected, match=match):
+        state.apply(MessageCorrelated("m", "game-7"))
+    assert state.messages["m"] == before
+    with pytest.raises(EventRejected, match="no message"):
+        state.apply(MessageCorrelated("absent", "game-7"))
+
+
+@pytest.mark.parametrize(
+    ("keys", "count", "cost", "match"),
+    [
+        ((), 0, None, "from 1 to"),
+        (("b", "a"), 2, None, "distinct and sorted"),
+        (("a", "a"), 2, None, "distinct and sorted"),
+        (("Game 7",), 1, None, "key"),
+        (("a", "b"), 1, None, "at least the keys listed"),
+        (("a",), 2, None, "list every key"),
+        (("a",), 1, -1, "cost_micro_usd"),
+        (("a",), 1, MAX_COST_MICRO_USD + 1, "cost_micro_usd"),
+    ],
+)
+def test_a_bad_turn_correlation_is_refused(
+    keys: tuple[str, ...], count: int, cost: int | None, match: str
+) -> None:
+    with pytest.raises(InvalidField, match=match):
+        TurnCorrelated("alpha", keys, count, cost)
+
+
+def test_a_turn_with_more_keys_than_it_lists_lists_the_most_it_may() -> None:
+    keys = tuple(sorted(f"k{n:03d}" for n in range(MAX_TURN_KEYS)))
+    event = TurnCorrelated("alpha", keys, MAX_TURN_KEYS + 5, None)
+    assert event.key_count - len(event.keys) == 5
+
+
+def test_turns_total_under_each_key_they_carried() -> None:
+    state = build(*parties())
+    state.apply(TurnCorrelated("alpha", ("game-7", "game-8"), 2, 250_000))
+    state.apply(TurnCorrelated("beta", ("game-7",), 1, None))
+    state.apply(TurnCorrelated("alpha", ("game-7",), 1, 1_000_000))
+    # A shared turn counts its whole cost under each key, and is named as shared.
+    assert state.correlations == {
+        "game-8": Correlation(1, 1, 250_000, 0),
+        "game-7": Correlation(3, 1, 1_250_000, 1),
+    }
+    with pytest.raises(EventRejected, match="no line"):
+        state.apply(TurnCorrelated("omega", ("game-7",), 1, None))
+
+
+def test_a_keys_cost_total_is_held_at_the_largest_recorded() -> None:
+    state = build(*parties())
+    for _ in range(2):
+        state.apply(TurnCorrelated("alpha", ("game-7",), 1, MAX_COST_MICRO_USD))
+    assert state.correlations["game-7"].cost_micro_usd == MAX_COST_MICRO_USD
+
+
+def test_the_key_used_least_recently_is_dropped_past_the_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(model, "MAX_CORRELATIONS", 2)
+    state = build(*parties())
+    for key in ("a", "b", "a", "c"):
+        state.apply(TurnCorrelated("alpha", (key,), 1, 1))
+    # "b" was used least recently once "a" was used again, so "c" displaced it.
+    assert list(state.correlations) == ["a", "c"]
+    assert state.correlations["a"].turns == 2
+    copied = state.copy()
+    copied.apply(TurnCorrelated("alpha", ("d",), 1, 1))
+    assert list(state.correlations) == ["a", "c"]
+
+
+# The disclosure check. Item B2 of 2026-10-28.
+
+
+@pytest.mark.parametrize(
+    ("checked_at", "matched", "match"),
+    [
+        ("2026-10-28 19:00", 0, "checked_at"),
+        ("2026-10-28T19:00:00Z", -1, "matched_lines"),
+        ("2026-10-28T19:00:00Z", model.MAX_DISCLOSURE_MATCHES + 1, "matched_lines"),
+    ],
+)
+def test_a_bad_disclosure_check_is_refused(
+    checked_at: str, matched: int, match: str
+) -> None:
+    with pytest.raises(InvalidField, match=match):
+        DisclosureChecked("alpha", checked_at, matched)
+
+
+def test_a_line_keeps_only_its_latest_disclosure_check_times() -> None:
+    state = build(*parties())
+    times = [
+        f"2026-10-28T19:{minute:02d}:00Z"
+        for minute in range(model.MAX_DISCLOSURE_CHECKS + 2)
+    ]
+    for time in times:
+        state.apply(DisclosureChecked("alpha", time, 0))
+    assert state.disclosure_checks == {
+        "alpha": tuple(times[-model.MAX_DISCLOSURE_CHECKS :])
+    }
+    with pytest.raises(EventRejected, match="no line"):
+        state.apply(DisclosureChecked("omega", times[0], 0))

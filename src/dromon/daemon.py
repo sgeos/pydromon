@@ -38,7 +38,11 @@ import contextlib
 import fcntl
 import os
 import signal
+import ssl
 import sys
+import time
+import traceback
+from datetime import UTC, datetime
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,7 +50,21 @@ from typing import Any, Final, cast
 
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import __version__, exits, restart
+from dromon import __version__, exits, peercred, restart
+from dromon.federation import (
+    NO_FEDERATION,
+    PEERS_DIR_NAME,
+    FederationError,
+    FederationConfig,
+    check_token_store,
+    ensure_identity,
+    format_host_port,
+    peer_directories,
+    plan_peers,
+    store_token,
+    stored_token,
+    unconfined_refusal,
+)
 from dromon import client
 from dromon.agents import (
     OFF as AGENTS_OFF,
@@ -68,7 +86,7 @@ from dromon.driver import (
     DriverError,
     Strategy,
 )
-from dromon.eventlog import EventLog, LogError, utc_now
+from dromon.eventlog import EventLog, LogError, read_entries, utc_now
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.mailbox import MAX_PAGE, listing, outcome, replied_ids, sent, summary
 from dromon.lineconfig import (
@@ -105,24 +123,54 @@ from dromon.overrides import (
 from dromon.overrides import decode as decode_override
 from dromon.overrides import encode as encode_override
 from dromon.model import (
+    ID_PATTERN,
+    PeerKeyed,
     ProjectOverridden,
     AgentAccess,
     AgentAddress,
     AgentRegistered,
     AgentRevoked,
+    Correlation,
     EventRejected,
     InvalidField,
     LineAddress,
     Message,
     OperatorAddress,
     QuestionStatus,
+    RemoteAddress,
+    ReturnCode,
     State,
-    parse_address,
+    parse_any_address,
 )
 from dromon import launcher
 from dromon.paths import PathError, ProjectPaths, ensure_private_dir, project_paths
+from dromon.forwarder import (
+    Connector,
+    Forwarder,
+    announced_name,
+    orphaned,
+    sent_times,
+)
+from dromon.federation_tls import TLS_HANDSHAKE_TIMEOUT_SECONDS
+from dromon.tls_link import (
+    peer_connector,
+    pinned_peer,
+    presented_pin,
+    server_context_for,
+)
+from dromon.peering import (
+    HELLO_KEYS,
+    HELLO_TIMEOUT_SECONDS,
+    MAX_HELLO_LINE_BYTES,
+    MAX_PEER_CONNECTIONS,
+    Receiver,
+    choose_version,
+    identify,
+    outcome_result,
+)
 from dromon.protocol import (
     MAX_LINE_BYTES,
+    MAX_PEER_LINE_BYTES,
     PROTOCOL_VERSION,
     ErrorCode,
     Operation,
@@ -134,6 +182,7 @@ from dromon.protocol import (
     request_id_of,
 )
 from dromon.scheduler import (
+    CORRELATION_ARGUMENT,
     DEFAULT_OPERATOR,
     DEFAULT_TICK_SECONDS,
     MAX_TICK_SECONDS,
@@ -197,6 +246,11 @@ class Daemon:
     )
     hold_wakes: bool = False
     """Whether the command line held wakes, which a restart's successor keeps."""
+    receiver: Receiver = field(default_factory=lambda: Receiver(time.monotonic))
+    """The judge of peer deliveries, with each peer's rate limit in memory."""
+    connect: Connector | None = None
+    """How the forwarder reaches a peer, by default ``peer_connector``, which reaches
+    each peer over its own transport. Tests give their own."""
     successor: list[str] | None = field(default=None, init=False)
     """The options a successor starts with, once a restart is ready to stop."""
     _watches: set["asyncio.Task[None]"] = field(
@@ -412,13 +466,176 @@ class Daemon:
         )
         return Response(request.request_id, ok=True, result=_bounded(result))
 
+    def respond_peer(self, session: "PeerSession", line: bytes) -> Response:
+        """Answer one line on the peer socket, which serves only ``hello`` and
+        ``deliver``. Never raises for anything a peer can send."""
+        try:
+            request = decode_request(line, MAX_PEER_LINE_BYTES)
+        except ProtocolError as error:
+            return _refusal(
+                request_id_of(line, MAX_PEER_LINE_BYTES), error.code, str(error)
+            )
+        match request.operation:
+            case Operation.PING:
+                return Response(request.request_id, ok=True, result={})
+            case Operation.HELLO:
+                return self._hello(session, request)
+            case Operation.DELIVER:
+                return self._deliver(session, request)
+            case _:
+                return _refusal(
+                    request.request_id,
+                    ErrorCode.UNKNOWN_OPERATION,
+                    "the peer socket serves only hello and deliver",
+                )
+
+    def _hello(self, session: "PeerSession", request: Request) -> Response:
+        """Name the connection's peer by the token it presents on the socket, or over
+        TLS by the pin of the key its handshake presented, when ``hello`` takes no
+        token. The name it gives itself is advisory and never names it. An undeclared
+        peer and a wrong token are refused alike."""
+        args = request.args
+        if session.peer_id is not None:
+            return _refusal(
+                request.request_id,
+                ErrorCode.REJECTED,
+                "hello was already given on this connection",
+            )
+        keys = HELLO_KEYS - {"token"} if session.pin_sha256 else HELLO_KEYS
+        if frozenset(args) != keys:
+            return _refusal(
+                request.request_id,
+                ErrorCode.BAD_REQUEST,
+                f"hello takes exactly {sorted(keys)}",
+            )
+        name = args["name"]
+        if not isinstance(name, str) or ID_PATTERN.fullmatch(name) is None:
+            return _refusal(
+                request.request_id, ErrorCode.BAD_REQUEST, "name is not an identifier"
+            )
+        version = choose_version(args["versions"])
+        if version is None:
+            return _refusal(
+                request.request_id,
+                ErrorCode.UNSUPPORTED_VERSION,
+                "no federation version in common",
+            )
+        peer_id = (
+            pinned_peer(self.project.federation, self.log.state, session.pin_sha256)
+            if session.pin_sha256
+            else identify(self.log.state, args["token"])
+        )
+        if peer_id is None:
+            print(
+                f"dromond: refused a peer's hello, announced as {name}",
+                file=sys.stderr,
+            )
+            return _refusal(request.request_id, ErrorCode.REJECTED, PEER_REFUSED)
+        session.peer_id = peer_id
+        session.token_sha256 = self.log.state.peers[peer_id].token_sha256
+        return Response(request.request_id, ok=True, result={"version": version})
+
+    def _deliver(self, session: "PeerSession", request: Request) -> Response:
+        """Judge one delivery from the connection's peer. The peer's token, or over
+        TLS its pin, is checked again, so a token revoked, a pin changed or a peer
+        removed while connected delivers nothing more."""
+        peer_id = session.peer_id
+        if peer_id is None:
+            return _refusal(
+                request.request_id, ErrorCode.REJECTED, "deliver needs a hello first"
+            )
+        peer = self.log.state.peers.get(peer_id)
+        if session.pin_sha256:
+            named = pinned_peer(
+                self.project.federation, self.log.state, session.pin_sha256
+            )
+            lost = named != peer_id
+        else:
+            lost = (
+                peer is None
+                or peer.removed
+                or peer.token_sha256 != session.token_sha256
+            )
+        if lost:
+            session.peer_id = None
+            session.token_sha256 = ""
+            return _refusal(request.request_id, ErrorCode.REJECTED, PEER_REFUSED)
+        try:
+            outcome = self.receiver.deliver(
+                self.log.state,
+                self.project.federation,
+                peer_id,
+                request.args,
+                self.scheduler.receive,
+            )
+        except EventRejected as error:
+            # The receiver's checks run before the append, so this is a fault here,
+            # reported as transient rather than as a refusal the peer would keep.
+            print(
+                f"dromond: a delivery from peer {peer_id} was not recorded: {error}",
+                file=sys.stderr,
+            )
+            return _refusal(
+                request.request_id,
+                ErrorCode.INTERNAL,
+                "the daemon could not record the message",
+            )
+        return Response(request.request_id, ok=True, result=outcome_result(outcome))
+
+    def forwarder(self) -> Forwarder:
+        """The forwarder for the project's peers, made once the log holds the peers
+        of this start. Mail waiting for a peer no longer declared is returned with
+        ``unknown_peer`` first. The send times of waiting mail are read from the log,
+        so expiry survives a restart, and the log is read only when mail waits."""
+        federation = self.project.federation
+        for message_id in orphaned(self.log.state, federation):
+            self.scheduler.return_mail(message_id, ReturnCode.UNKNOWN_PEER)
+        waiting = {m for queue in self.log.state.outbox.values() for m in queue}
+        times = (
+            sent_times(read_entries(self.paths.event_log), waiting) if waiting else {}
+        )
+        store = self.paths.state_dir / PEERS_DIR_NAME
+        forwarder = Forwarder(
+            self.scheduler,
+            federation,
+            (
+                peer_connector(self.paths.state_dir, store)
+                if self.connect is None
+                else self.connect
+            ),
+            lambda peer_id: _outbound_token(store, peer_id),
+            announced_name(self.paths.root, self.scheduler.discloses),
+            time.monotonic,
+            lambda: datetime.now(UTC),
+            times,
+        )
+        self.scheduler.on_outbox = forwarder.notify
+        self.scheduler.peer_reports = forwarder.reports
+        return forwarder
+
     def execute(self, request: Request) -> Response:
         """Answer one decoded request with operator authority."""
         match request.operation:
             case Operation.PING:
                 return Response(request.request_id, ok=True, result={})
             case Operation.STATUS:
-                return Response(request.request_id, ok=True, result=self.status())
+                key = request.args.get(CORRELATION_ARGUMENT)
+                if key is None:
+                    return Response(request.request_id, ok=True, result=self.status())
+                if not isinstance(key, str) or ID_PATTERN.fullmatch(key) is None:
+                    return _refusal(
+                        request.request_id,
+                        ErrorCode.BAD_REQUEST,
+                        "correlation is not an identifier",
+                    )
+                return Response(
+                    request.request_id,
+                    ok=True,
+                    result={
+                        **self.status(),
+                        "correlation": correlation_totals(self.log.state, key),
+                    },
+                )
             case Operation.STOP:
                 lost = self.tasks_lost(sorted(self.log.state.lines))
                 self.stop_requested.set()
@@ -431,6 +648,13 @@ class Daemon:
                     ok=False,
                     error_code=ErrorCode.UNKNOWN_OPERATION,
                     error_message=f"{request.operation} is served on the agent socket",
+                )
+            case Operation.HELLO | Operation.DELIVER:
+                return Response(
+                    request.request_id,
+                    ok=False,
+                    error_code=ErrorCode.UNKNOWN_OPERATION,
+                    error_message=f"{request.operation} is served on the peer socket",
                 )
             case (
                 Operation.CREATE_LINE
@@ -464,6 +688,11 @@ class Daemon:
                 | Operation.AGENT_ADD
                 | Operation.AGENT_REVOKE
                 | Operation.AGENT_LIST
+                | Operation.PEER_TOKEN
+                | Operation.PEER_REVOKE
+                | Operation.PEER_STORE
+                | Operation.PEER_LIST
+                | Operation.PEER_KEY
             ):
                 return self._command(request)
 
@@ -574,6 +803,22 @@ class Daemon:
                     result: dict[str, object] = {"agent": str(AgentAddress(agent_id))}
                 case Operation.AGENT_LIST:
                     result = self._agent_list(request.args)
+                case Operation.PEER_TOKEN:
+                    (peer_id,) = _text_args(request.args, ("peer",))
+                    result = self._peer_token(peer_id)
+                case Operation.PEER_REVOKE:
+                    (peer_id,) = _text_args(request.args, ("peer",))
+                    self.log.append(PeerKeyed(peer_id, ""))
+                    result = {"peer": peer_id, "revoked": True}
+                case Operation.PEER_STORE:
+                    peer_id, token = _text_args(request.args, ("peer", "token"))
+                    result = self._peer_store(peer_id, token)
+                case Operation.PEER_LIST:
+                    _text_args(request.args, ())
+                    result = self._peer_list()
+                case Operation.PEER_KEY:
+                    _text_args(request.args, ())
+                    result = self._peer_key()
                 case _:
                     result = self._send(request.args)
         except ProtocolError as error:
@@ -594,6 +839,7 @@ class Daemon:
             ProjectMismatch,
             SandboxError,
             DisclosureError,
+            FederationError,
         ) as error:
             return Response(
                 request.request_id,
@@ -731,7 +977,11 @@ class Daemon:
         """Refuse a working directory that does not exist or is not allowed, a
         plugin that would not load, and instructions ``check_instructions`` refuses,
         before anything is recorded. Raises ``ConfigError``."""
-        resolve_workdir(config.workdir, self.paths.root, protected_dirs(self.paths))
+        resolve_workdir(
+            config.workdir,
+            self.paths.root,
+            protected_dirs(self.paths, self.project.federation),
+        )
         check_plugins(config)
         check_instructions(config.instructions, self.paths.root)
 
@@ -775,7 +1025,7 @@ class Daemon:
                 self.log.state,
                 owner,
                 unread_only=unread_only,
-                sender=None if sender is None else parse_address(sender),
+                sender=None if sender is None else parse_any_address(sender),
                 offset=offset,
                 limit=limit,
             )
@@ -986,7 +1236,7 @@ class Daemon:
             check_engines(config)
         except ValueError as error:
             raise OverrideError(str(error)) from error
-        fixed = ("sandbox", "settings", "teacher", "agents")
+        fixed = ("sandbox", "settings", "teacher", "agents", "federation")
         moved = [
             name
             for name in fixed
@@ -1052,6 +1302,64 @@ class Daemon:
             "token": token,
             "listening": self.agents.listen,
         }
+
+    def _peer_token(self, peer_id: str) -> dict[str, object]:
+        """Issue the token the peer presents to this daemon, replacing any earlier one,
+        and return it. The token is returned once and only its digest is stored, as for
+        an agent. The peer must be declared in the project file."""
+        token = new_token()
+        self.log.append(PeerKeyed(peer_id, token_digest(token)))
+        return {"peer": peer_id, "token": token}
+
+    def _peer_store(self, peer_id: str, token: str) -> dict[str, object]:
+        """Store the token the peer issued for this daemon under ``.dromon/peers``.
+        The peer must be declared in the log, so a mistyped name stores nothing."""
+        known = self.log.state.peers.get(peer_id)
+        if known is None or known.removed:
+            raise FederationError(f"no peer {peer_id}")
+        path = store_token(self.paths.state_dir / PEERS_DIR_NAME, peer_id, token)
+        return {"peer": peer_id, "stored": str(path)}
+
+    def _peer_key(self) -> dict[str, object]:
+        """This daemon's TLS identity, made once under ``.dromon/peers``, with its pin
+        and the path of its public certificate, which the operator gives the peer's
+        operator with the pin. The private key never leaves the store."""
+        store = self.paths.state_dir / PEERS_DIR_NAME
+        identity, made = ensure_identity(store)
+        return {
+            "pin_sha256": identity.pin_sha256,
+            "certificate": str(identity.certificate),
+            "made": made,
+        }
+
+    def _peer_list(self) -> dict[str, object]:
+        """The declared peers, with each one's directions and whether a token is issued
+        for it and stored from it. Never a token or a digest."""
+        store = self.paths.state_dir / PEERS_DIR_NAME
+        peers: list[object] = []
+        for peer_id, definition in sorted(self.project.federation.peers.items()):
+            known = self.log.state.peers.get(peer_id)
+            try:
+                stored: object = stored_token(store, peer_id) is not None
+            except FederationError as error:
+                stored = str(error)
+            peers.append(
+                {
+                    "peer": peer_id,
+                    "transport": definition.transport,
+                    "socket": None
+                    if definition.socket is None
+                    else str(definition.socket),
+                    "address": None
+                    if definition.address is None
+                    else format_host_port(definition.address),
+                    "inbound": definition.inbound,
+                    "outbound": definition.outbound,
+                    "issued": known is not None and bool(known.token_sha256),
+                    "stored": stored,
+                }
+            )
+        return {"listen": self.project.federation.listen, "peers": peers}
 
     def _agent_list(self, args: dict[str, object]) -> dict[str, object]:
         _text_args(args, ())
@@ -1119,6 +1427,7 @@ class Daemon:
                     "delivered": status.delivered,
                     "read": status.read,
                     "outcome": status.outcome,
+                    "delivery": status.delivery,
                 }
                 for status in page
             ],
@@ -1149,8 +1458,8 @@ class Daemon:
         recipient, body, operator = values[:3]
         reply_to = values[3] if optional else None
         sender = OperatorAddress(operator)
-        address = parse_address(recipient)
-        if urgent:
+        address = parse_any_address(recipient)
+        if urgent and not isinstance(address, RemoteAddress):
             # Checked before the operator is registered, so a refusal records nothing.
             self.scheduler.check_priority(sender, address)
         self.scheduler.ensure_operator(sender.operator_id)
@@ -1245,6 +1554,10 @@ class Daemon:
             "daemon": self.scheduler.daemon_status(),
             "restart": self.scheduler.restart_status(),
             "lines": self.scheduler.line_summaries(),
+            "scheduler": self.scheduler.fault_status(),
+            "peers": [
+                report.wire(detail=True) for report in self.scheduler.peer_reports()
+            ],
             "agents": {
                 "listen": self.agents.listen,
                 "anonymous": self.agents.anonymous.value,
@@ -1258,6 +1571,50 @@ class Daemon:
 
 MAX_AGENT_TEXT: Final = 48 * 1024
 """The most text one agent result carries, so it fits one protocol line."""
+
+
+PEER_REFUSED: Final = "the peer was refused"
+"""The one refusal of an unknown peer, a wrong token and a revoked one, so a caller
+cannot tell which peer names are declared."""
+
+
+@dataclass(slots=True)
+class PeerSession:
+    """One connection on the peer socket, and the peer its ``hello`` named."""
+
+    daemon: Daemon
+    peer_id: str | None = None
+    token_sha256: str = ""
+    """The digest the peer's token matched at ``hello``, checked again at each
+    ``deliver``."""
+    pin_sha256: str = ""
+    """Over TLS, the pin of the key the peer presented in its handshake, which names
+    it at ``hello`` and again at each ``deliver``. Empty on the socket."""
+
+    async def respond(self, line: bytes) -> Response:
+        return self.daemon.respond_peer(self, line)
+
+
+def correlation_totals(state: State, key: str) -> dict[str, object]:
+    """The totals of one correlation key as ``status`` reports them. The cost is a
+    decimal text of whole millionths of a dollar, so no float rounds it. A key with
+    no recorded turn, or one dropped as least recently used, reports ``recorded``
+    false and zero totals."""
+    total = state.correlations.get(key)
+    found = total if total is not None else Correlation()
+    micro = found.cost_micro_usd
+    return {
+        "key": key,
+        "recorded": total is not None,
+        "turns": found.turns,
+        "shared_turns": found.shared_turns,
+        "cost_usd": f"{micro // 1_000_000}.{micro % 1_000_000:06d}",
+        "unknown_cost_turns": found.unknown_cost_turns,
+    }
+
+
+def _refusal(request_id: str, code: ErrorCode, message: str) -> Response:
+    return Response(request_id, ok=False, error_code=code, error_message=message)
 
 
 def _bounded(result: dict[str, object]) -> dict[str, object]:
@@ -1345,6 +1702,7 @@ async def _connection(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
     responder: Responder,
+    limit: int = MAX_LINE_BYTES,
 ) -> None:
     """Serve requests on one connection until EOF, timeout, error or stop."""
     try:
@@ -1362,7 +1720,7 @@ async def _connection(
                         "",
                         ok=False,
                         error_code=ErrorCode.TOO_LONG,
-                        error_message=f"the line exceeds {MAX_LINE_BYTES} bytes",
+                        error_message=f"the line exceeds {limit} bytes",
                     ),
                 )
                 break
@@ -1372,7 +1730,7 @@ async def _connection(
                 await _write(
                     writer,
                     Response(
-                        request_id_of(line),
+                        request_id_of(line, limit),
                         ok=False,
                         error_code=ErrorCode.BAD_REQUEST,
                         error_message="the connection closed inside a line",
@@ -1388,9 +1746,273 @@ async def _connection(
             await writer.wait_closed()
 
 
+class LineReader:
+    """Reads lines of at most ``limit`` bytes in chunks, so that the stream's own
+    limit can stay small. The peer socket's stream is limited to the ``hello`` line,
+    and an identified peer's larger lines are read through this."""
+
+    def __init__(self, reader: asyncio.StreamReader, limit: int) -> None:
+        self._reader = reader
+        self._limit = limit
+        self._buffer = bytearray()
+
+    async def readline(self) -> bytes:
+        """The next line with its newline, or what remains at end of file, which is
+        empty or lacks the newline. Raises ``ValueError`` past the limit. Each pass
+        returns, raises, or grows the buffer toward the limit, so it is bounded."""
+        while True:
+            end = self._buffer.find(b"\n")
+            if end >= 0:
+                if end + 1 > self._limit:
+                    raise ValueError(f"the line exceeds {self._limit} bytes")
+                line = bytes(self._buffer[: end + 1])
+                del self._buffer[: end + 1]
+                return line
+            if len(self._buffer) >= self._limit:
+                raise ValueError(f"the line exceeds {self._limit} bytes")
+            chunk = await self._reader.read(MAX_HELLO_LINE_BYTES)
+            if not chunk:
+                rest = bytes(self._buffer)
+                self._buffer.clear()
+                return rest
+            self._buffer += chunk
+
+
+async def peer_connection(
+    daemon: Daemon,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    session: "PeerSession",
+) -> None:
+    """Serve one connection on the peer socket. Its first line must arrive within
+    ``HELLO_TIMEOUT_SECONDS`` and hold at most ``MAX_HELLO_LINE_BYTES``, the stream's
+    own limit, and anything but an accepted ``hello`` closes the connection after its
+    answer. Later lines may be as large as ``MAX_PEER_LINE_BYTES``, and the connection
+    closes when the session loses its peer, as a revoked token makes it."""
+    try:
+        try:
+            first = await asyncio.wait_for(reader.readline(), HELLO_TIMEOUT_SECONDS)
+        except TimeoutError:
+            return
+        except ValueError:
+            await _write(writer, _too_long(MAX_HELLO_LINE_BYTES))
+            return
+        if not first.endswith(b"\n"):
+            return
+        await _write(writer, await session.respond(first))
+        lines = LineReader(reader, MAX_PEER_LINE_BYTES)
+        while session.peer_id is not None and not daemon.stop_requested.is_set():
+            try:
+                line = await asyncio.wait_for(lines.readline(), IDLE_TIMEOUT_SECONDS)
+            except TimeoutError:
+                break
+            except ValueError:
+                await _write(writer, _too_long(MAX_PEER_LINE_BYTES))
+                break
+            if not line.endswith(b"\n"):
+                break
+            await _write(writer, await session.respond(line))
+    except (ConnectionError, BrokenPipeError):
+        pass
+    finally:
+        writer.close()
+        with contextlib.suppress(ConnectionError, BrokenPipeError):
+            await writer.wait_closed()
+
+
+async def tls_peer_connection(
+    daemon: Daemon,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    context: ssl.SSLContext,
+) -> None:
+    """Serve one connection on the TLS listener. The handshake must finish within
+    ``TLS_HANDSHAKE_TIMEOUT_SECONDS`` and present the key of an inbound ``tls`` peer
+    by its pin, before any frame is read, and the connection is then served as one on
+    the peer socket, with the peer named by that pin in place of a token. A refusal is
+    said on standard error and answered with nothing, since a client that failed the
+    handshake cannot read an answer."""
+    try:
+        await writer.start_tls(
+            context, ssl_handshake_timeout=TLS_HANDSHAKE_TIMEOUT_SECONDS
+        )
+    except (OSError, TimeoutError) as error:
+        # ``ssl.SSLError`` and ``ConnectionError`` are ``OSError``.
+        print(
+            f"dromond: refused a tls connection, its handshake failed: {error!r}",
+            file=sys.stderr,
+        )
+        await _closed(writer)
+        return
+    pin = presented_pin(writer.get_extra_info("ssl_object"))
+    if pin is None or (
+        pinned_peer(daemon.project.federation, daemon.log.state, pin) is None
+    ):
+        print(
+            "dromond: refused a tls connection, its key matches no inbound tls peer",
+            file=sys.stderr,
+        )
+        await _closed(writer)
+        return
+    await peer_connection(daemon, reader, writer, PeerSession(daemon, pin_sha256=pin))
+
+
+async def _closed(writer: asyncio.StreamWriter) -> None:
+    writer.close()
+    with contextlib.suppress(OSError):
+        await writer.wait_closed()
+
+
+def _too_long(limit: int) -> Response:
+    return Response(
+        "",
+        ok=False,
+        error_code=ErrorCode.TOO_LONG,
+        error_message=f"the line exceeds {limit} bytes",
+    )
+
+
+class ConnectionCap:
+    """Serves at most ``limit`` connections at once, and answers any further one with
+    one rejected response before closing it. The count includes connections still
+    being checked by ``peercred``, so a flood is turned away before any work for it.
+
+    Inference, not verified under load: one event loop runs every accept, so the count
+    needs no lock. A port with threads needs an atomic counter here."""
+
+    def __init__(self, limit: int, what: str) -> None:
+        if limit < 1:
+            raise ValueError(f"a connection cap must be at least 1, not {limit}")
+        self.limit = limit
+        self.what = what
+        self.active = 0
+
+    async def admit(
+        self,
+        writer: asyncio.StreamWriter,
+        serving: Callable[[], Awaitable[None]],
+        *,
+        answer: bool = True,
+    ) -> None:
+        """Serve the connection, or refuse it when the cap is reached. ``answer``
+        false closes a refused one without a response, as on the TLS listener, where
+        a plain line would only break the client's handshake."""
+        if self.active >= self.limit:
+            print(
+                f"dromond: refused a connection, {self.limit} {self.what} are open",
+                file=sys.stderr,
+            )
+            if not answer:
+                await _closed(writer)
+                return
+            try:
+                await _write(
+                    writer,
+                    Response(
+                        "",
+                        ok=False,
+                        error_code=ErrorCode.REJECTED,
+                        error_message=(
+                            f"the daemon serves at most {self.limit} {self.what}"
+                        ),
+                    ),
+                )
+            except (ConnectionError, BrokenPipeError):
+                pass
+            finally:
+                writer.close()
+                with contextlib.suppress(ConnectionError, BrokenPipeError):
+                    await writer.wait_closed()
+            return
+        self.active += 1
+        try:
+            await serving()
+        finally:
+            self.active -= 1
+
+
+def _outbound_token(store: Path, peer_id: str) -> str | None:
+    """The token stored for ``peer_id``, or ``None`` when none is stored or the store
+    is unsafe, which is said on standard error and retried at the next connection."""
+    try:
+        return stored_token(store, peer_id)
+    except FederationError as error:
+        print(
+            f"dromond: the token for peer {peer_id} is unusable: {error}",
+            file=sys.stderr,
+        )
+        return None
+
+
+async def _guarded(
+    writer: asyncio.StreamWriter,
+    own_uid: int,
+    serving: Callable[[], Awaitable[None]],
+) -> None:
+    """Serve a connection only when its peer runs as ``own_uid``, read by ``peercred``.
+
+    A refused connection receives one rejected response and is closed, and the refusal
+    is written to standard error, so an operator can see who was turned away.
+    """
+    reason = peercred.refusal(
+        cast(peercred.CredentialSocket, writer.get_extra_info("socket")), own_uid
+    )
+    if reason is None:
+        await serving()
+        return
+    print(f"dromond: refused a connection, {reason}", file=sys.stderr)
+    try:
+        await _write(
+            writer,
+            Response(
+                "",
+                ok=False,
+                error_code=ErrorCode.REJECTED,
+                error_message=f"the daemon refused the connection, {reason}",
+            ),
+        )
+    except (ConnectionError, BrokenPipeError):
+        pass
+    finally:
+        writer.close()
+        with contextlib.suppress(ConnectionError, BrokenPipeError):
+            await writer.wait_closed()
+
+
+def watch_task(
+    what: str, stop: asyncio.Event
+) -> Callable[["asyncio.Task[None]"], None]:
+    """A done callback that says on standard error, when it happens, that the task
+    for ``what`` ended with an exception or before ``stop`` was set. Without it, an
+    exception in a task the daemon awaits only at shutdown is seen only then.
+    ``PeerForwarder.run`` and ``Scheduler.run`` already survive what a step raises, so
+    this is the outer watch, for what escapes those."""
+
+    def ended(task: "asyncio.Task[None]") -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            trace = "".join(traceback.format_exception(error)).rstrip()
+            print(
+                f"dromond: the {what} ended with an unexpected error, and its work"
+                f" waits until the daemon restarts\n{trace}",
+                file=sys.stderr,
+            )
+        elif not stop.is_set():
+            print(
+                f"dromond: the {what} ended before the daemon stopped, and its work"
+                " waits until the daemon restarts",
+                file=sys.stderr,
+            )
+
+    return ended
+
+
 async def serve(daemon: Daemon) -> None:
     """Listen on the project's socket until a stop is requested."""
     loop = asyncio.get_running_loop()
+    own_uid = os.getuid()
     for signum in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(signum, daemon.stop_requested.set)
     writers: set[asyncio.StreamWriter] = set()
@@ -1399,14 +2021,24 @@ async def serve(daemon: Daemon) -> None:
         return daemon.respond(line)
 
     def accepting(
-        responder: Responder,
+        responder: Callable[[], Responder], limit: int = MAX_LINE_BYTES
     ) -> Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]:
+        """Accept connections, each served by a responder made for it, so that the
+        peer socket can keep the peer its ``hello`` named for one connection."""
+
         async def accept(
             reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         ) -> None:
             writers.add(writer)
             try:
-                await _connection(daemon, reader, writer, responder)
+                # Every socket goes through here, the operator's, the lines', the
+                # agents' and the peers', so none of them serves a process of another
+                # user.
+                await _guarded(
+                    writer,
+                    own_uid,
+                    lambda: _connection(daemon, reader, writer, responder(), limit),
+                )
             finally:
                 writers.discard(writer)
 
@@ -1414,7 +2046,9 @@ async def serve(daemon: Daemon) -> None:
 
     socket_path = daemon.paths.socket
     server = await asyncio.start_unix_server(
-        accepting(operator_responder), path=str(socket_path), limit=MAX_LINE_BYTES
+        accepting(lambda: operator_responder),
+        path=str(socket_path),
+        limit=MAX_LINE_BYTES,
     )
     # The line socket serves only lines whose engine was issued a token, so it is
     # always open, and it never accepts an agent or operator request.
@@ -1424,7 +2058,9 @@ async def serve(daemon: Daemon) -> None:
     servers = [
         server,
         await asyncio.start_unix_server(
-            accepting(daemon.respond_line), path=str(line_path), limit=MAX_LINE_BYTES
+            accepting(lambda: daemon.respond_line),
+            path=str(line_path),
+            limit=MAX_LINE_BYTES,
         ),
     ]
     line_path.chmod(0o600)
@@ -1436,7 +2072,7 @@ async def serve(daemon: Daemon) -> None:
             agent_path.unlink()
         servers.append(
             await asyncio.start_unix_server(
-                accepting(daemon.respond_agent),
+                accepting(lambda: daemon.respond_agent),
                 path=str(agent_path),
                 limit=MAX_LINE_BYTES,
             )
@@ -1447,8 +2083,53 @@ async def serve(daemon: Daemon) -> None:
             f" {daemon.agents.anonymous}, at most {daemon.agents.max_access}",
             file=sys.stderr,
         )
+    # One cap counts the peer socket's connections and the TLS listener's together,
+    # each from its accept, so a TLS connection counts before its handshake.
+    peer_cap = ConnectionCap(MAX_PEER_CONNECTIONS, "peer connections")
+    if daemon.project.federation.listen:
+        # A separate socket that serves only hello and deliver, so that nothing a
+        # peer sends reaches the operator's or an agent's dispatch.
+        peer_path = daemon.paths.peer_socket
+        with contextlib.suppress(FileNotFoundError):
+            peer_path.unlink()
+
+        async def peer_accept(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            writers.add(writer)
+            try:
+                await peer_cap.admit(
+                    writer,
+                    lambda: _guarded(
+                        writer,
+                        own_uid,
+                        lambda: peer_connection(
+                            daemon, reader, writer, PeerSession(daemon)
+                        ),
+                    ),
+                )
+            finally:
+                writers.discard(writer)
+
+        # The stream's limit is the hello line's, which bounds what a connection
+        # that has not named its peer can make the daemon buffer.
+        servers.append(
+            await asyncio.start_unix_server(
+                peer_accept, path=str(peer_path), limit=MAX_HELLO_LINE_BYTES
+            )
+        )
+        peer_path.chmod(0o600)
+        print(f"dromond: peers may connect on {peer_path}", file=sys.stderr)
+    tls_listener = await _listen_tls(daemon, peer_cap, writers)
+    if tls_listener is not None:
+        servers.append(tls_listener)
+    # Made before any task starts, so that a log it cannot read stops the start cleanly.
+    forwarder = daemon.forwarder()
     daemon.scheduler.recover()
     scheduling = asyncio.create_task(daemon.scheduler.run(daemon.stop_requested))
+    forwarding = asyncio.create_task(forwarder.run(daemon.stop_requested))
+    scheduling.add_done_callback(watch_task("scheduler", daemon.stop_requested))
+    forwarding.add_done_callback(watch_task("forwarder", daemon.stop_requested))
     try:
         # The umask already gives 0600, and this states it rather than relying on it.
         socket_path.chmod(0o600)
@@ -1457,6 +2138,10 @@ async def serve(daemon: Daemon) -> None:
     finally:
         daemon.stop_requested.set()
         await scheduling
+        # Its watch has said how it ended, and an error here must not keep the
+        # sockets open.
+        with contextlib.suppress(Exception):
+            await forwarding
         for listening in servers:
             listening.close()
         for writer in list(writers):
@@ -1468,6 +2153,52 @@ async def serve(daemon: Daemon) -> None:
                 )
         for signum in (signal.SIGTERM, signal.SIGINT):
             loop.remove_signal_handler(signum)
+
+
+async def _listen_tls(
+    daemon: Daemon, cap: ConnectionCap, writers: set[asyncio.StreamWriter]
+) -> asyncio.Server | None:
+    """The TLS listener on ``tls_listen``, when the project names one. A context or
+    address that fails is said on standard error and nothing listens over TLS, so
+    the rest of the daemon, the socket's peers included, still serves. **Decided by
+    core, for review.** Refusing the start would make the failure louder, at the
+    cost of every other service."""
+    federation = daemon.project.federation
+    if federation.tls_listen is None:
+        return None
+    where = format_host_port(federation.tls_listen)
+    try:
+        context = server_context_for(
+            daemon.paths.state_dir, daemon.paths.state_dir / PEERS_DIR_NAME, federation
+        )
+    except (FederationError, OSError) as error:
+        print(f"dromond: nothing listens over tls on {where}: {error}", file=sys.stderr)
+        return None
+
+    async def accept(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        writers.add(writer)
+        try:
+            await cap.admit(
+                writer,
+                lambda: tls_peer_connection(daemon, reader, writer, context),
+                answer=False,
+            )
+        finally:
+            writers.discard(writer)
+
+    host, port = federation.tls_listen
+    try:
+        # The stream's limit is the hello line's, as on the peer socket.
+        server = await asyncio.start_server(
+            accept, host, port, limit=MAX_HELLO_LINE_BYTES
+        )
+    except OSError as error:
+        print(f"dromond: nothing listens over tls on {where}: {error}", file=sys.stderr)
+        return None
+    print(f"dromond: peers may connect over tls on {where}", file=sys.stderr)
+    return server
 
 
 def successor_args(overrides: Overrides, hold_wakes: bool) -> list[str]:
@@ -1515,10 +2246,18 @@ class ProjectMismatch(Exception):
     """The project file and the event log disagree on something that cannot change."""
 
 
-def protected_dirs(paths: ProjectPaths) -> tuple[Path, ...]:
+def protected_dirs(
+    paths: ProjectPaths, federation: FederationConfig = NO_FEDERATION
+) -> tuple[Path, ...]:
     """The directories every enabled sandbox denies, which hold the event log, the
-    project file and the daemon's socket."""
-    return (paths.state_dir.resolve(), paths.runtime_dir.resolve())
+    project file and the daemon's socket, followed by each declared peer's, which hold
+    the same for another project. Raises ``ConfigError`` when a peer names this
+    project's own directories, or two peers share one."""
+    own = (paths.state_dir.resolve(), paths.runtime_dir.resolve())
+    try:
+        return own + peer_directories(federation, own)
+    except FederationError as error:
+        raise ConfigError(str(error)) from error
 
 
 def check_plugins(config: LineConfig) -> None:
@@ -1535,7 +2274,7 @@ def check_sandboxes(config: ProjectConfig, paths: ProjectPaths) -> None:
     """Refuse a project file whose working directories are not allowed, or whose
     sandboxes cannot be made safe in them, before anything starts, rather than at
     each line's first turn. Raises ``ConfigError`` or ``SandboxError``."""
-    protected = protected_dirs(paths)
+    protected = protected_dirs(paths, config.federation)
     effective(config.sandbox, paths.root, protected)
     for line in config.lines.values():
         check_plugins(line.config)
@@ -1562,11 +2301,20 @@ def check_sandbox_required(
     project requires one. Codex and Grok lines run under their own permission
     profiles, Pi lines take no built-in tool that could run a command or touch a
     file, and Cursor and Antigravity lines are refused, so they satisfy the
-    requirement. Raises ``SandboxError``."""
+    requirement. Also refuse a line on an engine Dromon cannot confine while the
+    project declares peers and does not accept it, by decision 9 of the federation
+    design, which counts a Claude Code line without an enabled sandbox, by the
+    operator's decision of 2026-10-28. Raises ``SandboxError``."""
+    merged: SandboxConfig | None = merge([project.sandbox, config.sandbox])
+    sandboxed = merged is not None and merged.enabled
+    refusal = unconfined_refusal(
+        project.federation, line_id, ENGINE_OF.get(model), sandboxed
+    )
+    if refusal is not None:
+        raise SandboxError(refusal)
     if not project.require_sandbox or ENGINE_OF.get(model) != CLAUDE_CODE_ENGINE:
         return
-    merged: SandboxConfig | None = merge([project.sandbox, config.sandbox])
-    if merged is None or not merged.enabled:
+    if not sandboxed:
         raise SandboxError(
             f"line {line_id} would run on Claude Code without an enabled sandbox,"
             " which the project's daemon.require_sandbox requires"
@@ -1755,9 +2503,11 @@ def run(
     os.umask(0o077)
     given = overrides or Overrides()
     try:
+        peercred.check_supported()
         ensure_private_dir(paths.state_dir)
         ensure_private_dir(paths.runtime_dir)
         ensure_private_dir(paths.left_reports)
+        check_token_store(paths.state_dir / PEERS_DIR_NAME)
         file = config_path(paths.state_dir)
         config = load(file, paths.root) if file.exists() else ProjectConfig()
         check_sandboxes(config, paths)
@@ -1768,7 +2518,13 @@ def run(
     except AlreadyRunning as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.ALREADY_RUNNING
-    except (PathError, ConfigFileError, ValueError, InvalidField) as error:
+    except (
+        PathError,
+        ConfigFileError,
+        ValueError,
+        InvalidField,
+        peercred.PeerCredentialError,
+    ) as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
     line_tokens = LineTokens()
@@ -1785,7 +2541,7 @@ def run(
                     str(paths.root),
                     project_sandbox=config.sandbox,
                     project_settings=config.settings,
-                    protected=protected_dirs(paths),
+                    protected=protected_dirs(paths, config.federation),
                     line_tokens=line_tokens,
                     line_socket=paths.line_socket,
                     line_secrets=line_secrets,
@@ -1796,7 +2552,7 @@ def run(
                 tick_seconds=tick,
                 wake_every_ticks=config.wake_every_ticks,
                 root=paths.root,
-                protected=protected_dirs(paths),
+                protected=protected_dirs(paths, config.federation),
                 daemon_commit=read_head_commit(Path(__file__).parent),
                 daemon_checkout=Path(__file__).parent,
                 processes_identifiable=environment_reading_works(),
@@ -1810,6 +2566,15 @@ def run(
             check_lines_sandboxed(config, log, scheduler)
             check_roles(scheduler, log, config)
             apply_project(scheduler, log, config)
+            for event in plan_peers(log.state, config.federation):
+                log.append(event)
+            scheduler.federation = config.federation
+            scheduler.peer_turns.set_allowances(
+                {
+                    peer_id: peer.turns_per_hour
+                    for peer_id, peer in config.federation.peers.items()
+                }
+            )
             teacher = start_teacher(config, paths)
             try:
                 daemon = Daemon(
@@ -1839,11 +2604,17 @@ def run(
         EventRejected,
         TeacherError,
         SandboxError,
+        FederationError,
     ) as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
     finally:
-        for stale in (paths.socket, paths.agent_socket, paths.line_socket):
+        for stale in (
+            paths.socket,
+            paths.agent_socket,
+            paths.line_socket,
+            paths.peer_socket,
+        ):
             with contextlib.suppress(FileNotFoundError):
                 stale.unlink()
         os.close(lock)

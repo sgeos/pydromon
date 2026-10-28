@@ -20,6 +20,10 @@ PROTOCOL_VERSION: Final = 1
 MAX_LINE_BYTES: Final = 64 * 1024
 """Upper bound on one request or response line, including its newline."""
 
+MAX_PEER_LINE_BYTES: Final = 8 * 1024 * 1024
+"""Upper bound on one line on the peer socket, the bound of an encoded event, so the
+largest body a peer's policy may permit fits even when escaping multiplies its size."""
+
 REQUEST_ID_PATTERN: Final = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
@@ -66,10 +70,24 @@ class Operation(StrEnum):
     AGENT_ADD = "agent_add"
     AGENT_REVOKE = "agent_revoke"
     AGENT_LIST = "agent_list"
+    PEER_TOKEN = "peer_token"  # noqa: S105, an operation name
+    """Operator only. Not offered to external agents."""
+    PEER_REVOKE = "peer_revoke"
+    """Operator only. Not offered to external agents."""
+    PEER_STORE = "peer_store"
+    """Operator only. Not offered to external agents."""
+    PEER_LIST = "peer_list"
+    """Operator only. Not offered to external agents."""
+    PEER_KEY = "peer_key"
+    """Operator only. Not offered to external agents."""
     AGENT_TOOLS = "agent_tools"
     """Served only on the agent socket."""
     AGENT_CALL = "agent_call"
     """Served only on the agent socket."""
+    HELLO = "hello"
+    """Served only on the peer socket."""
+    DELIVER = "deliver"
+    """Served only on the peer socket."""
 
 
 class ErrorCode(StrEnum):
@@ -107,7 +125,7 @@ class Response:
     error_message: str | None = None
 
 
-def _dumps(document: dict[str, object]) -> bytes:
+def _dumps(document: dict[str, object], limit: int = MAX_LINE_BYTES) -> bytes:
     text = json.dumps(
         document,
         ensure_ascii=False,
@@ -116,8 +134,8 @@ def _dumps(document: dict[str, object]) -> bytes:
         allow_nan=False,
     )
     line = (text + "\n").encode("utf-8")
-    if len(line) > MAX_LINE_BYTES:
-        raise ProtocolError(ErrorCode.TOO_LONG, f"the line exceeds {MAX_LINE_BYTES}")
+    if len(line) > limit:
+        raise ProtocolError(ErrorCode.TOO_LONG, f"the line exceeds {limit}")
     found = _float_at(document)
     if found is not None:
         # The decoder refuses every float, so a sender that let one through would
@@ -162,9 +180,9 @@ def _object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, obj
     return document
 
 
-def _loads(line: bytes) -> dict[str, object]:
-    if len(line) > MAX_LINE_BYTES:
-        raise ProtocolError(ErrorCode.TOO_LONG, f"the line exceeds {MAX_LINE_BYTES}")
+def _loads(line: bytes, limit: int = MAX_LINE_BYTES) -> dict[str, object]:
+    if len(line) > limit:
+        raise ProtocolError(ErrorCode.TOO_LONG, f"the line exceeds {limit}")
     try:
         text = line.decode("utf-8")
         document: object = json.loads(
@@ -200,7 +218,7 @@ def _request_id(document: dict[str, object]) -> str:
     return value
 
 
-def encode_request(request: Request) -> bytes:
+def encode_request(request: Request, limit: int = MAX_LINE_BYTES) -> bytes:
     document: dict[str, object] = {
         "id": request.request_id,
         "op": request.operation.value,
@@ -208,12 +226,13 @@ def encode_request(request: Request) -> bytes:
     }
     if request.args:
         document["args"] = request.args
-    return _dumps(document)
+    return _dumps(document, limit)
 
 
-def decode_request(line: bytes) -> Request:
-    """Return the request in ``line``, or raise ``ProtocolError`` with a code."""
-    document = _loads(line)
+def decode_request(line: bytes, limit: int = MAX_LINE_BYTES) -> Request:
+    """Return the request in ``line``, or raise ``ProtocolError`` with a code. Only the
+    peer socket gives a ``limit`` above ``MAX_LINE_BYTES``."""
+    document = _loads(line, limit)
     _version(document)
     request_id = _request_id(document)
     if set(document) not in ({"id", "op", "v"}, {"args", "id", "op", "v"}):
@@ -235,7 +254,7 @@ def decode_request(line: bytes) -> Request:
         ) from error
 
 
-def request_id_of(line: bytes) -> str:
+def request_id_of(line: bytes, limit: int = MAX_LINE_BYTES) -> str:
     """Return the request id in a line that failed to decode, or ``""`` if none.
 
     Lets an error response name the request it answers whenever the id is readable.
@@ -243,7 +262,7 @@ def request_id_of(line: bytes) -> str:
     answered under its own id, and the client reports the refusal rather than a
     mismatched id.
     """
-    if len(line) > MAX_LINE_BYTES:
+    if len(line) > limit:
         return ""
     try:
         document: object = json.loads(
@@ -259,7 +278,7 @@ def request_id_of(line: bytes) -> str:
         return ""
 
 
-def encode_response(response: Response) -> bytes:
+def encode_response(response: Response, limit: int = MAX_LINE_BYTES) -> bytes:
     document: dict[str, object] = {
         "id": response.request_id,
         "ok": response.ok,
@@ -273,13 +292,13 @@ def encode_response(response: Response) -> bytes:
             "code": code.value,
             "message": response.error_message or "",
         }
-    return _dumps(document)
+    return _dumps(document, limit)
 
 
-def decode_response(line: bytes) -> Response:
+def decode_response(line: bytes, limit: int = MAX_LINE_BYTES) -> Response:
     """Return the response in ``line``. The daemon is trusted less than the operator,
     so its responses are checked like any other input."""
-    document = _loads(line)
+    document = _loads(line, limit)
     _version(document)
     request_id = document.get("id")
     if not isinstance(request_id, str):

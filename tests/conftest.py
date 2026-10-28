@@ -11,6 +11,7 @@ from dromon import priority
 from dromon.driver import Strategy
 from dromon.lineconfig import LineConfig, encode_config
 from dromon.model import (
+    HARNESS,
     AgentAccess,
     AgentAddress,
     AgentRegistered,
@@ -32,13 +33,21 @@ from dromon.model import (
     LineStateChanged,
     MessageAcknowledged,
     MessagePrioritized,
+    MessageCorrelated,
+    TurnCorrelated,
+    DisclosureChecked,
     MessageDelivered,
     MessageRead,
+    MessageReceived,
+    MessageReturned,
+    MessageUnconfirmed,
+    ReturnCode,
     MessageKind,
     MessageSent,
     OperatorAddress,
     OperatorRegistered,
     ProjectOverridden,
+    RemoteAddress,
     QuestionSuperseded,
     QuestionWithdrawn,
     WakeIssued,
@@ -46,6 +55,7 @@ from dromon.model import (
     WakeScheduled,
     WakeWithdrawn,
     TaskNoted,
+    TaskRecorded,
     RestartNoted,
     LineCostMarked,
     ProcessesLeft,
@@ -59,6 +69,9 @@ from dromon.model import (
     RoleNoteKind,
     BudgetStated,
     BudgetSource,
+    PeerDeclared,
+    PeerKeyed,
+    PeerRemoved,
 )
 
 ENGINE = "claude-opus-5-5"
@@ -67,6 +80,8 @@ BETA = LineAddress("beta")
 ANA = OperatorAddress("ana")
 BEN = OperatorAddress("ben")
 PROBE = AgentAddress("probe")
+KAIZEN = RemoteAddress("keleusma", LineAddress("kaizen"))
+KAIZEN_ANA = RemoteAddress("keleusma", OperatorAddress("ana"))
 NOTE = MessageKind.NOTE
 QUESTION = MessageKind.QUESTION
 AT = "2026-10-27T05:00:00Z"
@@ -118,8 +133,13 @@ SCENARIO: tuple[Event, ...] = (
     LineAwakened("alpha"),
     MessageSent("m6", ALPHA, ALPHA, NOTE, "a note to my next turn"),
     MessageSent("m3", ALPHA, BEN, NOTE, "thank you", reply_to="m2"),
+    MessageSent("h1", HARNESS, BEN, NOTE, "a note the harness wrote"),
     AgentRegistered("probe", AgentAccess.MESSAGE, "0" * 64),
     MessageSent("m4", PROBE, BETA, NOTE, "from an agent"),
+    MessageCorrelated("m4", "game-7.round-2"),
+    TurnCorrelated("beta", ("game-7.round-2",), 1, 1_250_000),
+    TurnCorrelated("beta", ("game-7.round-2", "game-8"), 2, None),
+    DisclosureChecked("beta", "2026-10-28T19:00:00Z", 2),
     MessageSent("m5", BETA, PROBE, NOTE, "to an agent", reply_to="m4"),
     AgentRegistered("guest", AgentAccess.OBSERVE, ""),
     AgentRevoked("guest"),
@@ -129,6 +149,30 @@ SCENARIO: tuple[Event, ...] = (
     WakeScheduled("beta", "s3", "2026-10-26T10:30:00Z", "compact wake"),
     WakeWithdrawn("beta", "s3"),
     TaskNoted("beta", "n1", "b8k2", "completed", "Your background task b8k2 ended."),
+    TaskRecorded(
+        "beta",
+        "b8k2",
+        "./scripts/check.sh",
+        "completed",
+        0,
+        "/work/tasks/b8k2.output",
+        "0" * 64,
+        1024,
+        "a" * 40,
+        "2026-10-28T19:05:00Z",
+    ),
+    TaskRecorded(
+        "beta",
+        "b8k3",
+        "make",
+        "failed",
+        None,
+        None,
+        None,
+        None,
+        "",
+        "2026-10-28T19:06:00Z",
+    ),
     RestartNoted("beta", "n2", "Your last turn ended at a safe point for a restart."),
     LineCostMarked("beta", "session-b", 1_250_000),
     ProcessesLeft("beta", "stopped", (4242, 4243), ("sleep 600", "make watch"), 1),
@@ -164,6 +208,22 @@ SCENARIO: tuple[Event, ...] = (
         "claude-code", 40, "2026-10-28T00:00:00Z", BudgetSource.OPERATOR, "", AT
     ),
     BudgetStated("codex", 0, None, BudgetSource.ENGINE, "a plan limit", AT),
+    PeerDeclared("keleusma", "unix", '{"inbound":true}'),
+    PeerKeyed("keleusma", "c" * 64),
+    MessageReceived("r1", KAIZEN, BETA, "from a peer", None, "m-origin-1", AT, True),
+    MessagePrioritized("r1"),
+    MessageReceived("r2", KAIZEN_ANA, ANA, "from a peer's operator", None, "m-o2", AT),
+    MessageDelivered("r1"),
+    MessageSent("p1", BETA, KAIZEN, NOTE, "a reply to a peer", reply_to="r1"),
+    MessagePrioritized("p1"),
+    MessageSent("p2", ANA, KAIZEN, NOTE, "an operator's note to a peer"),
+    MessageSent("p3", BETA, KAIZEN_ANA, NOTE, "a line's note to a peer's operator"),
+    MessageDelivered("p1"),
+    MessageReturned("p2", ReturnCode.REFUSED, None),
+    MessageUnconfirmed("p3", "n3"),
+    PeerDeclared("keleusma", "unix", '{"inbound":false}'),
+    PeerKeyed("keleusma", ""),
+    PeerRemoved("keleusma"),
     LineStateChanged("alpha", LineState.STOPPED),
 )
 
