@@ -24,12 +24,14 @@ Trust boundaries.
 """
 
 import json
+import os
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final, Protocol
 
 from dromon.eventlog import EventLog
+from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 from dromon.model import (
     MessageDelivered,
     MessageKind,
@@ -157,13 +159,20 @@ class CommandRelay:
     input and a timeout, which every target platform has.
     """
 
-    def __init__(self, argv: Sequence[str], timeout_seconds: float = 30.0) -> None:
+    def __init__(
+        self,
+        argv: Sequence[str],
+        timeout_seconds: float = 30.0,
+        *,
+        environment: Mapping[str, str] | None = None,
+    ) -> None:
         if not argv or not all(argv):
             raise ValueError("argv must be a non-empty sequence of non-empty strings")
         if not 0 < timeout_seconds <= 3600:
             raise ValueError("timeout_seconds must be in (0, 3600]")
         self._argv = tuple(argv)
         self._timeout = timeout_seconds
+        self._environment = os.environ if environment is None else environment
 
     def forward(self, notice: Notice) -> None:
         payload = encode_notice(notice) + "\n"
@@ -174,6 +183,7 @@ class CommandRelay:
                 self._argv,
                 input=payload.encode("utf-8"),
                 capture_output=True,
+                env=allowlisted(self._environment, BASE_ENVIRONMENT),
                 timeout=self._timeout,
                 check=False,
             )

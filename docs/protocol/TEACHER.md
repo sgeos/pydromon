@@ -46,8 +46,10 @@ project's teacher without a daemon.
    process identifier in `teacher.pid` in the runtime directory, writes its output to
    `teacher.log` there, and waits up to 60 seconds for it to answer. The model must
    appear in `GET /api/tags`, and Dromon never pulls it, because a pull downloads many
-   gigabytes and is the operator's decision. Unless the model is already loaded or
-   `--force` is given, Dromon refuses to load it when the memory the operating system
+   gigabytes and is the operator's decision. Ollama receives only `PATH`, `HOME`,
+   `LANG`, `TERM` and `TMPDIR` from the daemon environment when present, plus Dromon's
+   `OLLAMA_HOST`. Other daemon variables are omitted. Unless the model is already loaded
+   or `--force` is given, Dromon refuses to load it when the memory the operating system
    reports as available is less than the model's size in `GET /api/tags` plus
    `memory_headroom_gb`. Available memory is `kern.memorystatus_level` percent of the
    physical memory on macOS and `MemAvailable` on Linux, and where neither exists the

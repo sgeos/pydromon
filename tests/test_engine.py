@@ -43,7 +43,7 @@ from claude_agent_sdk import (
 
 from claude_agent_sdk.types import RateLimitStatus
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
-from dromon.driver import Credential, Driver, Strategy, driver_resource
+from dromon.driver import Action, Credential, Driver, Event, Strategy, driver_resource
 from dromon.priority import SteeredDriver
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, McpServer, ToolPolicy
 from dromon.engine import (
@@ -93,7 +93,9 @@ def init(
     )
 
 
-def result(subtype: str = "success", turns: int = 1) -> ResultMessage:
+def result(
+    subtype: str = "success", turns: int = 1, message: str | None = None
+) -> ResultMessage:
     return ResultMessage(
         subtype=subtype,
         duration_ms=1,
@@ -102,6 +104,7 @@ def result(subtype: str = "success", turns: int = 1) -> ResultMessage:
         num_turns=turns,
         session_id="session-1",
         total_cost_usd=0.001,
+        result=message,
     )
 
 
@@ -222,6 +225,8 @@ def test_options_follow_the_driver_and_isolate_the_line() -> None:
     assert options.allowed_tools == []
     assert options.resume is None
     assert options.cwd == "/work"
+    assert options.env is not None
+    assert options.env["ENABLE_TOOL_SEARCH"] == "true"
 
 
 def test_the_claude_code_adapter_refuses_a_driver_for_another_engine() -> None:
@@ -349,6 +354,35 @@ def test_a_turn_without_a_result_is_refused() -> None:
         run(line(Scripted([init(), say(TextBlock("x"))])))
 
 
+@pytest.mark.parametrize("reported_in", ["assistant", "result"])
+def test_a_success_result_reporting_missing_sign_in_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    reported_in: str,
+) -> None:
+    message = "Not logged in · Please run /login"
+    messages: list[Message] = [init()]
+    if reported_in == "assistant":
+        messages.extend([say(TextBlock(message)), result()])
+    else:
+        messages.append(result(turns=0, message=message))
+    session = Scripted(messages)
+    result_events: list[Event] = []
+    original_step = Driver.step
+
+    def record_step(driver: Driver, event: Event) -> Action:
+        if event.tag == "result":
+            result_events.append(event)
+        return original_step(driver, event)
+
+    monkeypatch.setattr(Driver, "step", record_step)
+    target = line(session)
+    with pytest.raises(EngineRefused, match="not signed in"):
+        run(target)
+    assert session.interrupts == (1 if reported_in == "assistant" else 0)
+    assert len(session.prompts) == 1
+    assert not result_events
+
+
 @pytest.mark.live
 def test_a_live_turn_on_the_subscription() -> None:
     if os.environ.get("DROMON_LIVE_TESTS") != "1":
@@ -418,12 +452,19 @@ def test_the_gate_allows_exactly_the_given_tools() -> None:
 GITHUB = McpServer("stdio", command="gh-mcp")
 
 
-def configured(config: LineConfig, session: Scripted) -> ClaudeCodeLine:
+def configured(
+    config: LineConfig,
+    session: Scripted,
+    *,
+    environment: Mapping[str, str] | None = None,
+    secret_names: tuple[str, ...] = (),
+) -> ClaudeCodeLine:
     return ClaudeCodeLine(
         Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
         Path("/work"),
         config=config,
-        environment={},
+        environment=environment or {},
+        secret_names=secret_names,
         session_factory=session.factory,
     )
 
@@ -436,6 +477,66 @@ def test_configured_servers_and_built_in_tools_reach_the_engine() -> None:
     assert options.tools == ["Read"]
     assert options.mcp_servers == {"github": {"type": "stdio", "command": "gh-mcp"}}
     assert options.strict_mcp_config is True
+
+
+def test_mcp_secret_resolution_is_scoped_to_the_line_grant() -> None:
+    config = LineConfig(
+        mcp_servers=(
+            (
+                "docs",
+                McpServer(
+                    "http",
+                    url="https://docs.example/mcp",
+                    headers=(("Authorization", "Bearer ${LINE_A_TOKEN}"),),
+                ),
+            ),
+        )
+    )
+    session = Scripted([init(), result()])
+    run(
+        configured(
+            config,
+            session,
+            environment={"LINE_A_TOKEN": "a-secret", "LINE_B_TOKEN": "b-secret"},
+            secret_names=("LINE_A_TOKEN",),
+        )
+    )
+    options = session.options[0]
+    assert options.mcp_servers == {
+        "docs": {
+            "type": "http",
+            "url": "https://docs.example/mcp",
+            "headers": {"Authorization": "Bearer a-secret"},
+        }
+    }
+    assert "LINE_A_TOKEN" not in options.env
+    assert "LINE_B_TOKEN" not in options.env
+
+
+def test_a_line_cannot_resolve_another_lines_secret() -> None:
+    config = LineConfig(
+        mcp_servers=(
+            (
+                "docs",
+                McpServer(
+                    "http",
+                    url="https://docs.example/mcp",
+                    headers=(("Authorization", "Bearer ${LINE_B_TOKEN}"),),
+                ),
+            ),
+        )
+    )
+    session = Scripted([])
+    with pytest.raises(EngineRefused, match="does not set LINE_B_TOKEN"):
+        run(
+            configured(
+                config,
+                session,
+                environment={"LINE_A_TOKEN": "a-secret", "LINE_B_TOKEN": "b-secret"},
+                secret_names=("LINE_A_TOKEN",),
+            )
+        )
+    assert session.options == []
 
 
 def test_inheriting_the_account_turns_off_strict_mcp_and_accepts_its_tools() -> None:

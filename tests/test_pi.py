@@ -355,14 +355,21 @@ def test_a_subscription_environment_has_no_credential_variables() -> None:
         "OCI_CLI_KEY_FILE": "/k",
         "DATABASE_PASSWORD": "p",
     }
-    chosen = engine_environment(environment, Strategy.SUBSCRIPTION)
+    chosen = engine_environment(environment, Strategy.SUBSCRIPTION, "openai")
     # Pi review, F5: endpoints and credential locations go with the keys.
     assert chosen == {"PATH": "/usr/bin", "HOME": "/home/x"}
-    metered = engine_environment(environment, Strategy.API)
-    assert metered["OPENAI_API_KEY"] == "k"
+    metered = engine_environment(environment, Strategy.API, "openai")
+    assert metered == {"PATH": "/usr/bin", "HOME": "/home/x", "OPENAI_API_KEY": "k"}
+    flexible = engine_environment(environment, Strategy.FLEXIBLE, "openai")
+    assert flexible == metered
     assert "PI_CODING_AGENT_DIR" not in metered
+    assert "AWS_SECRET_ACCESS_KEY" not in metered
+    assert "XAI_API_KEY" not in engine_environment(environment, Strategy.API, "openai")
+    assert "OPENAI_API_KEY" not in engine_environment(
+        environment, Strategy.API, "unknown-provider"
+    )
     with pytest.raises(EngineRefused, match="PI_PACKAGE_DIR"):
-        engine_environment({"PI_PACKAGE_DIR": "/x"}, Strategy.SUBSCRIPTION)
+        engine_environment({"PI_PACKAGE_DIR": "/x"}, Strategy.SUBSCRIPTION, "openai")
 
 
 # The agent directory.
@@ -522,8 +529,24 @@ def test_a_subscription_line_refuses_an_api_key_before_pi_starts(home: Path) -> 
 def test_an_api_line_runs_on_an_api_key(home: Path) -> None:
     server = FakePi()
     answer = {"status": "ready", "provider": "openai", "authType": "api_key"}
-    report = run(line(server, home, strategy=Strategy.API, answer=answer))
+    report = run(
+        line(
+            server,
+            home,
+            strategy=Strategy.API,
+            answer=answer,
+            environment={
+                "PATH": "/usr/bin",
+                "OPENAI_API_KEY": "openai-key",
+                "XAI_API_KEY": "unrelated-key",
+                "DAEMON_ONLY_SENTINEL": "private",
+            },
+        )
+    )
     assert report.credential is Credential.API
+    assert server.environment["OPENAI_API_KEY"] == "openai-key"
+    assert "XAI_API_KEY" not in server.environment
+    assert "DAEMON_ONLY_SENTINEL" not in server.environment
 
 
 def write_fake(directory: Path, name: str, body: str) -> Path:
@@ -605,7 +628,15 @@ def test_the_environment_carries_the_agent_directory_tools_and_token(
     home: Path,
 ) -> None:
     server = FakePi()
-    target = line(server, home, environment={"PATH": "/usr/bin", "OPENAI_API_KEY": "k"})
+    target = line(
+        server,
+        home,
+        environment={
+            "PATH": "/usr/bin",
+            "OPENAI_API_KEY": "k",
+            "DAEMON_ONLY_SENTINEL": "not-allowlisted",
+        },
+    )
     target.mark = "alpha.mark"
     run(target)
     env = server.environment
@@ -615,6 +646,7 @@ def test_the_environment_carries_the_agent_directory_tools_and_token(
     assert env["DROMON_LINE_TOKEN"] == "tok"  # noqa: S105, a test token
     assert env["DROMON_LINE_MARK"] == "alpha.mark"
     assert "OPENAI_API_KEY" not in env
+    assert "DAEMON_ONLY_SENTINEL" not in env
     assert server.arguments[server.arguments.index("--tools") + 1] == OWN
 
 

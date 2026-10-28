@@ -437,6 +437,7 @@ class FakeChild:
 
     def __init__(self) -> None:
         self.killed = False
+        self.environment: dict[str, str] = {}
 
     def kill(self) -> None:
         self.killed = True
@@ -449,7 +450,10 @@ class FakeChild:
 def probe(monkeypatch: pytest.MonkeyPatch) -> FakeChild:
     child = FakeChild()
 
-    def popen(command: list[str], **_: object) -> FakeChild:
+    def popen(command: list[str], **kwargs: object) -> FakeChild:
+        environment = kwargs.get("env")
+        assert isinstance(environment, dict)
+        child.environment = environment
         return child
 
     monkeypatch.setattr(processes.subprocess, "Popen", popen)
@@ -481,6 +485,8 @@ def test_the_self_test_needs_both_readers_to_see_the_child(
     single: bool,
     works: bool,
 ) -> None:
+    monkeypatch.setenv("DROMON_TEST_ONLY", "must-not-reach-probe")
+
     seen = ["DROMON_PROBE=t"]
 
     def environments(uid: int) -> dict[int, list[str]]:
@@ -493,6 +499,12 @@ def test_the_self_test_needs_both_readers_to_see_the_child(
     monkeypatch.setattr(processes, "read_environment", environment)
     assert processes.environment_reading_works() is works
     assert probe.killed
+    assert processes.PROBE_VARIABLE in probe.environment
+    assert set(probe.environment) <= {
+        *processes.BASE_ENVIRONMENT,
+        processes.PROBE_VARIABLE,
+    }
+    assert "DROMON_TEST_ONLY" not in probe.environment
 
 
 def test_a_child_that_cannot_start_fails_the_self_test(

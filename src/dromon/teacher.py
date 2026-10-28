@@ -44,6 +44,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, cast
 
+from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
+
 DEFAULT_ENDPOINT: Final = "http://127.0.0.1:11434"
 LOCAL_ENDPOINT: Final = re.compile(r"http://(127\.0\.0\.1|localhost):([0-9]{1,5})")
 KEEP_ALIVE: Final = re.compile(r"-1|0|[1-9][0-9]{0,5}[smh]")
@@ -347,7 +349,10 @@ class Teacher:
         """Start ``ollama serve`` on the endpoint and wait until it answers."""
         self.runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         host = self.config.endpoint.removeprefix("http://")
-        environment = {**self._environment, "OLLAMA_HOST": host}
+        environment = {
+            **allowlisted(self._environment, BASE_ENVIRONMENT),
+            "OLLAMA_HOST": host,
+        }
         try:
             pid = self._starter(
                 ["ollama", "serve"], environment, self.runtime_dir / LOG_FILE

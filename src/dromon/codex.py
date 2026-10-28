@@ -114,6 +114,7 @@ from dromon.ceiling import (
 )
 from dromon.launcher import STOP_POLICY_VARIABLE, StopPolicy
 from dromon.processes import MARK_VARIABLE
+from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
 from dromon.model import InvalidField, format_due
 
@@ -294,11 +295,11 @@ def engine_environment(
             + ", ".join(present)
             + ". Unset these variables."
         )
-    chosen = (
-        dict(environment)
-        if strategy is not Strategy.SUBSCRIPTION
-        else {k: v for k, v in environment.items() if k not in API_ENVIRONMENT}
+    chosen = allowlisted(
+        environment, (*BASE_ENVIRONMENT, *API_ENVIRONMENT, "XDG_CACHE_HOME")
     )
+    if strategy is Strategy.SUBSCRIPTION:
+        chosen = {k: v for k, v in chosen.items() if k not in API_ENVIRONMENT}
     if "XDG_CACHE_HOME" not in chosen:
         chosen["XDG_CACHE_HOME"] = ensure_cache_home(default_cache_home())
     return chosen

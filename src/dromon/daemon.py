@@ -192,6 +192,9 @@ class Daemon:
     """The project file as last loaded, at start or by ``reload_project``."""
     command_line: Overrides = field(default_factory=Overrides)
     project_file_present: bool = False
+    line_secrets: dict[str, tuple[str, ...]] = field(
+        default_factory=dict[str, tuple[str, ...]], repr=False
+    )
     hold_wakes: bool = False
     """Whether the command line held wakes, which a restart's successor keeps."""
     successor: list[str] | None = field(default=None, init=False)
@@ -1007,6 +1010,13 @@ class Daemon:
             if line_id in self.log.state.lines:
                 self.scheduler.set_line_policy(line_id, None, None)
         apply_project(self.scheduler, self.log, config)
+        self.line_secrets.clear()
+        self.line_secrets.update(
+            {
+                line_id: definition.secret_names
+                for line_id, definition in config.lines.items()
+            }
+        )
         self.scheduler.set_disclosure_terms(terms)
         self.scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
         self.project = config
@@ -1762,6 +1772,9 @@ def run(
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
     line_tokens = LineTokens()
+    line_secrets = {
+        line_id: definition.secret_names for line_id, definition in config.lines.items()
+    }
     launcher.configure(paths.left_reports)
     successor: list[str] | None = None
     try:
@@ -1775,6 +1788,7 @@ def run(
                     protected=protected_dirs(paths),
                     line_tokens=line_tokens,
                     line_socket=paths.line_socket,
+                    line_secrets=line_secrets,
                 ),
                 limits=limits,
                 default_operator=operator,
@@ -1808,6 +1822,7 @@ def run(
                     project=config,
                     command_line=given,
                     project_file_present=file.exists(),
+                    line_secrets=line_secrets,
                     hold_wakes=hold_wakes,
                 )
                 daemon.apply_project_values()
