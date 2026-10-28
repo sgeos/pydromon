@@ -45,15 +45,15 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | Operation | Result |
 |---|---|
 | `ping` | An empty object |
-| `status` | `daemon_version`, `protocol_version`, `pid`, `project`, `started_at`, `daemon`, the object `line_status` gives, with the commit the daemon started from, `restart`, the draining restart or the last one abandoned or `null`, as [`RESTART.md`](RESTART.md) specifies, and `event_log` with `last_seq`, `lines`, `operators`, `open_questions`, and the log's size and growth, `events`, `bytes`, `since_start`, `events_per_hour`, `bytes_per_hour` and `compaction`, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies for `line_status`, where an unknown size is `null` and never zero |
+| `status` | `daemon_version`, `protocol_version`, `pid`, `project`, `started_at`, `daemon`, the object `line_status` gives, with the commit the daemon started from, `restart`, the draining restart or the last one abandoned or `null`, as [`RESTART.md`](RESTART.md) specifies, and `event_log` with `last_seq`, `lines`, `operators`, `open_questions`, and the log's size and growth, `events`, `bytes`, `since_start`, `events_per_hour`, `bytes_per_hour` and `compaction`, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies for `line_status`, where an unknown size is `null` and never zero, and `peers`, each declared peer's delivery with `peer`, `state`, `waiting`, `oldest`, `oldest_sent_at`, `last_contact`, `backoff_seconds`, `fault` and `faults`, as [`FEDERATION.md`](../architecture/FEDERATION.md) describes, and from 2026-10-28 `scheduler`, the scheduler's watch with `fault`, its last unexpected exception until a tick completes or `null`, and `faults`, the count since the daemon started. From 2026-10-28 the optional argument `correlation`, an identifier, adds `correlation`, that key's totals as [`AGENTS.md`](AGENTS.md) specifies, and a key that is not an identifier is refused as `bad_request` |
 | `stop` | `{"stopping": true}`, after which the daemon closes its connections, removes its socket and exits |
 | `restart` | Arguments `operator`, and optionally `mode`, `wait` or `interrupt` with `wait` the default, `wait_seconds`, a whole number from 1 to 3,600 with 600 the default, and `end_tasks`, a boolean with false the default. Begins a restart to upgrade, as [`RESTART.md`](RESTART.md) specifies. Returns `restarting`, true, `mode`, `wait_seconds`, `running`, the lines with a turn in flight, `pid` and `commit`, the daemon's, and with `end_tasks` the warning `stop` gives about background tasks. Refused while a restart drains, and while kept engine sessions run background tasks without `end_tasks`. Operator only, and not offered to external agents |
 | `create_line` | Arguments `line_id`, `model`, `strategy`, and optionally `config`, an object of [`LINE_CONFIG.md`](LINE_CONFIG.md), and `engine_session`, an existing engine session to continue, recorded as `line_session` right after `line_created` and checked as that event is. Result `{"line_id": ...}`. Refused when no packaged driver serves the model and strategy, when the configuration's `workdir` is not allowed, or when the project requires a sandbox and the line would run on Claude Code without one |
 | `configure_line` | Arguments `line_id` and `config`. Replaces the line's configuration from its next turn. A changed `workdir` also appends `line_session_cleared`. Refused when the `workdir` is not allowed, or when the project requires a sandbox and the line would run on Claude Code without one |
 | `questions` | Optionally `operator`. Result `{"questions": [...]}`, the open questions for that operator, or for all when omitted, oldest first, each with `question_id`, `line`, `operator`, `text` and `choices`. Listing marks each question delivered, because the client has shown it |
-| `mail` | Arguments `operator`, and optionally `unread_only`, `sender`, `offset` and `limit`, at most 50. Delivers the operator's undelivered mail, then returns `total`, `unread`, `unanswered` and `messages`, a page of headers with `message_id`, `sender`, `kind`, `reply_to`, `read` and `outcome`, one of `replied`, `acknowledged` and `unanswered`, oldest first |
+| `mail` | Arguments `operator`, and optionally `unread_only`, `sender`, `offset` and `limit`, at most 50. Delivers the operator's undelivered mail, then returns `total`, `unread`, `unanswered` and `messages`, a page of headers with `message_id`, `sender`, `kind`, `reply_to`, `read` and `outcome`, one of `replied`, `acknowledged` and `unanswered`, oldest first. A note the harness wrote has `sender` `!dromon`, from 2026-10-28, and may be acknowledged but not replied to. No argument of any request may name `!dromon`, `sender` included, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies |
 | `acknowledge` | Arguments `operator` and `message_id`. Marks a message in the operator's mailbox dealt with, without a reply |
-| `sent` | Arguments `operator`, and optionally `unanswered_only`, `offset` and `limit`. Returns `total` and `messages`, the operator's sent mail with `message_id`, `recipient`, `kind`, `delivered`, `read` and `outcome` |
+| `sent` | Arguments `operator`, and optionally `unanswered_only`, `offset` and `limit`. Returns `total` and `messages`, the operator's sent mail with `message_id`, `recipient`, `kind`, `delivered`, `read`, `outcome` and `delivery`. `delivery` is `waiting`, `delivered` or `read` for local mail, and `waiting for peer`, `delivered to peer`, `returned` with its code, or `unconfirmed` for mail to a peer, added on 2026-10-28 |
 | `read` | Arguments `operator` and `message_id`. Returns the message with its `body` and `choices`, and marks it read the first time |
 | `line_view` | Arguments `line_id`, and optionally `limit`, at most 50. Returns `line`, the line's status entry, `tick`, `total`, the count of messages involving the line, `messages`, the newest of them oldest first, each with a body preview of at most 600 characters and `truncated`, kept within a 40,000 byte budget, and `open_questions`, the line's open questions. What an attached client polls |
 | `line_activity` | Arguments `line_id`, and optionally `after`, a revision, default 0. Returns `line_id`, `seq`, the daemon's newest revision, `entries`, the line's activity entries changed after `after`, oldest first, the newest kept within a 40,000 byte budget, and `complete`, false when older changed entries were left out. Each entry has `entry_id`, `seq`, `kind` and `text`, as the activity section below specifies. What an attached client polls to follow a turn |
@@ -76,8 +76,13 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `agent_add` | Arguments `agent` and `access`. Registers an external agent, or replaces its access and token. Returns `agent`, `access`, `effective_access` under the policy's ceiling, `token`, shown only here, and `listening` |
 | `agent_revoke` | Argument `agent`. Revokes it |
 | `agent_list` | No arguments. Returns `policy`, with `listen`, `anonymous` and `max_access`, and `agents`, each with `agent`, `access`, `token` and `revoked` |
+| `peer_token` | Argument `peer`, a peer the log holds as declared. Issues the token the peer presents to this daemon, replacing any earlier one, records its digest with `peer_keyed`, and returns `peer` and `token`. The token is returned once. Operator only, and not offered to external agents. Added on 2026-10-28 |
+| `peer_revoke` | Argument `peer`. Records `peer_keyed` with an empty digest, so the peer's token no longer works, and returns `peer` and `revoked`. Refused when no token is issued. Operator only, and not offered to external agents. Added on 2026-10-28 |
+| `peer_store` | Arguments `peer`, a peer the log holds as declared, and `token`, 16 to 256 letters, digits, `-` or `_`. Stores the token the peer issued for this daemon in `.dromon/peers/PEER.token`, mode 0600 in a directory of mode 0700, replacing any earlier one, and returns `peer` and `stored`, the file's path. A refusal never quotes the token. Operator only, and not offered to external agents. Added on 2026-10-28 |
+| `peer_list` | No arguments. Returns `listen` and `peers`, each with `peer`, `transport`, `socket`, null for a `tls` peer, `address`, null for a `unix` peer, `inbound`, `outbound`, `issued`, whether a token is issued for it, and `stored`, whether one from it is stored, or the reason a stored file is refused. Never a token or a digest. Operator only, and not offered to external agents. Added on 2026-10-28 |
+| `peer_key` | No arguments. Makes this daemon's Transport Layer Security identity once, an Ed25519 key and a self-signed certificate in `.dromon/peers`, each mode 0600 in a directory of mode 0700, and returns `pin_sha256`, the SHA-256 of its public key, `certificate`, the certificate's path, and `made`, whether it was made by this call. An existing identity is never replaced. A store holding only one of the two files, or a file that is not this user's with mode 0600, is refused. Never returns the private key. Operator only, and not offered to external agents. Added on 2026-10-28 |
 | `answer` | Arguments `question_id`, `body` and `operator`. Records the operator's reply, which must come from the operator the question was asked of. Result `{"message_id": ...}`. The answer wakes the asking line in a later tick |
-| `send` | Arguments `recipient`, a line or `@operator`, `body`, `operator`, and optionally `reply_to` and `priority`, a boolean, default false. Registers the operator if new and records a note from them. With `priority` true the note is priority mail, as [`PRIORITY.md`](PRIORITY.md) specifies, which must go to a line and which for an operator is unlimited. Result `message_id` and `priority`. A refused priority note records nothing and registers no operator |
+| `send` | Arguments `recipient`, a line, `@operator`, or from 2026-10-28 a remote address such as `keleusma:@ana` that the outbound policy allows, `body`, `operator`, and optionally `reply_to` and `priority`, a boolean, default false. Registers the operator if new and records a note from them. With `priority` true the note is priority mail, as [`PRIORITY.md`](PRIORITY.md) specifies, which must go to a line and which for an operator is unlimited. Mail to a peer is held to the disclosure list, and may be priority mail only to a peer's line and only when the peer's `priority_out` is true, from step 6 of federation phase 1. Result `message_id` and `priority`. A refused priority note records nothing and registers no operator |
 
 `status` also returns `tick`, the ticks run in this daemon's lifetime, and `lines`, one
 entry per line with `line_id`, `engine`, `strategy`, `state`, `condition`, as
@@ -127,7 +132,7 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | Command | Behaviour | Exit status |
 |---|---|---|
 | `dromon start` | Starts a detached `dromond` in a new session and waits for it to answer `ping`, up to 60 seconds or the `--wait` seconds given, above 0 and at most 600. On a loaded host the daemon was observed still starting after 10 seconds. Succeeds without action when a daemon already answers | 0, or 1 on failure |
-| `dromon status` | Prints the `status` result, with one row per line giving its condition, its pending mail, and a hibernation or hold its condition does not already name | 0, 4 when no daemon answers, or 1 |
+| `dromon status` | Prints the `status` result, with one row per line giving its condition, its pending mail, and a hibernation or hold its condition does not already name. `--correlation KEY` adds a row with that key's turns, shared turns, known cost and turns of unknown cost | 0, 4 when no daemon answers, or 1 |
 | `dromon proposal list` | Lists proposed changes recorded by lines | 0, or 1 on a read error |
 | `dromon proposal show PROPOSAL_ID` | Shows a proposal's message, file list and patch as untrusted text | 0, or 1 when missing or invalid |
 | `dromon stop` | Sends `stop` and waits up to 10 seconds for the socket to disappear | 0, 4 when no daemon answers, or 1 |
@@ -157,6 +162,8 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromon answer QUESTION BODY` | Sends `answer`, with `--operator`, default the login name | 0, 4, or 1 |
 | `dromon probe` | Runs one short turn without the daemon on the engine of `--model`, and reports the driver, the engine, the credential and the capabilities the engine reports | 0 or 1 |
 | `dromon agent add NAME --access LEVEL`, `dromon agent list`, `dromon agent revoke NAME` | Sends `agent_add`, `agent_list` or `agent_revoke`. `add` prints the token once with an MCP configuration for the agent | 0, 2, 4, or 1 |
+| `dromon agent send --agent NAME --to PARTY BODY` | Sends `agent_call` for the agent's `send_message` on the agent socket, not the operator socket, reading the token from `DROMON_AGENT_TOKEN`, as [`AGENTS.md`](AGENTS.md) specifies, and prints `sent as` and the message identifier. `--correlation KEY` gives the note a correlation key | 0, 2, 4, or 1 |
+| `dromon peer list`, `dromon peer token NAME`, `dromon peer revoke NAME`, `dromon peer store NAME`, `dromon peer key` | Sends `peer_list`, `peer_token`, `peer_revoke`, `peer_store` or `peer_key`. `token` prints the token once. `key` prints the pin and the certificate's path, and takes no name. `store` reads the token from its standard input, never from an argument, so it does not appear in the process list or the shell's history | 0, 2, 4, or 1 |
 | `dromon mcp --agent NAME` or `--line LINE` | Serves one external agent over MCP on standard input and output, reading its token from `DROMON_AGENT_TOKEN`, as [`AGENTS.md`](AGENTS.md) specifies, or one line's own tools to its engine through `lines.sock`, reading the line's token from `DROMON_LINE_TOKEN` | 0, or 1 on an oversized message |
 | `dromon teacher [up\|status\|down]` | Brings the project's teacher up, reports it, or releases it, without the daemon, as [`TEACHER.md`](TEACHER.md) specifies. The default is `status`. `--force` loads the model when too little memory is available | 0, or 1 on failure or when the project declares no teacher |
 | `dromon config` | Validates `.dromon/dromon.toml` without a daemon, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, and prints its limits, wake policy and lines | 0, or 1 on an invalid file |
@@ -329,12 +336,65 @@ through their `send_message` tool, and the daemon fixes each tool's sender to it
 
 The socket's access control is the runtime directory, which must be owned by the
 current user with mode 0700. The daemon refuses to start otherwise and never changes an
-existing directory's mode. The socket and the event log are created with mode 0600. Any
-process running as the same user can connect, so the protocol treats every request as
-untrusted input and checks it strictly. A peer credential check on each connection is
-not yet implemented, because its interface differs between macOS and Linux. External
+existing directory's mode. The socket and the event log are created with mode 0600.
+
+**Peer credentials, since 2026-10-28.** Every socket the daemon serves, this one, the
+line socket, the agent socket and the peer socket, reads the user of each connecting process from its
+peer credentials, `LOCAL_PEERCRED` on macOS and `SO_PEERCRED` on Linux, and refuses a
+process of another user with one `rejected` response whose identifier is empty, then
+closes the connection and writes the refusal to standard error. A connection whose
+credentials cannot be read is refused in the same way, and a platform that offers
+neither interface refuses to start the daemon. The check proves only the user. Any
+process running as the same user can still connect, a line's shell included when its
+sandbox does not deny the runtime directory, so the protocol treats every request as
+untrusted input and checks it strictly. External
 agents never use this socket. They reach the separate agent socket, whose requests are
 authorized by agent and access level.
+
+## The peer socket
+
+**Added on 2026-10-28, step 4 of federation phase 1.** A project whose
+`[federation] listen` is true also serves `peers.sock` in the runtime directory, mode
+0600, removed when the daemon stops. Peer daemons deliver mail on it, as
+[`FEDERATION.md`](../architecture/FEDERATION.md) designs. It uses the framing above
+with a line limit of 8,388,608 bytes, the bound of an encoded event, and serves only
+`ping` and the two operations below. This socket, the agent socket and the line socket
+answer every other operation `unknown_operation`, and the operator socket answers
+`hello` and `deliver` the same way.
+
+| Operation | Behaviour |
+|---|---|
+| `hello` | Arguments exactly `versions`, a list of 1 to 16 integers, `name`, an identifier the caller gives itself, advisory only, and `token`. Names the connection's peer by its token, the one `peer_token` issued, and returns `version`, the federation version chosen, today `1`. An undeclared peer and a wrong or revoked token get the one `rejected` refusal `the peer was refused`, written to standard error with the announced name. No version in common is `unsupported_version`. A second `hello` on one connection is `rejected` |
+| `deliver` | Arguments exactly `origin_id`, the sending daemon's identifier for the message, `sender` and `recipient`, each a local address as its own daemon writes it, `kind`, `body`, `reply_to`, an identifier or `null`, and `priority`, a boolean. Needs a `hello` on the connection, and checks again that the peer's token is the one it presented. Returns `outcome` `accepted` with `message_id`, `duplicate` and `priority`, true when the note was recorded as priority mail, which a duplicate answers as it was first recorded, or `refused` with `code` and `retry` false, or `busy` with `retry_seconds`. Only `accepted` without `duplicate` records anything, one `message_received` |
+
+The receiver's checks run in this order. Every `deliver` counts toward the peer's rate
+limit of 60 in 600 seconds, past which it is `busy`. An envelope that does not have
+exactly its keys, or whose addresses, identifiers or types do not follow the grammar,
+is `malformed`. A resend under an origin identifier already recorded is answered
+`accepted` with `duplicate` true when it is the same message, or `conflict` when it is
+not, before the policy is read, so a policy changed since then cannot refuse mail that
+was accepted. Then inbound off, a recipient outside `reach` or missing, and a question
+are `refused` alike, a body over `max_body_bytes` in UTF-8 is `too_large`, a `reply_to`
+that does not name a message from the recipient to the sender is `unknown_reply`, and
+waiting mail at `waiting_per_recipient` or at the peer's `waiting` is `full`.
+
+**Before `hello`.** **Decided by the operator on 2026-10-28, and built in step 5.** A
+connection's first line must arrive within 10 seconds and hold at most 65,536 bytes,
+and the connection is closed after its answer unless that line was an accepted
+`hello`. A line past the bound is answered `too_long` and closed, and a connection that
+sends nothing in time is closed without an answer. Only after `hello` may a line reach
+the limit of 8,388,608 bytes, so a process that holds no token cannot make the daemon
+buffer that much. The connection is also closed once a `deliver` finds its peer's token
+revoked or replaced. The listener serves at most 16 connections at once, counting those
+not yet past `hello`, and answers a further one `rejected` before closing it.
+
+**The sending end.** **Added on 2026-10-28, step 5 of federation phase 1.** A daemon
+sends its peer mail as a client of the peer's `peers.sock`, one `hello` per connection
+and then one `deliver` at a time, as
+[`FEDERATION.md`](../architecture/FEDERATION.md) specifies under delivery. Its
+`hello` gives its project directory's name, lowercased, when that is an identifier the
+disclosure list does not cover, and `dromon` otherwise. It records a message as
+delivered only from the peer's `accepted` answer, never from a write that succeeded.
 
 ## Not yet specified
 

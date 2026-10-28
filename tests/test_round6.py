@@ -223,6 +223,12 @@ def compactable(world: World, **keys: object) -> None:
     )
 
 
+def context_at_warning(world: World) -> None:
+    """Give direct tool calls a context estimate that satisfies its precondition."""
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    world.scheduler._context["alpha"] = warning  # pyright: ignore[reportPrivateUsage]
+
+
 @pytest.fixture
 def worlds(tmp_path: Path) -> Generator[Callable[..., World]]:
     """Builds worlds whose event logs are closed after the test, since an unclosed
@@ -251,6 +257,7 @@ def test_compact_session_schedules_a_wake_a_minute_ahead_by_default(
     world: World,
 ) -> None:
     compactable(world)
+    context_at_warning(world)
     result = world.call("compact_session", {})
     assert "is_error" not in result
     pending = world.log.state.scheduled["alpha"]
@@ -263,6 +270,7 @@ def test_compact_session_schedules_a_wake_a_minute_ahead_by_default(
 
 def test_compact_session_takes_the_seconds_to_wait(world: World) -> None:
     compactable(world)
+    context_at_warning(world)
     world.call("compact_session", {"seconds": 300})
     due = START + timedelta(seconds=300)
     assert world.log.state.scheduled["alpha"].due == due.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -270,6 +278,7 @@ def test_compact_session_takes_the_seconds_to_wait(world: World) -> None:
 
 def test_compact_session_keeps_a_wake_already_pending(world: World) -> None:
     compactable(world)
+    context_at_warning(world)
     world.call("wake_after", {"seconds": 3600, "note": "check the build"})
     before = world.log.state.scheduled["alpha"]
     result = world.call("compact_session", {"seconds": 60})
@@ -311,6 +320,7 @@ def test_compact_session_refused_once_withdrawn_schedules_no_wake(
 def test_the_wake_starts_the_compacted_turn_without_other_mail(world: World) -> None:
     compactable(world)
     world.run("start")
+    context_at_warning(world)
     world.call("compact_session", {})
     world.clock.now = START + timedelta(seconds=61)
     world.run()
@@ -326,7 +336,8 @@ def test_the_wake_starts_the_compacted_turn_without_other_mail(world: World) -> 
 
 def test_a_compacted_turn_is_not_told_to_compact_again(world: World) -> None:
     compactable(world)
-    world.context = 776_518
+    world.context = 1_000_000
+    context_at_warning(world)
     world.run("grow", "and grow")
     world.call("compact_session", {})
     world.run("work")
@@ -537,8 +548,8 @@ def test_a_compaction_that_cannot_get_below_the_threshold_is_not_repeated(
 def test_automatic_compaction_resumes_once_a_compaction_gets_below(
     world: World,
 ) -> None:
-    compactable(world, auto_compact_tokens=180_000)
-    world.context = 400_000
+    compactable(world, auto_compact_tokens=180_000, context_warn_tokens=250_000)
+    world.context = 200_000
     world.after = 250_000
     world.run("grow")
     world.run("work")
@@ -556,9 +567,9 @@ def test_automatic_compaction_resumes_once_a_compaction_gets_below(
 
 
 def test_a_request_takes_precedence_over_the_automatic_reason(world: World) -> None:
-    compactable(world, auto_compact_tokens=180_000)
+    compactable(world, auto_compact_tokens=180_000, context_warn_tokens=180_000)
     world.context = 200_000
-    world.run("grow")
+    world.scheduler._context["alpha"] = 200_000  # pyright: ignore[reportPrivateUsage]
     world.call("compact_session", {})
     world.run("work")
     engine = world.engine
@@ -589,6 +600,7 @@ def test_an_unreported_compaction_leaves_no_cause_for_a_later_one(
     )
     world.scheduler._engine_factory = world.build  # pyright: ignore[reportPrivateUsage]
     compactable(world)
+    context_at_warning(world)
     world.call("compact_session", {})
     world.run("work")
     engine = world.engine

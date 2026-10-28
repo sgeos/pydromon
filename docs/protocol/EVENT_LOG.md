@@ -26,7 +26,9 @@ state by replaying the same log.
 | Line address | A line's identifier, such as `alpha` |
 | Operator address | `@` followed by an operator's identifier, such as `@ana`. `@` never appears in an identifier, so the two kinds of address cannot collide |
 | Agent address | `&` followed by an external agent's identifier, such as `&claude-main`. `&` never appears in an identifier |
-| Address | A line address, an operator address or an agent address |
+| Remote address | A peer's identifier, `:`, and a line, operator or agent address as that peer writes it, such as `keleusma:kaizen` or `keleusma:@ana`. It begins with an identifier, never with `@` or `&`, and holds exactly one `:`, so no remote party reads as a local operator and no address routes through a second peer. Added on 2026-10-28 for federation, as [`FEDERATION.md`](../architecture/FEDERATION.md) specifies |
+| Local address | A line address, an operator address or an agent address |
+| Address | A local address or a remote address |
 | Agent access | `none`, `observe`, `message`, `manage` or `operator`, each including the levels before it |
 | Token digest | 64 lowercase hexadecimal characters, the SHA-256 of a token, or empty for an agent admitted without one |
 | Text | A Unicode string with a valid UTF-8 encoding of at most 1,048,576 bytes. Lone surrogates are invalid |
@@ -60,6 +62,17 @@ An external agent is a party too, with its own mailbox, as
 [`AGENTS.md`](AGENTS.md) specifies. It may send and receive notes but not ask
 questions, and a revoked agent neither sends nor receives.
 
+**The harness.** **Decided by the operator on 2026-10-28.** The harness itself sends
+the notes it writes on its own account, such as a failover, a handoff it made, or an
+outage of a peer, under the sender address `!dromon`. It is not a party. It has no
+mailbox, it always exists, and no event creates it. An identifier never begins with
+`!`, so no other address reads as it. No client, line, agent or peer input may name
+it, since every input is parsed as a party's address, which refuses its text. Only
+the decoding of the daemon's own log reads it, and only as the `sender` of a
+`message_sent`. **Porting note.** A port keeps the two parsers apart, one for party
+addresses that refuses `!dromon` and one for a logged sender that admits it, so that
+no input path can reach the second.
+
 ## Events
 
 Each event has a kind and fields, all required. An optional value is written as `null`.
@@ -82,10 +95,17 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `agent_registered` | `agent_id`, `access`, `token_sha256` | Always. Registers the agent, or replaces its access and digest and restores it if revoked. A token itself is never stored |
 | `agent_revoked` | `agent_id` | The agent exists and is not revoked |
 | `message_sent` | `message_id`, `sender` and `recipient` addresses, `kind`, `body` text, `choices`, `reply_to` message identifier or `null` | See the message rules below |
+| `message_received` | `message_id`, `sender` remote address, `recipient` local address, `body` text, `reply_to` message identifier or `null`, `origin_id` identifier, `received_at` time, `priority_asked` boolean | The message does not exist and no pending scheduled wake reserves its identifier, the sender's peer is declared and not removed, no earlier `message_received` has this peer and `origin_id` among the keys kept, and the recipient exists. A `reply_to` names an existing message from the recipient to the sender. Records a note from a peer's party, the peer's own identifier for it, and the idempotency key of the peer and that identifier in one event, so a crash cannot record one without the other. Until it is delivered it counts toward the waiting mail of its peer and of its recipient. Applying it first drops the keys received more than 2,184 hours before its `received_at`, the longest expiry of 90 days and a day for the difference between clocks, oldest first and stopping at the first younger key, so the keys are bounded by the mail of that window. `priority_asked` records whether the peer's envelope asked for priority, which a `message_prioritized` follows when the receiver honours it. Added on 2026-10-28, `received_at` in step 5 and `priority_asked` in step 6 |
 | `message_read` | `message_id` | The message was delivered and not yet read. Its recipient opened it, which obliges nothing |
 | `message_acknowledged` | `message_id` | The message was delivered and not yet acknowledged. Its recipient marked it dealt with without a reply. Its sender sees the acknowledgement as distinct from a reply. A question stays open |
-| `message_prioritized` | `message_id` | The message exists, is a note to a line, is not delivered and is not priority mail. Marks it priority mail, as [`PRIORITY.md`](PRIORITY.md) specifies. The daemon appends it right after the note's `message_sent`. Added on 2026-10-27 |
-| `message_delivered` | `message_id` | The message exists and was not delivered. For a line, delivery is into a turn. For an operator, delivery is acceptance by the operator's relay or display in a client |
+| `message_prioritized` | `message_id` | The message exists, is a note to a line or to a peer's line, is not delivered, returned or unconfirmed, and is not priority mail. Marks it priority mail, as [`PRIORITY.md`](PRIORITY.md) specifies. The daemon appends it right after the note's `message_sent` or `message_received`. For mail to a peer it makes the envelope ask for priority. Added on 2026-10-27, and for peers on 2026-10-28 |
+| `message_correlated` | `message_id`, `key` identifier | The message exists, is a note from an external agent to a local line, is not delivered, and has no key. Gives it a correlation key, which names the agent's own task, as [`AGENTS.md`](AGENTS.md) specifies. The daemon appends it right after the note's `message_sent`. Added on 2026-10-28 |
+| `turn_correlated` | `line_id`, `keys` array of identifiers, `key_count` whole number, `cost_micro_usd` whole number from 0 to 10^15 or `null` | The line exists. `keys` holds from 1 to 64 distinct keys in sorted order, and `key_count` is at least their number, and equals it unless 64 are listed. Records that a turn of the line ended which delivered notes with these keys, however it ended, with the turn's cost in millionths of a dollar or `null` when the engine reported none. `key_count` is how many distinct keys the turn carried, so a reader sees that a turn counted under several keys cost its amount once. Applying it adds the turn to the totals of each listed key, the whole cost under each, and counts it as shared when `key_count` exceeds 1. The state keeps the totals of at most 4,096 keys, and drops the key used least recently to make room. Added on 2026-10-28 |
+| `task_recorded` | `line_id`, `task_id` of at most 128 bytes, `command` of at most 2,048 bytes, `status` of at most 32 bytes, `exit_code` 32-bit whole number or `null`, `output_file` of at most 1,024 bytes or `null`, `output_digest` SHA-256 in lowercase hexadecimal or `null`, `output_bytes` whole number or `null`, `workdir_commit` commit or empty, `ended_at` time | The line exists, and `output_digest` and `output_bytes` are both given or both `null`. Records that a background task of the line's engine ended between turns, for every end the engine reports, whether or not a `task_noted` wakes the line, and never wakes it. A command or output file name the disclosure list covers is withheld. The digest covers the output the engine reported inline, or else the output file read as a task note reads it, up to 16 MiB. `workdir_commit` is `HEAD` where the line works, empty when none was read, and says nothing of uncommitted changes. Applying it keeps the line's latest 10 records, which `role_status` shows its role's seats. Added on 2026-10-28 |
+| `disclosure_checked` | `line_id`, `checked_at` time, `matched_lines` whole number from 0 to 1,000,000 | The line exists. Records that the line checked a text or a file with `check_disclosure`, or that a line tool refused a text for disclosure, and how many of its lines held a term of the project's disclosure list. The text, its name and any term are never recorded. Applying it keeps the line's latest 10 check times, for the rate limit [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. Added on 2026-10-28 |
+| `message_delivered` | `message_id` | The message exists and was not delivered, returned or left unconfirmed. For a line, delivery is into a turn. For an operator, delivery is acceptance by the operator's relay or display in a client. For a party of a peer, it is the peer's `accepted`, and the message leaves the peer's outbox |
+| `message_returned` | `message_id`, `code` one of the codes of returned mail in [`FEDERATION.md`](../architecture/FEDERATION.md), `note_id` message identifier or `null` | The message exists, is to a party of a peer, and was not delivered, returned or left unconfirmed. When its sender is a line, `note_id` is a new identifier that no message, withdrawn wake or pending scheduled wake holds, and it is `null` otherwise. The message leaves its peer's outbox undelivered, and a line sender receives a note from itself under `note_id` whose text the model derives from the code. Added on 2026-10-28 |
+| `message_unconfirmed` | `message_id`, `note_id` message identifier or `null` | As for `message_returned`. The message expired after a copy of it may have reached the peer without an answer, so whether it was delivered is unknown, and a line sender's note says so. Added on 2026-10-28 |
 | `wake_requested` | `wake_id`, `line_id`, `message_id` | The wake does not exist, the line exists and is not stopped, and the message exists with the line as its recipient |
 | `wake_issued` | `wake_id` | The wake exists and was not issued, and its line is idle |
 | `wake_scheduled` | `line_id`, `message_id`, `due` due time, `note` wake note | The line exists, no message has the identifier, and no other line's pending scheduled wake reserves it. Becomes the line's one pending scheduled wake, replacing any earlier one, and reserves `message_id` for its note |
@@ -104,10 +124,19 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `ownership_changed` | `role_id`, `owner` and `previous` line identifiers or `null`, `cause` ownership cause, `by` address, `entry_id` or `null`, `changed_at` time, `back_to` line identifier or `null` | See the ownership rules below. Added on 2026-10-27, and `back_to` the same day, before any release |
 | `role_noted` | `role_id`, `entry_id`, `line_id`, `kind` entry kind, `body` text of 1 to 65,536 bytes, `workdir_commit` and `daemon_commit` commits, `noted_at` time | No entry has the identifier, the role exists and the line is its seat. A `handoff` or `recovery` entry is by the role's current owner, and a `note` by any seat. The daemon stamps both commits itself from `HEAD`. Added on 2026-10-27 |
 | `budget_stated` | `provider` identifier, `remaining_percent` a whole number from 0 to 100 or `null`, `resets_at` time or `null`, not both `null`, `source` budget source, `note` text of at most 1,024 bytes, `stated_at` time | Always. Replaces the provider's earlier statement. It is a snapshot and later turns do not adjust it. Added on 2026-10-27 |
+| `peer_declared` | `peer_id` identifier, `transport` of `unix` or `tls`, `policy` text of at most 65,536 bytes | The peer is new, was removed, or this changes its transport or policy. Recorded at start from the project file's `[peers]` table, as [`FEDERATION.md`](../architecture/FEDERATION.md) specifies. The policy is canonical JSON of every key of the peer's table but `transport`, and never holds a token. A peer declared again after its removal starts with no token. Added on 2026-10-28 |
+| `peer_removed` | `peer_id` | The peer is declared and not removed. Recorded at start when the project file no longer declares it. Clears its token digest. Added on 2026-10-28 |
+| `peer_keyed` | `peer_id`, `token_sha256` a SHA-256 digest or empty | The peer is declared and not removed, and an empty digest, which revokes the token, requires a token to revoke. The digest is of the token this daemon issued for the peer to present. Only the digest is ever stored. Added on 2026-10-28 |
 
 **Message rules.** A `message_sent` applies when every one of these holds.
 
-1. The message does not exist, and the sender and recipient both exist. They differ,
+1. The message does not exist, and the sender and recipient both exist. The harness
+   always exists. Neither is a
+   remote address, since a peer's mail is recorded by `message_received`. The recipient
+   may be a remote address whose peer is declared and not removed, when the message is
+   a note and fewer than 1,000 messages wait in that peer's outbox. Such a message
+   joins the outbox in the order sent. The daemon's outbound policy is checked before
+   the append, since it is configuration. They differ,
    unless the sender is a line, which may send itself a note, as
    [`PRIORITY.md`](PRIORITY.md) specifies since 2026-10-27. An operator or an agent
    may not. The firing of a scheduled wake, below, is one such note, and a
@@ -123,6 +152,9 @@ Each event has a kind and fields, all required. An optional value is written as 
    is refused.
 5. A reply to a question requires the question to be open, must be a note, and marks
    the question answered by this reply.
+6. A message from the harness is a note to a line or an operator of this daemon, never
+   to an agent or a peer, and is not a reply. Nothing replies to it, since by rule 4 a
+   reply would go to the harness, which is never a recipient.
 
 **Scheduled wakes.** **Decided by the operator on 2026-10-26.** A line schedules a wake
 for itself with the `wake_after` tool, as [`LINE_CONFIG.md`](LINE_CONFIG.md)
@@ -133,8 +165,8 @@ body is the note or the fixed withheld text below, and which has no choices and 
 `reply_to`. Applying it clears the
 pending wake. It is the only message to itself that clears a scheduled wake.
 
-- **Sender.** The model has no address for the daemon, an operator sender would make
-  the note operator mail, which carries authority and resets a line's autonomous-turn
+- **Sender.** The line scheduled the wake, so the note is its own, not the harness's.
+  An operator sender would make the note operator mail, which carries authority and resets a line's autonomous-turn
   count, and an agent sender would need a registered agent. A note from the line to
   itself is accurate, since the line scheduled it, shows as `from alpha` and never as
   operator mail, and needs no new kind of address in any port.
@@ -166,8 +198,8 @@ pending wake. It is the only message to itself that clears a scheduled wake.
    `handoff` and `relinquished` are made by the previous owner, and `relinquished`
    leaves the role vacant. `recovery` names an owner and is made by an operator or by
    the new owner itself, never by an external agent. `failover` names the previous
-   owner and an entry, and is recorded by the new owner's address, since the log has
-   no address for the harness that makes it.
+   owner and an entry, and is recorded by the new owner's address. The harness that
+   makes it sends notes but is not a party, so `by` never names it.
 5. `entry_id`, unless `null`, names an entry of the role. A `handoff` requires one, and
    it is the role's latest entry, a `handoff` entry by the previous owner.
 6. `back_to`, unless `null`, is on a `handoff`, differs from `owner`, and is a seat of
@@ -201,7 +233,8 @@ An event is stored as one JSON object.
 {"data":{"engine":"claude-opus-5-5","line_id":"alpha","strategy":"subscription"},"kind":"line_created","v":1}
 ```
 
-Addresses are written as their text forms, such as `"beta"`, `"@ana"` and `"&claude"`.
+Addresses are written as their text forms, such as `"beta"`, `"@ana"`, `"&claude"` and
+`"keleusma:kaizen"`. The harness, as a sender only, is written `"!dromon"`.
 
 - `v` is the format version, the integer `1`.
 - `kind` is the event kind and `data` holds exactly its fields.

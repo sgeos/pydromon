@@ -78,6 +78,31 @@ def test_a_full_file_parses_with_profiles_and_per_line_overrides() -> None:
     assert beta.wake_every_ticks == 5
 
 
+def test_a_profile_gives_its_players_their_recipients() -> None:
+    config = parse(
+        "version = 1\n"
+        "[profiles.player]\n"
+        'model = "claude-haiku-5-5"\n'
+        'recipients = ["&table"]\n'
+        "[lines.north]\n"
+        'profile = "player"\n'
+        "[lines.dealer]\n"
+        'profile = "player"\n'
+        'recipients = ["&table", "@ana"]\n'
+        "[lines.free]\n"
+        'model = "claude-haiku-5-5"\n'
+    )
+    lines = config.lines
+    assert lines["north"].config.recipients == ("&table",)
+    assert lines["dealer"].config.recipients == ("&table", "@ana")
+    assert lines["free"].config.recipients is None
+    with pytest.raises(ConfigFileError, match=r"lines\.free: recipients"):
+        parse(
+            'version = 1\n[lines.free]\nmodel = "claude-haiku-5-5"\n'
+            'recipients = ["!dromon"]\n'
+        )
+
+
 def test_a_minimal_file_takes_the_defaults() -> None:
     config = parse("version = 1\n")
     assert config == ProjectConfig()

@@ -12,12 +12,15 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
+from dromon import scheduler as scheduler_module
 from dromon.capabilities import Known, TABLES
 from dromon.driver import Strategy
 from dromon.engine import EnginePlanLimit, TurnReport
 from dromon.eventlog import EventLog
 from dromon.model import (
+    HARNESS,
     MAX_ROLE_NOTE_BYTES,
+    HarnessAddress,
     BudgetSource,
     BudgetStated,
     EventRejected,
@@ -196,12 +199,14 @@ class World:
         result = asyncio.run(invoke())
         return str(result["content"][0]["text"]), result.get("is_error") is True
 
-    def mail(self, sender: str, recipient: str) -> list[str]:
-        """The bodies of the delivered notes from ``sender`` to ``recipient``."""
+    def mail(self, sender: str | HarnessAddress, recipient: str) -> list[str]:
+        """The bodies of the delivered notes from ``sender``, a line or the harness,
+        to ``recipient``."""
+        source = LineAddress(sender) if isinstance(sender, str) else sender
         return [
             message.body
             for message in self.log.state.messages.values()
-            if message.sender == LineAddress(sender)
+            if message.sender == source
             and message.recipient == LineAddress(recipient)
             and message.delivered
         ]
@@ -312,6 +317,27 @@ def test_a_note_is_stamped_by_the_daemon_with_both_commits(world: World) -> None
     assert entry.entry_id in text
 
 
+def test_a_read_only_seat_can_record_review_findings_with_its_commit(
+    world: World,
+) -> None:
+    text, error = world.call(
+        "gamma",
+        RECORD_ROLE_NOTE_TOOL_NAME,
+        {"kind": "note", "body": "Review found no remaining issues."},
+    )
+    assert not error and "stamped by the daemon" in text
+    entry = next(iter(world.log.state.role_entries.values()))
+    assert (entry.line_id, entry.body, entry.kind) == (
+        "gamma",
+        "Review found no remaining issues.",
+        RoleNoteKind.NOTE,
+    )
+    assert (entry.workdir_commit, entry.daemon_commit) == (
+        WORKTREE_COMMIT,
+        DAEMON_COMMIT,
+    )
+
+
 @pytest.mark.parametrize(
     ("args", "message"),
     [
@@ -389,8 +415,10 @@ def test_a_handoff_records_the_note_and_the_change_and_wakes_the_successor(
     assert not world.log.state.lines["beta"].hibernated
     wake(world)
     assert len(world.prompts("beta")) == 1
-    (note,) = world.mail("alpha", "beta")
+    (note,) = world.mail(HARNESS, "beta")
     assert f"handed role core to you, with handoff entry {entry.entry_id}" in note
+    # The harness wrote it, so it is not recorded as from the line that handed over.
+    assert world.mail("alpha", "beta") == []
 
 
 def test_a_relinquish_with_no_successor_leaves_the_role_vacant(world: World) -> None:
@@ -719,7 +747,7 @@ def test_a_waiting_relinquish_that_no_longer_applies_keeps_the_role_and_says_so(
     (told,) = [
         message.body
         for message in world.log.state.messages.values()
-        if message.sender == ALPHA
+        if message.sender == HARNESS
         and message.recipient == ANA
         and "did not make the handoff" in message.body
     ]
@@ -869,11 +897,68 @@ def test_a_handoff_tells_the_successor_by_mail_not_by_the_checklist(
     wake(world, "alpha")
     (beta,) = world.prompts("beta")
     assert RECOVERY_CHECKLIST not in beta
-    (note,) = world.mail("alpha", "beta")
+    (note,) = world.mail(HARNESS, "beta")
     assert "handed role core to you" in note
     # The relinquishing seat made the change, so its own next turn is not told of it.
     (alpha,) = world.prompts("alpha")
     assert not alpha.startswith("Role core")
+
+
+def test_a_new_owner_turn_leads_with_the_journal_and_worktree_package(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot_bases: list[str | None] = []
+
+    def snapshot(_directory: Path, _base_commit: str | None = None) -> tuple[str, str]:
+        snapshot_bases.append(_base_commit)
+        return "## feature\n M src/example.py", "src/example.py | 2 +-"
+
+    monkeypatch.setattr(scheduler_module, "_worktree_snapshot", snapshot)
+    note = (
+        "Task: finish the review.\n"
+        "Diff summary: one file.\n"
+        "Gate and coverage: 3108 passed and 26 deselected.\n"
+        "Unresolved decisions: none.\n"
+        "Next action: operator runs socket tests."
+    )
+    world.scheduler.relinquish_ownership("alpha", note, "beta", None)
+    wake(world, "alpha")
+    (prompt,) = world.prompts("beta")
+    assert prompt.startswith("You own role core from this turn")
+    assert "Role transition package" in prompt
+    assert 'Task: "finish the review."' in prompt
+    assert 'Gate and coverage: "3108 passed and 26 deselected."' in prompt
+    assert 'Next action: "operator runs socket tests."' in prompt
+    assert 'Worktree status: "## feature\\n M src/example.py"' in prompt
+    assert 'Diff summary since the journal entry: "src/example.py | 2 +-"' in prompt
+    assert snapshot_bases == [WORKTREE_COMMIT]
+
+
+def test_a_role_transition_withholds_disclosing_journal_and_snapshot_text(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def snapshot(_directory: Path, _base_commit: str | None = None) -> tuple[str, str]:
+        return "## feature\n M hidden_file.py", "hidden_file.py | 2 +-"
+
+    monkeypatch.setattr(scheduler_module, "_worktree_snapshot", snapshot)
+    note = (
+        "Task: hidden task.\n"
+        "Diff summary: hidden change.\n"
+        "Gate and coverage: 1 passed.\n"
+        "Unresolved decisions: none.\n"
+        "Next action: continue."
+    )
+    world.scheduler.relinquish_ownership("alpha", note, "beta", None)
+    world.scheduler.set_disclosure_terms(["hidden"])
+
+    wake(world, "alpha")
+    (prompt,) = world.prompts("beta")
+    assert "hidden" not in prompt
+    assert "[withheld because it contains a term from the disclosure list]" in prompt
+    assert 'Worktree status: "[withheld' in prompt
+    assert 'Diff summary since the journal entry: "[withheld' in prompt
+    assert 'Task: "[withheld' in prompt
+    assert 'BEGIN ROLE JOURNAL DATA\n"[withheld' in prompt
 
 
 def test_role_status_shows_back_to(world: World) -> None:

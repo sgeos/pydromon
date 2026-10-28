@@ -7,6 +7,10 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- `dromon config` no longer warns that the seats of one role share a workdir, which
+  they do by design, since only the role's owner writes there. A writing line outside
+  the role in the same workdir is still warned about. Found by the operator on
+  2026-10-28.
 - A read-only Claude Code line could leave its sandbox. A sandbox layer that set
   `allowUnsandboxedCommands` true or `failIfUnavailable` false let a shell command run
   outside the Seatbelt sandbox that denies writes to the working directory. The read
@@ -68,6 +72,155 @@ All notable changes are recorded here. The format follows
   turn. Task ends reported during a turn and ends of tasks the line stopped are
   recorded without creating another wake.
 
+- Phase 2 of federation, step 1. A `[peers.NAME]` table may declare `transport =
+  "tls"` with the peer's `address`, `pin_sha256` and `certificate`, and
+  `[federation]` may name `tls_listen`, which is required exactly when a `tls` peer is
+  inbound. Both are validated and recorded with `peer_declared`. A `unix` peer's recorded
+  policy is unchanged, so an upgrade declares no peer again.
+- Phase 2 of federation, step 2. `dromon peer key` makes the daemon's Ed25519
+  identity once in `.dromon/peers` and prints its pin and the path of its public
+  certificate, which the operator gives the peer's operator. It never replaces an
+  existing identity and never returns the private key.
+- Phase 2 of federation, step 3. `dromon.tls_link` reaches a `tls` peer at its
+  `address` over the engines role's pinned TLS transport, presenting the daemon's
+  identity and trusting only the peer's certificate and pin, behind the forwarder's
+  connector seam. `hello` over TLS carries no token. The daemon's connector follows
+  each peer's transport.
+- Phase 2 of federation, step 4. The daemon listens on `federation.tls_listen`,
+  counting each connection under the peer connection cap of 16 before its handshake,
+  which must finish within 10 seconds and present the key of an inbound `tls` peer by
+  its pin before any frame is read. That pin names the peer at `hello`, which takes no
+  token over TLS, and again at each `deliver`. At most one `tls` peer may be inbound,
+  since the certificates `dromon.federation_tls` makes share one subject name.
+- Phase 2 of federation, step 5. Mail to a `tls` peer is no longer refused at send.
+  The policy is the same on both transports, which decide only how mail travels.
+- `dromon agent send --agent NAME --to PARTY BODY` sends one note as a registered
+  external agent through the agent socket, with the token from `DROMON_AGENT_TOKEN`, so
+  a service that is not an MCP client can tell a line that its turn has come. A test
+  shows that such a note wakes an idle line for exactly one turn, which counts as
+  autonomous.
+- A line's configuration may list its `recipients`, the parties it may send mail to,
+  enforced by the daemon. Without the key every party is allowed, as before. A line may
+  always send itself a note, and its questions to an operator are not limited, so an
+  operator can seat several lines at an external task with no private channel between
+  them.
+- An external agent's note to a line may carry a `correlation` key naming the agent's
+  own task. The event log records it as `message_correlated`, and records each turn
+  that delivered keyed notes as `turn_correlated`, with its cost and how many keys it
+  carried, so the turns and cost of one external task are totalled under its key.
+  `dromon status --correlation KEY`, the agent's `dromon_status` and `dromon agent
+  send --correlation KEY` show and carry them. A turn under two keys counts its whole
+  cost under each, and is counted as shared.
+- When a line's turn ends with background tasks of its kept session still running and
+  the line sent no mail during it, the line's next prompt says so once, so that work
+  going on unannounced is noticed.
+- When the commit checked out in a line's worktree moved since its last turn ended, as
+  after an operator commits or merges its work, the line's next prompt names the
+  commits before and after and the `git log` range between them.
+- A line's prompt no longer counts as unread its own notes, such as fired wakes and
+  task-end notes, that an earlier turn was shown, and says how many it left out.
+- A line's `check_disclosure` tool checks a text, or a file in its working directory,
+  against the project's disclosure list and answers pass or fail with how many lines
+  hold a listed term, never the term. Each check is recorded as `disclosure_checked`,
+  and a line may check at most 10 times in an hour, since each answer could otherwise
+  test candidate words one by one. A line tool's refusal for disclosure counts against
+  the same limit, and when the limit is spent the line is held and an operator asked,
+  with every such tool answering alike until the line is released.
+- Every background task end a kept engine reports between turns is recorded as
+  `task_recorded`, with its command, status, exit code, output file, the SHA-256 digest
+  and size of its output and the worktree commit, and `role_status` lists each seat's
+  latest three, so a reviewing seat can check a gate without running it again.
+- The design of federation between Dromon daemons, `docs/architecture/FEDERATION.md`,
+  approved by the operator on 2026-10-28. A line or an operator in one project can
+  message and wake a party in another, addressed as `keleusma:kaizen`, with the peer
+  named by local configuration. Mail from a peer is untrusted data and never operator
+  authority, peers are default deny per direction, and each daemon's disclosure list
+  applies to mail leaving it, operator mail included. Phase 1 is the same machine over
+  Unix domain sockets with a peer credential check and a token per peer. Phase 2 is
+  different machines over Transport Layer Security version 1.3 with pinned keys.
+  Amended the same day with the operator's decisions on the review. The receiver
+  enforces which local parties a peer may reach, peers are refused while a line runs
+  unconfined unless the project accepts it, peer mail neither counts toward nor resets
+  a line's autonomous turns, waiting mail is bounded, mail that expires after it may
+  have arrived is recorded as unconfirmed, and outbound mail is default deny.
+- Every socket the daemon serves, the operator socket, the line socket and the agent
+  socket, refuses a connection from a process of another user, read from the peer's
+  credentials, `LOCAL_PEERCRED` on macOS and `SO_PEERCRED` on Linux. A connection
+  whose credentials cannot be read is refused too, and a platform with neither
+  interface refuses to start the daemon. This is step 1 of federation phase 1, and
+  closes debt that `CLIENT.md` recorded.
+- The project file's `[federation]` and `[peers]` tables, validated strictly, with
+  both directions of a peer off and every list empty by default. Each declared peer's
+  runtime directory, and its `.dromon` when its project is named, are protected from
+  local lines as the project's own are, through the Claude Code sandbox, the Codex
+  profile and the Grok profile check. While peers are declared, a line on Pi, Cursor
+  Agent or Antigravity is refused unless `federation.accept_unconfined` is true. A
+  reload that changes either table needs a restart. This is step 2 of federation
+  phase 1, and peer mail itself comes in later steps.
+- The peer table in the event log and the peers' tokens, step 3 of federation phase
+  1. The daemon records each declared peer at start with `peer_declared`, and a peer
+  no longer declared with `peer_removed`, and `dromon peer token`, `revoke`, `store`
+  and `list` issue, revoke and store the tokens peers present, keeping only the digest
+  of a token issued and the token a peer issued in `.dromon/peers`, mode 0600 in a
+  directory of mode 0700. The daemon refuses to start when the store is wider. While
+  peers are declared, a Claude Code line without an enabled sandbox is refused as an
+  unconfined line, by the operator's decision of 2026-10-28.
+- Mail from peers, step 4 of federation phase 1. The remote address `peer:party` in the
+  model and the codec, the `message_received` event with its idempotency key, and
+  `peers.sock`, opened when `federation.listen` is true, which serves only `hello` and
+  `deliver`. A peer is named by its token alone. Each delivery is checked against the
+  grammar, the rate limit of 60 in 600 seconds, the peer's `inbound`, `reach` and
+  `max_body_bytes`, the reply route and the waiting bounds, and answered `accepted`,
+  `refused` with a fixed code or `busy`. A resend is a duplicate or a conflict. Peer
+  mail neither counts toward a line's autonomous-turn allowance nor resets it, and each
+  peer may start at most `turns_per_hour` turns for one line in any hour. Mail to a
+  peer comes with the outbox of step 5.
+- Mail to peers, step 5 of federation phase 1. A line, an agent or an operator may send
+  a note to a remote address that the outbound policy allows, checked at send against
+  `outbound`, `senders`, `remote`, `max_body_bytes` and the disclosure list, which now
+  holds an operator's mail to a peer too. The note waits in its peer's outbox, at most
+  1,000, and a forwarder per peer delivers it in order over the peer's `peers.sock`
+  with `hello` and `deliver`, behind a connector seam that the TLS transport of phase 2
+  will fill. `accepted` records `message_delivered`, a refusal records the new
+  `message_returned` with its fixed code, and a message that expires is returned with
+  `expired` or, when a copy may have arrived, recorded by the new `message_unconfirmed`.
+  A line sender gets a note for each. Twenty `busy` answers end a message as expired,
+  and backoff runs from 5 seconds to 15 minutes. `list_sent` and `dromon sent` show
+  `delivered to peer`, `returned` with its code, or `unconfirmed`. The operator's
+  decisions of 2026-10-28 are built with it. A connection to `peers.sock` must send its
+  `hello` within 10 seconds in one line of 64 KiB, and `message_received` carries
+  `received_at`, so the received keys older than the longest expiry and a day are
+  dropped. From the review of the TLS transport, the peer listener serves at most 16
+  connections at once, and a message is recorded as delivered only from the peer's
+  answer, never from a write that succeeded.
+- A watch on the forwarder, after step 5 of federation phase 1. An unexpected exception
+  in a peer's forwarder is written to standard error with its traceback, kept until a
+  message is accepted again, and followed by backoff, so the forwarder keeps running.
+  The daemon also says at once when its forwarding task ends with an error or before a
+  stop, and such an end no longer keeps the sockets open at shutdown.
+- Federation phase 1 step 6, priority mail to and from peers and peer state. A sender
+  may mark mail to a peer's line priority when the peer's `priority_out` is true, with a
+  line's priority mail counted toward its own limit, and the envelope asks for it. The
+  receiver honours it only under its `priority_in`, counting the whole peer as one
+  sender and keeping each line's limit, and otherwise records ordinary mail whose
+  header says that its priority was not honoured. `message_received` gains
+  `priority_asked`, and `message_prioritized` may mark mail waiting for a peer's line.
+  `status`, `dromon status` and `line_status` show each peer's state, what waits and
+  since when, and its last contact. When a peer's oldest message has waited an hour,
+  the harness sends the default operator one note for that outage, which ends when
+  the peer accepts mail again.
+- A sender address for the harness itself, `!dromon`, at the operator's decision of
+  2026-10-28. No client, line, agent or peer input can name it, and only the daemon's
+  own log reads it, as the sender of a `message_sent` note to a line or an operator.
+  The outage note, the failover notes to the operator and to the new owner, the note
+  to a successor of a handoff, and the request to prepare a handoff move to it, since
+  they were recorded as from a line that did not write them. Nothing replies to it,
+  and its notes are not counted unanswered.
+- The scheduler's watch, at the operator's instruction of 2026-10-28, as the
+  forwarder has. An unexpected exception in a tick is reported with its traceback,
+  kept as `scheduler.fault` in `status` until a tick completes, and followed by a
+  pause from 1 second to 1 minute, and a done callback on the scheduling task says at
+  once when it ends early.
 - Dromon's own Grok home. A Grok line runs with `GROK_HOME` at `~/.grok/dromon-home`,
   never the operator's Grok home, whose MCP servers and permission mode the first
   live probe showed Grok loads. Dromon writes the home's `config.toml`, which sets

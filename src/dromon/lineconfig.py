@@ -58,7 +58,7 @@ from pathlib import Path
 from typing import Final, NoReturn, cast
 
 from dromon.launcher import StopPolicy
-from dromon.model import ID_PATTERN
+from dromon.model import ID_PATTERN, InvalidField, parse_any_address
 from dromon.sandbox import SandboxConfig, SandboxError, parse_sandbox
 from dromon.settings import (
     SettingsConfig,
@@ -330,6 +330,10 @@ class LineConfig:
     context_handoff: bool = True
     """Whether the line's first turn in a new engine session, after a rebind or a
     cleared session, begins with a selection from its mail. Row 13."""
+    recipients: tuple[str, ...] | None = None
+    """The parties the line may send mail to, as addresses written canonically, or
+    ``None`` for every party. A line may always send itself a note, which opens no
+    channel to anyone. Questions to an operator are not limited by it."""
 
     def allows(self, tool_name: str, own_tools: frozenset[str]) -> bool:
         """Whether the policy allows ``tool_name``. Dromon's own tools always pass."""
@@ -404,6 +408,8 @@ def encode_config(config: LineConfig) -> str:
         document["auto_compact_tokens"] = config.auto_compact_tokens
     if not config.context_handoff:
         document["context_handoff"] = False
+    if config.recipients is not None:
+        document["recipients"] = list(config.recipients)
     return json.dumps(
         document,
         ensure_ascii=False,
@@ -579,6 +585,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         "allow_compact",
         "auto_compact_tokens",
         "context_handoff",
+        "recipients",
     }
     unknown = set(document) - allowed
     if unknown:
@@ -715,7 +722,23 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         allow_compact=compact,
         auto_compact_tokens=auto,
         context_handoff=handoff,
+        recipients=(
+            _recipients(document["recipients"]) if "recipients" in document else None
+        ),
     )
+
+
+def _recipients(value: object) -> tuple[str, ...]:
+    """Addresses, local or remote, each written canonically, distinct and sorted. An
+    empty list is allowed, and leaves the line only its notes to itself."""
+    found: set[str] = set()
+    for text in _texts(value, "recipients"):
+        try:
+            address = parse_any_address(text)
+        except InvalidField as error:
+            _fail(f"recipients: {text!r} is not an address, {error}")
+        found.add(str(address))
+    return tuple(sorted(found))
 
 
 def decode_config(text: str) -> LineConfig:

@@ -106,6 +106,23 @@ handoff_below_percent = 10  # the default, or 0 for never
 | `lines.ID.session` | text | none | An existing engine session the line adopts when the daemon creates it, checked as `line_session` is in [`EVENT_LOG.md`](EVENT_LOG.md). Ignored for a line that exists |
 | `teacher` | table | none | The project's local teacher model, as [`TEACHER.md`](TEACHER.md) specifies |
 | `agents` | table | off | Which external agents may connect, and with what access, as [`AGENTS.md`](AGENTS.md) specifies |
+| `federation.listen` | boolean | `false` | Whether the daemon opens its peer socket. Validated, with no effect until the peer socket is built |
+| `federation.tls_listen` | `HOST:PORT` text | none | The address of the daemon's Transport Layer Security listener, a host name or an address with a version 6 address in brackets, and a port in [1, 65535]. Required exactly when a `tls` peer is inbound, so no network listener is configured unless a peer needs one. At most one `tls` peer may be inbound until each certificate carries a name of its own. A listener that cannot start is said on standard error, and the rest of the daemon still serves |
+| `federation.accept_unconfined` | boolean | `false` | Whether lines on an engine Dromon cannot confine may run in a project with peers, as below |
+| `federation.waiting_per_recipient` | integer in [1, 100000] | 200 | The bound on mail from all peers waiting for one local party. Validated, with no effect until peer mail is built |
+| `peers.ID` | table | none | Another Dromon daemon, on this machine or on another, named by an identifier, as [`FEDERATION.md`](../architecture/FEDERATION.md) designs it. At most 64 |
+| `peers.ID.transport` | `unix` or `tls` | `unix` | A `unix` peer is on this machine. A `tls` peer is reached over Transport Layer Security, the second phase. Mail to it passes the same policy as mail to a `unix` peer. A key of the other transport is an error |
+| `peers.ID.socket` | absolute path | required for `unix` | The peer's `peers.sock`, at most 103 bytes, without `.` or `..` steps. Its directory is the peer's runtime directory |
+| `peers.ID.project` | absolute path | none | A `unix` peer's project root, whose `.dromon` is then denied to local lines |
+| `peers.ID.address` | `HOST:PORT` text | required for `tls` | The peer's listener, written as `federation.tls_listen` is |
+| `peers.ID.pin_sha256` | 64 lowercase hexadecimal digits | required for `tls` | The SHA-256 of the peer's public key, which its operator reads from `dromon peer key`. No two peers share one |
+| `peers.ID.certificate` | relative path | required for `tls` | The peer's public certificate, relative to `.dromon`, at most 1024 bytes, without empty, `.` or `..` steps |
+| `peers.ID.inbound`, `outbound`, `priority_in`, `priority_out` | boolean | `false` | The peer's directions and priority, as the design specifies |
+| `peers.ID.reach`, `senders`, `remote` | list of at most 256 local addresses | empty | The local parties the peer may send to, the local parties that may send to it, and its parties that may be addressed, each named once. A remote address is refused |
+| `peers.ID.max_body_bytes` | integer in [1, 1048576] | 65536 | The largest body sent to or accepted from the peer |
+| `peers.ID.expire_hours` | integer in [1, 2160] | 168 | How long mail to the peer waits before it expires |
+| `peers.ID.turns_per_hour` | integer in [1, 60] | 6 | Turns the peer's mail may start for one local line in an hour |
+| `peers.ID.waiting` | integer in [1, 100000] | 500 | The bound on mail from the peer waiting for all local parties |
 | `sandbox` | table | none | The project's sandbox, merged under every line's, as [`SANDBOX.md`](SANDBOX.md) specifies |
 | `profiles.NAME.sandbox`, `lines.ID.sandbox` | table | none | A profile's or a line's sandbox. These merge rather than replace |
 | `settings` | table | none | The project's engine settings, merged under every line's, as [`SETTINGS.md`](SETTINGS.md) specifies |
@@ -158,8 +175,8 @@ handoff_below_percent = 10  # the default, or 0 for never
   created through the client and absent from the file are left as they are.
 - **Reload.** `reload_project` applies the file again without a restart, with the same
   rules, after checking all of it, so a refused reload applies nothing. It refuses a
-  change to the sandbox, the engine settings, the teacher or the external agent policy,
-  which apply only at start. Its roles are recorded as above. A line the file no longer declares returns to the
+  change to the sandbox, the engine settings, the teacher, the external agent policy or
+  the federation and peer tables, which apply only at start. Its roles are recorded as above. A line the file no longer declares returns to the
   project's limits and wake policy. The leases table is applied again, and a held lease
   whose name the file no longer declares ends.
 - **Lines on other engines.** A project file whose own `[sandbox]` or `[settings]`
@@ -183,6 +200,26 @@ changes nothing. Codex and Grok lines run under their own permission profiles, a
 tool, as [`PI.md`](PI.md) specifies, so all three satisfy it. **Why.** A
 line without an enabled sandbox can reach the daemon's socket from its shell and act
 with operator authority, as [`SANDBOX.md`](SANDBOX.md) records.
+
+**Peers.** **Added on 2026-10-28, step 2 of phase 1 of
+[`FEDERATION.md`](../architecture/FEDERATION.md).** Each declared peer's runtime
+directory, the directory of its `socket`, and the `.dromon` of its `project` when one is
+named, are protected as the project's own state and runtime directories are. Every
+enabled sandbox denies them, the Codex profile denies those that exist, the check of
+the Grok profiles requires them, and no `workdir` may lie in or contain one, as
+[`SANDBOX.md`](SANDBOX.md) specifies. A peer whose directory is one of the project's
+own, or two peers that share one, are refused. While the project declares any peer,
+the daemon refuses a line on Pi, Cursor Agent or Antigravity, which Dromon cannot
+confine, unless `federation.accept_unconfined` is true. The check runs where the
+required sandbox's does. **Why.** A line that is not confined runs as the operator's
+user and could read the peer tokens of a later step and act as a peer, and the
+operator decided on 2026-10-28 that peers need the operator's explicit acceptance of
+that. **Added on 2026-10-28, step 3.** A Claude Code line without an enabled sandbox is
+refused too, by the operator's decision of that day. At start the daemon records each
+declared peer with `peer_declared`, and a peer the file no longer declares with
+`peer_removed`, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies, and refuses to start when
+`.dromon/peers`, the token store, is wider than mode 0700 or holds anything but files
+of mode 0600 of the operator's user.
 
 **Disclosure list.** `daemon.disclosure_terms` names a file of terms that must not leave
 the machine through Dromon, such as private context or code names, resolved against
@@ -219,6 +256,34 @@ stops the start, or refuses the reload and keeps the previous list.
 - **Limits.** A term written another way, split across messages, or encoded passes.
   The guard catches accidents and is not a barrier against a line that tries to evade
   it. Engine transcripts, which the engines keep themselves, are outside it.
+- **Checking before sending.** **Item B2 of 2026-10-28.** A line's `check_disclosure`
+  tool checks a `text`, or a `path` relative to its working directory, and answers
+  `pass` or `fail` with how many lines hold a listed term, compared as above, and
+  never which term. Each check is recorded as `disclosure_checked`, without the text
+  or its name, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies. **Proposed.** A line may
+  check at most 10 times in any 3,600 seconds, counted from the recorded times on the
+  wall clock, so the limit survives a restart. Every answer says whether a text holds
+  a term, so an unlimited check would let a line test candidate words one by one. A
+  file is read as `write_scratch` writes, walked without following a link, and only
+  when it is a regular file of the daemon's user with one name, outside every
+  directory Dromon protects, and at most 1 MiB. A refusal, of a missing list, a limit
+  reached, or a text or file not read, records nothing and reveals nothing of the
+  list. **Decided by the operator on 2026-10-28.** A refusal for disclosure by
+  `send_message`, `ask_operator`, `wake_after` or `write_scratch` gives the same
+  answer, so it counts against the same limit and is recorded as `disclosure_checked`
+  too. Dromon applies this to every line tool that refuses for disclosure, which
+  adds `record_role_note`, `relinquish_ownership`, `take_ownership` and
+  `propose_change`. A text that passes is not counted. When a refusal finds the
+  limit spent, Dromon holds the line and asks an operator instead of answering, and
+  every one of these tools and `check_disclosure` then gives one fixed answer,
+  without checking, until an operator releases the line. A release does not empty
+  the window, so a further refusal within it holds the line again. A line already
+  held for another reason is not asked about twice, and the release of that hold
+  ends this one too. `check_disclosure` itself, when its limit is reached, still
+  refuses with the time of its next check and does not hold the line, since that
+  refusal reveals nothing of the list. **Fact.** Each spent limit still yields one
+  further answer, since the held reply differs from a sent one, so a line learns at
+  most 11 answers per release.
 
 ## Trust
 

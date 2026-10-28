@@ -16,6 +16,7 @@ import pytest
 import keleusma
 from claude_agent_sdk import SdkMcpTool
 
+from dromon import scheduler as scheduler_module
 from dromon.activity import ActivityKind
 from dromon.driver import Driver, DriverError, Event, Strategy
 from dromon.engine import ClaudeCodeLine, EnginePlanLimit, TurnReport
@@ -23,6 +24,10 @@ from dromon.eventlog import EventLog, read_entries
 from dromon.lineconfig import ConfigError, LineConfig, ToolPolicy, encode_config
 from dromon.overrides import OverrideError
 from dromon.model import (
+    AgentAccess,
+    AgentAddress,
+    AgentRegistered,
+    Correlation,
     EventRejected,
     LineAddress,
     LineOverridden,
@@ -31,12 +36,14 @@ from dromon.model import (
     LineState,
     LineStateChanged,
     Message,
+    MessageCorrelated,
     MessageDelivered,
     MessageRead,
     MessageKind,
     MessageSent,
     OperatorAddress,
     QuestionStatus,
+    TurnCorrelated,
     WakeIssued,
     WakeRequested,
 )
@@ -350,6 +357,156 @@ def test_a_message_wakes_an_idle_line_and_is_delivered(make_world: MakeWorld) ->
     assert f"  {message_id} from @ana, note, unread" in prompt
     assert "hello" not in prompt
     assert received(target, prompt) == [("@ana", "hello")]
+
+
+def test_a_registered_agents_note_wakes_an_idle_line_for_exactly_one_turn(
+    make_world: MakeWorld,
+) -> None:
+    # An external service, such as a game table, tells a line its turn has come
+    # through the same send_message tool the agent socket serves.
+    target = make_world({"alpha": [[], [], []]})
+    table = AgentAddress("table")
+    target.log.append(AgentRegistered(table.agent_id, AgentAccess.MESSAGE, ""))
+    assert target.log.state.lines["alpha"].state is LineState.IDLE
+
+    async def act() -> None:
+        result = await call_tool(
+            target.scheduler.send_tool(table), {"to": "alpha", "body": "your move"}
+        )
+        assert result.get("is_error") is not True
+
+    run(target, act)
+    sent = [e for e in target.events() if isinstance(e, MessageSent)]
+    assert [(m.sender, m.recipient) for m in sent] == [(table, LineAddress("alpha"))]
+    assert [w.message_id for w in wakes_for(target, "alpha")] == [sent[0].message_id]
+    prompts = target.engines["alpha"].prompts
+    assert len(prompts) == 1
+    assert received(target, prompts[0]) == [("&table", "your move")]
+    assert target.log.state.lines["alpha"].state is LineState.IDLE
+    assert target.log.state.messages[sent[0].message_id].delivered
+    turns = target.scheduler.line_status("alpha")["autonomous_turns"]
+    assert isinstance(turns, dict)
+    assert (turns["allowed"], turns["used"]) == (
+        DEFAULT_LIMITS.max_autonomous_turns,
+        1,
+    )
+
+
+def test_a_line_sends_only_to_its_recipients_and_itself(
+    make_world: MakeWorld,
+) -> None:
+    # A player at a game table may answer the table but has no private channel to
+    # another player, or to an operator.
+    turn: Turn = [
+        {"to": "&table", "body": "I pass"},
+        {"to": "beta", "body": "psst"},
+        {"to": "@ana", "body": "hello"},
+        {"to": "alpha", "body": "a note to myself"},
+    ]
+    target = make_world({"beta": [], "alpha": [turn]})
+    table = AgentAddress("table")
+    target.log.append(AgentRegistered(table.agent_id, AgentAccess.MESSAGE, ""))
+    target.scheduler.configure_line("alpha", LineConfig(recipients=(str(table),)))
+
+    async def act() -> None:
+        await call_tool(
+            target.scheduler.send_tool(table), {"to": "alpha", "body": "your move"}
+        )
+
+    run(target, act)
+    results = target.engines["alpha"].results
+    assert [r.get("is_error") is True for r in results] == [False, True, True, False]
+    refusal = results[1]["content"][0]["text"]
+    assert refusal == (
+        "line alpha may send mail only to &table, by its configuration's recipients,"
+        " so not to beta"
+    )
+    sent = [
+        (m.recipient, m.body)
+        for m in target.events()
+        if isinstance(m, MessageSent) and m.sender == LineAddress("alpha")
+    ]
+    assert sent == [(table, "I pass"), (LineAddress("alpha"), "a note to myself")]
+
+
+def test_an_agents_correlated_notes_total_the_turns_they_start(
+    make_world: MakeWorld,
+) -> None:
+    # Queue of 2026-10-28, item A4. Two notes keyed to two tasks start one turn,
+    # which counts under both and records that it carried two keys.
+    target = make_world({"alpha": [[], []], "beta": []})
+    table = AgentAddress("table")
+    target.log.append(AgentRegistered(table.agent_id, AgentAccess.MESSAGE, ""))
+    engine = target.engine("alpha")
+    engine.cost = 0.25
+    tool = target.scheduler.send_tool(table)
+
+    async def act() -> None:
+        for key in ("game-8", "game-7"):
+            result = await call_tool(
+                tool, {"to": "alpha", "body": f"move in {key}", "correlation": key}
+            )
+            assert result.get("is_error") is not True
+        await target.scheduler.idle()
+        engine.cost = None
+        await call_tool(tool, {"to": "alpha", "body": "again", "correlation": "game-7"})
+        await call_tool(tool, {"to": "beta", "body": "no key"})
+
+    run(target, act)
+    assert len(engine.prompts) == 2
+    events = target.events()
+    marked = [e for e in events if isinstance(e, MessageCorrelated)]
+    assert [e.key for e in marked] == ["game-8", "game-7", "game-7"]
+    assert [e for e in events if isinstance(e, TurnCorrelated)] == [
+        TurnCorrelated("alpha", ("game-7", "game-8"), 2, 250_000),
+        TurnCorrelated("alpha", ("game-7",), 1, None),
+    ]
+    totals = target.log.state.correlations
+    assert totals["game-7"] == Correlation(2, 1, 250_000, 1)
+    assert totals["game-8"] == Correlation(1, 1, 250_000, 0)
+
+
+def test_only_an_agents_note_to_a_line_carries_a_correlation_key(
+    make_world: MakeWorld,
+) -> None:
+    turn: Turn = [{"to": "beta", "body": "keyed", "correlation": "game-7"}]
+    target = make_world({"alpha": [turn], "beta": []})
+    table = AgentAddress("table")
+    target.log.append(AgentRegistered(table.agent_id, AgentAccess.MESSAGE, ""))
+    agent_tool = target.scheduler.send_tool(table)
+    line_tool = target.scheduler.send_tool("alpha")
+    schemas = [
+        cast(dict[str, object], tool.input_schema) for tool in (line_tool, agent_tool)
+    ]
+    assert [
+        "correlation" in cast(dict[str, object], schema["properties"])
+        for schema in schemas
+    ] == [False, True]
+    refusals: list[str] = []
+
+    async def act() -> None:
+        for args in (
+            {"to": "@ana", "body": "x", "correlation": "game-7"},
+            {"to": "alpha", "body": "x", "correlation": "Game 7"},
+            {"to": "alpha", "body": "x", "correlation": 7},
+        ):
+            result = await call_tool(agent_tool, args)
+            assert result.get("is_error") is True
+            refusals.append(result["content"][0]["text"])
+        with pytest.raises(EventRejected, match="only an external agent"):
+            target.scheduler.send(
+                ANA, LineAddress("alpha"), "start", correlation="game-7"
+            )
+        target.scheduler.send(ANA, LineAddress("alpha"), "start")
+
+    run(target, act)
+    assert "carried only to a line" in refusals[0]
+    assert "correlation" in refusals[1]
+    assert refusals[2] == "correlation must be text"
+    assert target.engines["alpha"].results[0].get("is_error") is True
+    events = target.events()
+    assert not [e for e in events if isinstance(e, MessageCorrelated | TurnCorrelated)]
+    assert [m.body for m in events if isinstance(m, MessageSent)] == ["start"]
 
 
 def test_two_lines_exchange_messages_and_each_recipient_is_woken(
@@ -1502,3 +1659,60 @@ def test_project_values_change_while_running(make_world: MakeWorld) -> None:
         scheduler.set_project(DEFAULT_LIMITS, "ben", 0.5, 0)
     with pytest.raises(ValueError, match="tick_seconds"):
         scheduler.set_project(DEFAULT_LIMITS, "ben", 99.0, 1)
+
+
+class Faulty(Exception):
+    """An exception no rule of the scheduler expects."""
+
+
+def test_the_watch_keeps_a_faulty_scheduler_running(
+    make_world: MakeWorld,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(scheduler_module, "FIRST_FAULT_PAUSE_SECONDS", 0.0)
+    world = make_world({"alpha": [[]]})
+    original = world.scheduler.step
+    raised: list[int] = []
+
+    def broken() -> None:
+        if not raised:
+            raised.append(1)
+            raise Faulty("a bug in a tick")
+        original()
+
+    monkeypatch.setattr(world.scheduler, "step", broken)
+    run(world, send(world, "alpha", "hello"))
+    # The tick after the fault ran the turn, and its completion cleared the fault.
+    assert raised == [1] and "alpha" in world.engines
+    assert world.scheduler.fault_status() == {"fault": None, "faults": 1}
+    err = capsys.readouterr().err
+    assert "the scheduler failed unexpectedly, fault 1" in err
+    assert "Traceback" in err and "a bug in a tick" in err
+
+
+def test_the_schedulers_pause_doubles_to_its_bound(make_world: MakeWorld) -> None:
+    world = make_world({})
+
+    async def pauses() -> list[float]:
+        stop = asyncio.Event()
+        stop.set()
+        found: list[float] = []
+        for _ in range(8):
+            await world.scheduler._fault_found(Faulty("x"), stop)  # pyright: ignore[reportPrivateUsage]
+            found.append(world.scheduler._fault_pause)  # pyright: ignore[reportPrivateUsage]
+        return found
+
+    assert asyncio.run(pauses()) == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0]
+    assert scheduler_module.MAX_FAULT_PAUSE_SECONDS == 60.0
+    assert world.scheduler.fault_status() == {"fault": "Faulty: x", "faults": 8}
+
+
+def test_dromon_status_prints_the_schedulers_fault_only_while_it_lasts() -> None:
+    from dromon import cli
+
+    row = cli._scheduler_row  # pyright: ignore[reportPrivateUsage]
+    assert row({"fault": None, "faults": 3}) is None
+    assert row({"fault": "Faulty: x", "faults": 3}) == (
+        "scheduler fault Faulty: x, 3 since the daemon started"
+    )

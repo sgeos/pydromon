@@ -17,9 +17,9 @@ from claude_agent_sdk import SdkMcpTool
 from dromon import __version__
 from dromon.codex import default_cache_home, engine_environment
 from dromon.disclosure import REFUSAL, load_terms
-from dromon.driver import Strategy
-from dromon.engine import CLAUDE_CODE_PROMPT_MARK, TurnReport
-from dromon.eventlog import EventLog
+from dromon.driver import Driver, Strategy
+from dromon.engine import CLAUDE_CODE_PROMPT_MARK, ClaudeCodeLine, TurnReport
+from dromon.eventlog import EventLog, read_entries
 from dromon.lineconfig import (
     ConfigError,
     LineConfig,
@@ -30,8 +30,11 @@ from dromon.lineconfig import (
 from dromon.projectconfig import ConfigFileError, parse
 from dromon.limits import Limits
 from dromon import scheduler as scheduler_module
-from dromon.mailbox import summary
+from dromon.mailbox import MailSummary, summary
 from dromon.model import (
+    DISCLOSURE_CHECK_WINDOW_SECONDS,
+    MAX_DISCLOSURE_CHECKS,
+    DisclosureChecked,
     LineAddress,
     LineCreated,
     LineHeld,
@@ -40,9 +43,11 @@ from dromon.model import (
     MessageSent,
     OperatorAddress,
     OperatorRegistered,
+    RoleNoteKind,
     State,
 )
 from dromon.scheduler import (
+    DISCLOSURE_HELD,
     MAX_LINE_STATUS_DEFAULT_BYTES,
     MAX_SCRATCH_BYTES,
     UNRELEASED_NOTE,
@@ -87,6 +92,7 @@ class World:
     def __init__(self, path: Path, root: Path) -> None:
         self.root = root
         self.clock = Clock()
+        self.log_path = path
         self.log = EventLog(path)
         self.engines: dict[str, Recorder] = {}
         self.scheduler = self.start()
@@ -251,6 +257,65 @@ def test_line_status_requests_long_lists_separately(world: World) -> None:
     lists = json.loads(lists_text)["lists"]
     assert lists["other_lines"][0]["line_id"] == "beta"
     assert isinstance(lists["recent_turns"], list)
+
+
+def test_detailed_line_status_shows_the_effective_sandbox_and_shared_git_boundary(
+    world: World,
+) -> None:
+    tree = world.root / "trees" / "line"
+    tree.mkdir(parents=True)
+    common = world.root / "primary" / ".git"
+    gitdir = common / "worktrees" / "line"
+    gitdir.mkdir(parents=True)
+    (common / "hooks").mkdir()
+    (common / "config").write_text("[core]\n")
+    (gitdir / "commondir").write_text("../..\n")
+    (tree / ".git").write_text(f"gitdir: {gitdir}\n")
+    settings: dict[str, object] = {
+        "enabled": True,
+        "filesystem": {
+            "allowWrite": [str(tree)],
+            "denyWrite": [str(common / "config"), str(common / "hooks")],
+        },
+    }
+    claude = ClaudeCodeLine(
+        Driver.for_model(HAIKU, Strategy.SUBSCRIPTION),
+        tree,
+        sandbox=settings,
+    )
+    world.scheduler._engines["alpha"] = claude  # pyright: ignore[reportPrivateUsage]
+
+    text, error = world.call("line_status", {"detail": True})
+    assert not error
+    status = json.loads(text)["sandbox"]
+    assert status["available"] is True
+    assert status["enabled"] is True
+    assert status["settings"] == settings
+    filesystem = cast(dict[str, object], status["filesystem"])
+    assert filesystem["default_write_root"] == str(tree)
+    assert filesystem["allowWrite"] == [str(tree)]
+    assert filesystem["denyWrite"] == [str(common / "config"), str(common / "hooks")]
+    assert status["shared_git_directory"] == str(common)
+    assert status["shared_git_directory_write_allowed"] is False
+    assert status["shared_git_denied_paths"] == [
+        str(common / "config"),
+        str(common / "hooks"),
+    ]
+
+    claude.sandbox = cast(
+        dict[str, object],
+        {
+            "enabled": True,
+            "filesystem": {
+                "allowWrite": [str(tree), str(common)],
+                "denyWrite": [str(common / "hooks"), str(common / "config")],
+            },
+        },
+    )
+    text, error = world.call("line_status", {"detail": True})
+    assert not error
+    status = json.loads(text)["sandbox"]
+    assert status["shared_git_directory_write_allowed"] is True
 
 
 def test_default_line_status_has_a_hard_size_bound(
@@ -813,6 +878,221 @@ def test_the_disclosure_check_covers_the_scratch_path(
     assert not (world.root / "tmp").exists()
 
 
+# Item B2 of 2026-10-28, check_disclosure.
+
+
+def listed(world: World, tmp_path: Path) -> None:
+    (tmp_path / "terms").write_text("codename\nsecond term\n")
+    world.scheduler.set_disclosure_terms(load_terms(tmp_path / "terms"))
+
+
+def checks(world: World) -> list[DisclosureChecked]:
+    return [
+        entry.event
+        for entry in read_entries(world.log_path)
+        if isinstance(entry.event, DisclosureChecked)
+    ]
+
+
+def test_check_disclosure_answers_pass_or_fail_with_a_count(
+    world: World, tmp_path: Path
+) -> None:
+    listed(world, tmp_path)
+    text, error = world.call("check_disclosure", {"text": "clean\nlines"})
+    assert not error and text.startswith("pass, 0 lines hold a term")
+    body = "the CODENAME\nclean\nCodename and a Second Term\n"
+    text, error = world.call("check_disclosure", {"text": body})
+    assert not error and text.startswith("fail, 2 lines hold a term")
+    (world.root / "notes.md").write_text("one codename line\nclean\n")
+    text, error = world.call("check_disclosure", {"path": "notes.md"})
+    assert not error and text.startswith("fail, 1 line holds a term")
+    left = MAX_DISCLOSURE_CHECKS - 3
+    assert f"You have {left} of {MAX_DISCLOSURE_CHECKS} checks left" in text
+    assert "codename" not in text.casefold() and "second term" not in text.casefold()
+    recorded = checks(world)
+    assert [event.matched_lines for event in recorded] == [0, 2, 1]
+    assert {event.checked_at for event in recorded} == {"2026-10-26T09:00:00Z"}
+
+
+def test_check_disclosure_is_limited_per_line_across_a_restart(
+    world: World, tmp_path: Path
+) -> None:
+    listed(world, tmp_path)
+    for _ in range(MAX_DISCLOSURE_CHECKS):
+        _, error = world.call("check_disclosure", {"text": "clean"})
+        assert not error
+    world.clock.now += timedelta(seconds=DISCLOSURE_CHECK_WINDOW_SECONDS - 1)
+    world.log.close()
+    world.log = EventLog(world.log_path)
+    world.start()
+    listed(world, tmp_path)
+    text, error = world.call("check_disclosure", {"text": "codename"})
+    assert error and "next is allowed at 2026-10-26T10:00:00Z" in text
+    assert len(checks(world)) == MAX_DISCLOSURE_CHECKS
+    # The window slides, so each check made an hour ago frees one place.
+    world.clock.now += timedelta(seconds=1)
+    text, error = world.call("check_disclosure", {"text": "clean"})
+    assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 1} of" in text
+    world.clock.now += timedelta(seconds=1)
+    text, error = world.call("check_disclosure", {"text": "clean"})
+    assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 2} of" in text
+
+
+def test_check_disclosure_refuses_without_a_list_or_one_input(
+    world: World, tmp_path: Path
+) -> None:
+    text, error = world.call("check_disclosure", {"text": "x"})
+    assert error and "no disclosure list" in text
+    listed(world, tmp_path)
+    for args in ({}, {"text": "x", "path": "y"}):
+        text, error = world.call("check_disclosure", cast(dict[str, object], args))
+        assert error and "exactly one of text and path" in text
+    big = "x" * (scheduler_module.MAX_CHECKED_BYTES + 1)
+    text, error = world.call("check_disclosure", {"text": big})
+    assert error and "is over" in text
+    assert checks(world) == []
+
+
+@pytest.mark.parametrize(
+    ("path", "message"),
+    [
+        ("/etc/passwd", "relative path"),
+        ("~/notes", "relative path"),
+        ("../escape.md", "may not contain .."),
+        (".dromon/secret.md", "Dromon protects"),
+        ("link.md", "cannot read link.md"),
+        ("linked/escape.md", "cannot read linked/escape.md"),
+        ("hard.md", "more than one name"),
+        ("folder", "not a regular file"),
+        ("missing.md", "cannot read missing.md"),
+    ],
+)
+def test_check_disclosure_reads_only_the_lines_own_files(
+    world: World, tmp_path: Path, path: str, message: str
+) -> None:
+    listed(world, tmp_path)
+    outside = tmp_path / "escape.md"
+    outside.write_text("codename\n")
+    (world.root / ".dromon" / "secret.md").write_text("codename\n")
+    (world.root / "link.md").symlink_to(outside)
+    (world.root / "linked").symlink_to(tmp_path)
+    os.link(outside, world.root / "hard.md")
+    (world.root / "folder").mkdir()
+    text, error = world.call("check_disclosure", {"path": path})
+    assert error and message in text
+    assert checks(world) == []
+
+
+# B2, as decided by the operator on 2026-10-28. A refusal for disclosure answers
+# the same question a check does, so it spends the same limit.
+
+DISCLOSING_CALLS: list[tuple[str, dict[str, object]]] = [
+    ("send_message", {"to": "@ana", "body": "a Codename"}),
+    ("ask_operator", {"question": "a Codename?", "choices": []}),
+    ("wake_after", {"seconds": 60, "note": "a Codename"}),
+    ("write_scratch", {"path": "draft.md", "text": "a Codename"}),
+]
+
+
+def held(world: World) -> list[LineHeld]:
+    return [
+        entry.event
+        for entry in read_entries(world.log_path)
+        if isinstance(entry.event, LineHeld)
+    ]
+
+
+@pytest.mark.parametrize(("name", "args"), DISCLOSING_CALLS)
+def test_a_refusal_for_disclosure_spends_a_check(
+    world: World, tmp_path: Path, name: str, args: dict[str, object]
+) -> None:
+    listed(world, tmp_path)
+    text, error = world.call(name, args)
+    assert error and text == REFUSAL
+    assert [event.matched_lines for event in checks(world)] == [1]
+    text, error = world.call("check_disclosure", {"text": "clean"})
+    assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 2} of" in text
+
+
+def test_the_role_and_proposal_tools_spend_a_check_too(
+    world: World, tmp_path: Path
+) -> None:
+    listed(world, tmp_path)
+    scheduler = world.scheduler
+    calls = [
+        lambda: scheduler.record_role_note("alpha", RoleNoteKind.NOTE, "codename"),
+        lambda: scheduler.relinquish_ownership("alpha", "codename", None, None),
+        lambda: scheduler.take_ownership("alpha", "codename"),
+        lambda: scheduler.propose_change("alpha", "codename", ["a.py"], "patch"),
+    ]
+    for call in calls:
+        with pytest.raises(LineToolRefused, match=REFUSAL):
+            call()
+    assert len(checks(world)) == len(calls)
+
+
+def test_a_text_that_passes_spends_no_check(world: World, tmp_path: Path) -> None:
+    listed(world, tmp_path)
+    text, error = world.call("send_message", {"to": "@ana", "body": "clean"})
+    assert not error and text.startswith("sent as")
+    assert checks(world) == []
+
+
+def test_a_spent_limit_holds_the_line_and_answers_nothing_more(
+    world: World, tmp_path: Path
+) -> None:
+    listed(world, tmp_path)
+    for _ in range(MAX_DISCLOSURE_CHECKS):
+        text, error = world.call("send_message", {"to": "@ana", "body": "codename"})
+        assert error and text == REFUSAL
+    assert world.log.state.lines["alpha"].held_by is None
+    text, error = world.call("send_message", {"to": "@ana", "body": "codename"})
+    assert error and text == DISCLOSURE_HELD
+    question_id = world.log.state.lines["alpha"].held_by
+    assert question_id is not None
+    question = world.log.state.messages[question_id]
+    assert question.kind is MessageKind.QUESTION
+    assert "disclosure checks" in question.body
+    # Every checked tool now answers alike, so a clean text and a listed one cannot
+    # be told apart, and the held turn learns nothing further of the list.
+    sent = len(world.log.state.messages)
+    clean: list[tuple[str, dict[str, object]]] = [
+        ("send_message", {"to": "@ana", "body": "clean"}),
+        ("write_scratch", {"path": "clean.md", "text": "clean"}),
+        ("check_disclosure", {"text": "clean"}),
+    ]
+    for name, args in [*DISCLOSING_CALLS, *clean]:
+        text, error = world.call(name, args)
+        assert error and text == DISCLOSURE_HELD, name
+    assert len(world.log.state.messages) == sent
+    assert not (world.root / "tmp" / "clean.md").exists()
+    assert len(checks(world)) == MAX_DISCLOSURE_CHECKS
+    assert len(held(world)) == 1
+    # A release lets clean text through, while the window, still full, holds the
+    # line again at its next refusal.
+    world.scheduler.release("alpha")
+    text, error = world.call("send_message", {"to": "@ana", "body": "clean"})
+    assert not error and text.startswith("sent as")
+    text, error = world.call("send_message", {"to": "@ana", "body": "codename"})
+    assert error and text == DISCLOSURE_HELD
+    assert len(held(world)) == 2
+
+
+def test_a_line_held_already_is_not_held_twice(world: World, tmp_path: Path) -> None:
+    listed(world, tmp_path)
+    world.scheduler.hold("alpha", "passed a test limit")
+    for _ in range(MAX_DISCLOSURE_CHECKS):
+        world.call("wake_after", {"seconds": 60, "note": "codename"})
+    text, error = world.call("wake_after", {"seconds": 60, "note": "clean"})
+    assert not error and "codename" not in text
+    text, error = world.call("wake_after", {"seconds": 60, "note": "codename"})
+    assert error and text == DISCLOSURE_HELD
+    assert len(held(world)) == 1
+    world.scheduler.release("alpha")
+    text, error = world.call("wake_after", {"seconds": 60, "note": "clean"})
+    assert not error
+
+
 def test_the_repeat_memory_is_pruned_after_the_window(world: World) -> None:
     scheduler = world.scheduler
     for number in range(5):
@@ -1163,3 +1443,57 @@ def test_list_mail_notes_stay_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in ("a", "b", "c"):
         scheduler_module._bounded_put(store, key, key.upper())  # pyright: ignore[reportPrivateUsage]
     assert store == {"b": "B", "c": "C"}
+
+
+# The operator's requests after phase 2 of federation, decided on 2026-10-28.
+
+MOVED = "The commit checked out in your worktree moved"
+
+
+def test_a_turn_is_told_once_when_its_worktree_head_moved(world: World) -> None:
+    """A line learns at its next turn that an operator committed or merged its work,
+    with the commits before and after. A first commit, a turn with no move, and a
+    worktree outside a checkout tell nothing."""
+    outside = world.turn("one")
+    checkout(world.root, "a" * 40)
+    appeared = world.turn("two")
+    still = world.turn("three")
+    checkout(world.root, "b" * 40)
+    moved = world.turn("four")
+    after = world.turn("five")
+    assert all(MOVED not in prompt for prompt in (outside, appeared, still, after))
+    assert moved.startswith(
+        f"{MOVED} from {'a' * 12} to {'b' * 12} since your last turn ended."
+        f" git log --oneline {'a' * 12}..{'b' * 12} lists the commits between"
+    )
+
+
+def test_own_notes_shown_to_an_earlier_turn_leave_unread(world: World) -> None:
+    """A note a line sent itself, such as a wake that fired after its work was done,
+    is counted unread in the turn it reaches and left out of unread in later turns.
+    An operator's unread mail is never left out, and line_status counts every
+    unread message."""
+    alpha = LineAddress("alpha")
+    own = world.turn("check the gate", sender=alpha)
+    first = world.turn("from ana")
+    second = world.turn("from ana again")
+    assert MailSummary(1, 1, 0).sentence() in own
+    assert MailSummary(1, 1, 1, collapsed=1).sentence() in first
+    assert MailSummary(1, 2, 2, collapsed=1).sentence() in second
+    assert summary(world.log.state, alpha, 0) == MailSummary(0, 3, 2)
+
+
+@pytest.mark.parametrize(
+    ("collapsed", "said"),
+    [
+        (0, None),
+        (1, "1 note of your own, such as fired wakes, shown to an earlier turn is"),
+        (2, "2 notes of your own, such as fired wakes, shown to an earlier turn are"),
+    ],
+)
+def test_the_summary_says_how_many_own_notes_it_left_out(
+    collapsed: int, said: str | None
+) -> None:
+    sentence = MailSummary(1, 0, 0, collapsed=collapsed).sentence()
+    assert sentence.startswith("1 new message. 0 unread. 0 unanswered.")
+    assert (said in sentence) if said else sentence.endswith("unanswered.")

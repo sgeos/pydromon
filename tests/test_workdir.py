@@ -42,7 +42,12 @@ from dromon.protocol import ErrorCode, Response
 from dromon.sandbox import SandboxError, blocks_unsandboxed, effective, parse_sandbox
 from dromon.scheduler import LineEngine, LineSpec, Scheduler, engine_factory
 from dromon.engine import EngineRefused, TurnReport
-from dromon.workdir import MAX_POINTER_BYTES, git_write_guards, resolve_workdir
+from dromon.workdir import (
+    MAX_POINTER_BYTES,
+    git_common_directory,
+    git_write_guards,
+    resolve_workdir,
+)
 
 HAIKU = "claude-haiku-5-5"
 ANA = OperatorAddress("ana")
@@ -189,6 +194,7 @@ def test_a_linked_worktree_guards_the_common_directory_and_its_pointers(
     tmp_path: Path,
 ) -> None:
     common, gitdir, tree = linked_worktree(tmp_path)
+    assert git_common_directory(tree) == common
     assert git_write_guards(tree) == tuple(
         sorted(
             {
@@ -1013,6 +1019,34 @@ def test_dromon_config_warns_when_writing_lines_share_workdir(
     output = capsys.readouterr().out
     assert "warning: writing lines a, b share workdir" in output
     assert "reader" not in output.split("warning:", maxsplit=1)[1]
+
+
+def test_dromon_config_does_not_warn_about_seats_of_one_role(
+    tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Seats of one role share its worktree by design, and only the owner writes there.
+    # A writing line outside the role in the same worktree is still a second writer.
+    state = tmp_path / ".dromon"
+    state.mkdir()
+    (tmp_path / "wt").mkdir()
+    seats = (
+        "version = 1\n"
+        "[lines.core]\nmodel = 'claude-opus-5-5'\nbuiltin_tools = ['Bash']\n"
+        "[lines.core-luna]\nmodel = 'claude-haiku-5-5'\nbuiltin_tools = ['Write']\n"
+        "[roles.core]\nworkdir = 'wt'\nseats = ['core', 'core-luna']\n"
+    )
+    (state / "dromon.toml").write_text(seats)
+    runtime = ["--runtime-dir", str(short_runtime)]
+    assert cli.main(["--project", str(tmp_path), *runtime, "config"]) == 0
+    assert "warning:" not in capsys.readouterr().out
+
+    (state / "dromon.toml").write_text(
+        seats + "[lines.other]\nmodel = 'claude-haiku-5-5'\n"
+        "builtin_tools = ['Edit']\nworkdir = 'wt'\n"
+    )
+    assert cli.main(["--project", str(tmp_path), *runtime, "config"]) == 0
+    output = capsys.readouterr().out
+    assert "warning: writing lines core, core-luna, other share workdir" in output
 
 
 def test_dromon_config_resolves_workdir_symlinks_for_shared_writer_warning(

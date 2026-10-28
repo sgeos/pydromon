@@ -316,6 +316,12 @@ def test_a_due_wake_fires_as_a_note_from_the_line_and_wakes_it(world: World) -> 
     assert message.body == "read the gate's log" and message.delivered
     prompt = world.engines["alpha"].prompts[0]
     assert f"  {message_id} from alpha, note, unread" in prompt
+    due = format_due(START + timedelta(seconds=600))
+    delivered = format_due(world.clock.now)
+    assert f"your scheduled wake, due {due}, delivered {delivered}" in prompt
+    assert world.scheduler.mail_notes(message_id) == (
+        f"scheduled wake due {due}, delivered {delivered}"
+    )
     assert "alpha" not in world.log.state.scheduled
     summary = world.scheduler.line_summaries()[0]
     assert summary["autonomous_turns"] == 1 and summary["scheduled_wake"] is None
@@ -419,6 +425,7 @@ def test_every_line_has_the_tool_and_status_shows_the_pending_wake(
         "line_status",
         "read_instructions",
         "write_scratch",
+        "check_disclosure",
         "propose_change",
         "list_processes",
         "stop_process",

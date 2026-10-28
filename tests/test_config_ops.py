@@ -12,7 +12,7 @@ from claude_agent_sdk import SdkMcpTool
 
 from dromon.configview import Overrides
 from dromon.daemon import Daemon
-from dromon.driver import Strategy
+from dromon.driver import ENGINE_OF, Strategy
 from dromon.eventlog import EventLog
 from dromon.limits import DEFAULT_LIMITS
 from dromon.paths import ProjectPaths, project_paths
@@ -347,3 +347,23 @@ def test_stored_project_overrides_that_do_not_apply_are_skipped(
         assert client.daemon.scheduler.limits_for("alpha") == DEFAULT_LIMITS
     reported = capsys.readouterr().err
     assert "colour" in reported and "tick_seconds" in reported
+
+
+def test_a_reload_that_changes_the_peers_needs_a_restart(paths: ProjectPaths) -> None:
+    with attached(paths) as client:
+        write_file(paths, '[peers.k]\nsocket = "/srv/k/run/peers.sock"\n')
+        moved = client.ask("reload_project")
+        assert not moved.ok and "federation" in (moved.error_message or "")
+        assert "restarts" in (moved.error_message or "")
+
+
+def test_an_unconfined_line_is_not_created_beside_peers(paths: ProjectPaths) -> None:
+    project = loaded(paths, '[peers.k]\nsocket = "/srv/k/run/peers.sock"\n')
+    pi = next(model for model, engine in ENGINE_OF.items() if engine == "pi")
+    with attached(paths, project=project) as client:
+        before = client.daemon.log.last_seq
+        refused = client.ask(
+            "create_line", {"line_id": "p", "model": pi, "strategy": "subscription"}
+        )
+        assert not refused.ok and "cannot confine" in (refused.error_message or "")
+        assert client.daemon.log.last_seq == before

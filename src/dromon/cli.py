@@ -85,6 +85,8 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "probe": "run one short turn on the engine and report its capabilities",
     "teacher": "bring the project's local teacher model up, report it, or release it",
     "agent": "register, list or revoke the external agents that may connect",
+    "peer": "list the declared peers, issue, revoke or store their tokens, or show"
+    " this daemon's key",
     "mcp": "serve an external agent over MCP on standard input and output",
     "proposal": "list or show proposed changes from session lines",
 }
@@ -106,9 +108,13 @@ def _start(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 
 
 def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
-    del arguments
+    correlation: str | None = arguments.correlation
     try:
-        response = call(paths.socket, Operation.STATUS)
+        response = call(
+            paths.socket,
+            Operation.STATUS,
+            args=None if correlation is None else {"correlation": correlation},
+        )
     except DaemonNotRunning:
         print(f"dromon status: not running for {paths.root}")
         return exits.NOT_RUNNING
@@ -134,12 +140,73 @@ def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             f" open questions {counts.get('open_questions')}"
         )
         print(_log_growth(counts))
+    watch = result.get("scheduler")
+    if isinstance(watch, dict):
+        row = _scheduler_row(cast(Mapping[str, object], watch))
+        if row is not None:
+            print(row)
     found = result.get("lines")
     lines = cast(list[object], found) if isinstance(found, list) else []
     for entry in lines:
         if isinstance(entry, dict):
             print(_line_row(cast(Mapping[str, object], entry)))
+    found = result.get("peers")
+    peers = cast(list[object], found) if isinstance(found, list) else []
+    for entry in peers:
+        if isinstance(entry, dict):
+            print(_peer_row(cast(Mapping[str, object], entry)))
+    totals = result.get("correlation")
+    if isinstance(totals, dict):
+        print(_correlation_row(cast(Mapping[str, object], totals)))
     return exits.OK
+
+
+def _correlation_row(totals: Mapping[str, object]) -> str:
+    """The line of ``dromon status --correlation`` for one key's totals. The cost
+    counts every turn under each key it carried, so the shared turns are named."""
+    key = totals.get("key")
+    if not totals.get("recorded"):
+        return f"correlation {key}, no turn recorded"
+    unknown = totals.get("unknown_cost_turns")
+    return (
+        f"correlation {key}, turns {totals.get('turns')},"
+        f" shared with other keys {totals.get('shared_turns')},"
+        f" known cost ${totals.get('cost_usd')}"
+        + (f", turns of unknown cost {unknown}" if unknown else "")
+    )
+
+
+def _scheduler_row(watch: Mapping[str, object]) -> str | None:
+    """The line of ``dromon status`` for a fault the scheduler's watch keeps, or
+    ``None`` while there is none."""
+    fault = watch.get("fault")
+    if fault is None:
+        return None
+    return f"scheduler fault {fault}, {watch.get('faults')} since the daemon started"
+
+
+def _peer_row(peer: Mapping[str, object]) -> str:
+    """One line of ``dromon status`` for a peer: its delivery, what waits and since
+    when, when it last answered, and a fault in its forwarder."""
+    parts = [f"peer {peer.get('peer')}", str(peer.get("state"))]
+    waiting = peer.get("waiting")
+    if waiting:
+        since = peer.get("oldest_sent_at")
+        parts.append(
+            f"{waiting} waiting, the oldest {peer.get('oldest')}"
+            + (f" since {since}" if since is not None else "")
+        )
+    else:
+        parts.append("nothing waiting")
+    contact = peer.get("last_contact")
+    parts.append(
+        "no contact since the daemon started"
+        if contact is None
+        else f"last contact {contact}"
+    )
+    if peer.get("fault") is not None:
+        parts.append(f"fault {peer.get('fault')}")
+    return ", ".join(parts)
 
 
 def _line_row(line: Mapping[str, object]) -> str:
@@ -738,13 +805,16 @@ def _sent(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     entries = cast(list[dict[str, object]], response.get("messages", []))
     print(f"{response.get('total')} sent")
     for entry in entries:
-        delivery = (
-            "read"
-            if entry.get("read") is True
-            else "delivered"
-            if entry.get("delivered") is True
-            else "waiting"
-        )
+        delivery = entry.get("delivery")
+        if not isinstance(delivery, str):
+            # A daemon before step 5 of federation sends no delivery.
+            delivery = (
+                "read"
+                if entry.get("read") is True
+                else "delivered"
+                if entry.get("delivered") is True
+                else "waiting"
+            )
         print(
             f"{entry.get('message_id')} to {entry.get('recipient')},"
             f" {entry.get('kind')}, {delivery}, {entry.get('outcome')}"
@@ -866,8 +936,17 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             workdir_path = paths.root / workdir_path
         resolved = str(workdir_path.resolve())
         shared_workdirs.setdefault(resolved, []).append(line_id)
+    # The seats of one role share its worktree by design, since only its owner writes
+    # there, so they count as one writer. A line of another role, or of none, beside
+    # them is still warned about.
+    role_of = {
+        line_id: f"role {role_id}"
+        for role_id, role in config.roles.items()
+        for line_id in role.seats
+    }
     for workdir, line_ids in sorted(shared_workdirs.items()):
-        if len(line_ids) > 1:
+        writers = {role_of.get(line_id, f"line {line_id}") for line_id in line_ids}
+        if len(writers) > 1:
             print(
                 "warning: writing lines "
                 + ", ".join(line_ids)
@@ -880,6 +959,8 @@ def _agent(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     """Register, list or revoke external agents, through the daemon."""
     action: str = arguments.action
     name: str | None = arguments.name
+    if action == "send":
+        return _agent_send(paths, arguments)
     if action != "list" and name is None:
         print(f"dromon agent {action}: name the agent", file=sys.stderr)
         return exits.USAGE
@@ -931,6 +1012,148 @@ def _agent(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         "env": {TOKEN_ENV: result["token"]},
     }
     print(json.dumps({"mcpServers": {"dromon": server}}, indent=2))
+    return exits.OK
+
+
+AGENT_SEND_TIMEOUT_SECONDS: Final = 60.0
+"""How long ``dromon agent send`` waits for the daemon, as ``dromon mcp`` does."""
+
+
+def _agent_send(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Send one note as an external agent, through the agent socket, for a service
+    that is not an MCP client. The note goes through the agent's ``send_message``
+    tool, so the daemon authenticates the agent and applies its access as it does for
+    ``dromon mcp``. The token is read from ``DROMON_AGENT_TOKEN``, never from an
+    argument, which other processes could read."""
+    agent: str | None = arguments.agent
+    to: str | None = arguments.to
+    body: str | None = arguments.name
+    if agent is None or to is None or body is None:
+        print(
+            "dromon agent send: give --agent NAME, --to PARTY and the body",
+            file=sys.stderr,
+        )
+        return exits.USAGE
+    tool_arguments: dict[str, object] = {"to": to, "body": body}
+    correlation: str | None = arguments.correlation
+    if correlation is not None:
+        tool_arguments["correlation"] = correlation
+    args: dict[str, object] = {
+        "agent": agent,
+        "tool": "send_message",
+        "arguments": tool_arguments,
+    }
+    token = os.environ.get(TOKEN_ENV) or None
+    if token is not None:
+        args["token"] = token
+    try:
+        response = call(
+            paths.agent_socket, Operation.AGENT_CALL, AGENT_SEND_TIMEOUT_SECONDS, args
+        )
+    except DaemonNotRunning:
+        print(
+            f"dromon agent send: no daemon for {paths.root} lets agents connect",
+            file=sys.stderr,
+        )
+        return exits.NOT_RUNNING
+    except (ProtocolError, TimeoutError, OSError) as error:
+        print(f"dromon agent send: {error}", file=sys.stderr)
+        return exits.FAILURE
+    if not response.ok or response.result is None:
+        print(f"dromon agent send: {response.error_message}", file=sys.stderr)
+        return exits.FAILURE
+    result = response.result
+    texts = [
+        str(item.get("text", ""))
+        for item in cast(list[dict[str, object]], result.get("content", []))
+    ]
+    if result.get("is_error"):
+        print(f"dromon agent send: {' '.join(texts)}", file=sys.stderr)
+        return exits.FAILURE
+    for text in texts:
+        print(text)
+    return exits.OK
+
+
+MAX_PEER_TOKEN_INPUT: Final = 1024
+"""The most characters ``dromon peer store`` reads from standard input."""
+
+
+def _peer(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """List the declared peers, or issue, revoke or store a peer's token, through the
+    daemon. ``store`` reads the token from standard input, never from an argument, so
+    it does not appear in the process list or the shell's history."""
+    action: str = arguments.action
+    name: str | None = arguments.name
+    if action == "key" and name is not None:
+        print("dromon peer key: takes no peer name", file=sys.stderr)
+        return exits.USAGE
+    if action not in ("list", "key") and name is None:
+        print(f"dromon peer {action}: name the peer", file=sys.stderr)
+        return exits.USAGE
+    args: dict[str, object] = {} if name is None else {"peer": name}
+    operation = {
+        "list": Operation.PEER_LIST,
+        "token": Operation.PEER_TOKEN,
+        "revoke": Operation.PEER_REVOKE,
+        "store": Operation.PEER_STORE,
+        "key": Operation.PEER_KEY,
+    }[action]
+    if action == "store":
+        args["token"] = sys.stdin.readline(MAX_PEER_TOKEN_INPUT).strip()
+    try:
+        response = call(paths.socket, operation, args=args)
+    except DaemonNotRunning:
+        print(f"dromon peer: no daemon is running for {paths.root}", file=sys.stderr)
+        return exits.NOT_RUNNING
+    except (ProtocolError, TimeoutError, OSError) as error:
+        print(f"dromon peer: {error}", file=sys.stderr)
+        return exits.FAILURE
+    if not response.ok or response.result is None:
+        print(f"dromon peer: {response.error_message}", file=sys.stderr)
+        return exits.FAILURE
+    result = response.result
+    match action:
+        case "list":
+            listening = "listening" if result["listen"] else "not listening"
+            print(f"peers {listening}")
+            for entry in cast(list[dict[str, object]], result["peers"]):
+                directions = [
+                    direction
+                    for direction in ("inbound", "outbound")
+                    if entry[direction]
+                ]
+                issued = "issued" if entry["issued"] else "not issued"
+                stored = entry["stored"]
+                held = (
+                    stored
+                    if isinstance(stored, str)
+                    else ("stored" if stored else "not stored")
+                )
+                print(
+                    f"{entry['peer']} {entry['transport']}"
+                    f" {' and '.join(directions) or 'closed'},"
+                    f" its token {issued}, its token for us {held}"
+                )
+        case "token":
+            print(f"token {result['token']}")
+            print(
+                "The token is shown once. Store it in the peer's project with"
+                " dromon peer store, under the name that project gives this one."
+            )
+        case "revoke":
+            print(f"revoked the token of peer {result['peer']}")
+        case "key":
+            made = "made now" if result["made"] else "made earlier"
+            print(f"pin_sha256 {result['pin_sha256']}")
+            print(f"certificate {result['certificate']}, {made}")
+            print(
+                "Give the pin and the certificate to the peer's operator, who writes"
+                " them as pin_sha256 and certificate in that project's peer table."
+                " The private key stays in .dromon/peers."
+            )
+        case _:
+            print(f"stored the token for peer {result['peer']}")
     return exits.OK
 
 
@@ -1415,6 +1638,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "role": _role,
     "budget": _budget,
     "agent": _agent,
+    "peer": _peer,
     "mcp": _mcp,
     "proposal": _proposal,
 }
@@ -1613,6 +1837,12 @@ def build_parser() -> argparse.ArgumentParser:
                 choices=[strategy.value for strategy in Strategy],
                 help="the new driver's credential strategy",
             )
+        if name == "status":
+            command.add_argument(
+                "--correlation",
+                metavar="KEY",
+                help="also total the turns and cost recorded under this key",
+            )
         if name == "release":
             command.add_argument("line_id", help="the held line")
         if name == "interrupt":
@@ -1778,15 +2008,42 @@ def build_parser() -> argparse.ArgumentParser:
                 " change the strategy",
             )
         if name == "agent":
-            command.add_argument("action", choices=["add", "list", "revoke"])
+            command.add_argument("action", choices=["add", "list", "revoke", "send"])
             command.add_argument(
-                "name", nargs="?", help="the agent, for add and revoke"
+                "name",
+                nargs="?",
+                metavar="NAME_OR_BODY",
+                help="the agent, for add and revoke, or the note's body, for send",
+            )
+            command.add_argument(
+                "--agent",
+                help="for send, the agent that sends. Its token is read from"
+                " DROMON_AGENT_TOKEN",
+            )
+            command.add_argument(
+                "--to", help="for send, the party the note is for, such as a line"
+            )
+            command.add_argument(
+                "--correlation",
+                metavar="KEY",
+                help="for send, a key naming the agent's task, under which the"
+                " line's turns and their cost are totalled",
             )
             command.add_argument(
                 "--access",
                 choices=[level.value for level in AgentAccess],
                 default=AgentAccess.MESSAGE.value,
                 help="what the agent may do, for add, default %(default)s",
+            )
+        if name == "peer":
+            command.add_argument(
+                "action", choices=["list", "token", "revoke", "store", "key"]
+            )
+            command.add_argument(
+                "name",
+                nargs="?",
+                help="the peer, for token, revoke and store. store reads the token"
+                " from standard input. key shows this daemon's own pin",
             )
         if name == "role":
             command.add_argument(
