@@ -293,6 +293,10 @@ PROJECT_DIRECTORY: Final = ".grok"
 """A project's own Grok directory, refused at every project level by
 ``check_project``."""
 
+REFUSED_PROJECT_ENTRIES: Final = (PROJECT_DIRECTORY, ".claude", ".cursor", ".agents")
+"""Project directories whose settings, rules, skills or hooks Grok could load, but
+which Dromon has not read as Grok configuration."""
+
 MAX_HOME_FILE: Final = 1024 * 1024
 """The largest home or settings file Dromon reads."""
 
@@ -479,22 +483,21 @@ def _project_levels(workspace: Path) -> list[Path]:
 
 
 def check_project(workspace: Path) -> None:
-    """Refuse a turn when any project level holds a ``.grok`` file, or a ``.grok``
-    directory with anything in it. **Review of read-only seats, second round, finding
-    3.** Grok's configuration guide says a project's ``.grok/config.toml`` adds MCP
-    servers, plugins and permission rules, and its other guides read a project's
-    ``.grok`` for hooks, rules, skills and a sandbox file, which a worktree could
-    supply. Dromon refuses them whole rather than read them, as the Antigravity
-    adapter refuses its workspace directories."""
+    """Refuse a turn when any project level holds an unread Grok or harness directory.
+    Grok's guides describe loading configuration, hooks, rules or skills from these
+    directories, which a worktree could supply. Dromon refuses them whole rather than
+    reading their contents, as the Antigravity adapter refuses its workspace
+    directories. **Operator decision, 2026-10-28.**"""
     found = [
-        str(directory / PROJECT_DIRECTORY)
+        str(directory / name)
         for directory in _project_levels(workspace)
-        if _loading_entries(directory, (PROJECT_DIRECTORY,))
+        for name in REFUSED_PROJECT_ENTRIES
+        if _loading_entries(directory, (name,))
     ]
     if found:
         raise EngineRefused(
-            "Grok would load project configuration Dromon has not read from "
-            + ", ".join(found)
+            "Grok would load project configuration or instructions Dromon has not"
+            " read from " + ", ".join(found)
         )
 
 
@@ -930,11 +933,11 @@ class GrokLine:
         user_home = grok_home / USER_HOME
         prepare_home(grok_home, self.cwd, self.protected)
         check_home(grok_home)
+        check_project(self.cwd)
         claude_mode = claude_mode_refusal(user_home, self.cwd)
         if claude_mode is not None:
             raise EngineRefused(claude_mode)
         check_user_home(user_home)
-        check_project(self.cwd)
         environment["GROK_HOME"] = str(grok_home)
         environment["HOME"] = str(user_home)
         environment["GROK_SANDBOX"] = check_profile(

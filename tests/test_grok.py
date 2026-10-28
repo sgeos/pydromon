@@ -1551,28 +1551,31 @@ def test_a_claude_settings_mode_in_grok_home_directory_refuses_the_turn(
     assert server.methods() == []
 
 
-def test_a_claude_settings_mode_in_the_project_still_refuses_the_turn(
+def test_a_project_claude_directory_refuses_before_grok_starts(
     project: tuple[Path, Path, Path],
 ) -> None:
     workspace, _, _ = project
     settings(workspace, {"permissions": {"defaultMode": "bypassPermissions"}})
     server = probed_grok()
-    with pytest.raises(EngineRefused, match="defaultMode to 'bypassPermissions'"):
+    with pytest.raises(EngineRefused, match="project configuration or instructions"):
         run(line(server, project))
     assert server.methods() == []
 
 
 @pytest.mark.parametrize("level", ["workspace", "repository"])
-def test_a_projects_own_grok_directory_is_refused(tmp_path: Path, level: str) -> None:
+@pytest.mark.parametrize("name", [".grok", ".claude", ".cursor", ".agents"])
+def test_a_projects_grok_or_harness_directory_is_refused(
+    tmp_path: Path, level: str, name: str
+) -> None:
     repository = tmp_path / "repo"
     workspace = repository / "packages" / "one"
     workspace.mkdir(parents=True)
     (repository / ".git").mkdir()
-    directory = (workspace if level == "workspace" else repository) / ".grok"
+    directory = (workspace if level == "workspace" else repository) / name
     check_project(workspace)
     directory.mkdir()
     check_project(workspace)
-    (directory / "config.toml").write_text("[mcp_servers.x]\ncommand = 'x'\n")
+    (directory / "rules").write_text("unread instructions")
     with pytest.raises(EngineRefused, match=re.escape(str(directory))):
         check_project(workspace)
     shutil.rmtree(directory)
@@ -1592,12 +1595,14 @@ def test_a_grok_directory_outside_the_project_is_not_read(tmp_path: Path) -> Non
     check_project(workspace)
 
 
-def test_a_projects_grok_directory_refuses_the_turn_before_grok_starts(
-    project: tuple[Path, Path, Path],
+@pytest.mark.parametrize("name", [".grok", ".claude", ".cursor", ".agents"])
+def test_a_project_harness_directory_refuses_the_turn_before_grok_starts(
+    project: tuple[Path, Path, Path], name: str
 ) -> None:
     workspace, _, _ = project
-    (workspace / ".grok").mkdir()
-    (workspace / ".grok" / "sandbox.toml").write_text("[profiles.dromon-reader]\n")
+    directory = workspace / name
+    directory.mkdir()
+    (directory / "rules").write_text("unread instructions")
     server = probed_grok()
     with pytest.raises(EngineRefused, match="project configuration"):
         run(line(server, project))
