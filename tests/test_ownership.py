@@ -928,6 +928,33 @@ def test_a_new_owner_turn_leads_with_the_journal_and_worktree_package(
     assert snapshot_bases == [WORKTREE_COMMIT]
 
 
+def test_a_role_transition_withholds_disclosing_journal_and_snapshot_text(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def snapshot(_directory: Path, _base_commit: str | None = None) -> tuple[str, str]:
+        return "## feature\n M hidden_file.py", "hidden_file.py | 2 +-"
+
+    monkeypatch.setattr(scheduler_module, "_worktree_snapshot", snapshot)
+    note = (
+        "Task: hidden task.\n"
+        "Diff summary: hidden change.\n"
+        "Gate and coverage: 1 passed.\n"
+        "Unresolved decisions: none.\n"
+        "Next action: continue."
+    )
+    world.scheduler.relinquish_ownership("alpha", note, "beta", None)
+    world.scheduler.set_disclosure_terms(["hidden"])
+
+    wake(world, "alpha")
+    (prompt,) = world.prompts("beta")
+    assert "hidden" not in prompt
+    assert "[withheld because it contains a term from the disclosure list]" in prompt
+    assert 'Worktree status: "[withheld' in prompt
+    assert 'Diff summary since the journal entry: "[withheld' in prompt
+    assert 'Task: "[withheld' in prompt
+    assert 'BEGIN ROLE JOURNAL DATA\n"[withheld' in prompt
+
+
 def test_role_status_shows_back_to(world: World) -> None:
     world.scheduler.relinquish_ownership("alpha", "over", "beta", "alpha")
     change = world.scheduler.role_status("beta")["last_change"]

@@ -45,8 +45,10 @@ fell due while the daemon was down fires at its first tick. The wall clock is
 injected, so tests control it, and it is distinct from the monotonic clock that
 measures cooldowns. A fired note is the reserved message's one firing, and any other
 note a line sends itself is ordinary self mail. A compaction-only wake does not spend
-an autonomous turn, and a context-warning wake is withdrawn if a later estimate falls
-below the effective compaction threshold before the wake fires.
+an autonomous turn once while context remains at or past its warning. A later report
+below the warning allows one more uncounted compaction-only wake. A context-warning
+wake is withdrawn if a later estimate falls below the effective compaction threshold
+before the wake fires.
 
 Leases. A project may declare named leases, such as ``full-gate``, so that its lines
 take turns at a shared resource. ``acquire_lease`` succeeds only while no line holds
@@ -657,6 +659,9 @@ STOP_PROCESS_TOOL_NAME: Final = "stop_process"
 LIST_BACKGROUND_TOOL_NAME: Final = "list_background"
 COMPACT_SESSION_TOOL_NAME: Final = "compact_session"
 COMPACTION_CONTEXT_WARNING: Final = "context_warning"
+ROLE_PACKAGE_WITHHELD: Final = (
+    "[withheld because it contains a term from the disclosure list]"
+)
 CONTEXT_COMPACTION_NOTE: Final = (
     "Dromon requests a context compaction before your next turn."
 )
@@ -1385,6 +1390,12 @@ class Scheduler:
         """Lines whose next turn begins by compacting their session."""
         self._context_compaction_wakes: set[str] = set()
         """Lines woken for compaction at the context warning, until dispatch."""
+        self._compaction_free_turn_used: set[str] = set()
+        """Lines that used their one uncounted compaction turn in the current
+        context-warning interval. A reported context below the warning resets it."""
+        self._compaction_free_turn_inflight: set[str] = set()
+        """Lines currently in that uncounted turn, whose intermediate context
+        reports cannot reset the allowance before the turn ends."""
         self._context_compaction_wake_ids: dict[str, str] = {}
         """Identifiers of context-warning wakes, retained through dispatch."""
         self._context: dict[str, int] = {}
@@ -1397,6 +1408,9 @@ class Scheduler:
         """The identifier of the wake each line's latest ``compact_session`` call
         scheduled, which the compaction withdraws. In memory, so after a restart the
         wake fires, and its note says that a restart loses the request."""
+        self._compact_wake_free: set[str] = set()
+        """Lines whose ``compact_session`` wake was requested at or past the
+        context warning and can use the one free compaction turn."""
         self._context_source: dict[str, str] = {}
         """Where each line's context estimate came from, one of the
         ``CONTEXT_FROM_*`` values, for the note ``line_status`` gives with it."""
@@ -2149,6 +2163,12 @@ class Scheduler:
             and self._context_compaction_wake_ids.get(line_id) == previous.message_id
         ):
             self._context_compaction_wake_ids.pop(line_id, None)
+        if (
+            previous is not None
+            and self._compact_wake.get(line_id) == previous.message_id
+        ):
+            self._compact_wake.pop(line_id, None)
+            self._compact_wake_free.discard(line_id)
         self._work.set()
         return message_id, due
 
@@ -2186,6 +2206,7 @@ class Scheduler:
         """Withdraw the line's pending wake if ``compact_session`` scheduled it, and
         return its identifier, or ``None`` when there was none to withdraw."""
         message_id = self._compact_wake.pop(line_id, None)
+        self._compact_wake_free.discard(line_id)
         pending = self._log.state.scheduled.get(line_id)
         if message_id is None or pending is None or pending.message_id != message_id:
             return None
@@ -2596,6 +2617,12 @@ class Scheduler:
         compaction on it: an estimate at or past ``auto_compact_tokens`` just after
         a compaction holds it, and any estimate below releases it. Called with the
         size a compaction left or its estimate, and with each turn's estimate."""
+        previous = self._context.get(line_id)
+        warning = self.effective_config(line_id).context_warn_tokens
+        if line_id not in self._compaction_free_turn_inflight and (
+            tokens < warning or (previous is not None and previous < warning <= tokens)
+        ):
+            self._compaction_free_turn_used.discard(line_id)
         self._context[line_id] = tokens
         self._context_source[line_id] = source
         threshold = self._auto_compact_threshold(line_id)
@@ -2941,8 +2968,9 @@ class Scheduler:
                 ),
                 "note": (
                     "used counts finished turns. A turn in flight is counted when it"
-                    " ends, except a turn solely for compaction. A turn an operator's"
-                    " mail started resets the count."
+                    " ends, except the first compaction-only turn in a context-warning"
+                    " interval. A later report below the warning allows another. A"
+                    " turn an operator's mail started resets the count."
                 ),
             },
             "cost_usd": self.cost_status(line_id),
@@ -4191,7 +4219,9 @@ class Scheduler:
         caused: str,
     ) -> str:
         """Lead a new owner with its latest journal entry and a bounded worktree
-        snapshot. Journal prose is untrusted data and stays explicitly delimited."""
+        snapshot. Journal prose is untrusted data and stays explicitly delimited.
+        The journal may predate a change to the disclosure list, and snapshot paths
+        may contain a listed term, so each included part is checked when composed."""
         role = self._log.state.roles[role_id]
         entry = (
             self._log.state.role_entries.get(change.entry_id)
@@ -4221,14 +4251,30 @@ class Scheduler:
             )
         except LineToolRefused:
             status, diff = "unavailable", "unavailable"
+        if self.discloses(status):
+            status = ROLE_PACKAGE_WITHHELD
+        if self.discloses(diff):
+            diff = ROLE_PACKAGE_WITHHELD
+        workdir = (
+            ROLE_PACKAGE_WITHHELD if self.discloses(role.workdir) else role.workdir
+        )
+        journal_disclosed = self.discloses(body)
         shown_body = _cut(body, 4096)
         if len(body.encode("utf-8", "replace")) > 4096:
             shown_body += "\n[journal entry excerpt]"
         fields = _named_note_fields(body)
+        if journal_disclosed:
+            shown_body = ROLE_PACKAGE_WITHHELD
+            fields = {name: ROLE_PACKAGE_WITHHELD for name in fields}
+        else:
+            fields = {
+                name: ROLE_PACKAGE_WITHHELD if self.discloses(value) else value
+                for name, value in fields.items()
+            }
         return (
             f"You own role {role_id} from this turn, {caused}, taken from"
             f" {change.previous or 'no seat'}.\n\nRole transition package"
-            f"\nWorktree: {role.workdir}; current HEAD {commit or 'unknown'}"
+            f"\nWorktree: {workdir}; current HEAD {commit or 'unknown'}"
             f"; journal entry HEAD {stamp}."
             f"\nWorktree status: {json.dumps(status, ensure_ascii=True)}"
             "\nDiff summary since the journal entry: "
@@ -4549,6 +4595,13 @@ class Scheduler:
                 )
             if not self._may_compact(line_id):
                 return _tool_error("this line may not compact its session")
+            context = self._context.get(line_id)
+            warning = self.effective_config(line_id).context_warn_tokens
+            if context is None or context < warning:
+                return _tool_error(
+                    "your context must be at or past this line's warning at"
+                    f" {warning} tokens before it can be compacted"
+                )
             pending = self._log.state.scheduled.get(line_id)
             if pending is not None:
                 self._compact_requests.add(line_id)
@@ -4566,6 +4619,7 @@ class Scheduler:
                 return _tool_error(str(error))
             self._compact_requests.add(line_id)
             self._compact_wake[line_id] = message_id
+            self._compact_wake_free.add(line_id)
             return _tool_text(
                 "Your session will be compacted at the start of your next turn. A wake"
                 f" is scheduled for {due}, whose note arrives as {message_id}, so the"
@@ -4581,8 +4635,9 @@ class Scheduler:
                 " summarizes the conversation so far so that each engine call re-reads"
                 " less. It schedules a wake for that turn, after 60 seconds or the"
                 " seconds given, unless a wake is already pending, and withdraws that"
-                " wake if an earlier turn makes the compaction. Your next prompt"
-                " says the context before and after."
+                " wake if an earlier turn makes the compaction. Use it only when"
+                " context is at or past this line's warning. Your next prompt says"
+                " the context before and after."
             ),
             input_schema=COMPACT_SESSION_SCHEMA,
             handler=handler,
@@ -5217,11 +5272,28 @@ class Scheduler:
             and not from_operator
             and next(iter(message_ids)) in compaction_wake_ids
         )
-        self._counting[line_id] = not from_operator and not compaction_only
+        uncounted_compaction = (
+            not from_operator
+            and compaction_only
+            and line_id not in self._compaction_free_turn_used
+            and (
+                (
+                    self._compact_wake.get(line_id) in message_ids
+                    and line_id in self._compact_wake_free
+                )
+                or self._context.get(line_id, 0)
+                >= self.effective_config(line_id).context_warn_tokens
+            )
+        )
+        if uncounted_compaction:
+            self._compaction_free_turn_used.add(line_id)
+            self._compaction_free_turn_inflight.add(line_id)
+        self._counting[line_id] = not from_operator and not uncounted_compaction
         if self._context_compaction_wake_ids.get(line_id) in message_ids:
             self._context_compaction_wake_ids.pop(line_id, None)
         if self._compact_wake.get(line_id) in message_ids:
             self._compact_wake.pop(line_id, None)
+            self._compact_wake_free.discard(line_id)
         compaction: str | None = None
         owed: tuple[str, Handoff | None] | None = None
         refused: Exception | None = None
@@ -5379,6 +5451,7 @@ class Scheduler:
             self._counting.get(line_id, not from_operator),
             report,
         )
+        self._compaction_free_turn_inflight.discard(line_id)
         if failed and self._operator_mail(line_id) == mailed:
             self._hold_failed(line_id, ending)
         self.fail_over_if_unable(line_id)
