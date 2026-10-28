@@ -5,11 +5,13 @@ layer owns addresses, policy, JSON validation and idempotency. This module owns 
 identity files, TLS 1.3 authentication and bounded newline framing.
 
 Each daemon uses one self-signed Ed25519 certificate for both client and server
-authentication. A TLS context trusts exactly the configured peer certificate, requires
-the other side to present it during the handshake, and then checks the SHA-256 digest
-of its SubjectPublicKeyInfo before returning the connection. Certificate names are
-not identities. Session tickets are disabled so there is no resumable handshake path
-for early data. Python's ssl module exposes no API to enable early data. With TLS 1.3,
+authentication. A TLS context trusts exactly the configured peer certificates, requires
+the other side to present one during the handshake, and then checks the SHA-256 digest
+of its SubjectPublicKeyInfo before returning the connection. Each generated certificate
+uses this digest as its common name so peers can distinguish certificates in
+diagnostics. Certificate names are not identities. Session tickets are disabled so
+there is no resumable handshake path for early data. Python's ssl module exposes no API
+to enable early data. With TLS 1.3,
 the client-side handshake can finish before the server reports that it rejected the
 client certificate. A returned client connection is not proof of server acceptance;
 the caller must wait for the server's first application response. A read may instead
@@ -33,11 +35,12 @@ import socket
 import ssl
 import stat
 import time
+from collections.abc import Sequence
 from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import BinaryIO, Final, Literal
+from typing import BinaryIO, Final, Literal, cast
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
@@ -53,6 +56,8 @@ DEFAULT_FRAME_TIMEOUT_SECONDS: Final = 30.0
 TLS_HANDSHAKE_TIMEOUT_SECONDS: Final = 10.0
 """The proposed 10-second handshake and pre-hello deadline in FEDERATION.md."""
 MAX_IDENTITY_FILE_BYTES: Final = 65536
+MAX_PEER_CERTIFICATES: Final = 64
+"""Maximum number of explicitly trusted peer certificates in one TLS context."""
 KEY_FILENAME: Final = "identity-key.pem"
 CERTIFICATE_FILENAME: Final = "identity-certificate.pem"
 CERTIFICATE_VALIDITY_DAYS: Final = 3650
@@ -146,13 +151,17 @@ def public_key_pin(certificate: x509.Certificate) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def client_context(identity: IdentityFiles, peer_certificate: Path) -> ssl.SSLContext:
-    """Build a client context that requires and trusts only ``peer_certificate``."""
+def client_context(
+    identity: IdentityFiles, peer_certificate: Path | Sequence[Path]
+) -> ssl.SSLContext:
+    """Build a client context that requires and trusts the configured peer certs."""
     return _context("client", identity, peer_certificate)
 
 
-def server_context(identity: IdentityFiles, peer_certificate: Path) -> ssl.SSLContext:
-    """Build a server context that requires and trusts only ``peer_certificate``."""
+def server_context(
+    identity: IdentityFiles, peer_certificate: Path | Sequence[Path]
+) -> ssl.SSLContext:
+    """Build a server context that requires and trusts the configured peer certs."""
     return _context("server", identity, peer_certificate)
 
 
@@ -362,37 +371,67 @@ def read_first_response(reader: FrameReader) -> bytes:
     return response
 
 
+def _peer_certificate_paths(
+    peer_certificate: object,
+) -> tuple[Path, ...]:
+    paths: tuple[object, ...]
+    if isinstance(peer_certificate, Path):
+        paths = (peer_certificate,)
+    elif isinstance(peer_certificate, Sequence) and not isinstance(
+        peer_certificate, (str, bytes, bytearray)
+    ):
+        paths = tuple(cast(Sequence[object], peer_certificate))
+    else:
+        raise TransportError("peer certificates must be file paths")
+    if not paths:
+        raise TransportError("at least one peer certificate is required")
+    if len(paths) > MAX_PEER_CERTIFICATES:
+        raise TransportError(
+            f"at most {MAX_PEER_CERTIFICATES} peer certificates are allowed"
+        )
+    checked_paths: list[Path] = []
+    for path in paths:
+        if not isinstance(path, Path):
+            raise TransportError("peer certificates must be file paths")
+        checked_paths.append(path)
+    return tuple(checked_paths)
+
+
 def _context(
     role: Literal["client", "server"],
     identity: IdentityFiles,
-    peer_certificate_path: Path,
+    peer_certificate: Path | Sequence[Path],
 ) -> ssl.SSLContext:
+    peer_certificate_paths = _peer_certificate_paths(peer_certificate)
     with ExitStack() as files:
         key_file = files.enter_context(_open_checked_file(identity.private_key))
         local_certificate_file = files.enter_context(
             _open_checked_file(identity.certificate)
         )
-        peer_certificate_file = files.enter_context(
-            _open_checked_file(peer_certificate_path)
-        )
         key_bytes = _read_bounded_file(key_file, identity.private_key)
         local_certificate_bytes = _read_bounded_file(
             local_certificate_file, identity.certificate
-        )
-        peer_certificate_bytes = _read_bounded_file(
-            peer_certificate_file, peer_certificate_path
         )
         key_file.seek(0)
         local_certificate_file.seek(0)
         local_certificate = _load_one_certificate(
             local_certificate_bytes, identity.certificate
         )
-        peer_certificate = _load_one_certificate(
-            peer_certificate_bytes, peer_certificate_path
-        )
+        peer_certificate_bytes: list[bytes] = []
         private_key = _load_private_key(key_bytes, identity.private_key)
         _validate_self_signed(local_certificate, private_key)
-        _validate_self_signed(peer_certificate)
+        for peer_certificate_path in peer_certificate_paths:
+            peer_certificate_file = files.enter_context(
+                _open_checked_file(peer_certificate_path)
+            )
+            certificate_bytes = _read_bounded_file(
+                peer_certificate_file, peer_certificate_path
+            )
+            trusted_certificate = _load_one_certificate(
+                certificate_bytes, peer_certificate_path
+            )
+            _validate_self_signed(trusted_certificate)
+            peer_certificate_bytes.append(certificate_bytes)
         if not hmac.compare_digest(
             public_key_pin(local_certificate), identity.pin_sha256
         ):
@@ -413,8 +452,8 @@ def _context(
             keyfile=_descriptor_path(key_file.fileno()),
         )
         try:
-            peer_certificate_pem = peer_certificate_bytes.decode("ascii")
-            context.load_verify_locations(cadata=peer_certificate_pem)
+            peer_certificates_pem = b"\n".join(peer_certificate_bytes).decode("ascii")
+            context.load_verify_locations(cadata=peer_certificates_pem)
         except (UnicodeDecodeError, ssl.SSLError) as error:
             raise TransportError("cannot load the pinned peer certificate") from error
         context.options |= ssl.OP_NO_TICKET
@@ -478,17 +517,29 @@ def _wrap_tls(
 
 def _self_signed_certificate(private_key: Ed25519PrivateKey) -> x509.Certificate:
     now = datetime.now(UTC)
+    public_key = private_key.public_key()
+    public_key_der = public_key.public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    subject_pin = hashlib.sha256(public_key_der).hexdigest()
     subject = x509.Name(
-        [x509.NameAttribute(NameOID.COMMON_NAME, "Dromon federation peer")]
+        [
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Dromon federation peer"),
+            x509.NameAttribute(NameOID.COMMON_NAME, subject_pin),
+        ]
     )
     return (
         x509.CertificateBuilder()
         .subject_name(subject)
         .issuer_name(subject)
-        .public_key(private_key.public_key())
+        .public_key(public_key)
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - timedelta(minutes=5))
         .not_valid_after(now + timedelta(days=CERTIFICATE_VALIDITY_DAYS))
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(public_key), critical=False
+        )
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .add_extension(
             x509.ExtendedKeyUsage(

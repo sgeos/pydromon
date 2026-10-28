@@ -33,6 +33,7 @@ from dromon.paths import ProjectPaths, project_paths
 from dromon.projectconfig import ProjectConfig
 from dromon.protocol import Response
 from dromon import scheduler as scheduler_module
+from dromon import restart
 from dromon.scheduler import trigger_note
 from dromon.scheduler import LineSpec, Scheduler
 
@@ -67,6 +68,7 @@ class Engine:
         self.prompts: list[str] = []
         self.tasks = tasks
         self.retired = 0
+        self.self_started_interrupts = 0
 
     async def run_turn(self, prompt: str) -> TurnReport:
         self.prompts.append(prompt)
@@ -77,6 +79,9 @@ class Engine:
 
     async def retire(self) -> None:
         self.retired += 1
+
+    async def interrupt_self_started(self) -> None:
+        self.self_started_interrupts += 1
 
     def kept_status(self) -> dict[str, object]:
         return {
@@ -173,6 +178,17 @@ def test_a_task_is_noted_once(world: World) -> None:
     assert len(world.notes()) == 1
 
 
+def test_task_ends_during_a_turn_are_recorded_without_waking(world: World) -> None:
+    end = BackgroundEnd("t1", "make gate", "completed", during_turn=True)
+    message_id = world.scheduler.background_ended("alpha", end)
+    assert message_id is not None
+    message = world.log.state.messages[message_id]
+    assert message.delivered
+    assert world.scheduler.line_summaries()[0]["pending"] == 0
+    (note,) = world.notes()
+    assert "ended while a Dromon turn was running" in note
+
+
 def test_task_notes_are_limited_per_minute(world: World) -> None:
     limit = scheduler_module.MAX_TASK_NOTES
     for index in range(limit):
@@ -198,6 +214,113 @@ def test_task_notes_are_limited_per_minute(world: World) -> None:
         " notes."
     )
     assert len(world.notes()) == limit + 1
+
+
+def test_a_task_triggered_turn_uses_ordinary_turn_and_cost_limits(
+    world: World,
+) -> None:
+    async def go() -> None:
+        stop = asyncio.Event()
+        loop = asyncio.create_task(world.scheduler.run(stop))
+        world.scheduler.set_project(
+            Limits(max_autonomous_turns=2, max_cost_usd=0.2), "ana", 0, 1
+        )
+        world.scheduler.send(LineAddress("alpha"), LineAddress("alpha"), "start")
+        await world.scheduler.idle()
+        finish = world.scheduler.begin_self_started("alpha", (END,))
+        assert finish is not None
+        assert world.scheduler.begin_self_started("alpha", (END,)) is None
+        report = TurnReport(
+            "success", 1, "finished", (), None, None, "session-1", None, 0.125
+        )
+        finish(report, None)
+        await world.scheduler.idle()
+        status = world.status()
+        assert status["autonomous_turns"]["used"] == 2
+        assert status["cost_usd"]["estimate"] == "0.2500"
+        assert status["held_by"] is not None
+        notes = world.notes()
+        assert any("ordinary Dromon turn" in note for note in notes)
+        stop.set()
+        await loop
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "blocker", ["held", "hibernated", "restart", "running", "tick"]
+)
+def test_a_task_triggered_turn_is_refused_when_a_normal_turn_cannot_start(
+    world: World, blocker: str
+) -> None:
+    async def go() -> None:
+        if blocker == "held":
+            world.scheduler.hold("alpha", "held for this test")
+        elif blocker == "hibernated":
+            world.scheduler.hibernate("alpha")
+        elif blocker == "restart":
+            world.scheduler.begin_restart(restart.Mode.WAIT, "ana", 60)
+        elif blocker == "running":
+            running = asyncio.create_task(asyncio.sleep(60))
+            world.scheduler._running["alpha"] = running  # pyright: ignore[reportPrivateUsage]
+            try:
+                assert world.scheduler.begin_self_started("alpha", (END,)) is None
+            finally:
+                running.cancel()
+                await asyncio.gather(running, return_exceptions=True)
+            return
+        else:
+            world.scheduler.wake_every_ticks = 2
+            world.scheduler.tick = 1
+
+        assert world.scheduler.begin_self_started("alpha", (END,)) is None
+
+    asyncio.run(go())
+
+
+def test_a_task_triggered_turn_is_refused_when_its_start_token_fails(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world.scheduler.engine_for("alpha")
+
+    def fail_start_token(line_id: str, engine: object) -> None:
+        del line_id, engine
+        raise RuntimeError("token unavailable")
+
+    monkeypatch.setattr(world.scheduler, "_start_token", fail_start_token)
+    assert world.scheduler.begin_self_started("alpha", (END,)) is None
+    assert world.notes() == []
+
+
+def test_cancelling_a_task_triggered_turn_interrupts_the_engine(world: World) -> None:
+    async def go() -> None:
+        world.scheduler.engine_for("alpha")
+        finish = world.scheduler.begin_self_started("alpha", (END,))
+        assert finish is not None
+        monitor = world.scheduler._running["alpha"]  # pyright: ignore[reportPrivateUsage]
+        await asyncio.sleep(0)
+        monitor.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await monitor
+        assert world.engines["alpha"].self_started_interrupts == 1
+
+    asyncio.run(go())
+
+
+def test_a_task_triggered_turn_waits_for_already_sent_mail(world: World) -> None:
+    async def go() -> None:
+        stop = asyncio.Event()
+        loop = asyncio.create_task(world.scheduler.run(stop))
+        world.scheduler.send(LineAddress("alpha"), LineAddress("alpha"), "start")
+        await world.scheduler.idle()
+        world.scheduler.send(ANA, LineAddress("alpha"), "operator message")
+        finish = world.scheduler.begin_self_started("alpha", (END,))
+        assert finish is None
+        assert world.notes() == ["start"]
+        stop.set()
+        await loop
+
+    asyncio.run(go())
 
 
 def test_a_task_note_withholds_a_disclosed_command(world: World) -> None:

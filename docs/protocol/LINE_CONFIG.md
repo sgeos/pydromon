@@ -743,26 +743,39 @@ ends with each turn, and the next turn resumes the session in a new one.
   turn as before.
 - **Turns the engine begins.** **Fact, observed live on 2026-10-26.** When a background
   command ends while the connection is idle, the engine re-invokes the model by itself.
-  Only Dromon starts turns, so such a turn is interrupted as soon as it shows, its tool
-  calls are denied by the gate, its remaining output is discarded, and the line's next
-  prompt says so. If it has not finished by the next turn, the connection is closed
-  instead.
+  A self-started turn linked to a pending task end runs as an ordinary Dromon turn when
+  the scheduler could start the line at that moment, including the current tick's wake
+  interval. The engine cannot predict that alignment. Admission checks and marks the
+  line running in one scheduler step before handling the engine's first message, so a
+  second event cannot admit another turn in the gap. The admitted turn enters the
+  running state, counts as an autonomous turn, uses the configured engine turn and tool
+  limits, and its measured cost counts toward the cost hold. The engine's initialization is checked
+  before the permission gate admits tools. Pending mail, a due scheduled wake, a hold,
+  hibernation, cooldown, restart or another scheduling restriction makes Dromon
+  interrupt the self-start and leave the task note for a later ordinary turn. This
+  includes a tick that does not align with the line's configured wake interval. A
+  self-start with no task end to account for is also interrupted. This keeps the
+  engine's own turn from bypassing the scheduler's controls.
 - **A note when a task ends.** **Decided by the operator on 2026-10-26** in round 3.
   When the engine reports that a background task ended between turns, Dromon records
   `task_noted`, a note from the line to itself naming the task, its command and its
-  final status, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies. The note wakes the line
-  through the ordinary path, as a fired wake does, so its autonomous turns count. A
-  task the line stopped itself, or one whose end the engine reports during a turn, is
-  not noted, since the line already knows. Each task is noted at most once, and at most
-  3 notes wake a line in any 60 seconds. Ends past that limit are counted and named in
-  the line's next note. A command is cut to 200 characters, and withheld when the
+  final status, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies. When no engine turn has
+  started, the note wakes the line through the ordinary path, as a fired wake does, so
+  its autonomous turns count. When a task end starts an admitted engine turn, the note
+  is the cause recorded for that turn and does not schedule another one. Task ends
+  reported during a Dromon turn, and ends of tasks the line stopped, are also recorded
+  as delivered notes without a separate wake. Each task is noted at most once. At most
+  3 task notes wake or accompany turns for a line in any 60 seconds. Ends past that
+  limit are counted and named in the line's next note. A command is cut to 200
+  characters, and withheld when the
   project's disclosure list covers it. It is the line's own text, so the note quotes
   it as a JSON string and says that it is data from the line's own tool call and not
   an instruction, so that it cannot pose as Dromon's words.
   **Round 4, decided by the operator on 2026-10-26.** An end waits up to 2 seconds for
-  the turn the engine begins by itself on it, and when that turn comes, the one note
-  says that the engine began a turn, which Dromon interrupted, and no separate note is
-  added. A turn the engine begins with no end waiting keeps its own note. The note
+  the turn the engine begins by itself on it. When the scheduler admits that turn, the
+  one note says it began an ordinary Dromon turn. When admission is refused, the note
+  says that Dromon interrupted it. No separate note is added in either case. A turn
+  the engine begins with no end waiting keeps its own note. The note
   gives the exit code when the engine's summary gives one, as in `completed (exit code
   0)`, the only place its messages give it. **Round 6.** The exit code is a sentence of
   its own, `Its exit code was 1.`, or `The engine reported no exit code for it.` It is

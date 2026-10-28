@@ -8,8 +8,10 @@ only after ``set_permission_mode``, as Claude Code 2.1.310's engine loop does.
 import asyncio
 import contextlib
 import json
+import re
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from importlib import resources
 from pathlib import Path
 from typing import Any, cast
 
@@ -30,7 +32,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from dromon.driver import Action, Driver, Event, Strategy
+from dromon.driver import Action, Driver, Event, Strategy, driver_resource
 from dromon import launcher, redact
 from dromon.activity import ActivityKind, ActivityLog
 from dromon.ceiling import HARD_REASON, STOP_REASON, Choice
@@ -58,6 +60,7 @@ from dromon.engine import (
     flag_settings,
     is_handshake,
     BackgroundEnd,
+    SelfStartedFinish,
     DIED_NOTE,
     FILES_CHANGED,
     MAX_FINGERPRINT_FILE_BYTES,
@@ -524,7 +527,6 @@ def test_a_turn_the_engine_begins_by_itself_is_interrupted_and_noted(
     async def go() -> None:
         await engine.run_turn("first")
         connection = factory.connections[0]
-        connection.stream.put_nowait(notified("t1"))
         connection.stream.put_nowait(say("I was re-invoked"))
         await settle()
         assert connection.interrupts == 1
@@ -1341,7 +1343,7 @@ def test_a_task_without_a_known_command_is_named_by_its_description(
     assert ends == [BackgroundEnd("t2", "the engine's description", "failed")]
 
 
-def test_ends_inside_a_turn_or_asked_for_by_the_line_are_not_reported(
+def test_ends_inside_a_turn_or_asked_for_by_the_line_are_recorded_without_waking(
     tmp_path: Path,
 ) -> None:
     factory = Factory(
@@ -1369,7 +1371,120 @@ def test_ends_inside_a_turn_or_asked_for_by_the_line_are_not_reported(
         await engine.close()
 
     asyncio.run(go())
-    assert ends == []
+    assert ends == [
+        BackgroundEnd("t1", "sleep 1", "completed", None, "out.txt", during_turn=True),
+        BackgroundEnd(
+            "t2", "sleep 300", "completed", None, "out.txt", stopped_by_line=True
+        ),
+    ]
+
+
+def test_a_task_triggered_turn_can_be_admitted_and_reported(
+    tmp_path: Path,
+) -> None:
+    factory = Factory([[started("t1"), result()]])
+    ended: list[BackgroundEnd] = []
+    settled: list[tuple[TurnReport | None, Exception | None]] = []
+
+    def begin(ends: tuple[BackgroundEnd, ...]) -> SelfStartedFinish | None:
+        assert len(ends) == 1
+        assert ends[0].self_started
+
+        def finish(report: TurnReport | None, error: Exception | None) -> None:
+            settled.append((report, error))
+
+        return finish
+
+    engine = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        tmp_path,
+        config=LineConfig(keep_session=True, builtin_tools=("Read",)),
+        environment={},
+        kept_factory=factory,
+        clock=Clock(),
+        poll_seconds=3600.0,
+        task_ended=ended.append,
+        begin_self_started=begin,
+    )
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        gate = factory.options[0].can_use_tool
+        assert gate is not None
+        denied = await gate("Read", {}, CONTEXT)
+        assert isinstance(denied, PermissionResultDeny)
+        connection = factory.connections[0]
+        connection.stream.put_nowait(notified("t1"))
+        connection.stream.put_nowait(say("the task finished"))
+        await settle()
+        allowed = await gate("Read", {}, CONTEXT)
+        assert isinstance(allowed, PermissionResultAllow)
+        connection.stream.put_nowait(result())
+        await settle()
+        assert connection.interrupts == 0
+        assert ended == []
+        assert len(settled) == 1
+        report, error = settled[0]
+        assert error is None
+        assert report is not None and report.text == "the task finished"
+        await engine.close()
+
+    asyncio.run(go())
+
+
+def test_a_task_triggered_turn_uses_the_fresh_driver_tool_budget(
+    tmp_path: Path,
+) -> None:
+    resource = driver_resource(MODEL, Strategy.SUBSCRIPTION)
+    source = resources.files("dromon.drivers").joinpath(resource).read_text()
+    budgeted = re.sub(
+        r"fn tool_budget\(\) -> Word \{ \d+ \}",
+        "fn tool_budget() -> Word { 0 }",
+        source,
+    )
+    assert budgeted != source
+    factory = Factory([[result()]])
+    settled: list[tuple[TurnReport | None, Exception | None]] = []
+
+    def begin(ends: tuple[BackgroundEnd, ...]) -> SelfStartedFinish | None:
+        assert len(ends) == 1 and ends[0].self_started
+
+        def finish(report: TurnReport | None, error: Exception | None) -> None:
+            settled.append((report, error))
+
+        return finish
+
+    engine = ClaudeCodeLine(
+        Driver(budgeted),
+        tmp_path,
+        config=LineConfig(keep_session=True, builtin_tools=("Read",)),
+        environment={},
+        kept_factory=factory,
+        clock=Clock(),
+        poll_seconds=3600.0,
+        begin_self_started=begin,
+    )
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        connection = factory.connections[0]
+        connection.stream.put_nowait(notified("t1"))
+        connection.stream.put_nowait(
+            AssistantMessage(
+                content=[ToolUseBlock(id="call-1", name="Read", input={})],
+                model=MODEL,
+            )
+        )
+        connection.stream.put_nowait(result())
+        await settle()
+        assert connection.interrupts == 1
+        assert len(settled) == 1
+        report, error = settled[0]
+        assert error is None
+        assert report is not None and report.interrupted_for == "tool_budget"
+        await engine.close()
+
+    asyncio.run(go())
 
 
 def test_task_status_reads_each_report() -> None:

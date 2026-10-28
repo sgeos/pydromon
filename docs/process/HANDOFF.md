@@ -16,11 +16,13 @@ completed, moved or abandoned.
   `stop_policy`, `dromon restart`, `dromon hibernate` and `awaken`, priority mail and
   self mail. Roles with provider seats, write ownership and automatic failover, per
   `docs/architecture/ROLES.md`, and read-only seats. A Grok home Dromon owns. Probe
-  recording and scrubbing. The Keleusma template, answered twice. `federation_tls`.
-- **In flight.** `feat/federation` holds federation phase 1, steps 1 to 5 committed,
-  per `docs/architecture/FEDERATION.md`: two daemons on one machine exchange notes,
-  tested outside the sandbox. Steps 6 and phase 2, joining the TLS transport, are
-  next. `feat/report-findings` holds this round's experience findings.
+  recording and scrubbing. The Keleusma template, answered twice. An environment
+  allowlist for every engine. Federation phases 1 and 2, over Unix sockets and over
+  TLS with pinned keys, per `docs/architecture/FEDERATION.md`. `dromon agent send`,
+  per-line `recipients`, correlation keys, `check_disclosure` and task records.
+  Self-started turns after a task end run under the scheduler's admission.
+- **In flight.** `core` lifts `MAX_INBOUND_TLS` in `federation.py`, now that each
+  certificate subject is distinct.
 - **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310,
   `pykeleusma==0.2.2.0` and `cryptography==50.0.2`, all from PyPI.
 - **Published.** Public `sgeos/pydromon`, 0BSD, synced with `sgeos/project-template` at
@@ -58,6 +60,16 @@ seats on Opus, Haiku and GPT-6-Luna. Upgrades use `dromon restart`.
 - **Launcher.** A `setsid` child and `~/.claude.json` unverified, per `LINE_CONFIG.md`.
 - **Flaky tests.** Two kept-session timing tests fail under load, rarely.
 - **Clients.** Polling, no token meter, Tk checked only withdrawn.
+- **Round 3 requests.** Four seats reported, two satisfied. Most asked for a task
+  summary with open decisions and artifact paths that survives an engine reset or a
+  handoff, and for marking state as verified, unknown or inaccessible. Smaller ones are
+  a wake cancelled by its task's end note, the last-turn commit kept across a restart,
+  `read_mail` on a line's own sent mail, and diffs of a single commit for review.
+- **Live probes for review.** The review line asks to cite a live probe the operator
+  runs. That touches the rule against a review line starting an engine, so it is the
+  operator's decision.
+- **Disclosure list.** A project file must name `[daemon] disclosure_terms`, or no
+  line's mail or report is checked. `dromon config` does not show the setting.
 - **Several agents in one game.** An analysis of what Dromon would need is drafted for
   the operator, not yet in the repository.
 - **In the design.** Hosted teacher traces, the Rust repository name, remote clients.
@@ -73,7 +85,7 @@ need a command outside it. The rest run inside it with `-m "not socket and not l
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-./scripts/check.sh          # about 3150 tests pass, plus 10 live tests deselected
+./scripts/check.sh          # about 3190 tests pass, plus 10 live tests deselected
 ```
 
 Report any check not run, and any commit after the one that last rewrote this file.

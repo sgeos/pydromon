@@ -108,7 +108,7 @@ import traceback
 from datetime import UTC, datetime, timedelta
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, BinaryIO, Final, Protocol, cast, runtime_checkable
 
@@ -155,6 +155,7 @@ from dromon.pi import PiLine
 from dromon import __version__
 from dromon.engine import ENGINE_NAME as ENGINE_NAME_CLAUDE
 from dromon.engine import (
+    BeginSelfStarted,
     CLAUDE_CODE_PROMPT_MARK,
     COMPACTION_REQUESTED,
     HANDSHAKE_KIND,
@@ -163,6 +164,7 @@ from dromon.engine import (
     PER_TURN_SOURCE,
     MAX_COMMAND_CHARACTERS,
     BackgroundEnd,
+    SelfStartedFinish,
     ClaudeCodeLine,
     EnginePlanLimit,
     EngineRefused,
@@ -964,6 +966,13 @@ class HaltingEngine(Protocol):
 
 
 @runtime_checkable
+class SelfStartedEngine(Protocol):
+    """A kept engine whose admitted task-triggered turn can be interrupted."""
+
+    async def interrupt_self_started(self) -> None: ...
+
+
+@runtime_checkable
 class CeilingEngine(Protocol):
     """An engine whose kept connection can ask an operator at its ceiling, as
     ``dromon.ceiling`` describes."""
@@ -1023,7 +1032,7 @@ class LineSpec:
     task_ended: Callable[[BackgroundEnd], object] = field(
         default=lambda end: None, compare=False
     )
-    """Where the engine reports a background task that ended between turns."""
+    """Where the engine reports a background task that ended."""
     cost_mark: tuple[str, float] | None = None
     """The engine session and running cost total its last turn reported, so a
     rebuilt engine measures its next turn from there."""
@@ -1063,6 +1072,10 @@ class LineSpec:
     )
     """Where an engine reports, with a note, that its account has no credit left,
     before any turn fails, which a Codex engine does."""
+    begin_self_started: BeginSelfStarted = field(
+        default=lambda ends: None, compare=False
+    )
+    """Whether a task-triggered engine turn can run under scheduler control."""
 
 
 type EngineFactory = Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], LineEngine]
@@ -1327,6 +1340,7 @@ def engine_factory(
             observe=spec.observe,
             mark=spec.mark,
             task_ended=spec.task_ended,
+            begin_self_started=spec.begin_self_started,
             cost_mark=spec.cost_mark,
             compacted=spec.compacted,
             spent_between=spec.spent_between,
@@ -6668,12 +6682,17 @@ class Scheduler:
         self._detached[line_id] = pids
         self._record_left(line_id, DETACHED_CAUSE, processes)
 
-    def background_ended(self, line_id: str, end: BackgroundEnd) -> str | None:
-        """Wake ``line_id`` because its engine reported ``end`` between turns, with a
-        note from the line to itself, as a fired wake is, so its autonomous turns
-        count. At most one note per task and ``MAX_TASK_NOTES`` per line within
+    def background_ended(
+        self, line_id: str, end: BackgroundEnd, *, defer_wake: bool = False
+    ) -> str | None:
+        """Record a task end, waking the line when it needs a separate turn.
+
+        Ends reported during a Dromon turn or for a task the line stopped are
+        already known to the line, so their records are delivered without a wake.
+        A task-triggered turn may defer delivery until it records that turn's wake.
+        Ordinary wakes are limited to ``MAX_TASK_NOTES`` per line within
         ``TASK_NOTE_WINDOW_SECONDS``. Returns the note's identifier, or ``None``
-        when none was posted."""
+        when it was already recorded or the wake limit suppressed it."""
         if line_id not in self._log.state.lines:
             return None
         noted = self._noted_tasks.setdefault(line_id, deque(maxlen=MAX_NOTED_TASKS))
@@ -6685,10 +6704,12 @@ class Scheduler:
         recent = self._task_notes.setdefault(line_id, deque())
         while recent and now - recent[0] >= TASK_NOTE_WINDOW_SECONDS:
             recent.popleft()
-        if len(recent) >= MAX_TASK_NOTES:
+        record_only = end.during_turn or end.stopped_by_line
+        if not record_only and len(recent) >= MAX_TASK_NOTES:
             self._unnoted_tasks[line_id] = self._unnoted_tasks.get(line_id, 0) + 1
             return None
-        recent.append(now)
+        if not record_only:
+            recent.append(now)
         detected = format_due(self._wall_clock())
         body = self._task_note(line_id, end, detected)
         unnoted = self._unnoted_tasks.pop(line_id, 0)
@@ -6708,10 +6729,192 @@ class Scheduler:
             )
         )
         _bounded_put(self._task_detected, message_id, detected)
-        self._sent.append(message_id)
+        if record_only:
+            self._log.append(MessageDelivered(message_id))
+            message = self._log.state.messages[message_id]
+            self._notes([(message_id, message)])
+        elif not defer_wake:
+            self._sent.append(message_id)
+            self._failed.discard(line_id)
+            self._work.set()
+        return message_id
+
+    def begin_self_started(
+        self, line_id: str, ends: tuple[BackgroundEnd, ...]
+    ) -> SelfStartedFinish | None:
+        """Admit a task-triggered engine turn only when a normal line turn could
+        start now, then record its task notes as the wake that started it."""
+        if (
+            line_id not in self._log.state.lines
+            or not ends
+            or not self._can_start(line_id)
+            or self.deliverable(line_id)
+            or line_id in self._due_wakes()
+            or any(
+                self._log.state.messages[message_id].recipient == LineAddress(line_id)
+                for message_id in self._sent
+            )
+        ):
+            return None
+        engine = self._engines.get(line_id)
+        if engine is None:
+            return None
+        now = self._clock()
+        recent = self._task_notes.setdefault(line_id, deque())
+        while recent and now - recent[0] >= TASK_NOTE_WINDOW_SECONDS:
+            recent.popleft()
+        unique_ends = tuple({end.task_id: end for end in ends}.values())
+        task_ids = {end.task_id for end in unique_ends}
+        noted = self._noted_tasks.get(line_id, deque())
+        pending = task_ids - set(noted)
+        if not pending or len(recent) + len(pending) > MAX_TASK_NOTES:
+            return None
+        try:
+            self._start_token(line_id, engine)
+        except Exception:  # noqa: BLE001
+            return None
+        message_ids: list[str] = []
+        for end in unique_ends:
+            admitted = replace(end, self_started=True, self_started_admitted=True)
+            message_id = self.background_ended(line_id, admitted, defer_wake=True)
+            if message_id is not None:
+                message_ids.append(message_id)
+        if not message_ids:
+            self._end_token(line_id, engine)
+            return None
+
+        wake_id = new_id("w")
+        self._log.append(WakeRequested(wake_id, line_id, message_ids[0]))
+        self._log.append(WakeIssued(wake_id))
+        for message_id in message_ids:
+            self._log.append(MessageDelivered(message_id))
+            self._post_office.discard(message_id)
+            message = self._log.state.messages[message_id]
+            self._notes([(message_id, message)])
+        self._log.append(LineStateChanged(line_id, LineState.RUNNING))
+        self._turns[line_id] = self._turns.get(line_id, 0) + 1
+        self._counting[line_id] = True
+        seat = self._log.state.seats.get(line_id)
+        if seat is not None and self._log.state.roles[seat.role_id].owner == line_id:
+            self._turn_owned.add(line_id)
+        self.activity.record(
+            line_id,
+            ActivityKind.TURN_STARTED,
+            "The engine began a turn in response to a background task ending.",
+        )
+        completion: asyncio.Future[tuple[TurnReport | None, Exception | None]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        mailed = self._operator_mail(line_id)
+        monitor = asyncio.get_running_loop().create_task(
+            self._self_started_turn(line_id, completion, mailed)
+        )
+        self._running[line_id] = monitor
         self._failed.discard(line_id)
         self._work.set()
-        return message_id
+
+        def finish(report: TurnReport | None, error: Exception | None) -> None:
+            if not completion.done():
+                completion.set_result((report, error))
+
+        return finish
+
+    async def _self_started_turn(
+        self,
+        line_id: str,
+        completion: asyncio.Future[tuple[TurnReport | None, Exception | None]],
+        mailed: int,
+    ) -> None:
+        """Apply the ordinary scheduler accounting and holds to an engine turn
+        admitted after a task end."""
+        report: TurnReport | None = None
+        error: Exception | None = None
+        ending = "cancelled"
+        failed = False
+        engine = self._engines.get(line_id)
+        try:
+            report, error = await asyncio.shield(completion)
+            if error is not None:
+                if isinstance(error, EnginePlanLimit):
+                    if error.may_move_role:
+                        self.plan_limit_reached(line_id, error)
+                        self._plan_held[line_id] = self.hold(line_id, str(error))
+                    else:
+                        self.hold(line_id, f"{error}{INFERRED_LIMIT_NOTE}")
+                    ending = f"held: {error}"
+                else:
+                    self._failed.add(line_id)
+                    failed = True
+                    ending = f"failed: {error}"
+                    print(
+                        f"dromond: line {line_id} self-started turn failed: {error}",
+                        file=sys.stderr,
+                    )
+            elif report is not None:
+                if report.context_tokens is not None:
+                    self._context_reported(
+                        line_id, report.context_tokens, CONTEXT_FROM_CALL
+                    )
+                self.turn_reports.append((line_id, report))
+                self._mark_cost(line_id, report.cost_mark)
+                recorded = self._log.state.lines[line_id].engine_session
+                if report.session_id and report.session_id != recorded:
+                    self._log.append(LineSession(line_id, report.session_id))
+                ending = report.subtype
+                redirected = self._redirected.get(line_id)
+                if redirected is not None and report.interrupted_for == redirected:
+                    ending += f", ended at a safe point for {redirected}"
+                    if redirected == restart.REASON:
+                        self._note_restart(line_id)
+                elif report.interrupted_for is not None:
+                    ending += f", interrupted by its driver: {report.interrupted_for}"
+                elif turn_outcome(report) == FAILED:
+                    ending = f"failed: the engine ended the turn as {report.subtype}"
+                    self._failed.add(line_id)
+                    failed = True
+        except asyncio.CancelledError:
+            self._interrupted.add(line_id)
+            if isinstance(engine, SelfStartedEngine):
+                try:
+                    await engine.interrupt_self_started()
+                except Exception as interrupt_error:  # noqa: BLE001
+                    print(
+                        f"dromond: line {line_id}'s self-started turn could not be"
+                        f" interrupted: {interrupt_error}",
+                        file=sys.stderr,
+                    )
+            raise
+        except Exception as unexpected:  # noqa: BLE001
+            error = unexpected
+            self._failed.add(line_id)
+            failed = True
+            ending = f"failed: {unexpected}"
+            print(
+                f"dromond: line {line_id} self-started turn failed: {unexpected}",
+                file=sys.stderr,
+            )
+        finally:
+            self._end_token(line_id, engine)
+            self.collect_left()
+            self._spawn_check(line_id)
+            self._interrupted.discard(line_id)
+            self._moved.discard(line_id)
+            self._redirect_for.pop(line_id, None)
+            self._redirected.pop(line_id, None)
+            self._restart_asked.discard(line_id)
+            self.activity.record(line_id, ActivityKind.TURN_ENDED, ending)
+            line = self._log.state.lines.get(line_id)
+            if line is not None and line.state is LineState.RUNNING:
+                self._log.append(LineStateChanged(line_id, LineState.IDLE))
+            self._running.pop(line_id, None)
+            self._turn_owned.discard(line_id)
+            self._last_turn_end[line_id] = self._clock()
+            self._settle_relinquish(line_id)
+            self._work.set()
+        self._apply_limits(line_id, TurnCause.AUTONOMOUS, True, report)
+        if failed and self._operator_mail(line_id) == mailed:
+            self._hold_failed(line_id, ending)
+        self.fail_over_if_unable(line_id)
 
     def _record_task(self, line_id: str, end: BackgroundEnd) -> None:
         """**Item B3 of 2026-10-28.** Record ``task_recorded`` for ``end``, whether or
@@ -6794,9 +6997,25 @@ class Scheduler:
             )
         ]
         if end.self_started:
+            if end.self_started_admitted:
+                parts.append(
+                    "The engine began an ordinary Dromon turn in response to this"
+                    " task end."
+                )
+            else:
+                parts.append(
+                    "The engine began a turn by itself when it ended, which Dromon"
+                    " interrupted, and its tool calls were denied."
+                )
+        if end.during_turn:
             parts.append(
-                "The engine began a turn by itself when it ended, which Dromon"
-                " interrupted, and its tool calls were denied."
+                "The task ended while a Dromon turn was running, so its end was"
+                " recorded without a separate wake."
+            )
+        if end.stopped_by_line:
+            parts.append(
+                "The line had stopped this task, so its end was recorded without a"
+                " separate wake."
             )
         command = _cut(end.command, MAX_COMMAND_CHARACTERS)
         if self.discloses(command):
@@ -7066,6 +7285,7 @@ class Scheduler:
                 lambda text: self.consent_fallback(line_id, text),
                 lambda: self.redirect_reason(line_id),
                 lambda note: self.credits_spent(line_id, note),
+                begin_self_started=lambda ends: self.begin_self_started(line_id, ends),
             )
             engine = self._engine_factory(spec, self.own_tools(line_id))
             self._engines[line_id] = engine
