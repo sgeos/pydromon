@@ -163,7 +163,10 @@ def wake(world: World, *line_ids: str) -> None:
 
 
 def limit(resets_at: str | None = None) -> EnginePlanLimit:
-    return EnginePlanLimit("Claude subscription plan limit reached", resets_at)
+    """A limit read from a shape the Agent SDK types, which may move a role."""
+    return EnginePlanLimit(
+        "Claude subscription plan limit reached", resets_at, may_move_role=True
+    )
 
 
 # The order a failover follows.
@@ -292,6 +295,20 @@ def test_failover_plan_rests_on_an_entry_the_harness_wrote(world: World) -> None
         plan_failover(world.log.state, "core", "beta", "spent", "e3", STAMP)
 
 
+def test_two_failovers_planned_from_one_state_cannot_both_apply(world: World) -> None:
+    """The review's race. Each change names the owner it replaces, so the second of
+    two plans made from the same state is refused by the model and moves nothing."""
+    state = world.log.state
+    first = plan_failover(state, "core", "beta", "spent", "e1", STAMP)
+    second = plan_failover(state, "core", "gamma", "spent", "e2", STAMP)
+    for event in first.events:
+        world.log.append(event)
+    _, change = second.events
+    with pytest.raises(EventRejected, match="owned by beta, not alpha"):
+        world.log.append(change)
+    assert world.owner() == "beta"
+
+
 def test_an_owner_at_a_plan_limit_fails_over_to_the_next_usable_seat(
     world: World,
 ) -> None:
@@ -318,6 +335,35 @@ def test_an_owner_at_a_plan_limit_fails_over_to_the_next_usable_seat(
     assert beta.startswith("You own role core from this turn, by the harness")
     assert RECOVERY_CHECKLIST in beta
     assert world.log.state.lines["alpha"].held_by is not None
+
+
+def test_an_inferred_limit_holds_and_asks_but_never_moves_the_role(
+    world: World,
+) -> None:
+    """The operator's decision of 2026-10-27. A limit read from inferred codes or
+    free text holds its line and asks, records no budget, and grounds neither a
+    failover nor a seat's own take."""
+    world.scripts["alpha"] = [EnginePlanLimit("Codex plan limit reached")]
+    wake(world, "alpha")
+    assert world.owner() == "alpha"
+    assert CLAUDE not in world.log.state.budgets
+    question = world.log.state.lines["alpha"].held_by
+    assert question is not None
+    asked = world.log.state.messages[question].body
+    assert "never observed live" in asked and "moved no role" in asked
+    assert world.mail("alpha", ANA) == []
+    assert world.scheduler.fail_over_if_unable("alpha") is None
+    assert world.owner() == "alpha"
+    # The operator may still move it.
+    world.scheduler.give_ownership(ANA, "core", "beta")
+    assert world.owner() == "beta"
+
+
+def test_only_the_observed_and_typed_shapes_may_move_a_role() -> None:
+    assert not EnginePlanLimit("unknown").may_move_role
+    info = RateLimitInfo(status="rejected", resets_at=None, rate_limit_type=None)
+    typed = rejected_limit(info)
+    assert typed is not None and typed.may_move_role
 
 
 def test_a_failover_passes_over_seats_that_are_not_usable(world: World) -> None:

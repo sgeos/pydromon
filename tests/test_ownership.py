@@ -93,7 +93,9 @@ class Scripted:
             calls = script.pop(0) if script else []
             for call in calls:
                 if call.get("tool") == "plan_limit":
-                    raise EnginePlanLimit("Claude subscription plan limit reached")
+                    raise EnginePlanLimit(
+                        "Claude subscription plan limit reached", may_move_role=True
+                    )
                 if call.get("tool") == "gate":
                     await self.world.gates[self.line_id].wait()
                     continue
@@ -434,25 +436,25 @@ def test_a_stopped_successor_is_refused(world: World) -> None:
 
 
 def test_back_to_returns_the_role_for_a_short_alternation(world: World) -> None:
-    first = world.scheduler.relinquish_ownership(
+    first, _ = world.scheduler.relinquish_ownership(
         "alpha", "over to you", "beta", "alpha"
     )
     handed = world.role().changed
     assert handed is not None and (first.owner, handed.back_to) == ("beta", "alpha")
-    second = world.scheduler.relinquish_ownership("beta", "back to you", None, None)
+    second, _ = world.scheduler.relinquish_ownership("beta", "back to you", None, None)
     change = world.role().changed
     assert second.owner == "alpha" and change is not None
     assert (change.cause, change.back_to) == (OwnershipCause.HANDOFF, None)
     assert "returns to alpha" in second.note
     # The return carried no back_to of its own, so the next one leaves it vacant.
-    third = world.scheduler.relinquish_ownership("alpha", "done", None, None)
+    third, _ = world.scheduler.relinquish_ownership("alpha", "done", None, None)
     assert third.owner is None
 
 
 def test_a_named_successor_overrides_back_to(world: World) -> None:
     world.scheduler.relinquish_ownership("alpha", "over to you", "beta", "alpha")
     world.log.append(SeatBound("delta", "core", True))
-    plan = world.scheduler.relinquish_ownership("beta", "to delta", "delta", None)
+    plan, _ = world.scheduler.relinquish_ownership("beta", "to delta", "delta", None)
     assert plan.owner == "delta"
 
 
@@ -461,7 +463,7 @@ def test_a_return_to_a_seat_that_cannot_own_leaves_the_role_vacant(
 ) -> None:
     world.scheduler.relinquish_ownership("alpha", "over to you", "beta", "alpha")
     world.log.append(LineStateChanged("alpha", LineState.STOPPED))
-    plan = world.scheduler.relinquish_ownership("beta", "back to you", None, None)
+    plan, _ = world.scheduler.relinquish_ownership("beta", "back to you", None, None)
     assert plan.owner is None and world.role().owner is None
     assert "cannot take it now" in plan.note
 
@@ -645,10 +647,58 @@ def test_an_operator_take_waits_for_the_owners_turn_and_wakes_the_new_owner(
 # What follows a change of owner.
 
 
-def test_a_successor_waits_for_the_former_owners_turn_to_end(world: World) -> None:
-    """Never two writers. The owner relinquishes during its turn, which goes on with
-    the engine it started with, so the successor's first turn starts only once that
-    turn ends, though its note arrives at once."""
+def test_a_relinquish_inside_the_owners_turn_takes_effect_when_it_ends(
+    world: World, tmp_path: Path
+) -> None:
+    """Never two writers, and never a change of owner during a turn, by the
+    operator's decision of 2026-10-27. The owner relinquishes during its turn, which
+    keeps the role until it ends. The change is then made, stamped with the commit
+    the turn left, and the former owner's engine is dropped, so its next turn has no
+    write access. The successor's first turn starts only after that."""
+    world.gates["alpha"] = asyncio.Event()
+    world.scripts["alpha"].append(
+        [
+            {"tool": RELINQUISH_OWNERSHIP_TOOL_NAME, "note": "over", "to": "beta"},
+            {"tool": RELINQUISH_OWNERSHIP_TOOL_NAME, "note": "again", "to": "beta"},
+            {"tool": "gate"},
+        ]
+    )
+    later = "e" * 40
+
+    async def act() -> None:
+        world.scheduler.send(ANA, ALPHA, "hand the role to beta")
+        await until(lambda: len(world.results("alpha")) == 2)
+        for _ in range(50):
+            await asyncio.sleep(0)
+        unchanged = world.role().changed
+        assert world.role().owner == "alpha" and unchanged is not None
+        assert unchanged.cause is OwnershipCause.DECLARED
+        assert world.order == ["start alpha"]
+        (tmp_path / "project" / ".git" / "HEAD").write_text(later + "\n")
+        world.gates["alpha"].set()
+
+    run(world, act)
+    waiting, again = world.results("alpha")
+    said = str(waiting["content"][0]["text"])
+    assert waiting.get("is_error") is not True
+    assert "passes to beta when this turn ends" in said and "read only" in said
+    assert again.get("is_error") is True
+    assert "already waits" in str(again["content"][0]["text"])
+    change = world.role().changed
+    assert world.role().owner == "beta" and change is not None
+    assert (change.cause, change.previous) == (OwnershipCause.HANDOFF, "alpha")
+    entry = world.log.state.role_entries[str(change.entry_id)]
+    assert (entry.body, entry.workdir_commit) == ("over", later)
+    assert world.order == ["start alpha", "end alpha", "start beta", "end beta"]
+    # The former owner's engine was dropped, so its next turn is built anew, and
+    # the successor's was first built after the change, as the owner.
+    wake(world, "alpha", "beta")
+    assert len(world.engines["alpha"]) == 2 and len(world.engines["beta"]) == 1
+
+
+def test_a_waiting_relinquish_that_no_longer_applies_keeps_the_role_and_says_so(
+    world: World,
+) -> None:
     world.gates["alpha"] = asyncio.Event()
     world.scripts["alpha"].append(
         [
@@ -659,18 +709,20 @@ def test_a_successor_waits_for_the_former_owners_turn_to_end(world: World) -> No
 
     async def act() -> None:
         world.scheduler.send(ANA, ALPHA, "hand the role to beta")
-        await until(lambda: world.role().owner == "beta")
-        for _ in range(50):
-            await asyncio.sleep(0)
-        assert world.order == ["start alpha"]
+        await until(lambda: len(world.results("alpha")) == 1)
+        world.log.append(LineStateChanged("beta", LineState.STOPPED))
         world.gates["alpha"].set()
 
     run(world, act)
-    assert world.order == ["start alpha", "end alpha", "start beta", "end beta"]
-    # The former owner's engine was dropped, so its next turn is built anew, and
-    # the successor's was first built after the change, as the owner.
-    wake(world, "alpha", "beta")
-    assert len(world.engines["alpha"]) == 2 and len(world.engines["beta"]) == 1
+    assert world.role().owner == "alpha"
+    (told,) = [
+        message.body
+        for message in world.log.state.messages.values()
+        if message.sender == ALPHA
+        and message.recipient == ANA
+        and "did not make the handoff" in message.body
+    ]
+    assert "could not apply when the turn ended" in told
 
 
 def test_a_successor_waits_for_the_former_owners_kept_connection_to_close(

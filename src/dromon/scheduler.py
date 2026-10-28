@@ -162,6 +162,7 @@ from dromon.engine import (
     resolve_plugin,
 )
 from dromon.eventlog import EventLog
+from dromon import proposals as proposal_store
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, effective, merge
@@ -398,6 +399,13 @@ MAX_SCRATCH_BYTES: Final = 256 * 1024
 SCRATCH_DIRECTORY: Final = "tmp"
 
 LINE_STATUS_TOOL_NAME: Final = "line_status"
+MAX_LINE_STATUS_DEFAULT_BYTES: Final = 8192
+INFERRED_LIMIT_NOTE: Final = (
+    ", read from inferred wording that was never observed live, so Dromon recorded no"
+    " budget and moved no role. dromon budget set and dromon role take do either"
+)
+"""Added to the hold of a plan limit whose ``may_move_role`` is false, which the
+operator decided on 2026-10-27 holds and asks and never fails over."""
 ROLE_STATUS_TOOL_NAME: Final = "role_status"
 ROLE_STATUS_ENTRIES: Final = 5
 """How many of a role's latest journal entries ``role_status`` lists. Only the
@@ -478,7 +486,9 @@ TAKE_OWNERSHIP_SCHEMA: Final[dict[str, object]] = {
     "required": ["reason"],
     "additionalProperties": False,
 }
+
 WRITE_SCRATCH_TOOL_NAME: Final = "write_scratch"
+PROPOSE_CHANGE_TOOL_NAME: Final = "propose_change"
 READ_INSTRUCTIONS_TOOL_NAME: Final = "read_instructions"
 
 NO_ARGUMENTS_SCHEMA: Final[dict[str, object]] = {
@@ -495,6 +505,37 @@ READ_INSTRUCTIONS_SCHEMA: Final[dict[str, object]] = {
             "description": "Return the whole text. Default false, a summary",
         },
     },
+    "additionalProperties": False,
+}
+
+LINE_STATUS_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "detail": {
+            "type": "boolean",
+            "description": "Include diagnostic fields. Default false",
+        },
+        "lists": {
+            "type": "boolean",
+            "description": "Include long lists such as other lines and recent turns",
+        },
+    },
+    "additionalProperties": False,
+}
+
+PROPOSE_CHANGE_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "message": {"type": "string", "minLength": 1, "maxLength": 8192},
+        "files": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "minItems": 1,
+            "maxItems": 64,
+        },
+        "patch": {"type": "string", "minLength": 1, "maxLength": 196608},
+    },
+    "required": ["message", "files", "patch"],
     "additionalProperties": False,
 }
 
@@ -601,6 +642,10 @@ STOP_PROCESS_TOOL_NAME: Final = "stop_process"
 
 LIST_BACKGROUND_TOOL_NAME: Final = "list_background"
 COMPACT_SESSION_TOOL_NAME: Final = "compact_session"
+COMPACTION_CONTEXT_WARNING: Final = "context_warning"
+CONTEXT_COMPACTION_NOTE: Final = (
+    "Dromon requests a context compaction before your next turn."
+)
 STOP_BACKGROUND_TOOL_NAME: Final = "stop_background"
 
 DEFAULT_COMPACT_WAKE_SECONDS: Final = 60
@@ -1235,6 +1280,8 @@ class Scheduler:
         """Each line's latest delivered task-end note, with its lateness."""
         self._compact_requests: set[str] = set()
         """Lines whose next turn begins by compacting their session."""
+        self._context_compaction_wakes: set[str] = set()
+        """Lines woken for compaction at the context warning, until dispatch."""
         self._context: dict[str, int] = {}
         """Each line's context estimate after its last turn that reported one."""
         self._last_compaction: dict[str, dict[str, object]] = {}
@@ -1312,15 +1359,19 @@ class Scheduler:
         self._hold = hold_wakes
         self._engines: dict[str, LineEngine] = {}
         self._plan_held: dict[str, str] = {}
+        """The question each line was held with at a plan limit its engine reported
+        from a shape that may move a role, which a seat's own recovery may rest on
+        while the hold lasts. In memory, so after a restart only the provider budget
+        the limit recorded as 0 percent shows that an owner cannot act."""
+        self._relinquish_pending: dict[str, tuple[str, str | None, str | None]] = {}
+        """The handoff each owner asked for inside its own turn, as its note, ``to``
+        and ``back_to``, applied when that turn ends. In memory only, so a daemon
+        that stops during the turn loses the request, and the line keeps its role,
+        which is the safe side."""
         self._failover_told: dict[str, str] = {}
         """What each role's operator was last told of a failover that found no seat,
         so the same is not told at every turn's end. Lost at a restart, after which
         it is told once again."""
-        """The question each line was held with at a plan limit its engine reported,
-        which a seat's own recovery may rest on while the hold lasts. In memory, so
-        after a restart only a provider budget recorded as 0 percent shows that an
-        owner cannot act. **Technical debt** until the budget step records one at
-        each plan limit."""
         self._turn_owned: set[str] = set()
         """Lines whose turn in flight started while they owned their role, so their
         engine was built as the role's writer. No other seat's turn as owner starts
@@ -2317,7 +2368,10 @@ class Scheduler:
             "warn_at": self.effective_config(line_id).context_warn_tokens,
             "note": note,
             "compact_session": self._may_compact(line_id),
-            "compaction_pending": line_id in self._compact_requests,
+            "compaction_pending": (
+                line_id in self._compact_requests
+                or line_id in self._context_compaction_wakes
+            ),
             "last_compaction": self._last_compaction.get(line_id),
             "auto_compact_held": line_id in self._auto_held,
         }
@@ -2353,11 +2407,11 @@ class Scheduler:
         self._last_compaction[line_id] = record
         after = compaction.get("after_tokens")
         estimate = compaction.get("after_estimate_tokens")
-        threshold = self.effective_config(line_id).auto_compact_tokens
+        threshold = self._auto_compact_threshold(line_id)
         if isinstance(after, int):
-            self._context_reported(line_id, after, CONTEXT_FROM_COMPACTION)
             if threshold is not None and after >= threshold:
                 self._auto_held.add(line_id)
+            self._context_reported(line_id, after, CONTEXT_FROM_COMPACTION)
         elif type(estimate) is int and estimate > 0:
             # An engine that estimates the size itself, as Pi does, gives it here.
             note = compaction.get("after_estimate_note")
@@ -2365,9 +2419,9 @@ class Scheduler:
             record["after_estimate_note"] = (
                 note if isinstance(note, str) else AFTER_ESTIMATE_NOTE
             )
-            self._context_reported(line_id, estimate, CONTEXT_FROM_ENGINE_ESTIMATE)
             if threshold is not None and estimate >= threshold:
                 self._auto_held.add(line_id)
+            self._context_reported(line_id, estimate, CONTEXT_FROM_ENGINE_ESTIMATE)
         else:
             self._context.pop(line_id, None)
             self._context_source.pop(line_id, None)
@@ -2405,10 +2459,10 @@ class Scheduler:
             return
         last["after_estimate_tokens"] = tokens
         last["after_estimate_note"] = AFTER_ESTIMATE_NOTE
-        self._context_reported(line_id, tokens, CONTEXT_FROM_ESTIMATE)
-        threshold = self.effective_config(line_id).auto_compact_tokens
+        threshold = self._auto_compact_threshold(line_id)
         if threshold is not None and tokens >= threshold:
             self._auto_held.add(line_id)
+        self._context_reported(line_id, tokens, CONTEXT_FROM_ESTIMATE)
 
     def _context_reported(self, line_id: str, tokens: int, source: str) -> None:
         """Record a context estimate the engine reported and where it came from,
@@ -2418,9 +2472,12 @@ class Scheduler:
         size a compaction left or its estimate, and with each turn's estimate."""
         self._context[line_id] = tokens
         self._context_source[line_id] = source
-        threshold = self.effective_config(line_id).auto_compact_tokens
+        threshold = self._auto_compact_threshold(line_id)
         if threshold is None or tokens < threshold:
             self._auto_held.discard(line_id)
+            self._context_compaction_wakes.discard(line_id)
+        else:
+            self._ensure_context_compaction_wake(line_id)
 
     def _may_compact(self, line_id: str) -> bool:
         """Whether the line has ``compact_session``: a Claude Code or Codex line
@@ -2431,6 +2488,53 @@ class Scheduler:
         on_compacting = engine in (ENGINE_NAME_CLAUDE, codex.ENGINE_NAME)
         return on_compacting and self.effective_config(line_id).allow_compact
 
+    def _auto_compact_threshold(self, line_id: str) -> int | None:
+        """The earlier of the configured warning and optional automatic threshold."""
+        if not self._may_compact(line_id):
+            return None
+        config = self.effective_config(line_id)
+        configured = config.auto_compact_tokens
+        return (
+            config.context_warn_tokens
+            if configured is None
+            else min(config.context_warn_tokens, configured)
+        )
+
+    def _line_hibernated(self, line_id: str) -> bool:
+        """Whether the event-model line is hibernated."""
+        line = self._log.state.lines.get(line_id)
+        return line is not None and line.hibernated
+
+    def _ensure_context_compaction_wake(self, line_id: str) -> None:
+        """Queue one self-note to compact before the next turn at the context warning.
+
+        A hibernated line keeps the need in its context estimate and gets no note until
+        a scheduling pass after it is awakened.
+        """
+        threshold = self.effective_config(line_id).context_warn_tokens
+        context = self._context.get(line_id)
+        if (
+            not self._may_compact(line_id)
+            or self._log.state.lines[line_id].held_by is not None
+            or context is None
+            or context < threshold
+            or line_id in self._auto_held
+            or line_id in self._context_compaction_wakes
+            or self._line_hibernated(line_id)
+        ):
+            return
+        self._context_compaction_wakes.add(line_id)
+        note = CONTEXT_COMPACTION_NOTE
+        if self.discloses(note):
+            note = WITHHELD_WAKE_NOTE
+        if line_id in self._log.state.scheduled:
+            return
+        message_id = new_id("m")
+        self._log.append(
+            WakeScheduled(line_id, message_id, format_due(self._wall_clock()), note)
+        )
+        self._work.set()
+
     def _compaction_reason(self, line_id: str) -> str | None:
         """Why the line's next turn begins with a compaction, or ``None`` when it
         does not: a request the line made, or its context at or past its
@@ -2440,20 +2544,26 @@ class Scheduler:
         threshold is reported, since compacting again would not bring it below and
         would cost every turn. The warning still shows meanwhile."""
         requested = line_id in self._compact_requests
+        warning_wake = line_id in self._context_compaction_wakes
         self._compact_requests.discard(line_id)
+        self._context_compaction_wakes.discard(line_id)
         if not self._may_compact(line_id):
             return None
         if requested:
             return COMPACTION_REQUESTED
-        threshold = self.effective_config(line_id).auto_compact_tokens
         context = self._context.get(line_id)
-        if threshold is None or context is None or context < threshold:
+        if context is None:
             return None
         if line_id in self._auto_held:
             return None
+        if warning_wake:
+            return COMPACTION_CONTEXT_WARNING
+        threshold = self._auto_compact_threshold(line_id)
+        if threshold is None or context < threshold:
+            return None
         return (
             f"automatically, because its context of about {context} tokens reached"
-            f" this line's auto_compact_tokens of {threshold}"
+            f" the automatic compaction threshold of {threshold}"
         )
 
     def spent_between(
@@ -2595,9 +2705,60 @@ class Scheduler:
         except ConfigError as error:
             raise LineToolRefused(str(error)) from error
 
-    def line_status(self, line_id: str) -> dict[str, object]:
-        """What ``line_id`` may know of itself, its daemon and the other lines. It
-        holds no configuration document and no message body."""
+    def line_status(
+        self, line_id: str, *, detail: bool = True, lists: bool = True
+    ) -> dict[str, object]:
+        """Build status for internal callers. The line tool explicitly chooses the
+        compact default and only returns details or long lists when requested."""
+        full = self._detailed_line_status(line_id)
+        if detail and lists:
+            return full
+        if detail:
+            status = dict(full)
+            leases = cast(list[dict[str, object]], status.pop("leases"))
+            turns = cast(list[dict[str, object]], status.pop("recent_turns"))
+            others = cast(list[dict[str, object]], status.pop("other_lines"))
+            status["lease_count"] = len(leases)
+            status["recent_turn_count"] = len(turns)
+            status["other_line_count"] = len(others)
+            kept = cast(dict[str, object], status["kept_session"])
+            tasks = cast(list[dict[str, object]], kept.pop("tasks"))
+            kept["background_task_count"] = len(tasks)
+            processes = cast(dict[str, object], status["processes"])
+            left = processes.get("left")
+            if isinstance(left, dict):
+                left_status = cast(dict[str, object], left)
+                left_processes = cast(
+                    list[dict[str, object]], left_status.pop("processes")
+                )
+                left_status["process_count"] = len(left_processes)
+            return status
+        compact = _compact_line_status(full)
+        if lists:
+            kept = cast(dict[str, object], full["kept_session"])
+            processes = cast(dict[str, object], full["processes"])
+            left = processes.get("left")
+            left_processes: list[dict[str, object]] = []
+            if isinstance(left, dict):
+                left_processes = cast(
+                    list[dict[str, object]], cast(dict[str, object], left)["processes"]
+                )
+            compact["lists"] = {
+                "leases": full["leases"],
+                "recent_turns": full["recent_turns"],
+                "other_lines": full["other_lines"],
+                "background_tasks": kept["tasks"],
+                "left_processes": left_processes,
+            }
+            if _status_size(compact) > MAX_LINE_STATUS_DEFAULT_BYTES:
+                return _truncated_line_status(full, lists_truncated=True)
+            return compact
+        if _status_size(compact) <= MAX_LINE_STATUS_DEFAULT_BYTES:
+            return compact
+        return _truncated_line_status(full, lists_truncated=False)
+
+    def _detailed_line_status(self, line_id: str) -> dict[str, object]:
+        """The full status before the caller selects compact, detail or list fields."""
         state = self._log.state
         line = state.lines[line_id]
         limits = self.limits_for(line_id)
@@ -3089,16 +3250,31 @@ class Scheduler:
 
     def line_status_tool(self, line_id: str) -> SdkMcpTool[Any]:
         """The ``line_status`` tool for ``line_id``."""
-        return self._view_tool(
-            LINE_STATUS_TOOL_NAME,
-            "Show your own state: your hold, autonomous turns and estimated cost with"
-            " their limits, leases, scheduled wake, unread mail, model, working"
-            " directory, engine session and whether it is kept with its background"
-            " tasks, the cost of your last ten turns, your last wake's lateness, the"
-            " daemon's version and commit and whether its checkout has moved since it"
-            " started, your worktree's commit with a sentence that cites both, and"
-            " the other lines' state, read only.",
-            lambda: json.dumps(self.line_status(line_id), indent=2, sort_keys=True),
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, LINE_STATUS_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            detail = args.get("detail", False)
+            lists = args.get("lists", False)
+            if type(detail) is not bool:
+                return _tool_error("detail must be true or false")
+            if type(lists) is not bool:
+                return _tool_error("lists must be true or false")
+            status = self.line_status(line_id, detail=detail, lists=lists)
+            if lists and _status_size(status) > MAX_LINE_STATUS_DEFAULT_BYTES:
+                status = _truncated_line_status(status, lists_truncated=True)
+            return _tool_text(json.dumps(status, indent=2, sort_keys=True))
+
+        return SdkMcpTool(
+            name=LINE_STATUS_TOOL_NAME,
+            description=(
+                "Show a compact read-only summary of your state by default. Set detail"
+                " to true for diagnostics, and lists to true for recent turns, other"
+                " lines, leases and background processes."
+            ),
+            input_schema=LINE_STATUS_SCHEMA,
+            handler=handler,
         )
 
     def role_status(self, line_id: str) -> dict[str, object]:
@@ -3213,7 +3389,8 @@ class Scheduler:
 
     def _plan_limited(self, line_id: str) -> bool:
         """Whether ``line_id`` is held, still, by the hold of a plan limit its engine
-        reported in this daemon run."""
+        reported in this daemon run from a shape that may move a role. A limit read
+        from inferred wording is never recorded here."""
         line = self._log.state.lines.get(line_id)
         question = self._plan_held.get(line_id)
         return line is not None and question is not None and line.held_by == question
@@ -3280,15 +3457,36 @@ class Scheduler:
 
     def relinquish_ownership(
         self, line_id: str, note: str, to: str | None, back_to: str | None
-    ) -> Plan:
+    ) -> tuple[Plan, bool]:
         """``line_id`` gives its role up with the handoff note ``note``, as
-        ``roles.plan_relinquish`` decides, and returns the plan applied. The caller's
-        turn goes on with the engine it started with, and the successor's first turn
-        waits for it to end. Raises ``LineToolRefused``."""
+        ``roles.plan_relinquish`` decides, and returns the plan with whether it waits.
+
+        **Decided by the operator on 2026-10-27.** Called inside the owner's own turn,
+        it is the planned handoff, but the change takes effect only when that turn
+        ends, so ownership never changes during a turn and the turn never writes
+        after the role has gone. The plan is checked now, so a refusal reaches the
+        caller, and is made again with a fresh entry and stamp when the turn ends,
+        so the entry cites the commit the turn left. The plan returned is then the
+        one checked, and true says it waits. The former owner's engine is dropped
+        when the change is made, so its next turn has no write access. Outside a
+        turn the change is made at once. Raises ``LineToolRefused``."""
         if self.discloses(note):
             raise LineToolRefused(disclosure.REFUSAL)
+        if line_id in self._relinquish_pending:
+            raise LineToolRefused("a handoff already waits for this turn to end")
+        plan = self._plan_relinquish(line_id, note, to, back_to)
+        if line_id in self._running:
+            self._relinquish_pending[line_id] = (note, to, back_to)
+            return plan, True
+        self._append_plan(plan)
+        self._ownership_moved(plan)
+        return plan, False
+
+    def _plan_relinquish(
+        self, line_id: str, note: str, to: str | None, back_to: str | None
+    ) -> Plan:
         try:
-            plan = plan_relinquish(
+            return plan_relinquish(
                 self._log.state,
                 line_id,
                 note,
@@ -3299,9 +3497,27 @@ class Scheduler:
             )
         except RoleConflict as error:
             raise LineToolRefused(str(error)) from error
+
+    def _settle_relinquish(self, line_id: str) -> None:
+        """Make the handoff ``line_id`` asked for inside the turn that just ended.
+        Should the state have changed so that it no longer applies, the line keeps
+        its role and the operator is told, since nothing is guessed in its place."""
+        pending = self._relinquish_pending.pop(line_id, None)
+        if pending is None:
+            return
+        note, to, back_to = pending
+        try:
+            plan = self._plan_relinquish(line_id, note, to, back_to)
+        except LineToolRefused as error:
+            said = (
+                f"Dromon did not make the handoff {line_id} asked for in its turn,"
+                f" which could not apply when the turn ended: {error}"
+            )
+            self.activity.record(line_id, ActivityKind.NOTICE, said)
+            self._tell_operator(line_id, said)
+            return
         self._append_plan(plan)
         self._ownership_moved(plan)
-        return plan
 
     def take_ownership(self, line_id: str, reason: str) -> tuple[Plan, str]:
         """``line_id`` takes its role for itself, on a ground the harness observes,
@@ -3512,7 +3728,10 @@ class Scheduler:
     def plan_limit_reached(self, line_id: str, error: EnginePlanLimit) -> None:
         """Record what ``line_id``'s engine reported at a plan limit as its provider's
         budget, 0 percent with the reset time the engine gave, if any, so that a
-        failover passes over the provider's other seats."""
+        failover passes over the provider's other seats. Only a limit whose
+        ``may_move_role`` is true is recorded, since a spent budget moves roles."""
+        if not error.may_move_role:
+            return
         provider = ENGINE_OF.get(self.model_of(line_id))
         if provider is None:
             return
@@ -3798,9 +4017,21 @@ class Scheduler:
             if back_to is not None and not isinstance(back_to, str):
                 return _tool_error("back_to must be text")
             try:
-                plan = self.relinquish_ownership(line_id, note, to, back_to)
+                plan, waits = self.relinquish_ownership(line_id, note, to, back_to)
             except LineToolRefused as error:
                 return _tool_error(str(error))
+            if waits:
+                successor = (
+                    f"passes to {plan.owner}"
+                    if plan.owner is not None
+                    else "is left vacant"
+                )
+                return _tool_text(
+                    f"role {plan.role_id} {successor} when this turn ends, with your"
+                    " note as its handoff entry, stamped then. You own it until then."
+                    " Finish the turn without further writes, since your next turn"
+                    f" is built read only. {plan.note}".rstrip()
+                )
             text = (
                 f"role {plan.role_id} passed to {plan.owner} with handoff entry"
                 f" {plan.entry_id}. It is woken with a note once this turn ends."
@@ -3918,6 +4149,72 @@ class Scheduler:
             handler=handler,
         )
 
+    def propose_change_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The propose_change tool, which leaves changes for operator review."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, PROPOSE_CHANGE_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            message = args.get("message")
+            files = args.get("files")
+            patch = args.get("patch")
+            if not isinstance(message, str):
+                return _tool_error("message must be text")
+            if not isinstance(files, list) or not all(
+                isinstance(path, str) for path in cast(list[object], files)
+            ):
+                return _tool_error("files must be a list of paths")
+            if not isinstance(patch, str):
+                return _tool_error("patch must be text")
+            try:
+                proposal = self.propose_change(
+                    line_id, message, cast(list[str], files), patch
+                )
+            except (LineToolRefused, proposal_store.ProposalError) as error:
+                return _tool_error(str(error))
+            return _tool_text(
+                f"recorded proposal {proposal.proposal_id}. The operator can review it"
+                " with dromon proposal show "
+                f"{proposal.proposal_id}; it has not changed any project files."
+            )
+
+        return SdkMcpTool(
+            name=PROPOSE_CHANGE_TOOL_NAME,
+            description=(
+                "Record a proposed change for the operator to review. Provide a short"
+                " message, the changed file paths relative to your worktree, and a"
+                " unified diff as patch text. This records a suggestion only and does"
+                " not edit project files or commit."
+            ),
+            input_schema=PROPOSE_CHANGE_SCHEMA,
+            handler=handler,
+        )
+
+    def propose_change(
+        self, line_id: str, message: str, files: list[str], patch: str
+    ) -> proposal_store.Proposal:
+        """Store a bounded, disclosure-checked patch for operator review."""
+        if self._root is None:
+            raise LineToolRefused("this daemon does not know its project root")
+        if self.discloses(message, patch, *files):
+            raise LineToolRefused(disclosure.REFUSAL)
+        workdir = str(self._workdir_of(line_id))
+        proposal = proposal_store.Proposal(
+            proposal_id=new_id("p"),
+            created_at=format_due(self._wall_clock()),
+            line_id=line_id,
+            workdir=workdir,
+            message=message,
+            files=tuple(files),
+            patch=patch,
+        )
+        try:
+            proposal_store.write(self._root, proposal)
+        except proposal_store.ProposalError as error:
+            raise LineToolRefused(str(error)) from error
+        return proposal
+
     def own_tools(self, line_id: str) -> list[SdkMcpTool[Any]]:
         """A line's own Dromon tools, whose sender each fixes to the line."""
         return [
@@ -3929,6 +4226,7 @@ class Scheduler:
             self.line_status_tool(line_id),
             self.read_instructions_tool(line_id),
             self.write_scratch_tool(line_id),
+            self.propose_change_tool(line_id),
             self.list_processes_tool(line_id),
             self.stop_process_tool(line_id),
             self.list_mail_tool(line_id),
@@ -4467,8 +4765,11 @@ class Scheduler:
 
         A line in its cooldown, or waiting for its wake tick, with mail waiting keeps
         the loop ticking, so its turn starts on time rather than when more mail
-        arrives.
+        arrives. A compactable line past its context warning is also queued here,
+        unless it is hibernated, so it compacts before any later work is delivered.
         """
+        for line_id in sorted(self._log.state.lines):
+            self._ensure_context_compaction_wake(line_id)
         if self._running or self._sent or self._due_wakes():
             return True
         return any(
@@ -4637,6 +4938,8 @@ class Scheduler:
                 self._compaction_cause[line_id] = (
                     COMPACT_SESSION_TOOL_NAME
                     if compaction == COMPACTION_REQUESTED
+                    else COMPACTION_CONTEXT_WARNING
+                    if compaction == COMPACTION_CONTEXT_WARNING
                     else "auto_compact_tokens"
                 )
             prompt = compose_prompt(
@@ -4730,8 +5033,13 @@ class Scheduler:
             self._count_interrupted(line_id, engine)
             raise
         except EnginePlanLimit as error:
-            self.plan_limit_reached(line_id, error)
-            self._plan_held[line_id] = self.hold(line_id, str(error))
+            if error.may_move_role:
+                self.plan_limit_reached(line_id, error)
+                self._plan_held[line_id] = self.hold(line_id, str(error))
+            else:
+                # Inferred wording holds and asks, and is never a ground to move a
+                # role, so it records no budget and no plan hold.
+                self.hold(line_id, f"{error}{INFERRED_LIMIT_NOTE}")
             ending = f"held: {error}"
             print(f"dromond: line {line_id} held: {error}", file=sys.stderr)
         except Exception as error:  # noqa: BLE001
@@ -4759,6 +5067,9 @@ class Scheduler:
             self._running.pop(line_id, None)
             self._turn_owned.discard(line_id)
             self._last_turn_end[line_id] = self._clock()
+            # A handoff asked for in the turn takes effect now that it has ended,
+            # however it ended.
+            self._settle_relinquish(line_id)
             self._work.set()
         self._apply_limits(line_id, from_operator, report)
         if failed and self._operator_mail(line_id) == mailed:
@@ -5765,6 +6076,113 @@ def _left_summary(left: ProcessesLeft | None) -> dict[str, object] | None:
             " its executable's name and its arguments with secrets masked"
         ),
     }
+
+
+def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
+    """Select the bounded, list-free fields shown by ``line_status`` by default."""
+    autonomous = cast(dict[str, object], full["autonomous_turns"])
+    cost = cast(dict[str, object], full["cost_usd"])
+    context = cast(dict[str, object], full["context"])
+    daemon = cast(dict[str, object], full["daemon"])
+    commits = cast(dict[str, object], full["commits"])
+    kept = cast(dict[str, object], full["kept_session"])
+    workdir_commit = _commit_name(commits.get("workdir"))
+    daemon_commit = _commit_name(commits.get("daemon"))
+    checkout_commit = _commit_name(commits.get("daemon_checkout"))
+    stale = commits.get("stale")
+    cite = (
+        f"line {full['line_id']} read its worktree at commit"
+        f" {workdir_commit or 'unknown'}, under the daemon at commit"
+        f" {daemon_commit or 'unknown'}"
+    )
+    if stale is True and checkout_commit is not None:
+        cite += f", whose checkout has since moved to {checkout_commit}"
+    return {
+        "line_id": full["line_id"],
+        "state": full["state"],
+        "condition": full["condition"],
+        "held_by": full["held_by"],
+        "autonomous_turns": {
+            "used": autonomous["used"],
+            "allowed": autonomous["allowed"],
+        },
+        "cost_usd": {
+            "estimate": cost["estimate"],
+            "basis": cost["basis"],
+            "limit": cost["limit"],
+        },
+        "leases": len(cast(list[dict[str, object]], full["leases"])),
+        "scheduled_wake": full["scheduled_wake"],
+        "unread": full["unread"],
+        "pending": full["pending"],
+        "model": full["model"],
+        "strategy": full["strategy"],
+        "context": {
+            "estimated_tokens": context["estimated_tokens"],
+            "warn_at": context["warn_at"],
+            "compact_session": context["compact_session"],
+            "compaction_pending": context["compaction_pending"],
+            "auto_compact_held": context["auto_compact_held"],
+        },
+        "daemon": {
+            "version": daemon["version"],
+            "commit": daemon["commit"],
+            "checkout_commit": daemon["checkout_commit"],
+            "stale": daemon["stale"],
+        },
+        "commits": {
+            "workdir": workdir_commit,
+            "daemon": daemon_commit,
+            "daemon_checkout": checkout_commit,
+            "stale": stale if type(stale) is bool else None,
+            "cite": cite + ".",
+            "note": commits.get("note"),
+        },
+        "background_task_count": len(cast(list[dict[str, object]], kept["tasks"])),
+        "recent_turn_count": len(cast(list[dict[str, object]], full["recent_turns"])),
+        "other_line_count": len(cast(list[dict[str, object]], full["other_lines"])),
+    }
+
+
+def _commit_name(value: object) -> str | None:
+    """A bounded hexadecimal Git object name from commit status, or ``None``."""
+    if (
+        isinstance(value, str)
+        and len(value) in (40, 64)
+        and all(character in "0123456789abcdefABCDEF" for character in value)
+    ):
+        return value
+    return None
+
+
+def _status_size(status: dict[str, object]) -> int:
+    """The UTF-8 size of status as the line tool formats its JSON response."""
+    return len(json.dumps(status, indent=2, sort_keys=True).encode("utf-8"))
+
+
+def _truncated_line_status(
+    full: dict[str, object], *, lists_truncated: bool
+) -> dict[str, object]:
+    """A bounded status response that says which shorter request to make."""
+    compact = _compact_line_status(full)
+    result: dict[str, object] = {
+        "line_id": compact["line_id"],
+        "state": compact["state"],
+        "status_truncated": True,
+        "detail_available": True,
+        "lists_available": True,
+        "lists_truncated": lists_truncated,
+        "commits": compact["commits"],
+        "suggested_arguments": {"detail": True, "lists": False},
+    }
+    if _status_size(result) > MAX_LINE_STATUS_DEFAULT_BYTES:
+        return {
+            "line_id": compact["line_id"],
+            "state": compact["state"],
+            "status_truncated": True,
+            "commits": compact["commits"],
+        }
+    return result
 
 
 def engine_output_roots() -> list[Path]:

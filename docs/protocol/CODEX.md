@@ -104,6 +104,9 @@ structured code, Dromon uses the specific phrases `plan limit`, `usage limit`,
 `reached your limit`, `reached the usage limit` and `quota exceeded`. The generic word
 `quota` does not classify an error. A live app-server error is needed to confirm this
 vocabulary. A reported reset time is kept in the operator question that holds the line.
+**Decided by the operator on 2026-10-27.** Since this vocabulary is inferred, a limit
+read from it holds the line and asks, records no budget, and never moves a role. Only
+the observed `usageLimitExceeded` shape above may fail a role over.
 
 ## Tools across threads
 

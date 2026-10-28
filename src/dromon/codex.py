@@ -592,7 +592,9 @@ def _plan_limit(error: object) -> str | None:
     """Recognize a structured limit code or specific limit wording.
 
     **Inference, not observed live.** The words below are plausible app-server
-    representations. A live error is needed to confirm the vocabulary.
+    representations. A live error is needed to confirm the vocabulary. So the
+    ``EnginePlanLimit`` raised from it holds the line and asks, and never moves a
+    role, by the operator's decision of 2026-10-27.
     """
     if not isinstance(error, dict):
         return None
@@ -739,7 +741,9 @@ def usage_limit(error: object) -> EnginePlanLimit | None:
     message = fields.get("message")
     resets_at = reset_from_message(message) if isinstance(message, str) else None
     suffix = "" if resets_at is None else f", which resets at {resets_at}"
-    return EnginePlanLimit(f"Codex usage limit exceeded{suffix}", resets_at)
+    return EnginePlanLimit(
+        f"Codex usage limit exceeded{suffix}", resets_at, may_move_role=True
+    )
 
 
 def credits_spent(params: Mapping[str, Any]) -> str | None:

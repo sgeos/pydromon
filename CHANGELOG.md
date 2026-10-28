@@ -102,6 +102,24 @@ All notable changes are recorded here. The format follows
   `role_handoff`, `budgets` and `budget_set`, and none is offered to external agents.
   The question to the operator when an owner has not relinquished within the role's
   `handoff_seconds` is not built yet.
+- The operator's decisions of 2026-10-27 on the review of step 3, as
+  `docs/architecture/ROLES.md` records. Only a plan limit read from a shape observed
+  live, or typed by the Agent SDK, records a budget and may move a role. A limit read
+  from Codex's inferred codes or free-text phrases holds the line and asks, records no
+  budget, and grounds neither a failover nor a seat's own take. `relinquish_ownership`
+  inside the owner's turn takes effect when that turn ends, stamped then, and a second
+  call in the same turn is refused. Automatic failover on an engine's budget report is
+  kept. A seat with a turn in flight may be chosen, and gains write access from its
+  next turn. The confining engines stay empty until read-only seats merge, and are
+  then derived from the capability table, with Grok out until a probe.
+- Compact `line_status` responses by default, with bounded output and explicit requests
+  for diagnostic fields and long lists. List responses are bounded too. Lines with
+  context compaction enabled wake at their context warning so compaction can happen
+  before the next real turn, except when held or hibernated. A new
+  `propose_change` tool records a bounded patch, file list and message for operator
+  review through `dromon proposal list` and `dromon proposal show`; its file list must
+  match the patch headers and excludes protected paths. It never applies a patch or
+  commits. `dromon config` warns when writing-capable lines share a workdir.
 - Restart to upgrade, by the operator's decision of 2026-10-27, as
   `docs/protocol/RESTART.md` specifies.
   - `dromon restart [--interrupt] [--wait-seconds S] [--end-tasks]` and the client

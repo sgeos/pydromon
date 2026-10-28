@@ -271,11 +271,21 @@ class EngineRefused(Exception):
 class EnginePlanLimit(EngineRefused):
     """The subscription reached a plan limit and needs operator release.
     ``resets_at`` is the reset time the engine reported, in the model's
-    ``YYYY-MM-DDTHH:MM:SSZ`` form, or ``None`` when it gave none in a known form."""
+    ``YYYY-MM-DDTHH:MM:SSZ`` form, or ``None`` when it gave none in a known form.
 
-    def __init__(self, message: str, resets_at: str | None = None) -> None:
+    ``may_move_role`` says whether the shape it was read from may move a role.
+    **Decided by the operator on 2026-10-27.** Only a shape observed live, or one the
+    Agent SDK types and documents, may record its provider's budget as spent and so
+    ground a failover. A limit read from inferred codes or free text holds the line
+    and asks, and never moves a role. It defaults to false, so an adapter that does
+    not say holds only, which is default deny."""
+
+    def __init__(
+        self, message: str, resets_at: str | None = None, *, may_move_role: bool = False
+    ) -> None:
         super().__init__(message)
         self.resets_at = resets_at
+        self.may_move_role = may_move_role
 
 
 BILLING_ERROR: Final = "billing_error"
@@ -313,6 +323,7 @@ def rejected_limit(info: RateLimitInfo) -> EnginePlanLimit | None:
     return EnginePlanLimit(
         f"Claude subscription plan limit reached in its {window} window{suffix}",
         resets_at,
+        may_move_role=True,
     )
 
 
@@ -2053,10 +2064,12 @@ class ClaudeCodeLine:
         that ended in error while the engine's latest report was a rejected limit. A
         turn that succeeded is kept, even past a limit, so its work is counted."""
         if turn.billing:
-            raise EnginePlanLimit(BILLING_LIMIT)
+            raise EnginePlanLimit(BILLING_LIMIT, may_move_role=True)
         failed = result is None or result.is_error
         if failed and self._limit is not None:
-            raise EnginePlanLimit(str(self._limit), self._limit.resets_at)
+            raise EnginePlanLimit(
+                str(self._limit), self._limit.resets_at, may_move_role=True
+            )
 
     async def _enter[S](
         self,

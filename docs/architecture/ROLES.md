@@ -101,11 +101,23 @@ daemon counts no engine as able to confine a seat, and a seat runs only while it
 its role or the role is vacant. A seat of a vacant role runs so that it can take the
 role. Once the branch merges, the engines whose capability table entry says they can
 make the worktree read only are counted, and their seats are built with read access.
+**Decided by the operator on 2026-10-27.** The merge derives the set from the
+capability table's entries that give `read_only_workdir` as yes, and does not type it
+in by hand, so the set cannot fall out of step with the table. Grok's entry is
+unknown, so Grok stays out of the set until an operator probe confirms it. Until the
+merge the set stays empty, which `roles.CONFINING_ENGINES` records.
 
 **Never two writers.** A take while the owner runs is refused, and the operator who
-must take it now sends `interrupt` first. **Implemented.** A seat's own tools change
-ownership during its own turn, so the rule as built is that the change is recorded at
-once, every turn goes on with the engine it started with, and no seat's turn as the
+must take it now sends `interrupt` first. **Decided by the operator on 2026-10-27.** An
+owner's `relinquish_ownership` inside its own turn is the planned handoff, and is
+kept, but the change takes effect only when that turn ends. The call is checked at
+once, so a refusal reaches the owner, and is made again when the turn ends, however it
+ends, with the handoff entry stamped with the commit the turn left. The former owner's
+engine is then dropped, so the turn keeps no write access after it. Should the change
+no longer apply by then, the owner keeps the role and the operator is told. A daemon
+that stops during the turn loses the request, and the owner keeps the role.
+**Implemented.** A seat's `take_ownership` inside its own turn is recorded at once, but
+that turn goes on with the read access it started with, and no seat's turn as the
 owner starts while another seat's turn that started as the owner is in flight, or
 while that seat's kept connection is still closing. A seat that does not own the role
 runs beside the owner where its engine can confine it. The former owner's engine is dropped and its kept connection closed,
@@ -128,7 +140,8 @@ The operator asks with `dromon role handoff ROLE --to SEAT`, or in words to the 
    and mail in flight, and calls `relinquish_ownership` with a handoff note and the
    successor's identifier.
 3. The daemon records the note as a `role_noted` entry of kind `handoff`, stamped with
-   both commits, then `ownership_changed` with cause `handoff`. It awakens the
+   both commits, then `ownership_changed` with cause `handoff`, when the owner's turn
+   ends. It awakens the
    successor if it was hibernated, and sends it a note that wakes it with the entry's
    identifier.
 4. The successor reads the entry with `role_status`, checks it as the next section
@@ -177,7 +190,10 @@ over when that turn ends.
 Under `automatic` the role passes to the next usable seat in the declared order, from
 the owner round to the front. A seat is usable when it may own the role, is not
 stopped, hibernated, held or failed, and its provider's stated budget does not show it
-spent. The change is recorded with cause `failover` and rests on a note entry that says
+spent. **Decided by the operator on 2026-10-27.** A seat with a turn in flight is
+usable. It becomes the owner at once, but that turn goes on with the read access it
+started with, and the seat gains write access only from its next turn, which is
+built as the owner. The change is recorded with cause `failover` and rests on a note entry that says
 the harness wrote it, why, and from whom to whom. The new owner is woken by a note to
 itself, and its turn leads with the recovery checklist. The operator who last wrote to
 the former owner is told in a note recorded as from the former owner, as a hold's
@@ -195,8 +211,12 @@ end of the owner's next turn, does.
 **What counts as unable to act.** The plan-limit hold of the recovery table, with the
 budget an engine reports, and a budget stated at 0 percent whose reset has not passed.
 Each engine's out-of-credit errors are classified only where their shape is on
-record, as the next section says. A turn that fails in any other way holds the line as
-before, and is not a ground.
+record, as the next section says. **Decided by the operator on 2026-10-27.** Only a
+shape observed live, or one the Agent SDK types and documents, may move a role. A
+limit read from Codex's inferred codes or free-text phrases holds the line and asks,
+records no budget, and grounds neither a failover nor a seat's own take, so the
+operator moves the role, if at all. A turn that fails in any other way holds the line
+as before, and is not a ground.
 
 ## Recovery
 
@@ -217,7 +237,7 @@ journal entry, since the model takes entries only from seats.
 | Owner's state | A seat may take | The operator may take |
 |---|---|---|
 | Vacant, after a relinquish without a successor | Yes | Yes |
-| Held at a plan limit its engine reported | Yes | Yes |
+| Held at a plan limit its engine reported, from an observed or typed shape | Yes | Yes |
 | Its provider's budget recorded as 0 percent | Yes | Yes |
 | Failed, or held at a conversation limit | No | Yes |
 | Idle with budget, or running | No | Yes, once the owner has no turn in flight |
@@ -271,7 +291,7 @@ record. Only Codex's camel-case shapes were observed live, by the operator on
 | Engine | Classified as budget exhausted | Source of the shape |
 |---|---|---|
 | Claude Code | A failed turn while the engine's latest `rate_limit_event` has status `rejected` and its overage is not `allowed` or `allowed_warning`, with its reset time. An assistant message whose `error` is `billing_error`, in any turn | The `RateLimitInfo` and `AssistantMessageError` types of the installed Agent SDK |
-| Codex | A turn that does not complete after an `error` notice, or with a `turn.error`, whose `codexErrorInfo` is `usageLimitExceeded`, with the reset time read from its message. Before any turn fails, an `account/rateLimits/updated` notice whose `credits` has `hasCredits` and `unlimited` both false and whose `primary` and `secondary` windows are both null, which records the budget at 0 with no reset at once. The older snake-case codes and phrases of [`CODEX.md`](../protocol/CODEX.md) still count, and their reset time stays in the hold's text | The camel-case shapes observed live on 2026-10-27. The snake-case codes are inferred and unverified |
+| Codex | A turn that does not complete after an `error` notice, or with a `turn.error`, whose `codexErrorInfo` is `usageLimitExceeded`, with the reset time read from its message. Before any turn fails, an `account/rateLimits/updated` notice whose `credits` has `hasCredits` and `unlimited` both false and whose `primary` and `secondary` windows are both null, which records the budget at 0 with no reset at once. The older snake-case codes and phrases of [`CODEX.md`](../protocol/CODEX.md) hold the line and ask, but record no budget and never move a role | The camel-case shapes observed live on 2026-10-27. The snake-case codes and phrases are inferred and unverified |
 | Grok, Pi, Cursor, Antigravity | Nothing. A failed turn holds the line as before | No shape is on record |
 
 **Inference.** The engine reports a change of rate-limit status, not each turn, so the
@@ -290,7 +310,10 @@ once when it arrives between the owner's turns.
 seat a failover would choose now, and each seat in the failover order with its
 provider's budget, its source and its time, and whether it is usable. A budget at 0
 percent fails an owner over, and a budget below the threshold asks for a planned
-handoff, as the sections above say. **Superseded on 2026-10-27.** The earlier design
+handoff, as the sections above say. **Decided by the operator on 2026-10-27.** That
+holds for a budget an engine reports from an observed or typed shape as well as for
+an operator's statement, since the operator wants switching automatic, and the
+operator is told at once of each failover. **Superseded on 2026-10-27.** The earlier design
 had the harness move no role by budget, and ask the operator with the other seats as
 choices instead. That question is not built, and `ask` keeps the hold's question.
 
@@ -330,8 +353,9 @@ line without a role behaves exactly as today.
   report, and is shown with its source and age.
 - **A misclassified limit.** A failure counted as budget exhausted when it was not
   moves the role and records the provider spent until an operator states otherwise.
-  The Claude Code shapes come from the Agent SDK's types, and Codex's snake-case codes
-  are inferred. Codex's camel-case shapes were observed live. Only an account with no
+  Only the Claude Code shapes, from the Agent SDK's types, and Codex's camel-case
+  shapes, observed live, can do so. Codex's inferred snake-case codes and phrases only
+  hold the line and ask. Only an account with no
   credit and no reported plan window was observed, so a notice of no credit counts only
   when its `primary` and `secondary` windows are both null, by the operator's decision of
   2026-10-27. A plan with a window therefore never reads as spent from that notice,
@@ -377,6 +401,20 @@ them.
    their shape is known. An unknown shape holds the line as before.
 8. External agents may not change ownership, and each engine is its own provider until
    the budget step.
+
+**Amended by the operator on 2026-10-27, after the review of step 3.**
+
+9. Only observed shapes and the Agent SDK's typed, documented shapes may move a role.
+   Codex's inferred codes and free-text phrases hold the line and ask, and never fail
+   over.
+10. `relinquish_ownership` inside the owner's turn is the planned handoff, and takes
+    effect when that turn ends, after which the former owner has no write access.
+11. Automatic failover on an engine's budget report stays, and the operator is told at
+    once.
+12. The confining engines are derived from the capability table once read-only seats
+    merge, with Grok out until a probe, and the set is empty until then.
+13. A seat with a turn in flight may be chosen, and gains write access only from its
+    next turn.
 
 ## Order of work
 

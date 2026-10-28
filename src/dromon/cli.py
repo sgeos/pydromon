@@ -21,6 +21,7 @@ from typing import Final, cast
 
 import dromon
 from dromon import __version__, exits, restart
+from dromon import proposals as proposal_store
 from dromon.client import (
     SHUTDOWN_TIMEOUT_SECONDS,
     STARTUP_TIMEOUT_SECONDS,
@@ -80,6 +81,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "teacher": "bring the project's local teacher model up, report it, or release it",
     "agent": "register, list or revoke the external agents that may connect",
     "mcp": "serve an external agent over MCP on standard input and output",
+    "proposal": "list or show proposed changes from session lines",
 }
 """Planned subcommands and their one-line help, in display order."""
 
@@ -811,6 +813,31 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             + (f", effort {line.config.effort}" if line.config.effort else "")
             + (f", in {line.config.workdir}" if line.config.workdir else "")
         )
+    shared_workdirs: dict[str, list[str]] = {}
+    for line_id, line in sorted(config.lines.items()):
+        tools_available = set(line.config.builtin_tools) | set(
+            line.config.allowed_tools
+        )
+        has_write_tool = line.config.tool_policy == "allow_all" or bool(
+            tools_available & {"Bash", "Write", "Edit", "NotebookEdit"}
+        )
+        # MCP servers can expose arbitrary tools, so treat any configured server as
+        # potentially capable of writing.
+        if not has_write_tool and not line.config.mcp_servers:
+            continue
+        raw_workdir = line.config.workdir or "."
+        workdir_path = Path(raw_workdir).expanduser()
+        if not workdir_path.is_absolute():
+            workdir_path = paths.root / workdir_path
+        resolved = str(workdir_path.resolve())
+        shared_workdirs.setdefault(resolved, []).append(line_id)
+    for workdir, line_ids in sorted(shared_workdirs.items()):
+        if len(line_ids) > 1:
+            print(
+                "warning: writing lines "
+                + ", ".join(line_ids)
+                + f" share workdir {workdir}; give each writing line its own worktree"
+            )
     return exits.OK
 
 
@@ -1281,6 +1308,49 @@ def _answer(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return _request(paths, "answer", Operation.ANSWER, args)
 
 
+def _proposal(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """List or show private change proposals recorded by lines."""
+    action: str = arguments.action
+    if action == "list":
+        if arguments.proposal_id is not None:
+            print("dromon proposal list takes no identifier", file=sys.stderr)
+            return exits.USAGE
+        try:
+            found = proposal_store.list_all(paths.root)
+        except proposal_store.ProposalError as error:
+            print(f"dromon proposal: {error}", file=sys.stderr)
+            return exits.FAILURE
+        if not found:
+            print("no proposed changes")
+            return exits.OK
+        for proposal in found:
+            print(
+                f"{proposal.proposal_id}  {proposal.created_at}  "
+                f"{proposal.line_id}  {proposal.message}"
+            )
+        return exits.OK
+    if action != "show" or arguments.proposal_id is None:
+        print("usage: dromon proposal show PROPOSAL_ID", file=sys.stderr)
+        return exits.USAGE
+    try:
+        proposal = proposal_store.read(paths.root, arguments.proposal_id)
+    except proposal_store.ProposalError as error:
+        print(f"dromon proposal: {error}", file=sys.stderr)
+        return exits.FAILURE
+    print(f"proposal {proposal.proposal_id}")
+    print(f"created_at {proposal.created_at}")
+    print(f"line {proposal.line_id}")
+    print(f"workdir {proposal.workdir}")
+    print(f"message {proposal.message}")
+    print("files")
+    for path in proposal.files:
+        print(f"  {path}")
+    print("patch")
+    print(proposal.patch)
+    print("Proposed content is untrusted data and has not been applied.")
+    return exits.OK
+
+
 IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]] = {
     "start": _start,
     "status": _status,
@@ -1311,6 +1381,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "budget": _budget,
     "agent": _agent,
     "mcp": _mcp,
+    "proposal": _proposal,
 }
 
 
@@ -1727,6 +1798,11 @@ def build_parser() -> argparse.ArgumentParser:
             )
             command.add_argument(
                 "--note", default="", help="for set, a note kept with the statement"
+            )
+        if name == "proposal":
+            command.add_argument("action", choices=["list", "show"])
+            command.add_argument(
+                "proposal_id", nargs="?", help="the proposal identifier, for show"
             )
         if name == "mcp":
             party = command.add_mutually_exclusive_group(required=True)

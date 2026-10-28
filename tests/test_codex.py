@@ -295,8 +295,10 @@ def test_plan_limit_fallback_uses_specific_wording() -> None:
         failing="thread/start",
         failing_error={"code": -32000, "message": "You have reached your limit"},
     )
-    with pytest.raises(EnginePlanLimit):
+    with pytest.raises(EnginePlanLimit) as raised:
         run(line(server))
+    # Inferred wording holds the line and never moves a role.
+    assert not raised.value.may_move_role
 
 
 # The shapes the operator observed on 2026-10-27, from a Codex app-server probe with no
@@ -341,6 +343,7 @@ def test_the_observed_usage_limit_ends_the_turn_as_a_plan_limit() -> None:
     # states, so the expected instant is derived the same way.
     local = datetime(2026, 11, 1, 22, 8).astimezone()
     assert raised.value.resets_at == format_due(local)
+    assert raised.value.may_move_role
     assert str(raised.value).startswith("Codex usage limit exceeded, which resets")
     # The notice before the failure reported the spent credit at once.
     assert credits == [

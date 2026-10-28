@@ -428,7 +428,10 @@ CONFINING_ENGINES: Final[frozenset[str]] = frozenset()
 **Technical debt.** It is empty until ``feat/read-only-seats`` merges, since no engine
 here applies a read-only access yet, and then becomes the engines whose capability
 table entry gives ``read_only_workdir`` as yes. Empty is default deny, so a seat that
-does not own its role does not run beside an owner until its engine can confine it."""
+does not own its role does not run beside an owner until its engine can confine it.
+**Decided by the operator on 2026-10-27.** The merge derives the set from the table
+rather than typing it here, and Grok, whose entry is unknown, stays out until an
+operator probe confirms it."""
 
 
 def seat_access(state: State, line_id: str) -> Access | None:
