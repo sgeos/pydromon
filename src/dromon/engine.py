@@ -149,6 +149,7 @@ from dromon.ceiling import (
     nothing_to_settle,
 )
 from dromon.driver import TOOL_RESULT, ActionTag, Credential, Driver, Event, Strategy
+from dromon.engine_environment import TOOL_SEARCH_PINNED, TOOL_SEARCH_VARIABLE
 from dromon.lineconfig import DEFAULT_CONFIG, ConfigError, LineConfig
 from dromon.model import format_due
 from dromon.processes import MARK_VARIABLE
@@ -679,16 +680,6 @@ HALT_REASON: Final = (
 )
 """**Row 1 of the T3 Code review.** Why an operator's stop closed a kept connection
 whose interrupt settled while the engine still ran work."""
-
-TOOL_SEARCH_VARIABLE: Final = "ENABLE_TOOL_SEARCH"
-TOOL_SEARCH_PINNED: Final = "true"
-"""**Row 4 of the T3 Code review.** Every Claude Code line runs with tool search on,
-so the set of tool schemas the engine sends does not change between requests and
-rewrite the prompt cache, as ``dromon.settings`` explains. It is set in the engine's
-own environment, over whatever the daemon's holds, and in the env block of the flag
-settings Dromon passes, which ``flag_settings`` explains, and a line's settings may not
-set it. **Residual.** Managed policy settings apply after both, and could still set
-it."""
 
 
 def flag_settings(settings: Mapping[str, object] | None) -> dict[str, object]:

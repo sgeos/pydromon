@@ -5,16 +5,18 @@ line sends travels the same path as one sent by a model.
 """
 
 import asyncio
+import gc
 import re
 from collections.abc import Callable, Coroutine, Iterator, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
+import keleusma
 from claude_agent_sdk import SdkMcpTool
 
 from dromon.activity import ActivityKind
-from dromon.driver import DriverError, Strategy
+from dromon.driver import Driver, DriverError, Event, Strategy
 from dromon.engine import EnginePlanLimit, TurnReport
 from dromon.eventlog import EventLog, read_entries
 from dromon.lineconfig import ConfigError, LineConfig, ToolPolicy, encode_config
@@ -40,6 +42,7 @@ from dromon.model import (
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.mailbox import MailSummary, summary
 from dromon.scheduler import LineSpec, Scheduler, compose_prompt
+from dromon import priority
 
 HAIKU = "claude-haiku-5-5"
 ANA = OperatorAddress("ana")
@@ -188,6 +191,51 @@ def activity_of(scheduler: Scheduler, line_id: str) -> list[tuple[ActivityKind, 
 
 def run(target: World, act: Callable[[], Coroutine[Any, Any, None]]) -> None:
     asyncio.run(settle(target, act))
+
+
+def test_a_finished_lines_vm_is_released_before_python_gc(
+    tmp_path: Path,
+) -> None:
+    class DriverEngine:
+        def __init__(self, driver: Driver) -> None:
+            self.driver = driver
+            self.session_id: str | None = None
+
+        async def run_turn(self, prompt: str) -> TurnReport:
+            del prompt
+            self.driver.step(Event("turn_start"))
+            return TurnReport(
+                "success", 1, "ok", (), None, None, "session-1", None, None
+            )
+
+    def vm_count() -> int:
+        return sum(isinstance(value, keleusma.VM) for value in gc.get_objects())
+
+    log = EventLog(tmp_path / "driver-lifecycle.sqlite")
+    scheduler: Scheduler
+
+    def build(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> DriverEngine:
+        del tools
+        driver = priority.steered(
+            spec.model,
+            spec.strategy,
+            lambda: scheduler.redirect_reason(spec.line_id),
+        )
+        return DriverEngine(driver)
+
+    scheduler = Scheduler(log, build, tick_seconds=0)
+    baseline = vm_count()
+    scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+    engine = cast(DriverEngine, scheduler.engine_for("alpha"))
+    driver = engine.driver
+    assert vm_count() == baseline + 1
+    asyncio.run(engine.run_turn("finished"))
+
+    asyncio.run(scheduler.close_engines())
+
+    assert driver.closed
+    assert vm_count() == baseline
+    log.close()
 
 
 def send(

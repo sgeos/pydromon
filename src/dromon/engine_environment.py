@@ -11,6 +11,25 @@ BASE_ENVIRONMENT: tuple[str, ...] = ("PATH", "HOME", "LANG", "TERM", "TMPDIR")
 """The executable search path, the engine's isolated home, locale, terminal type,
 and temporary directory. Missing optional entries stay missing."""
 
+TOOL_SEARCH_VARIABLE = "ENABLE_TOOL_SEARCH"
+"""The Agent SDK's engine variable that keeps Claude Code's tool search enabled."""
+TOOL_SEARCH_PINNED = "true"
+"""Stable tool search keeps the tool schemas from changing between requests."""
+
+CLAUDE_ENGINE_ENVIRONMENT: tuple[str, ...] = (
+    TOOL_SEARCH_VARIABLE,
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_AGENT_SDK_VERSION",
+    "CLAUDE_CODE_SDK_READS_SESSION_STATE",
+    "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
+    "PWD",
+    "TRACEPARENT",
+    "TRACESTATE",
+    "BAGGAGE",
+)
+"""Claude Code inputs set by Dromon or the pinned Agent SDK before it starts the
+engine. The adapter does not forward other daemon variables."""
+
 
 def allowlisted(environment: Mapping[str, str], names: Sequence[str]) -> dict[str, str]:
     """Copy only named variables that exist in the supplied environment."""

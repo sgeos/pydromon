@@ -127,7 +127,13 @@ from pathlib import Path
 from typing import Final, cast
 
 from dromon.processes import MARK_VARIABLE, TreeRow, descendants, tree_or_reason
-from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
+from dromon.engine_environment import (
+    BASE_ENVIRONMENT,
+    CLAUDE_ENGINE_ENVIRONMENT,
+    TOOL_SEARCH_PINNED,
+    TOOL_SEARCH_VARIABLE,
+    allowlisted,
+)
 
 
 class StopPolicy(StrEnum):
@@ -372,6 +378,13 @@ def version_target(arguments: Sequence[str]) -> str | None:
         return claude_command()
     except Exception:  # noqa: BLE001
         return None
+
+
+def version_environment(environment: Mapping[str, str]) -> dict[str, str]:
+    """The short-lived environment for the Agent SDK's version-only CLI check."""
+    selected = allowlisted(environment, BASE_ENVIRONMENT)
+    selected[TOOL_SEARCH_VARIABLE] = TOOL_SEARCH_PINNED
+    return selected
 
 
 # The daemon's side.
@@ -1281,19 +1294,46 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 127
         # A version query starts nothing that lasts, so it needs no watcher.
         try:
-            os.execv(version, [version, *arguments])  # noqa: S606
+            os.execve(  # noqa: S606
+                version,
+                [version, *arguments],
+                version_environment(os.environ),
+            )
         except OSError as error:
             print(f"dromon-launch: cannot start {version}: {error}", file=sys.stderr)
+            return 127
+    if os.environ.get(FILTER_ENVIRONMENT_VARIABLE) == "1":
+        # The Agent SDK merges its host environment into options.env. Replace this
+        # launcher image with one carrying only the inputs its watcher and Claude
+        # Code need, before it creates any child process.
+        environment = allowlisted(
+            os.environ,
+            (
+                *BASE_ENVIRONMENT,
+                *CLAUDE_ENGINE_ENVIRONMENT,
+                MARK_VARIABLE,
+                *LAUNCH_VARIABLES,
+            ),
+        )
+        environment.pop(FILTER_ENVIRONMENT_VARIABLE, None)
+        try:
+            os.execve(  # noqa: S606
+                sys.executable,
+                [sys.executable, "-I", "-m", "dromon.launcher", *arguments],
+                environment,
+            )
+        except OSError as error:
+            print(
+                f"dromon-launch: cannot re-exec with the filtered environment: {error}",
+                file=sys.stderr,
+            )
             return 127
     policy = policy_of(os.environ)
     parent_text = os.environ.get(PARENT_VARIABLE, "")
     parent = int(parent_text) if parent_text.isdigit() else os.getppid()
     report = os.environ.get(REPORT_VARIABLE) or None
     mark = os.environ.get(LAUNCH_MARK_VARIABLE) or os.environ.get(MARK_VARIABLE)
-    if os.environ.get(FILTER_ENVIRONMENT_VARIABLE) == "1":
-        environment = allowlisted(os.environ, (*BASE_ENVIRONMENT, MARK_VARIABLE))
-    else:
-        environment = {k: v for k, v in os.environ.items() if k not in LAUNCH_VARIABLES}
+    environment = {k: v for k, v in os.environ.items() if k not in LAUNCH_VARIABLES}
     with contextlib.suppress(OSError):
         # Fails when the launcher already leads a session, as when the daemon
         # started it with a session of its own, which serves as well.

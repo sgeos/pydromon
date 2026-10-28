@@ -92,7 +92,12 @@ class FakeOllama:
 
 
 def teacher(
-    fake: FakeOllama, runtime: Path, *, memory: int | None = PLENTY, **table: object
+    fake: FakeOllama,
+    runtime: Path,
+    *,
+    memory: int | None = PLENTY,
+    environment: Mapping[str, str] | None = None,
+    **table: object,
 ) -> Teacher:
     config = parse_teacher({"model": MODEL, **table})
     ticks = iter(range(100_000))
@@ -101,7 +106,7 @@ def teacher(
         runtime,
         transport=fake.transport,
         starter=fake.starter,
-        environment={"PATH": "/bin"},
+        environment={"PATH": "/bin"} if environment is None else environment,
         clock=lambda: float(next(ticks)),
         sleep=lambda seconds: None,
         command_of=fake.command_of,
@@ -195,6 +200,28 @@ def test_up_starts_a_server_only_when_none_answers(tmp_path: Path) -> None:
     assert environment["OLLAMA_HOST"] == "127.0.0.1:11500"
     assert (tmp_path / "run" / PID_FILE).read_text() == "4242\n"
     assert (tmp_path / "run").stat().st_mode & 0o777 == 0o700
+
+
+def test_the_teacher_server_starts_with_only_its_allowlisted_environment(
+    tmp_path: Path,
+) -> None:
+    fake = FakeOllama(running=False)
+    target = teacher(
+        fake,
+        tmp_path,
+        environment={
+            "PATH": "/usr/bin",
+            "HOME": "/home/teacher",
+            "DAEMON_ONLY_SECRET": "must-not-reach-ollama",
+            "OLLAMA_HOST": "http://remote.invalid:9999",
+        },
+    )
+    target.up(force=True)
+    assert fake.started[0][1] == {
+        "PATH": "/usr/bin",
+        "HOME": "/home/teacher",
+        "OLLAMA_HOST": "127.0.0.1:11434",
+    }
 
 
 def test_up_refuses_to_pull_and_stops_a_server_it_started(tmp_path: Path) -> None:

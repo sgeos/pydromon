@@ -63,7 +63,6 @@ from dromon.jsonlines import (
     TURN_SECONDS,
     Connection,
     ConnectionFactory,
-    is_cloud_or_credential,
     json_lines_factory,
 )
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
@@ -102,69 +101,12 @@ except ``anthropic``. **Pi review, F7, decided by the operator on 2026-10-26.** 
 a Claude plan may be drawn through a third-party harness is not established, so a
 Claude sign-in through Pi is not taken to be a subscription and refuses the turn."""
 
-API_ENVIRONMENT: Final = frozenset(
-    {
-        "AI_GATEWAY_API_KEY",
-        "ANT_LING_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "ANTHROPIC_FEDERATION_RULE_ID",
-        "ANTHROPIC_IDENTITY_TOKEN_FILE",
-        "ANTHROPIC_OAUTH_TOKEN",
-        "ANTHROPIC_ORGANIZATION_ID",
-        "ANTHROPIC_SERVICE_ACCOUNT_ID",
-        "ANTHROPIC_WORKSPACE_ID",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_BEARER_TOKEN_BEDROCK",
-        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-        "AWS_PROFILE",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_WEB_IDENTITY_TOKEN_FILE",
-        "AZURE_OPENAI_API_KEY",
-        "CLOUDFLARE_API_KEY",
-        "COPILOT_GITHUB_TOKEN",
-        "GOOGLE_APPLICATION_CREDENTIALS",
-        "GOOGLE_CLOUD_API_KEY",
-        "HF_TOKEN",
-        "OPENAI_API_KEY",
-        "AWS_SESSION_TOKEN",
-        "AWS_SHARED_CREDENTIALS_FILE",
-        "AZURE_CLIENT_SECRET",
-        "AZURE_CLIENT_ID",
-        "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
-        "CLOUDSDK_AUTH_ACCESS_TOKEN",
-        "OCI_CLI_KEY_FILE",
-    }
-)
-"""Variables Pi 1.4.0 reads a credential from, besides those ``_is_api_variable``
-matches by name. Collected from its help, its provider guide and its source."""
-
-LOCATION_ENVIRONMENT: Final = frozenset(
-    {
-        "AWS_EC2_METADATA_SERVICE_ENDPOINT",
-        "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE",
-        "AWS_LOGIN_CACHE_DIRECTORY",
-        "AWS_SHARED_CREDENTIALS_FILE",
-        "AZURE_OPENAI_BASE_URL",
-        "AZURE_OPENAI_ENDPOINT",
-        "AZURE_OPENAI_RESOURCE_NAME",
-        "CLOUDFLARE_ACCOUNT_ID",
-        "CLOUDFLARE_GATEWAY_ID",
-        "CLOUDSDK_CONFIG",
-        "GCE_METADATA_HOST",
-        "GCE_METADATA_IP",
-        "GCLOUD_PROJECT",
-        "GOOGLE_CLOUD_LOCATION",
-        "GOOGLE_CLOUD_PROJECT",
-        "GOOGLE_CLOUD_QUOTA_PROJECT",
-        "LLAMA_BASE_URL",
-    }
-)
-"""Variables Pi 1.4.0 reads that name an endpoint, a credential store or the account a
-credential belongs to. **Pi review, F5.** A subscription line's Pi starts without them,
-so the operator's environment cannot send a credential elsewhere or select a store
-other than the one ``pi auth check`` reports."""
+PROVIDER_CREDENTIALS: Final[dict[str, tuple[str, ...]]] = {
+    "openai": ("OPENAI_API_KEY",),
+}
+"""Credential variables available to metered Pi strategies, keyed by the provider
+named in the packaged driver's model. Add a provider only with its verified key
+names."""
 
 
 DROMON_CONTROLLED: Final = (
@@ -324,32 +266,24 @@ def unsupported(config: LineConfig) -> str | None:
     return None
 
 
-def _is_api_variable(name: str) -> bool:
-    return (
-        name in API_ENVIRONMENT
-        or name in LOCATION_ENVIRONMENT
-        or is_cloud_or_credential(name)
-    )
-
-
 def engine_environment(
-    environment: Mapping[str, str], strategy: Strategy
+    environment: Mapping[str, str], strategy: Strategy, provider: str
 ) -> dict[str, str]:
     """The environment Pi starts with, without Dromon's own variables and, for a
-    subscription, without any credential variable. Raises ``EngineRefused`` when it
-    would make Pi load its code from elsewhere."""
+    subscription, without any credential variable. A metered strategy receives only
+    the provider's explicitly allowlisted credential. Raises ``EngineRefused`` when
+    the environment would make Pi load its code from elsewhere."""
     present = [name for name in REFUSED_ENVIRONMENT if environment.get(name)]
     if present:
         raise EngineRefused(
             "the environment conflicts with a Pi line: " + ", ".join(present)
         )
-    names = (*BASE_ENVIRONMENT, *API_ENVIRONMENT, *LOCATION_ENVIRONMENT)
-    chosen = allowlisted(environment, names)
-    return {
-        k: v
-        for k, v in chosen.items()
-        if not (strategy is Strategy.SUBSCRIPTION and _is_api_variable(k))
-    }
+    credential_names = (
+        PROVIDER_CREDENTIALS.get(provider, ())
+        if strategy is not Strategy.SUBSCRIPTION
+        else ()
+    )
+    return allowlisted(environment, (*BASE_ENVIRONMENT, *credential_names))
 
 
 def check_agent_dir(agent_dir: Path) -> None:
@@ -560,11 +494,13 @@ async def check_sign_in(
     T3 Code review."""
     if driver.settings.engine != ENGINE_NAME:
         raise EngineRefused(f"{driver.settings.model} is not a Pi model")
+    provider = harness_model(driver.settings.model).partition("/")[0]
     started = engine_environment(
-        os.environ if environment is None else environment, driver.settings.strategy
+        os.environ if environment is None else environment,
+        driver.settings.strategy,
+        provider,
     )
     started.update(_quiet((Path.home() if home is None else home) / AGENT_DIR))
-    provider = harness_model(driver.settings.model).partition("/")[0]
     return await accepted_credential(driver, provider, started, auth_check)
 
 
@@ -715,13 +651,13 @@ class PiLine:
         if reason is not None:
             raise EngineRefused(reason)
         settings = self.driver.settings
-        environment = engine_environment(self._environment, settings.strategy)
+        model = harness_model(settings.model)
+        provider = model.partition("/")[0]
+        environment = engine_environment(self._environment, settings.strategy, provider)
         check_agent_dir(self.agent_dir)
         effort = self.config.effort or settings.effort
         if effort not in THINKING:
             raise EngineRefused(f"the driver names an unknown effort {effort!r}")
-        model = harness_model(settings.model)
-        provider = model.partition("/")[0]
         environment.update(_quiet(self.agent_dir))
         credential = await accepted_credential(
             self.driver, provider, environment, self._auth_check

@@ -53,6 +53,7 @@ from dromon.launcher import (
     relayable,
     sweep_launches,
     version_target,
+    version_environment,
     walk_gap,
     walk_unavailable,
     wrap,
@@ -68,7 +69,11 @@ HARNESS = (
     "names = sorted(k for k in os.environ if k.startswith('DROMON_'))\n"
     "sys.stdout.write(json.dumps({'stay': stay.pid, 'away': away.pid,"
     " 'unapproved': os.environ.get('DAEMON_ONLY_SENTINEL'),"
-    " 'names': names}) + '\\n')\n"
+    " 'names': names, 'engine_environment': {name: os.environ.get(name) for name in ("
+    "'ENABLE_TOOL_SEARCH', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_AGENT_SDK_VERSION',"
+    "'CLAUDE_CODE_SDK_READS_SESSION_STATE', "
+    "'CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING')}}"
+    ") + '\\n')\n"
     "sys.stdout.flush()\n"
 )
 """A harness that starts one child in its own group and one that leaves it, reports
@@ -347,11 +352,25 @@ def test_the_launcher_drops_daemon_variables_before_starting_its_command(
         tmp_path,
         HARNESS,
         StopPolicy.KILL_ALL,
-        extra_environment={"DAEMON_ONLY_SENTINEL": "must-not-reach-child"},
+        extra_environment={
+            "DAEMON_ONLY_SENTINEL": "must-not-reach-child",
+            "ENABLE_TOOL_SEARCH": "true",
+            "CLAUDE_CODE_ENTRYPOINT": "sdk-py",
+            "CLAUDE_AGENT_SDK_VERSION": "0.2.174",
+            "CLAUDE_CODE_SDK_READS_SESSION_STATE": "1",
+            "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING": "true",
+        },
         filter_environment=True,
     )
     started.append(launched)
     assert launched.record["unapproved"] is None
+    assert launched.record["engine_environment"] == {
+        "ENABLE_TOOL_SEARCH": "true",
+        "CLAUDE_CODE_ENTRYPOINT": "sdk-py",
+        "CLAUDE_AGENT_SDK_VERSION": "0.2.174",
+        "CLAUDE_CODE_SDK_READS_SESSION_STATE": "1",
+        "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING": "true",
+    }
 
 
 def test_a_stop_under_kill_all_ends_the_harness_and_its_group(
@@ -718,6 +737,21 @@ def test_a_version_query_without_a_target_names_the_sdk_s_claude_code(
 
     monkeypatch.setattr(launcher, "claude_command", missing)
     assert version_target(["-v"]) is None
+
+
+def test_a_version_query_receives_only_the_base_environment() -> None:
+    assert version_environment(
+        {
+            "PATH": "/bin",
+            "HOME": "/home/line",
+            "ANTHROPIC_API_KEY": "must-not-reach-cli",
+            "DAEMON_ONLY_SENTINEL": "must-not-reach-cli",
+        }
+    ) == {
+        "PATH": "/bin",
+        "HOME": "/home/line",
+        "ENABLE_TOOL_SEARCH": "true",
+    }
 
 
 # Item 7 of the live check of 2026-10-26, a harness that ends its own work.

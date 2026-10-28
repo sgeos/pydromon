@@ -222,6 +222,8 @@ def test_options_follow_the_driver_and_isolate_the_line() -> None:
     assert options.allowed_tools == []
     assert options.resume is None
     assert options.cwd == "/work"
+    assert options.env is not None
+    assert options.env["ENABLE_TOOL_SEARCH"] == "true"
 
 
 def test_the_claude_code_adapter_refuses_a_driver_for_another_engine() -> None:
