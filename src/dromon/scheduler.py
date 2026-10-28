@@ -1037,6 +1037,7 @@ def engine_factory(
     line_socket: Path | None = None,
     accept_partial_isolation: bool = False,
     accept_unverified_credential: bool = False,
+    line_secrets: Mapping[str, Sequence[str]] | None = None,
 ) -> EngineFactory:
     """The production factory: each line on its packaged driver's engine.
 
@@ -1228,6 +1229,7 @@ def engine_factory(
             ceiling_reached=spec.ceiling_reached,
             ceiling_settled=spec.ceiling_settled,
             consent_asked=spec.consent_asked,
+            secret_names=lambda: tuple((line_secrets or {}).get(spec.line_id, ())),
         )
 
     return build

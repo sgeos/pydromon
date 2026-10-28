@@ -91,12 +91,12 @@ from dromon.jsonlines import (
     Connection,
     ConnectionFactory,
     NotJsonLine,
-    is_cloud_or_credential,
     json_lines_factory,
 )
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
 from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
+from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 
 ENGINE_NAME: Final = "antigravity"
 """The engine this adapter runs, as drivers name it."""
@@ -352,13 +352,7 @@ def engine_environment(
             "Antigravity lines support only the subscription strategy, because Dromon"
             " chooses the runtime's Google account sign-in and refuses its key methods"
         )
-    return {
-        k: v
-        for k, v in environment.items()
-        if not k.upper().startswith(CREDENTIAL_PREFIXES)
-        and not is_cloud_or_credential(k.upper())
-        and k not in DROMON_CONTROLLED
-    }
+    return allowlisted(environment, BASE_ENVIRONMENT)
 
 
 @dataclass(frozen=True, slots=True)

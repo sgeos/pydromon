@@ -456,7 +456,13 @@ def test_the_engine_expands_references_from_its_environment() -> None:
         {"s": {"type": "http", "url": "https://x", "headers": {"A": "${T}"}}}
     )
     config = LineConfig(mcp_servers=servers)
-    target = ClaudeCodeLine(driver(), ROOT, config=config, environment={"T": "v"})
+    target = ClaudeCodeLine(
+        driver(),
+        ROOT,
+        config=config,
+        environment={"T": "v"},
+        secret_names=("T",),
+    )
     assert target.options().mcp_servers == {
         "s": {"type": "http", "url": "https://x", "headers": {"A": "v"}}
     }

@@ -127,6 +127,7 @@ from pathlib import Path
 from typing import Final, cast
 
 from dromon.processes import MARK_VARIABLE, TreeRow, descendants, tree_or_reason
+from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 
 
 class StopPolicy(StrEnum):
@@ -145,6 +146,7 @@ daemon's side of the launch. The harness never sees it."""
 TARGET_VARIABLE: Final = "DROMON_LAUNCH_TARGET"
 PARENT_VARIABLE: Final = "DROMON_LAUNCH_PARENT"
 REPORT_VARIABLE: Final = "DROMON_LAUNCH_REPORT"
+FILTER_ENVIRONMENT_VARIABLE: Final = "DROMON_LAUNCH_FILTER_ENVIRONMENT"
 LAUNCH_MARK_VARIABLE: Final = "DROMON_LAUNCH_MARK"
 """The line's process mark for the launcher alone, for a harness that must not carry
 the mark itself, as Codex does not. A report names its line by the mark."""
@@ -153,6 +155,7 @@ LAUNCH_VARIABLES: Final = (
     TARGET_VARIABLE,
     PARENT_VARIABLE,
     REPORT_VARIABLE,
+    FILTER_ENVIRONMENT_VARIABLE,
     LAUNCH_MARK_VARIABLE,
 )
 """Variables for the launcher alone, removed before the harness starts."""
@@ -1287,7 +1290,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parent = int(parent_text) if parent_text.isdigit() else os.getppid()
     report = os.environ.get(REPORT_VARIABLE) or None
     mark = os.environ.get(LAUNCH_MARK_VARIABLE) or os.environ.get(MARK_VARIABLE)
-    environment = {k: v for k, v in os.environ.items() if k not in LAUNCH_VARIABLES}
+    if os.environ.get(FILTER_ENVIRONMENT_VARIABLE) == "1":
+        environment = allowlisted(os.environ, (*BASE_ENVIRONMENT, MARK_VARIABLE))
+    else:
+        environment = {k: v for k, v in os.environ.items() if k not in LAUNCH_VARIABLES}
     with contextlib.suppress(OSError):
         # Fails when the launcher already leads a session, as when the daemon
         # started it with a session of its own, which serves as well.

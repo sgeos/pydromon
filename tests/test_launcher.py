@@ -67,6 +67,7 @@ HARNESS = (
     "away = subprocess.Popen(['/bin/sleep', '60'], start_new_session=True)\n"
     "names = sorted(k for k in os.environ if k.startswith('DROMON_'))\n"
     "sys.stdout.write(json.dumps({'stay': stay.pid, 'away': away.pid,"
+    " 'unapproved': os.environ.get('DAEMON_ONLY_SENTINEL'),"
     " 'names': names}) + '\\n')\n"
     "sys.stdout.flush()\n"
 )
@@ -145,6 +146,8 @@ class Launched:
         report: Path | None = None,
         stdin: int = subprocess.DEVNULL,
         path: str = "/bin:/usr/bin",
+        extra_environment: dict[str, str] | None = None,
+        filter_environment: bool = False,
     ) -> None:
         script = tmp_path / "harness"
         script.write_text(f"#!{sys.executable}\n{body}")
@@ -159,6 +162,9 @@ class Launched:
         }
         if report is not None:
             environment[REPORT_VARIABLE] = str(report)
+        if filter_environment:
+            environment[launcher.FILTER_ENVIRONMENT_VARIABLE] = "1"
+        environment.update(extra_environment or {})
         self.process = subprocess.Popen(  # noqa: S603
             [sys.executable, "-I", "-m", "dromon.launcher"],
             env=environment,
@@ -332,6 +338,20 @@ def test_the_harness_sees_no_launch_variable_but_its_mark(
     started.append(launched)
     assert launched.record["names"] == [MARK_VARIABLE]
     assert not set(LAUNCH_VARIABLES) & set(launched.record["names"])  # type: ignore[arg-type]
+
+
+def test_the_launcher_drops_daemon_variables_before_starting_its_command(
+    tmp_path: Path, started: list[Launched]
+) -> None:
+    launched = Launched(
+        tmp_path,
+        HARNESS,
+        StopPolicy.KILL_ALL,
+        extra_environment={"DAEMON_ONLY_SENTINEL": "must-not-reach-child"},
+        filter_environment=True,
+    )
+    started.append(launched)
+    assert launched.record["unapproved"] is None
 
 
 def test_a_stop_under_kill_all_ends_the_harness_and_its_group(

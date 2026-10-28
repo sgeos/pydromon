@@ -24,6 +24,7 @@ operator can tell a limit of the engine from a gap in what Dromon has observed.
 | `max_turns` | yes | yes | no | no | no | no | Model calls in a turn are bounded, by the engine or by Dromon's count |
 | `credential_visible` | yes | yes | yes | yes | unknown | no | Dromon can tell which credential a turn uses |
 | `sign_in_check` | unknown | unknown | unknown | unknown | unknown | unknown | The engine can check its sign-in without a turn |
+| `mcp_http_sse_headers` | yes | no | no | no | no | no | Dromon's adapter accepts HTTP or SSE MCP servers with headers |
 
 **Pi was never run live.** Review of 2026-10-27, finding C1, by the operator's
 decision. Its table once said `yes` for `own_tools`, `deny_before_run` and
@@ -95,6 +96,34 @@ refused write recorded in `CODEX.md`.
 **Unknown is not empty.** A Claude Code `init` message without a list of tools was
 read as an empty list, which passed the check that the engine offers no tool the line
 was not given. Such a report is now unknown, and refuses the turn.
+
+## Engine process environments
+
+Each engine process starts with an explicit allowlist. The shared operating-system
+entries are `PATH` for command lookup, `HOME` for the engine's designated home,
+`LANG` for locale, `TERM` for terminal behavior, and `TMPDIR` for temporary files.
+Missing entries remain missing. Each adapter adds only the engine-specific names below.
+Adapter-created Dromon values such as a line token, process mark, profile path or
+temporary home are added at the point that needs them. Launcher control variables are
+removed before its child starts.
+
+| Adapter | Additional inherited entries | Scope |
+|---|---|---|
+| Claude Code | `DROMON_LINE_MARK` | Process tracking only. The launcher's target, parent, report and stop-policy entries are control data and are removed. |
+| Codex | `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, `XDG_CACHE_HOME` | Credentials are allowed only for `api` and `flexible` strategies. Subscription lines omit them. Dromon uses a supplied cache path or sets its private cache directory. |
+| Pi | `AI_GATEWAY_API_KEY`, `ANT_LING_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_IDENTITY_TOKEN_FILE`, `ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_ORGANIZATION_ID`, `ANTHROPIC_SERVICE_ACCOUNT_ID`, `ANTHROPIC_WORKSPACE_ID`, `AWS_ACCESS_KEY_ID`, `AWS_BEARER_TOKEN_BEDROCK`, `AWS_CONTAINER_CREDENTIALS_FULL_URI`, `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, `AWS_PROFILE`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_WEB_IDENTITY_TOKEN_FILE`, `AZURE_OPENAI_API_KEY`, `CLOUDFLARE_API_KEY`, `COPILOT_GITHUB_TOKEN`, `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_API_KEY`, `HF_TOKEN`, `OPENAI_API_KEY`, `AWS_SHARED_CREDENTIALS_FILE`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `ALIBABA_CLOUD_ACCESS_KEY_SECRET`, `CLOUDSDK_AUTH_ACCESS_TOKEN`, `OCI_CLI_KEY_FILE`, `AWS_EC2_METADATA_SERVICE_ENDPOINT`, `AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE`, `AWS_LOGIN_CACHE_DIRECTORY`, `AZURE_OPENAI_BASE_URL`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_RESOURCE_NAME`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_GATEWAY_ID`, `CLOUDSDK_CONFIG`, `GCE_METADATA_HOST`, `GCE_METADATA_IP`, `GCLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_QUOTA_PROJECT`, `LLAMA_BASE_URL` | These are the provider credential and endpoint names Pi documents. Subscription lines omit credentials and endpoint selectors. Dromon's Pi directory, bridge and tool values are set separately. |
+| Cursor Agent | `CURSOR_API_KEY`, `CURSOR_AUTH_TOKEN`, `CURSOR_AUTH_TOKEN_EXPIRES_AT` | Only for metered strategies. Subscription lines omit them. Dromon sets the config and data directories separately. |
+| Grok Build | `GROK_CLAUDE_MCPS_ENABLED`, `GROK_CURSOR_MCPS_ENABLED`, `GROK_CLAUDE_HOOKS_ENABLED`, `GROK_CURSOR_HOOKS_ENABLED` | Dromon sets these compatibility switches to disable scans of unrelated harness configuration. Its Grok home and sandbox are set separately. |
+| Antigravity | none | Runtime path, isolated home, profile and temporary directory are set separately by Dromon. |
+
+The adapter tables intentionally exclude every other daemon variable, including
+unrecognized credential variables and endpoint overrides. MCP `${NAME}` expansion is
+a separate path. The project file grants names per line, and Dromon resolves only those
+names into that line's MCP configuration, never into the engine environment.
+
+The adapter accepts HTTP or Server-Sent Events MCP headers only for Claude Code, which
+is reflected by `mcp_http_sse_headers` in the capability report. Other adapters refuse
+custom MCP server configuration.
 
 ## Minimum versions
 

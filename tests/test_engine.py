@@ -418,12 +418,19 @@ def test_the_gate_allows_exactly_the_given_tools() -> None:
 GITHUB = McpServer("stdio", command="gh-mcp")
 
 
-def configured(config: LineConfig, session: Scripted) -> ClaudeCodeLine:
+def configured(
+    config: LineConfig,
+    session: Scripted,
+    *,
+    environment: Mapping[str, str] | None = None,
+    secret_names: tuple[str, ...] = (),
+) -> ClaudeCodeLine:
     return ClaudeCodeLine(
         Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
         Path("/work"),
         config=config,
-        environment={},
+        environment=environment or {},
+        secret_names=secret_names,
         session_factory=session.factory,
     )
 
@@ -436,6 +443,66 @@ def test_configured_servers_and_built_in_tools_reach_the_engine() -> None:
     assert options.tools == ["Read"]
     assert options.mcp_servers == {"github": {"type": "stdio", "command": "gh-mcp"}}
     assert options.strict_mcp_config is True
+
+
+def test_mcp_secret_resolution_is_scoped_to_the_line_grant() -> None:
+    config = LineConfig(
+        mcp_servers=(
+            (
+                "docs",
+                McpServer(
+                    "http",
+                    url="https://docs.example/mcp",
+                    headers=(("Authorization", "Bearer ${LINE_A_TOKEN}"),),
+                ),
+            ),
+        )
+    )
+    session = Scripted([init(), result()])
+    run(
+        configured(
+            config,
+            session,
+            environment={"LINE_A_TOKEN": "a-secret", "LINE_B_TOKEN": "b-secret"},
+            secret_names=("LINE_A_TOKEN",),
+        )
+    )
+    options = session.options[0]
+    assert options.mcp_servers == {
+        "docs": {
+            "type": "http",
+            "url": "https://docs.example/mcp",
+            "headers": {"Authorization": "Bearer a-secret"},
+        }
+    }
+    assert "LINE_A_TOKEN" not in options.env
+    assert "LINE_B_TOKEN" not in options.env
+
+
+def test_a_line_cannot_resolve_another_lines_secret() -> None:
+    config = LineConfig(
+        mcp_servers=(
+            (
+                "docs",
+                McpServer(
+                    "http",
+                    url="https://docs.example/mcp",
+                    headers=(("Authorization", "Bearer ${LINE_B_TOKEN}"),),
+                ),
+            ),
+        )
+    )
+    session = Scripted([])
+    with pytest.raises(EngineRefused, match="does not set LINE_B_TOKEN"):
+        run(
+            configured(
+                config,
+                session,
+                environment={"LINE_A_TOKEN": "a-secret", "LINE_B_TOKEN": "b-secret"},
+                secret_names=("LINE_A_TOKEN",),
+            )
+        )
+    assert session.options == []
 
 
 def test_inheriting_the_account_turns_off_strict_mcp_and_accepts_its_tools() -> None:

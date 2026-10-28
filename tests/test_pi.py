@@ -605,7 +605,15 @@ def test_the_environment_carries_the_agent_directory_tools_and_token(
     home: Path,
 ) -> None:
     server = FakePi()
-    target = line(server, home, environment={"PATH": "/usr/bin", "OPENAI_API_KEY": "k"})
+    target = line(
+        server,
+        home,
+        environment={
+            "PATH": "/usr/bin",
+            "OPENAI_API_KEY": "k",
+            "DAEMON_ONLY_SENTINEL": "not-allowlisted",
+        },
+    )
     target.mark = "alpha.mark"
     run(target)
     env = server.environment
@@ -615,6 +623,7 @@ def test_the_environment_carries_the_agent_directory_tools_and_token(
     assert env["DROMON_LINE_TOKEN"] == "tok"  # noqa: S105, a test token
     assert env["DROMON_LINE_MARK"] == "alpha.mark"
     assert "OPENAI_API_KEY" not in env
+    assert "DAEMON_ONLY_SENTINEL" not in env
     assert server.arguments[server.arguments.index("--tools") + 1] == OWN
 
 

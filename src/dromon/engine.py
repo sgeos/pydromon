@@ -42,8 +42,9 @@ the gate sees it, and an allow rule approves one without the gate, within the to
 the configuration offers. Fact, verified on 2026-10-25 with Claude Haiku 5.5: with
 ``setting_sources=[]`` a deny rule refused a Bash call, and a ``UserPromptSubmit`` hook
 ran, saw a variable from ``env``, and its output reached the model. MCP server
-references such as ``${TOKEN}`` are replaced from the daemon's environment here, at the
-start of each turn, so the stored configuration holds only the reference.
+references such as ``${TOKEN}`` are replaced from names granted by the project file
+here, at the start of each turn, so the stored configuration holds only the reference
+and the secret never enters the engine process environment.
 
 Project settings. With ``project_settings`` a line also loads Claude Code's
 ``project`` setting source, which the SDK documents as ``.claude/settings.json`` under
@@ -1805,6 +1806,7 @@ def launch_environment(
     the pinned tool search, the line's process mark, and what its launcher needs."""
     environment = {TOOL_SEARCH_VARIABLE: TOOL_SEARCH_PINNED}
     environment.update(launcher.launch_environment(claude_cli(), stop_policy))
+    environment[launcher.FILTER_ENVIRONMENT_VARIABLE] = "1"
     if mark is not None:
         environment[MARK_VARIABLE] = mark
     return environment
@@ -1844,6 +1846,7 @@ class ClaudeCodeLine:
         ceiling_reached: Ask = no_operator,
         ceiling_settled: Settle = nothing_to_settle,
         consent_asked: Callable[[str], object] = no_consent_question,
+        secret_names: Callable[[], Sequence[str]] | Sequence[str] = (),
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -1858,6 +1861,9 @@ class ClaudeCodeLine:
         self.sandbox = None if sandbox is None else dict(sandbox)
         self.settings = None if settings is None else dict(settings)
         self._environment = os.environ if environment is None else environment
+        self._secret_names = (
+            secret_names if callable(secret_names) else lambda: tuple(secret_names)
+        )
         self._session_factory = session_factory
         self._observe = observe
         self.mark = mark
@@ -1919,9 +1925,14 @@ class ClaudeCodeLine:
         if effort not in ("low", "medium", "high", "xhigh", "max"):
             raise EngineRefused(f"the driver names an unknown effort {effort!r}")
         servers: dict[str, McpSdkServerConfig | dict[str, object]] = {}
+        mcp_environment = {
+            name: self._environment[name]
+            for name in self._secret_names()
+            if name in self._environment
+        }
         for name, server in self.config.mcp_servers:
             try:
-                servers[name] = server.sdk_config(self._environment)
+                servers[name] = server.sdk_config(mcp_environment)
             except ConfigError as error:
                 raise EngineRefused(
                     f"the MCP server {name} cannot start: {error}"

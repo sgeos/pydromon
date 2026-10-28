@@ -69,6 +69,7 @@ from dromon.jsonlines import (
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
 from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
+from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 
 ENGINE_NAME: Final = "pi"
 """The engine this adapter runs, as drivers name it."""
@@ -119,7 +120,6 @@ API_ENVIRONMENT: Final = frozenset(
         "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
         "AWS_PROFILE",
         "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
         "AWS_WEB_IDENTITY_TOKEN_FILE",
         "AZURE_OPENAI_API_KEY",
         "CLOUDFLARE_API_KEY",
@@ -127,6 +127,14 @@ API_ENVIRONMENT: Final = frozenset(
         "GOOGLE_APPLICATION_CREDENTIALS",
         "GOOGLE_CLOUD_API_KEY",
         "HF_TOKEN",
+        "OPENAI_API_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AZURE_CLIENT_SECRET",
+        "AZURE_CLIENT_ID",
+        "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
+        "CLOUDSDK_AUTH_ACCESS_TOKEN",
+        "OCI_CLI_KEY_FILE",
     }
 )
 """Variables Pi 1.4.0 reads a credential from, besides those ``_is_api_variable``
@@ -137,6 +145,7 @@ LOCATION_ENVIRONMENT: Final = frozenset(
         "AWS_EC2_METADATA_SERVICE_ENDPOINT",
         "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE",
         "AWS_LOGIN_CACHE_DIRECTORY",
+        "AWS_SHARED_CREDENTIALS_FILE",
         "AZURE_OPENAI_BASE_URL",
         "AZURE_OPENAI_ENDPOINT",
         "AZURE_OPENAI_RESOURCE_NAME",
@@ -334,12 +343,12 @@ def engine_environment(
         raise EngineRefused(
             "the environment conflicts with a Pi line: " + ", ".join(present)
         )
-    removed = set(DROMON_CONTROLLED)
+    names = (*BASE_ENVIRONMENT, *API_ENVIRONMENT, *LOCATION_ENVIRONMENT)
+    chosen = allowlisted(environment, names)
     return {
         k: v
-        for k, v in environment.items()
-        if k not in removed
-        and not (strategy is Strategy.SUBSCRIPTION and _is_api_variable(k))
+        for k, v in chosen.items()
+        if not (strategy is Strategy.SUBSCRIPTION and _is_api_variable(k))
     }
 
 
