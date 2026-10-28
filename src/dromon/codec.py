@@ -76,8 +76,10 @@ from dromon.model import (
     LocalAddress,
     RemoteAddress,
     ReturnCode,
+    Sender,
     parse_address,
     parse_any_address,
+    parse_sender,
 )
 
 FORMAT_VERSION: Final = 1
@@ -552,7 +554,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
         case "message_sent":
             return MessageSent(
                 _str(data, "message_id"),
-                _any_address(data, "sender"),
+                _sender(data, "sender"),
                 _any_address(data, "recipient"),
                 _member(data, "kind", MessageKind),
                 _str(data, "body"),
@@ -763,6 +765,12 @@ def _address(data: dict[str, object], name: str) -> LocalAddress:
 
 def _any_address(data: dict[str, object], name: str) -> Address:
     return parse_any_address(_str(data, name))
+
+
+def _sender(data: dict[str, object], name: str) -> Sender:
+    """A sender as the log records it, which may be the harness. The log is the
+    daemon's own, so this is the one decoding that may construct the harness."""
+    return parse_sender(_str(data, name))
 
 
 def _remote_address(data: dict[str, object], name: str) -> RemoteAddress:

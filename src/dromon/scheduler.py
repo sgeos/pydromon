@@ -98,6 +98,7 @@ import contextlib
 import secrets
 import time
 import sys
+import traceback
 from datetime import UTC, datetime, timedelta
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -126,7 +127,7 @@ from dromon.driver import ENGINE_OF, MODELS, Driver, DriverError, Strategy
 from dromon import priority, restart
 from dromon.priority import PriorityLimiter, PriorityRefused, peer_key
 from dromon.federation import NO_FEDERATION, FederationConfig
-from dromon.forwarder import PeerReport, check_outbound
+from dromon.forwarder import PeerReport, check_outbound, outage_text
 from dromon.peering import PeerPriority, PeerTurns, Received, TurnCause, turn_cause
 from dromon import acp, antigravity, codex, cursor, grok, pi
 from dromon.agents import LineTokens
@@ -223,6 +224,7 @@ from dromon.model import (
     FailoverPolicy,
     check_instant,
     Address,
+    Sender,
     BudgetSource,
     BudgetStated,
     RoleNoted,
@@ -230,6 +232,8 @@ from dromon.model import (
     OwnershipChanged,
     OwnershipCause,
     EventRejected,
+    HARNESS,
+    HarnessAddress,
     InvalidField,
     LineAddress,
     LineConfigured,
@@ -408,6 +412,11 @@ MIN_RATE_SECONDS: Final = 60
 
 MAX_SCRATCH_BYTES: Final = 256 * 1024
 SCRATCH_DIRECTORY: Final = "tmp"
+
+FIRST_FAULT_PAUSE_SECONDS: Final = 1.0
+MAX_FAULT_PAUSE_SECONDS: Final = 60.0
+"""The scheduler's pause after a fault doubles from 1 second to 1 minute. Shorter than
+the forwarder's backoff, since every line waits on the scheduler."""
 
 LINE_STATUS_TOOL_NAME: Final = "line_status"
 MAX_LINE_STATUS_DEFAULT_BYTES: Final = 8192
@@ -1452,6 +1461,11 @@ class Scheduler:
         """Told each peer and message that joins its outbox, so its forwarder wakes.
         The daemon sets it to its forwarder's."""
         self.peer_reports: Callable[[], list[PeerReport]] = list
+        self.fault: str | None = None
+        """The scheduler's last unexpected exception, until a tick completes."""
+        self.faults = 0
+        """Unexpected exceptions in the scheduler since the daemon started."""
+        self._fault_pause = 0.0
         """Each peer's delivery, which the daemon sets to its forwarder's."""
         """Each peer's turns per local line in the last hour, in memory, so a restart
         gives each peer a fresh allowance. Decision 10 of the federation design."""
@@ -1596,7 +1610,7 @@ class Scheduler:
 
     def send(
         self,
-        sender: Address,
+        sender: Sender,
         recipient: Address,
         body: str,
         reply_to: str | None = None,
@@ -1608,7 +1622,10 @@ class Scheduler:
         Priority mail is also marked ``message_prioritized``, and asks the
         recipient's running turn to end at its next safe point. Raises
         ``EventRejected`` for priority mail ``check_priority`` refuses, recording
-        nothing. A crash between the two appends leaves an ordinary note."""
+        nothing. A crash between the two appends leaves an ordinary note. The
+        harness sends only ordinary notes to this daemon's own parties."""
+        if isinstance(sender, HarnessAddress):
+            return self._harness_note(recipient, body)
         if isinstance(recipient, RemoteAddress):
             check_outbound(
                 self._log.state,
@@ -1673,6 +1690,22 @@ class Scheduler:
                 self._answer_ceiling(recipient.line_id, reply_to, body)
         if isinstance(recipient, LineAddress):
             self._failed.discard(recipient.line_id)
+        self._work.set()
+        return message_id
+
+    def _harness_note(self, recipient: Address, body: str) -> str:
+        """Record a note from the harness to ``recipient``, a line or an operator,
+        which the model checks. It is delivered in a later tick, and to a line it
+        counts as autonomous mail, as a line's note to itself does."""
+        message_id = new_id("m")
+        sent_at = self._wall_clock()
+        self._log.append(
+            MessageSent(message_id, HARNESS, recipient, MessageKind.NOTE, body)
+        )
+        if isinstance(recipient, LineAddress):
+            self._remember(message_id, HARNESS, recipient, body, sent_at)
+            self._failed.discard(recipient.line_id)
+        self._sent.append(message_id)
         self._work.set()
         return message_id
 
@@ -1746,6 +1779,14 @@ class Scheduler:
         note_id = self._owed_note(message_id)
         self._log.append(MessageUnconfirmed(message_id, note_id))
         self._noted(note_id)
+
+    def outage(self, report: PeerReport) -> None:
+        """Tell the default operator, in a note from the harness, that ``report``'s
+        peer has held its oldest message for an hour. The forwarder sends one for
+        each outage, which ends when the peer accepts mail again."""
+        operator = self._default_operator
+        self.ensure_operator(operator.operator_id)
+        self.send(HARNESS, operator, outage_text(report))
 
     def _owed_note(self, message_id: str) -> str | None:
         message = self._log.state.messages.get(message_id)
@@ -2097,6 +2138,9 @@ class Scheduler:
         question = self._log.state.messages.get(question_id)
         if question is None or question.kind is not MessageKind.QUESTION:
             raise EventRejected(f"no question {question_id}")
+        if isinstance(question.sender, HarnessAddress):
+            # The model lets only a line ask, so this guards the type alone.
+            raise EventRejected(f"question {question_id} has no asker to answer")
         return self.send(operator, question.sender, body, reply_to=question_id)
 
     def questions(self, operator: OperatorAddress | None) -> list[tuple[str, Message]]:
@@ -2758,7 +2802,7 @@ class Scheduler:
     def _remember(
         self,
         message_id: str,
-        sender: Address,
+        sender: Sender,
         recipient: Address,
         body: str,
         sent_at: datetime,
@@ -3609,7 +3653,7 @@ class Scheduler:
         ):
             self.awaken(plan.owner)
             self.send(
-                LineAddress(plan.previous),
+                HARNESS,
                 LineAddress(plan.owner),
                 f"Line {plan.previous} handed role {plan.role_id} to you, with handoff"
                 f" entry {plan.entry_id}. You own the role from this turn. Read the"
@@ -3822,10 +3866,9 @@ class Scheduler:
             f"Role {role_id} passed by failover from {owner} to {to}, because"
             f" {ground}, with entry {plan.entry_id}."
         )
-        address = LineAddress(to)
         self.send(
-            address,
-            address,
+            HARNESS,
+            LineAddress(to),
             f"Dromon passed role {role_id} to you by failover, because {ground}."
             " You own it from your next turn, which leads with the recovery"
             " checklist. Follow it before you change anything.",
@@ -3835,18 +3878,17 @@ class Scheduler:
 
     def _tell_operator(self, line_id: str, body: str) -> None:
         """Tell the operator who last wrote to ``line_id`` what the harness did to
-        its role, in a note recorded as from ``line_id``, as a hold's question is,
-        since the log has no address for the harness itself."""
+        its role, in a note from the harness, which wrote it."""
         operator = self.last_operator(line_id) or self._default_operator
         self.ensure_operator(operator.operator_id)
-        self.send(LineAddress(line_id), operator, body)
+        self.send(HARNESS, operator, body)
 
     def _ask_to_prepare_handoff(self, role_id: str, budget: BudgetStated) -> str | None:
-        """Ask ``role_id``'s owner, in a note to itself, to prepare a handoff to the
-        next usable seat, when ``budget`` is below the role's threshold, and say so.
-        ``None`` when the budget does not ask for one. A note to itself is how the
-        harness wakes a line without claiming an operator's or another line's
-        authority, as a scheduled wake does."""
+        """Ask ``role_id``'s owner, in a note from the harness, to prepare a handoff
+        to the next usable seat, when ``budget`` is below the role's threshold, and
+        say so. ``None`` when the budget does not ask for one. A note from the harness
+        wakes a line as autonomous mail, without claiming an operator's or another
+        line's authority."""
         role = self._log.state.roles[role_id]
         if role.owner is None or not below_handoff_threshold(role, budget):
             return None
@@ -3861,10 +3903,9 @@ class Scheduler:
                 f"Role {role_id}'s owner {role.owner} was not asked to prepare a"
                 f" handoff, though {stated}, since no other seat is usable."
             )
-        address = LineAddress(role.owner)
         self.send(
-            address,
-            address,
+            HARNESS,
+            LineAddress(role.owner),
             f"Dromon asks you to prepare a handoff of role {role_id} to {to}, since"
             f" {stated}. Leave the work in order and run the gate, then call"
             f" relinquish_ownership with to set to {to} and a handoff note."
@@ -5056,11 +5097,19 @@ class Scheduler:
         self._sent.clear()
 
     async def run(self, stop: asyncio.Event) -> None:
-        """Run ticks while there is work, until ``stop`` is set."""
+        """Run ticks while there is work, until ``stop`` is set. A tick or a sweep
+        that raises is a fault, which ``_fault_found`` reports before the loop goes
+        on, so the scheduler neither dies nor spins."""
         try:
             while not stop.is_set():
                 if self._work_waiting():
-                    self.step()
+                    try:
+                        self.step()
+                    except Exception as error:  # noqa: BLE001
+                        await self._fault_found(error, stop)
+                        continue
+                    self._fault_pause = 0.0
+                    self.fault = None
                     if self._tick_seconds:
                         with contextlib.suppress(TimeoutError):
                             await asyncio.wait_for(stop.wait(), self._tick_seconds)
@@ -5070,7 +5119,11 @@ class Scheduler:
                 self._work.clear()
                 # Each rest, at most MAX_REST_SECONDS apart, also sweeps the launch
                 # records of launchers that exited between turns. Review N1.
-                self.collect_left()
+                try:
+                    self.collect_left()
+                except Exception as error:  # noqa: BLE001
+                    await self._fault_found(error, stop)
+                    continue
                 worker = asyncio.create_task(self._work.wait())
                 stopping = asyncio.create_task(stop.wait())
                 # Rest until work arrives, or until the next scheduled wake falls due.
@@ -5090,6 +5143,39 @@ class Scheduler:
             if self._running:
                 await asyncio.gather(*self._running.values(), return_exceptions=True)
             await self.close_engines()
+
+    async def _fault_found(self, error: Exception, stop: asyncio.Event) -> None:
+        """The watch, as the forwarder has one. An exception that no rule expects is
+        a fault in the scheduler. It is written to standard error with its traceback
+        and kept in ``fault`` until a tick completes, and the scheduler pauses, from
+        ``FIRST_FAULT_PAUSE_SECONDS`` doubling to ``MAX_FAULT_PAUSE_SECONDS``, so it
+        neither dies, which would leave every line waiting unseen until shutdown, nor
+        spins on a fault that recurs.
+
+        Assumption. A tick appends each event whole, so a fault between two appends
+        leaves the log consistent, and the next tick works from it as a restart
+        would. A fault that recurs on every tick holds every line, and ``status``
+        shows it to the operator."""
+        self.fault = f"{type(error).__name__}: {error}"
+        self.faults += 1
+        self._fault_pause = (
+            FIRST_FAULT_PAUSE_SECONDS
+            if self._fault_pause == 0
+            else min(self._fault_pause * 2, MAX_FAULT_PAUSE_SECONDS)
+        )
+        trace = "".join(traceback.format_exception(error)).rstrip()
+        print(
+            f"dromond: the scheduler failed unexpectedly, fault {self.faults}, and"
+            f" pauses {self._fault_pause:g} seconds\n{trace}",
+            file=sys.stderr,
+        )
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), self._fault_pause)
+
+    def fault_status(self) -> dict[str, object]:
+        """The scheduler's watch as the operator's ``status`` shows it. A line's
+        ``line_status`` leaves it out, since the fault's text may name a path."""
+        return {"fault": self.fault, "faults": self.faults}
 
     async def idle(self) -> None:
         """Wait until nothing is in flight and no tick would start a turn. For tests."""

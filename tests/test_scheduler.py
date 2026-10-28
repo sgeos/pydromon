@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
+from dromon import scheduler as scheduler_module
 from dromon.activity import ActivityKind
 from dromon.driver import DriverError, Strategy
 from dromon.engine import EnginePlanLimit, TurnReport
@@ -1378,3 +1379,60 @@ def test_project_values_change_while_running(make_world: MakeWorld) -> None:
         scheduler.set_project(DEFAULT_LIMITS, "ben", 0.5, 0)
     with pytest.raises(ValueError, match="tick_seconds"):
         scheduler.set_project(DEFAULT_LIMITS, "ben", 99.0, 1)
+
+
+class Faulty(Exception):
+    """An exception no rule of the scheduler expects."""
+
+
+def test_the_watch_keeps_a_faulty_scheduler_running(
+    make_world: MakeWorld,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(scheduler_module, "FIRST_FAULT_PAUSE_SECONDS", 0.0)
+    world = make_world({"alpha": [[]]})
+    original = world.scheduler.step
+    raised: list[int] = []
+
+    def broken() -> None:
+        if not raised:
+            raised.append(1)
+            raise Faulty("a bug in a tick")
+        original()
+
+    monkeypatch.setattr(world.scheduler, "step", broken)
+    run(world, send(world, "alpha", "hello"))
+    # The tick after the fault ran the turn, and its completion cleared the fault.
+    assert raised == [1] and "alpha" in world.engines
+    assert world.scheduler.fault_status() == {"fault": None, "faults": 1}
+    err = capsys.readouterr().err
+    assert "the scheduler failed unexpectedly, fault 1" in err
+    assert "Traceback" in err and "a bug in a tick" in err
+
+
+def test_the_schedulers_pause_doubles_to_its_bound(make_world: MakeWorld) -> None:
+    world = make_world({})
+
+    async def pauses() -> list[float]:
+        stop = asyncio.Event()
+        stop.set()
+        found: list[float] = []
+        for _ in range(8):
+            await world.scheduler._fault_found(Faulty("x"), stop)  # pyright: ignore[reportPrivateUsage]
+            found.append(world.scheduler._fault_pause)  # pyright: ignore[reportPrivateUsage]
+        return found
+
+    assert asyncio.run(pauses()) == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0]
+    assert scheduler_module.MAX_FAULT_PAUSE_SECONDS == 60.0
+    assert world.scheduler.fault_status() == {"fault": "Faulty: x", "faults": 8}
+
+
+def test_dromon_status_prints_the_schedulers_fault_only_while_it_lasts() -> None:
+    from dromon import cli
+
+    row = cli._scheduler_row  # pyright: ignore[reportPrivateUsage]
+    assert row({"fault": None, "faults": 3}) is None
+    assert row({"fault": "Faulty: x", "faults": 3}) == (
+        "scheduler fault Faulty: x, 3 since the daemon started"
+    )

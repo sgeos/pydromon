@@ -17,6 +17,8 @@ from dromon.engine import EnginePlanLimit, TurnReport, rejected_limit
 from dromon.eventlog import EventLog
 from dromon.model import (
     DEFAULT_HANDOFF_BELOW_PERCENT,
+    HARNESS,
+    HarnessAddress,
     BudgetSource,
     BudgetStated,
     EventRejected,
@@ -118,13 +120,17 @@ class World:
     def owner(self) -> str | None:
         return self.log.state.roles["core"].owner
 
-    def mail(self, sender: str, recipient: str | OperatorAddress) -> list[str]:
-        """The notes, not the questions, from ``sender`` to ``recipient``."""
+    def mail(
+        self, sender: str | HarnessAddress, recipient: str | OperatorAddress
+    ) -> list[str]:
+        """The notes, not the questions, from ``sender``, a line or the harness, to
+        ``recipient``."""
         to = LineAddress(recipient) if isinstance(recipient, str) else recipient
+        source = LineAddress(sender) if isinstance(sender, str) else sender
         return [
             message.body
             for message in self.log.state.messages.values()
-            if message.sender == LineAddress(sender)
+            if message.sender == source
             and message.recipient == to
             and message.kind is MessageKind.NOTE
         ]
@@ -326,10 +332,10 @@ def test_an_owner_at_a_plan_limit_fails_over_to_the_next_usable_seat(
     assert world.owner() == "beta"
     change = world.log.state.roles["core"].changed
     assert change is not None and change.cause is OwnershipCause.FAILOVER
-    (told,) = world.mail("alpha", ANA)
+    (told,) = world.mail(HARNESS, ANA)
     assert told.startswith("Dromon failed over. Role core passed by failover")
     assert "held at a plan limit" in told
-    (woken,) = world.mail("beta", "beta")
+    (woken,) = world.mail(HARNESS, "beta")
     assert "passed role core to you by failover" in woken
     (beta,) = world.prompts["beta"]
     assert beta.startswith("You own role core from this turn, by the harness")
@@ -351,7 +357,7 @@ def test_an_inferred_limit_holds_and_asks_but_never_moves_the_role(
     assert question is not None
     asked = world.log.state.messages[question].body
     assert "never observed live" in asked and "moved no role" in asked
-    assert world.mail("alpha", ANA) == []
+    assert world.mail(HARNESS, ANA) == []
     assert world.scheduler.fail_over_if_unable("alpha") is None
     assert world.owner() == "alpha"
     # The operator may still move it.
@@ -373,11 +379,11 @@ def test_a_failover_passes_over_seats_that_are_not_usable(world: World) -> None:
     # Gamma is on alpha's provider, whose budget the limit recorded as spent, and
     # delta may not own the role, so no seat is usable.
     assert world.owner() == "alpha"
-    (told,) = world.mail("alpha", ANA)
+    (told,) = world.mail(HARNESS, ANA)
     assert told.startswith("Dromon could not fail over. Role core stays with alpha")
     # A further trigger with nothing changed is not told again.
     assert world.scheduler.fail_over_if_unable("alpha") is not None
-    assert len(world.mail("alpha", ANA)) == 1
+    assert len(world.mail(HARNESS, ANA)) == 1
     # Once a seat is usable, a statement of the budget passes the role to it.
     world.scheduler.awaken("beta")
     followed = world.state_budget(CLAUDE, 0)
@@ -396,7 +402,7 @@ def test_under_ask_no_owner_changes(tmp_path: Path) -> None:
         wake(world, "alpha")
         assert world.owner() == "alpha"
         assert world.log.state.lines["alpha"].held_by is not None
-        assert not world.mail("beta", "beta")
+        assert not world.mail(HARNESS, "beta")
         (said,) = world.state_budget(CLAUDE, 0)
         assert said.startswith("Role core stays with alpha, because its failover")
     finally:
@@ -415,7 +421,7 @@ def test_a_low_budget_asks_the_owner_to_prepare_a_handoff(world: World) -> None:
     assert world.state_budget(CLAUDE, 10) == []
     (said,) = world.state_budget(CLAUDE, 9)
     assert said.startswith("Role core's owner alpha was asked to prepare a handoff")
-    (asked,) = world.mail("alpha", "alpha")
+    (asked,) = world.mail(HARNESS, "alpha")
     assert "prepare a handoff of role core to beta" in asked
     assert "relinquish_ownership with to set to beta" in asked
     assert world.owner() == "alpha"
@@ -427,7 +433,7 @@ def test_a_low_budget_with_no_usable_seat_asks_nothing(world: World) -> None:
     world.scheduler.hibernate("gamma")
     (said,) = world.state_budget(CLAUDE, 5)
     assert said.endswith("since no other seat is usable.")
-    assert not world.mail("alpha", "alpha")
+    assert not world.mail(HARNESS, "alpha")
 
 
 def test_an_owner_in_flight_fails_over_when_its_turn_ends(world: World) -> None:
@@ -535,8 +541,10 @@ def test_an_owner_out_of_credit_between_turns_fails_over_at_once(
     assert world.owner() == "gamma"
     change = world.log.state.roles["core"].changed
     assert change is not None and change.cause is OwnershipCause.FAILOVER
-    (told,) = world.mail("beta", ANA)
+    (told,) = world.mail(HARNESS, ANA)
     assert "from beta to gamma, because its owner beta's provider budget" in told
+    # The harness wrote it, so it is not recorded as from the line it is about.
+    assert world.mail("beta", ANA) == []
 
 
 def test_a_reset_time_in_another_form_is_dropped_from_the_budget(

@@ -41,6 +41,7 @@ from dromon.forwarder import (
     FIRST_BACKOFF_SECONDS,
     MAX_BACKOFF_SECONDS,
     MAX_BUSY,
+    OUTAGE_SECONDS,
     Forwarder,
     Link,
     LinkError,
@@ -53,10 +54,12 @@ from dromon.forwarder import (
     connect_unix,
     envelope,
     orphaned,
+    outage_text,
     sent_times,
 )
 from dromon.mailbox import sent
 from dromon.model import (
+    HARNESS,
     Address,
     AgentAddress,
     RECEIVED_KEY_HOURS,
@@ -971,6 +974,99 @@ def test_a_peers_report_shows_what_waits_and_when_it_last_answered(out: Out) -> 
     assert after.last_contact == out.wall.now and after.waiting == 1
 
 
+def outage_notes(out: Out) -> list[str]:
+    """The notes the harness sent the default operator."""
+    return [
+        message.body
+        for message in out.log.state.messages.values()
+        if message.sender == HARNESS
+        and message.recipient == out.scheduler.default_operator
+    ]
+
+
+def test_an_outage_is_told_once_after_an_hour_until_mail_is_accepted(
+    out: Out,
+) -> None:
+    first = out.send("one")
+    out.peer.down = True
+    out.step()
+    # Not yet an hour.
+    out.wall.now += timedelta(seconds=OUTAGE_SECONDS - 1)
+    out.clock.now += FIRST_BACKOFF_SECONDS
+    out.step()
+    assert outage_notes(out) == []
+    out.wall.now += timedelta(seconds=1)
+    out.clock.now += 2 * FIRST_BACKOFF_SECONDS
+    out.step()
+    (told,) = outage_notes(out)
+    assert told.startswith(f"Dromon has not delivered mail to peer {PEER} for an hour.")
+    assert f"1 message waits, the oldest {first}" in told
+    # Later attempts of the same outage tell nothing more.
+    out.clock.now += MAX_BACKOFF_SECONDS
+    out.step()
+    assert len(outage_notes(out)) == 1
+    # Accepted mail ends the outage, so the next one is told again.
+    out.peer.down = False
+    out.clock.now += MAX_BACKOFF_SECONDS
+    out.peer.answers = [WELCOME, accepted()]
+    assert out.step() == 0.0
+    assert not out.one.outage_told
+    asyncio.run(out.one.drop_link())
+    out.send("two")
+    out.peer.down = True
+    out.step()
+    out.wall.now += timedelta(seconds=OUTAGE_SECONDS)
+    out.clock.now += MAX_BACKOFF_SECONDS
+    out.step()
+    assert len(outage_notes(out)) == 2
+
+
+def test_a_refusal_does_not_end_an_outage(out: Out) -> None:
+    """The design ends an outage only when the peer accepts mail, so a peer that
+    answers but refuses every message is still told of once."""
+    out.send("one")
+    out.send("two")
+    out.wall.now += timedelta(seconds=OUTAGE_SECONDS)
+    out.peer.answers = [WELCOME, refused("refused")]
+    out.step()
+    assert len(outage_notes(out)) == 1
+    assert out.one.outage_told
+
+
+def test_an_outage_note_that_fails_never_holds_up_delivery(
+    out: Out, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def broken(report: object) -> None:
+        raise Faulty("no log")
+
+    out.scheduler.outage = broken  # pyright: ignore[reportAttributeAccessIssue]
+    out.send()
+    out.wall.now += timedelta(seconds=OUTAGE_SECONDS)
+    out.peer.answers = [WELCOME, accepted()]
+    assert out.step() == 0.0
+    assert out.log.state.outbox.get(PEER, {}) == {}
+    assert "the outage note for peer keleusma failed" in capsys.readouterr().err
+
+
+def test_the_outage_note_says_what_waits_and_when_the_peer_last_answered(
+    out: Out,
+) -> None:
+    out.send("one")
+    out.send("two")
+    report = out.one.report()
+    text = outage_text(report)
+    assert "2 messages wait" in text
+    assert "It has not answered since the daemon started." in text
+    contact = out.wall.now
+    out.one.last_contact = contact
+    assert f"It last answered at {model.format_due(contact)}." in outage_text(
+        out.one.report()
+    )
+    # The fault is left to dromon status, since its text may name a path.
+    out.one.fault = "Faulty: at /some/path"
+    assert "/some/path" not in outage_text(out.one.report())
+
+
 def test_a_lines_view_of_a_peer_leaves_out_the_fault(out: Out) -> None:
     out.one.fault, out.one.faults = "Faulty: at /some/path", 1
     report = out.one.report()
@@ -1421,6 +1517,7 @@ def test_an_operator_sends_to_a_peer_through_the_daemon(
         assert status.result is not None
         peers = cast(list[dict[str, object]], status.result["peers"])
         assert [(p["peer"], p["waiting"], p["faults"]) for p in peers] == [(PEER, 1, 0)]
+        assert status.result["scheduler"] == {"fault": None, "faults": 0}
         # The client protocol refuses a float, so the whole status must encode.
         encode_response(status)
         listed = daemon.respond(request("sent", {"operator": "ana"}))

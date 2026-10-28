@@ -227,10 +227,38 @@ class RemoteAddress:
 
 type Address = LocalAddress | RemoteAddress
 
+HARNESS_TEXT: Final = "!dromon"
+"""How the harness's own address is written. An identifier never begins with ``!``, so
+no other address reads as it."""
+
+
+@dataclass(frozen=True, slots=True)
+class HarnessAddress:
+    """The harness itself, as the sender of the notes it writes on its own account,
+    such as a failover or an outage of a peer. Decided by the operator on 2026-10-28,
+    since a note recorded as from a line the line did not write misattributes it.
+
+    No party can claim it. ``parse_address`` and ``parse_any_address`` refuse its text,
+    so no client, line, agent or peer input can name it, and only the daemon's own code
+    and the decoding of its log construct it. It sends notes and never receives mail,
+    so nothing replies to it."""
+
+    def __str__(self) -> str:
+        return HARNESS_TEXT
+
+
+HARNESS: Final = HarnessAddress()
+
+type Sender = Address | HarnessAddress
+"""Who a message is from. Only the harness sends without being addressable."""
+
 
 def parse_address(text: str) -> LocalAddress:
     """Return the local address written as ``text``: ``line``, ``@operator`` or
-    ``&agent``. A remote address is refused, as text that is not an address."""
+    ``&agent``. A remote address is refused, as text that is not an address, and so is
+    the harness's address, which no input may name."""
+    if text == HARNESS_TEXT:
+        raise InvalidField("the harness's address is reserved to the harness")
     if text.startswith(OPERATOR_PREFIX):
         return OperatorAddress(text.removeprefix(OPERATOR_PREFIX))
     if text.startswith(AGENT_PREFIX):
@@ -246,12 +274,26 @@ def parse_any_address(text: str) -> Address:
     return RemoteAddress(peer_id, parse_address(party))
 
 
+def parse_sender(text: str) -> Sender:
+    """Return the sender written as ``text``, which may be the harness. Only the
+    decoding of the daemon's own log calls it, never the decoding of any input."""
+    if text == HARNESS_TEXT:
+        return HARNESS
+    return parse_any_address(text)
+
+
 def check_address(name: str, value: object) -> None:
     """Raise ``InvalidField`` unless ``value`` is an address."""
     if not isinstance(
         value, LineAddress | OperatorAddress | AgentAddress | RemoteAddress
     ):
         raise InvalidField(f"{name} is not an address: {value!r}")
+
+
+def check_sender(name: str, value: object) -> None:
+    """Raise ``InvalidField`` unless ``value`` is an address or the harness."""
+    if not isinstance(value, HarnessAddress):
+        check_address(name, value)
 
 
 def check_local_address(name: str, value: object) -> None:
@@ -662,11 +704,12 @@ class PeerKeyed:
 
 @dataclass(frozen=True, slots=True)
 class MessageSent:
-    """A message between any two parties. A question is a message of kind question
-    from a line to an operator, and a reply names the message it answers."""
+    """A message between any two parties, or a note from the harness to a line or an
+    operator. A question is a message of kind question from a line to an operator, and
+    a reply names the message it answers."""
 
     message_id: str
-    sender: Address
+    sender: Sender
     recipient: Address
     kind: MessageKind
     body: str
@@ -675,7 +718,7 @@ class MessageSent:
 
     def __post_init__(self) -> None:
         check_id("message_id", self.message_id)
-        check_address("sender", self.sender)
+        check_sender("sender", self.sender)
         check_address("recipient", self.recipient)
         check_member("kind", self.kind, MessageKind)
         check_text("body", self.body)
@@ -1429,7 +1472,7 @@ class Agent:
 
 @dataclass(frozen=True, slots=True)
 class Message:
-    sender: Address
+    sender: Sender
     recipient: Address
     kind: MessageKind
     body: str
@@ -2053,6 +2096,8 @@ class State:
         self._check_withdrawn(event.message_id)
         if isinstance(event.sender, RemoteAddress):
             raise EventRejected("mail from a peer is recorded by message_received")
+        if isinstance(event.sender, HarnessAddress):
+            self._check_harness_note(event)
         if isinstance(event.recipient, RemoteAddress):
             # The daemon's outbound policy is checked before the append, since it is
             # configuration rather than log. The log holds what replay needs.
@@ -2063,7 +2108,8 @@ class State:
                 raise EventRejected(
                     f"{MAX_OUTBOX} messages already wait for peer {peer_id}"
                 )
-        self._require_party(event.sender)
+        if not isinstance(event.sender, HarnessAddress):
+            self._require_party(event.sender)
         self._require_party(event.recipient)
         firing = self._is_firing(event)
         # Decided by the operator on 2026-10-27. A line may send itself a note, for a
@@ -2087,6 +2133,18 @@ class State:
             self._live_line(event.sender.line_id)
         if event.reply_to is not None:
             self._check_reply(event, event.reply_to)
+
+    def _check_harness_note(self, event: MessageSent) -> None:
+        """The harness sends notes on its own account to a line or an operator of
+        this daemon. It asks nothing and answers nothing, since no party writes to
+        it, and it sends nothing to a peer, whose envelope would carry an address the
+        peer could not answer."""
+        if event.kind is not MessageKind.NOTE:
+            raise EventRejected("the harness sends only notes")
+        if event.reply_to is not None:
+            raise EventRejected("the harness replies to nothing")
+        if not isinstance(event.recipient, LineAddress | OperatorAddress):
+            raise EventRejected("the harness writes only to a line or an operator")
 
     def _check_message_received(self, event: MessageReceived) -> None:
         if event.message_id in self.messages:

@@ -18,7 +18,7 @@ all see the same mailbox.
 from dataclasses import dataclass
 from typing import Final
 
-from dromon.model import Address, Message, RemoteAddress, State
+from dromon.model import Address, HarnessAddress, Message, RemoteAddress, State
 
 MAX_PAGE: Final = 50
 """Upper bound on the messages one listing returns, so a large mailbox is paged."""
@@ -65,9 +65,9 @@ def is_answered(message_id: str, message: Message, replied: set[str]) -> bool:
 def summary(state: State, owner: Address, new: int) -> MailSummary:
     """The counts for ``owner``'s mailbox after ``new`` messages arrived. A reply to a
     question Dromon asked on the owner's behalf when it held the owner, such as an
-    operator's ``resume``, and a note from the owner to itself, a fired wake or a
-    task-end note, are not counted unanswered, since neither asks anything of the
-    owner."""
+    operator's ``resume``, a note from the owner to itself, a fired wake or a
+    task-end note, and a note from the harness, which nothing can reply to, are not
+    counted unanswered, since none asks a reply of the owner."""
     held = mailbox(state, owner)
     replied = replied_ids(state, owner)
     return MailSummary(
@@ -79,6 +79,7 @@ def summary(state: State, owner: Address, new: int) -> MailSummary:
             if not is_answered(message_id, message, replied)
             and message.reply_to not in state.hold_questions
             and message.sender != owner
+            and not isinstance(message.sender, HarnessAddress)
         ),
     )
 

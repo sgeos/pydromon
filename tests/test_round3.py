@@ -663,6 +663,17 @@ def test_a_lines_notes_to_itself_are_not_counted_unanswered(world: World) -> Non
     assert (counts.unread, counts.unanswered) == (2, 1)
 
 
+def test_a_note_from_the_harness_is_not_counted_unanswered(world: World) -> None:
+    """Nothing can reply to the harness, so its notes ask no reply of a line."""
+    from dromon.mailbox import summary
+    from dromon.model import HARNESS, MessageDelivered
+
+    note = world.scheduler.send(HARNESS, LineAddress("alpha"), "Dromon failed over")
+    world.log.append(MessageDelivered(note))
+    counts = summary(world.log.state, LineAddress("alpha"), 0)
+    assert (counts.unread, counts.unanswered) == (1, 0)
+
+
 # E, each recent turn explains its cost.
 
 

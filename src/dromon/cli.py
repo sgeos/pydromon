@@ -130,6 +130,11 @@ def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             f" open questions {counts.get('open_questions')}"
         )
         print(_log_growth(counts))
+    watch = result.get("scheduler")
+    if isinstance(watch, dict):
+        row = _scheduler_row(cast(Mapping[str, object], watch))
+        if row is not None:
+            print(row)
     found = result.get("lines")
     lines = cast(list[object], found) if isinstance(found, list) else []
     for entry in lines:
@@ -141,6 +146,15 @@ def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         if isinstance(entry, dict):
             print(_peer_row(cast(Mapping[str, object], entry)))
     return exits.OK
+
+
+def _scheduler_row(watch: Mapping[str, object]) -> str | None:
+    """The line of ``dromon status`` for a fault the scheduler's watch keeps, or
+    ``None`` while there is none."""
+    fault = watch.get("fault")
+    if fault is None:
+        return None
+    return f"scheduler fault {fault}, {watch.get('faults')} since the daemon started"
 
 
 def _peer_row(peer: Mapping[str, object]) -> str:

@@ -1475,6 +1475,7 @@ class Daemon:
             "daemon": self.scheduler.daemon_status(),
             "restart": self.scheduler.restart_status(),
             "lines": self.scheduler.line_summaries(),
+            "scheduler": self.scheduler.fault_status(),
             "peers": [
                 report.wire(detail=True) for report in self.scheduler.peer_reports()
             ],
@@ -1831,8 +1832,8 @@ def watch_task(
     """A done callback that says on standard error, when it happens, that the task
     for ``what`` ended with an exception or before ``stop`` was set. Without it, an
     exception in a task the daemon awaits only at shutdown is seen only then.
-    ``PeerForwarder.run`` already survives what ``step`` raises, so this is the outer
-    watch, for what escapes that one."""
+    ``PeerForwarder.run`` and ``Scheduler.run`` already survive what a step raises, so
+    this is the outer watch, for what escapes those."""
 
     def ended(task: "asyncio.Task[None]") -> None:
         if task.cancelled():
@@ -1971,6 +1972,7 @@ async def serve(daemon: Daemon) -> None:
     daemon.scheduler.recover()
     scheduling = asyncio.create_task(daemon.scheduler.run(daemon.stop_requested))
     forwarding = asyncio.create_task(forwarder.run(daemon.stop_requested))
+    scheduling.add_done_callback(watch_task("scheduler", daemon.stop_requested))
     forwarding.add_done_callback(watch_task("forwarder", daemon.stop_requested))
     try:
         # The umask already gives 0600, and this states it rather than relying on it.

@@ -426,7 +426,14 @@ outbox in `State.outbox`. Choices the design left open, for the operator's revie
   at once when that task ends with an error or before the daemon stops, rather than at
   shutdown. **Limit.** A fault that recurs on every attempt holds the outbox at its head
   until the message expires. The peer state of step 6 shows the fault to the operator,
-  and the outage note will once its sender is decided.
+  and after an hour the outage note tells the operator that mail waits.
+  **The scheduler's watch.** At the operator's instruction of 2026-10-28 the scheduling
+  task has the same two watches. An unexpected exception in a tick or in the sweep of
+  exited launchers is written to standard error with its traceback, kept as the
+  scheduler's `fault` until a tick completes, and followed by a pause that doubles from
+  1 second to 1 minute, so the scheduler neither dies nor spins. `status` gives
+  `scheduler` with its `fault` and `faults`, and `dromon status` prints a row while a
+  fault lasts. A done callback on the scheduling task is the outer watch.
 
 ### Receiving
 
@@ -631,9 +638,20 @@ the bounds survive a restart.
   `dromon status` prints a row for each. `line_status` gives the same for each peer the
   line may send to, without the backoff and the fault, whose text may name a path the
   project file holds. **Inference.** The oldest message's identifier may be another
-  sender's, which tells the line only that the peer's queue holds it. **The outage note
-  waits on the operator's choice of its sender,** since the log has no harness sender
-  and an operator cannot send a note to itself.
+  sender's, which tells the line only that the peer's queue holds it.
+  **Outage note implemented on 2026-10-28, step 6 of phase 1.** The operator chose its
+  sender on 2026-10-28, a sender address for the harness itself, `!dromon`, which no
+  party can claim, as [`EVENT_LOG.md`](../protocol/EVENT_LOG.md) specifies. The
+  failover notes, which were recorded as from a line that did not write them, moved to
+  it at the same time. The forwarder checks at each step whether the message at the
+  head of the outbox has waited `OUTAGE_SECONDS`, an hour, and the first time it has,
+  the harness sends the default operator one note naming the peer, how many messages
+  wait, the oldest and when it was sent, and when the peer last answered. It leaves
+  out the fault, whose text may name a path, and points to `dromon status`. Only an
+  accepted message ends the outage, so a peer that answers but refuses every message
+  is told of once. **Limits.** A step runs only after a backoff, so the note may come
+  up to 15 minutes late. A note that fails is said on standard error and not tried
+  again for that outage, so that telling never holds up delivery.
 - **Restart.** The outbox is derived from the log, so a restarted daemon resumes it in
   order with nothing lost.
 

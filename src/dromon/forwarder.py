@@ -85,6 +85,9 @@ MAX_BACKOFF_SECONDS: Final = 900.0
 """The backoff runs from 5 seconds to 15 minutes, doubling, as the design gives."""
 MAX_BUSY: Final = 20
 """The ``busy`` answers one message may receive before it ends as expired."""
+OUTAGE_SECONDS: Final = 3600
+"""How long the message at the head of a peer's outbox waits before the operator is
+told of the outage, as the design gives."""
 DEFAULT_NAME: Final = "dromon"
 """The name announced in ``hello`` when the project's directory name is not an
 identifier or is covered by the disclosure list."""
@@ -128,6 +131,8 @@ class Outbox(Protocol):
     def return_mail(self, message_id: str, code: ReturnCode) -> None: ...
 
     def leave_unconfirmed(self, message_id: str) -> None: ...
+
+    def outage(self, report: "PeerReport") -> None: ...
 
 
 def check_outbound(
@@ -334,6 +339,26 @@ class PeerReport:
         return found
 
 
+def outage_text(report: PeerReport) -> str:
+    """The outage note for ``report``. It leaves out the fault, whose text may name a
+    path, and points to ``dromon status``, which shows it to the operator alone."""
+    waiting = (
+        "1 message waits" if report.waiting == 1 else f"{report.waiting} messages wait"
+    )
+    contact = (
+        "It has not answered since the daemon started."
+        if report.last_contact is None
+        else f"It last answered at {format_due(report.last_contact)}."
+    )
+    return (
+        f"Dromon has not delivered mail to peer {report.peer_id} for an hour."
+        f" {waiting}, the oldest {report.oldest} since"
+        f" {_instant(report.oldest_sent_at)}. {contact} dromon status shows the"
+        " peer's state and any fault. No further note is sent for this outage, which"
+        " ends when the peer accepts mail again."
+    )
+
+
 def _instant(value: datetime | None) -> str | None:
     return None if value is None else format_due(value)
 
@@ -372,6 +397,9 @@ class PeerForwarder:
     faults: int = 0
     """Unexpected exceptions since the daemon started."""
     last_contact: datetime | None = None
+    outage_told: bool = False
+    """Whether the operator was told of the outage under way, kept in memory, so a
+    restart may tell once more."""
 
     def report(self) -> PeerReport:
         state = self.outbox.state
@@ -413,6 +441,7 @@ class PeerForwarder:
         message_id, message = head
         if self.judge(message_id, message):
             return 0.0
+        self.watch_outage(message_id)
         now = self.clock()
         if now < self.not_before:
             self.phase = Phase.BACKING_OFF
@@ -462,6 +491,26 @@ class PeerForwarder:
         self.end(message_id)
         self.outbox.return_mail(message_id, code)
         return True
+
+    def watch_outage(self, message_id: str) -> None:
+        """Tell the operator once, when ``message_id`` at the head of the outbox has
+        waited ``OUTAGE_SECONDS``, and no more until the peer accepts mail again.
+        Checked at each step, so a note comes at most one backoff late. A note that
+        fails is said on standard error and not tried again for this outage, so that
+        telling never holds up delivery."""
+        if self.outage_told:
+            return
+        sent = self.sent_at.get(message_id)
+        if sent is None or self.wall_clock() - sent < timedelta(seconds=OUTAGE_SECONDS):
+            return
+        self.outage_told = True
+        try:
+            self.outbox.outage(self.report())
+        except Exception as error:  # noqa: BLE001
+            print(
+                f"dromond: the outage note for peer {self.peer_id} failed: {error!r}",
+                file=sys.stderr,
+            )
 
     def expire(self, message_id: str) -> None:
         """End ``message_id`` as expired, unknown when a copy may have arrived."""
@@ -570,6 +619,7 @@ class PeerForwarder:
         if result is not None and outcome == "accepted":
             self.backoff = 0.0
             self.fault = None
+            self.outage_told = False
             self.end(message_id)
             self.outbox.forwarded(message_id)
             return 0.0

@@ -62,6 +62,17 @@ An external agent is a party too, with its own mailbox, as
 [`AGENTS.md`](AGENTS.md) specifies. It may send and receive notes but not ask
 questions, and a revoked agent neither sends nor receives.
 
+**The harness.** **Decided by the operator on 2026-10-28.** The harness itself sends
+the notes it writes on its own account, such as a failover, a handoff it made, or an
+outage of a peer, under the sender address `!dromon`. It is not a party. It has no
+mailbox, it always exists, and no event creates it. An identifier never begins with
+`!`, so no other address reads as it. No client, line, agent or peer input may name
+it, since every input is parsed as a party's address, which refuses its text. Only
+the decoding of the daemon's own log reads it, and only as the `sender` of a
+`message_sent`. **Porting note.** A port keeps the two parsers apart, one for party
+addresses that refuses `!dromon` and one for a logged sender that admits it, so that
+no input path can reach the second.
+
 ## Events
 
 Each event has a kind and fields, all required. An optional value is written as `null`.
@@ -115,7 +126,8 @@ Each event has a kind and fields, all required. An optional value is written as 
 
 **Message rules.** A `message_sent` applies when every one of these holds.
 
-1. The message does not exist, and the sender and recipient both exist. Neither is a
+1. The message does not exist, and the sender and recipient both exist. The harness
+   always exists. Neither is a
    remote address, since a peer's mail is recorded by `message_received`. The recipient
    may be a remote address whose peer is declared and not removed, when the message is
    a note and fewer than 1,000 messages wait in that peer's outbox. Such a message
@@ -136,6 +148,9 @@ Each event has a kind and fields, all required. An optional value is written as 
    is refused.
 5. A reply to a question requires the question to be open, must be a note, and marks
    the question answered by this reply.
+6. A message from the harness is a note to a line or an operator of this daemon, never
+   to an agent or a peer, and is not a reply. Nothing replies to it, since by rule 4 a
+   reply would go to the harness, which is never a recipient.
 
 **Scheduled wakes.** **Decided by the operator on 2026-10-26.** A line schedules a wake
 for itself with the `wake_after` tool, as [`LINE_CONFIG.md`](LINE_CONFIG.md)
@@ -146,8 +161,8 @@ body is the note or the fixed withheld text below, and which has no choices and 
 `reply_to`. Applying it clears the
 pending wake. It is the only message to itself that clears a scheduled wake.
 
-- **Sender.** The model has no address for the daemon, an operator sender would make
-  the note operator mail, which carries authority and resets a line's autonomous-turn
+- **Sender.** The line scheduled the wake, so the note is its own, not the harness's.
+  An operator sender would make the note operator mail, which carries authority and resets a line's autonomous-turn
   count, and an agent sender would need a registered agent. A note from the line to
   itself is accurate, since the line scheduled it, shows as `from alpha` and never as
   operator mail, and needs no new kind of address in any port.
@@ -179,8 +194,8 @@ pending wake. It is the only message to itself that clears a scheduled wake.
    `handoff` and `relinquished` are made by the previous owner, and `relinquished`
    leaves the role vacant. `recovery` names an owner and is made by an operator or by
    the new owner itself, never by an external agent. `failover` names the previous
-   owner and an entry, and is recorded by the new owner's address, since the log has
-   no address for the harness that makes it.
+   owner and an entry, and is recorded by the new owner's address. The harness that
+   makes it sends notes but is not a party, so `by` never names it.
 5. `entry_id`, unless `null`, names an entry of the role. A `handoff` requires one, and
    it is the role's latest entry, a `handoff` entry by the previous owner.
 6. `back_to`, unless `null`, is on a `handoff`, differs from `owner`, and is a seat of
@@ -215,7 +230,7 @@ An event is stored as one JSON object.
 ```
 
 Addresses are written as their text forms, such as `"beta"`, `"@ana"`, `"&claude"` and
-`"keleusma:kaizen"`.
+`"keleusma:kaizen"`. The harness, as a sender only, is written `"!dromon"`.
 
 - `v` is the format version, the integer `1`.
 - `kind` is the event kind and `data` holds exactly its fields.

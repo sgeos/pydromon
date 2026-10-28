@@ -115,8 +115,21 @@ All notable changes are recorded here. The format follows
   header says that its priority was not honoured. `message_received` gains
   `priority_asked`, and `message_prioritized` may mark mail waiting for a peer's line.
   `status`, `dromon status` and `line_status` show each peer's state, what waits and
-  since when, and its last contact. The outage note waits on the operator's choice of
-  its sender.
+  since when, and its last contact. When a peer's oldest message has waited an hour,
+  the harness sends the default operator one note for that outage, which ends when
+  the peer accepts mail again.
+- A sender address for the harness itself, `!dromon`, at the operator's decision of
+  2026-10-28. No client, line, agent or peer input can name it, and only the daemon's
+  own log reads it, as the sender of a `message_sent` note to a line or an operator.
+  The outage note, the failover notes to the operator and to the new owner, the note
+  to a successor of a handoff, and the request to prepare a handoff move to it, since
+  they were recorded as from a line that did not write them. Nothing replies to it,
+  and its notes are not counted unanswered.
+- The scheduler's watch, at the operator's instruction of 2026-10-28, as the
+  forwarder has. An unexpected exception in a tick is reported with its traceback,
+  kept as `scheduler.fault` in `status` until a tick completes, and followed by a
+  pause from 1 second to 1 minute, and a done callback on the scheduling task says at
+  once when it ends early.
 - Automatic switching of a role's owner, roles step 3, at the operator's instruction
   of 2026-10-27, as `docs/architecture/ROLES.md` describes. A role declares its seats'
   order, a failover policy, `automatic` by default or `ask`, and

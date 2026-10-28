@@ -11,6 +11,7 @@ from dromon import priority
 from dromon.driver import Strategy
 from dromon.lineconfig import LineConfig, encode_config
 from dromon.model import (
+    HARNESS,
     AgentAccess,
     AgentAddress,
     AgentRegistered,
@@ -128,6 +129,7 @@ SCENARIO: tuple[Event, ...] = (
     LineAwakened("alpha"),
     MessageSent("m6", ALPHA, ALPHA, NOTE, "a note to my next turn"),
     MessageSent("m3", ALPHA, BEN, NOTE, "thank you", reply_to="m2"),
+    MessageSent("h1", HARNESS, BEN, NOTE, "a note the harness wrote"),
     AgentRegistered("probe", AgentAccess.MESSAGE, "0" * 64),
     MessageSent("m4", PROBE, BETA, NOTE, "from an agent"),
     MessageSent("m5", BETA, PROBE, NOTE, "to an agent", reply_to="m4"),

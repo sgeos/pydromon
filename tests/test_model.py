@@ -1,11 +1,15 @@
 """The data model's field validation, state transitions and rejections."""
 
+from collections.abc import Callable
 from dataclasses import fields
 from typing import get_args
 
 import pytest
 
 from dromon.model import (
+    HARNESS,
+    HARNESS_TEXT,
+    HarnessAddress,
     AgentAccess,
     AgentAddress,
     AgentRegistered,
@@ -38,6 +42,8 @@ from dromon.model import (
     WakeIssued,
     WakeRequested,
     parse_address,
+    parse_any_address,
+    parse_sender,
 )
 
 ENGINE = "claude-opus-5-5"
@@ -83,7 +89,8 @@ def test_the_scenario_uses_every_kind_of_party_and_message(
     sent = [e for e in scenario if isinstance(e, MessageSent)]
     assert {m.kind for m in sent} == set(MessageKind)
     parties = {LineAddress, OperatorAddress, AgentAddress}
-    assert {type(m.sender) for m in sent} == parties
+    # The harness sends but is never a party anyone addresses.
+    assert {type(m.sender) for m in sent} == parties | {HarnessAddress}
     # Only a recipient may be remote, since mail from a peer is message_received.
     assert {type(m.recipient) for m in sent} == parties | {RemoteAddress}
     assert (
@@ -146,6 +153,58 @@ def test_a_line_and_an_operator_with_one_identifier_are_different_addresses() ->
 def test_malformed_address_text_is_refused(text: str) -> None:
     with pytest.raises(InvalidField):
         parse_address(text)
+
+
+@pytest.mark.parametrize("parse", [parse_address, parse_any_address])
+def test_no_input_can_name_the_harness(parse: Callable[[str], object]) -> None:
+    """The operator's decision of 2026-10-28. Clients, lines, agents and peers name
+    addresses through these two, so none of them can claim the harness's address,
+    and a peer cannot write it as its party."""
+    for text in (HARNESS_TEXT, f"keleusma:{HARNESS_TEXT}"):
+        with pytest.raises(InvalidField):
+            parse(text)
+
+
+def test_only_the_log_reads_the_harness_as_a_sender() -> None:
+    assert parse_sender(HARNESS_TEXT) == HARNESS == HarnessAddress()
+    assert parse_sender(str(HARNESS)) is HARNESS
+    assert parse_sender("alpha") == ALPHA
+    assert parse_sender("keleusma:@ana") == RemoteAddress("keleusma", ANA)
+
+
+@pytest.mark.parametrize("recipient", [ALPHA, ANA])
+def test_the_harness_sends_a_note_to_a_line_or_an_operator(
+    recipient: LineAddress | OperatorAddress,
+) -> None:
+    state = build(*parties(), MessageSent("h", HARNESS, recipient, NOTE, "failed over"))
+    assert state.messages["h"].sender == HARNESS
+
+
+@pytest.mark.parametrize(
+    ("event", "reason"),
+    [
+        (MessageSent("h", HARNESS, ANA, QUESTION, "?"), "only notes"),
+        (MessageSent("h", HARNESS, ANA, NOTE, "", reply_to="m"), "replies to nothing"),
+        (
+            MessageSent("h", HARNESS, AgentAddress("probe"), NOTE, ""),
+            "only to a line or an operator",
+        ),
+        (
+            MessageSent("h", HARNESS, RemoteAddress("keleusma", ALPHA), NOTE, ""),
+            "only to a line or an operator",
+        ),
+    ],
+)
+def test_the_harness_asks_answers_and_forwards_nothing(
+    event: MessageSent, reason: str
+) -> None:
+    state = build(
+        *parties(),
+        AgentRegistered("probe", AgentAccess.MESSAGE, "0" * 64),
+        MessageSent("m", ANA, ALPHA, NOTE, "hello"),
+    )
+    with pytest.raises(EventRejected, match=reason):
+        state.check(event)
 
 
 def test_operators_are_addressed_separately() -> None:
