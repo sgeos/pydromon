@@ -9,7 +9,11 @@ authentication. A TLS context trusts exactly the configured peer certificate, re
 the other side to present it during the handshake, and then checks the SHA-256 digest
 of its SubjectPublicKeyInfo before returning the connection. Certificate names are
 not identities. Session tickets are disabled so there is no resumable handshake path
-for early data. Python's ssl module exposes no API to enable early data.
+for early data. Python's ssl module exposes no API to enable early data. With TLS 1.3,
+the client-side handshake can finish before the server reports that it rejected the
+client certificate. A returned client connection is not proof of server acceptance;
+the caller must wait for the server's first application response. A read may instead
+receive the authentication alert or closed connection.
 """
 
 import hashlib
@@ -133,7 +137,12 @@ def server_context(identity: IdentityFiles, peer_certificate: Path) -> ssl.SSLCo
 def wrap_client(
     connection: socket.socket, context: ssl.SSLContext, peer_pin_sha256: str
 ) -> ssl.SSLSocket:
-    """Complete a mutually authenticated client handshake and check the peer pin."""
+    """Complete the client handshake and check the server pin.
+
+    On TLS 1.3, the server may report client-certificate rejection after this call
+    returns. Callers must wait for the first application response and treat a TLS alert
+    or closed connection as rejection.
+    """
     _check_pin_syntax(peer_pin_sha256)
     try:
         wrapped = context.wrap_socket(connection, server_side=False)

@@ -193,10 +193,19 @@ def test_server_rejects_client_without_a_certificate(tmp_path: Path) -> None:
         future = pool.submit(_serve_one, listener, server, local.pin_sha256)
         with socket.create_connection(listener.getsockname(), TIMEOUT_SECONDS) as raw:
             raw.settimeout(TIMEOUT_SECONDS)
-            with pytest.raises(ssl.SSLError):
-                no_certificate.wrap_socket(raw, server_hostname=None)
+            client_tls = no_certificate.wrap_socket(raw, server_hostname=None)
         with pytest.raises(ssl.SSLError):
             future.result(timeout=TIMEOUT_SECONDS)
+        try:
+            client_tls.settimeout(TIMEOUT_SECONDS)
+            try:
+                received = client_tls.recv(1)
+            except ssl.SSLError:
+                pass
+            else:
+                assert received == b""
+        finally:
+            client_tls.close()
 
     listener.close()
 
@@ -211,6 +220,8 @@ def test_server_rejects_a_client_that_offers_only_tls_12(tmp_path: Path) -> None
     server = server_context(peer, local.certificate)
     listener = _listener()
 
+    # TLS 1.2 cannot negotiate with this TLS 1.3-only server, so rejection is in the
+    # initial handshake. This differs from client-certificate rejection under TLS 1.3.
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(_serve_one, listener, server, local.pin_sha256)
         with socket.create_connection(listener.getsockname(), TIMEOUT_SECONDS) as raw:
