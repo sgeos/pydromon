@@ -56,13 +56,16 @@ linked worktree, pushed the branch, and released the lease. The first build fail
 because the sandbox refuses `sccache`, and succeeded with `RUSTC_WRAPPER` unset, which
 the project file below therefore sets.
 
-**Fact, reported by the operator on 2026-10-28.** A trial under a Dromon line's
-sandbox fetched over HTTPS, denied reads of the three credential files and denied a
-write to a second worktree, and allowed writes under `TMPDIR`. `gh` failed certificate
-verification with `x509: failed to verify certificate: OSStatus -26276`. A push dry
-run printed `fatal: failed to store: 100001` even though its process exited zero, so
-that exit status does not establish that pushing works. These results do not establish
-that the new Go certificate setting below fixes `gh`; the operator must repeat the trial.
+**Fact, reported by the operator on 2026-10-28.** In a trial under a Dromon line's
+sandbox with `enableWeakerNetworkIsolation = true`, `gh pr view`, `gh run list` and
+`gh run view --log` succeeded, so the reported TLS failure was gone. At the operator's
+direction, a real push of a throwaway branch to pydromon and its deletion also succeeded.
+Every Git call printed `fatal: failed to store: 100001` and still exited zero. The
+MacPorts system Git configuration at `/opt/local/etc/gitconfig` selects `osxkeychain`
+before the repository's `gh` helper, and that helper cannot write the keychain in the
+sandbox. The successful push marks the push check below as passed, though the helper
+configuration still needs attention. The Keleusma repository's SSH remote and its own
+line sandbox remain untested.
 
 ## Established facts and remaining live checks
 
@@ -142,9 +145,10 @@ command could not write its cache under `~/.cache/gh`, which the sandbox denies.
 was in a Claude Code sandbox, not a Dromon line sandbox.
 
 Repeat the checks below in an operator-run scratch-project trial line using the updated
-Keleusma profile. Check fetch and push, pull request viewing and log retrieval in the
-Dromon line sandbox. Pull request creation should use a disposable draft on pydromon. A
-merge check requires the operator's confirmation in session.
+Keleusma profile. Check fetch, pull request viewing and log retrieval in the Dromon line
+sandbox. The pydromon throwaway push and branch deletion passed on 2026-10-28. Pull
+request creation should use a disposable draft on pydromon. A merge check requires the
+operator's confirmation in session.
 
 1. From each line's worktree, run `git -c http.followRedirects=true fetch
    https://github.com/sgeos/keleusma.git <branch>` and confirm it fetches the intended
@@ -153,9 +157,10 @@ merge check requires the operator's confirmation in session.
 2. From a disposable local commit, run `git push --dry-run
    https://github.com/sgeos/keleusma.git HEAD:refs/heads/dromon-sandbox-check`.
    This checks the configured `gh` credential helper without changing the remote. It
-   needs `github.com` and `api.github.com` for helper authentication. The earlier
-   Dromon-line trial printed a credential-helper error despite exit status zero, so
-   inspect both output and exit status.
+   needs `github.com` and `api.github.com` for helper authentication. **Passed for
+   pydromon on 2026-10-28.** A real throwaway-branch push and deletion succeeded, but Git
+   still printed the credential-helper error despite exit status zero. The Keleusma
+   repository and Dromon-line helper configuration have not been verified.
 3. On pydromon's disposable remote, run `gh pr create --draft --title "sandbox check"
    --body "temporary check"` from a disposable pushed branch, then `gh pr view --json
    url,state` and close the draft with `gh pr close <number>`. Do not use Keleusma for
@@ -244,9 +249,22 @@ CLAUDE_CODE_STREAM_CLOSE_TIMEOUT=300000 uv run --project /PATH/TO/pydromon dromo
 uv run --project /PATH/TO/pydromon dromon attach kaizen
 ```
 
-The remote currently stays on SSH. Before enabling push from a line, the operator must
-choose and configure the HTTPS remote and confirm that the `gh` credential helper works
-in the sandbox. The other three lines join by adding their sections from the file below.
+The Keleusma remote currently stays on SSH. Before enabling push from a line, the
+operator must choose and configure an HTTPS remote and confirm that the `gh` credential
+helper works in that sandbox. The other three lines join by adding their sections from
+the file below.
+
+**Recommendation, unverified.** In the Keleusma repository, reset inherited credential
+helpers before adding GitHub CLI's helper. Run this from the repository root.
+
+```sh
+git config --local --replace-all credential.helper ""
+git config --local --add credential.helper '!gh auth git-credential'
+```
+
+The empty helper resets helpers from system configuration, including MacPorts'
+`osxkeychain` helper. This repository-local configuration has not been tried in the
+sandbox.
 
 ## The project file
 
