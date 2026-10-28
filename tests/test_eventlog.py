@@ -1,5 +1,6 @@
 """The SQLite event log, its replay, and the ways it refuses to be misused."""
 
+import json
 import re
 import sqlite3
 import stat
@@ -23,7 +24,9 @@ from dromon.eventlog import (
 from dromon.model import (
     Event,
     EventRejected,
+    LineAwakened,
     LineCreated,
+    LineHibernated,
     LineState,
     LineStateChanged,
     State,
@@ -262,6 +265,50 @@ def test_an_event_that_does_not_apply_is_corruption(path: Path) -> None:
     insert(path, encode(LineCreated("alpha", ENGINE, "subscription")))
     with pytest.raises(LogCorrupt, match="event 2 does not apply"):
         replay(path)
+
+
+def renamed(event: Event, old_kind: str) -> str:
+    """``event`` encoded under a kind's former wire name, as an older log holds it."""
+    document = json.loads(encode(event))
+    document["kind"] = old_kind
+    return json.dumps(document)
+
+
+def test_an_old_log_with_mute_events_replays_as_hibernate_and_awaken(
+    path: Path,
+) -> None:
+    created = LineCreated("alpha", ENGINE, "subscription")
+    write(path, (created,))
+    insert(path, renamed(LineHibernated("alpha"), "line_muted"))
+    insert(path, renamed(LineAwakened("alpha"), "line_unmuted"))
+    insert(path, renamed(LineHibernated("alpha"), "line_muted"))
+    expected = State()
+    for event in (
+        created,
+        LineHibernated("alpha"),
+        LineAwakened("alpha"),
+        LineHibernated("alpha"),
+    ):
+        expected.apply(event)
+    assert replay(path) == expected
+    assert expected.lines["alpha"].hibernated
+    with EventLog(path) as log:
+        log.append(LineAwakened("alpha"))
+        assert not log.state.lines["alpha"].hibernated
+    assert [entry.event for entry in read_entries(path)][1:] == [
+        LineHibernated("alpha"),
+        LineAwakened("alpha"),
+        LineHibernated("alpha"),
+        LineAwakened("alpha"),
+    ]
+    with raw(path) as connection:
+        kinds = [
+            json.loads(payload)["kind"]
+            for (payload,) in connection.execute(
+                "SELECT payload FROM events ORDER BY seq"
+            )
+        ]
+    assert kinds[1:] == ["line_muted", "line_unmuted", "line_muted", "line_awakened"]
 
 
 def test_a_gap_in_the_sequence_is_corruption(path: Path) -> None:

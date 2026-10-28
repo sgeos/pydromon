@@ -54,6 +54,49 @@ from the engine before reading on. The process is stopped when the turn ends.
 
 ## Plan limits
 
+**Fact, observed by the operator on 2026-10-27** from a Codex app-server with
+GPT-6-Luna and no credit left, recorded in the operator's private probe store. The
+messages arrived in this order.
+
+1. A notice `account/rateLimits/updated` with `params.rateLimits.limitId` `premium`,
+   `params.rateLimits.credits` equal to `{"hasCredits": false, "unlimited": false,
+   "balance": "0"}`, and `primary`, `secondary`, `planType` and `rateLimitReachedType`
+   all null.
+2. A notice `thread/status/changed` with `status.type` `systemError`.
+3. A notice `error` with `params.error.codexErrorInfo` `usageLimitExceeded`, in camel
+   case, `params.willRetry` false, and a `params.error.message` that reads, with the
+   apostrophe U+2019, as follows.
+
+   ```text
+   You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 1st, 2026 10:08 PM.
+   ```
+
+4. A notice `turn/completed` with `turn.status` `failed` and the same `turn.error`
+   object.
+
+**Implemented.** A turn that does not complete, after an `error` notice for the line's
+thread or with a `turn.error` whose `codexErrorInfo` is exactly `usageLimitExceeded`,
+ends as a plan limit and holds the line. A turn that completes after such a notice is
+not a limit. The reset time is read from the message where it matches the wording
+`try again at MON Dth, YYYY H:MM AM`, with English month abbreviations, and is recorded
+with the provider's budget. **Inference.** Reading the time from the wording is an
+inference about the wording, which a change to it defeats, leaving the reset unknown.
+**Assumption.** The message names no time zone, so it is read in the local zone of the
+daemon's host, which is the app-server's host, on the inference that Codex formats it
+in its host's zone.
+
+**Decided by the operator on 2026-10-27.** A notice whose `credits` has `hasCredits`
+and `unlimited` both false, and whose `primary` and `secondary` are both present and
+null, is the provider's budget at 0. That is the observed shape. The scheduler records
+it with no reset as soon as the notice arrives, in a turn or between turns, and acts on
+it before any turn fails. A repeated notice records nothing while the budget is spent.
+The operator narrowed the rule to require both windows null on the same day, because
+only an account with no plan window reported was observed, and whether an account with
+allowance left in a window also reports `hasCredits` false is unknown. A notice with a
+window, or without either window key, records nothing, even when the window is used up,
+and an account whose plan window is spent is left to the turn's `usageLimitExceeded`
+error.
+
 **Inference, not observed in a live app-server error.** The structured codes
 `plan_limit_reached`, `plan_limit_exceeded`, `usage_limit_reached` and
 `usage_limit_exceeded` identify subscription limits. When Codex supplies no recognized
@@ -61,6 +104,9 @@ structured code, Dromon uses the specific phrases `plan limit`, `usage limit`,
 `reached your limit`, `reached the usage limit` and `quota exceeded`. The generic word
 `quota` does not classify an error. A live app-server error is needed to confirm this
 vocabulary. A reported reset time is kept in the operator question that holds the line.
+**Decided by the operator on 2026-10-27.** Since this vocabulary is inferred, a limit
+read from it holds the line and asks, records no budget, and never moves a role. Only
+the observed `usageLimitExceeded` shape above may fail a role over.
 
 ## Tools across threads
 

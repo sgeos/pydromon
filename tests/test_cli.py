@@ -254,25 +254,30 @@ def answering(
     ("command", "result", "printed"),
     [
         (
-            "mute",
-            {"line_id": "alpha", "muted": True, "changed": True, "running": False},
-            "muted alpha\n",
+            "hibernate",
+            {"line_id": "alpha", "hibernated": True, "changed": True, "running": False},
+            "hibernated alpha\n",
         ),
         (
-            "mute",
-            {"line_id": "alpha", "muted": True, "changed": True, "running": True},
-            "muted alpha, whose turn in flight finishes first",
+            "hibernate",
+            {"line_id": "alpha", "hibernated": True, "changed": True, "running": True},
+            "hibernated alpha, whose turn in flight finishes first",
         ),
         (
-            "mute",
-            {"line_id": "alpha", "muted": True, "changed": False, "running": False},
-            "alpha was already muted",
+            "hibernate",
+            {
+                "line_id": "alpha",
+                "hibernated": True,
+                "changed": False,
+                "running": False,
+            },
+            "alpha was already hibernated",
         ),
-        ("unmute", {"line_id": "alpha", "changed": True}, "unmuted alpha"),
-        ("unmute", {"line_id": "alpha", "changed": False}, "alpha was not muted"),
+        ("awaken", {"line_id": "alpha", "changed": True}, "awakened alpha"),
+        ("awaken", {"line_id": "alpha", "changed": False}, "alpha was not hibernated"),
     ],
 )
-def test_mute_and_unmute_send_their_operation_and_say_what_changed(
+def test_hibernate_and_awaken_send_their_operation_and_say_what_changed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     short_runtime: Path,
@@ -289,14 +294,14 @@ def test_mute_and_unmute_send_their_operation_and_say_what_changed(
     assert printed in capsys.readouterr().out
 
 
-def test_mute_reports_a_refusal_and_a_missing_daemon(
+def test_hibernate_reports_a_refusal_and_a_missing_daemon(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     short_runtime: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     runtime = ["--runtime-dir", str(short_runtime)]
-    argv = ["--project", str(tmp_path), *runtime, "mute", "nobody"]
+    argv = ["--project", str(tmp_path), *runtime, "hibernate", "nobody"]
     assert cli.main(argv) == exits.NOT_RUNNING
 
     def refuse(
@@ -307,7 +312,7 @@ def test_mute_reports_a_refusal_and_a_missing_daemon(
 
     monkeypatch.setattr(cli, "call", refuse)
     assert cli.main(argv) == exits.FAILURE
-    assert "dromon mute: no line nobody" in capsys.readouterr().err
+    assert "dromon hibernate: no line nobody" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(("flag", "expected"), [([], None), (["--priority"], True)])
@@ -328,28 +333,73 @@ def test_send_passes_priority_only_when_asked(
     assert args.get("priority") is expected
 
 
-def test_status_lists_each_line_with_its_mute_and_hold(
+@pytest.mark.parametrize(
+    ("priority", "printed"),
+    [(False, "message_id m-1\n"), (True, "message_id m-1\npriority mail\n")],
+)
+def test_send_prints_the_message_id_and_priority_only_when_true(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    short_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+    priority: bool,
+    printed: str,
+) -> None:
+    sent: list[tuple[Operation, dict[str, object] | None]] = []
+    answer: dict[str, object] = {"message_id": "m-1", "priority": priority}
+    monkeypatch.setattr(cli, "call", answering(sent, answer))
+    runtime = ["--runtime-dir", str(short_runtime)]
+    argv = ["--project", str(tmp_path), *runtime, "send", "alpha", "stop"]
+    assert cli.main([*argv, "--operator", "ana"]) == exits.OK
+    assert capsys.readouterr().out == printed
+
+
+def test_send_refused_by_the_daemon_is_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    short_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def refuse(
+        socket: Path, operation: Operation, args: dict[str, object] | None = None
+    ) -> Response:
+        del socket, operation, args
+        return Response("r", False, error_message="priority mail goes to a line")
+
+    monkeypatch.setattr(cli, "call", refuse)
+    runtime = ["--runtime-dir", str(short_runtime)]
+    argv = ["--project", str(tmp_path), *runtime, "send", "@ben", "stop"]
+    assert cli.main([*argv, "--operator", "ana", "--priority"]) == exits.FAILURE
+    assert "dromon send: priority mail goes to a line" in capsys.readouterr().err
+
+
+def test_status_lists_each_line_with_its_hibernate_and_hold(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     short_runtime: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     lines: list[dict[str, object]] = [
-        {"line_id": "alpha", "condition": "muted", "muted": True, "pending": 2},
+        {
+            "line_id": "alpha",
+            "condition": "hibernated",
+            "hibernated": True,
+            "pending": 2,
+        },
         {
             "line_id": "beta",
             "condition": "running",
-            "muted": True,
+            "hibernated": True,
             "pending": 0,
             "held_by": "q-1",
         },
-        {"line_id": "gamma", "condition": "idle", "muted": False, "pending": 0},
+        {"line_id": "gamma", "condition": "idle", "hibernated": False, "pending": 0},
     ]
     sent: list[tuple[Operation, dict[str, object] | None]] = []
     monkeypatch.setattr(cli, "call", answering(sent, {"pid": 1, "lines": lines}))
     runtime = ["--runtime-dir", str(short_runtime)]
     assert cli.main(["--project", str(tmp_path), *runtime, "status"]) == exits.OK
     out = capsys.readouterr().out
-    assert "line alpha, muted, 2 pending\n" in out
-    assert "line beta, running, 0 pending, muted, held by q-1\n" in out
+    assert "line alpha, hibernated, 2 pending\n" in out
+    assert "line beta, running, 0 pending, hibernated, held by q-1\n" in out
     assert "line gamma, idle, 0 pending\n" in out

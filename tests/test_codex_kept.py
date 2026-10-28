@@ -163,6 +163,7 @@ class World:
         ends: list[BackgroundEnd] | None = None,
         reached: Callable[[int], str | None] | None = None,
         settled: Callable[[str], object] | None = None,
+        credits: list[str] | None = None,
     ) -> CodexLine:
         @asynccontextmanager
         async def connect(
@@ -190,6 +191,7 @@ class World:
             task_ended=(ends if ends is not None else []).append,
             ceiling_reached=reached or (lambda tasks: None),
             ceiling_settled=settled or (lambda question_id: None),
+            credits_spent=(credits if credits is not None else []).append,
         )
 
 
@@ -436,6 +438,55 @@ def test_a_limit_from_the_end_of_turn_listing_propagates_to_the_scheduler(
     async def go() -> None:
         with pytest.raises(EnginePlanLimit, match="reset time tomorrow"):
             await engine.run_turn("start command")
+        assert engine._kept is None  # pyright: ignore[reportPrivateUsage]
+
+    asyncio.run(go())
+
+
+NO_CREDIT: dict[str, Any] = {
+    "method": "account/rateLimits/updated",
+    "params": {
+        "rateLimits": {
+            "limitId": "premium",
+            "credits": {"hasCredits": False, "unlimited": False, "balance": "0"},
+            "primary": None,
+            "secondary": None,
+        }
+    },
+}
+"""The notice the operator observed on 2026-10-27, cut to the fields read."""
+
+
+def test_a_spent_credit_between_turns_is_reported_at_once(tmp_path: Path) -> None:
+    world = World([[done()]])
+    credits: list[str] = []
+    engine = world.line(tmp_path, credits=credits)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        world.servers[0].out.put_nowait(NO_CREDIT)
+        await settle()
+        assert len(credits) == 1 and "no credit left" in credits[0]
+        await engine.close()
+
+    asyncio.run(go())
+
+
+def test_the_observed_usage_limit_closes_the_kept_app_server(tmp_path: Path) -> None:
+    error = {
+        "message": "try again at Nov 1st, 2026 10:08 PM.",
+        "codexErrorInfo": "usageLimitExceeded",
+    }
+    failed = {
+        "method": "turn/completed",
+        "params": {"turn": {"id": "t", "status": "failed", "error": error}},
+    }
+    world = World([[failed]])
+    engine = world.line(tmp_path)
+
+    async def go() -> None:
+        with pytest.raises(EnginePlanLimit, match="usage limit exceeded"):
+            await engine.run_turn("start")
         assert engine._kept is None  # pyright: ignore[reportPrivateUsage]
 
     asyncio.run(go())

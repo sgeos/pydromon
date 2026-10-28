@@ -10,6 +10,7 @@ import sys
 from collections import deque
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,7 @@ from dromon.launcher import (
     STOP_POLICY_VARIABLE,
 )
 from dromon.lineconfig import LineConfig, config_from_document
+from dromon.model import format_due
 from dromon.projectconfig import parse
 from dromon.sandbox import parse_sandbox
 from dromon.scheduler import LineSpec, engine_factory
@@ -232,6 +234,7 @@ def line(
     environment: Mapping[str, str] | None = None,
     session_id: str | None = None,
     observe: Observer = ignore,
+    credits: list[str] | None = None,
 ) -> CodexLine:
     @asynccontextmanager
     async def connect(
@@ -252,6 +255,7 @@ def line(
         connection_factory=connect,
         server_lister=lambda env: ["gmail", "slack"],
         observe=observe,
+        credits_spent=(credits if credits is not None else []).append,
     )
 
 
@@ -291,8 +295,162 @@ def test_plan_limit_fallback_uses_specific_wording() -> None:
         failing="thread/start",
         failing_error={"code": -32000, "message": "You have reached your limit"},
     )
-    with pytest.raises(EnginePlanLimit):
+    with pytest.raises(EnginePlanLimit) as raised:
         run(line(server))
+    # Inferred wording holds the line and never moves a role.
+    assert not raised.value.may_move_role
+
+
+# The shapes the operator observed on 2026-10-27, from a Codex app-server probe with no
+# credit left, in the order they arrived.
+
+OBSERVED_MESSAGE = (
+    "You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to"
+    " purchase more credits or try again at Nov 1st, 2026 10:08 PM."
+)
+OBSERVED_ERROR: dict[str, object] = {
+    "message": OBSERVED_MESSAGE,
+    "codexErrorInfo": "usageLimitExceeded",
+}
+NO_CREDIT: dict[str, object] = {
+    "limitId": "premium",
+    "credits": {"hasCredits": False, "unlimited": False, "balance": "0"},
+    "primary": None,
+    "secondary": None,
+    "planType": None,
+    "rateLimitReachedType": None,
+}
+
+
+def observed_failure(error: dict[str, object] = OBSERVED_ERROR) -> list[dict[str, Any]]:
+    return [
+        notice("account/rateLimits/updated", rateLimits=NO_CREDIT),
+        notice("thread/status/changed", threadId="th", status={"type": "systemError"}),
+        notice("error", threadId="th", turnId="t1", error=error, willRetry=False),
+        notice(
+            "turn/completed",
+            threadId="th",
+            turn={"id": "t1", "status": "failed", "error": error},
+        ),
+    ]
+
+
+def test_the_observed_usage_limit_ends_the_turn_as_a_plan_limit() -> None:
+    credits: list[str] = []
+    with pytest.raises(EnginePlanLimit) as raised:
+        run(line(FakeServer(observed_failure()), credits=credits))
+    # The reset is read in the host's local zone, by the assumption reset_from_message
+    # states, so the expected instant is derived the same way.
+    local = datetime(2026, 11, 1, 22, 8).astimezone()
+    assert raised.value.resets_at == format_due(local)
+    assert raised.value.may_move_role
+    assert str(raised.value).startswith("Codex usage limit exceeded, which resets")
+    # The notice before the failure reported the spent credit at once.
+    assert credits == [
+        "Codex reported no credit left for its premium limit, with hasCredits and"
+        " unlimited false"
+    ]
+
+
+def test_either_report_of_the_usage_limit_suffices() -> None:
+    error_only = observed_failure()
+    error_only[-1] = completed("failed")
+    turn_only = observed_failure()
+    del turn_only[2]
+    for script in (error_only, turn_only):
+        with pytest.raises(EnginePlanLimit):
+            run(line(FakeServer(script)))
+
+
+def test_another_failure_still_fails_the_turn_and_holds_the_line() -> None:
+    other: dict[str, object] = {"message": "server error", "codexErrorInfo": "other"}
+    report = run(line(FakeServer(observed_failure(other))))
+    assert report.subtype == "failed"
+    # An error notice for another thread is not the line's.
+    foreign = observed_failure()
+    foreign[2] = notice("error", threadId="elsewhere", error=OBSERVED_ERROR)
+    foreign[-1] = completed("failed")
+    assert run(line(FakeServer(foreign))).subtype == "failed"
+
+
+def test_a_turn_that_completes_after_a_limit_notice_is_not_a_limit() -> None:
+    script = [
+        notice("error", threadId="th", error=OBSERVED_ERROR, willRetry=True),
+        message("done"),
+        completed(),
+    ]
+    assert run(line(FakeServer(script))).text == "done"
+
+
+def test_only_the_observed_camel_case_code_is_a_usage_limit() -> None:
+    assert codex_module.usage_limit(OBSERVED_ERROR) is not None
+    others: tuple[object, ...] = (
+        {"codexErrorInfo": "usage_limit_exceeded", "message": OBSERVED_MESSAGE},
+        {"codexErrorInfo": {"usageLimitExceeded": {}}, "message": OBSERVED_MESSAGE},
+        {"message": OBSERVED_MESSAGE},
+        "usageLimitExceeded",
+        None,
+    )
+    for error in others:
+        assert codex_module.usage_limit(error) is None
+    unworded = codex_module.usage_limit({"codexErrorInfo": "usageLimitExceeded"})
+    assert unworded is not None and unworded.resets_at is None
+    assert str(unworded) == "Codex usage limit exceeded"
+
+
+def test_the_reset_is_read_from_the_observed_wording_in_a_given_zone() -> None:
+    read = codex_module.reset_from_message
+    assert read(OBSERVED_MESSAGE, UTC) == "2026-11-01T22:08:00Z"
+    pacific = timezone(timedelta(hours=-7))
+    assert read(OBSERVED_MESSAGE, pacific) == "2026-11-02T05:08:00Z"
+    assert read("try again at Jan 2nd, 2027 12:05 AM.", UTC) == "2027-01-02T00:05:00Z"
+    assert read("try again at Mar 3rd, 2027 12:30 PM.", UTC) == "2027-03-03T12:30:00Z"
+    assert read("try again at Apr 21st, 2027 1:00 PM.", UTC) == "2027-04-21T13:00:00Z"
+    for unread in (
+        "try again later.",
+        "try again at Feb 30th, 2027 10:08 PM.",
+        "try again at Foo 1st, 2027 10:08 PM.",
+        "try again at Nov 1st, 2026 13:08 PM.",
+        "try again at Nov 1st, 2026 0:08 AM.",
+        "try again at Nov 1st, 2026 10:08.",
+    ):
+        assert read(unread, UTC) is None
+
+
+def test_only_no_credit_and_no_unlimited_is_a_spent_credit() -> None:
+    spent = codex_module.credits_spent
+    assert spent({"rateLimits": NO_CREDIT}) is not None
+    for credits in (
+        {"hasCredits": True, "unlimited": False},
+        {"hasCredits": False, "unlimited": True},
+        {"hasCredits": False},
+        {"hasCredits": "false", "unlimited": False},
+        None,
+    ):
+        assert spent({"rateLimits": {**NO_CREDIT, "credits": credits}}) is None
+    assert spent({}) is None
+
+
+def test_no_credit_with_a_reported_window_is_not_a_spent_credit() -> None:
+    """The operator's narrowing of 2026-10-27. Only the observed shape, both windows
+    present and null, counts, since an account with a plan window may still have
+    allowance left while it has no purchased credit."""
+    spent = codex_module.credits_spent
+    window: dict[str, object] = {"usedPercent": 40, "windowDurationMins": 300}
+    for name in ("primary", "secondary"):
+        assert spent({"rateLimits": {**NO_CREDIT, name: window}}) is None
+        missing = {key: value for key, value in NO_CREDIT.items() if key != name}
+        assert spent({"rateLimits": missing}) is None
+    spent_window: dict[str, object] = {"usedPercent": 100, "windowDurationMins": 300}
+    assert spent({"rateLimits": {**NO_CREDIT, "primary": spent_window}}) is None
+
+
+def test_the_unnamed_credit_note() -> None:
+    spent = codex_module.credits_spent
+    unnamed = spent({"rateLimits": {**NO_CREDIT, "limitId": None}})
+    assert unnamed == (
+        "Codex reported no credit left, with hasCredits and unlimited false"
+    )
 
 
 def test_app_server_output_close_is_bounded_even_while_process_lives(

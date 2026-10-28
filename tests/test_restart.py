@@ -11,9 +11,7 @@ import argparse
 import asyncio
 import json
 import os
-import shutil
 import sys
-import tempfile
 from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -149,25 +147,6 @@ async def until(condition: Callable[[], bool]) -> None:
             return
         await asyncio.sleep(0.0005)
     raise AssertionError("the condition never held")
-
-
-# Pytest's own temporary paths can exceed macOS's 103-byte socket path limit, so each
-# test gets a short runtime directory of its own, removed when the test ends.
-_SHORT: list[Path] = []
-
-
-@pytest.fixture(autouse=True)
-def _short_runtime_directory() -> Iterator[None]:
-    parent = Path(tempfile.mkdtemp(prefix="dr"))
-    _SHORT.append(parent)
-    yield
-    _SHORT.remove(parent)
-    shutil.rmtree(parent, ignore_errors=True)
-
-
-def _short_run() -> Path:
-    """The current test's short runtime directory, which does not exist yet."""
-    return _SHORT[-1] / "run"
 
 
 def run(target: World, act: Callable[[], Coroutine[Any, Any, None]]) -> None:
@@ -403,18 +382,18 @@ def test_tasks_that_begin_during_the_drain_abandon_the_restart(
     assert status is not None and "lines beta" in cast(str, status["reason"])
 
 
-def test_a_muted_line_is_interrupted_by_a_restart_and_stays_muted_after(
+def test_a_hibernated_line_is_interrupted_by_a_restart_and_stays_hibernated_after(
     world: World,
 ) -> None:
     gate = asyncio.Event()
     world.gates["alpha"] = [gate]
     wake_id, _ = world.scheduler.schedule_wake("beta", 600, "later")
-    world.scheduler.mute("beta")
+    world.scheduler.hibernate("beta")
 
     async def act() -> None:
         world.scheduler.send(ANA, ALPHA, "work on it")
         await until(lambda: world.scheduler.running_lines() == ["alpha"])
-        world.scheduler.mute("alpha")
+        world.scheduler.hibernate("alpha")
         world.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 60)
         gate.set()
 
@@ -423,15 +402,15 @@ def test_a_muted_line_is_interrupted_by_a_restart_and_stays_muted_after(
     world.restart()
     run(world, nothing)
     state = world.log.state
-    assert state.lines["alpha"].muted and state.lines["beta"].muted
+    assert state.lines["alpha"].hibernated and state.lines["beta"].hibernated
     assert state.scheduled["beta"].message_id == wake_id
-    # The note waits for the unmute, like any mail of a muted line.
+    # The note waits for the awaken, like any mail of a hibernated line.
     assert len(world.prompts["alpha"]) == 1
 
-    async def unmute() -> None:
-        world.scheduler.unmute("alpha")
+    async def awaken() -> None:
+        world.scheduler.awaken("alpha")
 
-    run(world, unmute)
+    run(world, awaken)
     assert len(world.prompts["alpha"]) == 2
     assert "daemon restart" in world.prompts["alpha"][1]
 
@@ -495,9 +474,10 @@ def test_successor_args_read_back_as_the_same_command_line() -> None:
 
 
 def test_start_successor_reports_a_successor_that_does_not_start(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    paths: ProjectPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    paths = project_paths(tmp_path, _short_run())
     started: list[Sequence[str]] = []
 
     def start(paths: ProjectPaths, args: Sequence[str]) -> int:
@@ -527,8 +507,15 @@ def respond(target: Daemon, op: str, args: dict[str, object]) -> Response:
     return target.respond(line)
 
 
-def make_daemon(target: World, tmp_path: Path) -> Daemon:
-    paths = project_paths(tmp_path, _short_run())
+@pytest.fixture
+def paths(tmp_path: Path, short_runtime: Path) -> ProjectPaths:
+    """The project's paths. Their runtime directory is the shared short one, because
+    ``project_paths`` refuses a socket path over macOS's limit, which a runtime
+    directory under pytest's own temporary path can pass."""
+    return project_paths(tmp_path, short_runtime)
+
+
+def make_daemon(target: World, paths: ProjectPaths) -> Daemon:
     return Daemon(
         paths,
         target.log,
@@ -540,10 +527,10 @@ def make_daemon(target: World, tmp_path: Path) -> Daemon:
 
 
 def test_restart_drains_then_stops_for_a_successor_with_the_same_options(
-    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    world: World, paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(restart, "POLL_SECONDS", 1e-6)
-    target = make_daemon(world, tmp_path)
+    target = make_daemon(world, paths)
     gate = asyncio.Event()
     world.gates["alpha"] = [gate]
 
@@ -571,10 +558,10 @@ def test_restart_drains_then_stops_for_a_successor_with_the_same_options(
 
 
 def test_an_abandoned_restart_does_not_stop_the_daemon(
-    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    world: World, paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(restart, "POLL_SECONDS", 1e-6)
-    target = make_daemon(world, tmp_path)
+    target = make_daemon(world, paths)
     gate = asyncio.Event()
     world.gates["alpha"] = [gate]
     world.safe_points = 0
@@ -618,12 +605,12 @@ def test_an_abandoned_restart_does_not_stop_the_daemon(
 )
 def test_a_bad_restart_is_refused_and_changes_nothing(
     world: World,
-    tmp_path: Path,
+    paths: ProjectPaths,
     args: dict[str, object],
     code: ErrorCode,
     text: str,
 ) -> None:
-    target = make_daemon(world, tmp_path)
+    target = make_daemon(world, paths)
 
     async def go() -> Response:
         return respond(target, "restart", args)
@@ -634,8 +621,10 @@ def test_a_bad_restart_is_refused_and_changes_nothing(
     assert world.scheduler.restart_status() is None
 
 
-def test_a_restart_while_one_drains_is_rejected(world: World, tmp_path: Path) -> None:
-    target = make_daemon(world, tmp_path)
+def test_a_restart_while_one_drains_is_rejected(
+    world: World, paths: ProjectPaths
+) -> None:
+    target = make_daemon(world, paths)
 
     async def go() -> tuple[Response, Response]:
         first = respond(target, "restart", {"operator": "ana"})
@@ -700,10 +689,10 @@ def no_sleep(seconds: float) -> None:
 
 
 @pytest.fixture
-def cli_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ProjectPaths:
+def cli_paths(paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch) -> ProjectPaths:
     monkeypatch.setattr(cli, "RESTART_POLL_SECONDS", 0.0)
     monkeypatch.setattr(cli, "_preflight", lambda: None)
-    return project_paths(tmp_path, _short_run())
+    return paths
 
 
 def test_dromon_restart_waits_for_a_new_pid_and_names_both_commits(
@@ -867,14 +856,14 @@ def test_the_restart_subcommand_parses_its_options() -> None:
 
 def test_dromon_restart_crosses_the_wire_to_a_daemon_whose_rates_are_known(
     world: World,
-    tmp_path: Path,
+    paths: ProjectPaths,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(restart, "POLL_SECONDS", 1e-6)
     monkeypatch.setattr(cli, "RESTART_POLL_SECONDS", 0.0)
     monkeypatch.setattr(cli, "_preflight", lambda: None)
-    target = make_daemon(world, tmp_path)
+    target = make_daemon(world, paths)
     world.monotonic = 67.0
     events = world.log.last_seq - world.log.opened_seq
     assert events * 3600 % 67 != 0, "the rate must have a fraction"

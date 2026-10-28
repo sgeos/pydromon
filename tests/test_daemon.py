@@ -908,45 +908,45 @@ def test_several_clients_attach_to_lines_at_once(paths: ProjectPaths) -> None:
         reap(pid)
 
 
-def test_mute_and_unmute_record_the_change_once_and_show_in_status(
+def test_hibernate_and_awaken_record_the_change_once_and_show_in_status(
     paths: ProjectPaths,
 ) -> None:
     request(
         paths, "create_line", {"line_id": "alpha", "model": HAIKU, "strategy": "api"}
     )
-    first = request(paths, "mute", {"line_id": "alpha"})
+    first = request(paths, "hibernate", {"line_id": "alpha"})
     assert first.ok and first.result == {
         "line_id": "alpha",
-        "muted": True,
+        "hibernated": True,
         "changed": True,
         "running": False,
     }
-    again = request(paths, "mute", {"line_id": "alpha"})
+    again = request(paths, "hibernate", {"line_id": "alpha"})
     assert again.ok and again.result is not None and again.result["changed"] is False
     status = request(paths, "status", {})
     assert status.result is not None
     (line,) = cast(list[dict[str, object]], status.result["lines"])
-    assert (line["muted"], line["condition"]) == (True, "muted")
-    off = request(paths, "unmute", {"line_id": "alpha"})
+    assert (line["hibernated"], line["condition"]) == (True, "hibernated")
+    off = request(paths, "awaken", {"line_id": "alpha"})
     assert off.ok and off.result == {
         "line_id": "alpha",
-        "muted": False,
+        "hibernated": False,
         "changed": True,
     }
     with EventLog(paths.event_log) as log:
-        assert not log.state.lines["alpha"].muted
+        assert not log.state.lines["alpha"].hibernated
 
 
 @pytest.mark.parametrize(
     ("op", "args", "code"),
     [
-        ("mute", {"line_id": "nobody"}, ErrorCode.REJECTED),
-        ("unmute", {"line_id": "nobody"}, ErrorCode.REJECTED),
-        ("mute", {}, ErrorCode.BAD_REQUEST),
-        ("mute", {"line_id": "alpha", "extra": "x"}, ErrorCode.BAD_REQUEST),
+        ("hibernate", {"line_id": "nobody"}, ErrorCode.REJECTED),
+        ("awaken", {"line_id": "nobody"}, ErrorCode.REJECTED),
+        ("hibernate", {}, ErrorCode.BAD_REQUEST),
+        ("hibernate", {"line_id": "alpha", "extra": "x"}, ErrorCode.BAD_REQUEST),
     ],
 )
-def test_mute_refuses_a_bad_request(
+def test_hibernate_refuses_a_bad_request(
     paths: ProjectPaths, op: str, args: dict[str, object], code: ErrorCode
 ) -> None:
     request(

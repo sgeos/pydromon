@@ -263,8 +263,8 @@ def test_context_warning_does_not_queue_a_note_for_a_held_line(world: World) -> 
     assert "alpha" not in world.scheduler._context_compaction_wakes  # pyright: ignore[reportPrivateUsage]
 
 
-def test_context_warning_does_not_wake_muted_line(world: World) -> None:
-    world.scheduler.mute("alpha")
+def test_context_warning_does_not_wake_hibernated_line(world: World) -> None:
+    world.scheduler.hibernate("alpha")
     world.scheduler._context_reported(  # pyright: ignore[reportPrivateUsage]
         "alpha", 150_001, CONTEXT_FROM_CALL
     )
@@ -272,7 +272,7 @@ def test_context_warning_does_not_wake_muted_line(world: World) -> None:
     assert world.scheduler._context_compaction_wakes == set()  # pyright: ignore[reportPrivateUsage]
     assert "alpha" not in world.log.state.scheduled
 
-    world.scheduler.unmute("alpha")
+    world.scheduler.awaken("alpha")
     assert world.scheduler._work_waiting() is True  # pyright: ignore[reportPrivateUsage]
     assert "alpha" in world.log.state.scheduled
 

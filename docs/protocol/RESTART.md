@@ -19,7 +19,7 @@ turns keep working.
 | Mode | Running turns |
 |---|---|
 | `wait`, the default | Each ends by itself |
-| `interrupt` | Each is asked to end at its next safe point, the point priority mail uses. The engine reports the turn and keeps its session. A muted line's turn is interrupted too, since the operator asked for it |
+| `interrupt` | Each is asked to end at its next safe point, the point priority mail uses. The engine reports the turn and keeps its session. A hibernated line's turn is interrupted too, since the operator asked for it |
 
 A drain is bounded by `wait_seconds`, a whole number of seconds, 600 by default and at
 most 3,600. Once no turn
@@ -48,7 +48,7 @@ note, from the line to itself, as the turn ends. The successor delivers it like 
 note, so the line is woken and its work continues in its resumed session. Its header in
 the prompt and in `list_mail` says `a daemon restart ended your last turn at a safe
 point`, and the body names the operator who asked. The turn it starts counts as
-autonomous toward the line's limits. A muted line's note waits for its unmute.
+autonomous toward the line's limits. A hibernated line's note waits until it is awakened.
 
 A turn asked to end whose restart was then abandoned, before the turn's report arrived,
 leaves a note that says the restart was abandoned, which wakes the line in the same
@@ -68,7 +68,7 @@ the event log as any start does, so the following survive.
 | Kept across a restart | Because |
 |---|---|
 | Each line's engine session | It is in the log as `line_session`, and the next turn resumes it |
-| Mutes | They are in the log as `line_muted` |
+| Hibernates | They are in the log as `line_hibernated` |
 | Scheduled wakes | They are in the log, and one that fell due during the drain fires at the successor's first tick |
 | Mail and notes | Undelivered messages start in the successor's post office |
 | Holds and questions | They are in the log |

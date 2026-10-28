@@ -1,4 +1,4 @@
-"""Wake mute, priority mail and self mail, driven by scripted engines.
+"""Wake hibernate, priority mail and self mail, driven by scripted engines.
 
 The scripted engine asks ``LineSpec.redirect`` at each of its safe points, as a line's
 ``SteeredDriver`` does once a tool result is delivered or a message without a tool use
@@ -37,8 +37,8 @@ from dromon.model import (
     AgentRegistered,
     EventRejected,
     LineAddress,
-    LineMuted,
-    LineUnmuted,
+    LineHibernated,
+    LineAwakened,
     MessagePrioritized,
     OperatorAddress,
 )
@@ -441,15 +441,15 @@ def test_a_self_note_with_the_pending_wake_s_text_is_no_firing(
     assert "your scheduled wake" not in engine.prompts[1]
 
 
-# Mute.
+# Hibernate.
 
 
-def test_a_muted_line_keeps_its_mail_and_runs_no_turn_until_unmuted(
+def test_a_hibernated_line_keeps_its_mail_and_runs_no_turn_until_awakened(
     make_world: MakeWorld,
 ) -> None:
     target = make_world(["alpha"])
-    assert target.scheduler.mute("alpha") is True
-    assert target.scheduler.mute("alpha") is False
+    assert target.scheduler.hibernate("alpha") is True
+    assert target.scheduler.hibernate("alpha") is False
 
     async def act() -> None:
         target.scheduler.send(ANA, ALPHA, "work")
@@ -457,40 +457,42 @@ def test_a_muted_line_keeps_its_mail_and_runs_no_turn_until_unmuted(
     run(target, act)
     assert target.prompts("alpha") == []
     status = target.scheduler.line_status("alpha")
-    assert status["muted"] is True
-    assert status["condition"] == "muted"
+    assert status["hibernated"] is True
+    assert status["condition"] == "hibernated"
     assert status["pending"] == 1
     summary = target.scheduler.line_summaries()[0]
-    assert summary["muted"] is True and summary["condition"] == "muted"
+    assert summary["hibernated"] is True and summary["condition"] == "hibernated"
 
-    async def unmute() -> None:
-        assert target.scheduler.unmute("alpha") is True
-        assert target.scheduler.unmute("alpha") is False
+    async def awaken() -> None:
+        assert target.scheduler.awaken("alpha") is True
+        assert target.scheduler.awaken("alpha") is False
 
-    run(target, unmute)
+    run(target, awaken)
     assert len(target.prompts("alpha")) == 1
-    assert target.scheduler.line_status("alpha")["muted"] is False
+    assert target.scheduler.line_status("alpha")["hibernated"] is False
     events = [entry.event for entry in read_entries(target.path)]
-    assert [type(e) for e in events if isinstance(e, LineMuted | LineUnmuted)] == [
-        LineMuted,
-        LineUnmuted,
+    assert [
+        type(e) for e in events if isinstance(e, LineHibernated | LineAwakened)
+    ] == [
+        LineHibernated,
+        LineAwakened,
     ]
 
 
-def test_mute_refuses_an_unknown_line(make_world: MakeWorld) -> None:
+def test_hibernate_refuses_an_unknown_line(make_world: MakeWorld) -> None:
     target = make_world(["alpha"])
     with pytest.raises(EventRejected, match="no line nobody"):
-        target.scheduler.mute("nobody")
+        target.scheduler.hibernate("nobody")
     with pytest.raises(EventRejected, match="no line nobody"):
-        target.scheduler.unmute("nobody")
+        target.scheduler.awaken("nobody")
 
 
-def test_a_muted_line_keeps_its_scheduled_wake_pending_until_unmuted(
+def test_a_hibernated_line_keeps_its_scheduled_wake_pending_until_awakened(
     make_world: MakeWorld,
 ) -> None:
     target = make_world(["alpha"])
     message_id, _ = target.scheduler.schedule_wake("alpha", 60, "look again")
-    target.scheduler.mute("alpha")
+    target.scheduler.hibernate("alpha")
     target.now = START + timedelta(seconds=120)
 
     async def act() -> None:
@@ -502,47 +504,47 @@ def test_a_muted_line_keeps_its_scheduled_wake_pending_until_unmuted(
     assert message_id not in target.log.state.messages
     assert target.prompts("alpha") == []
 
-    async def unmute() -> None:
-        target.scheduler.unmute("alpha")
+    async def awaken() -> None:
+        target.scheduler.awaken("alpha")
 
-    run(target, unmute)
+    run(target, awaken)
     assert "alpha" not in target.log.state.scheduled
     assert len(target.prompts("alpha")) == 1
     assert "your scheduled wake, due" in target.prompts("alpha")[0]
 
 
-def held_while_muted(target: World, wake: Callable[[], object]) -> list[str]:
-    """Mute alpha, run ``wake``, check that no turn ran, then unmute and return the
+def held_while_hibernated(target: World, wake: Callable[[], object]) -> list[str]:
+    """Hibernate alpha, run ``wake``, check that no turn ran, then awaken and return the
     prompts of the turns that followed. Review finding 2 of 2026-10-27."""
-    target.scheduler.mute("alpha")
+    target.scheduler.hibernate("alpha")
 
     async def act() -> None:
         wake()
 
     run(target, act)
     assert target.prompts("alpha") == []
-    assert target.scheduler.condition("alpha") == "muted"
+    assert target.scheduler.condition("alpha") == "hibernated"
 
-    async def unmute() -> None:
-        target.scheduler.unmute("alpha")
+    async def awaken() -> None:
+        target.scheduler.awaken("alpha")
 
-    run(target, unmute)
+    run(target, awaken)
     return target.prompts("alpha")
 
 
-def test_a_muted_line_runs_no_turn_for_a_question_answer(
+def test_a_hibernated_line_runs_no_turn_for_a_question_answer(
     make_world: MakeWorld,
 ) -> None:
     target = make_world(["alpha"])
     question = target.scheduler.ask("alpha", ANA, "Which file?", ("a.md", "b.md"))
     answers: list[str] = []
-    prompts = held_while_muted(
+    prompts = held_while_hibernated(
         target, lambda: answers.append(target.scheduler.answer(ANA, question, "b.md"))
     )
     assert len(prompts) == 1 and answers[0] in prompts[0]
 
 
-def test_a_muted_line_runs_no_turn_for_a_ceiling_answer(
+def test_a_hibernated_line_runs_no_turn_for_a_ceiling_answer(
     make_world: MakeWorld,
 ) -> None:
     target = make_world(["alpha"])
@@ -552,7 +554,7 @@ def test_a_muted_line_runs_no_turn_for_a_ceiling_answer(
     assert isinstance(asked.recipient, OperatorAddress)
     operator = asked.recipient
     answers: list[str] = []
-    prompts = held_while_muted(
+    prompts = held_while_hibernated(
         target,
         lambda: answers.append(
             target.scheduler.answer(operator, question, asked.choices[0])
@@ -561,7 +563,7 @@ def test_a_muted_line_runs_no_turn_for_a_ceiling_answer(
     assert len(prompts) == 1 and answers[0] in prompts[0]
 
 
-def test_a_muted_line_keeps_its_compaction_wake_pending_until_unmuted(
+def test_a_hibernated_line_keeps_its_compaction_wake_pending_until_awakened(
     make_world: MakeWorld,
 ) -> None:
     target = make_world(["alpha"])
@@ -573,14 +575,14 @@ def test_a_muted_line_keeps_its_compaction_wake_pending_until_unmuted(
     def due() -> None:
         target.now = START + timedelta(seconds=120)
 
-    prompts = held_while_muted(target, due)
+    prompts = held_while_hibernated(target, due)
     assert reserved in target.log.state.messages
     assert len(prompts) == 1 and "your scheduled wake, due" in prompts[0]
 
 
-def test_a_muted_line_runs_no_turn_for_a_task_note(make_world: MakeWorld) -> None:
+def test_a_hibernated_line_runs_no_turn_for_a_task_note(make_world: MakeWorld) -> None:
     target = make_world(["alpha"])
-    target.scheduler.mute("alpha")
+    target.scheduler.hibernate("alpha")
 
     async def act() -> None:
         noted = target.scheduler.background_ended(
@@ -593,7 +595,7 @@ def test_a_muted_line_runs_no_turn_for_a_task_note(make_world: MakeWorld) -> Non
     assert target.scheduler.line_status("alpha")["pending"] == 1
 
 
-def test_a_turn_running_when_muted_finishes_with_its_tools_and_no_turn_follows(
+def test_a_turn_running_when_hibernated_finishes_with_its_tools_and_no_turn_follows(
     make_world: MakeWorld,
 ) -> None:
     target = make_world(["alpha", "beta"])
@@ -604,11 +606,11 @@ def test_a_turn_running_when_muted_finishes_with_its_tools_and_no_turn_follows(
     async def act() -> None:
         target.scheduler.send(ANA, ALPHA, "work")
         await until(lambda: len(target.prompts("alpha")) == 1)
-        target.scheduler.mute("alpha")
+        target.scheduler.hibernate("alpha")
         assert target.scheduler.condition("alpha") == "running"
-        # The muted line's own tools still work in the turn it is running.
+        # The hibernated line's own tools still work in the turn it is running.
         tool = target.scheduler.send_tool("alpha")
-        result = await tool.handler({"to": "beta", "body": "from a muted line"})
+        result = await tool.handler({"to": "beta", "body": "from a hibernated line"})
         assert str(result["content"][0]["text"]).startswith("sent as m-")
         target.scheduler.send(ANA, ALPHA, "more work")
         gate.set()
@@ -745,7 +747,9 @@ async def _briefly(target: World, act: Callable[[], Coroutine[Any, Any, None]]) 
     await loop
 
 
-def test_priority_mail_does_not_end_a_muted_lines_turn(make_world: MakeWorld) -> None:
+def test_priority_mail_does_not_end_a_hibernated_lines_turn(
+    make_world: MakeWorld,
+) -> None:
     target = make_world(["alpha"])
     gate = asyncio.Event()
     target.gates["alpha"].append(gate)
@@ -753,7 +757,7 @@ def test_priority_mail_does_not_end_a_muted_lines_turn(make_world: MakeWorld) ->
     async def act() -> None:
         target.scheduler.send(ANA, ALPHA, "work")
         await until(lambda: len(target.prompts("alpha")) == 1)
-        target.scheduler.mute("alpha")
+        target.scheduler.hibernate("alpha")
         target.scheduler.send(ANA, ALPHA, "redirect", priority=True)
         gate.set()
 
@@ -768,7 +772,7 @@ def test_lines_priority_mail_is_rate_limited_and_a_refusal_records_nothing(
 ) -> None:
     target = make_world(["alpha", "beta"])
     tool = target.scheduler.send_tool("alpha")
-    target.scheduler.mute("beta")
+    target.scheduler.hibernate("beta")
 
     async def calls() -> list[dict[str, Any]]:
         args = {"to": "beta", "body": "now", "priority": True}
@@ -791,7 +795,7 @@ def test_lines_priority_mail_is_rate_limited_and_a_refusal_records_nothing(
 
 def test_operator_priority_mail_is_unlimited(make_world: MakeWorld) -> None:
     target = make_world(["alpha"])
-    target.scheduler.mute("alpha")
+    target.scheduler.hibernate("alpha")
     count = priority.MAX_PER_SENDER + priority.MAX_PER_RECIPIENT + 1
     for index in range(count):
         target.scheduler.send(ANA, ALPHA, f"now {index}", priority=True)

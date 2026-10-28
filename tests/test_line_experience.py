@@ -220,7 +220,7 @@ def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
             "line_id": "beta",
             "state": "idle",
             "held": False,
-            "muted": False,
+            "hibernated": False,
             "workdir_commit": None,
             "leases": ["gate"],
         }

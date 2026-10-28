@@ -18,8 +18,8 @@ from dromon.model import (
     InvalidField,
     LineAddress,
     LineCreated,
-    LineMuted,
-    LineUnmuted,
+    LineHibernated,
+    LineAwakened,
     LineState,
     LineStateChanged,
     MessageAcknowledged,
@@ -339,9 +339,14 @@ REJECTIONS: list[tuple[str, list[Event], Event, str]] = [
         MessageSent("m", AgentAddress("probe"), AgentAddress("probe"), NOTE, ""),
         "cannot message itself",
     ),
-    ("mute twice", [*parties(), LineMuted("alpha")], LineMuted("alpha"), "is muted"),
-    ("unmute unmuted", parties(), LineUnmuted("alpha"), "is not muted"),
-    ("mute no line", parties(), LineMuted("x"), "no line"),
+    (
+        "hibernate twice",
+        [*parties(), LineHibernated("alpha")],
+        LineHibernated("alpha"),
+        "is hibernated",
+    ),
+    ("awaken awakened", parties(), LineAwakened("alpha"), "is not hibernated"),
+    ("hibernate no line", parties(), LineHibernated("x"), "no line"),
     ("prioritize nothing", parties(), MessagePrioritized("m"), "no message m"),
     (
         "prioritize twice",
@@ -604,12 +609,12 @@ def test_a_line_may_send_itself_a_note_that_waits_undelivered() -> None:
     assert not note.delivered and not note.priority
 
 
-def test_mute_and_priority_change_only_their_own_flags() -> None:
+def test_hibernate_and_priority_change_only_their_own_flags() -> None:
     state = build(*parties(), MessageSent("m", ANA, ALPHA, NOTE, "now"))
     before = state.lines["alpha"]
-    state.apply(LineMuted("alpha"))
-    assert state.lines["alpha"].muted
-    state.apply(LineUnmuted("alpha"))
+    state.apply(LineHibernated("alpha"))
+    assert state.lines["alpha"].hibernated
+    state.apply(LineAwakened("alpha"))
     assert state.lines["alpha"] == before
     state.apply(MessagePrioritized("m"))
     assert state.messages["m"].priority
