@@ -41,7 +41,7 @@ from dromon.driver import Strategy
 from dromon.priority import SteeredDriver
 from dromon.engine import EngineRefused, TurnReport
 from dromon.jsonlines import Connection, ConnectionFactory, NotJsonLine
-from dromon.lineconfig import LineConfig, McpServer
+from dromon.lineconfig import LineConfig, McpServer, WorkdirAccess
 from dromon.sandbox import parse_sandbox
 from dromon.scheduler import LineEngine, LineSpec, engine_factory
 
@@ -504,6 +504,7 @@ def test_a_line_takes_its_drivers_effort(home: Path, runtime: Path) -> None:
 @pytest.mark.parametrize(
     ("config", "reason"),
     [
+        (LineConfig(workdir_access=WorkdirAccess.READ), "read-only working directory"),
         (LineConfig(builtin_tools=("Read",)), "no built-in tools"),
         (
             LineConfig(mcp_servers=(("x", McpServer("stdio", command="x")),)),

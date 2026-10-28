@@ -157,9 +157,9 @@ def test_role_status_shows_the_owner_the_seats_and_the_last_change(
     assert (
         "owner" in seats[0] and "hibernated" in seats[1] and "may not own" in seats[2]
     )
-    # No engine confines a seat yet, so the seats that do not own wait.
+    # The configured Claude Code engine confines both non-owning seats.
     waits = "waits, its engine cannot confine it"
-    assert [waits in line for line in seats] == [False, True, True]
+    assert [waits in line for line in seats] == [False, False, False]
     named = dromon("role", "status", "core")
     assert named == (exits.OK, out, "")
 

@@ -155,6 +155,13 @@ class ToolPolicy(StrEnum):
     ALLOW_ALL = "allow_all"
 
 
+class WorkdirAccess(StrEnum):
+    """The engine's permission to write inside its working directory."""
+
+    WRITE = "write"
+    READ = "read"
+
+
 class AtMax(StrEnum):
     """What a kept connection does when it reaches ``keep_session_max_seconds`` with
     background work still running. Each is bounded by ``keep_session_hard_seconds``.
@@ -289,6 +296,8 @@ class LineConfig:
     workdir: str | None = None
     """The directory the engine runs in, as written, or ``None`` for the project
     root."""
+    workdir_access: WorkdirAccess = WorkdirAccess.WRITE
+    """Whether the engine may write its workdir, as enforced by its confinement."""
     project_settings: bool = False
     """Whether a Claude Code line also loads Claude Code's project setting source, the
     working directory's ``.claude/settings.json`` and what it brings."""
@@ -373,6 +382,8 @@ def encode_config(config: LineConfig) -> str:
         document["instructions"] = list(config.instructions)
     if config.workdir is not None:
         document["workdir"] = config.workdir
+    if config.workdir_access is not WorkdirAccess.WRITE:
+        document["workdir_access"] = config.workdir_access.value
     if config.project_settings:
         document["project_settings"] = True
     if config.plugins:
@@ -561,6 +572,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         "claude_code_prompt",
         "instructions",
         "workdir",
+        "workdir_access",
         "project_settings",
         "plugins",
         "keep_session",
@@ -621,6 +633,9 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
     if len(set(instructions)) != len(instructions):
         _fail("instructions names a file twice")
     workdir = _workdir(document["workdir"]) if "workdir" in document else None
+    workdir_access = _choice(
+        document, "workdir_access", WorkdirAccess, WorkdirAccess.WRITE
+    )
     project_settings = document.get("project_settings", False)
     if type(project_settings) is not bool:
         _fail("project_settings must be a boolean")
@@ -694,6 +709,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         claude_code_prompt=prompt,
         instructions=instructions,
         workdir=workdir,
+        workdir_access=workdir_access,
         project_settings=project_settings,
         plugins=plugins,
         keep_session=keep,

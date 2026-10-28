@@ -16,17 +16,29 @@ key, and its ``initialize`` answer must name the cached sign-in as its default
 authentication method. An API driver is refused, since Dromon cannot yet make Grok
 prefer a key over a cached sign-in.
 
+Grok's home. A Grok line runs with ``GROK_HOME`` set to Dromon's own Grok home,
+``~/.grok/dromon-home``, never the operator's. Dromon writes its ``config.toml``, which
+sets the asking mode and declares no MCP server or hook, and its ``sandbox.toml`` when
+either is missing, and before every turn refuses any drift, any policy or trust file
+that sets something, and any agents, hooks, plugins, rules, skills or workflows there.
+Grok runs with ``HOME`` set to ``USER_HOME`` inside that home, so it cannot read the
+operator's Claude Code, Cursor or other harness files, and Dromon refuses a turn when
+that directory holds any or a Claude Code settings file there names another mode.
+The operator signs Grok in to that home once, by hand, with ``SIGN_IN``.
+
 Sandbox. Grok's custom sandbox profiles live only in ``sandbox.toml`` files, which an
-overlay cannot set. Dromon therefore requires the operator to define ``dromon-reader``
-and, for a line given ``Edit`` or ``Write``, ``dromon-writer``, checks before each turn
-that the profile denies Dromon's state and runtime directories and that a writer keeps
-``.git`` read-only, and selects it with ``GROK_SANDBOX``. Grok documents that a custom
+overlay cannot set. Dromon's Grok home defines ``dromon-reader`` and, for a line given
+``Edit`` or ``Write``, ``dromon-writer``. Dromon checks before each turn that the
+profile denies Dromon's state and runtime directories and that a writer keeps ``.git``
+read-only, and selects it with ``GROK_SANDBOX``. Grok documents that a custom
 profile it cannot apply stops it from starting. On macOS Grok does not block a child
 process's network access under any profile.
 
-Tools and permissions. Grok loads the operator's configuration, including MCP servers
-and a permission mode. Dromon asks for Grok's ask mode, refuses a session that reports
-any other mode, answers every permission request from the line's configuration, and
+Tools and permissions. Grok 1.0.70 reports no permission mode, so Dromon relies on its
+home's mode, refuses a turn when a Claude Code settings file Grok reads names another,
+refuses a session that reports a mode other than the asking one, refuses one that
+loads any MCP server but Dromon's, answers
+every permission request from the line's configuration, and
 interrupts and refuses a turn in which Grok uses a tool the line was not given. Each
 tool call is judged when first seen, and a later update or request that changes its
 name, title or kind refuses the turn. Dromon's
@@ -56,12 +68,14 @@ from claude_agent_sdk import SdkMcpTool
 from dromon import acp, evidence
 from dromon.acp import bridge_command as bridge_command
 from dromon.activity import ActivityKind, Observer, ignore
+from dromon.capabilities import GROK as GROK_CAPABILITIES
+from dromon.capabilities import Known
 from dromon.driver import TOOL_RESULT, ActionTag, Credential, Driver, Event, Strategy
 from dromon.engine import EngineRefused, TurnReport, read_instructions
 from dromon import launcher
 from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
-from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
+from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
 
 ENGINE_NAME: Final = "grok-build"
 """The engine this adapter runs, as drivers name it."""
@@ -100,14 +114,424 @@ API_ENVIRONMENT: Final = (
 )
 """Variables that may give Grok a credential other than its cached sign-in."""
 
-DROMON_CONTROLLED: Final = ("GROK_SANDBOX", "GROK_CONFIG", "GROK_CONFIG_PATH")
-"""Variables Dromon sets or clears itself."""
+HOME_VARIABLES: Final = (
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+)
+"""Variables through which Grok could find files under the operator's home directory,
+as the Antigravity adapter names them. ``HOME`` is replaced with the line's own, and the
+others are removed."""
 
-REFUSED_ENVIRONMENT: Final = ("GROK_HOME", "XAI_API_BASE_URL")
-"""Variables that would move Grok's configuration or send its requests elsewhere."""
+DROMON_CONTROLLED: Final = (
+    "GROK_HOME",
+    "GROK_SANDBOX",
+    "GROK_CONFIG",
+    "GROK_CONFIG_PATH",
+    *HOME_VARIABLES,
+)
+"""Variables Dromon sets or clears itself. An inherited ``GROK_HOME`` or ``HOME`` is
+replaced by Dromon's own, never honoured."""
+
+REFUSED_ENVIRONMENT: Final = (
+    "XAI_API_BASE_URL",
+    "GROK_CLI_CHAT_PROXY_BASE_URL",
+    "GROK_AUTH_PROVIDER_COMMAND",
+    "GROK_OIDC_ISSUER",
+    "GROK_OIDC_CLIENT_ID",
+)
+"""Variables that would send Grok's requests elsewhere or sign it in through another
+flow than the one stored in Dromon's Grok home, from Grok's authentication guide."""
+
+COMPAT_ENVIRONMENT: Final[Mapping[str, str]] = {
+    "GROK_CLAUDE_MCPS_ENABLED": "0",
+    "GROK_CURSOR_MCPS_ENABLED": "0",
+    "GROK_CLAUDE_HOOKS_ENABLED": "0",
+    "GROK_CURSOR_HOOKS_ENABLED": "0",
+}
+"""Variables Grok documents as turning off its scans of Claude Code's and Cursor's MCP
+server and hook files, which read the home directory whatever ``GROK_HOME`` is.
+Dromon's Grok home sets the same cells to false. **Probe of 2026-10-27.** They narrow
+what Grok loads, but the servers Grok reports are checked as well. **Inference, not
+verified.** That ``0`` turns a scan off, which Grok's guide implies without giving the
+value."""
 
 ASK_MODES: Final = frozenset({"default", "ask"})
 """Session modes in which Grok asks before a tool call that is not read-only."""
+
+MODE_CATEGORY: Final = "mode"
+"""The ACP ``configOptions`` category of a session's permission mode. **Inference.**
+ACP names it so. Grok 1.0.70 sends no such option, and its ``x.ai/sessionConfig``
+uses the category ``mode`` for reasoning efforts, so that list is never read."""
+
+SERVERS_UPDATED: Final = "x.ai/mcp/servers_updated"
+"""Grok's list of the MCP servers a session loaded, as ``mcpServers`` of ``name``,
+``source`` and ``type``. **Probe of 2026-10-27.** Grok 1.0.70 sent it before its
+``session/new`` answer, with the servers of the user's own configuration, although
+Dromon passed none."""
+MCP_PROGRESS: Final = "x.ai/mcp/init_progress"
+"""Grok's count of the MCP servers a session is connecting, as ``total``."""
+MODELS_UPDATE: Final = "x.ai/models/update"
+"""Grok's models, as ``currentModelId`` and ``availableModels``."""
+SESSION_NOTIFICATION: Final = "x.ai/session_notification"
+"""Grok's session notices, of which Dromon reads ``model_changed``."""
+SETTINGS_UPDATE: Final = "x.ai/settings/update"
+"""Grok's account settings from its service, with a ``permission_mode`` that was
+null on 2026-10-27 while the user's ``config.toml`` set ``always-approve``, so it is
+not the session's mode and is read only as a reason to refuse."""
+IGNORED_NOTIFICATIONS: Final = frozenset(
+    {"x.ai/session/setup", "x.ai/announcements/update"}
+)
+"""Grok notices identified in the probe of 2026-10-27 that carry nothing Dromon acts
+on, the phases of opening a session and the product's announcements."""
+
+
+def extension_method(method: str) -> str:
+    """A Grok extension method's name without ACP's ``_`` prefix for extensions,
+    which Grok 1.0.70 sends and its guide omits, so both spellings are read alike."""
+    return method.removeprefix("_")
+
+
+# Dromon's own Grok home.
+
+HOME_DIR: Final = Path(".grok") / "dromon-home"
+"""Dromon's own Grok home, relative to the home directory, which a Grok line reads as
+``GROK_HOME``, following Pi's dedicated agent directory. **Operator's decision of
+2026-10-27.** The probe of that day showed that a Grok started on the operator's own
+home loads the operator's MCP servers and permission mode, which no flag, overlay or
+ACP field overrides, so a Grok line never reads that home."""
+
+USER_HOME: Final = "home"
+"""The directory inside Dromon's Grok home that a Grok line reads as ``HOME``, as an
+Antigravity line reads one of its own. **Operator's decision of 2026-10-27.** Grok's
+permissions guide says it reads ``defaultMode`` from ``~/.claude/settings.json`` with
+no setting to stop it, and its rules, skills and hook guides name ``~/.claude``,
+``~/.claude.json``, ``~/.cursor`` and ``~/.agents``, so a Grok line never sees the
+operator's home through ``HOME``. **Inference from Grok's authentication guide.** The
+sign-in is the file ``auth.json`` under ``GROK_HOME``, and the guide names no keychain,
+so the sign-in does not depend on ``HOME``. **Not verified.** That Grok finds the home
+directory through ``HOME`` rather than the account database."""
+
+_GROK_HOME_TEXT: Final = f"$HOME/{HOME_DIR.as_posix()}"
+
+SIGN_IN: Final = (
+    f'mkdir -p -m 700 "{_GROK_HOME_TEXT}/{USER_HOME}" &&'
+    f' GROK_HOME="{_GROK_HOME_TEXT}" HOME="{_GROK_HOME_TEXT}/{USER_HOME}" grok login'
+)
+"""The command with which the operator signs Grok in to Dromon's home, once, by hand.
+``grok login`` is the sign-in of Grok's authentication guide, and ``GROK_HOME`` is the
+variable its configuration guide documents for moving its directory. ``HOME`` is set as
+a turn sets it, so the sign-in reads none of the operator's other harness files and
+keeps anything it may write under ``HOME`` where a turn finds it. ``GROK_HOME`` comes
+first, so both expand the operator's ``HOME`` in any POSIX shell. Dromon never writes,
+reads or copies the credential this stores."""
+
+HOME_CONFIG: Final = (
+    "# Dromon's Grok home. Dromon wrote this file and refuses a Grok turn when it\n"
+    "# changes. Delete it to have Dromon write it again.\n"
+    "\n"
+    "[ui]\n"
+    'permission_mode = "default"\n'
+    "\n"
+    "[compat.claude]\n"
+    "mcps = false\n"
+    "hooks = false\n"
+    "\n"
+    "[compat.cursor]\n"
+    "mcps = false\n"
+    "hooks = false\n"
+)
+"""The whole of the home's ``config.toml``. It sets Grok's asking mode, declares no
+MCP server and no hook, and turns off the scans of Claude Code's and Cursor's MCP
+servers and hooks. Compared by its parsed contents before every turn, so any key Grok
+or anyone else adds is drift."""
+
+POLICY_FILES: Final = ("managed_config.toml", "requirements.toml")
+"""Policy files Grok reads from its home, which may add hooks, MCP servers or a pinned
+permission mode. **Observed on 2026-10-27, key names only.** Grok keeps both in the
+operator's home as empty files, so each must be absent or empty."""
+
+TRUST_FILE: Final = "trusted_folders.toml"
+"""Grok's record of trusted folders, which lets a project's hooks, MCP servers,
+plugins and permission rules load. It must be absent or list no folder."""
+
+SYSTEM_POLICY_DIR: Final = Path("/etc/grok")
+"""Where Grok reads its system policy files, which must be absent or empty too. macOS
+device management, which Grok also reads, cannot be checked from here."""
+
+REFUSED_HOME_ENTRIES: Final = (
+    "agents",
+    "hooks",
+    "hooks-paths",
+    "installed-plugins",
+    "lsp.json",
+    "plugins",
+    "rules",
+    "skills",
+    "workflows",
+)
+"""Entries of a Grok home that would give a line agents, hooks, plugins, language
+servers, rules, skills or workflows it was not given, as Grok's guide lists them. A
+file is refused when present, a directory when it holds anything, since Grok may
+create an empty one."""
+
+USER_HOME_HARNESS_ENTRIES: Final = (
+    ".agents",
+    ".claude",
+    ".claude.json",
+    ".cursor",
+    ".grok",
+)
+"""Entries of the line's ``HOME`` through which Grok's guide says it loads another
+harness's settings, permission mode, MCP servers, hooks, rules or skills, or its own
+home when ``GROK_HOME`` is unset. Refused as ``REFUSED_HOME_ENTRIES`` are, after
+``claude_mode_refusal`` has read the Claude Code settings there."""
+
+PROJECT_DIRECTORY: Final = ".grok"
+"""A project's own Grok directory, refused at every project level by
+``check_project``."""
+
+REFUSED_PROJECT_ENTRIES: Final = (PROJECT_DIRECTORY, ".claude", ".cursor", ".agents")
+"""Project directories whose settings, rules, skills or hooks Grok could load, but
+which Dromon has not read as Grok configuration."""
+
+MAX_HOME_FILE: Final = 1024 * 1024
+"""The largest home or settings file Dromon reads."""
+
+CLAUDE_MANAGED_SETTINGS: Final = (
+    Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+    Path("/etc/claude-code/managed-settings.json"),
+)
+"""Claude Code's managed settings, which Grok reads for a permission mode."""
+
+
+def _read_small(file: Path) -> str | None:
+    """A home or settings file's text, ``None`` when absent, or ``EngineRefused``."""
+    try:
+        with file.open("rb") as handle:
+            raw = handle.read(MAX_HOME_FILE + 1)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise EngineRefused(f"cannot read {file}: {error}") from error
+    if len(raw) > MAX_HOME_FILE:
+        raise EngineRefused(f"{file} exceeds {MAX_HOME_FILE} bytes")
+    try:
+        return raw.decode("utf-8")
+    except ValueError as error:
+        raise EngineRefused(f"{file} is not UTF-8") from error
+
+
+def _read_toml(file: Path) -> dict[str, object] | None:
+    text = _read_small(file)
+    if text is None:
+        return None
+    try:
+        return tomllib.loads(text)
+    except ValueError as error:
+        raise EngineRefused(f"{file} is not TOML: {error}") from error
+
+
+def _is_empty(document: Mapping[str, object]) -> bool:
+    """Whether a TOML document sets nothing, allowing empty top-level tables."""
+    return all(value == {} for value in document.values())
+
+
+def _write_new(file: Path, text: str) -> None:
+    """Write ``file`` only if it does not exist, owner-only, never through a link."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(file, flags, 0o600)
+    except FileExistsError:
+        return
+    except OSError as error:
+        raise EngineRefused(f"cannot write {file}: {error}") from error
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def _own_directory(directory: Path, label: str) -> None:
+    """Create ``directory`` owner-only if missing, and refuse a link, a file, or one
+    other users may write."""
+    if directory.is_symlink():
+        raise EngineRefused(
+            f"{label} {directory} is a symbolic link, which Grok's sandbox refuses and"
+            " Dromon does not follow"
+        )
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as error:
+        raise EngineRefused(f"cannot create {label} {directory}: {error}") from error
+    if not directory.is_dir():
+        raise EngineRefused(f"{label} {directory} is not a directory")
+    if directory.stat().st_mode & 0o022:
+        raise EngineRefused(
+            f"{label} {directory} may be written by other users. Make it owner-only,"
+            " as Grok's guide asks of a home that holds a sign-in."
+        )
+
+
+def prepare_home(grok_home: Path, workspace: Path, protected: Sequence[Path]) -> None:
+    """Create Dromon's Grok home and the line's ``HOME`` inside it, owner-only, and
+    write the Grok home's ``config.toml`` and ``sandbox.toml`` when either is missing.
+    An existing file is never replaced, so drift is refused by ``check_home``,
+    ``check_user_home`` and ``check_profile`` rather than repaired. Nothing here
+    writes, reads or copies a credential.
+
+    Porting note. ``O_NOFOLLOW`` and the mode bits are POSIX, as Grok's sandbox is."""
+    _own_directory(grok_home, "Dromon's Grok home")
+    _own_directory(grok_home / USER_HOME, "a Grok line's home directory")
+    _write_new(grok_home / "config.toml", HOME_CONFIG)
+    _write_new(
+        grok_home / "sandbox.toml",
+        profile_snippet(READER_PROFILE, workspace, protected)
+        + "\n\n"
+        + profile_snippet(WRITER_PROFILE, workspace, protected)
+        + "\n",
+    )
+
+
+def check_home(grok_home: Path, system: Path = SYSTEM_POLICY_DIR) -> None:
+    """Refuse Dromon's Grok home when its configuration has drifted from Dromon's,
+    when a policy or trust file sets anything, or when it holds an entry that would
+    load something the line was not given. ``auth.json`` is never opened."""
+    config = grok_home / "config.toml"
+    document = _read_toml(config)
+    if document != tomllib.loads(HOME_CONFIG):
+        raise EngineRefused(
+            f"{config} is not the configuration Dromon wrote for its Grok home."
+            " Delete it to have Dromon write it again."
+        )
+    for file in [grok_home / name for name in POLICY_FILES] + [
+        system / name for name in POLICY_FILES
+    ]:
+        policy = _read_toml(file)
+        if policy is not None and not _is_empty(policy):
+            raise EngineRefused(
+                f"{file} sets Grok policy, which may add hooks, MCP servers or a"
+                " permission mode a Grok line was not given"
+            )
+    trust = _read_toml(grok_home / TRUST_FILE)
+    if trust is not None and not _is_empty(trust):
+        raise EngineRefused(
+            f"{grok_home / TRUST_FILE} trusts a folder, which would let a project's"
+            " hooks, MCP servers and permission rules load for a Grok line"
+        )
+    found = _loading_entries(grok_home, REFUSED_HOME_ENTRIES)
+    if found:
+        raise EngineRefused(
+            f"Dromon's Grok home {grok_home} holds " + ", ".join(found) + ", which"
+            " would give a line agents, hooks, plugins, rules, skills or workflows it"
+            " was not given"
+        )
+
+
+def check_user_home(user_home: Path) -> None:
+    """Refuse the line's ``HOME`` when it holds another harness's files, which Grok
+    would load. Run after ``claude_mode_refusal``, which names a mode there first."""
+    found = _loading_entries(user_home, USER_HOME_HARNESS_ENTRIES)
+    if found:
+        raise EngineRefused(
+            f"a Grok line's home directory {user_home} holds " + ", ".join(found) + ","
+            " from which Grok would load another harness's settings, servers, hooks,"
+            " rules or skills"
+        )
+
+
+def _loading_entries(directory: Path, names: Sequence[str]) -> list[str]:
+    """Which of ``names`` in ``directory`` are a file or link, or a directory that
+    holds anything. An empty directory is allowed, since Grok may create one."""
+    found: list[str] = []
+    for name in names:
+        entry = directory / name
+        if entry.is_dir() and not entry.is_symlink():
+            if any(True for _ in entry.iterdir()):
+                found.append(name)
+        elif os.path.lexists(entry):
+            found.append(name)
+    return found
+
+
+def _claude_settings_files(home: Path, workspace: Path) -> list[Path]:
+    """The Claude Code settings files Grok's guide says it reads a mode from, the
+    user's under ``home``, the managed ones, and each project level from the workspace
+    up to its repository's root, or the workspace alone outside a repository. ``home``
+    is the ``HOME`` Grok runs with, the line's own, not the operator's."""
+    files = [
+        home / ".claude" / "settings.json",
+        home / ".claude" / "settings.local.json",
+        *CLAUDE_MANAGED_SETTINGS,
+    ]
+    for directory in _project_levels(workspace):
+        files.append(directory / ".claude" / "settings.json")
+        files.append(directory / ".claude" / "settings.local.json")
+    return files
+
+
+def _project_levels(workspace: Path) -> list[Path]:
+    """Each directory from the workspace up to its repository's root, or the
+    workspace alone outside a repository, as Grok's guides say it reads project
+    files. The walk is bounded by the depth of the path."""
+    levels: list[Path] = []
+    for directory in (workspace, *workspace.parents):
+        levels.append(directory)
+        if os.path.lexists(directory / ".git"):
+            return levels
+    return [workspace]
+
+
+def check_project(workspace: Path) -> None:
+    """Refuse a turn when any project level holds an unread Grok or harness directory.
+    Grok's guides describe loading configuration, hooks, rules or skills from these
+    directories, which a worktree could supply. Dromon refuses them whole rather than
+    reading their contents, as the Antigravity adapter refuses its workspace
+    directories. **Operator decision, 2026-10-28.**"""
+    found = [
+        str(directory / name)
+        for directory in _project_levels(workspace)
+        for name in REFUSED_PROJECT_ENTRIES
+        if _loading_entries(directory, (name,))
+    ]
+    if found:
+        raise EngineRefused(
+            "Grok would load project configuration or instructions Dromon has not"
+            " read from " + ", ".join(found)
+        )
+
+
+def claude_mode_refusal(home: Path, workspace: Path) -> str | None:
+    """Why a Claude Code settings file refuses a Grok turn, or ``None``. Grok's guide
+    says it reads ``defaultMode`` from these files and does not say whether its own
+    ``permission_mode`` outranks them, so a file that names any mode but Grok's
+    asking one refuses the turn. **Not verified live.** Which one wins."""
+    for file in _claude_settings_files(home, workspace):
+        text = _read_small(file)
+        if text is None:
+            continue
+        try:
+            document: object = json.loads(text)
+        except ValueError:
+            return f"{file} is not JSON, and Grok reads a permission mode from it"
+        if not isinstance(document, dict):
+            continue
+        settings = cast(dict[str, object], document)
+        permissions = settings.get("permissions")
+        mode = (
+            cast(dict[str, object], permissions).get("defaultMode")
+            if isinstance(permissions, dict)
+            and "defaultMode" in cast(dict[str, object], permissions)
+            else settings.get("defaultMode")
+        )
+        if mode is not None and mode not in ASK_MODES:
+            return (
+                f"{file} sets Claude Code's defaultMode to {mode!r}, which Grok also"
+                " reads, and Grok's guide does not say whether Dromon's Grok home"
+                " outranks it"
+            )
+    return None
+
 
 EFFORTS: Final[dict[str, str]] = {
     "low": "low",
@@ -136,7 +560,21 @@ ABSOLUTE_TURN_SECONDS: Final = 4 * 60 * 60
 
 
 def unsupported(config: LineConfig) -> str | None:
-    """Why a Grok line cannot run ``config``, or ``None`` if it can."""
+    """Why a Grok line cannot run ``config``, or ``None`` if it can.
+
+    **Review of read-only seats, second round, findings 1 and 2.** A read-only working
+    directory is refused until a live probe shows the ``dromon-reader`` profile deny a
+    write to the worktree and ``capabilities.GROK`` records ``read_only_workdir`` as
+    known. The profile rests on Grok's built-in ``read-only`` base, which Dromon names
+    but cannot inspect."""
+    if (
+        config.workdir_access is WorkdirAccess.READ
+        and GROK_CAPABILITIES.read_only_workdir is not Known.YES
+    ):
+        return (
+            "Grok cannot yet confine a line to a read-only working directory, because"
+            " no live probe has shown its read-only sandbox base deny a write there"
+        )
     extra = sorted(set(config.builtin_tools) - SUPPORTED_BUILTINS)
     if extra:
         return (
@@ -181,14 +619,20 @@ def engine_environment(
             "the environment conflicts with a Grok line: " + ", ".join(present)
         )
     removed = set(API_ENVIRONMENT) | set(DROMON_CONTROLLED)
-    return {k: v for k, v in environment.items() if k not in removed}
+    kept = {k: v for k, v in environment.items() if k not in removed}
+    return {**kept, **COMPAT_ENVIRONMENT}
 
 
 # The sandbox profile.
 
 
 def profile_name(config: LineConfig) -> str:
-    return WRITER_PROFILE if WRITE_TOOLS & set(config.builtin_tools) else READER_PROFILE
+    return (
+        WRITER_PROFILE
+        if config.workdir_access is WorkdirAccess.WRITE
+        and WRITE_TOOLS & set(config.builtin_tools)
+        else READER_PROFILE
+    )
 
 
 def _load_profiles(file: Path) -> dict[str, dict[str, object]]:
@@ -255,26 +699,43 @@ def profile_snippet(name: str, workspace: Path, protected: Sequence[Path]) -> st
     return "\n".join(lines)
 
 
+PROFILE_KEYS: Final = frozenset({"extends", "deny", "read_only", "restrict_network"})
+"""The keys a Dromon profile may set. ``read_write`` would let a reader write, so it
+and any key Grok adds later are refused."""
+
+
 def check_profile(
-    config: LineConfig, workspace: Path, protected: Sequence[Path], home: Path
+    config: LineConfig,
+    workspace: Path,
+    protected: Sequence[Path],
+    home: Path,
+    grok_home: Path,
 ) -> str:
     """The name of the Grok profile the line runs under, after checking that it denies
     every ``protected`` directory and, for a writer, keeps ``.git`` read-only. Raises
     ``EngineRefused`` naming the table to add when it does not.
 
-    Grok uses the user's definition when the user's and the project's files differ, so
-    the user's file is checked first.
+    The profile is read from Dromon's Grok home alone. A project's ``.grok``, where a
+    project's ``sandbox.toml`` would live, is refused by ``check_project``, so no
+    project file can replace it. The reader's ``extends`` names Grok's built-in
+    ``read-only`` base, whose denial of writes Dromon cannot inspect, which is why a
+    read-only working directory is refused by ``unsupported``. ``home`` resolves a
+    ``~`` in a ``deny`` entry, and is the line's own ``HOME``, at which Grok's sandbox
+    guide anchors ``~``. **Inference, not verified.**
+    That Grok reads ``sandbox.toml`` from ``GROK_HOME``, as it does ``config.toml``.
     """
     name = profile_name(config)
-    user = _load_profiles(home / ".grok" / "sandbox.toml")
-    project = _load_profiles(workspace / ".grok" / "sandbox.toml")
-    profile = user.get(name) or project.get(name)
-    advice = (
-        f" Add this to ~/.grok/sandbox.toml:\n\n"
-        f"{profile_snippet(name, workspace, protected)}"
-    )
+    file = grok_home / "sandbox.toml"
+    profile = _load_profiles(file).get(name)
+    advice = f" Add this to {file}:\n\n{profile_snippet(name, workspace, protected)}"
     if profile is None:
         raise EngineRefused(f"no Grok sandbox profile {name} is defined.{advice}")
+    unknown = sorted(set(profile) - PROFILE_KEYS)
+    if unknown:
+        raise EngineRefused(
+            f"the Grok sandbox profile {name} sets " + ", ".join(unknown) + ", which"
+            f" Dromon does not accept for it.{advice}"
+        )
     base = profile.get("extends", "workspace")
     if base not in PROFILE_BASES[name]:
         raise EngineRefused(
@@ -398,6 +859,8 @@ class _Turn:
     refusal: str | None = None
     cancelled: bool = False
     absolute_deadline: float | None = None
+    servers_reported: bool = False
+    """Whether Grok listed the session's MCP servers, which a prompt requires."""
 
 
 def grok_arguments(model: str, effort: str) -> list[str]:
@@ -466,8 +929,19 @@ class GrokLine:
         reason = unsupported(self.config)
         if reason is not None:
             raise EngineRefused(reason)
+        grok_home = self._home / HOME_DIR
+        user_home = grok_home / USER_HOME
+        prepare_home(grok_home, self.cwd, self.protected)
+        check_home(grok_home)
+        check_project(self.cwd)
+        claude_mode = claude_mode_refusal(user_home, self.cwd)
+        if claude_mode is not None:
+            raise EngineRefused(claude_mode)
+        check_user_home(user_home)
+        environment["GROK_HOME"] = str(grok_home)
+        environment["HOME"] = str(user_home)
         environment["GROK_SANDBOX"] = check_profile(
-            self.config, self.cwd, self.protected, self._home
+            self.config, self.cwd, self.protected, user_home, grok_home
         )
         effort = self.config.effort or self.driver.settings.effort
         if effort not in EFFORTS:
@@ -551,6 +1025,106 @@ class GrokLine:
             await self._answer(message["id"], method, params, turn)
         elif method == "session/update":
             await self._update(cast(dict[str, Any], params.get("update") or {}), turn)
+        else:
+            refusal = self._notice_refusal(extension_method(method), params, turn)
+            if refusal is not None:
+                await self._cancel(turn, refusal)
+
+    def _allowed_servers(self) -> frozenset[str]:
+        return frozenset(
+            str(server["name"])
+            for server in acp.mcp_servers(self.bridge, self.line_token)
+        )
+
+    def _notice_refusal(
+        self, method: str, params: Mapping[str, Any], turn: _Turn
+    ) -> str | None:
+        """Why one of Grok's own notifications refuses the turn, or ``None``.
+        **Probe of 2026-10-27.** A notice not identified here is passed over, as
+        before, since a notification cannot be refused, and a request not identified
+        is still answered with an error."""
+        if method == SERVERS_UPDATED:
+            turn.servers_reported = True
+            return self._servers_refusal(params.get("mcpServers"))
+        if method == MCP_PROGRESS:
+            total = params.get("total")
+            allowed = len(self._allowed_servers())
+            if total is not None and (type(total) is not int or total > allowed):
+                return (
+                    f"Grok is connecting {total!r} MCP servers, and a Grok line has"
+                    f" only Dromon's, {allowed}"
+                )
+            return None
+        if method == MODELS_UPDATE:
+            if "currentModelId" in params:
+                return self._model_refusal(params.get("currentModelId"))
+            return None
+        if method == SESSION_NOTIFICATION:
+            update = params.get("update")
+            if (
+                isinstance(update, dict)
+                and cast(dict[str, Any], update).get("sessionUpdate") == "model_changed"
+            ):
+                return self._model_refusal(cast(dict[str, Any], update).get("model_id"))
+            return None
+        if method == SETTINGS_UPDATE:
+            mode = params.get("permission_mode")
+            if mode is not None and mode not in ASK_MODES:
+                return f"Grok's settings name the permission mode {mode!r}"
+            return None
+        return None
+
+    def _servers_refusal(self, servers: object) -> str | None:
+        """Why a list of loaded MCP servers refuses the turn, or ``None`` when it
+        holds Dromon's own server at most. Other servers are counted and never
+        named, since their names are the operator's configuration."""
+        if not isinstance(servers, list):
+            return "Grok reported its MCP servers in a shape Dromon does not read"
+        allowed = self._allowed_servers()
+        others = 0
+        for server in cast(list[object], servers):
+            name = (
+                cast(dict[str, Any], server).get("name")
+                if isinstance(server, dict)
+                else None
+            )
+            if not isinstance(name, str) or name not in allowed:
+                others += 1
+        if others:
+            return (
+                f"Grok loaded {others} MCP servers besides Dromon's, from the user's"
+                " own configuration, and a Grok line may have only Dromon's tools"
+            )
+        return None
+
+    def _model_refusal(self, model: object) -> str | None:
+        """Why a model Grok reports during the session refuses the turn. The driver
+        runs Grok with ``--model``, so any other model, or one that is not a name,
+        is not the model the driver accepted."""
+        expected = self.driver.settings.model
+        if model != expected:
+            return f"Grok switched the session's model to {model!r}, not {expected!r}"
+        return None
+
+    def _mode_refusal(self, result: Mapping[str, Any]) -> str | None:
+        """Why the session's permission mode refuses the turn, read from a
+        ``configOptions`` entry of the category ``mode``, or ``None``. **Probe of
+        2026-10-27.** Grok 1.0.70 reports no mode, and no ACP field, flag or overlay
+        sets one, so a session that reports none rests on the checks made before
+        Grok started. Dromon's Grok home sets the asking mode, no policy file or
+        Claude Code settings file names another, and ``session/new`` asks for
+        neither ``yoloMode`` nor ``autoMode``. **Not verified live.** That Grok then
+        runs in that mode, which it cannot report."""
+        for option in cast(list[Any], result.get("configOptions") or []):
+            if not isinstance(option, dict):
+                continue
+            entry = cast(dict[str, Any], option)
+            if entry.get("category") == MODE_CATEGORY:
+                current = entry.get("currentValue")
+                if current in ASK_MODES:
+                    return None
+                return f"the engine runs in the permission mode {current!r}"
+        return None
 
     def _permits(self, tool_call: Mapping[str, Any]) -> tuple[bool, str]:
         """Whether the line may make ``tool_call``, and the tool name to count it as.
@@ -611,6 +1185,13 @@ class GrokLine:
         elif kind == "agent_thought_chunk":
             self._observe(ActivityKind.THINKING, "")
             await self._act(Event("thinking"), turn)
+        elif kind == "current_mode_update":
+            # A session that leaves the asking modes mid-turn no longer asks Dromon.
+            mode = update.get("currentModeId")
+            if mode not in ASK_MODES:
+                await self._cancel(
+                    turn, f"the engine switched to the permission mode {mode!r}"
+                )
         elif kind in ("tool_call", "tool_call_update"):
             # Antigravity review, F1 to F3, applied to Grok on 2026-10-26. No kind is
             # exempt, and every update to a call is compared with its record.
@@ -683,7 +1264,8 @@ class GrokLine:
         if method != "cached_token":
             raise EngineRefused(
                 f"the engine reports the authentication method {method!r}, not its"
-                " cached sign-in"
+                " cached sign-in. Sign Grok in to Dromon's Grok home once, by hand,"
+                f" with {SIGN_IN}"
             )
         # Inference, not verified live: the cached sign-in is a Grok subscription.
         credential = Credential.SUBSCRIPTION
@@ -715,6 +1297,14 @@ class GrokLine:
         if not session_id:
             raise EngineRefused("the engine started a session without an identifier")
         self.session_id_in_use = session_id
+        if turn.refusal is not None:
+            return session_id
+        if not turn.servers_reported:
+            turn.refusal = (
+                "Grok did not report its MCP servers, so Dromon cannot confirm that"
+                " a Grok line has only Dromon's tools"
+            )
+            return session_id
         model = acp.reported_model(result)
         verdict = self.driver.step(Event("init", model or ""))
         if verdict.tag is ActionTag.REFUSE:
@@ -723,10 +1313,13 @@ class GrokLine:
             )
             return session_id
         # Refuse the turn unless the session asks before acting, switching to
-        # ``default`` when Grok offers it.
-        refusal = await acp.ensure_mode(
-            self._rpc(), session_id, result, ASK_MODES, "default"
-        )
+        # ``default`` when Grok offers it through ACP's ``modes``.
+        if isinstance(result.get("modes"), dict):
+            refusal = await acp.ensure_mode(
+                self._rpc(), session_id, result, ASK_MODES, "default"
+            )
+        else:
+            refusal = self._mode_refusal(result)
         if refusal is not None:
             turn.refusal = refusal
         return session_id

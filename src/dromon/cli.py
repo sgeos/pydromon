@@ -43,7 +43,12 @@ from dromon.model import AgentAccess
 from dromon.protocol import Operation, ProtocolError
 from dromon.scheduler import LineSpec, engine_factory
 from dromon import settings as engine_settings
-from dromon.sandbox import SandboxConfig, merge, sandbox_from_settings
+from dromon.sandbox import (
+    SandboxConfig,
+    effective as effective_sandbox,
+    merge,
+    sandbox_from_settings,
+)
 from dromon.settings import SettingsConfig, split_settings_file
 from dromon.workdir import read_head_commit
 
@@ -872,6 +877,35 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         )
     for line_id, line in sorted(config.lines.items()):
         line_settings = engine_settings.merge([config.settings, line.config.settings])
+        line_sandbox = merge([config.sandbox, line.config.sandbox])
+        raw_workdir = line.config.workdir or "."
+        workdir = Path(raw_workdir).expanduser()
+        if not workdir.is_absolute():
+            workdir = paths.root / workdir
+        workdir = workdir.resolve()
+        sandbox_document = effective_sandbox(line_sandbox, workdir, ())
+        raw_filesystem = (
+            sandbox_document.get("filesystem") if sandbox_document is not None else None
+        )
+        filesystem = (
+            cast(dict[str, object], raw_filesystem)
+            if isinstance(raw_filesystem, dict)
+            else {}
+        )
+        raw_allow_write = filesystem.get("allowWrite", [])
+        allow_write = (
+            [
+                path
+                for path in cast(list[object], raw_allow_write)
+                if isinstance(path, str)
+            ]
+            if isinstance(raw_allow_write, list)
+            else []
+        )
+        writes = (
+            ", ".join(sorted(os.path.expanduser(path) for path in allow_write))
+            or "none"
+        )
         tools = ", ".join(line.config.builtin_tools) or "no built-in tools"
         servers = ", ".join(line.config.server_names()) or "no MCP servers"
         print(
@@ -882,6 +916,7 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             + (f", effort {line.config.effort}" if line.config.effort else "")
             + (f", in {line.config.workdir}" if line.config.workdir else "")
         )
+        print(f"  effective sandbox allowWrite: {writes}")
     shared_workdirs: dict[str, list[str]] = {}
     for line_id, line in sorted(config.lines.items()):
         tools_available = set(line.config.builtin_tools) | set(

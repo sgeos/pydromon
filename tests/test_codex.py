@@ -43,7 +43,7 @@ from dromon.launcher import (
     LAUNCH_VARIABLES,
     STOP_POLICY_VARIABLE,
 )
-from dromon.lineconfig import LineConfig
+from dromon.lineconfig import LineConfig, config_from_document
 from dromon.model import format_due
 from dromon.projectconfig import parse
 from dromon.sandbox import parse_sandbox
@@ -1054,6 +1054,21 @@ def test_the_profile_writes_only_with_a_write_tool_and_never_git(
             ".": "write",
             ".git": "read",
         }
+
+
+def test_a_read_only_workdir_profile_keeps_tmp_writable() -> None:
+    import tomllib
+
+    config = config_from_document(
+        {"builtin_tools": ["Bash", "Edit", "Write"], "workdir_access": "read"}
+    )
+    text = profile_of(server_arguments([], config, ()))
+    profile = tomllib.loads(f"profile = {text}")["profile"]
+    assert profile["filesystem"][":workspace_roots"] == {
+        ".": "read",
+        ".git": "read",
+        "tmp": "write",
+    }
 
 
 def test_the_profile_denies_each_protected_directory_that_exists(

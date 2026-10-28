@@ -12,6 +12,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
+from dromon.capabilities import Known, TABLES
 from dromon.driver import Strategy
 from dromon.engine import EnginePlanLimit, TurnReport
 from dromon.eventlog import EventLog
@@ -837,9 +838,16 @@ def test_a_seats_access_follows_ownership_and_its_engine_decides_the_wait(
     assert not waits_unconfined(state, "beta", PROVIDER, frozenset())
 
 
-def test_no_engine_confines_a_seat_until_read_only_seats_merge() -> None:
-    """**Technical debt.** This changes when ``feat/read-only-seats`` merges."""
-    assert not CONFINING_ENGINES
+def test_confining_engines_follow_the_capability_table() -> None:
+    assert (
+        frozenset(
+            engine
+            for engine, table in TABLES.items()
+            if table.read_only_workdir is Known.YES
+        )
+        == CONFINING_ENGINES
+    )
+    assert "grok-build" not in CONFINING_ENGINES
 
 
 def test_the_former_and_the_new_owner_are_told_at_their_next_turn(

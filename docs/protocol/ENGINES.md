@@ -19,6 +19,7 @@ operator can tell a limit of the engine from a gap in what Dromon has observed.
 | `kept_session` | yes | no | no | yes | no | no | A connection can be kept between turns |
 | `own_tools` | yes | unknown | yes | yes | unknown | unknown | Dromon's own tools reach the model, through MCP or an extension |
 | `deny_before_run` | yes | unknown | no | yes | unknown | no | Every built-in tool is denied before it runs |
+| `read_only_workdir` | yes | no | no | yes | unknown | no | The adapter confines a read-only workdir while preserving the scratch exception |
 | `cost_report` | yes | yes | no | no | no | unknown | The engine reports a cost for each turn |
 | `max_turns` | yes | yes | no | no | no | no | Model calls in a turn are bounded, by the engine or by Dromon's count |
 | `credential_visible` | yes | yes | yes | yes | unknown | no | Dromon can tell which credential a turn uses |
@@ -37,6 +38,14 @@ it was merged, under the rule of finding C1. `own_tools`, `deny_before_run` and
 `sign_in_check` are `yes` only where a live run showed them. The other capabilities are
 as the adapter's code states them, and `unknown` where the code names its reading an
 inference. A test checks each column's `kept_session` against what its adapter refuses.
+
+**Grok's read-only workdir is unknown.** Review of read-only seats, finding 3. The
+`dromon-reader` profile rests on Grok's built-in `read-only` base, which Dromon names but
+cannot inspect, and no live run has shown that the profile denies writes to the
+worktree. It stays `unknown` until an operator probe shows it, and the adapter refuses a
+read-only line while it is anything but `yes`. Second round, findings 1 and 2. Codex's
+`yes` rests on its adapter's code and its profile check, with no live observation of a
+refused write recorded in `CODEX.md`.
 
 - **Codex** was run live with Codex 0.164.0 and GPT-6-Luna on 2026-10-25, as
   [`CODEX.md`](CODEX.md) records. A resumed thread, Dromon's tools as dynamic tools and

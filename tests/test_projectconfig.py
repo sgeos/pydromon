@@ -339,6 +339,60 @@ def test_config_reports_a_valid_file(
     assert "line beta: claude-opus-5-5 subscription, allow_all, Read, docs" in out
 
 
+def test_config_reports_each_lines_effective_sandbox_write_grant(
+    tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tmp_path / ".dromon"
+    state.mkdir(mode=0o700)
+    (state / "dromon.toml").write_text(
+        """\
+version = 1
+
+[profiles.reader]
+model = "claude-haiku-5-5"
+strategy = "subscription"
+
+[profiles.reader.sandbox]
+enabled = true
+enableWeakerNetworkIsolation = true
+
+[profiles.reader.sandbox.filesystem]
+allowWrite = ["/shared/repo/.git", "~/.cargo/registry"]
+
+[lines.alpha]
+profile = "reader"
+workdir = "worktrees/alpha"
+
+[lines.alpha.sandbox.filesystem]
+allowWrite = [".", "../../cache/alpha"]
+
+[lines.beta]
+profile = "reader"
+workdir = "worktrees/beta"
+
+[lines.beta.sandbox.filesystem]
+allowWrite = [".", "../../cache/beta"]
+"""
+    )
+    argv = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime), "config"]
+
+    assert cli.main(argv) == exits.OK
+
+    out = capsys.readouterr().out
+    alpha, beta = out.split("line alpha:", 1)[1].split("line beta:", 1)
+    assert f"{tmp_path}/worktrees/alpha" in alpha
+    assert f"{tmp_path}/cache/alpha" in alpha
+    assert f"{tmp_path}/worktrees/beta" not in alpha
+    assert f"{tmp_path}/cache/beta" not in alpha
+    assert f"{tmp_path}/worktrees/beta" in beta
+    assert f"{tmp_path}/cache/beta" in beta
+    assert f"{tmp_path}/worktrees/alpha" not in beta
+    assert f"{tmp_path}/cache/alpha" not in beta
+    assert "/shared/repo/.git" in alpha and "/shared/repo/.git" in beta
+    assert str(Path.home() / ".cargo/registry") in alpha
+    assert str(Path.home() / ".cargo/registry") in beta
+
+
 def test_config_reports_an_invalid_file_with_its_location(
     tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

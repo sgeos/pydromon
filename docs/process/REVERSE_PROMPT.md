@@ -4,31 +4,29 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-27, the rest of the T3 Code list
+## 2026-10-28, roles, provider seats and the first federation steps
 
-**Done.** The Opus `worker` line wrote it, the Haiku `reviewer` line reviewed it, and
-two fix rounds followed.
+**Done, merged in pull requests 57 to 63.**
 
-- **Failures.** A failed turn holds its line and asks an operator. Instruction paths
-  resolve against the project root and are checked at load.
-- **Evidence.** `dromon probe --record` and `--scrub` give replayable fixtures. The
-  first is a scrubbed live Claude Haiku 5.5 probe.
-- **Data.** Engine capabilities are tables of yes, no or unknown, with a minimum
-  version. Cost keeps unknown apart from zero. Each turn records its isolation.
-- **Mail.** Request keys stop a retried call from acting twice. A rebind or a cleared
-  session carries a bounded handoff of recent mail.
-- **Status.** Event-log size and growth, and `dromon probe --no-turn`.
-- **Declined.** Workspace capture, with reasons in `DESIGN.md`.
+- **Roles.** The team is restructured into the roles `core`, `engines` and `review`,
+  each in its own worktree, with seats on several providers. Write ownership is held,
+  relinquished and taken through the harness, and fails over automatically when an
+  owner's provider is exhausted, per `docs/architecture/ROLES.md`.
+- **Checked live.** A planned handoff of `engines` from an Opus seat to a Codex seat,
+  hibernation, priority mail interrupting a turn after a tool result, `dromon
+  restart` draining two turns, and Codex's real out-of-credit error.
+- **Keleusma.** Both kaizen reviews are answered. In a Dromon line's own sandbox, an
+  HTTPS fetch, `gh`, and a real push and deletion of a throwaway branch worked, and the
+  credential reads and a second worktree's write were denied.
+- **Grok.** The first live probe found that Grok loads the operator's own MCP servers
+  and reads Claude Code's permission mode. Dromon now gives Grok its own home and HOME.
+- **Federation.** `federation_tls` is merged. Phase 1 on `feat/federation` delivers
+  notes between two daemons on one machine, tested outside the sandbox.
 
-**Not verified.** No live turn ran except the recorded probe. Request keys are held only
-in memory. The Grok, Codex and Antigravity capability rows are unknown.
+**Not verified.** Automatic failover has not fired live. Grok has not run a turn.
+Claude Code's limit shapes are typed, not observed.
 
-**Harness finding.** Mail reaches a line only between turns, so a line on a long
-multi-item turn cannot be redirected until it stops. Two operator messages waited
-through six items.
-
-**Earlier today.** The bounded engine waits and the stop policies are merged, and the
-stop policies are verified live on macOS, as `LINE_CONFIG.md` records.
-
-**Next.** Fill the Grok, Codex and Antigravity rows and their recording, then the
-lines' experience reports.
+**For the operator.**
+1. Sign in to Dromon's Grok home with the command in `GROK.md`.
+2. The Keleusma decisions listed in `KELEUSMA_DOGFOOD.md`.
+3. State provider budgets with `dromon budget set`, since no engine reports one.
