@@ -276,7 +276,7 @@ each other today. **Implemented.** `role_status`, a tool offered only to a seat,
 lists the role's worktree and handoff bound, the owner and the latest change of owner,
 each seat's condition, hibernation, model, provider, stated budget and worktree commit, and
 the role's latest five journal entries, the newest with its body, so a seat can find
-its peers. Until the budget step, each engine counts as its own provider. A note between seats is ordinary line mail, data from its
+its peers. Until the budget step, each engine counts as its own provider. **Item B3 of 2026-10-28.** Each seat also lists `recent_tasks`, its latest three background task ends from `task_recorded`, each with its command, status, exit code, output file, the SHA-256 digest and size of its output and the worktree commit, so a reviewing seat can check a gate the owner ran without running it again. The commit says nothing of uncommitted changes, and an end the engine reports during a turn is not recorded. A note between seats is ordinary line mail, data from its
 sender like any other, and counts toward the autonomous limits as mail between lines
 does. No role-wide broadcast is proposed, because a broadcast multiplies turns across
 providers whose budgets are short.

@@ -616,6 +616,110 @@ class MessagePrioritized:
         check_id("message_id", self.message_id)
 
 
+MAX_TURN_KEYS: Final = 64
+"""The most correlation keys one ``turn_correlated`` lists."""
+
+MAX_TURN_KEY_COUNT: Final = 1_000_000
+"""The largest count of keys one turn may record as carried."""
+
+MAX_CORRELATIONS: Final = 4096
+"""The most correlation keys the state totals. The key used least recently is
+dropped to make room for a new one, so a long-running daemon stays bounded."""
+
+
+@dataclass(frozen=True, slots=True)
+class MessageCorrelated:
+    """An external agent's note to a line carries a correlation key, which names the
+    agent's own task, so the turns the note starts can be totalled under it.
+    Appended right after the ``message_sent`` it marks, while the note is
+    undelivered. **Queue of 2026-10-28, item A4.** The key has the form of an
+    identifier."""
+
+    message_id: str
+    key: str
+
+    def __post_init__(self) -> None:
+        check_id("message_id", self.message_id)
+        check_id("key", self.key)
+
+
+@dataclass(frozen=True, slots=True)
+class TurnCorrelated:
+    """A line's turn ended that delivered at least one correlated note, with the
+    keys those notes carried and the turn's cost in whole millionths of a dollar,
+    or ``None`` when the engine reported none. ``key_count`` is how many distinct
+    keys the turn carried, so a reader sees that a turn counted under two keys cost
+    its amount once, not twice. ``keys`` lists them sorted, the first
+    ``MAX_TURN_KEYS`` when there were more."""
+
+    line_id: str
+    keys: tuple[str, ...]
+    key_count: int
+    cost_micro_usd: int | None
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        if not 1 <= len(self.keys) <= MAX_TURN_KEYS:
+            raise InvalidField(f"keys must list from 1 to {MAX_TURN_KEYS} keys")
+        for key in self.keys:
+            check_id("key", key)
+        if list(self.keys) != sorted(set(self.keys)):
+            raise InvalidField("keys must be distinct and sorted")
+        count = self.key_count
+        if type(count) is not int or not len(self.keys) <= count <= MAX_TURN_KEY_COUNT:
+            raise InvalidField("key_count must count at least the keys listed")
+        if count > len(self.keys) and len(self.keys) < MAX_TURN_KEYS:
+            raise InvalidField(
+                f"keys must list every key when the turn carried at most"
+                f" {MAX_TURN_KEYS}"
+            )
+        cost = self.cost_micro_usd
+        if cost is not None and (
+            type(cost) is not int or not 0 <= cost <= MAX_COST_MICRO_USD
+        ):
+            raise InvalidField(
+                f"cost_micro_usd must be null or a whole number from 0 to"
+                f" {MAX_COST_MICRO_USD}"
+            )
+
+
+MAX_DISCLOSURE_CHECKS: Final = 10
+"""The most ``check_disclosure`` calls one line may make within
+``DISCLOSURE_CHECK_WINDOW_SECONDS``, and the most check times the state keeps for a
+line. **Proposed for item B2 of 2026-10-28.** Each pass or fail answer says whether a
+text holds a listed term, so an unbounded tool would let a line test candidate words
+one by one and recover the list."""
+
+DISCLOSURE_CHECK_WINDOW_SECONDS: Final = 3600
+"""The window ``MAX_DISCLOSURE_CHECKS`` applies to."""
+
+MAX_DISCLOSURE_MATCHES: Final = 1_000_000
+"""The largest count of matching lines one ``disclosure_checked`` records."""
+
+
+@dataclass(frozen=True, slots=True)
+class DisclosureChecked:
+    """A line checked a text or a file against the project's disclosure list, at
+    ``checked_at``, and ``matched_lines`` of its lines held a listed term. Neither
+    the text, its name nor any term is recorded. **Item B2 of 2026-10-28.** The
+    record makes the rate limit survive a restart of the daemon, and shows an
+    operator how often each line asked."""
+
+    line_id: str
+    checked_at: str
+    matched_lines: int
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_instant("checked_at", self.checked_at)
+        count = self.matched_lines
+        if type(count) is not int or not 0 <= count <= MAX_DISCLOSURE_MATCHES:
+            raise InvalidField(
+                f"matched_lines must be a whole number from 0 to"
+                f" {MAX_DISCLOSURE_MATCHES}"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class OperatorRegistered:
     operator_id: str
@@ -918,6 +1022,65 @@ class TaskNoted:
         check_text("task_id", self.task_id, MAX_TASK_ID_BYTES)
         check_text("status", self.status, MAX_TASK_STATUS_BYTES)
         check_text("body", self.body, MAX_TASK_NOTE_BYTES)
+
+
+MAX_TASK_RECORDS: Final = 10
+"""How many of each line's latest ``task_recorded`` events the state keeps."""
+
+MAX_TASK_COMMAND_BYTES: Final = 2048
+MAX_TASK_PATH_BYTES: Final = 1024
+MAX_TASK_OUTPUT_BYTES: Final = 2**53
+MAX_EXIT_CODE: Final = 2**31
+DIGEST_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
+
+
+@dataclass(frozen=True, slots=True)
+class TaskRecorded:
+    """A background task of a line's engine ended between turns, with its command,
+    final status, exit code, output file and the SHA-256 digest and size of its
+    output where the daemon could read it, the commit checked out where the line
+    works, empty when none was read, and when the daemon learned of the end.
+    **Item B3 of 2026-10-28.** It lets the other seats of a role check a gate the
+    owner ran without running it again. It is recorded for every end the engine
+    reports, whether or not a note wakes the line, and never wakes it."""
+
+    line_id: str
+    task_id: str
+    command: str
+    status: str
+    exit_code: int | None
+    output_file: str | None
+    output_digest: str | None
+    output_bytes: int | None
+    workdir_commit: str
+    ended_at: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_text("task_id", self.task_id, MAX_TASK_ID_BYTES)
+        check_text("command", self.command, MAX_TASK_COMMAND_BYTES)
+        check_text("status", self.status, MAX_TASK_STATUS_BYTES)
+        code = self.exit_code
+        if code is not None and (
+            type(code) is not int or not -MAX_EXIT_CODE <= code < MAX_EXIT_CODE
+        ):
+            raise InvalidField("exit_code must be null or a 32-bit whole number")
+        if self.output_file is not None:
+            check_text("output_file", self.output_file, MAX_TASK_PATH_BYTES)
+        digest = self.output_digest
+        if digest is not None:
+            check_text("output_digest", digest, 64)
+            if DIGEST_PATTERN.fullmatch(digest) is None:
+                raise InvalidField("output_digest must be null or a SHA-256 hex digest")
+        size = self.output_bytes
+        if size is not None and (
+            type(size) is not int or not 0 <= size <= MAX_TASK_OUTPUT_BYTES
+        ):
+            raise InvalidField("output_bytes must be null or a whole number")
+        if (digest is None) != (size is None):
+            raise InvalidField("output_digest and output_bytes are given together")
+        check_commit("workdir_commit", self.workdir_commit)
+        check_instant("ended_at", self.ended_at)
 
 
 MAX_RESTART_NOTE_BYTES: Final = 2048
@@ -1403,11 +1566,15 @@ type Event = (
     | MessageRead
     | MessageAcknowledged
     | MessagePrioritized
+    | MessageCorrelated
+    | TurnCorrelated
+    | DisclosureChecked
     | WakeRequested
     | WakeIssued
     | WakeScheduled
     | WakeWithdrawn
     | TaskNoted
+    | TaskRecorded
     | RestartNoted
     | LineCostMarked
     | ProcessesLeft
@@ -1500,6 +1667,24 @@ class Message:
     priority_asked: bool = False
     """Whether the peer that delivered the note asked for priority, as
     ``message_received`` records."""
+    correlation: str | None = None
+    """The key ``message_correlated`` gave the note, if any."""
+
+
+@dataclass(frozen=True, slots=True)
+class Correlation:
+    """The totals of one correlation key, from every ``turn_correlated`` that
+    listed it. A turn's whole cost counts under each key it carried, so the totals
+    of several keys may count one turn more than once, and ``shared_turns`` says how
+    many of these turns carried more than one key."""
+
+    turns: int = 0
+    shared_turns: int = 0
+    cost_micro_usd: int = 0
+    """The sum of the known costs, held at ``MAX_COST_MICRO_USD``."""
+    unknown_cost_turns: int = 0
+    """The turns whose engine reported no cost, which may still have cost
+    something."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1631,6 +1816,19 @@ class State:
     )
     """How many messages received from all peers each local party has not yet been
     delivered. A party with none has no entry."""
+    correlations: dict[str, Correlation] = field(default_factory=dict[str, Correlation])
+    """The totals of each correlation key, the key used least recently first, at most
+    ``MAX_CORRELATIONS``."""
+    disclosure_checks: dict[str, tuple[str, ...]] = field(
+        default_factory=dict[str, tuple[str, ...]]
+    )
+    """When each line last checked a text against the disclosure list, oldest first,
+    at most ``MAX_DISCLOSURE_CHECKS`` times per line, for the rate limit."""
+    task_records: dict[str, tuple[TaskRecorded, ...]] = field(
+        default_factory=dict[str, tuple[TaskRecorded, ...]]
+    )
+    """Each line's latest background task ends, oldest first, at most
+    ``MAX_TASK_RECORDS`` per line, which its role's seats read."""
 
     def copy(self) -> "State":
         """Return an independent snapshot. The records are frozen, so maps suffice."""
@@ -1656,6 +1854,9 @@ class State:
             {peer_id: dict(waiting) for peer_id, waiting in self.outbox.items()},
             dict(self.waiting_from),
             dict(self.waiting_for),
+            dict(self.correlations),
+            dict(self.disclosure_checks),
+            dict(self.task_records),
         )
 
     def open_questions(self, operator_id: str) -> list[str]:
@@ -1750,6 +1951,10 @@ class State:
                     raise EventRejected(f"message {event.message_id} was read")
             case MessagePrioritized():
                 self._check_prioritized(event)
+            case MessageCorrelated():
+                self._check_correlated(event)
+            case TurnCorrelated() | DisclosureChecked() | TaskRecorded():
+                self._line(event.line_id)
             case WakeRequested():
                 self._check_wake_requested(event)
             case WakeIssued():
@@ -1913,6 +2118,21 @@ class State:
             case MessagePrioritized():
                 message = self.messages[event.message_id]
                 self.messages[event.message_id] = replace(message, priority=True)
+            case MessageCorrelated():
+                message = self.messages[event.message_id]
+                self.messages[event.message_id] = replace(
+                    message, correlation=event.key
+                )
+            case TurnCorrelated():
+                self._total_correlated(event)
+            case TaskRecorded():
+                records = self.task_records.get(event.line_id, ())
+                self.task_records[event.line_id] = (*records, event)[-MAX_TASK_RECORDS:]
+            case DisclosureChecked():
+                times = self.disclosure_checks.get(event.line_id, ())
+                self.disclosure_checks[event.line_id] = (*times, event.checked_at)[
+                    -MAX_DISCLOSURE_CHECKS:
+                ]
             case WakeRequested():
                 self.wakes[event.wake_id] = Wake(
                     event.line_id, event.message_id, issued=False
@@ -2213,6 +2433,38 @@ class State:
             raise EventRejected(f"message {event.message_id} is not to a line")
         if message.delivered:
             raise EventRejected(f"message {event.message_id} was delivered")
+
+    def _check_correlated(self, event: MessageCorrelated) -> None:
+        message = self._message(event.message_id)
+        if message.correlation is not None:
+            raise EventRejected(f"message {event.message_id} has a correlation key")
+        if not isinstance(message.sender, AgentAddress):
+            raise EventRejected(f"message {event.message_id} is not from an agent")
+        if message.kind is not MessageKind.NOTE:
+            raise EventRejected(f"message {event.message_id} is not a note")
+        if not isinstance(message.recipient, LineAddress):
+            raise EventRejected(f"message {event.message_id} is not to a line")
+        if message.delivered:
+            raise EventRejected(f"message {event.message_id} was delivered")
+
+    def _total_correlated(self, event: TurnCorrelated) -> None:
+        """Add a turn to each key it lists, moving each to the most recent end, and
+        drop the keys used least recently beyond ``MAX_CORRELATIONS``."""
+        shared = 1 if event.key_count > 1 else 0
+        known = event.cost_micro_usd
+        for key in event.keys:
+            total = self.correlations.pop(key, Correlation())
+            self.correlations[key] = Correlation(
+                total.turns + 1,
+                total.shared_turns + shared,
+                min(total.cost_micro_usd + (known or 0), MAX_COST_MICRO_USD),
+                total.unknown_cost_turns + (1 if known is None else 0),
+            )
+        # Bounded by MAX_TURN_KEYS, the most keys one event can add. The order is the
+        # dictionary's insertion order, a porting hazard, since a Rust port needs an
+        # ordered map to drop the same keys on replay.
+        while len(self.correlations) > MAX_CORRELATIONS:
+            del self.correlations[next(iter(self.correlations))]
 
     def _check_reply(self, event: MessageSent, reply_to: str) -> None:
         parent = self._message(reply_to)

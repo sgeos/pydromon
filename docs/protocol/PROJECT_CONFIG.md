@@ -251,6 +251,21 @@ stops the start, or refuses the reload and keeps the previous list.
 - **Limits.** A term written another way, split across messages, or encoded passes.
   The guard catches accidents and is not a barrier against a line that tries to evade
   it. Engine transcripts, which the engines keep themselves, are outside it.
+- **Checking before sending.** **Item B2 of 2026-10-28.** A line's `check_disclosure`
+  tool checks a `text`, or a `path` relative to its working directory, and answers
+  `pass` or `fail` with how many lines hold a listed term, compared as above, and
+  never which term. Each check is recorded as `disclosure_checked`, without the text
+  or its name, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies. **Proposed.** A line may
+  check at most 10 times in any 3,600 seconds, counted from the recorded times on the
+  wall clock, so the limit survives a restart. Every answer says whether a text holds
+  a term, so an unlimited check would let a line test candidate words one by one. A
+  file is read as `write_scratch` writes, walked without following a link, and only
+  when it is a regular file of the daemon's user with one name, outside every
+  directory Dromon protects, and at most 1 MiB. A refusal, of a missing list, a limit
+  reached, or a text or file not read, records nothing and reveals nothing of the
+  list. **Fact.** The refusals of `send_message`, `ask_operator`, `wake_after` and
+  `write_scratch` give the same answer without a limit, so the limit on this tool
+  alone does not close that channel.
 
 ## Trust
 

@@ -8,7 +8,7 @@ import asyncio
 import re
 from collections.abc import Callable, Coroutine, Iterator, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
@@ -24,6 +24,7 @@ from dromon.model import (
     AgentAccess,
     AgentAddress,
     AgentRegistered,
+    Correlation,
     EventRejected,
     LineAddress,
     LineOverridden,
@@ -32,12 +33,14 @@ from dromon.model import (
     LineState,
     LineStateChanged,
     Message,
+    MessageCorrelated,
     MessageDelivered,
     MessageRead,
     MessageKind,
     MessageSent,
     OperatorAddress,
     QuestionStatus,
+    TurnCorrelated,
     WakeIssued,
     WakeRequested,
 )
@@ -300,6 +303,86 @@ def test_a_line_sends_only_to_its_recipients_and_itself(
         if isinstance(m, MessageSent) and m.sender == LineAddress("alpha")
     ]
     assert sent == [(table, "I pass"), (LineAddress("alpha"), "a note to myself")]
+
+
+def test_an_agents_correlated_notes_total_the_turns_they_start(
+    make_world: MakeWorld,
+) -> None:
+    # Queue of 2026-10-28, item A4. Two notes keyed to two tasks start one turn,
+    # which counts under both and records that it carried two keys.
+    target = make_world({"alpha": [[], []], "beta": []})
+    table = AgentAddress("table")
+    target.log.append(AgentRegistered(table.agent_id, AgentAccess.MESSAGE, ""))
+    engine = target.engine("alpha")
+    engine.cost = 0.25
+    tool = target.scheduler.send_tool(table)
+
+    async def act() -> None:
+        for key in ("game-8", "game-7"):
+            result = await call_tool(
+                tool, {"to": "alpha", "body": f"move in {key}", "correlation": key}
+            )
+            assert result.get("is_error") is not True
+        await target.scheduler.idle()
+        engine.cost = None
+        await call_tool(tool, {"to": "alpha", "body": "again", "correlation": "game-7"})
+        await call_tool(tool, {"to": "beta", "body": "no key"})
+
+    run(target, act)
+    assert len(engine.prompts) == 2
+    events = target.events()
+    marked = [e for e in events if isinstance(e, MessageCorrelated)]
+    assert [e.key for e in marked] == ["game-8", "game-7", "game-7"]
+    assert [e for e in events if isinstance(e, TurnCorrelated)] == [
+        TurnCorrelated("alpha", ("game-7", "game-8"), 2, 250_000),
+        TurnCorrelated("alpha", ("game-7",), 1, None),
+    ]
+    totals = target.log.state.correlations
+    assert totals["game-7"] == Correlation(2, 1, 250_000, 1)
+    assert totals["game-8"] == Correlation(1, 1, 250_000, 0)
+
+
+def test_only_an_agents_note_to_a_line_carries_a_correlation_key(
+    make_world: MakeWorld,
+) -> None:
+    turn: Turn = [{"to": "beta", "body": "keyed", "correlation": "game-7"}]
+    target = make_world({"alpha": [turn], "beta": []})
+    table = AgentAddress("table")
+    target.log.append(AgentRegistered(table.agent_id, AgentAccess.MESSAGE, ""))
+    agent_tool = target.scheduler.send_tool(table)
+    line_tool = target.scheduler.send_tool("alpha")
+    schemas = [
+        cast(dict[str, object], tool.input_schema) for tool in (line_tool, agent_tool)
+    ]
+    assert [
+        "correlation" in cast(dict[str, object], schema["properties"])
+        for schema in schemas
+    ] == [False, True]
+    refusals: list[str] = []
+
+    async def act() -> None:
+        for args in (
+            {"to": "@ana", "body": "x", "correlation": "game-7"},
+            {"to": "alpha", "body": "x", "correlation": "Game 7"},
+            {"to": "alpha", "body": "x", "correlation": 7},
+        ):
+            result = await call_tool(agent_tool, args)
+            assert result.get("is_error") is True
+            refusals.append(result["content"][0]["text"])
+        with pytest.raises(EventRejected, match="only an external agent"):
+            target.scheduler.send(
+                ANA, LineAddress("alpha"), "start", correlation="game-7"
+            )
+        target.scheduler.send(ANA, LineAddress("alpha"), "start")
+
+    run(target, act)
+    assert "carried only to a line" in refusals[0]
+    assert "correlation" in refusals[1]
+    assert refusals[2] == "correlation must be text"
+    assert target.engines["alpha"].results[0].get("is_error") is True
+    events = target.events()
+    assert not [e for e in events if isinstance(e, MessageCorrelated | TurnCorrelated)]
+    assert [m.body for m in events if isinstance(m, MessageSent)] == ["start"]
 
 
 def test_two_lines_exchange_messages_and_each_recipient_is_woken(

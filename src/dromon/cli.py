@@ -102,9 +102,13 @@ def _start(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 
 
 def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
-    del arguments
+    correlation: str | None = arguments.correlation
     try:
-        response = call(paths.socket, Operation.STATUS)
+        response = call(
+            paths.socket,
+            Operation.STATUS,
+            args=None if correlation is None else {"correlation": correlation},
+        )
     except DaemonNotRunning:
         print(f"dromon status: not running for {paths.root}")
         return exits.NOT_RUNNING
@@ -145,7 +149,25 @@ def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     for entry in peers:
         if isinstance(entry, dict):
             print(_peer_row(cast(Mapping[str, object], entry)))
+    totals = result.get("correlation")
+    if isinstance(totals, dict):
+        print(_correlation_row(cast(Mapping[str, object], totals)))
     return exits.OK
+
+
+def _correlation_row(totals: Mapping[str, object]) -> str:
+    """The line of ``dromon status --correlation`` for one key's totals. The cost
+    counts every turn under each key it carried, so the shared turns are named."""
+    key = totals.get("key")
+    if not totals.get("recorded"):
+        return f"correlation {key}, no turn recorded"
+    unknown = totals.get("unknown_cost_turns")
+    return (
+        f"correlation {key}, turns {totals.get('turns')},"
+        f" shared with other keys {totals.get('shared_turns')},"
+        f" known cost ${totals.get('cost_usd')}"
+        + (f", turns of unknown cost {unknown}" if unknown else "")
+    )
 
 
 def _scheduler_row(watch: Mapping[str, object]) -> str | None:
@@ -976,10 +998,14 @@ def _agent_send(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return exits.USAGE
+    tool_arguments: dict[str, object] = {"to": to, "body": body}
+    correlation: str | None = arguments.correlation
+    if correlation is not None:
+        tool_arguments["correlation"] = correlation
     args: dict[str, object] = {
         "agent": agent,
         "tool": "send_message",
-        "arguments": {"to": to, "body": body},
+        "arguments": tool_arguments,
     }
     token = os.environ.get(TOKEN_ENV) or None
     if token is not None:
@@ -1762,6 +1788,12 @@ def build_parser() -> argparse.ArgumentParser:
                 choices=[strategy.value for strategy in Strategy],
                 help="the new driver's credential strategy",
             )
+        if name == "status":
+            command.add_argument(
+                "--correlation",
+                metavar="KEY",
+                help="also total the turns and cost recorded under this key",
+            )
         if name == "release":
             command.add_argument("line_id", help="the held line")
         if name == "interrupt":
@@ -1941,6 +1973,12 @@ def build_parser() -> argparse.ArgumentParser:
             )
             command.add_argument(
                 "--to", help="for send, the party the note is for, such as a line"
+            )
+            command.add_argument(
+                "--correlation",
+                metavar="KEY",
+                help="for send, a key naming the agent's task, under which the"
+                " line's turns and their cost are totalled",
             )
             command.add_argument(
                 "--access",

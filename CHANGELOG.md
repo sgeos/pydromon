@@ -49,6 +49,25 @@ All notable changes are recorded here. The format follows
   always send itself a note, and its questions to an operator are not limited, so an
   operator can seat several lines at an external task with no private channel between
   them.
+- An external agent's note to a line may carry a `correlation` key naming the agent's
+  own task. The event log records it as `message_correlated`, and records each turn
+  that delivered keyed notes as `turn_correlated`, with its cost and how many keys it
+  carried, so the turns and cost of one external task are totalled under its key.
+  `dromon status --correlation KEY`, the agent's `dromon_status` and `dromon agent
+  send --correlation KEY` show and carry them. A turn under two keys counts its whole
+  cost under each, and is counted as shared.
+- When a line's turn ends with background tasks of its kept session still running and
+  the line sent no mail during it, the line's next prompt says so once, so that work
+  going on unannounced is noticed.
+- A line's `check_disclosure` tool checks a text, or a file in its working directory,
+  against the project's disclosure list and answers pass or fail with how many lines
+  hold a listed term, never the term. Each check is recorded as `disclosure_checked`,
+  and a line may check at most 10 times in an hour, since each answer could otherwise
+  test candidate words one by one.
+- Every background task end a kept engine reports between turns is recorded as
+  `task_recorded`, with its command, status, exit code, output file, the SHA-256 digest
+  and size of its output and the worktree commit, and `role_status` lists each seat's
+  latest three, so a reviewing seat can check a gate without running it again.
 - The design of federation between Dromon daemons, `docs/architecture/FEDERATION.md`,
   approved by the operator on 2026-10-28. A line or an operator in one project can
   message and wake a party in another, addressed as `keleusma:kaizen`, with the peer

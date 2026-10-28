@@ -104,7 +104,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Protocol, cast, runtime_checkable
+from typing import Any, BinaryIO, Final, Protocol, cast, runtime_checkable
 
 from claude_agent_sdk import SdkMcpTool
 
@@ -254,6 +254,16 @@ from dromon.model import (
     MessageAcknowledged,
     MessageKind,
     MessagePrioritized,
+    MessageCorrelated,
+    TurnCorrelated,
+    MAX_TURN_KEYS,
+    DISCLOSURE_CHECK_WINDOW_SECONDS,
+    MAX_DISCLOSURE_CHECKS,
+    MAX_DISCLOSURE_MATCHES,
+    DisclosureChecked,
+    MAX_TASK_COMMAND_BYTES,
+    MAX_TASK_PATH_BYTES,
+    TaskRecorded,
     MessageRead,
     MessageReceived,
     MessageReturned,
@@ -287,6 +297,7 @@ from dromon.model import (
     MAX_TASK_ID_BYTES,
     MAX_TASK_STATUS_BYTES,
     MAX_TASK_NOTE_BYTES,
+    check_id,
     format_due,
     parse_address,
     parse_any_address,
@@ -328,6 +339,25 @@ SEND_TOOL_SCHEMA: Final[dict[str, object]] = {
     "required": ["to", "body"],
     "additionalProperties": False,
 }
+
+CORRELATION_ARGUMENT: Final = "correlation"
+
+AGENT_SEND_TOOL_SCHEMA: Final[dict[str, object]] = {
+    **SEND_TOOL_SCHEMA,
+    "properties": {
+        **cast(dict[str, object], SEND_TOOL_SCHEMA["properties"]),
+        CORRELATION_ARGUMENT: {
+            "type": "string",
+            "description": (
+                "Optional. A key naming your own task, of lower-case letters, digits,"
+                " dots, underscores and hyphens, at most 64 characters. The turns of"
+                " the line this note wakes, and their cost, are totalled under it"
+            ),
+        },
+    },
+}
+"""The ``send_message`` schema an external agent is given, which may carry a
+correlation key. **Queue of 2026-10-28, item A4.** A line's schema has no key."""
 
 ASK_TOOL_NAME: Final = "ask_operator"
 
@@ -413,6 +443,28 @@ MIN_RATE_SECONDS: Final = 60
 MAX_SCRATCH_BYTES: Final = 256 * 1024
 SCRATCH_DIRECTORY: Final = "tmp"
 
+MAX_DIGEST_BYTES: Final = 16 * 1024 * 1024
+"""The largest task output ``task_recorded`` digests. A larger one is recorded with no
+digest, so one end cannot hold the event loop for long."""
+DIGEST_CHUNK_BYTES: Final = 1024 * 1024
+WITHHELD_COMMAND: Final = "withheld, since the disclosure list covers it"
+
+CHECK_DISCLOSURE_TOOL_NAME: Final = "check_disclosure"
+MAX_CHECKED_BYTES: Final = 1024 * 1024
+"""The largest text or file ``check_disclosure`` reads, so one check stays cheap."""
+
+CHECK_DISCLOSURE_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "text": {"type": "string", "description": "A text to check, at most 1 MiB"},
+        "path": {
+            "type": "string",
+            "description": "A file to check, relative to your working directory",
+        },
+    },
+    "additionalProperties": False,
+}
+
 FIRST_FAULT_PAUSE_SECONDS: Final = 1.0
 MAX_FAULT_PAUSE_SECONDS: Final = 60.0
 """The scheduler's pause after a fault doubles from 1 second to 1 minute. Shorter than
@@ -428,6 +480,9 @@ INFERRED_LIMIT_NOTE: Final = (
 operator decided on 2026-10-27 holds and asks and never fails over."""
 ROLE_STATUS_TOOL_NAME: Final = "role_status"
 ROLE_STATUS_ENTRIES: Final = 5
+ROLE_STATUS_TASKS: Final = 3
+"""How many of each seat's latest background task ends ``role_status`` lists, newest
+last, so a reviewing seat can check a gate the owner ran. Item B3 of 2026-10-28."""
 """How many of a role's latest journal entries ``role_status`` lists. Only the
 latest carries its body, which bounds the view by one entry's size."""
 RECOVERY_CHECKLIST: Final = (
@@ -1295,6 +1350,10 @@ class Scheduler:
         self._noted_tasks: dict[str, deque[str]] = {}
         self._unnoted_tasks: dict[str, int] = {}
         """Background task ends the rate limit left without a note, per line."""
+        self._quiet_tasks: dict[str, int] = {}
+        """How many background tasks still ran when each line's last turn ended
+        without the line sending any mail, for its next prompt. Held in memory only,
+        since a restart of the daemon closes kept sessions and ends their tasks."""
         self._turn_costs: dict[str, deque[dict[str, object]]] = {}
         self._counting: dict[str, bool] = {}
         """Whether each line's turn in flight counts as autonomous."""
@@ -1616,8 +1675,12 @@ class Scheduler:
         reply_to: str | None = None,
         *,
         priority: bool = False,
+        correlation: str | None = None,
     ) -> str:
         """Record a note from ``sender``. It is delivered in a later tick.
+
+        A ``correlation`` key, which only an agent's note to a local line may carry,
+        is recorded right after the note as ``message_correlated``.
 
         Priority mail is also marked ``message_prioritized``, and asks the
         recipient's running turn to end at its next safe point. Raises
@@ -1628,6 +1691,12 @@ class Scheduler:
             return self._harness_note(recipient, body)
         if isinstance(sender, LineAddress):
             self.check_recipient(sender.line_id, recipient)
+        if correlation is not None:
+            check_id("correlation", correlation)
+            if not isinstance(sender, AgentAddress):
+                raise EventRejected("only an external agent's note carries a key")
+            if not isinstance(recipient, LineAddress):
+                raise EventRejected("a correlation key is carried only to a line")
         if isinstance(recipient, RemoteAddress):
             check_outbound(
                 self._log.state,
@@ -1675,6 +1744,8 @@ class Scheduler:
                 message_id, sender, recipient, MessageKind.NOTE, body, reply_to=reply_to
             )
         )
+        if correlation is not None:
+            self._log.append(MessageCorrelated(message_id, correlation))
         if priority and isinstance(recipient, LineAddress):
             self._log.append(MessagePrioritized(message_id))
             if isinstance(sender, LineAddress):
@@ -2056,9 +2127,14 @@ class Scheduler:
         """The ``send_message`` tool for ``owner``, a line or an agent, whose sender it
         fixes. A plain identifier names a line."""
         sender = _party(owner)
+        schema = (
+            AGENT_SEND_TOOL_SCHEMA
+            if isinstance(sender, AgentAddress)
+            else SEND_TOOL_SCHEMA
+        )
 
         async def handler(args: dict[str, Any]) -> dict[str, Any]:
-            unexpected = _unexpected(args, SEND_TOOL_SCHEMA)
+            unexpected = _unexpected(args, schema)
             if unexpected:
                 return _tool_error(unexpected)
             try:
@@ -2071,8 +2147,11 @@ class Scheduler:
             body: object = args.get("body")
             reply_to: object = args.get("reply_to")
             urgent: object = args.get("priority", False)
+            correlation: object = args.get(CORRELATION_ARGUMENT)
             if not isinstance(to, str) or not isinstance(body, str):
                 return _tool_error("to and body must be text")
+            if correlation is not None and not isinstance(correlation, str):
+                return _tool_error("correlation must be text")
             if reply_to is not None and not isinstance(reply_to, str):
                 return _tool_error("reply_to must be text")
             if not isinstance(urgent, bool):
@@ -2081,7 +2160,12 @@ class Scheduler:
                 return _tool_error(disclosure.REFUSAL)
             try:
                 message_id = self.send(
-                    sender, parse_any_address(to), body, reply_to, priority=urgent
+                    sender,
+                    parse_any_address(to),
+                    body,
+                    reply_to,
+                    priority=urgent,
+                    correlation=correlation,
                 )
             except (InvalidField, EventRejected) as error:
                 return _tool_error(str(error))
@@ -2101,7 +2185,7 @@ class Scheduler:
                 " next turn, never in this one. Priority mail to another line also"
                 " ends that line's running turn at a safe point."
             ),
-            input_schema=SEND_TOOL_SCHEMA,
+            input_schema=schema,
             handler=handler,
         )
 
@@ -3275,6 +3359,108 @@ class Scheduler:
             handle.write(data)
         return f"{SCRATCH_DIRECTORY}/{Path(*parts)}"
 
+    def check_disclosure(
+        self, line_id: str, text: str | None, path: str | None
+    ) -> tuple[int, int]:
+        """**Item B2 of 2026-10-28.** Check ``text``, or the file at ``path`` in the
+        line's working directory, against the project's disclosure list, record
+        ``disclosure_checked``, and return how many of its lines hold a listed term
+        and how many checks the line has left in the window. Never says which term.
+
+        Refused when the project has no list, when the line made
+        ``MAX_DISCLOSURE_CHECKS`` checks within ``DISCLOSURE_CHECK_WINDOW_SECONDS``,
+        and for a text or file the check cannot read. A refusal records nothing,
+        since it reveals nothing of the list. The window is read from the recorded
+        times on the wall clock, so it survives a restart, and a clock set back
+        lengthens it while one set forward shortens it."""
+        if (text is None) == (path is None):
+            raise LineToolRefused("give exactly one of text and path")
+        if not self._disclosure:
+            raise LineToolRefused("this project has no disclosure list")
+        now = self._wall_clock()
+        times = self._log.state.disclosure_checks.get(line_id, ())
+        if len(times) >= MAX_DISCLOSURE_CHECKS:
+            reopens = parse_due(times[-MAX_DISCLOSURE_CHECKS]) + timedelta(
+                seconds=DISCLOSURE_CHECK_WINDOW_SECONDS
+            )
+            if now < reopens:
+                raise LineToolRefused(
+                    f"the limit of {MAX_DISCLOSURE_CHECKS} checks in"
+                    f" {DISCLOSURE_CHECK_WINDOW_SECONDS} seconds is reached, and the"
+                    f" next is allowed at {format_due(reopens)}"
+                )
+        if text is None:
+            text = self._read_checked(line_id, cast(str, path))
+        elif len(text.encode("utf-8")) > MAX_CHECKED_BYTES:
+            raise LineToolRefused(f"text is over {MAX_CHECKED_BYTES} bytes")
+        matched = min(
+            disclosure.matching_lines(self._disclosure, text), MAX_DISCLOSURE_MATCHES
+        )
+        self._log.append(DisclosureChecked(line_id, format_due(now), matched))
+        recent = self._log.state.disclosure_checks[line_id]
+        window = timedelta(seconds=DISCLOSURE_CHECK_WINDOW_SECONDS)
+        used = sum(1 for time in recent if now - parse_due(time) < window)
+        return matched, max(0, MAX_DISCLOSURE_CHECKS - used)
+
+    def _read_checked(self, line_id: str, path: str) -> str:
+        """The text of the file at ``path``, relative to the line's working
+        directory, for ``check_disclosure``. It is walked from the working
+        directory's descriptor one component at a time without following any link,
+        as ``write_scratch`` writes, and read only when it is a regular file of the
+        daemon's user with one name, outside every directory Dromon protects, and at
+        most ``MAX_CHECKED_BYTES``. So a line cannot have the daemon test a file its
+        own sandbox denies. Bytes that are not UTF-8 are replaced, which can only
+        hide a term written in them."""
+        if not path or "\x00" in path or path.startswith(("/", "~")):
+            raise LineToolRefused(
+                "path must be a relative path in your working directory"
+            )
+        parts = Path(path).parts
+        if ".." in parts or not parts:
+            raise LineToolRefused("path may not contain ..")
+        root = Path(os.path.realpath(self._workdir_of(line_id)))
+        candidate = root.joinpath(*parts)
+        for directory in self._protected:
+            guarded = Path(os.path.realpath(directory))
+            if candidate == guarded or guarded in candidate.parents:
+                raise LineToolRefused(f"{path} is in a directory Dromon protects")
+        try:
+            parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError as error:
+            raise LineToolRefused(
+                f"cannot open the working directory: {error.strerror}"
+            ) from error
+        try:
+            for name in parts[:-1]:
+                entered = os.open(
+                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
+                )
+                os.close(parent)
+                parent = entered
+            descriptor = os.open(
+                parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent
+            )
+        except OSError as error:
+            raise LineToolRefused(
+                f"cannot read {path}: {error.strerror or type(error).__name__}"
+            ) from error
+        finally:
+            os.close(parent)
+        # Checked on the bare descriptor, since opening a directory as a file object
+        # raises before any check could refuse it.
+        facts = os.fstat(descriptor)
+        if not stat.S_ISREG(facts.st_mode):
+            os.close(descriptor)
+            raise LineToolRefused(f"{path} is not a regular file")
+        if facts.st_nlink != 1 or facts.st_uid != os.getuid():
+            os.close(descriptor)
+            raise LineToolRefused(f"{path} has more than one name or another owner")
+        with os.fdopen(descriptor, "rb") as handle:
+            raw = handle.read(MAX_CHECKED_BYTES + 1)
+        if len(raw) > MAX_CHECKED_BYTES:
+            raise LineToolRefused(f"{path} is over {MAX_CHECKED_BYTES} bytes")
+        return raw.decode("utf-8", "replace")
+
     def engine_config(self, line_id: str) -> LineConfig:
         """The configuration ``line_id``'s engine is built with, which is the
         effective one with its instruction paths resolved against the project root,
@@ -3565,6 +3751,12 @@ class Scheduler:
                     "provider": engine,
                     "budget": None if budget is None else _budget_view(budget),
                     "workdir_commit": self._workdir_commit(seat_id),
+                    "recent_tasks": [
+                        _task_view(record)
+                        for record in state.task_records.get(seat_id, ())[
+                            -ROLE_STATUS_TASKS:
+                        ]
+                    ],
                 }
             )
         entries = [
@@ -4385,6 +4577,42 @@ class Scheduler:
             handler=handler,
         )
 
+    def check_disclosure_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``check_disclosure`` tool for ``line_id``, which answers pass or fail
+        with a count of matching lines and never a term."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, CHECK_DISCLOSURE_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            text: object = args.get("text")
+            path: object = args.get("path")
+            if not isinstance(text, str | None) or not isinstance(path, str | None):
+                return _tool_error("text and path must be text")
+            try:
+                matched, left = self.check_disclosure(line_id, text, path)
+            except (LineToolRefused, EventRejected) as error:
+                return _tool_error(str(error))
+            lines = "1 line holds" if matched == 1 else f"{matched} lines hold"
+            outcome = "pass" if matched == 0 else "fail"
+            return _tool_text(
+                f"{outcome}, {lines} a term from the project's disclosure list."
+                f" You have {left} of {MAX_DISCLOSURE_CHECKS} checks left in"
+                f" {DISCLOSURE_CHECK_WINDOW_SECONDS} seconds."
+            )
+
+        return SdkMcpTool(
+            name=CHECK_DISCLOSURE_TOOL_NAME,
+            description=(
+                "Check a text, or a file in your working directory, against the"
+                " project's disclosure list. The answer is pass or fail with how many"
+                " lines hold a listed term, never the term. Checks are limited per"
+                " hour and recorded."
+            ),
+            input_schema=CHECK_DISCLOSURE_SCHEMA,
+            handler=handler,
+        )
+
     def propose_change_tool(self, line_id: str) -> SdkMcpTool[Any]:
         """The propose_change tool, which leaves changes for operator review."""
 
@@ -4462,6 +4690,7 @@ class Scheduler:
             self.line_status_tool(line_id),
             self.read_instructions_tool(line_id),
             self.write_scratch_tool(line_id),
+            self.check_disclosure_tool(line_id),
             self.propose_change_tool(line_id),
             self.list_processes_tool(line_id),
             self.stop_process_tool(line_id),
@@ -5255,6 +5484,9 @@ class Scheduler:
                 budget=self._budget_line(line_id, cause, warn=compaction is None),
                 notes=self._notes(messages),
             )
+            quiet = self._quiet_notice(line_id)
+            if quiet is not None:
+                prompt = f"{quiet}\n\n{prompt}"
             owed = self._handoff(line_id, messages)
             if owed is not None and owed[1] is not None:
                 prompt = f"{owed[1].text}\n\n{prompt}"
@@ -5267,8 +5499,9 @@ class Scheduler:
         seat = self._log.state.seats.get(line_id)
         if seat is not None and self._log.state.roles[seat.role_id].owner == line_id:
             self._turn_owned.add(line_id)
+        keys = sorted({m.correlation for _, m in messages if m.correlation is not None})
         task = asyncio.get_running_loop().create_task(
-            self._turn(line_id, prompt, cause, compaction, owed, refused)
+            self._turn(line_id, prompt, cause, compaction, owed, refused, tuple(keys))
         )
         self._running[line_id] = task
 
@@ -5280,14 +5513,17 @@ class Scheduler:
         compaction: str | None = None,
         owed: tuple[str, Handoff | None] | None = None,
         refused: Exception | None = None,
+        keys: tuple[str, ...] = (),
     ) -> None:
         """Run one turn of ``line_id``. ``refused`` is a failure that came before the
-        turn, as it was dispatched, which fails the turn before any engine runs."""
+        turn, as it was dispatched, which fails the turn before any engine runs.
+        ``keys`` are the sorted correlation keys of the notes the turn delivered."""
         report: TurnReport | None = None
         ending = "cancelled"
         failed = False
         engine: LineEngine | None = None
         mailed = self._operator_mail(line_id)
+        sent = self._line_mail(line_id)
         self.activity.record(line_id, ActivityKind.TURN_STARTED, prompt)
         try:
             if refused is not None:
@@ -5367,6 +5603,8 @@ class Scheduler:
             self.activity.record(line_id, ActivityKind.TURN_ENDED, ending)
             if self._log.state.lines[line_id].state is LineState.RUNNING:
                 self._log.append(LineStateChanged(line_id, LineState.IDLE))
+            self._correlate(line_id, keys, report)
+            self._note_quiet(line_id, sent)
             self._running.pop(line_id, None)
             self._turn_owned.discard(line_id)
             self._last_turn_end[line_id] = self._clock()
@@ -5429,6 +5667,43 @@ class Scheduler:
             for message in self._log.state.messages.values()
             if message.sender == address
             and isinstance(message.recipient, OperatorAddress)
+        )
+
+    def _line_mail(self, line_id: str) -> int:
+        """How many messages ``line_id`` has sent to any party but itself, notes and
+        questions alike, so a turn can tell whether it sent any. Its notes to itself,
+        such as fired wakes, tell no one else of its work."""
+        address = LineAddress(line_id)
+        return sum(
+            1
+            for message in self._log.state.messages.values()
+            if message.sender == address and message.recipient != address
+        )
+
+    def _note_quiet(self, line_id: str, sent: int) -> None:
+        """**Item B1 of 2026-10-28.** Remember for ``line_id``'s next prompt that its
+        turn ended with background tasks of its kept session still running while it
+        sent no mail, which ``sent`` counts from the turn's start. A trial line
+        ended such turns and no one learned that its work went on. The count is
+        read from the engine as the turn ends, so a task that ends at that moment
+        may still be counted, and the next prompt says only that tasks ran."""
+        tasks = self.kept_tasks(line_id)
+        if tasks > 0 and self._line_mail(line_id) == sent:
+            self._quiet_tasks[line_id] = tasks
+        else:
+            self._quiet_tasks.pop(line_id, None)
+
+    def _quiet_notice(self, line_id: str) -> str | None:
+        """What ``line_id``'s next turn is told, once, of a last turn that ended with
+        background tasks running and no mail sent, or ``None``."""
+        tasks = self._quiet_tasks.pop(line_id, None)
+        if tasks is None:
+            return None
+        counted = "1 background task" if tasks == 1 else f"{tasks} background tasks"
+        return (
+            f"Your last turn ended with {counted} of your kept session still running,"
+            " and you sent no mail in it, so no operator or line learned from you"
+            " that the work goes on. If someone waits on it, tell them."
         )
 
     def _hold_failed(self, line_id: str, ending: str) -> None:
@@ -5528,6 +5803,24 @@ class Scheduler:
         task = loop.create_task(self.report_detached(line_id))
         self._halting.add(task)
         task.add_done_callback(self._halting.discard)
+
+    def _correlate(
+        self, line_id: str, keys: tuple[str, ...], report: TurnReport | None
+    ) -> None:
+        """Record ``turn_correlated`` for a turn that delivered correlated notes,
+        however it ended. A turn without a report, such as an interrupted or failed
+        one, has an unknown cost, since it may still have cost something."""
+        if not keys:
+            return
+        cost = None if report is None else report.cost_estimate_usd
+        micro = (
+            None
+            if cost is None
+            else min(max(round(cost * 1_000_000), 0), MAX_COST_MICRO_USD)
+        )
+        self._log.append(
+            TurnCorrelated(line_id, keys[:MAX_TURN_KEYS], len(keys), micro)
+        )
 
     def _mark_cost(self, line_id: str, mark: tuple[str, float] | None) -> None:
         """Record the engine's running cost total for the line's session, so a
@@ -5893,6 +6186,7 @@ class Scheduler:
         if end.task_id in noted:
             return None
         noted.append(end.task_id)
+        self._record_task(line_id, end)
         now = self._clock()
         recent = self._task_notes.setdefault(line_id, deque())
         while recent and now - recent[0] >= TASK_NOTE_WINDOW_SECONDS:
@@ -5924,6 +6218,74 @@ class Scheduler:
         self._failed.discard(line_id)
         self._work.set()
         return message_id
+
+    def _record_task(self, line_id: str, end: BackgroundEnd) -> None:
+        """**Item B3 of 2026-10-28.** Record ``task_recorded`` for ``end``, whether or
+        not a note wakes the line, so its role's other seats can check a gate it ran
+        without running it again. A command or output file name the disclosure list
+        covers is withheld. The digest covers the output the engine reported inline,
+        or else the output file, read under the rules a task note reads it by, whole
+        up to ``MAX_DIGEST_BYTES``. The commit is ``HEAD`` where the line works and
+        says nothing of uncommitted changes. A record the model refuses is reported
+        and dropped, since it must not stop the note."""
+        command = end.command
+        if self.discloses(command):
+            command = WITHHELD_COMMAND
+        output_file = end.output_file
+        if output_file is not None and self.discloses(output_file):
+            output_file = WITHHELD_COMMAND
+        digest, size = self._output_digest(line_id, end)
+        try:
+            self._log.append(
+                TaskRecorded(
+                    line_id,
+                    _cut(end.task_id, MAX_TASK_ID_BYTES),
+                    _cut(command, MAX_TASK_COMMAND_BYTES),
+                    _cut(end.status, MAX_TASK_STATUS_BYTES),
+                    end.exit_code,
+                    None
+                    if output_file is None
+                    else _cut(output_file, MAX_TASK_PATH_BYTES),
+                    digest,
+                    size,
+                    self._workdir_commit(line_id) or "",
+                    format_due(self._wall_clock()),
+                )
+            )
+        except (EventRejected, InvalidField) as error:
+            print(
+                f"dromond: the end of task {end.task_id!r} could not be recorded:"
+                f" {error}",
+                file=sys.stderr,
+            )
+
+    def _output_digest(
+        self, line_id: str, end: BackgroundEnd
+    ) -> tuple[str | None, int | None]:
+        """The SHA-256 digest and size in bytes of ``end``'s output, or ``None`` for
+        both when the daemon read none or the output exceeds ``MAX_DIGEST_BYTES``.
+        Inline output is digested as UTF-8. The file is read in bounded chunks on
+        the event loop's thread, as ``_output_head`` reads, so a large output delays
+        the loop by the time one bounded read takes."""
+        if end.output is not None:
+            data = end.output.encode("utf-8", "surrogatepass")
+            return hashlib.sha256(data).hexdigest(), len(data)
+        if end.output_file is None:
+            return None, None
+        _, handle = self._open_output(line_id, end.output_file)
+        if handle is None:
+            return None, None
+        digest = hashlib.sha256()
+        size = 0
+        with handle:
+            # At most MAX_DIGEST_BYTES / DIGEST_CHUNK_BYTES + 1 reads.
+            while size <= MAX_DIGEST_BYTES:
+                chunk = handle.read(DIGEST_CHUNK_BYTES)
+                if not chunk:
+                    return digest.hexdigest(), size
+                digest.update(chunk)
+                size += len(chunk)
+        return None, None
 
     def _task_note(self, line_id: str, end: BackgroundEnd, detected: str) -> str:
         """The note for ``end``. The command and the output are the line's own
@@ -5996,31 +6358,46 @@ class Scheduler:
         one name or another owner, or inside a directory Dromon protects. These
         checks keep a line from having the daemon read for it a file its own
         sandbox denies."""
+        state, handle = self._open_output(line_id, path)
+        if handle is None:
+            return state, ""
+        with handle:
+            raw = handle.read(OUTPUT_HEAD_BYTES)
+        lines = raw.decode("utf-8", "replace").splitlines()[:OUTPUT_HEAD_LINES]
+        head = "\n".join(lines)
+        return (OUTPUT_QUOTED, head) if head else (OUTPUT_EMPTY, "")
+
+    def _open_output(self, line_id: str, path: str) -> tuple[str, BinaryIO | None]:
+        """A task's output file opened for reading, under the rules
+        ``_output_head`` gives, or the state that says why it was not opened."""
         if not path.startswith("/") or "\x00" in path:
-            return OUTPUT_OUTSIDE, ""
+            return OUTPUT_OUTSIDE, None
         file = Path(path)
         if ".." in file.parts or file.parent.name != "tasks":
-            return OUTPUT_OUTSIDE, ""
+            return OUTPUT_OUTSIDE, None
         if not file.name.endswith(".output") or file.name.startswith("."):
-            return OUTPUT_OUTSIDE, ""
+            return OUTPUT_OUTSIDE, None
         for literal, real in self._output_roots(line_id):
             for form in (literal, real):
                 if form in file.parents:
-                    return self._read_below(real, file.relative_to(form).parts)
-        return OUTPUT_OUTSIDE, ""
+                    return self._open_below(real, file.relative_to(form).parts)
+        return OUTPUT_OUTSIDE, None
 
-    def _read_below(self, root: Path, parts: tuple[str, ...]) -> tuple[str, str]:
-        """The state and head of the file at ``parts`` below the real directory
-        ``root``, walked without following links."""
+    def _open_below(
+        self, root: Path, parts: tuple[str, ...]
+    ) -> tuple[str, BinaryIO | None]:
+        """The file at ``parts`` below the real directory ``root``, walked without
+        following links and opened only when it is a regular file of the daemon's
+        user with one name, or the state that says why it was not."""
         candidate = root.joinpath(*parts)
         for directory in self._protected:
             guarded = Path(os.path.realpath(directory))
             if candidate == guarded or guarded in candidate.parents:
-                return OUTPUT_OUTSIDE, ""
+                return OUTPUT_OUTSIDE, None
         try:
             parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
         except OSError:
-            return OUTPUT_UNREADABLE, ""
+            return OUTPUT_UNREADABLE, None
         try:
             for name in parts[:-1]:
                 entered = os.open(
@@ -6032,23 +6409,22 @@ class Scheduler:
                 parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent
             )
         except FileNotFoundError:
-            return OUTPUT_MISSING, ""
+            return OUTPUT_MISSING, None
         except OSError:
-            return OUTPUT_UNREADABLE, ""
+            return OUTPUT_UNREADABLE, None
         finally:
             os.close(parent)
-        with os.fdopen(descriptor, "rb") as handle:
-            facts = os.fstat(handle.fileno())
-            if (
-                not stat.S_ISREG(facts.st_mode)
-                or facts.st_nlink != 1
-                or facts.st_uid != os.getuid()
-            ):
-                return OUTPUT_UNREADABLE, ""
-            raw = handle.read(OUTPUT_HEAD_BYTES)
-        lines = raw.decode("utf-8", "replace").splitlines()[:OUTPUT_HEAD_LINES]
-        head = "\n".join(lines)
-        return (OUTPUT_QUOTED, head) if head else (OUTPUT_EMPTY, "")
+        # Checked on the bare descriptor, since opening a directory as a file object
+        # raises before any check could refuse it.
+        facts = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(facts.st_mode)
+            or facts.st_nlink != 1
+            or facts.st_uid != os.getuid()
+        ):
+            os.close(descriptor)
+            return OUTPUT_UNREADABLE, None
+        return OUTPUT_QUOTED, os.fdopen(descriptor, "rb")
 
     def _output_roots(self, line_id: str) -> list[tuple[Path, Path]]:
         """Where a line's task output may be read from, each as written and as a
@@ -6502,6 +6878,21 @@ def _cost_mark_of(recorded: tuple[str, int] | None) -> tuple[str, float] | None:
     if recorded is None:
         return None
     return recorded[0], recorded[1] / 1_000_000
+
+
+def _task_view(record: TaskRecorded) -> dict[str, object]:
+    """A recorded background task end as ``role_status`` shows it."""
+    return {
+        "task_id": record.task_id,
+        "command": record.command,
+        "status": record.status,
+        "exit_code": record.exit_code,
+        "output_file": record.output_file,
+        "output_sha256": record.output_digest,
+        "output_bytes": record.output_bytes,
+        "workdir_commit": record.workdir_commit or None,
+        "ended_at": record.ended_at,
+    }
 
 
 def _cut(text: str, limit: int) -> str:

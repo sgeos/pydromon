@@ -40,7 +40,7 @@ held to the project's sandbox requirement, as [`PROJECT_CONFIG.md`](PROJECT_CONF
 `wake_after`, `acquire_lease` or `release_lease`, which only lines have, and no
 `rebind_line`, `hibernate`, `awaken` or `restart`, which only an operator has through a
 client. Nor has it `line_status`,
-`read_instructions`, `write_scratch`, `list_processes` or `stop_process`, which
+`read_instructions`, `write_scratch`, `check_disclosure`, `list_processes` or `stop_process`, which
 describe, write or act for a line. An agent below
 `operator` access is refused when its `create_line` or `configure_line` sets
 `plugins`, since plugins load code into a line. An anonymous agent whose chosen name contains a
@@ -166,6 +166,26 @@ as autonomous, as a line's own notes do, so a long task paced by an agent reache
 - **Words.** A seat is a line's place in a role, as `docs/architecture/ROLES.md`
   defines it. A place an external agent gives a line, such as a seat at a game table, is
   called a player, so the two are not confused.
+
+- **Correlation keys.** An agent's `send_message` to a local line takes an optional
+  `correlation`, a key of the form of an identifier that names the agent's own task,
+  such as one game. The daemon records it with `message_correlated`, and when a turn
+  that delivered keyed notes ends, however it ends, records `turn_correlated` with the
+  keys and the turn's cost, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies. A line's own
+  `send_message` takes no key, and a key on a note to an operator, to a peer or from
+  an operator is refused. `dromon_status` with `correlation` adds the object
+  `correlation`, with `key`, `recorded`, `turns`, `shared_turns`, `cost_usd` as a
+  decimal text and `unknown_cost_turns`, and `dromon agent send --correlation KEY`
+  and `dromon status --correlation KEY` carry and show the same. **Added on
+  2026-10-28.**
+- **Shared turns are not double cost.** A turn that delivered notes with two keys
+  counts its whole cost under each, since the daemon cannot divide one turn between
+  tasks. Its `turn_correlated` records `key_count`, and each key's `shared_turns`
+  counts such turns, so the totals of several keys are not to be added. A turn whose
+  engine reports no cost is counted in `unknown_cost_turns`, never as zero. Only the
+  turn that delivers a keyed note is counted, not the turns a line then starts by
+  itself, such as for its own notes. **Decided by the operator on 2026-10-28** that
+  the totals are durable, kept in the event log.
 
 A sketch of such a profile, with the agent registered as `table`.
 

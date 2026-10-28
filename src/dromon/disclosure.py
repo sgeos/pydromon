@@ -67,3 +67,16 @@ def discloses(terms: Iterable[str], texts: Iterable[str]) -> bool:
     """Whether any of ``texts`` holds any of ``terms``, which are case folded."""
     folded = [text.casefold() for text in texts]
     return any(term in text for term in terms for text in folded)
+
+
+def matching_lines(terms: Iterable[str], text: str) -> int:
+    """How many lines of ``text`` hold any of ``terms``, which are case folded. The
+    count says how much of a text to look at and never which term matched. Since
+    ``load_terms`` reads each term from one line, no term holds a line break, so the
+    count is 0 exactly when ``discloses`` finds nothing."""
+    listed = tuple(terms)
+    return sum(
+        1
+        for line in text.casefold().splitlines()
+        if any(term in line for term in listed)
+    )

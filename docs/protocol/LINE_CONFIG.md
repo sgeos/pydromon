@@ -107,13 +107,14 @@ argument outside a tool's schema is refused.
 | `list_sent` | Lists what became of the line's sent mail |
 | `acquire_lease`, `release_lease` | Take and give up a lease the project declares, as below |
 | `line_status` | Shows a compact read-only status by default, with diagnostic detail and long lists available by argument, as below |
-| `role_status` | Offered only to a seat of a role. Shows the role's worktree, failover policy, handoff threshold, owner, the seat a failover would pass it to now and the latest change of owner, its seats in the failover order with whether each is usable for a failover, their condition, worktree access, whether each waits because its engine cannot confine it, model, provider and stated budget, and its latest five journal entries, the newest with its body, read only, as [`ROLES.md`](../architecture/ROLES.md) describes. Added on 2026-10-27 |
+| `role_status` | Offered only to a seat of a role. Shows the role's worktree, failover policy, handoff threshold, owner, the seat a failover would pass it to now and the latest change of owner, its seats in the failover order with whether each is usable for a failover, their condition, worktree access, whether each waits because its engine cannot confine it, model, provider and stated budget, each seat's latest three background task ends with the digest of their output, and its latest five journal entries, the newest with its body, read only, as [`ROLES.md`](../architecture/ROLES.md) describes. Added on 2026-10-27, and the task ends on 2026-10-28 |
 | `record_role_note` | Offered only to a seat. Records a journal entry of `kind` `note`, by any seat, or `recovery`, by the owner, which the daemon stamps with the role worktree's commit, its own commit and the time. A handoff entry is written only by `relinquish_ownership`. Added on 2026-10-27 |
 | `relinquish_ownership` | Offered only to a seat, and refused unless it owns its role. Records the handoff `note` as a handoff entry and gives the role to the seat `to`, or with no `to` to the seat the handoff that gave it the role named as `back_to`, or else leaves it vacant. A return to a seat that can no longer own the role leaves it vacant and says so. Called inside the owner's own turn, which is how a seat calls it, the request is checked at once and the change is made when that turn ends, with the entry stamped then, and the tool says so. A second call in the same turn is refused. A change that no longer applies when the turn ends is not made, and the operator is told. A successor is awakened and sent a note from the harness, `!dromon`, saying the former owner handed it the role, and the former owner's engine is dropped, so its next turn is built read only. `back_to`, which needs `to`, is the seat the role returns to when the successor next relinquishes without naming one. Added on 2026-10-27 |
 | `take_ownership` | Offered only to a seat that may own its role. Takes the role, with cause `recovery`, only on a ground the harness observes, which is a vacant role, an owner held at a plan limit its engine reported in this daemon run from a shape observed live or typed by the Agent SDK, never from inferred wording, or an owner whose provider budget is recorded as 0 percent with no reset time passed, and never while the owner has a turn in flight. The `reason` of 1 to 4,096 bytes and the ground are recorded as a note entry that the change rests on. Added on 2026-10-27 |
 | `propose_change` | Records a proposed patch, file list and message for operator review; it does not change project files |
 | `read_instructions` | Shows the instructions the line's next turn receives, as below |
 | `write_scratch` | Writes a file under `tmp/` in the line's working directory, as below |
+| `check_disclosure` | Checks a text or a file in the line's working directory against the project's disclosure list, answering pass or fail with a count of matching lines and never a term, rate limited and recorded, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. Added on 2026-10-28 |
 | `list_processes`, `stop_process` | List and stop the processes the line started, as below |
 
 **Decided by the operator on 2026-10-26**, from the lines' own reports, for what follows
@@ -756,6 +757,15 @@ ends with each turn, and the next turn resumes the session in a new one.
   An end is a `task_notification` with a `status` of `completed`, `failed` or
   `stopped`, or a `task_updated` whose `patch.status` is `completed`, `failed` or
   `killed`, whichever comes first.
+- **A turn left with tasks running.** **Item B1 of 2026-10-28**, from a trial in which a
+  line ended its turns with background tasks still running and told no one. When a
+  turn ends while the kept connection reports background tasks, and the line sent no
+  note or question to any party but itself during the turn, the line's next prompt
+  opens by saying how many tasks ran and that it sent no mail, once. **Fact.** The
+  wake when such a task ends already comes through Dromon as the note above, and the
+  turn the engine begins by itself is still interrupted, as above. **Inference.** The
+  count is read as the turn ends, so a task ending at that moment may be counted. It
+  is held in memory only, since a restart of the daemon closes the kept connection.
 - **Cost.** **Fact, observed live on 2026-10-26.** On a kept connection the engine
   reports with each result a cost total for every turn since the connection opened.
   **Fact, read from the engine's code on 2026-10-26, and consistent with what was

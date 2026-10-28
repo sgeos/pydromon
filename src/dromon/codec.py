@@ -41,6 +41,10 @@ from dromon.model import (
     MessageDelivered,
     MessageAcknowledged,
     MessagePrioritized,
+    MessageCorrelated,
+    TurnCorrelated,
+    DisclosureChecked,
+    TaskRecorded,
     MessageKind,
     MessageRead,
     MessageReceived,
@@ -129,11 +133,26 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "message_read": ("message_id",),
     "message_acknowledged": ("message_id",),
     "message_prioritized": ("message_id",),
+    "message_correlated": ("message_id", "key"),
+    "turn_correlated": ("line_id", "keys", "key_count", "cost_micro_usd"),
+    "disclosure_checked": ("line_id", "checked_at", "matched_lines"),
     "wake_requested": ("wake_id", "line_id", "message_id"),
     "wake_issued": ("wake_id",),
     "wake_scheduled": ("line_id", "message_id", "due", "note"),
     "wake_withdrawn": ("line_id", "message_id"),
     "task_noted": ("line_id", "message_id", "task_id", "status", "body"),
+    "task_recorded": (
+        "line_id",
+        "task_id",
+        "command",
+        "status",
+        "exit_code",
+        "output_file",
+        "output_digest",
+        "output_bytes",
+        "workdir_commit",
+        "ended_at",
+    ),
     "restart_noted": ("line_id", "message_id", "body"),
     "line_cost_marked": ("line_id", "engine_session", "total_micro_usd"),
     "processes_left": ("line_id", "cause", "pids", "commands", "more"),
@@ -378,6 +397,37 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
             return "message_acknowledged", {"message_id": event.message_id}
         case MessagePrioritized():
             return "message_prioritized", {"message_id": event.message_id}
+        case MessageCorrelated():
+            return "message_correlated", {
+                "message_id": event.message_id,
+                "key": event.key,
+            }
+        case TurnCorrelated():
+            return "turn_correlated", {
+                "line_id": event.line_id,
+                "keys": list(event.keys),
+                "key_count": event.key_count,
+                "cost_micro_usd": event.cost_micro_usd,
+            }
+        case TaskRecorded():
+            return "task_recorded", {
+                "line_id": event.line_id,
+                "task_id": event.task_id,
+                "command": event.command,
+                "status": event.status,
+                "exit_code": event.exit_code,
+                "output_file": event.output_file,
+                "output_digest": event.output_digest,
+                "output_bytes": event.output_bytes,
+                "workdir_commit": event.workdir_commit,
+                "ended_at": event.ended_at,
+            }
+        case DisclosureChecked():
+            return "disclosure_checked", {
+                "line_id": event.line_id,
+                "checked_at": event.checked_at,
+                "matched_lines": event.matched_lines,
+            }
         case WakeRequested():
             return "wake_requested", {
                 "wake_id": event.wake_id,
@@ -590,6 +640,34 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
             return MessageAcknowledged(_str(data, "message_id"))
         case "message_prioritized":
             return MessagePrioritized(_str(data, "message_id"))
+        case "message_correlated":
+            return MessageCorrelated(_str(data, "message_id"), _str(data, "key"))
+        case "turn_correlated":
+            return TurnCorrelated(
+                _str(data, "line_id"),
+                tuple(_list(data, "keys", str)),
+                _int(data, "key_count"),
+                _optional_int(data, "cost_micro_usd"),
+            )
+        case "task_recorded":
+            return TaskRecorded(
+                _str(data, "line_id"),
+                _str(data, "task_id"),
+                _str(data, "command"),
+                _str(data, "status"),
+                _optional_int(data, "exit_code"),
+                _optional_str(data, "output_file"),
+                _optional_str(data, "output_digest"),
+                _optional_int(data, "output_bytes"),
+                _str(data, "workdir_commit"),
+                _str(data, "ended_at"),
+            )
+        case "disclosure_checked":
+            return DisclosureChecked(
+                _str(data, "line_id"),
+                _str(data, "checked_at"),
+                _int(data, "matched_lines"),
+            )
         case "wake_requested":
             return WakeRequested(
                 _str(data, "wake_id"), _str(data, "line_id"), _str(data, "message_id")

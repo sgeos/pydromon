@@ -19,7 +19,7 @@ from dromon.codex import default_cache_home, engine_environment
 from dromon.disclosure import REFUSAL, load_terms
 from dromon.driver import Strategy
 from dromon.engine import CLAUDE_CODE_PROMPT_MARK, TurnReport
-from dromon.eventlog import EventLog
+from dromon.eventlog import EventLog, read_entries
 from dromon.lineconfig import (
     ConfigError,
     LineConfig,
@@ -32,6 +32,9 @@ from dromon.limits import Limits
 from dromon import scheduler as scheduler_module
 from dromon.mailbox import summary
 from dromon.model import (
+    DISCLOSURE_CHECK_WINDOW_SECONDS,
+    MAX_DISCLOSURE_CHECKS,
+    DisclosureChecked,
     LineAddress,
     LineCreated,
     LineHeld,
@@ -87,6 +90,7 @@ class World:
     def __init__(self, path: Path, root: Path) -> None:
         self.root = root
         self.clock = Clock()
+        self.log_path = path
         self.log = EventLog(path)
         self.engines: dict[str, Recorder] = {}
         self.scheduler = self.start()
@@ -811,6 +815,111 @@ def test_the_disclosure_check_covers_the_scratch_path(
     )
     assert (text, error) == (REFUSAL, True)
     assert not (world.root / "tmp").exists()
+
+
+# Item B2 of 2026-10-28, check_disclosure.
+
+
+def listed(world: World, tmp_path: Path) -> None:
+    (tmp_path / "terms").write_text("codename\nsecond term\n")
+    world.scheduler.set_disclosure_terms(load_terms(tmp_path / "terms"))
+
+
+def checks(world: World) -> list[DisclosureChecked]:
+    return [
+        entry.event
+        for entry in read_entries(world.log_path)
+        if isinstance(entry.event, DisclosureChecked)
+    ]
+
+
+def test_check_disclosure_answers_pass_or_fail_with_a_count(
+    world: World, tmp_path: Path
+) -> None:
+    listed(world, tmp_path)
+    text, error = world.call("check_disclosure", {"text": "clean\nlines"})
+    assert not error and text.startswith("pass, 0 lines hold a term")
+    body = "the CODENAME\nclean\nCodename and a Second Term\n"
+    text, error = world.call("check_disclosure", {"text": body})
+    assert not error and text.startswith("fail, 2 lines hold a term")
+    (world.root / "notes.md").write_text("one codename line\nclean\n")
+    text, error = world.call("check_disclosure", {"path": "notes.md"})
+    assert not error and text.startswith("fail, 1 line holds a term")
+    left = MAX_DISCLOSURE_CHECKS - 3
+    assert f"You have {left} of {MAX_DISCLOSURE_CHECKS} checks left" in text
+    assert "codename" not in text.casefold() and "second term" not in text.casefold()
+    recorded = checks(world)
+    assert [event.matched_lines for event in recorded] == [0, 2, 1]
+    assert {event.checked_at for event in recorded} == {"2026-10-26T09:00:00Z"}
+
+
+def test_check_disclosure_is_limited_per_line_across_a_restart(
+    world: World, tmp_path: Path
+) -> None:
+    listed(world, tmp_path)
+    for _ in range(MAX_DISCLOSURE_CHECKS):
+        _, error = world.call("check_disclosure", {"text": "clean"})
+        assert not error
+    world.clock.now += timedelta(seconds=DISCLOSURE_CHECK_WINDOW_SECONDS - 1)
+    world.log.close()
+    world.log = EventLog(world.log_path)
+    world.start()
+    listed(world, tmp_path)
+    text, error = world.call("check_disclosure", {"text": "codename"})
+    assert error and "next is allowed at 2026-10-26T10:00:00Z" in text
+    assert len(checks(world)) == MAX_DISCLOSURE_CHECKS
+    # The window slides, so each check made an hour ago frees one place.
+    world.clock.now += timedelta(seconds=1)
+    text, error = world.call("check_disclosure", {"text": "clean"})
+    assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 1} of" in text
+    world.clock.now += timedelta(seconds=1)
+    text, error = world.call("check_disclosure", {"text": "clean"})
+    assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 2} of" in text
+
+
+def test_check_disclosure_refuses_without_a_list_or_one_input(
+    world: World, tmp_path: Path
+) -> None:
+    text, error = world.call("check_disclosure", {"text": "x"})
+    assert error and "no disclosure list" in text
+    listed(world, tmp_path)
+    for args in ({}, {"text": "x", "path": "y"}):
+        text, error = world.call("check_disclosure", cast(dict[str, object], args))
+        assert error and "exactly one of text and path" in text
+    big = "x" * (scheduler_module.MAX_CHECKED_BYTES + 1)
+    text, error = world.call("check_disclosure", {"text": big})
+    assert error and "is over" in text
+    assert checks(world) == []
+
+
+@pytest.mark.parametrize(
+    ("path", "message"),
+    [
+        ("/etc/passwd", "relative path"),
+        ("~/notes", "relative path"),
+        ("../escape.md", "may not contain .."),
+        (".dromon/secret.md", "Dromon protects"),
+        ("link.md", "cannot read link.md"),
+        ("linked/escape.md", "cannot read linked/escape.md"),
+        ("hard.md", "more than one name"),
+        ("folder", "not a regular file"),
+        ("missing.md", "cannot read missing.md"),
+    ],
+)
+def test_check_disclosure_reads_only_the_lines_own_files(
+    world: World, tmp_path: Path, path: str, message: str
+) -> None:
+    listed(world, tmp_path)
+    outside = tmp_path / "escape.md"
+    outside.write_text("codename\n")
+    (world.root / ".dromon" / "secret.md").write_text("codename\n")
+    (world.root / "link.md").symlink_to(outside)
+    (world.root / "linked").symlink_to(tmp_path)
+    os.link(outside, world.root / "hard.md")
+    (world.root / "folder").mkdir()
+    text, error = world.call("check_disclosure", {"path": path})
+    assert error and message in text
+    assert checks(world) == []
 
 
 def test_the_repeat_memory_is_pruned_after_the_window(world: World) -> None:

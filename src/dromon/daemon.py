@@ -127,6 +127,7 @@ from dromon.model import (
     AgentAddress,
     AgentRegistered,
     AgentRevoked,
+    Correlation,
     EventRejected,
     InvalidField,
     LineAddress,
@@ -172,6 +173,7 @@ from dromon.protocol import (
     request_id_of,
 )
 from dromon.scheduler import (
+    CORRELATION_ARGUMENT,
     DEFAULT_OPERATOR,
     DEFAULT_TICK_SECONDS,
     MAX_TICK_SECONDS,
@@ -584,7 +586,23 @@ class Daemon:
             case Operation.PING:
                 return Response(request.request_id, ok=True, result={})
             case Operation.STATUS:
-                return Response(request.request_id, ok=True, result=self.status())
+                key = request.args.get(CORRELATION_ARGUMENT)
+                if key is None:
+                    return Response(request.request_id, ok=True, result=self.status())
+                if not isinstance(key, str) or ID_PATTERN.fullmatch(key) is None:
+                    return _refusal(
+                        request.request_id,
+                        ErrorCode.BAD_REQUEST,
+                        "correlation is not an identifier",
+                    )
+                return Response(
+                    request.request_id,
+                    ok=True,
+                    result={
+                        **self.status(),
+                        "correlation": correlation_totals(self.log.state, key),
+                    },
+                )
             case Operation.STOP:
                 lost = self.tasks_lost(sorted(self.log.state.lines))
                 self.stop_requested.set()
@@ -1511,6 +1529,24 @@ class PeerSession:
 
     async def respond(self, line: bytes) -> Response:
         return self.daemon.respond_peer(self, line)
+
+
+def correlation_totals(state: State, key: str) -> dict[str, object]:
+    """The totals of one correlation key as ``status`` reports them. The cost is a
+    decimal text of whole millionths of a dollar, so no float rounds it. A key with
+    no recorded turn, or one dropped as least recently used, reports ``recorded``
+    false and zero totals."""
+    total = state.correlations.get(key)
+    found = total if total is not None else Correlation()
+    micro = found.cost_micro_usd
+    return {
+        "key": key,
+        "recorded": total is not None,
+        "turns": found.turns,
+        "shared_turns": found.shared_turns,
+        "cost_usd": f"{micro // 1_000_000}.{micro % 1_000_000:06d}",
+        "unknown_cost_turns": found.unknown_cost_turns,
+    }
 
 
 def _refusal(request_id: str, code: ErrorCode, message: str) -> Response:
