@@ -22,13 +22,18 @@ refuses to start when either is wider or is not its user's. The store is denied 
 every sandboxed line with the rest of the state directory, and is not protected from
 an unconfined process of the same user, as the design's trust section states.
 
-Phase 1 is the same machine only. A peer with the ``tls`` transport of phase 2 is
-refused until that phase is built, rather than accepted and ignored.
+Phase 2 adds peers on other machines, reached over Transport Layer Security. A ``tls``
+peer names its ``address``, the pin of its public key in ``pin_sha256`` and its public
+certificate in ``certificate``, a path under the state directory, and has no socket or
+project on this machine. ``tls_listen`` is the address this daemon listens on, and is
+required exactly when a ``tls`` peer is inbound, so no network listener opens unless a
+peer needs it. The key fields are parsed here, and ``dromon.federation_tls`` uses them.
 
 Porting note. Plain data and bounded loops over the file's tables. The bound on a
 socket path is that of ``sun_path`` on macOS, the smaller of the two platforms.
 """
 
+import ipaddress
 import json
 import os
 import re
@@ -38,6 +43,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, cast
 
+from cryptography import x509
+
+from dromon.federation_tls import (
+    CERTIFICATE_FILENAME,
+    KEY_FILENAME,
+    MAX_IDENTITY_FILE_BYTES,
+    IdentityFiles,
+    TransportError,
+    generate_identity,
+    public_key_pin,
+)
 from dromon.model import (
     ID_PATTERN,
     LONGEST_EXPIRY_HOURS,
@@ -53,13 +69,16 @@ from dromon.model import (
 )
 
 FEDERATION_KEYS: Final = frozenset(
-    {"listen", "accept_unconfined", "waiting_per_recipient"}
+    {"listen", "tls_listen", "accept_unconfined", "waiting_per_recipient"}
 )
 PEER_KEYS: Final = frozenset(
     {
         "transport",
         "socket",
         "project",
+        "address",
+        "pin_sha256",
+        "certificate",
         "inbound",
         "outbound",
         "reach",
@@ -75,6 +94,20 @@ PEER_KEYS: Final = frozenset(
 )
 TRANSPORT_UNIX: Final = "unix"
 TRANSPORT_TLS: Final = "tls"
+UNIX_ONLY_KEYS: Final = frozenset({"socket", "project"})
+MAX_INBOUND_TLS: Final = 1
+"""The inbound ``tls`` peers a daemon may declare. **Fact,** found by test on
+2026-10-28. Every certificate ``dromon.federation_tls`` makes has one subject name and
+no key identifier, so OpenSSL, given several to trust in one server context, looks up
+the first by name and refuses a client that presents another. The limit is lifted
+when certificates carry distinct names, which is the engines role's module."""
+TLS_ONLY_KEYS: Final = frozenset({"address", "pin_sha256", "certificate"})
+MAX_HOST_BYTES: Final = 253
+"""The longest host name the Domain Name System allows."""
+MAX_CERTIFICATE_PATH_BYTES: Final = 1024
+PIN_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
+"""A pin, the SHA-256 of a public key, as ``dromon.federation_tls`` writes one."""
+HOST_PATTERN: Final = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?")
 PEER_SOCKET_NAME: Final = "peers.sock"
 """The name of a daemon's federation socket, in its runtime directory. A peer's
 ``socket`` must end in it, so its parent is the peer's runtime directory."""
@@ -129,13 +162,19 @@ class PeerDefinition:
     default, so a peer declared with only its socket can do nothing."""
 
     peer_id: str
-    socket: Path
-    """The peer's ``peers.sock``, an absolute path. Its parent is the peer's runtime
-    directory."""
+    socket: Path | None
+    """The peer's ``peers.sock``, an absolute path, for a ``unix`` peer. Its parent is
+    the peer's runtime directory. ``None`` for a ``tls`` peer."""
     project: Path | None = None
     """The peer's project root, an absolute path, whose ``.dromon`` is denied to local
-    lines, or ``None`` when the operator does not name it."""
+    lines, or ``None`` when the operator does not name it or the peer is ``tls``."""
     transport: str = TRANSPORT_UNIX
+    address: tuple[str, int] | None = None
+    """The host and port of a ``tls`` peer's listener."""
+    pin_sha256: str | None = None
+    """The SHA-256 of a ``tls`` peer's public key, in lowercase hexadecimal."""
+    certificate: Path | None = None
+    """A ``tls`` peer's public certificate, relative to the state directory."""
     inbound: bool = False
     outbound: bool = False
     reach: tuple[LocalAddress, ...] = ()
@@ -153,7 +192,10 @@ class PeerDefinition:
 
     def directories(self) -> tuple[Path, ...]:
         """The peer's directories that local lines are denied, its runtime directory
-        and, when its project is named, its state directory."""
+        and, when its project is named, its state directory. A ``tls`` peer has none
+        on this machine."""
+        if self.socket is None:
+            return ()
         runtime = self.socket.parent
         if self.project is None:
             return (runtime,)
@@ -168,6 +210,8 @@ class FederationConfig:
     accept_unconfined: bool = False
     waiting_per_recipient: int = DEFAULT_WAITING_PER_RECIPIENT
     peers: dict[str, PeerDefinition] = field(default_factory=dict[str, PeerDefinition])
+    tls_listen: tuple[str, int] | None = None
+    """The host and port of this daemon's TLS listener, or ``None`` for none."""
 
 
 NO_FEDERATION: Final = FederationConfig()
@@ -193,7 +237,43 @@ def parse_federation(federation: object, peers: object) -> FederationConfig:
         raise FederationError(f"peers declares more than {MAX_PEERS} peers")
     for peer_id, value in sorted(named.items()):
         found[peer_id] = _peer(peer_id, value)
-    return FederationConfig(listen, unconfined, per_recipient, found)
+    raw_listen = table.get("tls_listen")
+    tls_listen = (
+        None if raw_listen is None else _host_port(raw_listen, "federation.tls_listen")
+    )
+    inbound_tls = sorted(
+        peer_id
+        for peer_id, peer in found.items()
+        if peer.transport == TRANSPORT_TLS and peer.inbound
+    )
+    if inbound_tls and tls_listen is None:
+        raise FederationError(
+            f"peers.{inbound_tls[0]} is an inbound tls peer, so federation.tls_listen"
+            " must name the address to listen on"
+        )
+    if tls_listen is not None and not inbound_tls:
+        raise FederationError(
+            "federation.tls_listen opens a network listener, but no tls peer is inbound"
+        )
+    if len(inbound_tls) > MAX_INBOUND_TLS:
+        raise FederationError(
+            f"peers.{inbound_tls[0]} and peers.{inbound_tls[1]} are both inbound tls"
+            f" peers, and at most {MAX_INBOUND_TLS} may be until each certificate"
+            " carries a name of its own"
+        )
+    pins: dict[str, str] = {}
+    for peer_id, peer in sorted(found.items()):
+        if peer.pin_sha256 is None:
+            continue
+        if peer.pin_sha256 in pins:
+            raise FederationError(
+                f"peers.{peer_id} and peers.{pins[peer.pin_sha256]} share one pin,"
+                " so a connection could not tell them apart"
+            )
+        pins[peer.pin_sha256] = peer_id
+    return FederationConfig(
+        listen, unconfined, per_recipient, found, tls_listen=tls_listen
+    )
 
 
 def _peer(peer_id: str, value: object) -> PeerDefinition:
@@ -203,26 +283,50 @@ def _peer(peer_id: str, value: object) -> PeerDefinition:
     table = _table(value, key)
     _known(table, key, PEER_KEYS)
     transport = table.get("transport", TRANSPORT_UNIX)
-    if transport == TRANSPORT_TLS:
+    if transport not in (TRANSPORT_UNIX, TRANSPORT_TLS):
         raise FederationError(
-            f"{key}.transport tls belongs to phase 2, which is not yet built"
+            f"{key}.transport must be {TRANSPORT_UNIX} or {TRANSPORT_TLS}"
         )
-    if transport != TRANSPORT_UNIX:
-        raise FederationError(f"{key}.transport must be {TRANSPORT_UNIX}")
-    socket = _absolute(table.get("socket"), f"{key}.socket", MAX_SOCKET_PATH_BYTES)
-    if socket.name != PEER_SOCKET_NAME:
-        raise FederationError(f"{key}.socket must name a file {PEER_SOCKET_NAME}")
-    raw_project = table.get("project")
-    project = (
-        None
-        if raw_project is None
-        else _absolute(raw_project, f"{key}.project", MAX_PROJECT_PATH_BYTES)
+    foreign = sorted(
+        set(table) & (TLS_ONLY_KEYS if transport == TRANSPORT_UNIX else UNIX_ONLY_KEYS)
     )
+    if foreign:
+        raise FederationError(
+            f"{key}.{foreign[0]} does not apply to a {transport} peer"
+        )
+    socket: Path | None = None
+    project: Path | None = None
+    address: tuple[str, int] | None = None
+    pin: str | None = None
+    certificate: Path | None = None
+    if transport == TRANSPORT_UNIX:
+        socket = _absolute(table.get("socket"), f"{key}.socket", MAX_SOCKET_PATH_BYTES)
+        if socket.name != PEER_SOCKET_NAME:
+            raise FederationError(f"{key}.socket must name a file {PEER_SOCKET_NAME}")
+        raw_project = table.get("project")
+        project = (
+            None
+            if raw_project is None
+            else _absolute(raw_project, f"{key}.project", MAX_PROJECT_PATH_BYTES)
+        )
+    else:
+        address = _host_port(table.get("address"), f"{key}.address")
+        raw_pin = table.get("pin_sha256")
+        if not isinstance(raw_pin, str) or PIN_PATTERN.fullmatch(raw_pin) is None:
+            raise FederationError(
+                f"{key}.pin_sha256 must be 64 lowercase hexadecimal digits, as"
+                " dromon peer key prints one"
+            )
+        pin = raw_pin
+        certificate = _relative(table.get("certificate"), f"{key}.certificate")
     return PeerDefinition(
         peer_id=peer_id,
         socket=socket,
         project=project,
-        transport=TRANSPORT_UNIX,
+        transport=transport,
+        address=address,
+        pin_sha256=pin,
+        certificate=certificate,
         inbound=_flag(table, key, "inbound"),
         outbound=_flag(table, key, "outbound"),
         reach=_parties(table, key, "reach"),
@@ -302,6 +406,49 @@ def _absolute(value: object, key: str, most: int) -> Path:
     return Path(value)
 
 
+def _relative(value: object, key: str) -> Path:
+    """A path relative to the state directory, without ``.`` or ``..`` steps, so it
+    cannot leave that directory by its spelling. A symbolic link inside it is the
+    reader's to refuse."""
+    if not isinstance(value, str) or not value or value.startswith(("/", "~")):
+        raise FederationError(f"{key} must be a path relative to .dromon")
+    if "\x00" in value:
+        raise FederationError(f"{key} holds a zero byte")
+    if len(value.encode("utf-8")) > MAX_CERTIFICATE_PATH_BYTES:
+        raise FederationError(
+            f"{key} must be a path of at most {MAX_CERTIFICATE_PATH_BYTES} bytes"
+        )
+    if any(step in ("", ".", "..") for step in value.split("/")):
+        raise FederationError(f"{key} has an empty, . or .. step")
+    return Path(value)
+
+
+def _host_port(value: object, key: str) -> tuple[str, int]:
+    """A ``host:port`` text, with an Internet Protocol version 6 host in brackets.
+    The host is an address or a name of letters, digits, dots and hyphens, so it
+    carries no scheme, path or space."""
+    if not isinstance(value, str):
+        raise FederationError(f"{key} must be a host:port text")
+    host, colon, port_text = value.rpartition(":")
+    if not colon or not port_text.isascii() or not port_text.isdigit():
+        raise FederationError(f"{key} must end in :PORT")
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise FederationError(f"{key} has a port outside 1 to 65535")
+    if host.startswith("[") and host.endswith("]"):
+        try:
+            return str(ipaddress.IPv6Address(host[1:-1])), port
+        except ValueError as error:
+            raise FederationError(f"{key} has a malformed address") from error
+    if (
+        len(host) > MAX_HOST_BYTES
+        or not host.isascii()
+        or HOST_PATTERN.fullmatch(host) is None
+    ):
+        raise FederationError(f"{key} has a malformed host")
+    return host, port
+
+
 def _parties(table: dict[str, object], key: str, name: str) -> tuple[LocalAddress, ...]:
     """A list of local addresses, distinct and sorted, none of them remote."""
     value = table.get(name, [])
@@ -379,10 +526,9 @@ def unconfined_refusal(
 def policy_text(peer: PeerDefinition) -> str:
     """The peer's policy as canonical JSON, which ``peer_declared`` records. It holds
     every key of the peer's table but its transport, which the event holds apart, and
-    never a token, since none is in the table."""
+    never a token, since none is in the table. A ``unix`` peer's document is the one
+    phase 1 recorded, so an upgrade declares no peer again."""
     document: dict[str, object] = {
-        "socket": str(peer.socket),
-        "project": None if peer.project is None else str(peer.project),
         "inbound": peer.inbound,
         "outbound": peer.outbound,
         "reach": [str(address) for address in peer.reach],
@@ -395,6 +541,17 @@ def policy_text(peer: PeerDefinition) -> str:
         "turns_per_hour": peer.turns_per_hour,
         "waiting": peer.waiting,
     }
+    if peer.transport == TRANSPORT_UNIX:
+        document["socket"] = str(peer.socket)
+        document["project"] = None if peer.project is None else str(peer.project)
+    else:
+        document["address"] = (
+            None if peer.address is None else format_host_port(peer.address)
+        )
+        document["pin_sha256"] = peer.pin_sha256
+        document["certificate"] = (
+            None if peer.certificate is None else str(peer.certificate)
+        )
     return json.dumps(
         document,
         ensure_ascii=False,
@@ -402,6 +559,12 @@ def policy_text(peer: PeerDefinition) -> str:
         sort_keys=True,
         allow_nan=False,
     )
+
+
+def format_host_port(address: tuple[str, int]) -> str:
+    """``address`` written as the project file writes it."""
+    host, port = address
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
 
 def plan_peers(state: State, federation: FederationConfig) -> tuple[Event, ...]:
@@ -544,3 +707,71 @@ def stored_token(directory: Path, peer_id: str) -> str | None:
     if TOKEN_PATTERN.fullmatch(token) is None:
         raise FederationError(f"{path} does not hold a token")
     return token
+
+
+def read_identity(directory: Path) -> IdentityFiles | None:
+    """This daemon's own TLS identity in the store, or ``None`` when it has none yet.
+    Raises ``FederationError`` when only one of its two files exists, or when either
+    is not a regular file of this user with mode 0600, or the certificate does not
+    load. The private key is checked but not read, so its bytes stay on disk until a
+    connection needs them."""
+    key = directory / KEY_FILENAME
+    certificate = directory / CERTIFICATE_FILENAME
+    present = [path.exists() or path.is_symlink() for path in (key, certificate)]
+    if not any(present):
+        return None
+    if not all(present):
+        raise FederationError(
+            f"{directory} holds only one of {KEY_FILENAME} and {CERTIFICATE_FILENAME}."
+            " Move the other aside and run dromon peer key again"
+        )
+    _check_owned(key, os.lstat(key), stat.S_ISREG, "a regular file", STORE_FILE_MODE)
+    data = _read_owned(certificate, MAX_IDENTITY_FILE_BYTES)
+    try:
+        loaded = x509.load_pem_x509_certificate(data)
+    except ValueError as error:
+        raise FederationError(f"{certificate} does not hold a certificate") from error
+    return IdentityFiles(key, certificate, public_key_pin(loaded))
+
+
+def ensure_identity(directory: Path) -> tuple[IdentityFiles, bool]:
+    """This daemon's TLS identity, made in the store when it has none, and whether it
+    was made now. An existing identity is never replaced, so its pin, which peers
+    have written in their project files, stays valid. Raises ``FederationError``."""
+    found = read_identity(directory)
+    if found is not None:
+        return found, False
+    try:
+        made = generate_identity(directory)
+    except TransportError as error:
+        raise FederationError(str(error)) from error
+    check_token_store(directory)
+    return made, True
+
+
+def read_certificate(path: Path) -> bytes:
+    """The bytes of a peer's public certificate file, held to the store's ownership
+    and mode rules and to the identity files' size limit. Raises ``FederationError``.
+    The bytes are not parsed here, since ``dromon.federation_tls`` checks them."""
+    return _read_owned(path, MAX_IDENTITY_FILE_BYTES)
+
+
+def _read_owned(path: Path, most: int) -> bytes:
+    """The bytes of ``path``, opened without following a link and checked on the open
+    descriptor, so a file swapped in after a check is not the one read."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise FederationError(f"{path} could not be read: {error.strerror}") from error
+    with os.fdopen(descriptor, "rb") as file:
+        _check_owned(
+            path,
+            os.fstat(file.fileno()),
+            stat.S_ISREG,
+            "a regular file",
+            STORE_FILE_MODE,
+        )
+        data = file.read(most + 1)
+    if len(data) > most:
+        raise FederationError(f"{path} is over {most} bytes")
+    return data

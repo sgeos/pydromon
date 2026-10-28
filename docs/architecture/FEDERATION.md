@@ -230,6 +230,13 @@ senders = ["core"]
   in any case, since that is its runtime directory.
 - **A pin is public.** A key's digest is not a secret, so it may sit in the project
   file, where review can see it.
+- **The `tls` keys.** **Implemented on 2026-10-28, step 1 of phase 2.** A `tls` peer
+  needs `address`, `pin_sha256` and `certificate`, and may not name `socket` or
+  `project`, nor may a `unix` peer name the `tls` keys. `tls_listen` is required
+  exactly when a `tls` peer is inbound. **Decided by core, for the operator's review.**
+  No two peers may share a pin, since the listener names the peer by the pin it
+  presents. A `unix` peer's recorded policy is the one phase 1 wrote, so an upgrade
+  records no new `peer_declared`.
 
 ## Same machine
 
@@ -316,7 +323,11 @@ each side presents a self-signed certificate and checks the other's against a pi
 SHA-256 digest of its public key.
 
 - **Keys.** `dromon peer key` makes the daemon's key pair once, Ed25519 alone as
-  decision 21 settles, and prints its pin.
+  decision 21 settles, and prints its pin. **Implemented on 2026-10-28, step 2 of
+  phase 2.** The key and certificate are `identity-key.pem` and
+  `identity-certificate.pem` in `.dromon/peers`, beside the tokens and under the same
+  mode check at start. An existing identity is never replaced, since peers have
+  written its pin. Replacing a key means moving both files aside first.
   Operators exchange pins out of band and write the peer's pin in the configuration.
 - **Handshake.** Version 1.3 only, with early data refused, since data sent in a
   zero round trip handshake can be replayed. The pin is the identity, so no certificate
@@ -401,8 +412,9 @@ outbox in `State.outbox`. Choices the design left open, for the operator's revie
   disclosure list there.
 - **Priority mail to a peer** was refused at send until step 6, which follows
   **Priority mail** below.
-- **A `tls` peer is refused at send** until phase 2. Mail already waiting for a peer
-  whose transport became `tls` waits and expires, since no connector reaches it.
+- **A `tls` peer was refused at send** until step 5 of phase 2, implemented on
+  2026-10-28. The policy at send and at each attempt is now the same on both
+  transports, and the transport decides only how mail travels.
 - **The token is read at each connection,** so a token stored with `dromon peer store`
   while the daemon runs is used at the next attempt. With none stored, the forwarder
   backs off and says so on standard error.
@@ -411,6 +423,49 @@ outbox in `State.outbox`. Choices the design left open, for the operator's revie
   role's `dromon.federation_tls` becomes another connector in phase 2. `hello` and
   `deliver` are the forwarder's and do not change, except that `hello` carries the
   token only where the transport needs one.
+- **The TLS connector.** **Implemented on 2026-10-28, step 3 of phase 2,** in
+  `dromon.tls_link`. Choices for the operator's review.
+  - **Fact.** `hello` over TLS carries no token, and a token stored for a `tls` peer
+    is not read, since the pinned key names the daemon.
+  - **Fact.** The identity and the peer's certificate are read at each connection, so
+    an identity made or a certificate replaced while the daemon runs is used at the
+    next attempt. A missing or damaged one is a transient failure that backs off.
+  - **Fact.** The connection attempt and the handshake each have a deadline of 10
+    seconds, and each later frame has the forwarder's answer timeout of 30 seconds.
+    The connection deadline of `dromon.federation_tls` is applied to the handshake
+    alone, since it would otherwise end a kept link 10 seconds after it opened.
+  - **Fact.** The transport is blocking, so each call runs in a worker thread. A lock
+    makes a close wait for a read under way. **Technical debt.** A stop during a read
+    therefore waits up to 30 seconds, and the name of a peer's host is resolved
+    without a deadline of its own.
+  - **Fact.** An answer longer than 65,536 bytes is refused, as on the socket. The
+    transport's frame reader still buffers up to its own limit of 8 MiB before the
+    check, which a hostile peer the operator declared could use to hold that much
+    memory per link.
+  - **Fact.** The round trip over a real connection is tested only where sockets are
+    allowed, as continuous integration allows.
+- **The TLS listener.** **Implemented on 2026-10-28, step 4 of phase 2,** in
+  `dromon.daemon` with helpers in `dromon.tls_link`. Choices for the operator's review.
+  - **Fact.** The listener accepts plain connections and counts each under the cap of
+    16 that the peer socket shares, before its handshake, so the cap bounds
+    unauthenticated connections too. The design's proposed 8 for those alone is not
+    built. A connection past the cap is closed without an answer.
+  - **Fact.** Each connection is upgraded with asyncio's own TLS, with a handshake
+    deadline of 10 seconds, and needs no thread. The key presented must match the pin
+    of an inbound `tls` peer before any frame is read, and that pin names the peer at
+    `hello` and again at each `deliver`, so a pin changed or a peer removed by a
+    reload delivers nothing more.
+  - **Fact.** The server context is built at start and trusts each inbound peer's
+    certificate. A peer added or a certificate replaced by a reload is trusted only
+    after a restart.
+  - **Fact, found by test.** Every certificate that `dromon.federation_tls` makes has
+    the subject name `Dromon federation peer` and no key identifier, so one context
+    trusting two of them refuses the second. **Decided by core, for review.** At most
+    one `tls` peer may be inbound until certificates carry distinct names, which is the
+    engines role's module. A test fails when that changes.
+  - **Decided by core, for review.** A listener whose context or address fails is said
+    on standard error, and the rest of the daemon still serves. Refusing the start
+    would be louder, at the cost of every other service.
 - **The name announced in `hello`** is the project directory's name, lowercased, when
   it is an identifier the disclosure list does not cover, and `dromon` otherwise.
 - **An answer that is not an answer,** an error response, a malformed result or a

@@ -36,6 +36,20 @@ def peer(**keys: object) -> dict[str, object]:
     return {"socket": SOCKET, **keys}
 
 
+PIN = "0123456789abcdef" * 4
+
+
+def tls(**keys: object) -> dict[str, object]:
+    found: dict[str, object] = {
+        "transport": "tls",
+        "address": "studio.example.net:7411",
+        "pin_sha256": PIN,
+        "certificate": "peers/studio.pem",
+    }
+    found.update(keys)
+    return {key: value for key, value in found.items() if value is not None}
+
+
 def declared(**peers: dict[str, object]) -> federation.FederationConfig:
     return parse_federation(None, peers)
 
@@ -98,8 +112,46 @@ MALFORMED: list[tuple[tuple[object, object], str]] = [
     ((None, {"Bad": peer()}), "peers.Bad is not a valid peer identifier"),
     ((None, {"k": 1}), "peers.k must be a table"),
     ((None, {"k": peer(bogus=1)}), "peers.k.bogus is not a known key"),
-    ((None, {"k": peer(transport="tls")}), "phase 2, which is not yet built"),
-    ((None, {"k": peer(transport="smtp")}), "peers.k.transport must be unix"),
+    ((None, {"k": peer(transport="smtp")}), "peers.k.transport must be unix or tls"),
+    ((None, {"k": peer(address="h:1")}), "peers.k.address does not apply to a unix"),
+    ((None, {"k": tls(socket=SOCKET)}), "peers.k.socket does not apply to a tls"),
+    ((None, {"k": tls(project="/srv/k")}), "peers.k.project does not apply to a tls"),
+    ((None, {"k": tls(address=None)}), "peers.k.address must be a host:port"),
+    ((None, {"k": tls(address="host")}), "peers.k.address must end in :PORT"),
+    ((None, {"k": tls(address="host:0")}), "port outside 1 to 65535"),
+    ((None, {"k": tls(address="host:65536")}), "port outside 1 to 65535"),
+    ((None, {"k": tls(address="host:+1")}), "must end in :PORT"),
+    ((None, {"k": tls(address="a b:1")}), "peers.k.address has a malformed host"),
+    ((None, {"k": tls(address="h/x:1")}), "has a malformed host"),
+    ((None, {"k": tls(address=":1")}), "has a malformed host"),
+    ((None, {"k": tls(address="-h:1")}), "has a malformed host"),
+    ((None, {"k": tls(address="ü.example:1")}), "has a malformed host"),
+    ((None, {"k": tls(address="[::g]:1")}), "has a malformed address"),
+    ((None, {"k": tls(pin_sha256=None)}), "pin_sha256 must be 64 lowercase"),
+    ((None, {"k": tls(pin_sha256=PIN.upper())}), "pin_sha256 must be 64 lowercase"),
+    ((None, {"k": tls(pin_sha256=PIN[:-1])}), "pin_sha256 must be 64 lowercase"),
+    ((None, {"k": tls(certificate=None)}), "must be a path relative to .dromon"),
+    ((None, {"k": tls(certificate="/k.pem")}), "must be a path relative to .dromon"),
+    ((None, {"k": tls(certificate="~/k.pem")}), "must be a path relative"),
+    ((None, {"k": tls(certificate="peers/../k.pem")}), "has an empty, . or .."),
+    ((None, {"k": tls(certificate="peers//k.pem")}), "has an empty, . or .."),
+    ((None, {"k": tls(certificate="a\x00")}), "holds a zero byte"),
+    ((None, {"k": tls(certificate="a" * 1025)}), "at most 1024 bytes"),
+    ((None, {"k": tls(inbound=True)}), "so federation.tls_listen must name"),
+    (({"tls_listen": "0.0.0.0:7411"}, {"k": tls()}), "no tls peer is inbound"),
+    (({"tls_listen": "0.0.0.0:7411"}, None), "no tls peer is inbound"),
+    (({"tls_listen": 7411}, None), "federation.tls_listen must be a host:port"),
+    ((None, {"a": tls(), "b": tls()}), "peers.b and peers.a share one pin"),
+    (
+        (
+            {"tls_listen": "0.0.0.0:7411"},
+            {
+                "a": tls(inbound=True, reach=["alpha"]),
+                "b": tls(inbound=True, reach=["alpha"], pin_sha256="1" * 64),
+            },
+        ),
+        "at most 1 may be",
+    ),
     ((None, {"k": {}}), "peers.k.socket must be an absolute path"),
     ((None, {"k": peer(socket="run/peers.sock")}), "must be an absolute path"),
     ((None, {"k": peer(socket="/srv/k/run/x.sock")}), "must name a file peers"),
@@ -139,6 +191,39 @@ def test_lists_and_peers_are_bounded() -> None:
     peers["extra"] = peer(socket="/srv/extra/peers.sock")
     with pytest.raises(FederationError, match="more than 64 peers"):
         parse_federation(None, peers)
+
+
+def test_a_tls_peer_reads_back_with_its_key_fields() -> None:
+    config = parse_federation(
+        {"tls_listen": "[2001:DB8::1]:7411"},
+        {
+            "studio": tls(inbound=True, outbound=True),
+            "local": tls(address="127.0.0.1:1", pin_sha256="f" * 64),
+        },
+    )
+    listen = config.tls_listen
+    assert listen is not None and listen == ("2001:db8::1", 7411)
+    assert federation.format_host_port(listen) == "[2001:db8::1]:7411"
+    found = config.peers["studio"]
+    assert found.transport == "tls" and found.socket is None and found.project is None
+    assert found.address == ("studio.example.net", 7411)
+    assert found.pin_sha256 == PIN
+    assert found.certificate == Path("peers/studio.pem")
+    assert found.directories() == ()
+    assert config.peers["local"].address == ("127.0.0.1", 1)
+    policy = federation.policy_text(found)
+    assert '"address":"studio.example.net:7411"' in policy
+    assert f'"pin_sha256":"{PIN}"' in policy
+    assert '"certificate":"peers/studio.pem"' in policy
+    assert '"socket"' not in policy and '"project"' not in policy
+
+
+def test_a_unix_peers_policy_text_is_what_phase_1_recorded() -> None:
+    found = declared(k=peer(project="/srv/keleusma")).peers["k"]
+    policy = federation.policy_text(found)
+    assert f'"socket":"{SOCKET}"' in policy
+    assert '"project":"/srv/keleusma"' in policy
+    assert '"address"' not in policy and '"pin_sha256"' not in policy
 
 
 def test_a_peer_denies_its_runtime_directory_and_its_named_state() -> None:

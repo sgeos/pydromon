@@ -188,7 +188,11 @@ def test_a_line_cannot_send_a_listed_term(
     text = cast(str, result["content"][0]["text"])
     assert result["is_error"] is True and text == REFUSAL
     assert TERM.casefold() not in text.casefold()
-    assert last_seq(scheduler) == before
+    # The refusal is recorded as one disclosure check, which holds no text, at the
+    # operator's decision of 2026-10-28, so that it spends the line's limit.
+    assert last_seq(scheduler) == before + 1
+    state = scheduler._log.state  # pyright: ignore[reportPrivateUsage]
+    assert len(state.disclosure_checks["alpha"]) == 1
 
 
 def test_clean_text_still_passes_every_tool(scheduler: Scheduler) -> None:

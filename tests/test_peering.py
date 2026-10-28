@@ -21,11 +21,16 @@ from dromon import client
 from dromon.agents import token_digest
 from dromon.codec import DecodeError, decode, encode
 from dromon.configview import Overrides
-from dromon.daemon import Daemon, PeerSession
+from dromon.daemon import Daemon, PeerSession, tls_peer_connection
 from dromon.driver import Strategy
 from dromon.engine import TurnReport
 from dromon.eventlog import EventLog
-from dromon.federation import FederationConfig, parse_federation, plan_peers
+from dromon.federation import (
+    FederationConfig,
+    ensure_identity,
+    parse_federation,
+    plan_peers,
+)
 from dromon.limits import Limits
 from dromon.model import (
     AgentAddress,
@@ -69,8 +74,9 @@ from dromon.peering import (
     turn_cause,
 )
 from dromon.projectconfig import ProjectConfig
-from dromon.protocol import MAX_LINE_BYTES, Operation, Response
+from dromon.protocol import MAX_LINE_BYTES, Operation, Request, Response
 from dromon.scheduler import PRIORITY_DECLINED, LineEngine, LineSpec, Scheduler
+from dromon.tls_link import server_context_for, tls_connector
 
 PEER = "keleusma"
 KAIZEN = RemoteAddress(PEER, LineAddress("kaizen"))
@@ -657,6 +663,128 @@ def test_a_new_token_issued_while_connected_ends_the_session(
         daemon.log.append(PeerKeyed(PEER, token_digest("N" * 43)))
         refused = peer_ask(session, line("deliver", envelope()))
         assert not refused.ok and daemon.log.state.received == {}
+
+
+PIN = "0123456789abcdef" * 4
+
+
+def tls_config(**keys: object) -> FederationConfig:
+    table: dict[str, object] = {
+        "transport": "tls",
+        "address": "studio.example.net:7411",
+        "pin_sha256": PIN,
+        "certificate": "peers/keleusma.pem",
+        "inbound": True,
+        "reach": ["alpha", "@ana"],
+        **keys,
+    }
+    listen = {"tls_listen": "127.0.0.1:7411"} if table["inbound"] else {}
+    return parse_federation(listen, {PEER: table})
+
+
+def tls_hello(**keys: object) -> bytes:
+    return line("hello", {"versions": [1], "name": "keleusma", **keys})
+
+
+def test_over_tls_the_pin_names_the_peer_and_hello_takes_no_token(
+    paths: ProjectPaths,
+) -> None:
+    with attached(paths, tls_config()) as daemon:
+        session = PeerSession(daemon, pin_sha256=PIN)
+        greeted = peer_ask(session, tls_hello())
+        assert greeted.ok and session.peer_id == PEER
+        delivered = peer_ask(session, line("deliver", envelope()))
+        assert delivered.result is not None
+        assert delivered.result["outcome"] == "accepted"
+        with_token = peer_ask(PeerSession(daemon, pin_sha256=PIN), hello())
+        assert not with_token.ok and with_token.error_code == "bad_request"
+
+
+def test_a_key_no_inbound_peer_pins_is_refused(paths: ProjectPaths) -> None:
+    with attached(paths, tls_config()) as daemon:
+        refused = peer_ask(PeerSession(daemon, pin_sha256="f" * 64), tls_hello())
+        assert not refused.ok and refused.error_message == "the peer was refused"
+        daemon.project = ProjectConfig(federation=tls_config(inbound=False))
+        closed = peer_ask(PeerSession(daemon, pin_sha256=PIN), tls_hello())
+        assert not closed.ok and closed.error_message == "the peer was refused"
+
+
+def test_a_token_never_names_a_tls_peer_on_the_socket(paths: ProjectPaths) -> None:
+    with attached(paths, tls_config()) as daemon:
+        refused = peer_ask(PeerSession(daemon), hello())
+        assert not refused.ok and refused.error_message == "the peer was refused"
+
+
+def test_a_pin_changed_while_connected_delivers_nothing_more(
+    paths: ProjectPaths,
+) -> None:
+    with attached(paths, tls_config()) as daemon:
+        session = PeerSession(daemon, pin_sha256=PIN)
+        assert peer_ask(session, tls_hello()).ok
+        daemon.project = ProjectConfig(federation=tls_config(pin_sha256="f" * 64))
+        refused = peer_ask(session, line("deliver", envelope()))
+        assert not refused.ok and refused.error_message == "the peer was refused"
+        assert session.peer_id is None
+        assert daemon.log.state.received == {}
+
+
+@pytest.mark.socket
+def test_a_note_crosses_the_tls_listener(paths: ProjectPaths, tmp_path: Path) -> None:
+    """The connector of step 3 against the listener of step 4, over loopback."""
+    server_identity, _ = ensure_identity(paths.state_dir / "peers")
+    sender_dir = tmp_path / "sender"
+    sender_identity, _ = ensure_identity(sender_dir / "peers")
+    for source, target in (
+        (sender_identity.certificate, paths.state_dir / "peers" / "keleusma.pem"),
+        (server_identity.certificate, sender_dir / "listener.pem"),
+    ):
+        target.write_bytes(source.read_bytes())
+        target.chmod(0o600)
+    config = tls_config(pin_sha256=sender_identity.pin_sha256)
+    with attached(paths, config) as daemon:
+        context = server_context_for(paths.state_dir, paths.state_dir / "peers", config)
+
+        async def scenario() -> tuple[Response, Response]:
+            server = await asyncio.start_server(
+                lambda r, w: tls_peer_connection(daemon, r, w, context),
+                "127.0.0.1",
+                0,
+            )
+            port = server.sockets[0].getsockname()[1]
+            definition = parse_federation(
+                None,
+                {
+                    PEER: {
+                        "transport": "tls",
+                        "address": f"127.0.0.1:{port}",
+                        "pin_sha256": server_identity.pin_sha256,
+                        "certificate": "listener.pem",
+                        "outbound": True,
+                    }
+                },
+            ).peers[PEER]
+            try:
+                link = await tls_connector(sender_dir, sender_dir / "peers")(
+                    PEER, definition
+                )
+                try:
+                    greeted = await link.exchange(
+                        Request("h", Operation.HELLO, {"versions": [1], "name": "k"})
+                    )
+                    delivered = await link.exchange(
+                        Request("d", Operation.DELIVER, envelope())
+                    )
+                finally:
+                    await link.close()
+            finally:
+                server.close()
+                await server.wait_closed()
+            return greeted, delivered
+
+        greeted, delivered = asyncio.run(scenario())
+        assert greeted.ok
+        assert delivered.result is not None
+        assert delivered.result["outcome"] == "accepted"
 
 
 def test_a_peer_line_may_exceed_the_client_line_limit(paths: ProjectPaths) -> None:

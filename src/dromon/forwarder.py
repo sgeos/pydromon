@@ -23,8 +23,9 @@ with ``refused``, ``too_large`` or ``disclosure`` when it no longer passes.
 
 The transport seam. A ``Connector`` opens a ``Link`` to a peer, a channel that carries
 one request and its answer at a time. ``connect_unix`` is the same-machine transport of
-phase 1. Phase 2 adds a connector over Transport Layer Security, which
-``dromon.federation_tls`` provides on its own branch, and the forwarder is unchanged.
+phase 1. ``dromon.tls_link`` holds phase 2's connector over Transport Layer Security,
+and the forwarder is unchanged but for ``hello``, which carries a token only on the
+socket.
 
 Memory. Backoff, the busy count, the times first seen and the marks of copies that
 may have reached the peer are kept in memory. A restart resets the backoff, and marks
@@ -152,10 +153,6 @@ def check_outbound(
     peer = state.peers.get(peer_id)
     if definition is None or peer is None or peer.removed:
         raise EventRejected(f"no peer {peer_id}")
-    if definition.transport != TRANSPORT_UNIX:
-        raise EventRejected(
-            f"peer {peer_id} is reached over tls, which phase 2 of federation adds"
-        )
     if not definition.outbound:
         raise EventRejected(f"mail to peer {peer_id} is off")
     if sender not in definition.senders:
@@ -281,10 +278,10 @@ class UnixLink:
 
 
 async def connect_unix(peer_id: str, definition: PeerDefinition) -> Link:
-    """Open a link to ``peer_id``'s ``peers.sock``. A ``tls`` peer waits for phase 2,
-    and is refused here as a transient failure, so its mail waits and expires."""
-    if definition.transport != TRANSPORT_UNIX:
-        raise LinkError(f"peer {peer_id} is reached over tls, which phase 2 adds")
+    """Open a link to ``peer_id``'s ``peers.sock``. A ``tls`` peer is refused here as
+    a transient failure, since ``dromon.tls_link`` reaches it."""
+    if definition.transport != TRANSPORT_UNIX or definition.socket is None:
+        raise LinkError(f"peer {peer_id} is not reached over a unix socket")
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_unix_connection(str(definition.socket), limit=MAX_LINE_BYTES),
@@ -376,7 +373,7 @@ class PeerForwarder:
     outbox: Outbox
     connect: Connector
     token: Callable[[], str | None]
-    """Reads the token this daemon presents to the peer, ``None`` when none is
+    """Reads the token this daemon presents to a ``unix`` peer, ``None`` when none is
     stored. Read at each connection, so a token stored while the daemon runs is used
     at the next one."""
     name: str
@@ -532,13 +529,15 @@ class PeerForwarder:
         """The open link, or a new one past ``hello``. Raises ``LinkError``."""
         if self.link is not None:
             return self.link
-        token = self.token()
-        if token is None and self.definition.transport == TRANSPORT_UNIX:
-            raise LinkError(f"no token is stored for peer {self.peer_id}")
-        link = await self.connect(self.peer_id, self.definition)
         args: dict[str, object] = {"versions": [FEDERATION_VERSION], "name": self.name}
-        if token is not None:
+        # Only the socket needs a token. Over TLS the pinned key names this daemon,
+        # so a token stored for the peer is neither read nor sent.
+        if self.definition.transport == TRANSPORT_UNIX:
+            token = self.token()
+            if token is None:
+                raise LinkError(f"no token is stored for peer {self.peer_id}")
             args["token"] = token
+        link = await self.connect(self.peer_id, self.definition)
         try:
             response = await link.exchange(
                 Request(_request_id(), Operation.HELLO, args)

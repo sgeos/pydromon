@@ -78,6 +78,8 @@ class Operation(StrEnum):
     """Operator only. Not offered to external agents."""
     PEER_LIST = "peer_list"
     """Operator only. Not offered to external agents."""
+    PEER_KEY = "peer_key"
+    """Operator only. Not offered to external agents."""
     AGENT_TOOLS = "agent_tools"
     """Served only on the agent socket."""
     AGENT_CALL = "agent_call"

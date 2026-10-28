@@ -59,9 +59,10 @@ identity, mailbox, configuration and overrides. ``line_rebound`` records it, the
 override is dropped, the engine session is cleared and the engine rebuilt.
 
 Disclosure guard. When the project names a disclosure list, a message, question or
-wake note that a line or an external agent sends through these tools is refused, and
-nothing is recorded, if its text holds a listed term, as ``dromon.disclosure``
-specifies. The refusal never names the term.
+wake note that a line or an external agent sends through these tools is refused if
+its text holds a listed term, as ``dromon.disclosure`` specifies. The refusal never
+names the term. A line's refusal is recorded as ``disclosure_checked``, without the
+text, and counts against its limit of checks, as ``refuse_disclosed`` describes.
 
 Safety. Two lines can wake each other without end, and a line can run up cost without
 anyone watching. ``dromon.limits`` sets how many turns a line may take in a row without
@@ -453,6 +454,13 @@ WITHHELD_COMMAND: Final = "withheld, since the disclosure list covers it"
 CHECK_DISCLOSURE_TOOL_NAME: Final = "check_disclosure"
 MAX_CHECKED_BYTES: Final = 1024 * 1024
 """The largest text or file ``check_disclosure`` reads, so one check stays cheap."""
+DISCLOSURE_HELD: Final = (
+    "Dromon held this line and asked an operator, since its disclosure checks and"
+    " refusals reached their limit. Nothing was sent, written or checked, and"
+    " nothing will be until an operator resumes the line."
+)
+"""The answer of every disclosure-checked line tool once the line spent its limit,
+whatever the text holds, so a held line learns nothing more of the list."""
 
 CHECK_DISCLOSURE_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
@@ -1444,6 +1452,11 @@ class Scheduler:
         """How many background tasks still ran when each line's last turn ended
         without the line sending any mail, for its next prompt. Held in memory only,
         since a restart of the daemon closes kept sessions and ends their tasks."""
+        self._disclosure_spent: set[str] = set()
+        """Lines that spent their disclosure limit and are held for it. Every
+        disclosure-checked tool answers ``DISCLOSURE_HELD`` for them until an
+        operator releases the line. Held in memory, since a held line starts no turn
+        and a restart ends the turn that spent it."""
         self._turn_costs: dict[str, deque[dict[str, object]]] = {}
         self._counting: dict[str, bool] = {}
         """Whether each line's turn in flight counts as autonomous."""
@@ -2246,8 +2259,13 @@ class Scheduler:
                 return _tool_error("reply_to must be text")
             if not isinstance(urgent, bool):
                 return _tool_error("priority must be true or false")
-            if self.discloses(body):
-                return _tool_error(disclosure.REFUSAL)
+            refusal = (
+                self.refuse_disclosed(sender.line_id, body)
+                if isinstance(sender, LineAddress)
+                else (disclosure.REFUSAL if self.discloses(body) else None)
+            )
+            if refusal is not None:
+                return _tool_error(refusal)
             try:
                 message_id = self.send(
                     sender,
@@ -2373,8 +2391,11 @@ class Scheduler:
                 isinstance(choice, str) for choice in cast(list[object], choices)
             ):
                 return _tool_error("choices must be a list of text")
-            if self.discloses(question, *cast(list[str], choices)):
-                return _tool_error(disclosure.REFUSAL)
+            refusal = self.refuse_disclosed(
+                line_id, question, *cast(list[str], choices)
+            )
+            if refusal is not None:
+                return _tool_error(refusal)
             try:
                 operator = self._operator_for(line_id, to)
                 message_id = self.ask(
@@ -2534,8 +2555,9 @@ class Scheduler:
                 return _tool_error("seconds must be a whole number")
             if not isinstance(note, str):
                 return _tool_error("note must be text")
-            if self.discloses(note):
-                return _tool_error(disclosure.REFUSAL)
+            refusal = self.refuse_disclosed(line_id, note)
+            if refusal is not None:
+                return _tool_error(refusal)
             replaced = self._log.state.scheduled.get(line_id)
             try:
                 message_id, due = self.schedule_wake(line_id, seconds, note)
@@ -3412,8 +3434,9 @@ class Scheduler:
         data = text.encode("utf-8")
         if len(data) > MAX_SCRATCH_BYTES:
             raise LineToolRefused(f"text is over {MAX_SCRATCH_BYTES} bytes")
-        if self.discloses(text, path):
-            raise LineToolRefused(disclosure.REFUSAL)
+        refusal = self.refuse_disclosed(line_id, text, path)
+        if refusal is not None:
+            raise LineToolRefused(refusal)
         workdir = self._workdir_of(line_id)
         # Every component is opened relative to its parent's descriptor without
         # following links, so no link swapped in at any level can redirect the
@@ -3460,25 +3483,24 @@ class Scheduler:
         Refused when the project has no list, when the line made
         ``MAX_DISCLOSURE_CHECKS`` checks within ``DISCLOSURE_CHECK_WINDOW_SECONDS``,
         and for a text or file the check cannot read. A refusal records nothing,
-        since it reveals nothing of the list. The window is read from the recorded
-        times on the wall clock, so it survives a restart, and a clock set back
-        lengthens it while one set forward shortens it."""
+        since it reveals nothing of the list, so a spent limit refuses here without
+        holding the line, unlike ``refuse_disclosed``. The window is read from the
+        recorded times on the wall clock, so it survives a restart, and a clock set
+        back lengthens it while one set forward shortens it."""
+        if line_id in self._disclosure_spent:
+            raise LineToolRefused(DISCLOSURE_HELD)
         if (text is None) == (path is None):
             raise LineToolRefused("give exactly one of text and path")
         if not self._disclosure:
             raise LineToolRefused("this project has no disclosure list")
         now = self._wall_clock()
-        times = self._log.state.disclosure_checks.get(line_id, ())
-        if len(times) >= MAX_DISCLOSURE_CHECKS:
-            reopens = parse_due(times[-MAX_DISCLOSURE_CHECKS]) + timedelta(
-                seconds=DISCLOSURE_CHECK_WINDOW_SECONDS
+        reopens = self._disclosure_reopens(line_id, now)
+        if reopens is not None:
+            raise LineToolRefused(
+                f"the limit of {MAX_DISCLOSURE_CHECKS} checks in"
+                f" {DISCLOSURE_CHECK_WINDOW_SECONDS} seconds is reached, and the"
+                f" next is allowed at {format_due(reopens)}"
             )
-            if now < reopens:
-                raise LineToolRefused(
-                    f"the limit of {MAX_DISCLOSURE_CHECKS} checks in"
-                    f" {DISCLOSURE_CHECK_WINDOW_SECONDS} seconds is reached, and the"
-                    f" next is allowed at {format_due(reopens)}"
-                )
         if text is None:
             text = self._read_checked(line_id, cast(str, path))
         elif len(text.encode("utf-8")) > MAX_CHECKED_BYTES:
@@ -3491,6 +3513,58 @@ class Scheduler:
         window = timedelta(seconds=DISCLOSURE_CHECK_WINDOW_SECONDS)
         used = sum(1 for time in recent if now - parse_due(time) < window)
         return matched, max(0, MAX_DISCLOSURE_CHECKS - used)
+
+    def _disclosure_reopens(self, line_id: str, now: datetime) -> datetime | None:
+        """When the line's window of disclosure checks and refusals next has room,
+        or None when it has room now."""
+        times = self._log.state.disclosure_checks.get(line_id, ())
+        if len(times) < MAX_DISCLOSURE_CHECKS:
+            return None
+        reopens = parse_due(times[-MAX_DISCLOSURE_CHECKS]) + timedelta(
+            seconds=DISCLOSURE_CHECK_WINDOW_SECONDS
+        )
+        return reopens if now < reopens else None
+
+    def refuse_disclosed(self, line_id: str, *texts: str) -> str | None:
+        """**Decided by the operator on 2026-10-28.** The refusal a line tool gives
+        for ``texts``, or None when it may proceed. A refusal for disclosure answers
+        whether the text holds a listed term, the same oracle ``check_disclosure``
+        is, so it counts against the same limit and is recorded as
+        ``disclosure_checked``. Once the limit is spent, the line is held and an
+        operator asked, and every disclosure-checked tool then answers
+        ``DISCLOSURE_HELD`` without checking until the line is released, so the
+        rest of the turn learns nothing.
+
+        A text that passes is not counted, so the limit bounds only the failures.
+        A line already held for another reason is not asked about twice, and its
+        release clears this hold too."""
+        if line_id in self._disclosure_spent:
+            return DISCLOSURE_HELD
+        if not self.discloses(*texts):
+            return None
+        line = self._log.state.lines.get(line_id)
+        if line is None:
+            return disclosure.REFUSAL
+        now = self._wall_clock()
+        if self._disclosure_reopens(line_id, now) is None:
+            matched = sum(
+                disclosure.matching_lines(self._disclosure, text) for text in texts
+            )
+            self._log.append(
+                DisclosureChecked(
+                    line_id, format_due(now), min(matched, MAX_DISCLOSURE_MATCHES)
+                )
+            )
+            return disclosure.REFUSAL
+        self._disclosure_spent.add(line_id)
+        if line.held_by is None:
+            self.hold(
+                line_id,
+                f"reached the limit of {MAX_DISCLOSURE_CHECKS} disclosure checks and"
+                f" refusals in {DISCLOSURE_CHECK_WINDOW_SECONDS} seconds, so a"
+                " further answer could reveal more of the list",
+            )
+        return DISCLOSURE_HELD
 
     def _read_checked(self, line_id: str, path: str) -> str:
         """The text of the file at ``path``, relative to the line's working
@@ -3965,8 +4039,9 @@ class Scheduler:
     def record_role_note(self, line_id: str, kind: RoleNoteKind, body: str) -> str:
         """Record ``body`` in ``line_id``'s role journal, stamped by the daemon, and
         return the entry's identifier. Raises ``LineToolRefused``."""
-        if self.discloses(body):
-            raise LineToolRefused(disclosure.REFUSAL)
+        refusal = self.refuse_disclosed(line_id, body)
+        if refusal is not None:
+            raise LineToolRefused(refusal)
         try:
             plan = plan_note(
                 self._log.state, line_id, kind, body, new_id("e"), self._stamp(line_id)
@@ -3991,8 +4066,9 @@ class Scheduler:
         one checked, and true says it waits. The former owner's engine is dropped
         when the change is made, so its next turn has no write access. Outside a
         turn the change is made at once. Raises ``LineToolRefused``."""
-        if self.discloses(note):
-            raise LineToolRefused(disclosure.REFUSAL)
+        refusal = self.refuse_disclosed(line_id, note)
+        if refusal is not None:
+            raise LineToolRefused(refusal)
         if line_id in self._relinquish_pending:
             raise LineToolRefused("a handoff already waits for this turn to end")
         plan = self._plan_relinquish(line_id, note, to, back_to)
@@ -4048,8 +4124,9 @@ class Scheduler:
             raise LineToolRefused(
                 f"reason must be text of 1 to {MAX_TAKE_REASON_BYTES} bytes"
             )
-        if self.discloses(reason):
-            raise LineToolRefused(disclosure.REFUSAL)
+        refusal = self.refuse_disclosed(line_id, reason)
+        if refusal is not None:
+            raise LineToolRefused(refusal)
         state = self._log.state
         seat = state.seats.get(line_id)
         if seat is None:
@@ -4751,8 +4828,9 @@ class Scheduler:
         """Store a bounded, disclosure-checked patch for operator review."""
         if self._root is None:
             raise LineToolRefused("this daemon does not know its project root")
-        if self.discloses(message, patch, *files):
-            raise LineToolRefused(disclosure.REFUSAL)
+        refusal = self.refuse_disclosed(line_id, message, patch, *files)
+        if refusal is not None:
+            raise LineToolRefused(refusal)
         workdir = str(self._workdir_of(line_id))
         proposal = proposal_store.Proposal(
             proposal_id=new_id("p"),
@@ -5371,6 +5449,7 @@ class Scheduler:
         self._cost.pop(line_id, None)
         self._cost_unknown.pop(line_id, None)
         self._failed.discard(line_id)
+        self._disclosure_spent.discard(line_id)
         self._work.set()
 
     def _apply_limits(

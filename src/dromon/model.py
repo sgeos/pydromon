@@ -700,8 +700,10 @@ MAX_DISCLOSURE_MATCHES: Final = 1_000_000
 @dataclass(frozen=True, slots=True)
 class DisclosureChecked:
     """A line checked a text or a file against the project's disclosure list, at
-    ``checked_at``, and ``matched_lines`` of its lines held a listed term. Neither
-    the text, its name nor any term is recorded. **Item B2 of 2026-10-28.** The
+    ``checked_at``, and ``matched_lines`` of its lines held a listed term, or a line
+    tool refused a text for disclosure, which the operator decided on 2026-10-28
+    counts as a check. Neither the text, its name nor any term is recorded.
+    **Item B2 of 2026-10-28.** The
     record makes the rate limit survive a restart of the daemon, and shows an
     operator how often each line asked."""
 

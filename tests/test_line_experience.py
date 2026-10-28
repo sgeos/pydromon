@@ -43,9 +43,11 @@ from dromon.model import (
     MessageSent,
     OperatorAddress,
     OperatorRegistered,
+    RoleNoteKind,
     State,
 )
 from dromon.scheduler import (
+    DISCLOSURE_HELD,
     MAX_LINE_STATUS_DEFAULT_BYTES,
     MAX_SCRATCH_BYTES,
     UNRELEASED_NOTE,
@@ -920,6 +922,116 @@ def test_check_disclosure_reads_only_the_lines_own_files(
     text, error = world.call("check_disclosure", {"path": path})
     assert error and message in text
     assert checks(world) == []
+
+
+# B2, as decided by the operator on 2026-10-28. A refusal for disclosure answers
+# the same question a check does, so it spends the same limit.
+
+DISCLOSING_CALLS: list[tuple[str, dict[str, object]]] = [
+    ("send_message", {"to": "@ana", "body": "a Codename"}),
+    ("ask_operator", {"question": "a Codename?", "choices": []}),
+    ("wake_after", {"seconds": 60, "note": "a Codename"}),
+    ("write_scratch", {"path": "draft.md", "text": "a Codename"}),
+]
+
+
+def held(world: World) -> list[LineHeld]:
+    return [
+        entry.event
+        for entry in read_entries(world.log_path)
+        if isinstance(entry.event, LineHeld)
+    ]
+
+
+@pytest.mark.parametrize(("name", "args"), DISCLOSING_CALLS)
+def test_a_refusal_for_disclosure_spends_a_check(
+    world: World, tmp_path: Path, name: str, args: dict[str, object]
+) -> None:
+    listed(world, tmp_path)
+    text, error = world.call(name, args)
+    assert error and text == REFUSAL
+    assert [event.matched_lines for event in checks(world)] == [1]
+    text, error = world.call("check_disclosure", {"text": "clean"})
+    assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 2} of" in text
+
+
+def test_the_role_and_proposal_tools_spend_a_check_too(
+    world: World, tmp_path: Path
+) -> None:
+    listed(world, tmp_path)
+    scheduler = world.scheduler
+    calls = [
+        lambda: scheduler.record_role_note("alpha", RoleNoteKind.NOTE, "codename"),
+        lambda: scheduler.relinquish_ownership("alpha", "codename", None, None),
+        lambda: scheduler.take_ownership("alpha", "codename"),
+        lambda: scheduler.propose_change("alpha", "codename", ["a.py"], "patch"),
+    ]
+    for call in calls:
+        with pytest.raises(LineToolRefused, match=REFUSAL):
+            call()
+    assert len(checks(world)) == len(calls)
+
+
+def test_a_text_that_passes_spends_no_check(world: World, tmp_path: Path) -> None:
+    listed(world, tmp_path)
+    text, error = world.call("send_message", {"to": "@ana", "body": "clean"})
+    assert not error and text.startswith("sent as")
+    assert checks(world) == []
+
+
+def test_a_spent_limit_holds_the_line_and_answers_nothing_more(
+    world: World, tmp_path: Path
+) -> None:
+    listed(world, tmp_path)
+    for _ in range(MAX_DISCLOSURE_CHECKS):
+        text, error = world.call("send_message", {"to": "@ana", "body": "codename"})
+        assert error and text == REFUSAL
+    assert world.log.state.lines["alpha"].held_by is None
+    text, error = world.call("send_message", {"to": "@ana", "body": "codename"})
+    assert error and text == DISCLOSURE_HELD
+    question_id = world.log.state.lines["alpha"].held_by
+    assert question_id is not None
+    question = world.log.state.messages[question_id]
+    assert question.kind is MessageKind.QUESTION
+    assert "disclosure checks" in question.body
+    # Every checked tool now answers alike, so a clean text and a listed one cannot
+    # be told apart, and the held turn learns nothing further of the list.
+    sent = len(world.log.state.messages)
+    clean: list[tuple[str, dict[str, object]]] = [
+        ("send_message", {"to": "@ana", "body": "clean"}),
+        ("write_scratch", {"path": "clean.md", "text": "clean"}),
+        ("check_disclosure", {"text": "clean"}),
+    ]
+    for name, args in [*DISCLOSING_CALLS, *clean]:
+        text, error = world.call(name, args)
+        assert error and text == DISCLOSURE_HELD, name
+    assert len(world.log.state.messages) == sent
+    assert not (world.root / "tmp" / "clean.md").exists()
+    assert len(checks(world)) == MAX_DISCLOSURE_CHECKS
+    assert len(held(world)) == 1
+    # A release lets clean text through, while the window, still full, holds the
+    # line again at its next refusal.
+    world.scheduler.release("alpha")
+    text, error = world.call("send_message", {"to": "@ana", "body": "clean"})
+    assert not error and text.startswith("sent as")
+    text, error = world.call("send_message", {"to": "@ana", "body": "codename"})
+    assert error and text == DISCLOSURE_HELD
+    assert len(held(world)) == 2
+
+
+def test_a_line_held_already_is_not_held_twice(world: World, tmp_path: Path) -> None:
+    listed(world, tmp_path)
+    world.scheduler.hold("alpha", "passed a test limit")
+    for _ in range(MAX_DISCLOSURE_CHECKS):
+        world.call("wake_after", {"seconds": 60, "note": "codename"})
+    text, error = world.call("wake_after", {"seconds": 60, "note": "clean"})
+    assert not error and "codename" not in text
+    text, error = world.call("wake_after", {"seconds": 60, "note": "codename"})
+    assert error and text == DISCLOSURE_HELD
+    assert len(held(world)) == 1
+    world.scheduler.release("alpha")
+    text, error = world.call("wake_after", {"seconds": 60, "note": "clean"})
+    assert not error
 
 
 def test_the_repeat_memory_is_pruned_after_the_window(world: World) -> None:

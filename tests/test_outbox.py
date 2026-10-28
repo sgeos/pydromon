@@ -391,14 +391,21 @@ def test_priority_to_a_peer_follows_the_local_rules(
         check_outbound_priority(definition, sender, recipient)
 
 
-def test_the_policy_refuses_a_removed_peer_and_a_tls_peer() -> None:
+def test_the_policy_refuses_a_removed_peer() -> None:
     state = outbound_state()
     state.apply(PeerRemoved(PEER))
     with pytest.raises(EventRejected, match="no peer"):
         check_outbound(state, federation(), ALPHA, KAIZEN, "x", priority=False)
+
+
+def test_the_policy_is_the_same_for_a_tls_peer() -> None:
+    """Phase 2 step 5. The transport decides how mail travels, never whether it may
+    be sent, so a ``tls`` peer passes and fails exactly where a ``unix`` peer does."""
     tls = federation()
     tls.peers[PEER] = replace(tls.peers[PEER], transport="tls")
-    with pytest.raises(EventRejected, match="phase 2"):
+    check_outbound(outbound_state(), tls, ALPHA, KAIZEN, "x", priority=False)
+    tls.peers[PEER] = replace(tls.peers[PEER], outbound=False)
+    with pytest.raises(EventRejected, match="mail to peer .* is off"):
         check_outbound(outbound_state(), tls, ALPHA, KAIZEN, "x", priority=False)
 
 
@@ -629,6 +636,34 @@ def test_the_forwarder_says_hello_then_delivers_in_order(out: Out) -> None:
     assert out.peer.connects == 1 and out.one.phase is Phase.IDLE
     statuses, _ = sent(out.log.state, ALPHA)
     assert {s.delivery for s in statuses} == {"delivered to peer"}
+
+
+@pytest.mark.parametrize("stored", [TOKEN, None])
+def test_hello_over_tls_carries_no_token(tmp_path: Path, stored: str | None) -> None:
+    """The pinned key names the daemon over TLS, so a token stored for the peer is
+    not sent, and none is needed."""
+    config = parse_federation(
+        {},
+        {
+            PEER: {
+                "transport": "tls",
+                "address": "studio.example.net:7411",
+                "pin_sha256": "0123456789abcdef" * 4,
+                "certificate": "peers/keleusma.pem",
+                "outbound": True,
+                "senders": ["alpha"],
+                "remote": ["kaizen"],
+            }
+        },
+    )
+    world = Out(tmp_path / "events.db", config)
+    try:
+        world.token = stored
+        world.peer.answers = [WELCOME]
+        asyncio.run(world.one.open_link())
+        assert world.peer.requests[0].args == {"versions": [1], "name": "core"}
+    finally:
+        world.log.close()
 
 
 def test_only_an_answer_records_delivery(out: Out) -> None:

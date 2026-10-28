@@ -62,6 +62,28 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Phase 2 of federation, step 1. A `[peers.NAME]` table may declare `transport =
+  "tls"` with the peer's `address`, `pin_sha256` and `certificate`, and
+  `[federation]` may name `tls_listen`, which is required exactly when a `tls` peer is
+  inbound. Both are validated and recorded with `peer_declared`. A `unix` peer's recorded
+  policy is unchanged, so an upgrade declares no peer again.
+- Phase 2 of federation, step 2. `dromon peer key` makes the daemon's Ed25519
+  identity once in `.dromon/peers` and prints its pin and the path of its public
+  certificate, which the operator gives the peer's operator. It never replaces an
+  existing identity and never returns the private key.
+- Phase 2 of federation, step 3. `dromon.tls_link` reaches a `tls` peer at its
+  `address` over the engines role's pinned TLS transport, presenting the daemon's
+  identity and trusting only the peer's certificate and pin, behind the forwarder's
+  connector seam. `hello` over TLS carries no token. The daemon's connector follows
+  each peer's transport.
+- Phase 2 of federation, step 4. The daemon listens on `federation.tls_listen`,
+  counting each connection under the peer connection cap of 16 before its handshake,
+  which must finish within 10 seconds and present the key of an inbound `tls` peer by
+  its pin before any frame is read. That pin names the peer at `hello`, which takes no
+  token over TLS, and again at each `deliver`. At most one `tls` peer may be inbound,
+  since the certificates `dromon.federation_tls` makes share one subject name.
+- Phase 2 of federation, step 5. Mail to a `tls` peer is no longer refused at send.
+  The policy is the same on both transports, which decide only how mail travels.
 - `dromon agent send --agent NAME --to PARTY BODY` sends one note as a registered
   external agent through the agent socket, with the token from `DROMON_AGENT_TOKEN`, so
   a service that is not an MCP client can tell a line that its turn has come. A test
@@ -86,7 +108,9 @@ All notable changes are recorded here. The format follows
   against the project's disclosure list and answers pass or fail with how many lines
   hold a listed term, never the term. Each check is recorded as `disclosure_checked`,
   and a line may check at most 10 times in an hour, since each answer could otherwise
-  test candidate words one by one.
+  test candidate words one by one. A line tool's refusal for disclosure counts against
+  the same limit, and when the limit is spent the line is held and an operator asked,
+  with every such tool answering alike until the line is released.
 - Every background task end a kept engine reports between turns is recorded as
   `task_recorded`, with its command, status, exit code, output file, the SHA-256 digest
   and size of its output and the worktree commit, and `role_status` lists each seat's

@@ -106,12 +106,16 @@ handoff_below_percent = 10  # the default, or 0 for never
 | `teacher` | table | none | The project's local teacher model, as [`TEACHER.md`](TEACHER.md) specifies |
 | `agents` | table | off | Which external agents may connect, and with what access, as [`AGENTS.md`](AGENTS.md) specifies |
 | `federation.listen` | boolean | `false` | Whether the daemon opens its peer socket. Validated, with no effect until the peer socket is built |
+| `federation.tls_listen` | `HOST:PORT` text | none | The address of the daemon's Transport Layer Security listener, a host name or an address with a version 6 address in brackets, and a port in [1, 65535]. Required exactly when a `tls` peer is inbound, so no network listener is configured unless a peer needs one. At most one `tls` peer may be inbound until each certificate carries a name of its own. A listener that cannot start is said on standard error, and the rest of the daemon still serves |
 | `federation.accept_unconfined` | boolean | `false` | Whether lines on an engine Dromon cannot confine may run in a project with peers, as below |
 | `federation.waiting_per_recipient` | integer in [1, 100000] | 200 | The bound on mail from all peers waiting for one local party. Validated, with no effect until peer mail is built |
-| `peers.ID` | table | none | Another Dromon daemon on this machine, named by an identifier, as [`FEDERATION.md`](../architecture/FEDERATION.md) designs it. At most 64 |
-| `peers.ID.transport` | `unix` | `unix` | `tls` belongs to the second phase and is refused until it is built |
-| `peers.ID.socket` | absolute path | required | The peer's `peers.sock`, at most 103 bytes, without `.` or `..` steps. Its directory is the peer's runtime directory |
-| `peers.ID.project` | absolute path | none | The peer's project root, whose `.dromon` is then denied to local lines |
+| `peers.ID` | table | none | Another Dromon daemon, on this machine or on another, named by an identifier, as [`FEDERATION.md`](../architecture/FEDERATION.md) designs it. At most 64 |
+| `peers.ID.transport` | `unix` or `tls` | `unix` | A `unix` peer is on this machine. A `tls` peer is reached over Transport Layer Security, the second phase. Mail to it passes the same policy as mail to a `unix` peer. A key of the other transport is an error |
+| `peers.ID.socket` | absolute path | required for `unix` | The peer's `peers.sock`, at most 103 bytes, without `.` or `..` steps. Its directory is the peer's runtime directory |
+| `peers.ID.project` | absolute path | none | A `unix` peer's project root, whose `.dromon` is then denied to local lines |
+| `peers.ID.address` | `HOST:PORT` text | required for `tls` | The peer's listener, written as `federation.tls_listen` is |
+| `peers.ID.pin_sha256` | 64 lowercase hexadecimal digits | required for `tls` | The SHA-256 of the peer's public key, which its operator reads from `dromon peer key`. No two peers share one |
+| `peers.ID.certificate` | relative path | required for `tls` | The peer's public certificate, relative to `.dromon`, at most 1024 bytes, without empty, `.` or `..` steps |
 | `peers.ID.inbound`, `outbound`, `priority_in`, `priority_out` | boolean | `false` | The peer's directions and priority, as the design specifies |
 | `peers.ID.reach`, `senders`, `remote` | list of at most 256 local addresses | empty | The local parties the peer may send to, the local parties that may send to it, and its parties that may be addressed, each named once. A remote address is refused |
 | `peers.ID.max_body_bytes` | integer in [1, 1048576] | 65536 | The largest body sent to or accepted from the peer |
@@ -263,9 +267,22 @@ stops the start, or refuses the reload and keeps the previous list.
   when it is a regular file of the daemon's user with one name, outside every
   directory Dromon protects, and at most 1 MiB. A refusal, of a missing list, a limit
   reached, or a text or file not read, records nothing and reveals nothing of the
-  list. **Fact.** The refusals of `send_message`, `ask_operator`, `wake_after` and
-  `write_scratch` give the same answer without a limit, so the limit on this tool
-  alone does not close that channel.
+  list. **Decided by the operator on 2026-10-28.** A refusal for disclosure by
+  `send_message`, `ask_operator`, `wake_after` or `write_scratch` gives the same
+  answer, so it counts against the same limit and is recorded as `disclosure_checked`
+  too. Dromon applies this to every line tool that refuses for disclosure, which
+  adds `record_role_note`, `relinquish_ownership`, `take_ownership` and
+  `propose_change`. A text that passes is not counted. When a refusal finds the
+  limit spent, Dromon holds the line and asks an operator instead of answering, and
+  every one of these tools and `check_disclosure` then gives one fixed answer,
+  without checking, until an operator releases the line. A release does not empty
+  the window, so a further refusal within it holds the line again. A line already
+  held for another reason is not asked about twice, and the release of that hold
+  ends this one too. `check_disclosure` itself, when its limit is reached, still
+  refuses with the time of its next check and does not hold the line, since that
+  refusal reveals nothing of the list. **Fact.** Each spent limit still yields one
+  further answer, since the held reply differs from a sent one, so a line learns at
+  most 11 answers per release.
 
 ## Trust
 

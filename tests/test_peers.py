@@ -25,7 +25,9 @@ from dromon.federation import (
     FederationConfig,
     FederationError,
     check_token_store,
+    ensure_identity,
     parse_federation,
+    read_identity,
     plan_peers,
     policy_text,
     store_token,
@@ -157,11 +159,66 @@ def test_the_policy_is_canonical_and_holds_every_key_but_the_transport() -> None
     )
     text = policy_text(config.peers["k"])
     document = json.loads(text)
-    assert set(document) == federation.PEER_KEYS - {"transport"}
+    # A unix peer's document holds every key a unix peer may set, the one phase 1
+    # recorded, and no key of the tls transport.
+    assert set(document) == federation.PEER_KEYS - {"transport"} - (
+        federation.TLS_ONLY_KEYS
+    )
     assert text == json.dumps(document, sort_keys=True, separators=(",", ":"))
     assert document["reach"] == ["@ana", "core"]
     assert document["project"] == "/srv/k"
     assert json.loads(policy_text(peers(k=peer("k")).peers["k"]))["project"] is None
+
+
+# The daemon's own TLS identity, phase 2 step 2.
+
+
+def test_the_identity_is_made_once_and_its_pin_kept(tmp_path: Path) -> None:
+    store = tmp_path / PEERS_DIR_NAME
+    assert read_identity(store) is None
+    made, fresh = ensure_identity(store)
+    assert fresh and len(made.pin_sha256) == 64
+    assert os.stat(store).st_mode & 0o777 == 0o700
+    for path in (made.private_key, made.certificate):
+        assert path.parent == store and os.stat(path).st_mode & 0o777 == 0o600
+    again, fresh = ensure_identity(store)
+    assert not fresh and again == made
+    assert read_identity(store) == made
+    check_token_store(store)
+
+
+def test_a_damaged_identity_is_refused_not_replaced(tmp_path: Path) -> None:
+    store = tmp_path / PEERS_DIR_NAME
+    made, _ = ensure_identity(store)
+    made.certificate.chmod(0o644)
+    with pytest.raises(FederationError, match="wider than 0600"):
+        ensure_identity(store)
+    made.certificate.chmod(0o600)
+    made.certificate.write_bytes(b"not a certificate")
+    with pytest.raises(FederationError, match="does not hold a certificate"):
+        ensure_identity(store)
+    made.certificate.unlink()
+    with pytest.raises(FederationError, match="holds only one of"):
+        ensure_identity(store)
+    assert made.private_key.exists()
+    made.certificate.symlink_to(made.private_key)
+    with pytest.raises(FederationError, match="could not be read"):
+        ensure_identity(store)
+
+
+def test_peer_key_answers_the_pin_and_never_the_key(paths: ProjectPaths) -> None:
+    with attached(paths, peers(k=peer("k"))) as daemon:
+        first = ok(daemon, "peer_key")
+        assert first["made"] is True
+        second = ok(daemon, "peer_key")
+        assert second["made"] is False
+        assert second["pin_sha256"] == first["pin_sha256"]
+        store = paths.state_dir / PEERS_DIR_NAME
+        assert first["certificate"] == str(store / "identity-certificate.pem")
+        key = (store / "identity-key.pem").read_text()
+        assert "PRIVATE KEY" in key and key not in json.dumps(first)
+        refused = ask(daemon, "peer_key", {"peer": "k"})
+        assert not refused.ok
 
 
 # The token store.
@@ -346,7 +403,7 @@ def test_peer_operations_are_not_served_on_the_agent_socket(
     paths: ProjectPaths,
 ) -> None:
     with attached(paths, peers(k=peer("k"))) as daemon:
-        for op in ("peer_token", "peer_list"):
+        for op in ("peer_token", "peer_list", "peer_key"):
             line = json.dumps({"id": "r", "op": op, "v": 1, "args": {"peer": "k"}})
             response = asyncio.run(daemon.respond_agent((line + "\n").encode()))
             assert not response.ok

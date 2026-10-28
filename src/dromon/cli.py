@@ -85,7 +85,8 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "probe": "run one short turn on the engine and report its capabilities",
     "teacher": "bring the project's local teacher model up, report it, or release it",
     "agent": "register, list or revoke the external agents that may connect",
-    "peer": "list the declared peers, or issue, revoke or store their tokens",
+    "peer": "list the declared peers, issue, revoke or store their tokens, or show"
+    " this daemon's key",
     "mcp": "serve an external agent over MCP on standard input and output",
     "proposal": "list or show proposed changes from session lines",
 }
@@ -1084,7 +1085,10 @@ def _peer(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     it does not appear in the process list or the shell's history."""
     action: str = arguments.action
     name: str | None = arguments.name
-    if action != "list" and name is None:
+    if action == "key" and name is not None:
+        print("dromon peer key: takes no peer name", file=sys.stderr)
+        return exits.USAGE
+    if action not in ("list", "key") and name is None:
         print(f"dromon peer {action}: name the peer", file=sys.stderr)
         return exits.USAGE
     args: dict[str, object] = {} if name is None else {"peer": name}
@@ -1093,6 +1097,7 @@ def _peer(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         "token": Operation.PEER_TOKEN,
         "revoke": Operation.PEER_REVOKE,
         "store": Operation.PEER_STORE,
+        "key": Operation.PEER_KEY,
     }[action]
     if action == "store":
         args["token"] = sys.stdin.readline(MAX_PEER_TOKEN_INPUT).strip()
@@ -1138,6 +1143,15 @@ def _peer(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             )
         case "revoke":
             print(f"revoked the token of peer {result['peer']}")
+        case "key":
+            made = "made now" if result["made"] else "made earlier"
+            print(f"pin_sha256 {result['pin_sha256']}")
+            print(f"certificate {result['certificate']}, {made}")
+            print(
+                "Give the pin and the certificate to the peer's operator, who writes"
+                " them as pin_sha256 and certificate in that project's peer table."
+                " The private key stays in .dromon/peers."
+            )
         case _:
             print(f"stored the token for peer {result['peer']}")
     return exits.OK
@@ -2022,12 +2036,14 @@ def build_parser() -> argparse.ArgumentParser:
                 help="what the agent may do, for add, default %(default)s",
             )
         if name == "peer":
-            command.add_argument("action", choices=["list", "token", "revoke", "store"])
+            command.add_argument(
+                "action", choices=["list", "token", "revoke", "store", "key"]
+            )
             command.add_argument(
                 "name",
                 nargs="?",
                 help="the peer, for token, revoke and store. store reads the token"
-                " from standard input",
+                " from standard input. key shows this daemon's own pin",
             )
         if name == "role":
             command.add_argument(
