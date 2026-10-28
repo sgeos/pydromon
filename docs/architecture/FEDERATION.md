@@ -186,8 +186,8 @@ waiting_per_recipient = 200         # mail from all peers waiting for one local 
 
 [peers.keleusma]
 transport = "unix"                  # or "tls" in phase 2
-socket = "/Users/ana/projects/rust/keleusma/.dromon/run/peers.sock"
-project = "/Users/ana/projects/rust/keleusma"   # its .dromon is denied to local lines
+socket = "/home/ana/projects/rust/keleusma/.dromon/run/peers.sock"
+project = "/home/ana/projects/rust/keleusma"   # its .dromon is denied to local lines
 inbound = true                      # the peer may deliver mail here
 outbound = true                     # this daemon may deliver mail to the peer
 reach = ["core", "@ana"]            # local parties the peer may send to
@@ -305,8 +305,8 @@ senders = ["core"]
   directory protected. A `workdir` that contains a peer's directory is refused, as for
   the project's own, so a peer nested inside a line's working directory other than the
   project root stops the start.
-- **Confidentiality.** No encryption on the socket. **Reason.** Both ends run as one
-  user on one machine, and the runtime directory has mode 0700, so encryption would
+- **Confidentiality.** The socket carries plain text. **Reason.** Both ends run as one
+  user on one machine, and the runtime directory has mode 0700, so a cipher would
   defend against nothing the file permissions do not.
 - **Different users on one machine.** Out of scope. The check refuses a different user,
   and a later design may allow one by configuration or use phase 2 over the loopback
