@@ -106,6 +106,10 @@ argument outside a tool's schema is refused.
 | `list_sent` | Lists what became of the line's sent mail |
 | `acquire_lease`, `release_lease` | Take and give up a lease the project declares, as below |
 | `line_status` | Shows a compact read-only status by default, with diagnostic detail and long lists available by argument, as below |
+| `role_status` | Offered only to a seat of a role. Shows the role's worktree, failover policy, handoff threshold, owner, the seat a failover would pass it to now and the latest change of owner, its seats in the failover order with whether each is usable for a failover, their condition, worktree access, whether each waits because its engine cannot confine it, model, provider and stated budget, and its latest five journal entries, the newest with its body, read only, as [`ROLES.md`](../architecture/ROLES.md) describes. Added on 2026-10-27 |
+| `record_role_note` | Offered only to a seat. Records a journal entry of `kind` `note`, by any seat, or `recovery`, by the owner, which the daemon stamps with the role worktree's commit, its own commit and the time. A handoff entry is written only by `relinquish_ownership`. Added on 2026-10-27 |
+| `relinquish_ownership` | Offered only to a seat, and refused unless it owns its role. Records the handoff `note` as a handoff entry and gives the role to the seat `to`, or with no `to` to the seat the handoff that gave it the role named as `back_to`, or else leaves it vacant. A return to a seat that can no longer own the role leaves it vacant and says so. Called inside the owner's own turn, which is how a seat calls it, the request is checked at once and the change is made when that turn ends, with the entry stamped then, and the tool says so. A second call in the same turn is refused. A change that no longer applies when the turn ends is not made, and the operator is told. A successor is awakened and sent a note from the former owner, and the former owner's engine is dropped, so its next turn is built read only. `back_to`, which needs `to`, is the seat the role returns to when the successor next relinquishes without naming one. Added on 2026-10-27 |
+| `take_ownership` | Offered only to a seat that may own its role. Takes the role, with cause `recovery`, only on a ground the harness observes, which is a vacant role, an owner held at a plan limit its engine reported in this daemon run from a shape observed live or typed by the Agent SDK, never from inferred wording, or an owner whose provider budget is recorded as 0 percent with no reset time passed, and never while the owner has a turn in flight. The `reason` of 1 to 4,096 bytes and the ground are recorded as a note entry that the change rests on. Added on 2026-10-27 |
 | `propose_change` | Records a proposed patch, file list and message for operator review; it does not change project files |
 | `read_instructions` | Shows the instructions the line's next turn receives, as below |
 | `write_scratch` | Writes a file under `tmp/` in the line's working directory, as below |
@@ -127,7 +131,7 @@ and suggests `detail: true, lists: false` to omit the lists.
 
 Set `detail` to true for diagnostic fields, including the resolved `workdir`,
 `engine_session`, kept-session state, process status, event-log status and full context
-details. The detailed response also reports whether the line is muted and gives the
+details. The detailed response also reports whether the line is hibernated and gives the
 worktree and daemon commits with a sentence that cites both. Detail mode keeps arrays
 summarized by counts. Set `lists` to true to receive
 the long lists of leases, recent turns, other lines, kept-session tasks and left
@@ -509,8 +513,8 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
   next prompt's first line says the context's size, that every engine call re-reads
   it, and that `compact_session` compacts it, or that an operator can enable it. A
   line with `allow_compact` is also sent a self-note that wakes it to compact before
-  its next real turn, even when no mail was waiting. A muted line receives no wake
-  until it is unmuted. The default of 150,000 leaves room before an engine's automatic
+  its next real turn, even when no mail was waiting. A hibernated line receives no wake
+  until it is awakened. The default of 150,000 leaves room before an engine's automatic
   compaction near a 200,000 token window, and past it a turn of a few calls re-reads a
   million tokens.
 - **`compact_session`.** No arguments before round 6. Only a Claude Code line, and

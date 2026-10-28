@@ -46,7 +46,7 @@ a message ends the turn, so its end is no point to interrupt at.
 
 A turn that reaches no safe point, such as one that makes no tool call or one long tool
 call to its end, is not interrupted. Its priority mail then leads the next turn. A
-muted line is never interrupted by priority mail, which waits with its other mail.
+hibernated line is never interrupted by priority mail, which waits with its other mail.
 
 Rate limit. Priority mail from lines is limited, so that one line cannot keep another
 from working. A line may send at most ``MAX_PER_SENDER`` priority notes, and a line may

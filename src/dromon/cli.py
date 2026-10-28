@@ -68,11 +68,13 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "sent": "show what became of the mail an operator sent",
     "release": "resume a line the daemon held at a conversation limit",
     "interrupt": "stop a line's turn in flight, as Escape does in an attached client",
-    "mute": "start no more turns of a line, keeping its mail, session and wakes",
-    "unmute": "let a muted line be woken again by the mail and wakes it kept",
+    "hibernate": "start no more turns of a line, keeping its mail, session and wakes",
+    "awaken": "let a hibernated line be woken again by the mail and wakes it kept",
     "rebind": "move a line to another model and strategy, keeping its identity",
     "settings": "show the project's settings, and a line's, with where each comes from",
     "set": "change a project or line setting, or return it to the layers below",
+    "role": "show roles and their journals, or give, vacate or ask to hand over one",
+    "budget": "list the providers' stated budgets, or state one",
     "reload": "read the project file again and apply its lines, limits and wake policy",
     "config": "check the project file and show what it declares",
     "probe": "run one short turn on the engine and report its capabilities",
@@ -136,15 +138,15 @@ def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 
 
 def _line_row(line: Mapping[str, object]) -> str:
-    """One line of ``dromon status`` for a session line, naming a mute and a hold,
-    which each keep the line from waking."""
+    """One line of ``dromon status`` for a session line, naming a hibernation and a
+    hold, which each keep the line from waking."""
     parts = [
         f"line {line.get('line_id')}",
         str(line.get("condition", line.get("state"))),
         f"{line.get('pending')} pending",
     ]
-    if line.get("muted") is True and line.get("condition") != "muted":
-        parts.append("muted")
+    if line.get("hibernated") is True and line.get("condition") != "hibernated":
+        parts.append("hibernated")
     if line.get("held_by") is not None and line.get("condition") != "held":
         parts.append(f"held by {line.get('held_by')}")
     return ", ".join(parts)
@@ -636,7 +638,15 @@ def _send(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         args["reply_to"] = arguments.reply_to
     if arguments.priority:
         args["priority"] = True
-    return _request(paths, "send", Operation.SEND, args)
+    answer = _call(paths, "send", Operation.SEND, args)
+    if isinstance(answer, int):
+        return answer
+    # The message id alone, as before priority mail, so that a script reading it
+    # still can. The result's priority flag is printed only when it is true.
+    print(f"message_id {answer.get('message_id')}")
+    if answer.get("priority") is True:
+        print("priority mail")
+    return exits.OK
 
 
 def _questions(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
@@ -979,33 +989,33 @@ def _interrupt(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
-def _mute(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
-    """Send ``mute``, and say whether a turn in flight finishes first."""
+def _hibernate(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Send ``hibernate``, and say whether a turn in flight finishes first."""
     line_id: str = arguments.line_id
-    response = _call(paths, "mute", Operation.MUTE, {"line_id": line_id})
+    response = _call(paths, "hibernate", Operation.HIBERNATE, {"line_id": line_id})
     if isinstance(response, int):
         return response
     if response.get("changed") is not True:
-        print(f"{line_id} was already muted")
+        print(f"{line_id} was already hibernated")
     elif response.get("running") is True:
         print(
-            f"muted {line_id}, whose turn in flight finishes first. dromon interrupt"
-            " stops it now"
+            f"hibernated {line_id}, whose turn in flight finishes first."
+            " dromon interrupt stops it now"
         )
     else:
-        print(f"muted {line_id}")
+        print(f"hibernated {line_id}")
     return exits.OK
 
 
-def _unmute(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+def _awaken(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     line_id: str = arguments.line_id
-    response = _call(paths, "unmute", Operation.UNMUTE, {"line_id": line_id})
+    response = _call(paths, "awaken", Operation.AWAKEN, {"line_id": line_id})
     if isinstance(response, int):
         return response
     if response.get("changed") is True:
-        print(f"unmuted {line_id}")
+        print(f"awakened {line_id}")
     else:
-        print(f"{line_id} was not muted, so nothing changed")
+        print(f"{line_id} was not hibernated, so nothing changed")
     return exits.OK
 
 
@@ -1104,6 +1114,173 @@ def _read(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
+def _role(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Show roles, read a journal entry, or change or ask for a change of owner."""
+    action: str = arguments.action
+    name: str | None = arguments.name
+    command = f"role {action}"
+    operator: str = arguments.operator
+    if action != "status" and name is None:
+        what = "the journal entry" if action == "entry" else "the role"
+        print(f"dromon {command}: name {what}", file=sys.stderr)
+        return exits.USAGE
+    needed = {"take": "seat", "handoff": "to"}.get(action)
+    if needed is not None and getattr(arguments, needed) is None:
+        print(f"dromon {command}: give --{needed}", file=sys.stderr)
+        return exits.USAGE
+    match action:
+        case "status":
+            operation = Operation.ROLES
+            args: dict[str, object] = {} if name is None else {"role_id": name}
+        case "entry":
+            operation = Operation.ROLE_ENTRY
+            args = {"entry_id": name}
+        case "take":
+            operation = Operation.ROLE_TAKE
+            args = {"role_id": name, "seat": arguments.seat, "operator": operator}
+        case "vacate":
+            operation = Operation.ROLE_VACATE
+            args = {"role_id": name, "operator": operator}
+        case _:
+            operation = Operation.ROLE_HANDOFF
+            args = {"role_id": name, "to": arguments.to, "operator": operator}
+    result = _call(paths, command, operation, args)
+    if isinstance(result, int):
+        return result
+    match action:
+        case "status":
+            roles = cast(list[dict[str, object]], result["roles"])
+            if not roles:
+                print("no roles are declared")
+            for role in roles:
+                _print_role(role)
+        case "entry":
+            print(
+                f"entry {result['entry_id']} of role {result['role_id']}, a"
+                f" {result['kind']} by {result['line_id']} at {result['noted_at']},"
+                f" worktree {result['workdir_commit'] or 'unknown'}, daemon"
+                f" {result['daemon_commit'] or 'unknown'}"
+            )
+            print(result["body"])
+        case "take" | "vacate":
+            owner = result["owner"] or "no seat"
+            print(
+                f"role {result['role_id']} passed from"
+                f" {result['previous'] or 'no seat'} to {owner}"
+            )
+            if "warning" in result:
+                print(f"warning: {result['warning']}")
+        case _:
+            print(
+                f"asked {result['owner']} to hand role {result['role_id']} to"
+                f" {result['to']}, in priority mail {result['message_id']}"
+            )
+            if result["owner_hibernated"] is True:
+                print(
+                    f"{result['owner']} is hibernated, so it reads the request"
+                    " once awakened"
+                )
+    return exits.OK
+
+
+def _print_role(role: Mapping[str, object]) -> None:
+    """One role of ``roles``, with its seats and the latest journal entries."""
+    print(
+        f"role {role['role_id']} in {role['workdir']}, owner"
+        f" {role['owner'] or 'none, vacant'}, handoff within"
+        f" {role['handoff_seconds']} seconds"
+    )
+    below = role["handoff_below_percent"]
+    print(
+        f"  failover {role['failover']}, next seat {role['next_seat'] or 'none'},"
+        " handoff asked " + (f"below {below} percent" if below else "never by budget")
+    )
+    change = cast(Mapping[str, object] | None, role["last_change"])
+    if change is not None:
+        back = f", back to {change['back_to']}" if change["back_to"] else ""
+        print(
+            f"  last change {change['cause']} by {change['by']} at"
+            f" {change['changed_at']}, from {change['previous'] or 'no seat'} to"
+            f" {change['owner'] or 'no seat'}{back}"
+        )
+    for seat in cast(list[Mapping[str, object]], role["seats"]):
+        marks = [str(seat["condition"])]
+        if seat["owner"] is True:
+            marks.insert(0, "owner")
+        if seat["may_own"] is not True:
+            marks.append("may not own")
+        if seat["hibernated"] is True:
+            marks.append("hibernated")
+        if seat["usable"] is not True and seat["owner"] is not True:
+            marks.append("not usable for failover")
+        if seat["waits_unconfined"] is True:
+            marks.append("waits, its engine cannot confine it")
+        budget = cast(Mapping[str, object] | None, seat["budget"])
+        if budget is not None:
+            marks.append(f"budget {_budget_text(budget)}")
+        print(
+            f"  seat {seat['line_id']} on {seat['model']}, {', '.join(marks)},"
+            f" at {seat['workdir_commit'] or 'no commit'}"
+        )
+    for entry in cast(list[Mapping[str, object]], role["journal"]):
+        print(
+            f"  entry {entry['entry_id']}, a {entry['kind']} by {entry['line_id']} at"
+            f" {entry['noted_at']}, {entry['chars']} characters"
+        )
+
+
+def _budget_text(budget: Mapping[str, object]) -> str:
+    """A stated budget, with its source and time, since it is a snapshot."""
+    parts: list[str] = []
+    if budget["remaining_percent"] is not None:
+        parts.append(f"{budget['remaining_percent']} percent")
+    if budget["resets_at"] is not None:
+        parts.append(f"resets {budget['resets_at']}")
+    parts.append(f"stated by {budget['source']} at {budget['stated_at']}")
+    return ", ".join(parts)
+
+
+def _budget(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """List the providers' stated budgets, or state one as an operator."""
+    action: str = arguments.action
+    command = f"budget {action}"
+    if action == "list":
+        result = _call(paths, command, Operation.BUDGETS, {})
+        if isinstance(result, int):
+            return result
+        budgets = cast(list[Mapping[str, object]], result["budgets"])
+        if not budgets:
+            print("no budget is stated")
+        for budget in budgets:
+            spent = ", spent now" if budget["spent"] is True else ""
+            note = f", {budget['note']}" if budget["note"] else ""
+            print(f"{budget['provider']}: {_budget_text(budget)}{spent}{note}")
+        providers = cast(list[str], result["providers"])
+        print(f"providers {', '.join(providers)}")
+        return exits.OK
+    provider: str | None = arguments.provider
+    percent: int | None = arguments.percent
+    resets_at: str | None = arguments.resets_at
+    if provider is None:
+        print(f"dromon {command}: name the provider", file=sys.stderr)
+        return exits.USAGE
+    if percent is None and resets_at is None:
+        print(f"dromon {command}: give --percent, --resets-at or both", file=sys.stderr)
+        return exits.USAGE
+    args: dict[str, object] = {"provider": provider, "note": arguments.note}
+    if percent is not None:
+        args["remaining_percent"] = percent
+    if resets_at is not None:
+        args["resets_at"] = resets_at
+    result = _call(paths, command, Operation.BUDGET_SET, args)
+    if isinstance(result, int):
+        return result
+    print(f"{result['provider']}: {_budget_text(result)}")
+    for followed in cast(list[str], result["followed"]):
+        print(followed)
+    return exits.OK
+
+
 def _call(
     paths: ProjectPaths, command: str, operation: Operation, args: dict[str, object]
 ) -> dict[str, object] | int:
@@ -1191,8 +1368,8 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "sent": _sent,
     "release": _release,
     "interrupt": _interrupt,
-    "mute": _mute,
-    "unmute": _unmute,
+    "hibernate": _hibernate,
+    "awaken": _awaken,
     "rebind": _rebind,
     "settings": _settings,
     "set": _set,
@@ -1200,6 +1377,8 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "attach": _attach,
     "config": _config,
     "teacher": _teacher,
+    "role": _role,
+    "budget": _budget,
     "agent": _agent,
     "mcp": _mcp,
     "proposal": _proposal,
@@ -1403,8 +1582,8 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("line_id", help="the held line")
         if name == "interrupt":
             command.add_argument("line_id", help="the line whose turn to stop")
-        if name == "mute":
-            command.add_argument("line_id", help="the line to mute")
+        if name == "hibernate":
+            command.add_argument("line_id", help="the line to hibernate")
         if name == "restart":
             command.add_argument(
                 "--interrupt",
@@ -1431,8 +1610,8 @@ def build_parser() -> argparse.ArgumentParser:
                 default=default_operator(),
                 help="who asks for the restart, default %(default)s",
             )
-        if name == "unmute":
-            command.add_argument("line_id", help="the muted line")
+        if name == "awaken":
+            command.add_argument("line_id", help="the hibernated line")
         if name == "start":
             command.add_argument(
                 "--wait",
@@ -1573,6 +1752,52 @@ def build_parser() -> argparse.ArgumentParser:
                 choices=[level.value for level in AgentAccess],
                 default=AgentAccess.MESSAGE.value,
                 help="what the agent may do, for add, default %(default)s",
+            )
+        if name == "role":
+            command.add_argument(
+                "action",
+                choices=["status", "entry", "take", "vacate", "handoff"],
+                nargs="?",
+                default="status",
+                help="default %(default)s",
+            )
+            command.add_argument(
+                "name",
+                nargs="?",
+                help="the role, which status may omit for every role, or for entry"
+                " the journal entry",
+            )
+            command.add_argument("--seat", help="for take, the seat given the role")
+            command.add_argument(
+                "--to", help="for handoff, the seat the owner is asked to hand it to"
+            )
+            command.add_argument(
+                "--operator",
+                default=default_operator(),
+                help="who makes the change or the request, default %(default)s",
+            )
+        if name == "budget":
+            command.add_argument(
+                "action",
+                choices=["list", "set"],
+                nargs="?",
+                default="list",
+                help="default %(default)s",
+            )
+            command.add_argument("provider", nargs="?", help="for set, the provider")
+            command.add_argument(
+                "--percent",
+                type=int,
+                default=None,
+                help="for set, the whole percentage of the plan that remains",
+            )
+            command.add_argument(
+                "--resets-at",
+                default=None,
+                help="for set, when the plan resets, as YYYY-MM-DDTHH:MM:SSZ",
+            )
+            command.add_argument(
+                "--note", default="", help="for set, a note kept with the statement"
             )
         if name == "proposal":
             command.add_argument("action", choices=["list", "show"])

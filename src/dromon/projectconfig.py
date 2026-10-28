@@ -39,7 +39,18 @@ from dromon.lineconfig import (
     check_instructions,
     config_from_document,
 )
-from dromon.model import ID_PATTERN, InvalidField, LineSession
+from dromon.model import (
+    DEFAULT_HANDOFF_BELOW_PERCENT,
+    DEFAULT_HANDOFF_SECONDS,
+    MAX_ROLE_SEATS,
+    FailoverPolicy,
+    ID_PATTERN,
+    MAX_HANDOFF_SECONDS,
+    MIN_HANDOFF_SECONDS,
+    InvalidField,
+    LineSession,
+    check_workdir,
+)
 from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, SandboxError, merge, parse_sandbox
 from dromon.settings import SettingsConfig, SettingsError, parse_settings
@@ -65,6 +76,7 @@ TOP_KEYS: Final = frozenset(
         "leases",
         "profiles",
         "lines",
+        "roles",
     }
 )
 DAEMON_KEYS: Final = frozenset(
@@ -75,6 +87,18 @@ LIMIT_KEYS: Final = frozenset(
 )
 WAKE_KEYS: Final = frozenset({"every_ticks"})
 LEASE_KEYS: Final = frozenset({"names", "ttl_seconds"})
+ROLE_KEYS: Final = frozenset(
+    {
+        "workdir",
+        "owner",
+        "seats",
+        "handoff_seconds",
+        "failover",
+        "handoff_below_percent",
+    }
+)
+MAX_SEATS: Final = MAX_ROLE_SEATS
+"""The most seats one role may declare, a bound on the planning loop and the status."""
 DEFAULT_LEASE_TTL: Final = 10800
 MIN_LEASE_TTL: Final = 60
 MAX_LEASE_TTL: Final = 86400
@@ -107,7 +131,7 @@ TOOL_KEYS: Final = frozenset(
 LAYERED_KEYS: Final = frozenset({"sandbox", "settings"})
 """Keys whose profile and line tables merge as Claude Code's scopes do."""
 LINE_KEYS: Final = (
-    frozenset({"profile", "model", "strategy", "limits", "wake", "session"})
+    frozenset({"profile", "model", "strategy", "limits", "wake", "session", "may_own"})
     | TOOL_KEYS
     | LAYERED_KEYS
 )
@@ -153,6 +177,31 @@ class LineDefinition:
     """The line's own wake policy, or ``None`` for the project's."""
     session: str | None = None
     """An existing engine session the line adopts when the daemon creates it."""
+    may_own: bool = True
+    """Whether the line, as a seat of a role, may own the role. Meaningless for a line
+    that is a seat of no role."""
+
+
+@dataclass(frozen=True, slots=True)
+class RoleDefinition:
+    """A ``[roles.NAME]`` table. Its seats are lines the same file declares."""
+
+    role_id: str
+    workdir: str
+    """The role's worktree, relative to the project root, as ``check_workdir``
+    accepts it."""
+    seats: tuple[str, ...]
+    """The role's seats, in the file's order, distinct and at most ``MAX_SEATS``."""
+    owner: str | None = None
+    """The seat that owns the role when it is first declared, or ``None`` for a role
+    that starts vacant. Used only while the role has never had an owner."""
+    handoff_seconds: int = DEFAULT_HANDOFF_SECONDS
+    failover: FailoverPolicy = FailoverPolicy.AUTOMATIC
+    """Whether the harness passes the role on by itself when its owner cannot act,
+    or leaves the change to an operator."""
+    handoff_below_percent: int = DEFAULT_HANDOFF_BELOW_PERCENT
+    """The stated budget below which the owner is asked to prepare a handoff, or 0
+    for never."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +228,7 @@ class ProjectConfig:
     lease_ttl_seconds: int = DEFAULT_LEASE_TTL
     """How long an acquired lease lasts unless it is released first."""
     lines: dict[str, LineDefinition] = field(default_factory=dict[str, LineDefinition])
+    roles: dict[str, RoleDefinition] = field(default_factory=dict[str, RoleDefinition])
 
 
 def config_path(state_dir: Path) -> Path:
@@ -315,6 +365,7 @@ class _Reader:
         lines: dict[str, LineDefinition] = {}
         for line_id, value in sorted(cast(dict[str, object], lines_table).items()):
             lines[line_id] = self.line(line_id, value, profiles, limits, wake)
+        roles = self.roles(top.get("roles", {}), lines)
         return ProjectConfig(
             operator=operator,
             tick_seconds=tick,
@@ -329,6 +380,7 @@ class _Reader:
             lease_names=lease_names,
             lease_ttl_seconds=lease_ttl,
             lines=lines,
+            roles=roles,
         )
 
     def limits(self, value: object, key: str, base: Limits) -> Limits:
@@ -366,6 +418,100 @@ class _Reader:
                 f"must be a whole number from {MIN_LEASE_TTL} to {MAX_LEASE_TTL}",
             )
         return tuple(sorted(found)), ttl
+
+    def roles(
+        self, value: object, lines: dict[str, LineDefinition]
+    ) -> dict[str, RoleDefinition]:
+        """The ``[roles]`` tables. A seat that sets no ``workdir`` of its own takes the
+        role's, which is written into ``lines`` so that the line runs there. One that
+        sets its own must name the same directory, which the daemon checks once it
+        can resolve both."""
+        if not isinstance(value, dict):
+            raise self.fail("roles", "must be a table")
+        found: dict[str, RoleDefinition] = {}
+        seated: dict[str, str] = {}
+        for role_id, table in sorted(cast(dict[str, object], value).items()):
+            role = self.role(role_id, table, lines)
+            for line_id in role.seats:
+                if line_id in seated:
+                    raise self.fail(
+                        f"roles.{role_id}.seats",
+                        f"line {line_id} is already a seat of role {seated[line_id]}",
+                    )
+                seated[line_id] = role_id
+                line = lines[line_id]
+                if line.config.workdir is None:
+                    config = replace(line.config, workdir=role.workdir)
+                    lines[line_id] = replace(line, config=config)
+            found[role_id] = role
+        return found
+
+    def role(
+        self, role_id: str, value: object, lines: Mapping[str, LineDefinition]
+    ) -> RoleDefinition:
+        key = f"roles.{role_id}"
+        if ID_PATTERN.fullmatch(role_id) is None:
+            raise self.fail(key, "is not a valid role identifier")
+        table = self.table(value, key, ROLE_KEYS)
+        workdir = table.get("workdir")
+        try:
+            check_workdir(workdir)
+        except InvalidField as error:
+            raise self.fail(f"{key}.workdir", str(error)) from error
+        seats = table.get("seats")
+        if not isinstance(seats, list) or not 1 <= len(cast(list[object], seats)) <= (
+            MAX_SEATS
+        ):
+            raise self.fail(
+                f"{key}.seats", f"must be a list of 1 to {MAX_SEATS} line identifiers"
+            )
+        names: list[str] = []
+        for seat in cast(list[object], seats):
+            if not isinstance(seat, str) or seat not in lines:
+                raise self.fail(
+                    f"{key}.seats", f"{seat!r} is not a line this file declares"
+                )
+            if seat in names:
+                raise self.fail(f"{key}.seats", f"names {seat!r} twice")
+            names.append(seat)
+        owner = table.get("owner")
+        if owner is not None:
+            if not isinstance(owner, str) or owner not in names:
+                raise self.fail(f"{key}.owner", f"{owner!r} is not a seat of the role")
+            if not lines[owner].may_own:
+                raise self.fail(
+                    f"{key}.owner", f"line {owner} has may_own false, so cannot own it"
+                )
+        seconds = table.get("handoff_seconds", DEFAULT_HANDOFF_SECONDS)
+        if (
+            type(seconds) is not int
+            or not MIN_HANDOFF_SECONDS <= seconds <= MAX_HANDOFF_SECONDS
+        ):
+            raise self.fail(
+                f"{key}.handoff_seconds",
+                f"must be a whole number from {MIN_HANDOFF_SECONDS} to"
+                f" {MAX_HANDOFF_SECONDS}",
+            )
+        failover = table.get("failover", FailoverPolicy.AUTOMATIC.value)
+        if failover not in tuple(FailoverPolicy):
+            raise self.fail(
+                f"{key}.failover",
+                f"must be one of {', '.join(p.value for p in FailoverPolicy)}",
+            )
+        below = table.get("handoff_below_percent", DEFAULT_HANDOFF_BELOW_PERCENT)
+        if type(below) is not int or not 0 <= below <= 100:
+            raise self.fail(
+                f"{key}.handoff_below_percent", "must be a whole number from 0 to 100"
+            )
+        return RoleDefinition(
+            role_id=role_id,
+            workdir=cast(str, workdir),
+            seats=tuple(names),
+            owner=owner,
+            handoff_seconds=seconds,
+            failover=FailoverPolicy(cast(str, failover)),
+            handoff_below_percent=below,
+        )
 
     def wake(self, value: object, key: str, base: int) -> int:
         document = self.table(value, key, WAKE_KEYS)
@@ -472,6 +618,9 @@ class _Reader:
             sandbox=merge([profile_sandbox, own_sandbox]),
             settings=engine_settings.merge([profile_settings, own_settings]),
         )
+        may_own = merged.get("may_own", True)
+        if type(may_own) is not bool:
+            raise self.fail(f"{key}.may_own", "must be a boolean")
         session = own.get("session")
         if session is not None:
             if not isinstance(session, str):
@@ -492,4 +641,5 @@ class _Reader:
             if "wake" not in merged
             else self.wake(merged["wake"], f"{key}.wake", wake),
             session=session,
+            may_own=may_own,
         )

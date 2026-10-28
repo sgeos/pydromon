@@ -72,6 +72,7 @@ from collections.abc import (
 )
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import Any, Final, Protocol, cast
 
@@ -114,6 +115,7 @@ from dromon.ceiling import (
 from dromon.launcher import STOP_POLICY_VARIABLE, StopPolicy
 from dromon.processes import MARK_VARIABLE
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig
+from dromon.model import InvalidField, format_due
 
 ENGINE_NAME: Final = "codex"
 """The engine this adapter runs, as drivers name it."""
@@ -590,7 +592,9 @@ def _plan_limit(error: object) -> str | None:
     """Recognize a structured limit code or specific limit wording.
 
     **Inference, not observed live.** The words below are plausible app-server
-    representations. A live error is needed to confirm the vocabulary.
+    representations. A live error is needed to confirm the vocabulary. So the
+    ``EnginePlanLimit`` raised from it holds the line and asks, and never moves a
+    role, by the operator's decision of 2026-10-27.
     """
     if not isinstance(error, dict):
         return None
@@ -655,6 +659,129 @@ def _plan_limit_message(fields: Mapping[str, object]) -> str:
     return f"Codex subscription plan limit reached{suffix}"
 
 
+USAGE_LIMIT_EXCEEDED: Final = "usageLimitExceeded"
+"""The ``codexErrorInfo`` of an error object at the end of a plan's credit, in camel
+case. Observed 2026-10-27 by the operator, from a Codex app-server probe with no credit
+left, in both the ``error`` notice and the failed turn's ``turn.error``."""
+
+RATE_LIMITS_UPDATED: Final = "account/rateLimits/updated"
+"""The notice whose ``rateLimits.credits`` reported no credit left, observed
+2026-10-27 before the turn failed, with ``hasCredits`` and ``unlimited`` false."""
+
+RESET_WORDING: Final = re.compile(
+    r"try again at ([A-Z][a-z]{2}) ([0-9]{1,2})(?:st|nd|rd|th), ([0-9]{4})"
+    r" ([0-9]{1,2}):([0-9]{2}) ([AP]M)"
+)
+"""The reset time in the observed limit message, such as ``try again at Nov 1st, 2026
+10:08 PM``. The wording is the only source of the time, so reading it is an inference
+about the wording, which a change to it defeats, leaving the reset unknown."""
+
+MONTHS: Final = (
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+)
+"""English month abbreviations, matched here rather than by ``strptime``, whose
+``%b`` follows the process locale."""
+
+
+def reset_from_message(message: str, zone: tzinfo | None = None) -> str | None:
+    """The reset time a Codex limit message states, in the model's due-time form, or
+    ``None`` where the message does not match ``RESET_WORDING`` or names no real time.
+
+    **Assumption.** The message names no time zone. It is read in ``zone``, by
+    default the local zone of the daemon's host, which is the host the app-server
+    runs on, on the inference that Codex formats the time in its host's local zone.
+    A wrong zone moves the reset by whole hours, which only delays or hastens when a
+    stated budget stops counting as spent. Porting note: the local zone is the
+    operating system's, which the Rust port reads by its own means."""
+    found = RESET_WORDING.search(message)
+    if found is None or found.group(1) not in MONTHS:
+        return None
+    hour = int(found.group(4))
+    if not 1 <= hour <= 12:
+        return None
+    hour = hour % 12 + (12 if found.group(6) == "PM" else 0)
+    try:
+        local = datetime(
+            int(found.group(3)),
+            MONTHS.index(found.group(1)) + 1,
+            int(found.group(2)),
+            hour,
+            int(found.group(5)),
+            tzinfo=zone,
+        )
+        return format_due(local if zone is not None else local.astimezone())
+    except (OverflowError, ValueError, InvalidField):
+        return None
+
+
+def ignore_credits(note: str) -> None:
+    """Outside a daemon, a spent credit has nowhere to be recorded."""
+
+
+def usage_limit(error: object) -> EnginePlanLimit | None:
+    """The plan limit an error object reports by ``USAGE_LIMIT_EXCEEDED``, with the
+    reset time its message states, or ``None``. Only the observed shape counts, a
+    ``codexErrorInfo`` of exactly that text."""
+    if not isinstance(error, dict):
+        return None
+    fields = cast(dict[str, object], error)
+    if fields.get("codexErrorInfo") != USAGE_LIMIT_EXCEEDED:
+        return None
+    message = fields.get("message")
+    resets_at = reset_from_message(message) if isinstance(message, str) else None
+    suffix = "" if resets_at is None else f", which resets at {resets_at}"
+    return EnginePlanLimit(
+        f"Codex usage limit exceeded{suffix}", resets_at, may_move_role=True
+    )
+
+
+def credits_spent(params: Mapping[str, Any]) -> str | None:
+    """A note saying the account has no credit left, when a ``RATE_LIMITS_UPDATED``
+    notice reports ``hasCredits`` and ``unlimited`` both false and its ``primary``
+    and ``secondary`` windows present and null, or ``None``.
+
+    **Operator's rule, 2026-10-27.** That shape, which is the one observed, is the
+    provider's budget at 0, which the harness can act on before any turn fails. The
+    operator narrowed it the same day to require both windows null, because whether
+    an account with allowance left in a plan window also reports ``hasCredits`` false
+    is unknown. A notice with a window, or without the window keys, is therefore not
+    read as spent, and a plan whose windows are spent is left to the turn's
+    ``usageLimitExceeded`` error."""
+    limits = params.get("rateLimits")
+    if not isinstance(limits, dict):
+        return None
+    reported_limits = cast(dict[str, object], limits)
+    for window in ("primary", "secondary"):
+        if window not in reported_limits or reported_limits[window] is not None:
+            return None
+    credits = reported_limits.get("credits")
+    if not isinstance(credits, dict):
+        return None
+    reported = cast(dict[str, object], credits)
+    if reported.get("hasCredits") is not False:
+        return None
+    if reported.get("unlimited") is not False:
+        return None
+    limit_id = reported_limits.get("limitId")
+    named = (
+        f" for its {limit_id} limit"
+        if isinstance(limit_id, str) and 0 < len(limit_id) <= 64
+        else ""
+    )
+    return f"Codex reported no credit left{named}, with hasCredits and unlimited false"
+
+
 def breakdown(value: object) -> dict[str, int]:
     """A token usage breakdown's whole-number counts, under Dromon's names."""
     if not isinstance(value, dict):
@@ -673,6 +800,9 @@ class _Turn:
     tool_uses: list[str] = field(default_factory=list[str])
     interrupted_for: str | None = None
     refusal: str | None = None
+    limit: EnginePlanLimit | None = None
+    """The plan limit an error notice or the turn's own error reported, which ends a
+    turn that did not complete as a plan limit rather than as a failure."""
     turn_id: str | None = None
     status: str = ""
     tools_changed: bool = False
@@ -843,6 +973,7 @@ class CodexLine:
         compaction_estimated: Callable[[int], object] = ignore_estimate,
         ceiling_reached: Ask = no_operator,
         ceiling_settled: Settle = nothing_to_settle,
+        credits_spent: Callable[[str], object] = ignore_credits,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -876,6 +1007,7 @@ class CodexLine:
         self._estimated = compaction_estimated
         self._ceiling_reached = ceiling_reached
         self._ceiling_settled = ceiling_settled
+        self._credits_spent = credits_spent
         self._request: CompactionRequest | None = None
         """The compaction the next turn begins with, if any, which each turn takes
         as it starts, as on a Claude Code line."""
@@ -919,6 +1051,7 @@ class CodexLine:
             ) from error
         if work.refusal is not None and turn.refusal is None:
             turn.refusal = work.refusal
+        turn.limit = turn.limit or work.limit
         after = work.calls[-1].get("total_tokens") if work.calls else None
         compaction: dict[str, int | str | None] = {
             # Codex reports no trigger, so none is made up for it.
@@ -997,6 +1130,8 @@ class CodexLine:
                 self._connection = None
         if turn.refusal is not None:
             raise EngineRefused(turn.refusal)
+        if turn.limit is not None and turn.status != "completed":
+            raise turn.limit
         return self._report(turn, credential, thread_id, compaction)
 
     def _report(
@@ -1152,10 +1287,29 @@ class CodexLine:
         elif method == "turn/completed":
             completed = cast(dict[str, Any], params.get("turn") or {})
             turn.status = str(completed.get("status") or "")
+            turn.limit = turn.limit or usage_limit(completed.get("error"))
+        elif method == "error" and self._this_thread(params):
+            turn.limit = turn.limit or usage_limit(params.get("error"))
+        elif method == RATE_LIMITS_UPDATED:
+            self._rate_limits(params)
         elif method == TOKEN_USAGE_UPDATED:
             self._usage_seen(params, turn)
         elif method == THREAD_COMPACTED and self._this_thread(params):
             turn.compacted = True
+
+    def _rate_limits(self, params: Mapping[str, Any]) -> None:
+        """Report an account with no credit left to the scheduler at once, in a turn
+        or between turns, as ``credits_spent`` reads it."""
+        note = credits_spent(params)
+        if note is None:
+            return
+        try:
+            self._credits_spent(note)
+        except Exception as error:  # noqa: BLE001
+            print(
+                f"dromond: a spent Codex credit could not be recorded: {error}",
+                file=sys.stderr,
+            )
 
     def _this_thread(self, params: Mapping[str, Any]) -> bool:
         """Whether a notice is about the line's own thread, or names none."""
@@ -1602,6 +1756,9 @@ class CodexLine:
                 cast(dict[str, Any], params.get("item") or {}), completed=True
             )
             return
+        if method == RATE_LIMITS_UPDATED:
+            self._rate_limits(cast(dict[str, Any], message.get("params") or {}))
+            return
         if method == "turn/started":
             started = cast(dict[str, Any], message.get("params") or {})
             turn_id = cast(dict[str, Any], started.get("turn") or {}).get("id")
@@ -1989,6 +2146,9 @@ class CodexLine:
         if turn.refusal is not None:
             await self.close()
             raise EngineRefused(turn.refusal)
+        if turn.limit is not None and turn.status != "completed":
+            await self.close("Codex reported a subscription plan limit")
+            raise turn.limit
         try:
             await self.list_background()
         except EnginePlanLimit:

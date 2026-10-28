@@ -61,6 +61,18 @@ max_autonomous_turns = 3
 
 [lines.beta.wake]
 every_ticks = 5
+
+[lines.gamma]
+model = "grok-4.7"
+may_own = false         # a seat that may read and advise but never own its role
+
+[roles.docs]
+workdir = "tmp/worktrees/docs"
+owner = "beta"          # the first owner, recorded only while the role never had one
+seats = ["beta", "gamma"]
+handoff_seconds = 3600  # the default
+failover = "automatic"  # the default, or "ask"
+handoff_below_percent = 10  # the default, or 0 for never
 ```
 
 | Key | Type | Default | Meaning |
@@ -82,6 +94,14 @@ every_ticks = 5
 | `lines.ID.limits` | table | the file's | Limits for this line, each key defaulting to the file's |
 | `lines.ID.wake` | table | the file's | The wake policy for this line |
 | tool keys | as in `LINE_CONFIG.md` | as there | `builtin_tools`, `mcp_servers`, `tool_policy`, `allowed_tools`, `inherit_account_mcp`, `effort`, `claude_code_prompt`, `instructions`, `workdir`, `project_settings` |
+| `lines.ID.may_own` | boolean | `true` | Whether the line, as a seat of a role, may own the role. A profile may set it |
+| `roles.ID` | table | none | A role, named by an identifier, as [`ROLES.md`](../architecture/ROLES.md) designs it |
+| `roles.ID.workdir` | relative path | required | The role's worktree, relative to the project root, with `/` between steps and no empty, `.` or `..` step, or `.` for the root |
+| `roles.ID.seats` | list of 1 to 16 line identifiers | required | The role's seats, each a line this file declares, distinct, and a seat of no other role in the file. Their order is the order a failover follows |
+| `roles.ID.owner` | line identifier | none | The role's first owner, a seat whose `may_own` is true. Without it the role starts vacant |
+| `roles.ID.handoff_seconds` | integer in [60, 86400] | 3600 | How long a planned ownership handoff may take |
+| `roles.ID.failover` | `automatic` or `ask` | `automatic` | Whether the harness passes the role to the next usable seat itself when its owner cannot act, or leaves the change to an operator, as [`ROLES.md`](../architecture/ROLES.md) specifies |
+| `roles.ID.handoff_below_percent` | integer in [0, 100] | 10 | The stated budget of the owner's provider below which the owner is asked to prepare a handoff. 0 never asks |
 | `lines.ID.session` | text | none | An existing engine session the line adopts when the daemon creates it, checked as `line_session` is in [`EVENT_LOG.md`](EVENT_LOG.md). Ignored for a line that exists |
 | `teacher` | table | none | The project's local teacher model, as [`TEACHER.md`](TEACHER.md) specifies |
 | `agents` | table | off | Which external agents may connect, and with what access, as [`AGENTS.md`](AGENTS.md) specifies |
@@ -109,6 +129,20 @@ every_ticks = 5
   [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies, and for each line whose merged sandbox
   is enabled, reads the git files [`SANDBOX.md`](SANDBOX.md) guards. A failure refuses
   the start or the reload.
+- **Roles.** A seat that sets no `workdir` takes its role's, and one that sets its own
+  must name the same directory once both are resolved. The role's worktree is checked
+  as a line's `workdir` is, so it must exist and lie outside the directories Dromon
+  protects. At start, and at a reload, the daemon records the file's roles with the
+  events [`EVENT_LOG.md`](EVENT_LOG.md) specifies, after creating the seats' lines and
+  setting the project's operator. A new or changed role appends `role_declared`, a new
+  seat or a changed `may_own` appends `seat_bound`, and `owner` appends an
+  `ownership_changed` with cause `declared`, made by the project's operator, only while
+  the role has never had an owner. A restart therefore never undoes a handoff, a
+  recovery or a relinquishment. The events are checked against the log before any is
+  appended, so a file that moves an owned role's worktree, bars its current owner from
+  owning it, or makes a seat of another role's seat is refused, and the start or the
+  reload with it. The log has no event that unbinds a seat or retires a role, so one
+  the file drops stays in the log as it was. Added on 2026-10-27.
 - **Located errors.** Every error names the file. A syntax error carries its line and
   column. Any other error carries the dotted key path and the line of its table or key
   when it can be found. The daemon refuses to start on an invalid file.
@@ -124,7 +158,7 @@ every_ticks = 5
 - **Reload.** `reload_project` applies the file again without a restart, with the same
   rules, after checking all of it, so a refused reload applies nothing. It refuses a
   change to the sandbox, the engine settings, the teacher or the external agent policy,
-  which apply only at start. A line the file no longer declares returns to the
+  which apply only at start. Its roles are recorded as above. A line the file no longer declares returns to the
   project's limits and wake policy. The leases table is applied again, and a held lease
   whose name the file no longer declares ends.
 - **Lines on other engines.** A project file whose own `[sandbox]` or `[settings]`

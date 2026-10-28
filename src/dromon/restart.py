@@ -19,7 +19,8 @@ the harness so that every line's session migrates to the latest installed versio
   sessions run background tasks it would stop, unless the request accepts that.
 - Once no turn runs, the daemon stops as ``stop`` does, then starts its successor with
   the same command-line options, after it has released its lock and its sockets. The
-  successor reads the event log, so sessions, mutes, scheduled wakes and mail survive.
+  successor reads the event log, so sessions, hibernations, scheduled wakes and mail
+  survive.
 
 Porting note. The plan is plain data with a deadline on a monotonic clock, and the
 watch is a poll bounded by a count derived from the wait, so both map onto a state
