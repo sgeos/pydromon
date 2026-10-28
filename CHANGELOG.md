@@ -104,6 +104,11 @@ All notable changes are recorded here. The format follows
 - When a line's turn ends with background tasks of its kept session still running and
   the line sent no mail during it, the line's next prompt says so once, so that work
   going on unannounced is noticed.
+- When the commit checked out in a line's worktree moved since its last turn ended, as
+  after an operator commits or merges its work, the line's next prompt names the
+  commits before and after and the `git log` range between them.
+- A line's prompt no longer counts as unread its own notes, such as fired wakes and
+  task-end notes, that an earlier turn was shown, and says how many it left out.
 - A line's `check_disclosure` tool checks a text, or a file in its working directory,
   against the project's disclosure list and answers pass or fail with how many lines
   hold a listed term, never the term. Each check is recorded as `disclosure_checked`,

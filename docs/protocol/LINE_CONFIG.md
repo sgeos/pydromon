@@ -358,6 +358,23 @@ headers of the newly delivered mail follow, and bodies stay in the mailbox.
   none asks a reply of the line. The state the event log builds keeps
   every such question's identifier from its `line_held` event, so the rule survives a
   restart. **Decided by the operator on 2026-10-26** in round 2.
+- **Own notes from earlier turns.** **Requested by the operator on 2026-10-28, and
+  the rule decided by core for review.** The summary's unread count leaves out a note
+  from the line to itself, a fired wake or a task-end note, that is still unread and
+  was delivered to an earlier turn, and the sentence then says how many it left out.
+  Such a note was shown to that turn, which dealt with it or chose not to, and a wake
+  that fires after its work is done is otherwise acknowledged unopened and counted
+  unread for good. Mail from anyone else is never left out, and `line_status` and
+  `list_mail` count and list every unread message.
+- **A moved worktree.** **Requested by the operator on 2026-10-28.** When the commit
+  checked out in the line's working directory differs from the one it held when the
+  line's last turn ended, as after an operator commits or merges the line's work, the
+  prompt opens by naming both commits and the `git log` range that lists the commits
+  between. **Decided by core for review.** The daemon reads `HEAD` from a few small
+  files and never runs git or reads its objects, so it names the two ends and not
+  each commit. A move during a turn, such as the line's own commit, is not told. The
+  commit at a turn's end is kept in memory, so the first turn after a restart tells
+  nothing.
 
 **Leases.** **Decided by the operator on 2026-10-26.** A project declares named leases
 in its `[leases]` table, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, so its

@@ -30,7 +30,7 @@ from dromon.lineconfig import (
 from dromon.projectconfig import ConfigFileError, parse
 from dromon.limits import Limits
 from dromon import scheduler as scheduler_module
-from dromon.mailbox import summary
+from dromon.mailbox import MailSummary, summary
 from dromon.model import (
     DISCLOSURE_CHECK_WINDOW_SECONDS,
     MAX_DISCLOSURE_CHECKS,
@@ -1384,3 +1384,57 @@ def test_list_mail_notes_stay_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in ("a", "b", "c"):
         scheduler_module._bounded_put(store, key, key.upper())  # pyright: ignore[reportPrivateUsage]
     assert store == {"b": "B", "c": "C"}
+
+
+# The operator's requests after phase 2 of federation, decided on 2026-10-28.
+
+MOVED = "The commit checked out in your worktree moved"
+
+
+def test_a_turn_is_told_once_when_its_worktree_head_moved(world: World) -> None:
+    """A line learns at its next turn that an operator committed or merged its work,
+    with the commits before and after. A first commit, a turn with no move, and a
+    worktree outside a checkout tell nothing."""
+    outside = world.turn("one")
+    checkout(world.root, "a" * 40)
+    appeared = world.turn("two")
+    still = world.turn("three")
+    checkout(world.root, "b" * 40)
+    moved = world.turn("four")
+    after = world.turn("five")
+    assert all(MOVED not in prompt for prompt in (outside, appeared, still, after))
+    assert moved.startswith(
+        f"{MOVED} from {'a' * 12} to {'b' * 12} since your last turn ended."
+        f" git log --oneline {'a' * 12}..{'b' * 12} lists the commits between"
+    )
+
+
+def test_own_notes_shown_to_an_earlier_turn_leave_unread(world: World) -> None:
+    """A note a line sent itself, such as a wake that fired after its work was done,
+    is counted unread in the turn it reaches and left out of unread in later turns.
+    An operator's unread mail is never left out, and line_status counts every
+    unread message."""
+    alpha = LineAddress("alpha")
+    own = world.turn("check the gate", sender=alpha)
+    first = world.turn("from ana")
+    second = world.turn("from ana again")
+    assert MailSummary(1, 1, 0).sentence() in own
+    assert MailSummary(1, 1, 1, collapsed=1).sentence() in first
+    assert MailSummary(1, 2, 2, collapsed=1).sentence() in second
+    assert summary(world.log.state, alpha, 0) == MailSummary(0, 3, 2)
+
+
+@pytest.mark.parametrize(
+    ("collapsed", "said"),
+    [
+        (0, None),
+        (1, "1 note of your own, such as fired wakes, shown to an earlier turn is"),
+        (2, "2 notes of your own, such as fired wakes, shown to an earlier turn are"),
+    ],
+)
+def test_the_summary_says_how_many_own_notes_it_left_out(
+    collapsed: int, said: str | None
+) -> None:
+    sentence = MailSummary(1, 0, 0, collapsed=collapsed).sentence()
+    assert sentence.startswith("1 new message. 0 unread. 0 unanswered.")
+    assert (said in sentence) if said else sentence.endswith("unanswered.")

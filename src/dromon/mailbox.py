@@ -15,6 +15,7 @@ These are pure functions of the state, so a client, a line's tools and the wake 
 all see the same mailbox.
 """
 
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Final
 
@@ -29,14 +30,25 @@ class MailSummary:
     new: int
     unread: int
     unanswered: int
+    collapsed: int = 0
+    """The owner's own unread notes, such as fired wakes and task-end notes, that an
+    earlier turn was shown and that ``unread`` therefore leaves out."""
 
     def sentence(self) -> str:
         """The summary in the form a wake prompt opens with."""
         plural = "" if self.new == 1 else "s"
-        return (
+        text = (
             f"{self.new} new message{plural}. {self.unread} unread."
             f" {self.unanswered} unanswered."
         )
+        if self.collapsed:
+            own = "note" if self.collapsed == 1 else "notes"
+            verb = "is" if self.collapsed == 1 else "are"
+            text += (
+                f" {self.collapsed} {own} of your own, such as fired wakes, shown to"
+                f" an earlier turn {verb} left out of unread."
+            )
+        return text
 
 
 def mailbox(state: State, owner: Address) -> list[tuple[str, Message]]:
@@ -62,17 +74,40 @@ def is_answered(message_id: str, message: Message, replied: set[str]) -> bool:
     return message_id in replied or message.acknowledged
 
 
-def summary(state: State, owner: Address, new: int) -> MailSummary:
+def summary(
+    state: State,
+    owner: Address,
+    new: int,
+    *,
+    fresh: Collection[str] | None = None,
+) -> MailSummary:
     """The counts for ``owner``'s mailbox after ``new`` messages arrived. A reply to a
     question Dromon asked on the owner's behalf when it held the owner, such as an
     operator's ``resume``, a note from the owner to itself, a fired wake or a
     task-end note, and a note from the harness, which nothing can reply to, are not
-    counted unanswered, since none asks a reply of the owner."""
+    counted unanswered, since none asks a reply of the owner.
+
+    ``fresh``, given by a wake prompt, holds the identifiers that prompt delivers.
+    The owner's own unread notes outside it were delivered to an earlier turn, which
+    was shown them and dealt with them or chose not to, so they are counted as
+    ``collapsed`` and left out of ``unread``. **Decided by core on 2026-10-28, for
+    review.** A wake that fires after the work it was set for is done otherwise
+    swells ``unread`` for good, since a line acknowledges such a note without
+    opening it. Mail from anyone else is never collapsed."""
     held = mailbox(state, owner)
     replied = replied_ids(state, owner)
+    collapsed = (
+        0
+        if fresh is None
+        else sum(
+            1
+            for message_id, message in held
+            if not message.read and message.sender == owner and message_id not in fresh
+        )
+    )
     return MailSummary(
         new=new,
-        unread=sum(1 for _, message in held if not message.read),
+        unread=sum(1 for _, message in held if not message.read) - collapsed,
         unanswered=sum(
             1
             for message_id, message in held
@@ -81,6 +116,7 @@ def summary(state: State, owner: Address, new: int) -> MailSummary:
             and message.sender != owner
             and not isinstance(message.sender, HarnessAddress)
         ),
+        collapsed=collapsed,
     )
 
 

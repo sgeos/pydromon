@@ -1584,6 +1584,9 @@ class Scheduler:
         cost is never shown as zero. Row 8 of the T3 Code review."""
         """Estimated cost of each line's turns since its last release."""
         self._last_turn_end: dict[str, float] = {}
+        self._head_after: dict[str, str | None] = {}
+        """The commit checked out in each line's worktree as its last turn ended, for
+        ``_head_notice``. In memory only, so a restart forgets it."""
         self._failed: set[str] = set()
         self._tick_seconds = tick_seconds
         self._running: dict[str, asyncio.Task[None]] = {}
@@ -5648,7 +5651,12 @@ class Scheduler:
             prompt = compose_prompt(
                 line_id,
                 messages,
-                summary(self._log.state, address, len(messages)),
+                summary(
+                    self._log.state,
+                    address,
+                    len(messages),
+                    fresh={message_id for message_id, _ in messages},
+                ),
                 replied_ids(self._log.state, address),
                 budget=self._budget_line(line_id, cause, warn=compaction is None),
                 notes=self._notes(messages),
@@ -5656,6 +5664,9 @@ class Scheduler:
             quiet = self._quiet_notice(line_id)
             if quiet is not None:
                 prompt = f"{quiet}\n\n{prompt}"
+            moved = self._head_notice(line_id)
+            if moved is not None:
+                prompt = f"{moved}\n\n{prompt}"
             owed = self._handoff(line_id, messages)
             if owed is not None and owed[1] is not None:
                 prompt = f"{owed[1].text}\n\n{prompt}"
@@ -5777,6 +5788,7 @@ class Scheduler:
             self._running.pop(line_id, None)
             self._turn_owned.discard(line_id)
             self._last_turn_end[line_id] = self._clock()
+            self._head_after[line_id] = self._workdir_commit(line_id)
             # A handoff asked for in the turn takes effect now that it has ended,
             # however it ended.
             self._settle_relinquish(line_id)
@@ -5861,6 +5873,26 @@ class Scheduler:
             self._quiet_tasks[line_id] = tasks
         else:
             self._quiet_tasks.pop(line_id, None)
+
+    def _head_notice(self, line_id: str) -> str | None:
+        """What ``line_id``'s next turn is told when the commit checked out in its
+        worktree moved since its last turn ended, as when an operator commits or
+        merges the line's work, or ``None``. **Decided by core on 2026-10-28, for
+        review.** The notice names the commit before and the commit after, and leaves
+        the commits between to ``git log``, because the daemon reads ``HEAD`` from a
+        few small files and never runs git or reads its objects. A move during a turn,
+        such as the line's own commit, is not told, and neither is the first turn
+        after a restart, since the commit is kept in memory."""
+        before = self._head_after.get(line_id)
+        after = self._workdir_commit(line_id)
+        if before is None or after is None or before == after:
+            return None
+        return (
+            f"The commit checked out in your worktree moved from {before[:12]} to"
+            f" {after[:12]} since your last turn ended. git log --oneline"
+            f" {before[:12]}..{after[:12]} lists the commits between, and git status"
+            " shows what is left uncommitted."
+        )
 
     def _quiet_notice(self, line_id: str) -> str | None:
         """What ``line_id``'s next turn is told, once, of a last turn that ended with
