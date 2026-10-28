@@ -366,11 +366,11 @@ def test_the_environment_drops_credentials_and_refuses_redirection() -> None:
         "GROK_CONFIG": "{}",
         "GROK_HOME": "/elsewhere",
         "GROK_SANDBOX": "off",
-        "HOME": "/Users/operator",
-        "XDG_CONFIG_HOME": "/Users/operator/.config",
-        "XDG_DATA_HOME": "/Users/operator/.local/share",
-        "XDG_STATE_HOME": "/Users/operator/.local/state",
-        "XDG_CACHE_HOME": "/Users/operator/.cache",
+        "HOME": "/home/operator",
+        "XDG_CONFIG_HOME": "/home/operator/.config",
+        "XDG_DATA_HOME": "/home/operator/.local/share",
+        "XDG_STATE_HOME": "/home/operator/.local/state",
+        "XDG_CACHE_HOME": "/home/operator/.cache",
     }
     assert set(grok_module.HOME_VARIABLES) < set(environment)
     kept = {"PATH": "/bin", **COMPAT_ENVIRONMENT}
