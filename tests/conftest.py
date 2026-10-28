@@ -59,6 +59,9 @@ from dromon.model import (
     RoleNoteKind,
     BudgetStated,
     BudgetSource,
+    PeerDeclared,
+    PeerKeyed,
+    PeerRemoved,
 )
 
 ENGINE = "claude-opus-5-5"
@@ -164,6 +167,11 @@ SCENARIO: tuple[Event, ...] = (
         "claude-code", 40, "2026-10-28T00:00:00Z", BudgetSource.OPERATOR, "", AT
     ),
     BudgetStated("codex", 0, None, BudgetSource.ENGINE, "a plan limit", AT),
+    PeerDeclared("keleusma", "unix", '{"inbound":true}'),
+    PeerKeyed("keleusma", "c" * 64),
+    PeerDeclared("keleusma", "unix", '{"inbound":false}'),
+    PeerKeyed("keleusma", ""),
+    PeerRemoved("keleusma"),
     LineStateChanged("alpha", LineState.STOPPED),
 )
 

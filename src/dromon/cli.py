@@ -80,6 +80,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "probe": "run one short turn on the engine and report its capabilities",
     "teacher": "bring the project's local teacher model up, report it, or release it",
     "agent": "register, list or revoke the external agents that may connect",
+    "peer": "list the declared peers, or issue, revoke or store their tokens",
     "mcp": "serve an external agent over MCP on standard input and output",
     "proposal": "list or show proposed changes from session lines",
 }
@@ -908,6 +909,75 @@ def _agent(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
+MAX_PEER_TOKEN_INPUT: Final = 1024
+"""The most characters ``dromon peer store`` reads from standard input."""
+
+
+def _peer(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """List the declared peers, or issue, revoke or store a peer's token, through the
+    daemon. ``store`` reads the token from standard input, never from an argument, so
+    it does not appear in the process list or the shell's history."""
+    action: str = arguments.action
+    name: str | None = arguments.name
+    if action != "list" and name is None:
+        print(f"dromon peer {action}: name the peer", file=sys.stderr)
+        return exits.USAGE
+    args: dict[str, object] = {} if name is None else {"peer": name}
+    operation = {
+        "list": Operation.PEER_LIST,
+        "token": Operation.PEER_TOKEN,
+        "revoke": Operation.PEER_REVOKE,
+        "store": Operation.PEER_STORE,
+    }[action]
+    if action == "store":
+        args["token"] = sys.stdin.readline(MAX_PEER_TOKEN_INPUT).strip()
+    try:
+        response = call(paths.socket, operation, args=args)
+    except DaemonNotRunning:
+        print(f"dromon peer: no daemon is running for {paths.root}", file=sys.stderr)
+        return exits.NOT_RUNNING
+    except (ProtocolError, TimeoutError, OSError) as error:
+        print(f"dromon peer: {error}", file=sys.stderr)
+        return exits.FAILURE
+    if not response.ok or response.result is None:
+        print(f"dromon peer: {response.error_message}", file=sys.stderr)
+        return exits.FAILURE
+    result = response.result
+    match action:
+        case "list":
+            listening = "listening" if result["listen"] else "not listening"
+            print(f"peers {listening}")
+            for entry in cast(list[dict[str, object]], result["peers"]):
+                directions = [
+                    direction
+                    for direction in ("inbound", "outbound")
+                    if entry[direction]
+                ]
+                issued = "issued" if entry["issued"] else "not issued"
+                stored = entry["stored"]
+                held = (
+                    stored
+                    if isinstance(stored, str)
+                    else ("stored" if stored else "not stored")
+                )
+                print(
+                    f"{entry['peer']} {entry['transport']}"
+                    f" {' and '.join(directions) or 'closed'},"
+                    f" its token {issued}, its token for us {held}"
+                )
+        case "token":
+            print(f"token {result['token']}")
+            print(
+                "The token is shown once. Store it in the peer's project with"
+                " dromon peer store, under the name that project gives this one."
+            )
+        case "revoke":
+            print(f"revoked the token of peer {result['peer']}")
+        case _:
+            print(f"stored the token for peer {result['peer']}")
+    return exits.OK
+
+
 def _dromon_command() -> str:
     """The path of this ``dromon``, so an MCP configuration starts the same one."""
     launched = Path(sys.argv[0])
@@ -1389,6 +1459,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "role": _role,
     "budget": _budget,
     "agent": _agent,
+    "peer": _peer,
     "mcp": _mcp,
     "proposal": _proposal,
 }
@@ -1761,6 +1832,14 @@ def build_parser() -> argparse.ArgumentParser:
                 choices=[level.value for level in AgentAccess],
                 default=AgentAccess.MESSAGE.value,
                 help="what the agent may do, for add, default %(default)s",
+            )
+        if name == "peer":
+            command.add_argument("action", choices=["list", "token", "revoke", "store"])
+            command.add_argument(
+                "name",
+                nargs="?",
+                help="the peer, for token, revoke and store. store reads the token"
+                " from standard input",
             )
         if name == "role":
             command.add_argument(

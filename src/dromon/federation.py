@@ -3,8 +3,9 @@
 A peer is another Dromon daemon that the operator declares by name in the project file.
 ``docs/architecture/FEDERATION.md`` is the design, approved by the operator on
 2026-10-28 and amended the same day. This module holds what phase 1 has built so far,
-the validated peer table and the directories it adds to every line's protected set.
-Peer mail, the peer socket, tokens and the events come in later steps.
+the validated peer table, the directories it adds to every line's protected set, the
+peer events that record the table at start, and the token store under
+``.dromon/peers``. Peer mail and the peer socket come in later steps.
 
 Trust. The tables are operator configuration, committed with the project, and no line
 or agent tool can change them. Each peer's state and runtime directories are denied to
@@ -13,6 +14,13 @@ project's event log or reach its peer socket through the file system. A project 
 peers refuses lines on an engine that Dromon cannot confine, unless the project file
 accepts them, because such a line could read the peer tokens and act as a peer.
 
+Tokens. A peer presents the token this daemon issued for it, of which only the SHA-256
+is recorded, by ``peer_keyed``. The token the peer issued for this daemon is kept in
+``.dromon/peers/NAME.token``, mode 0600 in a directory of mode 0700, and the daemon
+refuses to start when either is wider or is not its user's. The store is denied to
+every sandboxed line with the rest of the state directory, and is not protected from
+an unconfined process of the same user, as the design's trust section states.
+
 Phase 1 is the same machine only. A peer with the ``tls`` transport of phase 2 is
 refused until that phase is built, rather than accepted and ignored.
 
@@ -20,8 +28,11 @@ Porting note. Plain data and bounded loops over the file's tables. The bound on 
 socket path is that of ``sun_path`` on macOS, the smaller of the two platforms.
 """
 
+import json
 import os
-from collections.abc import Sequence
+import re
+import stat
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, cast
@@ -30,7 +41,12 @@ from dromon.model import (
     ID_PATTERN,
     MAX_TEXT_BYTES,
     Address,
+    Event,
+    EventRejected,
     InvalidField,
+    PeerDeclared,
+    PeerRemoved,
+    State,
     parse_address,
 )
 
@@ -80,8 +96,25 @@ MAX_WAITING: Final = 100_000
 
 UNCONFINED_ENGINES: Final = frozenset({"pi", "cursor-agent", "antigravity"})
 """Engines Dromon cannot confine to keep a line from the state directory, by the
-operator's decision 9 of 2026-10-28. **Open.** Whether a Claude Code line without an
-enabled sandbox counts too awaits the operator, so it is not refused here."""
+operator's decision 9 of 2026-10-28."""
+
+SANDBOXED_ENGINES: Final = frozenset({"claude-code"})
+"""Engines confined only while the line's merged sandbox is enabled, so that a line on
+one without it is unconfined too, by the operator's decision of 2026-10-28 on the first
+open point of the design."""
+
+PEERS_DIR_NAME: Final = "peers"
+"""The token store, a directory in the state directory."""
+TOKEN_SUFFIX: Final = ".token"  # noqa: S105, a file name, not a secret
+MAX_TOKEN_BYTES: Final = 256
+TOKEN_PATTERN: Final = re.compile(r"[A-Za-z0-9_-]{16,256}")
+"""A stored token, as ``secrets.token_urlsafe`` writes one. No whitespace and no line
+break, so the file holds exactly the token."""
+MAX_STORE_ENTRIES: Final = 4 * MAX_PEERS
+"""The most entries the store's check reads, which bounds its loop. A store with more is
+refused, since each peer needs one file and a temporary one only while it is written."""
+STORE_DIR_MODE: Final = 0o700
+STORE_FILE_MODE: Final = 0o600
 
 
 class FederationError(ValueError):
@@ -317,12 +350,21 @@ def peer_directories(
 
 
 def unconfined_refusal(
-    federation: FederationConfig, line_id: str, engine: str | None
+    federation: FederationConfig, line_id: str, engine: str | None, sandboxed: bool
 ) -> str | None:
     """Why a line of ``engine`` may not run in a project with these peers, or
-    ``None`` when it may. Decision 9 of the design."""
+    ``None`` when it may. ``sandboxed`` says whether the line's merged sandbox is
+    enabled, which confines an engine of ``SANDBOXED_ENGINES``. Decision 9 of the
+    design, and the operator's decision on its first open point."""
     if not federation.peers or federation.accept_unconfined:
         return None
+    if engine in SANDBOXED_ENGINES and not sandboxed:
+        return (
+            f"line {line_id} runs on {engine} without an enabled sandbox, so Dromon"
+            " cannot confine it, and the project declares peers. Enable its sandbox,"
+            " or set accept_unconfined = true in [federation] to accept that the line"
+            " could act as a peer"
+        )
     if engine not in UNCONFINED_ENGINES:
         return None
     return (
@@ -330,3 +372,173 @@ def unconfined_refusal(
         " project declares peers. Set accept_unconfined = true in [federation]"
         " to accept that the line could act as a peer"
     )
+
+
+def policy_text(peer: PeerDefinition) -> str:
+    """The peer's policy as canonical JSON, which ``peer_declared`` records. It holds
+    every key of the peer's table but its transport, which the event holds apart, and
+    never a token, since none is in the table."""
+    document: dict[str, object] = {
+        "socket": str(peer.socket),
+        "project": None if peer.project is None else str(peer.project),
+        "inbound": peer.inbound,
+        "outbound": peer.outbound,
+        "reach": [str(address) for address in peer.reach],
+        "senders": [str(address) for address in peer.senders],
+        "remote": [str(address) for address in peer.remote],
+        "priority_in": peer.priority_in,
+        "priority_out": peer.priority_out,
+        "max_body_bytes": peer.max_body_bytes,
+        "expire_hours": peer.expire_hours,
+        "turns_per_hour": peer.turns_per_hour,
+        "waiting": peer.waiting,
+    }
+    return json.dumps(
+        document,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    )
+
+
+def plan_peers(state: State, federation: FederationConfig) -> tuple[Event, ...]:
+    """The events that bring ``state``'s peers in line with ``federation``, in the order
+    of the peers' names. A peer that is new, removed earlier, or changed in transport or
+    policy is declared, and a peer the log holds and the file no longer declares is
+    removed. Raises ``FederationError`` when an event does not apply, which a valid
+    table and a valid log never cause."""
+    trial = state.copy()
+    events: list[Event] = []
+    wanted: list[Event] = []
+    for peer_id, peer in sorted(federation.peers.items()):
+        declared = PeerDeclared(peer_id, peer.transport, policy_text(peer))
+        known = trial.peers.get(peer_id)
+        if (
+            known is None
+            or known.removed
+            or (known.transport, known.policy) != (peer.transport, declared.policy)
+        ):
+            wanted.append(declared)
+    for peer_id, known in sorted(trial.peers.items()):
+        if not known.removed and peer_id not in federation.peers:
+            wanted.append(PeerRemoved(peer_id))
+    for event in wanted:
+        try:
+            trial.apply(event)
+        except EventRejected as error:
+            raise FederationError(str(error)) from error
+        events.append(event)
+    return tuple(events)
+
+
+def check_token_store(directory: Path) -> None:
+    """Refuse a token store that is not a directory of this user with mode 0700, or
+    that holds anything other than regular files of this user with mode 0600. A store
+    that does not exist passes, since no token is stored yet. Raises
+    ``FederationError`` naming the path, never a token.
+
+    The check reads modes with ``lstat``, so a symbolic link is refused rather than
+    followed. **Inference.** It runs at start, and a change to the modes while the
+    daemon runs is seen only at the next start or the next write."""
+    try:
+        info = os.lstat(directory)
+    except FileNotFoundError:
+        return
+    _check_owned(directory, info, stat.S_ISDIR, "a directory", STORE_DIR_MODE)
+    seen = 0
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            seen += 1
+            if seen > MAX_STORE_ENTRIES:
+                raise FederationError(
+                    f"{directory} holds more than {MAX_STORE_ENTRIES} entries"
+                )
+            path = Path(entry.path)
+            _check_owned(
+                path, os.lstat(path), stat.S_ISREG, "a regular file", STORE_FILE_MODE
+            )
+
+
+def _check_owned(
+    path: Path,
+    info: os.stat_result,
+    is_kind: Callable[[int], bool],
+    what: str,
+    mode: int,
+) -> None:
+    if not is_kind(info.st_mode):
+        raise FederationError(f"{path} must be {what}")
+    if info.st_uid != os.getuid():
+        raise FederationError(f"{path} must belong to this user")
+    found = stat.S_IMODE(info.st_mode)
+    if found & ~mode:
+        raise FederationError(f"{path} has mode {found:04o}, wider than {mode:04o}")
+
+
+def token_path(directory: Path, peer_id: str) -> Path:
+    """Where the token the peer issued for this daemon is stored."""
+    if ID_PATTERN.fullmatch(peer_id) is None:
+        raise FederationError(f"{peer_id!r} is not a valid peer identifier")
+    return directory / f"{peer_id}{TOKEN_SUFFIX}"
+
+
+def store_token(directory: Path, peer_id: str, token: str) -> Path:
+    """Store the token the peer issued for this daemon, replacing any earlier one, and
+    return its path. The directory is created with mode 0700 when missing and checked,
+    and the file is written whole to a temporary name with mode 0600 and then renamed,
+    so a crash leaves the old token or the new one and never a part. Raises
+    ``FederationError``, whose text never holds the token."""
+    final = token_path(directory, peer_id)
+    if TOKEN_PATTERN.fullmatch(token) is None:
+        raise FederationError(
+            "a peer token is 16 to 256 letters, digits, - or _, as dromon peer token"
+            " prints one"
+        )
+    try:
+        directory.mkdir(mode=STORE_DIR_MODE, exist_ok=True)
+    except OSError as error:
+        raise FederationError(
+            f"{directory} could not be made: {error.strerror}"
+        ) from error
+    check_token_store(directory)
+    temporary = directory / f".{peer_id}{TOKEN_SUFFIX}.new"
+    try:
+        temporary.unlink(missing_ok=True)
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            STORE_FILE_MODE,
+        )
+        try:
+            os.write(descriptor, token.encode("ascii"))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, final)
+    except OSError as error:
+        raise FederationError(
+            f"{final} could not be written: {error.strerror}"
+        ) from error
+    return final
+
+
+def stored_token(directory: Path, peer_id: str) -> str | None:
+    """The token stored for the peer, or ``None`` when none is. Raises
+    ``FederationError`` for a file that is not a regular file of this user with mode
+    0600, or that does not hold a token, without quoting its content."""
+    path = token_path(directory, peer_id)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    _check_owned(path, info, stat.S_ISREG, "a regular file", STORE_FILE_MODE)
+    if info.st_size > MAX_TOKEN_BYTES:
+        raise FederationError(f"{path} does not hold a token")
+    try:
+        token = path.read_bytes().decode("ascii")
+    except (OSError, UnicodeDecodeError) as error:
+        raise FederationError(f"{path} does not hold a token") from error
+    if TOKEN_PATTERN.fullmatch(token) is None:
+        raise FederationError(f"{path} does not hold a token")
+    return token

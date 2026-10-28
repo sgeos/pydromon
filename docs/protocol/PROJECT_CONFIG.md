@@ -209,8 +209,12 @@ confine, unless `federation.accept_unconfined` is true. The check runs where the
 required sandbox's does. **Why.** A line that is not confined runs as the operator's
 user and could read the peer tokens of a later step and act as a peer, and the
 operator decided on 2026-10-28 that peers need the operator's explicit acceptance of
-that. **Open.** Whether a Claude Code line without an enabled sandbox is refused too
-awaits the operator.
+that. **Added on 2026-10-28, step 3.** A Claude Code line without an enabled sandbox is
+refused too, by the operator's decision of that day. At start the daemon records each
+declared peer with `peer_declared`, and a peer the file no longer declares with
+`peer_removed`, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies, and refuses to start when
+`.dromon/peers`, the token store, is wider than mode 0700 or holds anything but files
+of mode 0600 of the operator's user.
 
 **Disclosure list.** `daemon.disclosure_terms` names a file of terms that must not leave
 the machine through Dromon, such as private context or code names, resolved against

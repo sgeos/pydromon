@@ -492,6 +492,57 @@ class AgentRevoked:
         check_id("agent_id", self.agent_id)
 
 
+PEER_TRANSPORTS: Final = frozenset({"unix", "tls"})
+"""The transports of ``docs/architecture/FEDERATION.md``. Phase 1 builds ``unix``."""
+
+MAX_PEER_POLICY_BYTES: Final = 64 * 1024
+"""Upper bound on a peer's recorded policy, which lists at most three times 256
+addresses of at most 66 bytes each, with room for the rest."""
+
+
+@dataclass(frozen=True, slots=True)
+class PeerDeclared:
+    """A peer daemon that the project file declares, or a change to its transport or
+    policy. Recorded at start from the project file. The policy is canonical JSON text
+    that the federation module writes and reads, and never holds a token, so the model
+    keeps it whole and does not interpret it."""
+
+    peer_id: str
+    transport: str
+    policy: str
+
+    def __post_init__(self) -> None:
+        check_id("peer_id", self.peer_id)
+        if self.transport not in PEER_TRANSPORTS:
+            raise InvalidField(f"transport is not a peer transport: {self.transport!r}")
+        check_text("policy", self.policy, MAX_PEER_POLICY_BYTES)
+
+
+@dataclass(frozen=True, slots=True)
+class PeerRemoved:
+    """The project file no longer declares the peer. Its token digest is cleared, so a
+    peer declared again needs a new token."""
+
+    peer_id: str
+
+    def __post_init__(self) -> None:
+        check_id("peer_id", self.peer_id)
+
+
+@dataclass(frozen=True, slots=True)
+class PeerKeyed:
+    """The SHA-256 of the token this daemon issued for the peer to present, or an empty
+    digest that revokes the token. Only the digest is ever stored."""
+
+    peer_id: str
+    token_sha256: str
+
+    def __post_init__(self) -> None:
+        check_id("peer_id", self.peer_id)
+        if self.token_sha256 and TOKEN_HASH.fullmatch(self.token_sha256) is None:
+            raise InvalidField("token_sha256 is not a SHA-256 hex digest")
+
+
 @dataclass(frozen=True, slots=True)
 class MessageSent:
     """A message between any two parties. A question is a message of kind question
@@ -1139,6 +1190,9 @@ type Event = (
     | OwnershipChanged
     | RoleNoted
     | BudgetStated
+    | PeerDeclared
+    | PeerRemoved
+    | PeerKeyed
 )
 
 
@@ -1205,6 +1259,17 @@ class Message:
     restart_note: bool = False
     """Whether ``restart_noted`` recorded the note, so its header can say so in the
     restarted daemon, which holds nothing else of the restart."""
+
+
+@dataclass(frozen=True, slots=True)
+class Peer:
+    """A declared peer, as the latest ``peer_declared`` and ``peer_keyed`` left it."""
+
+    transport: str
+    policy: str
+    token_sha256: str = ""
+    """The digest of the token the peer presents, or empty when none is issued."""
+    removed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1298,6 +1363,8 @@ class State:
     """Every role's journal entries, keyed by entry, in the order they were noted."""
     budgets: dict[str, BudgetStated] = field(default_factory=dict[str, BudgetStated])
     """Each provider's latest stated budget, keyed by provider."""
+    peers: dict[str, Peer] = field(default_factory=dict[str, Peer])
+    """Every peer ever declared, keyed by peer, including removed ones."""
 
     def copy(self) -> "State":
         """Return an independent snapshot. The records are frozen, so maps suffice."""
@@ -1317,6 +1384,7 @@ class State:
             dict(self.seats),
             dict(self.role_entries),
             dict(self.budgets),
+            dict(self.peers),
         )
 
     def open_questions(self, operator_id: str) -> list[str]:
@@ -1444,6 +1512,20 @@ class State:
                 self._check_role_noted(event)
             case BudgetStated():
                 pass
+            case PeerDeclared():
+                peer = self.peers.get(event.peer_id)
+                if (
+                    peer is not None
+                    and not peer.removed
+                    and (peer.transport, peer.policy) == (event.transport, event.policy)
+                ):
+                    raise EventRejected(f"peer {event.peer_id} is declared as that")
+            case PeerRemoved():
+                self._peer(event.peer_id)
+            case PeerKeyed():
+                peer = self._peer(event.peer_id)
+                if not event.token_sha256 and not peer.token_sha256:
+                    raise EventRejected(f"peer {event.peer_id} has no token to revoke")
             case _:
                 assert_never(event)
 
@@ -1600,10 +1682,32 @@ class State:
                 self.role_entries[event.entry_id] = event
             case BudgetStated():
                 self.budgets[event.provider] = event
+            case PeerDeclared():
+                peer = self.peers.get(event.peer_id)
+                self.peers[event.peer_id] = (
+                    Peer(event.transport, event.policy)
+                    if peer is None or peer.removed
+                    else replace(peer, transport=event.transport, policy=event.policy)
+                )
+            case PeerRemoved():
+                peer = self.peers[event.peer_id]
+                self.peers[event.peer_id] = replace(peer, token_sha256="", removed=True)
+            case PeerKeyed():
+                peer = self.peers[event.peer_id]
+                self.peers[event.peer_id] = replace(
+                    peer, token_sha256=event.token_sha256
+                )
             case _:
                 assert_never(event)
 
     # Lookups that turn a missing identifier into a rejection.
+
+    def _peer(self, peer_id: str) -> Peer:
+        """A declared peer that is not removed."""
+        peer = self.peers.get(peer_id)
+        if peer is None or peer.removed:
+            raise EventRejected(f"no peer {peer_id}")
+        return peer
 
     def _line(self, line_id: str) -> Line:
         line = self.lines.get(line_id)

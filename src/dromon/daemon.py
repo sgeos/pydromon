@@ -49,9 +49,14 @@ from claude_agent_sdk import SdkMcpTool
 from dromon import __version__, exits, peercred, restart
 from dromon.federation import (
     NO_FEDERATION,
+    PEERS_DIR_NAME,
     FederationError,
     FederationConfig,
+    check_token_store,
     peer_directories,
+    plan_peers,
+    store_token,
+    stored_token,
     unconfined_refusal,
 )
 from dromon import client
@@ -112,6 +117,7 @@ from dromon.overrides import (
 from dromon.overrides import decode as decode_override
 from dromon.overrides import encode as encode_override
 from dromon.model import (
+    PeerKeyed,
     ProjectOverridden,
     AgentAccess,
     AgentAddress,
@@ -468,6 +474,10 @@ class Daemon:
                 | Operation.AGENT_ADD
                 | Operation.AGENT_REVOKE
                 | Operation.AGENT_LIST
+                | Operation.PEER_TOKEN
+                | Operation.PEER_REVOKE
+                | Operation.PEER_STORE
+                | Operation.PEER_LIST
             ):
                 return self._command(request)
 
@@ -578,6 +588,19 @@ class Daemon:
                     result: dict[str, object] = {"agent": str(AgentAddress(agent_id))}
                 case Operation.AGENT_LIST:
                     result = self._agent_list(request.args)
+                case Operation.PEER_TOKEN:
+                    (peer_id,) = _text_args(request.args, ("peer",))
+                    result = self._peer_token(peer_id)
+                case Operation.PEER_REVOKE:
+                    (peer_id,) = _text_args(request.args, ("peer",))
+                    self.log.append(PeerKeyed(peer_id, ""))
+                    result = {"peer": peer_id, "revoked": True}
+                case Operation.PEER_STORE:
+                    peer_id, token = _text_args(request.args, ("peer", "token"))
+                    result = self._peer_store(peer_id, token)
+                case Operation.PEER_LIST:
+                    _text_args(request.args, ())
+                    result = self._peer_list()
                 case _:
                     result = self._send(request.args)
         except ProtocolError as error:
@@ -598,6 +621,7 @@ class Daemon:
             ProjectMismatch,
             SandboxError,
             DisclosureError,
+            FederationError,
         ) as error:
             return Response(
                 request.request_id,
@@ -1053,6 +1077,47 @@ class Daemon:
             "token": token,
             "listening": self.agents.listen,
         }
+
+    def _peer_token(self, peer_id: str) -> dict[str, object]:
+        """Issue the token the peer presents to this daemon, replacing any earlier one,
+        and return it. The token is returned once and only its digest is stored, as for
+        an agent. The peer must be declared in the project file."""
+        token = new_token()
+        self.log.append(PeerKeyed(peer_id, token_digest(token)))
+        return {"peer": peer_id, "token": token}
+
+    def _peer_store(self, peer_id: str, token: str) -> dict[str, object]:
+        """Store the token the peer issued for this daemon under ``.dromon/peers``.
+        The peer must be declared in the log, so a mistyped name stores nothing."""
+        known = self.log.state.peers.get(peer_id)
+        if known is None or known.removed:
+            raise FederationError(f"no peer {peer_id}")
+        path = store_token(self.paths.state_dir / PEERS_DIR_NAME, peer_id, token)
+        return {"peer": peer_id, "stored": str(path)}
+
+    def _peer_list(self) -> dict[str, object]:
+        """The declared peers, with each one's directions and whether a token is issued
+        for it and stored from it. Never a token or a digest."""
+        store = self.paths.state_dir / PEERS_DIR_NAME
+        peers: list[object] = []
+        for peer_id, definition in sorted(self.project.federation.peers.items()):
+            known = self.log.state.peers.get(peer_id)
+            try:
+                stored: object = stored_token(store, peer_id) is not None
+            except FederationError as error:
+                stored = str(error)
+            peers.append(
+                {
+                    "peer": peer_id,
+                    "transport": definition.transport,
+                    "socket": str(definition.socket),
+                    "inbound": definition.inbound,
+                    "outbound": definition.outbound,
+                    "issued": known is not None and bool(known.token_sha256),
+                    "stored": stored,
+                }
+            )
+        return {"listen": self.project.federation.listen, "peers": peers}
 
     def _agent_list(self, args: dict[str, object]) -> dict[str, object]:
         _text_args(args, ())
@@ -1615,14 +1680,18 @@ def check_sandbox_required(
     file, and Cursor and Antigravity lines are refused, so they satisfy the
     requirement. Also refuse a line on an engine Dromon cannot confine while the
     project declares peers and does not accept it, by decision 9 of the federation
-    design. Raises ``SandboxError``."""
-    refusal = unconfined_refusal(project.federation, line_id, ENGINE_OF.get(model))
+    design, which counts a Claude Code line without an enabled sandbox, by the
+    operator's decision of 2026-10-28. Raises ``SandboxError``."""
+    merged: SandboxConfig | None = merge([project.sandbox, config.sandbox])
+    sandboxed = merged is not None and merged.enabled
+    refusal = unconfined_refusal(
+        project.federation, line_id, ENGINE_OF.get(model), sandboxed
+    )
     if refusal is not None:
         raise SandboxError(refusal)
     if not project.require_sandbox or ENGINE_OF.get(model) != CLAUDE_CODE_ENGINE:
         return
-    merged: SandboxConfig | None = merge([project.sandbox, config.sandbox])
-    if merged is None or not merged.enabled:
+    if not sandboxed:
         raise SandboxError(
             f"line {line_id} would run on Claude Code without an enabled sandbox,"
             " which the project's daemon.require_sandbox requires"
@@ -1815,6 +1884,7 @@ def run(
         ensure_private_dir(paths.state_dir)
         ensure_private_dir(paths.runtime_dir)
         ensure_private_dir(paths.left_reports)
+        check_token_store(paths.state_dir / PEERS_DIR_NAME)
         file = config_path(paths.state_dir)
         config = load(file, paths.root) if file.exists() else ProjectConfig()
         check_sandboxes(config, paths)
@@ -1869,6 +1939,8 @@ def run(
             check_lines_sandboxed(config, log, scheduler)
             check_roles(scheduler, log, config)
             apply_project(scheduler, log, config)
+            for event in plan_peers(log.state, config.federation):
+                log.append(event)
             teacher = start_teacher(config, paths)
             try:
                 daemon = Daemon(
@@ -1897,6 +1969,7 @@ def run(
         EventRejected,
         TeacherError,
         SandboxError,
+        FederationError,
     ) as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE

@@ -66,6 +66,14 @@ All notable changes are recorded here. The format follows
   Agent or Antigravity is refused unless `federation.accept_unconfined` is true. A
   reload that changes either table needs a restart. This is step 2 of federation
   phase 1, and peer mail itself comes in later steps.
+- The peer table in the event log and the peers' tokens, step 3 of federation phase
+  1. The daemon records each declared peer at start with `peer_declared`, and a peer
+  no longer declared with `peer_removed`, and `dromon peer token`, `revoke`, `store`
+  and `list` issue, revoke and store the tokens peers present, keeping only the digest
+  of a token issued and the token a peer issued in `.dromon/peers`, mode 0600 in a
+  directory of mode 0700. The daemon refuses to start when the store is wider. While
+  peers are declared, a Claude Code line without an enabled sandbox is refused as an
+  unconfined line, by the operator's decision of 2026-10-28.
 - Automatic switching of a role's owner, roles step 3, at the operator's instruction
   of 2026-10-27, as `docs/architecture/ROLES.md` describes. A role declares its seats'
   order, a failover policy, `automatic` by default or `ask`, and

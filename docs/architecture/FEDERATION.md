@@ -4,7 +4,8 @@
 
 **Approved by the operator on 2026-10-28, with all seven decisions at the end as
 recommended.** Phase 1 is being built in steps, starting with the peer credential check
-on the existing sockets. **Amended on 2026-10-28** with the operator's decisions on the
+on the existing sockets. Steps 1 to 3 are built, and a part built is marked
+**Implemented** with its date and step. **Amended on 2026-10-28** with the operator's decisions on the
 review line's findings, which are collected as decisions 8 to 16 at the end and marked
 **Decided** where they apply. Points marked **Proposed** below are approved design that
 is not yet built. Points marked **Proposed, not yet decided** came from the review or
@@ -148,10 +149,10 @@ operator authority. The design keeps that without exception.
   or move one by rebinding, when the line would run on an engine that Dromon cannot
   confine, which today is Pi, Cursor or Antigravity, unless the project file accepts it
   with `[federation] accept_unconfined = true`. A reload that changes the peer tables
-  is refused in any case, since they apply only at start. **Proposed, an
-  extension the operator has not yet confirmed.** A Claude Code line without an enabled
-  sandbox is unconfined too, so the same rule applies to it, and `daemon.require_sandbox`
-  satisfies it. **Fact.** Codex lines run under the `dromon-line` profile and Grok lines
+  is refused in any case, since they apply only at start. **Decided by the operator on
+  2026-10-28, and implemented in step 3.** A Claude Code line without an enabled sandbox
+  is unconfined too, so the same rule applies to it, and an enabled sandbox, which
+  `daemon.require_sandbox` requires, satisfies it. **Fact.** Codex lines run under the `dromon-line` profile and Grok lines
   under the operator's checked profiles, both of which deny the state and runtime
   directories, as [`CODEX.md`](../protocol/CODEX.md) and
   [`GROK.md`](../protocol/GROK.md) specify.
@@ -211,7 +212,13 @@ senders = ["core"]
   2, are stored under `.dromon/peers/`, a directory of mode 0700, in files of mode 0600.
   **Decided.** The daemon refuses to start when either mode is wider, and every
   sandboxed line is denied the directory with the rest of the state directory. Both
-  commands go to the operator socket.
+  commands go to the operator socket. **Implemented on 2026-10-28, step 3 of phase 1.**
+  `dromon peer store NAME` stores the peer's token, read from standard input so that it
+  never appears in the process list or the shell's history. `dromon peer revoke NAME`
+  revokes the token issued, and `dromon peer list` shows whether each token is issued
+  and stored, never a token. The start check reads the store with `lstat`, so a
+  symbolic link is refused, and it is not repeated while the daemon runs, so a mode
+  widened after start is seen at the next start or the next store.
 - **The peer's project.** A `unix` peer may name its project root in `project`, so that
   its `.dromon` is denied to local lines as below. The parent of its `socket` is denied
   in any case, since that is its runtime directory.
@@ -581,6 +588,16 @@ the outbox, the idempotency keys and each peer's policy exactly.
 | `message_returned` | `message_id`, `code`, `note_id` message identifier or `null` | The message has a remote recipient and is neither delivered, returned nor unconfirmed. With a line sender, `note_id` names the note to the line, checked as `task_noted` is |
 | `message_unconfirmed` | `message_id`, `note_id` message identifier or `null` | As for `message_returned`. The message expired after its envelope may have reached the peer, so its outcome is unknown |
 
+**Implemented on 2026-10-28, step 3 of phase 1.** `peer_declared`, `peer_removed` and
+`peer_keyed`, as [`EVENT_LOG.md`](../protocol/EVENT_LOG.md) specifies, recorded at start
+from the project file and by `dromon peer token` and `dromon peer revoke`. Three
+differences from the table. The policy holds every key of the peer's table but
+`transport`, including `socket` and `project`, since a `unix` peer has no pin.
+`peer_removed` clears the token digest, so a peer declared again needs a new token.
+**Reason.** Default deny, since a removed peer's token should not come back with a later
+declaration. Returning waiting mail with `unknown_peer` comes with the outbox, since no
+mail waits for a peer yet.
+
 **Replay.** The outbox of a peer is its messages with a remote recipient through it,
 neither delivered, returned nor unconfirmed, in `seq` order. The waiting mail of the
 bounds above is every `message_received` not yet delivered. The idempotency keys are
@@ -701,7 +718,8 @@ changing the envelope's version 1, unless noted.
    states that any unsandboxed process of the same user can act as a peer.
 9. **Unconfined engines.** Peers are refused while any line runs on an engine that
    cannot be confined, today Pi, Cursor or Antigravity, unless the project file sets
-   `[federation] accept_unconfined = true`.
+   `[federation] accept_unconfined = true`. The operator decided later on 2026-10-28
+   that a Claude Code line without an enabled sandbox counts as unconfined too.
 10. **Peer mail and the turn allowance.** Peer mail never counts toward a line's
     autonomous-turn allowance and never resets it, and each peer has its own turn
     allowance per line, so a peer cannot hold a local line.
@@ -715,8 +733,6 @@ changing the envelope's version 1, unless noted.
 
 **Open, raised by the review line or by these amendments, and not yet decided.**
 
-- Whether a Claude Code line without an enabled sandbox counts as unconfined under
-  decision 9. The recommendation is that it does.
 - Whether turns started by peer mail should have a cost cap of their own, since the
   line's cost limit can still hold it.
 - A cap on `busy` answers for one message, so that a busy peer cannot stall a queue

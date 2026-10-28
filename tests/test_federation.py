@@ -2,6 +2,7 @@
 protected set, and the refusal of unconfined engines in a project with peers. The
 design is ``docs/architecture/FEDERATION.md``."""
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -24,7 +25,7 @@ from dromon.lineconfig import DEFAULT_CONFIG, ConfigError
 from dromon.model import AgentAddress, LineAddress, OperatorAddress
 from dromon.paths import ProjectPaths, project_paths
 from dromon.projectconfig import ConfigFileError, ProjectConfig, parse
-from dromon.sandbox import SandboxError
+from dromon.sandbox import SandboxError, parse_sandbox
 
 SOCKET = "/srv/keleusma/run/peers.sock"
 PI = next(model for model, engine in ENGINE_OF.items() if engine == "pi")
@@ -181,13 +182,26 @@ def test_unconfined_engines_are_known_engines() -> None:
 
 def test_unconfined_engines_are_refused_only_with_peers_and_without_consent() -> None:
     peers = declared(k=peer())
-    assert unconfined_refusal(NO_FEDERATION, "a", "pi") is None
-    assert unconfined_refusal(peers, "a", "claude-code") is None
+    assert unconfined_refusal(NO_FEDERATION, "a", "pi", False) is None
+    assert unconfined_refusal(peers, "a", "codex", False) is None
     for engine in sorted(federation.UNCONFINED_ENGINES):
-        refusal = unconfined_refusal(peers, "a", engine)
-        assert refusal is not None and f"line a runs on {engine}" in refusal
+        for sandboxed in (False, True):
+            refusal = unconfined_refusal(peers, "a", engine, sandboxed)
+            assert refusal is not None and f"line a runs on {engine}" in refusal
     accepted = parse_federation({"accept_unconfined": True}, {"k": peer()})
-    assert unconfined_refusal(accepted, "a", "pi") is None
+    assert unconfined_refusal(accepted, "a", "pi", False) is None
+
+
+def test_claude_code_is_unconfined_beside_peers_only_without_its_sandbox() -> None:
+    peers = declared(k=peer())
+    assert federation.SANDBOXED_ENGINES.issubset(ENGINES)
+    for engine in sorted(federation.SANDBOXED_ENGINES):
+        assert unconfined_refusal(peers, "a", engine, True) is None
+        refusal = unconfined_refusal(peers, "a", engine, False)
+        assert refusal is not None and "without an enabled sandbox" in refusal
+        assert unconfined_refusal(NO_FEDERATION, "a", engine, False) is None
+        accepted = parse_federation({"accept_unconfined": True}, {"k": peer()})
+        assert unconfined_refusal(accepted, "a", engine, False) is None
 
 
 def project_with_peers(paths: ProjectPaths, extra: str = "") -> ProjectConfig:
@@ -273,7 +287,26 @@ def test_a_line_on_an_unconfined_engine_is_refused_beside_peers(
     config = project_with_peers(paths)
     with pytest.raises(SandboxError, match="which Dromon cannot confine"):
         check_sandbox_required(config, "a", PI, DEFAULT_CONFIG)
-    check_sandbox_required(config, "a", OPUS, DEFAULT_CONFIG)
     check_sandbox_required(ProjectConfig(), "a", PI, DEFAULT_CONFIG)
     accepted = project_with_peers(paths, "accept_unconfined = true")
     check_sandbox_required(accepted, "a", PI, DEFAULT_CONFIG)
+
+
+def test_a_claude_code_line_needs_its_sandbox_beside_peers(
+    paths: ProjectPaths,
+) -> None:
+    config = project_with_peers(paths)
+    with pytest.raises(SandboxError, match="without an enabled sandbox"):
+        check_sandbox_required(config, "a", OPUS, DEFAULT_CONFIG)
+    sandboxed = replace(
+        DEFAULT_CONFIG, sandbox=parse_sandbox({"enabled": True}, operator=True)
+    )
+    check_sandbox_required(config, "a", OPUS, sandboxed)
+    disabled = replace(
+        DEFAULT_CONFIG, sandbox=parse_sandbox({"enabled": False}, operator=True)
+    )
+    with pytest.raises(SandboxError, match="without an enabled sandbox"):
+        check_sandbox_required(config, "a", OPUS, disabled)
+    check_sandbox_required(ProjectConfig(), "a", OPUS, DEFAULT_CONFIG)
+    accepted = project_with_peers(paths, "accept_unconfined = true")
+    check_sandbox_required(accepted, "a", OPUS, DEFAULT_CONFIG)

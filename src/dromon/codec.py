@@ -67,6 +67,9 @@ from dromon.model import (
     RoleNoteKind,
     BudgetStated,
     BudgetSource,
+    PeerDeclared,
+    PeerKeyed,
+    PeerRemoved,
     parse_address,
 )
 
@@ -162,6 +165,9 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "note",
         "stated_at",
     ),
+    "peer_declared": ("peer_id", "transport", "policy"),
+    "peer_removed": ("peer_id",),
+    "peer_keyed": ("peer_id", "token_sha256"),
 }
 """The wire name of each event kind and its fields, in declaration order."""
 
@@ -443,6 +449,19 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "note": event.note,
                 "stated_at": event.stated_at,
             }
+        case PeerDeclared():
+            return "peer_declared", {
+                "peer_id": event.peer_id,
+                "transport": event.transport,
+                "policy": event.policy,
+            }
+        case PeerRemoved():
+            return "peer_removed", {"peer_id": event.peer_id}
+        case PeerKeyed():
+            return "peer_keyed", {
+                "peer_id": event.peer_id,
+                "token_sha256": event.token_sha256,
+            }
         case _:
             assert_never(event)
 
@@ -611,6 +630,14 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "note"),
                 _str(data, "stated_at"),
             )
+        case "peer_declared":
+            return PeerDeclared(
+                _str(data, "peer_id"), _str(data, "transport"), _str(data, "policy")
+            )
+        case "peer_removed":
+            return PeerRemoved(_str(data, "peer_id"))
+        case "peer_keyed":
+            return PeerKeyed(_str(data, "peer_id"), _str(data, "token_sha256"))
         case _:
             raise DecodeError(f"unknown event kind {kind!r}")
 
