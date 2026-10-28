@@ -133,13 +133,23 @@ and suggests `detail: true, lists: false` to omit the lists.
 
 Set `detail` to true for diagnostic fields, including the resolved `workdir`,
 `engine_session`, kept-session state, process status, event-log status and full context
-details. The detailed response also reports whether the line is hibernated and gives the
-worktree and daemon commits with a sentence that cites both. Detail mode keeps arrays
-summarized by counts. Set `lists` to true to receive
-the long lists of leases, recent turns, other lines, kept-session tasks and left
-processes under a `lists` object. With both arguments true, the tool returns the full
-diagnostic object and those lists. No mode returns a configuration document or message
-body.
+details. It also gives `sandbox`, the built engine's full effective Claude Code sandbox
+document, including resolved write paths and Dromon's added write denials. Its
+`shared_git_directory_write_allowed` says whether the shared Git directory itself is
+writable through that sandbox, and `shared_git_denied_paths` lists denied paths inside
+or around it. A denied descendant can coexist with permission to write elsewhere in
+that directory. For an engine without a Claude Code sandbox document, `sandbox` states
+why those details are unavailable. The detailed response also reports whether the line
+is hibernated and gives the worktree and daemon commits with a sentence that cites both.
+Detail mode keeps arrays summarized by counts. Set `lists` to true to receive the long
+lists of leases, recent turns, other lines, kept-session tasks and left processes under
+a `lists` object. With both arguments true, the tool returns the full diagnostic object
+and those lists. No mode returns a configuration document or message body.
+
+When Dromon refuses a tool call, the error names the permission layer or setting that
+refused it, such as the line's `tool_policy` or
+`sandbox.allowUnsandboxedCommands=false`. When Claude Code reports a sandbox refusal,
+its tool error is passed through by the engine so the line can use the reported reason.
 
 **`propose_change`.** It requires a non-empty message, one to 64 unique relative file
 paths, and a non-empty Git unified patch whose file headers match the list. Paths cannot
@@ -329,7 +339,9 @@ those allowed and its estimated cost since its last release of its limit, so the
 sees how close a hold is without calling `line_status`. The counts are those before
 the turn, which is counted when it ends, so the line also says whether the turn is
 autonomous and what the count becomes, or that an operator's mail started it and the
-count starts again from 0. **Found in round 4.** A reviewer read 0 in the prompt of a
+count starts again from 0. A turn whose only purpose is compaction does not increase
+the autonomous turn count, though its reported or unknown cost still applies.
+**Found in round 4.** A reviewer read 0 in the prompt of a
 turn a task-end note started and took it for a missed count. The turn was counted
 when it ended, which the worker line observed, so this was a gap in what the prompt
 said, not in the count. The mail summary and the
@@ -343,7 +355,9 @@ headers of the newly delivered mail follow, and bodies stay in the mailbox.
   The memory does not survive a restart, so a message sent before one is never marked.
 - **Scheduled wakes.** A fired wake's header says it is the line's scheduled wake and
   gives the time it was due and the time it is delivered. The due time is kept in the
-  state the event log builds, so it survives a restart.
+  state the event log builds, so it survives a restart. A delivery time is shown
+  beside it in the line's delivered mail and in `last_fired_wake` while the daemon has
+  that delivery in memory.
 - **`list_mail`.** **Decided by the operator on 2026-10-26** in round 2. A listed entry
   ends with `repeat_of` and the earlier message's identifier when its message repeated
   one, and a fired wake's entry ends with `scheduled wake due` and its due time, then
@@ -394,9 +408,9 @@ to read the result.
   replaces it, which the tool's answer reports with the replaced due time.
 - **Firing.** At the first tick at or after the due time, the note is recorded as a
   message from the line to itself, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies under
-  scheduled wakes. It wakes the line through the ordinary path in a later tick, counts
-  toward the line's autonomous-turn limit like any mail that is not from an operator,
-  and waits like other mail while the line is held. A wake that fell due while the
+  scheduled wakes. It wakes the line through the ordinary path in a later tick and
+  counts toward the autonomous-turn limit, except when it is solely a compaction
+  wake. It waits like other mail while the line is held. A wake that fell due while the
   daemon was down fires at its first tick. A note that the disclosure list in force at
   firing covers is replaced by a fixed notice, as [`EVENT_LOG.md`](EVENT_LOG.md)
   specifies, so a list changed by a reload or a restart still applies.
@@ -515,10 +529,14 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
   next prompt's first line says the context's size, that every engine call re-reads
   it, and that `compact_session` compacts it, or that an operator can enable it. A
   line with `allow_compact` is also sent a self-note that wakes it to compact before
-  its next real turn, even when no mail was waiting. A hibernated line receives no wake
-  until it is awakened. The default of 150,000 leaves room before an engine's automatic
-  compaction near a 200,000 token window, and past it a turn of a few calls re-reads a
-  million tokens.
+  its next real turn, even when no mail was waiting. Repeated estimates coalesce onto
+  one wake. If a later estimate falls below the effective compaction threshold before
+  that wake fires, the daemon withdraws it. This threshold is the warning unless
+  `auto_compact_tokens` sets an earlier one. A turn with only this compaction wake
+  does not spend an autonomous turn. A hibernated line receives no wake until it is
+  awakened. The
+  default of 150,000 leaves room before an engine's automatic compaction near a
+  200,000 token window, and past it a turn of a few calls re-reads a million tokens.
 - **`compact_session`.** No arguments before round 6. Only a Claude Code line, and
   from round 6 a Codex line, whose configuration sets `allow_compact` has it, and it is refused if the setting is withdrawn. It marks the
   line's own next turn to begin with a compaction. **Fact, read from the bundled Claude

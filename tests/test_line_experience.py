@@ -17,8 +17,8 @@ from claude_agent_sdk import SdkMcpTool
 from dromon import __version__
 from dromon.codex import default_cache_home, engine_environment
 from dromon.disclosure import REFUSAL, load_terms
-from dromon.driver import Strategy
-from dromon.engine import CLAUDE_CODE_PROMPT_MARK, TurnReport
+from dromon.driver import Driver, Strategy
+from dromon.engine import CLAUDE_CODE_PROMPT_MARK, ClaudeCodeLine, TurnReport
 from dromon.eventlog import EventLog
 from dromon.lineconfig import (
     ConfigError,
@@ -251,6 +251,65 @@ def test_line_status_requests_long_lists_separately(world: World) -> None:
     lists = json.loads(lists_text)["lists"]
     assert lists["other_lines"][0]["line_id"] == "beta"
     assert isinstance(lists["recent_turns"], list)
+
+
+def test_detailed_line_status_shows_the_effective_sandbox_and_shared_git_boundary(
+    world: World,
+) -> None:
+    tree = world.root / "trees" / "line"
+    tree.mkdir(parents=True)
+    common = world.root / "primary" / ".git"
+    gitdir = common / "worktrees" / "line"
+    gitdir.mkdir(parents=True)
+    (common / "hooks").mkdir()
+    (common / "config").write_text("[core]\n")
+    (gitdir / "commondir").write_text("../..\n")
+    (tree / ".git").write_text(f"gitdir: {gitdir}\n")
+    settings: dict[str, object] = {
+        "enabled": True,
+        "filesystem": {
+            "allowWrite": [str(tree)],
+            "denyWrite": [str(common / "config"), str(common / "hooks")],
+        },
+    }
+    claude = ClaudeCodeLine(
+        Driver.for_model(HAIKU, Strategy.SUBSCRIPTION),
+        tree,
+        sandbox=settings,
+    )
+    world.scheduler._engines["alpha"] = claude  # pyright: ignore[reportPrivateUsage]
+
+    text, error = world.call("line_status", {"detail": True})
+    assert not error
+    status = json.loads(text)["sandbox"]
+    assert status["available"] is True
+    assert status["enabled"] is True
+    assert status["settings"] == settings
+    filesystem = cast(dict[str, object], status["filesystem"])
+    assert filesystem["default_write_root"] == str(tree)
+    assert filesystem["allowWrite"] == [str(tree)]
+    assert filesystem["denyWrite"] == [str(common / "config"), str(common / "hooks")]
+    assert status["shared_git_directory"] == str(common)
+    assert status["shared_git_directory_write_allowed"] is False
+    assert status["shared_git_denied_paths"] == [
+        str(common / "config"),
+        str(common / "hooks"),
+    ]
+
+    claude.sandbox = cast(
+        dict[str, object],
+        {
+            "enabled": True,
+            "filesystem": {
+                "allowWrite": [str(tree), str(common)],
+                "denyWrite": [str(common / "hooks"), str(common / "config")],
+            },
+        },
+    )
+    text, error = world.call("line_status", {"detail": True})
+    assert not error
+    status = json.loads(text)["sandbox"]
+    assert status["shared_git_directory_write_allowed"] is True
 
 
 def test_default_line_status_has_a_hard_size_bound(

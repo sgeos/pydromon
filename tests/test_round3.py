@@ -910,6 +910,9 @@ def test_compact_session_asks_for_a_compaction_and_refuses_otherwise(
     from dromon.lineconfig import LineConfig
 
     world.scheduler.configure_line("alpha", LineConfig(allow_compact=True))
+    world.scheduler._context["alpha"] = (  # pyright: ignore[reportPrivateUsage]
+        world.scheduler.effective_config("alpha").context_warn_tokens
+    )
     tool = next(
         t for t in world.scheduler.own_tools("alpha") if t.name == "compact_session"
     )
@@ -1090,6 +1093,9 @@ def test_a_pending_compaction_reaches_the_lines_engine_at_its_next_turn(
 
     world.scheduler._engine_factory = build  # pyright: ignore[reportPrivateUsage]
     world.scheduler.configure_line("alpha", LineConfig(allow_compact=True))
+    world.scheduler._context["alpha"] = (  # pyright: ignore[reportPrivateUsage]
+        world.scheduler.effective_config("alpha").context_warn_tokens
+    )
     tool = next(
         t for t in world.scheduler.own_tools("alpha") if t.name == "compact_session"
     )
@@ -1098,6 +1104,7 @@ def test_a_pending_compaction_reaches_the_lines_engine_at_its_next_turn(
         return await tool.handler({})
 
     asyncio.run(ask())
+    world.scheduler._context.pop("alpha", None)  # pyright: ignore[reportPrivateUsage]
     world.run("work")
     assert sent[0] == "/compact"
     assert sent[1].startswith(
@@ -1173,6 +1180,9 @@ def test_a_pending_compaction_is_dropped_when_the_configuration_changes(
     from dromon.lineconfig import LineConfig
 
     world.scheduler.configure_line("alpha", LineConfig(allow_compact=True))
+    world.scheduler._context["alpha"] = (  # pyright: ignore[reportPrivateUsage]
+        world.scheduler.effective_config("alpha").context_warn_tokens
+    )
     tool = next(
         t for t in world.scheduler.own_tools("alpha") if t.name == "compact_session"
     )

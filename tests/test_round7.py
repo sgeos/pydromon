@@ -179,11 +179,17 @@ class World:
 
     def compact_wake(self) -> str:
         """Ask for a compaction and return the identifier of the wake it scheduled."""
+        seeded_context = "alpha" not in self.scheduler._context  # pyright: ignore[reportPrivateUsage]
+        if seeded_context:
+            warning = self.scheduler.effective_config("alpha").context_warn_tokens
+            self.scheduler._context["alpha"] = warning  # pyright: ignore[reportPrivateUsage]
         self.call("compact_session", {})
+        if seeded_context:
+            self.scheduler._context.pop("alpha", None)  # pyright: ignore[reportPrivateUsage]
         return self.log.state.scheduled["alpha"].message_id
 
     def past_due(self) -> None:
-        self.clock.now = START + timedelta(seconds=61)
+        self.clock.now += timedelta(seconds=61)
 
 
 @pytest.fixture
@@ -241,6 +247,7 @@ def test_the_wakes_own_turn_compacts_and_withdraws_nothing(world: World) -> None
     assert message_id in world.log.state.messages
     assert withdrawn(world) == []
     assert world.status()["context"]["last_compaction"]["withdrawn_wake"] is None
+    assert world.status()["autonomous_turns"]["used"] == 0
 
 
 def test_context_warning_wakes_compactable_line_without_mail(world: World) -> None:
@@ -251,6 +258,62 @@ def test_context_warning_wakes_compactable_line_without_mail(world: World) -> No
     world.run()
     assert world.engine.reasons == [COMPACTION_CONTEXT_WARNING]
     assert world.status()["context"]["estimated_tokens"] == 5_000
+    assert world.status()["autonomous_turns"]["used"] == 0
+
+
+def test_context_warning_wakes_are_coalesced_and_withdrawn_below_warning(
+    world: World,
+) -> None:
+    world.scheduler._context_reported(  # pyright: ignore[reportPrivateUsage]
+        "alpha", 150_001, CONTEXT_FROM_CALL
+    )
+    first = world.log.state.scheduled["alpha"].message_id
+    world.scheduler._context_reported(  # pyright: ignore[reportPrivateUsage]
+        "alpha", 151_000, CONTEXT_FROM_CALL
+    )
+    assert world.log.state.scheduled["alpha"].message_id == first
+    assert (
+        sum(
+            isinstance(entry.event, WakeScheduled) for entry in read_entries(world.path)
+        )
+        == 1
+    )
+
+    world.scheduler._context_reported(  # pyright: ignore[reportPrivateUsage]
+        "alpha", 149_999, CONTEXT_FROM_CALL
+    )
+    assert "alpha" not in world.log.state.scheduled
+    assert withdrawn(world) == [WakeWithdrawn("alpha", first)]
+    assert "alpha" not in world.scheduler._context_compaction_wakes  # pyright: ignore[reportPrivateUsage]
+
+
+def test_compact_session_refuses_while_context_is_below_its_warning(
+    world: World,
+) -> None:
+    world.scheduler._context["alpha"] = 4_999  # pyright: ignore[reportPrivateUsage]
+    result = world.call("compact_session", {})
+    assert result.get("is_error") is True
+    assert "at or past this line's warning" in str(result["content"][0]["text"])
+    assert "alpha" not in world.log.state.scheduled
+
+
+def test_only_one_compaction_wake_is_uncounted_per_warning_interval(
+    world: World,
+) -> None:
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    world.scheduler._context["alpha"] = warning  # pyright: ignore[reportPrivateUsage]
+    world.context = warning
+    world.after = warning + 1
+
+    world.compact_wake()
+    world.past_due()
+    world.run()
+    assert world.status()["autonomous_turns"]["used"] == 1
+
+    world.compact_wake()
+    world.past_due()
+    world.run()
+    assert world.status()["autonomous_turns"]["used"] == 2
 
 
 def test_context_warning_does_not_queue_a_note_for_a_held_line(world: World) -> None:
@@ -293,6 +356,9 @@ def test_compaction_that_leaves_context_high_does_not_queue_another_wake(
 def test_a_wake_the_line_scheduled_itself_is_never_withdrawn(world: World) -> None:
     world.call("wake_after", {"seconds": 3600, "note": "check the build"})
     own = world.log.state.scheduled["alpha"]
+    world.scheduler._context["alpha"] = (  # pyright: ignore[reportPrivateUsage]
+        world.scheduler.effective_config("alpha").context_warn_tokens
+    )
     world.call("compact_session", {})
     world.run("work")
     assert world.engine.reasons == ["at your request"]
@@ -478,6 +544,9 @@ def test_f4_a_held_wake_fires_on_the_next_tick_after_its_turn_ends(
 def test_the_tool_says_the_wake_is_withdrawn_if_an_earlier_turn_compacts(
     world: World,
 ) -> None:
+    world.scheduler._context["alpha"] = (  # pyright: ignore[reportPrivateUsage]
+        world.scheduler.effective_config("alpha").context_warn_tokens
+    )
     result = world.call("compact_session", {})
     assert "withdrawn" in str(result["content"][0]["text"])
 
