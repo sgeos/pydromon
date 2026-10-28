@@ -6911,7 +6911,7 @@ class Scheduler:
             self._last_turn_end[line_id] = self._clock()
             self._settle_relinquish(line_id)
             self._work.set()
-        self._apply_limits(line_id, False, report)
+        self._apply_limits(line_id, TurnCause.AUTONOMOUS, True, report)
         if failed and self._operator_mail(line_id) == mailed:
             self._hold_failed(line_id, ending)
         self.fail_over_if_unable(line_id)
