@@ -528,6 +528,7 @@ version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "claude-agent-sdk" },
+    { name = "cryptography" },
     { name = "pykeleusma" },
 ]
 
@@ -541,6 +542,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "claude-agent-sdk", specifier = "==0.2.174" },
+    { name = "cryptography", specifier = "==50.0.2" },
     { name = "pykeleusma", specifier = "==0.2.2.0" },
 ]
 
