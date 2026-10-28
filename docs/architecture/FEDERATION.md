@@ -4,7 +4,7 @@
 
 **Approved by the operator on 2026-10-28, with all seven decisions at the end as
 recommended.** Phase 1 is being built in steps, starting with the peer credential check
-on the existing sockets. Steps 1 to 3 are built, and a part built is marked
+on the existing sockets. Steps 1 to 4 are built, and a part built is marked
 **Implemented** with its date and step. **Amended on 2026-10-28** with the operator's decisions on the
 review line's findings, which are collected as decisions 8 to 16 at the end and marked
 **Decided** where they apply. Points marked **Proposed** below are approved design that
@@ -101,7 +101,12 @@ itself writes it.
 a fourth form, the remote address, and its text is the form above. **Fact.** Today
 `dromon.model.parse_address` treats every text that begins with neither `@` nor `&` as
 a line, and an identifier cannot contain `:`, so no existing log holds a remote address
-and none decodes differently.
+and none decodes differently. **Implemented on 2026-10-28, step 4 of phase 1.** The
+model holds a remote address as a peer's identifier and a local address, and the codec
+reads and writes its text form. Only `message_received` carries one so far. A line's
+`send_message` and an operator's `send` still refuse a remote address, and the model
+refuses one in `message_sent`, until the outbox of step 5. A line's `list_mail` accepts
+one as a sender to filter by.
 
 ## Trust
 
@@ -233,7 +238,8 @@ senders = ["core"]
   `[federation] listen` is true and removed when the daemon stops. It speaks the framing
   of [`CLIENT.md`](../protocol/CLIENT.md) and serves only the federation operations
   below. The operator socket and the agent socket refuse them, so a peer reaches nothing
-  else.
+  else. **Implemented on 2026-10-28, step 4 of phase 1,** with the line socket refusing
+  them too, as [`CLIENT.md`](../protocol/CLIENT.md) specifies under the peer socket.
 - **One connection per direction.** A daemon delivers its outbound mail by connecting to
   the peer's `peers.sock`, and receives inbound mail only on its own. Each direction then
   has one listener and one connector, so the per-direction policy maps onto the
@@ -249,7 +255,12 @@ senders = ["core"]
   hazard below. The Linux path is covered by continuous integration's tests only, not
   observed here.
 - **Token.** The connecting daemon presents the token this daemon issued for it, compared
-  in constant time against the stored digest. **Reason.** The peer credential check
+  in constant time against the stored digest. **Implemented on 2026-10-28, step 4.**
+  The token alone names the peer, compared against every keyed peer's digest, and
+  `deliver` checks again that the peer's digest is the one its token matched, so a
+  token revoked or replaced during a connection delivers nothing more. A `hello` is
+  accepted for a keyed peer whatever its `inbound`, and `deliver` then refuses with
+  `refused`, as the receiving rules below require. **Reason.** The peer credential check
   proves only that the caller runs as the same user. **Fact.** A line runs as that user
   too. The token separates a peer daemon from a line's shell, and from another peer.
 - **What the token rests on.** The token is kept from lines by the sandbox rule that
@@ -260,7 +271,10 @@ senders = ["core"]
   completed `hello` within 10 seconds is closed, and at most 8 such connections are open
   at once, so a local process cannot hold the listener. An undeclared peer name and a
   wrong token get the same refusal, so a caller cannot learn which peer names are
-  declared.
+  declared. **Not built in step 4,** since it is not decided. The 30 second idle
+  timeout of every socket closes a connection that sends nothing, and the 8,388,608
+  byte line limit applies before `hello` as after, so one process of the operator's
+  user can still hold several connections open, each with a buffer of that size.
 - **The peer's directories.** **Implemented on 2026-10-28, step 2 of phase 1.** Each
   declared peer's runtime directory, the directory of its `socket`, and the `.dromon` of
   its `project` when one is named, join the project's protected directories. Every
@@ -380,6 +394,17 @@ third daemon.
    to the post office at the end of the tick, like any other mail, and wakes its
    recipient as local mail does.
 
+**Implemented on 2026-10-28, step 4 of phase 1,** in `dromon.peering`, with the order
+of checks that [`CLIENT.md`](../protocol/CLIENT.md) gives. Four choices the design left
+open. Every `deliver` counts toward the rate limit, not only the accepted ones, so a
+peer cannot make the receiver check without limit by sending refused mail. A resend is
+answered as a duplicate or a conflict before the policy is read, so a policy narrowed
+after the first delivery cannot refuse mail that was accepted, which would let its
+sender return a message its recipient holds. A question is refused with `refused`,
+since only notes cross. A note's priority is answered false until step 6. Peer mail
+never clears a line held out of scheduling by a failed turn, which local mail does,
+so a peer cannot restart a failing line.
+
 ### Ordering
 
 - **Proposed.** Mail to one peer is delivered in the order it was sent here, one
@@ -426,6 +451,13 @@ receiver's loop as the operator socket's `send` does, so a resting loop starts a
 
 **Decided.** Mail from a peer never counts toward a line's autonomous-turn allowance
 and never resets it, so a peer can neither hold a local line nor release one.
+**Implemented on 2026-10-28, step 4 of phase 1.** A turn has one of three causes,
+operator, autonomous or peer, and the prompt's opening line says which. A turn that
+only peer mail started is charged to each peer whose mail in it had allowance left.
+Peer mail past its allowance does not keep the scheduler ticking, and the scheduler's
+rest, at most 60 seconds, finds it once the hour allows, so it may start its turn up to
+a minute late. A turn that only peer mail started never holds the line for the
+autonomous-turn limit, even when an override has lowered the limit below the count.
 
 - **Which turns count.** A turn woken only by peer mail neither counts nor resets. A
   turn that local line or agent mail also woke counts as it does today, and a turn that
@@ -582,7 +614,7 @@ the outbox, the idempotency keys and each peer's policy exactly.
 | `peer_removed` | `peer_id` | The peer is declared. Addresses through it are refused from then on, and the daemon returns every message still waiting for it with `unknown_peer` |
 | `peer_keyed` | `peer_id`, `token_sha256` | The peer is declared. The digest of the token this daemon issued for the peer, or empty to revoke it. Recorded by `dromon peer token` |
 | `message_sent` | Unchanged | Also applies to a remote recipient when its peer is declared and not removed, the sender is local and the kind is `note`. The remote party's existence is the peer's to check |
-| `message_received` | `message_id`, `sender` remote address, `recipient` local address, `body`, `reply_to` local message identifier or `null`, `origin_id` | The sender's peer is declared and not removed, no earlier `message_received` has this peer and origin identifier, and the message rules of [`EVENT_LOG.md`](../protocol/EVENT_LOG.md) hold for a note, with the remote sender standing in for an existing one |
+| `message_received` | `message_id`, `sender` remote address, `recipient` local address, `body`, `reply_to` local message identifier or `null`, `origin_id` | The sender's peer is declared and not removed, no earlier `message_received` has this peer and origin identifier, and the message rules of [`EVENT_LOG.md`](../protocol/EVENT_LOG.md) hold for a note, with the remote sender standing in for an existing one. Implemented in step 4 |
 | `message_prioritized` | Unchanged | Also follows a `message_received` when the receiver honours its priority |
 | `message_delivered` | Unchanged | For a remote recipient, the peer accepted the message |
 | `message_returned` | `message_id`, `code`, `note_id` message identifier or `null` | The message has a remote recipient and is neither delivered, returned nor unconfirmed. With a line sender, `note_id` names the note to the line, checked as `task_noted` is |
@@ -612,8 +644,8 @@ of growth to the log's existing debt of no compaction.
 
 ## Wire protocol
 
-**Proposed.** Federation version 1, framed as [`CLIENT.md`](../protocol/CLIENT.md)
-frames requests, one canonical JSON object per line. A frame is at most 8,388,608 bytes,
+**Proposed, and implemented for the receiving end on 2026-10-28 in step 4.** Federation
+version 1, framed as [`CLIENT.md`](../protocol/CLIENT.md) frames requests, one canonical JSON object per line. A frame is at most 8,388,608 bytes,
 the bound of an encoded event, so the largest body a policy may permit fits even when
 escaping multiplies its size.
 

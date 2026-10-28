@@ -74,6 +74,16 @@ All notable changes are recorded here. The format follows
   directory of mode 0700. The daemon refuses to start when the store is wider. While
   peers are declared, a Claude Code line without an enabled sandbox is refused as an
   unconfined line, by the operator's decision of 2026-10-28.
+- Mail from peers, step 4 of federation phase 1. The remote address `peer:party` in the
+  model and the codec, the `message_received` event with its idempotency key, and
+  `peers.sock`, opened when `federation.listen` is true, which serves only `hello` and
+  `deliver`. A peer is named by its token alone. Each delivery is checked against the
+  grammar, the rate limit of 60 in 600 seconds, the peer's `inbound`, `reach` and
+  `max_body_bytes`, the reply route and the waiting bounds, and answered `accepted`,
+  `refused` with a fixed code or `busy`. A resend is a duplicate or a conflict. Peer
+  mail neither counts toward a line's autonomous-turn allowance nor resets it, and each
+  peer may start at most `turns_per_hour` turns for one line in any hour. Mail to a
+  peer comes with the outbox of step 5.
 - Automatic switching of a role's owner, roles step 3, at the operator's instruction
   of 2026-10-27, as `docs/architecture/ROLES.md` describes. A role declares its seats'
   order, a failover policy, `automatic` by default or `ask`, and

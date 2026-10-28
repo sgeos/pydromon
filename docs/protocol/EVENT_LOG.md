@@ -26,7 +26,9 @@ state by replaying the same log.
 | Line address | A line's identifier, such as `alpha` |
 | Operator address | `@` followed by an operator's identifier, such as `@ana`. `@` never appears in an identifier, so the two kinds of address cannot collide |
 | Agent address | `&` followed by an external agent's identifier, such as `&claude-main`. `&` never appears in an identifier |
-| Address | A line address, an operator address or an agent address |
+| Remote address | A peer's identifier, `:`, and a line, operator or agent address as that peer writes it, such as `keleusma:kaizen` or `keleusma:@ana`. It begins with an identifier, never with `@` or `&`, and holds exactly one `:`, so no remote party reads as a local operator and no address routes through a second peer. Added on 2026-10-28 for federation, as [`FEDERATION.md`](../architecture/FEDERATION.md) specifies |
+| Local address | A line address, an operator address or an agent address |
+| Address | A local address or a remote address |
 | Agent access | `none`, `observe`, `message`, `manage` or `operator`, each including the levels before it |
 | Token digest | 64 lowercase hexadecimal characters, the SHA-256 of a token, or empty for an agent admitted without one |
 | Text | A Unicode string with a valid UTF-8 encoding of at most 1,048,576 bytes. Lone surrogates are invalid |
@@ -82,6 +84,7 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `agent_registered` | `agent_id`, `access`, `token_sha256` | Always. Registers the agent, or replaces its access and digest and restores it if revoked. A token itself is never stored |
 | `agent_revoked` | `agent_id` | The agent exists and is not revoked |
 | `message_sent` | `message_id`, `sender` and `recipient` addresses, `kind`, `body` text, `choices`, `reply_to` message identifier or `null` | See the message rules below |
+| `message_received` | `message_id`, `sender` remote address, `recipient` local address, `body` text, `reply_to` message identifier or `null`, `origin_id` identifier | The message does not exist and no pending scheduled wake reserves its identifier, the sender's peer is declared and not removed, no earlier `message_received` has this peer and `origin_id`, and the recipient exists. A `reply_to` names an existing message from the recipient to the sender. Records a note from a peer's party, the peer's own identifier for it, and the idempotency key of the peer and that identifier in one event, so a crash cannot record one without the other. Until it is delivered it counts toward the waiting mail of its peer and of its recipient. Added on 2026-10-28 |
 | `message_read` | `message_id` | The message was delivered and not yet read. Its recipient opened it, which obliges nothing |
 | `message_acknowledged` | `message_id` | The message was delivered and not yet acknowledged. Its recipient marked it dealt with without a reply. Its sender sees the acknowledgement as distinct from a reply. A question stays open |
 | `message_prioritized` | `message_id` | The message exists, is a note to a line, is not delivered and is not priority mail. Marks it priority mail, as [`PRIORITY.md`](PRIORITY.md) specifies. The daemon appends it right after the note's `message_sent`. Added on 2026-10-27 |
@@ -110,7 +113,9 @@ Each event has a kind and fields, all required. An optional value is written as 
 
 **Message rules.** A `message_sent` applies when every one of these holds.
 
-1. The message does not exist, and the sender and recipient both exist. They differ,
+1. The message does not exist, and the sender and recipient both exist. Neither is a
+   remote address, since a peer's mail is recorded by `message_received`, and mail to
+   a peer waits for the outbox of a later step of federation phase 1. They differ,
    unless the sender is a line, which may send itself a note, as
    [`PRIORITY.md`](PRIORITY.md) specifies since 2026-10-27. An operator or an agent
    may not. The firing of a scheduled wake, below, is one such note, and a
@@ -204,7 +209,8 @@ An event is stored as one JSON object.
 {"data":{"engine":"claude-opus-5-5","line_id":"alpha","strategy":"subscription"},"kind":"line_created","v":1}
 ```
 
-Addresses are written as their text forms, such as `"beta"`, `"@ana"` and `"&claude"`.
+Addresses are written as their text forms, such as `"beta"`, `"@ana"`, `"&claude"` and
+`"keleusma:kaizen"`.
 
 - `v` is the format version, the integer `1`.
 - `kind` is the event kind and `data` holds exactly its fields.

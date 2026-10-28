@@ -39,6 +39,7 @@ import fcntl
 import os
 import signal
 import sys
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -117,6 +118,7 @@ from dromon.overrides import (
 from dromon.overrides import decode as decode_override
 from dromon.overrides import encode as encode_override
 from dromon.model import (
+    ID_PATTERN,
     PeerKeyed,
     ProjectOverridden,
     AgentAccess,
@@ -131,11 +133,20 @@ from dromon.model import (
     QuestionStatus,
     State,
     parse_address,
+    parse_any_address,
 )
 from dromon import launcher
 from dromon.paths import PathError, ProjectPaths, ensure_private_dir, project_paths
+from dromon.peering import (
+    HELLO_KEYS,
+    Receiver,
+    choose_version,
+    identify,
+    outcome_result,
+)
 from dromon.protocol import (
     MAX_LINE_BYTES,
+    MAX_PEER_LINE_BYTES,
     PROTOCOL_VERSION,
     ErrorCode,
     Operation,
@@ -207,6 +218,8 @@ class Daemon:
     project_file_present: bool = False
     hold_wakes: bool = False
     """Whether the command line held wakes, which a restart's successor keeps."""
+    receiver: Receiver = field(default_factory=lambda: Receiver(time.monotonic))
+    """The judge of peer deliveries, with each peer's rate limit in memory."""
     successor: list[str] | None = field(default=None, init=False)
     """The options a successor starts with, once a restart is ready to stop."""
     _watches: set["asyncio.Task[None]"] = field(
@@ -422,6 +435,105 @@ class Daemon:
         )
         return Response(request.request_id, ok=True, result=_bounded(result))
 
+    def respond_peer(self, session: "PeerSession", line: bytes) -> Response:
+        """Answer one line on the peer socket, which serves only ``hello`` and
+        ``deliver``. Never raises for anything a peer can send."""
+        try:
+            request = decode_request(line, MAX_PEER_LINE_BYTES)
+        except ProtocolError as error:
+            return _refusal(
+                request_id_of(line, MAX_PEER_LINE_BYTES), error.code, str(error)
+            )
+        match request.operation:
+            case Operation.PING:
+                return Response(request.request_id, ok=True, result={})
+            case Operation.HELLO:
+                return self._hello(session, request)
+            case Operation.DELIVER:
+                return self._deliver(session, request)
+            case _:
+                return _refusal(
+                    request.request_id,
+                    ErrorCode.UNKNOWN_OPERATION,
+                    "the peer socket serves only hello and deliver",
+                )
+
+    def _hello(self, session: "PeerSession", request: Request) -> Response:
+        """Name the connection's peer by the token it presents. The name it gives
+        itself is advisory and never names it. An undeclared peer and a wrong token
+        are refused alike."""
+        args = request.args
+        if session.peer_id is not None:
+            return _refusal(
+                request.request_id,
+                ErrorCode.REJECTED,
+                "hello was already given on this connection",
+            )
+        if frozenset(args) != HELLO_KEYS:
+            return _refusal(
+                request.request_id,
+                ErrorCode.BAD_REQUEST,
+                f"hello takes exactly {sorted(HELLO_KEYS)}",
+            )
+        name = args["name"]
+        if not isinstance(name, str) or ID_PATTERN.fullmatch(name) is None:
+            return _refusal(
+                request.request_id, ErrorCode.BAD_REQUEST, "name is not an identifier"
+            )
+        version = choose_version(args["versions"])
+        if version is None:
+            return _refusal(
+                request.request_id,
+                ErrorCode.UNSUPPORTED_VERSION,
+                "no federation version in common",
+            )
+        peer_id = identify(self.log.state, args["token"])
+        if peer_id is None:
+            print(
+                f"dromond: refused a peer's hello, announced as {name}",
+                file=sys.stderr,
+            )
+            return _refusal(request.request_id, ErrorCode.REJECTED, PEER_REFUSED)
+        session.peer_id = peer_id
+        session.token_sha256 = self.log.state.peers[peer_id].token_sha256
+        return Response(request.request_id, ok=True, result={"version": version})
+
+    def _deliver(self, session: "PeerSession", request: Request) -> Response:
+        """Judge one delivery from the connection's peer. The peer's token is checked
+        again, so a token revoked or a peer removed while connected delivers nothing
+        more."""
+        peer_id = session.peer_id
+        if peer_id is None:
+            return _refusal(
+                request.request_id, ErrorCode.REJECTED, "deliver needs a hello first"
+            )
+        peer = self.log.state.peers.get(peer_id)
+        if peer is None or peer.removed or peer.token_sha256 != session.token_sha256:
+            session.peer_id = None
+            session.token_sha256 = ""
+            return _refusal(request.request_id, ErrorCode.REJECTED, PEER_REFUSED)
+        try:
+            outcome = self.receiver.deliver(
+                self.log.state,
+                self.project.federation,
+                peer_id,
+                request.args,
+                self.scheduler.receive,
+            )
+        except EventRejected as error:
+            # The receiver's checks run before the append, so this is a fault here,
+            # reported as transient rather than as a refusal the peer would keep.
+            print(
+                f"dromond: a delivery from peer {peer_id} was not recorded: {error}",
+                file=sys.stderr,
+            )
+            return _refusal(
+                request.request_id,
+                ErrorCode.INTERNAL,
+                "the daemon could not record the message",
+            )
+        return Response(request.request_id, ok=True, result=outcome_result(outcome))
+
     def execute(self, request: Request) -> Response:
         """Answer one decoded request with operator authority."""
         match request.operation:
@@ -441,6 +553,13 @@ class Daemon:
                     ok=False,
                     error_code=ErrorCode.UNKNOWN_OPERATION,
                     error_message=f"{request.operation} is served on the agent socket",
+                )
+            case Operation.HELLO | Operation.DELIVER:
+                return Response(
+                    request.request_id,
+                    ok=False,
+                    error_code=ErrorCode.UNKNOWN_OPERATION,
+                    error_message=f"{request.operation} is served on the peer socket",
                 )
             case (
                 Operation.CREATE_LINE
@@ -807,7 +926,7 @@ class Daemon:
                 self.log.state,
                 owner,
                 unread_only=unread_only,
-                sender=None if sender is None else parse_address(sender),
+                sender=None if sender is None else parse_any_address(sender),
                 offset=offset,
                 limit=limit,
             )
@@ -1326,6 +1445,29 @@ MAX_AGENT_TEXT: Final = 48 * 1024
 """The most text one agent result carries, so it fits one protocol line."""
 
 
+PEER_REFUSED: Final = "the peer was refused"
+"""The one refusal of an unknown peer, a wrong token and a revoked one, so a caller
+cannot tell which peer names are declared."""
+
+
+@dataclass(slots=True)
+class PeerSession:
+    """One connection on the peer socket, and the peer its ``hello`` named."""
+
+    daemon: Daemon
+    peer_id: str | None = None
+    token_sha256: str = ""
+    """The digest the peer's token matched at ``hello``, checked again at each
+    ``deliver``."""
+
+    async def respond(self, line: bytes) -> Response:
+        return self.daemon.respond_peer(self, line)
+
+
+def _refusal(request_id: str, code: ErrorCode, message: str) -> Response:
+    return Response(request_id, ok=False, error_code=code, error_message=message)
+
+
 def _bounded(result: dict[str, object]) -> dict[str, object]:
     """``result`` with each text item cut to ``MAX_AGENT_TEXT`` characters, noting the
     cut, since a message body may be larger than a protocol line."""
@@ -1411,6 +1553,7 @@ async def _connection(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
     responder: Responder,
+    limit: int = MAX_LINE_BYTES,
 ) -> None:
     """Serve requests on one connection until EOF, timeout, error or stop."""
     try:
@@ -1428,7 +1571,7 @@ async def _connection(
                         "",
                         ok=False,
                         error_code=ErrorCode.TOO_LONG,
-                        error_message=f"the line exceeds {MAX_LINE_BYTES} bytes",
+                        error_message=f"the line exceeds {limit} bytes",
                     ),
                 )
                 break
@@ -1438,7 +1581,7 @@ async def _connection(
                 await _write(
                     writer,
                     Response(
-                        request_id_of(line),
+                        request_id_of(line, limit),
                         ok=False,
                         error_code=ErrorCode.BAD_REQUEST,
                         error_message="the connection closed inside a line",
@@ -1501,19 +1644,23 @@ async def serve(daemon: Daemon) -> None:
         return daemon.respond(line)
 
     def accepting(
-        responder: Responder,
+        responder: Callable[[], Responder], limit: int = MAX_LINE_BYTES
     ) -> Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]:
+        """Accept connections, each served by a responder made for it, so that the
+        peer socket can keep the peer its ``hello`` named for one connection."""
+
         async def accept(
             reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         ) -> None:
             writers.add(writer)
             try:
-                # Every socket goes through here, the operator's, the lines' and the
-                # agents', so none of them serves a process of another user.
+                # Every socket goes through here, the operator's, the lines', the
+                # agents' and the peers', so none of them serves a process of another
+                # user.
                 await _guarded(
                     writer,
                     own_uid,
-                    lambda: _connection(daemon, reader, writer, responder),
+                    lambda: _connection(daemon, reader, writer, responder(), limit),
                 )
             finally:
                 writers.discard(writer)
@@ -1522,7 +1669,9 @@ async def serve(daemon: Daemon) -> None:
 
     socket_path = daemon.paths.socket
     server = await asyncio.start_unix_server(
-        accepting(operator_responder), path=str(socket_path), limit=MAX_LINE_BYTES
+        accepting(lambda: operator_responder),
+        path=str(socket_path),
+        limit=MAX_LINE_BYTES,
     )
     # The line socket serves only lines whose engine was issued a token, so it is
     # always open, and it never accepts an agent or operator request.
@@ -1532,7 +1681,9 @@ async def serve(daemon: Daemon) -> None:
     servers = [
         server,
         await asyncio.start_unix_server(
-            accepting(daemon.respond_line), path=str(line_path), limit=MAX_LINE_BYTES
+            accepting(lambda: daemon.respond_line),
+            path=str(line_path),
+            limit=MAX_LINE_BYTES,
         ),
     ]
     line_path.chmod(0o600)
@@ -1544,7 +1695,7 @@ async def serve(daemon: Daemon) -> None:
             agent_path.unlink()
         servers.append(
             await asyncio.start_unix_server(
-                accepting(daemon.respond_agent),
+                accepting(lambda: daemon.respond_agent),
                 path=str(agent_path),
                 limit=MAX_LINE_BYTES,
             )
@@ -1555,6 +1706,21 @@ async def serve(daemon: Daemon) -> None:
             f" {daemon.agents.anonymous}, at most {daemon.agents.max_access}",
             file=sys.stderr,
         )
+    if daemon.project.federation.listen:
+        # A separate socket that serves only hello and deliver, so that nothing a
+        # peer sends reaches the operator's or an agent's dispatch.
+        peer_path = daemon.paths.peer_socket
+        with contextlib.suppress(FileNotFoundError):
+            peer_path.unlink()
+        servers.append(
+            await asyncio.start_unix_server(
+                accepting(lambda: PeerSession(daemon).respond, MAX_PEER_LINE_BYTES),
+                path=str(peer_path),
+                limit=MAX_PEER_LINE_BYTES,
+            )
+        )
+        peer_path.chmod(0o600)
+        print(f"dromond: peers may connect on {peer_path}", file=sys.stderr)
     daemon.scheduler.recover()
     scheduling = asyncio.create_task(daemon.scheduler.run(daemon.stop_requested))
     try:
@@ -1941,6 +2107,12 @@ def run(
             apply_project(scheduler, log, config)
             for event in plan_peers(log.state, config.federation):
                 log.append(event)
+            scheduler.peer_turns.set_allowances(
+                {
+                    peer_id: peer.turns_per_hour
+                    for peer_id, peer in config.federation.peers.items()
+                }
+            )
             teacher = start_teacher(config, paths)
             try:
                 daemon = Daemon(
@@ -1974,7 +2146,12 @@ def run(
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
     finally:
-        for stale in (paths.socket, paths.agent_socket, paths.line_socket):
+        for stale in (
+            paths.socket,
+            paths.agent_socket,
+            paths.line_socket,
+            paths.peer_socket,
+        ):
             with contextlib.suppress(FileNotFoundError):
                 stale.unlink()
         os.close(lock)

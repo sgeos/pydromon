@@ -34,11 +34,13 @@ from dromon.model import (
     MessagePrioritized,
     MessageDelivered,
     MessageRead,
+    MessageReceived,
     MessageKind,
     MessageSent,
     OperatorAddress,
     OperatorRegistered,
     ProjectOverridden,
+    RemoteAddress,
     QuestionSuperseded,
     QuestionWithdrawn,
     WakeIssued,
@@ -70,6 +72,8 @@ BETA = LineAddress("beta")
 ANA = OperatorAddress("ana")
 BEN = OperatorAddress("ben")
 PROBE = AgentAddress("probe")
+KAIZEN = RemoteAddress("keleusma", LineAddress("kaizen"))
+KAIZEN_ANA = RemoteAddress("keleusma", OperatorAddress("ana"))
 NOTE = MessageKind.NOTE
 QUESTION = MessageKind.QUESTION
 AT = "2026-10-27T05:00:00Z"
@@ -169,6 +173,9 @@ SCENARIO: tuple[Event, ...] = (
     BudgetStated("codex", 0, None, BudgetSource.ENGINE, "a plan limit", AT),
     PeerDeclared("keleusma", "unix", '{"inbound":true}'),
     PeerKeyed("keleusma", "c" * 64),
+    MessageReceived("r1", KAIZEN, BETA, "from a peer", None, "m-origin-1"),
+    MessageReceived("r2", KAIZEN_ANA, ANA, "from a peer's operator", None, "m-o2"),
+    MessageDelivered("r1"),
     PeerDeclared("keleusma", "unix", '{"inbound":false}'),
     PeerKeyed("keleusma", ""),
     PeerRemoved("keleusma"),

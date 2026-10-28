@@ -125,6 +125,7 @@ from dromon.overrides import encode as encode_override
 from dromon.driver import ENGINE_OF, MODELS, Driver, DriverError, Strategy
 from dromon import priority, restart
 from dromon.priority import PriorityLimiter, PriorityRefused
+from dromon.peering import PeerTurns, TurnCause, turn_cause
 from dromon import acp, antigravity, codex, cursor, grok, pi
 from dromon.agents import LineTokens
 from dromon import capabilities, launcher, redact
@@ -248,7 +249,10 @@ from dromon.model import (
     MessageKind,
     MessagePrioritized,
     MessageRead,
+    MessageReceived,
     MessageSent,
+    LocalAddress,
+    RemoteAddress,
     OperatorAddress,
     AgentAddress,
     OperatorRegistered,
@@ -275,6 +279,7 @@ from dromon.model import (
     MAX_TASK_NOTE_BYTES,
     format_due,
     parse_address,
+    parse_any_address,
     parse_due,
 )
 
@@ -1425,6 +1430,9 @@ class Scheduler:
         self._priority = PriorityLimiter(clock)
         """Lines' priority mail over the rate limit's window, in memory, so a restart
         starts the count again."""
+        self.peer_turns = PeerTurns(clock)
+        """Each peer's turns per local line in the last hour, in memory, so a restart
+        gives each peer a fresh allowance. Decision 10 of the federation design."""
         self._redirect_for: dict[str, str] = {}
         """The priority note each running line's turn is to end for at its next safe
         point, until the turn ends."""
@@ -1605,6 +1613,26 @@ class Scheduler:
                 self._answer_ceiling(recipient.line_id, reply_to, body)
         if isinstance(recipient, LineAddress):
             self._failed.discard(recipient.line_id)
+        self._work.set()
+        return message_id
+
+    def receive(
+        self,
+        sender: RemoteAddress,
+        recipient: LocalAddress,
+        body: str,
+        reply_to: str | None,
+        origin_id: str,
+    ) -> str:
+        """Record a note a peer delivered. It joins the post office in the next tick,
+        as local mail does. Unlike local mail it never clears a failed line, so a
+        peer cannot restart a line whose turn failed. Raises ``EventRejected`` when
+        the event does not apply, recording nothing."""
+        message_id = new_id("m")
+        self._log.append(
+            MessageReceived(message_id, sender, recipient, body, reply_to, origin_id)
+        )
+        self._sent.append(message_id)
         self._work.set()
         return message_id
 
@@ -2302,7 +2330,7 @@ class Scheduler:
 
     # What a line sees of itself and of the daemon.
 
-    def _budget_line(self, line_id: str, from_operator: bool, warn: bool = True) -> str:
+    def _budget_line(self, line_id: str, cause: TurnCause, warn: bool = True) -> str:
         """The line that opens every turn's prompt, so that a line sees how close a
         hold is. The counts are those before the turn, which is counted when it
         ends, so the line also says how this turn will count. Without ``warn`` it
@@ -2311,13 +2339,22 @@ class Scheduler:
         limits = self.limits_for(line_id)
         used = self._autonomous.get(line_id, 0)
         cost = self._cost.get(line_id, 0.0)
-        counting = (
-            "An operator's mail started this turn, so the count of autonomous turns"
-            " starts again from 0 when it ends."
-            if from_operator
-            else f"This turn is autonomous, so the count becomes {used + 1} when it"
-            " ends."
-        )
+        match cause:
+            case TurnCause.OPERATOR:
+                counting = (
+                    "An operator's mail started this turn, so the count of autonomous"
+                    " turns starts again from 0 when it ends."
+                )
+            case TurnCause.PEER:
+                counting = (
+                    "Only a peer's mail started this turn, so the count of autonomous"
+                    f" turns stays at {used} when it ends."
+                )
+            case TurnCause.AUTONOMOUS:
+                counting = (
+                    f"This turn is autonomous, so the count becomes {used + 1} when it"
+                    " ends."
+                )
         unknown = self._cost_unknown.get(line_id, 0)
         spent = (
             f"${cost:.2f}"
@@ -4445,7 +4482,7 @@ class Scheduler:
                     self._log.state,
                     mailbox_owner,
                     unread_only=unread_only,
-                    sender=None if sender is None else parse_address(sender),
+                    sender=None if sender is None else parse_any_address(sender),
                     offset=offset,
                     limit=limit,
                 )
@@ -4773,8 +4810,18 @@ class Scheduler:
         if self._running or self._sent or self._due_wakes():
             return True
         return any(
-            self._eligible(line_id) and self.deliverable(line_id)
+            self._eligible(line_id) and self._may_wake(line_id)
             for line_id in self._log.state.lines
+        )
+
+    def _may_wake(self, line_id: str) -> bool:
+        """Whether the line has post office mail that may start its turn. Peer mail
+        past its peer's turn allowance waits without keeping the loop ticking, and
+        the loop's rest, at most ``MAX_REST_SECONDS``, finds it once the hour
+        allows."""
+        messages = self.deliverable(line_id)
+        return bool(messages) and self.peer_turns.may_wake(
+            line_id, (message for _, message in messages)
         )
 
     # Conversation limits.
@@ -4809,10 +4856,19 @@ class Scheduler:
         self._work.set()
 
     def _apply_limits(
-        self, line_id: str, from_operator: bool, report: TurnReport | None
+        self, line_id: str, cause: TurnCause, report: TurnReport | None
     ) -> None:
-        """Count a finished turn and hold the line if it passed a limit."""
-        turns = 0 if from_operator else self._autonomous.get(line_id, 0) + 1
+        """Count a finished turn and hold the line if it passed a limit. A turn that
+        only peer mail started leaves the count of autonomous turns as it was, so a
+        peer can neither hold a line nor release one. Its cost still counts."""
+        used = self._autonomous.get(line_id, 0)
+        match cause:
+            case TurnCause.OPERATOR:
+                turns = 0
+            case TurnCause.PEER:
+                turns = used
+            case TurnCause.AUTONOMOUS:
+                turns = used + 1
         self._autonomous[line_id] = turns
         if report is not None:
             costs = self._turn_costs.setdefault(
@@ -4830,7 +4886,7 @@ class Scheduler:
         cost = self._cost.get(line_id, 0.0)
         limits = self.limits_for(line_id)
         reason: str | None = None
-        if turns >= limits.max_autonomous_turns:
+        if cause is TurnCause.AUTONOMOUS and turns >= limits.max_autonomous_turns:
             reason = f"took {turns} turns in a row without mail from an operator"
         elif cost > limits.max_cost_usd:
             reason = (
@@ -4851,7 +4907,9 @@ class Scheduler:
             if not self._can_start(line_id):
                 continue
             messages = self.deliverable(line_id)
-            if not messages:
+            if not messages or not self.peer_turns.may_wake(
+                line_id, (message for _, message in messages)
+            ):
                 continue
             self._begin_turn(line_id, messages)
         self._post_office.update(self._sent)
@@ -4916,10 +4974,13 @@ class Scheduler:
             self._post_office.discard(message_id)
         self._turns[line_id] = self._turns.get(line_id, 0) + 1
         address = LineAddress(line_id)
-        from_operator = any(
-            isinstance(message.sender, OperatorAddress) for _, message in messages
-        )
-        self._counting[line_id] = not from_operator
+        cause = turn_cause(message for _, message in messages)
+        if cause is TurnCause.PEER:
+            self.peer_turns.record(
+                line_id,
+                self.peer_turns.starters(line_id, (m for _, m in messages)),
+            )
+        self._counting[line_id] = cause is TurnCause.AUTONOMOUS
         compaction: str | None = None
         owed: tuple[str, Handoff | None] | None = None
         refused: Exception | None = None
@@ -4947,9 +5008,7 @@ class Scheduler:
                 messages,
                 summary(self._log.state, address, len(messages)),
                 replied_ids(self._log.state, address),
-                budget=self._budget_line(
-                    line_id, from_operator, warn=compaction is None
-                ),
+                budget=self._budget_line(line_id, cause, warn=compaction is None),
                 notes=self._notes(messages),
             )
             owed = self._handoff(line_id, messages)
@@ -4965,7 +5024,7 @@ class Scheduler:
         if seat is not None and self._log.state.roles[seat.role_id].owner == line_id:
             self._turn_owned.add(line_id)
         task = asyncio.get_running_loop().create_task(
-            self._turn(line_id, prompt, from_operator, compaction, owed, refused)
+            self._turn(line_id, prompt, cause, compaction, owed, refused)
         )
         self._running[line_id] = task
 
@@ -4973,7 +5032,7 @@ class Scheduler:
         self,
         line_id: str,
         prompt: str,
-        from_operator: bool,
+        cause: TurnCause,
         compaction: str | None = None,
         owed: tuple[str, Handoff | None] | None = None,
         refused: Exception | None = None,
@@ -5071,7 +5130,7 @@ class Scheduler:
             # however it ended.
             self._settle_relinquish(line_id)
             self._work.set()
-        self._apply_limits(line_id, from_operator, report)
+        self._apply_limits(line_id, cause, report)
         if failed and self._operator_mail(line_id) == mailed:
             self._hold_failed(line_id, ending)
         self.fail_over_if_unable(line_id)

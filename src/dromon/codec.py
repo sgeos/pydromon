@@ -43,6 +43,7 @@ from dromon.model import (
     MessagePrioritized,
     MessageKind,
     MessageRead,
+    MessageReceived,
     MessageSent,
     OperatorRegistered,
     QuestionSuperseded,
@@ -70,7 +71,10 @@ from dromon.model import (
     PeerDeclared,
     PeerKeyed,
     PeerRemoved,
+    LocalAddress,
+    RemoteAddress,
     parse_address,
+    parse_any_address,
 )
 
 FORMAT_VERSION: Final = 1
@@ -103,6 +107,14 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "body",
         "choices",
         "reply_to",
+    ),
+    "message_received": (
+        "message_id",
+        "sender",
+        "recipient",
+        "body",
+        "reply_to",
+        "origin_id",
     ),
     "message_delivered": ("message_id",),
     "message_read": ("message_id",),
@@ -327,6 +339,15 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "choices": list(event.choices),
                 "reply_to": event.reply_to,
             }
+        case MessageReceived():
+            return "message_received", {
+                "message_id": event.message_id,
+                "sender": str(event.sender),
+                "recipient": str(event.recipient),
+                "body": event.body,
+                "reply_to": event.reply_to,
+                "origin_id": event.origin_id,
+            }
         case MessageDelivered():
             return "message_delivered", {"message_id": event.message_id}
         case MessageRead():
@@ -511,12 +532,21 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
         case "message_sent":
             return MessageSent(
                 _str(data, "message_id"),
-                _address(data, "sender"),
-                _address(data, "recipient"),
+                _any_address(data, "sender"),
+                _any_address(data, "recipient"),
                 _member(data, "kind", MessageKind),
                 _str(data, "body"),
                 _choices(data),
                 _optional_str(data, "reply_to"),
+            )
+        case "message_received":
+            return MessageReceived(
+                _str(data, "message_id"),
+                _remote_address(data, "sender"),
+                _address(data, "recipient"),
+                _str(data, "body"),
+                _optional_str(data, "reply_to"),
+                _str(data, "origin_id"),
             )
         case "message_delivered":
             return MessageDelivered(_str(data, "message_id"))
@@ -695,8 +725,19 @@ def _optional_str(data: dict[str, object], name: str) -> str | None:
     return value
 
 
-def _address(data: dict[str, object], name: str) -> Address:
+def _address(data: dict[str, object], name: str) -> LocalAddress:
     return parse_address(_str(data, name))
+
+
+def _any_address(data: dict[str, object], name: str) -> Address:
+    return parse_any_address(_str(data, name))
+
+
+def _remote_address(data: dict[str, object], name: str) -> RemoteAddress:
+    address = parse_any_address(_str(data, name))
+    if not isinstance(address, RemoteAddress):
+        raise DecodeError(f"{name} is not a remote address")
+    return address
 
 
 def _member[

@@ -182,11 +182,40 @@ class AgentAddress:
         return AGENT_PREFIX + self.agent_id
 
 
-type Address = LineAddress | OperatorAddress | AgentAddress
+type LocalAddress = LineAddress | OperatorAddress | AgentAddress
+"""A party of this daemon."""
+
+REMOTE_SEPARATOR: Final = ":"
+"""Separates a peer's name from the address of one of its parties. It never appears in
+an identifier, so a remote address splits at its first colon without ambiguity."""
 
 
-def parse_address(text: str) -> Address:
-    """Return the address written as ``text``: ``line``, ``@operator`` or ``&agent``."""
+@dataclass(frozen=True, slots=True)
+class RemoteAddress:
+    """A party of a peer, written ``peer:party`` with the party as the peer writes it.
+
+    It begins with the peer's identifier, never with ``@`` or ``&``, so a remote
+    operator can never be read as a local one. One level only, since the party is
+    always local to the peer, so no address routes through a second peer.
+    """
+
+    peer_id: str
+    party: LocalAddress
+
+    def __post_init__(self) -> None:
+        check_id("peer_id", self.peer_id)
+        check_local_address("party", self.party)
+
+    def __str__(self) -> str:
+        return f"{self.peer_id}{REMOTE_SEPARATOR}{self.party}"
+
+
+type Address = LocalAddress | RemoteAddress
+
+
+def parse_address(text: str) -> LocalAddress:
+    """Return the local address written as ``text``: ``line``, ``@operator`` or
+    ``&agent``. A remote address is refused, as text that is not an address."""
     if text.startswith(OPERATOR_PREFIX):
         return OperatorAddress(text.removeprefix(OPERATOR_PREFIX))
     if text.startswith(AGENT_PREFIX):
@@ -194,10 +223,34 @@ def parse_address(text: str) -> Address:
     return LineAddress(text)
 
 
+def parse_any_address(text: str) -> Address:
+    """Return the address written as ``text``, local or ``peer:party``. Only the event
+    codec reads remote addresses so far, since mail to a peer needs the outbox of a
+    later step."""
+    peer_id, separator, party = text.partition(REMOTE_SEPARATOR)
+    if not separator:
+        return parse_address(text)
+    return RemoteAddress(peer_id, parse_address(party))
+
+
 def check_address(name: str, value: object) -> None:
     """Raise ``InvalidField`` unless ``value`` is an address."""
-    if not isinstance(value, LineAddress | OperatorAddress | AgentAddress):
+    if not isinstance(
+        value, LineAddress | OperatorAddress | AgentAddress | RemoteAddress
+    ):
         raise InvalidField(f"{name} is not an address: {value!r}")
+
+
+def check_local_address(name: str, value: object) -> None:
+    """Raise ``InvalidField`` unless ``value`` is a local address."""
+    if not isinstance(value, LineAddress | OperatorAddress | AgentAddress):
+        raise InvalidField(f"{name} is not a local address: {value!r}")
+
+
+def check_remote_address(name: str, value: object) -> None:
+    """Raise ``InvalidField`` unless ``value`` is a remote address."""
+    if not isinstance(value, RemoteAddress):
+        raise InvalidField(f"{name} is not a remote address: {value!r}")
 
 
 # Enumerations.
@@ -566,6 +619,32 @@ class MessageSent:
         check_optional_id("reply_to", self.reply_to)
         if self.kind is MessageKind.NOTE and self.choices:
             raise InvalidField("only a question has choices")
+
+
+@dataclass(frozen=True, slots=True)
+class MessageReceived:
+    """A note a peer delivered, from one of its parties to a local one.
+
+    One event records the message and its idempotency key, the peer and the peer's own
+    identifier for the message, so a crash cannot record one without the other. Only
+    notes cross between daemons, and ``reply_to`` names a local message, the one the
+    remote sender answers.
+    """
+
+    message_id: str
+    sender: RemoteAddress
+    recipient: LocalAddress
+    body: str
+    reply_to: str | None
+    origin_id: str
+
+    def __post_init__(self) -> None:
+        check_id("message_id", self.message_id)
+        check_remote_address("sender", self.sender)
+        check_local_address("recipient", self.recipient)
+        check_text("body", self.body)
+        check_optional_id("reply_to", self.reply_to)
+        check_id("origin_id", self.origin_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1026,7 +1105,7 @@ class OwnershipChanged:
     owner: str | None
     previous: str | None
     cause: OwnershipCause
-    by: Address
+    by: LocalAddress
     entry_id: str | None
     changed_at: str
     back_to: str | None = None
@@ -1036,7 +1115,7 @@ class OwnershipChanged:
         check_optional_id("owner", self.owner)
         check_optional_id("previous", self.previous)
         check_member("cause", self.cause, OwnershipCause)
-        check_address("by", self.by)
+        check_local_address("by", self.by)
         check_optional_id("entry_id", self.entry_id)
         check_instant("changed_at", self.changed_at)
         check_optional_id("back_to", self.back_to)
@@ -1168,6 +1247,7 @@ type Event = (
     | AgentRegistered
     | AgentRevoked
     | MessageSent
+    | MessageReceived
     | MessageDelivered
     | MessageRead
     | MessageAcknowledged
@@ -1259,6 +1339,9 @@ class Message:
     restart_note: bool = False
     """Whether ``restart_noted`` recorded the note, so its header can say so in the
     restarted daemon, which holds nothing else of the restart."""
+    origin_id: str | None = None
+    """The peer's own identifier for a message ``message_received`` recorded, or
+    ``None`` for local mail."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1365,6 +1448,20 @@ class State:
     """Each provider's latest stated budget, keyed by provider."""
     peers: dict[str, Peer] = field(default_factory=dict[str, Peer])
     """Every peer ever declared, keyed by peer, including removed ones."""
+    received: dict[tuple[str, str], str] = field(
+        default_factory=dict[tuple[str, str], str]
+    )
+    """The idempotency keys of ``message_received``, each peer and origin identifier
+    with the local identifier it was given. It grows with the mail received, as the
+    messages do."""
+    waiting_from: dict[str, int] = field(default_factory=dict[str, int])
+    """How many messages received from each peer are not yet delivered. A peer with
+    none has no entry."""
+    waiting_for: dict[LocalAddress, int] = field(
+        default_factory=dict[LocalAddress, int]
+    )
+    """How many messages received from all peers each local party has not yet been
+    delivered. A party with none has no entry."""
 
     def copy(self) -> "State":
         """Return an independent snapshot. The records are frozen, so maps suffice."""
@@ -1385,6 +1482,9 @@ class State:
             dict(self.role_entries),
             dict(self.budgets),
             dict(self.peers),
+            dict(self.received),
+            dict(self.waiting_from),
+            dict(self.waiting_for),
         )
 
     def open_questions(self, operator_id: str) -> list[str]:
@@ -1451,6 +1551,8 @@ class State:
                     raise EventRejected(f"no agent {event.agent_id} to revoke")
             case MessageSent():
                 self._check_message_sent(event)
+            case MessageReceived():
+                self._check_message_received(event)
             case MessageDelivered():
                 if self._message(event.message_id).delivered:
                     raise EventRejected(f"message {event.message_id} was delivered")
@@ -1593,9 +1695,16 @@ class State:
                 self.agents[event.agent_id] = replace(agent, revoked=True)
             case MessageSent():
                 self._apply_message_sent(event)
+            case MessageReceived():
+                self._apply_message_received(event)
             case MessageDelivered():
                 message = self.messages[event.message_id]
                 self.messages[event.message_id] = replace(message, delivered=True)
+                if isinstance(message.sender, RemoteAddress) and not isinstance(
+                    message.recipient, RemoteAddress
+                ):
+                    _decrement(self.waiting_from, message.sender.peer_id)
+                    _decrement(self.waiting_for, message.recipient)
             case MessageRead():
                 message = self.messages[event.message_id]
                 self.messages[event.message_id] = replace(message, read=True)
@@ -1732,6 +1841,9 @@ class State:
                 agent = self.agents.get(address.agent_id)
                 if agent is None or agent.revoked:
                     raise EventRejected(f"no agent {address.agent_id}")
+            case RemoteAddress():
+                # The remote party's existence is the peer's to check.
+                self._peer(address.peer_id)
             case _:
                 assert_never(address)
 
@@ -1783,6 +1895,11 @@ class State:
         if event.message_id in self.messages:
             raise EventRejected(f"message {event.message_id} exists")
         self._check_withdrawn(event.message_id)
+        if isinstance(event.sender, RemoteAddress):
+            raise EventRejected("mail from a peer is recorded by message_received")
+        if isinstance(event.recipient, RemoteAddress):
+            # Step 5 of phase 1 lifts this, with the outbox that delivers it.
+            raise EventRejected("mail to a peer needs the outbox, not yet built")
         self._require_party(event.sender)
         self._require_party(event.recipient)
         firing = self._is_firing(event)
@@ -1807,6 +1924,32 @@ class State:
             self._live_line(event.sender.line_id)
         if event.reply_to is not None:
             self._check_reply(event, event.reply_to)
+
+    def _check_message_received(self, event: MessageReceived) -> None:
+        if event.message_id in self.messages:
+            raise EventRejected(f"message {event.message_id} exists")
+        self._check_withdrawn(event.message_id)
+        reserver = self._reserver(event.message_id)
+        if reserver is not None:
+            raise EventRejected(
+                f"message {event.message_id} is reserved by line {reserver}'s"
+                " scheduled wake"
+            )
+        peer_id = event.sender.peer_id
+        self._peer(peer_id)
+        earlier = self.received.get((peer_id, event.origin_id))
+        if earlier is not None:
+            raise EventRejected(
+                f"peer {peer_id} delivered {event.origin_id} before, as {earlier}"
+            )
+        self._require_party(event.recipient)
+        if event.reply_to is not None:
+            parent = self._message(event.reply_to)
+            if (parent.sender, parent.recipient) != (event.recipient, event.sender):
+                raise EventRejected(
+                    f"a reply to {event.reply_to} must go from {parent.recipient}"
+                    f" to {parent.sender}"
+                )
 
     def _check_prioritized(self, event: MessagePrioritized) -> None:
         message = self._message(event.message_id)
@@ -2020,6 +2163,21 @@ class State:
                     parent, status=QuestionStatus.ANSWERED, answered_by=event.message_id
                 )
 
+    def _apply_message_received(self, event: MessageReceived) -> None:
+        peer_id = event.sender.peer_id
+        self.messages[event.message_id] = Message(
+            event.sender,
+            event.recipient,
+            MessageKind.NOTE,
+            event.body,
+            (),
+            event.reply_to,
+            origin_id=event.origin_id,
+        )
+        self.received[(peer_id, event.origin_id)] = event.message_id
+        self.waiting_from[peer_id] = self.waiting_from.get(peer_id, 0) + 1
+        self.waiting_for[event.recipient] = self.waiting_for.get(event.recipient, 0) + 1
+
     def _close(
         self,
         message_id: str,
@@ -2031,3 +2189,13 @@ class State:
         self.messages[message_id] = replace(
             question, status=status, superseded_by=superseded_by
         )
+
+
+def _decrement[K](counts: dict[K, int], key: K) -> None:
+    """Lower ``key``'s count by one, removing it at zero, so that a map of waiting
+    counts holds only the parties and peers with mail waiting."""
+    left = counts.get(key, 0) - 1
+    if left > 0:
+        counts[key] = left
+    else:
+        counts.pop(key, None)

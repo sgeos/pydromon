@@ -5,7 +5,8 @@ A peer is another Dromon daemon that the operator declares by name in the projec
 2026-10-28 and amended the same day. This module holds what phase 1 has built so far,
 the validated peer table, the directories it adds to every line's protected set, the
 peer events that record the table at start, and the token store under
-``.dromon/peers``. Peer mail and the peer socket come in later steps.
+``.dromon/peers``. The receiving end of peer mail is ``dromon.peering``, and the
+sending end comes in a later step.
 
 Trust. The tables are operator configuration, committed with the project, and no line
 or agent tool can change them. Each peer's state and runtime directories are denied to
@@ -40,7 +41,7 @@ from typing import Final, cast
 from dromon.model import (
     ID_PATTERN,
     MAX_TEXT_BYTES,
-    Address,
+    LocalAddress,
     Event,
     EventRejected,
     InvalidField,
@@ -136,11 +137,11 @@ class PeerDefinition:
     transport: str = TRANSPORT_UNIX
     inbound: bool = False
     outbound: bool = False
-    reach: tuple[Address, ...] = ()
+    reach: tuple[LocalAddress, ...] = ()
     """The local parties the peer may send to."""
-    senders: tuple[Address, ...] = ()
+    senders: tuple[LocalAddress, ...] = ()
     """The local parties that may send to the peer."""
-    remote: tuple[Address, ...] = ()
+    remote: tuple[LocalAddress, ...] = ()
     """The peer's parties that local senders may address, as the peer writes them."""
     priority_in: bool = False
     priority_out: bool = False
@@ -300,14 +301,14 @@ def _absolute(value: object, key: str, most: int) -> Path:
     return Path(value)
 
 
-def _parties(table: dict[str, object], key: str, name: str) -> tuple[Address, ...]:
+def _parties(table: dict[str, object], key: str, name: str) -> tuple[LocalAddress, ...]:
     """A list of local addresses, distinct and sorted, none of them remote."""
     value = table.get(name, [])
     if not isinstance(value, list) or len(cast(list[object], value)) > MAX_PARTIES:
         raise FederationError(
             f"{key}.{name} must be a list of at most {MAX_PARTIES} addresses"
         )
-    found: dict[str, Address] = {}
+    found: dict[str, LocalAddress] = {}
     for item in cast(list[object], value):
         if not isinstance(item, str):
             raise FederationError(f"{key}.{name} holds {item!r}, not an address")

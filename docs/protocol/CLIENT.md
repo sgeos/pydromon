@@ -337,7 +337,7 @@ current user with mode 0700. The daemon refuses to start otherwise and never cha
 existing directory's mode. The socket and the event log are created with mode 0600.
 
 **Peer credentials, since 2026-10-28.** Every socket the daemon serves, this one, the
-line socket and the agent socket, reads the user of each connecting process from its
+line socket, the agent socket and the peer socket, reads the user of each connecting process from its
 peer credentials, `LOCAL_PEERCRED` on macOS and `SO_PEERCRED` on Linux, and refuses a
 process of another user with one `rejected` response whose identifier is empty, then
 closes the connection and writes the refusal to standard error. A connection whose
@@ -348,6 +348,33 @@ sandbox does not deny the runtime directory, so the protocol treats every reques
 untrusted input and checks it strictly. External
 agents never use this socket. They reach the separate agent socket, whose requests are
 authorized by agent and access level.
+
+## The peer socket
+
+**Added on 2026-10-28, step 4 of federation phase 1.** A project whose
+`[federation] listen` is true also serves `peers.sock` in the runtime directory, mode
+0600, removed when the daemon stops. Peer daemons deliver mail on it, as
+[`FEDERATION.md`](../architecture/FEDERATION.md) designs. It uses the framing above
+with a line limit of 8,388,608 bytes, the bound of an encoded event, and serves only
+`ping` and the two operations below. This socket, the agent socket and the line socket
+answer every other operation `unknown_operation`, and the operator socket answers
+`hello` and `deliver` the same way.
+
+| Operation | Behaviour |
+|---|---|
+| `hello` | Arguments exactly `versions`, a list of 1 to 16 integers, `name`, an identifier the caller gives itself, advisory only, and `token`. Names the connection's peer by its token, the one `peer_token` issued, and returns `version`, the federation version chosen, today `1`. An undeclared peer and a wrong or revoked token get the one `rejected` refusal `the peer was refused`, written to standard error with the announced name. No version in common is `unsupported_version`. A second `hello` on one connection is `rejected` |
+| `deliver` | Arguments exactly `origin_id`, the sending daemon's identifier for the message, `sender` and `recipient`, each a local address as its own daemon writes it, `kind`, `body`, `reply_to`, an identifier or `null`, and `priority`, a boolean. Needs a `hello` on the connection, and checks again that the peer's token is the one it presented. Returns `outcome` `accepted` with `message_id`, `duplicate` and `priority`, which is false until priority from peers is built, or `refused` with `code` and `retry` false, or `busy` with `retry_seconds`. Only `accepted` without `duplicate` records anything, one `message_received` |
+
+The receiver's checks run in this order. Every `deliver` counts toward the peer's rate
+limit of 60 in 600 seconds, past which it is `busy`. An envelope that does not have
+exactly its keys, or whose addresses, identifiers or types do not follow the grammar,
+is `malformed`. A resend under an origin identifier already recorded is answered
+`accepted` with `duplicate` true when it is the same message, or `conflict` when it is
+not, before the policy is read, so a policy changed since then cannot refuse mail that
+was accepted. Then inbound off, a recipient outside `reach` or missing, and a question
+are `refused` alike, a body over `max_body_bytes` in UTF-8 is `too_large`, a `reply_to`
+that does not name a message from the recipient to the sender is `unknown_reply`, and
+waiting mail at `waiting_per_recipient` or at the peer's `waiting` is `full`.
 
 ## Not yet specified
 
