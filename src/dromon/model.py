@@ -22,7 +22,7 @@ each event has one explicit check, so each maps onto a Rust enum and a ``match``
 
 import re
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Final, assert_never
 
@@ -189,6 +189,21 @@ REMOTE_SEPARATOR: Final = ":"
 """Separates a peer's name from the address of one of its parties. It never appears in
 an identifier, so a remote address splits at its first colon without ambiguity."""
 
+LONGEST_EXPIRY_HOURS: Final = 24 * 90
+"""The longest a peer's ``expire_hours`` may be, and so the longest any Dromon daemon
+resends one message to a peer."""
+CLOCK_MARGIN_HOURS: Final = 24
+"""Allowance for the difference between two daemons' wall clocks."""
+RECEIVED_KEY_HOURS: Final = LONGEST_EXPIRY_HOURS + CLOCK_MARGIN_HOURS
+"""How long the key of a received message is kept. Decided by the operator on
+2026-10-28, keys older than the longest expiry are dropped, so the set is bounded by
+the mail one window can bring. A sender stops resending a message once it expires, so
+an older key would never see a resend. **Inference.** A sender whose clock runs more
+than the margin behind, or a daemon that is not Dromon, could resend past the window,
+and that resend would be recorded as a new message."""
+MAX_OUTBOX: Final = 1000
+"""The most messages that may wait for one peer. A send past it is refused at once."""
+
 
 @dataclass(frozen=True, slots=True)
 class RemoteAddress:
@@ -224,9 +239,7 @@ def parse_address(text: str) -> LocalAddress:
 
 
 def parse_any_address(text: str) -> Address:
-    """Return the address written as ``text``, local or ``peer:party``. Only the event
-    codec reads remote addresses so far, since mail to a peer needs the outbox of a
-    later step."""
+    """Return the address written as ``text``, local or ``peer:party``."""
     peer_id, separator, party = text.partition(REMOTE_SEPARATOR)
     if not separator:
         return parse_address(text)
@@ -277,6 +290,57 @@ LINE_TRANSITIONS: Final[frozenset[tuple[LineState, LineState]]] = frozenset(
 class MessageKind(StrEnum):
     NOTE = "note"
     QUESTION = "question"
+
+
+class ReturnCode(StrEnum):
+    """Why mail between daemons was refused or returned. Fixed, so a peer cannot put
+    its own text into a sender's prompt by refusing."""
+
+    UNKNOWN_PEER = "unknown_peer"
+    REFUSED = "refused"
+    TOO_LARGE = "too_large"
+    UNKNOWN_REPLY = "unknown_reply"
+    DISCLOSURE = "disclosure"
+    EXPIRED = "expired"
+    MALFORMED = "malformed"
+    CONFLICT = "conflict"
+    FULL = "full"
+
+
+RETURN_MEANINGS: Final[dict[ReturnCode, str]] = {
+    ReturnCode.UNKNOWN_PEER: "its peer is no longer declared",
+    ReturnCode.REFUSED: (
+        "the policy of the peer or of this daemon refuses its sender or recipient,"
+        " or the recipient does not exist there"
+    ),
+    ReturnCode.TOO_LARGE: "its body exceeds the limit for the peer",
+    ReturnCode.UNKNOWN_REPLY: "the peer does not know the message it replies to",
+    ReturnCode.DISCLOSURE: "it now holds a term of the disclosure list",
+    ReturnCode.EXPIRED: "it waited too long and no copy of it reached the peer",
+    ReturnCode.MALFORMED: "the peer found an address in it malformed",
+    ReturnCode.CONFLICT: "the peer holds a different message under its identifier",
+    ReturnCode.FULL: "the recipient has as much mail waiting as the peer allows",
+}
+"""What each code tells the sender of returned mail, in Dromon's own words."""
+
+
+def returned_note(message_id: str, recipient: "Address", code: ReturnCode) -> str:
+    """The note a line receives when its mail to a peer is returned."""
+    return (
+        f"Your message {message_id} to {recipient} was returned undelivered with the"
+        f" code {code.value}, which means {RETURN_MEANINGS[code]}. It was not sent"
+        " again."
+    )
+
+
+def unconfirmed_note(message_id: str, recipient: "Address") -> str:
+    """The note a line receives when its mail to a peer expired after a copy of it
+    may have reached the peer."""
+    return (
+        f"Your message {message_id} to {recipient} expired after a copy of it may have"
+        " reached the peer, so it may or may not have been delivered. It was not sent"
+        " again."
+    )
 
 
 class AgentAccess(StrEnum):
@@ -628,7 +692,8 @@ class MessageReceived:
     One event records the message and its idempotency key, the peer and the peer's own
     identifier for the message, so a crash cannot record one without the other. Only
     notes cross between daemons, and ``reply_to`` names a local message, the one the
-    remote sender answers.
+    remote sender answers. ``received_at`` dates the key, which is kept for
+    ``RECEIVED_KEY_HOURS`` only, as the operator decided on 2026-10-28.
     """
 
     message_id: str
@@ -637,6 +702,7 @@ class MessageReceived:
     body: str
     reply_to: str | None
     origin_id: str
+    received_at: str
 
     def __post_init__(self) -> None:
         check_id("message_id", self.message_id)
@@ -645,16 +711,52 @@ class MessageReceived:
         check_text("body", self.body)
         check_optional_id("reply_to", self.reply_to)
         check_id("origin_id", self.origin_id)
+        check_instant("received_at", self.received_at)
 
 
 @dataclass(frozen=True, slots=True)
 class MessageDelivered:
-    """The message reached its recipient's mailbox, by a turn, a relay or a client."""
+    """The message reached its recipient's mailbox, by a turn, a relay or a client.
+    For a recipient of a peer, the peer accepted it."""
 
     message_id: str
 
     def __post_init__(self) -> None:
         check_id("message_id", self.message_id)
+
+
+@dataclass(frozen=True, slots=True)
+class MessageReturned:
+    """Mail to a peer left its outbox undelivered, for the fixed reason ``code``.
+
+    When a line sent it, the same event records a note from the line to itself under
+    ``note_id``, as ``task_noted`` does, so its next turn says what was returned and
+    why. Mail an operator or an agent sent has no note, and shows as returned where
+    sent mail is listed.
+    """
+
+    message_id: str
+    code: ReturnCode
+    note_id: str | None
+
+    def __post_init__(self) -> None:
+        check_id("message_id", self.message_id)
+        check_member("code", self.code, ReturnCode)
+        check_optional_id("note_id", self.note_id)
+
+
+@dataclass(frozen=True, slots=True)
+class MessageUnconfirmed:
+    """Mail to a peer left its outbox when a copy of it may have reached the peer
+    without an answer, so whether it was delivered is unknown. Decision 12 of the
+    federation design. ``note_id`` is as for ``MessageReturned``."""
+
+    message_id: str
+    note_id: str | None
+
+    def __post_init__(self) -> None:
+        check_id("message_id", self.message_id)
+        check_optional_id("note_id", self.note_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1249,6 +1351,8 @@ type Event = (
     | MessageSent
     | MessageReceived
     | MessageDelivered
+    | MessageReturned
+    | MessageUnconfirmed
     | MessageRead
     | MessageAcknowledged
     | MessagePrioritized
@@ -1342,6 +1446,10 @@ class Message:
     origin_id: str | None = None
     """The peer's own identifier for a message ``message_received`` recorded, or
     ``None`` for local mail."""
+    returned: ReturnCode | None = None
+    """Why ``message_returned`` took mail to a peer from its outbox, if it did."""
+    unconfirmed: bool = False
+    """Whether ``message_unconfirmed`` took mail to a peer from its outbox."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1452,8 +1560,19 @@ class State:
         default_factory=dict[tuple[str, str], str]
     )
     """The idempotency keys of ``message_received``, each peer and origin identifier
-    with the local identifier it was given. It grows with the mail received, as the
-    messages do."""
+    with the local identifier it was given, in the order received. A key older than
+    ``RECEIVED_KEY_HOURS`` is dropped when a later message is received, so the set is
+    bounded by the mail of that window."""
+    received_times: dict[tuple[str, str], datetime] = field(
+        default_factory=dict[tuple[str, str], datetime]
+    )
+    """When each key in ``received`` was received, from its event."""
+    outbox: dict[str, dict[str, None]] = field(
+        default_factory=dict[str, dict[str, None]]
+    )
+    """Each peer's outbox, the mail to its parties neither delivered, returned nor
+    unconfirmed, in the order sent. A peer with none has no entry. The inner maps are
+    ordered sets."""
     waiting_from: dict[str, int] = field(default_factory=dict[str, int])
     """How many messages received from each peer are not yet delivered. A peer with
     none has no entry."""
@@ -1483,6 +1602,8 @@ class State:
             dict(self.budgets),
             dict(self.peers),
             dict(self.received),
+            dict(self.received_times),
+            {peer_id: dict(waiting) for peer_id, waiting in self.outbox.items()},
             dict(self.waiting_from),
             dict(self.waiting_for),
         )
@@ -1554,8 +1675,17 @@ class State:
             case MessageReceived():
                 self._check_message_received(event)
             case MessageDelivered():
-                if self._message(event.message_id).delivered:
+                message = self._message(event.message_id)
+                if message.delivered:
                     raise EventRejected(f"message {event.message_id} was delivered")
+                if message.returned is not None or message.unconfirmed:
+                    raise EventRejected(
+                        f"message {event.message_id} left its peer's outbox"
+                    )
+            case MessageReturned():
+                self._check_outbox_end(event.message_id, event.note_id)
+            case MessageUnconfirmed():
+                self._check_outbox_end(event.message_id, event.note_id)
             case MessageAcknowledged():
                 message = self._message(event.message_id)
                 if not message.delivered:
@@ -1705,6 +1835,25 @@ class State:
                 ):
                     _decrement(self.waiting_from, message.sender.peer_id)
                     _decrement(self.waiting_for, message.recipient)
+                self._leave_outbox(event.message_id, message)
+            case MessageReturned():
+                message = self.messages[event.message_id]
+                self.messages[event.message_id] = replace(message, returned=event.code)
+                self._leave_outbox(event.message_id, message)
+                self._note_end(
+                    message,
+                    event.note_id,
+                    returned_note(event.message_id, message.recipient, event.code),
+                )
+            case MessageUnconfirmed():
+                message = self.messages[event.message_id]
+                self.messages[event.message_id] = replace(message, unconfirmed=True)
+                self._leave_outbox(event.message_id, message)
+                self._note_end(
+                    message,
+                    event.note_id,
+                    unconfirmed_note(event.message_id, message.recipient),
+                )
             case MessageRead():
                 message = self.messages[event.message_id]
                 self.messages[event.message_id] = replace(message, read=True)
@@ -1898,8 +2047,15 @@ class State:
         if isinstance(event.sender, RemoteAddress):
             raise EventRejected("mail from a peer is recorded by message_received")
         if isinstance(event.recipient, RemoteAddress):
-            # Step 5 of phase 1 lifts this, with the outbox that delivers it.
-            raise EventRejected("mail to a peer needs the outbox, not yet built")
+            # The daemon's outbound policy is checked before the append, since it is
+            # configuration rather than log. The log holds what replay needs.
+            if event.kind is not MessageKind.NOTE:
+                raise EventRejected("only notes go to a peer")
+            peer_id = event.recipient.peer_id
+            if len(self.outbox.get(peer_id, {})) >= MAX_OUTBOX:
+                raise EventRejected(
+                    f"{MAX_OUTBOX} messages already wait for peer {peer_id}"
+                )
         self._require_party(event.sender)
         self._require_party(event.recipient)
         firing = self._is_firing(event)
@@ -1950,6 +2106,30 @@ class State:
                     f"a reply to {event.reply_to} must go from {parent.recipient}"
                     f" to {parent.sender}"
                 )
+
+    def _check_outbox_end(self, message_id: str, note_id: str | None) -> None:
+        """Mail may leave its peer's outbox once, by delivery, return or expiry. A
+        line sender is owed a note under ``note_id``, a new identifier, and any other
+        sender is not."""
+        message = self._message(message_id)
+        if not isinstance(message.recipient, RemoteAddress):
+            raise EventRejected(f"message {message_id} is not to a peer")
+        if message.delivered or message.returned is not None or message.unconfirmed:
+            raise EventRejected(f"message {message_id} left its peer's outbox")
+        if not isinstance(message.sender, LineAddress):
+            if note_id is not None:
+                raise EventRejected(f"{message.sender} is not a line, so has no note")
+            return
+        if note_id is None:
+            raise EventRejected(f"line {message.sender} is owed a note")
+        if note_id in self.messages:
+            raise EventRejected(f"message {note_id} exists")
+        self._check_withdrawn(note_id)
+        reserver = self._reserver(note_id)
+        if reserver is not None:
+            raise EventRejected(
+                f"message {note_id} is reserved by line {reserver}'s scheduled wake"
+            )
 
     def _check_prioritized(self, event: MessagePrioritized) -> None:
         message = self._message(event.message_id)
@@ -2162,9 +2342,47 @@ class State:
                 self.messages[event.reply_to] = replace(
                     parent, status=QuestionStatus.ANSWERED, answered_by=event.message_id
                 )
+        if isinstance(event.recipient, RemoteAddress):
+            self.outbox.setdefault(event.recipient.peer_id, {})[event.message_id] = None
+
+    def _leave_outbox(self, message_id: str, message: Message) -> None:
+        if not isinstance(message.recipient, RemoteAddress):
+            return
+        peer_id = message.recipient.peer_id
+        waiting = self.outbox.get(peer_id)
+        if waiting is None:
+            return
+        waiting.pop(message_id, None)
+        if not waiting:
+            del self.outbox[peer_id]
+
+    def _note_end(self, message: Message, note_id: str | None, body: str) -> None:
+        """Record the note a line sender is owed when its mail leaves the outbox
+        undelivered, from the line to itself."""
+        if note_id is None or not isinstance(message.sender, LineAddress):
+            return
+        self.messages[note_id] = Message(
+            message.sender, message.sender, MessageKind.NOTE, body, (), None
+        )
+
+    def _forget_old_keys(self, now: datetime) -> None:
+        """Drop the received keys older than ``RECEIVED_KEY_HOURS`` before ``now``,
+        oldest first. Keys are kept in the order received, so the loop stops at the
+        first key young enough. A wall clock set back can leave an old key behind a
+        younger one until that one ages too, which keeps a key longer, never
+        shorter. Bounded by the number of keys."""
+        cutoff = now - timedelta(hours=RECEIVED_KEY_HOURS)
+        for _ in range(len(self.received_times)):
+            key = next(iter(self.received_times))
+            if self.received_times[key] >= cutoff:
+                return
+            del self.received_times[key]
+            self.received.pop(key, None)
 
     def _apply_message_received(self, event: MessageReceived) -> None:
         peer_id = event.sender.peer_id
+        received_at = parse_due(event.received_at)
+        self._forget_old_keys(received_at)
         self.messages[event.message_id] = Message(
             event.sender,
             event.recipient,
@@ -2175,6 +2393,7 @@ class State:
             origin_id=event.origin_id,
         )
         self.received[(peer_id, event.origin_id)] = event.message_id
+        self.received_times[(peer_id, event.origin_id)] = received_at
         self.waiting_from[peer_id] = self.waiting_from.get(peer_id, 0) + 1
         self.waiting_for[event.recipient] = self.waiting_for.get(event.recipient, 0) + 1
 

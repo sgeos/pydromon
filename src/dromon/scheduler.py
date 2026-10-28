@@ -125,6 +125,8 @@ from dromon.overrides import encode as encode_override
 from dromon.driver import ENGINE_OF, MODELS, Driver, DriverError, Strategy
 from dromon import priority, restart
 from dromon.priority import PriorityLimiter, PriorityRefused
+from dromon.federation import NO_FEDERATION, FederationConfig
+from dromon.forwarder import check_outbound
 from dromon.peering import PeerTurns, TurnCause, turn_cause
 from dromon import acp, antigravity, codex, cursor, grok, pi
 from dromon.agents import LineTokens
@@ -250,9 +252,13 @@ from dromon.model import (
     MessagePrioritized,
     MessageRead,
     MessageReceived,
+    MessageReturned,
+    MessageUnconfirmed,
     MessageSent,
     LocalAddress,
     RemoteAddress,
+    ReturnCode,
+    State,
     OperatorAddress,
     AgentAddress,
     OperatorRegistered,
@@ -1169,6 +1175,10 @@ def _check_engine_supports(driver: Driver, config: LineConfig) -> None:
             raise ConfigError(reason)
 
 
+def _no_notice(peer_id: str, message_id: str) -> None:
+    """The outbox notice before the daemon sets one, which has nothing to wake."""
+
+
 def new_id(prefix: str) -> str:
     """A fresh identifier. Random, so identifiers never repeat across restarts."""
     return f"{prefix}-{secrets.token_hex(6)}"
@@ -1417,8 +1427,10 @@ class Scheduler:
             message_id
             for message_id, message in log.state.messages.items()
             if not message.delivered
+            and not isinstance(message.recipient, RemoteAddress)
         }
-        """Messages deliverable from the next tick on."""
+        """Messages deliverable from the next tick on. Mail to a peer leaves through
+        its outbox instead."""
         self._work = asyncio.Event()
         self.tick = 0
         """The number of ticks run in this daemon's lifetime."""
@@ -1431,6 +1443,11 @@ class Scheduler:
         """Lines' priority mail over the rate limit's window, in memory, so a restart
         starts the count again."""
         self.peer_turns = PeerTurns(clock)
+        self.federation: FederationConfig = NO_FEDERATION
+        """The project's peers and their policies, which the daemon sets at start."""
+        self.on_outbox: Callable[[str, str], None] = _no_notice
+        """Told each peer and message that joins its outbox, so its forwarder wakes.
+        The daemon sets it to its forwarder's."""
         """Each peer's turns per local line in the last hour, in memory, so a restart
         gives each peer a fresh allowance. Decision 10 of the federation design."""
         self._redirect_for: dict[str, str] = {}
@@ -1587,6 +1604,33 @@ class Scheduler:
         recipient's running turn to end at its next safe point. Raises
         ``EventRejected`` for priority mail ``check_priority`` refuses, recording
         nothing. A crash between the two appends leaves an ordinary note."""
+        if isinstance(recipient, RemoteAddress):
+            check_outbound(
+                self._log.state,
+                self.federation,
+                sender,
+                recipient,
+                body,
+                priority=priority,
+            )
+            # Decision 3 of the federation design. Mail to a peer leaves the project,
+            # so an operator's is held to the disclosure list too, and so is the
+            # sender's address, which the envelope carries.
+            if self.discloses(body, str(sender)):
+                raise EventRejected(disclosure.REFUSAL)
+            message_id = new_id("m")
+            self._log.append(
+                MessageSent(
+                    message_id,
+                    sender,
+                    recipient,
+                    MessageKind.NOTE,
+                    body,
+                    reply_to=reply_to,
+                )
+            )
+            self.on_outbox(recipient.peer_id, message_id)
+            return message_id
         if priority:
             self.check_priority(sender, recipient)
         message_id = new_id("m")
@@ -1630,11 +1674,55 @@ class Scheduler:
         the event does not apply, recording nothing."""
         message_id = new_id("m")
         self._log.append(
-            MessageReceived(message_id, sender, recipient, body, reply_to, origin_id)
+            MessageReceived(
+                message_id,
+                sender,
+                recipient,
+                body,
+                reply_to,
+                origin_id,
+                format_due(self._wall_clock()),
+            )
         )
         self._sent.append(message_id)
         self._work.set()
         return message_id
+
+    @property
+    def state(self) -> State:
+        """The state the log holds now."""
+        return self._log.state
+
+    def forwarded(self, message_id: str) -> None:
+        """Record that the peer accepted ``message_id``."""
+        self._log.append(MessageDelivered(message_id))
+
+    def return_mail(self, message_id: str, code: ReturnCode) -> None:
+        """Record that ``message_id`` left its peer's outbox undelivered for ``code``,
+        with a note to its sender when the sender is a line."""
+        note_id = self._owed_note(message_id)
+        self._log.append(MessageReturned(message_id, code, note_id))
+        self._noted(note_id)
+
+    def leave_unconfirmed(self, message_id: str) -> None:
+        """Record that ``message_id`` expired after a copy may have reached its peer,
+        with a note to its sender when the sender is a line."""
+        note_id = self._owed_note(message_id)
+        self._log.append(MessageUnconfirmed(message_id, note_id))
+        self._noted(note_id)
+
+    def _owed_note(self, message_id: str) -> str | None:
+        message = self._log.state.messages.get(message_id)
+        if message is None or not isinstance(message.sender, LineAddress):
+            return None
+        return new_id("m")
+
+    def _noted(self, note_id: str | None) -> None:
+        """Send the note of a return to the post office, as a task note is sent."""
+        if note_id is None:
+            return
+        self._sent.append(note_id)
+        self._work.set()
 
     def check_priority(self, sender: Address, recipient: Address) -> None:
         """Refuse priority mail that is not to a line, that a line sends itself, that
@@ -1898,7 +1986,7 @@ class Scheduler:
                 return _tool_error(disclosure.REFUSAL)
             try:
                 message_id = self.send(
-                    sender, parse_address(to), body, reply_to, priority=urgent
+                    sender, parse_any_address(to), body, reply_to, priority=urgent
                 )
             except (InvalidField, EventRejected) as error:
                 return _tool_error(str(error))

@@ -126,14 +126,18 @@ def peer_state(*, removed: bool = False) -> State:
     return state
 
 
+RECEIVED_AT = "2026-10-28T00:00:00Z"
+
+
 def received(
     message_id: str = "r1",
     origin_id: str = "o1",
     body: str = "hello",
     recipient: LineAddress | OperatorAddress | AgentAddress = ALPHA,
     reply_to: str | None = None,
+    at: str = RECEIVED_AT,
 ) -> MessageReceived:
-    return MessageReceived(message_id, KAIZEN, recipient, body, reply_to, origin_id)
+    return MessageReceived(message_id, KAIZEN, recipient, body, reply_to, origin_id, at)
 
 
 def test_received_mail_is_recorded_with_its_key_and_counted_while_it_waits() -> None:
@@ -191,19 +195,22 @@ def test_mail_from_an_undeclared_or_removed_peer_is_rejected() -> None:
         state.apply(received())
 
 
-def test_message_sent_never_carries_a_remote_party_before_the_outbox() -> None:
+def test_message_sent_never_comes_from_a_remote_party() -> None:
     state = peer_state()
     with pytest.raises(EventRejected, match="message_received"):
         state.apply(MessageSent("m1", KAIZEN, ALPHA, MessageKind.NOTE, "x"))
-    with pytest.raises(EventRejected, match="outbox"):
-        state.apply(MessageSent("m1", ALPHA, KAIZEN, MessageKind.NOTE, "x"))
 
 
 MALFORMED_RECEIVED: list[Callable[[], object]] = [
-    lambda: MessageReceived("r1", cast(RemoteAddress, ALPHA), ALPHA, "x", None, "o"),
-    lambda: MessageReceived("r1", KAIZEN, cast(LineAddress, KAIZEN), "x", None, "o"),
-    lambda: MessageReceived("r1", KAIZEN, ALPHA, "x", None, "Not An Id"),
-    lambda: MessageReceived("r1", KAIZEN, ALPHA, "x", "Bad Id", "o"),
+    lambda: MessageReceived(
+        "r1", cast(RemoteAddress, ALPHA), ALPHA, "x", None, "o", RECEIVED_AT
+    ),
+    lambda: MessageReceived(
+        "r1", KAIZEN, cast(LineAddress, KAIZEN), "x", None, "o", RECEIVED_AT
+    ),
+    lambda: MessageReceived("r1", KAIZEN, ALPHA, "x", None, "Not An Id", RECEIVED_AT),
+    lambda: MessageReceived("r1", KAIZEN, ALPHA, "x", "Bad Id", "o", RECEIVED_AT),
+    lambda: MessageReceived("r1", KAIZEN, ALPHA, "x", None, "o", "yesterday"),
     lambda: RemoteAddress(PEER, cast(LineAddress, KAIZEN)),
     lambda: RemoteAddress("Bad Peer", ALPHA),
 ]
@@ -254,7 +261,9 @@ class Recorder:
         self.count += 1
         message_id = f"r{self.count}"
         self.state.apply(
-            MessageReceived(message_id, sender, recipient, body, reply_to, origin_id)
+            MessageReceived(
+                message_id, sender, recipient, body, reply_to, origin_id, RECEIVED_AT
+            )
         )
         return message_id
 

@@ -734,13 +734,16 @@ def _sent(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     entries = cast(list[dict[str, object]], response.get("messages", []))
     print(f"{response.get('total')} sent")
     for entry in entries:
-        delivery = (
-            "read"
-            if entry.get("read") is True
-            else "delivered"
-            if entry.get("delivered") is True
-            else "waiting"
-        )
+        delivery = entry.get("delivery")
+        if not isinstance(delivery, str):
+            # A daemon before step 5 of federation sends no delivery.
+            delivery = (
+                "read"
+                if entry.get("read") is True
+                else "delivered"
+                if entry.get("delivered") is True
+                else "waiting"
+            )
         print(
             f"{entry.get('message_id')} to {entry.get('recipient')},"
             f" {entry.get('kind')}, {delivery}, {entry.get('outcome')}"

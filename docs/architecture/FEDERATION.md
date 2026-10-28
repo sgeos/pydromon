@@ -4,12 +4,13 @@
 
 **Approved by the operator on 2026-10-28, with all seven decisions at the end as
 recommended.** Phase 1 is being built in steps, starting with the peer credential check
-on the existing sockets. Steps 1 to 4 are built, and a part built is marked
+on the existing sockets. Steps 1 to 5 are built, and a part built is marked
 **Implemented** with its date and step. **Amended on 2026-10-28** with the operator's decisions on the
 review line's findings, which are collected as decisions 8 to 16 at the end and marked
 **Decided** where they apply. Points marked **Proposed** below are approved design that
 is not yet built. Points marked **Proposed, not yet decided** came from the review or
-from the amendments, await the operator, and are listed after the decisions.
+from the amendments, await the operator, and are listed after the decisions. The
+operator decided six of them later on 2026-10-28, as decisions 17 to 22.
 
 The operator asked for communication between Dromon daemons, first between two pydromon
 daemons on one machine, such as the Keleusma project's daemon and this one, and then
@@ -103,10 +104,10 @@ a fourth form, the remote address, and its text is the form above. **Fact.** Tod
 a line, and an identifier cannot contain `:`, so no existing log holds a remote address
 and none decodes differently. **Implemented on 2026-10-28, step 4 of phase 1.** The
 model holds a remote address as a peer's identifier and a local address, and the codec
-reads and writes its text form. Only `message_received` carries one so far. A line's
-`send_message` and an operator's `send` still refuse a remote address, and the model
-refuses one in `message_sent`, until the outbox of step 5. A line's `list_mail` accepts
-one as a sender to filter by.
+reads and writes its text form. A line's `list_mail` accepts one as a sender to filter
+by. **Implemented on 2026-10-28, step 5.** A line's `send_message`, an agent's, and an
+operator's `send` accept a remote address as the recipient, and `message_sent` records
+it, as the sending rules below require. The sender of a `message_sent` is never remote.
 
 ## Trust
 
@@ -267,14 +268,24 @@ senders = ["core"]
   denies every line Dromon's state and runtime directories, and from other users by its
   file mode. It is not kept from an unconfined process of the same user, as the trust
   section states, which is why decision 9 refuses peers while a line runs unconfined.
-- **Before `hello`.** **Proposed, not yet decided.** A connection that has not
-  completed `hello` within 10 seconds is closed, and at most 8 such connections are open
-  at once, so a local process cannot hold the listener. An undeclared peer name and a
+- **Before `hello`.** **Decided by the operator on 2026-10-28, as decision 20, and
+  implemented in step 5.** A connection's first line must arrive within 10 seconds and
+  hold at most 65,536 bytes, and anything but an accepted `hello` closes the connection
+  after its answer. The stream's own limit is that of the `hello` line, and an
+  identified peer's larger lines are read in chunks up to 8,388,608 bytes, so a process
+  that holds no token can make the daemon buffer about twice 65,536 bytes per
+  connection, the stream's flow control, and no more. An undeclared peer name and a
   wrong token get the same refusal, so a caller cannot learn which peer names are
-  declared. **Not built in step 4,** since it is not decided. The 30 second idle
-  timeout of every socket closes a connection that sends nothing, and the 8,388,608
-  byte line limit applies before `hello` as after, so one process of the operator's
-  user can still hold several connections open, each with a buffer of that size.
+  declared. **Decided by the operator later on 2026-10-28, as decision 23.** The
+  listener owns the cap on connections, which is 16 at once, counted before the
+  `peercred` check, and a further connection is answered `rejected` and closed. The
+  number 16 is the core line's choice, not the operator's, and leaves room beyond one
+  connection per configured peer for one that a restarted peer left open until its idle
+  timeout. **Inference.** A process that holds no token can therefore make the daemon
+  buffer about 16 times twice 65,536 bytes before `hello`, and it can also hold every
+  slot for 10 seconds at a time, which keeps the configured peers out while it does.
+  That denial of service needs a process of the operator's own user, which the trust
+  section already does not defend against.
 - **The peer's directories.** **Implemented on 2026-10-28, step 2 of phase 1.** Each
   declared peer's runtime directory, the directory of its `socket`, and the `.dromon` of
   its `project` when one is named, join the project's protected directories. Every
@@ -304,8 +315,8 @@ primitives from standard libraries.
 each side presents a self-signed certificate and checks the other's against a pinned
 SHA-256 digest of its public key.
 
-- **Keys.** `dromon peer key` makes the daemon's key pair once, Ed25519 by default with
-  ECDSA P-256 as the fallback where a peer's library lacks Ed25519, and prints its pin.
+- **Keys.** `dromon peer key` makes the daemon's key pair once, Ed25519 alone as
+  decision 21 settles, and prints its pin.
   Operators exchange pins out of band and write the peer's pin in the configuration.
 - **Handshake.** Version 1.3 only, with early data refused, since data sent in a
   zero round trip handshake can be replayed. The pin is the identity, so no certificate
@@ -379,6 +390,35 @@ third daemon.
 5. On a permanent refusal, the daemon appends `message_returned` with the refusal's
    code, and the outbox moves to the next message. On a transient one it retries the
    same message later.
+
+**Implemented on 2026-10-28, step 5 of phase 1,** in `dromon.forwarder`, with the model's
+outbox in `State.outbox`. Choices the design left open, for the operator's review.
+
+- **The policy is checked at send and again before each attempt.** A message whose
+  sender, recipient, size or text no longer passes the policy or the disclosure list in
+  force is returned with `refused`, `too_large` or `disclosure`, never sent. **Reason.**
+  A restart may change the project file, and the design already re-checks the
+  disclosure list there.
+- **Priority mail to a peer is refused at send** until step 6, whatever `priority_out`
+  says, and the envelope's `priority` is false.
+- **A `tls` peer is refused at send** until phase 2. Mail already waiting for a peer
+  whose transport became `tls` waits and expires, since no connector reaches it.
+- **The token is read at each connection,** so a token stored with `dromon peer store`
+  while the daemon runs is used at the next attempt. With none stored, the forwarder
+  backs off and says so on standard error.
+- **The transport seam.** A connector opens a link that carries one request and its
+  answer at a time. `connect_unix` is phase 1's, and the TLS transport of the engines
+  role's `dromon.federation_tls` becomes another connector in phase 2. `hello` and
+  `deliver` are the forwarder's and do not change, except that `hello` carries the
+  token only where the transport needs one.
+- **The name announced in `hello`** is the project directory's name, lowercased, when
+  it is an identifier the disclosure list does not cover, and `dromon` otherwise.
+- **An answer that is not an answer,** an error response, a malformed result or a
+  refusal code outside the table, is transient and backs off. A malformed one counts as
+  unanswered, so the message may expire as unconfirmed. An error response says the peer
+  recorded nothing, so it does not.
+- **No outage note and no peer state in `status` yet.** **Not built in step 5.** Both
+  are in the design under a peer that is down.
 
 ### Receiving
 
@@ -475,7 +515,8 @@ autonomous-turn limit, even when an override has lowered the limit below the cou
 - **Cost is still counted.** **Fact.** The tokens a turn spends are real whatever woke
   it, so a turn started by peer mail counts toward the line's cost limit, and that limit
   can hold the line. **Inference.** The per-peer allowance bounds how fast a peer can
-  bring a line to it, not whether. This is an open point below.
+  bring a line to it, not whether. **Decided by the operator on 2026-10-28, as decision
+  17.** Peer turns stay under the line's existing cost hold, with no cap of their own.
 
 ### Priority mail
 
@@ -518,7 +559,13 @@ the bounds survive a restart.
 ### When a peer is down
 
 - **Retry.** The forwarder retries the head of a peer's outbox with exponential backoff
-  from 5 seconds to 15 minutes, reset on success and on a restart.
+  from 5 seconds to 15 minutes, reset on success and on a restart. New mail ends an idle
+  wait and never a backoff. **Implemented in step 5.**
+- **Busy.** **Decided by the operator on 2026-10-28, as decision 18, and implemented in
+  step 5.** A `busy` answer waits the seconds the peer asks, at least 1 and at most the
+  backoff's 15 minutes. The 20th `busy` answer for one message ends it as an expired
+  message, returned with `expired` when no copy of it can have reached the peer, and
+  unconfirmed otherwise.
 - **Expiry.** **Decided.** A message older than the peer's `expire_hours`, a week by
   default, leaves the outbox. If its envelope may have reached the peer without an
   answer, its outcome is unknown and the daemon records `message_unconfirmed`, not a
@@ -529,11 +576,14 @@ the bounds survive a restart.
   writes its envelope, and after a restart it treats every waiting message as possibly
   written, which errs toward unknown. The note to a line sender says that the message
   may or may not have been delivered.
-- **Clocks.** **Proposed.** Backoff runs on the monotonic clock. Expiry compares the
-  event's recorded time with the wall clock, since it must survive a restart, so a wall
-  clock moved forward expires mail early, and the outcome is then unknown as above.
+- **Clocks.** **Implemented in step 5.** Backoff runs on the monotonic clock. Expiry
+  compares the wall clock with the `recorded_at` of the message's `message_sent`, read
+  from the log at start, and with the time the forwarder was told of mail sent while it
+  runs. **Porting note.** The model never reads `recorded_at`, and only this runtime
+  decision does. A wall clock moved forward expires mail early, and the outcome is then
+  unknown as above.
 - **Bounds.** At most 1,000 messages wait for one peer. A send beyond that is refused at
-  once and records nothing.
+  once and records nothing. **Implemented in step 5,** as a rule of `message_sent`.
 - **Telling the operator.** `status` and `line_status` show each peer's state, its
   oldest waiting message and the time of its last contact. When a peer's oldest message
   has waited an hour, the daemon sends one note to its default operator for that
@@ -553,7 +603,7 @@ put text into the sender's prompt by refusing.
 | `too_large` | The body exceeds the peer's limit |
 | `unknown_reply` | The peer does not know the message this one replies to |
 | `disclosure` | The body now holds a term of this daemon's disclosure list, below |
-| `expired` | The message waited longer than `expire_hours` and its envelope was never written |
+| `expired` | The message waited longer than `expire_hours`, or had 20 `busy` answers, and no copy of it can have reached the peer |
 | `malformed` | An address in the envelope does not follow the grammar |
 | `conflict` | The peer holds a different message under the same origin identifier |
 | `full` | The recipient, or the peer's share of the receiver, has as much mail waiting as the bounds allow |
@@ -563,10 +613,10 @@ state, and are given only after `reach` passed, which the review line found acce
 
 When the sender is a line, the same event records a note from the line to itself, as
 `task_noted` does, so its next wake prompt says which message was returned and why. An
-operator sees it in `dromon sent`. **Proposed, not yet decided.** When more than one
-message to a peer is returned or left unconfirmed in one tick, a line sender gets one
-note that lists them, so a peer that expires a long queue does not wake the line once
-per message.
+operator sees it in `dromon sent`. **Decided by the operator on 2026-10-28, as decision 19.** No batching in
+version 1. Each returned or unconfirmed message gives its line sender one note, and the
+notes of one tick wake the line once, as any mail does. **Implemented in step 5.** The
+note's text is derived from the code by the model, so it holds only Dromon's own words.
 
 ## Disclosure
 
@@ -614,7 +664,7 @@ the outbox, the idempotency keys and each peer's policy exactly.
 | `peer_removed` | `peer_id` | The peer is declared. Addresses through it are refused from then on, and the daemon returns every message still waiting for it with `unknown_peer` |
 | `peer_keyed` | `peer_id`, `token_sha256` | The peer is declared. The digest of the token this daemon issued for the peer, or empty to revoke it. Recorded by `dromon peer token` |
 | `message_sent` | Unchanged | Also applies to a remote recipient when its peer is declared and not removed, the sender is local and the kind is `note`. The remote party's existence is the peer's to check |
-| `message_received` | `message_id`, `sender` remote address, `recipient` local address, `body`, `reply_to` local message identifier or `null`, `origin_id` | The sender's peer is declared and not removed, no earlier `message_received` has this peer and origin identifier, and the message rules of [`EVENT_LOG.md`](../protocol/EVENT_LOG.md) hold for a note, with the remote sender standing in for an existing one. Implemented in step 4 |
+| `message_received` | `message_id`, `sender` remote address, `recipient` local address, `body`, `reply_to` local message identifier or `null`, `origin_id`, `received_at` | The sender's peer is declared and not removed, no earlier `message_received` kept has this peer and origin identifier, and the message rules of [`EVENT_LOG.md`](../protocol/EVENT_LOG.md) hold for a note, with the remote sender standing in for an existing one. Implemented in step 4, and `received_at` in step 5 for the bound on the keys |
 | `message_prioritized` | Unchanged | Also follows a `message_received` when the receiver honours its priority |
 | `message_delivered` | Unchanged | For a remote recipient, the peer accepted the message |
 | `message_returned` | `message_id`, `code`, `note_id` message identifier or `null` | The message has a remote recipient and is neither delivered, returned nor unconfirmed. With a line sender, `note_id` names the note to the line, checked as `task_noted` is |
@@ -638,9 +688,20 @@ allowances, the rate limit and the outage note's flag are in memory, and a resta
 resets them. That only retries sooner, may send one more outage note, and gives each
 peer a fresh allowance, and only the operator restarts the daemon.
 
-**Growth.** **Inference.** The idempotency keys grow with the mail received, as the
-messages themselves do. They add one identifier per message, so they add no new class
-of growth to the log's existing debt of no compaction.
+**Implemented on 2026-10-28, step 5 of phase 1.** `message_sent` to a remote party,
+`message_returned` and `message_unconfirmed`, as [`EVENT_LOG.md`](../protocol/EVENT_LOG.md)
+specifies. The outbox is the model's `outbox`, rebuilt by replay. At start the daemon
+returns the mail of a removed peer with `unknown_peer` before its forwarder runs.
+
+**Growth.** **Decided by the operator on 2026-10-28, as decision 22, and implemented in
+step 5.** The idempotency keys are bounded by the expiry window. Applying a
+`message_received` drops the keys received more than 2,184 hours before it, the longest
+`expire_hours` of 90 days and one day for the difference between two daemons' clocks.
+**Reason.** A sender never resends a message past its expiry, so an older key would see
+no resend. `received_at` is in the event, so replay drops the same keys. **Inference.**
+A sender whose clock runs more than a day behind, or a daemon that is not Dromon, could
+resend past the window, and the resend would be recorded as a new message. The messages
+themselves still grow with the log, which has no compaction.
 
 ## Wire protocol
 
@@ -678,9 +739,10 @@ daemon restarts, so a peer that changes its name on each connection sends one no
   exposes as one call per system, rather than `getpeereid`, which Linux lacks. The
   standard library's `peer_cred` is still an unstable feature. The behaviour on macOS
   and on Linux is stated separately in step 1's tests.
-- **Bounded memory.** **Open.** The idempotency set grows with the log. A Keleusma
-  implementation with bounded memory cannot hold it whole, so it will need a bound, or a
-  window past which a resend is refused without a lookup.
+- **Bounded memory.** **Decided, as decision 22.** The idempotency set holds only the
+  keys of the expiry window, so a Keleusma implementation needs room for the mail one
+  window can bring, which the rate limit bounds at 60 messages in 600 seconds for each
+  peer.
 - **Transport Layer Security.** Python's `ssl` in the prototype, `rustls` in Rust, and
   the host's library under Keleusma, which has no cryptography of its own and should not
   gain any.
@@ -765,16 +827,35 @@ changing the envelope's version 1, unless noted.
 
 **Open, raised by the review line or by these amendments, and not yet decided.**
 
-- Whether turns started by peer mail should have a cost cap of their own, since the
-  line's cost limit can still hold it.
-- A cap on `busy` answers for one message, so that a busy peer cannot stall a queue
-  for the whole expiry period. The recommendation is to expire the message after 20
-  `busy` answers, under decision 12.
-- One note per batch of returned or unconfirmed mail, and one note per change of a
-  peer's `hello` name, as proposed above.
-- The bounds before `hello` and on unauthenticated handshakes, 10 seconds and 8
-  connections, as proposed above.
-- Ed25519 alone or with the P-256 fallback. The review line recommends one algorithm.
-  The recommendation is Ed25519 alone, since both daemons are Dromon and use the same
-  library.
-- A bound on the idempotency set for a port with bounded memory.
+- One note per change of a peer's `hello` name, as proposed above.
+- The bound on unauthenticated TLS handshakes, 10 seconds as proposed above, which
+  phase 2 needs. Its count is no longer open, since decision 23 gives it to the
+  listener, which counts a TLS connection as it counts one on `peers.sock`.
+
+**Decided by the operator later on 2026-10-28.**
+
+17. **Peer turns and cost.** Turns started by peer mail stay under the line's existing
+    cost hold, with no cap of their own.
+18. **A cap on `busy`.** A message ends as expired after 20 `busy` answers, under
+    decision 12.
+19. **No batching in version 1.** Each returned or unconfirmed message gives its line
+    sender one note.
+20. **The bound before `hello`.** 10 seconds and one line of 65,536 bytes, and the
+    connection is closed otherwise.
+21. **Ed25519 alone,** without the P-256 fallback, since both daemons are Dromon and use
+    the same library.
+22. **The idempotency set** is bounded by the expiry window, dropping keys older than
+    the longest expiry.
+
+**Decided by the operator later on 2026-10-28, from the review of the TLS transport.**
+
+23. **The listener owns the connection cap.** The cap is counted where a connection is
+    accepted, not in a transport, so phase 2's TLS connections fall under the same
+    cap. Step 5 sets it at 16.
+24. **Delivery is recorded only from the peer's answer.** **Fact, from that review.**
+    The TLS client returns a writable socket before the server has accepted the
+    client's certificate, so a write that succeeds says nothing about delivery. The
+    forwarder records a message as delivered only from an `accepted` answer to its
+    `deliver`, read after an accepted answer to `hello`, on the Unix domain socket
+    transport as well. A link that takes the writes and never answers leaves the
+    message waiting, marked as possibly sent once a `deliver` was written.

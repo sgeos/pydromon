@@ -18,7 +18,7 @@ all see the same mailbox.
 from dataclasses import dataclass
 from typing import Final
 
-from dromon.model import Address, Message, State
+from dromon.model import Address, Message, RemoteAddress, State
 
 MAX_PAGE: Final = 50
 """Upper bound on the messages one listing returns, so a large mailbox is paged."""
@@ -136,13 +136,29 @@ class SentStatus:
     read: bool
     outcome: str
     """``replied``, ``acknowledged`` or ``unanswered``."""
+    delivery: str
+    """``waiting``, ``delivered`` or ``read`` for local mail. Mail to a peer is
+    ``waiting for peer``, ``delivered to peer``, ``returned`` with its code, or
+    ``unconfirmed``, since this daemon never learns whether a remote party read it."""
 
     def line(self) -> str:
-        delivery = "read" if self.read else "delivered" if self.delivered else "waiting"
         return (
-            f"{self.message_id} to {self.recipient}, {self.kind}, {delivery},"
+            f"{self.message_id} to {self.recipient}, {self.kind}, {self.delivery},"
             f" {self.outcome}"
         )
+
+
+def delivery(message: Message) -> str:
+    """How far ``message`` went, as ``SentStatus.delivery`` gives it."""
+    if not isinstance(message.recipient, RemoteAddress):
+        return (
+            "read" if message.read else "delivered" if message.delivered else "waiting"
+        )
+    if message.returned is not None:
+        return f"returned {message.returned.value}"
+    if message.unconfirmed:
+        return "unconfirmed"
+    return "delivered to peer" if message.delivered else "waiting for peer"
 
 
 def sent(
@@ -168,6 +184,7 @@ def sent(
             message.delivered,
             message.read,
             outcome(message_id, message, replied),
+            delivery(message),
         )
         if not unanswered_only or status.outcome == "unanswered":
             statuses.append(status)

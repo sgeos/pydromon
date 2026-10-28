@@ -44,6 +44,7 @@ from dromon.model import (
     MessageKind,
     OperatorAddress,
     RemoteAddress,
+    ReturnCode,
     State,
     check_text,
     parse_address,
@@ -55,6 +56,19 @@ list."""
 MAX_VERSIONS: Final = 16
 """The most versions a ``hello`` may list."""
 MAX_HELLO_TOKEN_BYTES: Final = 256
+HELLO_TIMEOUT_SECONDS: Final = 10.0
+MAX_HELLO_LINE_BYTES: Final = 64 * 1024
+"""Decided by the operator on 2026-10-28. A connection to ``peers.sock`` must send its
+``hello`` within ``HELLO_TIMEOUT_SECONDS``, as one line of at most this many bytes, and
+is closed after any first line that is not an accepted ``hello``. Only an identified
+peer may send the larger lines of ``deliver``, so a process that holds no token cannot
+make the daemon buffer them."""
+MAX_PEER_CONNECTIONS: Final = 16
+"""The most connections the peer listener serves at once, which the operator assigned
+to the listener on 2026-10-28. Each configured peer's forwarder holds at most one, and
+the rest of the room covers a connection a restarted peer left behind until its idle
+timeout. Together with the hello line's bound, it limits what processes that hold no
+token can make the daemon buffer."""
 
 RATE_WINDOW_SECONDS: Final = 600.0
 RATE_PER_PEER: Final = 60
@@ -73,19 +87,8 @@ DELIVER_KEYS: Final = frozenset(
 HELLO_KEYS: Final = frozenset({"versions", "name", "token"})
 
 
-class Code(StrEnum):
-    """Why a peer's mail was refused or returned. Fixed, so a peer cannot put its own
-    text into a sender's prompt by refusing."""
-
-    UNKNOWN_PEER = "unknown_peer"
-    REFUSED = "refused"
-    TOO_LARGE = "too_large"
-    UNKNOWN_REPLY = "unknown_reply"
-    DISCLOSURE = "disclosure"
-    EXPIRED = "expired"
-    MALFORMED = "malformed"
-    CONFLICT = "conflict"
-    FULL = "full"
+Code = ReturnCode
+"""The fixed codes of a refusal, which are the codes of returned mail."""
 
 
 @dataclass(frozen=True, slots=True)

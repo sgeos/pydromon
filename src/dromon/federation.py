@@ -6,7 +6,7 @@ A peer is another Dromon daemon that the operator declares by name in the projec
 the validated peer table, the directories it adds to every line's protected set, the
 peer events that record the table at start, and the token store under
 ``.dromon/peers``. The receiving end of peer mail is ``dromon.peering``, and the
-sending end comes in a later step.
+sending end is ``dromon.forwarder``.
 
 Trust. The tables are operator configuration, committed with the project, and no line
 or agent tool can change them. Each peer's state and runtime directories are denied to
@@ -40,6 +40,7 @@ from typing import Final, cast
 
 from dromon.model import (
     ID_PATTERN,
+    LONGEST_EXPIRY_HOURS,
     MAX_TEXT_BYTES,
     LocalAddress,
     Event,
@@ -88,7 +89,7 @@ MAX_PROJECT_PATH_BYTES: Final = 4096
 
 DEFAULT_MAX_BODY_BYTES: Final = 65536
 DEFAULT_EXPIRE_HOURS: Final = 168
-MAX_EXPIRE_HOURS: Final = 24 * 90
+MAX_EXPIRE_HOURS: Final = LONGEST_EXPIRY_HOURS
 DEFAULT_TURNS_PER_HOUR: Final = 6
 MAX_TURNS_PER_HOUR: Final = 60
 DEFAULT_WAITING: Final = 500

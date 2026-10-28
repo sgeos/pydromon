@@ -44,6 +44,8 @@ from dromon.model import (
     MessageKind,
     MessageRead,
     MessageReceived,
+    MessageReturned,
+    MessageUnconfirmed,
     MessageSent,
     OperatorRegistered,
     QuestionSuperseded,
@@ -73,6 +75,7 @@ from dromon.model import (
     PeerRemoved,
     LocalAddress,
     RemoteAddress,
+    ReturnCode,
     parse_address,
     parse_any_address,
 )
@@ -115,8 +118,11 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "body",
         "reply_to",
         "origin_id",
+        "received_at",
     ),
     "message_delivered": ("message_id",),
+    "message_returned": ("message_id", "code", "note_id"),
+    "message_unconfirmed": ("message_id", "note_id"),
     "message_read": ("message_id",),
     "message_acknowledged": ("message_id",),
     "message_prioritized": ("message_id",),
@@ -347,9 +353,21 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "body": event.body,
                 "reply_to": event.reply_to,
                 "origin_id": event.origin_id,
+                "received_at": event.received_at,
             }
         case MessageDelivered():
             return "message_delivered", {"message_id": event.message_id}
+        case MessageReturned():
+            return "message_returned", {
+                "message_id": event.message_id,
+                "code": event.code.value,
+                "note_id": event.note_id,
+            }
+        case MessageUnconfirmed():
+            return "message_unconfirmed", {
+                "message_id": event.message_id,
+                "note_id": event.note_id,
+            }
         case MessageRead():
             return "message_read", {"message_id": event.message_id}
         case MessageAcknowledged():
@@ -547,9 +565,20 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "body"),
                 _optional_str(data, "reply_to"),
                 _str(data, "origin_id"),
+                _str(data, "received_at"),
             )
         case "message_delivered":
             return MessageDelivered(_str(data, "message_id"))
+        case "message_returned":
+            return MessageReturned(
+                _str(data, "message_id"),
+                _member(data, "code", ReturnCode),
+                _optional_str(data, "note_id"),
+            )
+        case "message_unconfirmed":
+            return MessageUnconfirmed(
+                _str(data, "message_id"), _optional_str(data, "note_id")
+            )
         case "message_read":
             return MessageRead(_str(data, "message_id"))
         case "message_acknowledged":
@@ -749,6 +778,7 @@ def _member[
         RoleNoteKind,
         BudgetSource,
         FailoverPolicy,
+        ReturnCode,
     )
 ](data: dict[str, object], name: str, kind: type[T]) -> T:
     value = _str(data, name)

@@ -53,7 +53,7 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `questions` | Optionally `operator`. Result `{"questions": [...]}`, the open questions for that operator, or for all when omitted, oldest first, each with `question_id`, `line`, `operator`, `text` and `choices`. Listing marks each question delivered, because the client has shown it |
 | `mail` | Arguments `operator`, and optionally `unread_only`, `sender`, `offset` and `limit`, at most 50. Delivers the operator's undelivered mail, then returns `total`, `unread`, `unanswered` and `messages`, a page of headers with `message_id`, `sender`, `kind`, `reply_to`, `read` and `outcome`, one of `replied`, `acknowledged` and `unanswered`, oldest first |
 | `acknowledge` | Arguments `operator` and `message_id`. Marks a message in the operator's mailbox dealt with, without a reply |
-| `sent` | Arguments `operator`, and optionally `unanswered_only`, `offset` and `limit`. Returns `total` and `messages`, the operator's sent mail with `message_id`, `recipient`, `kind`, `delivered`, `read` and `outcome` |
+| `sent` | Arguments `operator`, and optionally `unanswered_only`, `offset` and `limit`. Returns `total` and `messages`, the operator's sent mail with `message_id`, `recipient`, `kind`, `delivered`, `read`, `outcome` and `delivery`. `delivery` is `waiting`, `delivered` or `read` for local mail, and `waiting for peer`, `delivered to peer`, `returned` with its code, or `unconfirmed` for mail to a peer, added on 2026-10-28 |
 | `read` | Arguments `operator` and `message_id`. Returns the message with its `body` and `choices`, and marks it read the first time |
 | `line_view` | Arguments `line_id`, and optionally `limit`, at most 50. Returns `line`, the line's status entry, `tick`, `total`, the count of messages involving the line, `messages`, the newest of them oldest first, each with a body preview of at most 600 characters and `truncated`, kept within a 40,000 byte budget, and `open_questions`, the line's open questions. What an attached client polls |
 | `line_activity` | Arguments `line_id`, and optionally `after`, a revision, default 0. Returns `line_id`, `seq`, the daemon's newest revision, `entries`, the line's activity entries changed after `after`, oldest first, the newest kept within a 40,000 byte budget, and `complete`, false when older changed entries were left out. Each entry has `entry_id`, `seq`, `kind` and `text`, as the activity section below specifies. What an attached client polls to follow a turn |
@@ -81,7 +81,7 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `peer_store` | Arguments `peer`, a peer the log holds as declared, and `token`, 16 to 256 letters, digits, `-` or `_`. Stores the token the peer issued for this daemon in `.dromon/peers/PEER.token`, mode 0600 in a directory of mode 0700, replacing any earlier one, and returns `peer` and `stored`, the file's path. A refusal never quotes the token. Operator only, and not offered to external agents. Added on 2026-10-28 |
 | `peer_list` | No arguments. Returns `listen` and `peers`, each with `peer`, `transport`, `socket`, `inbound`, `outbound`, `issued`, whether a token is issued for it, and `stored`, whether one from it is stored, or the reason a stored file is refused. Never a token or a digest. Operator only, and not offered to external agents. Added on 2026-10-28 |
 | `answer` | Arguments `question_id`, `body` and `operator`. Records the operator's reply, which must come from the operator the question was asked of. Result `{"message_id": ...}`. The answer wakes the asking line in a later tick |
-| `send` | Arguments `recipient`, a line or `@operator`, `body`, `operator`, and optionally `reply_to` and `priority`, a boolean, default false. Registers the operator if new and records a note from them. With `priority` true the note is priority mail, as [`PRIORITY.md`](PRIORITY.md) specifies, which must go to a line and which for an operator is unlimited. Result `message_id` and `priority`. A refused priority note records nothing and registers no operator |
+| `send` | Arguments `recipient`, a line, `@operator`, or from 2026-10-28 a remote address such as `keleusma:@ana` that the outbound policy allows, `body`, `operator`, and optionally `reply_to` and `priority`, a boolean, default false. Registers the operator if new and records a note from them. With `priority` true the note is priority mail, as [`PRIORITY.md`](PRIORITY.md) specifies, which must go to a line and which for an operator is unlimited. Mail to a peer is held to the disclosure list, and may not be priority mail before step 6 of federation phase 1. Result `message_id` and `priority`. A refused priority note records nothing and registers no operator |
 
 `status` also returns `tick`, the ticks run in this daemon's lifetime, and `lines`, one
 entry per line with `line_id`, `engine`, `strategy`, `state`, `condition`, as
@@ -375,6 +375,24 @@ was accepted. Then inbound off, a recipient outside `reach` or missing, and a qu
 are `refused` alike, a body over `max_body_bytes` in UTF-8 is `too_large`, a `reply_to`
 that does not name a message from the recipient to the sender is `unknown_reply`, and
 waiting mail at `waiting_per_recipient` or at the peer's `waiting` is `full`.
+
+**Before `hello`.** **Decided by the operator on 2026-10-28, and built in step 5.** A
+connection's first line must arrive within 10 seconds and hold at most 65,536 bytes,
+and the connection is closed after its answer unless that line was an accepted
+`hello`. A line past the bound is answered `too_long` and closed, and a connection that
+sends nothing in time is closed without an answer. Only after `hello` may a line reach
+the limit of 8,388,608 bytes, so a process that holds no token cannot make the daemon
+buffer that much. The connection is also closed once a `deliver` finds its peer's token
+revoked or replaced. The listener serves at most 16 connections at once, counting those
+not yet past `hello`, and answers a further one `rejected` before closing it.
+
+**The sending end.** **Added on 2026-10-28, step 5 of federation phase 1.** A daemon
+sends its peer mail as a client of the peer's `peers.sock`, one `hello` per connection
+and then one `deliver` at a time, as
+[`FEDERATION.md`](../architecture/FEDERATION.md) specifies under delivery. Its
+`hello` gives its project directory's name, lowercased, when that is an identifier the
+disclosure list does not cover, and `dromon` otherwise. It records a message as
+delivered only from the peer's `accepted` answer, never from a write that succeeded.
 
 ## Not yet specified
 

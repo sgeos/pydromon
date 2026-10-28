@@ -9,6 +9,7 @@ from dromon.model import (
     AgentAccess,
     AgentAddress,
     AgentRegistered,
+    RemoteAddress,
     LINE_TRANSITIONS,
     MAX_CHOICE_BYTES,
     MAX_CHOICES,
@@ -83,7 +84,8 @@ def test_the_scenario_uses_every_kind_of_party_and_message(
     assert {m.kind for m in sent} == set(MessageKind)
     parties = {LineAddress, OperatorAddress, AgentAddress}
     assert {type(m.sender) for m in sent} == parties
-    assert {type(m.recipient) for m in sent} == parties
+    # Only a recipient may be remote, since mail from a peer is message_received.
+    assert {type(m.recipient) for m in sent} == parties | {RemoteAddress}
     assert (
         len({m.recipient for m in sent if isinstance(m.recipient, OperatorAddress)}) > 1
     )

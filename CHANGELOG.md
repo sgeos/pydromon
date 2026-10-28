@@ -84,6 +84,24 @@ All notable changes are recorded here. The format follows
   mail neither counts toward a line's autonomous-turn allowance nor resets it, and each
   peer may start at most `turns_per_hour` turns for one line in any hour. Mail to a
   peer comes with the outbox of step 5.
+- Mail to peers, step 5 of federation phase 1. A line, an agent or an operator may send
+  a note to a remote address that the outbound policy allows, checked at send against
+  `outbound`, `senders`, `remote`, `max_body_bytes` and the disclosure list, which now
+  holds an operator's mail to a peer too. The note waits in its peer's outbox, at most
+  1,000, and a forwarder per peer delivers it in order over the peer's `peers.sock`
+  with `hello` and `deliver`, behind a connector seam that the TLS transport of phase 2
+  will fill. `accepted` records `message_delivered`, a refusal records the new
+  `message_returned` with its fixed code, and a message that expires is returned with
+  `expired` or, when a copy may have arrived, recorded by the new `message_unconfirmed`.
+  A line sender gets a note for each. Twenty `busy` answers end a message as expired,
+  and backoff runs from 5 seconds to 15 minutes. `list_sent` and `dromon sent` show
+  `delivered to peer`, `returned` with its code, or `unconfirmed`. The operator's
+  decisions of 2026-10-28 are built with it. A connection to `peers.sock` must send its
+  `hello` within 10 seconds in one line of 64 KiB, and `message_received` carries
+  `received_at`, so the received keys older than the longest expiry and a day are
+  dropped. From the review of the TLS transport, the peer listener serves at most 16
+  connections at once, and a message is recorded as delivered only from the peer's
+  answer, never from a write that succeeded.
 - Automatic switching of a role's owner, roles step 3, at the operator's instruction
   of 2026-10-27, as `docs/architecture/ROLES.md` describes. A role declares its seats'
   order, a failover policy, `automatic` by default or `ask`, and

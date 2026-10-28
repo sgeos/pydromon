@@ -40,6 +40,7 @@ import os
 import signal
 import sys
 import time
+from datetime import UTC, datetime
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -81,7 +82,7 @@ from dromon.driver import (
     DriverError,
     Strategy,
 )
-from dromon.eventlog import EventLog, LogError, utc_now
+from dromon.eventlog import EventLog, LogError, read_entries, utc_now
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.mailbox import MAX_PAGE, listing, outcome, replied_ids, sent, summary
 from dromon.lineconfig import (
@@ -131,14 +132,26 @@ from dromon.model import (
     Message,
     OperatorAddress,
     QuestionStatus,
+    RemoteAddress,
+    ReturnCode,
     State,
-    parse_address,
     parse_any_address,
 )
 from dromon import launcher
 from dromon.paths import PathError, ProjectPaths, ensure_private_dir, project_paths
+from dromon.forwarder import (
+    Connector,
+    Forwarder,
+    announced_name,
+    connect_unix,
+    orphaned,
+    sent_times,
+)
 from dromon.peering import (
     HELLO_KEYS,
+    HELLO_TIMEOUT_SECONDS,
+    MAX_HELLO_LINE_BYTES,
+    MAX_PEER_CONNECTIONS,
     Receiver,
     choose_version,
     identify,
@@ -220,6 +233,9 @@ class Daemon:
     """Whether the command line held wakes, which a restart's successor keeps."""
     receiver: Receiver = field(default_factory=lambda: Receiver(time.monotonic))
     """The judge of peer deliveries, with each peer's rate limit in memory."""
+    connect: Connector = connect_unix
+    """How the forwarder reaches a peer. Phase 2 adds a connector over Transport
+    Layer Security."""
     successor: list[str] | None = field(default=None, init=False)
     """The options a successor starts with, once a restart is ready to stop."""
     _watches: set["asyncio.Task[None]"] = field(
@@ -533,6 +549,32 @@ class Daemon:
                 "the daemon could not record the message",
             )
         return Response(request.request_id, ok=True, result=outcome_result(outcome))
+
+    def forwarder(self) -> Forwarder:
+        """The forwarder for the project's peers, made once the log holds the peers
+        of this start. Mail waiting for a peer no longer declared is returned with
+        ``unknown_peer`` first. The send times of waiting mail are read from the log,
+        so expiry survives a restart, and the log is read only when mail waits."""
+        federation = self.project.federation
+        for message_id in orphaned(self.log.state, federation):
+            self.scheduler.return_mail(message_id, ReturnCode.UNKNOWN_PEER)
+        waiting = {m for queue in self.log.state.outbox.values() for m in queue}
+        times = (
+            sent_times(read_entries(self.paths.event_log), waiting) if waiting else {}
+        )
+        store = self.paths.state_dir / PEERS_DIR_NAME
+        forwarder = Forwarder(
+            self.scheduler,
+            federation,
+            self.connect,
+            lambda peer_id: _outbound_token(store, peer_id),
+            announced_name(self.paths.root, self.scheduler.discloses),
+            time.monotonic,
+            lambda: datetime.now(UTC),
+            times,
+        )
+        self.scheduler.on_outbox = forwarder.notify
+        return forwarder
 
     def execute(self, request: Request) -> Response:
         """Answer one decoded request with operator authority."""
@@ -1304,6 +1346,7 @@ class Daemon:
                     "delivered": status.delivered,
                     "read": status.read,
                     "outcome": status.outcome,
+                    "delivery": status.delivery,
                 }
                 for status in page
             ],
@@ -1334,8 +1377,8 @@ class Daemon:
         recipient, body, operator = values[:3]
         reply_to = values[3] if optional else None
         sender = OperatorAddress(operator)
-        address = parse_address(recipient)
-        if urgent:
+        address = parse_any_address(recipient)
+        if urgent and not isinstance(address, RemoteAddress):
             # Checked before the operator is registered, so a refusal records nothing.
             self.scheduler.check_priority(sender, address)
         self.scheduler.ensure_operator(sender.operator_id)
@@ -1597,6 +1640,151 @@ async def _connection(
             await writer.wait_closed()
 
 
+class LineReader:
+    """Reads lines of at most ``limit`` bytes in chunks, so that the stream's own
+    limit can stay small. The peer socket's stream is limited to the ``hello`` line,
+    and an identified peer's larger lines are read through this."""
+
+    def __init__(self, reader: asyncio.StreamReader, limit: int) -> None:
+        self._reader = reader
+        self._limit = limit
+        self._buffer = bytearray()
+
+    async def readline(self) -> bytes:
+        """The next line with its newline, or what remains at end of file, which is
+        empty or lacks the newline. Raises ``ValueError`` past the limit. Each pass
+        returns, raises, or grows the buffer toward the limit, so it is bounded."""
+        while True:
+            end = self._buffer.find(b"\n")
+            if end >= 0:
+                if end + 1 > self._limit:
+                    raise ValueError(f"the line exceeds {self._limit} bytes")
+                line = bytes(self._buffer[: end + 1])
+                del self._buffer[: end + 1]
+                return line
+            if len(self._buffer) >= self._limit:
+                raise ValueError(f"the line exceeds {self._limit} bytes")
+            chunk = await self._reader.read(MAX_HELLO_LINE_BYTES)
+            if not chunk:
+                rest = bytes(self._buffer)
+                self._buffer.clear()
+                return rest
+            self._buffer += chunk
+
+
+async def peer_connection(
+    daemon: Daemon,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    session: "PeerSession",
+) -> None:
+    """Serve one connection on the peer socket. Its first line must arrive within
+    ``HELLO_TIMEOUT_SECONDS`` and hold at most ``MAX_HELLO_LINE_BYTES``, the stream's
+    own limit, and anything but an accepted ``hello`` closes the connection after its
+    answer. Later lines may be as large as ``MAX_PEER_LINE_BYTES``, and the connection
+    closes when the session loses its peer, as a revoked token makes it."""
+    try:
+        try:
+            first = await asyncio.wait_for(reader.readline(), HELLO_TIMEOUT_SECONDS)
+        except TimeoutError:
+            return
+        except ValueError:
+            await _write(writer, _too_long(MAX_HELLO_LINE_BYTES))
+            return
+        if not first.endswith(b"\n"):
+            return
+        await _write(writer, await session.respond(first))
+        lines = LineReader(reader, MAX_PEER_LINE_BYTES)
+        while session.peer_id is not None and not daemon.stop_requested.is_set():
+            try:
+                line = await asyncio.wait_for(lines.readline(), IDLE_TIMEOUT_SECONDS)
+            except TimeoutError:
+                break
+            except ValueError:
+                await _write(writer, _too_long(MAX_PEER_LINE_BYTES))
+                break
+            if not line.endswith(b"\n"):
+                break
+            await _write(writer, await session.respond(line))
+    except (ConnectionError, BrokenPipeError):
+        pass
+    finally:
+        writer.close()
+        with contextlib.suppress(ConnectionError, BrokenPipeError):
+            await writer.wait_closed()
+
+
+def _too_long(limit: int) -> Response:
+    return Response(
+        "",
+        ok=False,
+        error_code=ErrorCode.TOO_LONG,
+        error_message=f"the line exceeds {limit} bytes",
+    )
+
+
+class ConnectionCap:
+    """Serves at most ``limit`` connections at once, and answers any further one with
+    one rejected response before closing it. The count includes connections still
+    being checked by ``peercred``, so a flood is turned away before any work for it.
+
+    Inference, not verified under load: one event loop runs every accept, so the count
+    needs no lock. A port with threads needs an atomic counter here."""
+
+    def __init__(self, limit: int, what: str) -> None:
+        if limit < 1:
+            raise ValueError(f"a connection cap must be at least 1, not {limit}")
+        self.limit = limit
+        self.what = what
+        self.active = 0
+
+    async def admit(
+        self, writer: asyncio.StreamWriter, serving: Callable[[], Awaitable[None]]
+    ) -> None:
+        if self.active >= self.limit:
+            print(
+                f"dromond: refused a connection, {self.limit} {self.what} are open",
+                file=sys.stderr,
+            )
+            try:
+                await _write(
+                    writer,
+                    Response(
+                        "",
+                        ok=False,
+                        error_code=ErrorCode.REJECTED,
+                        error_message=(
+                            f"the daemon serves at most {self.limit} {self.what}"
+                        ),
+                    ),
+                )
+            except (ConnectionError, BrokenPipeError):
+                pass
+            finally:
+                writer.close()
+                with contextlib.suppress(ConnectionError, BrokenPipeError):
+                    await writer.wait_closed()
+            return
+        self.active += 1
+        try:
+            await serving()
+        finally:
+            self.active -= 1
+
+
+def _outbound_token(store: Path, peer_id: str) -> str | None:
+    """The token stored for ``peer_id``, or ``None`` when none is stored or the store
+    is unsafe, which is said on standard error and retried at the next connection."""
+    try:
+        return stored_token(store, peer_id)
+    except FederationError as error:
+        print(
+            f"dromond: the token for peer {peer_id} is unusable: {error}",
+            file=sys.stderr,
+        )
+        return None
+
+
 async def _guarded(
     writer: asyncio.StreamWriter,
     own_uid: int,
@@ -1712,17 +1900,42 @@ async def serve(daemon: Daemon) -> None:
         peer_path = daemon.paths.peer_socket
         with contextlib.suppress(FileNotFoundError):
             peer_path.unlink()
+        # The listener owns the cap, so a transport added later, such as TLS in
+        # phase 2, is counted where it is accepted.
+        peer_cap = ConnectionCap(MAX_PEER_CONNECTIONS, "peer connections")
+
+        async def peer_accept(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            writers.add(writer)
+            try:
+                await peer_cap.admit(
+                    writer,
+                    lambda: _guarded(
+                        writer,
+                        own_uid,
+                        lambda: peer_connection(
+                            daemon, reader, writer, PeerSession(daemon)
+                        ),
+                    ),
+                )
+            finally:
+                writers.discard(writer)
+
+        # The stream's limit is the hello line's, which bounds what a connection
+        # that has not named its peer can make the daemon buffer.
         servers.append(
             await asyncio.start_unix_server(
-                accepting(lambda: PeerSession(daemon).respond, MAX_PEER_LINE_BYTES),
-                path=str(peer_path),
-                limit=MAX_PEER_LINE_BYTES,
+                peer_accept, path=str(peer_path), limit=MAX_HELLO_LINE_BYTES
             )
         )
         peer_path.chmod(0o600)
         print(f"dromond: peers may connect on {peer_path}", file=sys.stderr)
+    # Made before any task starts, so that a log it cannot read stops the start cleanly.
+    forwarder = daemon.forwarder()
     daemon.scheduler.recover()
     scheduling = asyncio.create_task(daemon.scheduler.run(daemon.stop_requested))
+    forwarding = asyncio.create_task(forwarder.run(daemon.stop_requested))
     try:
         # The umask already gives 0600, and this states it rather than relying on it.
         socket_path.chmod(0o600)
@@ -1731,6 +1944,7 @@ async def serve(daemon: Daemon) -> None:
     finally:
         daemon.stop_requested.set()
         await scheduling
+        await forwarding
         for listening in servers:
             listening.close()
         for writer in list(writers):
@@ -2107,6 +2321,7 @@ def run(
             apply_project(scheduler, log, config)
             for event in plan_peers(log.state, config.federation):
                 log.append(event)
+            scheduler.federation = config.federation
             scheduler.peer_turns.set_allowances(
                 {
                     peer_id: peer.turns_per_hour
