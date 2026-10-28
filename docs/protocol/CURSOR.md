@@ -1,5 +1,8 @@
 # Cursor Agent Engine
 
+Cursor Agent refuses a line configured with `workdir_access: read`, because its
+adapter cannot confine writes to the working directory.
+
 > **Navigation**: [Protocol](./README.md) | [Documentation Root](../README.md)
 
 **Status.** Draft, written on 2026-10-26. Normative for Dromon's side. The Python module

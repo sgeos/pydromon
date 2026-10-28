@@ -51,6 +51,7 @@ from dromon.model import (
     parse_due,
     role_terms,
 )
+from dromon.capabilities import Known, TABLES
 from dromon.projectconfig import ProjectConfig
 
 
@@ -420,18 +421,16 @@ def check_handoff_request(state: State, role_id: str, to: str) -> str:
 
 type Access = Literal["write", "read"]
 """A seat's access to its role's worktree. The values are those of the engines role's
-``WorkdirAccess``, a string enumeration on the unmerged ``feat/read-only-seats``
-branch, so the merge can pass one where the other is read."""
+``WorkdirAccess`` string enumeration, so the merge can pass one where the other is
+read."""
 
-CONFINING_ENGINES: Final[frozenset[str]] = frozenset()
+CONFINING_ENGINES: Final[frozenset[str]] = frozenset(
+    engine for engine, table in TABLES.items() if table.read_only_workdir is Known.YES
+)
 """The engines whose adapter can make a role's worktree read only to a seat.
-**Technical debt.** It is empty until ``feat/read-only-seats`` merges, since no engine
-here applies a read-only access yet, and then becomes the engines whose capability
-table entry gives ``read_only_workdir`` as yes. Empty is default deny, so a seat that
-does not own its role does not run beside an owner until its engine can confine it.
-**Decided by the operator on 2026-10-27.** The merge derives the set from the table
-rather than typing it here, and Grok, whose entry is unknown, stays out until an
-operator probe confirms it."""
+Empty is default deny, so a seat that does not own its role does not run beside an
+owner until its engine can confine it. The set is derived from the capability table,
+so Grok, whose entry is unknown, stays out until an operator probe confirms it."""
 
 
 def seat_access(state: State, line_id: str) -> Access | None:

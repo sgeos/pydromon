@@ -36,7 +36,7 @@ from dromon.engine import EngineRefused, TurnReport
 from dromon.priority import SteeredDriver
 from dromon.grok import bridge_command
 from dromon.jsonlines import Connection, json_lines_factory
-from dromon.lineconfig import LineConfig
+from dromon.lineconfig import LineConfig, WorkdirAccess
 from dromon.pi import (
     tool_calls_in,
     DIALOG_REFUSED,
@@ -320,6 +320,9 @@ def test_the_pi_drivers_accept_only_the_model_pi_reports(strategy: Strategy) -> 
 
 def test_a_pi_line_takes_no_builtin_tools_and_none_of_claude_codes_features() -> None:
     assert unsupported(LineConfig()) is None
+    assert "read-only working directory" in (
+        unsupported(LineConfig(workdir_access=WorkdirAccess.READ)) or ""
+    )
     assert "no sandbox" in (unsupported(LineConfig(builtin_tools=("Read",))) or "")
     assert "MCP servers" in (unsupported(LineConfig(inherit_account_mcp=True)) or "")
     assert "Claude Code's" in (unsupported(LineConfig(claude_code_prompt=True)) or "")

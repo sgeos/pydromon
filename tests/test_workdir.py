@@ -7,7 +7,7 @@ import os
 from collections.abc import Callable, Coroutine, Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Final, cast
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
@@ -39,9 +39,9 @@ from dromon.model import (
 from dromon.paths import ProjectPaths, project_paths
 from dromon.projectconfig import ConfigFileError, ProjectConfig, config_path, parse
 from dromon.protocol import ErrorCode, Response
-from dromon.sandbox import SandboxError, effective, parse_sandbox
+from dromon.sandbox import SandboxError, blocks_unsandboxed, effective, parse_sandbox
 from dromon.scheduler import LineEngine, LineSpec, Scheduler, engine_factory
-from dromon.engine import TurnReport
+from dromon.engine import EngineRefused, TurnReport
 from dromon.workdir import MAX_POINTER_BYTES, git_write_guards, resolve_workdir
 
 HAIKU = "claude-haiku-5-5"
@@ -348,6 +348,141 @@ def test_a_claude_line_runs_in_its_workdir_with_its_paths_resolved_there(
     assert str(root / ".dromon") in sandbox["filesystem"]["denyRead"]
     default = build(haiku_spec(DEFAULT_CONFIG), [])
     assert isinstance(default, ClaudeCodeLine) and default.cwd == root
+
+
+def test_read_access_forces_claude_confinement_and_denies_file_writes(
+    tmp_path: Path,
+) -> None:
+    root = real(tmp_path)
+    config = config_from_document(
+        {
+            "workdir_access": "read",
+            "builtin_tools": ["Bash", "Edit", "Write"],
+        }
+    )
+    engine = engine_factory(str(root))(haiku_spec(config), [])
+    assert isinstance(engine, ClaudeCodeLine)
+    sandbox = cast(dict[str, object], engine.sandbox)
+    assert sandbox["enabled"] is True
+    filesystem = cast(dict[str, list[str]], sandbox["filesystem"])
+    assert str(root) in filesystem["denyWrite"]
+    settings = cast(dict[str, object], engine.settings)
+    permissions = cast(dict[str, list[str]], settings["permissions"])
+    assert "Write" in permissions["deny"]
+    assert "NotebookEdit" in permissions["deny"]
+    assert f"Edit(/{root}/**)" in permissions["deny"]
+
+
+def test_read_access_refuses_unconfined_claude_mcp_tools(tmp_path: Path) -> None:
+    root = real(tmp_path)
+    config = config_from_document(
+        {
+            "workdir_access": "read",
+            "mcp_servers": {"files": {"command": "file-server"}},
+        }
+    )
+    with pytest.raises(EngineRefused, match="cannot confine configured MCP"):
+        engine_factory(str(root))(haiku_spec(config), [])
+
+
+# One case per refusal branch of a read-only Claude line's configuration. Review of
+# read-only seats, finding 2.
+READ_ACCESS_REFUSALS: Final = [
+    pytest.param({"inherit_account_mcp": True}, "cannot confine", id="account-mcp"),
+    pytest.param({"tool_policy": "allow_all"}, "allow-all", id="allow-all"),
+    pytest.param(
+        {"allowed_tools": ["mcp__files__*"]}, "additional MCP", id="allowed-mcp"
+    ),
+    pytest.param({"project_settings": True}, "project settings", id="project"),
+    pytest.param({"plugins": ["~/plugins/one"]}, "plugins", id="plugins"),
+    pytest.param(
+        {
+            "settings": {
+                "hooks": {
+                    "SessionStart": [
+                        {"hooks": [{"type": "command", "command": "touch x"}]}
+                    ]
+                }
+            }
+        },
+        "command hooks",
+        id="hooks",
+    ),
+    pytest.param(
+        {"sandbox": {"enabled": True, "allowUnsandboxedCommands": True}},
+        "allowUnsandboxedCommands",
+        id="unsandboxed",
+    ),
+    pytest.param(
+        {"sandbox": {"enabled": True, "failIfUnavailable": False}},
+        "failIfUnavailable",
+        id="fail-open",
+    ),
+    pytest.param(
+        {"sandbox": {"enabled": True, "excludedCommands": ["git"]}},
+        "excludedCommands",
+        id="excluded",
+    ),
+    pytest.param(
+        {"sandbox": {"enabled": True, "filesystem": {"disabled": True}}},
+        "filesystem.disabled",
+        id="filesystem-off",
+    ),
+]
+
+
+@pytest.mark.parametrize(("document", "reason"), READ_ACCESS_REFUSALS)
+def test_read_access_refuses_each_way_out_of_the_claude_sandbox(
+    tmp_path: Path, document: dict[str, object], reason: str
+) -> None:
+    root = real(tmp_path)
+    config = config_from_document({"workdir_access": "read", **document})
+    with pytest.raises(EngineRefused, match=reason):
+        engine_factory(str(root))(haiku_spec(config), [])
+    # The same configuration with write access is accepted, so the refusal is the
+    # read access's own.
+    writer = config_from_document(document)
+    assert isinstance(engine_factory(str(root))(haiku_spec(writer), []), ClaudeCodeLine)
+
+
+@pytest.mark.parametrize(
+    "sandbox",
+    [
+        pytest.param({"allowUnsandboxedCommands": True}, id="unsandboxed"),
+        pytest.param({"failIfUnavailable": False}, id="fail-open"),
+    ],
+)
+def test_read_access_refuses_a_widening_project_sandbox(
+    tmp_path: Path, sandbox: dict[str, object]
+) -> None:
+    root = real(tmp_path)
+    project = parse_sandbox({"enabled": True, **sandbox}, operator=False)
+    # A line layer that sets the secure value does not hide the project's widening.
+    line = config_from_document(
+        {
+            "workdir_access": "read",
+            "sandbox": {"allowUnsandboxedCommands": False, "failIfUnavailable": True},
+        }
+    )
+    with pytest.raises(EngineRefused, match=next(iter(sandbox))):
+        engine_factory(str(root), project_sandbox=project)(haiku_spec(line), [])
+
+
+def test_read_access_forces_the_secure_sandbox_keys(tmp_path: Path) -> None:
+    root = real(tmp_path)
+    # A line with no sandbox of its own, and one that turns the sandbox off, both get
+    # the keys set explicitly rather than through the unattended defaults.
+    for document in ({}, {"sandbox": {"enabled": False}}):
+        config = config_from_document({"workdir_access": "read", **document})
+        engine = engine_factory(str(root))(haiku_spec(config), [])
+        assert isinstance(engine, ClaudeCodeLine)
+        sandbox = cast(dict[str, object], engine.sandbox)
+        assert sandbox["enabled"] is True
+        assert sandbox["allowUnsandboxedCommands"] is False
+        assert sandbox["failIfUnavailable"] is True
+        assert blocks_unsandboxed(
+            sandbox, "Bash", {"command": "touch x", "dangerouslyDisableSandbox": True}
+        )
 
 
 def test_an_unsandboxed_line_does_not_read_the_git_pointers(tmp_path: Path) -> None:

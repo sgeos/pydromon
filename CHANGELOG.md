@@ -7,6 +7,29 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- A read-only Claude Code line could leave its sandbox. A sandbox layer that set
+  `allowUnsandboxedCommands` true or `failIfUnavailable` false let a shell command run
+  outside the Seatbelt sandbox that denies writes to the working directory. The read
+  sandbox now sets both keys itself, after every other layer, and a line whose project
+  or own sandbox sets either the other way, or sets `excludedCommands` or
+  `filesystem.disabled`, is refused. Each refusal of a read-only Claude line now has a
+  test. Found by the review of read-only seats, findings 1 and 2.
+- Grok's `read_only_workdir` capability is unknown rather than yes, since no live run
+  has shown its reader profile deny a write. Review of read-only seats, finding 3. A
+  Grok line with `workdir_access: read` is now refused until that capability is
+  known, since the reader profile rests on Grok's built-in `read-only` base, which
+  Dromon cannot inspect. Second round, findings 1 and 2.
+- A Grok turn is refused when Grok loads any MCP server but Dromon's, which the
+  operator's first live probe of 2026-10-27 showed it does from the user's own
+  configuration, and when Grok does not list its servers. Grok's own notices for its
+  servers, models and settings are read, and one that shows another server, another
+  model or a mode that does not ask refuses the turn. A permission mode reported as a
+  `configOptions` entry of the category `mode` is accepted. Grok's scans of Claude
+  Code's and Cursor's MCP and hook files are turned off.
+- `dromon probe --scrub` also replaces MCP server names, addresses, commands and
+  arguments, slash command and skill names with their descriptions, host names,
+  agent ids and a subscription tier, so a scrubbed Grok recording holds none of the
+  operator's configuration.
 - A malformed time in a role or budget event named the field `due`, and now names
   its own field, such as `resets_at`.
 - `dromon send` prints the message identifier alone again. Since priority mail it had
@@ -35,6 +58,31 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Dromon's own Grok home. A Grok line runs with `GROK_HOME` at `~/.grok/dromon-home`,
+  never the operator's Grok home, whose MCP servers and permission mode the first
+  live probe showed Grok loads. Dromon writes the home's `config.toml`, which sets
+  Grok's asking mode and declares no MCP server or hook, and its `sandbox.toml` with
+  the `dromon-reader` and `dromon-writer` profiles, when either is missing. Before
+  every turn it refuses any drift in that `config.toml`, a policy or trust file that
+  sets anything, agents, hooks, plugins, rules, skills or workflows in the home, a
+  profile key such as `read_write`, and a Claude Code settings file whose
+  `defaultMode` is not `default`, since Grok reads that too. Grok runs with `HOME` set
+  to `~/.grok/dromon-home/home` and the `XDG_` home variables removed, as an
+  Antigravity line runs, so it cannot read the operator's Claude Code or Cursor files,
+  and a turn is refused when that directory holds `.claude`, `.claude.json`,
+  `.cursor`, `.agents` or `.grok`. A turn is also refused when the workspace or any
+  level up to its repository's root holds a project `.grok` with anything in it,
+  which could add servers, plugins, permission rules or sandbox profiles. It never
+  writes, reads or copies a credential. The operator signs Grok in to the home once
+  with the command in `docs/protocol/GROK.md`, which sets both `GROK_HOME` and
+  `HOME`. A session that reports no mode then rests on these checks rather than being
+  refused. Variables that would sign Grok in through another flow or send its
+  requests elsewhere are refused.
+- Per-line `workdir_access` supports `write` and `read`. Claude Code and Codex confine
+  read-mode writes with their sandbox or permission profile. Pi, Cursor Agent and
+  Antigravity refuse read mode, and Grok refuses it until a probe confirms its reader
+  profile. Codex replaces a kept thread when the access mode changes. Capability and
+  protocol documentation records the support matrix.
 - Automatic switching of a role's owner, roles step 3, at the operator's instruction
   of 2026-10-27, as `docs/architecture/ROLES.md` describes. A role declares its seats'
   order, a failover policy, `automatic` by default or `ask`, and

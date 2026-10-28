@@ -45,6 +45,7 @@ keys, duplicate keys and numbers are refused.
 | `plugins` | At most 16 distinct local plugin directories, each absolute or starting with `~/`, as the plugins section below specifies. Refused on Codex and Grok lines. Omitted when empty | none |
 | `instructions` | At most 16 distinct files, such as `CLAUDE.md`, whose text is appended to the system prompt at each turn. A relative path is resolved against the project root, whatever the line's `workdir`, and `~` against the home directory. Omitted when empty | none |
 | `workdir` | The directory the line's engine runs in, as the working directory section below specifies. Omitted when unset | the project root |
+| `workdir_access` | `write` or `read`; read confines the working directory to reads, with the scratch exception below | `write` |
 | `keep_session` | Keep a Claude Code or Codex line's engine connected between turns, as the kept sessions section below specifies. Refused on Grok lines. Omitted when false | `false` |
 | `keep_session_idle_seconds` | Seconds a kept connection waits for the next turn before it closes, a whole number from 60 to 86,400. Omitted at its default | `1800` |
 | `context_warn_tokens` | The estimated context, in tokens, past which the line's prompt warns, a whole number from 1,000 to 10,000,000, as the context section below specifies. Omitted at its default | `150000` |
@@ -1183,6 +1184,14 @@ before its engine runs, including one whose prompt could not be composed, holds 
 line and asks an operator, unless the line mailed an operator during the turn.
 
 ## Working directory
+
+`workdir_access` defaults to `write`. With `read`, Claude Code and Codex apply their
+engine sandbox or permission profile to prevent writes under the working directory.
+Dromon's `write_scratch` tool is the supported write path under `tmp`. Pi, Cursor Agent
+and Antigravity refuse to start in this mode because their adapters cannot enforce it.
+Grok refuses it too until a live probe shows its reader profile deny a write to the
+worktree, as [`GROK.md`](GROK.md) records. Claude Code also refuses configurations with mechanisms that can
+bypass its sandbox, as specified in [`SANDBOX.md`](SANDBOX.md).
 
 **Decided by the operator on 2026-10-25.** Each line's engine runs in its own working
 directory, so that a line can work in a git worktree of its own while the daemon's

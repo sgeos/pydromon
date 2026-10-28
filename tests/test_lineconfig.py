@@ -9,6 +9,7 @@ from dromon.lineconfig import (
     ConfigError,
     LineConfig,
     ToolPolicy,
+    WorkdirAccess,
     config_from_document,
     decode_config,
     encode_config,
@@ -38,6 +39,14 @@ def test_a_full_configuration_parses_and_round_trips() -> None:
     config = config_from_document(FULL)
     assert config.builtin_tools == ("Edit", "Read")
     assert config.server_names() == {"github", "docs", "local"}
+    assert decode_config(encode_config(config)) == config
+
+
+def test_read_only_workdir_access_round_trips_and_defaults_to_write() -> None:
+    assert DEFAULT_CONFIG.workdir_access is WorkdirAccess.WRITE
+    assert "workdir_access" not in json.loads(encode_config(DEFAULT_CONFIG))
+    config = config_from_document({"workdir_access": "read"})
+    assert config.workdir_access is WorkdirAccess.READ
     assert decode_config(encode_config(config)) == config
 
 
@@ -82,6 +91,7 @@ def test_a_claude_code_mcp_file_is_accepted() -> None:
 BAD: list[tuple[str, object, str]] = [
     ("an unknown key", {"tools": []}, "unknown configuration keys"),
     ("an unknown policy", {"tool_policy": "trust_me"}, "unknown tool_policy"),
+    ("an unknown workdir access", {"workdir_access": "maybe"}, "workdir_access"),
     ("a lowercase built-in", {"builtin_tools": ["read"]}, "malformed"),
     ("a loose pattern", {"allowed_tools": ["mcp__*"]}, "neither"),
     ("a mid-name wildcard", {"allowed_tools": ["mcp__a__b*"]}, "neither"),

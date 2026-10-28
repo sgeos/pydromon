@@ -110,6 +110,11 @@ the observed `usageLimitExceeded` shape above may fail a role over.
 
 ## Tools across threads
 
+For `workdir_access: read`, the `dromon-line` permission profile marks the working
+directory read-only and grants writes only to its `tmp` subdirectory. This setting is
+part of the stored thread fingerprint, so a resumed thread with different access is
+replaced before a turn starts.
+
 **Decided by the operator on 2026-10-26.** **Fact, observed live on 2026-10-26.** A
 resumed thread saw none of the tools Dromon added after it started.
 
