@@ -58,6 +58,10 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Generated federation certificates now name their SubjectPublicKeyInfo digest in the
+  certificate subject and include a subject key identifier. TLS contexts can trust a
+  bounded set of peer certificates while authentication remains based on configured
+  public-key pins.
 - Claude Code turns that start after a background task ends now run under the
   scheduler's normal admission, tool checks, autonomous-turn count and cost hold. A
   self-start that cannot be admitted stays interrupted and its task note wakes a later

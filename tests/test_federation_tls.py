@@ -9,10 +9,12 @@ from typing import Final, cast
 
 import pytest
 from cryptography import x509
+from cryptography.x509.oid import NameOID
 
 from dromon.federation_tls import (
     CERTIFICATE_FILENAME,
     KEY_FILENAME,
+    MAX_PEER_CERTIFICATES,
     FrameError,
     FrameTimeout,
     FrameReader,
@@ -61,12 +63,44 @@ def test_generated_certificates_have_distinct_subjects_bound_to_their_pins(
     assert first_certificate.subject != second_certificate.subject
     assert first_certificate.subject == first_certificate.issuer
     assert second_certificate.subject == second_certificate.issuer
-    assert first_certificate.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME) == [
-        f"Dromon federation peer {first.pin_sha256}"
-    ]
-    assert second_certificate.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME) == [
-        f"Dromon federation peer {second.pin_sha256}"
-    ]
+    assert [
+        attribute.value
+        for attribute in first_certificate.subject.get_attributes_for_oid(
+            NameOID.ORGANIZATION_NAME
+        )
+    ] == ["Dromon federation peer"]
+    assert [
+        attribute.value
+        for attribute in second_certificate.subject.get_attributes_for_oid(
+            NameOID.COMMON_NAME
+        )
+    ] == [second.pin_sha256]
+    assert [
+        attribute.value
+        for attribute in first_certificate.subject.get_attributes_for_oid(
+            NameOID.COMMON_NAME
+        )
+    ] == [first.pin_sha256]
+    assert [
+        attribute.value
+        for attribute in second_certificate.subject.get_attributes_for_oid(
+            NameOID.ORGANIZATION_NAME
+        )
+    ] == ["Dromon federation peer"]
+    for identity, certificate in (
+        (first, first_certificate),
+        (second, second_certificate),
+    ):
+        subject_key_identifier = certificate.extensions.get_extension_for_class(
+            x509.SubjectKeyIdentifier
+        ).value
+        assert subject_key_identifier == x509.SubjectKeyIdentifier.from_public_key(
+            certificate.public_key()
+        )
+        assert (
+            certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+            == identity.pin_sha256
+        )
 
 
 def test_identity_generation_does_not_replace_existing_files(tmp_path: Path) -> None:
@@ -168,6 +202,30 @@ def test_python_ssl_trusts_only_the_configured_peer_certificate(
             client_context(local, peer.certificate),
             server_context(untrusted, local.certificate),
         )
+
+
+def test_one_server_context_can_trust_two_peer_certificates(tmp_path: Path) -> None:
+    server_identity = generate_identity(tmp_path / "server")
+    first_peer = generate_identity(tmp_path / "first-peer")
+    second_peer = generate_identity(tmp_path / "second-peer")
+    server = server_context(
+        server_identity, [first_peer.certificate, second_peer.certificate]
+    )
+
+    for peer in (first_peer, second_peer):
+        tls = _memory_handshake(
+            client_context(peer, server_identity.certificate), server
+        )
+        verify_peer_pin(tls.server, peer.pin_sha256)
+
+
+def test_a_context_requires_a_bounded_nonempty_peer_set(tmp_path: Path) -> None:
+    identity = generate_identity(tmp_path / "identity")
+
+    with pytest.raises(TransportError, match="at least one peer certificate"):
+        server_context(identity, [])
+    with pytest.raises(TransportError, match="at most"):
+        server_context(identity, [identity.certificate] * (MAX_PEER_CERTIFICATES + 1))
 
 
 def test_python_ssl_requires_a_client_certificate(tmp_path: Path) -> None:
