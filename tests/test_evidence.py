@@ -4,6 +4,7 @@ spent."""
 
 import asyncio
 import dataclasses
+import gc
 import json
 import stat
 import sys
@@ -312,6 +313,11 @@ def test_a_json_lines_engine_is_recorded_with_its_standard_error(
 ) -> None:
     """The Pi, Cursor and Antigravity adapters start their engine this way, so a
     recording made here is what their probes record."""
+    # Cyclic garbage collection may run in a subprocess pipe callback while this
+    # test is draining standard error. Keleusma VMs are thread-bound, so collect
+    # any retired drivers on the test thread before starting the subprocess and
+    # again after its pipe tasks have ended.
+    gc.collect()
     directory = tmp_path / "bin"
     directory.mkdir()
     script = directory / "harness"
@@ -332,6 +338,7 @@ def test_a_json_lines_engine_is_recorded_with_its_standard_error(
     finally:
         evidence.RECORDING.reset(token)
         recording.close()
+        gc.collect()
     found = read_recording(path)
     assert found.frames == [(OUT, {"ask": 42}), (IN, {"answer": 42})]
     assert found.stderr is not None
