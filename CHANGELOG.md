@@ -71,7 +71,6 @@ All notable changes are recorded here. The format follows
   self-start that cannot be admitted stays interrupted and its task note wakes a later
   turn. Task ends reported during a turn and ends of tasks the line stopped are
   recorded without creating another wake.
-
 - Phase 2 of federation, step 1. A `[peers.NAME]` table may declare `transport =
   "tls"` with the peer's `address`, `pin_sha256` and `certificate`, and
   `[federation]` may name `tls_listen`, which is required exactly when a `tls` peer is
