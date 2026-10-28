@@ -703,6 +703,10 @@ class MessageReceived:
     reply_to: str | None
     origin_id: str
     received_at: str
+    priority_asked: bool = False
+    """Whether the peer's envelope asked for priority. A ``message_prioritized``
+    follows when the receiver honours it, so a note that asked and is not priority
+    mail had its priority declined, which its header says."""
 
     def __post_init__(self) -> None:
         check_id("message_id", self.message_id)
@@ -1450,6 +1454,9 @@ class Message:
     """Why ``message_returned`` took mail to a peer from its outbox, if it did."""
     unconfirmed: bool = False
     """Whether ``message_unconfirmed`` took mail to a peer from its outbox."""
+    priority_asked: bool = False
+    """Whether the peer that delivered the note asked for priority, as
+    ``message_received`` records."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -2137,7 +2144,14 @@ class State:
             raise EventRejected(f"message {event.message_id} is priority mail")
         if message.kind is not MessageKind.NOTE:
             raise EventRejected(f"message {event.message_id} is not a note")
-        if not isinstance(message.recipient, LineAddress):
+        recipient = message.recipient
+        if isinstance(recipient, RemoteAddress):
+            # Mail to a peer's line is marked while it waits in the outbox, so the
+            # forwarder's envelope asks the peer for priority.
+            if message.returned is not None or message.unconfirmed:
+                raise EventRejected(f"message {event.message_id} left its outbox")
+            recipient = recipient.party
+        if not isinstance(recipient, LineAddress):
             raise EventRejected(f"message {event.message_id} is not to a line")
         if message.delivered:
             raise EventRejected(f"message {event.message_id} was delivered")
@@ -2391,6 +2405,7 @@ class State:
             (),
             event.reply_to,
             origin_id=event.origin_id,
+            priority_asked=event.priority_asked,
         )
         self.received[(peer_id, event.origin_id)] = event.message_id
         self.received_times[(peer_id, event.origin_id)] = received_at

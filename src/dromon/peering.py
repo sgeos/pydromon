@@ -96,8 +96,7 @@ class Accepted:
     message_id: str
     duplicate: bool
     priority: bool = False
-    """Whether the receiver honoured the note's priority, which it does not before
-    step 6 of phase 1."""
+    """Whether the receiver honoured the note's priority."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,9 +258,29 @@ class WindowCounter[K: Hashable]:
         return max(1, int(self._window - (self._clock() - times[0]) + 0.999))
 
 
-type Receive = Callable[[RemoteAddress, LocalAddress, str, str | None, str], str]
-"""Records a received note and returns its local identifier, which the scheduler does
-so that the note joins the post office."""
+class PeerPriority(StrEnum):
+    """What a delivery asks of priority, and what the peer's policy lets it have."""
+
+    NONE = "none"
+    """The envelope did not ask for priority."""
+    DECLINED = "declined"
+    """It asked, and the peer's ``priority_in`` is false, so it is ordinary mail."""
+    PERMITTED = "permitted"
+    """It asked, and ``priority_in`` lets it be priority mail within the limits."""
+
+
+@dataclass(frozen=True, slots=True)
+class Received:
+    message_id: str
+    priority: bool
+    """Whether the note was recorded as priority mail."""
+
+
+type Receive = Callable[
+    [RemoteAddress, LocalAddress, str, str | None, str, PeerPriority], Received
+]
+"""Records a received note and says what it recorded, which the scheduler does so
+that the note joins the post office."""
 
 
 class Receiver:
@@ -320,14 +339,21 @@ class Receiver:
             or state.waiting_from.get(peer_id, 0) >= definition.waiting
         ):
             return Refused(Code.FULL)
-        message_id = receive(
+        if not envelope.priority:
+            priority = PeerPriority.NONE
+        elif definition.priority_in:
+            priority = PeerPriority.PERMITTED
+        else:
+            priority = PeerPriority.DECLINED
+        received = receive(
             sender,
             envelope.recipient,
             envelope.body,
             envelope.reply_to,
             envelope.origin_id,
+            priority,
         )
-        return Accepted(message_id, duplicate=False)
+        return Accepted(received.message_id, False, received.priority)
 
 
 def _resent(
@@ -348,7 +374,7 @@ def _resent(
         and first.reply_to == envelope.reply_to
         and envelope.kind == MessageKind.NOTE.value
     ):
-        return Accepted(message_id, duplicate=True)
+        return Accepted(message_id, True, first.priority)
     print(
         f"dromond: peer {peer_id} sent a different message under origin identifier"
         f" {envelope.origin_id}, recorded as {message_id}. Refused as a conflict",

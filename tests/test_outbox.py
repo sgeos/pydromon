@@ -26,6 +26,7 @@ from dromon.daemon import (
     LineReader,
     PeerSession,
     peer_connection,
+    watch_task,
 )
 from dromon.driver import Strategy
 from dromon.eventlog import Entry, EventLog, read_entries
@@ -48,6 +49,7 @@ from dromon.forwarder import (
     UnixLink,
     announced_name,
     check_outbound,
+    check_outbound_priority,
     connect_unix,
     envelope,
     orphaned,
@@ -55,6 +57,8 @@ from dromon.forwarder import (
 )
 from dromon.mailbox import sent
 from dromon.model import (
+    Address,
+    AgentAddress,
     RECEIVED_KEY_HOURS,
     Event,
     EventRejected,
@@ -79,8 +83,15 @@ from dromon.model import (
 )
 from dromon.paths import ProjectPaths, project_paths
 from dromon.peering import MAX_HELLO_LINE_BYTES
+from dromon.priority import MAX_PER_SENDER
 from dromon.projectconfig import ProjectConfig
-from dromon.protocol import MAX_PEER_LINE_BYTES, Operation, Request, Response
+from dromon.protocol import (
+    MAX_PEER_LINE_BYTES,
+    Operation,
+    Request,
+    Response,
+    encode_response,
+)
 from dromon.scheduler import LineEngine, LineSpec, Scheduler
 
 PEER = "keleusma"
@@ -333,7 +344,7 @@ def test_the_policy_lets_a_listed_sender_address_a_listed_party() -> None:
             False,
             "not a party",
         ),
-        (federation(), ALPHA, KAIZEN, "x", True, "priority"),
+        (federation(), ALPHA, KAIZEN, "x", True, "priority mail to peer"),
         (federation(max_body_bytes=4), ALPHA, KAIZEN, "é" * 3, False, "exceeds"),
     ],
 )
@@ -349,6 +360,32 @@ def test_the_policy_refuses_what_it_does_not_list(
         check_outbound(
             outbound_state(), config, sender, recipient, body, priority=priority
         )
+
+
+def test_priority_out_lets_a_sender_mark_mail_to_a_peers_line() -> None:
+    check_outbound(
+        outbound_state(),
+        federation(priority_out=True),
+        ALPHA,
+        KAIZEN,
+        "x",
+        priority=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("sender", "recipient", "match"),
+    [
+        (ALPHA, KAIZEN_ANA, "goes to a line"),
+        (AgentAddress("claude"), KAIZEN, "external agent"),
+    ],
+)
+def test_priority_to_a_peer_follows_the_local_rules(
+    sender: Address, recipient: RemoteAddress, match: str
+) -> None:
+    definition = federation(priority_out=True).peers[PEER]
+    with pytest.raises(EventRejected, match=match):
+        check_outbound_priority(definition, sender, recipient)
 
 
 def test_the_policy_refuses_a_removed_peer_and_a_tls_peer() -> None:
@@ -533,6 +570,36 @@ def test_a_line_sends_to_a_peer_with_its_tool(out: Out) -> None:
 
     assert "sent as" in str(asyncio.run(call()))
     assert len(out.log.state.outbox[PEER]) == 1
+
+
+@pytest.fixture
+def urgent(tmp_path: Path) -> Generator[Out]:
+    world = Out(tmp_path / "events.db", federation(priority_out=True))
+    yield world
+    world.log.close()
+
+
+def test_priority_mail_to_a_peer_is_marked_and_asks_in_its_envelope(
+    urgent: Out,
+) -> None:
+    message_id = urgent.scheduler.send(ALPHA, KAIZEN, "now", priority=True)
+    assert urgent.log.state.messages[message_id].priority
+    urgent.peer.answers = [WELCOME, accepted()]
+    assert urgent.step() == 0.0
+    assert urgent.peer.deliveries()[0]["priority"] is True
+    assert urgent.log.state.messages[message_id].delivered
+
+
+def test_a_lines_priority_mail_to_peers_counts_toward_its_limit(urgent: Out) -> None:
+    for _ in range(MAX_PER_SENDER):
+        urgent.scheduler.send(ALPHA, KAIZEN, "now", priority=True)
+    before = len(urgent.log.state.messages)
+    with pytest.raises(EventRejected, match="priority messages"):
+        urgent.scheduler.send(ALPHA, KAIZEN, "now", priority=True)
+    assert len(urgent.log.state.messages) == before
+    # An operator's priority mail is unlimited, as it is locally.
+    for _ in range(MAX_PER_SENDER + 1):
+        urgent.scheduler.send(ANA, KAIZEN, "now", priority=True)
 
 
 def test_the_forwarder_says_hello_then_delivers_in_order(out: Out) -> None:
@@ -781,6 +848,167 @@ def test_the_forwarder_runs_until_stopped(out: Out) -> None:
 
     asyncio.run(scenario())
     assert out.peer.closed == 1
+
+
+class Faulty(Exception):
+    """An exception no rule of the forwarder expects."""
+
+
+def test_the_watch_keeps_a_faulty_forwarder_running(
+    out: Out, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def broken(peer_id: str, definition: PeerDefinition) -> Link:
+        raise Faulty("a bug in the connector")
+
+    out.one.connect = broken
+
+    async def scenario() -> tuple[bool, str | None, int, float]:
+        stop = asyncio.Event()
+        running = asyncio.create_task(out.forwarder.run(stop))
+        message_id = out.send()
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if out.one.faults:
+                break
+        seen = (running.done(), out.one.fault, out.one.faults, out.one.backoff)
+        stop.set()
+        await asyncio.wait_for(running, 1)
+        assert list(out.log.state.outbox[PEER]) == [message_id]
+        return seen
+
+    done, fault, faults, backoff = asyncio.run(scenario())
+    assert not done
+    assert fault == "Faulty: a bug in the connector" and faults == 1
+    assert backoff == FIRST_BACKOFF_SECONDS
+    err = capsys.readouterr().err
+    assert "the forwarder for peer keleusma failed unexpectedly" in err
+    assert "Traceback" in err and "a bug in the connector" in err
+
+
+def test_an_accepted_message_clears_the_fault(out: Out) -> None:
+    out.send()
+    assert asyncio.run(out.one.fault_found(Faulty("once"))) == FIRST_BACKOFF_SECONDS
+    assert out.one.fault == "Faulty: once"
+    out.clock.now += FIRST_BACKOFF_SECONDS
+    out.peer.answers = [WELCOME, accepted()]
+    assert out.step() == 0.0
+    assert out.one.fault is None and out.one.faults == 1
+
+
+def test_a_link_that_fails_to_close_is_forgotten(
+    out: Out, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Unclosable(ScriptedLink):
+        async def close(self) -> None:
+            raise Faulty("stuck")
+
+    out.one.link = Unclosable(out.peer)
+    asyncio.run(out.one.drop_link())
+    assert out.one.link is None
+    assert "closing the link to peer keleusma failed" in capsys.readouterr().err
+
+
+def test_the_outer_watch_says_how_a_task_ended(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        watch = watch_task("forwarder", stop)
+
+        async def failing() -> None:
+            raise Faulty("escaped")
+
+        async def quiet() -> None:
+            return None
+
+        async def waiting() -> None:
+            await asyncio.Event().wait()
+
+        tasks = [asyncio.create_task(failing()), asyncio.create_task(quiet())]
+        for task in tasks:
+            task.add_done_callback(watch)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert capsys.readouterr().err.count("dromond: the forwarder ended") == 2
+        stop.set()
+        later = [asyncio.create_task(quiet()), asyncio.create_task(waiting())]
+        for task in later:
+            task.add_done_callback(watch)
+        later[1].cancel()
+        await asyncio.gather(*later, return_exceptions=True)
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+    assert capsys.readouterr().err == ""
+
+
+# Peer state in status and line_status, step 6 of phase 1.
+
+
+def test_a_peers_report_shows_what_waits_and_when_it_last_answered(out: Out) -> None:
+    quiet = out.forwarder.reports()[0]
+    assert (quiet.peer_id, quiet.phase, quiet.waiting, quiet.oldest) == (
+        PEER,
+        Phase.IDLE,
+        0,
+        None,
+    )
+    assert quiet.last_contact is None
+    first = out.send("one")
+    out.send("two")
+    out.peer.down = True
+    out.step()
+    down = out.one.report()
+    assert (down.phase, down.waiting, down.oldest) == (Phase.BACKING_OFF, 2, first)
+    assert down.oldest_sent_at == out.wall.now and down.last_contact is None
+    assert down.backoff_seconds == FIRST_BACKOFF_SECONDS
+    out.peer.down = False
+    out.clock.now += FIRST_BACKOFF_SECONDS
+    out.wall.now += timedelta(minutes=1)
+    out.peer.answers = [WELCOME, refused("refused")]
+    out.step()
+    after = out.one.report()
+    assert after.last_contact == out.wall.now and after.waiting == 1
+
+
+def test_a_lines_view_of_a_peer_leaves_out_the_fault(out: Out) -> None:
+    out.one.fault, out.one.faults = "Faulty: at /some/path", 1
+    report = out.one.report()
+    operator_view = report.wire(detail=True)
+    line_view = report.wire(detail=False)
+    assert operator_view["fault"] == "Faulty: at /some/path"
+    assert "fault" not in line_view and "backoff_seconds" not in line_view
+    assert {k: v for k, v in operator_view.items() if k in line_view} == line_view
+
+
+def test_line_status_shows_only_the_peers_a_line_may_send_to(out: Out) -> None:
+    out.scheduler.peer_reports = out.forwarder.reports
+    out.send("one")
+    alpha = out.scheduler.line_status("alpha", detail=False, lists=False)
+    assert alpha["peers"] == [out.one.report().wire(detail=False)]
+    assert out.scheduler.line_status("beta")["peers"] == []
+
+
+def test_dromon_status_prints_a_row_for_each_peer() -> None:
+    from dromon import cli
+
+    waiting = {
+        "peer": PEER,
+        "state": "backing_off",
+        "waiting": 2,
+        "oldest": "m-1",
+        "oldest_sent_at": AT,
+        "last_contact": None,
+        "fault": "Faulty: x",
+    }
+    assert cli._peer_row(waiting) == (  # pyright: ignore[reportPrivateUsage]
+        f"peer {PEER}, backing_off, 2 waiting, the oldest m-1 since {AT},"
+        " no contact since the daemon started, fault Faulty: x"
+    )
+    quiet = {"peer": PEER, "state": "idle", "waiting": 0, "last_contact": AT}
+    assert cli._peer_row(quiet) == (  # pyright: ignore[reportPrivateUsage]
+        f"peer {PEER}, idle, nothing waiting, last contact {AT}"
+    )
 
 
 def test_mail_for_a_removed_peer_is_orphaned(out: Out) -> None:
@@ -1188,6 +1416,13 @@ def test_an_operator_sends_to_a_peer_through_the_daemon(
         assert list(log.state.outbox[PEER]) == [sent_ok.result["message_id"]]
         urgent = daemon.respond(request("send", {**args, "priority": True}))
         assert not urgent.ok and "priority" in str(urgent.error_message)
+        daemon.forwarder()
+        status = daemon.respond(request("status"))
+        assert status.result is not None
+        peers = cast(list[dict[str, object]], status.result["peers"])
+        assert [(p["peer"], p["waiting"], p["faults"]) for p in peers] == [(PEER, 1, 0)]
+        # The client protocol refuses a float, so the whole status must encode.
+        encode_response(status)
         listed = daemon.respond(request("sent", {"operator": "ana"}))
         assert listed.result is not None
         messages = cast(list[dict[str, object]], listed.result["messages"])

@@ -850,7 +850,10 @@ ends with each turn, and the next turn resumes the session in a new one.
   only, while its cost also covers subagents and helper calls. `autonomous_turns` adds
   `current_turn_counts`, whether the turn in flight counts as autonomous, and a
   `note` saying that `used` counts finished turns. All of these are kept in memory and
-  start empty after a restart.
+  start empty after a restart. Step 6 of federation adds `peers`, each peer the line
+  may send to with its `peer`, `state`, `waiting`, `oldest`, `oldest_sent_at` and
+  `last_contact`, as [`FEDERATION.md`](../architecture/FEDERATION.md) describes, in
+  the compact view too.
 - **Warning before a loss.** **Decided by the operator on 2026-10-26** in round 3. When
   `configure_line`, a line's `set_setting`, `rebind_line`, `clear_session` or `stop`
   closes kept connections with background tasks running, the response adds

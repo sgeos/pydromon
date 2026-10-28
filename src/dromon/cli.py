@@ -135,7 +135,36 @@ def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     for entry in lines:
         if isinstance(entry, dict):
             print(_line_row(cast(Mapping[str, object], entry)))
+    found = result.get("peers")
+    peers = cast(list[object], found) if isinstance(found, list) else []
+    for entry in peers:
+        if isinstance(entry, dict):
+            print(_peer_row(cast(Mapping[str, object], entry)))
     return exits.OK
+
+
+def _peer_row(peer: Mapping[str, object]) -> str:
+    """One line of ``dromon status`` for a peer: its delivery, what waits and since
+    when, when it last answered, and a fault in its forwarder."""
+    parts = [f"peer {peer.get('peer')}", str(peer.get("state"))]
+    waiting = peer.get("waiting")
+    if waiting:
+        since = peer.get("oldest_sent_at")
+        parts.append(
+            f"{waiting} waiting, the oldest {peer.get('oldest')}"
+            + (f" since {since}" if since is not None else "")
+        )
+    else:
+        parts.append("nothing waiting")
+    contact = peer.get("last_contact")
+    parts.append(
+        "no contact since the daemon started"
+        if contact is None
+        else f"last contact {contact}"
+    )
+    if peer.get("fault") is not None:
+        parts.append(f"fault {peer.get('fault')}")
+    return ", ".join(parts)
 
 
 def _line_row(line: Mapping[str, object]) -> str:

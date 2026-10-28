@@ -119,6 +119,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "reply_to",
         "origin_id",
         "received_at",
+        "priority_asked",
     ),
     "message_delivered": ("message_id",),
     "message_returned": ("message_id", "code", "note_id"),
@@ -354,6 +355,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "reply_to": event.reply_to,
                 "origin_id": event.origin_id,
                 "received_at": event.received_at,
+                "priority_asked": event.priority_asked,
             }
         case MessageDelivered():
             return "message_delivered", {"message_id": event.message_id}
@@ -566,6 +568,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _optional_str(data, "reply_to"),
                 _str(data, "origin_id"),
                 _str(data, "received_at"),
+                _bool(data, "priority_asked"),
             )
         case "message_delivered":
             return MessageDelivered(_str(data, "message_id"))

@@ -36,6 +36,7 @@ from dromon.model import (
     Message,
     MessageDelivered,
     MessageKind,
+    MessagePrioritized,
     MessageReceived,
     MessageSent,
     OperatorAddress,
@@ -56,7 +57,9 @@ from dromon.peering import (
     Accepted,
     Busy,
     Code,
+    PeerPriority,
     PeerTurns,
+    Received,
     Receiver,
     Refused,
     TurnCause,
@@ -67,7 +70,7 @@ from dromon.peering import (
 )
 from dromon.projectconfig import ProjectConfig
 from dromon.protocol import MAX_LINE_BYTES, Operation, Response
-from dromon.scheduler import LineEngine, LineSpec, Scheduler
+from dromon.scheduler import PRIORITY_DECLINED, LineEngine, LineSpec, Scheduler
 
 PEER = "keleusma"
 KAIZEN = RemoteAddress(PEER, LineAddress("kaizen"))
@@ -249,6 +252,7 @@ class Recorder:
     def __init__(self, state: State) -> None:
         self.state = state
         self.count = 0
+        self.priorities: list[PeerPriority] = []
 
     def __call__(
         self,
@@ -257,15 +261,27 @@ class Recorder:
         body: str,
         reply_to: str | None,
         origin_id: str,
-    ) -> str:
+        priority: PeerPriority,
+    ) -> Received:
         self.count += 1
+        self.priorities.append(priority)
         message_id = f"r{self.count}"
         self.state.apply(
             MessageReceived(
-                message_id, sender, recipient, body, reply_to, origin_id, RECEIVED_AT
+                message_id,
+                sender,
+                recipient,
+                body,
+                reply_to,
+                origin_id,
+                RECEIVED_AT,
+                priority is not PeerPriority.NONE,
             )
         )
-        return message_id
+        honoured = priority is PeerPriority.PERMITTED
+        if honoured:
+            self.state.apply(MessagePrioritized(message_id))
+        return Received(message_id, honoured)
 
 
 def envelope(**keys: object) -> dict[str, object]:
@@ -881,3 +897,118 @@ def test_no_peer_socket_exists_unless_the_project_listens(
             if finished:
                 break
             time.sleep(0.05)
+
+
+# Priority mail from a peer, step 6 of phase 1.
+
+
+@pytest.mark.parametrize(
+    ("keys", "asked", "expected", "honoured"),
+    [
+        ({}, False, PeerPriority.NONE, False),
+        ({}, True, PeerPriority.DECLINED, False),
+        ({"priority_in": True}, True, PeerPriority.PERMITTED, True),
+        ({"priority_in": True}, False, PeerPriority.NONE, False),
+    ],
+)
+def test_the_receiver_passes_on_what_priority_the_policy_permits(
+    keys: dict[str, object],
+    asked: bool,
+    expected: PeerPriority,
+    honoured: bool,
+) -> None:
+    state = peer_state()
+    recorder = Recorder(state)
+    outcome = Receiver(Clock()).deliver(
+        state, config(**keys), PEER, envelope(priority=asked), recorder
+    )
+    assert outcome == Accepted("r1", False, honoured)
+    assert recorder.priorities == [expected]
+    message = state.messages["r1"]
+    assert (message.priority_asked, message.priority) == (asked, honoured)
+
+
+def test_a_resend_is_answered_with_the_priority_first_recorded() -> None:
+    state = peer_state()
+    receiver = Receiver(Clock())
+    recorder = Recorder(state)
+    permitting = config(priority_in=True)
+    receiver.deliver(state, permitting, PEER, envelope(priority=True), recorder)
+    again = receiver.deliver(state, config(), PEER, envelope(priority=True), recorder)
+    assert again == Accepted("r1", True, True)
+    assert recorder.count == 1
+
+
+def test_a_received_event_keeps_whether_priority_was_asked() -> None:
+    event = received()
+    asked = MessageReceived(
+        "r2", KAIZEN, ALPHA, "x", None, "o2", RECEIVED_AT, priority_asked=True
+    )
+    for each in (event, asked):
+        assert decode(encode(each)) == each
+
+
+def test_a_peer_counts_as_one_sender_and_each_line_keeps_its_limit(
+    paths: ProjectPaths,
+) -> None:
+    with attached(paths, config(priority_in=True)) as daemon:
+        scheduler = daemon.scheduler
+        for line_id in ("beta", "gamma"):
+            scheduler.create_line(line_id, "claude-haiku-5-5", Strategy.SUBSCRIPTION)
+        other = RemoteAddress(PEER, LineAddress("other"))
+
+        def receive(sender: RemoteAddress, line_id: str, origin_id: str) -> bool:
+            return scheduler.receive(
+                sender,
+                LineAddress(line_id),
+                "x",
+                None,
+                origin_id,
+                PeerPriority.PERMITTED,
+            ).priority
+
+        # The recipient's limit of two from lines, then the peer's of three, whatever
+        # the remote sender's name.
+        outcomes = [
+            receive(KAIZEN, "alpha", "o1"),
+            receive(other, "alpha", "o2"),
+            receive(KAIZEN, "alpha", "o3"),
+            receive(other, "beta", "o4"),
+            receive(KAIZEN, "gamma", "o5"),
+        ]
+        assert outcomes == [True, True, False, True, False]
+        state = daemon.log.state
+        for origin_id, honoured in zip(
+            ("o1", "o2", "o3", "o4", "o5"), outcomes, strict=True
+        ):
+            message = state.messages[state.received[(PEER, origin_id)]]
+            assert message.priority_asked and message.priority == honoured
+
+
+def test_priority_mail_goes_only_to_a_line(paths: ProjectPaths) -> None:
+    with attached(paths, config(priority_in=True)) as daemon:
+        received_note = daemon.scheduler.receive(
+            KAIZEN, ANA, "x", None, "o1", PeerPriority.PERMITTED
+        )
+        assert not received_note.priority
+        message = daemon.log.state.messages[received_note.message_id]
+        assert message.priority_asked and not message.priority
+
+
+@pytest.mark.parametrize(("priority_in", "honoured"), [(True, True), (False, False)])
+def test_a_note_says_whether_its_peers_priority_was_honoured(
+    paths: ProjectPaths, priority_in: bool, honoured: bool
+) -> None:
+    with attached(paths, config(priority_in=priority_in)) as daemon:
+        session = PeerSession(daemon)
+        assert peer_ask(session, hello()).ok
+        delivered = peer_ask(session, line("deliver", envelope(priority=True)))
+        assert delivered.result is not None
+        assert delivered.result["priority"] is honoured
+        message_id = cast(str, delivered.result["message_id"])
+        notes = daemon.scheduler.mail_notes(message_id)
+        assert notes == ("priority" if honoured else PRIORITY_DECLINED)
+        ordinary = peer_ask(session, line("deliver", envelope(origin_id="o2")))
+        assert ordinary.result is not None
+        plain = cast(str, ordinary.result["message_id"])
+        assert daemon.scheduler.mail_notes(plain) == ""

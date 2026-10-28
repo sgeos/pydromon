@@ -124,10 +124,10 @@ from dromon.overrides import encode as encode_override_document
 from dromon.overrides import encode as encode_override
 from dromon.driver import ENGINE_OF, MODELS, Driver, DriverError, Strategy
 from dromon import priority, restart
-from dromon.priority import PriorityLimiter, PriorityRefused
+from dromon.priority import PriorityLimiter, PriorityRefused, peer_key
 from dromon.federation import NO_FEDERATION, FederationConfig
-from dromon.forwarder import check_outbound
-from dromon.peering import PeerTurns, TurnCause, turn_cause
+from dromon.forwarder import PeerReport, check_outbound
+from dromon.peering import PeerPriority, PeerTurns, Received, TurnCause, turn_cause
 from dromon import acp, antigravity, codex, cursor, grok, pi
 from dromon.agents import LineTokens
 from dromon import capabilities, launcher, redact
@@ -591,6 +591,9 @@ STOPPED_REASON: Final = "was stopped by an operator"
 RESTART_HEADER: Final = "a daemon restart ended your last turn at a safe point"
 """The header note of a ``restart_noted`` note, as ``dromon.restart`` describes."""
 """Why an operator's stop holds a line, as ``Scheduler.interrupt`` describes."""
+PRIORITY_DECLINED: Final = "its peer asked for priority, which was not honoured"
+"""The header note of a peer's note whose priority this daemon declined, by its
+``priority_in`` or a rate limit, or by a crash before ``message_prioritized``."""
 
 DETACHED_CAUSE: Final = "detached"
 SWEPT_CAUSE: Final = "swept"
@@ -1448,6 +1451,8 @@ class Scheduler:
         self.on_outbox: Callable[[str, str], None] = _no_notice
         """Told each peer and message that joins its outbox, so its forwarder wakes.
         The daemon sets it to its forwarder's."""
+        self.peer_reports: Callable[[], list[PeerReport]] = list
+        """Each peer's delivery, which the daemon sets to its forwarder's."""
         """Each peer's turns per local line in the last hour, in memory, so a restart
         gives each peer a fresh allowance. Decision 10 of the federation design."""
         self._redirect_for: dict[str, str] = {}
@@ -1618,6 +1623,11 @@ class Scheduler:
             # sender's address, which the envelope carries.
             if self.discloses(body, str(sender)):
                 raise EventRejected(disclosure.REFUSAL)
+            if priority and isinstance(sender, LineAddress):
+                try:
+                    self._priority.check(sender.line_id, None)
+                except PriorityRefused as error:
+                    raise EventRejected(str(error)) from error
             message_id = new_id("m")
             self._log.append(
                 MessageSent(
@@ -1629,6 +1639,12 @@ class Scheduler:
                     reply_to=reply_to,
                 )
             )
+            # Marked before the forwarder hears of it, so its first envelope asks
+            # for priority. A crash between the two leaves an ordinary note.
+            if priority:
+                self._log.append(MessagePrioritized(message_id))
+                if isinstance(sender, LineAddress):
+                    self._priority.record(sender.line_id, None)
             self.on_outbox(recipient.peer_id, message_id)
             return message_id
         if priority:
@@ -1667,12 +1683,20 @@ class Scheduler:
         body: str,
         reply_to: str | None,
         origin_id: str,
-    ) -> str:
+        priority: PeerPriority = PeerPriority.NONE,
+    ) -> Received:
         """Record a note a peer delivered. It joins the post office in the next tick,
         as local mail does. Unlike local mail it never clears a failed line, so a
         peer cannot restart a line whose turn failed. Raises ``EventRejected`` when
-        the event does not apply, recording nothing."""
+        the event does not apply, recording nothing.
+
+        ``priority`` says whether the peer asked for priority and whether its
+        ``priority_in`` lets it. The note is priority mail only when both hold, its
+        recipient is a line, and the peer, counted as one sender, and the line are
+        within the rate limits of priority mail from lines. Otherwise it is ordinary
+        mail whose header says that its priority was declined."""
         message_id = new_id("m")
+        asked = priority is not PeerPriority.NONE
         self._log.append(
             MessageReceived(
                 message_id,
@@ -1682,11 +1706,23 @@ class Scheduler:
                 reply_to,
                 origin_id,
                 format_due(self._wall_clock()),
+                asked,
             )
         )
+        key = peer_key(sender.peer_id)
+        honoured = (
+            priority is PeerPriority.PERMITTED
+            and isinstance(recipient, LineAddress)
+            and self._priority.allows(key, recipient.line_id)
+        )
+        if honoured and isinstance(recipient, LineAddress):
+            self._log.append(MessagePrioritized(message_id))
+            self._priority.record(key, recipient.line_id)
+            if recipient.line_id in self._running:
+                self._redirect_for.setdefault(recipient.line_id, message_id)
         self._sent.append(message_id)
         self._work.set()
-        return message_id
+        return Received(message_id, honoured)
 
     @property
     def state(self) -> State:
@@ -2762,6 +2798,8 @@ class Scheduler:
                     else "priority"
                 )
                 self._ended_by.discard(message_id)
+            elif message.priority_asked:
+                parts.append(PRIORITY_DECLINED)
             if message.restart_note:
                 parts.append(RESTART_HEADER)
             repeated = self._repeats.pop(message_id, None)
@@ -2805,6 +2843,8 @@ class Scheduler:
         message = self._log.state.messages.get(message_id)
         if message is not None and message.priority:
             parts.append("priority")
+        elif message is not None and message.priority_asked:
+            parts.append(PRIORITY_DECLINED)
         if message is not None and message.restart_note:
             parts.append(RESTART_HEADER)
         repeated = self._repeat_of.get(message_id)
@@ -2882,6 +2922,17 @@ class Scheduler:
             return compact
         return _truncated_line_status(full, lists_truncated=False)
 
+    def peers_for(self, line_id: str) -> list[dict[str, object]]:
+        """The delivery of each peer ``line_id`` may send to, so a line whose mail
+        waits can see why, without the fault's text."""
+        address = LineAddress(line_id)
+        peers = self.federation.peers
+        return [
+            report.wire(detail=False)
+            for report in self.peer_reports()
+            if report.peer_id in peers and address in peers[report.peer_id].senders
+        ]
+
     def _detailed_line_status(self, line_id: str) -> dict[str, object]:
         """The full status before the caller selects compact, detail or list fields."""
         state = self._log.state
@@ -2936,6 +2987,7 @@ class Scheduler:
             "engine_session": line.engine_session,
             "kept_session": self.kept_session(line_id),
             "recent_turns": list(self._turn_costs.get(line_id, ())),
+            "peers": self.peers_for(line_id),
             "last_fired_wake": self._last_fired.get(line_id),
             "last_task_note": self._last_task_note.get(line_id),
             "context": self.context_status(line_id),
@@ -6262,6 +6314,7 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         "scheduled_wake": full["scheduled_wake"],
         "unread": full["unread"],
         "pending": full["pending"],
+        "peers": full["peers"],
         "model": full["model"],
         "strategy": full["strategy"],
         "context": {

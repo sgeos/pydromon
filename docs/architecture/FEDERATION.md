@@ -399,8 +399,8 @@ outbox in `State.outbox`. Choices the design left open, for the operator's revie
   force is returned with `refused`, `too_large` or `disclosure`, never sent. **Reason.**
   A restart may change the project file, and the design already re-checks the
   disclosure list there.
-- **Priority mail to a peer is refused at send** until step 6, whatever `priority_out`
-  says, and the envelope's `priority` is false.
+- **Priority mail to a peer** was refused at send until step 6, which follows
+  **Priority mail** below.
 - **A `tls` peer is refused at send** until phase 2. Mail already waiting for a peer
   whose transport became `tls` waits and expires, since no connector reaches it.
 - **The token is read at each connection,** so a token stored with `dromon peer store`
@@ -417,8 +417,16 @@ outbox in `State.outbox`. Choices the design left open, for the operator's revie
   refusal code outside the table, is transient and backs off. A malformed one counts as
   unanswered, so the message may expire as unconfirmed. An error response says the peer
   recorded nothing, so it does not.
-- **No outage note and no peer state in `status` yet.** **Not built in step 5.** Both
-  are in the design under a peer that is down.
+- **The watch.** **Implemented on 2026-10-28, after step 5, at the operator's
+  instruction.** An exception that no rule above expects is a fault in the forwarder,
+  not in the peer. The peer's forwarder writes it to standard error with its traceback,
+  keeps it until a message is accepted again, and backs off as after a transient
+  failure, so it neither dies nor spins. A link that fails to close is forgotten all
+  the same. A done callback on the daemon's forwarding task is the outer watch, and says
+  at once when that task ends with an error or before the daemon stops, rather than at
+  shutdown. **Limit.** A fault that recurs on every attempt holds the outbox at its head
+  until the message expires. The peer state of step 6 shows the fault to the operator,
+  and the outage note will once its sender is decided.
 
 ### Receiving
 
@@ -441,7 +449,7 @@ peer cannot make the receiver check without limit by sending refused mail. A res
 answered as a duplicate or a conflict before the policy is read, so a policy narrowed
 after the first delivery cannot refuse mail that was accepted, which would let its
 sender return a message its recipient holds. A question is refused with `refused`,
-since only notes cross. A note's priority is answered false until step 6. Peer mail
+since only notes cross. A note's priority was answered false until step 6. Peer mail
 never clears a line held out of scheduling by a failed turn, which local mail does,
 so a peer cannot restart a failing line.
 
@@ -533,6 +541,33 @@ autonomous-turn limit, even when an override has lowered the limit below the cou
 - A sender may mark mail to a peer priority only when its own `priority_out` is true for
   that peer.
 
+**Implemented on 2026-10-28, step 6 of phase 1.** Choices the design left open, for the
+operator's review.
+
+- **The sender keeps the local rules.** Mail to a peer may be priority only when it goes
+  to one of the peer's lines and is not from an external agent, as locally, and a line
+  sender's priority mail to peers counts toward its own limit of three per window. The
+  recipient's limit is the receiver's. An operator's is unlimited here as locally, and
+  the receiver still counts it as the peer's.
+- **The mark is in the log.** The sending daemon appends `message_prioritized` for the
+  waiting message right after its `message_sent`, so a restarted daemon still asks for
+  priority, and the envelope's `priority` reads it. A crash between the two sends an
+  ordinary note.
+- **What was asked is in the log.** `message_received` gains `priority_asked`, the
+  envelope's flag, so the header of a note whose priority was declined says so after a
+  restart, as `restart_noted` does for its own header. A note that asked and is not
+  priority mail was declined by `priority_in`, by a limit, by a recipient that is not a
+  line, or by a crash before its `message_prioritized`. **Porting note.** The field is
+  new in step 6, and no log written by `main` holds a `message_received`, so no default
+  for older entries is needed.
+- **A duplicate is answered with the first priority.** A resend is answered with the
+  priority the first copy was recorded with, so the answer does not change with the
+  policy or the limits in between.
+- **Priority mail from a peer does not escape the turn allowance.** It ends a running
+  turn at a safe point, and it leads the next turn, which starts without the line's
+  cooldown, but a turn only peer mail starts still needs the peer's allowance under
+  decision 10.
+
 ### Hibernated and held recipients
 
 **Proposed.** The receiver accepts mail for a hibernated or held line, as it keeps local
@@ -588,6 +623,17 @@ the bounds survive a restart.
   oldest waiting message and the time of its last contact. When a peer's oldest message
   has waited an hour, the daemon sends one note to its default operator for that
   outage, and no more until the peer has accepted mail again.
+  **Peer state implemented on 2026-10-28, step 6 of phase 1.** `status` gives `peers`,
+  one entry for each declared peer with its `state` of `idle`, `sending` or
+  `backing_off`, the number `waiting`, the `oldest` waiting message and when it was
+  sent, the time of its `last_contact`, which is any answer, `hello` included, since
+  the daemon started, and the forwarder's `backoff_seconds`, `fault` and `faults`.
+  `dromon status` prints a row for each. `line_status` gives the same for each peer the
+  line may send to, without the backoff and the fault, whose text may name a path the
+  project file holds. **Inference.** The oldest message's identifier may be another
+  sender's, which tells the line only that the peer's queue holds it. **The outage note
+  waits on the operator's choice of its sender,** since the log has no harness sender
+  and an operator cannot send a note to itself.
 - **Restart.** The outbox is derived from the log, so a restarted daemon resumes it in
   order with nothing lost.
 
@@ -664,8 +710,8 @@ the outbox, the idempotency keys and each peer's policy exactly.
 | `peer_removed` | `peer_id` | The peer is declared. Addresses through it are refused from then on, and the daemon returns every message still waiting for it with `unknown_peer` |
 | `peer_keyed` | `peer_id`, `token_sha256` | The peer is declared. The digest of the token this daemon issued for the peer, or empty to revoke it. Recorded by `dromon peer token` |
 | `message_sent` | Unchanged | Also applies to a remote recipient when its peer is declared and not removed, the sender is local and the kind is `note`. The remote party's existence is the peer's to check |
-| `message_received` | `message_id`, `sender` remote address, `recipient` local address, `body`, `reply_to` local message identifier or `null`, `origin_id`, `received_at` | The sender's peer is declared and not removed, no earlier `message_received` kept has this peer and origin identifier, and the message rules of [`EVENT_LOG.md`](../protocol/EVENT_LOG.md) hold for a note, with the remote sender standing in for an existing one. Implemented in step 4, and `received_at` in step 5 for the bound on the keys |
-| `message_prioritized` | Unchanged | Also follows a `message_received` when the receiver honours its priority |
+| `message_received` | `message_id`, `sender` remote address, `recipient` local address, `body`, `reply_to` local message identifier or `null`, `origin_id`, `received_at`, `priority_asked` boolean | The sender's peer is declared and not removed, no earlier `message_received` kept has this peer and origin identifier, and the message rules of [`EVENT_LOG.md`](../protocol/EVENT_LOG.md) hold for a note, with the remote sender standing in for an existing one. Implemented in step 4, `received_at` in step 5 for the bound on the keys, and `priority_asked` in step 6 |
+| `message_prioritized` | Unchanged | Also follows a `message_received` when the receiver honours its priority, and a `message_sent` to a peer's line, which must still wait in its outbox. Step 6 |
 | `message_delivered` | Unchanged | For a remote recipient, the peer accepted the message |
 | `message_returned` | `message_id`, `code`, `note_id` message identifier or `null` | The message has a remote recipient and is neither delivered, returned nor unconfirmed. With a line sender, `note_id` names the note to the line, checked as `task_noted` is |
 | `message_unconfirmed` | `message_id`, `note_id` message identifier or `null` | As for `message_returned`. The message expired after its envelope may have reached the peer, so its outcome is unknown |

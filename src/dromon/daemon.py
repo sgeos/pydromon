@@ -40,6 +40,7 @@ import os
 import signal
 import sys
 import time
+import traceback
 from datetime import UTC, datetime
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -574,6 +575,7 @@ class Daemon:
             times,
         )
         self.scheduler.on_outbox = forwarder.notify
+        self.scheduler.peer_reports = forwarder.reports
         return forwarder
 
     def execute(self, request: Request) -> Response:
@@ -1473,6 +1475,9 @@ class Daemon:
             "daemon": self.scheduler.daemon_status(),
             "restart": self.scheduler.restart_status(),
             "lines": self.scheduler.line_summaries(),
+            "peers": [
+                report.wire(detail=True) for report in self.scheduler.peer_reports()
+            ],
             "agents": {
                 "listen": self.agents.listen,
                 "anonymous": self.agents.anonymous.value,
@@ -1820,6 +1825,36 @@ async def _guarded(
             await writer.wait_closed()
 
 
+def watch_task(
+    what: str, stop: asyncio.Event
+) -> Callable[["asyncio.Task[None]"], None]:
+    """A done callback that says on standard error, when it happens, that the task
+    for ``what`` ended with an exception or before ``stop`` was set. Without it, an
+    exception in a task the daemon awaits only at shutdown is seen only then.
+    ``PeerForwarder.run`` already survives what ``step`` raises, so this is the outer
+    watch, for what escapes that one."""
+
+    def ended(task: "asyncio.Task[None]") -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            trace = "".join(traceback.format_exception(error)).rstrip()
+            print(
+                f"dromond: the {what} ended with an unexpected error, and its work"
+                f" waits until the daemon restarts\n{trace}",
+                file=sys.stderr,
+            )
+        elif not stop.is_set():
+            print(
+                f"dromond: the {what} ended before the daemon stopped, and its work"
+                " waits until the daemon restarts",
+                file=sys.stderr,
+            )
+
+    return ended
+
+
 async def serve(daemon: Daemon) -> None:
     """Listen on the project's socket until a stop is requested."""
     loop = asyncio.get_running_loop()
@@ -1936,6 +1971,7 @@ async def serve(daemon: Daemon) -> None:
     daemon.scheduler.recover()
     scheduling = asyncio.create_task(daemon.scheduler.run(daemon.stop_requested))
     forwarding = asyncio.create_task(forwarder.run(daemon.stop_requested))
+    forwarding.add_done_callback(watch_task("forwarder", daemon.stop_requested))
     try:
         # The umask already gives 0600, and this states it rather than relying on it.
         socket_path.chmod(0o600)
@@ -1944,7 +1980,10 @@ async def serve(daemon: Daemon) -> None:
     finally:
         daemon.stop_requested.set()
         await scheduling
-        await forwarding
+        # Its watch has said how it ended, and an error here must not keep the
+        # sockets open.
+        with contextlib.suppress(Exception):
+            await forwarding
         for listening in servers:
             listening.close()
         for writer in list(writers):

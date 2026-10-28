@@ -102,6 +102,21 @@ All notable changes are recorded here. The format follows
   dropped. From the review of the TLS transport, the peer listener serves at most 16
   connections at once, and a message is recorded as delivered only from the peer's
   answer, never from a write that succeeded.
+- A watch on the forwarder, after step 5 of federation phase 1. An unexpected exception
+  in a peer's forwarder is written to standard error with its traceback, kept until a
+  message is accepted again, and followed by backoff, so the forwarder keeps running.
+  The daemon also says at once when its forwarding task ends with an error or before a
+  stop, and such an end no longer keeps the sockets open at shutdown.
+- Federation phase 1 step 6, priority mail to and from peers and peer state. A sender
+  may mark mail to a peer's line priority when the peer's `priority_out` is true, with a
+  line's priority mail counted toward its own limit, and the envelope asks for it. The
+  receiver honours it only under its `priority_in`, counting the whole peer as one
+  sender and keeping each line's limit, and otherwise records ordinary mail whose
+  header says that its priority was not honoured. `message_received` gains
+  `priority_asked`, and `message_prioritized` may mark mail waiting for a peer's line.
+  `status`, `dromon status` and `line_status` show each peer's state, what waits and
+  since when, and its last contact. The outage note waits on the operator's choice of
+  its sender.
 - Automatic switching of a role's owner, roles step 3, at the operator's instruction
   of 2026-10-27, as `docs/architecture/ROLES.md` describes. A role declares its seats'
   order, a failover policy, `automatic` by default or `ask`, and

@@ -40,6 +40,7 @@ import asyncio
 import contextlib
 import secrets
 import sys
+import traceback
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -52,13 +53,16 @@ from dromon.federation import TRANSPORT_UNIX, FederationConfig, PeerDefinition
 from dromon.model import (
     ID_PATTERN,
     Address,
+    AgentAddress,
     EventRejected,
+    LineAddress,
     Message,
     MessageKind,
     MessageSent,
     RemoteAddress,
     ReturnCode,
     State,
+    format_due,
 )
 from dromon.peering import FEDERATION_VERSION
 from dromon.protocol import (
@@ -154,14 +158,32 @@ def check_outbound(
     if recipient.party not in definition.remote:
         raise EventRejected(f"{recipient} is not a party of peer {peer_id} to address")
     if priority:
-        raise EventRejected(
-            "priority mail to a peer comes with a later step, so send the note"
-            " without priority"
-        )
+        check_outbound_priority(definition, sender, recipient)
     if len(body.encode("utf-8")) > definition.max_body_bytes:
         raise EventRejected(
             f"the body exceeds the {definition.max_body_bytes} bytes peer {peer_id}"
             " accepts"
+        )
+
+
+def check_outbound_priority(
+    definition: PeerDefinition, sender: Address, recipient: RemoteAddress
+) -> None:
+    """Raise ``EventRejected`` unless ``sender`` may mark mail to ``recipient``
+    priority, which needs the peer's ``priority_out``. As locally, only a line
+    receives priority mail and an external agent sends none. The sender's rate limit
+    is the scheduler's, and the recipient's the peer's."""
+    if not definition.priority_out:
+        raise EventRejected(
+            f"priority mail to peer {recipient.peer_id} is off, so send the note"
+            " without priority"
+        )
+    if not isinstance(recipient.party, LineAddress):
+        raise EventRejected("priority mail goes to a line, not to an operator")
+    if isinstance(sender, AgentAddress):
+        raise EventRejected(
+            "an external agent may not send priority mail, which only operators"
+            " and lines may send"
         )
 
 
@@ -220,7 +242,7 @@ def envelope(state: State, message_id: str, message: Message) -> dict[str, objec
         "kind": MessageKind.NOTE.value,
         "body": message.body,
         "reply_to": reply_to,
-        "priority": False,
+        "priority": message.priority,
     }
 
 
@@ -274,6 +296,48 @@ class Phase(StrEnum):
     BACKING_OFF = "backing_off"
 
 
+@dataclass(frozen=True, slots=True)
+class PeerReport:
+    """One peer's delivery as ``status`` and ``line_status`` show it, so that an
+    outage is seen while it lasts rather than when its mail expires."""
+
+    peer_id: str
+    phase: Phase
+    waiting: int
+    oldest: str | None
+    """The message at the head of the outbox, which every later one waits behind."""
+    oldest_sent_at: datetime | None
+    last_contact: datetime | None
+    """When the peer last answered anything, ``hello`` included, since the daemon
+    started."""
+    backoff_seconds: int
+    """Whole seconds, since the client protocol carries no floats."""
+    fault: str | None
+    faults: int
+
+    def wire(self, *, detail: bool) -> dict[str, object]:
+        """The report as a status result carries it. A line's view leaves out the
+        backoff and the fault, whose text may name the peer's socket or a path of
+        this daemon, which the project file holds and a line may not read."""
+        found: dict[str, object] = {
+            "peer": self.peer_id,
+            "state": self.phase.value,
+            "waiting": self.waiting,
+            "oldest": self.oldest,
+            "oldest_sent_at": _instant(self.oldest_sent_at),
+            "last_contact": _instant(self.last_contact),
+        }
+        if detail:
+            found["backoff_seconds"] = self.backoff_seconds
+            found["fault"] = self.fault
+            found["faults"] = self.faults
+        return found
+
+
+def _instant(value: datetime | None) -> str | None:
+    return None if value is None else format_due(value)
+
+
 def _request_id() -> str:
     return f"f-{secrets.token_hex(6)}"
 
@@ -303,6 +367,27 @@ class PeerForwarder:
     not_before: float = 0.0
     busy: int = 0
     busy_for: str | None = None
+    fault: str | None = None
+    """The last unexpected exception, until a message is accepted again."""
+    faults: int = 0
+    """Unexpected exceptions since the daemon started."""
+    last_contact: datetime | None = None
+
+    def report(self) -> PeerReport:
+        state = self.outbox.state
+        waiting = state.outbox.get(self.peer_id, {})
+        oldest = next(iter(waiting), None)
+        return PeerReport(
+            self.peer_id,
+            self.phase,
+            len(waiting),
+            oldest,
+            None if oldest is None else self.sent_at.get(oldest),
+            self.last_contact,
+            round(self.backoff),
+            self.fault,
+            self.faults,
+        )
 
     def notify(self, message_id: str) -> None:
         """A message joined the outbox now."""
@@ -412,6 +497,7 @@ class PeerForwarder:
         except LinkError:
             await link.close()
             raise
+        self.last_contact = self.wall_clock()
         version = None if response.result is None else response.result.get("version")
         if not response.ok or version != FEDERATION_VERSION:
             await link.close()
@@ -423,9 +509,41 @@ class PeerForwarder:
         return link
 
     async def drop_link(self) -> None:
+        """Close the link, if any. A link whose close fails is forgotten all the
+        same, and the failure is said on standard error, so that closing can never
+        end the forwarder."""
         link, self.link = self.link, None
-        if link is not None:
+        if link is None:
+            return
+        try:
             await link.close()
+        except Exception as error:  # noqa: BLE001
+            print(
+                f"dromond: closing the link to peer {self.peer_id} failed: {error!r}",
+                file=sys.stderr,
+            )
+
+    async def fault_found(self, error: Exception) -> float:
+        """The watch. An exception that no rule above expects is a fault in this
+        forwarder, not in the peer. It is written to standard error with its
+        traceback and kept in ``fault`` until a message is accepted again, and the
+        forwarder backs off as after a transient failure, so it neither dies, which
+        would leave the outbox waiting unseen until shutdown, nor spins.
+
+        Assumption. A fault raised after a ``deliver`` was written leaves the
+        message marked as possibly sent, as ``step`` marked it, so the retry is a
+        duplicate the peer answers from its idempotency key. A fault that recurs on
+        every attempt holds the outbox at its head until the message expires, and
+        the peer's report in ``status`` shows the fault to the operator."""
+        self.fault = f"{type(error).__name__}: {error}"
+        self.faults += 1
+        trace = "".join(traceback.format_exception(error)).rstrip()
+        print(
+            f"dromond: the forwarder for peer {self.peer_id} failed unexpectedly,"
+            f" fault {self.faults}, and backs off\n{trace}",
+            file=sys.stderr,
+        )
+        return await self.fail(self.fault)
 
     async def fail(self, reason: str) -> float:
         """Back off after a transient failure, closing the link."""
@@ -446,10 +564,12 @@ class PeerForwarder:
     async def answer(self, message_id: str, response: Response, earlier: bool) -> float:
         """Record what the peer's answer to ``message_id`` decides. ``earlier`` says
         whether a copy sent before this one may have reached the peer unanswered."""
+        self.last_contact = self.wall_clock()
         result = response.result if response.ok else None
         outcome = None if result is None else result.get("outcome")
         if result is not None and outcome == "accepted":
             self.backoff = 0.0
+            self.fault = None
             self.end(message_id)
             self.outbox.forwarded(message_id)
             return 0.0
@@ -503,6 +623,8 @@ class PeerForwarder:
                     # The log refused what the forwarder recorded, which is a fault
                     # here. Backing off keeps it from spinning.
                     wait = await self.fail(f"the log refused a record: {error}")
+                except Exception as error:  # noqa: BLE001
+                    wait = await self.fault_found(error)
                 if wait == 0:
                     await asyncio.sleep(0)
                     continue
@@ -559,6 +681,10 @@ class Forwarder:
                 sent_at={m: sent_at[m] for m in waiting if m in sent_at},
                 possibly_sent=set(waiting),
             )
+
+    def reports(self) -> list[PeerReport]:
+        """Each declared peer's report, in name order."""
+        return [self.peers[peer_id].report() for peer_id in sorted(self.peers)]
 
     def notify(self, peer_id: str, message_id: str) -> None:
         forwarder = self.peers.get(peer_id)
