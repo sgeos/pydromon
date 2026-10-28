@@ -706,12 +706,16 @@ ends with each turn, and the next turn resumes the session in a new one.
 - **Turns the engine begins.** **Fact, observed live on 2026-10-26.** When a background
   command ends while the connection is idle, the engine re-invokes the model by itself.
   A self-started turn linked to a pending task end runs as an ordinary Dromon turn when
-  the scheduler could start the line at that moment. It enters the running state, counts
-  as an autonomous turn, uses the configured engine turn and tool limits, and its
-  measured cost counts toward the cost hold. The engine's initialization is checked
+  the scheduler could start the line at that moment, including the current tick's wake
+  interval. The engine cannot predict that alignment. Admission checks and marks the
+  line running in one scheduler step before handling the engine's first message, so a
+  second event cannot admit another turn in the gap. The admitted turn enters the
+  running state, counts as an autonomous turn, uses the configured engine turn and tool
+  limits, and its measured cost counts toward the cost hold. The engine's initialization is checked
   before the permission gate admits tools. Pending mail, a due scheduled wake, a hold,
   hibernation, cooldown, restart or another scheduling restriction makes Dromon
-  interrupt the self-start and leave the task note for a later ordinary turn. A
+  interrupt the self-start and leave the task note for a later ordinary turn. This
+  includes a tick that does not align with the line's configured wake interval. A
   self-start with no task end to account for is also interrupted. This keeps the
   engine's own turn from bypassing the scheduler's controls.
 - **A note when a task ends.** **Decided by the operator on 2026-10-26** in round 3.
