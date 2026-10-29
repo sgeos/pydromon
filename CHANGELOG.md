@@ -10,6 +10,12 @@ All notable changes are recorded here. The format follows
 - A hung test now ends the run after 300 seconds with the traceback of every thread,
   through pytest's `faulthandler_timeout`, instead of running out the job's 30 minute
   timeout in silence, as one macOS job did on 2026-10-28.
+- A Pi test failed in two gates of one session with a Keleusma virtual machine
+  dropped on another thread, and passed alone. **Inference.** A driver another test
+  left open was finalized by the cycle collector on asyncio's child-watcher thread.
+  The tests now turn automatic collection off and collect on the main thread every 25
+  tests, so a leak is finalized on the thread that made it. The original failure was
+  not reproduced, so the fix is not yet confirmed.
 - Two engine deadline tests gave their fakes ten milliseconds to reach a stage, so a
   loaded host could fail them naming an earlier stage. The Antigravity first-output
   test and the Grok start test now allow half a second.
