@@ -13,8 +13,9 @@ All notable changes are recorded here. The format follows
   field and the whole are bounded, an unknown key is refused, and the text is checked
   against the disclosure list. The brief leads the line's first turn after its engine
   session is new, as after a compaction, a restart or a rebind, and `line_status`
-  shows it, always delimited as untrusted data. Asked for by three of the round 3
-  reports.
+  shows it, always delimited as untrusted data. A turn that ends without a report,
+  as one that fails before its engine receives the prompt, leaves the lead owed to
+  the next turn. Asked for by three of the round 3 reports.
 
 ### Fixed
 

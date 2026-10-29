@@ -311,7 +311,10 @@ of its output, warns on its error stream and exits 0. The package names each suc
 as one the daemon could not read, and says that it may exist and be tracked, untracked
 or ignored. The query runs with `LC_ALL=C`, so git gives its untranslated wording
 whatever the operator's locale. **Assumption.** A later change of that wording leaves
-such a path out without naming it.
+such a path out without naming it. **Fact, observed.** Git quotes the path without
+escaping it, so the daemon reads the name up to the quote that git's own text follows.
+A name that itself holds that sequence is recorded only up to it, and the recorded name
+may then not exist.
 
 The former owner's processes are given as the daemon recorded them when its engine
 ended, or as none recorded. Where the platform does not let the daemon identify a

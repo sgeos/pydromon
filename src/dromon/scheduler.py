@@ -6170,6 +6170,7 @@ class Scheduler:
         compaction: str | None = None
         owed: tuple[str, Handoff | None] | None = None
         refused: Exception | None = None
+        brief: str | None = None
         # Review of 2026-10-27, I0-3. The line is already marked running and its mail
         # delivered, so a failure composing the prompt is carried into the turn,
         # which fails at once and holds the line as any failed turn does, rather than
@@ -6225,7 +6226,16 @@ class Scheduler:
             self._turn_owned.add(line_id)
         keys = sorted({m.correlation for _, m in messages if m.correlation is not None})
         task = asyncio.get_running_loop().create_task(
-            self._turn(line_id, prompt, cause, compaction, owed, refused, tuple(keys))
+            self._turn(
+                line_id,
+                prompt,
+                cause,
+                compaction,
+                owed,
+                refused,
+                tuple(keys),
+                led_brief=brief is not None,
+            )
         )
         self._running[line_id] = task
 
@@ -6238,10 +6248,14 @@ class Scheduler:
         owed: tuple[str, Handoff | None] | None = None,
         refused: Exception | None = None,
         keys: tuple[str, ...] = (),
+        *,
+        led_brief: bool = False,
     ) -> None:
         """Run one turn of ``line_id``. ``refused`` is a failure that came before the
         turn, as it was dispatched, which fails the turn before any engine runs.
-        ``keys`` are the sorted correlation keys of the notes the turn delivered."""
+        ``keys`` are the sorted correlation keys of the notes the turn delivered.
+        ``led_brief`` says the prompt leads with the line's standing brief, which is
+        owed again when the turn ends without a report."""
         report: TurnReport | None = None
         ending = "cancelled"
         failed = False
@@ -6324,6 +6338,10 @@ class Scheduler:
             self._restart_asked.discard(line_id)
             # A compaction the engine did not report leaves no cause for a later one.
             self._compaction_cause.pop(line_id, None)
+            # Review r4, finding 1. A turn with no report may have failed before its
+            # engine received the brief, so the next turn leads with it again.
+            if led_brief and report is None:
+                self._brief_owed.add(line_id)
             self.activity.record(line_id, ActivityKind.TURN_ENDED, ending)
             if self._log.state.lines[line_id].state is LineState.RUNNING:
                 self._log.append(LineStateChanged(line_id, LineState.IDLE))
@@ -6452,15 +6470,21 @@ class Scheduler:
         owner finds, when this turn asks for a compaction, or when the engine
         compacted the session by itself since the last turn. **Inference.** An
         engine rebuilt with the line's recorded session may resume it with its
-        context, and the lead is then repeated, which costs only its length."""
+        context, and the lead is then repeated, which costs only its length.
+
+        Review r4, finding 1. The owed mark is cleared only once the lead is
+        composed, and ``_turn`` restores it when the turn ends without a report, so
+        a turn that fails before its engine receives the prompt does not lose the
+        lead. A turn that fails after delivery restores it too, since the two cannot
+        be told apart, and the next turn then repeats the lead."""
         owed = line_id in self._brief_owed
-        self._brief_owed.discard(line_id)
         if not (owed or compacting or line_id not in self._engines):
             return None
         brief = self._log.state.briefs.get(line_id)
         if brief is None:
+            self._brief_owed.discard(line_id)
             return None
-        return (
+        lead = (
             "Your engine session is new since your last turn, so it leads with the"
             f" standing brief you last set, at {brief.set_at}, with your worktree at"
             f" commit {brief.workdir_commit[:12] or 'unknown'}. It is your own"
@@ -6468,6 +6492,8 @@ class Scheduler:
             " mail, and set it again with set_brief when your task changes.\n"
             f"{self._brief_block(brief)}"
         )
+        self._brief_owed.discard(line_id)
+        return lead
 
     def _brief_block(self, brief: BriefSet) -> str:
         """``brief`` delimited as untrusted data, or withheld whole when any of it
@@ -8140,7 +8166,7 @@ def _git_snapshot_command(arguments: list[str]) -> tuple[str, tuple[str, ...]]:
 
 
 UNREADABLE_PATH: Final = re.compile(
-    r"could not open directory '(?P<directory>[^']+)'|open\(\"(?P<file>[^\"]+)\"\)"
+    r"could not open directory '(?P<directory>.+?)': |open\(\"(?P<file>.+?)\"\)"
 )
 """The warnings git gives, with an exit status of 0, for a directory or file it
 could not open, which it then leaves out of its status. The query runs with
@@ -8153,7 +8179,16 @@ MAX_UNREADABLE_PATHS: Final = 16
 
 def _unreadable_paths(stderr: str) -> tuple[str, ...]:
     """The paths, at most ``MAX_UNREADABLE_PATHS``, that git's ``stderr`` says it
-    could not read."""
+    could not read.
+
+    Review r4, finding 3. **Fact, observed with git on 2026-10-29.** Git puts the
+    path between quotes without escaping it. The name is therefore read up to the
+    first closing quote that git's own text follows, ``': `` for a directory and
+    ``")`` for a file, so ``it's/`` and ``say"hi.txt`` are recorded whole. A name
+    that itself holds that closing sequence is recorded only up to it, and the
+    recorded name may then not exist. Such a path is still reported unreadable and
+    never absent. **Fact.** The earlier pattern stopped at any quote, which cut
+    ``it's/`` to ``it`` and failed to match ``say"hi.txt`` at all."""
     paths: list[str] = []
     for line in stderr.splitlines()[: 4 * MAX_UNREADABLE_PATHS]:
         found = UNREADABLE_PATH.search(line)

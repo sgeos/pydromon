@@ -1187,6 +1187,32 @@ def test_a_dropped_engine_and_a_compaction_each_bring_the_lead_back(
     assert leads == [True, True, False, True]
 
 
+def test_a_turn_that_fails_before_its_engine_gets_the_prompt_keeps_the_lead_owed(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review r4, finding 1. The engine is kept, so only the owed mark of its own
+    compaction calls for the lead, and the failed turn must not spend it."""
+    set_brief(world, "alpha", task="lift the bound")
+    wake(world, "alpha")
+    world.scheduler.session_compacted("alpha", {"trigger": "auto"})
+    walks: list[str] = []
+
+    async def refused_walk(line_id: str) -> None:
+        walks.append(line_id)
+        raise RuntimeError("refused before the engine ran")
+
+    monkeypatch.setattr(world.scheduler, "_check_walk", refused_walk)
+    wake(world, "alpha")
+    assert walks == ["alpha"]
+    assert len(world.prompts("alpha")) == 1
+    monkeypatch.undo()
+    world.scheduler.release("alpha")
+    wake(world, "alpha")
+    wake(world, "alpha")
+    leads = [BRIEF_BEGIN in prompt for prompt in world.prompts("alpha")]
+    assert leads == [True, True, False]
+
+
 def test_a_line_with_no_brief_gets_no_lead(world: World) -> None:
     wake(world, "alpha")
     (prompt,) = world.prompts("alpha")
@@ -1376,9 +1402,33 @@ def test_unreadable_paths_are_read_from_gits_warnings() -> None:
         "closed/",
         "secret.txt",
     )
-    many = "\n".join(f"could not open directory 'd{index}/'" for index in range(40))
+    many = "\n".join(
+        f"could not open directory 'd{index}/': Permission denied"
+        for index in range(40)
+    )
     assert len(scheduler_module._unreadable_paths(many)) == (  # pyright: ignore[reportPrivateUsage]
         scheduler_module.MAX_UNREADABLE_PATHS
+    )
+
+
+def test_a_quote_in_an_unreadable_name_is_recorded_whole() -> None:
+    """Review r4, finding 3. The first two warnings are as git gave them on
+    2026-10-29 for unreadable directories named ``say"hi`` and ``it's``, unescaped.
+    The third is the file form written to match, and was not observed. The last
+    two names hold git's closing sequence and are recorded only up to it."""
+    stderr = (
+        "warning: could not open directory 'say\"hi/': Permission denied\n"
+        "warning: could not open directory 'it's/': Permission denied\n"
+        'error: open("say"hi.txt"): Permission denied\n'
+        "warning: could not open directory 'a': b/': Permission denied\n"
+        'error: open("c")d"): Permission denied\n'
+    )
+    assert scheduler_module._unreadable_paths(stderr) == (  # pyright: ignore[reportPrivateUsage]
+        'say"hi/',
+        "it's/",
+        'say"hi.txt',
+        "a",
+        "c",
     )
 
 
