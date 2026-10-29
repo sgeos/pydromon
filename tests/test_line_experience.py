@@ -1243,6 +1243,7 @@ def test_daemon_status_says_when_the_checkout_moved(
     assert (status["stale"], status["checkout_commit"]) == (True, moved)
     note = cast(str, status["stale_note"])
     assert COMMIT[:12] in note and moved[:12] in note and "restarts" in note
+    assert f"loaded its code at {status['loaded_at']}" in note
 
 
 def test_line_status_cites_the_worktree_and_daemon_commits(
@@ -1283,15 +1284,19 @@ def test_line_status_cites_the_worktree_and_daemon_commits(
     moved = "d" * 40
     checkout(daemon, moved)
     compact_text, _ = world.call("line_status")
-    compact_commits = json.loads(compact_text)["commits"]
-    assert compact_commits["stale"] is True
-    assert compact_commits["cite"].endswith(
-        f", whose checkout has since moved to {moved}."
+    compact = json.loads(compact_text)
+    loaded_at = compact["daemon"]["loaded_at"]
+    assert loaded_at == world.scheduler.daemon_status()["loaded_at"]
+    stale_tail = (
+        f", whose checkout has since moved to {moved} after the daemon loaded its"
+        f" code at {loaded_at}."
     )
+    assert compact["commits"]["stale"] is True
+    assert compact["commits"]["cite"].endswith(stale_tail)
     text, _ = world.call("line_status", {"detail": True, "lists": True})
     commits = json.loads(text)["commits"]
     assert commits["stale"] is True
-    assert commits["cite"].endswith(f", whose checkout has since moved to {moved}.")
+    assert commits["cite"].endswith(stale_tail)
 
 
 def test_staleness_is_unknown_without_a_checkout_or_a_start_commit(

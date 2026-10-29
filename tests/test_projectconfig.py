@@ -458,3 +458,45 @@ def test_config_without_a_file_reports_the_defaults(
     argv = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime), "config"]
     assert cli.main(argv) == exits.OK
     assert "Built-in defaults apply" in capsys.readouterr().out
+
+
+def test_config_says_when_no_disclosure_list_is_named(
+    tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tmp_path / ".dromon"
+    state.mkdir(mode=0o700)
+    (state / "dromon.toml").write_text(EXAMPLE)
+    argv = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime), "config"]
+    assert cli.main(argv) == exits.OK
+    assert "disclosure list: none, so no line's mail" in capsys.readouterr().out
+
+
+def test_config_names_the_disclosure_list_but_never_its_terms(
+    tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tmp_path / ".dromon"
+    state.mkdir(mode=0o700)
+    (tmp_path / "terms.txt").write_text("codename-zeta\n")
+    (state / "dromon.toml").write_text(
+        EXAMPLE.replace("[daemon]\n", '[daemon]\ndisclosure_terms = "terms.txt"\n', 1)
+    )
+    argv = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime), "config"]
+    assert cli.main(argv) == exits.OK
+    out = capsys.readouterr().out
+    assert "disclosure list: terms.txt" in out
+    assert "codename-zeta" not in out
+
+
+def test_config_refuses_a_disclosure_list_it_cannot_read(
+    tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tmp_path / ".dromon"
+    state.mkdir(mode=0o700)
+    (state / "dromon.toml").write_text(
+        EXAMPLE.replace("[daemon]\n", '[daemon]\ndisclosure_terms = "absent.txt"\n', 1)
+    )
+    argv = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime), "config"]
+    assert cli.main(argv) == exits.FAILURE
+    captured = capsys.readouterr()
+    assert "is valid" not in captured.out
+    assert "absent.txt cannot be read" in captured.err

@@ -1,5 +1,6 @@
 """Fixtures shared across the test suite."""
 
+import gc
 import shutil
 import tempfile
 from collections.abc import Callable, Iterator
@@ -230,6 +231,41 @@ SCENARIO: tuple[Event, ...] = (
 
 STEERED_REASON = "priority mail m-1 from @ana"
 """The reason the ``steered`` fixture's driver gives to end a turn."""
+
+
+# Collection on the main thread only. **Found on 2026-10-29,** when a Pi test failed
+# twice in one gate and passed alone. A Keleusma virtual machine may be dropped only on
+# the thread that made it. A driver a test leaves open sits in a reference cycle until
+# the cycle collector runs, and the collector runs in whichever thread allocates when
+# its threshold is crossed. In a test that starts a subprocess through asyncio, that
+# can be asyncio's child-watcher thread, and the warning that follows is charged to
+# whichever test is running. Automatic collection is therefore off for the session,
+# and the main thread collects after every COLLECT_EVERY tests, so each leak is
+# finalized on the thread that made it. A collection after every test cost about 40
+# milliseconds each, which is two and a half minutes over the suite. A test that needs
+# a collection within itself calls gc.collect, as before. The daemon closes its drivers
+# explicitly and keeps automatic collection, so this is a property of the tests only.
+COLLECT_EVERY = 25
+_tests_since_collection = [0]
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_automatic_collection() -> Iterator[None]:
+    gc.disable()
+    try:
+        yield
+    finally:
+        gc.enable()
+        gc.collect()
+
+
+@pytest.fixture(autouse=True)
+def _collect_on_the_main_thread() -> Iterator[None]:
+    yield
+    _tests_since_collection[0] += 1
+    if _tests_since_collection[0] >= COLLECT_EVERY:
+        _tests_since_collection[0] = 0
+        gc.collect()
 
 
 @pytest.fixture

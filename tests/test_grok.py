@@ -1255,7 +1255,11 @@ def test_a_closed_connection_refuses_the_turn(
 def test_grok_start_and_turn_deadlines_are_bounded(
     project: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(grok_module, "START_SECONDS", 0.01)
+    # The bound is half a second rather than a hundredth, since the fake finishes the
+    # stages before the stalled one at once but a loaded host may not run them within
+    # ten milliseconds, and the error would then name an earlier stage. Found failing
+    # under load on 2026-10-29.
+    monkeypatch.setattr(grok_module, "START_SECONDS", 0.5)
     stalled_start = FakeGrok()
     stalled_start.blocked_method = "session/new"
     with pytest.raises(EngineRefused, match="start timed out during open session"):
@@ -1282,17 +1286,23 @@ def test_grok_start_and_turn_deadlines_are_bounded(
 def test_grok_sliding_deadline_resets_on_activity_and_obeys_absolute_cap(
     project: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(grok_module, "TURN_SECONDS", 0.1)
-    monkeypatch.setattr(grok_module, "ABSOLUTE_TURN_SECONDS", 0.5)
-    active = FakeGrok([chunk(str(index)) for index in range(6)])
+    # The active turn's twenty chunks take about 0.4 seconds in all, longer than the
+    # 0.3 second deadline, so it ends only if each chunk resets the deadline. Each
+    # gap of 0.02 seconds is a fifteenth of it, so a loaded host has room. The capped
+    # turn takes about 0.5 seconds against an absolute cap of 0.3, with a sliding
+    # deadline of 1 second that no gap comes near, so only the cap can end it.
+    monkeypatch.setattr(grok_module, "TURN_SECONDS", 0.3)
+    monkeypatch.setattr(grok_module, "ABSOLUTE_TURN_SECONDS", 5.0)
+    active = FakeGrok([chunk(str(index % 10)) for index in range(20)])
     active.activity_delay = 0.02
     report = run(line(active, project))
-    assert report.text == "012345"
+    assert report.text == "0123456789" * 2
 
-    monkeypatch.setattr(grok_module, "ABSOLUTE_TURN_SECONDS", 0.15)
+    monkeypatch.setattr(grok_module, "TURN_SECONDS", 1.0)
+    monkeypatch.setattr(grok_module, "ABSOLUTE_TURN_SECONDS", 0.3)
     capped = FakeGrok([chunk(str(index)) for index in range(10)])
-    capped.activity_delay = 0.02
-    with pytest.raises(EngineRefused, match="absolute cap of 0.15 seconds"):
+    capped.activity_delay = 0.05
+    with pytest.raises(EngineRefused, match="absolute cap of 0.3 seconds"):
         run(line(capped, project))
 
 

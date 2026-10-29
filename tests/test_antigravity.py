@@ -1343,8 +1343,12 @@ def test_a_turn_past_its_deadline_is_cancelled_and_refused(
 def test_no_first_output_has_a_bounded_stage_named_failure(
     home: Path, runtime: Path
 ) -> None:
+    # The bound is half a second rather than a hundredth, since the fake finishes the
+    # stages before the stalled one at once but a loaded host may not run them within
+    # ten milliseconds, and the error would then name an earlier stage. Found failing
+    # under load on 2026-10-29.
     server = FakeRuntime([], stop=None)
-    target = line(server, home, runtime, first_output_seconds=0.01)
+    target = line(server, home, runtime, first_output_seconds=0.5)
     with pytest.raises(
         EngineRefused, match="first model output before its first output"
     ):
@@ -1353,7 +1357,7 @@ def test_no_first_output_has_a_bounded_stage_named_failure(
 
     stalled_sign_in = FakeRuntime()
     stalled_sign_in.blocked_method = "authenticate"
-    target = line(stalled_sign_in, home, runtime, first_output_seconds=0.01)
+    target = line(stalled_sign_in, home, runtime, first_output_seconds=0.5)
     with pytest.raises(EngineRefused, match="sign-in before its first output"):
         run(target)
     assert stalled_sign_in.stops == 1
@@ -1361,7 +1365,7 @@ def test_no_first_output_has_a_bounded_stage_named_failure(
 
 def test_stage_is_reset_for_each_antigravity_turn(home: Path, runtime: Path) -> None:
     server = FakeRuntime()
-    target = line(server, home, runtime, first_output_seconds=0.01)
+    target = line(server, home, runtime, first_output_seconds=0.5)
     run(target)
     server.blocked_method = "initialize"
     with pytest.raises(EngineRefused, match="initialize before its first output"):
