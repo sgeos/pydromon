@@ -1469,6 +1469,10 @@ class Scheduler:
         self._protected = tuple(protected)
         self._daemon_commit = daemon_commit
         """The commit the daemon's own checkout had at start, if it runs from one."""
+        self._loaded_at = format_due(wall_clock())
+        """When this scheduler, and with it the daemon's code, was loaded. **Asked by
+        the review role on 2026-10-28,** so a report that cites a stale daemon can say
+        how long it has run behind its checkout."""
         self._daemon_checkout = daemon_checkout
         """A directory in the daemon's own checkout, whose HEAD ``line_status`` reads
         again at each call, or ``None``."""
@@ -3587,7 +3591,10 @@ class Scheduler:
             f" under the daemon at commit {started or 'unknown'}"
         )
         if daemon["stale"]:
-            cite += f", whose checkout has since moved to {daemon['checkout_commit']}"
+            cite += (
+                f", whose checkout has since moved to {daemon['checkout_commit']}"
+                f" after the daemon loaded its code at {daemon['loaded_at']}"
+            )
         return {
             "workdir": workdir,
             "daemon": started,
@@ -3614,8 +3621,9 @@ class Scheduler:
         if current is not None and started is not None and stale:
             note = (
                 f"The daemon's checkout has moved from {started[:12]} to"
-                f" {current[:12]} since the daemon started, so the running daemon does"
-                " not have that code until an operator restarts it."
+                f" {current[:12]} since the daemon loaded its code at"
+                f" {self._loaded_at}, so the running daemon does not have that code"
+                " until an operator restarts it."
             )
         return {
             "version": __version__,
@@ -3623,6 +3631,7 @@ class Scheduler:
             if __version__ == UNRELEASED_VERSION
             else None,
             "commit": started,
+            "loaded_at": self._loaded_at,
             "checkout_commit": current,
             "stale": stale,
             "stale_note": note,
@@ -7581,7 +7590,10 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         f" {daemon_commit or 'unknown'}"
     )
     if stale is True and checkout_commit is not None:
-        cite += f", whose checkout has since moved to {checkout_commit}"
+        cite += (
+            f", whose checkout has since moved to {checkout_commit}"
+            f" after the daemon loaded its code at {daemon['loaded_at']}"
+        )
     return {
         "line_id": full["line_id"],
         "state": full["state"],
@@ -7613,6 +7625,7 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         "daemon": {
             "version": daemon["version"],
             "commit": daemon["commit"],
+            "loaded_at": daemon["loaded_at"],
             "checkout_commit": daemon["checkout_commit"],
             "stale": daemon["stale"],
         },

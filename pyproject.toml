@@ -57,6 +57,14 @@ markers = [
 # Collection skips the state directory, which a line's sandbox denies outright, so a
 # line running the gate in its own project would otherwise fail to collect.
 addopts = "-m 'not live' --ignore=.dromon"
+# A test that runs for five minutes is taken as hung. pytest then prints the traceback
+# of every thread and exits, so a hang names its test rather than running out the job's
+# timeout in silence, as one macOS job did on 2026-10-28. The slowest test took 89
+# seconds on the operator's host on 2026-10-29, while two lines worked beside it, so
+# the bound leaves a margin for a slow runner. It uses the standard library's
+# faulthandler and adds no dependency.
+faulthandler_timeout = 300
+faulthandler_exit_on_timeout = true
 
 [tool.ruff]
 line-length = 88

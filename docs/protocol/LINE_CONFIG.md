@@ -224,6 +224,12 @@ The `daemon` object holds the following, decided by the operator on 2026-10-26 i
   the `HEAD` of the checkout its own code runs from, following loose refs, `packed-refs`
   and a linked worktree's pointers without running git. It is `null` when the daemon
   does not run from a checkout or the commit cannot be read.
+- **`loaded_at`.** From 2026-10-29, the time the daemon's scheduler was built, which is
+  when the running code was loaded, written as a due time in Coordinated Universal
+  Time.
+  **Asked by the review role on 2026-10-28,** so that a report citing a stale daemon
+  can say since when it has run behind its checkout. The stale note and the `cite`
+  sentence of `commits` name it.
 - **`checkout_commit`.** The same checkout's `HEAD`, read again at every call, which costs
   a few reads of small files and no process.
 - **`stale`.** `true` when the two differ, `false` when they match, and `null` when
