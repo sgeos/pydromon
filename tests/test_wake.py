@@ -552,6 +552,7 @@ def test_every_line_has_the_tool_and_status_shows_the_pending_wake(
         "read_mail",
         "acknowledge_mail",
         "list_sent",
+        "set_brief",
     ]
     assert world.scheduler.line_summaries()[0]["scheduled_wake"] is None
     world.call({"seconds": 60, "note": "a long note that the status leaves out"})

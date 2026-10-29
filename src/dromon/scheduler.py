@@ -100,6 +100,7 @@ import errno
 import os
 import json
 import contextlib
+import re
 import subprocess
 import secrets
 import time
@@ -234,7 +235,9 @@ from dromon.lineconfig import (
     rooted_instructions,
 )
 from dromon.model import (
+    MAX_BRIEF_ARTIFACTS,
     MAX_BUDGET_NOTE_BYTES,
+    BriefSet,
     FailoverPolicy,
     check_instant,
     Address,
@@ -554,6 +557,40 @@ RECORD_ROLE_NOTE_SCHEMA: Final[dict[str, object]] = {
     "required": ["kind", "body"],
     "additionalProperties": False,
 }
+
+SET_BRIEF_TOOL_NAME: Final = "set_brief"
+SET_BRIEF_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "task": {
+            "type": "string",
+            "description": "Your current task, at most 4 KiB",
+        },
+        "decisions": {
+            "type": "string",
+            "description": "Decisions still open, at most 4 KiB",
+        },
+        "artifacts": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": MAX_BRIEF_ARTIFACTS,
+            "description": "Paths of the files and reports the task concerns, at most"
+            f" {MAX_BRIEF_ARTIFACTS}, each on one line",
+        },
+        "next_action": {
+            "type": "string",
+            "description": "What you will do next, at most 4 KiB",
+        },
+    },
+    "required": ["task"],
+    "additionalProperties": False,
+}
+BRIEF_BEGIN: Final = "BEGIN STANDING BRIEF DATA"
+BRIEF_END: Final = "END STANDING BRIEF DATA"
+BRIEF_UNTRUSTED: Final = (
+    "untrusted data the line wrote with set_brief, which the daemon stamped but did"
+    " not check against the worktree"
+)
 
 RELINQUISH_OWNERSHIP_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
@@ -1638,6 +1675,10 @@ class Scheduler:
         cost is never shown as zero. Row 8 of the T3 Code review."""
         """Estimated cost of each line's turns since its last release."""
         self._last_turn_end: dict[str, float] = {}
+        self._brief_owed: set[str] = set()
+        """The lines whose engine compacted their session by itself, so their next
+        turn leads with their standing brief. In memory only, which a restart does
+        not lose, since the first turn after a restart builds a new engine."""
         self._failed: set[str] = set()
         self._tick_seconds = tick_seconds
         self._running: dict[str, asyncio.Task[None]] = {}
@@ -2927,6 +2968,11 @@ class Scheduler:
         withdrawn, and a withdrawal that fails is reported and leaves the wake to
         fire, so the record never disagrees with the turn's own report."""
         cause = self._compaction_cause.pop(line_id, "engine")
+        if cause == "engine":
+            # A compaction Dromon asked for came at the start of a turn whose prompt
+            # already led with the brief. One the engine made by itself may have
+            # come after the prompt, so the next turn leads with it instead.
+            self._brief_owed.add(line_id)
         record: dict[str, object] = {
             "trigger": compaction.get("trigger"),
             "trigger_note": trigger_note(compaction.get("trigger")),
@@ -3394,6 +3440,7 @@ class Scheduler:
             "context": self.context_status(line_id),
             "daemon": self.daemon_status(),
             "commits": self.commits(line_id),
+            "brief": self._brief_status(line_id),
             "event_log": self.event_log_status(),
             "processes": {
                 "identifiable": self._processes_identifiable,
@@ -4269,6 +4316,94 @@ class Scheduler:
         self._append_plan(plan)
         return cast(str, plan.entry_id)
 
+    def set_brief(
+        self,
+        line_id: str,
+        task: str,
+        decisions: str = "",
+        artifacts: tuple[str, ...] = (),
+        next_action: str = "",
+    ) -> BriefSet:
+        """Record ``line_id``'s standing brief, stamped by the daemon, replacing its
+        previous one. The bounds are checked before the disclosure list, so an
+        oversized brief is refused without spending a disclosure check. Raises
+        ``LineToolRefused``."""
+        stamp = self._stamp(line_id)
+        try:
+            event = BriefSet(
+                line_id,
+                task,
+                decisions,
+                artifacts,
+                next_action,
+                stamp.workdir_commit,
+                stamp.daemon_commit,
+                stamp.at,
+            )
+        except InvalidField as error:
+            raise LineToolRefused(str(error)) from error
+        refusal = self.refuse_disclosed(
+            line_id, task, decisions, next_action, *artifacts
+        )
+        if refusal is not None:
+            raise LineToolRefused(refusal)
+        try:
+            self._log.append(event)
+        except EventRejected as error:
+            raise LineToolRefused(str(error)) from error
+        return event
+
+    def set_brief_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``set_brief`` tool for ``line_id``, offered to every line."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, SET_BRIEF_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            task: object = args.get("task")
+            decisions: object = args.get("decisions", "")
+            artifacts: object = args.get("artifacts", [])
+            next_action: object = args.get("next_action", "")
+            if not all(
+                isinstance(text, str) for text in (task, decisions, next_action)
+            ):
+                return _tool_error("task, decisions and next_action must be text")
+            if not isinstance(artifacts, list) or not all(
+                isinstance(path, str) for path in cast(list[object], artifacts)
+            ):
+                return _tool_error("artifacts must be a list of paths")
+            try:
+                brief = self.set_brief(
+                    line_id,
+                    cast(str, task),
+                    cast(str, decisions),
+                    tuple(cast(list[str], artifacts)),
+                    cast(str, next_action),
+                )
+            except LineToolRefused as error:
+                return _tool_error(str(error))
+            return _tool_text(
+                f"brief set at {brief.set_at}, stamped by the daemon with worktree"
+                f" commit {brief.workdir_commit[:12] or 'unknown'}. It replaces your"
+                " previous brief."
+            )
+
+        return SdkMcpTool(
+            name=SET_BRIEF_TOOL_NAME,
+            description=(
+                "Record your standing brief, your current task, open decisions,"
+                " artifact paths and next action, replacing your previous one. It"
+                " leads your first turn after your engine session is new, as after a"
+                " compaction, a restart or a rebind, shows in line_status, and fills"
+                " a role transition package where your handoff entry is silent. Set"
+                " it when your task changes. The daemon stamps the time and both"
+                " commits. Fields are bounded, 16 KiB in all, and checked against the"
+                " disclosure list."
+            ),
+            input_schema=SET_BRIEF_SCHEMA,
+            handler=handler,
+        )
+
     def relinquish_ownership(
         self, line_id: str, note: str, to: str | None, back_to: str | None
     ) -> tuple[Plan, bool]:
@@ -4786,13 +4921,25 @@ class Scheduler:
         change: OwnershipChanged,
         caused: str,
     ) -> str:
-        """Lead a new owner with its latest journal entry and a bounded worktree
-        snapshot. Journal prose is untrusted data and stays explicitly delimited.
-        The journal may predate a change to the disclosure list, and snapshot paths
-        may contain a listed term, so each included part is checked when composed."""
-        role = self._log.state.roles[role_id]
+        """Lead a new owner with its latest journal entry, the former owner's
+        standing brief and a bounded worktree snapshot. Journal and brief prose is
+        untrusted data and stays explicitly delimited. The journal may predate a
+        change to the disclosure list, and snapshot paths may contain a listed term,
+        so each included part is checked when composed.
+
+        **Task of 2026-10-29.** Every item says where it came from, observed by the
+        daemon and when, reported by a line and when, unknown, or unreadable by the
+        daemon. A failover takes a role with no handoff entry, so a field its
+        journal entry lacks is taken from the former owner's brief, and where
+        neither has it the field is unknown. A path git could not read is named as
+        unreadable and never as absent or untracked, since git leaves it out of its
+        status without saying so there. The former owner is the seat the role
+        passed from, or with none, as after a vacancy, the author of the entry."""
+        state = self._log.state
+        role = state.roles[role_id]
+        now = format_due(self._wall_clock())
         entry = (
-            self._log.state.role_entries.get(change.entry_id)
+            state.role_entries.get(change.entry_id)
             if change.entry_id is not None
             else None
         )
@@ -4800,13 +4947,13 @@ class Scheduler:
             entry = next(
                 (
                     candidate
-                    for candidate in reversed(
-                        tuple(self._log.state.role_entries.values())
-                    )
+                    for candidate in reversed(tuple(state.role_entries.values()))
                     if candidate.role_id == role_id
                 ),
                 None,
             )
+        former = change.previous or (entry.line_id if entry is not None else None)
+        brief = None if former is None else state.briefs.get(former)
         body = "No journal entry is recorded for this role."
         stamp = "unknown"
         if entry is not None:
@@ -4814,15 +4961,17 @@ class Scheduler:
             stamp = entry.workdir_commit or "unknown"
         commit = self._workdir_commit(line_id)
         try:
-            status, diff = _worktree_snapshot(
+            status, diff, unreadable = _worktree_snapshot(
                 self._workdir_of(line_id), entry.workdir_commit if entry else None
             )
         except LineToolRefused:
-            status, diff = "unavailable", "unavailable"
+            status, diff, unreadable = "unavailable", "unavailable", ()
         if self.discloses(status):
             status = ROLE_PACKAGE_WITHHELD
         if self.discloses(diff):
             diff = ROLE_PACKAGE_WITHHELD
+        if self.discloses(*unreadable):
+            unreadable = (ROLE_PACKAGE_WITHHELD,)
         workdir = (
             ROLE_PACKAGE_WITHHELD if self.discloses(role.workdir) else role.workdir
         )
@@ -4830,34 +4979,124 @@ class Scheduler:
         shown_body = _cut(body, 4096)
         if len(body.encode("utf-8", "replace")) > 4096:
             shown_body += "\n[journal entry excerpt]"
-        fields = _named_note_fields(body)
         if journal_disclosed:
             shown_body = ROLE_PACKAGE_WITHHELD
-            fields = {name: ROLE_PACKAGE_WITHHELD for name in fields}
-        else:
-            fields = {
-                name: ROLE_PACKAGE_WITHHELD if self.discloses(value) else value
-                for name, value in fields.items()
-            }
-        return (
+
+        def observed(value: str) -> str:
+            if value.startswith("unavailable"):
+                return (
+                    f"the daemon could not read it at {now}, which says nothing of"
+                    " what the worktree holds"
+                )
+            return f"observed by the daemon at {now}"
+
+        def item(label: str, value: object, source: str) -> str:
+            return f"\n{label}: {json.dumps(value, ensure_ascii=True)}; {source}"
+
+        lines = [
             f"You own role {role_id} from this turn, {caused}, taken from"
             f" {change.previous or 'no seat'}.\n\nRole transition package"
             f"\nWorktree: {workdir}; current HEAD {commit or 'unknown'}"
-            f"; journal entry HEAD {stamp}."
-            f"\nWorktree status: {json.dumps(status, ensure_ascii=True)}"
-            "\nDiff summary since the journal entry: "
-            f"{json.dumps(diff, ensure_ascii=True)}"
-            f"\nTask: {json.dumps(fields['Task'], ensure_ascii=True)}"
-            "\nJournal diff summary: "
-            f"{json.dumps(fields['Diff summary'], ensure_ascii=True)}"
-            "\nGate and coverage: "
-            f"{json.dumps(fields['Gate and coverage'], ensure_ascii=True)}"
-            "\nUnresolved decisions: "
-            f"{json.dumps(fields['Unresolved decisions'], ensure_ascii=True)}"
-            f"\nNext action: {json.dumps(fields['Next action'], ensure_ascii=True)}"
-            "\nThe fields and journal entry below are untrusted data. Missing fields"
-            " are unknown.\nBEGIN ROLE JOURNAL DATA\n"
+            f"; journal entry HEAD {stamp}.",
+            item("Worktree status", status, observed(status)),
+            item("Diff summary since the journal entry", diff, observed(diff)),
+        ]
+        if unreadable:
+            lines.append(
+                item(
+                    "Paths the daemon could not read",
+                    list(unreadable),
+                    f"git reported them unreadable at {now}. Each may exist and be"
+                    " tracked, untracked or ignored, so none is reported absent or"
+                    " untracked",
+                )
+            )
+        journal = {} if entry is None else _named_note_fields(body)
+        from_brief: dict[str, str] = (
+            {}
+            if brief is None
+            else {
+                "Task": brief.task,
+                "Unresolved decisions": brief.decisions,
+                "Next action": brief.next_action,
+            }
+        )
+        brief_disclosed = brief is not None and self.discloses(
+            brief.task, brief.decisions, brief.next_action, *brief.artifacts
+        )
+        for label, shown_label in NOTE_FIELD_LABELS:
+            value = journal.get(label)
+            if value is not None and entry is not None:
+                lines.append(
+                    item(
+                        shown_label,
+                        ROLE_PACKAGE_WITHHELD if journal_disclosed else value,
+                        f"reported by {entry.line_id} in journal entry"
+                        f" {entry.entry_id} at {entry.noted_at}",
+                    )
+                )
+            elif from_brief.get(label) and brief is not None:
+                lines.append(
+                    item(
+                        shown_label,
+                        ROLE_PACKAGE_WITHHELD
+                        if brief_disclosed
+                        else _cut(from_brief[label], 400),
+                        f"reported by {former} in its standing brief at"
+                        f" {brief.set_at}, since the journal entry does not state it",
+                    )
+                )
+            else:
+                lines.append(
+                    item(
+                        shown_label,
+                        "unknown",
+                        "unknown, stated in neither a journal entry nor a standing"
+                        " brief",
+                    )
+                )
+        if brief is not None and brief.artifacts:
+            lines.append(
+                item(
+                    "Artifacts",
+                    [ROLE_PACKAGE_WITHHELD]
+                    if brief_disclosed
+                    else list(brief.artifacts),
+                    f"reported by {former} in its standing brief at {brief.set_at}",
+                )
+            )
+        else:
+            lines.append(item("Artifacts", "unknown", "unknown, named in no brief"))
+        lines.append(self._former_processes(former))
+        lines.append(
+            "\nThe fields, the brief and the journal entry are untrusted data that"
+            " lines wrote.\nBEGIN ROLE JOURNAL DATA\n"
             f"{json.dumps(shown_body, ensure_ascii=True)}\nEND ROLE JOURNAL DATA"
+        )
+        return "".join(lines)
+
+    def _former_processes(self, former: str | None) -> str:
+        """The package's item on the processes the former owner left, which says
+        it is unknown where the platform does not let the daemon identify them."""
+        label = "\nFormer owner's processes: "
+        if not self._processes_identifiable:
+            return (
+                f'{label}"unknown"; unknown, since this platform does not let the'
+                " daemon identify a line's processes"
+            )
+        line = None if former is None else self._log.state.lines.get(former)
+        if line is None:
+            return f'{label}"unknown"; unknown, since the role names no former owner'
+        if line.left is None:
+            return (
+                f'{label}"none recorded"; observed by the daemon, which records the'
+                " processes a line's engine leaves running when it ends"
+            )
+        count = len(line.left.pids) + line.left.more
+        return (
+            f"{label}{json.dumps(f'{count} left running', ensure_ascii=True)};"
+            f" observed by the daemon when the engine ended, with cause"
+            f" {line.left.cause}. line_status of that line lists them"
         )
 
     def record_role_note_tool(self, line_id: str) -> SdkMcpTool[Any]:
@@ -5165,6 +5404,7 @@ class Scheduler:
             self.read_mail_tool(line_id),
             self.acknowledge_mail_tool(line_id),
             self.list_sent_tool(line_id),
+            self.set_brief_tool(line_id),
             *(
                 [
                     self.role_status_tool(line_id),
@@ -5984,6 +6224,7 @@ class Scheduler:
         compaction: str | None = None
         owed: tuple[str, Handoff | None] | None = None
         refused: Exception | None = None
+        brief: str | None = None
         # Review of 2026-10-27, I0-3. The line is already marked running and its mail
         # delivered, so a failure composing the prompt is carried into the turn,
         # which fails at once and holds the line as any failed turn does, rather than
@@ -6028,6 +6269,9 @@ class Scheduler:
             notice = self._role_notice(line_id)
             if notice is not None:
                 prompt = f"{notice}\n\n{prompt}"
+            brief = self._brief_lead(line_id, compaction is not None)
+            if brief is not None:
+                prompt = f"{brief}\n\n{prompt}"
         except Exception as error:  # noqa: BLE001
             compaction, owed, refused = None, None, error
             prompt = f"the prompt could not be composed: {error}"
@@ -6036,7 +6280,16 @@ class Scheduler:
             self._turn_owned.add(line_id)
         keys = sorted({m.correlation for _, m in messages if m.correlation is not None})
         task = asyncio.get_running_loop().create_task(
-            self._turn(line_id, prompt, cause, compaction, owed, refused, tuple(keys))
+            self._turn(
+                line_id,
+                prompt,
+                cause,
+                compaction,
+                owed,
+                refused,
+                tuple(keys),
+                led_brief=brief is not None,
+            )
         )
         self._running[line_id] = task
 
@@ -6049,10 +6302,14 @@ class Scheduler:
         owed: tuple[str, Handoff | None] | None = None,
         refused: Exception | None = None,
         keys: tuple[str, ...] = (),
+        *,
+        led_brief: bool = False,
     ) -> None:
         """Run one turn of ``line_id``. ``refused`` is a failure that came before the
         turn, as it was dispatched, which fails the turn before any engine runs.
-        ``keys`` are the sorted correlation keys of the notes the turn delivered."""
+        ``keys`` are the sorted correlation keys of the notes the turn delivered.
+        ``led_brief`` says the prompt leads with the line's standing brief, which is
+        owed again when the turn ends without a report."""
         report: TurnReport | None = None
         ending = "cancelled"
         failed = False
@@ -6135,6 +6392,10 @@ class Scheduler:
             self._restart_asked.discard(line_id)
             # A compaction the engine did not report leaves no cause for a later one.
             self._compaction_cause.pop(line_id, None)
+            # Review r4, finding 1. A turn with no report may have failed before its
+            # engine received the brief, so the next turn leads with it again.
+            if led_brief and report is None:
+                self._brief_owed.add(line_id)
             self.activity.record(line_id, ActivityKind.TURN_ENDED, ending)
             line = self._log.state.lines.get(line_id)
             if line is not None and line.state is LineState.RUNNING:
@@ -6258,6 +6519,70 @@ class Scheduler:
             f" {before[:12]}..{after[:12]} lists the commits between, and git status"
             " shows what is left uncommitted."
         )
+
+    def _brief_lead(self, line_id: str, compacting: bool) -> str | None:
+        """What ``line_id``'s turn leads with when its engine session is new, its
+        standing brief, or ``None``. **Task of 2026-10-29.** A session is new when
+        the line holds no engine, which the first turn after a restart, a rebind, a
+        cleared session or a rebuild after a change of configuration or of a role's
+        owner finds, when this turn asks for a compaction, or when the engine
+        compacted the session by itself since the last turn. **Inference.** An
+        engine rebuilt with the line's recorded session may resume it with its
+        context, and the lead is then repeated, which costs only its length.
+
+        Review r4, finding 1. The owed mark is cleared only once the lead is
+        composed, and ``_turn`` restores it when the turn ends without a report, so
+        a turn that fails before its engine receives the prompt does not lose the
+        lead. A turn that fails after delivery restores it too, since the two cannot
+        be told apart, and the next turn then repeats the lead."""
+        owed = line_id in self._brief_owed
+        if not (owed or compacting or line_id not in self._engines):
+            return None
+        brief = self._log.state.briefs.get(line_id)
+        if brief is None:
+            self._brief_owed.discard(line_id)
+            return None
+        lead = (
+            "Your engine session is new since your last turn, so it leads with the"
+            f" standing brief you last set, at {brief.set_at}, with your worktree at"
+            f" commit {brief.workdir_commit[:12] or 'unknown'}. It is your own"
+            " earlier text and may be stale. Check it against the worktree and your"
+            " mail, and set it again with set_brief when your task changes.\n"
+            f"{self._brief_block(brief)}"
+        )
+        self._brief_owed.discard(line_id)
+        return lead
+
+    def _brief_block(self, brief: BriefSet) -> str:
+        """``brief`` delimited as untrusted data, or withheld whole when any of it
+        holds a term on the disclosure list now, which may have changed since the
+        brief was set."""
+        if self.discloses(
+            brief.task, brief.decisions, brief.next_action, *brief.artifacts
+        ):
+            body = ROLE_PACKAGE_WITHHELD
+        else:
+            body = json.dumps(_brief_fields(brief), ensure_ascii=True)
+        return f"{BRIEF_BEGIN}\n{body}\n{BRIEF_END}"
+
+    def _brief_status(self, line_id: str) -> dict[str, object] | None:
+        """``line_id``'s standing brief as ``line_status`` gives it, or ``None``."""
+        brief = self._log.state.briefs.get(line_id)
+        if brief is None:
+            return None
+        view: dict[str, object] = {
+            "set_at": brief.set_at,
+            "workdir_commit": brief.workdir_commit or None,
+            "daemon_commit": brief.daemon_commit or None,
+            "trust": BRIEF_UNTRUSTED,
+        }
+        if self.discloses(
+            brief.task, brief.decisions, brief.next_action, *brief.artifacts
+        ):
+            view["untrusted_data"] = ROLE_PACKAGE_WITHHELD
+        else:
+            view["untrusted_data"] = _brief_fields(brief)
+        return view
 
     def _quiet_notice(self, line_id: str) -> str | None:
         """What ``line_id``'s next turn is told, once, of a last turn that ended with
@@ -7572,6 +7897,35 @@ def _left_summary(left: ProcessesLeft | None) -> dict[str, object] | None:
     }
 
 
+def _brief_fields(brief: BriefSet) -> dict[str, object]:
+    """The line's own text of ``brief``, which every view delimits as untrusted."""
+    return {
+        "task": brief.task,
+        "decisions": brief.decisions,
+        "artifacts": list(brief.artifacts),
+        "next_action": brief.next_action,
+    }
+
+
+def _compact_brief(brief: object) -> dict[str, object] | None:
+    """A standing brief as the compact ``line_status`` gives it, its task and next
+    action cut short, so the default view stays within its bound. The detailed view
+    gives the whole brief."""
+    if not isinstance(brief, dict):
+        return None
+    view = dict(cast(dict[str, object], brief))
+    data = view.get("untrusted_data")
+    if isinstance(data, dict):
+        fields = cast(dict[str, object], data)
+        view["untrusted_data"] = {
+            "task": _cut(str(fields["task"]), 400),
+            "next_action": _cut(str(fields["next_action"]), 400),
+            "artifact_count": len(cast(list[str], fields["artifacts"])),
+        }
+        view["cut"] = "detail gives the whole brief"
+    return view
+
+
 def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
     """Select the bounded, list-free fields shown by ``line_status`` by default."""
     autonomous = cast(dict[str, object], full["autonomous_turns"])
@@ -7637,6 +7991,7 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
             "cite": cite + ".",
             "note": commits.get("note"),
         },
+        "brief": _compact_brief(full["brief"]),
         "background_task_count": len(cast(list[dict[str, object]], kept["tasks"])),
         "recent_turn_count": len(cast(list[dict[str, object]], full["recent_turns"])),
         "other_line_count": len(cast(list[dict[str, object]], full["other_lines"])),
@@ -7797,8 +8152,9 @@ def _entry_view(entry: RoleNoted, *, with_body: bool) -> dict[str, object]:
 
 def _worktree_snapshot(
     directory: Path, base_commit: str | None = None
-) -> tuple[str, str]:
-    """Read bounded Git status and changes since a journal commit, without a shell."""
+) -> tuple[str, str, tuple[str, ...]]:
+    """Read bounded Git status and changes since a journal commit, without a shell,
+    with the paths git reported it could not read."""
     prefix = [
         "git",
         "--no-optional-locks",
@@ -7807,25 +8163,31 @@ def _worktree_snapshot(
         "-C",
         str(directory),
     ]
-    status = _git_snapshot_command(
+    status, unreadable = _git_snapshot_command(
         [*prefix, "status", "--short", "--branch", "--untracked-files=normal"]
     )
     base = base_commit or "HEAD"
-    diff = _git_snapshot_command(
+    diff, _ = _git_snapshot_command(
         [*prefix, "diff", "--stat", "--no-ext-diff", "--no-textconv", base]
     )
-    return status, diff
+    return status, diff, unreadable
+
+
+NOTE_FIELD_LABELS: Final = (
+    ("Task", "Task"),
+    ("Diff summary", "Journal diff summary"),
+    ("Gate and coverage", "Gate and coverage"),
+    ("Unresolved decisions", "Unresolved decisions"),
+    ("Next action", "Next action"),
+)
+"""The labeled fields of a handoff note, each with the label the package shows it
+under, in the order of ``HANDOFF_TEMPLATE``."""
 
 
 def _named_note_fields(body: str) -> dict[str, str]:
-    """Read bounded labeled fields from a journal note, leaving absent ones unknown."""
-    labels = (
-        "Task",
-        "Diff summary",
-        "Gate and coverage",
-        "Unresolved decisions",
-        "Next action",
-    )
+    """Read bounded labeled fields from a journal note. A field the note does not
+    state is left out, so the package can take it from elsewhere."""
+    labels = tuple(label for label, _ in NOTE_FIELD_LABELS)
     values: dict[str, list[str]] = {label: [] for label in labels}
     current: str | None = None
     for line in body.splitlines():
@@ -7839,13 +8201,13 @@ def _named_note_fields(body: str) -> dict[str, str]:
         elif current is not None and line.strip():
             values[current].append(line.strip())
     return {
-        label: _cut(" ".join(parts), 400) if parts else "not stated in journal"
-        for label, parts in values.items()
+        label: _cut(" ".join(parts), 400) for label, parts in values.items() if parts
     }
 
 
-def _git_snapshot_command(arguments: list[str]) -> str:
-    """Run one fixed, read-only Git query with a short bound and bounded output."""
+def _git_snapshot_command(arguments: list[str]) -> tuple[str, tuple[str, ...]]:
+    """Run one fixed, read-only Git query with a short bound and bounded output, and
+    return it with the paths its warnings say it could not read."""
     try:
         result = subprocess.run(  # noqa: S603
             arguments,
@@ -7856,14 +8218,50 @@ def _git_snapshot_command(arguments: list[str]) -> str:
             errors="replace",
             timeout=1.0,
             check=False,
+            env={**os.environ, "LC_ALL": "C", "LANGUAGE": ""},
         )
     except (OSError, subprocess.TimeoutExpired):
-        return "unavailable"
+        return "unavailable", ()
     if result.returncode != 0:
         detail = result.stderr.strip() or "Git returned an error"
-        return "unavailable: " + _cut(detail, 240)
+        return "unavailable: " + _cut(detail, 240), ()
     value = result.stdout.strip() or "clean"
-    return _cut(value, 1200)
+    return _cut(value, 1200), _unreadable_paths(result.stderr)
+
+
+UNREADABLE_PATH: Final = re.compile(
+    r"could not open directory '(?P<directory>.+?)': |open\(\"(?P<file>.+?)\"\)"
+)
+"""The warnings git gives, with an exit status of 0, for a directory or file it
+could not open, which it then leaves out of its status. The query runs with
+``LC_ALL=C`` and an empty ``LANGUAGE``, so git gives its untranslated messages
+whatever the operator's locale. **Assumption.** The wording is git's own and may
+change in a later git, and a path whose warning is not matched is then not reported
+unreadable either."""
+MAX_UNREADABLE_PATHS: Final = 16
+
+
+def _unreadable_paths(stderr: str) -> tuple[str, ...]:
+    """The paths, at most ``MAX_UNREADABLE_PATHS``, that git's ``stderr`` says it
+    could not read.
+
+    Review r4, finding 3. **Fact, observed with git on 2026-10-29.** Git puts the
+    path between quotes without escaping it. The name is therefore read up to the
+    first closing quote that git's own text follows, ``': `` for a directory and
+    ``")`` for a file, so ``it's/`` and ``say"hi.txt`` are recorded whole. A name
+    that itself holds that closing sequence is recorded only up to it, and the
+    recorded name may then not exist. Such a path is still reported unreadable and
+    never absent. **Fact.** The earlier pattern stopped at any quote, which cut
+    ``it's/`` to ``it`` and failed to match ``say"hi.txt`` at all."""
+    paths: list[str] = []
+    for line in stderr.splitlines()[: 4 * MAX_UNREADABLE_PATHS]:
+        found = UNREADABLE_PATH.search(line)
+        if found is None:
+            continue
+        paths.append(_cut(found.group("directory") or found.group("file"), 240))
+        if len(paths) == MAX_UNREADABLE_PATHS:
+            break
+    return tuple(paths)
 
 
 def _tool_text(text: str) -> dict[str, Any]:

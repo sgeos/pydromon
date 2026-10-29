@@ -1383,6 +1383,7 @@ def test_the_line_socket_serves_only_the_lines_own_tools(
             "read_mail",
             "acknowledge_mail",
             "list_sent",
+            "set_brief",
         }
         sent = ask(
             "agent_call",

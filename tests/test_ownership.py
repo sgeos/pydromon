@@ -4,6 +4,8 @@ successor woken, the former writer's turn waited for, and each seat told at its 
 turn. Roles step 2, ``docs/architecture/ROLES.md``."""
 
 import asyncio
+import os
+import subprocess
 from collections.abc import Callable, Coroutine, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,7 +21,12 @@ from dromon.engine import EnginePlanLimit, TurnReport
 from dromon.eventlog import EventLog
 from dromon.model import (
     HARNESS,
+    MAX_BRIEF_ARTIFACTS,
+    MAX_BRIEF_BYTES,
+    MAX_BRIEF_FIELD_BYTES,
     MAX_ROLE_NOTE_BYTES,
+    BriefSet,
+    ProcessesLeft,
     HarnessAddress,
     BudgetSource,
     BudgetStated,
@@ -47,7 +54,10 @@ from dromon.roles import (
     waits_unconfined,
 )
 from dromon.scheduler import (
+    BRIEF_BEGIN,
+    BRIEF_END,
     MAX_TAKE_REASON_BYTES,
+    SET_BRIEF_TOOL_NAME,
     RECORD_ROLE_NOTE_TOOL_NAME,
     RECOVERY_CHECKLIST,
     RELINQUISH_OWNERSHIP_TOOL_NAME,
@@ -909,9 +919,11 @@ def test_a_new_owner_turn_leads_with_the_journal_and_worktree_package(
 ) -> None:
     snapshot_bases: list[str | None] = []
 
-    def snapshot(_directory: Path, _base_commit: str | None = None) -> tuple[str, str]:
+    def snapshot(
+        _directory: Path, _base_commit: str | None = None
+    ) -> tuple[str, str, tuple[str, ...]]:
         snapshot_bases.append(_base_commit)
-        return "## feature\n M src/example.py", "src/example.py | 2 +-"
+        return "## feature\n M src/example.py", "src/example.py | 2 +-", ()
 
     monkeypatch.setattr(scheduler_module, "_worktree_snapshot", snapshot)
     note = (
@@ -937,8 +949,10 @@ def test_a_new_owner_turn_leads_with_the_journal_and_worktree_package(
 def test_a_role_transition_withholds_disclosing_journal_and_snapshot_text(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def snapshot(_directory: Path, _base_commit: str | None = None) -> tuple[str, str]:
-        return "## feature\n M hidden_file.py", "hidden_file.py | 2 +-"
+    def snapshot(
+        _directory: Path, _base_commit: str | None = None
+    ) -> tuple[str, str, tuple[str, ...]]:
+        return "## feature\n M hidden_file.py", "hidden_file.py | 2 +-", ()
 
     monkeypatch.setattr(scheduler_module, "_worktree_snapshot", snapshot)
     note = (
@@ -988,3 +1002,454 @@ def test_a_change_the_model_refuses_is_reported_and_records_nothing(
                 format_due(START),
             )
         )
+
+
+# The standing brief, task of 2026-10-29, with ``set_brief``, ``brief_set``, the
+# lead of a turn on a new engine session and the sources of the package's items.
+
+BRIEF_AT = "2026-10-29T05:00:00Z"
+
+
+def brief_of(world: World, line_id: str) -> BriefSet | None:
+    return world.log.state.briefs.get(line_id)
+
+
+def set_brief(world: World, line_id: str, **args: object) -> tuple[str, bool]:
+    return world.call(line_id, SET_BRIEF_TOOL_NAME, args)
+
+
+# The event.
+
+
+def test_a_brief_is_stamped_by_the_daemon_and_replaces_the_previous(
+    world: World,
+) -> None:
+    text, failed = set_brief(world, "alpha", task="first")
+    assert not failed and "brief set at" in text
+    text, failed = set_brief(
+        world,
+        "alpha",
+        task="second",
+        decisions="keep the guard",
+        artifacts=["src/dromon/federation.py"],
+        next_action="run the gate",
+    )
+    assert not failed
+    brief = brief_of(world, "alpha")
+    assert brief is not None
+    assert (brief.task, brief.decisions, brief.artifacts, brief.next_action) == (
+        "second",
+        "keep the guard",
+        ("src/dromon/federation.py",),
+        "run the gate",
+    )
+    assert (brief.workdir_commit, brief.daemon_commit) == (
+        WORKTREE_COMMIT,
+        DAEMON_COMMIT,
+    )
+    assert brief.set_at == "2026-10-27T09:00:00Z"
+    assert brief_of(world, "beta") is None
+
+
+def test_set_brief_is_offered_to_every_line(world: World) -> None:
+    # delta is a seat of no role, so it is offered no role tool, but a brief.
+    for line_id in ("alpha", "gamma", "delta"):
+        names = {tool.name for tool in world.scheduler.own_tools(line_id)}
+        assert SET_BRIEF_TOOL_NAME in names
+
+
+def test_a_brief_survives_replay(world: World, tmp_path: Path) -> None:
+    set_brief(world, "beta", task="carry on", artifacts=["tmp/a.md", "docs/b c.md"])
+    expected = brief_of(world, "beta")
+    world.log.close()
+    reopened = EventLog(tmp_path / "project" / "events.sqlite")
+    try:
+        assert reopened.state.briefs == {"beta": expected}
+        assert reopened.state.copy().briefs == reopened.state.briefs
+    finally:
+        reopened.close()
+    # The fixture closes the log again, which a closed log allows.
+    world.log = EventLog(tmp_path / "project" / "events.sqlite")
+
+
+def test_a_brief_for_no_line_is_rejected(world: World) -> None:
+    with pytest.raises(Exception, match="no line ghost"):
+        world.log.append(BriefSet("ghost", "a task", "", (), "", "", "", BRIEF_AT))
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    [
+        ({"task": ""}, "task must not be empty"),
+        ({"task": "x" * (MAX_BRIEF_FIELD_BYTES + 1)}, "task"),
+        ({"decisions": "x" * (MAX_BRIEF_FIELD_BYTES + 1)}, "decisions"),
+        ({"next_action": "x" * (MAX_BRIEF_FIELD_BYTES + 1)}, "next_action"),
+        ({"artifacts": ("a",) * (MAX_BRIEF_ARTIFACTS + 1)}, "at most 32 artifacts"),
+        ({"artifacts": ("",)}, "non-empty path on one line"),
+        ({"artifacts": ("a\nb",)}, "non-empty path on one line"),
+        ({"artifacts": ("x" * 1025,)}, "artifact"),
+        ({"workdir_commit": "not a commit"}, "workdir_commit"),
+        ({"set_at": "yesterday"}, "set_at"),
+    ],
+)
+def test_the_event_refuses_each_unbounded_or_malformed_field(
+    fields: dict[str, Any], message: str
+) -> None:
+    values: dict[str, Any] = {
+        "line_id": "alpha",
+        "task": "a task",
+        "decisions": "",
+        "artifacts": (),
+        "next_action": "",
+        "workdir_commit": "",
+        "daemon_commit": "",
+        "set_at": BRIEF_AT,
+    }
+    values.update(fields)
+    with pytest.raises(InvalidField, match=message):
+        BriefSet(**values)
+
+
+def test_the_total_size_is_bounded_though_each_field_fits() -> None:
+    field = "x" * MAX_BRIEF_FIELD_BYTES
+    paths = tuple(f"{index:03}" + "p" * 1000 for index in range(MAX_BRIEF_ARTIFACTS))
+    assert 3 * MAX_BRIEF_FIELD_BYTES < MAX_BRIEF_BYTES
+    with pytest.raises(InvalidField, match=f"at most {MAX_BRIEF_BYTES} bytes"):
+        BriefSet("alpha", field, field, paths, field, "", "", BRIEF_AT)
+    BriefSet("alpha", field, field, (), field, "", "", BRIEF_AT)
+
+
+# The tool's refusals record nothing.
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        ({"task": "a", "owner": "me"}, "owner"),
+        ({"task": 3}, "must be text"),
+        ({"task": "a", "artifacts": "src"}, "list of paths"),
+        ({"task": "a", "artifacts": [1]}, "list of paths"),
+        ({"task": "x" * (MAX_BRIEF_FIELD_BYTES + 1)}, "task"),
+        ({"task": "a", "artifacts": ["a"] * (MAX_BRIEF_ARTIFACTS + 1)}, "at most"),
+    ],
+)
+def test_the_tool_refuses_unknown_keys_wrong_types_and_oversized_fields(
+    world: World, args: dict[str, object], message: str
+) -> None:
+    text, failed = world.call("alpha", SET_BRIEF_TOOL_NAME, args)
+    assert failed and message in text
+    assert brief_of(world, "alpha") is None
+
+
+def test_a_brief_with_a_disclosed_term_is_refused_and_counted(world: World) -> None:
+    world.scheduler.set_disclosure_terms(["hidden"])
+    for args in (
+        {"task": "the hidden task"},
+        {"task": "a", "decisions": "hidden"},
+        {"task": "a", "next_action": "hidden"},
+        {"task": "a", "artifacts": ["docs/hidden.md"]},
+    ):
+        text, failed = set_brief(world, "alpha", **args)
+        assert failed and "hidden" not in text
+    assert brief_of(world, "alpha") is None
+    assert len(world.log.state.disclosure_checks["alpha"]) == 4
+    with pytest.raises(LineToolRefused):
+        world.scheduler.set_brief("alpha", "hidden")
+
+
+# The lead of a turn whose engine session is new.
+
+
+def test_the_first_turn_on_a_new_engine_leads_with_the_brief(world: World) -> None:
+    set_brief(world, "alpha", task="lift the bound", next_action="run the gate")
+    wake(world, "alpha")
+    wake(world, "alpha")
+    first, second = world.prompts("alpha")
+    assert first.startswith("Your engine session is new since your last turn")
+    assert f"{BRIEF_BEGIN}\n" in first and f"\n{BRIEF_END}" in first
+    assert '"task": "lift the bound"' in first
+    assert BRIEF_BEGIN not in second
+
+
+def test_a_dropped_engine_and_a_compaction_each_bring_the_lead_back(
+    world: World,
+) -> None:
+    set_brief(world, "alpha", task="lift the bound")
+    wake(world, "alpha")
+    # The engine compacted the session by itself during the turn.
+    world.scheduler.session_compacted("alpha", {"trigger": "auto"})
+    wake(world, "alpha")
+    wake(world, "alpha")
+    # A rebind, a cleared session or a restart leaves the line with no engine.
+    world.scheduler._drop_engine("alpha")  # pyright: ignore[reportPrivateUsage]
+    wake(world, "alpha")
+    leads = [BRIEF_BEGIN in prompt for prompt in world.prompts("alpha")]
+    assert leads == [True, True, False, True]
+
+
+def test_a_turn_that_fails_before_its_engine_gets_the_prompt_keeps_the_lead_owed(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review r4, finding 1. The engine is kept, so only the owed mark of its own
+    compaction calls for the lead, and the failed turn must not spend it."""
+    set_brief(world, "alpha", task="lift the bound")
+    wake(world, "alpha")
+    world.scheduler.session_compacted("alpha", {"trigger": "auto"})
+    walks: list[str] = []
+
+    async def refused_walk(line_id: str) -> None:
+        walks.append(line_id)
+        raise RuntimeError("refused before the engine ran")
+
+    monkeypatch.setattr(world.scheduler, "_check_walk", refused_walk)
+    wake(world, "alpha")
+    assert walks == ["alpha"]
+    assert len(world.prompts("alpha")) == 1
+    monkeypatch.undo()
+    world.scheduler.release("alpha")
+    wake(world, "alpha")
+    wake(world, "alpha")
+    leads = [BRIEF_BEGIN in prompt for prompt in world.prompts("alpha")]
+    assert leads == [True, True, False]
+
+
+def test_a_line_with_no_brief_gets_no_lead(world: World) -> None:
+    wake(world, "alpha")
+    (prompt,) = world.prompts("alpha")
+    assert BRIEF_BEGIN not in prompt
+
+
+def test_a_brief_that_now_discloses_is_withheld_from_the_lead(world: World) -> None:
+    set_brief(world, "alpha", task="the hidden task")
+    world.scheduler.set_disclosure_terms(["hidden"])
+    wake(world, "alpha")
+    (prompt,) = world.prompts("alpha")
+    assert "hidden" not in prompt
+    assert f"{BRIEF_BEGIN}\n[withheld because" in prompt
+
+
+# line_status.
+
+
+def test_line_status_shows_the_brief_as_untrusted_data(world: World) -> None:
+    assert world.scheduler.line_status("alpha")["brief"] is None
+    long_task = "t" * 1000
+    set_brief(world, "alpha", task=long_task, artifacts=["a.md", "b.md"])
+    full = cast(dict[str, Any], world.scheduler.line_status("alpha")["brief"])
+    assert "untrusted" in full["trust"]
+    assert full["untrusted_data"]["task"] == long_task
+    assert full["workdir_commit"] == WORKTREE_COMMIT
+    compact = cast(
+        dict[str, Any],
+        world.scheduler.line_status("alpha", detail=False, lists=False)["brief"],
+    )
+    assert compact["untrusted_data"] == {
+        "task": long_task[:400],
+        "next_action": "",
+        "artifact_count": 2,
+    }
+
+
+# The role transition package.
+
+
+def taken_by_beta(world: World) -> str:
+    """beta takes the spent owner's role and returns its first prompt's package."""
+    world.budget(0)
+    world.scheduler.take_ownership("beta", "alpha is spent")
+    wake(world, "beta")
+    (prompt,) = world.prompts("beta")
+    return prompt
+
+
+type Snapshot = Callable[[Path, str | None], tuple[str, str, tuple[str, ...]]]
+
+
+def fake_snapshot(
+    status: str = "## feature\n M src/example.py",
+    unreadable: tuple[str, ...] = (),
+) -> Snapshot:
+    def fake(
+        _directory: Path, _base_commit: str | None = None
+    ) -> tuple[str, str, tuple[str, ...]]:
+        return status, "src/example.py | 2 +-", unreadable
+
+    return fake
+
+
+def test_the_package_without_a_brief_marks_each_field_unknown(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scheduler_module, "_worktree_snapshot", fake_snapshot())
+    prompt = taken_by_beta(world)
+    assert 'Task: "unknown"; unknown, stated in neither' in prompt
+    assert 'Next action: "unknown"; unknown' in prompt
+    assert 'Artifacts: "unknown"; unknown, named in no brief' in prompt
+    assert (
+        'Worktree status: "## feature\\n M src/example.py"; observed by the daemon'
+        " at 2026-10-27T09:00:00Z" in prompt
+    )
+
+
+def test_the_package_takes_what_the_journal_lacks_from_the_former_brief(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scheduler_module, "_worktree_snapshot", fake_snapshot())
+    world.scheduler.record_role_note(
+        "alpha", RoleNoteKind.NOTE, "Task: from the journal."
+    )
+    set_brief(
+        world,
+        "alpha",
+        task="from the brief",
+        decisions="keep the guard",
+        artifacts=["tmp/report.md"],
+        next_action="run the gate",
+    )
+    prompt = taken_by_beta(world)
+    # beta's take wrote the latest entry, which states no field, so each comes from
+    # alpha's brief.
+    assert (
+        'Task: "from the brief"; reported by alpha in its standing brief at'
+        " 2026-10-27T09:00:00Z, since the journal entry does not state it"
+    ) in prompt
+    assert 'Unresolved decisions: "keep the guard"; reported by alpha' in prompt
+    assert 'Next action: "run the gate"; reported by alpha' in prompt
+    assert 'Artifacts: ["tmp/report.md"]; reported by alpha' in prompt
+    assert 'Gate and coverage: "unknown"; unknown' in prompt
+
+
+def test_a_field_the_journal_states_comes_from_the_journal(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scheduler_module, "_worktree_snapshot", fake_snapshot())
+    set_brief(world, "alpha", task="from the brief", next_action="from the brief")
+    world.scheduler.relinquish_ownership(
+        "alpha", "Task: from the journal.", "beta", None
+    )
+    wake(world, "alpha")
+    (prompt,) = world.prompts("beta")
+    entry = world.log.state.roles["core"].changed
+    assert entry is not None and entry.entry_id is not None
+    assert (
+        f'Task: "from the journal."; reported by alpha in journal entry'
+        f" {entry.entry_id} at 2026-10-27T09:00:00Z"
+    ) in prompt
+    assert 'Next action: "from the brief"; reported by alpha in its standing' in prompt
+
+
+def test_an_unreadable_path_is_never_reported_absent_or_untracked(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        scheduler_module, "_worktree_snapshot", fake_snapshot(unreadable=(".dromon/",))
+    )
+    prompt = taken_by_beta(world)
+    assert (
+        'Paths the daemon could not read: [".dromon/"]; git reported them'
+        " unreadable at 2026-10-27T09:00:00Z. Each may exist and be tracked,"
+        " untracked or ignored, so none is reported absent or untracked"
+    ) in prompt
+
+
+def test_a_worktree_the_daemon_cannot_read_is_marked_so(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        scheduler_module, "_worktree_snapshot", fake_snapshot(status="unavailable")
+    )
+    prompt = taken_by_beta(world)
+    assert (
+        'Worktree status: "unavailable"; the daemon could not read it at'
+        " 2026-10-27T09:00:00Z, which says nothing of what the worktree holds"
+    ) in prompt
+
+
+def test_the_former_owners_processes_are_observed_or_unknown(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scheduler_module, "_worktree_snapshot", fake_snapshot())
+    scheduler = world.scheduler
+    scheduler._processes_identifiable = False  # pyright: ignore[reportPrivateUsage]
+    assert 'Former owner\'s processes: "unknown"; unknown, since this platform' in (
+        scheduler._former_processes("alpha")  # pyright: ignore[reportPrivateUsage]
+    )
+    scheduler._processes_identifiable = True  # pyright: ignore[reportPrivateUsage]
+    assert '"none recorded"; observed by the daemon' in (
+        scheduler._former_processes("alpha")  # pyright: ignore[reportPrivateUsage]
+    )
+    assert '"unknown"; unknown, since the role names no former owner' in (
+        scheduler._former_processes(None)  # pyright: ignore[reportPrivateUsage]
+    )
+    world.log.append(ProcessesLeft("alpha", "exited", (41, 42), ("a", "b"), 1))
+    assert '"3 left running"; observed by the daemon when the engine ended' in (
+        scheduler._former_processes("alpha")  # pyright: ignore[reportPrivateUsage]
+    )
+    prompt = taken_by_beta(world)
+    assert 'Former owner\'s processes: "3 left running"' in prompt
+
+
+# Git's unreadable paths.
+
+
+def test_unreadable_paths_are_read_from_gits_warnings() -> None:
+    stderr = (
+        "warning: could not open directory 'closed/': Permission denied\n"
+        "something else\n"
+        'error: open("secret.txt"): Permission denied\n'
+    )
+    assert scheduler_module._unreadable_paths(stderr) == (  # pyright: ignore[reportPrivateUsage]
+        "closed/",
+        "secret.txt",
+    )
+    many = "\n".join(
+        f"could not open directory 'd{index}/': Permission denied"
+        for index in range(40)
+    )
+    assert len(scheduler_module._unreadable_paths(many)) == (  # pyright: ignore[reportPrivateUsage]
+        scheduler_module.MAX_UNREADABLE_PATHS
+    )
+
+
+def test_a_quote_in_an_unreadable_name_is_recorded_whole() -> None:
+    """Review r4, finding 3. The first two warnings are as git gave them on
+    2026-10-29 for unreadable directories named ``say"hi`` and ``it's``, unescaped.
+    The third is the file form written to match, and was not observed. The last
+    two names hold git's closing sequence and are recorded only up to it."""
+    stderr = (
+        "warning: could not open directory 'say\"hi/': Permission denied\n"
+        "warning: could not open directory 'it's/': Permission denied\n"
+        'error: open("say"hi.txt"): Permission denied\n'
+        "warning: could not open directory 'a': b/': Permission denied\n"
+        'error: open("c")d"): Permission denied\n'
+    )
+    assert scheduler_module._unreadable_paths(stderr) == (  # pyright: ignore[reportPrivateUsage]
+        'say"hi/',
+        "it's/",
+        'say"hi.txt',
+        "a",
+        "c",
+    )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads every directory")
+def test_a_real_unreadable_directory_is_reported_unreadable(tmp_path: Path) -> None:
+    """Fact, observed with git on 2026-10-29. git status leaves an unreadable
+    directory out of its output and exits 0, so only its warning names it."""
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    git = ["git", "-C", str(checkout), "-c", "user.email=a@b", "-c", "user.name=a"]
+    subprocess.run([*git, "init", "-q"], check=True)  # noqa: S603
+    (checkout / "a").write_text("a\n")
+    subprocess.run([*git, "add", "a"], check=True)  # noqa: S603
+    subprocess.run([*git, "commit", "-qm", "a"], check=True)  # noqa: S603
+    closed = checkout / "closed"
+    closed.mkdir()
+    (closed / "b").write_text("b\n")
+    closed.chmod(0)
+    try:
+        status, _, unreadable = scheduler_module._worktree_snapshot(checkout)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        closed.chmod(0o755)
+    assert "closed" not in status
+    assert unreadable == ("closed/",)

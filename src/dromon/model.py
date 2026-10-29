@@ -1531,6 +1531,64 @@ class RoleNoted:
         check_instant("noted_at", self.noted_at)
 
 
+MAX_BRIEF_FIELD_BYTES: Final = 4096
+"""The largest text field of a standing brief."""
+MAX_BRIEF_ARTIFACTS: Final = 32
+"""The most artifact paths a standing brief names."""
+MAX_BRIEF_PATH_BYTES: Final = 1024
+"""The longest artifact path a standing brief names."""
+MAX_BRIEF_BYTES: Final = 16 * 1024
+"""The largest standing brief, its text fields and paths together, so every place
+that shows a brief is bounded by one size whatever the fields hold."""
+
+
+@dataclass(frozen=True, slots=True)
+class BriefSet:
+    """A line's standing brief, its current task, open decisions, artifact paths and
+    next action, replacing its previous brief. **Task of 2026-10-29.** It carries a
+    line's task across a new engine session and a change of a role's owner, which
+    mail alone did not. The text is the line's own and untrusted. The daemon stamps
+    both commits and the time itself, leaving a commit empty when it cannot read it.
+    An artifact path is a single line of text, since every view shows it on one."""
+
+    line_id: str
+    task: str
+    decisions: str
+    artifacts: tuple[str, ...]
+    next_action: str
+    workdir_commit: str
+    daemon_commit: str
+    set_at: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        for name, value in (
+            ("task", self.task),
+            ("decisions", self.decisions),
+            ("next_action", self.next_action),
+        ):
+            check_text(name, value, MAX_BRIEF_FIELD_BYTES)
+        if not self.task:
+            raise InvalidField("task must not be empty")
+        if len(self.artifacts) > MAX_BRIEF_ARTIFACTS:
+            raise InvalidField(f"at most {MAX_BRIEF_ARTIFACTS} artifacts are named")
+        for path in self.artifacts:
+            check_text("artifact", path, MAX_BRIEF_PATH_BYTES)
+            if not path or "\n" in path or "\r" in path:
+                raise InvalidField("an artifact is a non-empty path on one line")
+        size = sum(
+            len(text.encode("utf-8"))
+            for text in (self.task, self.decisions, self.next_action, *self.artifacts)
+        )
+        if size > MAX_BRIEF_BYTES:
+            raise InvalidField(
+                f"a brief is at most {MAX_BRIEF_BYTES} bytes, not {size}"
+            )
+        check_commit("workdir_commit", self.workdir_commit)
+        check_commit("daemon_commit", self.daemon_commit)
+        check_instant("set_at", self.set_at)
+
+
 @dataclass(frozen=True, slots=True)
 class BudgetStated:
     """What remains of a provider's plan, as an operator states it or an engine
@@ -1609,6 +1667,7 @@ type Event = (
     | SeatBound
     | OwnershipChanged
     | RoleNoted
+    | BriefSet
     | BudgetStated
     | PeerDeclared
     | PeerRemoved
@@ -1857,6 +1916,10 @@ class State:
     )
     """The worktree commit recorded as each line's latest turn ended."""
 
+    briefs: dict[str, BriefSet] = field(default_factory=dict[str, BriefSet])
+    """Each line's latest standing brief, keyed by line. A line with none has no
+    entry."""
+
     def copy(self) -> "State":
         """Return an independent snapshot. The records are frozen, so maps suffice."""
         return State(
@@ -1885,6 +1948,7 @@ class State:
             dict(self.disclosure_checks),
             dict(self.task_records),
             dict(self.last_turn_commits),
+            dict(self.briefs),
         )
 
     def open_questions(self, operator_id: str) -> list[str]:
@@ -2030,6 +2094,8 @@ class State:
                 self._check_ownership_changed(event)
             case RoleNoted():
                 self._check_role_noted(event)
+            case BriefSet():
+                self._line(event.line_id)
             case BudgetStated():
                 pass
             case PeerDeclared():
@@ -2261,6 +2327,8 @@ class State:
                 )
             case RoleNoted():
                 self.role_entries[event.entry_id] = event
+            case BriefSet():
+                self.briefs[event.line_id] = event
             case BudgetStated():
                 self.budgets[event.provider] = event
             case PeerDeclared():

@@ -73,6 +73,7 @@ from dromon.model import (
     OwnershipCause,
     RoleNoted,
     RoleNoteKind,
+    BriefSet,
     BudgetStated,
     BudgetSource,
     PeerDeclared,
@@ -198,6 +199,16 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "workdir_commit",
         "daemon_commit",
         "noted_at",
+    ),
+    "brief_set": (
+        "line_id",
+        "task",
+        "decisions",
+        "artifacts",
+        "next_action",
+        "workdir_commit",
+        "daemon_commit",
+        "set_at",
     ),
     "budget_stated": (
         "provider",
@@ -542,6 +553,17 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "daemon_commit": event.daemon_commit,
                 "noted_at": event.noted_at,
             }
+        case BriefSet():
+            return "brief_set", {
+                "line_id": event.line_id,
+                "task": event.task,
+                "decisions": event.decisions,
+                "artifacts": list(event.artifacts),
+                "next_action": event.next_action,
+                "workdir_commit": event.workdir_commit,
+                "daemon_commit": event.daemon_commit,
+                "set_at": event.set_at,
+            }
         case BudgetStated():
             return "budget_stated", {
                 "provider": event.provider,
@@ -776,6 +798,17 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "workdir_commit"),
                 _str(data, "daemon_commit"),
                 _str(data, "noted_at"),
+            )
+        case "brief_set":
+            return BriefSet(
+                _str(data, "line_id"),
+                _str(data, "task"),
+                _str(data, "decisions"),
+                tuple(_list(data, "artifacts", str)),
+                _str(data, "next_action"),
+                _str(data, "workdir_commit"),
+                _str(data, "daemon_commit"),
+                _str(data, "set_at"),
             )
         case "budget_stated":
             return BudgetStated(

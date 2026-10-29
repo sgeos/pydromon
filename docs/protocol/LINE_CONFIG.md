@@ -113,6 +113,7 @@ argument outside a tool's schema is refused.
 | `record_role_note` | Offered only to a seat. Records a journal entry of `kind` `note`, by any seat, or `recovery`, by the owner, which the daemon stamps with the role worktree's commit, its own commit and the time. A handoff entry is written only by `relinquish_ownership`. Added on 2026-10-27 |
 | `relinquish_ownership` | Offered only to a seat, and refused unless it owns its role. Records the handoff `note` as a handoff entry and gives the role to the seat `to`, or with no `to` to the seat the handoff that gave it the role named as `back_to`, or else leaves it vacant. A return to a seat that can no longer own the role leaves it vacant and says so. Called inside the owner's own turn, which is how a seat calls it, the request is checked at once and the change is made when that turn ends, with the entry stamped then, and the tool says so. A second call in the same turn is refused. A change that no longer applies when the turn ends is not made, and the operator is told. A successor is awakened and sent a note from the harness, `!dromon`, saying the former owner handed it the role, and the former owner's engine is dropped, so its next turn is built read only. `back_to`, which needs `to`, is the seat the role returns to when the successor next relinquishes without naming one. Added on 2026-10-27 |
 | `take_ownership` | Offered only to a seat that may own its role. Takes the role, with cause `recovery`, only on a ground the harness observes, which is a vacant role, an owner held at a plan limit its engine reported in this daemon run from a shape observed live or typed by the Agent SDK, never from inferred wording, or an owner whose provider budget is recorded as 0 percent with no reset time passed, and never while the owner has a turn in flight. The `reason` of 1 to 4,096 bytes and the ground are recorded as a note entry that the change rests on. Added on 2026-10-27 |
+| `set_brief` | Records the line's standing brief, its `task`, its open `decisions`, the `artifacts` its task concerns and its `next_action`, as one `brief_set` event that replaces its previous brief and that the daemon stamps with the time, the worktree's commit and its own. Only `task` is required. Each text field is at most 4,096 bytes, at most 32 paths are named, each on one line and at most 1,024 bytes, and the whole is at most 16,384 bytes. An unknown key is refused, and the text is checked against the disclosure list as `record_role_note` is. The brief leads the line's first turn after its engine session is new, is shown by `line_status`, and fills the role transition package where a journal entry is silent, as below. Added on 2026-10-29 |
 | `propose_change` | Records a proposed patch, file list and message for operator review; it does not change project files |
 | `read_instructions` | Shows the instructions the line's next turn receives, as below |
 | `write_scratch` | Writes a file under `tmp/` in the line's working directory, as below |
@@ -526,6 +527,41 @@ owed a handoff, from `line_rebound` or `line_session_cleared`, as
 - **Opting out.** A line whose configuration sets `context_handoff` to `false` is
   given no handoff, and the event is still recorded, with the outcome `opted_out`, so
   the log shows that the new session began without one.
+
+## Standing brief
+
+**Task of 2026-10-29**, from the round 3 reports, three of which asked that a line's
+current task survive an engine reset or a handoff. A context handoff carries the
+line's mail, from which a line had to reconstruct its intent. A standing brief carries
+the intent itself, in the line's own words, set with `set_brief` and recorded as
+`brief_set`, so it survives a replay and a restart.
+
+- **When it leads.** A turn whose engine session is new leads with the brief, before
+  any other notice. The session is new when the daemon holds no engine for the line,
+  which is so after a restart, a rebind, a cleared session, a change of configuration
+  and a change of the role's owner, when the turn asks for a compaction, and when the
+  engine compacted the session by itself since the last turn. **Inference.** An engine
+  rebuilt with the line's recorded session may resume that session with its context,
+  in which case the brief is repeated, which costs only its length. A compaction the
+  engine makes by itself during a turn is told at the next turn, one turn late.
+- **What it says.** The lead gives the time the brief was set and the worktree's
+  commit then, says that it is the line's own earlier text and may be stale, and
+  delimits the brief between `BEGIN STANDING BRIEF DATA` and `END STANDING BRIEF DATA`
+  as JSON.
+- **Where else it is shown.** `line_status` gives the whole brief in its detailed view
+  and its task and next action, cut to 400 bytes, in its compact one, each under
+  `untrusted_data` with a note that the line wrote it. The role transition package
+  takes from the former owner's brief what its journal entry lacks, as
+  [`ROLES.md`](../architecture/ROLES.md) describes.
+- **Trust.** The brief is untrusted data, since a line may relay in it what other lines
+  and agents wrote. The daemon stamps it and checks its bounds and the disclosure list,
+  and checks nothing else. A brief that holds a term the disclosure list in force
+  covers, which may have changed since the brief was set, is withheld whole from every
+  view.
+- **Porting note.** Which turn is on a new session is read from whether the daemon
+  holds an engine for the line, which is in memory. A port keeps that test, or records
+  the session's start, so that the first turn after its own restart also leads with the
+  brief.
 
 ## Context and compaction
 

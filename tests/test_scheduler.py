@@ -216,6 +216,12 @@ def test_a_finished_lines_vm_is_released_before_python_gc(
                 "success", 1, "ok", (), None, None, "session-1", None, None
             )
 
+    # Review r4, finding 5. The test proves that closing the engines releases the
+    # VM without a collection. ``tests/conftest.py`` turns automatic collection off,
+    # and nothing here collects, so ``gc.get_objects`` also counts cyclic garbage
+    # left by earlier tests. Each check is therefore a difference from the baseline
+    # taken here, never a total, and it holds only while the released driver has no
+    # reference cycle.
     def vm_count() -> int:
         return sum(isinstance(value, keleusma.VM) for value in gc.get_objects())
 
@@ -236,13 +242,13 @@ def test_a_finished_lines_vm_is_released_before_python_gc(
     scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
     engine = cast(DriverEngine, scheduler.engine_for("alpha"))
     driver = engine.driver
-    assert vm_count() == baseline + 1
+    assert vm_count() - baseline == 1
     asyncio.run(engine.run_turn("finished"))
 
     asyncio.run(scheduler.close_engines())
 
     assert driver.closed
-    assert vm_count() == baseline
+    assert vm_count() - baseline == 0
     log.close()
 
 
