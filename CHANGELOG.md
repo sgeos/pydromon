@@ -89,8 +89,11 @@ All notable changes are recorded here. The format follows
   counting each connection under the peer connection cap of 16 before its handshake,
   which must finish within 10 seconds and present the key of an inbound `tls` peer by
   its pin before any frame is read. That pin names the peer at `hello`, which takes no
-  token over TLS, and again at each `deliver`. At most one `tls` peer may be inbound,
-  since the certificates `dromon.federation_tls` makes share one subject name.
+  token over TLS, and again at each `deliver`.
+- Several `tls` peers may be inbound, up to the transport's bound of 64 certificates
+  one listener trusts, now that each certificate names its own key. The limit of one
+  is lifted. Two identities made before that change share the old subject name, so one
+  of them must be made again with `dromon peer key` before one listener trusts both.
 - Phase 2 of federation, step 5. Mail to a `tls` peer is no longer refused at send.
   The policy is the same on both transports, which decide only how mail travels.
 - `dromon agent send --agent NAME --to PARTY BODY` sends one note as a registered

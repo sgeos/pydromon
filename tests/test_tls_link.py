@@ -339,16 +339,21 @@ def test_the_listener_refuses_a_key_it_does_not_trust(tmp_path: Path) -> None:
 
 
 def test_one_listener_context_trusts_two_of_these_certificates(tmp_path: Path) -> None:
-    """The cause of ``MAX_INBOUND_TLS`` is gone. Each certificate now names its own key
-    in its subject and carries a key identifier, so a listener's context trusting two
-    peers admits both and tells them apart by pin. Lifting the limit is core's step."""
+    """Each certificate names its own key in its subject and carries a key identifier,
+    so a listener's context trusting two inbound peers admits both, and the presented
+    pin names each one, which is why ``MAX_INBOUND_TLS`` could be lifted."""
     state_dir, store, peers = identities(tmp_path, "studio", "workshop")
-    context = server_context_for(state_dir, store, listening_config(state_dir, peers))
+    config = listening_config(state_dir, peers)
+    context = server_context_for(state_dir, store, config)
     assert context.cert_store_stats()["x509"] == len(peers)
+    state = State()
+    for name in peers:
+        state.apply(PeerDeclared(name, "tls", "{}"))
     local, _ = ensure_identity(store)
     for name, identity in peers.items():
         _, far = handshake(client_context(identity, local.certificate), context)
         assert presented_pin(far) == identity.pin_sha256, name
+        assert pinned_peer(config, state, identity.pin_sha256) == name
 
 
 def test_only_inbound_tls_peers_are_trusted_or_named(tmp_path: Path) -> None:

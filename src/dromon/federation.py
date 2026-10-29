@@ -49,6 +49,7 @@ from dromon.federation_tls import (
     CERTIFICATE_FILENAME,
     KEY_FILENAME,
     MAX_IDENTITY_FILE_BYTES,
+    MAX_PEER_CERTIFICATES,
     IdentityFiles,
     TransportError,
     generate_identity,
@@ -95,14 +96,17 @@ PEER_KEYS: Final = frozenset(
 TRANSPORT_UNIX: Final = "unix"
 TRANSPORT_TLS: Final = "tls"
 UNIX_ONLY_KEYS: Final = frozenset({"socket", "project"})
-MAX_INBOUND_TLS: Final = 1
-"""The inbound ``tls`` peers a daemon may declare. **Fact,** found by test on
-2026-10-28. Certificates ``dromon.federation_tls`` made then had one subject name and
-no key identifier, so OpenSSL, given several to trust in one server context, looked up
-the first by name and refused a client that presented another. Certificates now name
-their own key and carry a key identifier, and a test shows one context trusting two.
-The limit stays until core lifts it. Two identities made before the change still
-share the old name, so one of them must be made again before a listener trusts both."""
+MAX_INBOUND_TLS: Final = MAX_PEER_CERTIFICATES
+"""The inbound ``tls`` peers a daemon may declare, the transport's own bound on the
+certificates one listener's context trusts. ``MAX_PEERS`` is the same today, so it
+binds first, and this check guards the transport's bound should that change. **Fact,**
+found by test on 2026-10-28. Certificates ``dromon.federation_tls`` made at first had
+one subject name and no key identifier, so OpenSSL, given several to trust in one
+server context, looked up the first by name and refused a client that presented
+another, and the limit was 1. Certificates now name their own key and carry a key
+identifier, and a test shows one context trusting two. Two identities made before that
+change still share the old name, so one of them must be made again with ``dromon peer
+key`` before one listener trusts both."""
 TLS_ONLY_KEYS: Final = frozenset({"address", "pin_sha256", "certificate"})
 MAX_HOST_BYTES: Final = 253
 """The longest host name the Domain Name System allows."""
@@ -259,9 +263,9 @@ def parse_federation(federation: object, peers: object) -> FederationConfig:
         )
     if len(inbound_tls) > MAX_INBOUND_TLS:
         raise FederationError(
-            f"peers.{inbound_tls[0]} and peers.{inbound_tls[1]} are both inbound tls"
-            f" peers, and at most {MAX_INBOUND_TLS} may be until each certificate"
-            " carries a name of its own"
+            f"{len(inbound_tls)} tls peers are inbound, from peers.{inbound_tls[0]},"
+            f" and at most {MAX_INBOUND_TLS} may be, the certificates one listener"
+            " trusts"
         )
     pins: dict[str, str] = {}
     for peer_id, peer in sorted(found.items()):
