@@ -21,6 +21,7 @@ from dromon.federation import (
     peer_directories,
     unconfined_refusal,
 )
+from dromon.federation_tls import MAX_PEER_CERTIFICATES
 from dromon.lineconfig import DEFAULT_CONFIG, ConfigError
 from dromon.model import AgentAddress, LineAddress, OperatorAddress
 from dromon.paths import ProjectPaths, project_paths
@@ -142,16 +143,6 @@ MALFORMED: list[tuple[tuple[object, object], str]] = [
     (({"tls_listen": "0.0.0.0:7411"}, None), "no tls peer is inbound"),
     (({"tls_listen": 7411}, None), "federation.tls_listen must be a host:port"),
     ((None, {"a": tls(), "b": tls()}), "peers.b and peers.a share one pin"),
-    (
-        (
-            {"tls_listen": "0.0.0.0:7411"},
-            {
-                "a": tls(inbound=True, reach=["alpha"]),
-                "b": tls(inbound=True, reach=["alpha"], pin_sha256="1" * 64),
-            },
-        ),
-        "at most 1 may be",
-    ),
     ((None, {"k": {}}), "peers.k.socket must be an absolute path"),
     ((None, {"k": peer(socket="run/peers.sock")}), "must be an absolute path"),
     ((None, {"k": peer(socket="/srv/k/run/x.sock")}), "must name a file peers"),
@@ -395,3 +386,35 @@ def test_a_claude_code_line_needs_its_sandbox_beside_peers(
     check_sandbox_required(ProjectConfig(), "a", OPUS, DEFAULT_CONFIG)
     accepted = project_with_peers(paths, "accept_unconfined = true")
     check_sandbox_required(accepted, "a", OPUS, DEFAULT_CONFIG)
+
+
+# Several inbound tls peers, once each certificate names its own key.
+
+
+def inbound_peers(count: int) -> dict[str, dict[str, object]]:
+    return {
+        f"p{index:02d}": tls(inbound=True, reach=["alpha"], pin_sha256=f"{index:064x}")
+        for index in range(count)
+    }
+
+
+def test_every_declared_peer_may_be_inbound_over_tls() -> None:
+    """The inbound bound is the transport's bound on the certificates one listener
+    trusts, which the bound on declared peers does not exceed, so a daemon may
+    declare every peer it may have as an inbound tls peer."""
+    assert federation.MAX_INBOUND_TLS == MAX_PEER_CERTIFICATES >= MAX_PEERS
+    config = parse_federation({"tls_listen": "0.0.0.0:7411"}, inbound_peers(MAX_PEERS))
+    assert sum(peer.inbound for peer in config.peers.values()) == MAX_PEERS
+
+
+def test_inbound_tls_peers_past_the_bound_are_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The check guards the transport's bound should the bound on declared peers ever
+    exceed it, so it is reached here with a smaller bound."""
+    monkeypatch.setattr(federation, "MAX_INBOUND_TLS", 2)
+    parse_federation({"tls_listen": "0.0.0.0:7411"}, inbound_peers(2))
+    with pytest.raises(
+        FederationError, match="3 tls peers are inbound, from peers.p00, and at most 2"
+    ):
+        parse_federation({"tls_listen": "0.0.0.0:7411"}, inbound_peers(3))
