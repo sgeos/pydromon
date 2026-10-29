@@ -125,6 +125,47 @@ def test_send_without_a_daemon_reports_not_running(
     assert cli.main(argv) == exits.NOT_RUNNING
 
 
+def test_a_send_that_times_out_says_it_may_have_been_sent(
+    tmp_path: Path,
+    short_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Found on 2026-10-29. The daemon recorded a message whose send timed out at the
+    client, so the client says the request may have taken effect, and how to check."""
+
+    def slow(*args: object, **kwargs: object) -> Response:
+        del args, kwargs
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(cli, "call", slow)
+    runtime = ["--runtime-dir", str(short_runtime)]
+    argv = ["--project", str(tmp_path), *runtime, "send", "alpha", "hi"]
+    assert cli.main(argv) == exits.FAILURE
+    err = capsys.readouterr().err
+    assert "dromon send: timed out." in err
+    assert "may still have carried the request out" in err
+    assert "with dromon sent." in err
+
+
+def test_another_failure_of_a_send_says_nothing_of_taking_effect(
+    tmp_path: Path,
+    short_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def refused(*args: object, **kwargs: object) -> Response:
+        del args, kwargs
+        raise ConnectionRefusedError("refused")
+
+    monkeypatch.setattr(cli, "call", refused)
+    runtime = ["--runtime-dir", str(short_runtime)]
+    argv = ["--project", str(tmp_path), *runtime, "send", "alpha", "hi"]
+    assert cli.main(argv) == exits.FAILURE
+    err = capsys.readouterr().err
+    assert "refused" in err and "carried the request out" not in err
+
+
 def test_tool_options_build_a_configuration(tmp_path: Path) -> None:
     servers = tmp_path / "mcp.json"
     servers.write_text(
