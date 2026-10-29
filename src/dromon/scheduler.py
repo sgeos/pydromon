@@ -273,6 +273,7 @@ from dromon.model import (
     MessagePrioritized,
     MessageCorrelated,
     TurnCorrelated,
+    LineTurnEnded,
     MAX_TURN_KEYS,
     DISCLOSURE_CHECK_WINDOW_SECONDS,
     MAX_DISCLOSURE_CHECKS,
@@ -444,6 +445,10 @@ WAKE_TOOL_SCHEMA: Final[dict[str, object]] = {
         "note": {
             "type": "string",
             "description": "What the wake is for. It arrives as a message from you",
+        },
+        "task_id": {
+            "type": "string",
+            "description": "A running background task whose end cancels this wake",
         },
         REQUEST_KEY: REQUEST_KEY_PROPERTY,
     },
@@ -1501,6 +1506,10 @@ class Scheduler:
         self._protected = tuple(protected)
         self._daemon_commit = daemon_commit
         """The commit the daemon's own checkout had at start, if it runs from one."""
+        self._loaded_at = format_due(wall_clock())
+        """When this scheduler, and with it the daemon's code, was loaded. **Asked by
+        the review role on 2026-10-28,** so a report that cites a stale daemon can say
+        how long it has run behind its checkout."""
         self._daemon_checkout = daemon_checkout
         """A directory in the daemon's own checkout, whose HEAD ``line_status`` reads
         again at each call, or ``None``."""
@@ -1666,9 +1675,6 @@ class Scheduler:
         cost is never shown as zero. Row 8 of the T3 Code review."""
         """Estimated cost of each line's turns since its last release."""
         self._last_turn_end: dict[str, float] = {}
-        self._head_after: dict[str, str | None] = {}
-        """The commit checked out in each line's worktree as its last turn ended, for
-        ``_head_notice``. In memory only, so a restart forgets it."""
         self._brief_owed: set[str] = set()
         """The lines whose engine compacted their session by itself, so their next
         turn leads with their standing brief. In memory only, which a restart does
@@ -2514,7 +2520,9 @@ class Scheduler:
             handler=handler,
         )
 
-    def schedule_wake(self, line_id: str, seconds: int, note: str) -> tuple[str, str]:
+    def schedule_wake(
+        self, line_id: str, seconds: int, note: str, task_id: str | None = None
+    ) -> tuple[str, str]:
         """Schedule ``line_id``'s one wake ``seconds`` from now, replacing any pending
         one, and return the identifier its note will carry and its due time.
 
@@ -2536,7 +2544,7 @@ class Scheduler:
         due = format_due(start + timedelta(seconds=seconds))
         message_id = new_id("m")
         previous = self._log.state.scheduled.get(line_id)
-        self._log.append(WakeScheduled(line_id, message_id, due, note))
+        self._log.append(WakeScheduled(line_id, message_id, due, note, task_id))
         if (
             previous is not None
             and self._context_compaction_wake_ids.get(line_id) == previous.message_id
@@ -2668,16 +2676,23 @@ class Scheduler:
                 return earlier
             seconds: object = args.get("seconds")
             note: object = args.get("note")
+            task_id: object = args.get("task_id")
             if type(seconds) is not int:
                 return _tool_error("seconds must be a whole number")
             if not isinstance(note, str):
                 return _tool_error("note must be text")
+            if task_id is not None and not isinstance(task_id, str):
+                return _tool_error("task_id must be text")
+            if task_id is not None and task_id not in self.running_task_ids(line_id):
+                return _tool_error(
+                    "task_id must name one of your running background tasks"
+                )
             refusal = self.refuse_disclosed(line_id, note)
             if refusal is not None:
                 return _tool_error(refusal)
             replaced = self._log.state.scheduled.get(line_id)
             try:
-                message_id, due = self.schedule_wake(line_id, seconds, note)
+                message_id, due = self.schedule_wake(line_id, seconds, note, task_id)
             except (InvalidField, EventRejected) as error:
                 return _tool_error(str(error))
             text = (
@@ -2686,6 +2701,10 @@ class Scheduler:
             )
             if replaced is not None:
                 text += f" It replaces the wake that was due at {replaced.due}."
+            if task_id is not None:
+                text += (
+                    f" It is cancelled if task {task_id} ends before the wake fires."
+                )
             result = _tool_text(text)
             self._request_keys.remember(line_id, WAKE_TOOL_NAME, args, result)
             return result
@@ -2697,11 +2716,31 @@ class Scheduler:
                 " command you started in the background. After the given seconds,"
                 " from 60 to 86400, your note arrives as a message from you, which"
                 " wakes you. You have at most one scheduled wake, and a new call"
-                " replaces it."
+                " replaces it. Optionally name one of your running background tasks"
+                " as task_id to cancel this wake if that task ends while the wake is"
+                " still scheduled. A wake that has fired already cannot be cancelled."
             ),
             input_schema=WAKE_TOOL_SCHEMA,
             handler=handler,
         )
+
+    def running_task_ids(self, line_id: str) -> set[str]:
+        """The task identifiers the line's kept engine currently reports running."""
+        engine = self._engines.get(line_id)
+        if not isinstance(engine, KeptEngine):
+            return set()
+        tasks = engine.kept_status().get("tasks")
+        if not isinstance(tasks, list):
+            return set()
+        found: set[str] = set()
+        for value in cast(list[object], tasks):
+            if not isinstance(value, Mapping):
+                continue
+            task = cast(Mapping[str, object], value)
+            task_id = task.get("task_id")
+            if isinstance(task_id, str) and task_id:
+                found.add(task_id)
+        return found
 
     # Leases.
 
@@ -3599,7 +3638,10 @@ class Scheduler:
             f" under the daemon at commit {started or 'unknown'}"
         )
         if daemon["stale"]:
-            cite += f", whose checkout has since moved to {daemon['checkout_commit']}"
+            cite += (
+                f", whose checkout has since moved to {daemon['checkout_commit']}"
+                f" after the daemon loaded its code at {daemon['loaded_at']}"
+            )
         return {
             "workdir": workdir,
             "daemon": started,
@@ -3626,8 +3668,9 @@ class Scheduler:
         if current is not None and started is not None and stale:
             note = (
                 f"The daemon's checkout has moved from {started[:12]} to"
-                f" {current[:12]} since the daemon started, so the running daemon does"
-                " not have that code until an operator restarts it."
+                f" {current[:12]} since the daemon loaded its code at"
+                f" {self._loaded_at}, so the running daemon does not have that code"
+                " until an operator restarts it."
             )
         return {
             "version": __version__,
@@ -3635,6 +3678,7 @@ class Scheduler:
             if __version__ == UNRELEASED_VERSION
             else None,
             "commit": started,
+            "loaded_at": self._loaded_at,
             "checkout_commit": current,
             "stale": stale,
             "stale_note": note,
@@ -5467,15 +5511,22 @@ class Scheduler:
                 self._post_office.discard(message_id)
 
     def read(self, owner: Address, message_id: str) -> Message:
-        """Open a message in ``owner``'s mailbox, marking it read the first time."""
+        """Open a received message, or a line's own sent message."""
         message = self._log.state.messages.get(message_id)
-        if message is None or message.recipient != owner:
+        received = message is not None and message.recipient == owner
+        sent_by_line = (
+            message is not None
+            and isinstance(owner, LineAddress)
+            and message.sender == owner
+        )
+        if message is None or not (received or sent_by_line):
             raise EventRejected(f"no message {message_id} in the mailbox of {owner}")
-        if not message.delivered:
-            self._log.append(MessageDelivered(message_id))
-            self._post_office.discard(message_id)
-        if not message.read:
-            self._log.append(MessageRead(message_id))
+        if received:
+            if not message.delivered:
+                self._log.append(MessageDelivered(message_id))
+                self._post_office.discard(message_id)
+            if not message.read:
+                self._log.append(MessageRead(message_id))
         return self._log.state.messages[message_id]
 
     def acknowledge(self, owner: Address, message_id: str) -> None:
@@ -5634,7 +5685,10 @@ class Scheduler:
 
         return SdkMcpTool(
             name=READ_MAIL_TOOL_NAME,
-            description="Open one message in your mailbox and mark it read.",
+            description=(
+                "Open one message sent to you, or one you sent. Received messages are"
+                " marked read."
+            ),
             input_schema=READ_MAIL_SCHEMA,
             handler=handler,
         )
@@ -6343,14 +6397,16 @@ class Scheduler:
             if led_brief and report is None:
                 self._brief_owed.add(line_id)
             self.activity.record(line_id, ActivityKind.TURN_ENDED, ending)
-            if self._log.state.lines[line_id].state is LineState.RUNNING:
+            line = self._log.state.lines.get(line_id)
+            if line is not None and line.state is LineState.RUNNING:
                 self._log.append(LineStateChanged(line_id, LineState.IDLE))
             self._correlate(line_id, keys, report)
             self._note_quiet(line_id, sent)
             self._running.pop(line_id, None)
             self._turn_owned.discard(line_id)
             self._last_turn_end[line_id] = self._clock()
-            self._head_after[line_id] = self._workdir_commit(line_id)
+            if line is not None:
+                self._log.append(LineTurnEnded(line_id, self._workdir_commit(line_id)))
             # A handoff asked for in the turn takes effect now that it has ended,
             # however it ended.
             self._settle_relinquish(line_id)
@@ -6449,9 +6505,11 @@ class Scheduler:
         review.** The notice names the commit before and the commit after, and leaves
         the commits between to ``git log``, because the daemon reads ``HEAD`` from a
         few small files and never runs git or reads its objects. A move during a turn,
-        such as the line's own commit, is not told, and neither is the first turn
-        after a restart, since the commit is kept in memory."""
-        before = self._head_after.get(line_id)
+        such as the line's own commit, is not told. The turn-end commit is recorded in
+        the event log, so the notice survives a daemon restart."""
+        if line_id not in self._log.state.last_turn_commits:
+            return None
+        before = self._log.state.last_turn_commits[line_id]
         after = self._workdir_commit(line_id)
         if before is None or after is None or before == after:
             return None
@@ -7234,6 +7292,8 @@ class Scheduler:
             self._running.pop(line_id, None)
             self._turn_owned.discard(line_id)
             self._last_turn_end[line_id] = self._clock()
+            if line is not None:
+                self._log.append(LineTurnEnded(line_id, self._workdir_commit(line_id)))
             self._settle_relinquish(line_id)
             self._work.set()
         self._apply_limits(line_id, TurnCause.AUTONOMOUS, True, report)
@@ -7884,7 +7944,10 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         f" {daemon_commit or 'unknown'}"
     )
     if stale is True and checkout_commit is not None:
-        cite += f", whose checkout has since moved to {checkout_commit}"
+        cite += (
+            f", whose checkout has since moved to {checkout_commit}"
+            f" after the daemon loaded its code at {daemon['loaded_at']}"
+        )
     return {
         "line_id": full["line_id"],
         "state": full["state"],
@@ -7916,6 +7979,7 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         "daemon": {
             "version": daemon["version"],
             "commit": daemon["commit"],
+            "loaded_at": daemon["loaded_at"],
             "checkout_commit": daemon["checkout_commit"],
             "stale": daemon["stale"],
         },

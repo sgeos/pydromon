@@ -33,6 +33,7 @@ from dromon.client import (
     stop,
 )
 from dromon.paths import PathError, ProjectPaths, ensure_private_dir, project_paths
+from dromon.disclosure import DisclosureError, load_terms
 from dromon.driver import MODELS, Credential, Driver, DriverError, Strategy
 from dromon import antigravity, capabilities, codex, cursor, evidence, grok, pi
 from dromon.engine import ENGINE_NAME as CLAUDE_CODE_ENGINE
@@ -843,6 +844,22 @@ def _attach(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     )
 
 
+def _disclosure_summary(terms: str | None, root: Path) -> str:
+    """Say which disclosure list the project file names, or that it names none.
+    **Found by the round 3 reports of 2026-10-28.** A project file without
+    ``[daemon] disclosure_terms`` checks nothing, and the team's own file had none
+    until ``check_disclosure`` refused for want of a list, so the absence is said
+    plainly. A list that cannot be read raises ``DisclosureError``, naming the file
+    only, since the daemon refuses to load such a file too. The terms are never
+    shown."""
+    if terms is None:
+        return (
+            "disclosure list: none, so no line's mail or report is checked against one"
+        )
+    load_terms(root / terms)
+    return f"disclosure list: {terms}"
+
+
 def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     """Validate ``.dromon/dromon.toml`` without a daemon and summarize it."""
     del arguments
@@ -857,8 +874,14 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     except ConfigFileError as error:
         print(f"dromon config: {error}", file=sys.stderr)
         return exits.FAILURE
+    try:
+        disclosure = _disclosure_summary(config.disclosure_terms, paths.root)
+    except DisclosureError as error:
+        print(f"dromon config: {error}", file=sys.stderr)
+        return exits.FAILURE
     limits = config.limits
     print(f"{file} is valid")
+    print(disclosure)
     print(
         f"limits: {limits.max_autonomous_turns} autonomous turns,"
         f" ${limits.max_cost_usd} estimated cost, {limits.cooldown_seconds}s cooldown"

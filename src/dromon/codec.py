@@ -43,6 +43,7 @@ from dromon.model import (
     MessagePrioritized,
     MessageCorrelated,
     TurnCorrelated,
+    LineTurnEnded,
     DisclosureChecked,
     TaskRecorded,
     MessageKind,
@@ -139,8 +140,9 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "disclosure_checked": ("line_id", "checked_at", "matched_lines"),
     "wake_requested": ("wake_id", "line_id", "message_id"),
     "wake_issued": ("wake_id",),
-    "wake_scheduled": ("line_id", "message_id", "due", "note"),
+    "wake_scheduled": ("line_id", "message_id", "due", "note", "task_id"),
     "wake_withdrawn": ("line_id", "message_id"),
+    "line_turn_ended": ("line_id", "workdir_commit"),
     "task_noted": ("line_id", "message_id", "task_id", "status", "body"),
     "task_recorded": (
         "line_id",
@@ -297,19 +299,20 @@ which added the seat order, the failover policy and the handoff threshold."""
 
 def _upgraded(kind: str, data: object) -> object:
     """``data`` with the defaults of fields added to its kind since it was written,
-    so a log written before them still decodes. Only ``role_declared`` has any. A
-    port carries the same defaults."""
-    if kind != "role_declared" or not isinstance(data, dict):
+    so a log written before them still decodes. A port carries the same defaults."""
+    if not isinstance(data, dict):
         return data
     fields = cast(dict[str, object], data)
-    if frozenset(fields) != ROLE_DECLARED_FIRST_FIELDS:
-        return fields
-    return {
-        **fields,
-        "seats": [],
-        "failover": FailoverPolicy.AUTOMATIC.value,
-        "handoff_below_percent": DEFAULT_HANDOFF_BELOW_PERCENT,
-    }
+    if kind == "role_declared" and frozenset(fields) == ROLE_DECLARED_FIRST_FIELDS:
+        return {
+            **fields,
+            "seats": [],
+            "failover": FailoverPolicy.AUTOMATIC.value,
+            "handoff_below_percent": DEFAULT_HANDOFF_BELOW_PERCENT,
+        }
+    if kind == "wake_scheduled" and "task_id" not in fields:
+        return {**fields, "task_id": None}
+    return fields
 
 
 def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
@@ -420,6 +423,11 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "key_count": event.key_count,
                 "cost_micro_usd": event.cost_micro_usd,
             }
+        case LineTurnEnded():
+            return "line_turn_ended", {
+                "line_id": event.line_id,
+                "workdir_commit": event.workdir_commit,
+            }
         case TaskRecorded():
             return "task_recorded", {
                 "line_id": event.line_id,
@@ -453,6 +461,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "message_id": event.message_id,
                 "due": event.due,
                 "note": event.note,
+                "task_id": event.task_id,
             }
         case WakeWithdrawn():
             return "wake_withdrawn", {
@@ -671,6 +680,10 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _int(data, "key_count"),
                 _optional_int(data, "cost_micro_usd"),
             )
+        case "line_turn_ended":
+            return LineTurnEnded(
+                _str(data, "line_id"), _optional_str(data, "workdir_commit")
+            )
         case "task_recorded":
             return TaskRecorded(
                 _str(data, "line_id"),
@@ -702,6 +715,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "message_id"),
                 _str(data, "due"),
                 _str(data, "note"),
+                _optional_str(data, "task_id"),
             )
         case "wake_withdrawn":
             return WakeWithdrawn(_str(data, "line_id"), _str(data, "message_id"))

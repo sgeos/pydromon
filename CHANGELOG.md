@@ -26,6 +26,28 @@ All notable changes are recorded here. The format follows
   path git could not read is named as unreadable, never as absent or untracked, and
   the former owner's process state is said to be unknown where the platform cannot
   identify a line's processes. Found in the live failover of 2026-10-28.
+- A hung test now ends the run after 300 seconds with the traceback of every thread,
+  through pytest's `faulthandler_timeout`, instead of running out the job's 30 minute
+  timeout in silence, as one macOS job did on 2026-10-28.
+- A Pi test failed in two gates of one session with a Keleusma virtual machine
+  dropped on another thread, and passed alone. **Inference.** A driver another test
+  left open was finalized by the cycle collector on asyncio's child-watcher thread.
+  The tests now turn automatic collection off and collect on the main thread every 25
+  tests, so a leak is finalized on the thread that made it. The original failure was
+  not reproduced, so the fix is not yet confirmed.
+- Two engine deadline tests gave their fakes ten milliseconds to reach a stage, so a
+  loaded host could fail them naming an earlier stage. The Antigravity first-output
+  test and the Grok start test now allow half a second.
+- The Grok sliding deadline test kept its limits a few tens of milliseconds apart, so a
+  loaded host could fire the inactivity deadline where the absolute cap was meant to.
+  Each limit is now far from the other and from the chunk delay, and the active turn
+  still outlasts the sliding deadline, so the test still proves that activity resets
+  it. Found by the core role's gate on 2026-10-28.
+- `dromon config` now names the disclosure list the project file gives, or says that
+  it gives none, in which case no line's mail or report is checked. It refuses a list
+  it cannot read, as the daemon does. The terms are never shown. Found by the round 3
+  reports, when `check_disclosure` refused in the team's own project for want of a
+  list.
 
 - `dromon config` no longer warns that the seats of one role share a workdir, which
   they do by design, since only the role's owner writes there. A writing line outside
@@ -82,6 +104,19 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- `wake_after` may name one of the line's running background tasks. Dromon records a
+  task binding on the scheduled wake, and the matching `task_noted` event withdraws it
+  atomically while it is still scheduled. A wake that has fired already cannot be
+  withdrawn. Logs containing `line_turn_ended` or a task-bound `wake_scheduled` event
+  require this daemon or a later one.
+- A line can reopen its own sent mail with `read_mail`. Reading outgoing mail does not
+  mark it delivered or read by its recipient, and a line cannot open mail between other
+  parties.
+- The event log records the worktree commit observed at each line turn's end. The moved
+  worktree notice can therefore compare against the last turn across a daemon restart.
+- The `daemon` object of `line_status` gives `loaded_at`, the time the daemon loaded
+  its code, and the stale note and the `cite` sentence name it, so a report that cites
+  a stale daemon says since when. Asked by the review role on 2026-10-28.
 - Generated federation certificates now name their SubjectPublicKeyInfo digest in the
   certificate subject and include a subject key identifier. TLS contexts can trust a
   bounded set of peer certificates while authentication remains based on configured

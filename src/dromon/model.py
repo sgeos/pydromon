@@ -683,6 +683,19 @@ class TurnCorrelated:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class LineTurnEnded:
+    """The last checked-out commit observed as a line's turn ended."""
+
+    line_id: str
+    workdir_commit: str | None
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        if self.workdir_commit is not None:
+            check_commit("workdir_commit", self.workdir_commit)
+
+
 MAX_DISCLOSURE_CHECKS: Final = 10
 """The most ``check_disclosure`` calls one line may make within
 ``DISCLOSURE_CHECK_WINDOW_SECONDS``, and the most check times the state keeps for a
@@ -972,6 +985,7 @@ class WakeScheduled:
     message_id: str
     due: str
     note: str
+    task_id: str | None = None
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
@@ -979,6 +993,8 @@ class WakeScheduled:
         check_text("due", self.due, len("YYYY-MM-DDTHH:MM:SSZ"))
         parse_due(self.due)
         check_text("note", self.note, MAX_WAKE_NOTE_BYTES)
+        if self.task_id is not None:
+            check_text("task_id", self.task_id, MAX_TASK_ID_BYTES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1011,8 +1027,9 @@ class TaskNoted:
     an admitted turn on it. An end during a turn or for a task the line stopped is
     recorded as delivered without a wake. Only the daemon records it, when the line's
     engine reports the end, and recording it is the whole of sending, so it needs no
-    separate ``message_sent``. A line may also send itself a note with
-    ``message_sent``, and the daemon records ``restart_noted``."""
+    separate ``message_sent``. If a pending wake names this task, applying this event
+    withdraws that wake atomically with the task note. A line may also send itself
+    a note with ``message_sent``, and the daemon records ``restart_noted``."""
 
     line_id: str
     message_id: str
@@ -1630,6 +1647,7 @@ type Event = (
     | MessagePrioritized
     | MessageCorrelated
     | TurnCorrelated
+    | LineTurnEnded
     | DisclosureChecked
     | WakeRequested
     | WakeIssued
@@ -1775,6 +1793,7 @@ class ScheduledWake:
     message_id: str
     due: str
     note: str
+    task_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1892,6 +1911,10 @@ class State:
     )
     """Each line's latest background task ends, oldest first, at most
     ``MAX_TASK_RECORDS`` per line, which its role's seats read."""
+    last_turn_commits: dict[str, str | None] = field(
+        default_factory=dict[str, str | None]
+    )
+    """The worktree commit recorded as each line's latest turn ended."""
 
     briefs: dict[str, BriefSet] = field(default_factory=dict[str, BriefSet])
     """Each line's latest standing brief, keyed by line. A line with none has no
@@ -1924,6 +1947,7 @@ class State:
             dict(self.correlations),
             dict(self.disclosure_checks),
             dict(self.task_records),
+            dict(self.last_turn_commits),
             dict(self.briefs),
         )
 
@@ -2021,7 +2045,12 @@ class State:
                 self._check_prioritized(event)
             case MessageCorrelated():
                 self._check_correlated(event)
-            case TurnCorrelated() | DisclosureChecked() | TaskRecorded():
+            case (
+                TurnCorrelated()
+                | LineTurnEnded()
+                | DisclosureChecked()
+                | TaskRecorded()
+            ):
                 self._line(event.line_id)
             case WakeRequested():
                 self._check_wake_requested(event)
@@ -2195,6 +2224,8 @@ class State:
                 )
             case TurnCorrelated():
                 self._total_correlated(event)
+            case LineTurnEnded():
+                self.last_turn_commits[event.line_id] = event.workdir_commit
             case TaskRecorded():
                 records = self.task_records.get(event.line_id, ())
                 self.task_records[event.line_id] = (*records, event)[-MAX_TASK_RECORDS:]
@@ -2212,7 +2243,7 @@ class State:
                 self.wakes[event.wake_id] = replace(wake, issued=True)
             case WakeScheduled():
                 self.scheduled[event.line_id] = ScheduledWake(
-                    event.message_id, event.due, event.note
+                    event.message_id, event.due, event.note, event.task_id
                 )
             case WakeWithdrawn():
                 del self.scheduled[event.line_id]
@@ -2230,7 +2261,15 @@ class State:
                 self.lines[event.line_id] = replace(line, unverified=event)
             case WalkLimited():
                 self.walk_limit = event.note
-            case TaskNoted() | RestartNoted():
+            case TaskNoted():
+                pending = self.scheduled.get(event.line_id)
+                if (
+                    pending is not None
+                    and pending.task_id is not None
+                    and pending.task_id == event.task_id
+                ):
+                    del self.scheduled[event.line_id]
+                    self.withdrawn_wakes.add(pending.message_id)
                 address = LineAddress(event.line_id)
                 self.messages[event.message_id] = Message(
                     address,
@@ -2239,7 +2278,17 @@ class State:
                     event.body,
                     (),
                     None,
-                    restart_note=isinstance(event, RestartNoted),
+                )
+            case RestartNoted():
+                address = LineAddress(event.line_id)
+                self.messages[event.message_id] = Message(
+                    address,
+                    address,
+                    MessageKind.NOTE,
+                    event.body,
+                    (),
+                    None,
+                    restart_note=True,
                 )
             case QuestionWithdrawn():
                 self._close(event.message_id, QuestionStatus.WITHDRAWN)
