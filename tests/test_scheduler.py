@@ -345,7 +345,7 @@ def test_a_message_wakes_an_idle_line_and_is_delivered(make_world: MakeWorld) ->
     message_id = next(e.message_id for e in events if isinstance(e, MessageSent))
     wake = wakes_for(target, "alpha")
     assert [w.message_id for w in wake] == [message_id]
-    tail = events[-6:]
+    tail = events[-7:]
     assert isinstance(tail[0], WakeRequested)
     assert tail[1] == WakeIssued(wake[0].wake_id)
     assert tail[2] == LineStateChanged("alpha", LineState.RUNNING)
@@ -1331,6 +1331,29 @@ def test_reading_twice_records_one_read(make_world: MakeWorld) -> None:
     asyncio.run(call_tool(tool, {"message_id": message_id}))
     reads = [e for e in target.events() if isinstance(e, MessageRead)]
     assert reads == [MessageRead(message_id)]
+
+
+def test_a_line_can_read_its_own_sent_mail_but_not_another_lines_sent_mail(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": [[]], "beta": [[]]})
+    alpha = LineAddress("alpha")
+    beta = LineAddress("beta")
+    sent = target.scheduler.send(alpha, ANA, "sent by alpha")
+    other = target.scheduler.send(beta, ANA, "sent by beta")
+    tool = target.scheduler.read_mail_tool("alpha")
+
+    opened = asyncio.run(call_tool(tool, {"message_id": sent}))
+    assert "sent by alpha" in tool_text(opened)
+    assert not target.log.state.messages[sent].read
+    assert not any(
+        isinstance(event, MessageRead) and event.message_id == sent
+        for event in target.events()
+    )
+
+    refused = asyncio.run(call_tool(tool, {"message_id": other}))
+    assert refused.get("isError", refused.get("is_error")) is True
+    assert "no message" in tool_text(refused)
 
 
 def test_mail_can_be_paged_and_filtered_by_sender(make_world: MakeWorld) -> None:

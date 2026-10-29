@@ -16,7 +16,7 @@ from dromon.codec import DecodeError, decode, encode
 from dromon.configview import Overrides
 from dromon.daemon import Daemon
 from dromon.driver import Strategy
-from dromon.engine import TurnReport
+from dromon.engine import BackgroundEnd, TurnReport
 from dromon.eventlog import EventLog, read_entries
 from dromon.limits import Limits
 from dromon.model import (
@@ -29,6 +29,7 @@ from dromon.model import (
     MessageSent,
     OperatorAddress,
     State,
+    TaskNoted,
     WakeScheduled,
     format_due,
     parse_due,
@@ -161,6 +162,17 @@ def test_a_reply_to_the_note_is_not_a_firing() -> None:
         )
 
 
+def test_recording_a_task_note_withdraws_its_bound_wake_in_the_same_event() -> None:
+    state = state_with_alpha()
+    state.apply(
+        WakeScheduled("alpha", "wake-1", "2026-10-26T09:30:00Z", "later", "task-1")
+    )
+    note = TaskNoted("alpha", "note-1", "task-1", "completed", "done")
+    state.apply(note)
+    assert "alpha" not in state.scheduled
+    assert "wake-1" in state.withdrawn_wakes
+
+
 # The scheduler.
 
 
@@ -183,6 +195,7 @@ class Recorder:
         self.session_id = spec.session_id
         self.tools = {tool.name: tool for tool in tools}
         self.prompts: list[str] = []
+        self.tasks: list[dict[str, str]] = []
 
     async def run_turn(self, prompt: str) -> TurnReport:
         self.prompts.append(prompt)
@@ -190,6 +203,16 @@ class Recorder:
         return TurnReport(
             "success", 1, "ok", (), None, None, self.session_id, None, None
         )
+
+    async def retire(self) -> None:
+        return None
+
+    def kept_status(self) -> dict[str, object]:
+        return {
+            "kept": True,
+            "background_tasks": len(self.tasks),
+            "tasks": list(self.tasks),
+        }
 
 
 class World:
@@ -337,6 +360,102 @@ def test_a_wake_counts_toward_the_autonomous_limit(tmp_path: Path) -> None:
         assert line.held_by is not None
     finally:
         target.log.close()
+
+
+def test_a_wake_bound_to_a_running_task_is_cancelled_when_it_ends(
+    world: World,
+) -> None:
+    engine = world.scheduler.engine_for("alpha")
+    assert isinstance(engine, Recorder)
+    engine.tasks = [{"task_id": "task-1", "command": "make gate"}]
+    result = world.call({"seconds": 60, "note": "check the gate", "task_id": "task-1"})
+    assert result.get("is_error") is not True
+    scheduled = world.log.state.scheduled["alpha"]
+    assert scheduled.task_id == "task-1"
+    assert "cancelled if task task-1 ends" in text_of(result)
+
+    before = world.log.last_seq
+    refused = world.call(
+        {"seconds": 60, "note": "check the gate", "task_id": "missing"}
+    )
+    assert refused.get("is_error") is True
+    assert "running background tasks" in text_of(refused)
+    assert world.log.last_seq == before
+
+    world.scheduler.background_ended(
+        "alpha", BackgroundEnd("task-1", "make gate", "completed")
+    )
+    assert "alpha" not in world.log.state.scheduled
+    assert scheduled.message_id in world.log.state.withdrawn_wakes
+    events = world.events()
+    assert isinstance(events[-1], TaskNoted)
+    assert scheduled.message_id not in {
+        event.message_id for event in events if isinstance(event, MessageSent)
+    }
+
+    world.log.close()
+    world.log = EventLog(world.path)
+    world.restart()
+    assert "alpha" not in world.log.state.scheduled
+    assert scheduled.message_id in world.log.state.withdrawn_wakes
+
+
+def test_wake_after_refuses_a_task_when_the_line_has_no_kept_engine(
+    world: World,
+) -> None:
+    assert "alpha" not in world.engines
+    before = world.log.last_seq
+
+    result = world.call({"seconds": 60, "note": "check the gate", "task_id": "task-1"})
+
+    assert result.get("is_error") is True
+    assert "running background tasks" in text_of(result)
+    assert world.log.last_seq == before
+    assert "alpha" not in world.log.state.scheduled
+
+
+def test_wake_after_refuses_a_task_after_it_has_ended(world: World) -> None:
+    engine = world.scheduler.engine_for("alpha")
+    assert isinstance(engine, Recorder)
+    engine.tasks = [{"task_id": "task-1", "command": "make gate"}]
+    args: dict[str, object] = {
+        "seconds": 60,
+        "note": "check the gate",
+        "task_id": "task-1",
+    }
+    assert world.call(args).get("is_error") is not True
+    world.scheduler.background_ended(
+        "alpha", BackgroundEnd("task-1", "make gate", "completed")
+    )
+    engine.tasks = []
+    before = world.log.last_seq
+
+    result = world.call(args)
+
+    assert result.get("is_error") is True
+    assert "running background tasks" in text_of(result)
+    assert world.log.last_seq == before
+    assert "alpha" not in world.log.state.scheduled
+
+
+def test_a_wake_that_fired_before_its_task_ended_is_not_withdrawn(
+    world: World,
+) -> None:
+    engine = world.scheduler.engine_for("alpha")
+    assert isinstance(engine, Recorder)
+    engine.tasks = [{"task_id": "task-1", "command": "make gate"}]
+    world.call({"seconds": 60, "note": "check the gate", "task_id": "task-1"})
+    message_id = world.log.state.scheduled["alpha"].message_id
+    world.clock.advance(60)
+
+    assert world.scheduler.fire_due_wakes() == [message_id]
+    assert "alpha" not in world.log.state.scheduled
+    world.scheduler.background_ended(
+        "alpha", BackgroundEnd("task-1", "make gate", "completed")
+    )
+
+    assert message_id not in world.log.state.withdrawn_wakes
+    assert world.log.state.messages[message_id].body == "check the gate"
 
 
 def test_a_held_lines_wake_fires_and_its_note_waits(world: World) -> None:

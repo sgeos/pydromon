@@ -104,7 +104,7 @@ argument outside a tool's schema is refused.
 |---|---|
 | `send_message` | Sends a note to a line, an operator or the line itself, delivered in a later tick. With `priority` true, a note to another line is priority mail, rate limited, as [`PRIORITY.md`](PRIORITY.md) specifies |
 | `ask_operator` | Asks an operator a question, which never pauses the line |
-| `wake_after` | Schedules one wake for the line, as below |
+| `wake_after` | Schedules one wake for the line, optionally tied to a running background task, as below |
 | `list_mail`, `read_mail`, `acknowledge_mail` | Page through, open and acknowledge the line's mailbox |
 | `list_sent` | Lists what became of the line's sent mail |
 | `acquire_lease`, `release_lease` | Take and give up a lease the project declares, as below |
@@ -372,6 +372,10 @@ headers of the newly delivered mail follow, and bodies stay in the mailbox.
   `delivered` and the time it was delivered. The repeat marks and delivery times live
   in the daemon's memory, at most 4,096 of each with the oldest forgotten first, so
   after a restart a wake's entry gives its due time only and no entry is a repeat.
+- **`read_mail`.** A line may open a message it received or one it sent. Opening
+  received mail records delivery and reading as before. Opening its own sent mail
+  returns the body without changing delivery or read state, which belongs to the
+  recipient. A line cannot open mail between other parties.
 - **Unanswered.** The summary's unanswered count leaves out a reply to a question Dromon
   asked on the line's behalf when it held the line, such as an operator's `resume`,
   and, from round 4, a note from the line to itself, a fired wake or a task-end note,
@@ -394,8 +398,7 @@ headers of the newly delivered mail follow, and bodies stay in the mailbox.
   between. **Decided by core for review.** The daemon reads `HEAD` from a few small
   files and never runs git or reads its objects, so it names the two ends and not
   each commit. A move during a turn, such as the line's own commit, is not told. The
-  commit at a turn's end is kept in memory, so the first turn after a restart tells
-  nothing.
+  turn-end commit is recorded in the event log, so the notice survives a daemon restart.
 
 **Leases.** **Decided by the operator on 2026-10-26.** A project declares named leases
 in its `[leases]` table, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, so its
@@ -427,11 +430,17 @@ command in the background, which survives the end of its turn, needs a way to be
 to read the result.
 
 - **Arguments.** `seconds`, a whole number from 60 to 86,400, and `note`, text of at
-  most 2,000 bytes. A number with a fraction, a boolean or text is refused.
+  most 2,000 bytes. Optional `task_id` names one of the line's currently running
+  background tasks. Naming a task that is not running is refused. A number with a
+  fraction, a boolean or text is refused.
 - **Effect.** The daemon appends `wake_scheduled` with the due time, the wall clock in
   Coordinated Universal Time plus `seconds`, rounded up to the whole second so a wake
   never fires early. A line has at most one pending scheduled wake, and a new call
   replaces it, which the tool's answer reports with the replaced due time.
+- **Task-bound fallback.** When the named task's end is recorded as a note for the line,
+  applying its `task_noted` event atomically withdraws the wake if it is still scheduled.
+  If the wake has fired already, its message cannot be withdrawn, and it has already
+  provided the fallback turn. An unbound wake behaves as before.
 - **Firing.** At the first tick at or after the due time, the note is recorded as a
   message from the line to itself, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies under
   scheduled wakes. It wakes the line through the ordinary path in a later tick and

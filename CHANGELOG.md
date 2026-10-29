@@ -85,6 +85,16 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- `wake_after` may name one of the line's running background tasks. Dromon records a
+  task binding on the scheduled wake, and the matching `task_noted` event withdraws it
+  atomically while it is still scheduled. A wake that has fired already cannot be
+  withdrawn. Logs containing `line_turn_ended` or a task-bound `wake_scheduled` event
+  require this daemon or a later one.
+- A line can reopen its own sent mail with `read_mail`. Reading outgoing mail does not
+  mark it delivered or read by its recipient, and a line cannot open mail between other
+  parties.
+- The event log records the worktree commit observed at each line turn's end. The moved
+  worktree notice can therefore compare against the last turn across a daemon restart.
 - The `daemon` object of `line_status` gives `loaded_at`, the time the daemon loaded
   its code, and the stale note and the `cite` sentence name it, so a report that cites
   a stale daemon says since when. Asked by the review role on 2026-10-28.

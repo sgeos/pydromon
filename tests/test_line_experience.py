@@ -1473,6 +1473,21 @@ def test_a_turn_is_told_once_when_its_worktree_head_moved(world: World) -> None:
     )
 
 
+def test_a_moved_worktree_notice_survives_a_daemon_restart(world: World) -> None:
+    checkout(world.root, "a" * 40)
+    world.turn("first")
+    world.log.close()
+    world.log = EventLog(world.log_path)
+    world.start()
+    checkout(world.root, "b" * 40)
+
+    prompt = world.turn("after the restart")
+    assert prompt.startswith(
+        f"{MOVED} from {'a' * 12} to {'b' * 12} since your last turn ended."
+        f" git log --oneline {'a' * 12}..{'b' * 12} lists the commits between"
+    )
+
+
 def test_own_notes_shown_to_an_earlier_turn_leave_unread(world: World) -> None:
     """A note a line sent itself, such as a wake that fired after its work was done,
     is counted unread in the turn it reaches and left out of unread in later turns.
