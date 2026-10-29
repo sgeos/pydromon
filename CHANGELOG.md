@@ -7,6 +7,23 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- A hung test now ends the run after 300 seconds with the traceback of every thread,
+  through pytest's `faulthandler_timeout`, instead of running out the job's 30 minute
+  timeout in silence, as one macOS job did on 2026-10-28.
+- Two engine deadline tests gave their fakes ten milliseconds to reach a stage, so a
+  loaded host could fail them naming an earlier stage. The Antigravity first-output
+  test and the Grok start test now allow half a second.
+- The Grok sliding deadline test kept its limits a few tens of milliseconds apart, so a
+  loaded host could fire the inactivity deadline where the absolute cap was meant to.
+  Each limit is now far from the other and from the chunk delay, and the active turn
+  still outlasts the sliding deadline, so the test still proves that activity resets
+  it. Found by the core role's gate on 2026-10-28.
+- `dromon config` now names the disclosure list the project file gives, or says that
+  it gives none, in which case no line's mail or report is checked. It refuses a list
+  it cannot read, as the daemon does. The terms are never shown. Found by the round 3
+  reports, when `check_disclosure` refused in the team's own project for want of a
+  list.
+
 - `dromon config` no longer warns that the seats of one role share a workdir, which
   they do by design, since only the role's owner writes there. A writing line outside
   the role in the same workdir is still warned about. Found by the operator on
@@ -62,6 +79,9 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- The `daemon` object of `line_status` gives `loaded_at`, the time the daemon loaded
+  its code, and the stale note and the `cite` sentence name it, so a report that cites
+  a stale daemon says since when. Asked by the review role on 2026-10-28.
 - Generated federation certificates now name their SubjectPublicKeyInfo digest in the
   certificate subject and include a subject key identifier. TLS contexts can trust a
   bounded set of peer certificates while authentication remains based on configured
