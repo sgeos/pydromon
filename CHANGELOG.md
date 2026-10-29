@@ -19,6 +19,10 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- A client request that times out now says that the daemon may still have carried it
+  out, and `dromon send` points to `dromon sent` before a retry. **Found on
+  2026-10-29,** when a send timed out at the client while the daemon was busy and the
+  message had in fact been recorded, so a retry would have sent it twice.
 - The role transition package now marks where each item came from, observed by the
   daemon, reported by a line, unknown, or unreadable by the daemon, each with its time.
   A field the journal entry lacks is taken from the former owner's standing brief, so
