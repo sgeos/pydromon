@@ -279,6 +279,48 @@ since mail would wake a seat that has no budget. The preamble names the new owne
 cause and the time, and says the worktree is now read only to it. Its own uncommitted
 changes, if any, are named in the recovery record it can read.
 
+### The role transition package
+
+**Implemented on 2026-10-29.** The first turn of a new owner by any cause but the
+declared one leads with a role transition package. Before this, the package read Task,
+Gate and coverage, Unresolved decisions and Next action only from the role's latest
+journal entry. **Fact.** A failover takes a role with no handoff note, so in the live
+failover of 2026-10-28 the new owner found every field missing, could not tell an
+absent path from an unreadable one, and was not told that the former owner's process
+state was unknown.
+
+Each item of the package now says where it came from, in one of four ways.
+
+| Marking | Meaning |
+|---|---|
+| Observed by the daemon, with the time | The daemon read it as it composed the package, as the worktree status and the diff summary are |
+| Reported by a line, with the line, the source and the time | A line wrote it, in a journal entry or in its standing brief, and the daemon did not check it |
+| Unknown | No source states it |
+| Could not be read by the daemon, with the time | The daemon tried and failed, which says nothing of what is there |
+
+A labeled field the journal entry does not state is taken from the former owner's
+standing brief, which `set_brief` records, as [`LINE_CONFIG.md`](../protocol/LINE_CONFIG.md)
+specifies. Task, Unresolved decisions and Next action have a counterpart in the brief,
+and the brief's artifact paths are an item of their own. Gate and coverage and the
+journal's diff summary have none and stay unknown when the entry is silent. The former
+owner is the seat the role passed from, or, after a vacancy, the author of the entry.
+
+**A path the daemon cannot read is never reported as absent or untracked.** **Fact,
+observed with git on 2026-10-29.** `git status` leaves a directory it cannot open out
+of its output, warns on its error stream and exits 0. The package names each such path
+as one the daemon could not read, and says that it may exist and be tracked, untracked
+or ignored. The query runs with `LC_ALL=C`, so git gives its untranslated wording
+whatever the operator's locale. **Assumption.** A later change of that wording leaves
+such a path out without naming it.
+
+The former owner's processes are given as the daemon recorded them when its engine
+ended, or as none recorded. Where the platform does not let the daemon identify a
+line's processes, the item says that their state is unknown.
+
+The fields, the brief and the journal entry are untrusted data that lines wrote, and the
+package delimits them as such. Each part is checked against the disclosure list as the
+package is composed and withheld whole when it holds a listed term.
+
 ## Messages between seats
 
 **Fact.** Any line may already send any line a note, so seats of a role can message
@@ -453,3 +495,8 @@ Roles, seats, owners, journal entries and budgets are plain records in the event
 checked by the model as lines are. Ownership is one optional field per role, changed
 only by an event that names the value it replaces, so it maps onto a compare and swap
 in a Rust or Keleusma state machine.
+
+**The package's unreadable paths.** The prototype learns which paths git could not read
+by matching git's untranslated warnings. **Porting hazard.** A port that reads the
+worktree through a git library rather than the git command receives these as errors of
+its own, and must still report each as unreadable rather than drop it.

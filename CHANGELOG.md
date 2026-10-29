@@ -5,7 +5,26 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- A standing brief for every line. `set_brief` records the line's current task, open
+  decisions, artifact paths and next action as one `brief_set` event, which replaces
+  its previous brief and which the daemon stamps with the time and both commits. Each
+  field and the whole are bounded, an unknown key is refused, and the text is checked
+  against the disclosure list. The brief leads the line's first turn after its engine
+  session is new, as after a compaction, a restart or a rebind, and `line_status`
+  shows it, always delimited as untrusted data. Asked for by three of the round 3
+  reports.
+
 ### Fixed
+
+- The role transition package now marks where each item came from, observed by the
+  daemon, reported by a line, unknown, or unreadable by the daemon, each with its time.
+  A field the journal entry lacks is taken from the former owner's standing brief, so
+  a failover, which writes no handoff note, no longer leaves every field missing. A
+  path git could not read is named as unreadable, never as absent or untracked, and
+  the former owner's process state is said to be unknown where the platform cannot
+  identify a line's processes. Found in the live failover of 2026-10-28.
 
 - `dromon config` no longer warns that the seats of one role share a workdir, which
   they do by design, since only the role's owner writes there. A writing line outside
