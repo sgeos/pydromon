@@ -62,6 +62,14 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- `wake_after` may name one of the line's running background tasks. Dromon records a
+  task binding on the scheduled wake, and the matching `task_noted` event withdraws it
+  atomically, so the fallback wake cannot start a duplicate turn after replay or restart.
+- A line can reopen its own sent mail with `read_mail`. Reading outgoing mail does not
+  mark it delivered or read by its recipient, and a line cannot open mail between other
+  parties.
+- The event log records the worktree commit observed at each line turn's end. The moved
+  worktree notice can therefore compare against the last turn across a daemon restart.
 - Generated federation certificates now name their SubjectPublicKeyInfo digest in the
   certificate subject and include a subject key identifier. TLS contexts can trust a
   bounded set of peer certificates while authentication remains based on configured

@@ -23,9 +23,11 @@ from dromon.model import (
     LineAwakened,
     LineCreated,
     LineHibernated,
+    LineTurnEnded,
     MessageKind,
     MessageSent,
     OperatorAddress,
+    WakeScheduled,
 )
 
 ANA = OperatorAddress("ana")
@@ -47,6 +49,29 @@ def test_the_field_table_matches_each_event(scenario: tuple[Event, ...]) -> None
         declared = tuple(f.name for f in fields(event))
         assert KIND_FIELDS[document["kind"]] == declared
         assert set(document["data"]) == set(declared)
+
+
+def test_old_scheduled_wake_events_decode_without_a_task_binding() -> None:
+    event = WakeScheduled("beta", "wake-1", "2026-10-26T09:30:00Z", "later")
+    assert (
+        decode(
+            wire(
+                "wake_scheduled",
+                {
+                    "line_id": "beta",
+                    "message_id": "wake-1",
+                    "due": "2026-10-26T09:30:00Z",
+                    "note": "later",
+                },
+            )
+        )
+        == event
+    )
+
+
+def test_a_line_turn_end_event_round_trips() -> None:
+    event = LineTurnEnded("beta", "a" * 40)
+    assert decode(encode(event)) == event
 
 
 def test_the_field_table_names_exactly_the_scenario_kinds(
