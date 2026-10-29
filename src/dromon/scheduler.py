@@ -2657,7 +2657,9 @@ class Scheduler:
             if replaced is not None:
                 text += f" It replaces the wake that was due at {replaced.due}."
             if task_id is not None:
-                text += f" It is cancelled if task {task_id} ends."
+                text += (
+                    f" It is cancelled if task {task_id} ends before the wake fires."
+                )
             result = _tool_text(text)
             self._request_keys.remember(line_id, WAKE_TOOL_NAME, args, result)
             return result
@@ -2670,7 +2672,8 @@ class Scheduler:
                 " from 60 to 86400, your note arrives as a message from you, which"
                 " wakes you. You have at most one scheduled wake, and a new call"
                 " replaces it. Optionally name one of your running background tasks"
-                " as task_id to cancel this wake when that task ends."
+                " as task_id to cancel this wake if that task ends while the wake is"
+                " still scheduled. A wake that has fired already cannot be cancelled."
             ),
             input_schema=WAKE_TOOL_SCHEMA,
             handler=handler,
@@ -6124,14 +6127,16 @@ class Scheduler:
             # A compaction the engine did not report leaves no cause for a later one.
             self._compaction_cause.pop(line_id, None)
             self.activity.record(line_id, ActivityKind.TURN_ENDED, ending)
-            if self._log.state.lines[line_id].state is LineState.RUNNING:
+            line = self._log.state.lines.get(line_id)
+            if line is not None and line.state is LineState.RUNNING:
                 self._log.append(LineStateChanged(line_id, LineState.IDLE))
             self._correlate(line_id, keys, report)
             self._note_quiet(line_id, sent)
             self._running.pop(line_id, None)
             self._turn_owned.discard(line_id)
             self._last_turn_end[line_id] = self._clock()
-            self._log.append(LineTurnEnded(line_id, self._workdir_commit(line_id)))
+            if line is not None:
+                self._log.append(LineTurnEnded(line_id, self._workdir_commit(line_id)))
             # A handoff asked for in the turn takes effect now that it has ended,
             # however it ended.
             self._settle_relinquish(line_id)

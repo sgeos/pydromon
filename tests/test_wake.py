@@ -400,6 +400,64 @@ def test_a_wake_bound_to_a_running_task_is_cancelled_when_it_ends(
     assert scheduled.message_id in world.log.state.withdrawn_wakes
 
 
+def test_wake_after_refuses_a_task_when_the_line_has_no_kept_engine(
+    world: World,
+) -> None:
+    assert "alpha" not in world.engines
+    before = world.log.last_seq
+
+    result = world.call({"seconds": 60, "note": "check the gate", "task_id": "task-1"})
+
+    assert result.get("is_error") is True
+    assert "running background tasks" in text_of(result)
+    assert world.log.last_seq == before
+    assert "alpha" not in world.log.state.scheduled
+
+
+def test_wake_after_refuses_a_task_after_it_has_ended(world: World) -> None:
+    engine = world.scheduler.engine_for("alpha")
+    assert isinstance(engine, Recorder)
+    engine.tasks = [{"task_id": "task-1", "command": "make gate"}]
+    args: dict[str, object] = {
+        "seconds": 60,
+        "note": "check the gate",
+        "task_id": "task-1",
+    }
+    assert world.call(args).get("is_error") is not True
+    world.scheduler.background_ended(
+        "alpha", BackgroundEnd("task-1", "make gate", "completed")
+    )
+    engine.tasks = []
+    before = world.log.last_seq
+
+    result = world.call(args)
+
+    assert result.get("is_error") is True
+    assert "running background tasks" in text_of(result)
+    assert world.log.last_seq == before
+    assert "alpha" not in world.log.state.scheduled
+
+
+def test_a_wake_that_fired_before_its_task_ended_is_not_withdrawn(
+    world: World,
+) -> None:
+    engine = world.scheduler.engine_for("alpha")
+    assert isinstance(engine, Recorder)
+    engine.tasks = [{"task_id": "task-1", "command": "make gate"}]
+    world.call({"seconds": 60, "note": "check the gate", "task_id": "task-1"})
+    message_id = world.log.state.scheduled["alpha"].message_id
+    world.clock.advance(60)
+
+    assert world.scheduler.fire_due_wakes() == [message_id]
+    assert "alpha" not in world.log.state.scheduled
+    world.scheduler.background_ended(
+        "alpha", BackgroundEnd("task-1", "make gate", "completed")
+    )
+
+    assert message_id not in world.log.state.withdrawn_wakes
+    assert world.log.state.messages[message_id].body == "check the gate"
+
+
 def test_a_held_lines_wake_fires_and_its_note_waits(world: World) -> None:
     world.scheduler.hold("alpha", "was held for this test")
     world.call({"seconds": 60, "note": "after the hold"})

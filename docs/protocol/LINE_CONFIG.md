@@ -432,9 +432,9 @@ to read the result.
   never fires early. A line has at most one pending scheduled wake, and a new call
   replaces it, which the tool's answer reports with the replaced due time.
 - **Task-bound fallback.** When the named task's end is recorded as a note for the line,
-  applying its `task_noted` event atomically withdraws the scheduled wake. The end note
-  provides the turn, and the later fallback wake cannot provide a duplicate. An unbound
-  wake behaves as before.
+  applying its `task_noted` event atomically withdraws the wake if it is still scheduled.
+  If the wake has fired already, its message cannot be withdrawn, and it has already
+  provided the fallback turn. An unbound wake behaves as before.
 - **Firing.** At the first tick at or after the due time, the note is recorded as a
   message from the line to itself, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies under
   scheduled wakes. It wakes the line through the ordinary path in a later tick and

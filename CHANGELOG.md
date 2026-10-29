@@ -64,7 +64,9 @@ All notable changes are recorded here. The format follows
 
 - `wake_after` may name one of the line's running background tasks. Dromon records a
   task binding on the scheduled wake, and the matching `task_noted` event withdraws it
-  atomically, so the fallback wake cannot start a duplicate turn after replay or restart.
+  atomically while it is still scheduled. A wake that has fired already cannot be
+  withdrawn. Logs containing `line_turn_ended` or a task-bound `wake_scheduled` event
+  require this daemon or a later one.
 - A line can reopen its own sent mail with `read_mail`. Reading outgoing mail does not
   mark it delivered or read by its recipient, and a line cannot open mail between other
   parties.
