@@ -14,7 +14,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import __version__
+from dromon import __version__, disclosure
 from dromon.codex import default_cache_home, engine_environment
 from dromon.disclosure import load_terms
 from dromon.driver import Driver, Strategy
@@ -735,10 +735,9 @@ def test_write_scratch_refuses_large_or_disclosing_text_and_bad_arguments(
     (tmp_path / "terms").write_text("codename\n")
     world.scheduler.set_disclosure_terms(load_terms(tmp_path / "terms"))
     text, error = world.call("write_scratch", {"path": "n", "text": "the Codename"})
-    assert (text, error) == (
-        "the text field contains a term from the project's disclosure list",
-        True,
-    )
+    # A path and a text are both offered, so the refusal names neither, per review r4
+    # finding F1.
+    assert (text, error) == (disclosure.REFUSAL, True)
     assert not (world.root / "tmp" / "n").exists()
     text, error = world.call("write_scratch", {"path": 3, "text": "x"})
     assert error and "must be text" in text
@@ -879,10 +878,7 @@ def test_the_disclosure_check_covers_the_scratch_path(
     text, error = world.call(
         "write_scratch", {"path": "the-codename-notes.md", "text": "clean"}
     )
-    assert (text, error) == (
-        "the path field contains a term from the project's disclosure list",
-        True,
-    )
+    assert (text, error) == (disclosure.REFUSAL, True)
     assert not (world.root / "tmp").exists()
 
 
@@ -1020,10 +1016,12 @@ def test_a_refusal_for_disclosure_spends_a_check(
         "send_message": "body",
         "ask_operator": "question",
         "wake_after": "note",
-        "write_scratch": "text",
+        "write_scratch": None,
     }[name]
     assert error and text == (
-        f"the {field} field contains a term from the project's disclosure list"
+        disclosure.REFUSAL
+        if field is None
+        else f"the {field} field contains a term from the project's disclosure list"
     )
     assert [event.matched_lines for event in checks(world)] == [1]
     text, error = world.call("check_disclosure", {"text": "clean"})
@@ -1042,7 +1040,7 @@ def test_the_role_and_proposal_tools_spend_a_check_too(
         lambda: scheduler.propose_change("alpha", "codename", ["a.py"], "patch"),
     ]
     for call in calls:
-        with pytest.raises(LineToolRefused, match="field contains a term"):
+        with pytest.raises(LineToolRefused, match="contains a term"):
             call()
     assert len(checks(world)) == len(calls)
 

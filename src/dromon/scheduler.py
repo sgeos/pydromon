@@ -1907,13 +1907,18 @@ class Scheduler:
             # Decision 3 of the federation design. Mail to a peer leaves the project,
             # so an operator's is held to the disclosure list too, and so is the
             # sender's address, which the envelope carries.
+            envelope = (("body", body), ("sender", str(sender)))
             disclosing_fields = tuple(
                 name
-                for name, text in (("body", body), ("sender", str(sender)))
+                for name, text in envelope
                 if disclosure.discloses(self._disclosure, (text,))
             )
             if disclosing_fields:
-                raise EventRejected(disclosure.field_refusal(disclosing_fields))
+                raise EventRejected(
+                    disclosure.refusal(
+                        disclosing_fields, sum(1 for _, text in envelope if text)
+                    )
+                )
             if priority and isinstance(sender, LineAddress):
                 try:
                     self._priority.check(sender.line_id, None)
@@ -3843,6 +3848,7 @@ class Scheduler:
         if line_id in self._disclosure_spent:
             return DISCLOSURE_HELD
         texts = tuple(text for _, text in fields)
+        offered = sum(1 for text in texts if text)
         matched_fields = tuple(
             name
             for name, text in fields
@@ -3852,7 +3858,7 @@ class Scheduler:
             return None
         line = self._log.state.lines.get(line_id)
         if line is None:
-            return disclosure.field_refusal(matched_fields)
+            return disclosure.refusal(matched_fields, offered)
         now = self._wall_clock()
         if self._disclosure_reopens(line_id, now) is None:
             matched = sum(
@@ -3863,7 +3869,7 @@ class Scheduler:
                     line_id, format_due(now), min(matched, MAX_DISCLOSURE_MATCHES)
                 )
             )
-            return disclosure.field_refusal(matched_fields)
+            return disclosure.refusal(matched_fields, offered)
         self._disclosure_spent.add(line_id)
         if line.held_by is None:
             self.hold(

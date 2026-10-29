@@ -11,8 +11,10 @@ All notable changes are recorded here. The format follows
   the engine made the compaction itself or a turn made it at Dromon's request, and a
   compaction that reports no size withdraws the daemon's own pending context-warning
   wake, which until now fired as a reminder after the compaction. A
-  disclosure refusal names the call field or fields that contain a listed term, never
-  the term or its position, while retaining the shared hourly limit. The prompt states
+  disclosure refusal names the field that contains a listed term when the call offered
+  text in that one field only, never the term or its position, and keeps the shared
+  hourly limit. A call with several fields gets the generic refusal, so a refusal still
+  answers one bit, per review r4 finding F1. The prompt states
   that its autonomous-turn count is the consecutive count without operator mail.
 
 - A standing brief for every line. `set_brief` records the line's current task, open

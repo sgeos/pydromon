@@ -247,10 +247,16 @@ stops the start, or refuses the reload and keeps the previous list.
   operator and is exempt. Agent names hold only lowercase letters, digits, `.`, `_` and
   `-`, so a term with a space or a capital letter matches only its folded form, and a
   term with a space matches no name.
-- **What a refusal says.** A tool refusal names the field or fields of the call that
-  contain a listed term, such as `body` or `note`, and never names the term or its
-  position. Nothing is recorded. A refusal of an outbound federated message names its
-  `body` field or `sender` field where either contains a listed term.
+- **What a refusal says.** A tool refusal names the field of the call that contains a
+  listed term, such as `body` or `note`, when the call offered text in that one field
+  only, and never names the term or its position. A call that offered text in several
+  fields is refused with the generic text, which names no field. **Review r4, finding
+  F1.** Naming each matching field of such a call would answer one bit per field in
+  one counted refusal, so a line could test several candidate words for the price of
+  one. A line that wants the field named sends it alone, at the cost of one check. No
+  message is recorded, and the refusal is recorded as `disclosure_checked`, which
+  holds no text. A refusal of an outbound federated message follows the same rule for
+  its `body` and `sender`.
 - **Not checked.** Messages from operators, who hold authority, and the questions the
   daemon asks on a held line's behalf.
 - **Secrecy.** Terms are never logged, returned or stored. Errors about the file name

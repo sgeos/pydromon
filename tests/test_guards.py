@@ -11,7 +11,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import daemon, exits
+from dromon import daemon, disclosure, exits
 from dromon.configview import Overrides
 from dromon.daemon import Daemon, check_lines_sandboxed, check_sandbox_required
 from dromon.disclosure import (
@@ -177,21 +177,23 @@ def last_seq(scheduler: Scheduler) -> int:
         (
             1,
             {"question": "which name?", "choices": ["the old one", TERM.upper()]},
-            "choices",
+            None,
         ),
         (2, {"seconds": 60, "note": f"recheck {TERM}"}, "note"),
     ],
 )
 def test_a_line_cannot_send_a_listed_term(
-    scheduler: Scheduler, tool_index: int, args: dict[str, object], field: str
+    scheduler: Scheduler, tool_index: int, args: dict[str, object], field: str | None
 ) -> None:
     tool = scheduler.own_tools("alpha")[tool_index]
     before = last_seq(scheduler)
     result = call(tool, args)
     text = cast(str, result["content"][0]["text"])
     assert result["is_error"] is True
-    assert (
-        text == f"the {field} field contains a term from the project's disclosure list"
+    assert text == (
+        disclosure.REFUSAL
+        if field is None
+        else f"the {field} field contains a term from the project's disclosure list"
     )
     assert TERM.casefold() not in text.casefold()
     # The refusal is recorded as one disclosure check, which holds no text, at the
@@ -212,21 +214,39 @@ def test_clean_text_still_passes_every_tool(scheduler: Scheduler) -> None:
         assert call(tool, args).get("is_error") is not True
 
 
-def test_a_refusal_names_each_matching_field_without_revealing_terms(
+def test_a_refusal_names_the_field_only_for_a_call_with_one(
     scheduler: Scheduler,
 ) -> None:
+    """Review r4, finding F1. Naming each matching field of a call with several would
+    answer one bit per field in one counted refusal, so a call that offers text in
+    several fields is refused without naming any, and one that offers one names it."""
     ask = scheduler.own_tools("alpha")[1]
-    result = call(
+    several = call(
         ask,
         {"question": f"{TERM} question", "choices": [f"choice {TERM.upper()}"]},
     )
-    text = cast(str, result["content"][0]["text"])
-    assert result["is_error"] is True
-    assert text == (
-        "the question and choices fields contain a term from the project's"
-        " disclosure list"
+    assert several["is_error"] is True
+    assert several["content"][0]["text"] == disclosure.REFUSAL
+    one_matching_of_two = call(
+        ask, {"question": "which name?", "choices": [f"choice {TERM}"]}
     )
-    assert TERM.casefold() not in text.casefold()
+    assert one_matching_of_two["content"][0]["text"] == disclosure.REFUSAL
+    alone = call(ask, {"question": f"{TERM} question"})
+    alone_text = cast(str, alone["content"][0]["text"])
+    assert alone_text == (
+        "the question field contains a term from the project's disclosure list"
+    )
+    assert TERM.casefold() not in alone_text.casefold()
+
+
+def test_the_refusal_helper_names_one_field_of_one_offered() -> None:
+    assert disclosure.refusal(("note",), 1) == (
+        "the note field contains a term from the project's disclosure list"
+    )
+    assert disclosure.refusal(("note",), 2) == disclosure.REFUSAL
+    assert disclosure.refusal(("a", "b"), 2) == disclosure.REFUSAL
+    with pytest.raises(ValueError, match="at least one field"):
+        disclosure.refusal((), 1)
 
 
 def test_an_external_agent_cannot_send_a_listed_term(scheduler: Scheduler) -> None:
