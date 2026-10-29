@@ -7,6 +7,14 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Compaction now withdraws a still-pending wake scheduled by `compact_session` whether
+  the engine made the compaction itself or a turn made it at Dromon's request, and a
+  compaction that reports no size withdraws the daemon's own pending context-warning
+  wake, which until now fired as a reminder after the compaction. A
+  disclosure refusal names the call field or fields that contain a listed term, never
+  the term or its position, while retaining the shared hourly limit. The prompt states
+  that its autonomous-turn count is the consecutive count without operator mail.
+
 - A standing brief for every line. `set_brief` records the line's current task, open
   decisions, artifact paths and next action as one `brief_set` event, which replaces
   its previous brief and which the daemon stamps with the time and both commits. Each

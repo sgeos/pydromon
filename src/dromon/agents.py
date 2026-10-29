@@ -434,7 +434,7 @@ class Gateway:
             # its mail, so it is held to the project's disclosure list. An agent the
             # operator registered with a token was named by the operator.
             if self.host.discloses(agent_id):
-                raise AgentError(disclosure.REFUSAL)
+                raise AgentError(disclosure.field_refusal(("name",)))
             access = _capped(self.policy.anonymous, self.policy.max_access)
             if access.rank >= AgentAccess.MESSAGE.rank and (
                 known is None or known.access != access

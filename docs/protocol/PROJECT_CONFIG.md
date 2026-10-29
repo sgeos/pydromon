@@ -241,14 +241,16 @@ stops the start, or refuses the reload and keeps the previous list.
   wakes the line.
 - **Anonymous agents.** An external agent admitted without a token names itself, and
   the name becomes the sender of its mail. An anonymous connection whose name contains
-  a listed term is refused with the same text, and nothing is recorded. This applies
-  on every connection, so a name listed after the agent first connected is refused
+  a listed term is refused naming its `name` field, and nothing is recorded. This
+  applies on every connection, so a name listed after the agent first connected is refused
   from then on. An agent the operator registered with `agent_add` was named by the
   operator and is exempt. Agent names hold only lowercase letters, digits, `.`, `_` and
   `-`, so a term with a space or a capital letter matches only its folded form, and a
   term with a space matches no name.
-- **What a refusal says.** That the text contains a term from the project's disclosure
-  list, and never which term. Nothing is recorded.
+- **What a refusal says.** A tool refusal names the field or fields of the call that
+  contain a listed term, such as `body` or `note`, and never names the term or its
+  position. Nothing is recorded. A refusal of an outbound federated message names its
+  `body` field or `sender` field where either contains a listed term.
 - **Not checked.** Messages from operators, who hold authority, and the questions the
   daemon asks on a held line's behalf.
 - **Secrecy.** Terms are never logged, returned or stored. Errors about the file name
@@ -269,8 +271,9 @@ stops the start, or refuses the reload and keeps the previous list.
   directory Dromon protects, and at most 1 MiB. A refusal, of a missing list, a limit
   reached, or a text or file not read, records nothing and reveals nothing of the
   list. **Decided by the operator on 2026-10-28.** A refusal for disclosure by
-  `send_message`, `ask_operator`, `wake_after` or `write_scratch` gives the same
-  answer, so it counts against the same limit and is recorded as `disclosure_checked`
+  `send_message`, `ask_operator`, `wake_after` or `write_scratch` identifies the
+  offending field without naming its value, so it counts against the same limit and
+  is recorded as `disclosure_checked`
   too. Dromon applies this to every line tool that refuses for disclosure, which
   adds `record_role_note`, `relinquish_ownership`, `take_ownership` and
   `propose_change`. A text that passes is not counted. When a refusal finds the

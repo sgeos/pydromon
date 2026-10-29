@@ -343,12 +343,12 @@ tools do the same for a line.
 
 ## The wake prompt
 
-Each turn's prompt opens with one line giving the line's autonomous turns used of
-those allowed and its estimated cost since its last release of its limit, so the line
-sees how close a hold is without calling `line_status`. The counts are those before
-the turn, which is counted when it ends, so the line also says whether the turn is
-autonomous and what the count becomes, or that an operator's mail started it and the
-count starts again from 0. A turn whose only purpose is compaction does not increase
+Each turn's prompt opens with one line giving the line's autonomous turns in a row
+without operator mail, of those allowed, and its estimated cost since its last release
+of its limit, so the line sees how close a hold is without calling `line_status`. The
+counts are those before the turn, which is counted when it ends, so the line also says
+whether the turn is autonomous and what the count becomes, or that an operator's mail
+started it and the count starts again from 0. A turn whose only purpose is compaction does not increase
 the autonomous turn count, though its reported or unknown cost still applies.
 **Found in round 4.** A reviewer read 0 in the prompt of a
 turn a task-end note started and took it for a missed count. The turn was counted
@@ -456,10 +456,12 @@ to read the result.
 - **Visibility.** `status` and `line_view` show the pending wake's due time and the
   identifier its note will carry, as [`CLIENT.md`](CLIENT.md) specifies.
 
-**Disclosure guard.** When the project names a disclosure list, `send_message`,
-`ask_operator` and `wake_after` refuse a body, question, choice or note that contains a
-listed term, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, and record nothing.
-A wake note is checked again when it fires.
+**Disclosure guard.** When the project names a disclosure list, a refused tool call
+names the field that contains a listed term, such as `body` or `note`, without naming
+the term or its position. If several fields contain a listed term, all such field names
+are reported. The refusal records nothing and counts against the same hourly limit as
+`check_disclosure`, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. A wake note
+is checked again when it fires.
 
 **Request keys.** **Row 11 of the T3 Code review, 2026-10-27.** `send_message`,
 `ask_operator` and `wake_after` each take an optional `request_key`, text of 1 to 128
@@ -687,9 +689,10 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
     reported, and the estimate is unknown until the line's next call reports one. Its
     cost stays unknown.
 - **Round 7, decided by the operator on 2026-10-26** from the round 6 reports.
-  - **The compaction's wake is withdrawn.** When the engine reports a compaction that
-    `compact_session` asked for, the daemon appends `wake_withdrawn` for the wake that
-    call scheduled, if it is still pending, and `last_compaction.withdrawn_wake` names
+  - **The compaction's wake is withdrawn.** When the engine reports any compaction,
+    whether the engine made it itself or a turn made it at `compact_session`'s request,
+    the daemon appends `wake_withdrawn` for the pending wake that call scheduled, if
+    it is still pending, and `last_compaction.withdrawn_wake` names
     it, or is `null`. A wake the line scheduled itself, before or after, is never
     withdrawn, since only the identifier of the wake `compact_session` scheduled is
     matched. The wake is withdrawn on the engine's report and not when a turn takes the

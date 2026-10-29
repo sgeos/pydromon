@@ -28,8 +28,15 @@ from typing import Final
 MAX_TERMS_FILE_BYTES: Final = 1024 * 1024
 """The largest disclosure list read, so a mistaken path cannot exhaust memory."""
 
-REFUSAL: Final = "the text contains a term from the project's disclosure list"
-"""The whole of what a refusal says, so that it never reveals which term matched."""
+
+def field_refusal(fields: Iterable[str]) -> str:
+    """Name the call fields holding a listed term, without revealing the term."""
+    names = tuple(dict.fromkeys(fields))
+    if not names:
+        raise ValueError("a disclosure refusal must name at least one field")
+    joined = names[0] if len(names) == 1 else " and ".join(names)
+    noun, verb = ("field", "contains") if len(names) == 1 else ("fields", "contain")
+    return f"the {joined} {noun} {verb} a term from the project's disclosure list"
 
 
 class DisclosureError(ValueError):
