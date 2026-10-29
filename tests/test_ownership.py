@@ -35,9 +35,12 @@ from dromon.model import (
     LineAddress,
     LineState,
     LineStateChanged,
+    Message,
+    MessageKind,
     OperatorAddress,
     OwnershipCause,
     OwnershipChanged,
+    RemoteAddress,
     Role,
     RoleDeclared,
     RoleNoteKind,
@@ -1385,6 +1388,23 @@ def test_another_lines_mail_never_fills_the_task(
     assert f'Task: "the operator\'s task"; operator mail {operator_id}' in prompt
     assert "a newer task from a line" not in prompt
     assert "a task from a line" not in prompt
+
+
+def test_a_remote_operators_mail_never_fills_the_task(world: World) -> None:
+    """Review r4, findings F2 and F5. A peer's operator is a ``RemoteAddress``, which
+    is never read as a local operator, so its mail fills nothing. The message is put
+    in the state directly, since declaring a peer is beside the point here."""
+    world.log.state.messages["m-remote"] = Message(
+        RemoteAddress("studio", OperatorAddress("ana")),
+        ALPHA,
+        MessageKind.NOTE,
+        "a task from another daemon's operator",
+        (),
+        None,
+        delivered=True,
+    )
+    observed = world.scheduler._observed_fields("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert "Task" not in observed
 
 
 def test_operator_mail_is_cut_to_its_first_bytes(
