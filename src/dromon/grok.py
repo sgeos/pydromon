@@ -859,8 +859,9 @@ def check_profile(
                 repr(name),
                 " profile in ",
                 str(file),
-                ". Add missing entries to its existing deny and read_only arrays, "
-                "leaving every other profile table and entry as it is. Required "
+                ". Add missing entries to its deny and read_only arrays, creating"
+                " either array if the profile has none, and leave every other profile"
+                " table and entry as it is. Required "
                 "deny entries are ",
                 json.dumps(deny_values),
                 "; required read_only entries are ",
