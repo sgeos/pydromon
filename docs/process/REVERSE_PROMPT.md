@@ -4,42 +4,38 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-30, one compaction wake, a wait for a task, and role notices once
+## 2026-10-30, own notes retired, and several files in one disclosure check
 
-**Done, merged in pull requests 87 to 89.**
+**Done, merged in pull requests 91 and 92.**
 
-- **Wait for a task.** A `wake_after` with `task_id` is documented as a wait. The
-  named task's end always wakes the line, past the task-note limit, and its note names
-  the wake it cancelled. A worker line in another project asked for this twice. A tool
-  that blocks inside a turn was declined, since it would hold the turn with no mail.
-- **Compaction wakes.** One context warning gives one wake, whose note names the
-  estimate, the warning and its source. The engines line received two in round 6,
-  because the next tick of the first wake's turn queued a second. After review, no
-  context wake waits behind another wake or behind mail, a fired note whose compaction
-  a turn already made starts no turn, and a pending context wake is adopted after a
-  restart.
-- **Role notices.** A seat is told of a role change once, across restarts. After this
-  morning's restart the engines seat was given a handoff package of 2026-10-28 again,
-  took the older task in it as its own, and acted on it. After review, only a turn
-  that started after the change counts as told.
+- **Own notes.** A line's own notes leave its count once a turn of the line ends
+  after their delivery. A worker line in another project counted 62, and core 87,
+  nearly all fired wakes and task notes already dealt with. The rule is read from
+  the event log, so every view and a restarted daemon agree. A turn whose engine
+  returned no report retires nothing, and its end is recorded with `unreported`.
+- **Disclosure checks.** `check_disclosure` takes up to eight files as one check.
+  Each file is counted on its own and the counts summed, and no answer says which
+  file matched. Its description says it covers only the project's configured list.
+- **The operator in the prompt.** The wake prompt names the operator that
+  `ask_operator` reaches when `to` is omitted, as at the turn's start.
 
-**Found by review.** A wait whose wake was cancelled or replaced left the line without
-a context wake. A restart forgot which wake was the context wake. A turn running when
-its role changed would have counted as told. All were fixed before merge.
+**Found by review.** A note delivered into a turn whose prompt was never composed
+was retired unseen. A term could span two files. The prompt's operator could change
+during the turn. A daemon before this round cannot read a log holding `unreported`,
+which the protocol now warns of. All were fixed or documented before merge.
 
-**Verified live on 2026-10-30.** A push over SSH to a private test repository, with the
-command Dromon builds and a deploy key in its own agent, and a refusal of an unpinned
-host. One Grok probe turn, with the cached sign-in and no MCP servers loaded. Grok
-sent `x.ai/mcp_initialized` rather than the `init_progress` that `GROK.md` expects.
+**Verified.** Full gates outside the sandbox and continuous integration passed on
+both pull requests. The daemon was restarted onto `2caeb4f`. Replaying this
+project's log and the other project's log read-only under the new rule gives every
+line 0 own notes. No line has yet run a turn on the new code.
 
-**Round 7 reports.** core was satisfied, and asked first for a read-only tool for its
-own event log entries, since both of its defects were found in the log. engines was
-not satisfied, because a stale task resurfaced, which the role notice fix addresses.
-review was not satisfied, because the daemon ran older code than every commit it
-reviewed. The daemon was restarted onto the merged code after this round.
+**Round 8 reports.** core was satisfied, and asks first again for a read-only tool
+for its own event log entries. engines was not satisfied, since a stale brief led
+its resumed context after a new task arrived. Two generic compaction notices it
+cited were scheduled at 18:08Z, before the fix of round 7 was loaded at 18:36Z.
+review was not satisfied, since its daemon was stale against the checkout while it
+reviewed. Both dissatisfied lines point at stale context, which is the best next
+iteration with the event log tool.
 
-**Not verified.** A Grok line turn with Dromon's tools, a line pushing over SSH, and
-any of this round's fixes in a live turn.
-
-**For the operator.** Delete the test repository `sgeos/dromon-ssh-probe`, whose
-deletion the session's token cannot do.
+**Not verified.** Any of this round's changes in a live turn. The other project's
+daemon runs the code it loaded before this round.

@@ -14,9 +14,10 @@ completed, moved or abandoned.
 - **Since 0.1.0, merged.** Six engine adapters, a launcher, roles with failover,
   federation over Unix sockets and TLS, standing briefs, task records and wakes, Git
   over SSH, fresh sessions, one unread rule, a validated shell, one compaction wake
-  per warning, a task-bound wake as a wait, and a role change told once across
-  restarts. `CHANGELOG.md` and git hold the detail.
-- **In flight.** None. The round 7 work is merged, per `REVERSE_PROMPT.md`.
+  per warning, a task-bound wake as a wait, a role change told once across
+  restarts, own notes retired after a turn, several files in one disclosure check,
+  and the operator named in the prompt. `CHANGELOG.md` and git hold the detail.
+- **In flight.** None. The round 8 work is merged, per `REVERSE_PROMPT.md`.
 - **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310,
   `pykeleusma==0.2.2.0` and `cryptography==50.0.2`, all from PyPI.
 - **Published.** Public `sgeos/pydromon`, 0BSD, synced with `sgeos/project-template` at
@@ -49,7 +50,8 @@ seats on Opus, Haiku and GPT-6-Luna. Upgrades use `dromon restart`.
 - **Event log.** Loaded whole, no compaction or migration.
 - **Secrets.** Literal MCP credentials and `env` values sit in the owner-only event log.
 - **Daemon debt.** SQLite and `ps` on the event loop thread, and driver state and
-  priority counts only in memory, per `CLIENT.md`. A daemon built before durable
+  priority counts only in memory, per `CLIENT.md`. On 2026-10-30, at a load average
+  of 366, `ps` took 13 seconds and client requests timed out. A daemon built before durable
   request keys cannot read a log that holds a keyed event.
 - **Parity gaps.** No credential masking, approval reviewer, plugins, language servers
   or MCP OAuth, and Linux not verified live, per `SANDBOX.md` and `SETTINGS.md`.
@@ -60,19 +62,21 @@ seats on Opus, Haiku and GPT-6-Luna. Upgrades use `dromon restart`.
   test of 2026-10-29 inside a Claude Code sandbox. On 2026-10-30 a push from a script
   to a private test repository succeeded with the command `gitssh` builds, a deploy
   key in its own agent and no `SSH_AUTH_SOCK`, and an empty known hosts file was
-  refused. Lines work over HTTPS. The operator deletes the test repository.
-  Signing, a line run and the Codex and Grok sandboxes are unverified. A line with its sandbox
+  refused. Lines work over HTTPS.
+  The operator left it in place, its README saying it can be deleted. Signing, a
+  line run and the Codex and Grok sandboxes are unverified. A line with its sandbox
   disabled can still change the pinned files between the per-turn checks.
 - **Shell.** A daemon whose `SHELL` is not bash or zsh refuses every Claude Code shell
   line. Its use of `CLAUDE_CODE_SHELL` is inferred, not observed.
-- **Requests, open.** From round 7, a read-only tool for a line's own event log
-  entries, own notes retired once delivered, the daemon kept on the commit a review
-  reads, the continuous integration result after a commit, a brief reset when a new
-  task arrives, and the reset time in `check_disclosure`. From round 6, a named
-  sandbox restriction in a gate result that cannot run. Earlier, review reports sent
+- **Requests, open.** A read-only tool for a line's own event log entries, asked
+  first by core twice. The newest operator task ahead of a stale brief, from engines
+  and review. A stale daemon marked in briefs and reports, the full gate result
+  mailed per commit, and the reset time in `check_disclosure`. Smaller, filtered
+  totals in `list_sent`, new tests run against an older commit in scratch, and a
+  named sandbox restriction in a gate that cannot run. Earlier, review reports sent
   to the line they concern, a next-turn cost estimate and the remaining allowance.
-  From Epagoge, the budget at task start, other lines' model and lease state, and a
-  reviewer's targeted test on the real tree.
+  From Epagoge, a visible truncation marker, a shared view of review findings, a
+  sanctioned scratch tree, the budget at task start and other lines' lease state.
 - **Declined.** Line numbers or per-file answers from `check_disclosure`, which would
   reveal listed terms. The hourly limit on checks is the protection.
 - **Compaction wakes.** Under the automatic hold no context wake wakes a line, by
@@ -82,6 +86,9 @@ seats on Opus, Haiku and GPT-6-Luna. Upgrades use `dromon restart`.
 - **Role notices.** A turn that fails before its engine reads the notice still counts
   as told. The count of turn starts relies on every turn logging its start.
 - **Self notes.** A note a line sends itself during a turn starts another turn.
+- **Own notes.** A line whose turns keep ending with no engine report keeps its
+  notes counted until a reported turn ends. A daemon before `unreported` cannot read
+  a log holding it, so a rollback past round 8 can fail to load.
 - **Quiet notice.** A silent turn the engine starts by itself saves no reminder.
 - **Launcher.** A `setsid` child and `~/.claude.json` unverified, per `LINE_CONFIG.md`.
 - **Several agents in one game.** An analysis is drafted for the operator, outside
@@ -101,7 +108,7 @@ need a command outside it. The rest run inside it with `-m "not socket and not l
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-./scripts/check.sh          # about 3850 tests pass, plus 10 live tests deselected
+./scripts/check.sh          # about 3880 tests pass, plus 10 live tests deselected
 ```
 
 Report any check not run, and any commit after the one that last rewrote this file.
