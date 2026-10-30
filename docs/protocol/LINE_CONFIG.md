@@ -462,8 +462,15 @@ to read the result.
   replaces it, which the tool's answer reports with the replaced due time.
 - **Task-bound fallback.** When the named task's end is recorded as a note for the line,
   applying its `task_noted` event atomically withdraws the wake if it is still scheduled.
-  If the wake has fired already, its message cannot be withdrawn, and it has already
-  provided the fallback turn. An unbound wake behaves as before.
+  This is a wait operation. The line ends its turn after scheduling it, then the task
+  end wakes the line with a note that names the cancelled wake. This note is emitted
+  even when the ordinary task-note limit has been reached. If the task outlives the
+  timeout, the wake fires instead. If the wake has fired already, its message cannot
+  be withdrawn, and it has already provided the fallback turn. An unbound wake behaves
+  as before.
+- **For review.** The wait uses a scheduled wake and ends the turn. It does not block
+  inside a tool call, because a blocked turn would hold the line open while preventing
+  it from receiving mail and other wake notices.
 - **Firing.** At the first tick at or after the due time, the note is recorded as a
   message from the line to itself, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies under
   scheduled wakes. It wakes the line through the ordinary path in a later tick and
