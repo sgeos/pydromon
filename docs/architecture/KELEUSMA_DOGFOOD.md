@@ -107,6 +107,24 @@ filesystem permissions or installed tools.
   version. **Inference.** Claude Code is the suitable engine for these configured
   writes and network access. The Codex sandbox in this deployment has no network, so it
   cannot fetch crates or use GitHub. Other engines need separate sandbox review.
+- **Fact.** Dromon resolves a relative instruction path against the project root,
+  whatever the line's `workdir`, so that a path means the same file for every line.
+  **Consequence.** A line in a worktree of another branch would read the root's
+  `CLAUDE.md`, which belongs to the branch checked out at the root, and nothing would
+  report it. The template therefore names each line's own `CLAUDE.md` by absolute path
+  inside its worktree. Found by the Kaizen line's third review, 2026-10-29.
+- **Alternative to a subagent, for blind labelling.** A separate labeller line with no
+  built-in tools, no MCP servers, no instructions but its labelling prompt, and an empty
+  `workdir` of its own outside the project and the pilot's store, receives the blind
+  view by `send_message` and answers the same way. **Fact.** Every line still has
+  Dromon's own tools. Of those, `check_disclosure` and `propose_change` take paths in
+  the line's `workdir`, and `line_status` names the other lines with their state,
+  worktree commit and leases, though not their mail or briefs. **Fact.** Dromon does
+  not restrict which parties may mail a line, so blindness rests on the senders, and a
+  mistaken sender could show the labeller what it must not see. **Inference.** A kept
+  or resumed session carries earlier items in its context, so labels after the first
+  are not independent unless the session is cleared between items. Check 8 lists what
+  to confirm before such a line runs.
 - **Fact.** This profile's built-in tool list does not offer Agent. **Inference.** Whether
   Claude Code subagents inherit a parent's sandbox is not established by this code or
   documentation. **Recommendation.** Check that behavior before offering Agent. A
@@ -191,7 +209,10 @@ operator's confirmation in session.
    mail.
 8. On a throwaway copy of the project file, test Agent availability and the subagent's
    sandbox inheritance with a harmless read-only subagent task. Do not enable the shadow
-   evaluation pilot's write or network grants until this behavior is confirmed.
+   evaluation pilot's write or network grants until this behavior is confirmed. For the
+   labeller line in place of a subagent, confirm instead, with `read_instructions` and
+   `line_status` from that line, that it has no built-in tools and no MCP servers, that
+   its `workdir` is empty, and that its session is cleared between items.
 9. In a throwaway proof worktree, run the project's documented proof-target build
    command inside the sandbox with `RUSTC_WRAPPER` unset. Record the exact command,
    target and result.
@@ -326,7 +347,7 @@ deny = ["Read(~/.ssh/**)", "Read(~/.aws/**)", "Read(~/.codex/auth.json)", "Read(
 [lines."kaizen"]
 profile = "keleusma"
 workdir = "/PATH/TO/keleusma/.worktrees/kaizen"
-instructions = ["CLAUDE.md", "~/.claude/CLAUDE.md"]
+instructions = ["/PATH/TO/keleusma/.worktrees/kaizen/CLAUDE.md", "~/.claude/CLAUDE.md"]
 
 [lines."kaizen".settings.env]
 CARGO_TARGET_DIR = "/PATH/TO/keleusma/.worktrees/kaizen/target"
@@ -338,7 +359,7 @@ allowWrite = ["/PATH/TO/keleusma/.worktrees/kaizen", "/PATH/TO/keleusma-cache/ka
 [lines."v0.2.3"]
 profile = "keleusma"
 workdir = "/PATH/TO/keleusma-worktrees/v0.2.x"
-instructions = ["CLAUDE.md", "~/.claude/CLAUDE.md"]
+instructions = ["/PATH/TO/keleusma-worktrees/v0.2.x/CLAUDE.md", "~/.claude/CLAUDE.md"]
 
 [lines."v0.2.3".settings.env]
 CARGO_TARGET_DIR = "/PATH/TO/keleusma-worktrees/v0.2.x/target"
@@ -350,7 +371,7 @@ allowWrite = ["/PATH/TO/keleusma-worktrees/v0.2.x", "/PATH/TO/keleusma-cache/v0.
 [lines."v0.3.0"]
 profile = "keleusma"
 workdir = "/PATH/TO/keleusma-worktrees/arena-composites"
-instructions = ["CLAUDE.md", "~/.claude/CLAUDE.md"]
+instructions = ["/PATH/TO/keleusma-worktrees/arena-composites/CLAUDE.md", "~/.claude/CLAUDE.md"]
 
 [lines."v0.3.0".settings.env]
 CARGO_TARGET_DIR = "/PATH/TO/keleusma-worktrees/arena-composites/target"
@@ -362,7 +383,7 @@ allowWrite = ["/PATH/TO/keleusma-worktrees/arena-composites", "/PATH/TO/keleusma
 [lines."proofs"]
 profile = "keleusma"
 workdir = "/PATH/TO/keleusma-worktrees/proofs"
-instructions = ["CLAUDE.md", "~/.claude/CLAUDE.md"]
+instructions = ["/PATH/TO/keleusma-worktrees/proofs/CLAUDE.md", "~/.claude/CLAUDE.md"]
 
 [lines."proofs".settings.env]
 CARGO_TARGET_DIR = "/PATH/TO/keleusma-worktrees/proofs/target"
