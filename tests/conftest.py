@@ -3,12 +3,15 @@
 import gc
 import shutil
 import tempfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 import pytest
+from typing import cast
 
 from dromon import priority
+from dromon import scheduler as scheduler_module
+from dromon.processes import ProcessInfo
 from dromon.driver import Strategy
 from dromon.lineconfig import LineConfig, encode_config
 from dromon.model import (
@@ -280,6 +283,35 @@ def _collect_on_the_main_thread() -> Iterator[None]:
     if _tests_since_collection[0] >= COLLECT_EVERY:
         _tests_since_collection[0] = 0
         gc.collect()
+
+
+class NoProcesses:
+    """A process table with no processes, which a test's scheduler is given in place
+    of the operating system's. **Found on 2026-10-29.** Two full gates hung for five
+    minutes in ``report_detached``, which ran the real ``/bin/ps`` from a test's
+    scheduler and stuck in the child's start, before the call's own timeout applies.
+    A test that needs the real table marks itself ``real_processes``."""
+
+    def own_processes(self) -> Sequence[ProcessInfo]:
+        return []
+
+    def has_variable(self, pid: int, assignment: str) -> bool:
+        return False
+
+    def environments(self) -> dict[int, list[str]]:
+        return {}
+
+    def send(self, pid: int, signal_number: int) -> None:
+        raise ProcessLookupError(pid)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_process_table(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    node = cast(pytest.Item, request.node)  # pyright: ignore[reportUnknownMemberType]
+    if node.get_closest_marker("real_processes") is None:
+        monkeypatch.setattr(scheduler_module, "SystemProcesses", NoProcesses)
 
 
 @pytest.fixture
