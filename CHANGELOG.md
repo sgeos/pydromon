@@ -16,7 +16,8 @@ All notable changes are recorded here. The format follows
   source of the estimate. Required by the operator on 2026-10-30. After review, no
   context-warning wake is queued while another wake is pending or mail waits for the
   line, and the line is no longer marked as woken for one it did not get, so a wait
-  for a background task that ends without a turn no longer suppresses the wake. A
+  for a background task that ends without a turn no longer suppresses the wake, nor
+  does a wake of the line's own that replaced it and then ended without a turn. A
   compaction reported after the wake fired delivers its note without a turn of its
   own, as the engines line's log showed one. A restarted daemon takes a pending wake
   with the context note as the warning's, so a later compaction withdraws it.

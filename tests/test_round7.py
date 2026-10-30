@@ -1437,3 +1437,39 @@ def test_a_fired_context_note_whose_compaction_was_made_starts_no_turn(
     assert world.log.state.messages[wake.message_id].delivered
     assert withdrawn(world) == []
     assert world.scheduler.deliverable("alpha") == []
+
+
+@pytest.mark.parametrize("ending", ["task_end", "fired"])
+def test_a_context_wake_replaced_by_the_line_follows_the_replacement(
+    world: World, ending: str
+) -> None:
+    """Re-review of c2d0695, R2. A wake_after that replaced the context wake left
+    the line marked as woken for compaction, so once the replacement ended without
+    a turn no context wake followed while the line stayed idle. A replacement that
+    fires starts its own turn, which compacts on the threshold, so no context wake
+    is needed then."""
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    world.context = warning + 1
+    world.after = None
+    world.scheduler._context_reported("alpha", warning + 1, CONTEXT_FROM_CALL)  # pyright: ignore[reportPrivateUsage]
+    assert len(context_wakes(world)) == 1
+    task_id = "task-1" if ending == "task_end" else None
+    world.scheduler.schedule_wake("alpha", 60, "my own wake", task_id)
+    assert world.status()["context"]["compaction_pending"] is False
+    if ending == "task_end":
+        world.scheduler.background_ended(
+            "alpha",
+            BackgroundEnd("task-1", "sleep 9", "completed", stopped_by_line=True),
+        )
+        assert "alpha" not in world.log.state.scheduled
+        world.scheduler._work_waiting()  # pyright: ignore[reportPrivateUsage]
+        assert len(context_wakes(world)) == 2
+        world.run()
+        assert world.engine.reasons == [COMPACTION_CONTEXT_WARNING]
+    else:
+        world.past_due()
+        world.run()
+        assert len(context_wakes(world)) == 1
+        (reason,) = world.engine.reasons
+        assert reason.startswith("automatically, because its context")
+    assert len(world.engine.prompts) == 1

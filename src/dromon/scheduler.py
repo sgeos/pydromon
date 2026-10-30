@@ -2756,7 +2756,11 @@ class Scheduler:
             previous is not None
             and self._context_compaction_wake_ids.get(line_id) == previous.message_id
         ):
+            # Re-review of c2d0695, R2. The line is no longer woken for compaction,
+            # so its mark goes too, or no context wake would follow once the
+            # replacement is gone while the line stays idle.
             self._context_compaction_wake_ids.pop(line_id, None)
+            self._context_compaction_wakes.discard(line_id)
         if (
             previous is not None
             and self._compact_wake.get(line_id) == previous.message_id
