@@ -22,7 +22,8 @@ All notable changes are recorded here. The format follows
   `line_turn_ended` with the new optional field `unreported`, which a daemon that
   predates it cannot read, so a rollback after such a turn cannot load the log. The
   prompt and the counts line of `list_mail` now say that a note past the count is
-  still listed by `list_mail` without a filter. Required by the operator in the round 8 review.
+  still listed by `list_mail` without a filter. Required by the operator in the round
+  8 review.
 - Wake prompts now state the operator at turn start that `ask_operator` will use when
   `to` is omitted, and explain that a new operator message during the turn changes
   that default.
