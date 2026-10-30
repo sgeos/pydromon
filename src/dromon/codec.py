@@ -74,6 +74,7 @@ from dromon.model import (
     RoleNoted,
     RoleNoteKind,
     BriefSet,
+    RequestStamp,
     BudgetStated,
     BudgetSource,
     PeerDeclared,
@@ -118,6 +119,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "body",
         "choices",
         "reply_to",
+        "request",
     ),
     "message_received": (
         "message_id",
@@ -140,7 +142,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "disclosure_checked": ("line_id", "checked_at", "matched_lines"),
     "wake_requested": ("wake_id", "line_id", "message_id"),
     "wake_issued": ("wake_id",),
-    "wake_scheduled": ("line_id", "message_id", "due", "note", "task_id"),
+    "wake_scheduled": ("line_id", "message_id", "due", "note", "task_id", "request"),
     "wake_withdrawn": ("line_id", "message_id"),
     "line_turn_ended": ("line_id", "workdir_commit"),
     "task_noted": ("line_id", "message_id", "task_id", "status", "body"),
@@ -241,6 +243,7 @@ class DecodeError(ValueError):
 def encode(event: Event) -> str:
     """Return the canonical JSON encoding of ``event``."""
     kind, data = _to_wire(event)
+    data = _without_nulls(kind, data)
     text = json.dumps(
         {"data": data, "kind": kind, "v": FORMAT_VERSION},
         ensure_ascii=False,
@@ -311,8 +314,36 @@ def _upgraded(kind: str, data: object) -> object:
             "handoff_below_percent": DEFAULT_HANDOFF_BELOW_PERCENT,
         }
     if kind == "wake_scheduled" and "task_id" not in fields:
-        return {**fields, "task_id": None}
+        fields = {**fields, "task_id": None}
+    if kind in OMITTED_WHEN_NULL:
+        fields = {
+            **{name: None for name in OMITTED_WHEN_NULL[kind] if name not in fields},
+            **fields,
+        }
     return fields
+
+
+OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
+    "message_sent": ("request",),
+    "wake_scheduled": ("request",),
+}
+"""The fields left out of the wire when they are null, which a log written before
+them never held, so decoding reads an absent one as null. **Task of 2026-10-29,
+round 5.** The request key of a keyed call is recorded in the event of its act, and
+an event of a call without a key is written as before it. **Porting hazard.** A port
+must omit these fields when null, not write them as null, so that its log stays
+readable by a daemon that predates them, and must read an absent one as null."""
+
+
+def _without_nulls(kind: str, data: dict[str, object]) -> dict[str, object]:
+    """``data`` without the fields ``OMITTED_WHEN_NULL`` names for ``kind`` that
+    are null."""
+    omitted = OMITTED_WHEN_NULL.get(kind, ())
+    return {
+        name: value
+        for name, value in data.items()
+        if not (name in omitted and value is None)
+    }
 
 
 def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
@@ -380,6 +411,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "body": event.body,
                 "choices": list(event.choices),
                 "reply_to": event.reply_to,
+                "request": _request_wire(event.request),
             }
         case MessageReceived():
             return "message_received", {
@@ -462,6 +494,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "due": event.due,
                 "note": event.note,
                 "task_id": event.task_id,
+                "request": _request_wire(event.request),
             }
         case WakeWithdrawn():
             return "wake_withdrawn", {
@@ -641,6 +674,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "body"),
                 _choices(data),
                 _optional_str(data, "reply_to"),
+                _request(data),
             )
         case "message_received":
             return MessageReceived(
@@ -716,6 +750,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "due"),
                 _str(data, "note"),
                 _optional_str(data, "task_id"),
+                _request(data),
             )
         case "wake_withdrawn":
             return WakeWithdrawn(_str(data, "line_id"), _str(data, "message_id"))
@@ -882,6 +917,21 @@ def _optional_str(data: dict[str, object], name: str) -> str | None:
     if not isinstance(value, str):
         raise DecodeError(f"{name} is not a string or null")
     return value
+
+
+def _request_wire(request: RequestStamp | None) -> dict[str, object] | None:
+    if request is None:
+        return None
+    return {"key": request.key, "digest": request.digest}
+
+
+def _request(data: dict[str, object]) -> RequestStamp | None:
+    """The request stamp in ``data``, or ``None`` when it has none."""
+    value = data["request"]
+    if value is None:
+        return None
+    stamp = _object(value, "the request", ("digest", "key"))
+    return RequestStamp(_str(stamp, "key"), _str(stamp, "digest"))
 
 
 def _address(data: dict[str, object], name: str) -> LocalAddress:

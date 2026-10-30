@@ -8,6 +8,7 @@ import pytest
 from dromon.codec import (
     FORMAT_VERSION,
     KIND_FIELDS,
+    OMITTED_WHEN_NULL,
     MAX_PAYLOAD_BYTES,
     RENAMED_KINDS,
     DecodeError,
@@ -48,7 +49,27 @@ def test_the_field_table_matches_each_event(scenario: tuple[Event, ...]) -> None
         document = json.loads(encode(event))
         declared = tuple(f.name for f in fields(event))
         assert KIND_FIELDS[document["kind"]] == declared
-        assert set(document["data"]) == set(declared)
+        omitted = {
+            name
+            for name in OMITTED_WHEN_NULL.get(document["kind"], ())
+            if getattr(event, name) is None
+        }
+        assert set(document["data"]) == set(declared) - omitted
+
+
+def test_the_scenario_writes_each_omitted_field_and_leaves_it_out(
+    scenario: tuple[Event, ...],
+) -> None:
+    """Each field left out when null appears both ways in the scenario, so the
+    round trip covers its presence and its absence."""
+    for kind, names in OMITTED_WHEN_NULL.items():
+        for name in names:
+            seen = {
+                name in json.loads(encode(event))["data"]
+                for event in scenario
+                if json.loads(encode(event))["kind"] == kind
+            }
+            assert seen == {True, False}, (kind, name)
 
 
 def test_old_scheduled_wake_events_decode_without_a_task_binding() -> None:
