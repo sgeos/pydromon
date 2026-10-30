@@ -941,7 +941,8 @@ def test_an_existing_profile_gets_additive_advice_and_keeps_other_tables(
             operator_home(home),
         )
     message = str(raised.value)
-    assert "leaving every other profile table and entry as it is" in message
+    assert "leave every other profile table and entry as it is" in message
+    assert "creating either array if the profile has none" in message
     assert "Required deny entries" in message
     assert "required read_only entries are []" in message
     assert "Remove unsupported keys" not in message
