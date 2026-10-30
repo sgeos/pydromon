@@ -11,25 +11,12 @@ completed, moved or abandoned.
 
 - **Milestone 0.1.0 is complete.** The modules and protocol documents are listed in
   `docs/architecture/DESIGN.md` and `docs/protocol/README.md`. History is in git.
-- **Since 0.1.0, merged.** Engine adapters for Claude Code, Codex, Grok, Pi, Cursor
-  Agent and Antigravity, with capability tables in `capabilities.py`. A launcher with
-  `stop_policy`, `dromon restart`, `dromon hibernate` and `awaken`, priority mail and
-  self mail. Roles with provider seats, write ownership and automatic failover, per
-  `docs/architecture/ROLES.md`, and read-only seats. A Grok home Dromon owns. Probe
-  recording and scrubbing. The Keleusma template, answered twice. An environment
-  allowlist for every engine. Federation phases 1 and 2, over Unix sockets and over
-  TLS with pinned keys, per `docs/architecture/FEDERATION.md`. `dromon agent send`,
-  per-line `recipients`, correlation keys, `check_disclosure` and task records.
-  Admitted self-started turns. Several inbound TLS peers. A standing brief per line
-  and a role transition package with marked provenance. Task-bound wakes, the
-  turn-end commit kept across a restart, and `read_mail` on sent mail. A 300-second
-  hung-test limit. Request keys recorded with their act. A silent-turn reminder that
-  checks its tasks. Git over SSH
-  for chosen lines, per the Git over SSH section of `PROJECT_CONFIG.md`, and a fresh
-  engine session on every turn, per `LINE_CONFIG.md`. Test schedulers get an empty
-  process table. One unread rule for every view with `own_notes` apart, a validated
-  shell for shell lines, and a silent-turn reminder dropped once the line mails.
-- **In flight.** None. The round 6 work is merged, per `REVERSE_PROMPT.md`.
+- **Since 0.1.0, merged.** Six engine adapters, a launcher, roles with failover,
+  federation over Unix sockets and TLS, standing briefs, task records and wakes, Git
+  over SSH, fresh sessions, one unread rule, a validated shell, one compaction wake
+  per warning, a task-bound wake as a wait, and a role change told once across
+  restarts. `CHANGELOG.md` and git hold the detail.
+- **In flight.** None. The round 7 work is merged, per `REVERSE_PROMPT.md`.
 - **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310,
   `pykeleusma==0.2.2.0` and `cryptography==50.0.2`, all from PyPI.
 - **Published.** Public `sgeos/pydromon`, 0BSD, synced with `sgeos/project-template` at
@@ -43,8 +30,11 @@ seats on Opus, Haiku and GPT-6-Luna. Upgrades use `dromon restart`.
 
 ## Open
 
-- **Grok.** Awaits the operator's sign-in to Dromon's Grok home, then a live probe,
-  per `GROK.md`. No Grok seat or report until then.
+- **Grok.** Signed in by the operator on 2026-10-30. One probe turn succeeded from a
+  directory outside the repository, with `cached_token` and no MCP servers. Grok sent
+  `x.ai/mcp_initialized`, not the `init_progress` that `GROK.md` expects. The main
+  checkout is refused, since its `.claude` holds a Claude Code write marker. Steps 1
+  to 4 of Verify first need a Grok line turn. The operator treats it as a subscription.
 - **Keleusma.** Ready for its four lines, with the live trial passed in a line's
   sandbox. The migration, the `full-gate` lease, cost holds, the HTTPS remote and push
   authority are the operator's, per `KELEUSMA_DOGFOOD.md`. Deferred by the operator on
@@ -64,38 +54,40 @@ seats on Opus, Haiku and GPT-6-Luna. Upgrades use `dromon restart`.
 - **Parity gaps.** No credential masking, approval reviewer, plugins, language servers
   or MCP OAuth, and Linux not verified live, per `SANDBOX.md` and `SETTINGS.md`.
 - **Unrun engines.** Pi, Cursor Agent and Antigravity, each with a verify-first list.
-- **Launcher.** A `setsid` child and `~/.claude.json` unverified, per `LINE_CONFIG.md`.
-- **Flaky tests.** The self-start grace test now ends its grace on release, not on
-  the clock. Other tests that wait on the clock may remain.
+- **Flaky tests.** Tests that wait on the clock may remain.
 - **Clients.** Polling, no token meter, Tk checked only withdrawn.
 - **Git over SSH.** Works only for a line whose sandbox is disabled, by the operator's
-  test of 2026-10-29 inside a Claude Code sandbox. The operator chose on 2026-10-30 a
-  minimal push test, then sandboxed work over HTTPS. A deploy key and probe script
-  wait in the ignored `tmp/r6` for the operator's private test repository. Signing,
-  a line run and the Codex and Grok sandboxes are unverified. A line with its sandbox
+  test of 2026-10-29 inside a Claude Code sandbox. On 2026-10-30 a push from a script
+  to a private test repository succeeded with the command `gitssh` builds, a deploy
+  key in its own agent and no `SSH_AUTH_SOCK`, and an empty known hosts file was
+  refused. Lines work over HTTPS. The operator deletes the test repository.
+  Signing, a line run and the Codex and Grok sandboxes are unverified. A line with its sandbox
   disabled can still change the pinned files between the per-turn checks.
-- **Shell.** A daemon whose `SHELL` is missing, or is not bash or zsh, refuses every
-  Claude Code shell line's turn. That Claude Code reads `CLAUDE_CODE_SHELL` is
-  inferred from strings in its executable, not observed in a turn.
-- **Requests, open.** From round 6, a named sandbox restriction in a gate result that
-  cannot run, per-turn cost in the compact `line_status`, a compaction wake that says
-  why it fired, and a wait on a named background task. Earlier, review reports sent
+- **Shell.** A daemon whose `SHELL` is not bash or zsh refuses every Claude Code shell
+  line. Its use of `CLAUDE_CODE_SHELL` is inferred, not observed.
+- **Requests, open.** From round 7, a read-only tool for a line's own event log
+  entries, own notes retired once delivered, the daemon kept on the commit a review
+  reads, the continuous integration result after a commit, a brief reset when a new
+  task arrives, and the reset time in `check_disclosure`. From round 6, a named
+  sandbox restriction in a gate result that cannot run. Earlier, review reports sent
   to the line they concern, a next-turn cost estimate and the remaining allowance.
   From Epagoge, the budget at task start, other lines' model and lease state, and a
   reviewer's targeted test on the real tree.
-- **Declined.** Line numbers from `check_disclosure`, since a file with one candidate
-  word per line would reveal in one check which are listed terms. The hourly limit on
-  checks is the protection. A per-file answer has the same flaw.
-- **Duplicate compaction wakes.** Seen by engines. Hypothesis, not checked, that one
-  is queued again while the estimate stays past the warning after a compaction.
+- **Declined.** Line numbers or per-file answers from `check_disclosure`, which would
+  reveal listed terms. The hourly limit on checks is the protection.
+- **Compaction wakes.** Under the automatic hold no context wake wakes a line, by
+  decision. A context note withheld for disclosure is not adopted after a restart, and
+  a line's own wake copying the context note may be dropped silently. A context wake
+  waits behind any undelivered mail, peer mail past its allowance included.
+- **Role notices.** A turn that fails before its engine reads the notice still counts
+  as told. The count of turn starts relies on every turn logging its start.
+- **Self notes.** A note a line sends itself during a turn starts another turn.
 - **Quiet notice.** A silent turn the engine starts by itself saves no reminder.
+- **Launcher.** A `setsid` child and `~/.claude.json` unverified, per `LINE_CONFIG.md`.
+- **Several agents in one game.** An analysis is drafted for the operator, outside
+  the repository.
 - **Fresh sessions.** Not run live. The Keleusma labeller line awaits it.
-- **Live probes for review.** Allowed by the operator on 2026-10-30. A review line may
-  cite a live probe the operator runs, and still may not start an engine.
-- **Garbage collection in tests.** Collected every 25 tests for an inferred cause of
-  a Pi test failure. Every gate since has passed, which supports but does not prove it.
-- **Several agents in one game.** An analysis of what Dromon would need is drafted for
-  the operator, not yet in the repository.
+- **Live probes for review.** A review line may cite one the operator runs.
 - **In the design.** Hosted teacher traces, the Rust repository name, remote clients.
 
 ## Environment
@@ -109,7 +101,7 @@ need a command outside it. The rest run inside it with `-m "not socket and not l
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-./scripts/check.sh          # about 3830 tests pass, plus 10 live tests deselected
+./scripts/check.sh          # about 3850 tests pass, plus 10 live tests deselected
 ```
 
 Report any check not run, and any commit after the one that last rewrote this file.
