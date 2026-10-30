@@ -150,7 +150,13 @@ from dromon.ceiling import (
     nothing_to_settle,
 )
 from dromon.driver import TOOL_RESULT, ActionTag, Credential, Driver, Event, Strategy
-from dromon.engine_environment import TOOL_SEARCH_PINNED, TOOL_SEARCH_VARIABLE
+from dromon.engine_environment import (
+    CLAUDE_SHELL_VARIABLE,
+    SHELL_VARIABLE,
+    TOOL_SEARCH_PINNED,
+    TOOL_SEARCH_VARIABLE,
+    selected_claude_shell,
+)
 from dromon.lineconfig import DEFAULT_CONFIG, ConfigError, LineConfig
 from dromon.model import format_due
 from dromon.processes import MARK_VARIABLE
@@ -1856,6 +1862,7 @@ def claude_cli() -> str:
 def launch_environment(
     mark: str | None,
     stop_policy: launcher.StopPolicy,
+    shell: str | None,
     git_ssh: GitSshAccess | None = None,
 ) -> dict[str, str]:
     """The variables a Claude Code line's engine starts with, beside the daemon's own:
@@ -1866,9 +1873,15 @@ def launch_environment(
     daemon's own environment holds under that name, which the Agent SDK merges in
     beneath these, never reaches the engine."""
     environment = {TOOL_SEARCH_VARIABLE: TOOL_SEARCH_PINNED}
+    if shell is not None:
+        environment[SHELL_VARIABLE] = shell
+        environment[CLAUDE_SHELL_VARIABLE] = shell
     environment.update(launcher.launch_environment(claude_cli(), stop_policy))
     environment[launcher.FILTER_ENVIRONMENT_VARIABLE] = "1"
     given = gitssh.environment(git_ssh)
+    if shell is not None:
+        given[SHELL_VARIABLE] = shell
+        given[CLAUDE_SHELL_VARIABLE] = shell
     for name in launcher.RELAYED_VARIABLES:
         environment[launcher.relayed(name)] = given.get(name, "")
     if mark is not None:
@@ -2053,10 +2066,28 @@ class ClaudeCodeLine:
             resume=self.session_id,
             sandbox=cast(SandboxSettings, self.sandbox),
             settings=json.dumps(flag_settings(self.settings)),
-            env=launch_environment(self.mark, self.config.stop_policy, self.git_ssh),
+            env=launch_environment(
+                self.mark,
+                self.config.stop_policy,
+                self._selected_shell(),
+                self.git_ssh,
+            ),
             cli_path=self._launcher(),
             system_prompt=self._system_prompt(),
         )
+
+    def _selected_shell(self) -> str | None:
+        if not (SHELL_TOOLS & set(self.config.builtin_tools)):
+            return None
+        try:
+            return selected_claude_shell(self._environment)
+        except ValueError as error:
+            raise EngineRefused(f"Claude Code shell unavailable: {error}") from error
+
+    @property
+    def environment_for_status(self) -> Mapping[str, str]:
+        """The environment this adapter uses to choose its shell."""
+        return self._environment
 
     def _leaves_background(self) -> bool:
         """Whether the line's stop policy leaves its background work running when its

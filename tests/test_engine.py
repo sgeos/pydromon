@@ -43,7 +43,9 @@ from claude_agent_sdk import (
 
 from claude_agent_sdk.types import RateLimitStatus
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
+from dromon import engine as engine_module
 from dromon.driver import Action, Credential, Driver, Event, Strategy, driver_resource
+from dromon.launcher import StopPolicy
 from dromon.priority import SteeredDriver
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, McpServer, ToolPolicy
 from dromon.engine import (
@@ -61,6 +63,7 @@ from dromon.engine import (
     check_environment,
     credential_of,
     permission_gate,
+    launch_environment,
 )
 
 MODEL = "claude-haiku-5-5"
@@ -164,6 +167,91 @@ def line(
 
 def run(target: ClaudeCodeLine, prompt: str = "hello") -> TurnReport:
     return asyncio.run(target.run_turn(prompt))
+
+
+def test_claude_bash_refuses_missing_shell_before_starting() -> None:
+    session = Scripted([])
+    target = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        Path("/work"),
+        config=LineConfig(builtin_tools=("Bash",)),
+        environment={},
+        session_factory=session.factory,
+    )
+    with pytest.raises(
+        EngineRefused, match="Claude Code shell unavailable: SHELL is not set"
+    ):
+        run(target)
+    assert session.options == []
+
+
+def test_claude_shell_override_is_forwarded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(engine_module, "claude_cli", lambda: "/bin/claude")
+
+    def fake_launch(target: str, policy: StopPolicy) -> dict[str, str]:
+        del policy
+        return {"DROMON_TEST_TARGET": target}
+
+    monkeypatch.setattr(
+        engine_module.launcher,
+        "launch_environment",
+        fake_launch,
+    )
+    environment = launch_environment(None, StopPolicy.KILL_ALL, "/bin/bash")
+    assert environment["SHELL"] == "/bin/bash"
+    assert environment["CLAUDE_CODE_SHELL"] == "/bin/bash"
+    assert environment[engine_module.launcher.relayed("SHELL")] == "/bin/bash"
+    assert (
+        environment[engine_module.launcher.relayed("CLAUDE_CODE_SHELL")] == "/bin/bash"
+    )
+
+
+def test_claude_line_without_shell_tool_drops_daemon_shell_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(engine_module, "claude_cli", lambda: "/bin/claude")
+
+    def fake_launch(target: str, policy: StopPolicy) -> dict[str, str]:
+        del policy
+        return {"DROMON_TEST_TARGET": target}
+
+    monkeypatch.setattr(engine_module.launcher, "launch_environment", fake_launch)
+    environment = launch_environment(None, StopPolicy.KILL_ALL, None)
+    assert "SHELL" not in environment
+    assert "CLAUDE_CODE_SHELL" not in environment
+    assert environment[engine_module.launcher.relayed("SHELL")] == ""
+    assert environment[engine_module.launcher.relayed("CLAUDE_CODE_SHELL")] == ""
+
+    filtered = {
+        "SHELL": "/daemon/unvalidated/shell",
+        "CLAUDE_CODE_SHELL": "/daemon/unvalidated/override",
+        **environment,
+    }
+    engine_module.launcher.unrelayed(filtered)
+    assert "SHELL" not in filtered
+    assert "CLAUDE_CODE_SHELL" not in filtered
+
+
+def test_claude_plain_line_forwards_no_inherited_shell_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(engine_module, "claude_cli", lambda: "/bin/claude")
+    session = Scripted([init(), say(TextBlock("ready")), result()])
+    target = line(
+        session,
+        environment={
+            "SHELL": "/daemon/unvalidated/shell",
+            "CLAUDE_CODE_SHELL": "/daemon/unvalidated/override",
+        },
+    )
+    run(target)
+    environment = session.options[0].env
+    assert environment[engine_module.launcher.relayed("SHELL")] == ""
+    assert environment[engine_module.launcher.relayed("CLAUDE_CODE_SHELL")] == ""
+    assert "SHELL" not in environment
+    assert "CLAUDE_CODE_SHELL" not in environment
 
 
 def test_a_plain_turn_reports_text_capabilities_and_session() -> None:

@@ -364,7 +364,11 @@ def test_any_line_needs_an_enabled_sandbox_to_load_plugins(tmp_path: Path) -> No
     with pytest.raises(EngineRefused, match="needs an enabled sandbox"):
         ClaudeCodeLine(driver(), tmp_path, config=config).options()
     sandboxed = ClaudeCodeLine(
-        driver(), tmp_path, config=config, sandbox={"enabled": True}
+        driver(),
+        tmp_path,
+        config=config,
+        sandbox={"enabled": True},
+        environment={"SHELL": "/bin/bash"},
     )
     assert sandboxed.options().plugins == [{"type": "local", "path": str(plugin)}]
 

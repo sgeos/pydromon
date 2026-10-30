@@ -166,7 +166,11 @@ LAUNCH_VARIABLES: Final = (
 )
 """Variables for the launcher alone, removed before the harness starts."""
 
-RELAYED_VARIABLES: Final = ("GIT_SSH_COMMAND",)
+RELAYED_VARIABLES: Final = (
+    "GIT_SSH_COMMAND",
+    "SHELL",
+    "CLAUDE_CODE_SHELL",
+)
 """Variables a Claude Code line's adapter gives its shell commands, which the
 launcher's filter would drop as daemon variables. The adapter sets each under the
 name ``relayed`` gives it, and the filter renames it back, so that only the adapter's
