@@ -25,8 +25,13 @@ completed, moved or abandoned.
   transition package whose items are marked as observed, reported, unknown or
   unreadable, filled from observed state when a former owner left nothing.
   Task-bound wakes, the turn-end commit kept across a restart, and `read_mail` on a
-  line's own sent mail. A hung test ends the run after 300 seconds.
-- **In flight.** None. The round 4 fixes are merged, per `REVERSE_PROMPT.md`.
+  line's own sent mail. A hung test ends the run after 300 seconds. Request keys
+  recorded in the event of their act, so a retry across a restart acts once. A
+  silent-turn reminder that checks its tasks before calling them running. Git over SSH
+  for chosen lines, per the Git over SSH section of `PROJECT_CONFIG.md`, and a fresh
+  engine session on every turn, per `LINE_CONFIG.md`. Test schedulers get an empty
+  process table.
+- **In flight.** None. The round 5 work is merged, per `REVERSE_PROMPT.md`.
 - **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310,
   `pykeleusma==0.2.2.0` and `cryptography==50.0.2`, all from PyPI.
 - **Published.** Public `sgeos/pydromon`, 0BSD, synced with `sgeos/project-template` at
@@ -56,21 +61,29 @@ seats on Opus, Haiku and GPT-6-Luna. Upgrades use `dromon restart`.
   refused calls escape the tool budget. See `CODEX.md`.
 - **Event log.** Loaded whole, no compaction or migration.
 - **Secrets.** Literal MCP credentials and `env` values sit in the owner-only event log.
-- **Daemon debt.** SQLite and `ps` on the event loop thread, driver state, request keys
-  and priority counts only in memory, per `CLIENT.md`.
+- **Daemon debt.** SQLite and `ps` on the event loop thread, and driver state and
+  priority counts only in memory, per `CLIENT.md`. A daemon built before durable
+  request keys cannot read a log that holds a keyed event.
 - **Parity gaps.** No credential masking, approval reviewer, plugins, language servers
   or MCP OAuth, and Linux not verified live, per `SANDBOX.md` and `SETTINGS.md`.
 - **Unrun engines.** Pi, Cursor Agent and Antigravity, each with a verify-first list.
 - **Launcher.** A `setsid` child and `~/.claude.json` unverified, per `LINE_CONFIG.md`.
-- **Flaky tests.** Two kept-session timing tests fail under load, rarely. Three
-  engine deadline tests were widened on 2026-10-29.
+- **Flaky tests.** One kept-session grace was widened on 2026-10-29 after it failed 1
+  run in 5 under load. Others may remain, and the self-start grace test still depends
+  on wall-clock timing.
 - **Clients.** Polling, no token meter, Tk checked only withdrawn.
-- **Round 4 requests, open.** Request keys are kept only in memory, so a retry across
-  a daemon restart sends twice. A line sees neither a cost estimate for its next turn
-  nor its engine's remaining allowance, which the engines may not report. A task that
-  ended in an earlier engine process can still be shown as running. Three Epagoge
-  requests remain: the budget at task start, other lines' model and lease state, and
-  a reviewer's targeted test on the real tree.
+- **Git over SSH.** Works only for a line whose sandbox is disabled, by the operator's
+  test of 2026-10-29 inside a Claude Code sandbox. Signing with a real key and a push
+  are unverified, since the operator's agent held no key, and so are the Codex and
+  Grok sandboxes. A line with its sandbox disabled can still change the pinned files
+  between the per-turn checks.
+- **Requests, open.** From round 5, line numbers from `check_disclosure` on a line's own
+  files, self-addressed wake notes kept out of the unread count, a stale brief after a
+  task change, and review reports delivered to the line they concern. From round 4, a
+  cost estimate for the next turn and the engine's remaining allowance, which the
+  engines may not report. From Epagoge, the budget at task start, other lines' model
+  and lease state in `line_status`, and a reviewer's targeted test on the real tree.
+- **Fresh sessions.** Not run live. The Keleusma labeller line awaits it.
 - **Live probes for review.** The review line asks to cite a live probe the operator
   runs. That touches the rule against a review line starting an engine, so it is the
   operator's decision.
@@ -92,7 +105,7 @@ need a command outside it. The rest run inside it with `-m "not socket and not l
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-./scripts/check.sh          # about 3690 tests pass, plus 10 live tests deselected
+./scripts/check.sh          # about 3790 tests pass, plus 10 live tests deselected
 ```
 
 Report any check not run, and any commit after the one that last rewrote this file.
