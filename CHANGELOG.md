@@ -7,6 +7,18 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Request keys are durable. A keyed call of `send_message`, `ask_operator` or
+  `wake_after` records its key and the digest of its other arguments in the
+  `message_sent` or `wake_scheduled` event of its act, so a retry that crosses a daemon
+  restart repeats the first answer instead of sending a second message, asking a
+  second question or moving the wake. The key is recorded in the same event as the
+  act, the bound of 256 keys per party and tool holds after replay, and the field is
+  left out of events without a key, so older logs still load. A repeated `wake_after`
+  no longer names the wake the first call replaced. Asked for by the review line's
+  report of round 4. **Rollback.** A daemon built before this change cannot decode a
+  keyed event, so a log that holds one needs this daemon or a later one. Review r5,
+  finding K1.
+
 - Compaction now withdraws a still-pending wake scheduled by `compact_session` whether
   the engine made the compaction itself or a turn made it at Dromon's request, and a
   compaction that reports no size withdraws the daemon's own pending context-warning
