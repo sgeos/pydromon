@@ -40,6 +40,7 @@ from dromon.engine import ENGINE_NAME as CLAUDE_CODE_ENGINE
 from dromon.engine import EngineRefused
 from dromon.agents import LINE_TOKEN_ENV, TOKEN_ENV
 from dromon.lineconfig import EFFORTS
+from dromon.projectconfig import ProjectConfig
 from dromon.model import AgentAccess
 from dromon.protocol import Operation, ProtocolError
 from dromon.scheduler import LineSpec, engine_factory
@@ -862,6 +863,28 @@ def _disclosure_summary(terms: str | None, root: Path) -> str:
     return f"disclosure list: {terms}"
 
 
+def _git_ssh_summary(config: ProjectConfig, paths: ProjectPaths) -> str:
+    """Say which agent socket and pinned hosts the project file forwards, and to
+    which lines, or that it forwards none. The table is checked as the daemon checks
+    it at start, against this command's own ``SSH_AUTH_SOCK``, so a refusal raises
+    ``ValueError``. **Assumption.** The daemon's environment may differ from the
+    shell that runs this command, so an inherited agent can pass here and be
+    refused at start, or the reverse."""
+    from dromon.daemon import git_ssh_access
+
+    if config.git_ssh is None:
+        return "git ssh: off, so no line's shell commands get an agent socket"
+    given = git_ssh_access(config, paths, os.environ)
+    access = next(iter(given.values()), None)
+    lines = ", ".join(sorted(given)) or "no line"
+    socket = config.git_ssh.agent if access is None else access.socket
+    return (
+        f"git ssh: agent {config.git_ssh.agent} at {socket},"
+        f" known hosts {config.git_ssh.known_hosts},"
+        f" public key {config.git_ssh.public_key}, for {lines}"
+    )
+
+
 def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     """Validate ``.dromon/dromon.toml`` without a daemon and summarize it."""
     del arguments
@@ -878,12 +901,14 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         return exits.FAILURE
     try:
         disclosure = _disclosure_summary(config.disclosure_terms, paths.root)
-    except DisclosureError as error:
+        git_ssh = _git_ssh_summary(config, paths)
+    except (DisclosureError, ValueError) as error:
         print(f"dromon config: {error}", file=sys.stderr)
         return exits.FAILURE
     limits = config.limits
     print(f"{file} is valid")
     print(disclosure)
+    print(git_ssh)
     print(
         f"limits: {limits.max_autonomous_turns} autonomous turns,"
         f" ${limits.max_cost_usd} estimated cost, {limits.cooldown_seconds}s cooldown"
@@ -941,6 +966,7 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             f" {_settings_summary(line_settings)}"
             + (f", effort {line.config.effort}" if line.config.effort else "")
             + (f", in {line.config.workdir}" if line.config.workdir else "")
+            + (", git ssh" if line.git_ssh else "")
         )
         print(f"  effective sandbox allowWrite: {writes}")
     shared_workdirs: dict[str, list[str]] = {}

@@ -179,6 +179,8 @@ from dromon import proposals as proposal_store
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, SandboxError, effective, merge, parse_sandbox
+from dromon import gitssh
+from dromon.gitssh import GitSshAccess, sandbox_layer, unreadable
 from dromon.settings import SettingsConfig
 from dromon.processes import (
     ProcessRefused,
@@ -916,6 +918,12 @@ class TurnRefused(RuntimeError):
     """The scheduler refused to start a line's turn, for the reason it gives."""
 
 
+class GitSshChanged(TurnRefused):
+    """A file of the ``[git_ssh]`` table changed since the daemon checked it at
+    start, so the line's turn is refused and the line held. The message names the
+    file and never its contents."""
+
+
 MAX_REST_SECONDS: Final = 60.0
 """The longest the loop rests, with or without a scheduled wake pending, so that a
 change of the wall clock delays a wake by at most this much, and launch records are
@@ -1198,6 +1206,7 @@ def engine_factory(
     accept_partial_isolation: bool = False,
     accept_unverified_credential: bool = False,
     line_secrets: Mapping[str, Sequence[str]] | None = None,
+    line_git_ssh: Mapping[str, GitSshAccess] | None = None,
 ) -> EngineFactory:
     """The production factory: each line on its packaged driver's engine.
 
@@ -1218,6 +1227,10 @@ def engine_factory(
     ends the turn before any command runs. Each line's engine settings are the
     project's merged with its own, with ``ask`` rules denied and the ``protected``
     directories denied to the built-in file tools.
+
+    A line in ``line_git_ssh``, which only the project file's ``[git_ssh]`` table
+    fills, gets that agent's ``GIT_SSH_COMMAND`` on every engine, and on Claude Code
+    with an enabled sandbox, the layer ``dromon.gitssh.sandbox_layer`` gives.
     """
 
     def _line_bridge(line_id: str) -> tuple[list[str], str | None]:
@@ -1233,6 +1246,7 @@ def engine_factory(
         # priority mail steers the driver rather than each engine.
         driver: Driver = priority.steered(spec.model, spec.strategy, spec.redirect)
         workdir = resolve_workdir(spec.config.workdir, Path(root), protected)
+        git_ssh = (line_git_ssh or {}).get(spec.line_id)
         if driver.settings.engine == codex.ENGINE_NAME:
             if project_sandbox is not None or project_settings is not None:
                 raise EngineRefused(
@@ -1242,6 +1256,7 @@ def engine_factory(
             return CodexLine(
                 driver,
                 workdir,
+                git_ssh=git_ssh,
                 config=spec.config,
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
@@ -1265,6 +1280,7 @@ def engine_factory(
             return GrokLine(
                 driver,
                 workdir,
+                git_ssh=git_ssh,
                 config=spec.config,
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
@@ -1284,6 +1300,7 @@ def engine_factory(
             return PiLine(
                 driver,
                 workdir,
+                git_ssh=git_ssh,
                 config=spec.config,
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
@@ -1303,6 +1320,7 @@ def engine_factory(
             return CursorLine(
                 driver,
                 workdir,
+                git_ssh=git_ssh,
                 config=spec.config,
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
@@ -1322,6 +1340,7 @@ def engine_factory(
             return AntigravityLine(
                 driver,
                 workdir,
+                git_ssh=git_ssh,
                 config=spec.config,
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
@@ -1366,19 +1385,30 @@ def engine_factory(
             )
             settings = engine_settings.merge([settings, restrictions])
         enabled = merged is not None and merged.enabled
+        if enabled and git_ssh is not None:
+            merged = merge([merged, sandbox_layer(git_ssh)])
         guarded = git_write_guards(workdir) if enabled else ()
         # A line that loads project settings or plugins must not write what it loads.
         claude_dir = (workdir / ".claude",) if spec.config.project_settings else ()
         plugin_dirs = tuple(resolve_plugin(path) for path in spec.config.plugins)
         write_protected = (*claude_dir, *plugin_dirs)
         guarded = (*guarded, *write_protected)
+        sandbox = effective(merged, workdir, protected, guarded)
+        if enabled and git_ssh is not None and sandbox is not None:
+            denied = unreadable(git_ssh, sandbox)
+            if denied is not None:
+                raise SandboxError(
+                    f"the line's sandbox denies reading {denied}, which ssh needs for"
+                    " the project's [git_ssh] table"
+                )
         return ClaudeCodeLine(
             driver,
             workdir,
+            git_ssh=git_ssh,
             config=spec.config,
             mcp_tools=list(own_tools),
             session_id=spec.session_id,
-            sandbox=effective(merged, workdir, protected, guarded),
+            sandbox=sandbox,
             settings=engine_settings.effective(settings, protected, write_protected),
             observe=spec.observe,
             mark=spec.mark,
@@ -1641,6 +1671,8 @@ class Scheduler:
         self._lease_ttl = DEFAULT_LEASE_TTL_SECONDS
         self._leases: dict[str, Lease] = {}
         """Held leases by name. In memory only, so a restart drops them."""
+        self._git_ssh: dict[str, GitSshAccess] = {}
+        """The ``[git_ssh]`` access of each line given it, checked before its turns."""
         self.limits = limits
         self.wake_every_ticks = wake_every_ticks
         self._line_limits: dict[str, Limits] = {}
@@ -1865,6 +1897,29 @@ class Scheduler:
     def ensure_operator(self, operator_id: str) -> None:
         if operator_id not in self._log.state.operators:
             self._log.append(OperatorRegistered(operator_id))
+
+    def set_git_ssh(self, access: Mapping[str, GitSshAccess]) -> None:
+        """Replace the lines whose ``[git_ssh]`` files each turn checks first."""
+        self._git_ssh = dict(access)
+
+    def _check_git_ssh(self, line_id: str) -> None:
+        """Refuse ``line_id``'s turn with ``GitSshChanged`` when a file of its
+        ``[git_ssh]`` access changed since the daemon checked it at start. **Review
+        of 2026-10-29, M1.** The check runs before the engine is built or a prompt
+        sent, so a line never runs a turn against a host key or a public key the
+        operator did not check. It detects a change at a turn's start and prevents
+        none, as ``dromon.gitssh.changed`` says."""
+        access = self._git_ssh.get(line_id)
+        if access is None:
+            return
+        path = gitssh.changed(access)
+        if path is not None:
+            raise GitSshChanged(
+                f"was refused a turn because the git_ssh file {path} changed since"
+                " the daemon checked it at start, or can no longer be read as the"
+                " operator's own. Restore the file, or restart the daemon so that"
+                " it checks the file again, before resuming the line"
+            )
 
     def set_disclosure_terms(self, terms: Sequence[str]) -> None:
         """Replace the disclosure terms the tools check, already case folded."""
@@ -6500,6 +6555,7 @@ class Scheduler:
             if refused is not None:
                 raise refused
             await self._check_walk(line_id)
+            self._check_git_ssh(line_id)
             engine = self.engine_for(line_id)
             self._start_token(line_id, engine)
             if compaction is not None:
@@ -6542,6 +6598,9 @@ class Scheduler:
                 ending = "interrupted by an operator"
             self._count_interrupted(line_id, engine)
             raise
+        except GitSshChanged as error:
+            self.hold(line_id, str(error))
+            ending = f"held: the line {error}"
         except EnginePlanLimit as error:
             if error.may_move_role:
                 self.plan_limit_reached(line_id, error)

@@ -357,6 +357,26 @@ def test_a_reload_that_changes_the_peers_needs_a_restart(paths: ProjectPaths) ->
         assert "restarts" in (moved.error_message or "")
 
 
+def test_a_reload_that_changes_git_ssh_needs_a_restart(paths: ProjectPaths) -> None:
+    """The agent was resolved and handed to the engine factory at start, so neither
+    the table nor the lines it reaches may change without a restart."""
+    table = "[git_ssh]\nagent = 'inherit'\nknown_hosts = 'k'\npublic_key = 'p'\n"
+    alpha = f"[lines.alpha]\nmodel = {HAIKU!r}\n"
+    with attached(paths, project=loaded(paths, table + alpha)) as client:
+        before = client.daemon.log.last_seq
+        write_file(paths, table + alpha + "git_ssh = true\n")
+        widened = client.ask("reload_project")
+        assert not widened.ok
+        assert "the lines given git_ssh" in (widened.error_message or "")
+        write_file(paths, alpha)
+        dropped = client.ask("reload_project")
+        assert not dropped.ok and "git_ssh" in (dropped.error_message or "")
+        assert "restarts" in (dropped.error_message or "")
+        assert client.daemon.log.last_seq == before
+        write_file(paths, table + alpha)
+        client.ok("reload_project")
+
+
 def test_an_unconfined_line_is_not_created_beside_peers(paths: ProjectPaths) -> None:
     project = loaded(paths, '[peers.k]\nsocket = "/srv/k/run/peers.sock"\n')
     pi = next(model for model, engine in ENGINE_OF.items() if engine == "pi")

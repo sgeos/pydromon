@@ -136,7 +136,8 @@ from claude_agent_sdk._internal.transport import Transport
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 from claude_agent_sdk.types import SystemPromptPreset
 
-from dromon import evidence, launcher, redact
+from dromon import evidence, gitssh, launcher, redact
+from dromon.gitssh import GitSshAccess
 from dromon.capabilities import CLAUDE_CODE, version_refusal
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.ceiling import (
@@ -1845,13 +1846,23 @@ def claude_cli() -> str:
 
 
 def launch_environment(
-    mark: str | None, stop_policy: launcher.StopPolicy
+    mark: str | None,
+    stop_policy: launcher.StopPolicy,
+    git_ssh: GitSshAccess | None = None,
 ) -> dict[str, str]:
     """The variables a Claude Code line's engine starts with, beside the daemon's own:
-    the pinned tool search, the line's process mark, and what its launcher needs."""
+    the pinned tool search, the line's process mark, what its launcher needs, and the
+    variables of ``git_ssh`` under the names ``launcher.relayed`` gives them.
+
+    Each relayed name is set, empty for a line without the option, so a value the
+    daemon's own environment holds under that name, which the Agent SDK merges in
+    beneath these, never reaches the engine."""
     environment = {TOOL_SEARCH_VARIABLE: TOOL_SEARCH_PINNED}
     environment.update(launcher.launch_environment(claude_cli(), stop_policy))
     environment[launcher.FILTER_ENVIRONMENT_VARIABLE] = "1"
+    given = gitssh.environment(git_ssh)
+    for name in launcher.RELAYED_VARIABLES:
+        environment[launcher.relayed(name)] = given.get(name, "")
     if mark is not None:
         environment[MARK_VARIABLE] = mark
     return environment
@@ -1893,6 +1904,7 @@ class ClaudeCodeLine:
         ceiling_settled: Settle = nothing_to_settle,
         consent_asked: Callable[[str], object] = no_consent_question,
         secret_names: Callable[[], Sequence[str]] | Sequence[str] = (),
+        git_ssh: GitSshAccess | None = None,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -1914,6 +1926,9 @@ class ClaudeCodeLine:
         self._observe = observe
         self.mark = mark
         """The process mark every process of this line inherits, if issued."""
+        self.git_ssh = git_ssh
+        """The agent and pinned hosts of the project's ``[git_ssh]`` table, if the
+        line was given them."""
         self._kept_factory = kept_factory
         self._task_ended = task_ended
         self._begin_self_started_callback = begin_self_started
@@ -2030,7 +2045,7 @@ class ClaudeCodeLine:
             resume=self.session_id,
             sandbox=cast(SandboxSettings, self.sandbox),
             settings=json.dumps(flag_settings(self.settings)),
-            env=launch_environment(self.mark, self.config.stop_policy),
+            env=launch_environment(self.mark, self.config.stop_policy, self.git_ssh),
             cli_path=self._launcher(),
             system_prompt=self._system_prompt(),
         )

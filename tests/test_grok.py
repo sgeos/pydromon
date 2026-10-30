@@ -53,6 +53,7 @@ from dromon.grok import (
 )
 from dromon.capabilities import Known
 from dromon.lineconfig import LineConfig, WorkdirAccess
+from dromon.gitssh import COMMAND_VARIABLE, GitSshAccess, ssh_command
 from dromon.mcp import Bridge
 from dromon.protocol import Response
 from dromon.model import LineAddress, LineCreated, OperatorRegistered
@@ -1835,3 +1836,22 @@ def test_extension_methods_are_read_with_or_without_the_prefix() -> None:
         grok_module.MODELS_UPDATE
     )
     assert grok_module.extension_method("session/update") == "session/update"
+
+
+GIT_SSH = GitSshAccess(
+    "/run/agent.sock", "/keys/known_hosts", "/keys/deploy.pub", "0" * 64, "0" * 64
+)
+"""A resolved ``[git_ssh]`` agent, which no test here connects to."""
+
+
+def test_a_grok_line_given_git_ssh_carries_its_command_and_no_other(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok([chunk("hello")])
+    target = line(server, project)
+    target.git_ssh = GIT_SSH
+    run(target)
+    assert server.environment[COMMAND_VARIABLE] == ssh_command(GIT_SSH)
+    plain = FakeGrok([chunk("hello")])
+    run(line(plain, project, environment={"PATH": "/bin", COMMAND_VARIABLE: "x"}))
+    assert COMMAND_VARIABLE not in plain.environment

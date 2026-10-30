@@ -76,6 +76,8 @@ from dromon import launcher
 from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
+from dromon import gitssh
+from dromon.gitssh import GitSshAccess
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
 
 ENGINE_NAME: Final = "grok-build"
@@ -896,6 +898,7 @@ class GrokLine:
         connection_factory: ConnectionFactory = _grok_agent,
         observe: Observer = ignore,
         mark: str | None = None,
+        git_ssh: GitSshAccess | None = None,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -915,6 +918,9 @@ class GrokLine:
         self._connect = connection_factory
         self._observe = observe
         self.mark = mark
+        self.git_ssh = git_ssh
+        """The agent and pinned hosts of the project's ``[git_ssh]`` table, if the
+        line was given them."""
         """The process mark every process of this line inherits, if issued."""
         self._client: acp.Client | None = None
         self.session_id_in_use: str | None = None
@@ -923,6 +929,7 @@ class GrokLine:
         """Run one turn for ``prompt`` and return what happened."""
         strategy = self.driver.settings.strategy
         environment = engine_environment(self._environment, strategy)
+        environment.update(gitssh.environment(self.git_ssh))
         if self.mark is not None:
             environment[MARK_VARIABLE] = self.mark
         environment[STOP_POLICY_VARIABLE] = self.config.stop_policy.value

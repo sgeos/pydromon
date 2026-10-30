@@ -46,6 +46,7 @@ from dromon.priority import SteeredDriver
 from dromon.grok import bridge_command
 from dromon.jsonlines import Connection
 from dromon.lineconfig import LineConfig, WorkdirAccess
+from dromon.gitssh import COMMAND_VARIABLE, GitSshAccess, ssh_command
 from dromon.sandbox import parse_sandbox
 from dromon.scheduler import LineEngine, LineSpec, engine_factory
 
@@ -693,3 +694,22 @@ def test_priority_mail_ends_the_turn_at_the_tool_result_and_not_the_text(
     assert asked == [1]
     assert report.interrupted_for == REASON
     assert server.stops == 1
+
+
+GIT_SSH = GitSshAccess(
+    "/run/agent.sock", "/keys/known_hosts", "/keys/deploy.pub", "0" * 64, "0" * 64
+)
+"""A resolved ``[git_ssh]`` agent, which no test here connects to."""
+
+
+def test_a_cursor_line_given_git_ssh_carries_its_command_and_no_other(
+    home: Path,
+) -> None:
+    server = FakeCursor()
+    target = line(server, home)
+    target.git_ssh = GIT_SSH
+    run(target)
+    assert server.environment[COMMAND_VARIABLE] == ssh_command(GIT_SSH)
+    plain = FakeCursor()
+    run(line(plain, home, environment={"PATH": "/bin", COMMAND_VARIABLE: "x"}))
+    assert COMMAND_VARIABLE not in plain.environment

@@ -166,6 +166,30 @@ LAUNCH_VARIABLES: Final = (
 )
 """Variables for the launcher alone, removed before the harness starts."""
 
+RELAYED_VARIABLES: Final = ("GIT_SSH_COMMAND",)
+"""Variables a Claude Code line's adapter gives its shell commands, which the
+launcher's filter would drop as daemon variables. The adapter sets each under the
+name ``relayed`` gives it, and the filter renames it back, so that only the adapter's
+value, never the daemon's own, reaches the engine. ``dromon.gitssh`` gives them."""
+RELAYED_PREFIX: Final = "DROMON_RELAYED_"
+
+
+def relayed(name: str) -> str:
+    """The name the adapter sets ``name`` under, for the launcher's filter."""
+    return RELAYED_PREFIX + name
+
+
+def unrelayed(environment: dict[str, str]) -> None:
+    """Rename each relayed variable in ``environment`` back to its own name, in
+    place, dropping an empty one, and drop every variable under its own name first,
+    so a daemon's value of it never passes."""
+    for name in RELAYED_VARIABLES:
+        environment.pop(name, None)
+        value = environment.pop(relayed(name), "")
+        if value:
+            environment[name] = value
+
+
 SCRIPT_NAME: Final = "dromon-launch"
 """The launcher's command, installed beside the Python interpreter, which the Agent
 SDK runs in place of Claude Code."""
@@ -1313,9 +1337,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 *CLAUDE_ENGINE_ENVIRONMENT,
                 MARK_VARIABLE,
                 *LAUNCH_VARIABLES,
+                *(relayed(name) for name in RELAYED_VARIABLES),
             ),
         )
         environment.pop(FILTER_ENVIRONMENT_VARIABLE, None)
+        unrelayed(environment)
         try:
             os.execve(  # noqa: S606
                 sys.executable,

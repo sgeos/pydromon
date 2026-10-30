@@ -23,6 +23,7 @@ import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 from claude_agent_sdk import ClaudeAgentOptions
@@ -378,6 +379,32 @@ def test_the_launcher_drops_daemon_variables_before_starting_its_command(
         "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING": "true",
         "CLAUDE_CONFIG_DIR": None,
     }
+
+
+GIT_HARNESS = HARNESS.replace(
+    "'CLAUDE_CONFIG_DIR')", "'CLAUDE_CONFIG_DIR', 'GIT_SSH_COMMAND')"
+)
+"""The harness, reporting also the command ``dromon.gitssh`` gives a line."""
+
+
+@pytest.mark.parametrize("line_value", ["ssh -F /dev/null", ""])
+def test_the_filter_passes_the_lines_git_command_and_never_the_daemons(
+    tmp_path: Path, started: list[Launched], line_value: str
+) -> None:
+    launched = Launched(
+        tmp_path,
+        GIT_HARNESS,
+        StopPolicy.KILL_ALL,
+        extra_environment={
+            "GIT_SSH_COMMAND": "ssh -i /operator/key",
+            launcher.relayed("GIT_SSH_COMMAND"): line_value,
+        },
+        filter_environment=True,
+    )
+    started.append(launched)
+    seen = cast(dict[str, object], launched.record["engine_environment"])
+    assert seen["GIT_SSH_COMMAND"] == (line_value or None)
+    assert launched.record["names"] == [MARK_VARIABLE]
 
 
 def test_a_stop_under_kill_all_ends_the_harness_and_its_group(

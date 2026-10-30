@@ -13,6 +13,27 @@ All notable changes are recorded here. The format follows
   each reset as `line_session_cleared`, which survives restart. The key implies
   `context_handoff = false`; loading refuses it with `keep_session = true`, explicit
   handoff enabled, or an unsupported engine adapter.
+- Git over the Secure Shell protocol for chosen lines, off by default. The project
+  file's `[git_ssh]` table names one agent socket, the daemon's own `SSH_AUTH_SOCK` or
+  an explicit socket such as that of a deploy-key agent, a `known_hosts` file that must
+  pin `github.com`, and the public key ssh offers. A line or a profile with
+  `git_ssh = true` gets a `GIT_SSH_COMMAND` with `-F /dev/null`, the agent, that key
+  alone, strict host key checking against that file and batch mode, on every engine
+  from one function, and on Claude Code with an enabled sandbox, the socket and
+  `github.com` allowed and both files denied to writes. Never a key file, and never
+  the operator's home. The daemon and `dromon config` refuse a missing or foreign
+  socket, a socket in a directory another user may write, an inherited agent without
+  `SSH_AUTH_SOCK`, and a `known_hosts` without a well-formed `github.com` key of an
+  accepted type, and a reload may not change the option. Each key is parsed as an
+  SSH public key, whose own type must match its line's, and a host line with any
+  negated pattern pins nothing. The daemon records the SHA-256 digest of both files
+  at start and checks them before each turn of a line given the option, and a change
+  refuses the turn, holds the line and asks an operator, naming the file and never
+  its contents. That detects tampering at a turn's start and does not prevent it.
+  Observed on 2026-10-29, ssh did not leave an enabled Claude Code sandbox, so the
+  option is inferred to work only for a line whose sandbox is disabled. Required by
+  the operator on 2026-10-29, with review findings M1, M2, L1, L2, L3 and L5 of the
+  same day.
 - Request keys are durable. A keyed call of `send_message`, `ask_operator` or
   `wake_after` records its key and the digest of its other arguments in the
   `message_sent` or `wake_scheduled` event of its act, so a retry that crosses a daemon
