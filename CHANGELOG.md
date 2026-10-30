@@ -13,6 +13,17 @@ All notable changes are recorded here. The format follows
   each reset as `line_session_cleared`, which survives restart. The key implies
   `context_handoff = false`; loading refuses it with `keep_session = true`, explicit
   handoff enabled, or an unsupported engine adapter.
+- Request keys are durable. A keyed call of `send_message`, `ask_operator` or
+  `wake_after` records its key and the digest of its other arguments in the
+  `message_sent` or `wake_scheduled` event of its act, so a retry that crosses a daemon
+  restart repeats the first answer instead of sending a second message, asking a
+  second question or moving the wake. The key is recorded in the same event as the
+  act, the bound of 256 keys per party and tool holds after replay, and the field is
+  left out of events without a key, so older logs still load. A repeated `wake_after`
+  no longer names the wake the first call replaced. Asked for by the review line's
+  report of round 4. **Rollback.** A daemon built before this change cannot decode a
+  keyed event, so a log that holds one needs this daemon or a later one. Review r5,
+  finding K1.
 
 - Compaction now withdraws a still-pending wake scheduled by `compact_session` whether
   the engine made the compaction itself or a turn made it at Dromon's request, and a
@@ -45,6 +56,10 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- A silent-turn reminder no longer repeats a saved background-task count as if it
+  were current. Dromon checks the same task identifiers against the live kept-session
+  listing and later task records, and reports unknown when it cannot verify an end.
+  `line_status` exposes the engine's `background_tasks_unknown` flag.
 - A client request that times out now says that the daemon may still have carried it
   out, and `dromon send` points to `dromon sent` before a retry. **Found on
   2026-10-29,** when a send timed out at the client while the daemon was busy and the

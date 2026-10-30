@@ -19,17 +19,22 @@ from dromon.model import (
     Event,
     LineAddress,
     MessageDelivered,
+    MessageKind,
     MessageSent,
     OperatorAddress,
     QuestionStatus,
+    RequestStamp,
     WakeScheduled,
 )
+from dromon import model as model_module
+from dromon.codec import decode, encode
 from dromon.requestkeys import (
     MAX_KEY_LENGTH,
     REPEATED,
     REQUEST_KEY,
     RequestKeyRefused,
-    RequestKeys,
+    digest_of,
+    stamp_of,
 )
 from dromon.scheduler import (
     ASK_TOOL_SCHEMA,
@@ -395,27 +400,34 @@ def test_each_mutating_tool_offers_a_key() -> None:
         assert REQUEST_KEY not in schema["required"]  # type: ignore[operator]
 
 
-def test_the_oldest_key_is_forgotten_past_the_bound() -> None:
-    keys = RequestKeys(limit=2)
-    result = {"content": [{"type": "text", "text": "done"}]}
+def test_the_oldest_key_is_forgotten_past_the_bound_before_and_after_replay(
+    worlds: Callable[..., World], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bound is the state's, so replay keeps the same keys the daemon kept."""
+    monkeypatch.setattr(model_module, "MAX_REQUEST_KEYS_PER_PARTY", 2)
+    world = worlds(Engine())
+    tool = world.scheduler.send_tool("alpha")
     for key in ("a", "b", "c"):
-        keys.remember("alpha", "t", {"x": 1, REQUEST_KEY: key}, result)
-    assert keys.earlier("alpha", "t", {"x": 1, REQUEST_KEY: "a"}) is None
-    assert keys.earlier("alpha", "t", {"x": 1, REQUEST_KEY: "c"}) is not None
-    assert keys.earlier("alpha", "t", {"x": 1}) is None
-    with pytest.raises(ValueError, match="at least 1"):
-        RequestKeys(limit=0)
-    with pytest.raises(RequestKeyRefused):
-        keys.earlier("alpha", "t", {"x": 2, REQUEST_KEY: "c"})
+        call(tool, to="@ana", body="x", request_key=key)
+    kept = world.log.state.requests[("alpha", "send_message")]
+    assert list(kept) == ["b", "c"]
+    again = call(tool, to="@ana", body="x", request_key="a")
+    assert REPEATED not in text_of(again)
+    before = dict(world.log.state.requests)
+    world.log.close()
+    restarted = worlds(Engine(), create=False)
+    assert restarted.log.state.requests == before
+    assert list(restarted.log.state.requests[("alpha", "send_message")]) == [
+        "c",
+        "a",
+    ]
 
 
 def test_arguments_are_compared_whatever_their_order() -> None:
-    keys = RequestKeys()
-    result = {"content": [{"type": "text", "text": "done"}]}
-    keys.remember("alpha", "t", {"a": 1, "b": 2, REQUEST_KEY: "k"}, result)
-    found = keys.earlier("alpha", "t", {REQUEST_KEY: "k", "b": 2, "a": 1})
-    assert found is not None and found["content"][0]["text"] == "done" + REPEATED
-    assert result["content"][0]["text"] == "done"
+    assert digest_of({"a": 1, "b": 2, REQUEST_KEY: "k"}) == digest_of(
+        {REQUEST_KEY: "other", "b": 2, "a": 1}
+    )
+    assert digest_of({"a": 1}) != digest_of({"a": 2})
 
 
 @pytest.mark.parametrize(
@@ -426,7 +438,204 @@ def test_arguments_json_cannot_hold_are_refused_before_the_call_acts(
 ) -> None:
     """Review of 2026-10-27, K3. Two objects with the same text once shared a
     digest, since values were written as their text."""
-    keys = RequestKeys()
     with pytest.raises(RequestKeyRefused, match="must have JSON arguments"):
-        keys.earlier("alpha", "t", {"x": value, REQUEST_KEY: "k"})
-    assert keys.earlier("alpha", "t", {"x": value}) is None
+        stamp_of({"x": value, REQUEST_KEY: "k"})
+    assert stamp_of({"x": value}) is None
+
+
+# Durable request keys, task of 2026-10-29, round 5. Each retry crosses a reload of
+# the event log from disk, as a daemon restart does.
+
+
+def reloaded(worlds: Callable[..., World], world: World) -> World:
+    world.log.close()
+    return worlds(Engine(), create=False)
+
+
+def acts_of(world: World, sender: LineAddress) -> list[str]:
+    return [
+        message_id
+        for message_id, message in world.log.state.messages.items()
+        if message.sender == sender
+    ]
+
+
+def test_a_keyed_send_repeated_after_a_restart_sends_once(
+    worlds: Callable[..., World],
+) -> None:
+    world = worlds(Engine())
+    first = call(
+        world.scheduler.send_tool("alpha"), to="@ana", body="hi", request_key="k"
+    )
+    restarted = reloaded(worlds, world)
+    again = call(
+        restarted.scheduler.send_tool("alpha"), to="@ana", body="hi", request_key="k"
+    )
+    assert text_of(again) == text_of(first) + REPEATED
+    assert len(acts_of(restarted, ALPHA)) == 1
+    assert restarted.events == []
+
+
+def test_a_keyed_priority_send_repeats_its_priority_after_a_restart(
+    worlds: Callable[..., World],
+) -> None:
+    world = worlds(Engine())
+    arguments: dict[str, Any] = {
+        "to": "beta",
+        "body": "stop",
+        "priority": True,
+        "request_key": "p",
+    }
+    first = call(world.scheduler.send_tool("alpha"), **arguments)
+    assert text_of(first).endswith(", with priority")
+    restarted = reloaded(worlds, world)
+    again = call(restarted.scheduler.send_tool("alpha"), **arguments)
+    assert text_of(again) == text_of(first) + REPEATED
+
+
+def test_a_keyed_question_repeated_after_a_restart_is_asked_once(
+    worlds: Callable[..., World],
+) -> None:
+    world = worlds(Engine())
+    arguments: dict[str, Any] = {
+        "question": "May I?",
+        "choices": ["yes", "no"],
+        "to": "@ana",
+        "request_key": "q",
+    }
+    first = call(world.scheduler.ask_tool("alpha"), **arguments)
+    restarted = reloaded(worlds, world)
+    again = call(restarted.scheduler.ask_tool("alpha"), **arguments)
+    assert text_of(again) == text_of(first) + REPEATED
+    (question,) = acts_of(restarted, ALPHA)
+    assert restarted.log.state.messages[question].kind is MessageKind.QUESTION
+
+
+def test_a_keyed_wake_repeated_after_a_restart_neither_moves_nor_doubles(
+    worlds: Callable[..., World],
+) -> None:
+    world = worlds(Engine())
+    first = call(
+        world.scheduler.wake_tool("alpha"), seconds=600, note="check", request_key="w"
+    )
+    pending = world.log.state.scheduled["alpha"]
+    restarted = reloaded(worlds, world)
+    again = call(
+        restarted.scheduler.wake_tool("alpha"),
+        seconds=600,
+        note="check",
+        request_key="w",
+    )
+    assert text_of(again) == text_of(first) + REPEATED
+    assert restarted.log.state.scheduled["alpha"] == pending
+    assert restarted.events == []
+
+
+def test_a_repeated_wake_leaves_out_the_wake_it_replaced(
+    worlds: Callable[..., World],
+) -> None:
+    """The documented difference. ``wake_scheduled`` does not record the wake it
+    replaced, so the rebuilt text has no sentence on it."""
+    world = worlds(Engine())
+    tool = world.scheduler.wake_tool("alpha")
+    call(tool, seconds=300, note="earlier")
+    first = call(tool, seconds=600, note="check", request_key="w")
+    assert " It replaces the wake that was due at " in text_of(first)
+    again = call(tool, seconds=600, note="check", request_key="w")
+    shown = text_of(first).split(" It replaces the wake")[0]
+    assert text_of(again) == shown + REPEATED
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "first", "other"),
+    [
+        (
+            "send_tool",
+            {"to": "@ana", "body": "hi"},
+            {"to": "@ana", "body": "something else"},
+        ),
+        (
+            "ask_tool",
+            {"question": "May I?", "to": "@ana"},
+            {"question": "May I not?", "to": "@ana"},
+        ),
+        ("wake_tool", {"seconds": 600, "note": "x"}, {"seconds": 900, "note": "x"}),
+    ],
+)
+def test_a_key_reused_for_other_arguments_after_a_restart_is_refused(
+    worlds: Callable[..., World],
+    tool_name: str,
+    first: dict[str, Any],
+    other: dict[str, Any],
+) -> None:
+    world = worlds(Engine())
+    call(getattr(world.scheduler, tool_name)("alpha"), **first, request_key="k")
+    restarted = reloaded(worlds, world)
+    refused = call(
+        getattr(restarted.scheduler, tool_name)("alpha"), **other, request_key="k"
+    )
+    assert refused.get("is_error") is True
+    assert "was used for a different" in text_of(refused)
+    assert restarted.events == []
+
+
+def test_a_log_written_without_keys_loads_and_keeps_no_keys(
+    worlds: Callable[..., World],
+) -> None:
+    """An unkeyed act is written as before the field existed, so an older daemon
+    reads it, and an event of an older daemon decodes with no key."""
+    world = worlds(Engine())
+    call(world.scheduler.send_tool("alpha"), to="@ana", body="hi")
+    call(world.scheduler.wake_tool("alpha"), seconds=600, note="x")
+    for event in world.events:
+        if isinstance(event, MessageSent | WakeScheduled):
+            assert '"request"' not in encode(event)
+            assert decode(encode(event)) == event
+    restarted = reloaded(worlds, world)
+    assert restarted.log.state.requests == {}
+    assert len(acts_of(restarted, ALPHA)) == 1
+
+
+def test_a_keyed_act_carries_its_stamp_in_its_own_event(
+    worlds: Callable[..., World],
+) -> None:
+    """The key is recorded atomically with the act, in the one event appended."""
+    world = worlds(Engine())
+    arguments: dict[str, Any] = {"to": "@ana", "body": "hi", "request_key": "k"}
+    call(world.scheduler.send_tool("alpha"), **arguments)
+    (sent,) = sent_by(world, ALPHA)
+    assert sent.request == RequestStamp("k", digest_of(arguments))
+    assert decode(encode(sent)) == sent
+
+
+def test_the_model_refuses_a_kept_key_and_a_harness_key(
+    worlds: Callable[..., World],
+) -> None:
+    world = worlds(Engine())
+    stamp = RequestStamp("k", "a" * 64)
+    world.log.append(
+        MessageSent("m-a", ALPHA, ANA, MessageKind.NOTE, "hi", request=stamp)
+    )
+    with pytest.raises(model_module.EventRejected, match="acted before"):
+        world.log.append(
+            MessageSent("m-b", ALPHA, ANA, MessageKind.NOTE, "hi", request=stamp)
+        )
+    # The same key on another tool of the same party is its own.
+    world.log.append(
+        MessageSent("q-c", ALPHA, ANA, MessageKind.QUESTION, "May I?", request=stamp)
+    )
+    with pytest.raises(model_module.EventRejected, match="gives no request key"):
+        world.log.append(
+            MessageSent(
+                "m-d", model_module.HARNESS, ALPHA, MessageKind.NOTE, "x", request=stamp
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("key", "digest"),
+    [("", "a" * 64), ("x" * (MAX_KEY_LENGTH + 1), "a" * 64), ("k", "nope")],
+)
+def test_a_malformed_stamp_is_invalid(key: str, digest: str) -> None:
+    with pytest.raises(model_module.InvalidField):
+        RequestStamp(key, digest)

@@ -218,6 +218,7 @@ def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
         "kept": False,
         "closes_at": None,
         "background_tasks": 0,
+        "background_tasks_unknown": False,
         "tasks": [],
     }
     assert full["leases"] == []
@@ -1198,6 +1199,7 @@ def test_line_status_reports_a_kept_session_and_its_deadline(world: World) -> No
         "kept": True,
         "closes_at": "2026-10-26T09:01:30Z",
         "background_tasks": 2,
+        "background_tasks_unknown": False,
         "tasks": [
             {"task_id": "t1", "command": "make gate"},
             {"task_id": "t2", "command": "sleep 300"},

@@ -32,7 +32,10 @@ Working directory. ``workdir`` names the directory a line's engine runs in, such
 git worktree of its own. A relative path is resolved against the project root, and
 ``~`` against the home directory, when the line is configured and again at each turn,
 by ``dromon.workdir``. Only the path is stored, and a line without one runs in the
-project root. The line's relative instruction and sandbox paths resolve against it.
+project root. The line's relative sandbox paths resolve against it, while its relative
+instruction paths resolve against the project root, as above. A line that works in a
+worktree of another branch therefore names its own ``CLAUDE.md`` by absolute path, or it
+reads the file of the branch checked out at the root.
 
 References. Any text of an MCP server may hold ``${NAME}`` or ``${NAME:-default}``,
 which the engine replaces with the daemon's environment at the start of each turn, as

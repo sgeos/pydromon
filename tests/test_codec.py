@@ -8,6 +8,7 @@ import pytest
 from dromon.codec import (
     FORMAT_VERSION,
     KIND_FIELDS,
+    OMITTED_WHEN_NULL,
     MAX_PAYLOAD_BYTES,
     RENAMED_KINDS,
     DecodeError,
@@ -48,7 +49,27 @@ def test_the_field_table_matches_each_event(scenario: tuple[Event, ...]) -> None
         document = json.loads(encode(event))
         declared = tuple(f.name for f in fields(event))
         assert KIND_FIELDS[document["kind"]] == declared
-        assert set(document["data"]) == set(declared)
+        omitted = {
+            name
+            for name in OMITTED_WHEN_NULL.get(document["kind"], ())
+            if getattr(event, name) is None
+        }
+        assert set(document["data"]) == set(declared) - omitted
+
+
+def test_the_scenario_writes_each_omitted_field_and_leaves_it_out(
+    scenario: tuple[Event, ...],
+) -> None:
+    """Each field left out when null appears both ways in the scenario, so the
+    round trip covers its presence and its absence."""
+    for kind, names in OMITTED_WHEN_NULL.items():
+        for name in names:
+            seen = {
+                name in json.loads(encode(event))["data"]
+                for event in scenario
+                if json.loads(encode(event))["kind"] == kind
+            }
+            assert seen == {True, False}, (kind, name)
 
 
 def test_old_scheduled_wake_events_decode_without_a_task_binding() -> None:
@@ -112,6 +133,22 @@ def test_an_encoding_is_pinned_so_ports_can_compare_bytes() -> None:
         '"strategy":"subscription"},"kind":"line_created","v":1}'
     )
     assert encode(LineCreated("alpha", "claude-opus-5-5", "subscription")) == expected
+
+
+def test_unkeyed_acts_encode_as_the_encoder_before_request_keys_did() -> None:
+    """Review r5, K2. The bytes were produced by the encoder at 559f7b2, before the
+    ``request`` field existed, so a daemon of that build reads these events."""
+    sent = (
+        '{"data":{"body":"hi","choices":[],"kind":"note","message_id":"m1",'
+        '"recipient":"@ana","reply_to":null,"sender":"beta"},'
+        '"kind":"message_sent","v":1}'
+    )
+    wake = (
+        '{"data":{"due":"2026-10-26T09:30:00Z","line_id":"beta","message_id":"m2",'
+        '"note":"look","task_id":null},"kind":"wake_scheduled","v":1}'
+    )
+    assert encode(MessageSent("m1", BETA, ANA, MessageKind.NOTE, "hi")) == sent
+    assert encode(WakeScheduled("beta", "m2", "2026-10-26T09:30:00Z", "look")) == wake
 
 
 def test_string_escapes_are_pinned_so_ports_can_compare_bytes() -> None:
