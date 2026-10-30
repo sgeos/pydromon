@@ -279,7 +279,8 @@ since mail would wake a seat that has no budget. The preamble names the new owne
 cause and the time, and says the worktree is now read only to it. Its own uncommitted
 changes, if any, are named in the recovery record it can read. Each affected seat is
 told once for the change. The event log records whether that seat ended a turn after
-the change, so replay preserves the notice state across a daemon restart. If no turn
+the change that started after the change, so a turn already in flight does not count.
+Replay preserves the notice state across a daemon restart. If no post-change turn
 ended, the next turn repeats the notice until one ends. A later ownership change
 starts a new notice for each affected seat.
 

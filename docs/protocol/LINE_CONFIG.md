@@ -649,13 +649,14 @@ After an `ownership_changed` event, the new owner receives the role transition p
 at the start of its next turn. A former owner receives a notice at the start of its
 next turn when another party made the change. Neither notice is sent by mail.
 
-Each seat receives the notice once for that change. The event log's order of
-`ownership_changed` and `line_turn_ended` events determines whether the seat has ended
-a turn since the change. Replay rebuilds that state, so a restart does not repeat a
-notice after the seat's turn ended. If no turn ended, its next turn still receives the
-notice, including after a restart. A later ownership change starts a new notice for
-each affected seat. The role transition package and former-owner notice are described
-in [`ROLES.md`](../architecture/ROLES.md).
+Each seat receives the notice once for that change. A turn counts only if its
+`line_state_changed` event to `running` follows the `ownership_changed` event and its
+`line_turn_ended` follows that start. Replay rebuilds the turn order, so a turn that
+was already running at the ownership change does not suppress the notice after a
+restart. If no post-change turn ended, the next turn still receives the notice,
+including after a restart. A later ownership change starts a new notice for each
+affected seat. The role transition package and former-owner notice are described in
+[`ROLES.md`](../architecture/ROLES.md).
 
 ## Context and compaction
 

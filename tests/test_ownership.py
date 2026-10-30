@@ -939,8 +939,10 @@ def test_role_notices_survive_restart_and_reset_for_a_later_change(
     assert world.scheduler._role_notice("beta") is None  # pyright: ignore[reportPrivateUsage]
     assert world.scheduler._role_notice("alpha") is None  # pyright: ignore[reportPrivateUsage]
 
-    world.log.append(LineTurnEnded("beta", WORKTREE_COMMIT))
-    world.log.append(LineTurnEnded("alpha", WORKTREE_COMMIT))
+    for line_id in ("beta", "alpha"):
+        world.log.append(LineStateChanged(line_id, LineState.RUNNING))
+        world.log.append(LineStateChanged(line_id, LineState.IDLE))
+        world.log.append(LineTurnEnded(line_id, WORKTREE_COMMIT))
     assert replay(world.log.path).role_change_ended_turns["core"] == {"alpha", "beta"}
     world.restart()
     assert world.scheduler._role_notice("beta") is None  # pyright: ignore[reportPrivateUsage]
@@ -949,6 +951,67 @@ def test_role_notices_survive_restart_and_reset_for_a_later_change(
     world.scheduler.give_ownership(ANA, "core", "alpha")
     assert world.scheduler._role_notice("alpha") is not None  # pyright: ignore[reportPrivateUsage]
     assert world.scheduler._role_notice("beta") is not None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_new_owners_pre_change_turn_does_not_consume_its_notice_after_restart(
+    world: World,
+) -> None:
+    world.gates["beta"] = asyncio.Event()
+    world.scripts["beta"] = [[{"tool": "gate"}]]
+
+    async def give_role_during_beta_turn() -> None:
+        world.scheduler.send(ANA, LineAddress("beta"), "start a turn")
+        await until(lambda: "start beta" in world.order)
+        # A public grant also wakes beta, which would start another turn at once.
+        world.log.append(
+            OwnershipChanged(
+                "core",
+                "beta",
+                "alpha",
+                OwnershipCause.OPERATOR,
+                ANA,
+                None,
+                format_due(world.now),
+            )
+        )
+        world.gates["beta"].set()
+
+    run(world, give_role_during_beta_turn)
+    assert "beta" not in world.log.state.role_change_ended_turns["core"]
+    world.restart()
+    wake(world, "beta")
+    assert world.prompts("beta")[1].startswith("You own role core from this turn")
+
+
+def test_a_former_owners_pre_change_turn_does_not_consume_its_notice_after_restart(
+    world: World,
+) -> None:
+    world.gates["alpha"] = asyncio.Event()
+    world.scripts["alpha"] = [[{"tool": "gate"}]]
+
+    async def change_role_during_alpha_turn() -> None:
+        world.scheduler.send(ANA, ALPHA, "start a turn")
+        await until(lambda: "start alpha" in world.order)
+        # The public operator command refuses a change while the current owner is
+        # running. This valid event exercises the spanning-turn order directly.
+        world.log.append(
+            OwnershipChanged(
+                "core",
+                "beta",
+                "alpha",
+                OwnershipCause.OPERATOR,
+                ANA,
+                None,
+                format_due(world.now),
+            )
+        )
+        world.gates["alpha"].set()
+
+    run(world, change_role_during_alpha_turn)
+    assert "alpha" not in world.log.state.role_change_ended_turns["core"]
+    world.restart()
+    wake(world, "alpha")
+    assert world.prompts("alpha")[1].startswith("Role core passed from you to beta")
 
 
 def test_a_handoff_tells_the_successor_by_mail_not_by_the_checklist(
