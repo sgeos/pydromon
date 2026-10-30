@@ -1061,6 +1061,14 @@ SELF_START_GRACE_SECONDS: Final = 2.0
 so that one note reports both. The engine begins that turn at once, in the
 observed case."""
 
+
+async def self_start_grace() -> None:
+    """Wait out ``SELF_START_GRACE_SECONDS``. A test replaces it with a wait it
+    releases, so that whether an end is noted before or after the grace does not
+    depend on how busy the machine is."""
+    await asyncio.sleep(SELF_START_GRACE_SECONDS)
+
+
 EXIT_CODE: Final = re.compile(r"\bexit code (-?\d{1,5})\)?\.?\s*$")
 """The exit code at the end of the engine's summary of a finished shell task.
 **Facts, observed live on 2026-10-26.** The summary is the only place the engine's
@@ -3062,7 +3070,7 @@ class ClaudeCodeLine:
                 )
 
     async def _flush_later(self, connection: _Connection) -> None:
-        await asyncio.sleep(SELF_START_GRACE_SECONDS)
+        await self_start_grace()
         if connection.pending:
             self._flush(connection, self_started=False)
 
