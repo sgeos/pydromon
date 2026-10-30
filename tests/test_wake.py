@@ -302,6 +302,16 @@ def test_wake_after_schedules_one_wake_rounded_up_to_the_second(world: World) ->
     assert len(scheduled) == 2
 
 
+def test_wait_tool_descriptions_explain_how_to_wait_for_a_task(world: World) -> None:
+    wake = world.tool()
+    background = world.scheduler.list_background_tool("alpha")
+
+    assert "end your turn after this call" in wake.description
+    assert "task end cancels this wake and wakes you" in wake.description
+    assert "process_id as task_id, then end your turn" in background.description
+    assert "otherwise the wake fires at its timeout" in background.description
+
+
 @pytest.mark.parametrize(
     ("args", "message"),
     [
@@ -389,6 +399,9 @@ def test_a_wake_bound_to_a_running_task_is_cancelled_when_it_ends(
     assert scheduled.message_id in world.log.state.withdrawn_wakes
     events = world.events()
     assert isinstance(events[-1], TaskNoted)
+    task_note = world.log.state.messages[events[-1].message_id]
+    assert "ended your wait" in task_note.body
+    assert scheduled.message_id in task_note.body
     assert scheduled.message_id not in {
         event.message_id for event in events if isinstance(event, MessageSent)
     }
@@ -398,6 +411,80 @@ def test_a_wake_bound_to_a_running_task_is_cancelled_when_it_ends(
     world.restart()
     assert "alpha" not in world.log.state.scheduled
     assert scheduled.message_id in world.log.state.withdrawn_wakes
+
+
+def test_a_named_wait_is_exempt_from_the_task_note_limit(tmp_path: Path) -> None:
+    target = World(tmp_path / "events.sqlite", Clock())
+    try:
+        engine = target.scheduler.engine_for("alpha")
+        assert isinstance(engine, Recorder)
+        engine.tasks = [{"task_id": "waited", "command": "make gate"}]
+        for index in range(scheduler_module.MAX_TASK_NOTES):
+            assert (
+                target.scheduler.background_ended(
+                    "alpha",
+                    BackgroundEnd(f"ordinary-{index}", "other", "completed"),
+                )
+                is not None
+            )
+
+        target.call({"seconds": 60, "note": "check the gate", "task_id": "waited"})
+        wake_id = target.log.state.scheduled["alpha"].message_id
+        task_note_id = target.scheduler.background_ended(
+            "alpha", BackgroundEnd("waited", "make gate", "completed")
+        )
+
+        assert task_note_id is not None
+        assert "alpha" not in target.log.state.scheduled
+        assert wake_id in target.log.state.withdrawn_wakes
+        note = target.log.state.messages[task_note_id]
+        assert "ended your wait" in note.body
+        assert wake_id in note.body
+        assert task_note_id in {
+            message_id for message_id, _ in target.scheduler.pending("alpha")
+        }
+
+        assert (
+            target.scheduler.background_ended(
+                "alpha", BackgroundEnd("ordinary-over-limit", "other", "completed")
+            )
+            is None
+        )
+        assert "ordinary-over-limit" not in {
+            event.task_id for event in target.events() if isinstance(event, TaskNoted)
+        }
+    finally:
+        target.log.close()
+
+
+def test_a_pending_task_wait_survives_restart_until_the_task_ends(
+    tmp_path: Path,
+) -> None:
+    target = World(tmp_path / "events.sqlite", Clock())
+    try:
+        engine = target.scheduler.engine_for("alpha")
+        assert isinstance(engine, Recorder)
+        engine.tasks = [{"task_id": "waited", "command": "make gate"}]
+        target.call({"seconds": 60, "note": "check the gate", "task_id": "waited"})
+        wake_id = target.log.state.scheduled["alpha"].message_id
+
+        target.log.close()
+        target.log = EventLog(target.path)
+        target.restart()
+        resumed = target.scheduler.engine_for("alpha")
+        assert isinstance(resumed, Recorder)
+        resumed.tasks = [{"task_id": "waited", "command": "make gate"}]
+
+        task_note_id = target.scheduler.background_ended(
+            "alpha", BackgroundEnd("waited", "make gate", "completed")
+        )
+
+        assert task_note_id is not None
+        assert "alpha" not in target.log.state.scheduled
+        assert wake_id in target.log.state.withdrawn_wakes
+        assert wake_id in target.log.state.messages[task_note_id].body
+    finally:
+        target.log.close()
 
 
 def test_wake_after_refuses_a_task_when_the_line_has_no_kept_engine(
@@ -438,7 +525,7 @@ def test_wake_after_refuses_a_task_after_it_has_ended(world: World) -> None:
     assert "alpha" not in world.log.state.scheduled
 
 
-def test_a_wake_that_fired_before_its_task_ended_is_not_withdrawn(
+def test_a_wake_fires_when_its_task_outlives_the_timeout(
     world: World,
 ) -> None:
     engine = world.scheduler.engine_for("alpha")
@@ -450,6 +537,7 @@ def test_a_wake_that_fired_before_its_task_ended_is_not_withdrawn(
 
     assert world.scheduler.fire_due_wakes() == [message_id]
     assert "alpha" not in world.log.state.scheduled
+    assert engine.tasks == [{"task_id": "task-1", "command": "make gate"}]
     world.scheduler.background_ended(
         "alpha", BackgroundEnd("task-1", "make gate", "completed")
     )
