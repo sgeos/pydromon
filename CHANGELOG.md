@@ -7,6 +7,14 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- Grok home checks now allow an empty regular `hooks-paths` file and an
+  `installed-plugins` directory containing only empty regular `*.lock` files, while
+  refusing symbolic links and any other contents. Grok writer profiles now hold the
+  actual Git directories read-only for linked worktrees and ordinary checkouts, and
+  deny the fixed credential paths under the daemon's real home. Refusal advice for an
+  existing profile names values to add without replacing other projects' profile
+  tables. `docs/protocol/GROK.md` records the observed and inferred behavior, including
+  the pointer files that remain unguarded between turns.
 - A line's own notes, such as fired wakes and task-end notes, leave the `own_notes`
   count once a turn of the line has ended after their delivery, whatever the turn's
   outcome, as well as once they are read, acknowledged or replied to. The count had

@@ -128,8 +128,14 @@ and workflows live in `$GROK_HOME`.
   `requirements.toml`, in the home or in `/etc/grok`, that sets anything, a
   `trusted_folders.toml` that trusts any folder, and any of `agents`, `hooks`,
   `hooks-paths`, `installed-plugins`, `lsp.json`, `plugins`, `rules`, `skills` or
-  `workflows`, a file when present and a folder when it holds anything. The refusal for
-  a drifted `config.toml` says to delete it, after which Dromon writes it again.
+  `workflows`. Empty regular files are allowed because they load no entries, and the
+  `installed-plugins` directory may hold only empty regular files named `*.lock`.
+  **Observed on 2026-10-30.** Grok created an empty `hooks-paths` file and an
+  `installed-plugins` directory containing an empty `registry.lock` file.
+  **Inference, not verified live.** These records load no hook paths or plugins.
+  Symbolic links, non-empty files and all other directory contents are refused. The
+  refusal for a drifted `config.toml` says to delete it, after which Dromon writes it
+  again.
 - **Credentials.** Dromon never writes, reads or copies a credential. It never opens
   `auth.json` in either home. The operator signs Grok in to Dromon's home once, by
   hand, with the command in Verify first below.
@@ -269,23 +275,31 @@ which kinds and updates Grok sends.
 
 A line without `Edit` or `Write` runs under `dromon-reader`, and one with either runs
 under `dromon-writer`. Dromon writes both into its Grok home's `sandbox.toml` when that
-file is missing, in this form.
+file is missing. The following paths are placeholders for the daemon home and Git
+directories.
 
 ```toml
 [profiles.dromon-reader]
 extends = "read-only"
-deny = [".dromon"]
+deny = [".dromon", "/placeholder/operator-home/.ssh", "/placeholder/operator-home/.aws",
+        "/placeholder/operator-home/.codex/auth.json",
+        "/placeholder/operator-home/.cargo/credentials.toml",
+        "/placeholder/operator-home/.pi/agent/auth.json"]
 
 [profiles.dromon-writer]
 extends = "workspace"
-read_only = ["/real/path/of/project/.git"]
-deny = [".dromon"]
+read_only = ["/placeholder/worktree/gitdir", "/placeholder/repository/gitdir"]
+deny = [".dromon", "/placeholder/operator-home/.ssh", "/placeholder/operator-home/.aws",
+        "/placeholder/operator-home/.codex/auth.json",
+        "/placeholder/operator-home/.cargo/credentials.toml",
+        "/placeholder/operator-home/.pi/agent/auth.json"]
 ```
 
 Before each turn Dromon checks that the profile extends `read-only` for a reader, or
 `workspace` or `strict` for a writer, that its `deny` entries cover the state and runtime
-directories as Grok resolves them, with `~` at the home directory and other relative
-entries at the workspace, that a writer's `read_only` or `deny` covers `.git`, and that
+directories and any existing credential paths as absolute paths under the daemon's
+real home, never through `~`, that a writer's `read_only` entries cover both the
+worktree's Git directory and the common Git directory, and that
 the profile sets no key but `extends`, `deny`, `read_only` and `restrict_network`, so a
 `read_write` grant is refused. The workspace is the line's working directory. Only the
 home's `sandbox.toml` is read, and a project's own `.grok`, where its `sandbox.toml`
@@ -293,9 +307,17 @@ would live, refuses the turn, as the home section says. **Inference, not verifie
 That Grok reads `sandbox.toml` from `GROK_HOME`, as it reads `config.toml`, and that
 the built-in `read-only` base denies every write to the workspace. The profile names are fixed, so Grok lines in different working
 directories share one definition of each, whose entries must cover every one of their
-`.git` paths and every protected directory by its real path. Dromon writes the file for
-the first line only, and a refusal for a later line names the table to add. The bridge below still runs in the
-project root, where it finds the runtime directory.
+Git directory and every protected directory by its real path. Dromon writes the file
+for the first line only. If a profile already exists, refusal advice lists values to
+add to its arrays and says to preserve the other profile tables. If a profile is
+missing, the advice gives its complete table. For a linked worktree, the `.git` pointer
+file and `commondir` file cannot be held as profile entries. A writer could rewrite a
+pointer during a turn. The next turn resolves it again and refuses unless the resulting
+Git directories are already held read-only. Between the check and that next turn, the
+pointer files themselves remain unguarded by the profile. The bridge below still runs
+in the project root, where it finds the runtime directory. The credential list does not
+include the operator's `.grok/auth.json` or `.claude.json`. Neither path has been tested
+with a Grok line, so this does not claim that either is safe to expose.
 **Inference, not verified.** A `read_only` entry inside a writable workspace keeps it
 read-only, as the field's name says.
 

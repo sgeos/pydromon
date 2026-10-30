@@ -7,6 +7,7 @@ script follows Grok Build 1.0.70's documentation and its ``initialize`` answer.
 import asyncio
 import dataclasses
 import json
+import os
 import re
 import shutil
 import tomllib
@@ -79,13 +80,23 @@ SEND: SdkMcpTool[Any] = SdkMcpTool(
 
 def write_profiles(home: Path, workspace: Path, *, writer_git: bool = True) -> None:
     (home / HOME_DIR).mkdir(mode=0o700, parents=True, exist_ok=True)
-    git = json.dumps(str((workspace / ".git").resolve()))
-    read_only = f"read_only = [{git}]\n" if writer_git else ""
-    (home / HOME_DIR / "sandbox.toml").write_text(
-        f'[profiles.{READER_PROFILE}]\nextends = "read-only"\ndeny = [".dromon"]\n'
-        f'[profiles.{WRITER_PROFILE}]\nextends = "workspace"\n{read_only}'
-        'deny = [".dromon"]\n'
+    daemon_home = home.parent / "operator-home"
+    reader = grok_module.profile_snippet(
+        READER_PROFILE, workspace, (workspace / ".dromon",), daemon_home
     )
+    writer = grok_module.profile_snippet(
+        WRITER_PROFILE, workspace, (workspace / ".dromon",), daemon_home
+    )
+    if not writer_git:
+        writer = "\n".join(
+            line for line in writer.splitlines() if not line.startswith("read_only =")
+        )
+    (home / HOME_DIR / "sandbox.toml").write_text(reader + "\n\n" + writer + "\n")
+
+
+def operator_home(home: Path) -> Path:
+    """A placeholder daemon home, distinct from Grok's isolated line home."""
+    return home.parent / "operator-home"
 
 
 @pytest.fixture
@@ -93,7 +104,7 @@ def project(tmp_path: Path) -> tuple[Path, Path, Path]:
     workspace = (tmp_path / "work").resolve()
     (workspace / ".dromon").mkdir(parents=True)
     (workspace / ".git").mkdir()
-    home = tmp_path / "home"
+    home = tmp_path / "operator-home"
     write_profiles(home, workspace)
     return workspace, home, workspace / ".dromon"
 
@@ -406,7 +417,12 @@ def prepared(tmp_path: Path) -> tuple[Path, Path, Path]:
     (workspace / ".dromon").mkdir(parents=True)
     (workspace / ".git").mkdir()
     grok_home = tmp_path / "home" / HOME_DIR
-    prepare_home(grok_home, workspace, (workspace / ".dromon",))
+    prepare_home(
+        grok_home,
+        workspace,
+        (workspace / ".dromon",),
+        tmp_path / "operator-home",
+    )
     return workspace, workspace / ".dromon", grok_home
 
 
@@ -433,7 +449,12 @@ def test_a_prepared_home_is_owner_only_and_passes_its_own_checks(
     home = tmp_path / "home"
     for tools in (("Bash",), ("Edit",)):
         check_profile(
-            LineConfig(builtin_tools=tools), workspace, (state,), home, grok_home
+            LineConfig(builtin_tools=tools),
+            workspace,
+            (state,),
+            home,
+            grok_home,
+            operator_home(home),
         )
 
 
@@ -590,13 +611,54 @@ def test_an_entry_that_loads_more_is_refused_unless_an_empty_folder(
     entry = grok_home / name
     entry.mkdir()
     check_home(grok_home, tmp_path / "etc")
-    (entry / "invented.md").write_text("")
+    (entry / "invented.md").write_text("content")
     with pytest.raises(EngineRefused, match=f"holds {name}"):
         check_home(grok_home, tmp_path / "etc")
     (entry / "invented.md").unlink()
     entry.rmdir()
     entry.write_text("")
+    check_home(grok_home, tmp_path / "etc")
+    entry.write_text("content")
     with pytest.raises(EngineRefused, match=f"holds {name}"):
+        check_home(grok_home, tmp_path / "etc")
+
+
+def test_installed_plugins_allows_only_empty_regular_lock_files(tmp_path: Path) -> None:
+    _, _, grok_home = prepared(tmp_path)
+    plugins = grok_home / "installed-plugins"
+    plugins.mkdir()
+    (plugins / "registry.lock").write_text("")
+    check_home(grok_home, tmp_path / "etc")
+    (plugins / "registry.lock").write_text("locked")
+    with pytest.raises(EngineRefused, match="holds installed-plugins"):
+        check_home(grok_home, tmp_path / "etc")
+    (plugins / "registry.lock").unlink()
+    (plugins / "unexpected.json").write_text("")
+    with pytest.raises(EngineRefused, match="holds installed-plugins"):
+        check_home(grok_home, tmp_path / "etc")
+
+
+def test_empty_hooks_paths_file_is_allowed_but_a_symlink_is_not(tmp_path: Path) -> None:
+    _, _, grok_home = prepared(tmp_path)
+    hooks_paths = grok_home / "hooks-paths"
+    hooks_paths.write_text("")
+    check_home(grok_home, tmp_path / "etc")
+    hooks_paths.unlink()
+    target = tmp_path / "hooks-paths"
+    target.write_text("")
+    hooks_paths.symlink_to(target)
+    with pytest.raises(EngineRefused, match="holds hooks-paths"):
+        check_home(grok_home, tmp_path / "etc")
+
+
+def test_installed_plugins_refuses_a_lock_symlink(tmp_path: Path) -> None:
+    _, _, grok_home = prepared(tmp_path)
+    plugins = grok_home / "installed-plugins"
+    plugins.mkdir()
+    target = tmp_path / "registry.lock"
+    target.write_text("")
+    (plugins / "registry.lock").symlink_to(target)
+    with pytest.raises(EngineRefused, match="holds installed-plugins"):
         check_home(grok_home, tmp_path / "etc")
 
 
@@ -703,10 +765,20 @@ def test_a_reader_and_a_writer_get_their_own_profiles(
     workspace, home, state = project
     grok_home = home / HOME_DIR
     reader = check_profile(
-        LineConfig(builtin_tools=("Bash",)), workspace, (state,), home, grok_home
+        LineConfig(builtin_tools=("Bash",)),
+        workspace,
+        (state,),
+        home,
+        grok_home,
+        operator_home(home),
     )
     writer = check_profile(
-        LineConfig(builtin_tools=("Edit",)), workspace, (state,), home, grok_home
+        LineConfig(builtin_tools=("Edit",)),
+        workspace,
+        (state,),
+        home,
+        grok_home,
+        operator_home(home),
     )
     assert (reader, writer) == (READER_PROFILE, WRITER_PROFILE)
 
@@ -725,13 +797,89 @@ def test_a_missing_profile_is_refused_with_the_table_to_add(tmp_path: Path) -> N
     home = tmp_path / "home"
     with pytest.raises(EngineRefused) as raised:
         check_profile(
-            LineConfig(), workspace, (workspace / ".dromon",), home, home / HOME_DIR
+            LineConfig(),
+            workspace,
+            (workspace / ".dromon",),
+            home,
+            home / HOME_DIR,
+            operator_home(home),
         )
     message = str(raised.value)
     assert f"no Grok sandbox profile {READER_PROFILE}" in message
     assert str(home / HOME_DIR / "sandbox.toml") in message
     assert f"[profiles.{READER_PROFILE}]" in message
     assert 'extends = "read-only"' in message and '".dromon"' in message
+    assert "operator-home/.ssh" in message and "~/" not in message
+
+
+def test_a_missing_credential_path_does_not_refuse_a_profile(tmp_path: Path) -> None:
+    workspace = (tmp_path / "work").resolve()
+    (workspace / ".dromon").mkdir(parents=True)
+    home = tmp_path / "home"
+    write_reader(home, 'extends = "read-only"\ndeny = [".dromon"]')
+    assert (
+        check_profile(
+            LineConfig(),
+            workspace,
+            (workspace / ".dromon",),
+            home,
+            home / HOME_DIR,
+            operator_home(home),
+        )
+        == READER_PROFILE
+    )
+
+
+def test_an_existing_credential_path_must_be_denied(tmp_path: Path) -> None:
+    workspace = (tmp_path / "work").resolve()
+    state = workspace / ".dromon"
+    state.mkdir(parents=True)
+    home = tmp_path / "home"
+    daemon_home = operator_home(home)
+    (daemon_home / ".ssh").mkdir(parents=True)
+    write_reader(home, 'extends = "read-only"\ndeny = [".dromon"]')
+    with pytest.raises(EngineRefused, match="does not deny .*operator-home/\\.ssh"):
+        check_profile(
+            LineConfig(), workspace, (state,), home, home / HOME_DIR, daemon_home
+        )
+
+
+def test_profile_does_not_deny_unverified_grok_or_claude_auth_paths(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "operator-home"
+    snippet = grok_module.profile_snippet(READER_PROFILE, tmp_path / "work", (), home)
+    assert ".grok/auth.json" not in snippet
+    assert ".claude.json" not in snippet
+
+
+def test_an_existing_profile_gets_additive_advice_and_keeps_other_tables(
+    tmp_path: Path,
+) -> None:
+    workspace = (tmp_path / "work").resolve()
+    state = workspace / ".dromon"
+    state.mkdir(parents=True)
+    home = tmp_path / "home"
+    file = home / HOME_DIR / "sandbox.toml"
+    file.parent.mkdir(parents=True)
+    file.write_text(
+        f'[profiles.{READER_PROFILE}]\nextends = "read-only"\n'
+        '[profiles.other-project]\nextends = "workspace"\ndeny = ["/other"]\n'
+    )
+    with pytest.raises(EngineRefused) as raised:
+        check_profile(
+            LineConfig(),
+            workspace,
+            (state,),
+            home,
+            home / HOME_DIR,
+            operator_home(home),
+        )
+    message = str(raised.value)
+    assert "preserve other profile tables" in message
+    assert "Required deny entries" in message
+    assert f"\n[profiles.{READER_PROFILE}]" not in message
+    assert "\n[profiles.other-project]" not in message
 
 
 def write_reader(home: Path, table: str) -> None:
@@ -765,7 +913,12 @@ def test_an_unsafe_reader_profile_is_refused(
     write_reader(home, table)
     with pytest.raises(EngineRefused, match=reason):
         check_profile(
-            LineConfig(), workspace, (workspace / ".dromon",), home, home / HOME_DIR
+            LineConfig(),
+            workspace,
+            (workspace / ".dromon",),
+            home,
+            home / HOME_DIR,
+            operator_home(home),
         )
 
 
@@ -775,13 +928,103 @@ def test_a_writer_must_keep_git_read_only(tmp_path: Path) -> None:
     (workspace / ".git").mkdir()
     home = tmp_path / "home"
     write_profiles(home, workspace, writer_git=False)
-    with pytest.raises(EngineRefused, match="leaves .*\\.git writable"):
+    with pytest.raises(EngineRefused, match="does not hold git directories read-only"):
         check_profile(
             LineConfig(builtin_tools=("Edit",)),
             workspace,
             (workspace / ".dromon",),
             home,
             home / HOME_DIR,
+            operator_home(home),
+        )
+
+
+def test_writer_profile_holds_an_ordinary_git_directory_read_only(
+    tmp_path: Path,
+) -> None:
+    workspace = (tmp_path / "work").resolve()
+    (workspace / ".dromon").mkdir(parents=True)
+    git = workspace / ".git"
+    git.mkdir()
+    home = tmp_path / "home"
+    write_profiles(home, workspace)
+    document = tomllib.loads((home / HOME_DIR / "sandbox.toml").read_text())
+    writer = document["profiles"][WRITER_PROFILE]
+    assert writer["read_only"] == [str(git)]
+    assert (
+        check_profile(
+            LineConfig(builtin_tools=("Edit",)),
+            workspace,
+            (workspace / ".dromon",),
+            home,
+            home / HOME_DIR,
+            operator_home(home),
+        )
+        == WRITER_PROFILE
+    )
+
+
+def linked_worktree(workspace: Path, common: Path, gitdir: Path) -> None:
+    workspace.mkdir(parents=True)
+    (workspace / ".dromon").mkdir()
+    common.mkdir(parents=True)
+    gitdir.mkdir(parents=True)
+    (gitdir / "commondir").write_text(os.path.relpath(common, gitdir))
+    (workspace / ".git").write_text(f"gitdir: {gitdir}\n")
+
+
+def test_writer_profile_holds_linked_worktree_and_common_git_directories(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "worktree"
+    common = tmp_path / "repository.git"
+    gitdir = common / "worktrees" / "feature"
+    linked_worktree(workspace, common, gitdir)
+    home = tmp_path / "home"
+    write_profiles(home, workspace)
+    document = tomllib.loads((home / HOME_DIR / "sandbox.toml").read_text())
+    writer = document["profiles"][WRITER_PROFILE]
+    assert set(writer["read_only"]) == {str(common), str(gitdir)}
+    assert str(workspace / ".git") not in writer["read_only"]
+    assert str(gitdir / "commondir") not in writer["read_only"]
+    assert (
+        check_profile(
+            LineConfig(builtin_tools=("Edit",)),
+            workspace,
+            (workspace / ".dromon",),
+            home,
+            home / HOME_DIR,
+            operator_home(home),
+        )
+        == WRITER_PROFILE
+    )
+
+
+def test_rewritten_linked_worktree_pointer_is_refused_on_the_next_check(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "worktree"
+    common = tmp_path / "repository.git"
+    gitdir = common / "worktrees" / "feature"
+    linked_worktree(workspace, common, gitdir)
+    home = tmp_path / "home"
+    write_profiles(home, workspace)
+    replacement_common = tmp_path / "replacement.git"
+    replacement_gitdir = replacement_common / "worktrees" / "feature"
+    replacement_common.mkdir()
+    replacement_gitdir.mkdir(parents=True)
+    (replacement_gitdir / "commondir").write_text(
+        os.path.relpath(replacement_common, replacement_gitdir)
+    )
+    (workspace / ".git").write_text(f"gitdir: {replacement_gitdir}\n")
+    with pytest.raises(EngineRefused, match="does not hold git directories read-only"):
+        check_profile(
+            LineConfig(builtin_tools=("Edit",)),
+            workspace,
+            (workspace / ".dromon",),
+            home,
+            home / HOME_DIR,
+            operator_home(home),
         )
 
 
@@ -794,7 +1037,14 @@ def test_deny_entries_resolve_as_grok_documents(tmp_path: Path) -> None:
     write_reader(home, 'extends = "read-only"\ndeny = [".dromon", "~/run"]')
     protected = (workspace / ".dromon", runtime)
     assert (
-        check_profile(LineConfig(), workspace, protected, home, home / HOME_DIR)
+        check_profile(
+            LineConfig(),
+            workspace,
+            protected,
+            home,
+            home / HOME_DIR,
+            operator_home(home),
+        )
         == READER_PROFILE
     )
 
@@ -812,7 +1062,12 @@ def test_neither_the_projects_nor_the_operators_own_profile_is_read(
     (home / ".grok" / "sandbox.toml").write_text(table)
     with pytest.raises(EngineRefused, match="no Grok sandbox profile"):
         check_profile(
-            LineConfig(), workspace, (workspace / ".dromon",), home, home / HOME_DIR
+            LineConfig(),
+            workspace,
+            (workspace / ".dromon",),
+            home,
+            home / HOME_DIR,
+            operator_home(home),
         )
 
 

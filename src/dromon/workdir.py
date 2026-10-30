@@ -159,6 +159,17 @@ def git_common_directory(directory: Path) -> Path | None:
     return None if found is None else found[1]
 
 
+def git_directories(directory: Path) -> tuple[Path, Path] | None:
+    """The checkout's worktree and common git directories, or ``None`` outside git.
+
+    A linked worktree has a private directory and a shared common directory. An
+    ordinary checkout uses the same directory for both. Pointer files are read with
+    the bounds and validation of ``_git_dirs``.
+    """
+    found = _git_dirs(directory)
+    return None if found is None else (found[0], found[1])
+
+
 OBJECT_NAME: Final = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 """A commit's object name, SHA-1 or SHA-256, in lowercase hexadecimal."""
 
