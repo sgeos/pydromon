@@ -373,12 +373,18 @@ git_ssh = true
   permission, and is the recommended form. The option grants a capability and lifts
   no rule, so a project's own rules that forbid lines to push, as pydromon's line rules
   do, still apply.
-- **Unverified.** Whether Claude Code's sandbox network proxy lets ssh reach
-  `github.com` on port 22, or `ssh.github.com` on port 443, is not known, and Dromon
-  configures no proxy route. Whether Codex's and Grok's own sandboxes let a command
-  connect to the socket or reach the network is not known either, and Codex's
-  workspace profile is believed to deny the network. The operator is to test these
-  live.
+- **Observed on 2026-10-29, inside an enabled Claude Code sandbox.** The test ran in
+  the operator's own Claude Code session, whose sandbox is configured like, but not
+  identically to, a Dromon line's. There `ssh` could not resolve `github.com` or
+  `ssh.github.com`, since the sandbox allows no direct connection, and a tunnel through
+  the sandbox's HTTP proxy with `ncat` was refused for port 22 and port 443. No further
+  route was tried, since working around the proxy is not Dromon's to do.
+  **Inference.** Git over SSH works only for a line whose Claude Code sandbox is
+  disabled. Under an enabled sandbox, use HTTPS with a credential the operator
+  provides instead. Dromon configures no proxy route.
+- **Unverified.** Whether Codex's and Grok's own sandboxes let a command connect to the
+  socket or reach the network is not known, and Codex's workspace profile is believed
+  to deny the network. No line has yet pushed over SSH through this option.
 
 ## Trust
 

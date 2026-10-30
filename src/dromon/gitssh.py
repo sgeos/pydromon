@@ -20,10 +20,12 @@ not what a line can do. An agent that holds only a deploy key narrows the reach 
 that repository. The option grants a capability and lifts no rule, so a project's
 own rules that forbid a line to push still apply.
 
-Unverified. Whether Claude Code's sandbox network proxy lets ``ssh`` reach
-``github.com`` on port 22, or ``ssh.github.com`` on port 443, is not known, and no
-proxy route is configured here. Whether Codex's and Grok's own sandboxes let a
-command connect to the socket is not known either.
+Observed on 2026-10-29. Inside an enabled Claude Code sandbox ``ssh`` could not
+resolve ``github.com``, and a tunnel through the sandbox's proxy was refused for ports
+22 and 443, so the option is inferred to work only for a line whose sandbox is
+disabled. ``docs/protocol/PROJECT_CONFIG.md`` records the test. No proxy route is
+configured here. Whether Codex's and Grok's own sandboxes let a command connect to
+the socket is not known.
 
 Porting note. The checks use POSIX file modes and owners, and ``shlex`` quoting for
 the POSIX shell that git runs ``GIT_SSH_COMMAND`` with.
