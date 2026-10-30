@@ -51,7 +51,7 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `create_line` | Arguments `line_id`, `model`, `strategy`, and optionally `config`, an object of [`LINE_CONFIG.md`](LINE_CONFIG.md), and `engine_session`, an existing engine session to continue, recorded as `line_session` right after `line_created` and checked as that event is. Result `{"line_id": ...}`. Refused when no packaged driver serves the model and strategy, when the configuration's `workdir` is not allowed, or when the project requires a sandbox and the line would run on Claude Code without one |
 | `configure_line` | Arguments `line_id` and `config`. Replaces the line's configuration from its next turn. A changed `workdir` also appends `line_session_cleared`. Refused when the `workdir` is not allowed, or when the project requires a sandbox and the line would run on Claude Code without one |
 | `questions` | Optionally `operator`. Result `{"questions": [...]}`, the open questions for that operator, or for all when omitted, oldest first, each with `question_id`, `line`, `operator`, `text` and `choices`. Listing marks each question delivered, because the client has shown it |
-| `mail` | Arguments `operator`, and optionally `unread_only`, `sender`, `offset` and `limit`, at most 50. Delivers the operator's undelivered mail, then returns `total`, `unread`, `unanswered` and `messages`, a page of headers with `message_id`, `sender`, `kind`, `reply_to`, `read` and `outcome`, one of `replied`, `acknowledged` and `unanswered`, oldest first. A note the harness wrote has `sender` `!dromon`, from 2026-10-28, and may be acknowledged but not replied to. No argument of any request may name `!dromon`, `sender` included, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies |
+| `mail` | Arguments `operator`, and optionally `unread_only`, `sender`, `offset` and `limit`, at most 50. `unread_only` selects the messages `unread` counts, which leave out the operator's own notes, from the round 6 review. Delivers the operator's undelivered mail, then returns `total`, `unread`, `unanswered`, from 2026-10-30 `own_notes`, and `messages`, a page of headers with `message_id`, `sender`, `kind`, `reply_to`, `read` and `outcome`, one of `replied`, `acknowledged` and `unanswered`, oldest first. A note the harness wrote has `sender` `!dromon`, from 2026-10-28, and may be acknowledged but not replied to. No argument of any request may name `!dromon`, `sender` included, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies |
 | `acknowledge` | Arguments `operator` and `message_id`. Marks a message in the operator's mailbox dealt with, without a reply |
 | `sent` | Arguments `operator`, and optionally `unanswered_only`, `offset` and `limit`. Returns `total` and `messages`, the operator's sent mail with `message_id`, `recipient`, `kind`, `delivered`, `read`, `outcome` and `delivery`. `delivery` is `waiting`, `delivered` or `read` for local mail, and `waiting for peer`, `delivered to peer`, `returned` with its code, or `unconfirmed` for mail to a peer, added on 2026-10-28 |
 | `read` | Arguments `operator` and `message_id`. Returns the message with its `body` and `choices`, and marks it read the first time |
@@ -94,8 +94,10 @@ reported a cost and some reported none, `cost_unknown_turns`, how many turns sin
 release reported no cost, so a client keeps an unknown cost apart from zero, `held_by`,
 the question holding the line or `null`, `scheduled_wake`, the line's pending scheduled wake as `due`, its due time, and
 `message_id`, the identifier its note will carry, or `null`, and `leases`, the leases
-the line holds, each with `name` and `expires`, its end as a due time. The note itself
-is not shown. `line_view` returns the same entry as `line`.
+the line holds, each with `name` and `expires`, its end as a due time, and from
+2026-10-30 `unread`, `unanswered` and `own_notes`, the line's mail counts, as
+[`LINE_CONFIG.md`](LINE_CONFIG.md) specifies for its summary. The note itself is not
+shown. `line_view` returns the same entry as `line`.
 
 ## Responses
 

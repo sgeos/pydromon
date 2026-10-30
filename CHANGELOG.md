@@ -7,6 +7,27 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- A line's own notes, such as fired wakes, task-end notes and compaction requests, are
+  no longer counted as unread in any view, and are counted apart as `own_notes`, so
+  nothing is hidden. One rule in `dromon.mailbox.summary` now gives the same unread,
+  unanswered and own-note counts to the wake prompt, `line_status`, `list_mail`, whose
+  first line now carries them, and the client's `mail` result and line entries, which
+  gain `own_notes`, and the line entries also `unread` and `unanswered`. Mail from an
+  operator, another line, an agent, a peer or the harness always counts. A prompt that
+  delivers an own note does not mark it read, which is decided for review. The
+  `MailSummary` field `collapsed` became `own_notes`, and the prompt's sentence now
+  says the notes are counted apart. Required by the operator on 2026-10-30, from the
+  review line's round 5 report. From the round 6 review, `list_mail` with
+  `unread_only` lists exactly what `unread` counts, a new `own_notes_only` filter
+  lists exactly what `own_notes` counts, and an own note leaves `own_notes` once it
+  is acknowledged or replied to as well as once it is read.
+- A turn that leads with the standing brief adds one sentence when an operator has
+  mailed the line since the brief was set, naming both times, so a stale brief is
+  read against that mail. The state keeps the newest such message as
+  `mail_since_brief`, from the order of events. Required by the operator on
+  2026-10-30. From the round 6 review, `line_status` gives the same fact under its
+  brief as `operator_mail_since`, and a time the event log does not give is looked
+  up once only.
 - Operator line configuration may set `fresh_session_each_turn` for Claude Code or
   Codex. Each turn starts without the prior engine session, context handoff or standing
   brief, while the mail that starts the turn is still delivered. The scheduler records

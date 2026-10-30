@@ -126,8 +126,8 @@ in this section.
 
 **`line_status`.** It takes optional `detail` and `lists` booleans, both false by
 default. The compact JSON answer includes the line's `line_id`, `state`, `condition`,
-`held_by`, autonomous turn and cost summaries, `scheduled_wake`, unread and pending
-message counts, `model`, `strategy`, a short context summary and daemon version and
+`held_by`, autonomous turn and cost summaries, `scheduled_wake`, the mail counts
+`unread`, `unanswered` and, from 2026-10-30, `own_notes`, the pending message count, `model`, `strategy`, a short context summary and daemon version and
 commit. It also includes a `commits` object with the worktree commit, the daemon commit
 and a sentence citing both. It includes counts of leases, background tasks, recent turns and other lines,
 not their contents. The default answer and every response that includes lists are
@@ -385,14 +385,30 @@ headers of the newly delivered mail follow, and bodies stay in the mailbox.
   none asks a reply of the line. The state the event log builds keeps
   every such question's identifier from its `line_held` event, so the rule survives a
   restart. **Decided by the operator on 2026-10-26** in round 2.
-- **Own notes from earlier turns.** **Requested by the operator on 2026-10-28, and
-  the rule decided by core for review.** The summary's unread count leaves out a note
-  from the line to itself, a fired wake or a task-end note, that is still unread and
-  was delivered to an earlier turn, and the sentence then says how many it left out.
-  Such a note was shown to that turn, which dealt with it or chose not to, and a wake
-  that fires after its work is done is otherwise acknowledged unopened and counted
-  unread for good. Mail from anyone else is never left out, and `line_status` and
-  `list_mail` count and list every unread message.
+- **Own notes.** **Required by the operator on 2026-10-30, the rule decided by core
+  for review.** A note from the line to itself, such as a fired wake, a task-end note
+  or a compaction request, is never counted in `unread`, and is counted in
+  `own_notes` instead, so nothing is hidden. One rule, `dromon.mailbox.summary`,
+  gives the counts to every view, the wake prompt's sentence, `line_status`, the
+  first line of `list_mail`, and the client's `mail` and line entries, so all give
+  the same figures for one mailbox. Mail from an operator, another line, an agent, a
+  remote party or the harness is always counted in `unread`. A prompt still
+  announces an own note it delivers, with its header as for every message.
+  **Review r6, finding 1.** `list_mail` with `unread_only` lists exactly what `unread`
+  counts, so it leaves out own notes, and with `own_notes_only` it lists exactly
+  what `own_notes` counts. The two select different messages, so giving both is
+  refused. The client's `mail` request has no `own_notes_only`, and its `unread_only`
+  follows the same rule. **Review r6, finding 6.** An own note leaves `own_notes`
+  once the line opens it, acknowledges it or replies to it. Lines already acknowledge
+  fired wakes without opening them, so the count stays near the notes still waiting
+  rather than growing with every wake. From 2026-10-28 until
+  this rule, only the wake prompt left such notes out, and only those delivered to an
+  earlier turn, so `line_status` counted them and the two disagreed. **Decided by core
+  for review.** A prompt that delivers an own note does not mark it read, since the
+  prompt shows its header and never its body, and marking it would change no count.
+  **Porting note.** The rule is a pure function of the state and adds no event, so a
+  port carries it unchanged. The sentence's wording changed, and so did the
+  `MailSummary` field, from `collapsed` to `own_notes`.
 - **A moved worktree.** **Requested by the operator on 2026-10-28.** When the commit
   checked out in the line's working directory differs from the one it held when the
   line's last turn ended, as after an operator commits or merges the line's work, the
@@ -585,6 +601,24 @@ the intent itself, in the line's own words, set with `set_brief` and recorded as
   commit then, says that it is the line's own earlier text and may be stale, and
   delimits the brief between `BEGIN STANDING BRIEF DATA` and `END STANDING BRIEF DATA`
   as JSON.
+- **Mail since the brief.** **Required by the operator on 2026-10-30.** The review
+  line's brief was stale after a compaction, since its task had changed in mail since
+  the brief was set. When an operator has mailed the line since its latest
+  `brief_set`, the lead adds one sentence that says so, naming the time the brief was
+  set and the time of the newest such mail, and that the task may have changed in
+  that mail. The brief itself is unchanged. Which mail is newer comes from the order
+  of events, which the state keeps as `mail_since_brief`, so replay agrees. The time
+  comes from the daemon's own record of the mail it sent, or after a restart from
+  that message's `recorded_at` in the event log, and where neither gives one the
+  sentence says so. Mail from other lines, agents, peers and the harness does not
+  count. **Porting note.** `recorded_at` is still never read by the model, and the
+  scheduler reads it from the log at most once for each such message after a
+  restart, keeping a time the log does not give as well, from review r6 finding 7.
+  **Review r6, finding 8.** `line_status` gives the same fact under its `brief` as
+  `operator_mail_since`, with `message_id` and `sent_at`, which is `null` where the
+  log gives no time, or `null` when no operator mail came since the brief, in both
+  its compact and detailed views, so a turn that does not lead with the brief can
+  see it.
 - **Where else it is shown.** `line_status` gives the whole brief in its detailed view
   and its task and next action, cut to 400 bytes, in its compact one, each under
   `untrusted_data` with a note that the line wrote it. The role transition package
