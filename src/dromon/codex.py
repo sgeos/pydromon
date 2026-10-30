@@ -1051,6 +1051,11 @@ class CodexLine:
         self._context: int | None = None
         """The context the last engine call's usage gave, kept on this engine."""
 
+    @property
+    def environment_for_status(self) -> Mapping[str, str]:
+        """The environment this adapter uses to choose its shell."""
+        return self._environment
+
     def request_compaction(
         self,
         reason: str = COMPACTION_REQUESTED,
@@ -1129,6 +1134,8 @@ class CodexLine:
             environment = engine_environment(
                 self._environment,
                 self.driver.settings.strategy,
+                # unsupported() limits Codex built-ins to Bash, Edit and Write, so
+                # Codex offers neither Claude Code's Monitor nor PowerShell tool.
                 require_shell="Bash" in self.config.builtin_tools,
             )
             # For the launcher, which removes both before the app-server starts and

@@ -969,6 +969,20 @@ def test_codex_bash_refuses_missing_shell() -> None:
     assert server.sent == []
 
 
+def test_codex_bash_refuses_nonexistent_shell_path() -> None:
+    server = FakeServer()
+    missing = "/path/that/does/not/exist/dromon-test-shell"
+    with pytest.raises(EngineRefused, match="SHELL must name an executable file"):
+        run(
+            line(
+                server,
+                config=LineConfig(builtin_tools=("Bash",)),
+                environment={"PATH": "/bin", "SHELL": missing},
+            )
+        )
+    assert server.sent == []
+
+
 def test_a_redirected_provider_is_always_refused() -> None:
     for strategy in Strategy:
         with pytest.raises(EngineRefused, match="OPENAI_BASE_URL"):

@@ -142,23 +142,29 @@ custom MCP server configuration.
 
 When a line is given a shell tool, Dromon requires the daemon's `SHELL` value to be an
 absolute path to an executable file. A missing value, relative path or non-executable
-file refuses the turn before the engine starts. `line_status` reports the path, or
-`unavailable` when validation fails.
+file refuses the turn before the engine starts. Claude Code additionally accepts only
+paths named `bash` or `zsh`, as required by its override. `line_status` reports whether
+the line requires a shell, the path its adapter will use, or the validation reason.
 
 The pinned Agent SDK source merges `ClaudeAgentOptions.env` into the CLI subprocess
-environment. The bundled Claude Code executable contains both the `CLAUDE_CODE_SHELL`
-environment name and an error directing users to set `SHELL` to a recognized shell.
-**Fact.** Both names occur in the pinned local executable. **Inference.**
-`CLAUDE_CODE_SHELL` selects the Bash tool's inner shell. Dromon sets both it and `SHELL`
-to the validated daemon value, so the explicit override and child process environment
-agree. No live Claude Code turn was used to determine this.
+environment. **Fact.** The bundled Claude Code executable contains the strings
+`Using shell override:`, `CLAUDE_CODE_SHELL=`, `is not a valid bash/zsh path, falling
+back to detection`, and `No suitable shell found. Claude CLI requires a Posix shell
+environment. Please ensure you have a valid shell installed and the SHELL environment
+variable set.` **Inference.** Claude Code reads `CLAUDE_CODE_SHELL` as an override and
+accepts only a Bash or Zsh path. Dromon sets both `SHELL` and `CLAUDE_CODE_SHELL` to the
+same validated path. The launcher relays only those adapter-selected values and drops
+the daemon's own values, including for Claude Code lines without shell tools. No live
+Claude Code turn was used to confirm selection.
 
 Codex receives the validated `SHELL` in its app-server environment and in
 `shell_environment_policy.set`, which the adapter uses for shell command variables.
 **Inference.** The app-server selects its shell from `SHELL`, since the adapter has no
 separate shell setting and previously omitted the variable. No live Codex turn was used
-to confirm that selection. If a later Codex interface provides a documented shell
-executable setting, it should replace this inference.
+to confirm that selection. The Codex adapter supports `Bash`, `Edit` and `Write` only,
+so it has neither Claude Code's `Monitor` nor `PowerShell` tool. If a later Codex
+interface provides a documented shell executable setting, it should replace this
+inference.
 
 ## Minimum versions
 

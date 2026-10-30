@@ -604,7 +604,12 @@ def test_a_claude_line_relays_its_command_past_the_launchers_filter(
     daemon = {COMMAND_VARIABLE: "ssh -i stolen", relayed: "x"}
     given = ClaudeCodeLine(driver, tmp_path, environment=daemon, git_ssh=access)
     plain = ClaudeCodeLine(driver, tmp_path, environment=daemon)
-    assert tuple(environment(access)) == launcher.RELAYED_VARIABLES
+    assert environment(access) == {COMMAND_VARIABLE: ssh_command(access)}
+    assert set(launcher.RELAYED_VARIABLES) >= {
+        COMMAND_VARIABLE,
+        "SHELL",
+        "CLAUDE_CODE_SHELL",
+    }
     assert given.options().env[relayed] == ssh_command(access)
     assert plain.options().env[relayed] == ""
     assert COMMAND_VARIABLE not in given.options().env

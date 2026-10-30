@@ -155,7 +155,7 @@ from dromon.engine_environment import (
     SHELL_VARIABLE,
     TOOL_SEARCH_PINNED,
     TOOL_SEARCH_VARIABLE,
-    selected_shell,
+    selected_claude_shell,
 )
 from dromon.lineconfig import DEFAULT_CONFIG, ConfigError, LineConfig
 from dromon.model import format_due
@@ -1871,6 +1871,9 @@ def launch_environment(
     environment.update(launcher.launch_environment(claude_cli(), stop_policy))
     environment[launcher.FILTER_ENVIRONMENT_VARIABLE] = "1"
     given = gitssh.environment(git_ssh)
+    if shell is not None:
+        given[SHELL_VARIABLE] = shell
+        given[CLAUDE_SHELL_VARIABLE] = shell
     for name in launcher.RELAYED_VARIABLES:
         environment[launcher.relayed(name)] = given.get(name, "")
     if mark is not None:
@@ -2069,9 +2072,14 @@ class ClaudeCodeLine:
         if not (SHELL_TOOLS & set(self.config.builtin_tools)):
             return None
         try:
-            return selected_shell(self._environment)
+            return selected_claude_shell(self._environment)
         except ValueError as error:
             raise EngineRefused(f"Claude Code shell unavailable: {error}") from error
+
+    @property
+    def environment_for_status(self) -> Mapping[str, str]:
+        """The environment this adapter uses to choose its shell."""
+        return self._environment
 
     def _leaves_background(self) -> bool:
         """Whether the line's stop policy leaves its background work running when its

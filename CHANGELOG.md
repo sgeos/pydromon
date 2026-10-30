@@ -8,12 +8,14 @@ All notable changes are recorded here. The format follows
 ### Fixed
 
 - Claude Code and Codex lines granted a shell tool now require the daemon's `SHELL` to
-  name an absolute executable. Claude Code receives both `SHELL` and its explicit
-  `CLAUDE_CODE_SHELL` override, and Codex receives `SHELL` in its app-server and
-  shell command environments. **Reported on 2026-10-29** by a worker line in another
-  project whose shell changed from bash to zsh between turns. `line_status` shows the
-  selected path. `check_disclosure` now explains where the project configures a list
-  and that a check cannot resolve without one.
+  name an absolute executable. Claude Code additionally requires Bash or Zsh and
+  receives the validated path as both `SHELL` and `CLAUDE_CODE_SHELL`, and the launcher
+  drops inherited shell values from lines without shell tools. Codex supports Bash as
+  its only shell tool and receives `SHELL` in its app-server and shell command
+  environments. `line_status` reports the line adapter's selected path or validation
+  reason. **Reported on 2026-10-29** by a worker line in another project whose shell
+  changed from bash to zsh between turns. `check_disclosure` now explains where the
+  project configures a list and that a check cannot resolve without one.
 
 ### Added
 

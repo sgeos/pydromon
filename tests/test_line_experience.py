@@ -833,10 +833,62 @@ def test_codex_lines_get_a_writable_cache_unless_one_is_set() -> None:
 def test_line_status_names_the_selected_shell(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    world.scheduler.configure_line("alpha", LineConfig(builtin_tools=("Bash",)))
     monkeypatch.setenv("SHELL", "/bin/bash")
     text, error = world.call("line_status", {"detail": False, "lists": False})
     assert not error
-    assert json.loads(text)["shell"] == "/bin/bash"
+    shell = json.loads(text)["shell"]
+    assert shell["required"] is True
+    assert shell["path"] == "/bin/bash"
+    assert shell["reason"] is None
+
+
+def test_line_status_uses_adapter_environment_and_reports_failure(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shell = tmp_path / "bash"
+    shell.write_text("#!/bin/sh\nexit 0\n")
+    shell.chmod(0o755)
+    world.scheduler.configure_line("alpha", LineConfig(builtin_tools=("Bash",)))
+    adapter = object.__new__(ClaudeCodeLine)
+    object.__setattr__(adapter, "_environment", {"SHELL": str(shell)})
+    adapter.sandbox = None
+    adapter.cwd = world.root
+    adapter.config = LineConfig(builtin_tools=("Bash",))
+    object.__setattr__(adapter, "_kept", None)
+    cast(dict[str, Any], object.__getattribute__(world.scheduler, "_engines"))[
+        "alpha"
+    ] = adapter
+    monkeypatch.setenv("SHELL", "/daemon/different/shell")
+
+    text, error = world.call("line_status", {"detail": False, "lists": False})
+    assert not error
+    status = json.loads(text)["shell"]
+    assert status == {"required": True, "path": str(shell), "reason": None}
+
+    object.__setattr__(adapter, "_environment", {"SHELL": "/missing/adapter/shell"})
+    text, error = world.call("line_status", {"detail": False, "lists": False})
+    assert not error
+    status = json.loads(text)["shell"]
+    assert status == {
+        "required": True,
+        "path": None,
+        "reason": "SHELL must name an executable file",
+    }
+
+
+def test_line_status_does_not_require_shell_when_line_has_no_shell_tool(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world.scheduler.configure_line("alpha", LineConfig(builtin_tools=("Read",)))
+    monkeypatch.setenv("SHELL", "/missing/daemon/shell")
+    text, error = world.call("line_status", {"detail": False, "lists": False})
+    assert not error
+    assert json.loads(text)["shell"] == {
+        "required": False,
+        "path": None,
+        "reason": None,
+    }
 
 
 # Review round 1: the write walk, the path check, the repeat memory, the cache.

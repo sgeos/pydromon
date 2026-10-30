@@ -42,9 +42,15 @@ def selected_shell(environment: Mapping[str, str]) -> str:
     return value
 
 
+def selected_claude_shell(environment: Mapping[str, str]) -> str:
+    """Return Claude Code's supported Bash or Zsh executable."""
+    value = selected_shell(environment)
+    if Path(value).name not in {"bash", "zsh"}:
+        raise ShellSelectionError("Claude Code requires SHELL to name bash or zsh")
+    return value
+
+
 CLAUDE_ENGINE_ENVIRONMENT: tuple[str, ...] = (
-    SHELL_VARIABLE,
-    CLAUDE_SHELL_VARIABLE,
     "USER",
     "LOGNAME",
     TOOL_SEARCH_VARIABLE,

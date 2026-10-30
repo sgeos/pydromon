@@ -202,6 +202,56 @@ def test_claude_shell_override_is_forwarded(
     environment = launch_environment(None, StopPolicy.KILL_ALL, "/bin/bash")
     assert environment["SHELL"] == "/bin/bash"
     assert environment["CLAUDE_CODE_SHELL"] == "/bin/bash"
+    assert environment[engine_module.launcher.relayed("SHELL")] == "/bin/bash"
+    assert (
+        environment[engine_module.launcher.relayed("CLAUDE_CODE_SHELL")] == "/bin/bash"
+    )
+
+
+def test_claude_line_without_shell_tool_drops_daemon_shell_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(engine_module, "claude_cli", lambda: "/bin/claude")
+
+    def fake_launch(target: str, policy: StopPolicy) -> dict[str, str]:
+        del policy
+        return {"DROMON_TEST_TARGET": target}
+
+    monkeypatch.setattr(engine_module.launcher, "launch_environment", fake_launch)
+    environment = launch_environment(None, StopPolicy.KILL_ALL, None)
+    assert "SHELL" not in environment
+    assert "CLAUDE_CODE_SHELL" not in environment
+    assert environment[engine_module.launcher.relayed("SHELL")] == ""
+    assert environment[engine_module.launcher.relayed("CLAUDE_CODE_SHELL")] == ""
+
+    filtered = {
+        "SHELL": "/daemon/unvalidated/shell",
+        "CLAUDE_CODE_SHELL": "/daemon/unvalidated/override",
+        **environment,
+    }
+    engine_module.launcher.unrelayed(filtered)
+    assert "SHELL" not in filtered
+    assert "CLAUDE_CODE_SHELL" not in filtered
+
+
+def test_claude_plain_line_forwards_no_inherited_shell_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(engine_module, "claude_cli", lambda: "/bin/claude")
+    session = Scripted([init(), say(TextBlock("ready")), result()])
+    target = line(
+        session,
+        environment={
+            "SHELL": "/daemon/unvalidated/shell",
+            "CLAUDE_CODE_SHELL": "/daemon/unvalidated/override",
+        },
+    )
+    run(target)
+    environment = session.options[0].env
+    assert environment[engine_module.launcher.relayed("SHELL")] == ""
+    assert environment[engine_module.launcher.relayed("CLAUDE_CODE_SHELL")] == ""
+    assert "SHELL" not in environment
+    assert "CLAUDE_CODE_SHELL" not in environment
 
 
 def test_a_plain_turn_reports_text_capabilities_and_session() -> None:
