@@ -28,8 +28,36 @@ from typing import Final
 MAX_TERMS_FILE_BYTES: Final = 1024 * 1024
 """The largest disclosure list read, so a mistaken path cannot exhaust memory."""
 
+
 REFUSAL: Final = "the text contains a term from the project's disclosure list"
-"""The whole of what a refusal says, so that it never reveals which term matched."""
+"""What a refusal says when it cannot name the field, so it never reveals which term
+or which field matched."""
+
+
+def field_refusal(fields: Iterable[str]) -> str:
+    """Name the call fields holding a listed term, without revealing the term."""
+    names = tuple(dict.fromkeys(fields))
+    if not names:
+        raise ValueError("a disclosure refusal must name at least one field")
+    joined = names[0] if len(names) == 1 else " and ".join(names)
+    noun, verb = ("field", "contains") if len(names) == 1 else ("fields", "contain")
+    return f"the {joined} {noun} {verb} a term from the project's disclosure list"
+
+
+def refusal(matched: Iterable[str], offered: int) -> str:
+    """The refusal for a call that offered ``offered`` fields with text, of which
+    ``matched`` hold a listed term. **Review r4, finding F1.** Naming the matched
+    fields of a call with several would answer one bit per field in one counted
+    refusal, so a line could test several candidate words for the price of one.
+    The field is therefore named only when the call offered text in one field, which
+    answers one bit as every refusal did before, and a line that wants a field named
+    sends it alone."""
+    names = tuple(dict.fromkeys(matched))
+    if not names:
+        raise ValueError("a disclosure refusal must name at least one field")
+    if offered == 1 and len(names) == 1:
+        return field_refusal(names)
+    return REFUSAL
 
 
 class DisclosureError(ValueError):

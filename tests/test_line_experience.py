@@ -14,9 +14,9 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import __version__
+from dromon import __version__, disclosure
 from dromon.codex import default_cache_home, engine_environment
-from dromon.disclosure import REFUSAL, load_terms
+from dromon.disclosure import load_terms
 from dromon.driver import Driver, Strategy
 from dromon.engine import CLAUDE_CODE_PROMPT_MARK, ClaudeCodeLine, TurnReport
 from dromon.eventlog import EventLog, read_entries
@@ -363,7 +363,8 @@ def test_line_status_lists_have_a_hard_size_bound(
 def test_every_prompt_opens_with_the_budget(world: World) -> None:
     first = world.turn("one")
     assert first.splitlines()[0] == (
-        "Autonomous turns used: 0 of 5. Estimated cost since your last release:"
+        "Autonomous turns in a row without operator mail: 0 of 5."
+        " Estimated cost since your last release:"
         " $0.00 of $3.00. A line past either is held. An operator's mail started"
         " this turn, so the count of autonomous turns starts again from 0 when it"
         " ends."
@@ -371,13 +372,14 @@ def test_every_prompt_opens_with_the_budget(world: World) -> None:
     assert first.splitlines()[1] == "1 new message. 1 unread. 1 unanswered."
     world.scheduler.send(LineAddress("beta"), LineAddress("alpha"), "from beta")
     second = world.turn(sender=LineAddress("beta"))
-    assert second.startswith("Autonomous turns used: 0 of 5.")
+    assert second.startswith("Autonomous turns in a row without operator mail: 0 of 5.")
     assert second.splitlines()[0].endswith(
         "This turn is autonomous, so the count becomes 1 when it ends."
     )
     third = world.turn("again", sender=LineAddress("beta"))
     assert third.startswith(
-        "Autonomous turns used: 1 of 5. Estimated cost since your last release:"
+        "Autonomous turns in a row without operator mail: 1 of 5."
+        " Estimated cost since your last release:"
         " $0.50 of $3.00."
     )
 
@@ -733,7 +735,9 @@ def test_write_scratch_refuses_large_or_disclosing_text_and_bad_arguments(
     (tmp_path / "terms").write_text("codename\n")
     world.scheduler.set_disclosure_terms(load_terms(tmp_path / "terms"))
     text, error = world.call("write_scratch", {"path": "n", "text": "the Codename"})
-    assert (text, error) == (REFUSAL, True)
+    # A path and a text are both offered, so the refusal names neither, per review r4
+    # finding F1.
+    assert (text, error) == (disclosure.REFUSAL, True)
     assert not (world.root / "tmp" / "n").exists()
     text, error = world.call("write_scratch", {"path": 3, "text": "x"})
     assert error and "must be text" in text
@@ -874,7 +878,7 @@ def test_the_disclosure_check_covers_the_scratch_path(
     text, error = world.call(
         "write_scratch", {"path": "the-codename-notes.md", "text": "clean"}
     )
-    assert (text, error) == (REFUSAL, True)
+    assert (text, error) == (disclosure.REFUSAL, True)
     assert not (world.root / "tmp").exists()
 
 
@@ -1008,7 +1012,17 @@ def test_a_refusal_for_disclosure_spends_a_check(
 ) -> None:
     listed(world, tmp_path)
     text, error = world.call(name, args)
-    assert error and text == REFUSAL
+    field = {
+        "send_message": "body",
+        "ask_operator": "question",
+        "wake_after": "note",
+        "write_scratch": None,
+    }[name]
+    assert error and text == (
+        disclosure.REFUSAL
+        if field is None
+        else f"the {field} field contains a term from the project's disclosure list"
+    )
     assert [event.matched_lines for event in checks(world)] == [1]
     text, error = world.call("check_disclosure", {"text": "clean"})
     assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 2} of" in text
@@ -1026,7 +1040,7 @@ def test_the_role_and_proposal_tools_spend_a_check_too(
         lambda: scheduler.propose_change("alpha", "codename", ["a.py"], "patch"),
     ]
     for call in calls:
-        with pytest.raises(LineToolRefused, match=REFUSAL):
+        with pytest.raises(LineToolRefused, match="contains a term"):
             call()
     assert len(checks(world)) == len(calls)
 
@@ -1044,7 +1058,9 @@ def test_a_spent_limit_holds_the_line_and_answers_nothing_more(
     listed(world, tmp_path)
     for _ in range(MAX_DISCLOSURE_CHECKS):
         text, error = world.call("send_message", {"to": "@ana", "body": "codename"})
-        assert error and text == REFUSAL
+        assert error and text == (
+            "the body field contains a term from the project's disclosure list"
+        )
     assert world.log.state.lines["alpha"].held_by is None
     text, error = world.call("send_message", {"to": "@ana", "body": "codename"})
     assert error and text == DISCLOSURE_HELD
@@ -1453,12 +1469,17 @@ def test_list_mail_notes_stay_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
 # The operator's requests after phase 2 of federation, decided on 2026-10-28.
 
 MOVED = "The commit checked out in your worktree moved"
+SKIPPED = (
+    "The daemon holds no record of the commit checked out in your worktree when an"
+    " earlier turn of yours ended"
+)
 
 
 def test_a_turn_is_told_once_when_its_worktree_head_moved(world: World) -> None:
     """A line learns at its next turn that an operator committed or merged its work,
-    with the commits before and after. A first commit, a turn with no move, and a
-    worktree outside a checkout tell nothing."""
+    with the commits before and after. A turn with no move and a worktree outside a
+    checkout tell nothing. A first commit after a turn that recorded none is told
+    as a skipped check, once."""
     outside = world.turn("one")
     checkout(world.root, "a" * 40)
     appeared = world.turn("two")
@@ -1466,7 +1487,17 @@ def test_a_turn_is_told_once_when_its_worktree_head_moved(world: World) -> None:
     checkout(world.root, "b" * 40)
     moved = world.turn("four")
     after = world.turn("five")
+    prompts = (outside, appeared, still, moved, after)
     assert all(MOVED not in prompt for prompt in (outside, appeared, still, after))
+    assert [SKIPPED in prompt for prompt in prompts] == [
+        False,
+        True,
+        False,
+        False,
+        False,
+    ]
+    assert appeared.startswith(f"{SKIPPED}, so it could not check")
+    assert f"Your worktree is at {'a' * 12} now" in appeared
     assert moved.startswith(
         f"{MOVED} from {'a' * 12} to {'b' * 12} since your last turn ended."
         f" git log --oneline {'a' * 12}..{'b' * 12} lists the commits between"
@@ -1486,6 +1517,20 @@ def test_a_moved_worktree_notice_survives_a_daemon_restart(world: World) -> None
         f"{MOVED} from {'a' * 12} to {'b' * 12} since your last turn ended."
         f" git log --oneline {'a' * 12}..{'b' * 12} lists the commits between"
     )
+
+
+def test_a_line_with_no_turn_end_commit_is_told_the_check_was_skipped_once(
+    world: World,
+) -> None:
+    """Task of 2026-10-29, the core report's request 1. A line whose earlier turns
+    ended under a daemon that recorded no turn-end commit, here a log with no
+    ``line_turn_ended`` for it, is told once that the check was skipped."""
+    checkout(world.root, "a" * 40)
+    assert "alpha" not in world.log.state.last_turn_commits
+    first = world.turn("first")
+    second = world.turn("second")
+    assert first.startswith(SKIPPED) and MOVED not in first
+    assert SKIPPED not in second and MOVED not in second
 
 
 def test_own_notes_shown_to_an_earlier_turn_leave_unread(world: World) -> None:

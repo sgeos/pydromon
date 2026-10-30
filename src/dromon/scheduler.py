@@ -1907,8 +1907,18 @@ class Scheduler:
             # Decision 3 of the federation design. Mail to a peer leaves the project,
             # so an operator's is held to the disclosure list too, and so is the
             # sender's address, which the envelope carries.
-            if self.discloses(body, str(sender)):
-                raise EventRejected(disclosure.REFUSAL)
+            envelope = (("body", body), ("sender", str(sender)))
+            disclosing_fields = tuple(
+                name
+                for name, text in envelope
+                if disclosure.discloses(self._disclosure, (text,))
+            )
+            if disclosing_fields:
+                raise EventRejected(
+                    disclosure.refusal(
+                        disclosing_fields, sum(1 for _, text in envelope if text)
+                    )
+                )
             if priority and isinstance(sender, LineAddress):
                 try:
                     self._priority.check(sender.line_id, None)
@@ -2355,9 +2365,13 @@ class Scheduler:
             if not isinstance(urgent, bool):
                 return _tool_error("priority must be true or false")
             refusal = (
-                self.refuse_disclosed(sender.line_id, body)
+                self.refuse_disclosed(sender.line_id, ("body", body))
                 if isinstance(sender, LineAddress)
-                else (disclosure.REFUSAL if self.discloses(body) else None)
+                else (
+                    disclosure.field_refusal(("body",))
+                    if self.discloses(body)
+                    else None
+                )
             )
             if refusal is not None:
                 return _tool_error(refusal)
@@ -2487,7 +2501,9 @@ class Scheduler:
             ):
                 return _tool_error("choices must be a list of text")
             refusal = self.refuse_disclosed(
-                line_id, question, *cast(list[str], choices)
+                line_id,
+                ("question", question),
+                ("choices", "\n".join(cast(list[str], choices))),
             )
             if refusal is not None:
                 return _tool_error(refusal)
@@ -2687,7 +2703,7 @@ class Scheduler:
                 return _tool_error(
                     "task_id must name one of your running background tasks"
                 )
-            refusal = self.refuse_disclosed(line_id, note)
+            refusal = self.refuse_disclosed(line_id, ("note", note))
             if refusal is not None:
                 return _tool_error(refusal)
             replaced = self._log.state.scheduled.get(line_id)
@@ -2900,7 +2916,8 @@ class Scheduler:
             else f"${cost:.2f} and {unknown} turns of unknown cost"
         )
         line = (
-            f"Autonomous turns used: {used} of {limits.max_autonomous_turns}."
+            f"Autonomous turns in a row without operator mail: {used} of"
+            f" {limits.max_autonomous_turns}."
             f" Estimated cost since your last release: {spent} of"
             f" ${limits.max_cost_usd:.2f}. A line past either is held. {counting}"
         )
@@ -2958,8 +2975,9 @@ class Scheduler:
         the turn, so a status read later in the same turn shows it. Its ``cause`` is
         ``compact_session`` or ``auto_compact_tokens`` for one Dromon asked for, whose
         ``trigger`` the engine reports as manual, and ``engine`` for one the engine
-        made by itself. A ``compact_session`` compaction withdraws the wake that call
-        scheduled, which has nothing left to do. The context estimate becomes the
+        made by itself. Any reported compaction withdraws a still-pending wake that
+        ``compact_session`` scheduled, since the session is now compacted. The context
+        estimate becomes the
         size the compaction left, or the engine's own estimate of it with its
         ``after_estimate_note``, as Pi gives, or unknown when the engine reported
         neither, until the turn's own calls estimate it again.
@@ -3007,8 +3025,18 @@ class Scheduler:
             self._context_source.pop(line_id, None)
             # Whether it got below the threshold is unknown, so it is held.
             self._auto_held.add(line_id)
-        if cause != COMPACT_SESSION_TOOL_NAME:
-            return
+            # The round 4 report of core. The daemon's context-warning wake is
+            # withdrawn when a reported size falls below the warning, which a
+            # compaction that reports no size never gives, so the wake fired as a
+            # reminder after the fact. A sized compaction is left to that check.
+            try:
+                self._withdraw_pending_context_wake(line_id)
+            except Exception as error:  # noqa: BLE001
+                print(
+                    f"dromond: line {line_id}'s context wake could not be withdrawn:"
+                    f" {error}",
+                    file=sys.stderr,
+                )
         try:
             record["withdrawn_wake"] = self._withdraw_compact_wake(line_id)
         except Exception as error:  # noqa: BLE001
@@ -3065,6 +3093,21 @@ class Scheduler:
             self._withdraw_context_compaction_wake(line_id)
         else:
             self._ensure_context_compaction_wake(line_id)
+
+    def _withdraw_pending_context_wake(self, line_id: str) -> None:
+        """Withdraw the daemon's context-warning wake if it is still scheduled, and
+        leave one that has fired, whose turn's end still reads its identifier."""
+        context_wake = self._context_compaction_wake_ids.get(line_id)
+        pending = self._log.state.scheduled.get(line_id)
+        if (
+            context_wake is None
+            or pending is None
+            or pending.message_id != context_wake
+        ):
+            return
+        self._log.append(WakeWithdrawn(line_id, context_wake))
+        self._context_compaction_wake_ids.pop(line_id, None)
+        self._context_compaction_wakes.discard(line_id)
 
     def _withdraw_context_compaction_wake(self, line_id: str) -> None:
         """Withdraw an auto wake that no longer has a compaction to perform."""
@@ -3698,7 +3741,7 @@ class Scheduler:
         data = text.encode("utf-8")
         if len(data) > MAX_SCRATCH_BYTES:
             raise LineToolRefused(f"text is over {MAX_SCRATCH_BYTES} bytes")
-        refusal = self.refuse_disclosed(line_id, text, path)
+        refusal = self.refuse_disclosed(line_id, ("text", text), ("path", path))
         if refusal is not None:
             raise LineToolRefused(refusal)
         workdir = self._workdir_of(line_id)
@@ -3789,9 +3832,9 @@ class Scheduler:
         )
         return reopens if now < reopens else None
 
-    def refuse_disclosed(self, line_id: str, *texts: str) -> str | None:
+    def refuse_disclosed(self, line_id: str, *fields: tuple[str, str]) -> str | None:
         """**Decided by the operator on 2026-10-28.** The refusal a line tool gives
-        for ``texts``, or None when it may proceed. A refusal for disclosure answers
+        for ``fields``, or None when it may proceed. A refusal for disclosure answers
         whether the text holds a listed term, the same oracle ``check_disclosure``
         is, so it counts against the same limit and is recorded as
         ``disclosure_checked``. Once the limit is spent, the line is held and an
@@ -3804,11 +3847,18 @@ class Scheduler:
         release clears this hold too."""
         if line_id in self._disclosure_spent:
             return DISCLOSURE_HELD
-        if not self.discloses(*texts):
+        texts = tuple(text for _, text in fields)
+        offered = sum(1 for text in texts if text)
+        matched_fields = tuple(
+            name
+            for name, text in fields
+            if disclosure.discloses(self._disclosure, (text,))
+        )
+        if not matched_fields:
             return None
         line = self._log.state.lines.get(line_id)
         if line is None:
-            return disclosure.REFUSAL
+            return disclosure.refusal(matched_fields, offered)
         now = self._wall_clock()
         if self._disclosure_reopens(line_id, now) is None:
             matched = sum(
@@ -3819,7 +3869,7 @@ class Scheduler:
                     line_id, format_due(now), min(matched, MAX_DISCLOSURE_MATCHES)
                 )
             )
-            return disclosure.REFUSAL
+            return disclosure.refusal(matched_fields, offered)
         self._disclosure_spent.add(line_id)
         if line.held_by is None:
             self.hold(
@@ -4304,7 +4354,7 @@ class Scheduler:
     def record_role_note(self, line_id: str, kind: RoleNoteKind, body: str) -> str:
         """Record ``body`` in ``line_id``'s role journal, stamped by the daemon, and
         return the entry's identifier. Raises ``LineToolRefused``."""
-        refusal = self.refuse_disclosed(line_id, body)
+        refusal = self.refuse_disclosed(line_id, ("body", body))
         if refusal is not None:
             raise LineToolRefused(refusal)
         try:
@@ -4343,7 +4393,11 @@ class Scheduler:
         except InvalidField as error:
             raise LineToolRefused(str(error)) from error
         refusal = self.refuse_disclosed(
-            line_id, task, decisions, next_action, *artifacts
+            line_id,
+            ("task", task),
+            ("decisions", decisions),
+            ("next_action", next_action),
+            ("artifacts", "\n".join(artifacts)),
         )
         if refusal is not None:
             raise LineToolRefused(refusal)
@@ -4419,7 +4473,7 @@ class Scheduler:
         one checked, and true says it waits. The former owner's engine is dropped
         when the change is made, so its next turn has no write access. Outside a
         turn the change is made at once. Raises ``LineToolRefused``."""
-        refusal = self.refuse_disclosed(line_id, note)
+        refusal = self.refuse_disclosed(line_id, ("note", note))
         if refusal is not None:
             raise LineToolRefused(refusal)
         if line_id in self._relinquish_pending:
@@ -4477,7 +4531,7 @@ class Scheduler:
             raise LineToolRefused(
                 f"reason must be text of 1 to {MAX_TAKE_REASON_BYTES} bytes"
             )
-        refusal = self.refuse_disclosed(line_id, reason)
+        refusal = self.refuse_disclosed(line_id, ("reason", reason))
         if refusal is not None:
             raise LineToolRefused(refusal)
         state = self._log.state
@@ -4930,8 +4984,10 @@ class Scheduler:
         **Task of 2026-10-29.** Every item says where it came from, observed by the
         daemon and when, reported by a line and when, unknown, or unreadable by the
         daemon. A failover takes a role with no handoff entry, so a field its
-        journal entry lacks is taken from the former owner's brief, and where
-        neither has it the field is unknown. A path git could not read is named as
+        journal entry lacks is taken from the former owner's brief. Where neither
+        has it, Task and Gate and coverage are filled from what the daemon observed,
+        as ``_observed_fields`` gives them, and any other field is unknown. A path
+        git could not read is named as
         unreadable and never as absent or untracked, since git leaves it out of its
         status without saying so there. The former owner is the seat the role
         passed from, or with none, as after a vacancy, the author of the entry."""
@@ -5024,6 +5080,7 @@ class Scheduler:
         brief_disclosed = brief is not None and self.discloses(
             brief.task, brief.decisions, brief.next_action, *brief.artifacts
         )
+        observed_fields = self._observed_fields(former)
         for label, shown_label in NOTE_FIELD_LABELS:
             value = journal.get(label)
             if value is not None and entry is not None:
@@ -5046,13 +5103,15 @@ class Scheduler:
                         f" {brief.set_at}, since the journal entry does not state it",
                     )
                 )
+            elif label in observed_fields:
+                lines.append(item(shown_label, *observed_fields[label]))
             else:
                 lines.append(
                     item(
                         shown_label,
                         "unknown",
                         "unknown, stated in neither a journal entry nor a standing"
-                        " brief",
+                        " brief, and not observed by the daemon",
                     )
                 )
         if brief is not None and brief.artifacts:
@@ -5074,6 +5133,63 @@ class Scheduler:
             f"{json.dumps(shown_body, ensure_ascii=True)}\nEND ROLE JOURNAL DATA"
         )
         return "".join(lines)
+
+    def _observed_fields(self, former: str | None) -> dict[str, tuple[object, str]]:
+        """The package fields the daemon observed itself for ``former``, each as its
+        value and its source, used only where the journal entry and the brief are
+        both silent. **Task of 2026-10-29.** Gate and coverage is the former owner's
+        latest task record and Task is the latest operator mail delivered to it.
+        Mail from a line, the harness, an agent or a peer never fills a field,
+        since only an operator holds operator authority. Each value is checked
+        against the disclosure list and withheld whole when it holds a term. The
+        latest task need not be a gate, and the latest mail need not state the
+        task, so each source says what it is. **Fact.** The state records no time
+        for a message, so the mail's source names its identifier only."""
+        if former is None:
+            return {}
+        fields: dict[str, tuple[object, str]] = {}
+        records = self._log.state.task_records.get(former, ())
+        if records:
+            record = records[-1]
+            gate: dict[str, object] = {
+                "command": _cut(record.command, 400),
+                "status": record.status,
+                "exit_code": record.exit_code,
+                "output_digest": record.output_digest,
+                "output_bytes": record.output_bytes,
+                "workdir_commit": record.workdir_commit or "unknown",
+            }
+            fields["Gate and coverage"] = (
+                ROLE_PACKAGE_WITHHELD
+                if self.discloses(record.command, record.status)
+                else gate,
+                f"observed by the daemon at {record.ended_at}, when background task"
+                f" {json.dumps(record.task_id, ensure_ascii=True)} of {former} ended."
+                " It is that line's latest recorded task and may not be a gate",
+            )
+        address = LineAddress(former)
+        mail = next(
+            (
+                (message_id, message)
+                for message_id, message in reversed(self._log.state.messages.items())
+                if message.recipient == address
+                and message.delivered
+                and isinstance(message.sender, OperatorAddress)
+            ),
+            None,
+        )
+        if mail is not None:
+            message_id, message = mail
+            text = _cut(message.body, MAX_PACKAGE_MAIL_BYTES)
+            if len(message.body.encode("utf-8", "replace")) > MAX_PACKAGE_MAIL_BYTES:
+                text += f" [first {MAX_PACKAGE_MAIL_BYTES} bytes]"
+            fields["Task"] = (
+                ROLE_PACKAGE_WITHHELD if self.discloses(message.body) else text,
+                f"operator mail {message_id} from {message.sender}, the latest"
+                f" delivered to {former}, observed by the daemon, which records no"
+                " time for mail. It may not state the task",
+            )
+        return fields
 
     def _former_processes(self, former: str | None) -> str:
         """The package's item on the processes the former owner left, which says
@@ -5366,7 +5482,12 @@ class Scheduler:
         """Store a bounded, disclosure-checked patch for operator review."""
         if self._root is None:
             raise LineToolRefused("this daemon does not know its project root")
-        refusal = self.refuse_disclosed(line_id, message, patch, *files)
+        refusal = self.refuse_disclosed(
+            line_id,
+            ("message", message),
+            ("patch", patch),
+            ("files", "\n".join(files)),
+        )
         if refusal is not None:
             raise LineToolRefused(refusal)
         workdir = str(self._workdir_of(line_id))
@@ -5469,8 +5590,8 @@ class Scheduler:
             return _tool_text(
                 "Your session will be compacted at the start of your next turn. A wake"
                 f" is scheduled for {due}, whose note arrives as {message_id}, so the"
-                " compaction does not wait for other mail. If an earlier turn makes"
-                " the compaction, the wake is withdrawn. The prompt gives the"
+                " compaction does not wait for other mail. Once the engine reports"
+                " any compaction, the pending wake is withdrawn. The prompt gives the"
                 " context before and after where the engine reports them."
             )
 
@@ -5481,7 +5602,7 @@ class Scheduler:
                 " summarizes the conversation so far so that each engine call re-reads"
                 " less. It schedules a wake for that turn, after 60 seconds or the"
                 " seconds given, unless a wake is already pending, and withdraws that"
-                " wake if an earlier turn makes the compaction. Use it only when"
+                " wake once any compaction is reported. Use it only when"
                 " context is at or past this line's warning. Your next prompt says"
                 " the context before and after."
             ),
@@ -6506,13 +6627,25 @@ class Scheduler:
         the commits between to ``git log``, because the daemon reads ``HEAD`` from a
         few small files and never runs git or reads its objects. A move during a turn,
         such as the line's own commit, is not told. The turn-end commit is recorded in
-        the event log, so the notice survives a daemon restart."""
-        if line_id not in self._log.state.last_turn_commits:
-            return None
-        before = self._log.state.last_turn_commits[line_id]
+        the event log, so the notice survives a daemon restart.
+
+        **Task of 2026-10-29.** Where no turn-end commit is recorded, as for a line
+        whose last turn ended under a daemon that did not record it or ended with
+        its worktree unreadable, the check is skipped and the turn is told so. This
+        happens once, since the turn's end records the commit. A worktree whose
+        commit cannot be read now is not told, since nothing could be compared."""
+        before = self._log.state.last_turn_commits.get(line_id)
         after = self._workdir_commit(line_id)
-        if before is None or after is None or before == after:
+        if after is None or before == after:
             return None
+        if before is None:
+            return (
+                "The daemon holds no record of the commit checked out in your"
+                " worktree when an earlier turn of yours ended, so it could not check"
+                f" whether that commit moved. Your worktree is at {after[:12]} now,"
+                " and git log and git status show what changed if you had turns"
+                " before."
+            )
         return (
             f"The commit checked out in your worktree moved from {before[:12]} to"
             f" {after[:12]} since your last turn ended. git log --oneline"
@@ -8172,6 +8305,10 @@ def _worktree_snapshot(
     )
     return status, diff, unreadable
 
+
+MAX_PACKAGE_MAIL_BYTES: Final = 600
+"""How much of the former owner's latest operator mail a role transition package
+shows as its Task, when no journal entry or brief states the task."""
 
 NOTE_FIELD_LABELS: Final = (
     ("Task", "Task"),
