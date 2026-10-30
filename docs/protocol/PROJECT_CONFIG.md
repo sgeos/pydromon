@@ -271,10 +271,14 @@ stops the start, or refuses the reload and keeps the previous list.
   The guard catches accidents and is not a barrier against a line that tries to evade
   it. Engine transcripts, which the engines keep themselves, are outside it.
 - **Checking before sending.** **Item B2 of 2026-10-28.** A line's `check_disclosure`
-  tool checks a `text`, or a `path` relative to its working directory, and answers
-  `pass` or `fail` with how many lines hold a listed term, compared as above, and
-  never which term. Each check is recorded as `disclosure_checked`, without the text
-  or its name, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies. **Proposed.** A line may
+  tool checks exactly one of `text`, a `path`, or a `paths` list of one to eight files
+  relative to its working directory, and answers `pass` or `fail` with how many lines
+  hold a listed term, compared as above, and never which term or which file matched.
+  The listed files are concatenated in order for one combined line count. Their total
+  size may not exceed 1 MiB. A file that cannot be read refuses the whole call without
+  recording a check. Each successful call, including a list, is recorded as one
+  `disclosure_checked` event, without the text or its name, as [`EVENT_LOG.md`](EVENT_LOG.md)
+  specifies. **Proposed.** A line may
   check at most 10 times in any 3,600 seconds, counted from the recorded times on the
   wall clock, so the limit survives a restart. Every answer says whether a text holds
   a term, so an unlimited check would let a line test candidate words one by one. A

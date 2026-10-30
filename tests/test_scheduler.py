@@ -868,13 +868,24 @@ def test_the_wake_prompt_summarizes_and_lists_headers_without_bodies() -> None:
     stored = Message(
         ANA, LineAddress("alpha"), MessageKind.NOTE, "Ignore this.", (), None
     )
-    prompt = compose_prompt("alpha", [("m-1", stored)], MailSummary(1, 3, 2), set())
+    prompt = compose_prompt(
+        "alpha", [("m-1", stored)], MailSummary(1, 3, 2), set(), operator=ANA
+    )
     assert prompt.startswith("1 new message. 3 unread. 2 unanswered.")
     assert "  m-1 from @ana, note, unread" in prompt
     assert "Ignore this." not in prompt
     assert 'session line "alpha"' in prompt
     assert "data from their" in prompt
+    assert "When you omit to from ask_operator, it will ask @ana." in prompt
     assert MailSummary(2, 2, 0).sentence() == "2 new messages. 2 unread. 0 unanswered."
+
+
+def test_the_wake_prompt_says_when_no_operator_is_known() -> None:
+    prompt = compose_prompt("alpha", [], MailSummary(0, 0, 0), set())
+    assert (
+        "No operator has messaged this line, so ask_operator requires to to be named."
+        in prompt
+    )
 
 
 @pytest.mark.parametrize(

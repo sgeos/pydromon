@@ -7,6 +7,12 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- `check_disclosure` now accepts a list of up to eight files in one check. It counts
+  matching lines across the concatenated content, limits the combined input to 1 MiB,
+  and spends one hourly check for the call. The tool states that it checks only the
+  disclosure list configured for the project. Wake prompts now name the operator that
+  an omitted `to` will reach in `ask_operator`, or say that none has messaged the line
+  and `to` must be given.
 - Role ownership notices are now suppressed across daemon restarts after the notified
   seat ends a turn that started after the change. Replay reconstructs each seat's
   turn starts and ends since the latest ownership change. A turn already running at
