@@ -11,15 +11,24 @@ whether the caller meant the first request or a new one.
 Only a call that acted is remembered. A refused call may be retried with its key, and
 acts when the cause of its refusal has gone.
 
+**Task of 2026-10-29, round 5.** The key is durable. A keyed call records its key and
+the digest of its other arguments as a ``RequestStamp`` in the event of its act, a
+``message_sent`` or a ``wake_scheduled``, so one append records both and no crash can
+leave the act without its key. The state keeps the acts by party, tool and key, and
+replay rebuilds them from the events alone, so a retry that crosses a daemon restart
+repeats the first result as one within the daemon's life does. Keys were once kept in
+memory only, which a restart forgot.
+
 Bounds and limits.
 - At most ``MAX_KEYS_PER_PARTY`` keys are kept for each party and tool, the oldest
-  forgotten first, so a party that cycles through more keys than that may act twice on
-  a key it reuses after it was forgotten.
-- Keys are kept in memory for the daemon's life, not in the event log, so a retry
-  that crosses a daemon restart acts again. The event log's format is unchanged.
-- A tool handler checks, acts and remembers with no ``await`` between, so in one
-  asyncio loop no other call interleaves. **Porting hazard.** A port that serves tools
-  from several threads must hold a lock across the three.
+  forgotten first, after replay as before it, so a party that cycles through more keys
+  than that may act twice on a key it reuses after it was forgotten.
+- The repeated result is rebuilt from the event of the act, so it does not depend on
+  what the daemon held in memory. Where it differs from the first result's text, the
+  tool that rebuilds it says so.
+- A tool handler checks, acts and records with no ``await`` between, so in one asyncio
+  loop no other call interleaves. **Porting hazard.** A port that serves tools from
+  several threads must hold a lock across the check and the append.
 """
 
 import hashlib
@@ -27,10 +36,18 @@ import json
 from collections.abc import Mapping
 from typing import Any, Final, cast
 
+from dromon.model import (
+    MAX_REQUEST_KEY_CHARS,
+    MAX_REQUEST_KEYS_PER_PARTY,
+    RequestedAct,
+    RequestStamp,
+    State,
+)
+
 REQUEST_KEY: Final = "request_key"
 """The argument each mutating line tool accepts."""
-MAX_KEY_LENGTH: Final = 128
-MAX_KEYS_PER_PARTY: Final = 256
+MAX_KEY_LENGTH: Final = MAX_REQUEST_KEY_CHARS
+MAX_KEYS_PER_PARTY: Final = MAX_REQUEST_KEYS_PER_PARTY
 
 REQUEST_KEY_PROPERTY: Final[dict[str, object]] = {
     "type": "string",
@@ -52,7 +69,7 @@ class RequestKeyRefused(ValueError):
     """A request key that is malformed, or was used for other arguments."""
 
 
-def _digest(arguments: Mapping[str, Any]) -> str:
+def digest_of(arguments: Mapping[str, Any]) -> str:
     """A digest of ``arguments`` without the key, independent of their order.
     Raises ``RequestKeyRefused`` for a value JSON cannot hold exactly, such as an
     object or a number that is not finite. **Review of 2026-10-27, K3.** Such values
@@ -86,58 +103,38 @@ def key_of(arguments: Mapping[str, Any]) -> str | None:
     return key
 
 
-class RequestKeys:
-    """The results of the keyed calls that acted, by party, tool and key."""
-
-    def __init__(self, limit: int = MAX_KEYS_PER_PARTY) -> None:
-        if limit < 1:
-            raise ValueError("the limit must be at least 1")
-        self._limit = limit
-        self._seen: dict[tuple[str, str], dict[str, tuple[str, dict[str, Any]]]] = {}
-
-    def earlier(
-        self, party: str, tool: str, arguments: Mapping[str, Any]
-    ) -> dict[str, Any] | None:
-        """The result of the earlier call this one repeats, with a note that it is a
-        repeat, or ``None`` when it repeats none. Raises ``RequestKeyRefused`` for a
-        malformed key, for arguments ``_digest`` refuses, which is checked here
-        before the call acts so that ``remember`` cannot fail after it, or for a key
-        used before with other arguments."""
-        key = key_of(arguments)
-        if key is None:
-            return None
-        current = _digest(arguments)
-        found = self._seen.get((party, tool), {}).get(key)
-        if found is None:
-            return None
-        digest, result = found
-        if digest != current:
-            raise RequestKeyRefused(
-                f"request_key {key!r} was used for a different {tool} call. Use a new"
-                " key for a new request"
-            )
-        return _repeated(result)
-
-    def remember(
-        self,
-        party: str,
-        tool: str,
-        arguments: Mapping[str, Any],
-        result: dict[str, Any],
-    ) -> None:
-        """Keep ``result`` for the key in ``arguments``, if any, forgetting the oldest
-        key of the party and tool beyond the limit."""
-        key = key_of(arguments)
-        if key is None:
-            return
-        seen = self._seen.setdefault((party, tool), {})
-        seen.pop(key, None)
-        seen[key] = (_digest(arguments), result)
-        while len(seen) > self._limit:
-            del seen[next(iter(seen))]
+def stamp_of(arguments: Mapping[str, Any]) -> RequestStamp | None:
+    """The stamp the act of a call with ``arguments`` records, or ``None`` when the
+    call gave no key. Raises ``RequestKeyRefused`` as ``key_of`` and ``digest_of``
+    do, before the call acts, so recording the act cannot fail on its key."""
+    key = key_of(arguments)
+    if key is None:
+        return None
+    return RequestStamp(key, digest_of(arguments))
 
 
-def _repeated(result: dict[str, Any]) -> dict[str, Any]:
+def earlier(
+    state: State, party: str, tool: str, arguments: Mapping[str, Any]
+) -> RequestedAct | None:
+    """The event of the earlier act this call repeats, or ``None`` when it repeats
+    none. Raises ``RequestKeyRefused`` for a malformed key, for arguments
+    ``digest_of`` refuses, or for a key the party used before on the tool with other
+    arguments."""
+    stamp = stamp_of(arguments)
+    if stamp is None:
+        return None
+    act = state.requests.get((party, tool), {}).get(stamp.key)
+    if act is None:
+        return None
+    if act.request is None or act.request.digest != stamp.digest:
+        raise RequestKeyRefused(
+            f"request_key {stamp.key!r} was used for a different {tool} call. Use a"
+            " new key for a new request"
+        )
+    return act
+
+
+def repeated(result: dict[str, Any]) -> dict[str, Any]:
     """``result`` with ``REPEATED`` after its first text block."""
     content: object = result.get("content")
     if not isinstance(content, list):

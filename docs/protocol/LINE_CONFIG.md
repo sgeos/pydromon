@@ -483,10 +483,22 @@ printable characters chosen by the caller, so a retried call does not act twice.
 - **Scope.** Keys belong to one party and one tool, so two lines, or one line's two
   tools, may use the same key.
 - **Bounds.** At most 256 keys are kept for each party and tool, the oldest forgotten
-  first. Keys live in the daemon's memory, not in the event log, so a retry across a
-  daemon restart acts again. **Porting hazard.** The check, the act and the record run
+  first, after a replay as before it. **Porting hazard.** The check and the append run
   with no suspension point between, which a single asyncio loop makes atomic. A port
-  that serves tools from several threads holds a lock across the three.
+  that serves tools from several threads holds a lock across the two.
+- **Durable.** **Task of 2026-10-29, round 5.** A keyed call records its key, with the
+  SHA-256 digest of its other arguments, as the `request` field of the event of its
+  act, a `message_sent` or a `wake_scheduled`, as [`EVENT_LOG.md`](EVENT_LOG.md)
+  specifies. One append records both, so no crash leaves the act without its key, and
+  a retry that crosses a daemon restart repeats the first answer. Keys were once kept
+  in the daemon's memory only, and a retry across a restart acted again.
+- **The repeated answer.** It is rebuilt from the event of the act and the state, so
+  it does not depend on what the daemon held in memory. For `send_message` and
+  `ask_operator` it is the first answer's text. **Decided by core for review.** A
+  repeated `wake_after` leaves out the sentence naming the wake the first call
+  replaced, since `wake_scheduled` does not record it. A repeated priority note says
+  `with priority` only when its `message_prioritized` was recorded, which a crash
+  between the two appends may have prevented.
 - **Agents.** An external agent's `send_message` is the same tool, and takes a key
   in the same way.
 

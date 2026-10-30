@@ -821,6 +821,43 @@ class PeerKeyed:
             raise InvalidField("token_sha256 is not a SHA-256 hex digest")
 
 
+MAX_REQUEST_KEY_CHARS: Final = 128
+"""The longest request key a keyed tool call may give, in characters."""
+MAX_REQUEST_KEYS_PER_PARTY: Final = 256
+"""How many request keys the state keeps for each party and tool, the oldest
+forgotten first."""
+REQUEST_SEND: Final = "send_message"
+REQUEST_ASK: Final = "ask_operator"
+REQUEST_WAKE: Final = "wake_after"
+"""The tools whose keyed calls the state remembers, named as the line tools are."""
+
+
+@dataclass(frozen=True, slots=True)
+class RequestStamp:
+    """The ``request_key`` a keyed call of ``send_message``, ``ask_operator`` or
+    ``wake_after`` gave, with the SHA-256 digest of its other arguments. **Task of
+    2026-10-29, round 5.** It is recorded in the event the call appended, so no crash
+    can leave the act without its key, and a retry after a daemon restart repeats
+    the first result instead of acting again."""
+
+    key: str
+    digest: str
+
+    def __post_init__(self) -> None:
+        check_text("request key", self.key)
+        if (
+            not 1 <= len(self.key) <= MAX_REQUEST_KEY_CHARS
+            or not self.key.isprintable()
+        ):
+            raise InvalidField(
+                f"request key must be text of 1 to {MAX_REQUEST_KEY_CHARS} printable"
+                " characters"
+            )
+        check_text("request digest", self.digest, 64)
+        if DIGEST_PATTERN.fullmatch(self.digest) is None:
+            raise InvalidField("request digest must be a SHA-256 hex digest")
+
+
 @dataclass(frozen=True, slots=True)
 class MessageSent:
     """A message between any two parties, or a note from the harness to a line or an
@@ -834,6 +871,9 @@ class MessageSent:
     body: str
     choices: tuple[str, ...] = ()
     reply_to: str | None = None
+    request: RequestStamp | None = None
+    """The request key of the ``send_message`` or ``ask_operator`` call that sent
+    it, or ``None``, absent from the wire, when the call gave none."""
 
     def __post_init__(self) -> None:
         check_id("message_id", self.message_id)
@@ -986,6 +1026,9 @@ class WakeScheduled:
     due: str
     note: str
     task_id: str | None = None
+    request: RequestStamp | None = None
+    """The request key of the ``wake_after`` call that scheduled it, or ``None``,
+    absent from the wire, when the call gave none."""
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
@@ -995,6 +1038,20 @@ class WakeScheduled:
         check_text("note", self.note, MAX_WAKE_NOTE_BYTES)
         if self.task_id is not None:
             check_text("task_id", self.task_id, MAX_TASK_ID_BYTES)
+
+
+type RequestedAct = MessageSent | WakeScheduled
+"""An event that records the act of a keyed tool call."""
+
+
+def request_slot(event: RequestedAct) -> tuple[str, str]:
+    """The party and tool whose keys ``event``'s request key belongs to. A note is
+    ``send_message``'s and a question ``ask_operator``'s, by the sender's address,
+    and a wake is ``wake_after``'s, by its line."""
+    if isinstance(event, WakeScheduled):
+        return event.line_id, REQUEST_WAKE
+    tool = REQUEST_ASK if event.kind is MessageKind.QUESTION else REQUEST_SEND
+    return str(event.sender), tool
 
 
 @dataclass(frozen=True, slots=True)
@@ -1920,6 +1977,14 @@ class State:
     """Each line's latest standing brief, keyed by line. A line with none has no
     entry."""
 
+    requests: dict[tuple[str, str], dict[str, RequestedAct]] = field(
+        default_factory=dict[tuple[str, str], dict[str, RequestedAct]]
+    )
+    """The keyed calls that acted, by party and tool, then by key, each with the
+    event that recorded the act, the oldest first, at most
+    ``MAX_REQUEST_KEYS_PER_PARTY`` for each party and tool. Replay rebuilds it from
+    the events alone, so the bound holds after a restart as before it."""
+
     def copy(self) -> "State":
         """Return an independent snapshot. The records are frozen, so maps suffice."""
         return State(
@@ -1949,6 +2014,7 @@ class State:
             dict(self.task_records),
             dict(self.last_turn_commits),
             dict(self.briefs),
+            {slot: dict(acts) for slot, acts in self.requests.items()},
         )
 
     def open_questions(self, operator_id: str) -> list[str]:
@@ -2015,6 +2081,7 @@ class State:
                     raise EventRejected(f"no agent {event.agent_id} to revoke")
             case MessageSent():
                 self._check_message_sent(event)
+                self._check_request(event)
             case MessageReceived():
                 self._check_message_received(event)
             case MessageDelivered():
@@ -2058,6 +2125,7 @@ class State:
                 self._check_wake_issued(event)
             case WakeScheduled():
                 self._check_wake_scheduled(event)
+                self._check_request(event)
             case WakeWithdrawn():
                 self._line(event.line_id)
                 pending = self.scheduled.get(event.line_id)
@@ -2179,6 +2247,7 @@ class State:
                 self.agents[event.agent_id] = replace(agent, revoked=True)
             case MessageSent():
                 self._apply_message_sent(event)
+                self._remember_request(event)
             case MessageReceived():
                 self._apply_message_received(event)
             case MessageDelivered():
@@ -2245,6 +2314,7 @@ class State:
                 self.scheduled[event.line_id] = ScheduledWake(
                     event.message_id, event.due, event.note, event.task_id
                 )
+                self._remember_request(event)
             case WakeWithdrawn():
                 del self.scheduled[event.line_id]
                 self.withdrawn_wakes.add(event.message_id)
@@ -2637,6 +2707,33 @@ class State:
                 f"message {event.message_id} is reserved by line {reserver}'s"
                 " scheduled wake"
             )
+
+    def _check_request(self, event: RequestedAct) -> None:
+        """A keyed act needs a party that may hold keys, and a key its party and tool
+        have not kept, since a call that repeats a kept key repeats its result and
+        records nothing. The harness and the wake that fires never give a key."""
+        if event.request is None:
+            return
+        if isinstance(event, MessageSent) and isinstance(event.sender, HarnessAddress):
+            raise EventRejected("the harness gives no request key")
+        if isinstance(event, MessageSent) and self._is_firing(event):
+            raise EventRejected("a firing wake gives no request key")
+        slot = request_slot(event)
+        if event.request.key in self.requests.get(slot, {}):
+            party, tool = slot
+            raise EventRejected(
+                f"request key {event.request.key!r} of {party} for {tool} acted before"
+            )
+
+    def _remember_request(self, event: RequestedAct) -> None:
+        """Keep ``event`` as the act of its request key, forgetting the oldest key of
+        its party and tool beyond ``MAX_REQUEST_KEYS_PER_PARTY``."""
+        if event.request is None:
+            return
+        acts = self.requests.setdefault(request_slot(event), {})
+        acts[event.request.key] = event
+        while len(acts) > MAX_REQUEST_KEYS_PER_PARTY:
+            del acts[next(iter(acts))]
 
     def _check_task_noted(self, event: TaskNoted) -> None:
         self._check_noted(event.line_id, event.message_id)
