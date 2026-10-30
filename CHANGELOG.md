@@ -7,6 +7,23 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- A line's own notes, such as fired wakes and task-end notes, leave the `own_notes`
+  count once a turn of the line has ended after their delivery, whatever the turn's
+  outcome, as well as once they are read, acknowledged or replied to. The count had
+  grown with every note a line left alone after its work was done, and a worker line
+  in another project counted 62. The rule is read from the event log alone, so it
+  holds across a restart, and the wake prompt, `line_status`, `list_mail` and the
+  client's views share it. A task note recorded during a running turn counts until
+  that turn ends, and a note delivered between turns without a wake counts until the
+  next turn ends. A prompt still marks nothing read, and mail from any other sender
+  is unchanged. Required by the operator on 2026-10-30 in round 8. A turn whose
+  engine returned no report, as when its prompt could not be composed, retires no
+  note, since its prompt may never have reached the engine, and records
+  `line_turn_ended` with the new optional field `unreported`, which a daemon that
+  predates it cannot read, so a rollback after such a turn cannot load the log. The
+  prompt and the counts line of `list_mail` now say that a note past the count is
+  still listed by `list_mail` without a filter. Required by the operator in the round
+  8 review.
 - Wake prompts now state the operator at turn start that `ask_operator` will use when
   `to` is omitted, and explain that a new operator message during the turn changes
   that default.

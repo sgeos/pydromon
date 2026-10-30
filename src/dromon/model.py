@@ -689,11 +689,21 @@ class LineTurnEnded:
 
     line_id: str
     workdir_commit: str | None
+    unreported: bool | None = None
+    """``True`` when the engine returned no report for the turn, as when its prompt
+    could not be composed, a check before the engine failed, the engine raised or the
+    turn was cancelled. The daemon then cannot say that the prompt reached the engine.
+    ``None`` otherwise, and in a log written before the field. **Round 8 review, ON1,
+    of 2026-10-30.** Such a turn retires no own note, as
+    ``State.reported_turn_ends`` says. ``False`` is refused, so the fact has one
+    encoding and the wire omits it when null."""
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
         if self.workdir_commit is not None:
             check_commit("workdir_commit", self.workdir_commit)
+        if self.unreported is not None and self.unreported is not True:
+            raise InvalidField("unreported must be true or null")
 
 
 MAX_DISCLOSURE_CHECKS: Final = 10
@@ -1807,6 +1817,13 @@ class Message:
     ``message_received`` records."""
     correlation: str | None = None
     """The key ``message_correlated`` gave the note, if any."""
+    reported_ends_at_delivery: int | None = None
+    """The recipient line's count of reported turn ends, ``State.reported_turn_ends``,
+    when ``message_delivered`` was applied, or ``None`` until then and for mail to any
+    other party. **Round 8 task of 2026-10-30.** A later count means that a turn of
+    the line whose engine reported it ended after the message reached the line, which
+    retires an own note from ``own_notes``, as ``dromon.mailbox.counts_own_note``
+    says."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1975,6 +1992,15 @@ class State:
     turn_start_counts: dict[str, int] = field(default_factory=dict[str, int])
     """Each line's number of recorded turn starts, reconstructed from
     ``line_state_changed`` events to ``running``."""
+    reported_turn_ends: dict[str, int] = field(default_factory=dict[str, int])
+    """Each line's number of reported turn ends, reconstructed from the
+    ``line_turn_ended`` events that are not ``unreported``. The daemon records the
+    event however the turn ended, and a failed or held turn whose engine still
+    returned a report counts. **Round 8 task of 2026-10-30.** Compared with a
+    message's ``reported_ends_at_delivery``, it says whether such a turn ended after
+    the message was delivered, from the order of events alone, so replay agrees.
+    **Round 8 review, ON1.** A turn with no report is left out, because its engine may
+    never have received the notes delivered into it."""
     role_change_turn_starts: dict[str, dict[str, int]] = field(
         default_factory=dict[str, dict[str, int]]
     )
@@ -2033,6 +2059,7 @@ class State:
             dict(self.task_records),
             dict(self.last_turn_commits),
             dict(self.turn_start_counts),
+            dict(self.reported_turn_ends),
             {
                 role_id: dict(line_counts)
                 for role_id, line_counts in self.role_change_turn_starts.items()
@@ -2289,7 +2316,14 @@ class State:
                 self._apply_message_received(event)
             case MessageDelivered():
                 message = self.messages[event.message_id]
-                self.messages[event.message_id] = replace(message, delivered=True)
+                ends = (
+                    self.reported_turn_ends.get(message.recipient.line_id, 0)
+                    if isinstance(message.recipient, LineAddress)
+                    else None
+                )
+                self.messages[event.message_id] = replace(
+                    message, delivered=True, reported_ends_at_delivery=ends
+                )
                 if isinstance(message.sender, RemoteAddress) and not isinstance(
                     message.recipient, RemoteAddress
                 ):
@@ -2332,6 +2366,10 @@ class State:
                 self._total_correlated(event)
             case LineTurnEnded():
                 self.last_turn_commits[event.line_id] = event.workdir_commit
+                if event.unreported is None:
+                    self.reported_turn_ends[event.line_id] = (
+                        self.reported_turn_ends.get(event.line_id, 0) + 1
+                    )
                 seat = self.seats.get(event.line_id)
                 if (
                     seat is not None

@@ -144,7 +144,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "wake_issued": ("wake_id",),
     "wake_scheduled": ("line_id", "message_id", "due", "note", "task_id", "request"),
     "wake_withdrawn": ("line_id", "message_id"),
-    "line_turn_ended": ("line_id", "workdir_commit"),
+    "line_turn_ended": ("line_id", "workdir_commit", "unreported"),
     "task_noted": ("line_id", "message_id", "task_id", "status", "body"),
     "task_recorded": (
         "line_id",
@@ -326,6 +326,7 @@ def _upgraded(kind: str, data: object) -> object:
 OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
     "message_sent": ("request",),
     "wake_scheduled": ("request",),
+    "line_turn_ended": ("unreported",),
 }
 """The fields left out of the wire when they are null, which a log written before
 them never held, so decoding reads an absent one as null. **Task of 2026-10-29,
@@ -459,6 +460,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
             return "line_turn_ended", {
                 "line_id": event.line_id,
                 "workdir_commit": event.workdir_commit,
+                "unreported": event.unreported,
             }
         case TaskRecorded():
             return "task_recorded", {
@@ -716,7 +718,9 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
             )
         case "line_turn_ended":
             return LineTurnEnded(
-                _str(data, "line_id"), _optional_str(data, "workdir_commit")
+                _str(data, "line_id"),
+                _optional_str(data, "workdir_commit"),
+                _optional_bool(data, "unreported"),
             )
         case "task_recorded":
             return TaskRecorded(
@@ -907,6 +911,15 @@ def _bool(data: dict[str, object], name: str) -> bool:
     value = data[name]
     if type(value) is not bool:
         raise DecodeError(f"{name} is not true or false")
+    return value
+
+
+def _optional_bool(data: dict[str, object], name: str) -> bool | None:
+    value = data[name]
+    if value is None:
+        return None
+    if type(value) is not bool:
+        raise DecodeError(f"{name} is not true, false or null")
     return value
 
 

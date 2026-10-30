@@ -148,6 +148,7 @@ SCENARIO: tuple[Event, ...] = (
     TurnCorrelated("beta", ("game-7.round-2",), 1, 1_250_000),
     TurnCorrelated("beta", ("game-7.round-2", "game-8"), 2, None),
     LineTurnEnded("beta", "a" * 40),
+    LineTurnEnded("beta", None, True),
     DisclosureChecked("beta", "2026-10-28T19:00:00Z", 2),
     MessageSent("m5", BETA, PROBE, NOTE, "to an agent", reply_to="m4"),
     AgentRegistered("guest", AgentAccess.OBSERVE, ""),

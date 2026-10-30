@@ -42,6 +42,7 @@ from dromon.model import (
     LineAddress,
     LineCreated,
     LineHeld,
+    LineTurnEnded,
     MessageDelivered,
     Message,
     MessageKind,
@@ -1688,11 +1689,14 @@ def test_a_line_with_no_turn_end_commit_is_told_the_check_was_skipped_once(
 ALPHA = LineAddress("alpha")
 
 
-def expected_counts(state: State, owner: LineAddress) -> tuple[int, int, int]:
+def expected_counts(
+    state: State, owner: LineAddress, shown: frozenset[str] = frozenset()
+) -> tuple[int, int, int]:
     """The unread, unanswered and own-note counts of ``owner``'s mailbox, counted
     here from the messages by their own rule, apart from ``dromon.mailbox``. Own
     notes and the harness's notes ask no reply, and a held line's resume is not
-    used in these tests."""
+    used in these tests. An own note in ``shown`` was delivered before a turn of
+    ``owner`` ended, which retires it, as ``shown_ids`` finds."""
     held = [
         (message_id, message)
         for message_id, message in state.messages.items()
@@ -1720,13 +1724,34 @@ def expected_counts(state: State, owner: LineAddress) -> tuple[int, int, int]:
             and not m.read
             and not m.acknowledged
             and i not in replied
+            and i not in shown
         ),
     )
 
 
+def shown_ids(world: World, line_id: str = "alpha") -> frozenset[str]:
+    """The messages delivered to ``line_id`` before one of its turns ended, found by
+    walking the event log file in order, apart from ``dromon.model``. Round 8."""
+    recipient = LineAddress(line_id)
+    messages = world.log.state.messages
+    waiting: set[str] = set()
+    shown: set[str] = set()
+    for entry in read_entries(world.log_path):
+        event = entry.event
+        if (
+            isinstance(event, MessageDelivered)
+            and messages[event.message_id].recipient == recipient
+        ):
+            waiting.add(event.message_id)
+        elif isinstance(event, LineTurnEnded) and event.line_id == line_id:
+            shown |= waiting
+            waiting.clear()
+    return frozenset(shown)
+
+
 LIST_MAIL_COUNTS = re.compile(
-    r"(\d+) unread, (\d+) unanswered and (\d+) notes of your own neither read nor"
-    r" acknowledged"
+    r"(\d+) unread, (\d+) unanswered and (\d+) notes of your own neither read,"
+    r" acknowledged nor shown to a turn that ended"
 )
 LIST_MAIL_ENTRY = re.compile(r"^(m-[0-9a-f]+) from ", re.MULTILINE)
 
@@ -1785,16 +1810,20 @@ def mixed_turn(world: World) -> str:
 def test_every_view_gives_one_unread_figure_for_a_mixed_mailbox(world: World) -> None:
     """Task of 2026-10-30. The wake prompt, ``line_status``, ``list_mail`` and the
     client give the same counts for the same mailbox, and an own note is counted
-    apart from unread, before and after a prompt delivers it, rather than only in
-    the prompt as before."""
+    apart from unread, rather than only in the prompt as before. **Round 8.** The
+    prompt that delivers it counts it, and every view leaves it out once that turn
+    has ended."""
     before = summary(world.log.state, ALPHA, 0)
     assert set(every_view(world).values()) == {(0, 0, 0)}
     assert before == MailSummary(0, 0, 0, 0)
     prompt = mixed_turn(world)
     state = world.log.state
-    expected = expected_counts(state, ALPHA)
-    assert expected == (3, 2, 1)
-    assert MailSummary(4, *expected).sentence() in prompt
+    # Nothing had been dealt with as the prompt was built, and no turn had ended.
+    at_prompt = expected_counts(state, ALPHA)
+    assert at_prompt == (3, 2, 1)
+    assert MailSummary(4, *at_prompt).sentence() in prompt
+    expected = expected_counts(state, ALPHA, shown_ids(world))
+    assert expected == (3, 2, 0)
     assert set(every_view(world).values()) == {expected}
     # The prompt still announces the own note, and does not mark it read.
     (own,) = [i for i, m in state.messages.items() if m.sender == ALPHA]
@@ -1809,7 +1838,7 @@ def test_every_view_gives_one_unread_figure_for_a_mixed_mailbox(world: World) ->
     world.call("read_mail", {"message_id": from_ana})
     world.call("read_mail", {"message_id": own})
     later = world.turn("from ana again")
-    expected = expected_counts(world.log.state, ALPHA)
+    expected = expected_counts(world.log.state, ALPHA, shown_ids(world))
     assert expected == (3, 3, 0)
     assert MailSummary(1, *expected).sentence() in later
     assert set(every_view(world).values()) == {expected}
@@ -1818,11 +1847,19 @@ def test_every_view_gives_one_unread_figure_for_a_mixed_mailbox(world: World) ->
 def test_a_filtered_listing_lists_what_its_count_counts(world: World) -> None:
     """Review r6, finding 1. ``unread_only`` listed own notes while the header beside
     it said they were not unread. Each filter now lists the messages its count
-    counts, and an own note is still listed on request."""
+    counts, and an own note is still listed on request. **Round 8.** The own note
+    is delivered after the turn, so no ended turn has been shown it yet."""
     mixed_turn(world)
+    note = world.scheduler.send(ALPHA, ALPHA, "a later note to myself")
+    world.log.append(MessageDelivered(note))
     state = world.log.state
-    unread, _, own_notes = expected_counts(state, ALPHA)
-    (own,) = [i for i, m in state.messages.items() if m.sender == ALPHA]
+    unread, _, own_notes = expected_counts(state, ALPHA, shown_ids(world))
+    (own,) = [
+        i
+        for i, m in state.messages.items()
+        if m.sender == ALPHA and i not in shown_ids(world)
+    ]
+    assert own == note
     others = [
         i
         for i, m in state.messages.items()
@@ -1859,22 +1896,28 @@ def test_a_listing_refuses_a_bad_own_notes_filter(
 
 
 def test_an_acknowledged_own_note_leaves_the_own_count(world: World) -> None:
-    """Review r6, finding 6. An own note a prompt delivered stays unread, and leaves
-    ``own_notes`` in every view once the line acknowledges it, as lines do with
-    fired wakes, so the count does not grow with every wake."""
+    """Review r6, finding 6. An own note stays unread, and leaves ``own_notes`` in
+    every view once the line acknowledges it, as lines do with fired wakes, so the
+    count does not grow with every wake. **Round 8.** The note is delivered after
+    the turn, so only the acknowledgement retires it."""
     mixed_turn(world)
-    (own,) = [i for i, m in world.log.state.messages.items() if m.sender == ALPHA]
+    own = world.scheduler.send(ALPHA, ALPHA, "a later note to myself")
+    world.log.append(MessageDelivered(own))
     assert set(every_view(world).values()) == {(3, 2, 1)}
     _, error = world.call("acknowledge_mail", {"message_id": own})
     assert not error
     state = world.log.state
     assert state.messages[own].read is False and state.messages[own].acknowledged
-    expected = expected_counts(state, ALPHA)
+    expected = expected_counts(state, ALPHA, shown_ids(world))
     assert expected == (3, 2, 0)
     assert set(every_view(world).values()) == {expected}
     assert listed_ids(world, {"own_notes_only": True}) == []
     later = world.turn("from ana again")
-    assert MailSummary(1, *expected_counts(world.log.state, ALPHA)).sentence() in later
+    shown = shown_ids(world)
+    assert (
+        MailSummary(1, *expected_counts(world.log.state, ALPHA, shown)).sentence()
+        in later
+    )
     assert "of your own, such as fired wakes" not in later
 
 
@@ -1933,13 +1976,13 @@ def test_only_the_owners_own_notes_are_counted_apart() -> None:
         (0, None),
         (
             1,
-            "1 note of your own, such as fired wakes, neither read nor"
-            " acknowledged, is counted apart",
+            "1 note of your own, such as fired wakes, is counted apart from unread"
+            " until read, acknowledged, or shown to a turn that ends.",
         ),
         (
             2,
-            "2 notes of your own, such as fired wakes, neither read nor"
-            " acknowledged, are counted apart",
+            "2 notes of your own, such as fired wakes, are counted apart from"
+            " unread until read, acknowledged, or shown to a turn that ends.",
         ),
     ],
 )
