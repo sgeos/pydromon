@@ -7,6 +7,11 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- Role ownership notices are now suppressed across daemon restarts after the notified
+  seat ends a turn. Replay reconstructs which seats ended turns since the latest
+  ownership change, so a seat that has not had a turn yet still receives the notice
+  after a restart. A later ownership change starts a new notice for both affected
+  seats.
 - A `wake_after` bound to a running background task now acts as a wait. The line can
   end its turn and be woken by that task even after reaching the ordinary task-note
   limit; the task note names the cancelled wake. If the task outlives the timeout, the

@@ -1972,6 +1972,12 @@ class State:
         default_factory=dict[str, str | None]
     )
     """The worktree commit recorded as each line's latest turn ended."""
+    role_change_ended_turns: dict[str, set[str]] = field(
+        default_factory=dict[str, set[str]]
+    )
+    """Seats that ended a turn since each role's latest ownership change. The event
+    order rebuilds this across a restart, so a role notice is repeated only if that
+    seat has not ended a turn since the change."""
 
     briefs: dict[str, BriefSet] = field(default_factory=dict[str, BriefSet])
     """Each line's latest standing brief, keyed by line. A line with none has no
@@ -2018,6 +2024,10 @@ class State:
             dict(self.disclosure_checks),
             dict(self.task_records),
             dict(self.last_turn_commits),
+            {
+                role_id: set(line_ids)
+                for role_id, line_ids in self.role_change_ended_turns.items()
+            },
             dict(self.briefs),
             dict(self.mail_since_brief),
             {slot: dict(acts) for slot, acts in self.requests.items()},
@@ -2305,6 +2315,11 @@ class State:
                 self._total_correlated(event)
             case LineTurnEnded():
                 self.last_turn_commits[event.line_id] = event.workdir_commit
+                seat = self.seats.get(event.line_id)
+                if seat is not None and self.roles[seat.role_id].changed is not None:
+                    self.role_change_ended_turns.setdefault(seat.role_id, set()).add(
+                        event.line_id
+                    )
             case TaskRecorded():
                 records = self.task_records.get(event.line_id, ())
                 self.task_records[event.line_id] = (*records, event)[-MAX_TASK_RECORDS:]
@@ -2405,6 +2420,7 @@ class State:
                 self.roles[event.role_id] = replace(
                     role, owner=event.owner, changed=event
                 )
+                self.role_change_ended_turns[event.role_id] = set()
             case RoleNoted():
                 self.role_entries[event.entry_id] = event
             case BriefSet():

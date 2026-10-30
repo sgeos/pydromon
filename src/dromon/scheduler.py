@@ -1746,8 +1746,8 @@ class Scheduler:
         owner's first turn waits for, since a kept connection's background tasks
         keep the writer's sandbox until it closes."""
         self._role_told: dict[str, OwnershipChanged] = {}
-        """The latest change of owner each seat's turn was told of. In memory, so a
-        restart tells a seat of the latest change once more."""
+        """The latest ownership change each seat's in-flight turn was told of.
+        Persisted turn-end events suppress repeat notices after a restart."""
         self._engine_built: dict[str, int] = {}
         """When each engine was built, in nanoseconds of the wall clock, so that only a
         launcher started since is taken for the engine's own. Review N1."""
@@ -5130,7 +5130,12 @@ class Scheduler:
         if seat is None:
             return None
         change = state.roles[seat.role_id].changed
-        if change is None or self._role_told.get(line_id) == change:
+        ended_since_change = state.role_change_ended_turns.get(seat.role_id, set())
+        if (
+            change is None
+            or self._role_told.get(line_id) == change
+            or line_id in ended_since_change
+        ):
             return None
         self._role_told[line_id] = change
         role_id = seat.role_id

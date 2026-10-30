@@ -35,6 +35,7 @@ from dromon.model import (
     LineAddress,
     LineState,
     LineStateChanged,
+    LineTurnEnded,
     Message,
     MessageKind,
     MessageSent,
@@ -149,6 +150,8 @@ class World:
     def __init__(
         self, root: Path, confining: frozenset[str] = frozenset({PROVIDER})
     ) -> None:
+        self.root = root
+        self.confining = confining
         (root / ".git").mkdir(parents=True)
         (root / ".git" / "HEAD").write_text(WORKTREE_COMMIT + "\n")
         self.log = EventLog(root / "events.sqlite")
@@ -229,6 +232,22 @@ class World:
 
     def role(self) -> Role:
         return self.log.state.roles["core"]
+
+    def restart(self) -> None:
+        """Reopen the event log and scheduler as a daemon restart would."""
+        path = self.log.path
+        self.log.close()
+        self.log = EventLog(path)
+        self.scheduler = Scheduler(
+            self.log,
+            self.build,
+            tick_seconds=0,
+            clock=lambda: 0.0,
+            wall_clock=lambda: self.now,
+            root=self.root,
+            daemon_commit=DAEMON_COMMIT,
+            confining_engines=self.confining,
+        )
 
     def budget(self, percent: int, resets_at: str | None = None) -> None:
         self.log.append(
@@ -904,6 +923,32 @@ def test_the_former_and_the_new_owner_are_told_at_their_next_turn(
     wake(world, "alpha", "beta")
     assert not world.prompts("alpha")[1].startswith("Role core")
     assert not world.prompts("beta")[1].startswith("You own role")
+
+
+def test_role_notices_survive_restart_and_reset_for_a_later_change(
+    world: World,
+) -> None:
+    world.scheduler.give_ownership(ANA, "core", "beta")
+    assert world.scheduler._role_notice("beta") is not None  # pyright: ignore[reportPrivateUsage]
+    assert world.scheduler._role_notice("alpha") is not None  # pyright: ignore[reportPrivateUsage]
+
+    # No turn ended after the change, so replay still owes each seat its notice.
+    world.restart()
+    assert world.scheduler._role_notice("beta") is not None  # pyright: ignore[reportPrivateUsage]
+    assert world.scheduler._role_notice("alpha") is not None  # pyright: ignore[reportPrivateUsage]
+    assert world.scheduler._role_notice("beta") is None  # pyright: ignore[reportPrivateUsage]
+    assert world.scheduler._role_notice("alpha") is None  # pyright: ignore[reportPrivateUsage]
+
+    world.log.append(LineTurnEnded("beta", WORKTREE_COMMIT))
+    world.log.append(LineTurnEnded("alpha", WORKTREE_COMMIT))
+    assert replay(world.log.path).role_change_ended_turns["core"] == {"alpha", "beta"}
+    world.restart()
+    assert world.scheduler._role_notice("beta") is None  # pyright: ignore[reportPrivateUsage]
+    assert world.scheduler._role_notice("alpha") is None  # pyright: ignore[reportPrivateUsage]
+
+    world.scheduler.give_ownership(ANA, "core", "alpha")
+    assert world.scheduler._role_notice("alpha") is not None  # pyright: ignore[reportPrivateUsage]
+    assert world.scheduler._role_notice("beta") is not None  # pyright: ignore[reportPrivateUsage]
 
 
 def test_a_handoff_tells_the_successor_by_mail_not_by_the_checklist(

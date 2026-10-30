@@ -643,6 +643,20 @@ the intent itself, in the line's own words, set with `set_brief` and recorded as
   the session's start, so that the first turn after its own restart also leads with the
   brief.
 
+## Role ownership notices
+
+After an `ownership_changed` event, the new owner receives the role transition package
+at the start of its next turn. A former owner receives a notice at the start of its
+next turn when another party made the change. Neither notice is sent by mail.
+
+Each seat receives the notice once for that change. The event log's order of
+`ownership_changed` and `line_turn_ended` events determines whether the seat has ended
+a turn since the change. Replay rebuilds that state, so a restart does not repeat a
+notice after the seat's turn ended. If no turn ended, its next turn still receives the
+notice, including after a restart. A later ownership change starts a new notice for
+each affected seat. The role transition package and former-owner notice are described
+in [`ROLES.md`](../architecture/ROLES.md).
+
 ## Context and compaction
 
 **Decided by the operator on 2026-10-26** in round 5, from the worker line's round 4
