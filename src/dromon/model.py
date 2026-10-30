@@ -1972,6 +1972,20 @@ class State:
         default_factory=dict[str, str | None]
     )
     """The worktree commit recorded as each line's latest turn ended."""
+    turn_start_counts: dict[str, int] = field(default_factory=dict[str, int])
+    """Each line's number of recorded turn starts, reconstructed from
+    ``line_state_changed`` events to ``running``."""
+    role_change_turn_starts: dict[str, dict[str, int]] = field(
+        default_factory=dict[str, dict[str, int]]
+    )
+    """Each seat's turn-start count when its role last changed owner. A turn counts
+    toward its notice only if its end follows a greater count."""
+    role_change_ended_turns: dict[str, set[str]] = field(
+        default_factory=dict[str, set[str]]
+    )
+    """Seats that ended a turn started after each role's latest ownership change.
+    The event order rebuilds this across a restart, so a role notice is repeated only
+    if that seat has not ended a post-change turn."""
 
     briefs: dict[str, BriefSet] = field(default_factory=dict[str, BriefSet])
     """Each line's latest standing brief, keyed by line. A line with none has no
@@ -2018,6 +2032,15 @@ class State:
             dict(self.disclosure_checks),
             dict(self.task_records),
             dict(self.last_turn_commits),
+            dict(self.turn_start_counts),
+            {
+                role_id: dict(line_counts)
+                for role_id, line_counts in self.role_change_turn_starts.items()
+            },
+            {
+                role_id: set(line_ids)
+                for role_id, line_ids in self.role_change_ended_turns.items()
+            },
             dict(self.briefs),
             dict(self.mail_since_brief),
             {slot: dict(acts) for slot, acts in self.requests.items()},
@@ -2200,6 +2223,10 @@ class State:
             case LineStateChanged():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, state=event.state)
+                if event.state is LineState.RUNNING:
+                    self.turn_start_counts[event.line_id] = (
+                        self.turn_start_counts.get(event.line_id, 0) + 1
+                    )
             case LineConfigured():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, config=event.config)
@@ -2305,6 +2332,18 @@ class State:
                 self._total_correlated(event)
             case LineTurnEnded():
                 self.last_turn_commits[event.line_id] = event.workdir_commit
+                seat = self.seats.get(event.line_id)
+                if (
+                    seat is not None
+                    and self.roles[seat.role_id].changed is not None
+                    and self.turn_start_counts.get(event.line_id, 0)
+                    > self.role_change_turn_starts.get(seat.role_id, {}).get(
+                        event.line_id, 0
+                    )
+                ):
+                    self.role_change_ended_turns.setdefault(seat.role_id, set()).add(
+                        event.line_id
+                    )
             case TaskRecorded():
                 records = self.task_records.get(event.line_id, ())
                 self.task_records[event.line_id] = (*records, event)[-MAX_TASK_RECORDS:]
@@ -2400,11 +2439,24 @@ class State:
                 )
             case SeatBound():
                 self.seats[event.line_id] = Seat(event.role_id, event.may_own)
+                if (
+                    self.roles[event.role_id].changed is not None
+                    and event.role_id in self.role_change_turn_starts
+                ):
+                    self.role_change_turn_starts[event.role_id][event.line_id] = (
+                        self.turn_start_counts.get(event.line_id, 0)
+                    )
             case OwnershipChanged():
                 role = self.roles[event.role_id]
                 self.roles[event.role_id] = replace(
                     role, owner=event.owner, changed=event
                 )
+                self.role_change_turn_starts[event.role_id] = {
+                    line_id: self.turn_start_counts.get(line_id, 0)
+                    for line_id, seat in self.seats.items()
+                    if seat.role_id == event.role_id
+                }
+                self.role_change_ended_turns[event.role_id] = set()
             case RoleNoted():
                 self.role_entries[event.entry_id] = event
             case BriefSet():

@@ -7,6 +7,11 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- Role ownership notices are now suppressed across daemon restarts after the notified
+  seat ends a turn that started after the change. Replay reconstructs each seat's
+  turn starts and ends since the latest ownership change. A turn already running at
+  the change no longer suppresses the notice, and a later ownership change starts a
+  new notice for both affected seats.
 - One context warning now gives one compaction wake. No context-warning wake is
   queued while the line's turn runs or a compaction decided for it is under way, any
   reported compaction withdraws a pending one whatever its size, and one that falls
