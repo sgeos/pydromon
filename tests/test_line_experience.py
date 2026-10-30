@@ -830,6 +830,15 @@ def test_codex_lines_get_a_writable_cache_unless_one_is_set() -> None:
     assert kept["XDG_CACHE_HOME"] == "/mine"
 
 
+def test_line_status_names_the_selected_shell(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    text, error = world.call("line_status", {"detail": False, "lists": False})
+    assert not error
+    assert json.loads(text)["shell"] == "/bin/bash"
+
+
 # Review round 1: the write walk, the path check, the repeat memory, the cache.
 
 
@@ -947,7 +956,10 @@ def test_check_disclosure_refuses_without_a_list_or_one_input(
     world: World, tmp_path: Path
 ) -> None:
     text, error = world.call("check_disclosure", {"text": "x"})
-    assert error and "no disclosure list" in text
+    assert error
+    assert "no disclosure list is configured for this project" in text
+    assert "daemon.disclosure_terms" in text
+    assert "cannot pass or fail" in text
     listed(world, tmp_path)
     for args in ({}, {"text": "x", "path": "y"}):
         text, error = world.call("check_disclosure", cast(dict[str, object], args))

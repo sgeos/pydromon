@@ -5,6 +5,16 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Claude Code and Codex lines granted a shell tool now require the daemon's `SHELL` to
+  name an absolute executable. Claude Code receives both `SHELL` and its explicit
+  `CLAUDE_CODE_SHELL` override, and Codex receives `SHELL` in its app-server and
+  shell command environments. **Reported on 2026-10-29** by a worker line in another
+  project whose shell changed from bash to zsh between turns. `line_status` shows the
+  selected path. `check_disclosure` now explains where the project configures a list
+  and that a check cannot resolve without one.
+
 ### Added
 
 - Operator line configuration may set `fresh_session_each_turn` for Claude Code or

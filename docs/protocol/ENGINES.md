@@ -120,8 +120,8 @@ only the common entries and pinned `ENABLE_TOOL_SEARCH`.
 
 | Adapter | Additional inherited entries | Scope |
 |---|---|---|
-| Claude Code | `USER`, `LOGNAME`, `ENABLE_TOOL_SEARCH`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_AGENT_SDK_VERSION`, `CLAUDE_CODE_SDK_READS_SESSION_STATE`, `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING`, `PWD`, `TRACEPARENT`, `TRACESTATE`, `BAGGAGE`, `DROMON_LINE_MARK` | Claude Code uses the account names to find its macOS Keychain sign-in, confirmed by the operator's live check. Tool search is pinned on. The Agent SDK sets the entry point, its version and session-state behavior. Checkpointing and trace values are present only when the SDK sets them. The process mark is for tracking. Launcher target, parent, report, stop-policy and filter entries do not reach Claude Code. |
-| Codex | `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, `XDG_CACHE_HOME` | Credentials are allowed only for `api` and `flexible` strategies. Subscription lines omit them. Dromon uses a supplied cache path or sets its private cache directory. |
+| Claude Code | `SHELL`, `CLAUDE_CODE_SHELL`, `USER`, `LOGNAME`, `ENABLE_TOOL_SEARCH`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_AGENT_SDK_VERSION`, `CLAUDE_CODE_SDK_READS_SESSION_STATE`, `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING`, `PWD`, `TRACEPARENT`, `TRACESTATE`, `BAGGAGE`, `DROMON_LINE_MARK` | Claude Code uses the account names to find its macOS Keychain sign-in, confirmed by the operator's live check. Tool search is pinned on. The Agent SDK sets the entry point, its version and session-state behavior. Checkpointing and trace values are present only when the SDK sets them. The process mark is for tracking. Launcher target, parent, report, stop-policy and filter entries do not reach Claude Code. |
+| Codex | `SHELL`, `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, `XDG_CACHE_HOME` | Credentials are allowed only for `api` and `flexible` strategies. Subscription lines omit them. Dromon uses a supplied cache path or sets its private cache directory. |
 | Pi | `OPENAI_API_KEY` | Only for `pi:openai/...` lines with `api` or `flexible` strategy. Subscription lines omit it. Other provider variables and endpoint selectors are not inherited. Dromon's Pi directory, bridge and tool values are set separately. |
 | Cursor Agent | `CURSOR_API_KEY`, `CURSOR_AUTH_TOKEN`, `CURSOR_AUTH_TOKEN_EXPIRES_AT` | Only for metered strategies. Subscription lines omit them. Dromon sets the config and data directories separately. |
 | Grok Build | `GROK_CLAUDE_MCPS_ENABLED`, `GROK_CURSOR_MCPS_ENABLED`, `GROK_CLAUDE_HOOKS_ENABLED`, `GROK_CURSOR_HOOKS_ENABLED` | Dromon sets these compatibility switches to disable scans of unrelated harness configuration. Its Grok home and sandbox are set separately. |
@@ -137,6 +137,28 @@ line's MCP configuration, never into the engine environment.
 The adapter accepts HTTP or Server-Sent Events MCP headers only for Claude Code, which
 is reflected by `mcp_http_sse_headers` in the capability report. Other adapters refuse
 custom MCP server configuration.
+
+## Shell selection
+
+When a line is given a shell tool, Dromon requires the daemon's `SHELL` value to be an
+absolute path to an executable file. A missing value, relative path or non-executable
+file refuses the turn before the engine starts. `line_status` reports the path, or
+`unavailable` when validation fails.
+
+The pinned Agent SDK source merges `ClaudeAgentOptions.env` into the CLI subprocess
+environment. The bundled Claude Code executable contains both the `CLAUDE_CODE_SHELL`
+environment name and an error directing users to set `SHELL` to a recognized shell.
+**Fact.** Both names occur in the pinned local executable. **Inference.**
+`CLAUDE_CODE_SHELL` selects the Bash tool's inner shell. Dromon sets both it and `SHELL`
+to the validated daemon value, so the explicit override and child process environment
+agree. No live Claude Code turn was used to determine this.
+
+Codex receives the validated `SHELL` in its app-server environment and in
+`shell_environment_policy.set`, which the adapter uses for shell command variables.
+**Inference.** The app-server selects its shell from `SHELL`, since the adapter has no
+separate shell setting and previously omitted the variable. No live Codex turn was used
+to confirm that selection. If a later Codex interface provides a documented shell
+executable setting, it should replace this inference.
 
 ## Minimum versions
 

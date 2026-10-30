@@ -183,7 +183,7 @@ class World:
             tmp_path,
             config=config,
             mcp_tools=tools or [],
-            environment={},
+            environment={"SHELL": "/bin/bash"},
             connection_factory=connect,
             server_lister=lambda env: [],
             clock=clock or Clock(),

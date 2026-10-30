@@ -175,6 +175,7 @@ from dromon.engine import (
     resolve_plugin,
 )
 from dromon.eventlog import EventLog
+from dromon.engine_environment import ShellSelectionError, selected_shell
 from dromon import proposals as proposal_store
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon import settings as engine_settings
@@ -3576,6 +3577,7 @@ class Scheduler:
             "workdir_path": workdir,
             "sandbox": self._sandbox_status(line_id, workdir),
             "engine_session": line.engine_session,
+            "shell": self._shell_status(),
             "kept_session": self.kept_session(line_id),
             "recent_turns": list(self._turn_costs.get(line_id, ())),
             "peers": self.peers_for(line_id),
@@ -3598,6 +3600,14 @@ class Scheduler:
             },
             "other_lines": others,
         }
+
+    @staticmethod
+    def _shell_status() -> str:
+        """The engine shell available to lines, or a short unavailable marker."""
+        try:
+            return selected_shell(os.environ)
+        except ShellSelectionError:
+            return "unavailable"
 
     def _sandbox_status(self, line_id: str, workdir: str | None) -> dict[str, object]:
         """Show the caller's full effective Claude Code sandbox and its Git write
@@ -3900,7 +3910,11 @@ class Scheduler:
         if (text is None) == (path is None):
             raise LineToolRefused("give exactly one of text and path")
         if not self._disclosure:
-            raise LineToolRefused("this project has no disclosure list")
+            raise LineToolRefused(
+                "no disclosure list is configured for this project. Set"
+                " daemon.disclosure_terms to a file path in the project file. This"
+                " check cannot pass or fail without a list."
+            )
         now = self._wall_clock()
         reopens = self._disclosure_reopens(line_id, now)
         if reopens is not None:
@@ -8334,6 +8348,7 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         "peers": full["peers"],
         "model": full["model"],
         "strategy": full["strategy"],
+        "shell": full["shell"],
         "context": {
             "estimated_tokens": context["estimated_tokens"],
             "warn_at": context["warn_at"],

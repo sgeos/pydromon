@@ -5,7 +5,9 @@ Each adapter adds only the variables its engine needs to the common operating-sy
 set. Engine credentials are handled separately by the adapter strategy.
 """
 
+import os
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 BASE_ENVIRONMENT: tuple[str, ...] = ("PATH", "HOME", "LANG", "TERM", "TMPDIR")
 """The executable search path, the engine's isolated home, locale, terminal type,
@@ -16,7 +18,33 @@ TOOL_SEARCH_VARIABLE = "ENABLE_TOOL_SEARCH"
 TOOL_SEARCH_PINNED = "true"
 """Stable tool search keeps the tool schemas from changing between requests."""
 
+SHELL_VARIABLE = "SHELL"
+"""The absolute shell executable selected by the operator's daemon environment."""
+
+CLAUDE_SHELL_VARIABLE = "CLAUDE_CODE_SHELL"
+"""Claude Code's explicit shell override for Bash tool commands."""
+
+
+class ShellSelectionError(ValueError):
+    """The daemon has no usable absolute shell executable for its engine lines."""
+
+
+def selected_shell(environment: Mapping[str, str]) -> str:
+    """Return the daemon's executable ``SHELL`` path or refuse an unsafe selection."""
+    value = environment.get(SHELL_VARIABLE)
+    if not value:
+        raise ShellSelectionError("SHELL is not set in the daemon environment")
+    path = Path(value)
+    if not path.is_absolute():
+        raise ShellSelectionError("SHELL must be an absolute path")
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise ShellSelectionError("SHELL must name an executable file")
+    return value
+
+
 CLAUDE_ENGINE_ENVIRONMENT: tuple[str, ...] = (
+    SHELL_VARIABLE,
+    CLAUDE_SHELL_VARIABLE,
     "USER",
     "LOGNAME",
     TOOL_SEARCH_VARIABLE,
