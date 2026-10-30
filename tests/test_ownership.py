@@ -1314,14 +1314,52 @@ def test_after_a_restart_the_time_is_read_from_the_log(
     assert lead is not None and f"the newest at {recorded}," in lead
     world.scheduler._operator_mail_at.clear()  # pyright: ignore[reportPrivateUsage]
 
+    scans: list[Path] = []
+
     def no_entries(path: Path) -> list[Entry]:
-        del path
+        scans.append(path)
         return []
 
     monkeypatch.setattr(scheduler_module, "read_entries", no_entries)
     lead = world.scheduler._brief_lead("alpha", False)  # pyright: ignore[reportPrivateUsage]
     assert lead is not None
     assert "the newest at a time the event log does not give," in lead
+    # Review r6, finding 7. The miss is kept, so later views do not read again.
+    again = world.scheduler._brief_lead("alpha", False)  # pyright: ignore[reportPrivateUsage]
+    status = cast(dict[str, Any], world.scheduler.line_status("alpha")["brief"])
+    assert again == lead
+    assert status["operator_mail_since"] == {"message_id": newest, "sent_at": None}
+    assert scans == [world.log.path]
+    # Newer operator mail sent by this process brings its own time, with no read.
+    world.scheduler.send(ANA, LineAddress("alpha"), "another task")
+    later = world.scheduler._brief_lead("alpha", False)  # pyright: ignore[reportPrivateUsage]
+    assert later is not None and f"the newest at {format_due(world.now)}," in later
+    assert scans == [world.log.path]
+
+
+def test_line_status_names_operator_mail_since_the_brief(world: World) -> None:
+    """Review r6, finding 8. A turn that does not lead with the brief sees the same
+    fact in ``line_status``, in detail and compact, and a new brief clears it."""
+    set_brief(world, "alpha", task="lift the bound")
+
+    def mail_since() -> tuple[object, object]:
+        detail = cast(dict[str, Any], world.scheduler.line_status("alpha")["brief"])
+        compact = cast(
+            dict[str, Any],
+            world.scheduler.line_status("alpha", detail=False, lists=False)["brief"],
+        )
+        return detail["operator_mail_since"], compact["operator_mail_since"]
+
+    assert mail_since() == (None, None)
+    note_from(world, LineAddress("beta"), "alpha")
+    assert mail_since() == (None, None)
+    world.now = START + timedelta(minutes=5)
+    message_id = world.scheduler.send(ANA, LineAddress("alpha"), "a new task")
+    expected = {"message_id": message_id, "sent_at": format_due(world.now)}
+    assert world.log.state.mail_since_brief["alpha"] == message_id
+    assert mail_since() == (expected, expected)
+    set_brief(world, "alpha", task="the new task")
+    assert mail_since() == (None, None)
 
 
 # line_status.

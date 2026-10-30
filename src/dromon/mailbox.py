@@ -31,8 +31,9 @@ class MailSummary:
     """Unread messages from every party but the owner."""
     unanswered: int
     own_notes: int = 0
-    """The owner's own unread notes, such as fired wakes, task-end notes and
-    compaction requests, which ``unread`` leaves out and this counts apart."""
+    """The owner's own notes, such as fired wakes, task-end notes and compaction
+    requests, that are neither read nor acknowledged, which ``unread`` leaves out and
+    this counts apart."""
 
     def sentence(self) -> str:
         """The summary in the form a wake prompt opens with."""
@@ -45,8 +46,8 @@ class MailSummary:
             own = "note" if self.own_notes == 1 else "notes"
             verb = "is" if self.own_notes == 1 else "are"
             text += (
-                f" {self.own_notes} unread {own} of your own, such as fired wakes,"
-                f" {verb} counted apart from unread."
+                f" {self.own_notes} {own} of your own, such as fired wakes, neither"
+                f" read nor acknowledged, {verb} counted apart from unread."
             )
         return text
 
@@ -64,6 +65,25 @@ def is_own_note(message: Message, owner: Address) -> bool:
     such as a fired wake, a task-end note or a compaction request. Mail from an
     operator, another line, an agent, a remote party or the harness never is."""
     return message.sender == owner
+
+
+def counts_unread(message: Message, owner: Address) -> bool:
+    """Whether ``message`` in ``owner``'s mailbox is counted in ``unread``, the rule
+    ``summary`` counts by and ``listing`` filters by with ``unread_only``."""
+    return not message.read and not is_own_note(message, owner)
+
+
+def counts_own_note(
+    message_id: str, message: Message, owner: Address, replied: set[str]
+) -> bool:
+    """Whether ``message`` in ``owner``'s mailbox is counted in ``own_notes``, the
+    rule ``summary`` counts by and ``listing`` filters by with ``own_notes_only``.
+    An own note leaves the count once it is read, acknowledged or replied to."""
+    return (
+        is_own_note(message, owner)
+        and not message.read
+        and not is_answered(message_id, message, replied)
+    )
 
 
 def mailbox(state: State, owner: Address) -> list[tuple[str, Message]]:
@@ -112,16 +132,19 @@ def summary(state: State, owner: Address, new: int) -> MailSummary:
     message's, and never its body, so the note was not read, and ``read`` stays
     true to what the owner opened. Since ``unread`` no longer counts own notes,
     marking them read would change no figure, and would add a ``message_read``
-    event to the log for each one."""
+    event to the log for each one.
+
+    **Review r6, finding 6.** An own note leaves ``own_notes`` once the owner
+    acknowledges it, or replies to it, as well as once it opens it. Lines already
+    acknowledge fired wakes without opening them, so the count stays near the notes
+    still waiting to be dealt with rather than growing with every fired wake. A line
+    that never deals with its notes still sees them counted, since they were not
+    dealt with."""
     held = mailbox(state, owner)
     replied = replied_ids(state, owner)
     return MailSummary(
         new=new,
-        unread=sum(
-            1
-            for _, message in held
-            if not message.read and not is_own_note(message, owner)
-        ),
+        unread=sum(1 for _, message in held if counts_unread(message, owner)),
         unanswered=sum(
             1
             for message_id, message in held
@@ -131,7 +154,9 @@ def summary(state: State, owner: Address, new: int) -> MailSummary:
             and not isinstance(message.sender, HarnessAddress)
         ),
         own_notes=sum(
-            1 for _, message in held if not message.read and is_own_note(message, owner)
+            1
+            for message_id, message in held
+            if counts_own_note(message_id, message, owner, replied)
         ),
     )
 
@@ -141,17 +166,29 @@ def listing(
     owner: Address,
     *,
     unread_only: bool = False,
+    own_notes_only: bool = False,
     sender: Address | None = None,
     offset: int = 0,
     limit: int = MAX_PAGE,
 ) -> tuple[list[tuple[str, Message]], int]:
-    """A page of ``owner``'s mailbox, oldest first, and the number of matches in all."""
+    """A page of ``owner``'s mailbox, oldest first, and the number of matches in all.
+
+    **Review r6, finding 1.** ``unread_only`` selects exactly what ``summary`` counts
+    in ``unread``, and ``own_notes_only`` exactly what it counts in ``own_notes``, so
+    a listing and the counts beside it agree. The two select disjoint messages, so
+    giving both is refused rather than answered with an empty page."""
     if offset < 0 or not 1 <= limit <= MAX_PAGE:
         raise ValueError(f"offset must be at least 0 and limit in [1, {MAX_PAGE}]")
+    if unread_only and own_notes_only:
+        raise ValueError(
+            "unread_only and own_notes_only select different messages, so give one"
+        )
+    replied = replied_ids(state, owner) if own_notes_only else set[str]()
     matches = [
         (message_id, message)
         for message_id, message in mailbox(state, owner)
-        if (not unread_only or not message.read)
+        if (not unread_only or counts_unread(message, owner))
+        and (not own_notes_only or counts_own_note(message_id, message, owner, replied))
         and (sender is None or message.sender == sender)
     ]
     return matches[offset : offset + limit], len(matches)

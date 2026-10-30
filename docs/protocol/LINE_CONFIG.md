@@ -393,8 +393,15 @@ headers of the newly delivered mail follow, and bodies stay in the mailbox.
   first line of `list_mail`, and the client's `mail` and line entries, so all give
   the same figures for one mailbox. Mail from an operator, another line, an agent, a
   remote party or the harness is always counted in `unread`. A prompt still
-  announces an own note it delivers, with its header as for every message, and
-  `list_mail` with `unread_only` still lists unread own notes. From 2026-10-28 until
+  announces an own note it delivers, with its header as for every message.
+  **Review r6, finding 1.** `list_mail` with `unread_only` lists exactly what `unread`
+  counts, so it leaves out own notes, and with `own_notes_only` it lists exactly
+  what `own_notes` counts. The two select different messages, so giving both is
+  refused. The client's `mail` request has no `own_notes_only`, and its `unread_only`
+  follows the same rule. **Review r6, finding 6.** An own note leaves `own_notes`
+  once the line opens it, acknowledges it or replies to it. Lines already acknowledge
+  fired wakes without opening them, so the count stays near the notes still waiting
+  rather than growing with every wake. From 2026-10-28 until
   this rule, only the wake prompt left such notes out, and only those delivered to an
   earlier turn, so `line_status` counted them and the two disagreed. **Decided by core
   for review.** A prompt that delivers an own note does not mark it read, since the
@@ -605,7 +612,13 @@ the intent itself, in the line's own words, set with `set_brief` and recorded as
   that message's `recorded_at` in the event log, and where neither gives one the
   sentence says so. Mail from other lines, agents, peers and the harness does not
   count. **Porting note.** `recorded_at` is still never read by the model, and the
-  scheduler reads it from the log at most once for each line after a restart.
+  scheduler reads it from the log at most once for each such message after a
+  restart, keeping a time the log does not give as well, from review r6 finding 7.
+  **Review r6, finding 8.** `line_status` gives the same fact under its `brief` as
+  `operator_mail_since`, with `message_id` and `sent_at`, which is `null` where the
+  log gives no time, or `null` when no operator mail came since the brief, in both
+  its compact and detailed views, so a turn that does not lead with the brief can
+  see it.
 - **Where else it is shown.** `line_status` gives the whole brief in its detailed view
   and its task and next action, cut to 400 bytes, in its compact one, each under
   `untrusted_data` with a note that the line wrote it. The role transition package

@@ -31,7 +31,7 @@ from dromon.lineconfig import (
 from dromon.projectconfig import ConfigFileError, parse
 from dromon.limits import Limits
 from dromon import scheduler as scheduler_module
-from dromon.mailbox import MailSummary, summary
+from dromon.mailbox import MailSummary, listing, summary
 from dromon.model import (
     HARNESS,
     DISCLOSURE_CHECK_WINDOW_SECONDS,
@@ -1570,13 +1570,29 @@ def expected_counts(state: State, owner: LineAddress) -> tuple[int, int, int]:
             and not m.acknowledged
             and not isinstance(m.sender, HarnessAddress)
         ),
-        sum(1 for _, m in held if m.sender == owner and not m.read),
+        sum(
+            1
+            for i, m in held
+            if m.sender == owner
+            and not m.read
+            and not m.acknowledged
+            and i not in replied
+        ),
     )
 
 
 LIST_MAIL_COUNTS = re.compile(
-    r"(\d+) unread, (\d+) unanswered and (\d+) unread notes of your own"
+    r"(\d+) unread, (\d+) unanswered and (\d+) notes of your own neither read nor"
+    r" acknowledged"
 )
+LIST_MAIL_ENTRY = re.compile(r"^(m-[0-9a-f]+) from ", re.MULTILINE)
+
+
+def listed_ids(world: World, args: dict[str, Any]) -> list[str]:
+    """The identifiers ``list_mail`` gives alpha for ``args``, in order."""
+    text, error = world.call("list_mail", args)
+    assert not error, text
+    return LIST_MAIL_ENTRY.findall(text)
 
 
 def every_view(world: World) -> dict[str, tuple[int, int, int]]:
@@ -1656,6 +1672,69 @@ def test_every_view_gives_one_unread_figure_for_a_mixed_mailbox(world: World) ->
     assert set(every_view(world).values()) == {expected}
 
 
+def test_a_filtered_listing_lists_what_its_count_counts(world: World) -> None:
+    """Review r6, finding 1. ``unread_only`` listed own notes while the header beside
+    it said they were not unread. Each filter now lists the messages its count
+    counts, and an own note is still listed on request."""
+    mixed_turn(world)
+    state = world.log.state
+    unread, _, own_notes = expected_counts(state, ALPHA)
+    (own,) = [i for i, m in state.messages.items() if m.sender == ALPHA]
+    others = [
+        i
+        for i, m in state.messages.items()
+        if m.recipient == ALPHA and m.sender != ALPHA and not m.read
+    ]
+    listed_unread = listed_ids(world, {"unread_only": True})
+    listed_own = listed_ids(world, {"own_notes_only": True})
+    assert listed_unread == others and len(listed_unread) == unread
+    assert listed_own == [own] and len(listed_own) == own_notes
+    assert own in listed_ids(world, {})
+    # The sender filter narrows either one.
+    assert listed_ids(world, {"own_notes_only": True, "sender": "beta"}) == []
+    assert listed_ids(world, {"unread_only": True, "sender": "@ana"}) == [
+        i for i in others if state.messages[i].sender == ANA
+    ]
+
+
+@pytest.mark.parametrize(
+    ("args", "said"),
+    [
+        ({"own_notes_only": "yes"}, "own_notes_only must be true or false"),
+        (
+            {"unread_only": True, "own_notes_only": True},
+            "unread_only and own_notes_only select different messages",
+        ),
+    ],
+)
+def test_a_listing_refuses_a_bad_own_notes_filter(
+    world: World, args: dict[str, Any], said: str
+) -> None:
+    text, error = world.call("list_mail", args)
+    assert error and said in text
+    assert LIST_MAIL_COUNTS.search(text) is None
+
+
+def test_an_acknowledged_own_note_leaves_the_own_count(world: World) -> None:
+    """Review r6, finding 6. An own note a prompt delivered stays unread, and leaves
+    ``own_notes`` in every view once the line acknowledges it, as lines do with
+    fired wakes, so the count does not grow with every wake."""
+    mixed_turn(world)
+    (own,) = [i for i, m in world.log.state.messages.items() if m.sender == ALPHA]
+    assert set(every_view(world).values()) == {(3, 2, 1)}
+    _, error = world.call("acknowledge_mail", {"message_id": own})
+    assert not error
+    state = world.log.state
+    assert state.messages[own].read is False and state.messages[own].acknowledged
+    expected = expected_counts(state, ALPHA)
+    assert expected == (3, 2, 0)
+    assert set(every_view(world).values()) == {expected}
+    assert listed_ids(world, {"own_notes_only": True}) == []
+    later = world.turn("from ana again")
+    assert MailSummary(1, *expected_counts(world.log.state, ALPHA)).sentence() in later
+    assert "of your own, such as fired wakes" not in later
+
+
 def test_only_the_owners_own_notes_are_counted_apart() -> None:
     """Mail from an operator, another line, an agent, a remote party or the harness
     is never left out of unread. Undelivered mail is in no count."""
@@ -1667,6 +1746,7 @@ def test_only_the_owners_own_notes_are_counted_apart() -> None:
         "m-harness": HARNESS,
         "m-own": ALPHA,
         "m-own-read": ALPHA,
+        "m-own-acknowledged": ALPHA,
     }
     state = State()
     for message_id, sender in senders.items():
@@ -1679,6 +1759,7 @@ def test_only_the_owners_own_notes_are_counted_apart() -> None:
             None,
             delivered=True,
             read=message_id == "m-own-read",
+            acknowledged=message_id == "m-own-acknowledged",
         )
     state.messages["m-waiting"] = Message(ANA, ALPHA, MessageKind.NOTE, "x", (), None)
     counts = summary(state, ALPHA, 0)
@@ -1686,6 +1767,18 @@ def test_only_the_owners_own_notes_are_counted_apart() -> None:
         state, ALPHA
     )
     assert counts == MailSummary(0, 5, 4, 1)
+    # The listing filters select exactly what the counts count.
+    unread, total = listing(state, ALPHA, unread_only=True)
+    assert [i for i, _ in unread] == [
+        "m-operator",
+        "m-line",
+        "m-agent",
+        "m-remote",
+        "m-harness",
+    ]
+    assert total == counts.unread
+    own, total = listing(state, ALPHA, own_notes_only=True)
+    assert [i for i, _ in own] == ["m-own"] and total == counts.own_notes
     # Another owner's view of the same notes counts them as anyone's mail.
     beta = summary(state, LineAddress("beta"), 0)
     assert beta == MailSummary(0, 0, 0, 0)
@@ -1695,8 +1788,16 @@ def test_only_the_owners_own_notes_are_counted_apart() -> None:
     ("own_notes", "said"),
     [
         (0, None),
-        (1, "1 unread note of your own, such as fired wakes, is counted apart"),
-        (2, "2 unread notes of your own, such as fired wakes, are counted apart"),
+        (
+            1,
+            "1 note of your own, such as fired wakes, neither read nor"
+            " acknowledged, is counted apart",
+        ),
+        (
+            2,
+            "2 notes of your own, such as fired wakes, neither read nor"
+            " acknowledged, are counted apart",
+        ),
     ],
 )
 def test_the_summary_says_how_many_own_notes_it_counts_apart(
