@@ -1005,6 +1005,17 @@ def test_check_disclosure_checks_multiple_files_as_one_call(
     assert "readme" not in text and "codename" not in text.casefold()
 
 
+def test_check_disclosure_does_not_match_across_file_boundaries(
+    world: World, tmp_path: Path
+) -> None:
+    listed(world, tmp_path)
+    (world.root / "first.md").write_text("code")
+    (world.root / "second.md").write_text("name\n")
+    text, error = world.call("check_disclosure", {"paths": ["first.md", "second.md"]})
+    assert not error and text.startswith("pass, 0 lines hold a term")
+    assert checks(world)[0].matched_lines == 0
+
+
 def test_check_disclosure_multi_file_call_spends_one_limit_entry(
     world: World, tmp_path: Path
 ) -> None:

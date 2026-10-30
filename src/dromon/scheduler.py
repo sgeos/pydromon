@@ -1580,10 +1580,15 @@ def compose_prompt(
         " later turn."
     )
     parts.append(
-        f"When you omit to from ask_operator, it will ask {operator}."
+        f"At this turn's start, the default recipient for ask_operator is {operator}."
+        " It changes if another operator messages you during this turn. The recipient"
+        " for a call without to is the operator who most recently messaged you when"
+        " that call is made."
         if operator is not None
-        else "No operator has messaged this line, so ask_operator requires"
-        " to to be named."
+        else "At this turn's start, no operator has messaged this line."
+        " ask_operator without to requires a named recipient unless an operator"
+        " messages you during this turn. After that, it uses the operator who most"
+        " recently messaged you."
     )
     return "\n".join(parts)
 
@@ -4125,23 +4130,23 @@ class Scheduler:
             )
         if text is not None and len(text.encode("utf-8")) > MAX_CHECKED_BYTES:
             raise LineToolRefused(f"text is over {MAX_CHECKED_BYTES} bytes")
+        matched_lines = 0
         if paths is not None:
-            parts: list[bytes] = []
             total_bytes = 0
             for file_path in paths:
                 file_bytes = self._read_checked(
                     line_id, file_path, MAX_CHECKED_BYTES - total_bytes
                 )
                 total_bytes += len(file_bytes)
-                parts.append(file_bytes)
-            text = b"".join(parts).decode("utf-8", "replace")
-        elif path is not None:
-            text = self._read_checked(line_id, path).decode("utf-8", "replace")
-        checked_text = cast(str, text)
-        matched = min(
-            disclosure.matching_lines(self._disclosure, checked_text),
-            MAX_DISCLOSURE_MATCHES,
-        )
+                matched_lines += disclosure.matching_lines(
+                    self._disclosure, file_bytes.decode("utf-8", "replace")
+                )
+        else:
+            if path is not None:
+                text = self._read_checked(line_id, path).decode("utf-8", "replace")
+            checked_text = cast(str, text)
+            matched_lines = disclosure.matching_lines(self._disclosure, checked_text)
+        matched = min(matched_lines, MAX_DISCLOSURE_MATCHES)
         self._log.append(DisclosureChecked(line_id, format_due(now), matched))
         recent = self._log.state.disclosure_checks[line_id]
         window = timedelta(seconds=DISCLOSURE_CHECK_WINDOW_SECONDS)
@@ -5780,7 +5785,8 @@ class Scheduler:
                 " for this project. A line told about a list elsewhere does not know"
                 " that this project covers it. The answer is pass or fail with how"
                 " many lines hold a listed term, never the term. The listed files are"
-                " combined for one count, and the combined content is at most 1 MiB."
+                " checked independently and their counts are summed, so a match does"
+                " not span files. Their combined content is at most 1 MiB."
                 " Checks are limited per hour and recorded."
             ),
             input_schema=CHECK_DISCLOSURE_SCHEMA,
