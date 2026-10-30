@@ -320,3 +320,30 @@ def test_fable_follows_the_opus_drivers_on_claude_code() -> None:
             opus.tool_budget,
             opus.context_window,
         )
+
+
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-6.1-terra"])
+def test_sol_and_terra_follow_the_luna_drivers_with_the_catalogues_window(
+    model: str,
+) -> None:
+    # Codex's model catalogue, fetched on 2026-10-30, gives GPT-6.1-Sol and GPT-6.1
+    # Terra a context window of 500,000 tokens. No turn on either has run through
+    # Dromon, so every other setting copies GPT-6-Luna's for the same strategy.
+    assert ENGINE_OF[model] == "codex"
+    for strategy in Strategy:
+        settings = Driver.for_model(model, strategy).settings
+        luna = Driver.for_model(LUNA, strategy).settings
+        assert (settings.model, settings.context_window) == (model, 500000)
+        assert (
+            settings.engine,
+            settings.strategy,
+            settings.effort,
+            settings.max_turns,
+            settings.tool_budget,
+        ) == (
+            luna.engine,
+            luna.strategy,
+            luna.effort,
+            luna.max_turns,
+            luna.tool_budget,
+        )

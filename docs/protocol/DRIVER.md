@@ -75,6 +75,15 @@ GPT-6-Luna's settings follow Codex's model catalogue as fetched on 2026-10-25, w
 gives it a default effort of medium and a context window of 272,000 tokens, and for a
 ChatGPT plan the subscription strategy means Codex's own sign-in.
 
+**GPT-6.1-Sol and GPT-6.1 Terra, added on 2026-10-30** at the operator's direction.
+Their settings follow Codex's model catalogue as fetched on 2026-10-30 by Codex
+0.164.0, which lists `gpt-6.1-sol` and `gpt-6.1-terra` with a context window of 500,000
+tokens each and a default effort of low. The subscription drivers keep the effort of
+medium that GPT-6-Luna's subscription driver sets, and the drivers that may bill per
+token keep low. **Not verified.** No turn has run on either model through Dromon, so
+whether Codex reports each model under its catalogue name, which the drivers require,
+and whether the operator's ChatGPT plan serves them, are unobserved.
+
 ## Engines
 
 Each driver names the engine it is written for, `claude-code`, `codex`, `grok-build`,

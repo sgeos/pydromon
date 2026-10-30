@@ -62,6 +62,10 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Drivers for GPT-6.1-Sol and GPT-6.1 Terra on Codex, `gpt-6.1-sol` and
+  `gpt-6.1-terra`, for every strategy, with a context window of 500,000 tokens from
+  Codex's model catalogue. Required by the operator on 2026-10-30. No turn on either
+  model has run through Dromon yet.
 - `check_disclosure` accepts a list of up to eight files in one check. It counts
   matching lines independently in each file and sums the counts, so a match cannot
   span a file boundary. It limits the combined input to 1 MiB and spends one hourly
