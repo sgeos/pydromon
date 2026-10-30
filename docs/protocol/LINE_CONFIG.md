@@ -412,16 +412,32 @@ headers of the newly delivered mail follow, and bodies stay in the mailbox.
 - **Own notes shown to a turn.** **Required by the operator on 2026-10-30 in round 8,
   the rule decided by core for review.** An own note also leaves `own_notes` once a
   turn of the line has ended after the note was delivered, whatever the turn's
-  outcome. A worker line in another project counted 62 own notes, and 89 of its 90
+  outcome, so long as its engine reported the turn. A worker line in another project counted 62 own notes, and 89 of its 90
   task notes were never read or acknowledged, so the count grew without bound and
   told the line nothing. The rule changes the one function above, so every view
   keeps giving one figure, and mail from any other sender is unchanged.
+  - **What shown means.** **Decided by the operator in the round 8 review.** Shown
+    means delivered to the line, whether in its prompt, inside a running turn or for
+    the record between turns. It does not mean that a prompt carried the note. A
+    note that leaves `own_notes` this way is in no count, and `list_mail` without a
+    filter still lists it, which the prompt's sentence and the counts line of
+    `list_mail` both say.
   - **From the event log alone.** The state counts each line's `line_turn_ended`
-    events, and each message delivered to a line keeps the count as it stood at its
-    `message_delivered`. A larger count now means a turn ended after the delivery.
-    The daemon records `line_turn_ended` however the turn ended, a failed or held
-    turn included, so the rule holds across a restart, and nothing of it is kept in
-    the scheduler's memory.
+    events that are not `unreported`, and each message delivered to a line keeps the
+    count as it stood at its `message_delivered`. A larger count now means a turn
+    with a report ended after the delivery. The daemon records `line_turn_ended`
+    however the turn ended, a failed or held turn included, so the rule holds across
+    a restart, and nothing of it is kept in the scheduler's memory.
+  - **A turn with no report.** **Required by the operator in the round 8 review,
+    ON1.** When the line's engine returns no report for a turn, the daemon cannot say
+    that its prompt reached the engine. The prompt may not have been composed, a
+    check before the engine may have failed, the engine may have raised, or the turn
+    may have been cancelled. The daemon then records `line_turn_ended` with
+    `unreported`, in an ordinary turn and in a turn the engine started on a task's
+    end alike, and the turn retires no note. Its notes count until a later turn of
+    the line ends with a report. A failed or cancelled engine may have read the
+    prompt, so the rule can keep a note counted one turn too long, and never retires
+    one unseen. An event written before the field counts as reported.
   - **The current prompt.** A note the current prompt delivered still counts, since
     its turn has not ended, so the turn shown it sees it counted.
   - **A task note recorded during a running turn.** No prompt delivers it. It counts
@@ -446,8 +462,9 @@ headers of the newly delivered mail follow, and bodies stay in the mailbox.
     its `own_notes` is 0.
   - **Porting note.** The rule depends on applying events in log order, which a port
     keeps. The sentence in the wake prompt and the counts line of `list_mail` changed
-    wording, and the state gained `turn_end_counts` and the message field
-    `turn_ends_at_delivery`, which no event carries.
+    wording, the state gained `reported_turn_ends` and the message field
+    `reported_ends_at_delivery`, which no event carries, and `line_turn_ended`
+    gained the optional `unreported`, which a port omits when null.
 - **A moved worktree.** **Requested by the operator on 2026-10-28.** When the commit
   checked out in the line's working directory differs from the one it held when the
   line's last turn ended, as after an operator commits or merges the line's work, the

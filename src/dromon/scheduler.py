@@ -6066,7 +6066,8 @@ class Scheduler:
                 f"{len(page)} of {total} matching messages, from {offset}."
                 f" {counts.unread} unread, {counts.unanswered} unanswered and"
                 f" {counts.own_notes} notes of your own neither read, acknowledged nor"
-                " shown to a turn that ended, in the mailbox."
+                " shown to a turn that ended, in the mailbox. Those shown are still"
+                " listed without a filter."
             ]
             for message_id, message in page:
                 entry = header(message_id, message, answered)
@@ -6846,7 +6847,16 @@ class Scheduler:
             self._turn_owned.discard(line_id)
             self._last_turn_end[line_id] = self._clock()
             if line is not None:
-                self._log.append(LineTurnEnded(line_id, self._workdir_commit(line_id)))
+                # Round 8 review, ON1. With no report the prompt may never have
+                # reached the engine, as when it could not be composed, so the turn
+                # retires none of the notes delivered into it.
+                self._log.append(
+                    LineTurnEnded(
+                        line_id,
+                        self._workdir_commit(line_id),
+                        True if report is None else None,
+                    )
+                )
             # A handoff asked for in the turn takes effect now that it has ended,
             # however it ended.
             self._settle_relinquish(line_id)
@@ -7954,7 +7964,15 @@ class Scheduler:
             self._turn_owned.discard(line_id)
             self._last_turn_end[line_id] = self._clock()
             if line is not None:
-                self._log.append(LineTurnEnded(line_id, self._workdir_commit(line_id)))
+                # Round 8 review, ON1, as in ``_turn``. An engine turn that failed or
+                # was cancelled before it reported retires none of its task notes.
+                self._log.append(
+                    LineTurnEnded(
+                        line_id,
+                        self._workdir_commit(line_id),
+                        True if report is None else None,
+                    )
+                )
             self._settle_relinquish(line_id)
             self._work.set()
         self._apply_limits(line_id, TurnCause.AUTONOMOUS, True, report)

@@ -95,6 +95,29 @@ def test_a_line_turn_end_event_round_trips() -> None:
     assert decode(encode(event)) == event
 
 
+def test_a_line_turn_end_writes_unreported_only_when_true() -> None:
+    """Round 8 review, ON1. A turn with no report is written with ``unreported``,
+    any other turn end is written as before the field, and a log written before it
+    decodes every turn end as reported."""
+    unreported = LineTurnEnded("beta", None, True)
+    assert json.loads(encode(unreported))["data"]["unreported"] is True
+    assert decode(encode(unreported)) == unreported
+    reported = LineTurnEnded("beta", None)
+    assert "unreported" not in json.loads(encode(reported))["data"]
+    before = wire("line_turn_ended", {"line_id": "beta", "workdir_commit": None})
+    # Equality with ``reported`` covers ``unreported``, which is ``None`` there.
+    assert decode(before) == reported
+
+
+@pytest.mark.parametrize("value", [False, 1, "true"])
+def test_a_line_turn_end_refuses_an_unreported_that_is_not_true(
+    value: object,
+) -> None:
+    data = {"line_id": "beta", "workdir_commit": None, "unreported": value}
+    with pytest.raises(DecodeError):
+        decode(wire("line_turn_ended", data))
+
+
 def test_the_field_table_names_exactly_the_scenario_kinds(
     scenario: tuple[Event, ...],
 ) -> None:

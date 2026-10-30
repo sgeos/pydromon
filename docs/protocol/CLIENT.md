@@ -98,7 +98,7 @@ the line holds, each with `name` and `expires`, its end as a due time, and from
 2026-10-30 `unread`, `unanswered` and `own_notes`, the line's mail counts, as
 [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies for its summary. From round 8 of
 2026-10-30, `own_notes` leaves out an own note once a turn of the line has ended after
-its delivery. The note itself is not
+its delivery with a report from its engine. The note itself is not
 shown. `line_view` returns the same entry as `line`.
 
 ## Responses

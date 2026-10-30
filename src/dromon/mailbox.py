@@ -40,7 +40,9 @@ class MailSummary:
     own_notes: int = 0
     """The owner's own notes, such as fired wakes, task-end notes and compaction
     requests, that are neither read nor acknowledged and that no turn of the owner
-    has ended since receiving, which ``unread`` leaves out and this counts apart."""
+    whose engine reported it has ended since their delivery, which ``unread`` leaves
+    out and this counts apart. A note that left this count is in no count, and is
+    still listed by ``list_mail`` without a filter."""
 
     def sentence(self) -> str:
         """The summary in the form a wake prompt opens with."""
@@ -55,7 +57,8 @@ class MailSummary:
             text += (
                 f" {self.own_notes} {own} of your own, such as fired wakes, {verb}"
                 " counted apart from unread until read, acknowledged, or shown to a"
-                " turn that ends."
+                " turn that ends. Those past that are still listed by list_mail"
+                " without a filter."
             )
         return text
 
@@ -83,15 +86,17 @@ def counts_unread(message: Message, owner: Address) -> bool:
 
 def shown_to_ended_turn(state: State, message: Message) -> bool:
     """Whether a turn of the line ``message`` was delivered to has ended since its
-    delivery, read from the event order alone, as ``State.turn_end_counts`` and
-    ``Message.turn_ends_at_delivery`` record it. Always false for mail to an operator,
-    an agent or a peer, which has no turns."""
-    if message.turn_ends_at_delivery is None or not isinstance(
+    delivery with a report from its engine, read from the event order alone, as
+    ``State.reported_turn_ends`` and ``Message.reported_ends_at_delivery`` record it.
+    Shown means delivered to the line, whether in a prompt, inside a running turn or
+    for the record between turns, and never only in a prompt. Always false for mail
+    to an operator, an agent or a peer, which has no turns."""
+    if message.reported_ends_at_delivery is None or not isinstance(
         message.recipient, LineAddress
     ):
         return False
-    ended = state.turn_end_counts.get(message.recipient.line_id, 0)
-    return ended > message.turn_ends_at_delivery
+    ended = state.reported_turn_ends.get(message.recipient.line_id, 0)
+    return ended > message.reported_ends_at_delivery
 
 
 def counts_own_note(
@@ -100,8 +105,8 @@ def counts_own_note(
     """Whether ``message`` in ``owner``'s mailbox is counted in ``own_notes``, the
     rule ``summary`` counts by and ``listing`` filters by with ``own_notes_only``.
     An own note leaves the count once it is read, acknowledged or replied to, or
-    once a turn of its line has ended after it was delivered, as ``summary`` sets
-    out."""
+    once a turn of its line has ended with a report after it was delivered, as
+    ``summary`` sets out."""
     return (
         is_own_note(message, owner)
         and not message.read
@@ -168,11 +173,27 @@ def summary(state: State, owner: Address, new: int) -> MailSummary:
     **Round 8 task of 2026-10-30, decided by core for review.** That last sentence no
     longer holds. An own note also leaves ``own_notes`` once a turn of its line has
     ended after the note was delivered, whatever the turn's outcome, since the daemon
-    records ``line_turn_ended`` for a failed or held turn too. Lines left fired wakes
+    records ``line_turn_ended`` for a failed or held turn too, so long as its engine
+    returned a report, as ON1 below says. Lines left fired wakes
     and task notes alone once their work was done, so the count grew without bound
     and told a line nothing. A worker line in another project counted 62, and 89 of
     its 90 task notes were never read or acknowledged.
 
+    **Round 8 review of 2026-10-30, decided by the operator.** Shown means delivered
+    to the line, whether in its prompt, inside a running turn or for the record
+    between turns. It does not mean that a prompt carried the note. A note retired
+    unopened is in no count, and is still listed by ``list_mail`` without a filter.
+
+    - **A turn with no report, ON1.** A turn whose engine returned no report retires
+      nothing, since the daemon cannot say that its prompt reached the engine. Its
+      prompt may not have been composed, a check before the engine may have failed,
+      the engine may have raised, or the turn may have been cancelled. The daemon
+      records ``line_turn_ended`` with ``unreported`` for it, in the ordinary turn
+      and in a turn the engine started, and its notes count until a later turn of
+      the line ends with a report. A cancelled or failed engine may have read the
+      prompt, so the rule can keep a note counted one turn too long, and never
+      retires one too early. A ``line_turn_ended`` written before the field counts
+      as reported, since nothing in it says otherwise.
     - **The current prompt.** A note the current prompt delivered still counts, since
       its turn has not ended, so the turn shown it sees it in the count.
     - **A task note recorded during a running turn.** No prompt delivers it, and it
@@ -198,9 +219,9 @@ def summary(state: State, owner: Address, new: int) -> MailSummary:
       operator, an agent or a peer keeps no turn count, so no line's turn retires
       it, and an operator cannot send itself a note, so its ``own_notes`` is 0.
 
-    The rule reads only ``State.turn_end_counts`` and each message's
-    ``turn_ends_at_delivery``, which the event order rebuilds, so it holds across a
-    restart and nothing of it is held in the scheduler's memory."""
+    The rule reads only ``State.reported_turn_ends`` and each message's
+    ``reported_ends_at_delivery``, which the event order rebuilds, so it holds
+    across a restart and nothing of it is held in the scheduler's memory."""
     held = mailbox(state, owner)
     replied = replied_ids(state, owner)
     return MailSummary(
