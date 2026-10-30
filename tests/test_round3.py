@@ -601,6 +601,9 @@ def test_a_quiet_notice_is_dropped_for_mail_sent_outside_any_turn(
     world.scheduler._engines["alpha"] = world.engines["alpha"]  # pyright: ignore[reportPrivateUsage]
     saved = world.scheduler._quiet_tasks["alpha"]  # pyright: ignore[reportPrivateUsage]
     assert saved.mail == 0
+    # The positive control. Without mail the same record gives a notice.
+    assert world.scheduler._quiet_notice("alpha") is not None  # pyright: ignore[reportPrivateUsage]
+    world.scheduler._quiet_tasks["alpha"] = saved  # pyright: ignore[reportPrivateUsage]
     world.scheduler.send(LineAddress("alpha"), ANA, "still building")
     assert world.scheduler._quiet_notice("alpha") is None  # pyright: ignore[reportPrivateUsage]
     world.log.close()
