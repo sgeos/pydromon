@@ -442,13 +442,16 @@ def operator_log(path: Path) -> None:
         log.append(LineTurnEnded("alpha", None))
 
 
-def test_an_operators_mailbox_is_not_retired_by_a_lines_turn(tmp_path: Path) -> None:
+def test_an_operators_mailbox_is_not_retired_by_a_lines_turn(
+    tmp_path: Path, short_runtime: Path
+) -> None:
     """Mail to an operator records no turn count, so a line's turn retires none of
     it. An operator cannot send itself a note, so its ``own_notes`` is 0, and the
-    client's ``mail`` request gives the counts ``summary`` gives."""
+    client's ``mail`` request gives the counts ``summary`` gives. The daemon checks
+    its socket path, which under ``tmp_path`` can exceed the limit."""
     from dromon.scheduler import Scheduler as Held
 
-    paths = project_paths(tmp_path, tmp_path / "run")
+    paths = project_paths(tmp_path, short_runtime)
     paths.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     operator_log(paths.event_log)
     with EventLog(paths.event_log) as log:
