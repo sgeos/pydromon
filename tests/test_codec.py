@@ -135,6 +135,22 @@ def test_an_encoding_is_pinned_so_ports_can_compare_bytes() -> None:
     assert encode(LineCreated("alpha", "claude-opus-5-5", "subscription")) == expected
 
 
+def test_unkeyed_acts_encode_as_the_encoder_before_request_keys_did() -> None:
+    """Review r5, K2. The bytes were produced by the encoder at 559f7b2, before the
+    ``request`` field existed, so a daemon of that build reads these events."""
+    sent = (
+        '{"data":{"body":"hi","choices":[],"kind":"note","message_id":"m1",'
+        '"recipient":"@ana","reply_to":null,"sender":"beta"},'
+        '"kind":"message_sent","v":1}'
+    )
+    wake = (
+        '{"data":{"due":"2026-10-26T09:30:00Z","line_id":"beta","message_id":"m2",'
+        '"note":"look","task_id":null},"kind":"wake_scheduled","v":1}'
+    )
+    assert encode(MessageSent("m1", BETA, ANA, MessageKind.NOTE, "hi")) == sent
+    assert encode(WakeScheduled("beta", "m2", "2026-10-26T09:30:00Z", "look")) == wake
+
+
 def test_string_escapes_are_pinned_so_ports_can_compare_bytes() -> None:
     text = "".join(chr(c) for c in range(0x20)) + '"\\/\x7f '
     escaped = (

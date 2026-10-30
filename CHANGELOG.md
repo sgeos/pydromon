@@ -15,7 +15,9 @@ All notable changes are recorded here. The format follows
   act, the bound of 256 keys per party and tool holds after replay, and the field is
   left out of events without a key, so older logs still load. A repeated `wake_after`
   no longer names the wake the first call replaced. Asked for by the review line's
-  report of round 4.
+  report of round 4. **Rollback.** A daemon built before this change cannot decode a
+  keyed event, so a log that holds one needs this daemon or a later one. Review r5,
+  finding K1.
 
 - Compaction now withdraws a still-pending wake scheduled by `compact_session` whether
   the engine made the compaction itself or a turn made it at Dromon's request, and a
