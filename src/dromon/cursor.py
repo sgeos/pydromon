@@ -68,6 +68,8 @@ from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
 from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
+from dromon import gitssh
+from dromon.gitssh import GitSshAccess
 
 ENGINE_NAME: Final = "cursor-agent"
 """The engine this adapter runs, as drivers name it."""
@@ -361,6 +363,7 @@ class CursorLine:
         connection_factory: ConnectionFactory | None = None,
         observe: Observer = ignore,
         mark: str | None = None,
+        git_ssh: GitSshAccess | None = None,
         partial_isolation: bool = False,
         turn_seconds: float = TURN_SECONDS,
     ) -> None:
@@ -387,6 +390,9 @@ class CursorLine:
         )
         self._observe = observe
         self.mark = mark
+        self.git_ssh = git_ssh
+        """The agent and pinned hosts of the project's ``[git_ssh]`` table, if the
+        line was given them."""
         """The process mark every process of this line inherits, if issued."""
         self.partial_isolation = partial_isolation
         """Whether the operator accepts that Cursor's uncovered tools are refused only
@@ -411,6 +417,7 @@ class CursorLine:
         if self.session_id is not None:
             raise EngineRefused(RESUME_REFUSAL)
         environment = engine_environment(self._environment, settings.strategy)
+        environment.update(gitssh.environment(self.git_ssh))
         check_workspace(self.cwd, self._home)
         if self.mark is not None:
             environment[MARK_VARIABLE] = self.mark

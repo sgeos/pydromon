@@ -96,6 +96,11 @@ handoff_below_percent = 10  # the default, or 0 for never
 | tool keys | as in `LINE_CONFIG.md` | as there | `builtin_tools`, `mcp_servers`, `tool_policy`, `allowed_tools`, `inherit_account_mcp`, `effort`, `claude_code_prompt`, `instructions`, `workdir`, `workdir_access`, `project_settings` |
 | `lines.ID.secrets` | list of environment variable names | none | Names this project grants that line to reference in its MCP configuration. Values are read from the daemon environment only for that line's MCP configuration and are never added to its engine process environment. A profile may grant names to its lines. |
 | `lines.ID.may_own` | boolean | `true` | Whether the line, as a seat of a role, may own the role. A profile may set it |
+| `lines.ID.git_ssh` | boolean | `false` | Whether the line's shell commands get the project's `[git_ssh]` agent, as below. A profile may set it. True without a `[git_ssh]` table is an error |
+| `git_ssh` | table | off | One Secure Shell (SSH) agent socket and pinned host keys for the lines that set `git_ssh`, as below |
+| `git_ssh.agent` | `inherit` or absolute path | required | `inherit` forwards the daemon's own `SSH_AUTH_SOCK`. A path names a socket, such as that of a separate agent holding only a deploy key |
+| `git_ssh.known_hosts` | path | required | A `known_hosts` file, absolute or relative to the project root, that holds a key for `github.com` |
+| `git_ssh.public_key` | path | required | The public key, absolute or relative to the project root, whose private half the agent holds, and the only key ssh offers |
 | `roles.ID` | table | none | A role, named by an identifier, as [`ROLES.md`](../architecture/ROLES.md) designs it |
 | `roles.ID.workdir` | relative path | required | The role's worktree, relative to the project root, with `/` between steps and no empty, `.` or `..` step, or `.` for the root |
 | `roles.ID.seats` | list of 1 to 16 line identifiers | required | The role's seats, each a line this file declares, distinct, and a seat of no other role in the file. Their order is the order a failover follows |
@@ -175,8 +180,9 @@ handoff_below_percent = 10  # the default, or 0 for never
   created through the client and absent from the file are left as they are.
 - **Reload.** `reload_project` applies the file again without a restart, with the same
   rules, after checking all of it, so a refused reload applies nothing. It refuses a
-  change to the sandbox, the engine settings, the teacher, the external agent policy or
-  the federation and peer tables, which apply only at start. Its roles are recorded as above. A line the file no longer declares returns to the
+  change to the sandbox, the engine settings, the teacher, the external agent policy,
+  the federation and peer tables, the `[git_ssh]` table or the lines that set
+  `git_ssh`, which apply only at start. Its roles are recorded as above. A line the file no longer declares returns to the
   project's limits and wake policy. The leases table is applied again, and a held lease
   whose name the file no longer declares ends.
 - **Lines on other engines.** A project file whose own `[sandbox]` or `[settings]`
@@ -293,6 +299,136 @@ stops the start, or refuses the reload and keeps the previous list.
   refusal reveals nothing of the list. **Fact.** Each spent limit still yields one
   further answer, since the held reply differs from a sent one, so a line learns at
   most 11 answers per release.
+
+## Git over SSH
+
+**Required by the operator on 2026-10-29.** A line's engine starts with an allowlisted
+environment and a home directory of its own, so the operator's `SSH_AUTH_SOCK`,
+`~/.ssh/config` and `known_hosts` never reach its shell commands, and an enabled
+sandbox denies the agent's socket. The `[git_ssh]` table lets the operator give
+chosen lines git over SSH. It is off by default, and only the project file sets it,
+so neither a client nor a line can turn it on.
+
+```toml
+[git_ssh]
+agent = "inherit"                  # or the absolute path of an agent socket
+known_hosts = "ops/known_hosts"    # holds GitHub's published host keys
+public_key = "ops/deploy.pub"      # the key the agent holds, public half only
+
+[lines.alpha]
+model = "claude-opus-5-5"
+git_ssh = true
+```
+
+- **What is forwarded.** Only an agent socket, never a key file and never the
+  operator's home directory. The line's shell commands get one variable,
+  `GIT_SSH_COMMAND`, and not `SSH_AUTH_SOCK`, so git uses the agent and other
+  programs are not pointed at it. The command is `ssh -F /dev/null` with
+  `IdentityAgent` set to the socket, `IdentityFile` set to the public key,
+  `IdentitiesOnly=yes`, `StrictHostKeyChecking=yes`, `UserKnownHostsFile` set to the
+  named file, `GlobalKnownHostsFile=/dev/null`, `UpdateHostKeys=no` and
+  `BatchMode=yes`. Each path is double quoted for ssh and the whole is quoted for the
+  shell git runs it with, so a space in a path is safe.
+- **Why a public key is required.** **Inference from the `ssh_config` manual page,
+  not tested here.** `IdentitiesOnly` offers only the agent keys that match a
+  configured identity file. A line's home holds none of the default files, so
+  without `public_key` ssh would offer no key at all.
+- **Checks at start.** The daemon checks the table whenever the file has one, even
+  when no line sets `git_ssh` yet, and refuses to start on a failure. `dromon config`
+  runs the same checks against its own environment, which may differ from the
+  daemon's, and shows the socket, the files and the lines given them. Refused are an
+  `inherit` agent when the daemon's environment has no `SSH_AUTH_SOCK`, a socket path
+  that does not exist, is not a socket, belongs to another user or is longer than 103
+  bytes, a socket in a directory that belongs to neither the operator nor root or
+  that its group or others may write, a `known_hosts` that is missing, is not UTF-8
+  or holds no plain entry with a well-formed key for `github.com`, and a public key
+  file that holds a private key or anything but one well-formed public key line.
+  Another user who may write the socket's directory could put a socket of their own
+  in its place after the check. A sticky directory such as `/tmp` is refused as
+  well, so that the rule stays one rule, and `ssh-agent` and the macOS launchd agent
+  both make a private directory for their socket. Each file must be a regular file
+  of the operator's user that neither its group nor others may write. A wildcard, a
+  line whose host list holds any negated pattern, and a line marked `@revoked` or
+  `@cert-authority` pin nothing, and a hashed name counts when it hashes
+  `github.com`. A negated pattern voids its whole line, as `ssh-keygen -F` reports
+  for `!github.com,github.com`, which errs toward refusing.
+- **Well-formed keys.** A key's base64 must decode to the SSH wire form, a
+  length-prefixed type string followed by the key data, whose type string equals the
+  key type the line names and whose data has that type's shape with nothing after
+  it. The types accepted are `ssh-ed25519`, `sk-ssh-ed25519@openssh.com`,
+  `ecdsa-sha2-nistp256`, `ecdsa-sha2-nistp384`, `ecdsa-sha2-nistp521`,
+  `sk-ecdsa-sha2-nistp256@openssh.com` and `ssh-rsa`. **Inference from the
+  `ssh_config` manual page's default `HostKeyAlgorithms`.** The certificate types
+  are left out, since they pin a host only under `@cert-authority`, and so is
+  `ssh-dss`, which OpenSSH no longer offers by default. The check proves that a
+  well-formed key is pinned, and never that the key is GitHub's. The operator must
+  compare the fingerprints, as `ssh-keygen -lf` prints them, with the ones GitHub
+  publishes before starting the daemon. Any of the three inside a directory Dromon protects is refused,
+  since an enabled sandbox denies it. No path may hold a control character, a quote, a
+  backslash, `$` or `%`, which ssh would expand or read as part of its option. No
+  host key is written into Dromon's code.
+- **Sandbox.** For a Claude Code line whose merged sandbox is enabled, Dromon merges
+  one further layer last, which adds the socket to `network.allowUnixSockets`,
+  `github.com` to `network.allowedDomains`, and both files to `filesystem.denyWrite`,
+  so a command cannot add a host key. The protected directories are denied after it,
+  as [`SANDBOX.md`](SANDBOX.md) specifies, so it lifts none of them. A line whose
+  sandbox denies reading either file is refused, since ssh inside it could not read
+  them. A line whose sandbox is absent or disabled gets the variable alone.
+- **Engines.** One function, `dromon.gitssh.environment`, gives the variable to every
+  adapter. Claude Code, Grok, Pi, Cursor Agent and Antigravity receive it in their
+  engine's environment, and Claude Code's launcher passes only Dromon's value, never
+  one in the daemon's own environment. **Fact, read from the pinned Agent SDK
+  0.2.174.** Its subprocess transport builds the engine's environment from the
+  daemon's own, then its entry point variable, then `options.env`, so `options.env`
+  wins. The adapter sets the relayed name in `options.env` for every line, empty for
+  a line without the option, so a value of that name in the daemon's environment
+  never wins, and the launcher's filter drops an empty one. Codex receives it through
+  `shell_environment_policy.set`, as the line's process mark does, so it reaches the
+  commands Codex runs and not Codex itself. Pi lines take no built-in tool, so a Pi
+  line has no shell command to use it.
+- **Changes between turns.** The daemon records the SHA-256 digest of both files as
+  it checks them at start. Before each turn of a line given the option, before its
+  engine is built or a prompt sent, it reads both files again. If either differs
+  from its digest, or is no longer a regular file of the operator's that no one else
+  may write, the turn is refused, the line is held, and an operator is asked, in a
+  question that names the file and never its contents. Answering resumes the line,
+  and its next turn is checked again, so the operator restores the file first or
+  restarts the daemon to accept it. A line whose sandbox is disabled runs as the
+  operator's user and can do anything that user can, including changing either
+  file between two checks and restoring it before the next. The digest check
+  therefore detects tampering at a turn's start and does not prevent it. Keep both
+  files outside every line's writable directories, such as its worktree, its home
+  and any directory its sandbox allows writing.
+- **Restart.** The socket is resolved once, at start. A reload that changes the table
+  or the lines that set `git_ssh` is refused, and an agent restarted on another socket
+  needs a daemon restart.
+- **Threat model.** A command that can reach the socket can ask the agent to sign
+  with every key the agent holds, for every host and repository those keys reach. It
+  can also run ssh with options of its own, so `GIT_SSH_COMMAND` narrows what git does
+  and not what a line can do, and `IdentitiesOnly` does not confine a line. An agent
+  that holds only a deploy key narrows the reach to that one repository and its
+  permission, and is the recommended form. The option grants a capability and lifts
+  no rule, so a project's own rules that forbid lines to push, as pydromon's line rules
+  do, still apply.
+- **Observed on 2026-10-29, inside an enabled Claude Code sandbox.** The test ran in
+  the operator's own Claude Code session, whose sandbox is configured like, but not
+  identically to, a Dromon line's. There `ssh` could not resolve `github.com` or
+  `ssh.github.com`, since the sandbox allows no direct connection, and a tunnel through
+  the sandbox's HTTP proxy with `ncat` was refused for port 22 and port 443. No further
+  route was tried, since working around the proxy is not Dromon's to do.
+  **Inference.** Git over SSH works only for a line whose Claude Code sandbox is
+  disabled. Under an enabled sandbox, use HTTPS with a credential the operator
+  provides instead. Dromon configures no proxy route.
+- **Observed on 2026-10-29, outside a sandbox.** The `GIT_SSH_COMMAND` that
+  `dromon.gitssh` builds, run by `git ls-remote` with no `SSH_AUTH_SOCK` and a home
+  directory that does not exist, reached GitHub, verified its host key against a
+  `known_hosts` file built from GitHub's published keys, and stopped at public key
+  authentication for a throwaway key GitHub does not know. With an empty `known_hosts`
+  file the same command was refused for the unknown host key.
+- **Unverified.** Signing with a key the agent holds, since the operator's agent held
+  none during the test, and any push. Whether Codex's and Grok's own sandboxes let a
+  command connect to the socket or reach the network, and Codex's workspace profile is
+  believed to deny the network.
 
 ## Trust
 

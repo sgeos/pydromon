@@ -37,6 +37,7 @@ from dromon.priority import SteeredDriver
 from dromon.grok import bridge_command
 from dromon.jsonlines import Connection, json_lines_factory
 from dromon.lineconfig import LineConfig, WorkdirAccess
+from dromon.gitssh import COMMAND_VARIABLE, GitSshAccess, ssh_command
 from dromon.pi import (
     tool_calls_in,
     DIALOG_REFUSED,
@@ -1044,3 +1045,22 @@ def test_a_message_counts_its_tool_calls_by_block_and_by_stop_reason() -> None:
     assert tool_calls_in({"content": [text, call, call]}) == 2
     assert tool_calls_in({"content": [text], "stopReason": "toolUse"}) == 1
     assert tool_calls_in({"content": "not a list"}) == 0
+
+
+GIT_SSH = GitSshAccess(
+    "/run/agent.sock", "/keys/known_hosts", "/keys/deploy.pub", "0" * 64, "0" * 64
+)
+"""A resolved ``[git_ssh]`` agent, which no test here connects to."""
+
+
+def test_a_pi_line_given_git_ssh_carries_its_command_and_no_other(
+    home: Path,
+) -> None:
+    server = FakePi()
+    target = line(server, home)
+    target.git_ssh = GIT_SSH
+    run(target)
+    assert server.environment[COMMAND_VARIABLE] == ssh_command(GIT_SSH)
+    plain = FakePi()
+    run(line(plain, home, environment={"PATH": "/bin", COMMAND_VARIABLE: "x"}))
+    assert COMMAND_VARIABLE not in plain.environment

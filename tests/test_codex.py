@@ -5,6 +5,7 @@ they need both the ``live`` marker selected and ``DROMON_LIVE_TESTS=1``.
 """
 
 import asyncio
+import json
 import os
 import sys
 from collections import deque
@@ -44,6 +45,7 @@ from dromon.launcher import (
     STOP_POLICY_VARIABLE,
 )
 from dromon.lineconfig import LineConfig, config_from_document
+from dromon.gitssh import COMMAND_VARIABLE, GitSshAccess, ssh_command
 from dromon.model import format_due
 from dromon.projectconfig import parse
 from dromon.sandbox import parse_sandbox
@@ -1238,3 +1240,28 @@ def test_a_finished_item_that_is_no_tool_is_not_a_safe_point(steered: Steered) -
     report = run(line(server, driver=driver))
     assert asked == []
     assert report.interrupted_for is None
+
+
+GIT_SSH = GitSshAccess(
+    "/run/agent.sock", "/keys/known_hosts", "/keys/deploy.pub", "0" * 64, "0" * 64
+)
+"""A resolved ``[git_ssh]`` agent, which no test here connects to."""
+
+
+def test_a_codex_line_given_git_ssh_sets_it_for_its_shell_commands_alone() -> None:
+    """As the mark does, through ``shell_environment_policy.set``, so Codex's own
+    policy cannot drop it and Codex's own processes do not carry it."""
+    server = FakeServer()
+    target = line(server, environment={"PATH": "/bin", COMMAND_VARIABLE: "x"})
+    target.git_ssh = GIT_SSH
+    run(target)
+    pairs = list(zip(server.arguments, server.arguments[1:], strict=False))
+    value = json.dumps(ssh_command(GIT_SSH))
+    assert ("-c", f"shell_environment_policy.set.{COMMAND_VARIABLE}={value}") in pairs
+    assert COMMAND_VARIABLE not in server.environment
+    plain = FakeServer()
+    run(line(plain, environment={"PATH": "/bin", COMMAND_VARIABLE: "x"}))
+    assert not any(COMMAND_VARIABLE in argument for argument in plain.arguments)
+    assert COMMAND_VARIABLE not in plain.environment
+    with pytest.raises(EngineRefused, match="not a bare TOML key"):
+        server_arguments([], LineConfig(), (), None, {"A.B": "x"})

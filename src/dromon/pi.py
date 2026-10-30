@@ -69,6 +69,8 @@ from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
 from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
+from dromon import gitssh
+from dromon.gitssh import GitSshAccess
 
 ENGINE_NAME: Final = "pi"
 """The engine this adapter runs, as drivers name it."""
@@ -606,6 +608,7 @@ class PiLine:
         extension: Path | None = None,
         observe: Observer = ignore,
         mark: str | None = None,
+        git_ssh: GitSshAccess | None = None,
         compacted: Callable[[Mapping[str, int | str | None]], object] = (
             lambda compaction: None
         ),
@@ -635,6 +638,9 @@ class PiLine:
         self._extension = extension
         self._observe = observe
         self.mark = mark
+        self.git_ssh = git_ssh
+        """The agent and pinned hosts of the project's ``[git_ssh]`` table, if the
+        line was given them."""
         """The process mark every process of this line inherits, if issued."""
         self._compacted = compacted
         self.turn_seconds = turn_seconds
@@ -654,6 +660,7 @@ class PiLine:
         model = harness_model(settings.model)
         provider = model.partition("/")[0]
         environment = engine_environment(self._environment, settings.strategy, provider)
+        environment.update(gitssh.environment(self.git_ssh))
         check_agent_dir(self.agent_dir)
         effort = self.config.effort or settings.effort
         if effort not in THINKING:

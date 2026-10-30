@@ -115,6 +115,8 @@ from dromon.ceiling import (
 from dromon.launcher import STOP_POLICY_VARIABLE, StopPolicy
 from dromon.processes import MARK_VARIABLE
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
+from dromon import gitssh
+from dromon.gitssh import GitSshAccess
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
 from dromon.model import InvalidField, format_due
 
@@ -398,20 +400,30 @@ def server_arguments(
     config: LineConfig,
     protected: Sequence[Path] = (),
     mark: str | None = None,
+    variables: Mapping[str, str] | None = None,
 ) -> list[str]:
     """The ``codex app-server`` arguments that isolate a line configured as ``config``
     from the operator's ``servers``, from every tool it was not given, and from the
     ``protected`` directories, and that give the line's shell commands its process
-    ``mark``.
+    ``mark`` and the further ``variables``, such as ``dromon.gitssh.environment``
+    gives.
 
     The mark goes through Codex's ``shell_environment_policy.set``, which applies to
     the commands Codex runs and not to Codex's own processes, so the app-server and its
-    helpers never carry it and a line cannot list or stop them."""
+    helpers never carry it and a line cannot list or stop them. The further variables
+    go the same way, so Codex's own policy cannot drop them."""
     arguments = ["app-server"]
     if mark is not None:
         arguments += [
             "-c",
             f"shell_environment_policy.set.{MARK_VARIABLE}={_toml_string(mark)}",
+        ]
+    for name, value in sorted((variables or {}).items()):
+        if BARE_KEY.fullmatch(name) is None:
+            raise EngineRefused(f"the variable name {name!r} is not a bare TOML key")
+        arguments += [
+            "-c",
+            f"shell_environment_policy.set.{name}={_toml_string(value)}",
         ]
     for name in sorted(set(servers)):
         # Codex's -c parser takes bare dotted keys only, and rejects a quoted one.
@@ -971,6 +983,7 @@ class CodexLine:
         server_lister: ServerLister = list_servers,
         observe: Observer = ignore,
         mark: str | None = None,
+        git_ssh: GitSshAccess | None = None,
         clock: Callable[[], float] = time.monotonic,
         poll_seconds: float = KEEP_POLL_SECONDS,
         task_ended: Callable[[BackgroundEnd], object] = ignore_end,
@@ -998,6 +1011,9 @@ class CodexLine:
         self._list_servers = server_lister
         self._observe = observe
         self.mark = mark
+        self.git_ssh = git_ssh
+        """The agent and pinned hosts of the project's ``[git_ssh]`` table, if the
+        line was given them."""
         """The process mark every process of this line inherits, if issued."""
         self._next_id = 0
         self._thread_id = ""
@@ -1105,7 +1121,11 @@ class CodexLine:
             if reason is not None:
                 raise EngineRefused(reason)
             arguments = server_arguments(
-                self._list_servers(environment), self.config, self.protected, self.mark
+                self._list_servers(environment),
+                self.config,
+                self.protected,
+                self.mark,
+                gitssh.environment(self.git_ssh),
             )
             instructions = read_instructions(self.config.instructions, self.cwd)
         except Exception:

@@ -99,6 +99,8 @@ from dromon.lineconfig import (
 )
 from dromon.projectconfig import ConfigFileError, ProjectConfig, config_path, load
 from dromon.sandbox import SandboxConfig, SandboxError, effective, merge
+from dromon import gitssh
+from dromon.gitssh import GitSshAccess, GitSshError, sandbox_layer, unreadable
 from dromon.processes import environment_reading_works
 from dromon.roles import RoleConflict, plan_roles
 from dromon.workdir import git_write_guards, read_head_commit, resolve_workdir
@@ -1221,9 +1223,10 @@ class Daemon:
     def _reload_project(self, args: dict[str, object]) -> dict[str, object]:
         """Read the project file again and apply its lines, limits and wake policy.
 
-        A change to the sandbox, the engine settings, the teacher or the external
-        agent policy is refused, because the running engine factory, teacher and
-        agent socket were built from them, and the daemon must restart to apply it.
+        A change to the sandbox, the engine settings, the teacher, the external
+        agent policy, the federation, the ``[git_ssh]`` table or the lines it
+        reaches is refused, because the running engine factory, teacher and agent
+        socket were built from them, and the daemon must restart to apply it.
         A refused reload changes nothing.
         """
         if args:
@@ -1236,12 +1239,14 @@ class Daemon:
             check_engines(config)
         except ValueError as error:
             raise OverrideError(str(error)) from error
-        fixed = ("sandbox", "settings", "teacher", "agents", "federation")
+        fixed = ("sandbox", "settings", "teacher", "agents", "federation", "git_ssh")
         moved = [
             name
             for name in fixed
             if getattr(config, name) != getattr(self.project, name)
         ]
+        if git_ssh_lines(config) != git_ssh_lines(self.project):
+            moved.append("the lines given git_ssh")
         if moved:
             raise OverrideError(
                 "the project file changes "
@@ -2294,6 +2299,51 @@ def check_sandboxes(config: ProjectConfig, paths: ProjectPaths) -> None:
                 )
 
 
+def git_ssh_access(
+    config: ProjectConfig, paths: ProjectPaths, environment: Mapping[str, str]
+) -> dict[str, GitSshAccess]:
+    """The resolved ``[git_ssh]`` agent of each line the project file gives it, and
+    none when the file has no such table. The table is checked whenever it is
+    present, so a socket or a file it names is refused before anything starts even
+    when no line uses it yet. Raises ``GitSshError``, which is a ``ValueError``,
+    also for a line whose enabled sandbox denies reading a file ssh needs.
+
+    ``environment`` is the daemon's own, read for ``SSH_AUTH_SOCK`` when the agent is
+    inherited. **Assumption.** The socket is resolved once, at start, so an agent
+    restarted on another socket needs a daemon restart too."""
+    if config.git_ssh is None:
+        return {}
+    protected = protected_dirs(paths, config.federation)
+    access = gitssh.resolve(config.git_ssh, paths.root, environment, protected)
+    given: dict[str, GitSshAccess] = {}
+    for line_id, line in sorted(config.lines.items()):
+        if not line.git_ssh:
+            continue
+        merged = merge([config.sandbox, line.config.sandbox])
+        if merged is not None and merged.enabled:
+            workdir = resolve_workdir(line.config.workdir, paths.root, protected)
+            document = effective(
+                merge([merged, sandbox_layer(access)]),
+                workdir,
+                protected,
+                git_write_guards(workdir),
+            )
+            denied = None if document is None else unreadable(access, document)
+            if denied is not None:
+                raise GitSshError(
+                    f"line {line_id}'s sandbox denies reading {denied}, which ssh"
+                    " needs for the [git_ssh] table",
+                    f"lines.{line_id}.git_ssh",
+                )
+        given[line_id] = access
+    return given
+
+
+def git_ssh_lines(config: ProjectConfig) -> tuple[str, ...]:
+    """The lines the project file gives its ``[git_ssh]`` agent."""
+    return tuple(sorted(i for i, line in config.lines.items() if line.git_ssh))
+
+
 def check_sandbox_required(
     project: ProjectConfig, line_id: str, model: str, config: LineConfig
 ) -> None:
@@ -2511,6 +2561,7 @@ def run(
         file = config_path(paths.state_dir)
         config = load(file, paths.root) if file.exists() else ProjectConfig()
         check_sandboxes(config, paths)
+        line_git_ssh = git_ssh_access(config, paths, os.environ)
         check_engines(config)
         terms = project_terms(config, paths)
         limits, operator, tick = resolve(config, given)
@@ -2545,6 +2596,7 @@ def run(
                     line_tokens=line_tokens,
                     line_socket=paths.line_socket,
                     line_secrets=line_secrets,
+                    line_git_ssh=line_git_ssh,
                 ),
                 limits=limits,
                 default_operator=operator,
@@ -2562,6 +2614,7 @@ def run(
             )
             scheduler.record_walk_gap(launcher.walk_gap())
             scheduler.set_disclosure_terms(terms)
+            scheduler.set_git_ssh(line_git_ssh)
             scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
             check_lines_sandboxed(config, log, scheduler)
             check_roles(scheduler, log, config)
