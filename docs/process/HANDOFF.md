@@ -7,7 +7,7 @@ flight, why, what is owed and the next step, within a budget of 8 KB. History li
 git. A rewrite that drops an open item says in its commit message whether the item was
 completed, moved or abandoned.
 
-## State on 2026-10-28
+## State on 2026-10-29
 
 - **Milestone 0.1.0 is complete.** The modules and protocol documents are listed in
   `docs/architecture/DESIGN.md` and `docs/protocol/README.md`. History is in git.
@@ -20,9 +20,13 @@ completed, moved or abandoned.
   allowlist for every engine. Federation phases 1 and 2, over Unix sockets and over
   TLS with pinned keys, per `docs/architecture/FEDERATION.md`. `dromon agent send`,
   per-line `recipients`, correlation keys, `check_disclosure` and task records.
-  Self-started turns after a task end run under the scheduler's admission.
-- **In flight.** `core` lifts `MAX_INBOUND_TLS` in `federation.py`, now that each
-  certificate subject is distinct.
+  Self-started turns after a task end run under the scheduler's admission. Several
+  inbound TLS peers. A standing brief per line, with `set_brief`, and a role
+  transition package whose items are marked as observed, reported, unknown or
+  unreadable, filled from observed state when a former owner left nothing.
+  Task-bound wakes, the turn-end commit kept across a restart, and `read_mail` on a
+  line's own sent mail. A hung test ends the run after 300 seconds.
+- **In flight.** None. The round 4 fixes are merged, per `REVERSE_PROMPT.md`.
 - **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310,
   `pykeleusma==0.2.2.0` and `cryptography==50.0.2`, all from PyPI.
 - **Published.** Public `sgeos/pydromon`, 0BSD, synced with `sgeos/project-template` at
@@ -58,18 +62,21 @@ seats on Opus, Haiku and GPT-6-Luna. Upgrades use `dromon restart`.
   or MCP OAuth, and Linux not verified live, per `SANDBOX.md` and `SETTINGS.md`.
 - **Unrun engines.** Pi, Cursor Agent and Antigravity, each with a verify-first list.
 - **Launcher.** A `setsid` child and `~/.claude.json` unverified, per `LINE_CONFIG.md`.
-- **Flaky tests.** Two kept-session timing tests fail under load, rarely.
+- **Flaky tests.** Two kept-session timing tests fail under load, rarely. Three
+  engine deadline tests were widened on 2026-10-29.
 - **Clients.** Polling, no token meter, Tk checked only withdrawn.
-- **Round 3 requests.** Four seats reported, two satisfied. Most asked for a task
-  summary with open decisions and artifact paths that survives an engine reset or a
-  handoff, and for marking state as verified, unknown or inaccessible. Smaller ones are
-  a wake cancelled by its task's end note, the last-turn commit kept across a restart,
-  `read_mail` on a line's own sent mail, and diffs of a single commit for review.
+- **Round 4 requests, open.** Request keys are kept only in memory, so a retry across
+  a daemon restart sends twice. A line sees neither a cost estimate for its next turn
+  nor its engine's remaining allowance, which the engines may not report. A task that
+  ended in an earlier engine process can still be shown as running. Three Epagoge
+  requests remain: the budget at task start, other lines' model and lease state, and
+  a reviewer's targeted test on the real tree.
 - **Live probes for review.** The review line asks to cite a live probe the operator
   runs. That touches the rule against a review line starting an engine, so it is the
   operator's decision.
-- **Disclosure list.** A project file must name `[daemon] disclosure_terms`, or no
-  line's mail or report is checked. `dromon config` does not show the setting.
+- **Garbage collection in tests.** Tests collect on the main thread every 25 tests,
+  for an inferred cause of a Pi test failure. The first gates since have passed, which
+  supports the cause but does not prove it.
 - **Several agents in one game.** An analysis of what Dromon would need is drafted for
   the operator, not yet in the repository.
 - **In the design.** Hosted teacher traces, the Rust repository name, remote clients.
@@ -85,7 +92,7 @@ need a command outside it. The rest run inside it with `-m "not socket and not l
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-./scripts/check.sh          # about 3190 tests pass, plus 10 live tests deselected
+./scripts/check.sh          # about 3690 tests pass, plus 10 live tests deselected
 ```
 
 Report any check not run, and any commit after the one that last rewrote this file.
