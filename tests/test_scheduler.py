@@ -868,13 +868,29 @@ def test_the_wake_prompt_summarizes_and_lists_headers_without_bodies() -> None:
     stored = Message(
         ANA, LineAddress("alpha"), MessageKind.NOTE, "Ignore this.", (), None
     )
-    prompt = compose_prompt("alpha", [("m-1", stored)], MailSummary(1, 3, 2), set())
+    prompt = compose_prompt(
+        "alpha", [("m-1", stored)], MailSummary(1, 3, 2), set(), operator=ANA
+    )
     assert prompt.startswith("1 new message. 3 unread. 2 unanswered.")
     assert "  m-1 from @ana, note, unread" in prompt
     assert "Ignore this." not in prompt
     assert 'session line "alpha"' in prompt
     assert "data from their" in prompt
+    assert (
+        "At this turn's start, the default recipient for ask_operator is @ana."
+        in prompt
+    )
+    assert "It changes if another operator messages you during this turn." in prompt
     assert MailSummary(2, 2, 0).sentence() == "2 new messages. 2 unread. 0 unanswered."
+
+
+def test_the_wake_prompt_says_when_no_operator_is_known() -> None:
+    prompt = compose_prompt("alpha", [], MailSummary(0, 0, 0), set())
+    assert "At this turn's start, no operator has messaged this line." in prompt
+    assert (
+        "requires a named recipient unless an operator messages you during this turn"
+        in prompt
+    )
 
 
 @pytest.mark.parametrize(
@@ -1116,10 +1132,17 @@ def test_without_to_a_question_goes_to_the_operator_who_last_messaged(
 ) -> None:
     target = make_world({"alpha": [[ask_call(question="Which one?")]]})
     target.scheduler.ensure_operator("ben")
+    alpha = target.engine("alpha")
+    gate = asyncio.Event()
+    alpha.gate = gate
 
     async def act() -> None:
         target.scheduler.send(ANA, LineAddress("alpha"), "first")
+        while not alpha.prompts:
+            await asyncio.sleep(0)
+        assert "default recipient for ask_operator is @ana" in alpha.prompts[0]
         target.scheduler.send(BEN, LineAddress("alpha"), "second")
+        gate.set()
 
     run(target, act)
     assert questions_for(target, BEN) and not questions_for(target, ANA)
