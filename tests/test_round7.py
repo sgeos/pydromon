@@ -377,15 +377,37 @@ def test_a_wake_that_replaced_the_compaction_wake_is_not_withdrawn(
     assert withdrawn(world) == []
 
 
-def test_a_compaction_the_engine_made_by_itself_withdraws_nothing(
+def test_a_compaction_the_engine_made_by_itself_withdraws_the_pending_compaction_wake(
     world: World,
 ) -> None:
     message_id = world.compact_wake()
     world.scheduler.session_compacted(
         "alpha", {"trigger": "auto", "before_tokens": 9, "after_tokens": 1}
     )
-    assert world.log.state.scheduled["alpha"].message_id == message_id
-    assert withdrawn(world) == []
+    assert "alpha" not in world.log.state.scheduled
+    assert [event.message_id for event in withdrawn(world)] == [message_id]
+
+
+def test_a_compaction_that_reports_no_size_withdraws_the_context_warning_wake(
+    world: World,
+) -> None:
+    """The round 4 report of core. The context-warning wake used to be withdrawn only
+    by a reported size below the warning, so it fired after a compaction whose size
+    the engine did not give."""
+    world.scheduler._context_reported(  # pyright: ignore[reportPrivateUsage]
+        "alpha", 150_001, CONTEXT_FROM_CALL
+    )
+    first = world.log.state.scheduled["alpha"].message_id
+    world.scheduler.session_compacted("alpha", {"trigger": "auto"})
+    assert "alpha" not in world.log.state.scheduled
+    assert withdrawn(world) == [WakeWithdrawn("alpha", first)]
+    # The size it left is unknown, so automatic compaction is held and no reminder
+    # follows at once, as for any compaction whose size is not reported.
+    assert world.status()["context"]["auto_compact_held"] is True
+    world.scheduler._context_reported(  # pyright: ignore[reportPrivateUsage]
+        "alpha", 150_002, CONTEXT_FROM_CALL
+    )
+    assert "alpha" not in world.log.state.scheduled
 
 
 def test_a_turn_that_did_not_compact_leaves_the_wake_to_fire(world: World) -> None:

@@ -11,12 +11,11 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import daemon, exits
+from dromon import daemon, disclosure, exits
 from dromon.configview import Overrides
 from dromon.daemon import Daemon, check_lines_sandboxed, check_sandbox_required
 from dromon.disclosure import (
     MAX_TERMS_FILE_BYTES,
-    REFUSAL,
     DisclosureError,
     discloses,
     load_terms,
@@ -170,23 +169,32 @@ def last_seq(scheduler: Scheduler) -> int:
 
 
 @pytest.mark.parametrize(
-    ("tool_index", "args"),
+    ("tool_index", "args", "field"),
     [
-        (0, {"to": "beta", "body": f"the {TERM.lower()} plan"}),
-        (0, {"to": "@ana", "body": f"about {TERM}"}),
-        (1, {"question": f"may I mention {TERM}?"}),
-        (1, {"question": "which name?", "choices": ["the old one", TERM.upper()]}),
-        (2, {"seconds": 60, "note": f"recheck {TERM}"}),
+        (0, {"to": "beta", "body": f"the {TERM.lower()} plan"}, "body"),
+        (0, {"to": "@ana", "body": f"about {TERM}"}, "body"),
+        (1, {"question": f"may I mention {TERM}?"}, "question"),
+        (
+            1,
+            {"question": "which name?", "choices": ["the old one", TERM.upper()]},
+            None,
+        ),
+        (2, {"seconds": 60, "note": f"recheck {TERM}"}, "note"),
     ],
 )
 def test_a_line_cannot_send_a_listed_term(
-    scheduler: Scheduler, tool_index: int, args: dict[str, object]
+    scheduler: Scheduler, tool_index: int, args: dict[str, object], field: str | None
 ) -> None:
     tool = scheduler.own_tools("alpha")[tool_index]
     before = last_seq(scheduler)
     result = call(tool, args)
     text = cast(str, result["content"][0]["text"])
-    assert result["is_error"] is True and text == REFUSAL
+    assert result["is_error"] is True
+    assert text == (
+        disclosure.REFUSAL
+        if field is None
+        else f"the {field} field contains a term from the project's disclosure list"
+    )
     assert TERM.casefold() not in text.casefold()
     # The refusal is recorded as one disclosure check, which holds no text, at the
     # operator's decision of 2026-10-28, so that it spends the line's limit.
@@ -206,11 +214,49 @@ def test_clean_text_still_passes_every_tool(scheduler: Scheduler) -> None:
         assert call(tool, args).get("is_error") is not True
 
 
+def test_a_refusal_names_the_field_only_for_a_call_with_one(
+    scheduler: Scheduler,
+) -> None:
+    """Review r4, finding F1. Naming each matching field of a call with several would
+    answer one bit per field in one counted refusal, so a call that offers text in
+    several fields is refused without naming any, and one that offers one names it."""
+    ask = scheduler.own_tools("alpha")[1]
+    several = call(
+        ask,
+        {"question": f"{TERM} question", "choices": [f"choice {TERM.upper()}"]},
+    )
+    assert several["is_error"] is True
+    assert several["content"][0]["text"] == disclosure.REFUSAL
+    one_matching_of_two = call(
+        ask, {"question": "which name?", "choices": [f"choice {TERM}"]}
+    )
+    assert one_matching_of_two["content"][0]["text"] == disclosure.REFUSAL
+    alone = call(ask, {"question": f"{TERM} question"})
+    alone_text = cast(str, alone["content"][0]["text"])
+    assert alone_text == (
+        "the question field contains a term from the project's disclosure list"
+    )
+    assert TERM.casefold() not in alone_text.casefold()
+
+
+def test_the_refusal_helper_names_one_field_of_one_offered() -> None:
+    assert disclosure.refusal(("note",), 1) == (
+        "the note field contains a term from the project's disclosure list"
+    )
+    assert disclosure.refusal(("note",), 2) == disclosure.REFUSAL
+    assert disclosure.refusal(("a", "b"), 2) == disclosure.REFUSAL
+    with pytest.raises(ValueError, match="at least one field"):
+        disclosure.refusal((), 1)
+
+
 def test_an_external_agent_cannot_send_a_listed_term(scheduler: Scheduler) -> None:
     tool = scheduler.send_tool(AgentAddress("probe"))
     before = last_seq(scheduler)
     result = call(tool, {"to": "beta", "body": f"{TERM} details"})
-    assert result["is_error"] is True and result["content"][0]["text"] == REFUSAL
+    assert result["is_error"] is True
+    assert result["content"][0]["text"] == (
+        "the body field contains a term from the project's disclosure list"
+    )
     assert last_seq(scheduler) == before
     assert call(tool, {"to": "beta", "body": "details"}).get("is_error") is not True
 
@@ -481,7 +527,9 @@ def test_an_anonymous_agent_cannot_name_itself_with_a_listed_term(
         for name in ("codename", "the-codename-bot", "codename.2"):
             response = agent_call(target, name, "send_message", to="alpha", body="hi")
             assert (response.ok, response.error_code) == (False, ErrorCode.REJECTED)
-            assert response.error_message == REFUSAL
+            assert response.error_message == (
+                "the name field contains a term from the project's disclosure list"
+            )
             assert name not in target.log.state.agents
         assert target.log.last_seq == before
         clean = agent_call(target, "helper", "send_message", to="alpha", body="hi")
@@ -496,7 +544,9 @@ def test_a_listed_term_added_later_refuses_an_anonymous_agent_already_known(
         assert "codename-bot" in target.log.state.agents
         list_terms(target, tmp_path, "codename\n")
         response = agent_call(target, "codename-bot", "list_mail")
-        assert response.error_message == REFUSAL
+        assert response.error_message == (
+            "the name field contains a term from the project's disclosure list"
+        )
 
 
 def test_an_agent_the_operator_registered_is_exempt(

@@ -14,9 +14,9 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import __version__
+from dromon import __version__, disclosure
 from dromon.codex import default_cache_home, engine_environment
-from dromon.disclosure import REFUSAL, load_terms
+from dromon.disclosure import load_terms
 from dromon.driver import Driver, Strategy
 from dromon.engine import CLAUDE_CODE_PROMPT_MARK, ClaudeCodeLine, TurnReport
 from dromon.eventlog import EventLog, read_entries
@@ -363,7 +363,8 @@ def test_line_status_lists_have_a_hard_size_bound(
 def test_every_prompt_opens_with_the_budget(world: World) -> None:
     first = world.turn("one")
     assert first.splitlines()[0] == (
-        "Autonomous turns used: 0 of 5. Estimated cost since your last release:"
+        "Autonomous turns in a row without operator mail: 0 of 5."
+        " Estimated cost since your last release:"
         " $0.00 of $3.00. A line past either is held. An operator's mail started"
         " this turn, so the count of autonomous turns starts again from 0 when it"
         " ends."
@@ -371,13 +372,14 @@ def test_every_prompt_opens_with_the_budget(world: World) -> None:
     assert first.splitlines()[1] == "1 new message. 1 unread. 1 unanswered."
     world.scheduler.send(LineAddress("beta"), LineAddress("alpha"), "from beta")
     second = world.turn(sender=LineAddress("beta"))
-    assert second.startswith("Autonomous turns used: 0 of 5.")
+    assert second.startswith("Autonomous turns in a row without operator mail: 0 of 5.")
     assert second.splitlines()[0].endswith(
         "This turn is autonomous, so the count becomes 1 when it ends."
     )
     third = world.turn("again", sender=LineAddress("beta"))
     assert third.startswith(
-        "Autonomous turns used: 1 of 5. Estimated cost since your last release:"
+        "Autonomous turns in a row without operator mail: 1 of 5."
+        " Estimated cost since your last release:"
         " $0.50 of $3.00."
     )
 
@@ -733,7 +735,9 @@ def test_write_scratch_refuses_large_or_disclosing_text_and_bad_arguments(
     (tmp_path / "terms").write_text("codename\n")
     world.scheduler.set_disclosure_terms(load_terms(tmp_path / "terms"))
     text, error = world.call("write_scratch", {"path": "n", "text": "the Codename"})
-    assert (text, error) == (REFUSAL, True)
+    # A path and a text are both offered, so the refusal names neither, per review r4
+    # finding F1.
+    assert (text, error) == (disclosure.REFUSAL, True)
     assert not (world.root / "tmp" / "n").exists()
     text, error = world.call("write_scratch", {"path": 3, "text": "x"})
     assert error and "must be text" in text
@@ -874,7 +878,7 @@ def test_the_disclosure_check_covers_the_scratch_path(
     text, error = world.call(
         "write_scratch", {"path": "the-codename-notes.md", "text": "clean"}
     )
-    assert (text, error) == (REFUSAL, True)
+    assert (text, error) == (disclosure.REFUSAL, True)
     assert not (world.root / "tmp").exists()
 
 
@@ -1008,7 +1012,17 @@ def test_a_refusal_for_disclosure_spends_a_check(
 ) -> None:
     listed(world, tmp_path)
     text, error = world.call(name, args)
-    assert error and text == REFUSAL
+    field = {
+        "send_message": "body",
+        "ask_operator": "question",
+        "wake_after": "note",
+        "write_scratch": None,
+    }[name]
+    assert error and text == (
+        disclosure.REFUSAL
+        if field is None
+        else f"the {field} field contains a term from the project's disclosure list"
+    )
     assert [event.matched_lines for event in checks(world)] == [1]
     text, error = world.call("check_disclosure", {"text": "clean"})
     assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 2} of" in text
@@ -1026,7 +1040,7 @@ def test_the_role_and_proposal_tools_spend_a_check_too(
         lambda: scheduler.propose_change("alpha", "codename", ["a.py"], "patch"),
     ]
     for call in calls:
-        with pytest.raises(LineToolRefused, match=REFUSAL):
+        with pytest.raises(LineToolRefused, match="contains a term"):
             call()
     assert len(checks(world)) == len(calls)
 
@@ -1044,7 +1058,9 @@ def test_a_spent_limit_holds_the_line_and_answers_nothing_more(
     listed(world, tmp_path)
     for _ in range(MAX_DISCLOSURE_CHECKS):
         text, error = world.call("send_message", {"to": "@ana", "body": "codename"})
-        assert error and text == REFUSAL
+        assert error and text == (
+            "the body field contains a term from the project's disclosure list"
+        )
     assert world.log.state.lines["alpha"].held_by is None
     text, error = world.call("send_message", {"to": "@ana", "body": "codename"})
     assert error and text == DISCLOSURE_HELD
