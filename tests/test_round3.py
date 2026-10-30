@@ -15,6 +15,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
+from dromon.codex import TERMINAL_POLL_SECONDS
 from dromon.configview import Overrides
 from dromon.daemon import Daemon
 from dromon.driver import Strategy
@@ -67,6 +68,7 @@ class Engine:
         self.session_id = spec.session_id
         self.prompts: list[str] = []
         self.tasks = tasks
+        self.tasks_unknown = False
         self.retired = 0
         self.self_started_interrupts = 0
 
@@ -88,7 +90,8 @@ class Engine:
             "kept": True,
             "seconds_to_close": None,
             "background_tasks": self.tasks,
-            "tasks": [],
+            "background_tasks_unknown": self.tasks_unknown,
+            "tasks": [{"task_id": f"task-{index}"} for index in range(self.tasks)],
         }
 
 
@@ -369,11 +372,9 @@ class MailingWorld(World):
         return engine
 
 
-@pytest.mark.parametrize(
-    ("tasks", "counted"), [(1, "1 background task"), (3, "3 background tasks")]
-)
+@pytest.mark.parametrize("tasks", [1, 3])
 def test_a_turn_left_with_tasks_and_no_mail_is_told_once(
-    tmp_path: Path, tasks: int, counted: str
+    tmp_path: Path, tasks: int
 ) -> None:
     world = World(tmp_path / "events.sqlite", tasks=tasks)
     first = turns(world, "start")
@@ -381,8 +382,104 @@ def test_a_turn_left_with_tasks_and_no_mail_is_told_once(
     second = turns(world, "next")
     third = turns(world, "again")
     assert QUIET not in first and QUIET not in third
-    assert second.startswith(f"{QUIET} {counted} of your kept session still running,")
+    unknown = "1 task" if tasks == 1 else f"{tasks} tasks"
+    assert f"The state of {unknown} is unknown" in second
+    assert "task records" in second and "output file" in second
+    assert "running" not in second
+    assert "If someone waits on it, tell them." in second
     world.log.close()
+
+
+def test_a_quiet_notice_confirms_a_task_still_running_in_the_kept_session(
+    tmp_path: Path,
+) -> None:
+    world = World(tmp_path / "events.sqlite", tasks=2)
+    turns(world, "start")
+    engine = world.engines["alpha"]
+    world.scheduler._engines["alpha"] = engine  # pyright: ignore[reportPrivateUsage]
+    notice = world.scheduler._quiet_notice("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert notice is not None
+    assert "Dromon still reports 2 background tasks running" in notice
+    assert "state is unknown" not in notice
+    world.log.close()
+
+
+def test_a_quiet_notice_uses_a_new_task_record_instead_of_saying_running(
+    tmp_path: Path,
+) -> None:
+    world = World(tmp_path / "events.sqlite", tasks=1)
+    turns(world, "start")
+    world.scheduler.background_ended(
+        "alpha", BackgroundEnd("task-0", "check", "completed")
+    )
+    notice = world.scheduler._quiet_notice("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert notice is not None
+    assert "Dromon recorded the end of 1 task" in notice
+    assert "task records" in notice
+    assert "still reports" not in notice
+    world.log.close()
+
+
+def test_a_quiet_notice_reports_unknown_when_kept_status_raises(
+    tmp_path: Path,
+) -> None:
+    class FailingEngine(Engine):
+        def kept_status(self) -> dict[str, object]:
+            raise RuntimeError("status unavailable")
+
+    world = World(tmp_path / "events.sqlite", tasks=1)
+    turns(world, "start")
+    engine = FailingEngine(LineSpec("alpha", HAIKU, Strategy.SUBSCRIPTION), tasks=1)
+    world.scheduler._engines["alpha"] = engine  # pyright: ignore[reportPrivateUsage]
+    notice = world.scheduler._quiet_notice("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert notice is not None
+    assert "state of 1 task is unknown" in notice
+    assert "task records" in notice and "output file" in notice
+    assert "running" not in notice
+    world.log.close()
+
+
+def test_a_quiet_notice_respects_an_unknown_task_listing(tmp_path: Path) -> None:
+    world = World(tmp_path / "events.sqlite", tasks=1)
+    turns(world, "start")
+    engine = world.engines["alpha"]
+    engine.tasks_unknown = True
+    world.scheduler._engines["alpha"] = engine  # pyright: ignore[reportPrivateUsage]
+    notice = world.scheduler._quiet_notice("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert notice is not None
+    assert "state of 1 task is unknown" in notice
+    assert "running" not in notice
+    world.log.close()
+
+
+def test_a_quiet_notice_distrusts_a_stale_task_listing(tmp_path: Path) -> None:
+    class StaleEngine(Engine):
+        def kept_status(self) -> dict[str, object]:
+            return {
+                **super().kept_status(),
+                "tasks_listed_seconds_ago": int(TERMINAL_POLL_SECONDS) + 1,
+            }
+
+    world = World(tmp_path / "events.sqlite", tasks=1)
+    turns(world, "start")
+    engine = StaleEngine(LineSpec("alpha", HAIKU, Strategy.SUBSCRIPTION), tasks=1)
+    world.scheduler._engines["alpha"] = engine  # pyright: ignore[reportPrivateUsage]
+    notice = world.scheduler._quiet_notice("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert notice is not None
+    assert "state of 1 task is unknown" in notice
+    assert "still reports" not in notice
+    world.log.close()
+
+
+def test_line_status_marks_the_task_count_unknown(world: World) -> None:
+    engine = Engine(LineSpec("alpha", HAIKU, Strategy.SUBSCRIPTION), tasks=2)
+    engine.tasks_unknown = True
+    world.scheduler._engines["alpha"] = engine  # pyright: ignore[reportPrivateUsage]
+    kept = world.status()["kept_session"]
+    assert kept["background_tasks"] == 2
+    assert kept["background_tasks_unknown"] is True
+    compact = world.scheduler.line_status("alpha", detail=False, lists=False)
+    assert compact["background_tasks_unknown"] is True
 
 
 def turns(world: World, body: str) -> str:
