@@ -19,7 +19,8 @@ All notable changes are recorded here. The format follows
   is unchanged. Required by the operator on 2026-10-30 in round 8. A turn whose
   engine returned no report, as when its prompt could not be composed, retires no
   note, since its prompt may never have reached the engine, and records
-  `line_turn_ended` with the new optional field `unreported`. The prompt and the
+  `line_turn_ended` with the new optional field `unreported`, which a daemon that
+  predates it cannot read, so a rollback after such a turn cannot load the log. The prompt and the
   counts line of `list_mail` now say that a note past the count is still listed by
   `list_mail` without a filter. Required by the operator in the round 8 review.
 - Role ownership notices are now suppressed across daemon restarts after the notified
