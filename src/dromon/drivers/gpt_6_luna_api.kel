@@ -4,8 +4,7 @@
 // refuses a subscription, so a line meant to be metered is never silently moved onto a
 // plan, and its settings keep turns short and effort low because every token is charged.
 //
-// Dromon has no Codex adapter yet, so no line runs this driver until one exists. Its
-// context window follows Codex's model catalogue as fetched on 2026-10-25.
+// Its context window follows Codex's model catalogue as fetched on 2026-10-25.
 //
 // The host sends one event per cycle together with the driver's state, and receives
 // one action together with the next state. The host stores the state between cycles,

@@ -42,6 +42,12 @@ subscription draws on a plan's limits while API usage is charged for every token
 | `gpt_6_luna_subscription.kel` | GPT-6-Luna on Codex | subscription | medium | 200 | 400 |
 | `gpt_6_luna_api.kel` | GPT-6-Luna on Codex | api | low | 2 | 10 |
 | `gpt_6_luna_flexible.kel` | GPT-6-Luna on Codex | flexible | low | 2 | 10 |
+| `gpt_6_1_sol_subscription.kel` | GPT-6.1-Sol on Codex | subscription | medium | 200 | 400 |
+| `gpt_6_1_sol_api.kel` | GPT-6.1-Sol on Codex | api | low | 2 | 10 |
+| `gpt_6_1_sol_flexible.kel` | GPT-6.1-Sol on Codex | flexible | low | 2 | 10 |
+| `gpt_6_1_terra_subscription.kel` | GPT-6.1 Terra on Codex | subscription | medium | 200 | 400 |
+| `gpt_6_1_terra_api.kel` | GPT-6.1 Terra on Codex | api | low | 2 | 10 |
+| `gpt_6_1_terra_flexible.kel` | GPT-6.1 Terra on Codex | flexible | low | 2 | 10 |
 | `grok_4_7_subscription.kel` | Grok 4.7 on Grok Build | subscription | high | 200 | 400 |
 | `grok_4_7_api.kel` | Grok 4.7 on Grok Build | api | medium | 4 | 20 |
 | `grok_4_7_flexible.kel` | Grok 4.7 on Grok Build | flexible | medium | 4 | 20 |
@@ -74,6 +80,15 @@ operator's approval, reported the subscription credential and the model
 GPT-6-Luna's settings follow Codex's model catalogue as fetched on 2026-10-25, which
 gives it a default effort of medium and a context window of 272,000 tokens, and for a
 ChatGPT plan the subscription strategy means Codex's own sign-in.
+
+**GPT-6.1-Sol and GPT-6.1 Terra, added on 2026-10-30** at the operator's direction.
+Their settings follow Codex's model catalogue as fetched on 2026-10-30 by Codex
+0.164.0, which lists `gpt-6.1-sol` and `gpt-6.1-terra` with a context window of 500,000
+tokens each and a default effort of low. The subscription drivers keep the effort of
+medium that GPT-6-Luna's subscription driver sets, and the drivers that may bill per
+token keep low. **Not verified.** No turn has run on either model through Dromon, so
+whether Codex reports each model under its catalogue name, which the drivers require,
+and whether the operator's ChatGPT plan serves them, are unobserved.
 
 ## Engines
 
