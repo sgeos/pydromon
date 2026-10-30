@@ -25,7 +25,12 @@ from dromon.codex import (
     Connection,
 )
 from dromon.driver import Driver, Strategy
-from dromon.engine import INTERRUPTED_KIND, SELF_STARTED_KIND, TurnReport
+from dromon.engine import (
+    INTERRUPTED_KIND,
+    SELF_STARTED_KIND,
+    BackgroundEnd,
+    TurnReport,
+)
 from dromon.eventlog import EventLog, read_entries
 from dromon.limits import Limits
 from dromon.lineconfig import config_from_document
@@ -45,10 +50,14 @@ from dromon.scheduler import (
     COMPACTION_CONTEXT_WARNING,
     CONTEXT_FROM_CALL,
     CONTEXT_FROM_COMPACTION,
+    CONTEXT_FROM_ENGINE_ESTIMATE,
     CONTEXT_FROM_ESTIMATE,
     CONTEXT_NOTES,
+    CONTEXT_WAKE_SOURCES,
+    WITHHELD_WAKE_NOTE,
     LineSpec,
     Scheduler,
+    context_compaction_note,
     engine_factory,
 )
 
@@ -305,15 +314,19 @@ def test_only_one_compaction_wake_is_uncounted_per_warning_interval(
     world.context = warning
     world.after = warning + 1
 
+    # Task of 2026-10-30. The first count was 1 only because a duplicate context
+    # wake, queued while this turn ran, fired after it as a counted turn.
     world.compact_wake()
     world.past_due()
     world.run()
-    assert world.status()["autonomous_turns"]["used"] == 1
+    assert len(world.engine.prompts) == 1
+    assert world.status()["autonomous_turns"]["used"] == 0
 
     world.compact_wake()
     world.past_due()
     world.run()
-    assert world.status()["autonomous_turns"]["used"] == 2
+    assert len(world.engine.prompts) == 2
+    assert world.status()["autonomous_turns"]["used"] == 1
 
 
 def test_context_warning_does_not_queue_a_note_for_a_held_line(world: World) -> None:
@@ -1127,3 +1140,336 @@ def test_pi_review_f3_an_engines_own_estimate_is_carried(world: World) -> None:
     assert last["after_estimate_note"] == "the engine's own estimate"
     assert context["estimated_tokens"] == 32000
     assert "engine's own estimate" in context["note"]
+
+
+# E. One context warning, one compaction wake. Task of 2026-10-30.
+
+CONTEXT_WAKE = "Dromon requests a context compaction"
+
+
+def context_wakes(world: World) -> list[WakeScheduled]:
+    """Every context-warning wake the log records, in order."""
+    return [
+        entry.event
+        for entry in read_entries(world.path)
+        if isinstance(entry.event, WakeScheduled)
+        and entry.event.note.startswith(CONTEXT_WAKE)
+    ]
+
+
+async def warning_turn(world: World) -> None:
+    """Let the context warning's wake start its turn, tick the loop as the daemon
+    does while the turn compacts, then let the compaction finish and run until
+    idle. The engines line's log showed a second wake one second into such a turn."""
+    world.gate = asyncio.Event()
+    stop = asyncio.Event()
+    loop = asyncio.create_task(world.scheduler.run(stop))
+    await world.compacting.wait()
+    for _ in range(20):
+        world.scheduler._work_waiting()  # pyright: ignore[reportPrivateUsage]
+        world.scheduler.step()
+        await asyncio.sleep(0)
+    world.gate.set()
+    await world.scheduler.idle()
+    stop.set()
+    await loop
+
+
+@pytest.mark.parametrize("after", [160_000, None])
+def test_one_context_warning_gives_one_compaction_wake(
+    world: World, after: int | None
+) -> None:
+    """Seq 4619 to 4640 of the engines line. A compaction that left the context
+    past the warning, or that reported no size, was followed by a second wake with
+    the same note, queued while the first wake's turn ran."""
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    world.context = warning + 1
+    world.after = after
+    world.scheduler._context_reported(  # pyright: ignore[reportPrivateUsage]
+        "alpha", warning + 1, CONTEXT_FROM_CALL
+    )
+    asyncio.run(warning_turn(world))
+    assert world.engine.reasons == [COMPACTION_CONTEXT_WARNING]
+    assert len(context_wakes(world)) == 1
+    assert len(world.engine.prompts) == 1
+    assert "alpha" not in world.log.state.scheduled
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        CONTEXT_FROM_CALL,
+        CONTEXT_FROM_COMPACTION,
+        CONTEXT_FROM_ESTIMATE,
+        CONTEXT_FROM_ENGINE_ESTIMATE,
+    ],
+)
+def test_a_context_wake_says_why_it_was_scheduled(world: World, source: str) -> None:
+    """The note names the estimate, the warning and where the estimate came from,
+    and holds nothing else but fixed text."""
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    tokens = warning + 1234
+    world.scheduler._context_reported("alpha", tokens, source)  # pyright: ignore[reportPrivateUsage]
+    (wake,) = context_wakes(world)
+    assert wake.note == context_compaction_note(tokens, warning, source)
+    assert f"your context of about {tokens} tokens" in wake.note
+    assert f"reached your warning of {warning}" in wake.note
+    assert f"estimated from {CONTEXT_WAKE_SOURCES[source]}." in wake.note
+    assert set(CONTEXT_WAKE_SOURCES) == set(CONTEXT_NOTES)
+
+
+def test_a_context_wake_note_that_discloses_is_withheld(world: World) -> None:
+    world.scheduler.set_disclosure_terms(["engine call"])
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    world.scheduler._context_reported("alpha", warning, CONTEXT_FROM_CALL)  # pyright: ignore[reportPrivateUsage]
+    assert world.log.state.scheduled["alpha"].note == WITHHELD_WAKE_NOTE
+
+
+@pytest.mark.parametrize("busy", ["running", "compacting"])
+def test_no_context_wake_is_queued_while_a_turn_runs_or_compacts(
+    world: World, busy: str
+) -> None:
+    """The pass after the turn ends decides again from the final estimate."""
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    scheduler = world.scheduler
+
+    async def go() -> None:
+        running = asyncio.create_task(asyncio.sleep(60))
+        if busy == "running":
+            scheduler._running["alpha"] = running  # pyright: ignore[reportPrivateUsage]
+        else:
+            scheduler._compaction_cause["alpha"] = COMPACTION_CONTEXT_WARNING  # pyright: ignore[reportPrivateUsage]
+        scheduler._context_reported("alpha", warning, CONTEXT_FROM_CALL)  # pyright: ignore[reportPrivateUsage]
+        scheduler._work_waiting()  # pyright: ignore[reportPrivateUsage]
+        assert "alpha" not in world.log.state.scheduled
+        scheduler._running.pop("alpha", None)  # pyright: ignore[reportPrivateUsage]
+        scheduler._compaction_cause.pop("alpha", None)  # pyright: ignore[reportPrivateUsage]
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+        scheduler._work_waiting()  # pyright: ignore[reportPrivateUsage]
+        assert len(context_wakes(world)) == 1
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("after", [160_000, None])
+def test_any_reported_compaction_withdraws_a_pending_context_wake(
+    world: World, after: int | None
+) -> None:
+    """A sized compaction that left the context past the threshold used to leave
+    the wake to fire. The automatic hold then keeps a new one from being queued."""
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    world.scheduler._context_reported("alpha", warning + 1, CONTEXT_FROM_CALL)  # pyright: ignore[reportPrivateUsage]
+    (wake,) = context_wakes(world)
+    world.scheduler.session_compacted(
+        "alpha",
+        {"trigger": "auto", "before_tokens": warning + 1, "after_tokens": after},
+    )
+    assert withdrawn(world) == [WakeWithdrawn("alpha", wake.message_id)]
+    assert world.status()["context"]["auto_compact_held"] is True
+    world.scheduler._work_waiting()  # pyright: ignore[reportPrivateUsage]
+    world.scheduler._context_reported("alpha", warning + 2, CONTEXT_FROM_CALL)  # pyright: ignore[reportPrivateUsage]
+    assert "alpha" not in world.log.state.scheduled
+    assert len(context_wakes(world)) == 1
+
+
+def test_a_context_wake_due_under_the_automatic_hold_is_withdrawn(
+    world: World,
+) -> None:
+    """The compaction it asks for would not be made, so it starts no turn."""
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    world.scheduler._context_reported("alpha", warning, CONTEXT_FROM_CALL)  # pyright: ignore[reportPrivateUsage]
+    (wake,) = context_wakes(world)
+    world.scheduler._auto_held.add("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert world.scheduler.fire_due_wakes() == []
+    assert withdrawn(world) == [WakeWithdrawn("alpha", wake.message_id)]
+    world.run()
+    assert "alpha" not in world.engines
+    assert wake.message_id not in world.log.state.messages
+
+
+def test_a_hibernated_line_gets_one_context_wake_once_awakened(world: World) -> None:
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    world.context = warning + 1
+    world.after = warning + 1
+    world.scheduler._context_reported("alpha", warning + 1, CONTEXT_FROM_CALL)  # pyright: ignore[reportPrivateUsage]
+    world.scheduler.hibernate("alpha")
+    world.run()
+    assert "alpha" not in world.engines
+    world.scheduler.awaken("alpha")
+    world.run()
+    assert len(context_wakes(world)) == 1
+    assert world.engine.reasons == [COMPACTION_CONTEXT_WARNING]
+    assert len(world.engine.prompts) == 1
+
+
+def test_after_a_restart_a_pending_context_wake_fires_once(world: World) -> None:
+    """The estimate is held in memory, so after a restart the adopted wake fires
+    with no compaction made, and its note says to ask for one. No second wake is
+    queued, since the restarted daemon has no estimate until a turn reports one."""
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    world.scheduler._context_reported("alpha", warning + 1, CONTEXT_FROM_CALL)  # pyright: ignore[reportPrivateUsage]
+    (wake,) = context_wakes(world)
+    world.scheduler = world.start()
+    world.run()
+    assert world.engine.reasons == []
+    assert len(world.engine.prompts) == 1
+    assert len(context_wakes(world)) == 1
+    body = world.log.state.messages[wake.message_id].body
+    assert body == wake.note and "restart" in body
+
+
+# F. Review of 2df2daa, R2, R3 and E1.
+
+
+@pytest.mark.parametrize("stopped", [True, False])
+def test_a_context_wake_blocked_by_a_task_wait_follows_the_wait(
+    world: World, stopped: bool
+) -> None:
+    """R2. A pending task-bound wait kept the context wake from being queued, and
+    the line was still marked as woken for it, so once the task's end cancelled the
+    wait without waking the line, no context wake followed while it stayed idle. An
+    end that wakes the line gives one turn, which compacts on the threshold."""
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    world.context = warning + 1
+    world.after = None
+    world.scheduler.schedule_wake("alpha", 600, "my wait", "task-1")
+    world.scheduler._context_reported("alpha", warning + 1, CONTEXT_FROM_CALL)  # pyright: ignore[reportPrivateUsage]
+    assert context_wakes(world) == []
+    world.scheduler.background_ended(
+        "alpha",
+        BackgroundEnd("task-1", "sleep 9", "completed", stopped_by_line=stopped),
+    )
+    assert "alpha" not in world.log.state.scheduled
+    world.scheduler._work_waiting()  # pyright: ignore[reportPrivateUsage]
+    assert len(context_wakes(world)) == int(stopped)
+    world.run()
+    assert len(world.engine.prompts) == 1
+    (reason,) = world.engine.reasons
+    if stopped:
+        assert reason == COMPACTION_CONTEXT_WARNING
+    else:
+        assert reason.startswith("automatically, because its context")
+
+
+@pytest.mark.parametrize("after", [5_000, None])
+def test_after_a_restart_a_compaction_withdraws_the_context_wake(
+    world: World, after: int | None
+) -> None:
+    """R3. The restarted daemon adopts a pending wake whose note is the context
+    note, so a compaction reported after the restart withdraws it rather than
+    leaving it to fire as a reminder after the fact."""
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    world.scheduler._context_reported("alpha", warning + 1, CONTEXT_FROM_CALL)  # pyright: ignore[reportPrivateUsage]
+    (wake,) = context_wakes(world)
+    world.scheduler = world.start()
+    world.scheduler.session_compacted(
+        "alpha",
+        {"trigger": "auto", "before_tokens": warning + 1, "after_tokens": after},
+    )
+    assert withdrawn(world) == [WakeWithdrawn("alpha", wake.message_id)]
+    world.run()
+    assert "alpha" not in world.engines
+    assert wake.message_id not in world.log.state.messages
+
+
+@pytest.mark.parametrize(("task_id", "adopted"), [(None, True), ("task-1", False)])
+def test_a_line_wake_imitating_the_context_note(
+    world: World, task_id: str | None, adopted: bool
+) -> None:
+    """R3. After a restart only the note tells a context wake apart, so a line's
+    own wake whose note imitates it is adopted when it names no task, which the
+    daemon's never does. What that gives the line is bounded: its own wake may be
+    withdrawn by a compaction, and its turn may be the one uncounted compaction turn
+    of the warning interval, which compact_session at the warning also gives."""
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    note = context_compaction_note(warning, warning, CONTEXT_FROM_CALL)
+    message_id, _ = world.scheduler.schedule_wake("alpha", 600, note, task_id)
+    world.scheduler = world.start()
+    world.scheduler.session_compacted(
+        "alpha", {"trigger": "auto", "before_tokens": warning, "after_tokens": 5_000}
+    )
+    assert withdrawn(world) == ([WakeWithdrawn("alpha", message_id)] if adopted else [])
+
+
+@pytest.mark.parametrize("after", [160_000, None])
+def test_mail_waiting_for_a_turn_gives_no_context_wake(
+    world: World, after: int | None
+) -> None:
+    """E1, seq 4877 to 4896 of the engines line. The context wake fired into the
+    sent queue in the tick that woke the line for older mail, that turn compacted,
+    and the fired note then started a turn of its own. Mail that will start the
+    line's next turn now keeps the wake from being queued, since that turn
+    compacts on the threshold."""
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    world.context = warning + 1
+    world.after = after
+    world.scheduler.set_line_policy("alpha", None, 3)
+    world.scheduler.send(ANA, LineAddress("alpha"), "older")
+    world.scheduler.step()
+    world.scheduler.step()
+    assert world.scheduler.deliverable("alpha")
+    world.scheduler._context_reported("alpha", warning + 1, CONTEXT_FROM_CALL)  # pyright: ignore[reportPrivateUsage]
+    world.run()
+    assert len(world.engine.prompts) == 1
+    (reason,) = world.engine.reasons
+    assert reason.startswith("automatically, because its context")
+    assert context_wakes(world) == []
+
+
+@pytest.mark.parametrize("after", [5_000, None])
+def test_a_fired_context_note_whose_compaction_was_made_starts_no_turn(
+    world: World, after: int | None
+) -> None:
+    """E1. A compaction reported after the context wake fired, and before its note
+    was delivered, delivers the note without a turn, since the compaction it asked
+    for is made. The line still finds it in its mailbox."""
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    world.scheduler._context_reported("alpha", warning + 1, CONTEXT_FROM_CALL)  # pyright: ignore[reportPrivateUsage]
+    (wake,) = context_wakes(world)
+    assert world.scheduler.fire_due_wakes() == [wake.message_id]
+    world.scheduler.session_compacted(
+        "alpha",
+        {"trigger": "auto", "before_tokens": warning + 1, "after_tokens": after},
+    )
+    world.run()
+    assert "alpha" not in world.engines
+    assert world.log.state.messages[wake.message_id].delivered
+    assert withdrawn(world) == []
+    assert world.scheduler.deliverable("alpha") == []
+
+
+@pytest.mark.parametrize("ending", ["task_end", "fired"])
+def test_a_context_wake_replaced_by_the_line_follows_the_replacement(
+    world: World, ending: str
+) -> None:
+    """Re-review of c2d0695, R2. A wake_after that replaced the context wake left
+    the line marked as woken for compaction, so once the replacement ended without
+    a turn no context wake followed while the line stayed idle. A replacement that
+    fires starts its own turn, which compacts on the threshold, so no context wake
+    is needed then."""
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    world.context = warning + 1
+    world.after = None
+    world.scheduler._context_reported("alpha", warning + 1, CONTEXT_FROM_CALL)  # pyright: ignore[reportPrivateUsage]
+    assert len(context_wakes(world)) == 1
+    task_id = "task-1" if ending == "task_end" else None
+    world.scheduler.schedule_wake("alpha", 60, "my own wake", task_id)
+    assert world.status()["context"]["compaction_pending"] is False
+    if ending == "task_end":
+        world.scheduler.background_ended(
+            "alpha",
+            BackgroundEnd("task-1", "sleep 9", "completed", stopped_by_line=True),
+        )
+        assert "alpha" not in world.log.state.scheduled
+        world.scheduler._work_waiting()  # pyright: ignore[reportPrivateUsage]
+        assert len(context_wakes(world)) == 2
+        world.run()
+        assert world.engine.reasons == [COMPACTION_CONTEXT_WARNING]
+    else:
+        world.past_due()
+        world.run()
+        assert len(context_wakes(world)) == 1
+        (reason,) = world.engine.reasons
+        assert reason.startswith("automatically, because its context")
+    assert len(world.engine.prompts) == 1
