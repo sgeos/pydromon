@@ -7,6 +7,13 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- One context warning now gives one compaction wake. No context-warning wake is
+  queued while the line's turn runs or a compaction decided for it is under way, any
+  reported compaction withdraws a pending one whatever its size, and one that falls
+  due under the automatic hold is withdrawn. The engines line received a second wake,
+  queued one second into the first wake's turn, which fired after it. The wake's note
+  now says why it was scheduled, with the estimated tokens, the warning and the
+  source of the estimate. Required by the operator on 2026-10-30.
 - Claude Code and Codex lines granted a shell tool now require the daemon's `SHELL` to
   name an absolute executable. Claude Code additionally requires Bash or Zsh and
   receives the validated path as both `SHELL` and `CLAUDE_CODE_SHELL`, and the launcher

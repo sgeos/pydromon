@@ -678,7 +678,17 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
   that wake fires, the daemon withdraws it. This threshold is the warning unless
   `auto_compact_tokens` sets an earlier one. A turn with only this compaction wake
   does not spend an autonomous turn. A hibernated line receives no wake until it is
-  awakened. The
+  awakened. **Task of 2026-10-30.** One warning gives one wake. None is queued while
+  the line's turn runs or while a compaction decided for it is under way, and the
+  pass after the turn ends decides again from the turn's final estimate. Any
+  reported compaction withdraws a pending wake, whether or not it reported a size,
+  and the automatic hold then keeps a new one from being queued while the context
+  stays past the threshold. A wake that falls due under that hold is withdrawn, as
+  one below the threshold is. The engines line's log showed a second wake queued one
+  second into the first wake's turn, which fired after it. The note says why it was
+  scheduled, naming the estimated tokens, the warning and where the estimate came
+  from, in fixed text, and says that a restart before it fires loses the request,
+  since which wake was the warning's is held in memory. The
   default of 150,000 leaves room before an engine's automatic compaction near a
   200,000 token window, and past it a turn of a few calls re-reads a million tokens.
 - **`compact_session`.** No arguments before round 6. Only a Claude Code line, and
