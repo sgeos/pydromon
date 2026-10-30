@@ -457,7 +457,11 @@ WAKE_TOOL_SCHEMA: Final[dict[str, object]] = {
         },
         "task_id": {
             "type": "string",
-            "description": "A running background task whose end cancels this wake",
+            "description": (
+                "A running background task to wait for. End your turn after naming"
+                " it. Its end cancels this wake and wakes you; otherwise this wake"
+                " fires after the timeout."
+            ),
         },
         REQUEST_KEY: REQUEST_KEY_PROPERTY,
     },
@@ -699,7 +703,9 @@ UNRELEASED_NOTE: Final = (
 MAX_TASK_NOTES: Final = 3
 TASK_NOTE_WINDOW_SECONDS: Final = 60.0
 """At most ``MAX_TASK_NOTES`` background task notes wake a line within this many
-seconds. Ends past the limit are counted and named in the next note."""
+seconds. A task named by the line's pending wake is exempt, so waiting cannot lose its
+wake to the ordinary task-note limit. Other ends past the limit are counted and named
+in the next note."""
 
 MAX_NOTED_TASKS: Final = 256
 
@@ -2722,6 +2728,9 @@ class Scheduler:
         """Schedule ``line_id``'s one wake ``seconds`` from now, replacing any pending
         one, and return the identifier its note will carry and its due time.
 
+        When ``task_id`` names a running task, its end cancels the pending wake and
+        wakes the line with a task note. The caller ends its turn to wait. If the task
+        outlives the timeout, the scheduled wake fires instead.
         The due time is rounded up to the whole second, so a wake never fires early.
         Raises ``InvalidField`` or ``EventRejected``.
         """
@@ -2927,8 +2936,10 @@ class Scheduler:
                 " from 60 to 86400, your note arrives as a message from you, which"
                 " wakes you. You have at most one scheduled wake, and a new call"
                 " replaces it. Optionally name one of your running background tasks"
-                " as task_id to cancel this wake if that task ends while the wake is"
-                " still scheduled. A wake that has fired already cannot be cancelled."
+                " as task_id to wait for it: end your turn after this call. The task"
+                " end cancels this wake and wakes you with a task note. If the task"
+                " outlives the timeout, this wake fires instead. A wake that has"
+                " fired already cannot be cancelled."
             ),
             input_schema=WAKE_TOOL_SCHEMA,
             handler=handler,
@@ -4367,7 +4378,9 @@ class Scheduler:
             description=(
                 "List the background terminals of your own engine thread, which"
                 " outlive your turn while your session is kept, with process_id, OS"
-                " pid and command."
+                " pid and command. To wait for one, call wake_after with its"
+                " process_id as task_id, then end your turn. Its end cancels that"
+                " wake and wakes you; otherwise the wake fires at its timeout."
             ),
             input_schema=NO_ARGUMENTS_SCHEMA,
             handler=handler,
@@ -7693,8 +7706,10 @@ class Scheduler:
         already known to the line, so their records are delivered without a wake.
         A task-triggered turn may defer delivery until it records that turn's wake.
         Ordinary wakes are limited to ``MAX_TASK_NOTES`` per line within
-        ``TASK_NOTE_WINDOW_SECONDS``. Returns the note's identifier, or ``None``
-        when it was already recorded or the wake limit suppressed it."""
+        ``TASK_NOTE_WINDOW_SECONDS``. The end of a task named by the pending wake is
+        exempt from that limit and its note names the wake it cancels. Returns the
+        note's identifier, or ``None`` when it was already recorded or the wake limit
+        suppressed it."""
         if line_id not in self._log.state.lines:
             return None
         noted = self._noted_tasks.setdefault(line_id, deque(maxlen=MAX_NOTED_TASKS))
@@ -7707,13 +7722,20 @@ class Scheduler:
         while recent and now - recent[0] >= TASK_NOTE_WINDOW_SECONDS:
             recent.popleft()
         record_only = end.during_turn or end.stopped_by_line
-        if not record_only and len(recent) >= MAX_TASK_NOTES:
+        pending_wake = self._log.state.scheduled.get(line_id)
+        waited_wake_id = (
+            pending_wake.message_id
+            if pending_wake is not None and pending_wake.task_id == end.task_id
+            else None
+        )
+        waiting_for_task = waited_wake_id is not None
+        if not record_only and len(recent) >= MAX_TASK_NOTES and not waiting_for_task:
             self._unnoted_tasks[line_id] = self._unnoted_tasks.get(line_id, 0) + 1
             return None
-        if not record_only:
+        if not record_only and not waiting_for_task:
             recent.append(now)
         detected = format_due(self._wall_clock())
-        body = self._task_note(line_id, end, detected)
+        body = self._task_note(line_id, end, detected, waited_wake_id)
         unnoted = self._unnoted_tasks.pop(line_id, 0)
         if unnoted:
             body += (
@@ -7769,7 +7791,15 @@ class Scheduler:
         task_ids = {end.task_id for end in unique_ends}
         noted = self._noted_tasks.get(line_id, deque())
         pending = task_ids - set(noted)
-        if not pending or len(recent) + len(pending) > MAX_TASK_NOTES:
+        scheduled = self._log.state.scheduled.get(line_id)
+        waited: set[str] = set()
+        if (
+            scheduled is not None
+            and isinstance(scheduled.task_id, str)
+            and scheduled.task_id in pending
+        ):
+            waited.add(scheduled.task_id)
+        if not pending or len(recent) + len(pending - waited) > MAX_TASK_NOTES:
             return None
         try:
             self._start_token(line_id, engine)
@@ -7988,7 +8018,13 @@ class Scheduler:
                 size += len(chunk)
         return None, None
 
-    def _task_note(self, line_id: str, end: BackgroundEnd, detected: str) -> str:
+    def _task_note(
+        self,
+        line_id: str,
+        end: BackgroundEnd,
+        detected: str,
+        cancelled_wake_id: str | None = None,
+    ) -> str:
         """The note for ``end``. The command and the output are the line's own
         text, so each is quoted as a JSON string and said to be data, and cannot pose
         as Dromon's words. Either is withheld when the disclosure list covers it."""
@@ -8000,6 +8036,10 @@ class Scheduler:
                 else f" Its exit code was {end.exit_code}."
             )
         ]
+        if cancelled_wake_id is not None:
+            parts.append(
+                f"It ended your wait and cancelled scheduled wake {cancelled_wake_id}."
+            )
         if end.self_started:
             if end.self_started_admitted:
                 parts.append(
