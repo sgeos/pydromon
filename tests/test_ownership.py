@@ -18,7 +18,7 @@ from dromon import scheduler as scheduler_module
 from dromon.capabilities import Known, TABLES
 from dromon.driver import Strategy
 from dromon.engine import EnginePlanLimit, TurnReport
-from dromon.eventlog import EventLog
+from dromon.eventlog import Entry, EventLog, read_entries, replay
 from dromon.model import (
     HARNESS,
     MAX_BRIEF_ARTIFACTS,
@@ -37,6 +37,7 @@ from dromon.model import (
     LineStateChanged,
     Message,
     MessageKind,
+    MessageSent,
     OperatorAddress,
     OwnershipCause,
     OwnershipChanged,
@@ -1231,6 +1232,96 @@ def test_a_brief_that_now_discloses_is_withheld_from_the_lead(world: World) -> N
     (prompt,) = world.prompts("alpha")
     assert "hidden" not in prompt
     assert f"{BRIEF_BEGIN}\n[withheld because" in prompt
+
+
+MAIL_SINCE = " Operator mail has arrived since this brief was set at"
+
+
+def note_from(world: World, sender: LineAddress, line_id: str) -> None:
+    """Wake ``line_id`` with a note from ``sender``, not from an operator."""
+
+    async def act() -> None:
+        world.scheduler.send(sender, LineAddress(line_id), "not an operator's")
+
+    run(world, act)
+
+
+def test_a_lead_says_when_operator_mail_is_newer_than_the_brief(world: World) -> None:
+    """Task of 2026-10-30. The review line's brief was stale after a compaction,
+    since its task had changed in mail since the brief was set."""
+    set_brief(world, "alpha", task="lift the bound")
+    brief = brief_of(world, "alpha")
+    assert brief is not None
+    world.now = START + timedelta(minutes=5)
+    wake(world, "alpha")
+    (first,) = world.prompts("alpha")
+    sentence = (
+        f"{MAIL_SINCE} {brief.set_at}, the newest at {format_due(world.now)},"
+        " so the task may have changed in that mail.\n"
+    )
+    assert sentence in first
+    assert first.index(sentence) < first.index(BRIEF_BEGIN)
+    # The brief itself is left as the line wrote it.
+    assert brief_of(world, "alpha") == brief
+
+
+def test_a_lead_says_nothing_of_mail_when_the_brief_is_newer(world: World) -> None:
+    wake(world, "alpha")
+    world.now = START + timedelta(minutes=5)
+    set_brief(world, "alpha", task="lift the bound")
+    world.scheduler._drop_engine("alpha")  # pyright: ignore[reportPrivateUsage]
+    note_from(world, LineAddress("beta"), "alpha")
+    note_from(world, LineAddress("alpha"), "alpha")
+    leads = [p for p in world.prompts("alpha") if BRIEF_BEGIN in p]
+    assert len(leads) == 1
+    assert MAIL_SINCE not in leads[0]
+    assert "alpha" not in world.log.state.mail_since_brief
+
+
+def test_mail_since_the_brief_is_rebuilt_from_the_log_alone(world: World) -> None:
+    """Only an operator's message counts, a new brief clears it, and replay
+    agrees."""
+    set_brief(world, "alpha", task="first")
+    note_from(world, LineAddress("beta"), "alpha")
+    assert "alpha" not in world.log.state.mail_since_brief
+    wake(world, "alpha", "beta")
+    newest = world.log.state.mail_since_brief["alpha"]
+    assert world.log.state.messages[newest].sender == ANA
+    assert world.log.state.mail_since_brief["beta"] != newest
+    assert replay(world.log.path).mail_since_brief == world.log.state.mail_since_brief
+    set_brief(world, "alpha", task="second")
+    assert "alpha" not in world.log.state.mail_since_brief
+    assert "alpha" not in replay(world.log.path).mail_since_brief
+
+
+def test_after_a_restart_the_time_is_read_from_the_log(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The time of mail sent before a restart comes from its entry's
+    ``recorded_at``, and a log that has no entry for it says so."""
+    set_brief(world, "alpha", task="lift the bound")
+    world.scheduler.send(ANA, LineAddress("alpha"), "a new task")
+    newest = world.log.state.mail_since_brief["alpha"]
+    (entry,) = [
+        e
+        for e in read_entries(world.log.path)
+        if isinstance(e.event, MessageSent) and e.event.message_id == newest
+    ]
+    recorded = format_due(datetime.fromisoformat(entry.recorded_at))
+    # A restart forgets the time this process kept.
+    world.scheduler._operator_mail_at.clear()  # pyright: ignore[reportPrivateUsage]
+    lead = world.scheduler._brief_lead("alpha", False)  # pyright: ignore[reportPrivateUsage]
+    assert lead is not None and f"the newest at {recorded}," in lead
+    world.scheduler._operator_mail_at.clear()  # pyright: ignore[reportPrivateUsage]
+
+    def no_entries(path: Path) -> list[Entry]:
+        del path
+        return []
+
+    monkeypatch.setattr(scheduler_module, "read_entries", no_entries)
+    lead = world.scheduler._brief_lead("alpha", False)  # pyright: ignore[reportPrivateUsage]
+    assert lead is not None
+    assert "the newest at a time the event log does not give," in lead
 
 
 # line_status.

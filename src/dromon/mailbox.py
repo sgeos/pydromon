@@ -15,7 +15,6 @@ These are pure functions of the state, so a client, a line's tools and the wake 
 all see the same mailbox.
 """
 
-from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Final
 
@@ -29,10 +28,11 @@ MAX_PAGE: Final = 50
 class MailSummary:
     new: int
     unread: int
+    """Unread messages from every party but the owner."""
     unanswered: int
-    collapsed: int = 0
-    """The owner's own unread notes, such as fired wakes and task-end notes, that an
-    earlier turn was shown and that ``unread`` therefore leaves out."""
+    own_notes: int = 0
+    """The owner's own unread notes, such as fired wakes, task-end notes and
+    compaction requests, which ``unread`` leaves out and this counts apart."""
 
     def sentence(self) -> str:
         """The summary in the form a wake prompt opens with."""
@@ -41,14 +41,29 @@ class MailSummary:
             f"{self.new} new message{plural}. {self.unread} unread."
             f" {self.unanswered} unanswered."
         )
-        if self.collapsed:
-            own = "note" if self.collapsed == 1 else "notes"
-            verb = "is" if self.collapsed == 1 else "are"
+        if self.own_notes:
+            own = "note" if self.own_notes == 1 else "notes"
+            verb = "is" if self.own_notes == 1 else "are"
             text += (
-                f" {self.collapsed} {own} of your own, such as fired wakes, shown to"
-                f" an earlier turn {verb} left out of unread."
+                f" {self.own_notes} unread {own} of your own, such as fired wakes,"
+                f" {verb} counted apart from unread."
             )
         return text
+
+    def counts(self) -> dict[str, int]:
+        """The three standing counts, as every structured view gives them."""
+        return {
+            "unread": self.unread,
+            "unanswered": self.unanswered,
+            "own_notes": self.own_notes,
+        }
+
+
+def is_own_note(message: Message, owner: Address) -> bool:
+    """Whether ``message`` in ``owner``'s mailbox is a note ``owner`` sent itself,
+    such as a fired wake, a task-end note or a compaction request. Mail from an
+    operator, another line, an agent, a remote party or the harness never is."""
+    return message.sender == owner
 
 
 def mailbox(state: State, owner: Address) -> list[tuple[str, Message]]:
@@ -74,49 +89,50 @@ def is_answered(message_id: str, message: Message, replied: set[str]) -> bool:
     return message_id in replied or message.acknowledged
 
 
-def summary(
-    state: State,
-    owner: Address,
-    new: int,
-    *,
-    fresh: Collection[str] | None = None,
-) -> MailSummary:
-    """The counts for ``owner``'s mailbox after ``new`` messages arrived. A reply to a
-    question Dromon asked on the owner's behalf when it held the owner, such as an
-    operator's ``resume``, a note from the owner to itself, a fired wake or a
-    task-end note, and a note from the harness, which nothing can reply to, are not
-    counted unanswered, since none asks a reply of the owner.
+def summary(state: State, owner: Address, new: int) -> MailSummary:
+    """The counts for ``owner``'s mailbox after ``new`` messages arrived, the one
+    rule every view uses, the wake prompt, ``line_status``, ``list_mail`` and the
+    client alike.
 
-    ``fresh``, given by a wake prompt, holds the identifiers that prompt delivers.
-    The owner's own unread notes outside it were delivered to an earlier turn, which
-    was shown them and dealt with them or chose not to, so they are counted as
-    ``collapsed`` and left out of ``unread``. **Decided by core on 2026-10-28, for
-    review.** A wake that fires after the work it was set for is done otherwise
-    swells ``unread`` for good, since a line acknowledges such a note without
-    opening it. Mail from anyone else is never collapsed."""
+    Unanswered. A reply to a question Dromon asked on the owner's behalf when it held
+    the owner, such as an operator's ``resume``, a note from the owner to itself and
+    a note from the harness, which nothing can reply to, are not counted, since none
+    asks a reply of the owner.
+
+    Own notes. **Task of 2026-10-30, the rule decided by core for review.** A note
+    the owner sent itself is never counted in ``unread``, and is counted in
+    ``own_notes`` instead, so nothing is hidden. Lines acknowledge such notes without
+    opening them, or ignore a wake that fired after its work was done, so counting
+    them unread swelled the figure for good. Until this task only the wake prompt
+    left them out, and only those shown to an earlier turn, so ``line_status`` and
+    the prompt gave different figures for one mailbox.
+
+    **Decided by core on 2026-10-30, for review.** A wake prompt that delivers an
+    own note does not mark it read. The prompt shows its header, as it shows every
+    message's, and never its body, so the note was not read, and ``read`` stays
+    true to what the owner opened. Since ``unread`` no longer counts own notes,
+    marking them read would change no figure, and would add a ``message_read``
+    event to the log for each one."""
     held = mailbox(state, owner)
     replied = replied_ids(state, owner)
-    collapsed = (
-        0
-        if fresh is None
-        else sum(
-            1
-            for message_id, message in held
-            if not message.read and message.sender == owner and message_id not in fresh
-        )
-    )
     return MailSummary(
         new=new,
-        unread=sum(1 for _, message in held if not message.read) - collapsed,
+        unread=sum(
+            1
+            for _, message in held
+            if not message.read and not is_own_note(message, owner)
+        ),
         unanswered=sum(
             1
             for message_id, message in held
             if not is_answered(message_id, message, replied)
             and message.reply_to not in state.hold_questions
-            and message.sender != owner
+            and not is_own_note(message, owner)
             and not isinstance(message.sender, HarnessAddress)
         ),
-        collapsed=collapsed,
+        own_notes=sum(
+            1 for _, message in held if not message.read and is_own_note(message, owner)
+        ),
     )
 
 
