@@ -1645,9 +1645,16 @@ def test_a_self_start_after_a_task_end_folds_into_its_note(tmp_path: Path) -> No
 def test_a_task_end_without_a_self_start_is_noted_after_the_grace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The grace is long enough that the two settles below finish inside it on a busy
-    # machine. At 0.01 seconds it ran out first and the test failed under load.
-    monkeypatch.setattr(engine_module, "SELF_START_GRACE_SECONDS", 0.5)
+    # The grace ends when the test releases it, not on the clock. A grace of 0.01
+    # seconds once ran out before the settles below on a busy machine.
+    released = asyncio.Event()
+    waiting: list[None] = []
+
+    async def grace() -> None:
+        waiting.append(None)
+        await released.wait()
+
+    monkeypatch.setattr(engine_module, "self_start_grace", grace)
     factory = Factory([[bash("tu1", "make gate"), launched("t1", "tu1"), result()]])
     ends: list[BackgroundEnd] = []
     engine = background_line(factory, tmp_path, ends)
@@ -1678,8 +1685,10 @@ def test_a_task_end_without_a_self_start_is_noted_after_the_grace(
             )
         )
         await settle()
+        assert waiting == [None]
         assert ends == []
-        await asyncio.sleep(1.0)
+        released.set()
+        await settle()
         await engine.close()
 
     asyncio.run(go())
