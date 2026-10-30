@@ -118,7 +118,7 @@ argument outside a tool's schema is refused.
 | `propose_change` | Records a proposed patch, file list and message for operator review; it does not change project files |
 | `read_instructions` | Shows the instructions the line's next turn receives, as below |
 | `write_scratch` | Writes a file under `tmp/` in the line's working directory, as below |
-| `check_disclosure` | Checks a text or a file in the line's working directory against the project's disclosure list, answering pass or fail with a count of matching lines and never a term, rate limited and recorded, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. Added on 2026-10-28 |
+| `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term or the file that matched. Files are checked independently, so a match cannot span files. The combined content is at most 1 MiB. One call, including a list, spends one recorded check, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. Added on 2026-10-28 |
 | `list_processes`, `stop_process` | List and stop the processes the line started, as below |
 
 **Decided by the operator on 2026-10-26**, from the lines' own reports, for what follows
@@ -356,6 +356,13 @@ turn a task-end note started and took it for a missed count. The turn was counte
 when it ended, which the worker line observed, so this was a gap in what the prompt
 said, not in the count. The mail summary and the
 headers of the newly delivered mail follow, and bodies stay in the mailbox.
+
+The prompt names the operator who most recently messaged the line at the start of the
+turn. The omitted `to` recipient can change during the turn if another operator
+messages the line. At the time of a call, `ask_operator` without `to` uses the operator
+who most recently messaged the line. When no operator has messaged the line at the
+start of a turn, the prompt says that `to` is required unless an operator messages it
+during that turn.
 
 - **Repeats.** A message whose sender, recipient and body match a message sent at most
   15 minutes before it is still delivered, and its header ends with

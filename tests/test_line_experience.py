@@ -988,6 +988,52 @@ def test_check_disclosure_answers_pass_or_fail_with_a_count(
     assert {event.checked_at for event in recorded} == {"2026-10-26T09:00:00Z"}
 
 
+def test_check_disclosure_checks_multiple_files_as_one_call(
+    world: World, tmp_path: Path
+) -> None:
+    listed(world, tmp_path)
+    (world.root / "readme-a.md").write_text("codename\nclean\n")
+    (world.root / "readme-b.md").write_text("clean\nsecond term\n")
+    (world.root / "review-a.md").write_text("codename")
+    text, error = world.call(
+        "check_disclosure",
+        {"paths": ["readme-a.md", "readme-b.md", "review-a.md"]},
+    )
+    assert not error and text.startswith("fail, 3 lines hold a term")
+    assert len(checks(world)) == 1
+    assert checks(world)[0].matched_lines == 3
+    assert f"You have {MAX_DISCLOSURE_CHECKS - 1} of" in text
+    assert "readme" not in text and "codename" not in text.casefold()
+
+
+def test_check_disclosure_does_not_match_across_file_boundaries(
+    world: World, tmp_path: Path
+) -> None:
+    listed(world, tmp_path)
+    (world.root / "first.md").write_text("code")
+    (world.root / "second.md").write_text("name\n")
+    text, error = world.call("check_disclosure", {"paths": ["first.md", "second.md"]})
+    assert not error and text.startswith("pass, 0 lines hold a term")
+    assert checks(world)[0].matched_lines == 0
+
+
+def test_check_disclosure_multi_file_call_spends_one_limit_entry(
+    world: World, tmp_path: Path
+) -> None:
+    listed(world, tmp_path)
+    (world.root / "one.md").write_text("clean\n")
+    (world.root / "two.md").write_text("also clean\n")
+    for _ in range(MAX_DISCLOSURE_CHECKS - 1):
+        _, error = world.call("check_disclosure", {"text": "clean"})
+        assert not error
+    text, error = world.call("check_disclosure", {"paths": ["one.md", "two.md"]})
+    assert not error and f"You have 0 of {MAX_DISCLOSURE_CHECKS}" in text
+    assert len(checks(world)) == MAX_DISCLOSURE_CHECKS
+    text, error = world.call("check_disclosure", {"text": "clean"})
+    assert error and "limit of 10 checks" in text
+    assert len(checks(world)) == MAX_DISCLOSURE_CHECKS
+
+
 def test_check_disclosure_is_limited_per_line_across_a_restart(
     world: World, tmp_path: Path
 ) -> None:
@@ -1021,12 +1067,33 @@ def test_check_disclosure_refuses_without_a_list_or_one_input(
     assert "daemon.disclosure_terms" in text
     assert "cannot pass or fail" in text
     listed(world, tmp_path)
-    for args in ({}, {"text": "x", "path": "y"}):
+    for args in (
+        {},
+        {"text": "x", "path": "y"},
+        {"text": "x", "paths": ["y"]},
+        {"path": "x", "paths": ["y"]},
+    ):
         text, error = world.call("check_disclosure", cast(dict[str, object], args))
-        assert error and "exactly one of text and path" in text
+        assert error and "exactly one of text, path and paths" in text
     big = "x" * (scheduler_module.MAX_CHECKED_BYTES + 1)
     text, error = world.call("check_disclosure", {"text": big})
     assert error and "is over" in text
+    assert checks(world) == []
+    (world.root / "first.md").write_text("x" * scheduler_module.MAX_CHECKED_BYTES)
+    (world.root / "second.md").write_text("y")
+    text, error = world.call("check_disclosure", {"paths": ["first.md", "second.md"]})
+    assert error and "over 1048576 bytes combined" in text
+    assert checks(world) == []
+    too_many = [
+        f"file-{number}.md" for number in range(scheduler_module.MAX_CHECKED_PATHS + 1)
+    ]
+    text, error = world.call("check_disclosure", {"paths": too_many})
+    assert error and f"between 1 and {scheduler_module.MAX_CHECKED_PATHS}" in text
+    assert checks(world) == []
+    text, error = world.call("check_disclosure", {"paths": []})
+    assert error and "between 1 and" in text
+    text, error = world.call("check_disclosure", {"paths": "one.md"})
+    assert error and "paths must be a list of text" in text
     assert checks(world) == []
 
 
@@ -1057,6 +1124,18 @@ def test_check_disclosure_reads_only_the_lines_own_files(
     (world.root / "folder").mkdir()
     text, error = world.call("check_disclosure", {"path": path})
     assert error and message in text
+    assert checks(world) == []
+
+
+def test_check_disclosure_refuses_a_missing_path_in_a_list(
+    world: World, tmp_path: Path
+) -> None:
+    listed(world, tmp_path)
+    (world.root / "present.md").write_text("clean\n")
+    text, error = world.call(
+        "check_disclosure", {"paths": ["present.md", "missing.md"]}
+    )
+    assert error and "cannot read missing.md" in text
     assert checks(world) == []
 
 

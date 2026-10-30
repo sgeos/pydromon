@@ -20,9 +20,12 @@ All notable changes are recorded here. The format follows
   engine returned no report, as when its prompt could not be composed, retires no
   note, since its prompt may never have reached the engine, and records
   `line_turn_ended` with the new optional field `unreported`, which a daemon that
-  predates it cannot read, so a rollback after such a turn cannot load the log. The prompt and the
-  counts line of `list_mail` now say that a note past the count is still listed by
-  `list_mail` without a filter. Required by the operator in the round 8 review.
+  predates it cannot read, so a rollback after such a turn cannot load the log. The
+  prompt and the counts line of `list_mail` now say that a note past the count is
+  still listed by `list_mail` without a filter. Required by the operator in the round 8 review.
+- Wake prompts now state the operator at turn start that `ask_operator` will use when
+  `to` is omitted, and explain that a new operator message during the turn changes
+  that default.
 - Role ownership notices are now suppressed across daemon restarts after the notified
   seat ends a turn that started after the change. Replay reconstructs each seat's
   turn starts and ends since the latest ownership change. A turn already running at
@@ -58,6 +61,11 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- `check_disclosure` accepts a list of up to eight files in one check. It counts
+  matching lines independently in each file and sums the counts, so a match cannot
+  span a file boundary. It limits the combined input to 1 MiB and spends one hourly
+  check for the call. The tool states that it checks only the disclosure list
+  configured for the project.
 - A line's own notes, such as fired wakes, task-end notes and compaction requests, are
   no longer counted as unread in any view, and are counted apart as `own_notes`, so
   nothing is hidden. One rule in `dromon.mailbox.summary` now gives the same unread,

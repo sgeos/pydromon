@@ -486,7 +486,9 @@ WITHHELD_COMMAND: Final = "withheld, since the disclosure list covers it"
 
 CHECK_DISCLOSURE_TOOL_NAME: Final = "check_disclosure"
 MAX_CHECKED_BYTES: Final = 1024 * 1024
-"""The largest text or file ``check_disclosure`` reads, so one check stays cheap."""
+"""The largest combined text or files ``check_disclosure`` reads in one check."""
+MAX_CHECKED_PATHS: Final = 8
+"""The largest file list ``check_disclosure`` accepts, bounding path validation."""
 DISCLOSURE_HELD: Final = (
     "Dromon held this line and asked an operator, since its disclosure checks and"
     " refusals reached their limit. Nothing was sent, written or checked, and"
@@ -502,6 +504,16 @@ CHECK_DISCLOSURE_SCHEMA: Final[dict[str, object]] = {
         "path": {
             "type": "string",
             "description": "A file to check, relative to your working directory",
+        },
+        "paths": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": MAX_CHECKED_PATHS,
+            "description": (
+                "Files to check together, relative to your working directory,"
+                f" at most {MAX_CHECKED_PATHS}"
+            ),
         },
     },
     "additionalProperties": False,
@@ -1539,6 +1551,7 @@ def compose_prompt(
     *,
     budget: str | None = None,
     notes: Mapping[str, str] | None = None,
+    operator: OperatorAddress | None = None,
 ) -> str:
     """The text that wakes ``line_id``: its budget, its mail summary and the new mail's
     headers, each followed by any note about it, such as that it repeats an earlier
@@ -1568,6 +1581,17 @@ def compose_prompt(
         " sends a message, which its recipient receives in a later turn, and"
         " ask_operator asks an operator a question, whose answer arrives as mail in a"
         " later turn."
+    )
+    parts.append(
+        f"At this turn's start, the default recipient for ask_operator is {operator}."
+        " It changes if another operator messages you during this turn. The recipient"
+        " for a call without to is the operator who most recently messaged you when"
+        " that call is made."
+        if operator is not None
+        else "At this turn's start, no operator has messaged this line."
+        " ask_operator without to requires a named recipient unless an operator"
+        " messages you during this turn. After that, it uses the operator who most"
+        " recently messaged you."
     )
     return "\n".join(parts)
 
@@ -4065,10 +4089,15 @@ class Scheduler:
         return f"{SCRATCH_DIRECTORY}/{Path(*parts)}"
 
     def check_disclosure(
-        self, line_id: str, text: str | None, path: str | None
+        self,
+        line_id: str,
+        text: str | None,
+        path: str | None,
+        paths: Sequence[str] | None = None,
     ) -> tuple[int, int]:
-        """**Item B2 of 2026-10-28.** Check ``text``, or the file at ``path`` in the
-        line's working directory, against the project's disclosure list, record
+        """**Item B2 of 2026-10-28.** Check ``text``, the file at ``path``, or the
+        files at ``paths`` in the line's working directory, against the project's
+        disclosure list, record
         ``disclosure_checked``, and return how many of its lines hold a listed term
         and how many checks the line has left in the window. Never says which term.
 
@@ -4081,8 +4110,13 @@ class Scheduler:
         back lengthens it while one set forward shortens it."""
         if line_id in self._disclosure_spent:
             raise LineToolRefused(DISCLOSURE_HELD)
-        if (text is None) == (path is None):
-            raise LineToolRefused("give exactly one of text and path")
+        offered = sum(value is not None for value in (text, path, paths))
+        if offered != 1:
+            raise LineToolRefused("give exactly one of text, path and paths")
+        if paths is not None and (not paths or len(paths) > MAX_CHECKED_PATHS):
+            raise LineToolRefused(
+                f"paths must contain between 1 and {MAX_CHECKED_PATHS} files"
+            )
         if not self._disclosure:
             raise LineToolRefused(
                 "no disclosure list is configured for this project. Set"
@@ -4097,13 +4131,25 @@ class Scheduler:
                 f" {DISCLOSURE_CHECK_WINDOW_SECONDS} seconds is reached, and the"
                 f" next is allowed at {format_due(reopens)}"
             )
-        if text is None:
-            text = self._read_checked(line_id, cast(str, path))
-        elif len(text.encode("utf-8")) > MAX_CHECKED_BYTES:
+        if text is not None and len(text.encode("utf-8")) > MAX_CHECKED_BYTES:
             raise LineToolRefused(f"text is over {MAX_CHECKED_BYTES} bytes")
-        matched = min(
-            disclosure.matching_lines(self._disclosure, text), MAX_DISCLOSURE_MATCHES
-        )
+        matched_lines = 0
+        if paths is not None:
+            total_bytes = 0
+            for file_path in paths:
+                file_bytes = self._read_checked(
+                    line_id, file_path, MAX_CHECKED_BYTES - total_bytes
+                )
+                total_bytes += len(file_bytes)
+                matched_lines += disclosure.matching_lines(
+                    self._disclosure, file_bytes.decode("utf-8", "replace")
+                )
+        else:
+            if path is not None:
+                text = self._read_checked(line_id, path).decode("utf-8", "replace")
+            checked_text = cast(str, text)
+            matched_lines = disclosure.matching_lines(self._disclosure, checked_text)
+        matched = min(matched_lines, MAX_DISCLOSURE_MATCHES)
         self._log.append(DisclosureChecked(line_id, format_due(now), matched))
         recent = self._log.state.disclosure_checks[line_id]
         window = timedelta(seconds=DISCLOSURE_CHECK_WINDOW_SECONDS)
@@ -4169,15 +4215,17 @@ class Scheduler:
             )
         return DISCLOSURE_HELD
 
-    def _read_checked(self, line_id: str, path: str) -> str:
-        """The text of the file at ``path``, relative to the line's working
+    def _read_checked(
+        self, line_id: str, path: str, max_bytes: int = MAX_CHECKED_BYTES
+    ) -> bytes:
+        """The contents of the file at ``path``, relative to the line's working
         directory, for ``check_disclosure``. It is walked from the working
         directory's descriptor one component at a time without following any link,
         as ``write_scratch`` writes, and read only when it is a regular file of the
         daemon's user with one name, outside every directory Dromon protects, and at
-        most ``MAX_CHECKED_BYTES``. So a line cannot have the daemon test a file its
-        own sandbox denies. Bytes that are not UTF-8 are replaced, which can only
-        hide a term written in them."""
+        most ``max_bytes``. So a line cannot have the daemon test a file its own
+        sandbox denies or make a list exceed its aggregate bound. Bytes that are not
+        UTF-8 are replaced, which can only hide a term written in them."""
         if not path or "\x00" in path or path.startswith(("/", "~")):
             raise LineToolRefused(
                 "path must be a relative path in your working directory"
@@ -4223,10 +4271,14 @@ class Scheduler:
             os.close(descriptor)
             raise LineToolRefused(f"{path} has more than one name or another owner")
         with os.fdopen(descriptor, "rb") as handle:
-            raw = handle.read(MAX_CHECKED_BYTES + 1)
-        if len(raw) > MAX_CHECKED_BYTES:
-            raise LineToolRefused(f"{path} is over {MAX_CHECKED_BYTES} bytes")
-        return raw.decode("utf-8", "replace")
+            raw = handle.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            raise LineToolRefused(
+                f"the checked files are over {MAX_CHECKED_BYTES} bytes combined"
+                if max_bytes < MAX_CHECKED_BYTES
+                else f"{path} is over {MAX_CHECKED_BYTES} bytes"
+            )
+        return raw
 
     def engine_config(self, line_id: str) -> LineConfig:
         """The configuration ``line_id``'s engine is built with, which is the
@@ -5704,10 +5756,20 @@ class Scheduler:
                 return _tool_error(unexpected)
             text: object = args.get("text")
             path: object = args.get("path")
+            paths: object = args.get("paths")
             if not isinstance(text, str | None) or not isinstance(path, str | None):
                 return _tool_error("text and path must be text")
+            if paths is not None:
+                if not isinstance(paths, list):
+                    return _tool_error("paths must be a list of text")
+                path_values = cast(list[object], paths)
+                if not all(isinstance(item, str) for item in path_values):
+                    return _tool_error("paths must be a list of text")
+                paths = path_values
             try:
-                matched, left = self.check_disclosure(line_id, text, path)
+                matched, left = self.check_disclosure(
+                    line_id, text, path, cast(list[str] | None, paths)
+                )
             except (LineToolRefused, EventRejected) as error:
                 return _tool_error(str(error))
             lines = "1 line holds" if matched == 1 else f"{matched} lines hold"
@@ -5721,10 +5783,14 @@ class Scheduler:
         return SdkMcpTool(
             name=CHECK_DISCLOSURE_TOOL_NAME,
             description=(
-                "Check a text, or a file in your working directory, against the"
-                " project's disclosure list. The answer is pass or fail with how many"
-                " lines hold a listed term, never the term. Checks are limited per"
-                " hour and recorded."
+                "Check text, one file, or a list of up to"
+                f" {MAX_CHECKED_PATHS} files against the one disclosure list configured"
+                " for this project. A line told about a list elsewhere does not know"
+                " that this project covers it. The answer is pass or fail with how"
+                " many lines hold a listed term, never the term. The listed files are"
+                " checked independently and their counts are summed, so a match does"
+                " not span files. Their combined content is at most 1 MiB."
+                " Checks are limited per hour and recorded."
             ),
             input_schema=CHECK_DISCLOSURE_SCHEMA,
             handler=handler,
@@ -6689,6 +6755,7 @@ class Scheduler:
                 replied_ids(self._log.state, address),
                 budget=self._budget_line(line_id, cause, warn=compaction is None),
                 notes=self._notes(messages),
+                operator=self.last_operator(line_id),
             )
             quiet = self._quiet_notice(line_id)
             if quiet is not None:
