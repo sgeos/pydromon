@@ -30,7 +30,8 @@ on `send_message`, which exists, so the open part is keys across a restart.
 
 **Not verified.** The inferred cause of the Pi test failure is not reproduced. The
 filled package has not been seen live, since no handoff has happened since it merged.
-Grok has not run a turn.
+Grok has not run a turn. Claude Code's limit shapes are typed, not observed. The TLS
+transport has run only between daemons on one machine.
 
 **For the operator.**
 1. Sign in to Dromon's Grok home with the command in `GROK.md`.
