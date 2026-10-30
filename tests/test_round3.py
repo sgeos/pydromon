@@ -1068,7 +1068,7 @@ def test_a_lines_notes_to_itself_are_not_counted_unanswered(world: World) -> Non
     for message_id in (note, request):
         world.log.append(MessageDelivered(cast(str, message_id)))
     counts = summary(world.log.state, LineAddress("alpha"), 0)
-    assert (counts.unread, counts.unanswered) == (2, 1)
+    assert (counts.unread, counts.unanswered, counts.own_notes) == (1, 1, 1)
 
 
 def test_a_note_from_the_harness_is_not_counted_unanswered(world: World) -> None:

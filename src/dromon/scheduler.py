@@ -174,7 +174,7 @@ from dromon.engine import (
     instruction_sizes,
     resolve_plugin,
 )
-from dromon.eventlog import EventLog
+from dromon.eventlog import EventLog, read_entries
 from dromon import proposals as proposal_store
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon import settings as engine_settings
@@ -968,6 +968,10 @@ LIST_MAIL_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
     "properties": {
         "unread_only": {"type": "boolean", "description": "Only unread messages"},
+        "own_notes_only": {
+            "type": "boolean",
+            "description": "Only your own notes neither read nor acknowledged",
+        },
         "sender": {"type": "string", "description": "Only messages from this address"},
         "offset": {"type": "integer", "minimum": 0, "description": "Matches to skip"},
         "limit": {
@@ -1644,6 +1648,11 @@ class Scheduler:
         self._wake_delivered: dict[str, str] = {}
         """When each fired wake's note was delivered, for ``list_mail``. In memory,
         so a note delivered before a restart shows its due time only."""
+        self._operator_mail_at: dict[str, tuple[str, str | None]] = {}
+        """The newest operator message to each line that this process sent or
+        looked up, by line, with the time it was sent, or ``None`` where the event
+        log's ``recorded_at`` does not give one. In memory, and read again from the
+        log once after a restart."""
         self._processes: ProcessTable = processes or SystemProcesses()
         self._line_tokens = line_tokens
         """The tokens lines' engines reach Dromon's tools with, which each turn
@@ -2058,6 +2067,11 @@ class Scheduler:
                 self._redirect_for.setdefault(recipient.line_id, message_id)
         if isinstance(recipient, LineAddress):
             self._remember(message_id, sender, recipient, body, sent_at)
+            if isinstance(sender, OperatorAddress):
+                self._operator_mail_at[recipient.line_id] = (
+                    message_id,
+                    format_due(sent_at),
+                )
         self._sent.append(message_id)
         if reply_to is not None and isinstance(recipient, LineAddress):
             line = self._log.state.lines.get(recipient.line_id)
@@ -3589,7 +3603,7 @@ class Scheduler:
             "cost_usd": self.cost_status(line_id),
             "leases": self.leases_of(line_id),
             "scheduled_wake": _scheduled_summary(pending),
-            "unread": summary(state, LineAddress(line_id), 0).unread,
+            **summary(state, LineAddress(line_id), 0).counts(),
             "pending": len(self.pending(line_id)),
             "model": self.model_of(line_id),
             "strategy": line.strategy,
@@ -5860,11 +5874,14 @@ class Scheduler:
             if unexpected:
                 return _tool_error(unexpected)
             unread_only: object = args.get("unread_only", False)
+            own_notes_only: object = args.get("own_notes_only", False)
             sender: object = args.get("sender")
             offset: object = args.get("offset", 0)
             limit: object = args.get("limit", MAX_PAGE)
             if type(unread_only) is not bool:
                 return _tool_error("unread_only must be true or false")
+            if type(own_notes_only) is not bool:
+                return _tool_error("own_notes_only must be true or false")
             if type(offset) is not int or type(limit) is not int:
                 return _tool_error("offset and limit must be integers")
             if sender is not None and not isinstance(sender, str):
@@ -5876,6 +5893,7 @@ class Scheduler:
                     self._log.state,
                     mailbox_owner,
                     unread_only=unread_only,
+                    own_notes_only=own_notes_only,
                     sender=None if sender is None else parse_any_address(sender),
                     offset=offset,
                     limit=limit,
@@ -5883,7 +5901,13 @@ class Scheduler:
             except (InvalidField, ValueError) as error:
                 return _tool_error(str(error))
             answered = replied_ids(self._log.state, mailbox_owner)
-            lines = [f"{len(page)} of {total} matching messages, from {offset}."]
+            counts = summary(self._log.state, mailbox_owner, 0)
+            lines = [
+                f"{len(page)} of {total} matching messages, from {offset}."
+                f" {counts.unread} unread, {counts.unanswered} unanswered and"
+                f" {counts.own_notes} notes of your own neither read nor acknowledged"
+                " in the mailbox."
+            ]
             for message_id, message in page:
                 entry = header(message_id, message, answered)
                 noted = self.mail_notes(message_id)
@@ -5894,8 +5918,10 @@ class Scheduler:
             name=LIST_MAIL_TOOL_NAME,
             description=(
                 "List messages in your mailbox, oldest first, without their bodies."
-                " Filter to unread messages or one sender, and page with offset and"
-                f" limit, at most {MAX_PAGE} at a time. An entry names the message it"
+                " Filter to unread messages, to your own notes such as fired wakes,"
+                " or to one sender, and page with offset and limit, at most"
+                f" {MAX_PAGE} at a time. Unread leaves out your own notes, as the"
+                " counts do. An entry names the message it"
                 " repeats, and a scheduled wake's note says when it was due and"
                 " delivered."
             ),
@@ -6498,12 +6524,7 @@ class Scheduler:
             prompt = compose_prompt(
                 line_id,
                 messages,
-                summary(
-                    self._log.state,
-                    address,
-                    len(messages),
-                    fresh={message_id for message_id, _ in messages},
-                ),
+                summary(self._log.state, address, len(messages)),
                 replied_ids(self._log.state, address),
                 budget=self._budget_line(line_id, cause, warn=compaction is None),
                 notes=self._notes(messages),
@@ -6873,11 +6894,65 @@ class Scheduler:
             f" standing brief you last set, at {brief.set_at}, with your worktree at"
             f" commit {brief.workdir_commit[:12] or 'unknown'}. It is your own"
             " earlier text and may be stale. Check it against the worktree and your"
-            " mail, and set it again with set_brief when your task changes.\n"
+            " mail, and set it again with set_brief when your task changes."
+            f"{self._mail_since_brief(line_id, brief)}\n"
             f"{self._brief_block(brief)}"
         )
         self._brief_owed.discard(line_id)
         return lead
+
+    def _mail_since_brief(self, line_id: str, brief: BriefSet) -> str:
+        """One sentence for the brief's lead when an operator mailed ``line_id``
+        after it set ``brief``, naming both times, or an empty text. **Task of
+        2026-10-30.** The review line's brief was stale after a compaction, since its
+        task had changed in mail since the brief was set. The brief itself is left as
+        the line wrote it. The order comes from the event log, as
+        ``State.mail_since_brief`` keeps it, and the time from this process's own
+        record or, after a restart, from the message's ``recorded_at``."""
+        newest = self._mail_after_brief(line_id)
+        if newest is None:
+            return ""
+        sent = newest[1]
+        when = (
+            f"the newest at {sent}"
+            if sent is not None
+            else "the newest at a time the event log does not give"
+        )
+        return (
+            f" Operator mail has arrived since this brief was set at {brief.set_at},"
+            f" {when}, so the task may have changed in that mail."
+        )
+
+    def _mail_after_brief(self, line_id: str) -> tuple[str, str | None] | None:
+        """The newest operator message to ``line_id`` since its brief was set, with
+        the time it was sent or ``None`` where the log does not give one, or ``None``
+        when no operator mail came since. The brief's lead and ``line_status`` both
+        read it. **Review r6, finding 7.** A time the log does not give is kept as
+        well, so the log is read at most once for each such message."""
+        message_id = self._log.state.mail_since_brief.get(line_id)
+        if message_id is None:
+            return None
+        known = self._operator_mail_at.get(line_id)
+        if known is not None and known[0] == message_id:
+            return known
+        found = (message_id, self._recorded_time(message_id))
+        self._operator_mail_at[line_id] = found
+        return found
+
+    def _recorded_time(self, message_id: str) -> str | None:
+        """When ``message_id`` was recorded, from its ``message_sent`` entry, to the
+        second, or ``None`` when no entry has it or its time does not parse. Reads the
+        whole log, which ``_mail_after_brief`` needs only once after a restart for
+        each line, since it keeps the result, a miss included. **Porting note.** The
+        model never reads ``recorded_at``, and this does not give it to the model."""
+        for entry in read_entries(self._log.path):
+            event = entry.event
+            if isinstance(event, MessageSent) and event.message_id == message_id:
+                try:
+                    return format_due(datetime.fromisoformat(entry.recorded_at))
+                except (ValueError, InvalidField):
+                    return None
+        return None
 
     def _brief_block(self, brief: BriefSet) -> str:
         """``brief`` delimited as untrusted data, or withheld whole when any of it
@@ -6896,11 +6971,18 @@ class Scheduler:
         brief = self._log.state.briefs.get(line_id)
         if brief is None:
             return None
+        newest = self._mail_after_brief(line_id)
         view: dict[str, object] = {
             "set_at": brief.set_at,
             "workdir_commit": brief.workdir_commit or None,
             "daemon_commit": brief.daemon_commit or None,
             "trust": BRIEF_UNTRUSTED,
+            # Review r6, finding 8. The lead's sentence, for a turn without the lead.
+            "operator_mail_since": (
+                None
+                if newest is None
+                else {"message_id": newest[0], "sent_at": newest[1]}
+            ),
         }
         if self.discloses(
             brief.task, brief.decisions, brief.next_action, *brief.artifacts
@@ -8102,6 +8184,7 @@ class Scheduler:
                 "tool_policy": self.effective_config(line_id).tool_policy.value,
                 "scheduled_wake": _scheduled_summary(state.scheduled.get(line_id)),
                 "leases": self.leases_of(line_id),
+                **summary(state, LineAddress(line_id), 0).counts(),
             }
             for line_id, line in sorted(state.lines.items())
         ]
@@ -8368,6 +8451,8 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         "leases": len(cast(list[dict[str, object]], full["leases"])),
         "scheduled_wake": full["scheduled_wake"],
         "unread": full["unread"],
+        "unanswered": full["unanswered"],
+        "own_notes": full["own_notes"],
         "pending": full["pending"],
         "peers": full["peers"],
         "model": full["model"],

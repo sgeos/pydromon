@@ -1976,6 +1976,11 @@ class State:
     briefs: dict[str, BriefSet] = field(default_factory=dict[str, BriefSet])
     """Each line's latest standing brief, keyed by line. A line with none has no
     entry."""
+    mail_since_brief: dict[str, str] = field(default_factory=dict[str, str])
+    """The newest message from an operator to each line sent after the line's latest
+    ``brief_set``, keyed by line, or no entry when none was. **Task of 2026-10-30.**
+    A turn that leads with the brief says so, since the task may have changed in
+    that mail. Built from the order of events alone, so replay agrees."""
 
     requests: dict[tuple[str, str], dict[str, RequestedAct]] = field(
         default_factory=dict[tuple[str, str], dict[str, RequestedAct]]
@@ -2014,6 +2019,7 @@ class State:
             dict(self.task_records),
             dict(self.last_turn_commits),
             dict(self.briefs),
+            dict(self.mail_since_brief),
             {slot: dict(acts) for slot, acts in self.requests.items()},
         )
 
@@ -2248,6 +2254,10 @@ class State:
             case MessageSent():
                 self._apply_message_sent(event)
                 self._remember_request(event)
+                if isinstance(event.sender, OperatorAddress) and isinstance(
+                    event.recipient, LineAddress
+                ):
+                    self.mail_since_brief[event.recipient.line_id] = event.message_id
             case MessageReceived():
                 self._apply_message_received(event)
             case MessageDelivered():
@@ -2399,6 +2409,7 @@ class State:
                 self.role_entries[event.entry_id] = event
             case BriefSet():
                 self.briefs[event.line_id] = event
+                self.mail_since_brief.pop(event.line_id, None)
             case BudgetStated():
                 self.budgets[event.provider] = event
             case PeerDeclared():
