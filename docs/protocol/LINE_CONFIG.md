@@ -688,7 +688,18 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
   second into the first wake's turn, which fired after it. The note says why it was
   scheduled, naming the estimated tokens, the warning and where the estimate came
   from, in fixed text, and says that a restart before it fires loses the request,
-  since which wake was the warning's is held in memory. The
+  since the estimate is held in memory. **Review of that task.** While another
+  wake is pending, such as a wait for a background task, or while mail waits for
+  the line, no wake is queued and the line is not marked as woken for one. The mail
+  starts a turn that compacts on the threshold, and once the other wake is gone
+  without a turn, the next pass queues the wake. A compaction reported after the
+  wake fired and before its note was delivered records the note as delivered
+  without a turn. After a restart, a pending wake whose note is the context note
+  and which names no task is taken as the warning's, so a later compaction
+  withdraws it. The log does not record who scheduled a wake, so a line's own wake
+  with an imitating note is taken too. That affects only the line's own wake, and
+  gives it at most the one uncounted compaction turn that `compact_session` at the
+  warning also gives. The
   default of 150,000 leaves room before an engine's automatic compaction near a
   200,000 token window, and past it a turn of a few calls re-reads a million tokens.
 - **`compact_session`.** No arguments before round 6. Only a Claude Code line, and

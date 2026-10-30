@@ -13,7 +13,13 @@ All notable changes are recorded here. The format follows
   due under the automatic hold is withdrawn. The engines line received a second wake,
   queued one second into the first wake's turn, which fired after it. The wake's note
   now says why it was scheduled, with the estimated tokens, the warning and the
-  source of the estimate. Required by the operator on 2026-10-30.
+  source of the estimate. Required by the operator on 2026-10-30. After review, no
+  context-warning wake is queued while another wake is pending or mail waits for the
+  line, and the line is no longer marked as woken for one it did not get, so a wait
+  for a background task that ends without a turn no longer suppresses the wake. A
+  compaction reported after the wake fired delivers its note without a turn of its
+  own, as the engines line's log showed one. A restarted daemon takes a pending wake
+  with the context note as the warning's, so a later compaction withdraws it.
 - Claude Code and Codex lines granted a shell tool now require the daemon's `SHELL` to
   name an absolute executable. Claude Code additionally requires Bash or Zsh and
   receives the validated path as both `SHELL` and `CLAUDE_CODE_SHELL`, and the launcher

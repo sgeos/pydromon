@@ -1653,8 +1653,30 @@ class Scheduler:
         self._compaction_free_turn_inflight: set[str] = set()
         """Lines currently in that uncounted turn, whose intermediate context
         reports cannot reset the allowance before the turn ends."""
-        self._context_compaction_wake_ids: dict[str, str] = {}
-        """Identifiers of context-warning wakes, retained through dispatch."""
+        self._context_compaction_wake_ids: dict[str, str] = {
+            line_id: pending.message_id
+            for line_id, pending in log.state.scheduled.items()
+            if pending.task_id is None
+            and pending.note.startswith(CONTEXT_COMPACTION_NOTE)
+        }
+        """Identifiers of context-warning wakes, retained through dispatch.
+
+        **Review of 2df2daa, R3.** After a restart the pending wakes whose note is
+        the context note are adopted, so a compaction reported after the restart
+        withdraws one rather than leaving it to fire after the fact. The event log
+        does not record who scheduled a wake, so the note is the only sign. A line's
+        own wake that imitates it is adopted too, unless it names a task, which the
+        daemon's never does. That gains the line nothing it lacks and affects no
+        other line. A compaction, the automatic hold or a context below the
+        threshold may withdraw its own wake. It stands in for the daemon's context
+        wake until it fires, which only moves the line's own warning to the time it
+        chose. Its turn may be the one uncounted compaction turn of the warning
+        interval, which ``compact_session`` at the warning also gives. It causes no
+        compaction the threshold would not, since adoption does not mark the line as
+        woken for one. A context note
+        withheld for disclosure, and a fired note not yet delivered, are not
+        adopted. Porting note: a field naming the wake's origin in ``WakeScheduled``
+        would replace the note test, at the cost of a change to the event log."""
         self._context: dict[str, int] = {}
         """Each line's context estimate after its last turn that reported one."""
         self._last_compaction: dict[str, dict[str, object]] = {}
@@ -2788,8 +2810,11 @@ class Scheduler:
         fired: list[str] = []
         for line_id in self._due_wakes():
             pending = self._log.state.scheduled[line_id]
-            # Task of 2026-10-30. Under the automatic hold the compaction the wake
-            # asks for would not be made, as below the threshold it is not needed.
+            # Task of 2026-10-30, and R1 of its review. A context known below the
+            # threshold needs no compaction. Under the automatic hold the last
+            # compaction did not bring the context below the threshold, or its effect
+            # is unknown, so another would not help, and the wake would cost a turn
+            # only to say so.
             if self._context_compaction_wake_ids.get(
                 line_id
             ) == pending.message_id and (
@@ -3266,17 +3291,28 @@ class Scheduler:
             self._ensure_context_compaction_wake(line_id)
 
     def _withdraw_pending_context_wake(self, line_id: str) -> None:
-        """Withdraw the daemon's context-warning wake if it is still scheduled, and
-        leave one that has fired, whose turn's end still reads its identifier."""
+        """Withdraw the daemon's context-warning wake if it is still scheduled, since
+        a compaction was just reported.
+
+        **E1 of the review of 2df2daa.** A wake that has fired and whose note is not
+        yet delivered is past withdrawal, so its note is recorded as delivered
+        without a turn. The line still finds it with ``list_mail``. A delivered note
+        belongs to the turn that is running, which is the one compacting."""
         context_wake = self._context_compaction_wake_ids.get(line_id)
-        pending = self._log.state.scheduled.get(line_id)
-        if (
-            context_wake is None
-            or pending is None
-            or pending.message_id != context_wake
-        ):
+        if context_wake is None:
             return
-        self._log.append(WakeWithdrawn(line_id, context_wake))
+        pending = self._log.state.scheduled.get(line_id)
+        message = self._log.state.messages.get(context_wake)
+        if pending is not None and pending.message_id == context_wake:
+            self._log.append(WakeWithdrawn(line_id, context_wake))
+        elif message is not None and not message.delivered:
+            self._log.append(MessageDelivered(context_wake))
+            self._notes([(context_wake, message)])
+            self._post_office.discard(context_wake)
+            if context_wake in self._sent:
+                self._sent.remove(context_wake)
+        else:
+            return
         self._context_compaction_wake_ids.pop(line_id, None)
         self._context_compaction_wakes.discard(line_id)
 
@@ -3334,6 +3370,19 @@ class Scheduler:
         the compaction, so each tick of the running turn queued a second wake, which
         fired once the turn ended. The pass after the turn ends decides again from
         the turn's final estimate.
+
+        **Review of 2df2daa, R2.** While another wake is pending, such as a wait for
+        a background task, no note is queued and the line is not marked as woken
+        for one. It was marked before, so once that wake was cancelled by its task's
+        end or replaced, no note followed while the line stayed idle. Each pass
+        decides again, so the note is queued once the other wake is gone.
+
+        **E1 of that review.** Nor is a note queued while mail waits for the line,
+        since that mail starts its next turn, which compacts on the threshold by
+        ``_compaction_reason``. The note fired in the tick that woke the line for
+        older mail, so it was delivered alone after that turn had compacted. Peer
+        mail past its peer's turn allowance also counts, and its turn compacts when
+        the allowance lets it start.
         """
         threshold = self.effective_config(line_id).context_warn_tokens
         context = self._context.get(line_id)
@@ -3348,6 +3397,8 @@ class Scheduler:
             or line_id in self._running
             or line_id in self._compaction_cause
             or self._line_hibernated(line_id)
+            or line_id in self._log.state.scheduled
+            or self.pending(line_id)
         ):
             return
         self._context_compaction_wakes.add(line_id)
@@ -3358,8 +3409,6 @@ class Scheduler:
         )
         if self.discloses(note):
             note = WITHHELD_WAKE_NOTE
-        if line_id in self._log.state.scheduled:
-            return
         message_id = new_id("m")
         self._log.append(
             WakeScheduled(line_id, message_id, format_due(self._wall_clock()), note)
