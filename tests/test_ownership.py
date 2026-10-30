@@ -35,13 +35,17 @@ from dromon.model import (
     LineAddress,
     LineState,
     LineStateChanged,
+    Message,
+    MessageKind,
     OperatorAddress,
     OwnershipCause,
     OwnershipChanged,
+    RemoteAddress,
     Role,
     RoleDeclared,
     RoleNoteKind,
     SeatBound,
+    TaskRecorded,
     format_due,
 )
 from dromon.roles import (
@@ -63,6 +67,7 @@ from dromon.scheduler import (
     RELINQUISH_OWNERSHIP_TOOL_NAME,
     ROLE_STATUS_TOOL_NAME,
     TAKE_OWNERSHIP_TOOL_NAME,
+    MAX_PACKAGE_MAIL_BYTES,
     LineSpec,
     LineToolRefused,
     Scheduler,
@@ -1283,12 +1288,148 @@ def test_the_package_without_a_brief_marks_each_field_unknown(
     monkeypatch.setattr(scheduler_module, "_worktree_snapshot", fake_snapshot())
     prompt = taken_by_beta(world)
     assert 'Task: "unknown"; unknown, stated in neither' in prompt
+    assert 'Gate and coverage: "unknown"; unknown, stated in neither' in prompt
+    assert "and not observed by the daemon" in prompt
     assert 'Next action: "unknown"; unknown' in prompt
     assert 'Artifacts: "unknown"; unknown, named in no brief' in prompt
     assert (
         'Worktree status: "## feature\\n M src/example.py"; observed by the daemon'
         " at 2026-10-27T09:00:00Z" in prompt
     )
+
+
+# Fields the daemon observed for a former owner that stated nothing.
+
+GATE_DIGEST = "d" * 64
+
+
+def mail(world: World, sender: OperatorAddress | LineAddress, body: str) -> str:
+    """Send alpha ``body`` from ``sender`` and run until alpha's turn delivers it,
+    returning the message identifier."""
+    sent: list[str] = []
+
+    async def act() -> None:
+        sent.append(world.scheduler.send(sender, ALPHA, body))
+
+    run(world, act)
+    return sent[0]
+
+
+def record_task(world: World, command: str = "./scripts/check.sh") -> None:
+    world.log.append(
+        TaskRecorded(
+            "alpha",
+            "bt1",
+            command,
+            "completed",
+            0,
+            None,
+            GATE_DIGEST,
+            120,
+            WORKTREE_COMMIT,
+            format_due(START),
+        )
+    )
+
+
+def test_a_silent_package_takes_task_and_gate_from_what_the_daemon_observed(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task of 2026-10-29. alpha set no brief and wrote no entry, so Task comes
+    from its latest operator mail and Gate and coverage from its latest task
+    record. The fields neither covers stay unknown."""
+    monkeypatch.setattr(scheduler_module, "_worktree_snapshot", fake_snapshot())
+    message_id = mail(world, ANA, "Build the observed package.")
+    record_task(world, "./scripts/old.sh")
+    record_task(world)
+    prompt = taken_by_beta(world)
+    assert (
+        f'Task: "Build the observed package."; operator mail {message_id} from'
+        " @ana, the latest delivered to alpha, observed by the daemon, which records"
+        " no time for mail. It may not state the task"
+    ) in prompt
+    gate = (
+        '{"command": "./scripts/check.sh", "status": "completed", "exit_code": 0,'
+        f' "output_digest": "{GATE_DIGEST}", "output_bytes": 120,'
+        f' "workdir_commit": "{WORKTREE_COMMIT}"}}'
+    )
+    assert (
+        f"Gate and coverage: {gate}; observed by the daemon at 2026-10-27T09:00:00Z,"
+        ' when background task "bt1" of alpha ended. It is that line\'s latest'
+        " recorded task and may not be a gate"
+    ) in prompt
+    assert 'Next action: "unknown"; unknown' in prompt
+    assert 'Unresolved decisions: "unknown"; unknown' in prompt
+
+
+def test_a_line_with_no_task_record_leaves_the_gate_unknown(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scheduler_module, "_worktree_snapshot", fake_snapshot())
+    mail(world, ANA, "the task")
+    assert "alpha" not in world.log.state.task_records
+    prompt = taken_by_beta(world)
+    assert 'Task: "the task"; operator mail' in prompt
+    assert 'Gate and coverage: "unknown"; unknown, stated in neither' in prompt
+
+
+def test_another_lines_mail_never_fills_the_task(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only an operator holds operator authority, so the latest operator mail is
+    taken over newer mail from a line, and mail from lines alone fills nothing."""
+    monkeypatch.setattr(scheduler_module, "_worktree_snapshot", fake_snapshot())
+    mail(world, LineAddress("gamma"), "a task from a line")
+    alone = world.scheduler._observed_fields("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert "Task" not in alone
+    operator_id = mail(world, ANA, "the operator's task")
+    mail(world, LineAddress("gamma"), "a newer task from a line")
+    prompt = taken_by_beta(world)
+    assert f'Task: "the operator\'s task"; operator mail {operator_id}' in prompt
+    assert "a newer task from a line" not in prompt
+    assert "a task from a line" not in prompt
+
+
+def test_a_remote_operators_mail_never_fills_the_task(world: World) -> None:
+    """Review r4, findings F2 and F5. A peer's operator is a ``RemoteAddress``, which
+    is never read as a local operator, so its mail fills nothing. The message is put
+    in the state directly, since declaring a peer is beside the point here."""
+    world.log.state.messages["m-remote"] = Message(
+        RemoteAddress("studio", OperatorAddress("ana")),
+        ALPHA,
+        MessageKind.NOTE,
+        "a task from another daemon's operator",
+        (),
+        None,
+        delivered=True,
+    )
+    observed = world.scheduler._observed_fields("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert "Task" not in observed
+
+
+def test_operator_mail_is_cut_to_its_first_bytes(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scheduler_module, "_worktree_snapshot", fake_snapshot())
+    mail(world, ANA, "x" * (MAX_PACKAGE_MAIL_BYTES + 50))
+    prompt = taken_by_beta(world)
+    shown = "x" * MAX_PACKAGE_MAIL_BYTES
+    assert f'Task: "{shown} [first {MAX_PACKAGE_MAIL_BYTES} bytes]"' in prompt
+    assert "x" * (MAX_PACKAGE_MAIL_BYTES + 1) not in prompt
+
+
+def test_a_disclosed_term_in_observed_fields_is_withheld(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scheduler_module, "_worktree_snapshot", fake_snapshot())
+    message_id = mail(world, ANA, "the hidden task")
+    record_task(world, "./scripts/hidden.sh")
+    world.scheduler.set_disclosure_terms(["hidden"])
+    prompt = taken_by_beta(world)
+    assert "hidden" not in prompt
+    assert "[withheld because" in prompt
+    assert f"operator mail {message_id} from @ana" in prompt
+    assert 'when background task "bt1" of alpha ended' in prompt
 
 
 def test_the_package_takes_what_the_journal_lacks_from_the_former_brief(

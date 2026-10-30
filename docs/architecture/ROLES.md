@@ -301,9 +301,23 @@ Each item of the package now says where it came from, in one of four ways.
 A labeled field the journal entry does not state is taken from the former owner's
 standing brief, which `set_brief` records, as [`LINE_CONFIG.md`](../protocol/LINE_CONFIG.md)
 specifies. Task, Unresolved decisions and Next action have a counterpart in the brief,
-and the brief's artifact paths are an item of their own. Gate and coverage and the
-journal's diff summary have none and stay unknown when the entry is silent. The former
-owner is the seat the role passed from, or, after a vacancy, the author of the entry.
+and the brief's artifact paths are an item of their own. The former owner is the seat
+the role passed from, or, after a vacancy, the author of the entry.
+
+**Fields the daemon observed, task of 2026-10-29.** Where the journal entry and the
+brief are both silent, two fields are filled from the daemon's own records, each marked
+observed by the daemon. Gate and coverage is the former owner's latest task record, with
+its command, final status, exit code, output digest and size, and commit, and the time
+the daemon learned it ended. Task is the latest operator mail delivered to the former
+owner, cut to its first 600 bytes and named by its message identifier. **Fact.** The
+state records no time for a message, so the item says so instead of giving one.
+**Decided by the operator.** Mail from a line, the harness, an agent or a peer never
+fills a field, since only an operator holds operator authority. Each value is checked
+against the disclosure list and withheld whole when it holds a term. **Assumption.** The
+latest task need not be a gate and the latest mail need not state the task, so each
+item says what it is and leaves the judgement to the new owner. The journal's diff
+summary, Unresolved decisions and Next action have no observed counterpart and stay
+unknown when no line states them.
 
 **A path the daemon cannot read is never reported as absent or untracked.** **Fact,
 observed with git on 2026-10-29.** `git status` leaves a directory it cannot open out

@@ -400,6 +400,11 @@ headers of the newly delivered mail follow, and bodies stay in the mailbox.
   files and never runs git or reads its objects, so it names the two ends and not
   each commit. A move during a turn, such as the line's own commit, is not told. The
   turn-end commit is recorded in the event log, so the notice survives a daemon restart.
+  **Task of 2026-10-29.** Where no turn-end commit is recorded for the line, as when its
+  last turn ended under a daemon that did not record one or with its worktree
+  unreadable, the check is skipped and the prompt says so, with the commit checked out
+  now. The turn's end records the commit, so this is said once. A worktree whose commit
+  cannot be read now is told nothing, since nothing could be compared.
 
 **Leases.** **Decided by the operator on 2026-10-26.** A project declares named leases
 in its `[leases]` table, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, so its
@@ -553,7 +558,9 @@ the intent itself, in the line's own words, set with `set_brief` and recorded as
 - **Where else it is shown.** `line_status` gives the whole brief in its detailed view
   and its task and next action, cut to 400 bytes, in its compact one, each under
   `untrusted_data` with a note that the line wrote it. The role transition package
-  takes from the former owner's brief what its journal entry lacks, as
+  takes from the former owner's brief what its journal entry lacks. Where both are
+  silent it fills Task from the former owner's latest operator mail and Gate and
+  coverage from its latest task record, each marked observed by the daemon, as
   [`ROLES.md`](../architecture/ROLES.md) describes.
 - **Trust.** The brief is untrusted data, since a line may relay in it what other lines
   and agents wrote. The daemon stamps it and checks its bounds and the disclosure list,
