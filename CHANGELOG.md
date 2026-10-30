@@ -7,6 +7,13 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Operator line configuration may set `fresh_session_each_turn` for Claude Code or
+  Codex. Each turn starts without the prior engine session, context handoff or standing
+  brief, while the mail that starts the turn is still delivered. The scheduler records
+  each reset as `line_session_cleared`, which survives restart. The key implies
+  `context_handoff = false`; loading refuses it with `keep_session = true`, explicit
+  handoff enabled, or an unsupported engine adapter.
+
 - Compaction now withdraws a still-pending wake scheduled by `compact_session` whether
   the engine made the compaction itself or a turn made it at Dromon's request, and a
   compaction that reports no size withdraws the daemon's own pending context-warning

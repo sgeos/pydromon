@@ -1402,6 +1402,13 @@ def _party(owner: str | Address) -> Address:
 
 def _check_engine_supports(driver: Driver, config: LineConfig) -> None:
     """Raise ``ConfigError`` if the driver's engine cannot run ``config``."""
+    if config.fresh_session_each_turn and driver.settings.engine not in {
+        ENGINE_NAME_CLAUDE,
+        codex.ENGINE_NAME,
+    }:
+        raise ConfigError(
+            "fresh_session_each_turn is supported only by Claude Code and Codex"
+        )
     checks = {
         codex.ENGINE_NAME: codex.unsupported,
         grok.ENGINE_NAME: grok.unsupported,
@@ -6299,6 +6306,14 @@ class Scheduler:
         for message_id, _ in messages:
             self._log.append(MessageDelivered(message_id))
             self._post_office.discard(message_id)
+        if self.effective_config(line_id).fresh_session_each_turn:
+            # Record this before building the engine so replay and restart also
+            # discard any session identifier left by the preceding turn. The
+            # triggering messages have already been delivered and remain in this
+            # turn's prompt. Context handoff is disabled by configuration.
+            self._log.append(LineSessionCleared(line_id))
+            self._drop_engine(line_id)
+            self._end_leases(line_id)
         self._turns[line_id] = self._turns.get(line_id, 0) + 1
         address = LineAddress(line_id)
         cause = turn_cause(message for _, message in messages)
@@ -6390,7 +6405,11 @@ class Scheduler:
             notice = self._role_notice(line_id)
             if notice is not None:
                 prompt = f"{notice}\n\n{prompt}"
-            brief = self._brief_lead(line_id, compaction is not None)
+            brief = (
+                None
+                if self.effective_config(line_id).fresh_session_each_turn
+                else self._brief_lead(line_id, compaction is not None)
+            )
             if brief is not None:
                 prompt = f"{brief}\n\n{prompt}"
         except Exception as error:  # noqa: BLE001

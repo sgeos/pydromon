@@ -78,6 +78,15 @@ def test_a_full_file_parses_with_profiles_and_per_line_overrides() -> None:
     assert beta.wake_every_ticks == 5
 
 
+def test_a_line_may_set_fresh_session_each_turn() -> None:
+    config = parse(
+        'version = 1\n[lines.alpha]\nmodel = "claude-haiku-5-5"\n'
+        'strategy = "subscription"\nfresh_session_each_turn = true\n'
+    )
+    assert config.lines["alpha"].config.fresh_session_each_turn
+    assert not config.lines["alpha"].config.context_handoff
+
+
 def test_a_profile_gives_its_players_their_recipients() -> None:
     config = parse(
         "version = 1\n"

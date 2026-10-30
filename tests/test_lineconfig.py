@@ -50,6 +50,36 @@ def test_read_only_workdir_access_round_trips_and_defaults_to_write() -> None:
     assert decode_config(encode_config(config)) == config
 
 
+def test_fresh_session_each_turn_implies_context_handoff_is_off() -> None:
+    config = config_from_document({"fresh_session_each_turn": True})
+    assert config.fresh_session_each_turn
+    assert not config.context_handoff
+    assert decode_config(encode_config(config)) == config
+    assert not LineConfig(fresh_session_each_turn=True).context_handoff
+    with pytest.raises(ConfigError, match="cannot be combined with keep_session"):
+        LineConfig(fresh_session_each_turn=True, keep_session=True)
+
+
+@pytest.mark.parametrize(
+    ("document", "message"),
+    [
+        (
+            {"fresh_session_each_turn": True, "keep_session": True},
+            "cannot be combined with keep_session",
+        ),
+        (
+            {"fresh_session_each_turn": True, "context_handoff": True},
+            "requires context_handoff to be false",
+        ),
+    ],
+)
+def test_conflicting_fresh_session_options_are_refused(
+    document: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ConfigError, match=message):
+        config_from_document(document)
+
+
 def test_the_encoding_is_canonical_and_versioned() -> None:
     text = encode_config(config_from_document(FULL))
     document = json.loads(text)

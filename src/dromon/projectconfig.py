@@ -127,6 +127,7 @@ TOOL_KEYS: Final = frozenset(
         "project_settings",
         "plugins",
         "keep_session",
+        "fresh_session_each_turn",
         "keep_session_idle_seconds",
         "keep_session_max_seconds",
         "keep_session_at_max",
