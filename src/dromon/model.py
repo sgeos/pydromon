@@ -1807,6 +1807,12 @@ class Message:
     ``message_received`` records."""
     correlation: str | None = None
     """The key ``message_correlated`` gave the note, if any."""
+    turn_ends_at_delivery: int | None = None
+    """The recipient line's count of ended turns, ``State.turn_end_counts``, when
+    ``message_delivered`` was applied, or ``None`` until then and for mail to any
+    other party. **Round 8 task of 2026-10-30.** A later count means that a turn of
+    the line ended after the message reached it, which retires an own note from
+    ``own_notes``, as ``dromon.mailbox.counts_own_note`` says."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1975,6 +1981,12 @@ class State:
     turn_start_counts: dict[str, int] = field(default_factory=dict[str, int])
     """Each line's number of recorded turn starts, reconstructed from
     ``line_state_changed`` events to ``running``."""
+    turn_end_counts: dict[str, int] = field(default_factory=dict[str, int])
+    """Each line's number of recorded turn ends, reconstructed from
+    ``line_turn_ended`` events, which the daemon records however the turn ended.
+    **Round 8 task of 2026-10-30.** Compared with a message's
+    ``turn_ends_at_delivery``, it says whether a turn ended after the message was
+    delivered, from the order of events alone, so replay agrees."""
     role_change_turn_starts: dict[str, dict[str, int]] = field(
         default_factory=dict[str, dict[str, int]]
     )
@@ -2033,6 +2045,7 @@ class State:
             dict(self.task_records),
             dict(self.last_turn_commits),
             dict(self.turn_start_counts),
+            dict(self.turn_end_counts),
             {
                 role_id: dict(line_counts)
                 for role_id, line_counts in self.role_change_turn_starts.items()
@@ -2289,7 +2302,14 @@ class State:
                 self._apply_message_received(event)
             case MessageDelivered():
                 message = self.messages[event.message_id]
-                self.messages[event.message_id] = replace(message, delivered=True)
+                ends = (
+                    self.turn_end_counts.get(message.recipient.line_id, 0)
+                    if isinstance(message.recipient, LineAddress)
+                    else None
+                )
+                self.messages[event.message_id] = replace(
+                    message, delivered=True, turn_ends_at_delivery=ends
+                )
                 if isinstance(message.sender, RemoteAddress) and not isinstance(
                     message.recipient, RemoteAddress
                 ):
@@ -2332,6 +2352,9 @@ class State:
                 self._total_correlated(event)
             case LineTurnEnded():
                 self.last_turn_commits[event.line_id] = event.workdir_commit
+                self.turn_end_counts[event.line_id] = (
+                    self.turn_end_counts.get(event.line_id, 0) + 1
+                )
                 seat = self.seats.get(event.line_id)
                 if (
                     seat is not None

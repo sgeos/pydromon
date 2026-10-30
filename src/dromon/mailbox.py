@@ -18,7 +18,14 @@ all see the same mailbox.
 from dataclasses import dataclass
 from typing import Final
 
-from dromon.model import Address, HarnessAddress, Message, RemoteAddress, State
+from dromon.model import (
+    Address,
+    HarnessAddress,
+    LineAddress,
+    Message,
+    RemoteAddress,
+    State,
+)
 
 MAX_PAGE: Final = 50
 """Upper bound on the messages one listing returns, so a large mailbox is paged."""
@@ -32,8 +39,8 @@ class MailSummary:
     unanswered: int
     own_notes: int = 0
     """The owner's own notes, such as fired wakes, task-end notes and compaction
-    requests, that are neither read nor acknowledged, which ``unread`` leaves out and
-    this counts apart."""
+    requests, that are neither read nor acknowledged and that no turn of the owner
+    has ended since receiving, which ``unread`` leaves out and this counts apart."""
 
     def sentence(self) -> str:
         """The summary in the form a wake prompt opens with."""
@@ -46,8 +53,9 @@ class MailSummary:
             own = "note" if self.own_notes == 1 else "notes"
             verb = "is" if self.own_notes == 1 else "are"
             text += (
-                f" {self.own_notes} {own} of your own, such as fired wakes, neither"
-                f" read nor acknowledged, {verb} counted apart from unread."
+                f" {self.own_notes} {own} of your own, such as fired wakes, {verb}"
+                " counted apart from unread until read, acknowledged, or shown to a"
+                " turn that ends."
             )
         return text
 
@@ -73,16 +81,32 @@ def counts_unread(message: Message, owner: Address) -> bool:
     return not message.read and not is_own_note(message, owner)
 
 
+def shown_to_ended_turn(state: State, message: Message) -> bool:
+    """Whether a turn of the line ``message`` was delivered to has ended since its
+    delivery, read from the event order alone, as ``State.turn_end_counts`` and
+    ``Message.turn_ends_at_delivery`` record it. Always false for mail to an operator,
+    an agent or a peer, which has no turns."""
+    if message.turn_ends_at_delivery is None or not isinstance(
+        message.recipient, LineAddress
+    ):
+        return False
+    ended = state.turn_end_counts.get(message.recipient.line_id, 0)
+    return ended > message.turn_ends_at_delivery
+
+
 def counts_own_note(
-    message_id: str, message: Message, owner: Address, replied: set[str]
+    state: State, message_id: str, message: Message, owner: Address, replied: set[str]
 ) -> bool:
     """Whether ``message`` in ``owner``'s mailbox is counted in ``own_notes``, the
     rule ``summary`` counts by and ``listing`` filters by with ``own_notes_only``.
-    An own note leaves the count once it is read, acknowledged or replied to."""
+    An own note leaves the count once it is read, acknowledged or replied to, or
+    once a turn of its line has ended after it was delivered, as ``summary`` sets
+    out."""
     return (
         is_own_note(message, owner)
         and not message.read
         and not is_answered(message_id, message, replied)
+        and not shown_to_ended_turn(state, message)
     )
 
 
@@ -139,7 +163,44 @@ def summary(state: State, owner: Address, new: int) -> MailSummary:
     acknowledge fired wakes without opening them, so the count stays near the notes
     still waiting to be dealt with rather than growing with every fired wake. A line
     that never deals with its notes still sees them counted, since they were not
-    dealt with."""
+    dealt with.
+
+    **Round 8 task of 2026-10-30, decided by core for review.** That last sentence no
+    longer holds. An own note also leaves ``own_notes`` once a turn of its line has
+    ended after the note was delivered, whatever the turn's outcome, since the daemon
+    records ``line_turn_ended`` for a failed or held turn too. Lines left fired wakes
+    and task notes alone once their work was done, so the count grew without bound
+    and told a line nothing. A worker line in another project counted 62, and 89 of
+    its 90 task notes were never read or acknowledged.
+
+    - **The current prompt.** A note the current prompt delivered still counts, since
+      its turn has not ended, so the turn shown it sees it in the count.
+    - **A task note recorded during a running turn.** No prompt delivers it, and it
+      counts until that running turn ends, then leaves with it. Decided so because
+      the line's engine reported the task's end inside that turn, so it is that
+      turn the end was shown to, and because a rule with no exception for it needs
+      no record of which deliveries a prompt made. Never counting it would hide it
+      from that turn's own ``line_status``.
+    - **Delivery between turns without a wake.** The end of a task the line stopped
+      is delivered for the record only, and so is a context note withdrawn after its
+      compaction, which is reported between turns when the engine compacted outside
+      a turn of Dromon's. Each counts until the next turn of its line ends, so that
+      turn sees it in the count before it leaves. Decided over counting it until
+      dealt with, which would bring back the unbounded count, since neither note
+      asks anything. Delivered inside a turn, either leaves when that turn ends, as
+      a task note does.
+    - **A turn cut short by a restart** records no turn end. Its notes count until
+      the next turn of the line ends after the restart.
+    - **Prompts still mark nothing read.** The round 6 decision above stands. Since
+      leaving the count no longer needs ``read``, marking a prompt's notes read would
+      change no figure and would only add events to the log.
+    - **Other mailboxes.** Mail from any other sender is unchanged. Mail to an
+      operator, an agent or a peer keeps no turn count, so no line's turn retires
+      it, and an operator cannot send itself a note, so its ``own_notes`` is 0.
+
+    The rule reads only ``State.turn_end_counts`` and each message's
+    ``turn_ends_at_delivery``, which the event order rebuilds, so it holds across a
+    restart and nothing of it is held in the scheduler's memory."""
     held = mailbox(state, owner)
     replied = replied_ids(state, owner)
     return MailSummary(
@@ -156,7 +217,7 @@ def summary(state: State, owner: Address, new: int) -> MailSummary:
         own_notes=sum(
             1
             for message_id, message in held
-            if counts_own_note(message_id, message, owner, replied)
+            if counts_own_note(state, message_id, message, owner, replied)
         ),
     )
 
@@ -188,7 +249,10 @@ def listing(
         (message_id, message)
         for message_id, message in mailbox(state, owner)
         if (not unread_only or counts_unread(message, owner))
-        and (not own_notes_only or counts_own_note(message_id, message, owner, replied))
+        and (
+            not own_notes_only
+            or counts_own_note(state, message_id, message, owner, replied)
+        )
         and (sender is None or message.sender == sender)
     ]
     return matches[offset : offset + limit], len(matches)

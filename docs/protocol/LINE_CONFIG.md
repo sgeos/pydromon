@@ -409,6 +409,45 @@ headers of the newly delivered mail follow, and bodies stay in the mailbox.
   **Porting note.** The rule is a pure function of the state and adds no event, so a
   port carries it unchanged. The sentence's wording changed, and so did the
   `MailSummary` field, from `collapsed` to `own_notes`.
+- **Own notes shown to a turn.** **Required by the operator on 2026-10-30 in round 8,
+  the rule decided by core for review.** An own note also leaves `own_notes` once a
+  turn of the line has ended after the note was delivered, whatever the turn's
+  outcome. A worker line in another project counted 62 own notes, and 89 of its 90
+  task notes were never read or acknowledged, so the count grew without bound and
+  told the line nothing. The rule changes the one function above, so every view
+  keeps giving one figure, and mail from any other sender is unchanged.
+  - **From the event log alone.** The state counts each line's `line_turn_ended`
+    events, and each message delivered to a line keeps the count as it stood at its
+    `message_delivered`. A larger count now means a turn ended after the delivery.
+    The daemon records `line_turn_ended` however the turn ended, a failed or held
+    turn included, so the rule holds across a restart, and nothing of it is kept in
+    the scheduler's memory.
+  - **The current prompt.** A note the current prompt delivered still counts, since
+    its turn has not ended, so the turn shown it sees it counted.
+  - **A task note recorded during a running turn.** No prompt delivers it. It counts
+    while that turn runs and leaves when it ends. **Decided by core for review**,
+    since the line's engine reported the task's end inside that turn, and since a
+    rule without an exception for it needs no record of which deliveries a prompt
+    made. Never counting it would hide it from that turn's own `line_status`.
+  - **Delivery between turns without a wake.** The end of a task the line stopped is
+    delivered for the record only, and so is a context note withdrawn after its
+    compaction, when the compaction is reported outside a turn of Dromon's. Each
+    counts until the next turn of the line ends, so that turn sees it counted.
+    **Decided by core for review**, over counting it until dealt with, which would
+    bring the unbounded count back for notes that ask nothing. Delivered inside a
+    turn, either leaves when that turn ends, as a task note does.
+  - **A turn cut short by a restart** records no turn end, so its notes count until
+    the next turn of the line ends after the restart.
+  - **Prompts mark nothing read.** The round 6 decision stands. Leaving the count no
+    longer needs `read`, so marking a prompt's notes read would change no figure and
+    would only add events to the log.
+  - **Mail to other parties.** Mail to an operator, an agent or a peer keeps no turn
+    count, so no line's turn retires it. An operator cannot send itself a note, so
+    its `own_notes` is 0.
+  - **Porting note.** The rule depends on applying events in log order, which a port
+    keeps. The sentence in the wake prompt and the counts line of `list_mail` changed
+    wording, and the state gained `turn_end_counts` and the message field
+    `turn_ends_at_delivery`, which no event carries.
 - **A moved worktree.** **Requested by the operator on 2026-10-28.** When the commit
   checked out in the line's working directory differs from the one it held when the
   line's last turn ended, as after an operator commits or merges the line's work, the

@@ -1006,7 +1006,10 @@ LIST_MAIL_SCHEMA: Final[dict[str, object]] = {
         "unread_only": {"type": "boolean", "description": "Only unread messages"},
         "own_notes_only": {
             "type": "boolean",
-            "description": "Only your own notes neither read nor acknowledged",
+            "description": (
+                "Only your own notes neither read, acknowledged nor shown to a turn"
+                " that ended"
+            ),
         },
         "sender": {"type": "string", "description": "Only messages from this address"},
         "offset": {"type": "integer", "minimum": 0, "description": "Matches to skip"},
@@ -6062,8 +6065,8 @@ class Scheduler:
             lines = [
                 f"{len(page)} of {total} matching messages, from {offset}."
                 f" {counts.unread} unread, {counts.unanswered} unanswered and"
-                f" {counts.own_notes} notes of your own neither read nor acknowledged"
-                " in the mailbox."
+                f" {counts.own_notes} notes of your own neither read, acknowledged nor"
+                " shown to a turn that ended, in the mailbox."
             ]
             for message_id, message in page:
                 entry = header(message_id, message, answered)
