@@ -349,7 +349,7 @@ def test_a_long_command_is_cut(world: World) -> None:
 
 # Item B1 of 2026-10-28, a turn left with tasks running and no mail sent.
 
-QUIET = "Your last turn ended with"
+QUIET = scheduler_module.QUIET_OPENING
 
 
 class Mailing(Engine):
@@ -500,6 +500,125 @@ def test_a_turn_that_mailed_is_not_told_of_its_tasks(tmp_path: Path) -> None:
 def test_a_turn_without_kept_tasks_is_not_told_of_them(world: World) -> None:
     prompts = [turns(world, "start"), turns(world, "next")]
     assert all(QUIET not in prompt for prompt in prompts)
+
+
+TASK_0 = BackgroundEnd("task-0", "make gate", "completed")
+
+
+def quiet_then_self_started(world: World, act: Callable[[], None] | None) -> list[str]:
+    """A silent turn that leaves task-0 running, then a turn the engine starts by
+    itself when task-0 ends, during which ``act`` runs, then a turn an operator's
+    mail starts. Returns the prompts of every Dromon turn in order, the silent one
+    first. A note ``act`` sends to the line wakes a turn of its own in between."""
+    world.tasks = 1
+    prompts: list[str] = []
+
+    async def go() -> None:
+        stop = asyncio.Event()
+        loop = asyncio.create_task(world.scheduler.run(stop))
+        world.scheduler.send(ANA, LineAddress("alpha"), "start the gate")
+        await asyncio.sleep(0)
+        await world.scheduler.idle()
+        assert "alpha" in world.scheduler._quiet_tasks  # pyright: ignore[reportPrivateUsage]
+        engine = world.engines["alpha"]
+        finish = world.scheduler.begin_self_started("alpha", (TASK_0,))
+        assert finish is not None
+        # The task has ended, so the kept session no longer lists it.
+        world.tasks = engine.tasks = 0
+        if act is not None:
+            act()
+        finish(
+            TurnReport("success", 1, "ok", (), None, None, "session-1", None, 0.1),
+            None,
+        )
+        await world.scheduler.idle()
+        stop.set()
+        await loop
+        prompts.extend(engine.prompts)
+
+    asyncio.run(go())
+    world.run("what next")
+    prompts.append(world.engines["alpha"].prompts[-1])
+    return prompts
+
+
+def test_mail_from_a_self_started_turn_drops_the_quiet_notice(world: World) -> None:
+    """Task of 2026-10-30. The core line's prompt said it sent no mail, although it
+    had mailed an operator in a turn its engine started when its gate ended."""
+
+    def report() -> None:
+        world.scheduler.send(LineAddress("alpha"), ANA, "the gate passed")
+
+    prompts = quiet_then_self_started(world, report)
+    assert len(prompts) == 2
+    assert all(QUIET not in prompt for prompt in prompts)
+
+
+def test_mail_to_another_line_drops_the_quiet_notice(world: World) -> None:
+    world.scheduler.create_line("beta", HAIKU, Strategy.SUBSCRIPTION)
+
+    def report() -> None:
+        world.scheduler.send(LineAddress("alpha"), LineAddress("beta"), "gate passed")
+
+    prompts = quiet_then_self_started(world, report)
+    assert all(QUIET not in prompt for prompt in prompts)
+
+
+@pytest.mark.parametrize("to_itself", [False, True])
+def test_a_self_started_turn_without_mail_keeps_the_quiet_notice(
+    world: World, to_itself: bool
+) -> None:
+    """A self-started turn that sends nothing, or only a note to itself, tells no
+    one. Every task the notice names has ended, which is decided for review not to
+    drop it, and its closing sentence speaks of how the work ended."""
+
+    def note_to_self() -> None:
+        world.scheduler.send(LineAddress("alpha"), LineAddress("alpha"), "remember")
+
+    prompts = quiet_then_self_started(world, note_to_self if to_itself else None)
+    # The note to itself wakes one more turn, which is the first to be told.
+    assert len(prompts) == (3 if to_itself else 2)
+    told = [prompt for prompt in prompts if QUIET in prompt]
+    assert told == [prompts[1]]
+    last = told[0]
+    assert last.count(QUIET) == 1
+    assert "you have sent no mail since" in last
+    assert "Dromon recorded the end of 1 task" in last
+    assert "No operator or line learned from you how this work ended." in last
+    assert "goes on" not in last
+    # Told once.
+    world.run("and again")
+    assert QUIET not in world.engines["alpha"].prompts[-1]
+
+
+def test_a_quiet_notice_is_dropped_for_mail_sent_outside_any_turn(
+    tmp_path: Path,
+) -> None:
+    """The count is compared whenever the notice is composed, so mail recorded by
+    any path after the silent turn drops it."""
+    world = World(tmp_path / "events.sqlite", tasks=2)
+    turns(world, "start")
+    world.scheduler._engines["alpha"] = world.engines["alpha"]  # pyright: ignore[reportPrivateUsage]
+    saved = world.scheduler._quiet_tasks["alpha"]  # pyright: ignore[reportPrivateUsage]
+    assert saved.mail == 0
+    # The positive control. Without mail the same record gives a notice.
+    assert world.scheduler._quiet_notice("alpha") is not None  # pyright: ignore[reportPrivateUsage]
+    world.scheduler._quiet_tasks["alpha"] = saved  # pyright: ignore[reportPrivateUsage]
+    world.scheduler.send(LineAddress("alpha"), ANA, "still building")
+    assert world.scheduler._quiet_notice("alpha") is None  # pyright: ignore[reportPrivateUsage]
+    world.log.close()
+
+
+def test_a_restart_forgets_the_quiet_notice(tmp_path: Path) -> None:
+    """The record is held in memory, and a restart also ends the kept session whose
+    tasks it names, so the restarted daemon says nothing of them."""
+    world = World(tmp_path / "events.sqlite", tasks=1)
+    turns(world, "start")
+    assert "alpha" in world.scheduler._quiet_tasks  # pyright: ignore[reportPrivateUsage]
+    world.log.close()
+    restarted = World(tmp_path / "events.sqlite", tasks=0)
+    assert QUIET not in turns(restarted, "after the restart")
+    restarted.log.close()
 
 
 # C. line_status: recent turn costs and the last fired wake.

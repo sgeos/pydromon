@@ -949,6 +949,16 @@ ends with each turn, and the next turn resumes the session in a new one.
   task ends already comes through Dromon as the note above, and a turn the engine
   begins by itself is still interrupted, as above. A restart closes the kept
   connection, so the reminder state is held in memory only.
+  **Task of 2026-10-30.** A turn the engine starts by itself when a task ends neither
+  saves nor clears the reminder, so mail the line sent in it went unseen, and the
+  next prompt said wrongly that it sent none. The saved state now holds the count of
+  mail the line had sent to any party but itself, and the reminder is dropped when
+  that count has grown by the time it would be told. Notes to itself, such as fired
+  wakes, do not count. The reminder opens with "A turn of yours ended with" and says
+  no mail was sent since, rather than speaking of the last turn. **Decided by core,
+  for review.** The reminder is kept when every task it names has a recorded end,
+  since the end's task note tells the line alone, and its closing sentence then says
+  that no one learned how the work ended.
 - **Cost.** **Fact, observed live on 2026-10-26.** On a kept connection the engine
   reports with each result a cost total for every turn since the connection opened.
   **Fact, read from the engine's code on 2026-10-26, and consistent with what was
