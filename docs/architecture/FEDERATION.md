@@ -544,11 +544,12 @@ so a peer cannot restart a failing line.
   duplicate would drop the second body while its sender believed it delivered. Since the
   event log never reuses an identifier, a conflict means a fault or a forgery at the
   sending end.
-- **Durable, unlike request keys.** The key is in the event log, so it survives a
+- **Durable, as request keys now are.** The key is in the event log, so it survives a
   restart of either daemon and never expires. **Fact.** A line's request keys of
-  [`LINE_CONFIG.md`](../protocol/LINE_CONFIG.md) live in memory only, and a retry across
-  a restart acts again. They keep doing so for the tool call itself, and a remote
-  message, once recorded, is never sent twice.
+  [`LINE_CONFIG.md`](../protocol/LINE_CONFIG.md) were kept in memory only until
+  2026-10-29, and are now recorded in the event of their act, so a retry across a
+  restart no longer acts again. They are still bounded per party and tool, unlike the
+  peer's key, and a remote message, once recorded, is never sent twice.
 - **No reused identifiers.** **Fact.** The event log never reuses a message identifier,
   so an origin identifier names one message of its peer forever.
 - **Replies.** The receiver gives each message its own identifier. When a local party

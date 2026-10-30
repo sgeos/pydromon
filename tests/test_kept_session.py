@@ -1645,7 +1645,9 @@ def test_a_self_start_after_a_task_end_folds_into_its_note(tmp_path: Path) -> No
 def test_a_task_end_without_a_self_start_is_noted_after_the_grace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(engine_module, "SELF_START_GRACE_SECONDS", 0.01)
+    # The grace is long enough that the two settles below finish inside it on a busy
+    # machine. At 0.01 seconds it ran out first and the test failed under load.
+    monkeypatch.setattr(engine_module, "SELF_START_GRACE_SECONDS", 0.5)
     factory = Factory([[bash("tu1", "make gate"), launched("t1", "tu1"), result()]])
     ends: list[BackgroundEnd] = []
     engine = background_line(factory, tmp_path, ends)
@@ -1677,7 +1679,7 @@ def test_a_task_end_without_a_self_start_is_noted_after_the_grace(
         )
         await settle()
         assert ends == []
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(1.0)
         await engine.close()
 
     asyncio.run(go())

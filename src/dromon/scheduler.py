@@ -141,14 +141,14 @@ from dromon.agents import LineTokens
 from dromon import capabilities, launcher, redact
 from dromon.handoff import Handoff
 from dromon.handoff import select as select_handoff
+from dromon import requestkeys
 from dromon.requestkeys import (
     REQUEST_KEY,
     REQUEST_KEY_PROPERTY,
     RequestKeyRefused,
-    RequestKeys,
 )
 from dromon.ceiling import CHOICES, Choice, is_question, question_text
-from dromon.codex import CodexLine
+from dromon.codex import TERMINAL_POLL_SECONDS, CodexLine
 from dromon.grok import GrokLine
 from dromon.antigravity import AntigravityLine
 from dromon.cursor import CursorLine
@@ -240,6 +240,7 @@ from dromon.model import (
     MAX_BRIEF_ARTIFACTS,
     MAX_BUDGET_NOTE_BYTES,
     BriefSet,
+    RequestStamp,
     FailoverPolicy,
     check_instant,
     Address,
@@ -1558,10 +1559,13 @@ class Scheduler:
         self._noted_tasks: dict[str, deque[str]] = {}
         self._unnoted_tasks: dict[str, int] = {}
         """Background task ends the rate limit left without a note, per line."""
-        self._quiet_tasks: dict[str, int] = {}
-        """How many background tasks still ran when each line's last turn ended
-        without the line sending any mail, for its next prompt. Held in memory only,
-        since a restart of the daemon closes kept sessions and ends their tasks."""
+        self._quiet_tasks: dict[
+            str,
+            tuple[int | None, tuple[str, ...] | None, frozenset[TaskRecorded]],
+        ] = {}
+        """Task count and identifiers reported after a silent turn, plus the records
+        already present then. ``None`` identifiers mean the engine could not give a
+        reliable task list."""
         self._disclosure_spent: set[str] = set()
         """Lines that spent their disclosure limit and are held for it. Every
         disclosure-checked tool answers ``DISCLOSURE_HELD`` for them until an
@@ -1738,8 +1742,6 @@ class Scheduler:
         self.turn_reports: list[tuple[str, TurnReport]] = []
         self._log_opened_at = clock()
         """When the scheduler took the log, on its own clock, for the log's growth."""
-        self._request_keys = RequestKeys()
-        """Results of keyed mutating tool calls, so a retry acts once. Row 11."""
         self._priority = PriorityLimiter(clock)
         """Lines' priority mail over the rate limit's window, in memory, so a restart
         starts the count again."""
@@ -1929,8 +1931,12 @@ class Scheduler:
         *,
         priority: bool = False,
         correlation: str | None = None,
+        request: RequestStamp | None = None,
     ) -> str:
         """Record a note from ``sender``. It is delivered in a later tick.
+
+        ``request`` is the stamp of the keyed ``send_message`` call that sends it,
+        recorded in the note's own ``message_sent``.
 
         A ``correlation`` key, which only an agent's note to a local line may carry,
         is recorded right after the note as ``message_correlated``.
@@ -1988,6 +1994,7 @@ class Scheduler:
                     MessageKind.NOTE,
                     body,
                     reply_to=reply_to,
+                    request=request,
                 )
             )
             # Marked before the forwarder hears of it, so its first envelope asks
@@ -2004,7 +2011,13 @@ class Scheduler:
         sent_at = self._wall_clock()
         self._log.append(
             MessageSent(
-                message_id, sender, recipient, MessageKind.NOTE, body, reply_to=reply_to
+                message_id,
+                sender,
+                recipient,
+                MessageKind.NOTE,
+                body,
+                reply_to=reply_to,
+                request=request,
             )
         )
         if correlation is not None:
@@ -2401,11 +2414,14 @@ class Scheduler:
             if unexpected:
                 return _tool_error(unexpected)
             try:
-                earlier = self._request_keys.earlier(str(sender), SEND_TOOL_NAME, args)
+                stamp = requestkeys.stamp_of(args)
+                earlier = requestkeys.earlier(
+                    self._log.state, str(sender), SEND_TOOL_NAME, args
+                )
             except RequestKeyRefused as error:
                 return _tool_error(str(error))
             if earlier is not None:
-                return earlier
+                return requestkeys.repeated(self._sent_result(earlier.message_id))
             to: object = args.get("to")
             body: object = args.get("body")
             reply_to: object = args.get("reply_to")
@@ -2438,16 +2454,11 @@ class Scheduler:
                     reply_to,
                     priority=urgent,
                     correlation=correlation,
+                    request=stamp,
                 )
             except (InvalidField, EventRejected) as error:
                 return _tool_error(str(error))
-            result = _tool_text(
-                f"sent as {message_id}, with priority"
-                if urgent
-                else f"sent as {message_id}"
-            )
-            self._request_keys.remember(str(sender), SEND_TOOL_NAME, args, result)
-            return result
+            return self._sent_result(message_id)
 
         return SdkMcpTool(
             name=SEND_TOOL_NAME,
@@ -2461,14 +2472,27 @@ class Scheduler:
             handler=handler,
         )
 
+    def _sent_result(self, message_id: str) -> dict[str, Any]:
+        """The result of a ``send_message`` call that sent ``message_id``, built from
+        the state, so a repeated call after a restart gives the first call's text.
+        **Fact.** Priority is read from the note's ``message_prioritized``, so after a
+        crash between the two appends a repeat says the note went without priority,
+        which is then what the log holds."""
+        message = self._log.state.messages.get(message_id)
+        if message is not None and message.priority:
+            return _tool_text(f"sent as {message_id}, with priority")
+        return _tool_text(f"sent as {message_id}")
+
     def ask(
         self,
         line_id: str,
         operator: OperatorAddress,
         question: str,
         choices: tuple[str, ...] = (),
+        request: RequestStamp | None = None,
     ) -> str:
-        """Record a question from ``line_id`` to ``operator`` in the queue.
+        """Record a question from ``line_id`` to ``operator`` in the queue, with the
+        stamp of the keyed ``ask_operator`` call that asks it, if any.
 
         A question never pauses its line. The line may end its turn or keep working, as
         it decides, and the answer reaches it as mail in a later turn, like any reply.
@@ -2482,6 +2506,7 @@ class Scheduler:
                 MessageKind.QUESTION,
                 question,
                 choices,
+                request=request,
             )
         )
         return message_id
@@ -2539,11 +2564,16 @@ class Scheduler:
             if unexpected:
                 return _tool_error(unexpected)
             try:
-                earlier = self._request_keys.earlier(line_id, ASK_TOOL_NAME, args)
+                stamp = requestkeys.stamp_of(args)
+                earlier = requestkeys.earlier(
+                    self._log.state, line_id, ASK_TOOL_NAME, args
+                )
             except RequestKeyRefused as error:
                 return _tool_error(str(error))
-            if earlier is not None:
-                return earlier
+            if isinstance(earlier, MessageSent):
+                return requestkeys.repeated(
+                    _tool_text(_asked_text(earlier.recipient, earlier.message_id))
+                )
             question: object = args.get("question")
             to: object = args.get("to")
             choices: object = args.get("choices", [])
@@ -2569,15 +2599,11 @@ class Scheduler:
                     operator,
                     question,
                     tuple(cast(list[str], choices)),
+                    stamp,
                 )
             except (InvalidField, EventRejected) as error:
                 return _tool_error(str(error))
-            result = _tool_text(
-                f"asked {operator} as {message_id}. The answer arrives as a message in"
-                " a later turn. You may end your turn or keep working meanwhile."
-            )
-            self._request_keys.remember(line_id, ASK_TOOL_NAME, args, result)
-            return result
+            return _tool_text(_asked_text(operator, message_id))
 
         return SdkMcpTool(
             name=ASK_TOOL_NAME,
@@ -2592,7 +2618,12 @@ class Scheduler:
         )
 
     def schedule_wake(
-        self, line_id: str, seconds: int, note: str, task_id: str | None = None
+        self,
+        line_id: str,
+        seconds: int,
+        note: str,
+        task_id: str | None = None,
+        request: RequestStamp | None = None,
     ) -> tuple[str, str]:
         """Schedule ``line_id``'s one wake ``seconds`` from now, replacing any pending
         one, and return the identifier its note will carry and its due time.
@@ -2615,7 +2646,9 @@ class Scheduler:
         due = format_due(start + timedelta(seconds=seconds))
         message_id = new_id("m")
         previous = self._log.state.scheduled.get(line_id)
-        self._log.append(WakeScheduled(line_id, message_id, due, note, task_id))
+        self._log.append(
+            WakeScheduled(line_id, message_id, due, note, task_id, request)
+        )
         if (
             previous is not None
             and self._context_compaction_wake_ids.get(line_id) == previous.message_id
@@ -2740,11 +2773,20 @@ class Scheduler:
             if unexpected:
                 return _tool_error(unexpected)
             try:
-                earlier = self._request_keys.earlier(line_id, WAKE_TOOL_NAME, args)
+                stamp = requestkeys.stamp_of(args)
+                earlier = requestkeys.earlier(
+                    self._log.state, line_id, WAKE_TOOL_NAME, args
+                )
             except RequestKeyRefused as error:
                 return _tool_error(str(error))
-            if earlier is not None:
-                return earlier
+            if isinstance(earlier, WakeScheduled):
+                return requestkeys.repeated(
+                    _tool_text(
+                        _wake_text(
+                            earlier.due, earlier.message_id, None, earlier.task_id
+                        )
+                    )
+                )
             seconds: object = args.get("seconds")
             note: object = args.get("note")
             task_id: object = args.get("task_id")
@@ -2763,22 +2805,19 @@ class Scheduler:
                 return _tool_error(refusal)
             replaced = self._log.state.scheduled.get(line_id)
             try:
-                message_id, due = self.schedule_wake(line_id, seconds, note, task_id)
+                message_id, due = self.schedule_wake(
+                    line_id, seconds, note, task_id, stamp
+                )
             except (InvalidField, EventRejected) as error:
                 return _tool_error(str(error))
-            text = (
-                f"a wake is scheduled for {due}. Its note will arrive as {message_id},"
-                " a message from you."
-            )
-            if replaced is not None:
-                text += f" It replaces the wake that was due at {replaced.due}."
-            if task_id is not None:
-                text += (
-                    f" It is cancelled if task {task_id} ends before the wake fires."
+            return _tool_text(
+                _wake_text(
+                    due,
+                    message_id,
+                    None if replaced is None else replaced.due,
+                    task_id,
                 )
-            result = _tool_text(text)
-            self._request_keys.remember(line_id, WAKE_TOOL_NAME, args, result)
-            return result
+            )
 
         return SdkMcpTool(
             name=WAKE_TOOL_NAME,
@@ -6667,16 +6706,70 @@ class Scheduler:
 
     def _note_quiet(self, line_id: str, sent: int) -> None:
         """**Item B1 of 2026-10-28.** Remember for ``line_id``'s next prompt that its
-        turn ended with background tasks of its kept session still running while it
-        sent no mail, which ``sent`` counts from the turn's start. A trial line
-        ended such turns and no one learned that its work went on. The count is
-        read from the engine as the turn ends, so a task that ends at that moment
-        may still be counted, and the next prompt says only that tasks ran."""
-        tasks = self.kept_tasks(line_id)
-        if tasks > 0 and self._line_mail(line_id) == sent:
-            self._quiet_tasks[line_id] = tasks
+        turn ended with background tasks of its kept session reported while it sent no
+        mail, which ``sent`` counts from the turn's start. A trial line ended such
+        turns and no one learned that its work went on. The next prompt reconciles the
+        saved identifiers with the current session and task records before describing
+        them as running."""
+        if self._line_mail(line_id) != sent:
+            self._quiet_tasks.pop(line_id, None)
+            return
+        snapshot = self._quiet_task_snapshot(line_id)
+        if snapshot is None:
+            return
+        count, task_ids = snapshot
+        if count is None or count > 0 or task_ids is None:
+            self._quiet_tasks[line_id] = (
+                count,
+                task_ids,
+                frozenset(self._log.state.task_records.get(line_id, ())),
+            )
         else:
             self._quiet_tasks.pop(line_id, None)
+
+    def _quiet_task_snapshot(
+        self, line_id: str
+    ) -> tuple[int | None, tuple[str, ...] | None] | None:
+        """The kept session's reliable task count and identifiers, or unknown.
+
+        A ``None`` result means that no kept engine is available. A ``None`` task
+        tuple means the engine is kept but could not give a complete, reliable list.
+        Review r5, Q1. A listing the engine reports as older than Codex's own poll
+        interval is not reliable, since a task may have ended after it. An engine
+        that reports no age is taken as current.
+        """
+        engine = self._engines.get(line_id)
+        if not isinstance(engine, KeptEngine):
+            return None
+        try:
+            status = engine.kept_status()
+        except Exception:  # noqa: BLE001
+            return (None, None)
+        if status.get("kept") is not True:
+            return (0, ())
+        count = status.get("background_tasks")
+        if type(count) is not int or count < 0:
+            count = None
+        if status.get("background_tasks_unknown") is True:
+            return (count, None)
+        age = status.get("tasks_listed_seconds_ago")
+        if type(age) is int and age > TERMINAL_POLL_SECONDS:
+            return (count, None)
+        raw_tasks = status.get("tasks")
+        if not isinstance(raw_tasks, list):
+            return (count, None) if count != 0 else (0, ())
+        task_ids: list[str] = []
+        for value in cast(list[object], raw_tasks):
+            if not isinstance(value, Mapping):
+                return (count, None)
+            task = cast(Mapping[str, object], value)
+            task_id = task.get("task_id")
+            if not isinstance(task_id, str) or not task_id or task_id in task_ids:
+                return (count, None)
+            task_ids.append(task_id)
+        if count is None or len(task_ids) != count:
+            return (count, None)
+        return (count, tuple(sorted(task_ids)))
 
     def _head_notice(self, line_id: str) -> str | None:
         """What ``line_id``'s next turn is told when the commit checked out in its
@@ -6777,16 +6870,76 @@ class Scheduler:
         return view
 
     def _quiet_notice(self, line_id: str) -> str | None:
-        """What ``line_id``'s next turn is told, once, of a last turn that ended with
-        background tasks running and no mail sent, or ``None``."""
-        tasks = self._quiet_tasks.pop(line_id, None)
-        if tasks is None:
+        """What ``line_id``'s next turn is told once about tasks from a silent turn,
+        checked against the current kept session and later task records."""
+        previous = self._quiet_tasks.pop(line_id, None)
+        if previous is None:
             return None
-        counted = "1 background task" if tasks == 1 else f"{tasks} background tasks"
-        return (
-            f"Your last turn ended with {counted} of your kept session still running,"
-            " and you sent no mail in it, so no operator or line learned from you"
-            " that the work goes on. If someone waits on it, tell them."
+        count, previous_ids, records_before = previous
+        current = self._quiet_task_snapshot(line_id)
+        new_records = tuple(
+            record
+            for record in self._log.state.task_records.get(line_id, ())
+            if record not in records_before
+        )
+        if previous_ids is None:
+            unknown = (
+                f"{count} background tasks"
+                if count is not None and count != 1
+                else "1 background task"
+                if count == 1
+                else "background-task state"
+            )
+            return (
+                f"Your last turn reported {unknown}, but Dromon could not reliably"
+                " list them, and you sent no mail, so their current state is unknown."
+                " Check the task records and"
+                " any output file they name. If someone waits on this work, tell"
+                " them."
+            )
+        current_ids: set[str] = set()
+        if current is not None and current[1] is not None:
+            current_ids.update(current[1])
+        reliable_current = current is not None and current[1] is not None
+        recorded_ids = {record.task_id for record in new_records}
+        ended_ids = set(previous_ids) & recorded_ids
+        running_ids: set[str] = set()
+        if reliable_current:
+            running_ids = (set(previous_ids) & current_ids) - ended_ids
+        unknown_ids = set(previous_ids) - running_ids - ended_ids
+        parts: list[str] = []
+        if running_ids:
+            count_text = (
+                "1 background task"
+                if len(running_ids) == 1
+                else f"{len(running_ids)} background tasks"
+            )
+            parts.append(
+                f"Dromon still reports {count_text} running in the kept session."
+            )
+        if ended_ids:
+            count_text = "1 task" if len(ended_ids) == 1 else f"{len(ended_ids)} tasks"
+            parts.append(
+                f"Dromon recorded the end of {count_text}. Check their task records"
+                " and any output file they name."
+            )
+        if unknown_ids:
+            count_text = (
+                "1 task" if len(unknown_ids) == 1 else f"{len(unknown_ids)} tasks"
+            )
+            parts.append(
+                f"The state of {count_text} is unknown because Dromon no longer"
+                " reports them and has no recorded end. Check the task records and"
+                " any output file they name."
+            )
+        if not parts:
+            return None
+        parts.append(
+            "No operator or line learned from you that this work goes on. If someone"
+            " waits on it, tell them."
+        )
+        return "Your last turn reported background tasks and sent no mail. " + " ".join(
+            parts
         )
 
     def _hold_failed(self, line_id: str, ending: str) -> None:
@@ -7834,6 +7987,7 @@ class Scheduler:
             "kept": status.get("kept") is True,
             "closes_at": closes_at,
             "background_tasks": status.get("background_tasks", 0),
+            "background_tasks_unknown": status.get("background_tasks_unknown") is True,
             "tasks": status.get("tasks", []),
         }
 
@@ -8185,6 +8339,7 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         },
         "brief": _compact_brief(full["brief"]),
         "background_task_count": len(cast(list[dict[str, object]], kept["tasks"])),
+        "background_tasks_unknown": kept.get("background_tasks_unknown") is True,
         "recent_turn_count": len(cast(list[dict[str, object]], full["recent_turns"])),
         "other_line_count": len(cast(list[dict[str, object]], full["other_lines"])),
     }
@@ -8458,6 +8613,34 @@ def _unreadable_paths(stderr: str) -> tuple[str, ...]:
         if len(paths) == MAX_UNREADABLE_PATHS:
             break
     return tuple(paths)
+
+
+def _asked_text(operator: Address, message_id: str) -> str:
+    """The result of an ``ask_operator`` call that asked ``message_id``, the same
+    for the first call and for a repeat, since both read it from the question."""
+    return (
+        f"asked {operator} as {message_id}. The answer arrives as a message in a"
+        " later turn. You may end your turn or keep working meanwhile."
+    )
+
+
+def _wake_text(
+    due: str, message_id: str, replaced_due: str | None, task_id: str | None
+) -> str:
+    """The result of a ``wake_after`` call. **Task of 2026-10-29, round 5.** A
+    repeat rebuilds it from the wake's ``wake_scheduled``, which does not record the
+    wake it replaced, so a repeat leaves out the sentence on the replaced wake that
+    the first call's text may have held. It may also name a wake that has fired or
+    been withdrawn since, as the first call's text would."""
+    text = (
+        f"a wake is scheduled for {due}. Its note will arrive as {message_id},"
+        " a message from you."
+    )
+    if replaced_due is not None:
+        text += f" It replaces the wake that was due at {replaced_due}."
+    if task_id is not None:
+        text += f" It is cancelled if task {task_id} ends before the wake fires."
+    return text
 
 
 def _tool_text(text: str) -> dict[str, Any]:

@@ -43,7 +43,7 @@ keys, duplicate keys and numbers are refused.
 | `claude_code_prompt` | Run a Claude Code line on Claude Code's own system prompt rather than an empty one. Omitted when false | `false` |
 | `project_settings` | Also load Claude Code's project setting source in the line's working directory, as [`SETTINGS.md`](SETTINGS.md) specifies. Refused on Codex and Grok lines. Omitted when false | `false` |
 | `plugins` | At most 16 distinct local plugin directories, each absolute or starting with `~/`, as the plugins section below specifies. Refused on Codex and Grok lines. Omitted when empty | none |
-| `instructions` | At most 16 distinct files, such as `CLAUDE.md`, whose text is appended to the system prompt at each turn. A relative path is resolved against the project root, whatever the line's `workdir`, and `~` against the home directory. Omitted when empty | none |
+| `instructions` | At most 16 distinct files, such as `CLAUDE.md`, whose text is appended to the system prompt at each turn. A relative path is resolved against the project root, whatever the line's `workdir`, and `~` against the home directory. A line whose `workdir` is a worktree of another branch reads the root's file for a relative path, so it names its own file by absolute path. Omitted when empty | none |
 | `workdir` | The directory the line's engine runs in, as the working directory section below specifies. Omitted when unset | the project root |
 | `workdir_access` | `write` or `read`; read confines the working directory to reads, with the scratch exception below | `write` |
 | `keep_session` | Keep a Claude Code or Codex line's engine connected between turns, as the kept sessions section below specifies. Refused on Grok lines. Omitted when false | `false` |
@@ -483,10 +483,22 @@ printable characters chosen by the caller, so a retried call does not act twice.
 - **Scope.** Keys belong to one party and one tool, so two lines, or one line's two
   tools, may use the same key.
 - **Bounds.** At most 256 keys are kept for each party and tool, the oldest forgotten
-  first. Keys live in the daemon's memory, not in the event log, so a retry across a
-  daemon restart acts again. **Porting hazard.** The check, the act and the record run
+  first, after a replay as before it. **Porting hazard.** The check and the append run
   with no suspension point between, which a single asyncio loop makes atomic. A port
-  that serves tools from several threads holds a lock across the three.
+  that serves tools from several threads holds a lock across the two.
+- **Durable.** **Task of 2026-10-29, round 5.** A keyed call records its key, with the
+  SHA-256 digest of its other arguments, as the `request` field of the event of its
+  act, a `message_sent` or a `wake_scheduled`, as [`EVENT_LOG.md`](EVENT_LOG.md)
+  specifies. One append records both, so no crash leaves the act without its key, and
+  a retry that crosses a daemon restart repeats the first answer. Keys were once kept
+  in the daemon's memory only, and a retry across a restart acted again.
+- **The repeated answer.** It is rebuilt from the event of the act and the state, so
+  it does not depend on what the daemon held in memory. For `send_message` and
+  `ask_operator` it is the first answer's text. **Decided by core for review.** A
+  repeated `wake_after` leaves out the sentence naming the wake the first call
+  replaced, since `wake_scheduled` does not record it. A repeated priority note says
+  `with priority` only when its `message_prioritized` was recorded, which a crash
+  between the two appends may have prevented.
 - **Agents.** An external agent's `send_message` is the same tool, and takes a key
   in the same way.
 
@@ -872,11 +884,19 @@ ends with each turn, and the next turn resumes the session in a new one.
   line ended its turns with background tasks still running and told no one. When a
   turn ends while the kept connection reports background tasks, and the line sent no
   note or question to any party but itself during the turn, the line's next prompt
-  opens by saying how many tasks ran and that it sent no mail, once. **Fact.** The
-  wake when such a task ends already comes through Dromon as the note above, and the
-  turn the engine begins by itself is still interrupted, as above. **Inference.** The
-  count is read as the turn ends, so a task ending at that moment may be counted. It
-  is held in memory only, since a restart of the daemon closes the kept connection.
+  opens with a reminder, once. Dromon saves the task identifiers it saw and checks
+  them against the current kept-session listing and task records before describing
+  them. It says they are still running only when the same identifiers remain in a
+  reliable listing. A recorded end is described as ended, and a task missing from an
+  unreliable or replaced session with no recorded end is described as unknown, with
+  directions to check its task record and any output file it names. **Fact.** The
+  reminder is generated by `scheduler._quiet_notice`. **Inference from the round 4
+  report.** Its stale running message is consistent with a remembered task count that
+  was never checked against later ends. The report did not identify its exact prompt,
+  and the present event log does not retain the earlier prompt text. The wake when a
+  task ends already comes through Dromon as the note above, and a turn the engine
+  begins by itself is still interrupted, as above. A restart closes the kept
+  connection, so the reminder state is held in memory only.
 - **Cost.** **Fact, observed live on 2026-10-26.** On a kept connection the engine
   reports with each result a cost total for every turn since the connection opened.
   **Fact, read from the engine's code on 2026-10-26, and consistent with what was
@@ -962,7 +982,10 @@ ends with each turn, and the next turn resumes the session in a new one.
 - **`line_status`.** `kept_session` gives whether the line is `configured` to keep its
   session, whether a connection is `kept` now, the time it `closes_at` in Coordinated
   Universal Time, which is `null` during a turn, the number of `background_tasks` the
-  engine reports running, and `tasks`, each with its `task_id` and `command`. Round 3
+  engine reports running, `background_tasks_unknown`, true when that count may be
+  stale because the engine cannot give a reliable current listing, and `tasks`, each
+  with its `task_id` and `command`. The compact status also gives
+  `background_tasks_unknown` next to `background_task_count`. Round 3
   adds `last_fired_wake`, the latest scheduled wake delivered to the line, with its
   `message_id`, `due` and `delivered` times and `late_seconds`, or `null`. Round 4
   gives `recent_turns`, the line's last ten turns, oldest first, each with its
