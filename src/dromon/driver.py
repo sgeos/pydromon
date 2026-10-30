@@ -44,6 +44,8 @@ ENGINE_OF: Final[dict[str, str]] = {
     "claude-haiku-5-5": "claude-code",
     "claude-fable-5-1": "claude-code",
     "gpt-6-luna": "codex",
+    "gpt-6.1-sol": "codex",
+    "gpt-6.1-terra": "codex",
     "grok-4.7": "grok-build",
     "pi:openai/gpt-6-luna": "pi",
     "cursor-agent:gpt-5.6-luna-medium": "cursor-agent",

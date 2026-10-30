@@ -1,0 +1,100 @@
+// Dromon driver for GPT-6.1-Sol run through Codex, driver interface 3.
+//
+// Strategy: flexible. The line accepts a ChatGPT plan or API usage billed per token. Its
+// settings are the API-safe ones, because the line may be charged per token, and the
+// credential actually used is recorded in the driver's state.
+//
+// Its settings follow Codex's model catalogue as fetched on 2026-10-30 by Codex 0.164.0,
+// which gives a default effort of low and a context window of 500,000 tokens. Its effort
+// stays low, as for every driver that may bill per token. No turn on this model has run
+// through Dromon yet.
+//
+// The host sends one event per cycle together with the driver's state, and receives
+// one action together with the next state. The host stores the state between cycles,
+// so that Dromon's event log can record it and a restarted daemon can resume it. Every
+// cycle yields exactly once, so its cost is bounded.
+//
+// Event:  (tag, text, number)
+// State:  (tool uses in the current turn, turns completed, credential code)
+// Action: (tag, text, number)
+//
+// Credential codes are 0 before the engine reports one, 1 for a subscription and 2 for
+// API usage billed per token.
+
+fn model() -> Text { "gpt-6.1-sol" }
+
+fn strategy() -> Text { "flexible" }
+
+fn tool_budget() -> Word { 10 }
+
+// Settings read by index before the first turn. The list ends with the tag "end".
+fn setting(index: Word) -> (Text, Text, Word) {
+    match index {
+        0 => ("interface", "", 3),
+        1 => ("strategy", strategy(), 0),
+        2 => ("model", model(), 0),
+        3 => ("effort", "low", 0),
+        4 => ("max_turns", "", 2),
+        5 => ("tool_budget", "", tool_budget()),
+        6 => ("context_window", "", 500000),
+        7 => ("engine", "codex", 0),
+        _ => ("end", "", 0),
+    }
+}
+
+fn credential_code(credential: Text) -> Word {
+    if credential == "subscription" {
+        1
+    } else {
+        if credential == "api" { 2 } else { 0 }
+    }
+}
+
+fn on_credential(
+    credential: Text,
+    state: (Word, Word, Word),
+) -> ((Text, Text, Word), (Word, Word, Word)) {
+    if credential == "subscription" or credential == "api" {
+        let code = credential_code(credential);
+        (("accept", credential, code), (state.0, state.1, code))
+    } else {
+        (("refuse", strategy(), 0), state)
+    }
+}
+
+fn on_init(reported: Text, state: (Word, Word, Word)) -> ((Text, Text, Word), (Word, Word, Word)) {
+    if reported == model() {
+        (("accept", reported, 0), state)
+    } else {
+        (("refuse", model(), 0), state)
+    }
+}
+
+fn on_tool_use(name: Text, state: (Word, Word, Word)) -> ((Text, Text, Word), (Word, Word, Word)) {
+    let used = state.0 + 1;
+    let next = (used, state.1, state.2);
+    if used > tool_budget() {
+        (("interrupt", "tool_budget", used), next)
+    } else {
+        (("continue", name, used), next)
+    }
+}
+
+loop main(
+    input: ((Text, Text, Word), (Word, Word, Word)),
+) -> ((Text, Text, Word), (Word, Word, Word)) {
+    let event = input.0;
+    let state = input.1;
+    let tag = event.0;
+    let step = match tag {
+        "settings" => (setting(event.2), state),
+        "credential" => on_credential(event.1, state),
+        "init" => on_init(event.1, state),
+        "turn_start" => (("continue", "", 0), (0, state.1, state.2)),
+        "tool_use" => on_tool_use(event.1, state),
+        "result" => (("end_turn", event.1, event.2), (state.0, state.1 + 1, state.2)),
+        _ => (("continue", "", 0), state),
+    };
+    let _ = yield step;
+    (("idle", "", 0), state)
+}

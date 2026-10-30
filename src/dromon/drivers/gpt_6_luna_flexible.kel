@@ -4,8 +4,7 @@
 // settings are the API-safe ones, because the line may be charged per token, and the
 // credential actually used is recorded in the driver's state.
 //
-// Dromon has no Codex adapter yet, so no line runs this driver until one exists. Its
-// context window follows Codex's model catalogue as fetched on 2026-10-25.
+// Its context window follows Codex's model catalogue as fetched on 2026-10-25.
 //
 // The host sends one event per cycle together with the driver's state, and receives
 // one action together with the next state. The host stores the state between cycles,
