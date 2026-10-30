@@ -7,6 +7,12 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Operator line configuration may set `fresh_session_each_turn` for Claude Code or
+  Codex. Each turn starts without the prior engine session, context handoff or standing
+  brief, while the mail that starts the turn is still delivered. The scheduler records
+  each reset as `line_session_cleared`, which survives restart. The key implies
+  `context_handoff = false`; loading refuses it with `keep_session = true`, explicit
+  handoff enabled, or an unsupported engine adapter.
 - Git over the Secure Shell protocol for chosen lines, off by default. The project
   file's `[git_ssh]` table names one agent socket, the daemon's own `SSH_AUTH_SOCK` or
   an explicit socket such as that of a deploy-key agent, a `known_hosts` file that must

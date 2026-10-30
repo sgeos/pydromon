@@ -213,6 +213,7 @@ class World:
     def __init__(self, path: Path, engine: Engine, config: LineConfig) -> None:
         self.log = EventLog(path)
         self.engine = engine
+        self.specs: list[LineSpec] = []
         self.events: list[Event] = []
         original = self.log.append
 
@@ -228,7 +229,8 @@ class World:
         self.scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION, config)
 
     def build(self, spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> Engine:
-        del spec, tools
+        del tools
+        self.specs.append(spec)
         return self.engine
 
 
@@ -315,6 +317,70 @@ def test_a_line_that_opted_out_gets_none_and_the_event_says_so(
     assert not any(prompt.startswith("Context handoff.") for prompt in engine.prompts)
     (event,) = handed(world)
     assert (event.outcome, event.message_ids, event.chars) == ("opted_out", (), 0)
+
+
+def test_fresh_session_each_turn_drops_prior_context_but_delivers_new_mail(
+    worlds: Callable[..., World],
+) -> None:
+    engine = Engine()
+    world = worlds(engine, LineConfig(fresh_session_each_turn=True))
+    world.scheduler.set_brief("alpha", "earlier task context")
+
+    async def noop() -> None:
+        return
+
+    message_ids: list[str] = []
+    for body in ("first case marker", "second case marker"):
+        message_ids.append(world.scheduler.send(ANA, ALPHA, body))
+        asyncio.run(running(world, noop))
+
+    first_prompts = [prompt for prompt in engine.prompts if message_ids[0] in prompt]
+    second_prompts = [prompt for prompt in engine.prompts if message_ids[1] in prompt]
+    assert first_prompts and second_prompts
+    assert all(message_ids[0] not in prompt for prompt in second_prompts)
+    assert all("Context handoff." not in prompt for prompt in engine.prompts)
+    assert all("earlier task context" not in prompt for prompt in engine.prompts)
+    case_specs = [spec for spec in world.specs if spec.session_id is None]
+    assert len(case_specs) >= 2
+    assert [event.cause for event in handed(world)] == ["cleared", "cleared"]
+    assert all(event.outcome == "opted_out" for event in handed(world))
+    assert sum(isinstance(event, LineSessionCleared) for event in world.events) >= 2
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "grok-4.7",
+        "pi:openai/gpt-6-luna",
+        "cursor-agent:gpt-5.6-luna-medium",
+        "antigravity:gemini-3.8-flash-high",
+    ],
+)
+def test_adapters_without_fresh_sessions_refuse_configuration_at_load(
+    worlds: Callable[..., World], model: str
+) -> None:
+    world = worlds(Engine())
+    with pytest.raises(ConfigError, match="supported only by Claude Code and Codex"):
+        world.scheduler.create_line(
+            "unsupported",
+            model,
+            Strategy.SUBSCRIPTION,
+            LineConfig(fresh_session_each_turn=True),
+        )
+    assert "unsupported" not in world.log.state.lines
+
+
+def test_codex_accepts_fresh_session_configuration_at_load(
+    worlds: Callable[..., World],
+) -> None:
+    world = worlds(Engine())
+    world.scheduler.create_line(
+        "codex",
+        "gpt-6-luna",
+        Strategy.SUBSCRIPTION,
+        LineConfig(fresh_session_each_turn=True),
+    )
+    assert world.scheduler.effective_config("codex").fresh_session_each_turn
 
 
 def test_a_turn_whose_engine_failed_leaves_the_handoff_owed(

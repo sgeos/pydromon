@@ -333,10 +333,20 @@ class LineConfig:
     context_handoff: bool = True
     """Whether the line's first turn in a new engine session, after a rebind or a
     cleared session, begins with a selection from its mail. Row 13."""
+    fresh_session_each_turn: bool = False
+    """Whether each turn starts a new engine session without context handoff."""
     recipients: tuple[str, ...] | None = None
     """The parties the line may send mail to, as addresses written canonically, or
     ``None`` for every party. A line may always send itself a note, which opens no
     channel to anyone. Questions to an operator are not limited by it."""
+
+    def __post_init__(self) -> None:
+        if self.fresh_session_each_turn:
+            if self.keep_session:
+                raise ConfigError(
+                    "fresh_session_each_turn cannot be combined with keep_session"
+                )
+            object.__setattr__(self, "context_handoff", False)
 
     def allows(self, tool_name: str, own_tools: frozenset[str]) -> bool:
         """Whether the policy allows ``tool_name``. Dromon's own tools always pass."""
@@ -393,6 +403,8 @@ def encode_config(config: LineConfig) -> str:
         document["plugins"] = list(config.plugins)
     if config.keep_session:
         document["keep_session"] = True
+    if config.fresh_session_each_turn:
+        document["fresh_session_each_turn"] = True
     if config.keep_session_idle_seconds != DEFAULT_KEEP_IDLE_SECONDS:
         document["keep_session_idle_seconds"] = config.keep_session_idle_seconds
     if config.keep_session_max_seconds != DEFAULT_KEEP_MAX_SECONDS:
@@ -579,6 +591,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         "project_settings",
         "plugins",
         "keep_session",
+        "fresh_session_each_turn",
         "keep_session_idle_seconds",
         "keep_session_max_seconds",
         "keep_session_at_max",
@@ -655,9 +668,16 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
     keep = document.get("keep_session", False)
     if type(keep) is not bool:
         _fail("keep_session must be a boolean")
+    fresh_session = document.get("fresh_session_each_turn", False)
+    if type(fresh_session) is not bool:
+        _fail("fresh_session_each_turn must be a boolean")
     handoff = document.get("context_handoff", True)
     if type(handoff) is not bool:
         _fail("context_handoff must be a boolean")
+    if fresh_session and keep:
+        _fail("fresh_session_each_turn cannot be combined with keep_session")
+    if fresh_session and "context_handoff" in document and handoff:
+        _fail("fresh_session_each_turn requires context_handoff to be false")
     idle = _seconds(document, "keep_session_idle_seconds", DEFAULT_KEEP_IDLE_SECONDS)
     ceiling = _seconds(document, "keep_session_max_seconds", DEFAULT_KEEP_MAX_SECONDS)
     if ceiling < idle:
@@ -716,6 +736,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         project_settings=project_settings,
         plugins=plugins,
         keep_session=keep,
+        fresh_session_each_turn=fresh_session,
         keep_session_idle_seconds=idle,
         keep_session_max_seconds=ceiling,
         keep_session_at_max=at_max,
@@ -724,7 +745,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         context_warn_tokens=warn,
         allow_compact=compact,
         auto_compact_tokens=auto,
-        context_handoff=handoff,
+        context_handoff=False if fresh_session else handoff,
         recipients=(
             _recipients(document["recipients"]) if "recipients" in document else None
         ),

@@ -47,6 +47,7 @@ keys, duplicate keys and numbers are refused.
 | `workdir` | The directory the line's engine runs in, as the working directory section below specifies. Omitted when unset | the project root |
 | `workdir_access` | `write` or `read`; read confines the working directory to reads, with the scratch exception below | `write` |
 | `keep_session` | Keep a Claude Code or Codex line's engine connected between turns, as the kept sessions section below specifies. Refused on Grok lines. Omitted when false | `false` |
+| `fresh_session_each_turn` | Start each turn in a new Claude Code or Codex engine session, without a context handoff or standing brief. Refused with `keep_session`, with explicit `context_handoff = true`, and on adapters that cannot start a new session each turn. Omitted when false | `false` |
 | `keep_session_idle_seconds` | Seconds a kept connection waits for the next turn before it closes, a whole number from 60 to 86,400. Omitted at its default | `1800` |
 | `context_warn_tokens` | The estimated context, in tokens, past which the line's prompt warns, a whole number from 1,000 to 10,000,000, as the context section below specifies. Omitted at its default | `150000` |
 | `allow_compact` | Give a Claude Code or Codex line `compact_session`, to compact its own session. Refused on Grok lines. Omitted when false | `false` |
@@ -54,7 +55,7 @@ keys, duplicate keys and numbers are refused.
 | `keep_session_max_seconds` | Seconds after the last turn a kept connection may stay open while the engine reports background tasks running, before `keep_session_at_max` applies, a whole number from 60 to 86,400 and not less than `keep_session_idle_seconds`. Omitted at its default | `14400` |
 | `keep_session_at_max` | What a kept connection does at `keep_session_max_seconds` with background tasks still running, `close`, `ask` or `keep`, as the ceiling section below specifies. Omitted at its default | `close` |
 | `keep_session_hard_seconds` | Seconds after the last turn past which no choice keeps a connection open, a whole number from 60 to 604,800 and not less than `keep_session_max_seconds`. Omitted at its default | `86400` |
-| `context_handoff` | Begin the line's first turn in a new engine session, after a rebind or a cleared session, with a selection from its mail, as the context handoff section below specifies. Omitted when true | `true` |
+| `context_handoff` | Begin the line's first turn in a new engine session, after a rebind or a cleared session, with a selection from its mail, as the context handoff section below specifies. Implied false by `fresh_session_each_turn` when omitted | `true` |
 | `recipients` | At most 256 addresses the line may send mail to, local or `peer:party`, each stored canonically, distinct and sorted. The daemon refuses `send_message` to any other party, and records nothing. A line may always send itself a note, and `ask_operator` is not limited. An empty list leaves only notes to itself. Omitted when unset, which allows every party. **Added on 2026-10-28**, so that an operator can seat several lines at an external task with no private channel between them | every party |
 | `stop_policy` | `kill_all` or `leave_background`, whether stopping the line's engine, or the daemon, ends everything the engine started or leaves its background descendants running, as the stop policy section below specifies. Omitted at its default | `kill_all` |
 
@@ -547,6 +548,22 @@ owed a handoff, from `line_rebound` or `line_session_cleared`, as
   given no handoff, and the event is still recorded, with the outcome `opted_out`, so
   the log shows that the new session began without one.
 
+## Fresh session each turn
+
+The operator may set `fresh_session_each_turn` for a line on Claude Code or Codex. Each
+turn then starts in a new engine session. The scheduler records `line_session_cleared`
+after delivering the mail that starts the turn and before building its engine. That
+event removes the prior session identifier durably, so a restart cannot resume it. The
+new turn still receives its starting mail. It receives no context handoff from earlier
+mail, no standing brief lead and no kept connection.
+
+This key implies `context_handoff = false` when that key is omitted. An explicit
+`context_handoff = true` is refused because it would carry earlier mail into the new
+session. `keep_session = true` is refused because a kept connection preserves engine
+state between turns. Grok Build, Pi, Cursor Agent and Antigravity configurations are
+refused at load because their adapters do not guarantee a new session per turn.
+The setting is part of operator line configuration and is not exposed as a line tool.
+
 ## Standing brief
 
 **Task of 2026-10-29**, from the round 3 reports, three of which asked that a line's
@@ -559,7 +576,8 @@ the intent itself, in the line's own words, set with `set_brief` and recorded as
   any other notice. The session is new when the daemon holds no engine for the line,
   which is so after a restart, a rebind, a cleared session, a change of configuration
   and a change of the role's owner, when the turn asks for a compaction, and when the
-  engine compacted the session by itself since the last turn. **Inference.** An engine
+  engine compacted the session by itself since the last turn. A line with
+  `fresh_session_each_turn` suppresses this lead. **Inference.** An engine
   rebuilt with the line's recorded session may resume that session with its context,
   in which case the brief is repeated, which costs only its length. A compaction the
   engine makes by itself during a turn is told at the next turn, one turn late.
