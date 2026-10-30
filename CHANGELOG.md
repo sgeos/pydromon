@@ -7,6 +7,19 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Git over the Secure Shell protocol for chosen lines, off by default. The project
+  file's `[git_ssh]` table names one agent socket, the daemon's own `SSH_AUTH_SOCK` or
+  an explicit socket such as that of a deploy-key agent, a `known_hosts` file that must
+  pin `github.com`, and the public key ssh offers. A line or a profile with
+  `git_ssh = true` gets a `GIT_SSH_COMMAND` with `-F /dev/null`, the agent, that key
+  alone, strict host key checking against that file and batch mode, on every engine
+  from one function, and on Claude Code with an enabled sandbox, the socket and
+  `github.com` allowed and both files denied to writes. Never a key file, and never
+  the operator's home. The daemon and `dromon config` refuse a missing or foreign
+  socket, an inherited agent without `SSH_AUTH_SOCK`, and a `known_hosts` without a
+  `github.com` key, and a reload may not change the option. Whether ssh can reach
+  GitHub through Claude Code's sandbox proxy is not yet known. Required by the
+  operator on 2026-10-29.
 - Compaction now withdraws a still-pending wake scheduled by `compact_session` whether
   the engine made the compaction itself or a turn made it at Dromon's request, and a
   compaction that reports no size withdraws the daemon's own pending context-warning

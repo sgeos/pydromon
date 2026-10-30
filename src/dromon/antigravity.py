@@ -97,6 +97,8 @@ from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
 from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
+from dromon import gitssh
+from dromon.gitssh import GitSshAccess
 
 ENGINE_NAME: Final = "antigravity"
 """The engine this adapter runs, as drivers name it."""
@@ -564,6 +566,7 @@ class AntigravityLine:
         connection_factory: ConnectionFactory | None = None,
         observe: Observer = ignore,
         mark: str | None = None,
+        git_ssh: GitSshAccess | None = None,
         partial_isolation: bool = False,
         unverified_credential: bool = False,
         turn_seconds: float = TURN_SECONDS,
@@ -589,6 +592,9 @@ class AntigravityLine:
         self._connect = connection_factory
         self._observe = observe
         self.mark = mark
+        self.git_ssh = git_ssh
+        """The agent and pinned hosts of the project's ``[git_ssh]`` table, if the
+        line was given them."""
         """The process mark every process of this line inherits, if issued."""
         self.partial_isolation = partial_isolation
         """Whether the operator accepts that a tool the runtime runs without asking is
@@ -623,6 +629,7 @@ class AntigravityLine:
                 " Antigravity line takes its driver's effort"
             )
         environment = engine_environment(self._environment, settings.strategy)
+        environment.update(gitssh.environment(self.git_ssh))
         self._credential()
         runtime = locate_runtime(self._environment, self._home)
         check_workspace(self.cwd, self._home)

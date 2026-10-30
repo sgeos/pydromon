@@ -63,6 +63,7 @@ from dromon.federation import (
     FederationError,
     parse_federation,
 )
+from dromon.gitssh import GitSshConfig, GitSshError, parse_git_ssh
 from dromon.teacher import TeacherConfig, TeacherError, parse_teacher
 
 CONFIG_FILE_NAME: Final = "dromon.toml"
@@ -82,6 +83,7 @@ TOP_KEYS: Final = frozenset(
         "agents",
         "federation",
         "peers",
+        "git_ssh",
         "leases",
         "profiles",
         "lines",
@@ -143,7 +145,18 @@ TOOL_KEYS: Final = frozenset(
 LAYERED_KEYS: Final = frozenset({"sandbox", "settings"})
 """Keys whose profile and line tables merge as Claude Code's scopes do."""
 LINE_KEYS: Final = (
-    frozenset({"profile", "model", "strategy", "limits", "wake", "session", "may_own"})
+    frozenset(
+        {
+            "profile",
+            "model",
+            "strategy",
+            "limits",
+            "wake",
+            "session",
+            "may_own",
+            "git_ssh",
+        }
+    )
     | TOOL_KEYS
     | LAYERED_KEYS
 )
@@ -195,6 +208,10 @@ class LineDefinition:
     secret_names: tuple[str, ...] = ()
     """Environment variable names this project grants the line to reference in its
     MCP configuration. Values are read from the daemon environment at turn time."""
+    git_ssh: bool = False
+    """Whether the line's shell commands get the project's ``[git_ssh]`` agent. Held
+    here and not in ``LineConfig``, so it never enters the event log and no client or
+    line can set it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +252,9 @@ class ProjectConfig:
     """Which external agents may connect, and with what access. Off by default."""
     federation: FederationConfig = NO_FEDERATION
     """The project's peers, other Dromon daemons, none by default."""
+    git_ssh: GitSshConfig | None = None
+    """The agent socket and pinned hosts the lines with ``git_ssh`` get, or ``None``.
+    Off by default."""
     require_sandbox: bool = False
     """Whether every Claude Code line must run with its merged sandbox enabled."""
     disclosure_terms: str | None = None
@@ -379,6 +399,12 @@ class _Reader:
         except FederationError as error:
             # Each message begins with the key it is about, which places the line.
             raise self.fail(str(error).split(" ", 1)[0], str(error)) from error
+        git_ssh: GitSshConfig | None = None
+        if "git_ssh" in top:
+            try:
+                git_ssh = parse_git_ssh(top["git_ssh"])
+            except GitSshError as error:
+                raise self.fail(error.key, str(error)) from error
         lease_names, lease_ttl = self.leases(top.get("leases", {}))
         profiles = self.profiles(top.get("profiles", {}))
         lines_table = top.get("lines", {})
@@ -387,6 +413,11 @@ class _Reader:
         lines: dict[str, LineDefinition] = {}
         for line_id, value in sorted(cast(dict[str, object], lines_table).items()):
             lines[line_id] = self.line(line_id, value, profiles, limits, wake)
+            if lines[line_id].git_ssh and git_ssh is None:
+                raise self.fail(
+                    f"lines.{line_id}.git_ssh",
+                    "is true, but the file has no [git_ssh] table to give the line",
+                )
         roles = self.roles(top.get("roles", {}), lines)
         return ProjectConfig(
             operator=operator,
@@ -398,6 +429,7 @@ class _Reader:
             teacher=teacher,
             agents=agents,
             federation=federation,
+            git_ssh=git_ssh,
             require_sandbox=require_sandbox,
             disclosure_terms=terms,
             lease_names=lease_names,
@@ -681,6 +713,9 @@ class _Reader:
         may_own = merged.get("may_own", True)
         if type(may_own) is not bool:
             raise self.fail(f"{key}.may_own", "must be a boolean")
+        git_ssh = merged.get("git_ssh", False)
+        if type(git_ssh) is not bool:
+            raise self.fail(f"{key}.git_ssh", "must be a boolean")
         session = own.get("session")
         if session is not None:
             if not isinstance(session, str):
@@ -703,4 +738,5 @@ class _Reader:
             session=session,
             may_own=may_own,
             secret_names=tuple(sorted(secret_names)),
+            git_ssh=git_ssh,
         )

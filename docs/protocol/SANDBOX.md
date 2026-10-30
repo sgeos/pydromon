@@ -133,6 +133,11 @@ project settings.
 5. **Unsandboxed retries.** Dromon's permission gate refuses a Bash, PowerShell or
    Monitor call that sets `dangerouslyDisableSandbox` while the sandbox is enabled
    without `allowUnsandboxedCommands`, whatever the line's tool policy.
+6. **Git over SSH.** For a line the project file gives its `[git_ssh]` agent, an
+   enabled sandbox gets one layer merged after every other, before the steps above
+   apply, which allows the agent's socket and `github.com` and denies writing the
+   `known_hosts` and public key files, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md)
+   specifies. Added on 2026-10-29.
 
 ## Parity and its limits
 

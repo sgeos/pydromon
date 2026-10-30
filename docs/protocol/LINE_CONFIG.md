@@ -1421,6 +1421,12 @@ whose file is readable by its owner only, and references are stored as written. 
 tool they bring, including a claude.ai account's mail and file connectors, and suit
 only lines the operator trusts with them.
 
+Git over the Secure Shell protocol is not part of this document. A line receives the
+project's `[git_ssh]` agent only through `git_ssh = true` on its own table or its
+profile in the project file, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies,
+so it never enters the event log and no client or line can set it. Added on
+2026-10-29.
+
 ## Not yet specified
 
 - References to secrets held in files or a keychain rather than the environment.

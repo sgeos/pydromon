@@ -179,6 +179,7 @@ from dromon import proposals as proposal_store
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, SandboxError, effective, merge, parse_sandbox
+from dromon.gitssh import GitSshAccess, sandbox_layer, unreadable
 from dromon.settings import SettingsConfig
 from dromon.processes import (
     ProcessRefused,
@@ -1197,6 +1198,7 @@ def engine_factory(
     accept_partial_isolation: bool = False,
     accept_unverified_credential: bool = False,
     line_secrets: Mapping[str, Sequence[str]] | None = None,
+    line_git_ssh: Mapping[str, GitSshAccess] | None = None,
 ) -> EngineFactory:
     """The production factory: each line on its packaged driver's engine.
 
@@ -1217,6 +1219,10 @@ def engine_factory(
     ends the turn before any command runs. Each line's engine settings are the
     project's merged with its own, with ``ask`` rules denied and the ``protected``
     directories denied to the built-in file tools.
+
+    A line in ``line_git_ssh``, which only the project file's ``[git_ssh]`` table
+    fills, gets that agent's ``GIT_SSH_COMMAND`` on every engine, and on Claude Code
+    with an enabled sandbox, the layer ``dromon.gitssh.sandbox_layer`` gives.
     """
 
     def _line_bridge(line_id: str) -> tuple[list[str], str | None]:
@@ -1232,6 +1238,7 @@ def engine_factory(
         # priority mail steers the driver rather than each engine.
         driver: Driver = priority.steered(spec.model, spec.strategy, spec.redirect)
         workdir = resolve_workdir(spec.config.workdir, Path(root), protected)
+        git_ssh = (line_git_ssh or {}).get(spec.line_id)
         if driver.settings.engine == codex.ENGINE_NAME:
             if project_sandbox is not None or project_settings is not None:
                 raise EngineRefused(
@@ -1241,6 +1248,7 @@ def engine_factory(
             return CodexLine(
                 driver,
                 workdir,
+                git_ssh=git_ssh,
                 config=spec.config,
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
@@ -1264,6 +1272,7 @@ def engine_factory(
             return GrokLine(
                 driver,
                 workdir,
+                git_ssh=git_ssh,
                 config=spec.config,
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
@@ -1283,6 +1292,7 @@ def engine_factory(
             return PiLine(
                 driver,
                 workdir,
+                git_ssh=git_ssh,
                 config=spec.config,
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
@@ -1302,6 +1312,7 @@ def engine_factory(
             return CursorLine(
                 driver,
                 workdir,
+                git_ssh=git_ssh,
                 config=spec.config,
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
@@ -1321,6 +1332,7 @@ def engine_factory(
             return AntigravityLine(
                 driver,
                 workdir,
+                git_ssh=git_ssh,
                 config=spec.config,
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
@@ -1365,19 +1377,30 @@ def engine_factory(
             )
             settings = engine_settings.merge([settings, restrictions])
         enabled = merged is not None and merged.enabled
+        if enabled and git_ssh is not None:
+            merged = merge([merged, sandbox_layer(git_ssh)])
         guarded = git_write_guards(workdir) if enabled else ()
         # A line that loads project settings or plugins must not write what it loads.
         claude_dir = (workdir / ".claude",) if spec.config.project_settings else ()
         plugin_dirs = tuple(resolve_plugin(path) for path in spec.config.plugins)
         write_protected = (*claude_dir, *plugin_dirs)
         guarded = (*guarded, *write_protected)
+        sandbox = effective(merged, workdir, protected, guarded)
+        if enabled and git_ssh is not None and sandbox is not None:
+            denied = unreadable(git_ssh, sandbox)
+            if denied is not None:
+                raise SandboxError(
+                    f"the line's sandbox denies reading {denied}, which ssh needs for"
+                    " the project's [git_ssh] table"
+                )
         return ClaudeCodeLine(
             driver,
             workdir,
+            git_ssh=git_ssh,
             config=spec.config,
             mcp_tools=list(own_tools),
             session_id=spec.session_id,
-            sandbox=effective(merged, workdir, protected, guarded),
+            sandbox=sandbox,
             settings=engine_settings.effective(settings, protected, write_protected),
             observe=spec.observe,
             mark=spec.mark,
