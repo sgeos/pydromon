@@ -7,7 +7,7 @@ flight, why, what is owed and the next step, within a budget of 8 KB. History li
 git. A rewrite that drops an open item says in its commit message whether the item was
 completed, moved or abandoned.
 
-## State on 2026-10-29
+## State on 2026-10-30
 
 - **Milestone 0.1.0 is complete.** The modules and protocol documents are listed in
   `docs/architecture/DESIGN.md` and `docs/protocol/README.md`. History is in git.
@@ -20,18 +20,16 @@ completed, moved or abandoned.
   allowlist for every engine. Federation phases 1 and 2, over Unix sockets and over
   TLS with pinned keys, per `docs/architecture/FEDERATION.md`. `dromon agent send`,
   per-line `recipients`, correlation keys, `check_disclosure` and task records.
-  Self-started turns after a task end run under the scheduler's admission. Several
-  inbound TLS peers. A standing brief per line, with `set_brief`, and a role
-  transition package whose items are marked as observed, reported, unknown or
-  unreadable, filled from observed state when a former owner left nothing.
-  Task-bound wakes, the turn-end commit kept across a restart, and `read_mail` on a
-  line's own sent mail. A hung test ends the run after 300 seconds. Request keys
-  recorded in the event of their act, so a retry across a restart acts once. A
-  silent-turn reminder that checks its tasks before calling them running. Git over SSH
+  Admitted self-started turns. Several inbound TLS peers. A standing brief per line
+  and a role transition package with marked provenance. Task-bound wakes, the
+  turn-end commit kept across a restart, and `read_mail` on sent mail. A 300-second
+  hung-test limit. Request keys recorded with their act. A silent-turn reminder that
+  checks its tasks. Git over SSH
   for chosen lines, per the Git over SSH section of `PROJECT_CONFIG.md`, and a fresh
   engine session on every turn, per `LINE_CONFIG.md`. Test schedulers get an empty
-  process table.
-- **In flight.** None. The round 5 work is merged, per `REVERSE_PROMPT.md`.
+  process table. One unread rule for every view with `own_notes` apart, a validated
+  shell for shell lines, and a silent-turn reminder dropped once the line mails.
+- **In flight.** None. The round 6 work is merged, per `REVERSE_PROMPT.md`.
 - **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310,
   `pykeleusma==0.2.2.0` and `cryptography==50.0.2`, all from PyPI.
 - **Published.** Public `sgeos/pydromon`, 0BSD, synced with `sgeos/project-template` at
@@ -49,12 +47,11 @@ seats on Opus, Haiku and GPT-6-Luna. Upgrades use `dromon restart`.
   per `GROK.md`. No Grok seat or report until then.
 - **Keleusma.** Ready for its four lines, with the live trial passed in a line's
   sandbox. The migration, the `full-gate` lease, cost holds, the HTTPS remote and push
-  authority are the operator's, per `KELEUSMA_DOGFOOD.md`.
+  authority are the operator's, per `KELEUSMA_DOGFOOD.md`. Deferred by the operator on
+  2026-10-30.
 - **Budgets.** No engine reports a remaining budget, so failover on budget needs
   `dromon budget set`. Codex limits are observed. Claude's are typed, not observed.
-- **Plan terms.** They assume ordinary use, which many lines may exceed.
-- **pykeleusma shared data.** Release `0.2.2.0` has it through `shared=`. Drivers keep
-  host-carried state by choice, so adopting it needs no repin.
+  Deferred by the operator on 2026-10-30.
 - **Operator relays.** Inbound adapters are deferred, per `RELAY.md`.
 - **Project file.** No user or managed layer, per `PROJECT_CONFIG.md`.
 - **Codex lines.** No MCP servers, sandbox or settings documents, or cost limit, and
@@ -68,28 +65,35 @@ seats on Opus, Haiku and GPT-6-Luna. Upgrades use `dromon restart`.
   or MCP OAuth, and Linux not verified live, per `SANDBOX.md` and `SETTINGS.md`.
 - **Unrun engines.** Pi, Cursor Agent and Antigravity, each with a verify-first list.
 - **Launcher.** A `setsid` child and `~/.claude.json` unverified, per `LINE_CONFIG.md`.
-- **Flaky tests.** One kept-session grace was widened on 2026-10-29 after it failed 1
-  run in 5 under load. Others may remain, and the self-start grace test still depends
-  on wall-clock timing.
+- **Flaky tests.** The self-start grace test now ends its grace on release, not on
+  the clock. Other tests that wait on the clock may remain.
 - **Clients.** Polling, no token meter, Tk checked only withdrawn.
 - **Git over SSH.** Works only for a line whose sandbox is disabled, by the operator's
-  test of 2026-10-29 inside a Claude Code sandbox. Signing with a real key and a push
-  are unverified, since the operator's agent held no key, and so are the Codex and
-  Grok sandboxes. A line with its sandbox disabled can still change the pinned files
-  between the per-turn checks.
-- **Requests, open.** From round 5, line numbers from `check_disclosure` on a line's own
-  files, self-addressed wake notes kept out of the unread count, a stale brief after a
-  task change, and review reports delivered to the line they concern. From round 4, a
-  cost estimate for the next turn and the engine's remaining allowance, which the
-  engines may not report. From Epagoge, the budget at task start, other lines' model
-  and lease state in `line_status`, and a reviewer's targeted test on the real tree.
+  test of 2026-10-29 inside a Claude Code sandbox. The operator chose on 2026-10-30 a
+  minimal push test, then sandboxed work over HTTPS. A deploy key and probe script
+  wait in the ignored `tmp/r6` for the operator's private test repository. Signing,
+  a line run and the Codex and Grok sandboxes are unverified. A line with its sandbox
+  disabled can still change the pinned files between the per-turn checks.
+- **Shell.** A daemon whose `SHELL` is missing, or is not bash or zsh, refuses every
+  Claude Code shell line's turn. That Claude Code reads `CLAUDE_CODE_SHELL` is
+  inferred from strings in its executable, not observed in a turn.
+- **Requests, open.** From round 6, a named sandbox restriction in a gate result that
+  cannot run, per-turn cost in the compact `line_status`, a compaction wake that says
+  why it fired, and a wait on a named background task. Earlier, review reports sent
+  to the line they concern, a next-turn cost estimate and the remaining allowance.
+  From Epagoge, the budget at task start, other lines' model and lease state, and a
+  reviewer's targeted test on the real tree.
+- **Declined.** Line numbers from `check_disclosure`, since a file with one candidate
+  word per line would reveal in one check which are listed terms. The hourly limit on
+  checks is the protection. A per-file answer has the same flaw.
+- **Duplicate compaction wakes.** Seen by engines. Hypothesis, not checked, that one
+  is queued again while the estimate stays past the warning after a compaction.
+- **Quiet notice.** A silent turn the engine starts by itself saves no reminder.
 - **Fresh sessions.** Not run live. The Keleusma labeller line awaits it.
-- **Live probes for review.** The review line asks to cite a live probe the operator
-  runs. That touches the rule against a review line starting an engine, so it is the
-  operator's decision.
-- **Garbage collection in tests.** Tests collect on the main thread every 25 tests,
-  for an inferred cause of a Pi test failure. The first gates since have passed, which
-  supports the cause but does not prove it.
+- **Live probes for review.** Allowed by the operator on 2026-10-30. A review line may
+  cite a live probe the operator runs, and still may not start an engine.
+- **Garbage collection in tests.** Collected every 25 tests for an inferred cause of
+  a Pi test failure. Every gate since has passed, which supports but does not prove it.
 - **Several agents in one game.** An analysis of what Dromon would need is drafted for
   the operator, not yet in the repository.
 - **In the design.** Hosted teacher traces, the Rust repository name, remote clients.
@@ -105,7 +109,7 @@ need a command outside it. The rest run inside it with `-m "not socket and not l
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-./scripts/check.sh          # about 3790 tests pass, plus 10 live tests deselected
+./scripts/check.sh          # about 3830 tests pass, plus 10 live tests deselected
 ```
 
 Report any check not run, and any commit after the one that last rewrote this file.
