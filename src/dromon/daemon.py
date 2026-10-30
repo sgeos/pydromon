@@ -1037,8 +1037,7 @@ class Daemon:
         counts = summary(self.log.state, owner, 0)
         return {
             "total": total,
-            "unread": counts.unread,
-            "unanswered": counts.unanswered,
+            **counts.counts(),
             "messages": [
                 {
                     "message_id": message_id,

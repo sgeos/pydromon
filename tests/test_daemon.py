@@ -398,6 +398,7 @@ def test_mail_lists_an_operators_mailbox_and_delivers_it(paths: ProjectPaths) ->
     assert response.ok and response.result is not None
     result = response.result
     assert (result["total"], result["unread"], result["unanswered"]) == (3, 3, 2)
+    assert result["own_notes"] == 0
     entries = cast(list[dict[str, object]], result["messages"])
     assert [e["message_id"] for e in entries] == ids
     assert (entries[0]["outcome"], entries[1]["outcome"]) == ("replied", "unanswered")

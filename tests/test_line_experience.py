@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 from collections.abc import Generator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -30,19 +31,25 @@ from dromon.lineconfig import (
 from dromon.projectconfig import ConfigFileError, parse
 from dromon.limits import Limits
 from dromon import scheduler as scheduler_module
-from dromon.mailbox import MailSummary, summary
+from dromon.mailbox import MailSummary, listing, summary
 from dromon.model import (
+    HARNESS,
     DISCLOSURE_CHECK_WINDOW_SECONDS,
     MAX_DISCLOSURE_CHECKS,
+    AgentAddress,
     DisclosureChecked,
+    HarnessAddress,
     LineAddress,
     LineCreated,
     LineHeld,
     MessageDelivered,
+    Message,
     MessageKind,
+    MessageRead,
     MessageSent,
     OperatorAddress,
     OperatorRegistered,
+    RemoteAddress,
     RoleNoteKind,
     State,
 )
@@ -164,7 +171,7 @@ def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
     secret_config = LineConfig(
         builtin_tools=("Read",),
         mcp_servers=(
-            ("notes", McpServer("stdio", command="notes", env=(("T", "s3"),))),
+            ("jotter", McpServer("stdio", command="jotter", env=(("T", "s3"),))),
         ),
     )
     scheduler.configure_line("alpha", secret_config)
@@ -234,7 +241,7 @@ def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
     ]
     assert full["commits"]["workdir"] is None
     assert full["commits"]["daemon"] == COMMIT
-    for secret in ("a private body", "notes", "s3", "was held for this test"):
+    for secret in ("a private body", "jotter", "s3", "was held for this test"):
         assert secret not in full_text
 
 
@@ -1599,32 +1606,276 @@ def test_a_line_with_no_turn_end_commit_is_told_the_check_was_skipped_once(
     assert SKIPPED not in second and MOVED not in second
 
 
-def test_own_notes_shown_to_an_earlier_turn_leave_unread(world: World) -> None:
-    """A note a line sent itself, such as a wake that fired after its work was done,
-    is counted unread in the turn it reaches and left out of unread in later turns.
-    An operator's unread mail is never left out, and line_status counts every
-    unread message."""
-    alpha = LineAddress("alpha")
-    own = world.turn("check the gate", sender=alpha)
-    first = world.turn("from ana")
-    second = world.turn("from ana again")
-    assert MailSummary(1, 1, 0).sentence() in own
-    assert MailSummary(1, 1, 1, collapsed=1).sentence() in first
-    assert MailSummary(1, 2, 2, collapsed=1).sentence() in second
-    assert summary(world.log.state, alpha, 0) == MailSummary(0, 3, 2)
+ALPHA = LineAddress("alpha")
+
+
+def expected_counts(state: State, owner: LineAddress) -> tuple[int, int, int]:
+    """The unread, unanswered and own-note counts of ``owner``'s mailbox, counted
+    here from the messages by their own rule, apart from ``dromon.mailbox``. Own
+    notes and the harness's notes ask no reply, and a held line's resume is not
+    used in these tests."""
+    held = [
+        (message_id, message)
+        for message_id, message in state.messages.items()
+        if message.recipient == owner and message.delivered
+    ]
+    replied = {
+        message.reply_to
+        for message in state.messages.values()
+        if message.sender == owner and message.reply_to is not None
+    }
+    others = [(i, m) for i, m in held if m.sender != owner]
+    return (
+        sum(1 for _, m in others if not m.read),
+        sum(
+            1
+            for i, m in others
+            if i not in replied
+            and not m.acknowledged
+            and not isinstance(m.sender, HarnessAddress)
+        ),
+        sum(
+            1
+            for i, m in held
+            if m.sender == owner
+            and not m.read
+            and not m.acknowledged
+            and i not in replied
+        ),
+    )
+
+
+LIST_MAIL_COUNTS = re.compile(
+    r"(\d+) unread, (\d+) unanswered and (\d+) notes of your own neither read nor"
+    r" acknowledged"
+)
+LIST_MAIL_ENTRY = re.compile(r"^(m-[0-9a-f]+) from ", re.MULTILINE)
+
+
+def listed_ids(world: World, args: dict[str, Any]) -> list[str]:
+    """The identifiers ``list_mail`` gives alpha for ``args``, in order."""
+    text, error = world.call("list_mail", args)
+    assert not error, text
+    return LIST_MAIL_ENTRY.findall(text)
+
+
+def every_view(world: World) -> dict[str, tuple[int, int, int]]:
+    """alpha's three counts as each view gives them: ``line_status`` compact and in
+    detail, ``list_mail``, and the client's line summaries."""
+    compact = json.loads(world.call("line_status")[0])
+    detail = json.loads(world.call("line_status", {"detail": True})[0])
+    listed = LIST_MAIL_COUNTS.search(world.call("list_mail")[0])
+    assert listed is not None
+    (client,) = [
+        entry
+        for entry in world.scheduler.line_summaries()
+        if entry["line_id"] == "alpha"
+    ]
+
+    def triple(view: dict[str, Any]) -> tuple[int, int, int]:
+        return (view["unread"], view["unanswered"], view["own_notes"])
+
+    return {
+        "compact": triple(compact),
+        "detail": triple(detail),
+        "list_mail": (int(listed[1]), int(listed[2]), int(listed[3])),
+        "client": triple(dict(client)),
+    }
+
+
+def mixed_turn(world: World) -> str:
+    """One turn of alpha woken by an operator, a peer line, the harness and alpha
+    itself, and the prompt it began with."""
+
+    async def go() -> None:
+        stop = asyncio.Event()
+        loop = asyncio.create_task(world.scheduler.run(stop))
+        world.scheduler.send(ANA, ALPHA, "from ana")
+        world.scheduler.send(LineAddress("beta"), ALPHA, "from beta")
+        world.scheduler.send(HARNESS, ALPHA, "from the harness")
+        world.scheduler.send(ALPHA, ALPHA, "a note to myself")
+        await asyncio.sleep(0)
+        await world.scheduler.idle()
+        stop.set()
+        await loop
+
+    asyncio.run(go())
+    return world.engines["alpha"].prompts[-1]
+
+
+def test_every_view_gives_one_unread_figure_for_a_mixed_mailbox(world: World) -> None:
+    """Task of 2026-10-30. The wake prompt, ``line_status``, ``list_mail`` and the
+    client give the same counts for the same mailbox, and an own note is counted
+    apart from unread, before and after a prompt delivers it, rather than only in
+    the prompt as before."""
+    before = summary(world.log.state, ALPHA, 0)
+    assert set(every_view(world).values()) == {(0, 0, 0)}
+    assert before == MailSummary(0, 0, 0, 0)
+    prompt = mixed_turn(world)
+    state = world.log.state
+    expected = expected_counts(state, ALPHA)
+    assert expected == (3, 2, 1)
+    assert MailSummary(4, *expected).sentence() in prompt
+    assert set(every_view(world).values()) == {expected}
+    # The prompt still announces the own note, and does not mark it read.
+    (own,) = [i for i, m in state.messages.items() if m.sender == ALPHA]
+    assert own in prompt
+    assert state.messages[own].read is False
+    assert not any(
+        isinstance(e.event, MessageRead) and e.event.message_id == own
+        for e in read_entries(world.log_path)
+    )
+    # Reading ana's message and the own note moves each count in every view.
+    (from_ana,) = [i for i, m in state.messages.items() if m.sender == ANA]
+    world.call("read_mail", {"message_id": from_ana})
+    world.call("read_mail", {"message_id": own})
+    later = world.turn("from ana again")
+    expected = expected_counts(world.log.state, ALPHA)
+    assert expected == (3, 3, 0)
+    assert MailSummary(1, *expected).sentence() in later
+    assert set(every_view(world).values()) == {expected}
+
+
+def test_a_filtered_listing_lists_what_its_count_counts(world: World) -> None:
+    """Review r6, finding 1. ``unread_only`` listed own notes while the header beside
+    it said they were not unread. Each filter now lists the messages its count
+    counts, and an own note is still listed on request."""
+    mixed_turn(world)
+    state = world.log.state
+    unread, _, own_notes = expected_counts(state, ALPHA)
+    (own,) = [i for i, m in state.messages.items() if m.sender == ALPHA]
+    others = [
+        i
+        for i, m in state.messages.items()
+        if m.recipient == ALPHA and m.sender != ALPHA and not m.read
+    ]
+    listed_unread = listed_ids(world, {"unread_only": True})
+    listed_own = listed_ids(world, {"own_notes_only": True})
+    assert listed_unread == others and len(listed_unread) == unread
+    assert listed_own == [own] and len(listed_own) == own_notes
+    assert own in listed_ids(world, {})
+    # The sender filter narrows either one.
+    assert listed_ids(world, {"own_notes_only": True, "sender": "beta"}) == []
+    assert listed_ids(world, {"unread_only": True, "sender": "@ana"}) == [
+        i for i in others if state.messages[i].sender == ANA
+    ]
 
 
 @pytest.mark.parametrize(
-    ("collapsed", "said"),
+    ("args", "said"),
     [
-        (0, None),
-        (1, "1 note of your own, such as fired wakes, shown to an earlier turn is"),
-        (2, "2 notes of your own, such as fired wakes, shown to an earlier turn are"),
+        ({"own_notes_only": "yes"}, "own_notes_only must be true or false"),
+        (
+            {"unread_only": True, "own_notes_only": True},
+            "unread_only and own_notes_only select different messages",
+        ),
     ],
 )
-def test_the_summary_says_how_many_own_notes_it_left_out(
-    collapsed: int, said: str | None
+def test_a_listing_refuses_a_bad_own_notes_filter(
+    world: World, args: dict[str, Any], said: str
 ) -> None:
-    sentence = MailSummary(1, 0, 0, collapsed=collapsed).sentence()
+    text, error = world.call("list_mail", args)
+    assert error and said in text
+    assert LIST_MAIL_COUNTS.search(text) is None
+
+
+def test_an_acknowledged_own_note_leaves_the_own_count(world: World) -> None:
+    """Review r6, finding 6. An own note a prompt delivered stays unread, and leaves
+    ``own_notes`` in every view once the line acknowledges it, as lines do with
+    fired wakes, so the count does not grow with every wake."""
+    mixed_turn(world)
+    (own,) = [i for i, m in world.log.state.messages.items() if m.sender == ALPHA]
+    assert set(every_view(world).values()) == {(3, 2, 1)}
+    _, error = world.call("acknowledge_mail", {"message_id": own})
+    assert not error
+    state = world.log.state
+    assert state.messages[own].read is False and state.messages[own].acknowledged
+    expected = expected_counts(state, ALPHA)
+    assert expected == (3, 2, 0)
+    assert set(every_view(world).values()) == {expected}
+    assert listed_ids(world, {"own_notes_only": True}) == []
+    later = world.turn("from ana again")
+    assert MailSummary(1, *expected_counts(world.log.state, ALPHA)).sentence() in later
+    assert "of your own, such as fired wakes" not in later
+
+
+def test_only_the_owners_own_notes_are_counted_apart() -> None:
+    """Mail from an operator, another line, an agent, a remote party or the harness
+    is never left out of unread. Undelivered mail is in no count."""
+    senders = {
+        "m-operator": ANA,
+        "m-line": LineAddress("beta"),
+        "m-agent": AgentAddress("helper"),
+        "m-remote": RemoteAddress("peer", OperatorAddress("ben")),
+        "m-harness": HARNESS,
+        "m-own": ALPHA,
+        "m-own-read": ALPHA,
+        "m-own-acknowledged": ALPHA,
+    }
+    state = State()
+    for message_id, sender in senders.items():
+        state.messages[message_id] = Message(
+            sender,
+            ALPHA,
+            MessageKind.NOTE,
+            "x",
+            (),
+            None,
+            delivered=True,
+            read=message_id == "m-own-read",
+            acknowledged=message_id == "m-own-acknowledged",
+        )
+    state.messages["m-waiting"] = Message(ANA, ALPHA, MessageKind.NOTE, "x", (), None)
+    counts = summary(state, ALPHA, 0)
+    assert (counts.unread, counts.unanswered, counts.own_notes) == expected_counts(
+        state, ALPHA
+    )
+    assert counts == MailSummary(0, 5, 4, 1)
+    # The listing filters select exactly what the counts count.
+    unread, total = listing(state, ALPHA, unread_only=True)
+    assert [i for i, _ in unread] == [
+        "m-operator",
+        "m-line",
+        "m-agent",
+        "m-remote",
+        "m-harness",
+    ]
+    assert total == counts.unread
+    own, total = listing(state, ALPHA, own_notes_only=True)
+    assert [i for i, _ in own] == ["m-own"] and total == counts.own_notes
+    # Another owner's view of the same notes counts them as anyone's mail.
+    beta = summary(state, LineAddress("beta"), 0)
+    assert beta == MailSummary(0, 0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    ("own_notes", "said"),
+    [
+        (0, None),
+        (
+            1,
+            "1 note of your own, such as fired wakes, neither read nor"
+            " acknowledged, is counted apart",
+        ),
+        (
+            2,
+            "2 notes of your own, such as fired wakes, neither read nor"
+            " acknowledged, are counted apart",
+        ),
+    ],
+)
+def test_the_summary_says_how_many_own_notes_it_counts_apart(
+    own_notes: int, said: str | None
+) -> None:
+    counts = MailSummary(1, 0, 0, own_notes)
+    sentence = counts.sentence()
     assert sentence.startswith("1 new message. 0 unread. 0 unanswered.")
     assert (said in sentence) if said else sentence.endswith("unanswered.")
+    assert counts.counts() == {"unread": 0, "unanswered": 0, "own_notes": own_notes}
+
+
+def test_a_refused_listing_gives_no_counts(world: World) -> None:
+    text, error = world.call("list_mail", {"limit": 0})
+    assert error and LIST_MAIL_COUNTS.search(text) is None
+    text, error = world.call("list_mail", {"unread_only": "yes"})
+    assert error and LIST_MAIL_COUNTS.search(text) is None
