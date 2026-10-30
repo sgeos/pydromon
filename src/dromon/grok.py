@@ -56,6 +56,7 @@ import asyncio
 import json
 import os
 import shutil
+import stat
 import tomllib
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -459,48 +460,72 @@ def check_user_home(user_home: Path) -> None:
 def _loading_entries(
     directory: Path, names: Sequence[str], *, allow_empty_records: bool = False
 ) -> list[str]:
-    """Entries that may load configuration, excluding only known empty regular files
-    and the empty lock records Grok creates in ``installed-plugins``. Never follow a
-    symbolic link. Empty directories are allowed because Grok may create them."""
+    """Entries that may load configuration, allowing only known empty Grok records.
+
+    ``hooks-paths`` may be an empty regular file. ``installed-plugins`` may hold only
+    empty regular ``*.lock`` files. Never follow symbolic links. Empty directories are
+    allowed because Grok may create them."""
     found: list[str] = []
     for name in names:
         entry = directory / name
-        if not os.path.lexists(entry):
-            continue
-        if entry.is_symlink():
-            found.append(name)
-            continue
         try:
-            if not allow_empty_records:
-                if entry.is_dir():
-                    if any(True for _ in entry.iterdir()):
-                        found.append(name)
-                else:
-                    found.append(name)
-                continue
-            if entry.is_file():
-                if entry.stat().st_size != 0:
-                    found.append(name)
-                continue
-            if not entry.is_dir():
-                found.append(name)
-                continue
-            children = list(entry.iterdir())
-            if not children:
-                continue
-            if name == "installed-plugins" and all(
-                child.name.endswith(".lock")
-                and not child.is_symlink()
-                and child.is_file()
-                and child.stat().st_size == 0
-                for child in children
-            ):
-                continue
-            found.append(name)
+            info = entry.lstat()
+        except FileNotFoundError:
+            continue
         except OSError as error:
             raise EngineRefused(
                 f"cannot inspect Grok home entry {entry}: {error}"
             ) from error
+        if stat.S_ISLNK(info.st_mode):
+            found.append(name)
+            continue
+        if not allow_empty_records:
+            if stat.S_ISDIR(info.st_mode):
+                try:
+                    if any(True for _ in entry.iterdir()):
+                        found.append(name)
+                except OSError as error:
+                    raise EngineRefused(
+                        f"cannot inspect Grok home entry {entry}: {error}"
+                    ) from error
+            else:
+                found.append(name)
+            continue
+        if stat.S_ISREG(info.st_mode):
+            if name != "hooks-paths" or info.st_size != 0:
+                found.append(name)
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            found.append(name)
+            continue
+        try:
+            children = list(entry.iterdir())
+        except OSError as error:
+            raise EngineRefused(
+                f"cannot inspect Grok home entry {entry}: {error}"
+            ) from error
+        if not children:
+            continue
+        if name != "installed-plugins":
+            found.append(name)
+            continue
+        allowed_locks = True
+        for child in children:
+            try:
+                child_info = child.lstat()
+            except OSError as error:
+                raise EngineRefused(
+                    f"cannot inspect Grok home entry {child}: {error}"
+                ) from error
+            if not (
+                child.name.endswith(".lock")
+                and stat.S_ISREG(child_info.st_mode)
+                and child_info.st_size == 0
+            ):
+                allowed_locks = False
+                break
+        if not allowed_locks:
+            found.append(name)
     return found
 
 
@@ -758,7 +783,9 @@ def profile_snippet(
         for p in protected
         if not _covers([workspace / ".dromon"], p)
     ]
-    deny.extend(str(path) for path in _credential_paths(daemon_home))
+    deny.extend(
+        str(path) for path in _credential_paths(daemon_home) if os.path.lexists(path)
+    )
     lines = [f"[profiles.{name}]"]
     if name == WRITER_PROFILE:
         lines.append('extends = "workspace"')
@@ -816,11 +843,15 @@ def check_profile(
             if not _covers([workspace / ".dromon"], path)
         ]
         deny_values.extend(
-            str(path) for path in _credential_paths(daemon_home) if path.exists()
+            str(path)
+            for path in _credential_paths(daemon_home)
+            if os.path.lexists(path)
         )
         git = git_directories(workspace)
         read_only_values = (
-            [] if git is None else [str(path) for path in sorted(set(git))]
+            []
+            if name != WRITER_PROFILE or git is None
+            else [str(path) for path in sorted(set(git))]
         )
         advice = "".join(
             (
@@ -828,14 +859,12 @@ def check_profile(
                 repr(name),
                 " profile in ",
                 str(file),
-                "; preserve other profile tables. Add missing values to existing "
-                "arrays. Set the required base and remove unsupported keys. Required "
+                ". Add missing entries to its existing deny and read_only arrays, "
+                "leaving every other profile table and entry as it is. Required "
                 "deny entries are ",
                 json.dumps(deny_values),
                 "; required read_only entries are ",
                 json.dumps(read_only_values),
-                "; required extends is ",
-                repr(PROFILE_EXTENDS[name]),
             )
         )
     if profile is None:
@@ -844,13 +873,15 @@ def check_profile(
     if unknown:
         raise EngineRefused(
             f"the Grok sandbox profile {name} sets " + ", ".join(unknown) + ", which"
-            f" Dromon does not accept for it.{advice}"
+            f" Dromon does not accept for it.{advice} Remove unsupported keys from"
+            " this profile."
         )
     base = profile.get("extends", "workspace")
     if base not in PROFILE_BASES[name]:
         raise EngineRefused(
             f"the Grok sandbox profile {name} extends {base!r}, which Dromon does not"
-            f" accept for it.{advice}"
+            f" accept for it.{advice} Set extends to {PROFILE_EXTENDS[name]!r} in this"
+            " profile."
         )
     denied = [
         path
@@ -859,12 +890,12 @@ def check_profile(
     ]
     required_deny = [
         *protected,
-        *(path for path in _credential_paths(daemon_home) if path.exists()),
+        *(path for path in _credential_paths(daemon_home) if os.path.lexists(path)),
     ]
     exposed = [
         str(path)
         for path in required_deny
-        if os.path.exists(path) and not _covers(denied, path)
+        if os.path.lexists(path) and not _covers(denied, path)
     ]
     if exposed:
         raise EngineRefused(

@@ -276,7 +276,7 @@ which kinds and updates Grok sends.
 A line without `Edit` or `Write` runs under `dromon-reader`, and one with either runs
 under `dromon-writer`. Dromon writes both into its Grok home's `sandbox.toml` when that
 file is missing. The following paths are placeholders for the daemon home and Git
-directories.
+directories. This example assumes every listed credential path exists.
 
 ```toml
 [profiles.dromon-reader]
@@ -309,8 +309,13 @@ the built-in `read-only` base denies every write to the workspace. The profile n
 directories share one definition of each, whose entries must cover every one of their
 Git directory and every protected directory by its real path. Dromon writes the file
 for the first line only. If a profile already exists, refusal advice lists values to
-add to its arrays and says to preserve the other profile tables. If a profile is
-missing, the advice gives its complete table. For a linked worktree, the `.git` pointer
+add to its arrays and says to leave other tables and entries as they are. If a profile
+is missing, the advice gives its complete table. A new profile includes only credential
+paths that exist when the file is written. If one is created later, the next turn is
+refused and its refusal advice names the path. A credential path that is a symbolic
+link is denied by its own path under the daemon home. **Not verified.** Whether Grok
+matches a deny entry through a symbolic link. Writer lines do not commit, so their Git
+directories remain read-only. For a linked worktree, the `.git` pointer
 file and `commondir` file cannot be held as profile entries. A writer could rewrite a
 pointer during a turn. The next turn resolves it again and refuses unless the resulting
 Git directories are already held read-only. Between the check and that next turn, the

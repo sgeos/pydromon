@@ -617,7 +617,11 @@ def test_an_entry_that_loads_more_is_refused_unless_an_empty_folder(
     (entry / "invented.md").unlink()
     entry.rmdir()
     entry.write_text("")
-    check_home(grok_home, tmp_path / "etc")
+    if name == "hooks-paths":
+        check_home(grok_home, tmp_path / "etc")
+    else:
+        with pytest.raises(EngineRefused, match=f"holds {name}"):
+            check_home(grok_home, tmp_path / "etc")
     entry.write_text("content")
     with pytest.raises(EngineRefused, match=f"holds {name}"):
         check_home(grok_home, tmp_path / "etc")
@@ -659,6 +663,24 @@ def test_installed_plugins_refuses_a_lock_symlink(tmp_path: Path) -> None:
     target.write_text("")
     (plugins / "registry.lock").symlink_to(target)
     with pytest.raises(EngineRefused, match="holds installed-plugins"):
+        check_home(grok_home, tmp_path / "etc")
+
+
+def test_failure_to_lstat_a_refused_entry_refuses_the_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, grok_home = prepared(tmp_path)
+    entry = grok_home / "installed-plugins"
+    entry.mkdir()
+    original_lstat = Path.lstat
+
+    def denied_lstat(path: Path) -> os.stat_result:
+        if path == entry:
+            raise PermissionError("inspection denied")
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", denied_lstat)
+    with pytest.raises(EngineRefused, match="cannot inspect Grok home entry"):
         check_home(grok_home, tmp_path / "etc")
 
 
@@ -795,6 +817,7 @@ def test_a_missing_profile_is_refused_with_the_table_to_add(tmp_path: Path) -> N
     workspace = tmp_path / "work"
     (workspace / ".dromon").mkdir(parents=True)
     home = tmp_path / "home"
+    (operator_home(home) / ".ssh").mkdir(parents=True)
     with pytest.raises(EngineRefused) as raised:
         check_profile(
             LineConfig(),
@@ -809,7 +832,8 @@ def test_a_missing_profile_is_refused_with_the_table_to_add(tmp_path: Path) -> N
     assert str(home / HOME_DIR / "sandbox.toml") in message
     assert f"[profiles.{READER_PROFILE}]" in message
     assert 'extends = "read-only"' in message and '".dromon"' in message
-    assert "operator-home/.ssh" in message and "~/" not in message
+    assert "operator-home/.ssh" in message and "operator-home/.aws" not in message
+    assert "~/" not in message
 
 
 def test_a_missing_credential_path_does_not_refuse_a_profile(tmp_path: Path) -> None:
@@ -844,6 +868,47 @@ def test_an_existing_credential_path_must_be_denied(tmp_path: Path) -> None:
         )
 
 
+def test_credentials_created_later_are_named_in_refusal_advice(tmp_path: Path) -> None:
+    workspace = (tmp_path / "work").resolve()
+    state = workspace / ".dromon"
+    state.mkdir(parents=True)
+    home = tmp_path / "home"
+    daemon_home = operator_home(home)
+    profile_file = home / HOME_DIR / "sandbox.toml"
+    profile_file.parent.mkdir(parents=True)
+    profile_file.write_text(
+        grok_module.profile_snippet(READER_PROFILE, workspace, (state,), daemon_home)
+    )
+    credential = daemon_home / ".cargo" / "credentials.toml"
+    credential.parent.mkdir(parents=True)
+    credential.write_text("token = 'placeholder'\n")
+    with pytest.raises(EngineRefused) as raised:
+        check_profile(
+            LineConfig(), workspace, (state,), home, home / HOME_DIR, daemon_home
+        )
+    message = str(raised.value)
+    assert str(credential) in message
+    assert str(credential) in message.split("Required deny entries are ", 1)[1]
+
+
+def test_a_symlinked_credential_is_denied_by_its_own_path(tmp_path: Path) -> None:
+    workspace = (tmp_path / "work").resolve()
+    state = workspace / ".dromon"
+    state.mkdir(parents=True)
+    home = tmp_path / "home"
+    daemon_home = operator_home(home)
+    ssh = daemon_home / ".ssh"
+    ssh.parent.mkdir(parents=True)
+    target = tmp_path / "external-ssh"
+    target.mkdir()
+    ssh.symlink_to(target)
+    snippet = grok_module.profile_snippet(
+        READER_PROFILE, workspace, (state,), daemon_home
+    )
+    assert str(ssh) in snippet
+    assert str(target) not in snippet
+
+
 def test_profile_does_not_deny_unverified_grok_or_claude_auth_paths(
     tmp_path: Path,
 ) -> None:
@@ -876,8 +941,11 @@ def test_an_existing_profile_gets_additive_advice_and_keeps_other_tables(
             operator_home(home),
         )
     message = str(raised.value)
-    assert "preserve other profile tables" in message
+    assert "leaving every other profile table and entry as it is" in message
     assert "Required deny entries" in message
+    assert "required read_only entries are []" in message
+    assert "Remove unsupported keys" not in message
+    assert "Set extends" not in message
     assert f"\n[profiles.{READER_PROFILE}]" not in message
     assert "\n[profiles.other-project]" not in message
 
@@ -911,7 +979,7 @@ def test_an_unsafe_reader_profile_is_refused(
     (workspace / ".dromon").mkdir(parents=True)
     home = tmp_path / "home"
     write_reader(home, table)
-    with pytest.raises(EngineRefused, match=reason):
+    with pytest.raises(EngineRefused, match=reason) as raised:
         check_profile(
             LineConfig(),
             workspace,
@@ -920,6 +988,13 @@ def test_an_unsafe_reader_profile_is_refused(
             home / HOME_DIR,
             operator_home(home),
         )
+    if reason.startswith("extends"):
+        assert "Set extends to 'read-only'" in str(raised.value)
+    elif "read_write" in table or "later =" in table:
+        assert "Remove unsupported keys from this profile" in str(raised.value)
+    else:
+        assert "Remove unsupported keys" not in str(raised.value)
+        assert "Set extends" not in str(raised.value)
 
 
 def test_a_writer_must_keep_git_read_only(tmp_path: Path) -> None:
