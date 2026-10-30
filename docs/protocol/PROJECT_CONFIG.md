@@ -339,12 +339,31 @@ git_ssh = true
   daemon's, and shows the socket, the files and the lines given them. Refused are an
   `inherit` agent when the daemon's environment has no `SSH_AUTH_SOCK`, a socket path
   that does not exist, is not a socket, belongs to another user or is longer than 103
-  bytes, a `known_hosts` that is missing, is not UTF-8 or holds no plain entry with a
-  key for `github.com`, and a public key file that holds a private key or anything
-  but one public key line. Each file must be a regular file of the operator's user
-  that neither its group nor others may write. A wildcard, a negated name and a line
-  marked `@revoked` or `@cert-authority` pin nothing, and a hashed name counts when it
-  hashes `github.com`. Any of the three inside a directory Dromon protects is refused,
+  bytes, a socket in a directory that belongs to neither the operator nor root or
+  that its group or others may write, a `known_hosts` that is missing, is not UTF-8
+  or holds no plain entry with a well-formed key for `github.com`, and a public key
+  file that holds a private key or anything but one well-formed public key line.
+  Another user who may write the socket's directory could put a socket of their own
+  in its place after the check. A sticky directory such as `/tmp` is refused as
+  well, so that the rule stays one rule, and `ssh-agent` and the macOS launchd agent
+  both make a private directory for their socket. Each file must be a regular file
+  of the operator's user that neither its group nor others may write. A wildcard, a
+  line whose host list holds any negated pattern, and a line marked `@revoked` or
+  `@cert-authority` pin nothing, and a hashed name counts when it hashes
+  `github.com`. A negated pattern voids its whole line, as `ssh-keygen -F` reports
+  for `!github.com,github.com`, which errs toward refusing.
+- **Well-formed keys.** A key's base64 must decode to the SSH wire form, a
+  length-prefixed type string followed by the key data, whose type string equals the
+  key type the line names and whose data has that type's shape with nothing after
+  it. The types accepted are `ssh-ed25519`, `sk-ssh-ed25519@openssh.com`,
+  `ecdsa-sha2-nistp256`, `ecdsa-sha2-nistp384`, `ecdsa-sha2-nistp521`,
+  `sk-ecdsa-sha2-nistp256@openssh.com` and `ssh-rsa`. **Inference from the
+  `ssh_config` manual page's default `HostKeyAlgorithms`.** The certificate types
+  are left out, since they pin a host only under `@cert-authority`, and so is
+  `ssh-dss`, which OpenSSH no longer offers by default. The check proves that a
+  well-formed key is pinned, and never that the key is GitHub's. The operator must
+  compare the fingerprints, as `ssh-keygen -lf` prints them, with the ones GitHub
+  publishes before starting the daemon. Any of the three inside a directory Dromon protects is refused,
   since an enabled sandbox denies it. No path may hold a control character, a quote, a
   backslash, `$` or `%`, which ssh would expand or read as part of its option. No
   host key is written into Dromon's code.
@@ -358,10 +377,28 @@ git_ssh = true
 - **Engines.** One function, `dromon.gitssh.environment`, gives the variable to every
   adapter. Claude Code, Grok, Pi, Cursor Agent and Antigravity receive it in their
   engine's environment, and Claude Code's launcher passes only Dromon's value, never
-  one in the daemon's own environment. Codex receives it through
+  one in the daemon's own environment. **Fact, read from the pinned Agent SDK
+  0.2.174.** Its subprocess transport builds the engine's environment from the
+  daemon's own, then its entry point variable, then `options.env`, so `options.env`
+  wins. The adapter sets the relayed name in `options.env` for every line, empty for
+  a line without the option, so a value of that name in the daemon's environment
+  never wins, and the launcher's filter drops an empty one. Codex receives it through
   `shell_environment_policy.set`, as the line's process mark does, so it reaches the
   commands Codex runs and not Codex itself. Pi lines take no built-in tool, so a Pi
   line has no shell command to use it.
+- **Changes between turns.** The daemon records the SHA-256 digest of both files as
+  it checks them at start. Before each turn of a line given the option, before its
+  engine is built or a prompt sent, it reads both files again. If either differs
+  from its digest, or is no longer a regular file of the operator's that no one else
+  may write, the turn is refused, the line is held, and an operator is asked, in a
+  question that names the file and never its contents. Answering resumes the line,
+  and its next turn is checked again, so the operator restores the file first or
+  restarts the daemon to accept it. A line whose sandbox is disabled runs as the
+  operator's user and can do anything that user can, including changing either
+  file between two checks and restoring it before the next. The digest check
+  therefore detects tampering at a turn's start and does not prevent it. Keep both
+  files outside every line's writable directories, such as its worktree, its home
+  and any directory its sandbox allows writing.
 - **Restart.** The socket is resolved once, at start. A reload that changes the table
   or the lines that set `git_ssh` is refused, and an agent restarted on another socket
   needs a daemon restart.

@@ -1047,7 +1047,9 @@ def test_a_message_counts_its_tool_calls_by_block_and_by_stop_reason() -> None:
     assert tool_calls_in({"content": "not a list"}) == 0
 
 
-GIT_SSH = GitSshAccess("/run/agent.sock", "/keys/known_hosts", "/keys/deploy.pub")
+GIT_SSH = GitSshAccess(
+    "/run/agent.sock", "/keys/known_hosts", "/keys/deploy.pub", "0" * 64, "0" * 64
+)
 """A resolved ``[git_ssh]`` agent, which no test here connects to."""
 
 

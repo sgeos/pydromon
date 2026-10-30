@@ -1838,7 +1838,9 @@ def test_extension_methods_are_read_with_or_without_the_prefix() -> None:
     assert grok_module.extension_method("session/update") == "session/update"
 
 
-GIT_SSH = GitSshAccess("/run/agent.sock", "/keys/known_hosts", "/keys/deploy.pub")
+GIT_SSH = GitSshAccess(
+    "/run/agent.sock", "/keys/known_hosts", "/keys/deploy.pub", "0" * 64, "0" * 64
+)
 """A resolved ``[git_ssh]`` agent, which no test here connects to."""
 
 

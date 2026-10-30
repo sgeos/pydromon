@@ -2614,6 +2614,7 @@ def run(
             )
             scheduler.record_walk_gap(launcher.walk_gap())
             scheduler.set_disclosure_terms(terms)
+            scheduler.set_git_ssh(line_git_ssh)
             scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
             check_lines_sandboxed(config, log, scheduler)
             check_roles(scheduler, log, config)

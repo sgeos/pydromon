@@ -696,7 +696,9 @@ def test_priority_mail_ends_the_turn_at_the_tool_result_and_not_the_text(
     assert server.stops == 1
 
 
-GIT_SSH = GitSshAccess("/run/agent.sock", "/keys/known_hosts", "/keys/deploy.pub")
+GIT_SSH = GitSshAccess(
+    "/run/agent.sock", "/keys/known_hosts", "/keys/deploy.pub", "0" * 64, "0" * 64
+)
 """A resolved ``[git_ssh]`` agent, which no test here connects to."""
 
 

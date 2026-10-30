@@ -16,10 +16,18 @@ All notable changes are recorded here. The format follows
   from one function, and on Claude Code with an enabled sandbox, the socket and
   `github.com` allowed and both files denied to writes. Never a key file, and never
   the operator's home. The daemon and `dromon config` refuse a missing or foreign
-  socket, an inherited agent without `SSH_AUTH_SOCK`, and a `known_hosts` without a
-  `github.com` key, and a reload may not change the option. Whether ssh can reach
-  GitHub through Claude Code's sandbox proxy is not yet known. Required by the
-  operator on 2026-10-29.
+  socket, a socket in a directory another user may write, an inherited agent without
+  `SSH_AUTH_SOCK`, and a `known_hosts` without a well-formed `github.com` key of an
+  accepted type, and a reload may not change the option. Each key is parsed as an
+  SSH public key, whose own type must match its line's, and a host line with any
+  negated pattern pins nothing. The daemon records the SHA-256 digest of both files
+  at start and checks them before each turn of a line given the option, and a change
+  refuses the turn, holds the line and asks an operator, naming the file and never
+  its contents. That detects tampering at a turn's start and does not prevent it.
+  Observed on 2026-10-29, ssh did not leave an enabled Claude Code sandbox, so the
+  option is inferred to work only for a line whose sandbox is disabled. Required by
+  the operator on 2026-10-29, with review findings M1, M2, L1, L2, L3 and L5 of the
+  same day.
 - Compaction now withdraws a still-pending wake scheduled by `compact_session` whether
   the engine made the compaction itself or a turn made it at Dromon's request, and a
   compaction that reports no size withdraws the daemon's own pending context-warning

@@ -6,6 +6,7 @@ line sends travels the same path as one sent by a model.
 
 import asyncio
 import gc
+import hashlib
 import re
 import threading
 from collections.abc import Callable, Coroutine, Iterator, Sequence
@@ -21,6 +22,7 @@ from dromon.activity import ActivityKind
 from dromon.driver import Driver, DriverError, Event, Strategy
 from dromon.engine import ClaudeCodeLine, EnginePlanLimit, TurnReport
 from dromon.eventlog import EventLog, read_entries
+from dromon.gitssh import GitSshAccess
 from dromon.lineconfig import ConfigError, LineConfig, ToolPolicy, encode_config
 from dromon.overrides import OverrideError
 from dromon.model import (
@@ -728,6 +730,57 @@ def test_a_plan_limit_holds_the_line_until_operator_release(
     assert question_id is not None
     assert "reset time tomorrow" in target.log.state.messages[question_id].body
     assert len(target.engines["alpha"].prompts) == 1
+
+
+def test_a_changed_git_ssh_file_refuses_the_turn_and_holds_the_line(
+    make_world: MakeWorld, tmp_path: Path
+) -> None:
+    """Review of 2026-10-29, M1. A line whose sandbox is disabled could rewrite the
+    pinned host keys for every line given the option, so each turn first compares
+    both files with the digests taken at load. A change refuses the turn before any
+    engine runs, holds the line and asks an operator, naming the file and never its
+    contents. Answering resumes the line, whose next turn is checked again."""
+    hosts, key = tmp_path / "known_hosts", tmp_path / "deploy.pub"
+    hosts.write_text("pinned\n")
+    key.write_text("key\n")
+    for file in (hosts, key):
+        file.chmod(0o644)
+    access = GitSshAccess(
+        "/run/agent.sock",
+        str(hosts),
+        str(key),
+        hashlib.sha256(hosts.read_bytes()).hexdigest(),
+        hashlib.sha256(key.read_bytes()).hexdigest(),
+    )
+    target = make_world({"alpha": [[], [], [], []]})
+    target.scheduler.set_git_ssh({"alpha": access})
+    run(target, send(target, "alpha", "hello"))
+    assert len(target.engines["alpha"].prompts) == 1
+    hosts.write_text("swapped-contents\n")
+    run(target, send(target, "alpha", "again"))
+    assert len(target.engines["alpha"].prompts) == 1
+    question_id = target.log.state.lines["alpha"].held_by
+    assert question_id is not None
+    body = target.log.state.messages[question_id].body
+    assert f"the git_ssh file {hosts} changed" in body
+    assert "swapped-contents" not in body
+    ending = activity_of(target.scheduler, "alpha")[-1]
+    assert ending == (
+        ActivityKind.TURN_ENDED,
+        f"held: the line {body.split('which ', 1)[1].split('. Its mail', 1)[0]}",
+    )
+    # Resumed with the file still changed, the next turn is refused again.
+    target.scheduler.send(ANA, LineAddress("alpha"), "resume", reply_to=question_id)
+    run(target, send(target, "alpha", "still"))
+    assert len(target.engines["alpha"].prompts) == 1
+    again = target.log.state.lines["alpha"].held_by
+    assert again is not None and again != question_id
+    # Restored, the line runs once it is resumed.
+    hosts.write_text("pinned\n")
+    target.scheduler.send(ANA, LineAddress("alpha"), "resume", reply_to=again)
+    run(target, send(target, "alpha", "restored"))
+    assert len(target.engines["alpha"].prompts) > 1
+    assert target.log.state.lines["alpha"].held_by is None
 
 
 def test_an_open_question_never_stops_its_line(make_world: MakeWorld) -> None:

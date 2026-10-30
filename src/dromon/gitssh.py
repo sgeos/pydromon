@@ -18,7 +18,12 @@ every key it holds, for any host and repository those keys reach, and can run
 ``ssh`` with options of its own, so ``GIT_SSH_COMMAND`` narrows what ``git`` does and
 not what a line can do. An agent that holds only a deploy key narrows the reach to
 that repository. The option grants a capability and lifts no rule, so a project's
-own rules that forbid a line to push still apply.
+own rules that forbid a line to push still apply. A line whose sandbox is disabled
+runs as the operator and could rewrite either file, so ``changed`` compares both with
+the digests taken at load before each of its turns, which detects a change at a
+turn's start and prevents none. The key checks prove a well-formed key is pinned,
+never that it is GitHub's, so the operator compares its fingerprints with GitHub's
+published ones.
 
 Observed on 2026-10-29. Inside an enabled Claude Code sandbox ``ssh`` could not
 resolve ``github.com``, and a tunnel through the sandbox's proxy was refused for ports
@@ -62,7 +67,27 @@ UNSAFE: Final = re.compile(r"[\x00-\x1f\x7f\"'\\$%]")
 """Characters refused in every path. ``ssh`` expands ``%`` tokens and ``${NAME}``
 in these options, and reads quotes and backslashes in them, so none can be written
 safely, and a control character could end the option."""
-KEY_TYPE: Final = re.compile(r"(ssh-|ecdsa-sha2-|sk-ssh-|sk-ecdsa-)[a-z0-9@.-]+")
+KEY_TYPES: Final = frozenset(
+    {
+        "ssh-ed25519",
+        "sk-ssh-ed25519@openssh.com",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
+        "sk-ecdsa-sha2-nistp256@openssh.com",
+        "ssh-rsa",
+    }
+)
+"""The key types accepted in ``known_hosts`` and in the public key file. **Review
+of 2026-10-29, M2 and L2.** Inference from the ``ssh_config`` manual page's default
+``HostKeyAlgorithms``, without the certificate types, which pin a host only under a
+``@cert-authority`` line, and without ``ssh-dss``, which OpenSSH no longer offers by
+default. The signature names ``rsa-sha2-256`` and ``rsa-sha2-512`` use ``ssh-rsa``
+keys."""
+ECDSA_POINT_BYTES: Final = {"nistp256": 65, "nistp384": 97, "nistp521": 133}
+"""The length of an uncompressed point on each curve, its ``0x04`` byte and both
+coordinates."""
+MAX_BLOB_FIELDS: Final = 8
 
 
 class GitSshError(ValueError):
@@ -88,11 +113,14 @@ class GitSshConfig:
 
 @dataclass(frozen=True, slots=True)
 class GitSshAccess:
-    """A ``GitSshConfig`` resolved and checked at load, as real absolute paths."""
+    """A ``GitSshConfig`` resolved and checked at load, as real absolute paths, with
+    the SHA-256 digest of each file's contents as they were checked."""
 
     socket: str
     known_hosts: str
     public_key: str
+    known_hosts_sha256: str
+    public_key_sha256: str
 
 
 def _path_text(value: object, key: str) -> str:
@@ -179,7 +207,36 @@ def _socket(config: GitSshConfig, environment: Mapping[str, str]) -> str:
             f"the agent socket {given!r} belongs to another user, not the operator",
             key,
         )
+    _socket_directory(real, given, key)
     return real
+
+
+def _socket_directory(real: str, given: str, key: str) -> None:
+    """Refuse a socket whose directory another user could change. **Review of
+    2026-10-29, L5.** Another user who may write the directory could remove the
+    socket and bind one of their own in its place after the check, and the line
+    would then ask that user's agent to sign. A directory of the operator's or of
+    root, writable by neither its group nor others, rules that out. A sticky
+    directory such as ``/tmp`` is refused too, though the sticky bit would keep
+    others from removing the operator's socket, so that the rule stays one rule.
+    ``ssh-agent`` and macOS's launchd both make a private directory for theirs."""
+    directory = os.path.dirname(real)
+    try:
+        found = os.stat(directory)
+    except OSError as error:
+        raise GitSshError(
+            f"the directory of the agent socket {given!r} cannot be read: {error}",
+            key,
+        ) from error
+    if found.st_uid not in (os.getuid(), 0) or found.st_mode & (
+        stat.S_IWGRP | stat.S_IWOTH
+    ):
+        raise GitSshError(
+            f"the agent socket {given!r} is in {directory!r}, which another user"
+            " may write. Name a socket in a directory that only the operator may"
+            " write",
+            key,
+        )
 
 
 def _operator_file(path: str, key: str, limit: int) -> tuple[str, bytes]:
@@ -222,21 +279,76 @@ def _hashed_match(pattern: str, host: str) -> bool:
     return hmac.compare_digest(digest, expected)
 
 
+def _blob_fields(blob: bytes) -> list[bytes] | None:
+    """The length-prefixed strings a key blob is made of, or ``None`` when it is not
+    a whole number of them, or holds more than ``MAX_BLOB_FIELDS``."""
+    fields: list[bytes] = []
+    at = 0
+    for _ in range(MAX_BLOB_FIELDS):
+        if at == len(blob):
+            return fields
+        if at + 4 > len(blob):
+            return None
+        size = int.from_bytes(blob[at : at + 4], "big")
+        at += 4
+        if size > len(blob) - at:
+            return None
+        fields.append(blob[at : at + size])
+        at += size
+    return fields if at == len(blob) else None
+
+
+def well_formed(key_type: str, encoded: str) -> bool:
+    """Whether ``encoded`` is the base64 of a public key blob of ``key_type``, one of
+    ``KEY_TYPES``, whose own type string is ``key_type`` and whose key data has the
+    shape that type gives it. **Review of 2026-10-29, M2.** This proves a
+    well-formed key, never that it is GitHub's."""
+    if key_type not in KEY_TYPES:
+        return False
+    try:
+        blob = base64.b64decode(encoded, validate=True)
+    except binascii.Error:
+        return False
+    fields = _blob_fields(blob)
+    if not fields or fields[0] != key_type.encode("ascii"):
+        return False
+    data = fields[1:]
+    match key_type:
+        case "ssh-ed25519":
+            return len(data) == 1 and len(data[0]) == 32
+        case "sk-ssh-ed25519@openssh.com":
+            return len(data) == 2 and len(data[0]) == 32 and len(data[1]) > 0
+        case "ssh-rsa":
+            return len(data) == 2 and all(len(part) > 0 for part in data)
+        case _:
+            curve = key_type.removeprefix("sk-").split("@")[0].rsplit("-", 1)[1]
+            count = 3 if key_type.startswith("sk-") else 2
+            return (
+                len(data) == count
+                and data[0] == curve.encode("ascii")
+                and len(data[1]) == ECDSA_POINT_BYTES[curve]
+                and data[1][0] == 4
+                and (count == 2 or len(data[2]) > 0)
+            )
+
+
 def pins(text: str, host: str = HOST) -> bool:
-    """Whether ``known_hosts`` text holds a plain entry with a key for ``host``.
-    A marked line, such as ``@revoked`` or ``@cert-authority``, a negated name and
-    a wildcard pattern pin nothing, so they do not count."""
+    """Whether ``known_hosts`` text holds a plain entry with a well-formed key for
+    ``host``. A marked line, such as ``@revoked`` or ``@cert-authority``, and a
+    wildcard pattern pin nothing, so they do not count. **Review of 2026-10-29,
+    L1.** Nor does a line whose host list holds any negated pattern, which agrees
+    with ``ssh-keygen -F`` as the review observed it for ``!github.com,github.com``,
+    and errs toward refusing."""
     for line in text.splitlines()[:65536]:
         fields = line.split()
         if len(fields) < 3 or fields[0].startswith(("#", "@")):
             continue
-        if KEY_TYPE.fullmatch(fields[1]) is None:
+        if not well_formed(fields[1], fields[2]):
             continue
-        try:
-            base64.b64decode(fields[2], validate=True)
-        except binascii.Error:
+        patterns = fields[0].split(",")
+        if any(pattern.startswith("!") for pattern in patterns):
             continue
-        for pattern in fields[0].split(","):
+        for pattern in patterns:
             if pattern.lower() == host or _hashed_match(pattern, host):
                 return True
     return False
@@ -255,13 +367,11 @@ def _public_key(contents: bytes, key: str) -> None:
         )
     lines = [line for line in text.splitlines() if line.strip()]
     fields = lines[0].split() if len(lines) == 1 else []
-    if len(fields) < 2 or KEY_TYPE.fullmatch(fields[0]) is None:
-        raise GitSshError(f"{key} must hold exactly one public key line", key)
-    try:
-        base64.b64decode(fields[1], validate=True)
-    except binascii.Error as error:
-        raise GitSshError(f"{key} must hold exactly one public key line", key) from (
-            error
+    if len(fields) < 2 or not well_formed(fields[0], fields[1]):
+        raise GitSshError(
+            f"{key} must hold exactly one well-formed public key line, of a type in"
+            f" {sorted(KEY_TYPES)}",
+            key,
         )
 
 
@@ -308,7 +418,45 @@ def resolve(
             raise GitSshError(
                 f"{key} {path!r} is inside {directory}, which Dromon protects", key
             )
-    return GitSshAccess(socket=socket, known_hosts=known_hosts, public_key=public_key)
+    return GitSshAccess(
+        socket=socket,
+        known_hosts=known_hosts,
+        public_key=public_key,
+        known_hosts_sha256=hashlib.sha256(hosts).hexdigest(),
+        public_key_sha256=hashlib.sha256(contents).hexdigest(),
+    )
+
+
+def changed(access: GitSshAccess) -> str | None:
+    """The first of the two files whose contents differ from those checked at load,
+    or that is now missing, unreadable, not the operator's or writable by another,
+    or ``None`` when both are as they were. **Review of 2026-10-29, M1.** A line
+    whose sandbox is disabled runs as the operator and could rewrite either file,
+    pinning ``github.com`` to another key for every line given the option. The
+    scheduler calls this before each turn of such a line. It detects a change at a
+    turn's start and prevents none, since a line can change a file and restore it
+    between two checks."""
+    for key, path, digest, limit in (
+        (
+            "git_ssh.known_hosts",
+            access.known_hosts,
+            access.known_hosts_sha256,
+            MAX_KNOWN_HOSTS_BYTES,
+        ),
+        (
+            "git_ssh.public_key",
+            access.public_key,
+            access.public_key_sha256,
+            MAX_PUBLIC_KEY_BYTES,
+        ),
+    ):
+        try:
+            _, contents = _operator_file(path, key, limit)
+        except GitSshError:
+            return path
+        if not hmac.compare_digest(hashlib.sha256(contents).hexdigest(), digest):
+            return path
+    return None
 
 
 def _option(name: str, path: str) -> str:

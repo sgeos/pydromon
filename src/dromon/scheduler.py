@@ -179,6 +179,7 @@ from dromon import proposals as proposal_store
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, SandboxError, effective, merge, parse_sandbox
+from dromon import gitssh
 from dromon.gitssh import GitSshAccess, sandbox_layer, unreadable
 from dromon.settings import SettingsConfig
 from dromon.processes import (
@@ -914,6 +915,12 @@ class LineToolRefused(ValueError):
 
 class TurnRefused(RuntimeError):
     """The scheduler refused to start a line's turn, for the reason it gives."""
+
+
+class GitSshChanged(TurnRefused):
+    """A file of the ``[git_ssh]`` table changed since the daemon checked it at
+    start, so the line's turn is refused and the line held. The message names the
+    file and never its contents."""
 
 
 MAX_REST_SECONDS: Final = 60.0
@@ -1653,6 +1660,8 @@ class Scheduler:
         self._lease_ttl = DEFAULT_LEASE_TTL_SECONDS
         self._leases: dict[str, Lease] = {}
         """Held leases by name. In memory only, so a restart drops them."""
+        self._git_ssh: dict[str, GitSshAccess] = {}
+        """The ``[git_ssh]`` access of each line given it, checked before its turns."""
         self.limits = limits
         self.wake_every_ticks = wake_every_ticks
         self._line_limits: dict[str, Limits] = {}
@@ -1879,6 +1888,29 @@ class Scheduler:
     def ensure_operator(self, operator_id: str) -> None:
         if operator_id not in self._log.state.operators:
             self._log.append(OperatorRegistered(operator_id))
+
+    def set_git_ssh(self, access: Mapping[str, GitSshAccess]) -> None:
+        """Replace the lines whose ``[git_ssh]`` files each turn checks first."""
+        self._git_ssh = dict(access)
+
+    def _check_git_ssh(self, line_id: str) -> None:
+        """Refuse ``line_id``'s turn with ``GitSshChanged`` when a file of its
+        ``[git_ssh]`` access changed since the daemon checked it at start. **Review
+        of 2026-10-29, M1.** The check runs before the engine is built or a prompt
+        sent, so a line never runs a turn against a host key or a public key the
+        operator did not check. It detects a change at a turn's start and prevents
+        none, as ``dromon.gitssh.changed`` says."""
+        access = self._git_ssh.get(line_id)
+        if access is None:
+            return
+        path = gitssh.changed(access)
+        if path is not None:
+            raise GitSshChanged(
+                f"was refused a turn because the git_ssh file {path} changed since"
+                " the daemon checked it at start, or can no longer be read as the"
+                " operator's own. Restore the file, or restart the daemon so that"
+                " it checks the file again, before resuming the line"
+            )
 
     def set_disclosure_terms(self, terms: Sequence[str]) -> None:
         """Replace the disclosure terms the tools check, already case folded."""
@@ -6465,6 +6497,7 @@ class Scheduler:
             if refused is not None:
                 raise refused
             await self._check_walk(line_id)
+            self._check_git_ssh(line_id)
             engine = self.engine_for(line_id)
             self._start_token(line_id, engine)
             if compaction is not None:
@@ -6507,6 +6540,9 @@ class Scheduler:
                 ending = "interrupted by an operator"
             self._count_interrupted(line_id, engine)
             raise
+        except GitSshChanged as error:
+            self.hold(line_id, str(error))
+            ending = f"held: the line {error}"
         except EnginePlanLimit as error:
             if error.may_move_role:
                 self.plan_limit_reached(line_id, error)

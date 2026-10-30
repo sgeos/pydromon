@@ -30,12 +30,14 @@ from dromon.gitssh import (
     GitSshAccess,
     GitSshConfig,
     GitSshError,
+    changed,
     environment,
     parse_git_ssh,
     pins,
     resolve,
     sandbox_layer,
     ssh_command,
+    well_formed,
 )
 from dromon.lineconfig import LineConfig
 from dromon.paths import ProjectPaths, project_paths
@@ -43,7 +45,15 @@ from dromon.projectconfig import ConfigFileError, ProjectConfig, parse
 from dromon.sandbox import SandboxError, parse_sandbox
 from dromon.scheduler import LineSpec, engine_factory
 
-KEY_BLOB = base64.b64encode(b"\x00\x00\x00\x0bssh-ed25519" + bytes(36)).decode()
+
+def blob(*fields: bytes) -> str:
+    """The base64 of a key blob made of ``fields``, each length prefixed."""
+    return base64.b64encode(
+        b"".join(len(field).to_bytes(4, "big") + field for field in fields)
+    ).decode()
+
+
+KEY_BLOB = blob(b"ssh-ed25519", bytes(range(32)))
 """A key of the right shape, not GitHub's, whose keys stay out of the code."""
 HOSTS_LINE = f"{HOST} ssh-ed25519 {KEY_BLOB}\n"
 PUBLIC_KEY = f"ssh-ed25519 {KEY_BLOB} deploy@example\n"
@@ -60,18 +70,29 @@ MODELS = {
 
 
 def fake_socket(
-    monkeypatch: pytest.MonkeyPatch, path: str, *, uid: int | None = None
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    *,
+    uid: int | None = None,
+    directory_mode: int = 0o700,
+    directory_uid: int | None = None,
 ) -> str:
     """Make ``os.stat`` in ``dromon.gitssh`` see a socket at ``path``, owned by
-    ``uid`` or the operator, and return its real path."""
+    ``uid`` or the operator, in a directory of ``directory_mode`` owned by
+    ``directory_uid`` or the operator, and return the socket's real path."""
     real = os.path.realpath(path)
     original: Callable[..., os.stat_result] = os.stat
     owner = os.getuid() if uid is None else uid
+    directory_owner = os.getuid() if directory_uid is None else directory_uid
 
     def fake(target: str | Path, *args: object, **kwargs: object) -> os.stat_result:
         if str(target) == real:
             return os.stat_result(
                 (stat.S_IFSOCK | 0o600, 0, 0, 1, owner, 0, 0, 0, 0, 0)
+            )
+        if str(target) == os.path.dirname(real):
+            return os.stat_result(
+                (stat.S_IFDIR | directory_mode, 0, 0, 1, directory_owner, 0, 0, 0, 0, 0)
             )
         return original(target, *args, **kwargs)
 
@@ -182,16 +203,23 @@ def test_the_file_places_a_refusal_on_its_key() -> None:
 # Resolution against the file system.
 
 
+def digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def test_both_socket_forms_resolve(files: Path, agent: str) -> None:
     named = resolve(config(agent), files, {})
     inherited = resolve(config(INHERIT), files, {"SSH_AUTH_SOCK": agent})
+    hosts, key = files / "ssh" / "known_hosts", files / "ssh" / "deploy.pub"
     assert (
         named
         == inherited
         == GitSshAccess(
             socket=agent,
-            known_hosts=os.path.realpath(files / "ssh" / "known_hosts"),
-            public_key=os.path.realpath(files / "ssh" / "deploy.pub"),
+            known_hosts=os.path.realpath(hosts),
+            public_key=os.path.realpath(key),
+            known_hosts_sha256=digest(hosts),
+            public_key_sha256=digest(key),
         )
     )
     absolute = GitSshConfig(
@@ -212,12 +240,19 @@ def test_an_inherited_agent_needs_the_daemons_socket(files: Path) -> None:
 
 
 def test_a_named_path_must_be_an_existing_socket_of_the_operator(
-    files: Path, monkeypatch: pytest.MonkeyPatch
+    files: Path, monkeypatch: pytest.MonkeyPatch, short_runtime: Path
 ) -> None:
+    # Pytest's own temporary paths can pass the socket length limit outside the
+    # agent sandbox, so the paths that must reach the later checks are kept short.
+    short = short_runtime.parent
+    missing, plain = short / "missing.sock", short / "plain"
+    plain.write_text("")
+    for path in (missing, plain):
+        assert len(os.path.realpath(path).encode()) <= gitssh.MAX_SOCKET_BYTES
     with pytest.raises(GitSshError, match="does not exist"):
-        resolve(config(str(files / "missing.sock")), files, {})
+        resolve(config(str(missing)), files, {})
     with pytest.raises(GitSshError, match="is not a socket"):
-        resolve(config(str(files / "ssh" / "known_hosts")), files, {})
+        resolve(config(str(plain)), files, {})
     other = fake_socket(monkeypatch, "/tmp/dromon-other.sock", uid=os.getuid() + 1)  # noqa: S108
     with pytest.raises(GitSshError, match="belongs to another user"):
         resolve(config(other), files, {})
@@ -225,9 +260,30 @@ def test_a_named_path_must_be_an_existing_socket_of_the_operator(
         resolve(config("/" + "s" * 103), files, {})
 
 
+def test_a_socket_in_a_directory_another_may_write_is_refused(
+    files: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of 2026-10-29, L5. Another user who may write the directory could put
+    a socket of their own in the socket's place after the check."""
+    path = "/run/dromon-test/agent.sock"
+    for mode, owner in (
+        (0o777 | stat.S_ISVTX, None),
+        (0o770, None),
+        (0o702, None),
+        (0o700, os.getuid() + 1),
+    ):
+        fake_socket(monkeypatch, path, directory_mode=mode, directory_uid=owner)
+        with pytest.raises(GitSshError, match="which another user may write"):
+            resolve(config(path), files, {})
+    for owner in (None, 0):
+        fake_socket(monkeypatch, path, directory_mode=0o755, directory_uid=owner)
+        assert resolve(config(path), files, {}).socket == os.path.realpath(path)
+
+
 @pytest.mark.socket
-def test_a_bound_socket_is_accepted(files: Path) -> None:
-    path = f"/tmp/dromon-test-bound-{os.getpid()}.sock"  # noqa: S108
+def test_a_bound_socket_is_accepted(files: Path, short_runtime: Path) -> None:
+    short_runtime.mkdir(mode=0o700)
+    path = str(short_runtime / "agent.sock")
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         server.bind(path)
@@ -246,6 +302,11 @@ def test_known_hosts_must_exist_and_pin_github(files: Path, agent: str) -> None:
         f"@revoked {HOST} ssh-ed25519 {KEY_BLOB}\n": "holds no key",
         f"# {HOST} ssh-ed25519 {KEY_BLOB}\n": "holds no key",
         f"{HOST} ssh-ed25519 not*base64\n": "holds no key",
+        f"{HOST} ssh-ed25519 AAAA\n": "holds no key",
+        f"{HOST} ssh-foo {blob(b'ssh-foo', bytes(32))}\n": "holds no key",
+        f"{HOST} ssh-rsa {KEY_BLOB}\n": "holds no key",
+        f"!{HOST},{HOST} ssh-ed25519 {KEY_BLOB}\n": "holds no key",
+        f"!gitlab.com,{HOST} ssh-ed25519 {KEY_BLOB}\n": "holds no key",
         f"{HOST}\n": "holds no key",
         f"gitlab.com ssh-ed25519 {KEY_BLOB}\n": "holds no key",
     }
@@ -280,10 +341,13 @@ def test_the_public_key_must_be_one_public_key(files: Path, agent: str) -> None:
     key = files / "ssh" / "deploy.pub"
     for text, message in {
         "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n": "holds a private key",
-        PUBLIC_KEY + PUBLIC_KEY: "exactly one public key line",
-        "": "exactly one public key line",
-        "ssh-ed25519\n": "exactly one public key line",
-        "ssh-ed25519 not*base64\n": "exactly one public key line",
+        PUBLIC_KEY + PUBLIC_KEY: "exactly one well-formed public key line",
+        "": "exactly one well-formed public key line",
+        "ssh-ed25519\n": "exactly one well-formed public key line",
+        "ssh-ed25519 not*base64\n": "exactly one well-formed public key line",
+        "ssh-ed25519 AAAA\n": "exactly one well-formed public key line",
+        f"ecdsa-sha2-nistp256 {KEY_BLOB}\n": "exactly one well-formed",
+        f"ssh-dss {blob(b'ssh-dss', b'p', b'q', b'g', b'y')}\n": "well-formed",
     }.items():
         key.write_text(text)
         with pytest.raises(GitSshError, match=message):
@@ -291,6 +355,88 @@ def test_the_public_key_must_be_one_public_key(files: Path, agent: str) -> None:
     key.write_bytes(b"\xff\xfe")
     with pytest.raises(GitSshError, match="not UTF-8"):
         resolve(config(agent), files, {})
+
+
+POINT = {
+    curve: b"\x04" + bytes(size - 1) for curve, size in gitssh.ECDSA_POINT_BYTES.items()
+}
+
+
+@pytest.mark.parametrize(
+    ("key_type", "fields"),
+    [
+        ("ssh-ed25519", [bytes(32)]),
+        ("sk-ssh-ed25519@openssh.com", [bytes(32), b"ssh:"]),
+        ("ssh-rsa", [b"\x01\x00\x01", b"\x00" + bytes(256)]),
+        ("ecdsa-sha2-nistp256", [b"nistp256", POINT["nistp256"]]),
+        ("ecdsa-sha2-nistp384", [b"nistp384", POINT["nistp384"]]),
+        ("ecdsa-sha2-nistp521", [b"nistp521", POINT["nistp521"]]),
+        (
+            "sk-ecdsa-sha2-nistp256@openssh.com",
+            [b"nistp256", POINT["nistp256"], b"ssh:"],
+        ),
+    ],
+)
+def test_each_accepted_key_type_parses_and_its_damage_is_refused(
+    key_type: str, fields: list[bytes]
+) -> None:
+    """Review of 2026-10-29, M2 and L2. The blob's own type must be the field's,
+    from the explicit set, with data of that type's shape and nothing after it."""
+    assert key_type in gitssh.KEY_TYPES
+    name = key_type.encode()
+    assert well_formed(key_type, blob(name, *fields))
+    assert not well_formed(key_type, blob(name, *fields[:-1]))
+    assert not well_formed(key_type, blob(name, *fields, b"extra"))
+    assert not well_formed(key_type, blob(name, *fields)[:-4])
+    other = next(iter(sorted(gitssh.KEY_TYPES - {key_type})))
+    assert not well_formed(other, blob(name, *fields))
+    assert not well_formed(key_type, blob(other.encode(), *fields))
+    raw = base64.b64decode(blob(name, *fields))
+    assert not well_formed(key_type, base64.b64encode(raw + b"\x00\x00").decode())
+
+
+def test_a_malformed_key_body_is_refused() -> None:
+    assert not well_formed("ssh-ed25519", "AAAA")
+    assert not well_formed("ssh-ed25519", blob(b"ssh-ed25519", bytes(31)))
+    assert not well_formed("ssh-rsa", blob(b"ssh-rsa", b"", b"n"))
+    assert not well_formed(
+        "ecdsa-sha2-nistp256",
+        blob(b"ecdsa-sha2-nistp256", b"nistp384", POINT["nistp256"]),
+    )
+    assert not well_formed(
+        "ecdsa-sha2-nistp256",
+        blob(b"ecdsa-sha2-nistp256", b"nistp256", b"\x02" + POINT["nistp256"][1:]),
+    )
+    assert not well_formed("ssh-foo", blob(b"ssh-foo", bytes(32)))
+    assert not well_formed(
+        "ssh-ed25519-cert-v01@openssh.com", blob(b"ssh-ed25519-cert-v01@openssh.com")
+    )
+    many = blob(b"ssh-ed25519", *([b"x"] * gitssh.MAX_BLOB_FIELDS))
+    assert not well_formed("ssh-ed25519", many)
+
+
+def test_a_change_to_either_file_after_load_is_detected(
+    files: Path, agent: str
+) -> None:
+    """Review of 2026-10-29, M1. The digests taken at load are compared before each
+    turn, and anything but the same contents of a file of the operator's counts."""
+    access = resolve(config(agent), files, {})
+    assert changed(access) is None
+    hosts, key = files / "ssh" / "known_hosts", files / "ssh" / "deploy.pub"
+    hosts.write_text(
+        HOSTS_LINE + f"{HOST} ssh-ed25519 {blob(b'ssh-ed25519', bytes(32))}\n"
+    )
+    assert changed(access) == access.known_hosts
+    hosts.write_text(HOSTS_LINE)
+    assert changed(access) is None
+    key.chmod(0o666)
+    assert changed(access) == access.public_key
+    key.chmod(0o644)
+    key.unlink()
+    assert changed(access) == access.public_key
+    key.write_text(PUBLIC_KEY)
+    key.chmod(0o644)
+    assert changed(access) is None
 
 
 def test_a_file_inside_a_protected_directory_is_refused(
@@ -309,6 +455,8 @@ def access_at(directory: Path, socket_path: str) -> GitSshAccess:
         socket=socket_path,
         known_hosts=str(directory / "known_hosts"),
         public_key=str(directory / "deploy.pub"),
+        known_hosts_sha256="0" * 64,
+        public_key_sha256="0" * 64,
     )
 
 
@@ -460,6 +608,32 @@ def test_a_claude_line_relays_its_command_past_the_launchers_filter(
     assert given.options().env[relayed] == ssh_command(access)
     assert plain.options().env[relayed] == ""
     assert COMMAND_VARIABLE not in given.options().env
+
+
+def test_the_relayed_name_in_the_daemons_environment_never_reaches_the_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of 2026-10-29, L3. **Fact, read from the pinned Agent SDK 0.2.174,**
+    ``SubprocessCLITransport.connect`` builds the engine's environment as the
+    daemon's ``os.environ``, then ``CLAUDE_CODE_ENTRYPOINT``, then
+    ``options.env``, so ``options.env`` wins over the daemon's own values. The
+    adapter sets the relayed name for every line, empty without the option, so a
+    relayed name the daemon's environment holds never wins. The merge is copied here
+    in the SDK's order, and the launcher's filter then sees what the engine would."""
+    relayed = launcher.relayed(COMMAND_VARIABLE)
+    monkeypatch.setenv(relayed, "ssh -i /operator/key")
+    monkeypatch.setenv(COMMAND_VARIABLE, "ssh -i /operator/key")
+    driver = Driver.for_model(MODELS["claude"], Strategy.SUBSCRIPTION)
+    access = access_at(Path("/keys"), "/run/agent.sock")
+    for git_ssh, expected in ((None, None), (access, ssh_command(access))):
+        line = ClaudeCodeLine(driver, tmp_path, git_ssh=git_ssh)
+        merged = {
+            **os.environ,
+            "CLAUDE_CODE_ENTRYPOINT": "sdk-py",
+            **line.options().env,
+        }
+        launcher.unrelayed(merged)
+        assert merged.get(COMMAND_VARIABLE) == expected
 
 
 def test_the_filter_renames_the_relayed_command_and_drops_the_daemons() -> None:

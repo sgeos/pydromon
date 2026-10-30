@@ -1242,7 +1242,9 @@ def test_a_finished_item_that_is_no_tool_is_not_a_safe_point(steered: Steered) -
     assert report.interrupted_for is None
 
 
-GIT_SSH = GitSshAccess("/run/agent.sock", "/keys/known_hosts", "/keys/deploy.pub")
+GIT_SSH = GitSshAccess(
+    "/run/agent.sock", "/keys/known_hosts", "/keys/deploy.pub", "0" * 64, "0" * 64
+)
 """A resolved ``[git_ssh]`` agent, which no test here connects to."""
 
 
