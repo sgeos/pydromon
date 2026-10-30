@@ -4,30 +4,34 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-28, federation, the environment allowlist and self-started turns
+## 2026-10-29, continuity across resets and handoffs
 
-**Done, merged in pull requests 65 to 68.**
+**Done, merged in pull requests 70 to 75.** The round 3 reports most often asked that a
+line's task survive an engine reset or a change of a role's owner.
 
-- **Environment.** Every engine starts from an allowlist instead of the daemon's whole
-  environment, and a `${NAME}` reference resolves only for a line the project file
-  grants it to. A turn that reports it is not signed in now fails.
-- **Federation.** Phases 1 and 2 deliver notes between daemons over Unix sockets and
-  over TLS 1.3 with pinned Ed25519 keys. External agents send through `dromon agent
-  send`, and a line's `recipients` bound whom it may mail.
-- **Report findings.** `check_disclosure`, task records, and notes when a turn ends with
-  tasks running or when a worktree's `HEAD` moved.
-- **Self-started turns.** A turn the engine begins at a task end is admitted as an
-  ordinary autonomous turn or interrupted, with refusal tests for each blocker.
+- **Standing brief.** `set_brief` records a line's task, decisions, artifacts and next
+  action, stamped and bounded. It leads the first turn of a new engine session.
+- **Handoff package.** Each item is marked as observed, reported, unknown or
+  unreadable. Where the former owner left no brief or journal entry, the gate comes
+  from its latest task record and the task from its latest local operator mail.
+- **Smaller requests.** Task-bound wakes, the turn-end commit kept across a restart,
+  `read_mail` on a line's own sent mail, spent compaction wakes withdrawn, a refusal
+  naming the field of a one-field call, and the turn count's scope stated.
+- **Operator fixes.** A hung test names itself after 300 seconds. `dromon config`
+  names the disclosure list. `line_status` gives the daemon's load time. A timed-out
+  client request says it may have taken effect. `DOGFOOD.md` matches the roles.
 
-**Checked live.** A variable set in the daemon was absent from a line's shell. Two
-scratch daemons exchanged a ping and its reply. Automatic failover moved a role from a
-Claude seat whose budget was set to zero to its Codex seat, which recorded recovery.
+**Found by review.** Naming every matching field of a call would have let one counted
+refusal answer several bits, so only a one-field call names its field.
 
-**Found by the reports.** The team's project file named no disclosure list, so no
-line's mail or report had been checked. It now does, and a check passed on a report.
+**Round 4 reports.** core was satisfied. engines was not, because its package showed
+every field unknown, which observed state now fills. review was not, asking for a key
+on `send_message`, which exists, so the open part is keys across a restart.
 
-**Not verified.** Grok has not run a turn. Claude Code's limit shapes are typed, not
-observed. The TLS transport has run only between daemons on one machine.
+**Not verified.** The inferred cause of the Pi test failure is not reproduced. The
+filled package has not been seen live, since no handoff has happened since it merged.
+Grok has not run a turn. Claude Code's limit shapes are typed, not observed. The TLS
+transport has run only between daemons on one machine.
 
 **For the operator.**
 1. Sign in to Dromon's Grok home with the command in `GROK.md`.

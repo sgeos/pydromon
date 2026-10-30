@@ -711,7 +711,9 @@ def _send(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         args["reply_to"] = arguments.reply_to
     if arguments.priority:
         args["priority"] = True
-    answer = _call(paths, "send", Operation.SEND, args)
+    answer = _call(
+        paths, "send", Operation.SEND, args, check_after_timeout="dromon sent"
+    )
     if isinstance(answer, int):
         return answer
     # The message id alone, as before priority mail, so that a script reading it
@@ -1563,15 +1565,34 @@ def _budget(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 
 
 def _call(
-    paths: ProjectPaths, command: str, operation: Operation, args: dict[str, object]
+    paths: ProjectPaths,
+    command: str,
+    operation: Operation,
+    args: dict[str, object],
+    *,
+    check_after_timeout: str | None = None,
 ) -> dict[str, object] | int:
-    """The result of one request, or the exit status that reports its failure."""
+    """The result of one request, or the exit status that reports its failure.
+
+    **Found on 2026-10-29.** ``dromon send`` timed out while the daemon was busy, yet
+    the message had been recorded, so a retry would have sent it twice. A timeout
+    therefore says that the request may have taken effect, and ``check_after_timeout``
+    names how to check before repeating it."""
     try:
         response = call(paths.socket, operation, args=args)
     except DaemonNotRunning:
         print(f"dromon {command}: not running for {paths.root}", file=sys.stderr)
         return exits.NOT_RUNNING
-    except (ProtocolError, TimeoutError, OSError) as error:
+    except TimeoutError as error:
+        print(
+            f"dromon {command}: {error}. The daemon may still have carried the"
+            " request out, so check before repeating it"
+            + (f", with {check_after_timeout}" if check_after_timeout else "")
+            + ".",
+            file=sys.stderr,
+        )
+        return exits.FAILURE
+    except (ProtocolError, OSError) as error:
         print(f"dromon {command}: {error}", file=sys.stderr)
         return exits.FAILURE
     if not response.ok or response.result is None:
