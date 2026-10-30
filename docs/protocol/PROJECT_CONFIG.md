@@ -382,9 +382,16 @@ git_ssh = true
   **Inference.** Git over SSH works only for a line whose Claude Code sandbox is
   disabled. Under an enabled sandbox, use HTTPS with a credential the operator
   provides instead. Dromon configures no proxy route.
-- **Unverified.** Whether Codex's and Grok's own sandboxes let a command connect to the
-  socket or reach the network is not known, and Codex's workspace profile is believed
-  to deny the network. No line has yet pushed over SSH through this option.
+- **Observed on 2026-10-29, outside a sandbox.** The `GIT_SSH_COMMAND` that
+  `dromon.gitssh` builds, run by `git ls-remote` with no `SSH_AUTH_SOCK` and a home
+  directory that does not exist, reached GitHub, verified its host key against a
+  `known_hosts` file built from GitHub's published keys, and stopped at public key
+  authentication for a throwaway key GitHub does not know. With an empty `known_hosts`
+  file the same command was refused for the unknown host key.
+- **Unverified.** Signing with a key the agent holds, since the operator's agent held
+  none during the test, and any push. Whether Codex's and Grok's own sandboxes let a
+  command connect to the socket or reach the network, and Codex's workspace profile is
+  believed to deny the network.
 
 ## Trust
 
