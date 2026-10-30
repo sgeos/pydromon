@@ -53,6 +53,7 @@ testpaths = ["tests"]
 markers = [
     "socket: binds a Unix domain socket",
     "live: calls the real engine on the operator's subscription",
+    "real_processes: gives a test's scheduler the operating system's process table",
 ]
 # Collection skips the state directory, which a line's sandbox denies outright, so a
 # line running the gate in its own project would otherwise fail to collect.

@@ -43,7 +43,7 @@ keys, duplicate keys and numbers are refused.
 | `claude_code_prompt` | Run a Claude Code line on Claude Code's own system prompt rather than an empty one. Omitted when false | `false` |
 | `project_settings` | Also load Claude Code's project setting source in the line's working directory, as [`SETTINGS.md`](SETTINGS.md) specifies. Refused on Codex and Grok lines. Omitted when false | `false` |
 | `plugins` | At most 16 distinct local plugin directories, each absolute or starting with `~/`, as the plugins section below specifies. Refused on Codex and Grok lines. Omitted when empty | none |
-| `instructions` | At most 16 distinct files, such as `CLAUDE.md`, whose text is appended to the system prompt at each turn. A relative path is resolved against the project root, whatever the line's `workdir`, and `~` against the home directory. Omitted when empty | none |
+| `instructions` | At most 16 distinct files, such as `CLAUDE.md`, whose text is appended to the system prompt at each turn. A relative path is resolved against the project root, whatever the line's `workdir`, and `~` against the home directory. A line whose `workdir` is a worktree of another branch reads the root's file for a relative path, so it names its own file by absolute path. Omitted when empty | none |
 | `workdir` | The directory the line's engine runs in, as the working directory section below specifies. Omitted when unset | the project root |
 | `workdir_access` | `write` or `read`; read confines the working directory to reads, with the scratch exception below | `write` |
 | `keep_session` | Keep a Claude Code or Codex line's engine connected between turns, as the kept sessions section below specifies. Refused on Grok lines. Omitted when false | `false` |
