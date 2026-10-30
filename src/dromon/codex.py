@@ -114,7 +114,13 @@ from dromon.ceiling import (
 )
 from dromon.launcher import STOP_POLICY_VARIABLE, StopPolicy
 from dromon.processes import MARK_VARIABLE
-from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
+from dromon.engine_environment import (
+    BASE_ENVIRONMENT,
+    SHELL_VARIABLE,
+    ShellSelectionError,
+    allowlisted,
+    selected_shell,
+)
 from dromon import gitssh
 from dromon.gitssh import GitSshAccess
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
@@ -285,7 +291,7 @@ def unsupported(config: LineConfig) -> str | None:
 
 
 def engine_environment(
-    environment: Mapping[str, str], strategy: Strategy
+    environment: Mapping[str, str], strategy: Strategy, *, require_shell: bool = False
 ) -> dict[str, str]:
     """The environment Codex starts with for ``strategy``, or ``EngineRefused`` when
     ``environment`` redirects the provider. A subscription line's Codex never sees the
@@ -297,9 +303,17 @@ def engine_environment(
             + ", ".join(present)
             + ". Unset these variables."
         )
+    shell: str | None = None
+    if require_shell:
+        try:
+            shell = selected_shell(environment)
+        except ShellSelectionError as error:
+            raise EngineRefused(f"Codex shell unavailable: {error}") from error
     chosen = allowlisted(
         environment, (*BASE_ENVIRONMENT, *API_ENVIRONMENT, "XDG_CACHE_HOME")
     )
+    if shell is not None:
+        chosen[SHELL_VARIABLE] = shell
     if strategy is Strategy.SUBSCRIPTION:
         chosen = {k: v for k, v in chosen.items() if k not in API_ENVIRONMENT}
     if "XDG_CACHE_HOME" not in chosen:
@@ -1037,6 +1051,11 @@ class CodexLine:
         self._context: int | None = None
         """The context the last engine call's usage gave, kept on this engine."""
 
+    @property
+    def environment_for_status(self) -> Mapping[str, str]:
+        """The environment this adapter uses to choose its shell."""
+        return self._environment
+
     def request_compaction(
         self,
         reason: str = COMPACTION_REQUESTED,
@@ -1109,23 +1128,30 @@ class CodexLine:
         refuses the turn also closes a kept connection."""
         request, self._request = self._request, None
         try:
+            reason = unsupported(self.config)
+            if reason is not None:
+                raise EngineRefused(reason)
             environment = engine_environment(
-                self._environment, self.driver.settings.strategy
+                self._environment,
+                self.driver.settings.strategy,
+                # unsupported() limits Codex built-ins to Bash, Edit and Write, so
+                # Codex offers neither Claude Code's Monitor nor PowerShell tool.
+                require_shell="Bash" in self.config.builtin_tools,
             )
             # For the launcher, which removes both before the app-server starts and
             # names the line by its mark in what it reports.
             environment[STOP_POLICY_VARIABLE] = self.config.stop_policy.value
             if self.mark is not None:
                 environment[launcher.LAUNCH_MARK_VARIABLE] = self.mark
-            reason = unsupported(self.config)
-            if reason is not None:
-                raise EngineRefused(reason)
+            variables = gitssh.environment(self.git_ssh)
+            if SHELL_VARIABLE in environment:
+                variables[SHELL_VARIABLE] = environment[SHELL_VARIABLE]
             arguments = server_arguments(
                 self._list_servers(environment),
                 self.config,
                 self.protected,
                 self.mark,
-                gitssh.environment(self.git_ssh),
+                variables,
             )
             instructions = read_instructions(self.config.instructions, self.cwd)
         except Exception:

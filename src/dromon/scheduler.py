@@ -163,6 +163,7 @@ from dromon.engine import (
     INTERRUPTED_KIND,
     SELF_STARTED_KIND,
     PER_TURN_SOURCE,
+    SHELL_TOOLS,
     MAX_COMMAND_CHARACTERS,
     BackgroundEnd,
     SelfStartedFinish,
@@ -175,6 +176,11 @@ from dromon.engine import (
     resolve_plugin,
 )
 from dromon.eventlog import EventLog, read_entries
+from dromon.engine_environment import (
+    ShellSelectionError,
+    selected_claude_shell,
+    selected_shell,
+)
 from dromon import proposals as proposal_store
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon import settings as engine_settings
@@ -3590,6 +3596,7 @@ class Scheduler:
             "workdir_path": workdir,
             "sandbox": self._sandbox_status(line_id, workdir),
             "engine_session": line.engine_session,
+            "shell": self._shell_status(line_id, config),
             "kept_session": self.kept_session(line_id),
             "recent_turns": list(self._turn_costs.get(line_id, ())),
             "peers": self.peers_for(line_id),
@@ -3612,6 +3619,39 @@ class Scheduler:
             },
             "other_lines": others,
         }
+
+    def _shell_status(self, line_id: str, config: LineConfig) -> dict[str, object]:
+        """Report the shell selection from the line adapter's environment."""
+        engine = self._engines.get(line_id)
+        engine_name = ENGINE_OF.get(self.model_of(line_id))
+        if isinstance(engine, ClaudeCodeLine) or engine_name == ENGINE_NAME_CLAUDE:
+            required = bool(SHELL_TOOLS & set(config.builtin_tools))
+            environment = (
+                engine.environment_for_status
+                if isinstance(engine, ClaudeCodeLine)
+                else os.environ
+            )
+            select = selected_claude_shell
+        elif isinstance(engine, CodexLine) or engine_name == "codex":
+            required = "Bash" in config.builtin_tools
+            environment = (
+                engine.environment_for_status
+                if isinstance(engine, CodexLine)
+                else os.environ
+            )
+            select = selected_shell
+        else:
+            return {
+                "required": False,
+                "path": None,
+                "reason": "this engine does not use the daemon SHELL value",
+            }
+        if not required:
+            return {"required": False, "path": None, "reason": None}
+        try:
+            return {"required": True, "path": select(environment), "reason": None}
+        except ShellSelectionError as error:
+            return {"required": True, "path": None, "reason": str(error)}
 
     def _sandbox_status(self, line_id: str, workdir: str | None) -> dict[str, object]:
         """Show the caller's full effective Claude Code sandbox and its Git write
@@ -3914,7 +3954,11 @@ class Scheduler:
         if (text is None) == (path is None):
             raise LineToolRefused("give exactly one of text and path")
         if not self._disclosure:
-            raise LineToolRefused("this project has no disclosure list")
+            raise LineToolRefused(
+                "no disclosure list is configured for this project. Set"
+                " daemon.disclosure_terms to a file path in the project file. This"
+                " check cannot pass or fail without a list."
+            )
         now = self._wall_clock()
         reopens = self._disclosure_reopens(line_id, now)
         if reopens is not None:
@@ -8419,6 +8463,7 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         "peers": full["peers"],
         "model": full["model"],
         "strategy": full["strategy"],
+        "shell": full["shell"],
         "context": {
             "estimated_tokens": context["estimated_tokens"],
             "warn_at": context["warn_at"],

@@ -874,7 +874,13 @@ def test_the_shell_counts_as_bash_only_for_a_line_given_bash() -> None:
     with pytest.raises(EngineRefused, match="not given: commandExecution"):
         run(line(FakeServer([item("commandExecution", command="ls")])))
     server = FakeServer([item("commandExecution", command="ls"), completed()])
-    report = run(line(server, config=LineConfig(builtin_tools=("Bash",))))
+    report = run(
+        line(
+            server,
+            config=LineConfig(builtin_tools=("Bash",)),
+            environment={"SHELL": "/bin/bash"},
+        )
+    )
     assert report.tool_uses == ("Bash",)
 
 
@@ -935,6 +941,46 @@ def test_a_subscription_lines_codex_never_sees_an_api_key() -> None:
         k: v for k, v in server.environment.items() if k not in LAUNCH_VARIABLES
     }
     assert launched == expected
+
+
+def test_codex_shell_is_explicit_for_lines_with_bash() -> None:
+    environment = {"PATH": "/bin", "SHELL": "/bin/bash"}
+    selected = engine_environment(
+        environment, Strategy.SUBSCRIPTION, require_shell=True
+    )
+    assert selected["SHELL"] == "/bin/bash"
+    server = FakeServer()
+    run(
+        line(
+            server,
+            config=LineConfig(builtin_tools=("Bash",)),
+            environment=environment,
+        )
+    )
+    assert 'shell_environment_policy.set.SHELL="/bin/bash"' in server.arguments
+
+
+def test_codex_bash_refuses_missing_shell() -> None:
+    server = FakeServer()
+    with pytest.raises(
+        EngineRefused, match="Codex shell unavailable: SHELL is not set"
+    ):
+        run(line(server, config=LineConfig(builtin_tools=("Bash",))))
+    assert server.sent == []
+
+
+def test_codex_bash_refuses_nonexistent_shell_path() -> None:
+    server = FakeServer()
+    missing = "/path/that/does/not/exist/dromon-test-shell"
+    with pytest.raises(EngineRefused, match="SHELL must name an executable file"):
+        run(
+            line(
+                server,
+                config=LineConfig(builtin_tools=("Bash",)),
+                environment={"PATH": "/bin", "SHELL": missing},
+            )
+        )
+    assert server.sent == []
 
 
 def test_a_redirected_provider_is_always_refused() -> None:
