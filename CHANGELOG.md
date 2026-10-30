@@ -77,6 +77,13 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- A silent-turn reminder no longer says that the line sent no mail when it mailed
+  another party in a turn its engine started by itself after a task ended. The saved
+  state keeps the count of mail the line had sent to anyone but itself, and the
+  reminder is dropped once that count has grown. It now opens "A turn of yours ended
+  with" rather than speaking of the last turn. It is still given when every task it
+  names has ended, with a closing sentence on how the work ended, which is decided
+  for review. Reported by the core line on 2026-10-30.
 - A silent-turn reminder no longer repeats a saved background-task count as if it
   were current. Dromon checks the same task identifiers against the live kept-session
   listing and later task records, and reports unknown when it cannot verify an end.

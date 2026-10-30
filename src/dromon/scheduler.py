@@ -937,6 +937,31 @@ def utc_clock() -> datetime:
     return datetime.now(UTC)
 
 
+QUIET_OPENING: Final = "A turn of yours ended with"
+"""How the notice of a silent turn's background tasks begins. **Task of 2026-10-30.**
+It said "your last turn", which was wrong once the engine had started a turn of its
+own in between."""
+
+
+@dataclass(frozen=True, slots=True)
+class QuietTurn:
+    """What a turn that sent no mail left in its kept session, which the line's next
+    prompt is told once."""
+
+    count: int | None
+    """The background tasks the engine reported, or ``None`` when it gave none."""
+    task_ids: tuple[str, ...] | None
+    """Their identifiers, or ``None`` when the engine could not list them reliably."""
+    records_before: frozenset[TaskRecorded]
+    """The line's task records already present then."""
+    mail: int
+    """The mail the line had sent to anyone but itself then, as ``_line_mail``
+    counts it. **Task of 2026-10-30.** A turn the engine starts by itself after a
+    task ends does not save or clear this record, so mail sent in it went unseen and
+    the next prompt said wrongly that no mail was sent. The notice is dropped once
+    this count has grown."""
+
+
 LIST_MAIL_TOOL_NAME: Final = "list_mail"
 
 LIST_MAIL_SCHEMA: Final[dict[str, object]] = {
@@ -1566,13 +1591,9 @@ class Scheduler:
         self._noted_tasks: dict[str, deque[str]] = {}
         self._unnoted_tasks: dict[str, int] = {}
         """Background task ends the rate limit left without a note, per line."""
-        self._quiet_tasks: dict[
-            str,
-            tuple[int | None, tuple[str, ...] | None, frozenset[TaskRecorded]],
-        ] = {}
-        """Task count and identifiers reported after a silent turn, plus the records
-        already present then. ``None`` identifiers mean the engine could not give a
-        reliable task list."""
+        self._quiet_tasks: dict[str, QuietTurn] = {}
+        """What a silent turn left running, by line, for the next prompt. In memory,
+        so a restart forgets it, as it ends the kept session whose tasks it names."""
         self._disclosure_spent: set[str] = set()
         """Lines that spent their disclosure limit and are held for it. Every
         disclosure-checked tool answers ``DISCLOSURE_HELD`` for them until an
@@ -6738,10 +6759,11 @@ class Scheduler:
             return
         count, task_ids = snapshot
         if count is None or count > 0 or task_ids is None:
-            self._quiet_tasks[line_id] = (
+            self._quiet_tasks[line_id] = QuietTurn(
                 count,
                 task_ids,
                 frozenset(self._log.state.task_records.get(line_id, ())),
+                sent,
             )
         else:
             self._quiet_tasks.pop(line_id, None)
@@ -6890,11 +6912,22 @@ class Scheduler:
 
     def _quiet_notice(self, line_id: str) -> str | None:
         """What ``line_id``'s next turn is told once about tasks from a silent turn,
-        checked against the current kept session and later task records."""
+        checked against the current kept session and later task records.
+
+        **Task of 2026-10-30.** Nothing is told once the line has sent mail to anyone
+        but itself since the silent turn, in whatever turn it sent it, such as one its
+        engine started by itself when a task ended. Its notes to itself tell no one.
+
+        **Decided by core on 2026-10-30, for review.** The notice is kept when every
+        task it names has a recorded end. A recorded end tells the line, through its
+        task note, and tells no one else, so the notice's point, that someone may
+        wait to hear of the work, still holds until the line sends mail. Its closing
+        sentence then speaks of how the work ended rather than of work going on."""
         previous = self._quiet_tasks.pop(line_id, None)
-        if previous is None:
+        if previous is None or self._line_mail(line_id) != previous.mail:
             return None
-        count, previous_ids, records_before = previous
+        count, previous_ids = previous.count, previous.task_ids
+        records_before = previous.records_before
         current = self._quiet_task_snapshot(line_id)
         new_records = tuple(
             record
@@ -6910,11 +6943,10 @@ class Scheduler:
                 else "background-task state"
             )
             return (
-                f"Your last turn reported {unknown}, but Dromon could not reliably"
-                " list them, and you sent no mail, so their current state is unknown."
-                " Check the task records and"
-                " any output file they name. If someone waits on this work, tell"
-                " them."
+                f"{QUIET_OPENING} {unknown} reported, but Dromon could not reliably"
+                " list them, and you have sent no mail since, so their current state"
+                " is unknown. Check the task records and any output file they name."
+                " If someone waits on this work, tell them."
             )
         current_ids: set[str] = set()
         if current is not None and current[1] is not None:
@@ -6953,12 +6985,18 @@ class Scheduler:
             )
         if not parts:
             return None
-        parts.append(
-            "No operator or line learned from you that this work goes on. If someone"
-            " waits on it, tell them."
+        learned = (
+            "how this work ended"
+            if ended_ids == set(previous_ids)
+            else "that this work goes on"
         )
-        return "Your last turn reported background tasks and sent no mail. " + " ".join(
-            parts
+        parts.append(
+            f"No operator or line learned from you {learned}. If someone waits on it,"
+            " tell them."
+        )
+        return (
+            f"{QUIET_OPENING} background tasks reported, and you have sent no mail"
+            " since. " + " ".join(parts)
         )
 
     def _hold_failed(self, line_id: str, ending: str) -> None:
