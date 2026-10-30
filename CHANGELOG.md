@@ -22,7 +22,7 @@ All notable changes are recorded here. The format follows
   with the context note as the warning's, so a later compaction withdraws it.
 - A `wake_after` bound to a running background task now acts as a wait. The line can
   end its turn and be woken by that task even after reaching the ordinary task-note
-  limit; the task note names the cancelled wake. If the task outlives the timeout, the
+  limit, and the task note names the cancelled wake. If the task outlives the timeout, the
   scheduled wake fires. The tool descriptions explain how to use the wait.
 - Claude Code and Codex lines granted a shell tool now require the daemon's `SHELL` to
   name an absolute executable. Claude Code additionally requires Bash or Zsh and
