@@ -1453,12 +1453,17 @@ def test_list_mail_notes_stay_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
 # The operator's requests after phase 2 of federation, decided on 2026-10-28.
 
 MOVED = "The commit checked out in your worktree moved"
+SKIPPED = (
+    "The daemon holds no record of the commit checked out in your worktree when an"
+    " earlier turn of yours ended"
+)
 
 
 def test_a_turn_is_told_once_when_its_worktree_head_moved(world: World) -> None:
     """A line learns at its next turn that an operator committed or merged its work,
-    with the commits before and after. A first commit, a turn with no move, and a
-    worktree outside a checkout tell nothing."""
+    with the commits before and after. A turn with no move and a worktree outside a
+    checkout tell nothing. A first commit after a turn that recorded none is told
+    as a skipped check, once."""
     outside = world.turn("one")
     checkout(world.root, "a" * 40)
     appeared = world.turn("two")
@@ -1466,7 +1471,17 @@ def test_a_turn_is_told_once_when_its_worktree_head_moved(world: World) -> None:
     checkout(world.root, "b" * 40)
     moved = world.turn("four")
     after = world.turn("five")
+    prompts = (outside, appeared, still, moved, after)
     assert all(MOVED not in prompt for prompt in (outside, appeared, still, after))
+    assert [SKIPPED in prompt for prompt in prompts] == [
+        False,
+        True,
+        False,
+        False,
+        False,
+    ]
+    assert appeared.startswith(f"{SKIPPED}, so it could not check")
+    assert f"Your worktree is at {'a' * 12} now" in appeared
     assert moved.startswith(
         f"{MOVED} from {'a' * 12} to {'b' * 12} since your last turn ended."
         f" git log --oneline {'a' * 12}..{'b' * 12} lists the commits between"
@@ -1486,6 +1501,20 @@ def test_a_moved_worktree_notice_survives_a_daemon_restart(world: World) -> None
         f"{MOVED} from {'a' * 12} to {'b' * 12} since your last turn ended."
         f" git log --oneline {'a' * 12}..{'b' * 12} lists the commits between"
     )
+
+
+def test_a_line_with_no_turn_end_commit_is_told_the_check_was_skipped_once(
+    world: World,
+) -> None:
+    """Task of 2026-10-29, the core report's request 1. A line whose earlier turns
+    ended under a daemon that recorded no turn-end commit, here a log with no
+    ``line_turn_ended`` for it, is told once that the check was skipped."""
+    checkout(world.root, "a" * 40)
+    assert "alpha" not in world.log.state.last_turn_commits
+    first = world.turn("first")
+    second = world.turn("second")
+    assert first.startswith(SKIPPED) and MOVED not in first
+    assert SKIPPED not in second and MOVED not in second
 
 
 def test_own_notes_shown_to_an_earlier_turn_leave_unread(world: World) -> None:

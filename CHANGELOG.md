@@ -7,6 +7,16 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- A role transition package whose former owner wrote no journal entry and set no
+  brief no longer leaves every field unknown. Gate and coverage is filled from the
+  former owner's latest task record and Task from the latest operator mail delivered
+  to it, cut to 600 bytes, each marked observed by the daemon with its source. Mail from
+  a line never fills a field, and each value is checked against the disclosure list.
+  Asked for by the engines report of round 4.
+- A turn whose line has no recorded turn-end commit is told that the moved-worktree
+  check was skipped, once, with the commit checked out now. Asked for by the core
+  report of round 4.
+
 - A standing brief for every line. `set_brief` records the line's current task, open
   decisions, artifact paths and next action as one `brief_set` event, which replaces
   its previous brief and which the daemon stamps with the time and both commits. Each
