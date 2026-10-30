@@ -15,6 +15,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
+from dromon.codex import TERMINAL_POLL_SECONDS
 from dromon.configview import Overrides
 from dromon.daemon import Daemon
 from dromon.driver import Strategy
@@ -448,6 +449,25 @@ def test_a_quiet_notice_respects_an_unknown_task_listing(tmp_path: Path) -> None
     assert notice is not None
     assert "state of 1 task is unknown" in notice
     assert "running" not in notice
+    world.log.close()
+
+
+def test_a_quiet_notice_distrusts_a_stale_task_listing(tmp_path: Path) -> None:
+    class StaleEngine(Engine):
+        def kept_status(self) -> dict[str, object]:
+            return {
+                **super().kept_status(),
+                "tasks_listed_seconds_ago": int(TERMINAL_POLL_SECONDS) + 1,
+            }
+
+    world = World(tmp_path / "events.sqlite", tasks=1)
+    turns(world, "start")
+    engine = StaleEngine(LineSpec("alpha", HAIKU, Strategy.SUBSCRIPTION), tasks=1)
+    world.scheduler._engines["alpha"] = engine  # pyright: ignore[reportPrivateUsage]
+    notice = world.scheduler._quiet_notice("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert notice is not None
+    assert "state of 1 task is unknown" in notice
+    assert "still reports" not in notice
     world.log.close()
 
 

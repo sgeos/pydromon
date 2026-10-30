@@ -148,7 +148,7 @@ from dromon.requestkeys import (
     RequestKeys,
 )
 from dromon.ceiling import CHOICES, Choice, is_question, question_text
-from dromon.codex import CodexLine
+from dromon.codex import TERMINAL_POLL_SECONDS, CodexLine
 from dromon.grok import GrokLine
 from dromon.antigravity import AntigravityLine
 from dromon.cursor import CursorLine
@@ -6639,6 +6639,9 @@ class Scheduler:
 
         A ``None`` result means that no kept engine is available. A ``None`` task
         tuple means the engine is kept but could not give a complete, reliable list.
+        Review r5, Q1. A listing the engine reports as older than Codex's own poll
+        interval is not reliable, since a task may have ended after it. An engine
+        that reports no age is taken as current.
         """
         engine = self._engines.get(line_id)
         if not isinstance(engine, KeptEngine):
@@ -6653,6 +6656,9 @@ class Scheduler:
         if type(count) is not int or count < 0:
             count = None
         if status.get("background_tasks_unknown") is True:
+            return (count, None)
+        age = status.get("tasks_listed_seconds_ago")
+        if type(age) is int and age > TERMINAL_POLL_SECONDS:
             return (count, None)
         raw_tasks = status.get("tasks")
         if not isinstance(raw_tasks, list):
@@ -6791,9 +6797,8 @@ class Scheduler:
             )
             return (
                 f"Your last turn reported {unknown}, but Dromon could not reliably"
-                " list them, and you sent no mail. Their current state is unknown"
-                " because Dromon cannot"
-                " confirm the kept session's task list. Check the task records and"
+                " list them, and you sent no mail, so their current state is unknown."
+                " Check the task records and"
                 " any output file they name. If someone waits on this work, tell"
                 " them."
             )
