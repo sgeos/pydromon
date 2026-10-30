@@ -38,6 +38,10 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- A silent-turn reminder no longer repeats a saved background-task count as if it
+  were current. Dromon checks the same task identifiers against the live kept-session
+  listing and later task records, and reports unknown when it cannot verify an end.
+  `line_status` exposes the engine's `background_tasks_unknown` flag.
 - A client request that times out now says that the daemon may still have carried it
   out, and `dromon send` points to `dromon sent` before a retry. **Found on
   2026-10-29,** when a send timed out at the client while the daemon was busy and the

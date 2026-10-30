@@ -1528,10 +1528,13 @@ class Scheduler:
         self._noted_tasks: dict[str, deque[str]] = {}
         self._unnoted_tasks: dict[str, int] = {}
         """Background task ends the rate limit left without a note, per line."""
-        self._quiet_tasks: dict[str, int] = {}
-        """How many background tasks still ran when each line's last turn ended
-        without the line sending any mail, for its next prompt. Held in memory only,
-        since a restart of the daemon closes kept sessions and ends their tasks."""
+        self._quiet_tasks: dict[
+            str,
+            tuple[int | None, tuple[str, ...] | None, frozenset[TaskRecorded]],
+        ] = {}
+        """Task count and identifiers reported after a silent turn, plus the records
+        already present then. ``None`` identifiers mean the engine could not give a
+        reliable task list."""
         self._disclosure_spent: set[str] = set()
         """Lines that spent their disclosure limit and are held for it. Every
         disclosure-checked tool answers ``DISCLOSURE_HELD`` for them until an
@@ -6608,16 +6611,64 @@ class Scheduler:
 
     def _note_quiet(self, line_id: str, sent: int) -> None:
         """**Item B1 of 2026-10-28.** Remember for ``line_id``'s next prompt that its
-        turn ended with background tasks of its kept session still running while it
-        sent no mail, which ``sent`` counts from the turn's start. A trial line
-        ended such turns and no one learned that its work went on. The count is
-        read from the engine as the turn ends, so a task that ends at that moment
-        may still be counted, and the next prompt says only that tasks ran."""
-        tasks = self.kept_tasks(line_id)
-        if tasks > 0 and self._line_mail(line_id) == sent:
-            self._quiet_tasks[line_id] = tasks
+        turn ended with background tasks of its kept session reported while it sent no
+        mail, which ``sent`` counts from the turn's start. A trial line ended such
+        turns and no one learned that its work went on. The next prompt reconciles the
+        saved identifiers with the current session and task records before describing
+        them as running."""
+        if self._line_mail(line_id) != sent:
+            self._quiet_tasks.pop(line_id, None)
+            return
+        snapshot = self._quiet_task_snapshot(line_id)
+        if snapshot is None:
+            return
+        count, task_ids = snapshot
+        if count is None or count > 0 or task_ids is None:
+            self._quiet_tasks[line_id] = (
+                count,
+                task_ids,
+                frozenset(self._log.state.task_records.get(line_id, ())),
+            )
         else:
             self._quiet_tasks.pop(line_id, None)
+
+    def _quiet_task_snapshot(
+        self, line_id: str
+    ) -> tuple[int | None, tuple[str, ...] | None] | None:
+        """The kept session's reliable task count and identifiers, or unknown.
+
+        A ``None`` result means that no kept engine is available. A ``None`` task
+        tuple means the engine is kept but could not give a complete, reliable list.
+        """
+        engine = self._engines.get(line_id)
+        if not isinstance(engine, KeptEngine):
+            return None
+        try:
+            status = engine.kept_status()
+        except Exception:  # noqa: BLE001
+            return (None, None)
+        if status.get("kept") is not True:
+            return (0, ())
+        count = status.get("background_tasks")
+        if type(count) is not int or count < 0:
+            count = None
+        if status.get("background_tasks_unknown") is True:
+            return (count, None)
+        raw_tasks = status.get("tasks")
+        if not isinstance(raw_tasks, list):
+            return (count, None) if count != 0 else (0, ())
+        task_ids: list[str] = []
+        for value in cast(list[object], raw_tasks):
+            if not isinstance(value, Mapping):
+                return (count, None)
+            task = cast(Mapping[str, object], value)
+            task_id = task.get("task_id")
+            if not isinstance(task_id, str) or not task_id or task_id in task_ids:
+                return (count, None)
+            task_ids.append(task_id)
+        if count is None or len(task_ids) != count:
+            return (count, None)
+        return (count, tuple(sorted(task_ids)))
 
     def _head_notice(self, line_id: str) -> str | None:
         """What ``line_id``'s next turn is told when the commit checked out in its
@@ -6718,16 +6769,77 @@ class Scheduler:
         return view
 
     def _quiet_notice(self, line_id: str) -> str | None:
-        """What ``line_id``'s next turn is told, once, of a last turn that ended with
-        background tasks running and no mail sent, or ``None``."""
-        tasks = self._quiet_tasks.pop(line_id, None)
-        if tasks is None:
+        """What ``line_id``'s next turn is told once about tasks from a silent turn,
+        checked against the current kept session and later task records."""
+        previous = self._quiet_tasks.pop(line_id, None)
+        if previous is None:
             return None
-        counted = "1 background task" if tasks == 1 else f"{tasks} background tasks"
-        return (
-            f"Your last turn ended with {counted} of your kept session still running,"
-            " and you sent no mail in it, so no operator or line learned from you"
-            " that the work goes on. If someone waits on it, tell them."
+        count, previous_ids, records_before = previous
+        current = self._quiet_task_snapshot(line_id)
+        new_records = tuple(
+            record
+            for record in self._log.state.task_records.get(line_id, ())
+            if record not in records_before
+        )
+        if previous_ids is None:
+            unknown = (
+                f"{count} background tasks"
+                if count is not None and count != 1
+                else "1 background task"
+                if count == 1
+                else "background-task state"
+            )
+            return (
+                f"Your last turn reported {unknown}, but Dromon could not reliably"
+                " list them, and you sent no mail. Their current state is unknown"
+                " because Dromon cannot"
+                " confirm the kept session's task list. Check the task records and"
+                " any output file they name. If someone waits on this work, tell"
+                " them."
+            )
+        current_ids: set[str] = set()
+        if current is not None and current[1] is not None:
+            current_ids.update(current[1])
+        reliable_current = current is not None and current[1] is not None
+        recorded_ids = {record.task_id for record in new_records}
+        ended_ids = set(previous_ids) & recorded_ids
+        running_ids: set[str] = set()
+        if reliable_current:
+            running_ids = (set(previous_ids) & current_ids) - ended_ids
+        unknown_ids = set(previous_ids) - running_ids - ended_ids
+        parts: list[str] = []
+        if running_ids:
+            count_text = (
+                "1 background task"
+                if len(running_ids) == 1
+                else f"{len(running_ids)} background tasks"
+            )
+            parts.append(
+                f"Dromon still reports {count_text} running in the kept session."
+            )
+        if ended_ids:
+            count_text = "1 task" if len(ended_ids) == 1 else f"{len(ended_ids)} tasks"
+            parts.append(
+                f"Dromon recorded the end of {count_text}. Check their task records"
+                " and any output file they name."
+            )
+        if unknown_ids:
+            count_text = (
+                "1 task" if len(unknown_ids) == 1 else f"{len(unknown_ids)} tasks"
+            )
+            parts.append(
+                f"The state of {count_text} is unknown because Dromon no longer"
+                " reports them and has no recorded end. Check the task records and"
+                " any output file they name."
+            )
+        if not parts:
+            return None
+        parts.append(
+            "No operator or line learned from you that this work goes on. If someone"
+            " waits on it, tell them."
+        )
+        return "Your last turn reported background tasks and sent no mail. " + " ".join(
+            parts
         )
 
     def _hold_failed(self, line_id: str, ending: str) -> None:
@@ -7775,6 +7887,7 @@ class Scheduler:
             "kept": status.get("kept") is True,
             "closes_at": closes_at,
             "background_tasks": status.get("background_tasks", 0),
+            "background_tasks_unknown": status.get("background_tasks_unknown") is True,
             "tasks": status.get("tasks", []),
         }
 
@@ -8126,6 +8239,7 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         },
         "brief": _compact_brief(full["brief"]),
         "background_task_count": len(cast(list[dict[str, object]], kept["tasks"])),
+        "background_tasks_unknown": kept.get("background_tasks_unknown") is True,
         "recent_turn_count": len(cast(list[dict[str, object]], full["recent_turns"])),
         "other_line_count": len(cast(list[dict[str, object]], full["other_lines"])),
     }
