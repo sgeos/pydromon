@@ -4,8 +4,7 @@
 // itself, and draws on the plan's limits. The driver refuses API usage billed per token,
 // so a misconfigured environment can never start charging per token through this driver.
 //
-// Dromon has no Codex adapter yet, so no line runs this driver until one exists. Its
-// settings follow Codex's model catalogue as fetched on 2026-10-25 by Codex 0.164.0,
+// Its settings follow Codex's model catalogue as fetched on 2026-10-25 by Codex 0.164.0,
 // where the model's default effort is medium and its context window 272,000 tokens.
 //
 // The host sends one event per cycle together with the driver's state, and receives
