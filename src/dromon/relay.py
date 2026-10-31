@@ -32,11 +32,11 @@ import stat
 import subprocess
 import sys
 import traceback
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Final, Protocol, cast
+from typing import Any, Final, Protocol, cast
 
 from dromon.eventlog import EventLog
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
@@ -165,7 +165,9 @@ class CommandRelay:
     channel.
 
     Porting note. A port needs only process spawning with an argument vector, standard
-    input and a timeout, which every target platform has.
+    input and a timeout, which every target platform has. Python's asyncio API does
+    not expose closing one subprocess pipe independently, so the stderr drain closes
+    that pipe through the subprocess transport after the command exits.
     """
 
     def __init__(
@@ -211,11 +213,12 @@ class CommandRelay:
     async def deliver(self, notice: Notice) -> None:
         """Hand ``notice`` to the command without blocking the event loop.
 
-        The command runs in its own process group, so a timeout or a stopping daemon
-        ends it and anything it started. Standard output is discarded and at most
-        ``STDERR_KEPT`` bytes of standard error are kept for the reason, so a command
-        that writes without end cannot fill the daemon's memory. Raises
-        ``RelayError`` as ``forward`` does."""
+        The command runs in its own process group. A timeout or daemon stop kills that
+        group, but does not reach a child that starts a new session. Standard output is
+        discarded and at most ``STDERR_KEPT`` bytes of standard error are kept. The
+        command's exit status determines acceptance; a descendant holding standard error
+        open does not extend the wait after the command exits. Raises ``RelayError`` as
+        ``forward`` does."""
         payload = (encode_notice(notice) + "\n").encode("utf-8")
         try:
             # As in ``forward``, the argument vector is operator configuration and no
@@ -252,31 +255,64 @@ STDERR_KEPT: Final = 4096
 
 
 async def _feed(process: "asyncio.subprocess.Process", payload: bytes) -> bytes:
-    """Write ``payload`` to the process, read its standard error to the end keeping
-    the first ``STDERR_KEPT`` bytes, and wait for it to exit. The read loop ends at
-    end of file, and the caller's timeout bounds it."""
+    """Feed input and drain bounded stderr while the command runs.
+
+    Once the command exits, close its stderr pipe and return the status without
+    waiting for descendants that inherited the descriptor."""
     stdin, stderr = process.stdin, process.stderr
     if stdin is None or stderr is None:
         raise RelayError("the relay command has no pipes")
+    reader = asyncio.create_task(_read_stderr(stderr))
     try:
-        stdin.write(payload)
-        await stdin.drain()
-    except (BrokenPipeError, ConnectionResetError):
-        # A command that exits without reading its notice is judged by its status.
-        pass
-    stdin.close()
+        try:
+            stdin.write(payload)
+            await stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            stdin.close()
+        while process.returncode is None:
+            await asyncio.sleep(0.01)
+        # asyncio's subprocess transport owns pipe 2. Closing it after the leader
+        # exits gives the reader buffered bytes and EOF, even if a child inherited
+        # the write end. The result cannot wait for that child.
+        _close_stderr_pipe(process)
+        await process.wait()
+        return await reader
+    finally:
+        _close_stderr_pipe(process)
+        if not reader.done():
+            reader.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reader
+
+
+async def _read_stderr(stderr: asyncio.StreamReader) -> bytes:
+    """Drain standard error while retaining only its first ``STDERR_KEPT`` bytes."""
     kept = bytearray()
     while chunk := await stderr.read(65536):
         if len(kept) < STDERR_KEPT:
             kept += chunk[: STDERR_KEPT - len(kept)]
-    await process.wait()
     return bytes(kept)
 
 
+def _close_stderr_pipe(process: "asyncio.subprocess.Process") -> None:
+    """Close the subprocess transport's stderr read end.
+
+    asyncio exposes the process wait but not a public way to close one inherited
+    pipe independently. This narrow access is necessary so a grandchild retaining
+    stderr cannot hold completion after the command exits."""
+    transport = cast(Any, process)._transport
+    pipe = cast(asyncio.BaseTransport | None, transport.get_pipe_transport(2))
+    if pipe is not None:
+        pipe.close()
+
+
 async def _end_group(process: "asyncio.subprocess.Process") -> None:
-    """Kill the command's process group and reap the command. Porting note. Process
-    groups are POSIX, and a port to another platform needs its own way to end the
-    command's children."""
+    """Kill the command's process group and reap the command.
+
+    A descendant that starts a new session escapes this kill. Process groups are
+    POSIX, and a port to another platform needs its own way to end group members."""
     if process.returncode is None:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(process.pid, signal.SIGKILL)
@@ -290,11 +326,9 @@ class FileRelay:
     operator's session can follow it with ``tail -f``. Round 11, item 2.
 
     The file is created readable and writable by its owner alone, and it is refused,
-    and the notice left pending, when it is a symbolic link, is not a regular file, is
-    owned by another user or is open to group or others, or when it lies in a line's
-    working directory outside every directory Dromon protects from lines. The last is
-    checked at every write, since a line may be configured into a new working
-    directory after the start. **Fact.** The file grows without bound. Truncating it
+    and the notice left pending, when it is outside a protected state or runtime
+    directory, is a symbolic link, is not a regular file, belongs to another user or
+    is open to group or others. **Fact.** The file grows without bound. Truncating it
     is the operator's, and ``tail -F`` follows a truncated file.
 
     Porting note. ``O_NOFOLLOW``, ``geteuid`` and permission bits are POSIX."""
@@ -302,25 +336,30 @@ class FileRelay:
     def __init__(
         self,
         path: Path,
-        workdirs: Callable[[], Iterable[Path]],
-        protected: Sequence[Path],
+        state_runtime_dirs: Sequence[Path],
     ) -> None:
         if not path.is_absolute():
             raise ValueError("a file relay's path must be absolute")
         self._path = path
-        self._workdirs = workdirs
-        self._protected = tuple(protected)
+        self._state_runtime_dirs = tuple(state_runtime_dirs)
 
     @property
     def path(self) -> Path:
         return self._path
 
     def forward(self, notice: Notice) -> None:
-        refusal = sink_refusal(self._path, self._workdirs(), self._protected)
+        refusal = sink_refusal(self._path, self._state_runtime_dirs)
         if refusal is not None:
             raise RelayError(refusal)
         line = (encode_notice(notice) + "\n").encode("utf-8")
-        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+        flags = (
+            os.O_WRONLY
+            | os.O_APPEND
+            | os.O_CREAT
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC
+            | os.O_NONBLOCK
+        )
         try:
             descriptor = os.open(self._path, flags, 0o600)
         except OSError as error:
@@ -355,31 +394,25 @@ class FileRelay:
         self.forward(notice)
 
 
-def sink_refusal(
-    path: Path, workdirs: Iterable[Path], protected: Sequence[Path]
-) -> str | None:
+def sink_refusal(path: Path, state_runtime_dirs: Sequence[Path]) -> str | None:
     """Why a notice file at ``path`` may not be written, or ``None``.
 
     **Decided by core for review, round 11.** A notice file may not lie in any line's
-    working directory, so that no line can read what is relayed to operators or write
-    a notice of its own into the file, except inside a directory Dromon protects,
-    such as ``.dromon/run``. Every enabled sandbox denies those to lines, and no line
-    may run in them. A line without a sandbox reaches the file wherever it is, which
-    no placement prevents."""
+    protected state or runtime directory, which every enabled engine sandbox denies
+    to lines. A line without a sandbox reaches the file there, since it runs as the
+    daemon's user."""
     parent = Path(os.path.realpath(path.parent))
     real = parent / path.name
     if not parent.is_dir():
         return f"the notice file's directory {path.parent} does not exist"
-    for guarded in protected:
-        if _encloses(Path(os.path.realpath(guarded)), real):
-            return None
-    for workdir in workdirs:
-        if _encloses(Path(os.path.realpath(workdir)), real):
-            return (
-                f"the notice file {path} lies in the working directory {workdir} of a"
-                " line, so a line could read or forge notices. Put it outside every"
-                " line's working directory, or under .dromon/run"
-            )
+    if not any(
+        _encloses(Path(os.path.realpath(directory)), real)
+        for directory in state_runtime_dirs
+    ):
+        return (
+            f"the notice file {path} must lie under a Dromon protected state or"
+            " runtime directory, which every enabled engine sandbox denies to lines"
+        )
     return None
 
 
@@ -468,9 +501,8 @@ def parse_relays(relays: object, operators: object) -> RelayConfig:
     for name, table in sorted(tables.items()):
         definitions[name] = _relay(f"relays.{name}", table)
     routes: dict[str, str] = {}
-    for operator_id, table in sorted(
-        ({} if operators is None else _tables(operators, "operators")).items()
-    ):
+    operator_tables = {} if operators is None else _tables(operators, "operators")
+    for operator_id, table in sorted(operator_tables.items()):
         key = f"operators.{operator_id}"
         unknown = sorted(set(table) - OPERATOR_KEYS)
         if unknown:
@@ -549,8 +581,7 @@ def sink_path(definition: RelayDefinition, root: Path) -> Path:
 def build_routes(
     config: RelayConfig,
     root: Path,
-    workdirs: Callable[[], Iterable[Path]],
-    protected: Sequence[Path],
+    state_runtime_dirs: Sequence[Path],
 ) -> dict[str, AsyncRelay]:
     """Each routed operator's relay. Raises ``RelayConfigError`` for a file relay
     whose notice file is refused now, so a start or a reload names it, rather than
@@ -559,10 +590,10 @@ def build_routes(
     for name, definition in sorted(config.relays.items()):
         if definition.kind is RelayKind.FILE:
             path = sink_path(definition, root)
-            refusal = sink_refusal(path, workdirs(), protected)
+            refusal = sink_refusal(path, state_runtime_dirs)
             if refusal is not None:
                 raise RelayConfigError(f"relays.{name}.path", refusal)
-            built[name] = FileRelay(path, workdirs, protected)
+            built[name] = FileRelay(path, state_runtime_dirs)
         else:
             built[name] = CommandRelay(definition.command, definition.timeout_seconds)
     return {operator: built[name] for operator, name in config.routes.items()}
@@ -597,7 +628,7 @@ class _Failure:
 
 class OperatorRelayer:
     """Forwards operators' undelivered mail through their relays, as ``RELAY.md``
-    specifies, one notice at a time, from a task of its own.
+    specifies, one notice at a time per relay instance, from a bounded set of tasks.
 
     - A pass runs when mail to an operator is recorded, when the routes change, when
       a failed notice's backoff ends, and every ``SWEEP_SECONDS`` in any case.
@@ -650,31 +681,42 @@ class OperatorRelayer:
         """One forwarding pass, and how long until the next unless notified."""
         unrouted = 0
         now = self._clock()
+        per_relay: dict[int, tuple[AsyncRelay, list[Notice]]] = {}
         for notice in pending_notices(self._mail.state):
             relay = self._routes.get(notice.operator_id)
             if relay is None:
                 unrouted += 1
                 continue
-            failure = self._failures.get(notice.message_id)
-            if failure is not None and failure.not_before > now:
-                continue
-            current = self._mail.state.messages.get(notice.message_id)
-            if current is None or current.delivered:
-                # A client delivered it while an earlier notice of this pass ran.
-                continue
-            try:
-                await relay.deliver(notice)
-            except RelayError as error:
-                self._fail(notice, str(error))
-                continue
-            except Exception as error:  # noqa: BLE001
-                # A defect in a relay fails its notice rather than the relayer.
-                traceback.print_exception(error, file=sys.stderr)
-                self._fail(notice, f"the relay failed unexpectedly: {error!r}")
-                continue
-            self._failures.pop(notice.message_id, None)
-            if self._mail.relayed(notice.message_id):
-                self.delivered += 1
+            group = per_relay.setdefault(id(relay), (relay, []))
+            group[1].append(notice)
+
+        async def forward_relay(relay: AsyncRelay, notices: list[Notice]) -> None:
+            for notice in notices:
+                failure = self._failures.get(notice.message_id)
+                if failure is not None and failure.not_before > now:
+                    continue
+                current = self._mail.state.messages.get(notice.message_id)
+                if current is None or current.delivered:
+                    continue
+                try:
+                    await relay.deliver(notice)
+                except RelayError as error:
+                    self._fail(notice, str(error))
+                    continue
+                except Exception as error:  # noqa: BLE001
+                    traceback.print_exception(error, file=sys.stderr)
+                    self._fail(notice, f"the relay failed unexpectedly: {error!r}")
+                    continue
+                self._failures.pop(notice.message_id, None)
+                if self._mail.relayed(notice.message_id):
+                    self.delivered += 1
+
+        await asyncio.gather(
+            *(
+                forward_relay(relay, notices)
+                for _, (relay, notices) in sorted(per_relay.items())
+            )
+        )
         self._unrouted = unrouted
         # Mail that is no longer pending, delivered by a client or not, is forgotten.
         pending = {notice.message_id for notice in pending_notices(self._mail.state)}

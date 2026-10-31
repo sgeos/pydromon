@@ -7,6 +7,12 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- Bound issue volume per line, ran different operators' relays concurrently while
+  preserving each operator's notice order, and restricted file relays to protected
+  state/runtime directories. File relay FIFO opens are nonblocking. Command relay
+  success now follows the command's exit status even when a child holds standard error
+  open. A child that starts a new session can still escape timeout process-group kills.
+
 - Refused Codex items count toward the driver's tool budget whether first announced by
   `item/started` or `item/completed`. Matching item identifiers are counted once
   regardless of notice order. A refusal announced by neither notice remains invisible.

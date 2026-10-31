@@ -62,10 +62,13 @@ send email, post to a chat service or write to a file, but must obtain any crede
 through its own explicit mechanism.
 
 The daemon runs the command without blocking its event loop. The command is the
-leader of its own process group, and on a timeout, or when the daemon stops while it
-runs, the whole group is killed, so a script cannot leave a child holding the notice.
-Its standard output is discarded, and only the first 4,096 bytes of its standard error
-are kept, of which 200 reach the reason a failure reports.
+leader of its own process group. On a timeout, or when the daemon stops while it runs,
+that group is killed. A descendant that starts a new session escapes this signal and
+may outlive the command or daemon. Standard output is discarded. Standard error is
+drained while the command runs, retaining at most 4,096 bytes, of which 200 reach a
+failure reason. Acceptance is judged by the command's exit status. Once it exits, the
+daemon closes its read end of standard error and does not wait for a descendant that
+inherited the pipe.
 
 ## File relay
 
@@ -74,18 +77,18 @@ one line, the notice's JSON followed by a newline, so an operator's session can 
 the file with `tail -f`, or with a tool that watches a file. No shell or script is
 involved.
 
-- The file is created with mode `0600`. It is refused, and the notice stays pending,
-  when it is a symbolic link, is not a regular file, belongs to another user or is
-  open to group or others.
+- The file must be under the daemon's protected state or runtime directory, which
+  every enabled engine sandbox denies to lines. It is refused elsewhere. The file is
+  created with mode `0600`. It is refused, and the notice stays pending, when it is a
+  symbolic link, is not a regular file, belongs to another user or is open to group or
+  others. It is opened nonblocking before its descriptor is checked, so a FIFO cannot
+  hold the event loop.
 - Each notice is written with one append and flushed to disk before delivery is
   recorded.
-- The notice file may not lie in any line's working directory, so that no line can
-  read what is relayed or write a notice of its own into the file. A directory Dromon
-  protects, such as `.dromon/run`, is the one exception, since every enabled sandbox
-  denies it to lines. The daemon checks this at start and at reload, and the relay
-  checks it again before every write, against each line's working directory as
-  configured then. A line configured into the directory later therefore stops the
-  writes, and its notices stay pending, rather than being refused itself.
+- The state or runtime directory prevents a line using its enabled sandbox from
+  reading the relayed notices or writing its own. This guarantee depends on the
+  sandbox enforcing its documented deny rules. An unsandboxed line can access the
+  file because it runs as the daemon's user.
 - **Fact.** The file grows without bound. Truncating it is the operator's, and
   `tail -F` follows a truncated file.
 - **Assumption.** The file is on a local disk. The append runs on the event loop, so a
@@ -99,8 +102,11 @@ involved.
   when a failed notice's backoff ends, and every 60 seconds in any case, so mail
   recorded by a path that does not wake the relayer, and mail waiting for a route a
   reload has just given, is still forwarded.
-- Notices are forwarded one at a time, in the order sent. A slow relay delays the
-  notices after it, by at most its timeout each.
+- Each configured relay instance with a route has one task, and its notices are
+  forwarded one at a time in send order, including when several operators share it.
+  Different relay tasks run concurrently, so a slow relay does not hold another
+  relay's notices. The project file accepts at most 32 relay definitions, which bounds
+  the number of tasks.
 - A notice whose relay fails is tried again after a backoff of 5 seconds, doubling at
   each failure up to 300 seconds. Backoff is per notice and held in memory, so a
   restart tries every pending notice at once. Every reload clears the backoff, whether
@@ -111,6 +117,10 @@ involved.
 - A relay that raises anything but a relay failure is a defect. Its notice is failed
   with the error's description, the trace goes to the daemon's standard error, and
   the relayer goes on.
+- A line may have at most five open issues. It may raise at most three issues in its
+  last twenty sent messages. These limits are checked by event replay, so a restart
+  cannot reset them. When a limit is reached, `send_message` tells the line to wait
+  for an operator reply or acknowledgment.
 - `dromon status` reports the routed operators, how many notices were relayed since
   the start, how many wait unrouted, and each failing notice with its attempts, its
   reason and when it is tried again, at most 10.

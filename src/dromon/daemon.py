@@ -625,26 +625,15 @@ class Daemon:
 
     def relay_routes(self, config: ProjectConfig) -> dict[str, AsyncRelay]:
         """The relay of each operator ``config`` routes. Raises ``ProjectMismatch``
-        for a relay refused now, such as a notice file in a line's working
-        directory, so a start or a reload names it and changes nothing.
-
-        The working directories a notice file is held out of are those of every
-        line in the log, as configured now, and of every line ``config`` declares,
-        and a file relay checks them again at each write."""
-        protected = protected_dirs(self.paths, config.federation)
+        for a relay refused now, including a notice file outside the daemon's
+        protected state or runtime directories, so a start or reload names it and
+        changes nothing."""
+        protected_dirs(self.paths, config.federation)
         root = self.paths.root
-
-        def workdirs() -> list[Path]:
-            found = self.scheduler.line_workdirs()
-            for definition in config.lines.values():
-                with contextlib.suppress(ConfigError):
-                    found.append(
-                        resolve_workdir(definition.config.workdir, root, protected)
-                    )
-            return found
+        state_runtime_dirs = (self.paths.state_dir, self.paths.runtime_dir)
 
         try:
-            return build_routes(config.relays, root, workdirs, protected)
+            return build_routes(config.relays, root, state_runtime_dirs)
         except RelayConfigError as error:
             raise ProjectMismatch(f"the project file is refused: {error}") from error
 

@@ -42,6 +42,14 @@ TOKEN_HASH: Final = re.compile(r"[0-9a-f]{64}")
 MAX_TEXT_BYTES: Final = 1024 * 1024
 """Upper bound on the UTF-8 size of a message body."""
 
+MAX_OPEN_ISSUES_PER_LINE: Final = 5
+"""At most five unclosed issues from one line may burden an operator."""
+
+ISSUE_RATE_WINDOW_MESSAGES: Final = 20
+MAX_ISSUES_PER_LINE_IN_WINDOW: Final = 3
+"""At most three issues in a line's last twenty sent messages, including the new one.
+This replay-deterministic rate limit does not depend on wall-clock time."""
+
 MAX_CONFIG_BYTES: Final = 256 * 1024
 """Upper bound on the UTF-8 size of a line's stored tool configuration."""
 
@@ -2656,8 +2664,39 @@ class State:
                 raise EventRejected("an issue is raised with an operator")
             if event.reply_to is not None or event.choices:
                 raise EventRejected("an issue opens a thread, and has no choices")
+            self._check_issue_limits(event.sender.line_id)
         if event.reply_to is not None:
             self._check_reply(event, event.reply_to)
+
+    def _check_issue_limits(self, line_id: str) -> None:
+        """Bound a line's open issues and issue rate using replayed message order."""
+        sender = LineAddress(line_id)
+        replies = {
+            (message.sender, message.reply_to)
+            for message in self.messages.values()
+            if message.reply_to is not None
+        }
+        open_issues = sum(
+            message.kind is MessageKind.ISSUE
+            and message.sender == sender
+            and not message.acknowledged
+            and (message.recipient, message_id) not in replies
+            for message_id, message in self.messages.items()
+        )
+        if open_issues >= MAX_OPEN_ISSUES_PER_LINE:
+            raise EventRejected(
+                f"at most {MAX_OPEN_ISSUES_PER_LINE} issues may remain open;"
+                " wait for an operator reply or acknowledgment"
+            )
+        recent = [
+            message for message in self.messages.values() if message.sender == sender
+        ][-(ISSUE_RATE_WINDOW_MESSAGES - 1) :]
+        issue_count = sum(message.kind is MessageKind.ISSUE for message in recent)
+        if issue_count >= MAX_ISSUES_PER_LINE_IN_WINDOW:
+            raise EventRejected(
+                f"at most {MAX_ISSUES_PER_LINE_IN_WINDOW} issues are allowed in"
+                f" {ISSUE_RATE_WINDOW_MESSAGES} sent messages; wait for a reply"
+            )
 
     def _check_harness_note(self, event: MessageSent) -> None:
         """The harness sends notes on its own account to a line or an operator of

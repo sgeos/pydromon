@@ -145,6 +145,10 @@ reply, and receives each through the operator's relay like any other mail, as
   since an issue opens its own thread. An external agent's `send_message` has no
   `issue` argument. An issue has no severity, label or state beyond open and closed,
   and no event marks it reopened. A further issue is a new message.
+- **Rate.** A line may have at most five open issues and at most three issues in its
+  last twenty sent messages. Both bounds are enforced by replay, so acknowledging an
+  issue frees an open slot but does not reset the rate limit. When a bound is reached,
+  the line is told to wait for an operator reply or acknowledgment.
 - **Rollback hazard.** A daemon older than this kind cannot read an event log that
   holds an issue, since its codec refuses an unknown message kind, so a rollback past
   it needs the log from before the first issue.

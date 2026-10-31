@@ -7,6 +7,7 @@ timeout, its process group and the event loop staying free are the behaviours un
 test."""
 
 import asyncio
+import contextlib
 import json
 import os
 import stat
@@ -25,7 +26,6 @@ from dromon.configview import Overrides
 from dromon.daemon import Daemon, ProjectMismatch, protected_dirs
 from dromon.driver import Strategy
 from dromon.eventlog import EventLog
-from dromon.lineconfig import LineConfig
 from dromon.mailbox import listing
 from dromon.model import (
     EventRejected,
@@ -205,6 +205,57 @@ def test_a_defect_in_a_relay_fails_its_notice_not_the_relayer(
     assert "KeyError" in capsys.readouterr().err
 
 
+def test_a_hung_operator_relay_does_not_hold_another_operator(
+    scheduler: Scheduler,
+) -> None:
+    first = scheduler.send(LineAddress("alpha"), ANA, "for ana")
+    second = scheduler.send(LineAddress("alpha"), BEN, "for ben")
+
+    class Hanging:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def deliver(self, notice: Notice) -> None:
+            del notice
+            self.started.set()
+            await self.release.wait()
+
+    class Fast:
+        def __init__(self) -> None:
+            self.delivered = asyncio.Event()
+
+        async def deliver(self, notice: Notice) -> None:
+            assert notice.message_id == second
+            self.delivered.set()
+
+    slow, fast = Hanging(), Fast()
+    relayer = relayer_for(scheduler, {"ana": slow, "ben": fast})
+
+    async def scenario() -> None:
+        task = asyncio.create_task(relayer.step())
+        await asyncio.wait_for(slow.started.wait(), 1)
+        await asyncio.wait_for(fast.delivered.wait(), 1)
+        assert not scheduler.state.messages[first].delivered
+        assert scheduler.state.messages[second].delivered
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+
+def test_operators_sharing_a_relay_keep_their_notices_in_order(
+    scheduler: Scheduler,
+) -> None:
+    first = scheduler.send(LineAddress("alpha"), ANA, "first")
+    second = scheduler.send(LineAddress("alpha"), BEN, "second")
+    shared = Recorder()
+    relayer = relayer_for(scheduler, {"ana": shared, "ben": shared})
+    asyncio.run(relayer.step())
+    assert [notice.message_id for notice in shared.notices] == [first, second]
+
+
 def test_mail_for_an_unrouted_operator_waits_for_a_client(
     scheduler: Scheduler,
 ) -> None:
@@ -380,6 +431,50 @@ def test_a_hung_command_times_out_and_its_group_is_killed(tmp_path: Path) -> Non
         pytest.fail("the command's child outlived the timeout")
 
 
+def test_a_command_child_that_starts_a_session_escapes_group_kill(
+    tmp_path: Path,
+) -> None:
+    child = tmp_path / "escaped.pid"
+    marker = tmp_path / "escaped.marker"
+    child_code = (
+        f"import time; time.sleep(0.5); open({str(marker)!r},'w').write('alive')"
+    )
+    script = (
+        "import subprocess,sys,time;"
+        f"p=subprocess.Popen([sys.executable,'-c',{child_code!r}],start_new_session=True);"
+        f"open({str(child)!r},'w').write(str(p.pid)); time.sleep(30)"
+    )
+    relay = CommandRelay([sys.executable, "-c", script], 0.2)
+    with pytest.raises(RelayError, match="timed out"):
+        asyncio.run(relay.deliver(notice()))
+    pid = int(child.read_text())
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.02)
+        assert marker.read_text() == "alive"
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, 9)
+
+
+def test_success_does_not_wait_for_a_child_holding_stderr(tmp_path: Path) -> None:
+    child = tmp_path / "child.pid"
+    child_code = "import time; time.sleep(20)"
+    script = (
+        "import subprocess,sys;"
+        f"p=subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
+        f"open({str(child)!r},'w').write(str(p.pid));"
+        "sys.exit(0)"
+    )
+    relay = CommandRelay([sys.executable, "-c", script], 2.0)
+    started = time.monotonic()
+    asyncio.run(relay.deliver(notice()))
+    assert time.monotonic() - started < 1.0
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(int(child.read_text()), 9)
+
+
 def test_a_failing_command_reports_its_status_and_bounded_detail() -> None:
     script = "import sys; sys.stderr.write('x' * 100000); sys.exit(3)"
     relay = CommandRelay([sys.executable, "-c", script], 5)
@@ -398,8 +493,10 @@ def test_a_missing_command_cannot_start(tmp_path: Path) -> None:
 
 
 def test_the_file_sink_appends_one_line_per_notice_owner_only(tmp_path: Path) -> None:
-    path = tmp_path / "notices.jsonl"
-    relay = FileRelay(path, list, ())
+    protected = tmp_path / ".dromon" / "run"
+    protected.mkdir(parents=True)
+    path = protected / "notices.jsonl"
+    relay = FileRelay(path, [protected])
     asyncio.run(relay.deliver(notice("m-1")))
     asyncio.run(relay.deliver(notice("m-2", MessageKind.ISSUE)))
     lines = path.read_text().splitlines()
@@ -409,45 +506,54 @@ def test_the_file_sink_appends_one_line_per_notice_owner_only(tmp_path: Path) ->
 
 
 def test_the_file_sink_refuses_a_link_and_an_open_file(tmp_path: Path) -> None:
-    target = tmp_path / "elsewhere"
+    protected = tmp_path / ".dromon" / "run"
+    protected.mkdir(parents=True)
+    target = protected / "elsewhere"
     target.write_text("")
     target.chmod(0o600)
-    link = tmp_path / "link.jsonl"
+    link = protected / "link.jsonl"
     link.symlink_to(target)
     with pytest.raises(RelayError, match="could not be opened"):
-        FileRelay(link, list, ()).forward(notice())
-    shared = tmp_path / "shared.jsonl"
+        FileRelay(link, [protected]).forward(notice())
+    shared = protected / "shared.jsonl"
     shared.write_text("")
     shared.chmod(0o644)
     with pytest.raises(RelayError, match="open to group or others"):
-        FileRelay(shared, list, ()).forward(notice())
+        FileRelay(shared, [protected]).forward(notice())
     assert shared.read_text() == "" and target.read_text() == ""
 
 
-def test_the_file_sink_is_never_in_a_lines_workdir(tmp_path: Path) -> None:
+def test_the_file_sink_does_not_block_opening_a_fifo(tmp_path: Path) -> None:
+    protected = tmp_path / ".dromon" / "run"
+    protected.mkdir(parents=True)
+    fifo = protected / "notices.jsonl"
+    os.mkfifo(fifo)
+    started = time.monotonic()
+    with pytest.raises(RelayError, match="could not be opened"):
+        FileRelay(fifo, [protected]).forward(notice())
+    assert time.monotonic() - started < 1.0
+
+
+def test_the_file_sink_must_be_under_a_protected_directory(tmp_path: Path) -> None:
     workdir = tmp_path / "work"
     (workdir / "deep").mkdir(parents=True)
     protected = workdir / ".dromon"
     protected.mkdir()
     inside = workdir / "deep" / "notices.jsonl"
-    assert "lies in the working directory" in str(
-        sink_refusal(inside, [workdir], [protected])
+    assert "protected state or runtime" in str(sink_refusal(inside, [protected]))
+    assert sink_refusal(protected / "notices.jsonl", [protected]) is None
+    assert "protected state or runtime" in str(
+        sink_refusal(tmp_path / "notices.jsonl", [protected])
     )
-    assert sink_refusal(protected / "notices.jsonl", [workdir], [protected]) is None
-    assert sink_refusal(tmp_path / "notices.jsonl", [workdir], [protected]) is None
-    assert "does not exist" in str(
-        sink_refusal(tmp_path / "absent" / "n.jsonl", [], [])
-    )
+    assert "does not exist" in str(sink_refusal(tmp_path / "absent" / "n.jsonl", []))
     alias = tmp_path / "alias"
     alias.symlink_to(workdir)
-    assert sink_refusal(alias / "notices.jsonl", [workdir], []) is not None
-    moving: list[Path] = []
-    relay = FileRelay(tmp_path / "notices.jsonl", lambda: moving, [])
+    assert sink_refusal(alias / "notices.jsonl", []) is not None
+    sink = protected / "notices.jsonl"
+    relay = FileRelay(sink, [protected])
     relay.forward(notice("m-1"))
-    moving.append(tmp_path)
-    with pytest.raises(RelayError, match="lies in the working directory"):
-        relay.forward(notice("m-2"))
-    assert len((tmp_path / "notices.jsonl").read_text().splitlines()) == 1
+    relay.forward(notice("m-2"))
+    assert len(sink.read_text().splitlines()) == 2
 
 
 # The project file.
@@ -561,7 +667,7 @@ def refusal(daemon: Daemon, op: str, args: dict[str, object]) -> str:
 def test_a_reload_moves_the_route_and_status_shows_the_relays(
     paths: ProjectPaths, tmp_path: Path
 ) -> None:
-    outside = tmp_path.parent / f"{tmp_path.name}-sink"
+    outside = paths.state_dir / "relay"
     outside.mkdir()
     first, second = outside / "first.jsonl", outside / "second.jsonl"
     file = config_path(paths.state_dir)
@@ -590,7 +696,7 @@ def test_a_reload_moves_the_route_and_status_shows_the_relays(
     ]
 
 
-def test_a_sink_in_a_lines_workdir_is_refused_at_start_and_reload(
+def test_a_sink_outside_protected_state_is_refused_at_start_and_reload(
     paths: ProjectPaths,
 ) -> None:
     file = config_path(paths.state_dir)
@@ -602,14 +708,14 @@ def test_a_sink_in_a_lines_workdir_is_refused_at_start_and_reload(
         with pytest.raises(ProjectMismatch, match="relays.tail.path"):
             daemon.relay_routes(refused)
         daemon.operator_relayer()
-        assert "lies in the working directory" in refusal(daemon, "reload_project", {})
+        assert "protected state or runtime" in refusal(daemon, "reload_project", {})
         assert daemon.project == ProjectConfig(), "a refused reload changes nothing"
         file.write_text(file_relay_project(".dromon/run/notices.jsonl"))
         (paths.state_dir / "run").mkdir(mode=0o700, exist_ok=True)
         ask(daemon, "reload_project", {})
 
 
-def test_a_file_line_moving_onto_the_sink_is_refused_too(
+def test_a_file_sink_outside_protected_state_is_refused_even_in_a_line_workdir(
     paths: ProjectPaths, tmp_path: Path
 ) -> None:
     """A line the reloaded file declares counts, though the log does not hold it
@@ -623,27 +729,8 @@ def test_a_file_line_moving_onto_the_sink_is_refused_too(
     )
     with EventLog(paths.event_log) as log:
         daemon = make_daemon(paths, log, ProjectConfig())
-        with pytest.raises(ProjectMismatch, match="lies in the working directory"):
+        with pytest.raises(ProjectMismatch, match="protected state or runtime"):
             daemon.relay_routes(config)
-
-
-def test_a_line_configured_onto_the_sink_stops_its_writes(
-    paths: ProjectPaths, tmp_path: Path
-) -> None:
-    outside = tmp_path.parent / f"{tmp_path.name}-moved"
-    outside.mkdir()
-    file = config_path(paths.state_dir)
-    file.write_text(file_relay_project(str(outside / "notices.jsonl")))
-    with EventLog(paths.event_log) as log:
-        daemon = make_daemon(paths, log, parse(file.read_text(), paths.root))
-        relayer = daemon.operator_relayer()
-        daemon.scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
-        daemon.scheduler.ensure_operator("ana")
-        daemon.scheduler.configure_line("alpha", LineConfig(workdir=str(outside)))
-        message_id = daemon.scheduler.send(LineAddress("alpha"), ANA, "one")
-        asyncio.run(relayer.step())
-        assert not log.state.messages[message_id].delivered
-        assert "lies in the working directory" in str(relayer.report()["failures"])
 
 
 # Item 3. Issues from lines.
@@ -672,6 +759,28 @@ def test_a_line_raises_an_issue_and_the_operator_lists_and_closes_it(
         "a reply closes an issue too"
     )
     assert scheduler.state.messages[other].kind is MessageKind.NOTE
+
+
+def test_a_line_cannot_exceed_its_open_issue_limit(scheduler: Scheduler) -> None:
+    for index in range(5):
+        if index:
+            for _ in range(20):
+                scheduler.send(LineAddress("alpha"), LineAddress("alpha"), "spacing")
+        scheduler.send(LineAddress("alpha"), ANA, f"issue {index}", issue=True)
+    for _ in range(20):
+        scheduler.send(LineAddress("alpha"), LineAddress("alpha"), "spacing")
+    with pytest.raises(EventRejected, match="wait for an operator reply"):
+        scheduler.send(LineAddress("alpha"), ANA, "one too many", issue=True)
+
+
+def test_a_line_cannot_exceed_its_issue_rate(scheduler: Scheduler) -> None:
+    for index in range(3):
+        issue_id = scheduler.send(
+            LineAddress("alpha"), ANA, f"issue {index}", issue=True
+        )
+        scheduler.send(ANA, LineAddress("alpha"), "resolved", reply_to=issue_id)
+    with pytest.raises(EventRejected, match="wait for a reply"):
+        scheduler.send(LineAddress("alpha"), ANA, "rate limited", issue=True)
 
 
 @pytest.mark.parametrize(
