@@ -127,7 +127,13 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Final, cast
 
-from dromon.processes import MARK_VARIABLE, TreeRow, descendants, tree_or_reason
+from dromon.processes import (
+    MARK_VARIABLE,
+    TreeReadFailure,
+    TreeRow,
+    descendants,
+    tree_or_reason,
+)
 from dromon.engine_environment import (
     BASE_ENVIRONMENT,
     CLAUDE_ENGINE_ENVIRONMENT,
@@ -226,6 +232,9 @@ WALK_DEADLINE_SECONDS: Final = 0.75
 EXIT_SECONDS: Final = 2.0
 """How long what the launcher terminated may take to exit before it is killed."""
 
+KILL_CONFIRM_SECONDS: Final = 0.25
+"""How long the launcher waits after SIGKILL before declaring the stop unverified."""
+
 REAP_SECONDS: Final = 0.5
 """How long a killed harness may take to be reaped."""
 
@@ -235,11 +244,14 @@ the daemon's close or stop and its freeze, so that it can write out what it queu
 Five of Claude Code's transcript drains, as the module's account of review N2 says."""
 
 STOP_BUDGET_SECONDS: Final = (
-    FLUSH_SECONDS + 2 * WALK_DEADLINE_SECONDS + EXIT_SECONDS + REAP_SECONDS
+    FLUSH_SECONDS
+    + 2 * WALK_DEADLINE_SECONDS
+    + EXIT_SECONDS
+    + KILL_CONFIRM_SECONDS
+    + REAP_SECONDS
 )
-"""The longest a launcher's stop takes, the flush grace, two walk deadlines, one wait
-and the reap, which must leave a margin within ``SDK_CLOSE_SECONDS``. ``KILL_ALL`` has
-no grace, so its stop is shorter."""
+"""The longest stop, including flush grace, two walk deadlines, the termination and
+kill-confirmation waits, and reaping, which must fit within ``SDK_CLOSE_SECONDS``."""
 
 LAUNCHER_EXIT_SECONDS: Final = STOP_BUDGET_SECONDS + 2.0
 """How long the daemon waits for a launcher it signalled before it kills it."""
@@ -330,7 +342,7 @@ def walk_unavailable() -> str | None:
     the ordinary bound, not ``WALK_SECONDS``, since it asks whether ``ps`` can run at
     all, and a slow answer on a loaded machine must not refuse a turn."""
     found = tree_or_reason(os.getuid())
-    return found if isinstance(found, str) else None
+    return str(found) if isinstance(found, TreeReadFailure) else None
 
 
 def policy_of(environment: Mapping[str, str]) -> StopPolicy:
@@ -765,15 +777,15 @@ def _answers(pid: int) -> bool:
     return True
 
 
-def read_rows() -> list[TreeRow] | str:
+def read_rows() -> list[TreeRow] | TreeReadFailure:
     """The daemon's user's processes, or why they cannot be read."""
     return tree_or_reason(os.getuid())
 
 
 async def sweep_launches(
     directory: Path | None,
-    read: Callable[[], list[TreeRow] | str] = read_rows,
-) -> list[Swept] | str:
+    read: Callable[[], list[TreeRow] | TreeReadFailure | str] = read_rows,
+) -> list[Swept] | TreeReadFailure | str:
     """Sweep the harness's group of every launch record whose launcher has exited,
     then remove the record, and say what each sweep did. Returns why the process
     table could not be read instead, in which case nothing is touched and every
@@ -805,7 +817,7 @@ async def sweep_launches(
     if not suspect:
         return []
     rows = read()
-    if isinstance(rows, str):
+    if isinstance(rows, (TreeReadFailure, str)):
         return rows
     running = [
         record
@@ -1045,9 +1057,9 @@ def _harness_tree(me: int, harness: int) -> list[TreeRow] | None:
         if remaining <= 0:
             return None
         rows = tree_or_reason(os.getuid(), min(WALK_SECONDS, remaining))
-        if not isinstance(rows, str):
+        if not isinstance(rows, TreeReadFailure):
             break
-        if not rows.startswith("ps did not answer within "):
+        if not rows.timed_out:
             return None
     found = {row.pid: row for row in descendants(rows, me)}
     found.update({row.pid: row for row in rows if row.pgid == harness})
@@ -1071,11 +1083,15 @@ def _reap_adopted(pids: set[int]) -> set[int]:
     return reaped
 
 
-def _wait_gone(exits: ExitWatch, pids: set[int]) -> set[int]:
-    """Wait up to ``EXIT_SECONDS`` for the harness and ``pids`` to end, and return
+def _wait_gone(
+    exits: ExitWatch, pids: set[int], seconds: float = EXIT_SECONDS
+) -> set[int]:
+    """Wait up to ``seconds`` for the harness and ``pids`` to end, and return
     those of ``pids`` not reaped here."""
+    if not pids:
+        return set()
     tracked = set(pids)
-    for _ in range(int(EXIT_SECONDS / CHECK_SECONDS)):
+    for _ in range(int(seconds / CHECK_SECONDS)):
         tracked -= _reap_adopted(tracked)
         if exits.exited() and not any(_alive(pid) for pid in tracked):
             break
@@ -1086,7 +1102,8 @@ def _wait_gone(exits: ExitWatch, pids: set[int]) -> set[int]:
 def end_tree(me: int, harness: int, exits: ExitWatch) -> bool:
     """``KILL_ALL``: freeze the harness's group, walk the tree, terminate the group
     and every descendant found, then kill what remains. Returns whether both walks
-    could read the process table. The harness is unreaped throughout, so its group's
+    could read the process table and every process targeted by ``SIGKILL`` was gone
+    by the confirmation deadline. The harness is unreaped throughout, so its group's
     identifier cannot have been reused. **Review F4 and F5.**"""
     # The first act is a signal to the whole group, so that nothing in it exits, and
     # so orphans a child, or starts another, while the table is read.
@@ -1107,7 +1124,9 @@ def end_tree(me: int, harness: int, exits: ExitWatch) -> bool:
     for pid in sorted(remaining):
         if _alive(pid):
             _send(pid, signal.SIGKILL)
-    return before is not None and after is not None
+    still_tracked = _wait_gone(exits, remaining, KILL_CONFIRM_SECONDS)
+    kill_confirmed = not any(_alive(pid) for pid in still_tracked)
+    return before is not None and after is not None and kill_confirmed
 
 
 def end_harness(

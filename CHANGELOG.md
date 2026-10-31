@@ -7,14 +7,22 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
-- Codex calls refused before execution count toward the driver's tool budget. The
-  adapter reports each refusal as tool use before interrupting the turn and sends at
-  most one interrupt for the resulting budget exhaustion.
+- Refused Codex items count toward the driver's tool budget whether first announced by
+  `item/started` or `item/completed`. Matching item identifiers are counted once
+  regardless of notice order. A refusal announced by neither notice remains invisible.
 - A launcher retries a timed-out process-table walk until its 0.75-second deadline.
   If the table still cannot be read while stopping under `kill_all`, it reports the
-  stop as unverified and exits unsuccessfully after ending the harness's group.
-  Daemon process-table inspections and launch-record sweeps use one worker thread with
-  at most eight queued calls, so a slow `ps` call does not block the event loop.
+  stop as unverified and exits unsuccessfully after ending the harness's group. It
+  waits 0.25 seconds after `SIGKILL` and reports unverified if a process remains.
+  Daemon process-table inspections and launch-record sweeps use separate worker threads with
+  bounded queues of eight calls each. The detached-process scan remains on the
+  event-loop thread to preserve Keleusma finalizer affinity.
+- Process-table failures use a typed error, and only an explicit timeout triggers the
+  launcher's retry. A queued process call cancelled by its caller is skipped, though
+  a call already running cannot be cancelled.
+- Launcher tests start the source module from this checkout explicitly. Tests that need
+  a real `ps` table are marked to skip when `ps` cannot run instead of branching their
+  expected exit status on a probe result.
 
 - Grok sessions now set the model to the exact identifier in the driver's settings
   when `session/new` or `session/load` reports another model. Dromon requires a model

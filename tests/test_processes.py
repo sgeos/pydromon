@@ -72,6 +72,35 @@ def test_process_worker_refuses_calls_past_its_bounded_queue() -> None:
         release.set()
 
 
+def test_process_worker_skips_a_queued_call_after_its_caller_cancels() -> None:
+    worker = ProcessWorker()
+    entered = threading.Event()
+    release = threading.Event()
+    ran: list[str] = []
+
+    def blocked() -> None:
+        entered.set()
+        release.wait(5)
+
+    async def exercise() -> None:
+        running = asyncio.create_task(worker.run(blocked))
+        assert await asyncio.to_thread(entered.wait, 1)
+        queued = asyncio.create_task(worker.run(lambda: ran.append("later")))
+        await asyncio.sleep(0)
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+        release.set()
+        await running
+        await asyncio.sleep(0.02)
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release.set()
+    assert ran == []
+
+
 class FakeTable:
     """A process table the test writes, which records the signals sent."""
 

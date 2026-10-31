@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import signal
+import threading
 import time
 from collections.abc import Callable, Coroutine, Iterator, Sequence
 from pathlib import Path
@@ -158,7 +159,9 @@ class World:
         table: Table | None = None,
         identifiable: bool = True,
         walk_check: Callable[[], str | None] | None = None,
-        sweep_read: Callable[[], list[TreeRow] | str] = launcher.read_rows,
+        sweep_read: Callable[
+            [], list[TreeRow] | launcher.TreeReadFailure | str
+        ] = launcher.read_rows,
         create: bool = True,
     ) -> None:
         self.log = EventLog(path)
@@ -581,6 +584,20 @@ def test_detached_processes_found_by_the_mark_are_recorded_once(
     monkeypatch.setattr(os, "getpid", lambda: DAEMON)
     world = worlds(Engine())
     marked(world, 4300, 4301)
+    event_loop_thread = threading.get_ident()
+    environments = world.table.environments
+    own_processes = world.table.own_processes
+
+    def read_environments() -> dict[int, list[str]]:
+        assert threading.get_ident() == event_loop_thread
+        return environments()
+
+    def read_processes() -> Sequence[ProcessInfo]:
+        assert threading.get_ident() == event_loop_thread
+        return own_processes()
+
+    monkeypatch.setattr(world.table, "environments", read_environments)
+    monkeypatch.setattr(world.table, "own_processes", read_processes)
 
     async def check() -> None:
         await world.scheduler.report_detached("alpha")

@@ -896,6 +896,48 @@ def test_refused_tool_calls_count_against_the_driver_budget(
     assert sum(message.get("method") == "turn/interrupt" for message in sent) == 1
 
 
+def test_refused_calls_count_once_when_start_and_completion_are_out_of_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = line(FakeServer())
+    turn = codex_module._Turn(turn_id="t1")  # pyright: ignore[reportPrivateUsage]
+    sent: list[dict[str, object]] = []
+
+    async def send(message: Mapping[str, object]) -> None:
+        sent.append(dict(message))
+
+    monkeypatch.setattr(target, "_send", send)
+
+    async def calls() -> None:
+        for index in range(luna().settings.tool_budget):
+            value = {"type": "mcpToolCall", "id": f"item-{index}"}
+            if index % 2:
+                await target._notice(  # pyright: ignore[reportPrivateUsage]
+                    "item/completed", {"item": value}, turn
+                )
+                await target._item_started(  # pyright: ignore[reportPrivateUsage]
+                    value, turn
+                )
+            else:
+                await target._item_started(  # pyright: ignore[reportPrivateUsage]
+                    value, turn
+                )
+                await target._notice(  # pyright: ignore[reportPrivateUsage]
+                    "item/completed", {"item": value}, turn
+                )
+        assert turn.interrupted_for is None
+        await target._notice(  # pyright: ignore[reportPrivateUsage]
+            "item/completed",
+            {"item": {"type": "mcpToolCall", "id": "completed-only"}},
+            turn,
+        )
+
+    asyncio.run(calls())
+    assert turn.interrupted_for == "tool_budget"
+    assert turn.refusal == "the engine used a tool the line was not given: mcpToolCall"
+    assert sum(message.get("method") == "turn/interrupt" for message in sent) == 1
+
+
 def test_the_shell_counts_as_bash_only_for_a_line_given_bash() -> None:
     with pytest.raises(EngineRefused, match="not given: commandExecution"):
         run(line(FakeServer([item("commandExecution", command="ls")])))

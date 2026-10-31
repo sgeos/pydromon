@@ -899,6 +899,8 @@ class _Turn:
     status: str = ""
     interrupt_sent: bool = False
     """Whether Dromon already sent this turn's single interrupt request."""
+    refused_items: set[str] = field(default_factory=set[str])
+    """Identifiers of refused items already counted, regardless of notice order."""
     tools_changed: bool = False
     """Whether this turn started a new thread because Dromon's tools changed."""
     calls: list[dict[str, int]] = field(default_factory=list[dict[str, int]])
@@ -1389,6 +1391,8 @@ class CodexLine:
                 # The safe point before the next model call that priority mail takes,
                 # as ``dromon.priority`` describes.
                 await self._act(Event(TOOL_RESULT), turn)
+            elif str(item.get("type") or "") not in QUIET_ITEMS:
+                await self._refuse_item(item, turn)
         elif method == "model/rerouted":
             model = str(params.get("toModel") or "")
             verdict = self.driver.step(Event("init", model))
@@ -1491,16 +1495,26 @@ class CodexLine:
             return
         name = self._tool_name(item)
         if name is None:
-            # The driver's budget counts tool attempts, including a call Dromon
-            # refuses before Codex can run it.
-            await self._act(Event("tool_use", kind), turn)
-            await self._interrupt(
-                turn, f"the engine used a tool the line was not given: {kind}"
-            )
+            await self._refuse_item(item, turn)
             return
         turn.tool_uses.append(name)
         self._observe(ActivityKind.TOOL, name)
         await self._act(Event("tool_use", name), turn)
+
+    async def _refuse_item(self, item: Mapping[str, Any], turn: _Turn) -> None:
+        """Count and refuse an unavailable item once across start and completion."""
+        kind = str(item.get("type") or "")
+        identifier = item.get("id")
+        if isinstance(identifier, str) and identifier in turn.refused_items:
+            return
+        if isinstance(identifier, str):
+            turn.refused_items.add(identifier)
+        # The driver's budget counts refused calls even when Codex reports only
+        # item/completed. Identifiers deduplicate either notice order.
+        await self._act(Event("tool_use", kind), turn)
+        await self._interrupt(
+            turn, f"the engine used a tool the line was not given: {kind}"
+        )
 
     def _tool_name(self, item: Mapping[str, Any]) -> str | None:
         """The tool an item is a use of, as the driver counts it, or ``None`` for an

@@ -194,6 +194,7 @@ from dromon.processes import (
     ProcessRefused,
     ProcessTable,
     ProcessWorker,
+    TreeReadFailure,
     UNIDENTIFIABLE,
     SystemProcesses,
     TreeRow,
@@ -1631,7 +1632,9 @@ class Scheduler:
         line_tokens: LineTokens | None = None,
         report_dir: Path | None = None,
         walk_check: Callable[[], str | None] | None = None,
-        sweep_read: Callable[[], list[TreeRow] | str] = launcher.read_rows,
+        sweep_read: Callable[[], list[TreeRow] | TreeReadFailure | str] = (
+            launcher.read_rows
+        ),
         confining_engines: frozenset[str] = CONFINING_ENGINES,
     ) -> None:
         if not 1 <= wake_every_ticks <= MAX_WAKE_EVERY_TICKS:
@@ -1756,6 +1759,9 @@ class Scheduler:
         log once after a restart."""
         self._processes: ProcessTable = processes or SystemProcesses()
         self._process_worker = ProcessWorker()
+        self._sweep_worker = ProcessWorker()
+        """Separate queue so a sweep waiting on signalled children cannot occupy
+        the worker that serves process inspections and stops."""
         self._process_tasks: set[asyncio.Task[None]] = set()
         """Background process scans started during recovery, kept until they finish."""
         self._line_tokens = line_tokens
@@ -7857,20 +7863,21 @@ class Scheduler:
         """Sweep the launch records of launchers that have exited, and record what
         each sweep found, as ``launcher.sweep_launches`` says. **Review N1.** A failure
         is reported on the daemon's standard error, and the records wait for the next
-        sweep. Process-table reads and the sweep's bounded signaling waits run on the
-        process worker, so status requests and other event-loop work continue."""
+        sweep. Process-table reads and the sweep's bounded signaling waits run on a
+        separate worker, so a sweep cannot occupy the process inspection queue."""
         try:
-            found = await self._process_worker.run(
+            found = await self._sweep_worker.run(
                 lambda: asyncio.run(
                     launcher.sweep_launches(self._report_dir, self._sweep_read)
                 )
             )
-            if isinstance(found, str):
-                if self._sweep_failure != found:
-                    self._sweep_failure = found
+            if isinstance(found, (TreeReadFailure, str)):
+                message = str(found)
+                if self._sweep_failure != message:
+                    self._sweep_failure = message
                     print(
                         f"dromond: launch records wait, as the process table cannot"
-                        f" be read: {found}",
+                        f" be read: {message}",
                         file=sys.stderr,
                     )
                 return
@@ -7884,11 +7891,13 @@ class Scheduler:
             for swept in found:
                 self._record_swept(swept)
         except ProcessRefused as error:
-            self._sweep_failure = str(error)
-            print(
-                f"dromond: the launch-record sweep was refused: {error}",
-                file=sys.stderr,
-            )
+            message = str(error)
+            if self._sweep_failure != message:
+                self._sweep_failure = message
+                print(
+                    f"dromond: the launch-record sweep was refused: {error}",
+                    file=sys.stderr,
+                )
         except Exception as error:  # noqa: BLE001
             # Any failure, in the sweep or in recording what it did, is said, since
             # the task that runs a sweep is not awaited until the daemon stops.
@@ -8000,18 +8009,16 @@ class Scheduler:
         ended, record the line's processes that still run, found by its mark, which
         have left the engine's process tree, so that no stop reached them. Nothing is
         ended. The same set is not recorded twice in a row, and nothing is checked
-        where the platform does not let the daemon read the mark."""
+        where the platform does not let the daemon read the mark. This scan stays on
+        the event-loop thread because collection can run in any worker thread, and a
+        Keleusma virtual machine must be finalized on the thread that created it. Its
+        operating-system reads have the process-table timeout."""
         if not self._processes_identifiable or line_id not in self._log.state.lines:
             return
         if self.kept_session(line_id).get("kept") is True:
             return
-        try:
-            mark = self.line_mark(line_id)
-            found = await self._process_worker.run(
-                lambda: line_processes(self._processes, mark, os.getpid())
-            )
-        except ProcessRefused:
-            return
+        mark = self.line_mark(line_id)
+        found = line_processes(self._processes, mark, os.getpid())
         processes = [
             (cast(int, p["pid"]), str(p["command"]))
             for p in found

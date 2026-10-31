@@ -146,10 +146,14 @@ def test_status_answers_while_a_process_table_read_hangs(
             sweep = asyncio.create_task(scheduler.sweep())
             assert await asyncio.to_thread(entered.wait, 1)
             response = daemon.respond(b'{"id":"s","op":"status","v":1}\n')
+            inspection = await scheduler._process_worker.run(  # pyright: ignore[reportPrivateUsage]
+                lambda: "inspection worker remained available"
+            )
             elapsed = time.monotonic() - started
             release.set()
             await sweep
             assert response.ok
+            assert inspection == "inspection worker remained available"
             assert elapsed < 0.2
 
         try:

@@ -59,9 +59,27 @@ from dromon.launcher import (
     walk_unavailable,
     wrap,
 )
-from dromon.processes import MARK_VARIABLE, TreeRow, descendants, parse_tree
+from dromon.processes import (
+    MARK_VARIABLE,
+    TreeReadFailure,
+    TreeRow,
+    descendants,
+    parse_tree,
+)
 
 MARK = "alpha.0123abcd"
+TEST_SOURCE = str(Path(__file__).resolve().parents[1] / "src")
+LAUNCHER_RUNNER = (
+    "import runpy, sys; "
+    f"sys.path.insert(0, {TEST_SOURCE!r}); "
+    "runpy.run_module('dromon.launcher', run_name='__main__')"
+)
+
+
+def launcher_command(*arguments: str) -> list[str]:
+    """Run this checkout's launcher source despite Python's isolated mode."""
+    return [sys.executable, "-I", "-c", LAUNCHER_RUNNER, *arguments]
+
 
 HARNESS = (
     "import json, os, subprocess, sys, time\n"
@@ -189,7 +207,7 @@ class Launched:
             environment[launcher.FILTER_ENVIRONMENT_VARIABLE] = "1"
         environment.update(extra_environment or {})
         self.process = subprocess.Popen(  # noqa: S603
-            [sys.executable, "-I", "-m", "dromon.launcher"],
+            launcher_command(),
             env=environment,
             stdin=stdin,
             stdout=subprocess.PIPE,
@@ -357,12 +375,14 @@ def test_a_timed_out_ps_walk_retries_within_its_deadline(
     clock = [0.0]
     calls: list[float] = []
 
-    def fake_ps(uid: int, timeout: float) -> list[TreeRow] | str:
+    def fake_ps(uid: int, timeout: float) -> list[TreeRow] | TreeReadFailure:
         del uid
         calls.append(timeout)
         if len(calls) == 1:
             clock[0] += timeout
-            return f"ps did not answer within {timeout:g} seconds"
+            return TreeReadFailure(
+                f"ps did not answer within {timeout:g} seconds", timed_out=True
+            )
         return []
 
     monkeypatch.setattr(launcher.time, "monotonic", lambda: clock[0])
@@ -447,6 +467,7 @@ def test_the_filter_passes_the_lines_git_command_and_never_the_daemons(
     assert launched.record["names"] == [MARK_VARIABLE]
 
 
+@NEEDS_PS
 def test_a_stop_under_kill_all_ends_the_harness_and_its_group(
     tmp_path: Path, started: list[Launched]
 ) -> None:
@@ -455,7 +476,7 @@ def test_a_stop_under_kill_all_ends_the_harness_and_its_group(
     stay = launched.pid("stay")
     assert alive(stay)
     launched.process.send_signal(signal.SIGTERM)
-    assert launched.wait() == (128 + signal.SIGTERM if ps_runs() else 1)
+    assert launched.wait() == 128 + signal.SIGTERM
     assert gone(stay)
 
 
@@ -475,7 +496,7 @@ STAND_IN = (
     "import os, subprocess, sys\n"
     "environment = dict(os.environ)\n"
     f"environment[{PARENT_VARIABLE!r}] = str(os.getpid())\n"
-    "launched = subprocess.Popen([sys.executable, '-I', '-m', 'dromon.launcher'],"
+    f"launched = subprocess.Popen([sys.executable, '-I', '-c', {LAUNCHER_RUNNER!r}],"
     " env=environment, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,"
     " start_new_session=True)\n"
     "sys.stdout.write(launched.stdout.readline().decode())\n"
@@ -512,15 +533,17 @@ def test_a_dead_daemon_is_noticed_and_everything_ended(tmp_path: Path) -> None:
                 os.kill(pid, signal.SIGKILL)
 
 
+@NEEDS_PS
 def test_a_harness_that_exits_has_its_group_ended_and_its_status_kept(
     tmp_path: Path, started: list[Launched]
 ) -> None:
     launched = Launched(tmp_path, HARNESS + "sys.exit(3)\n", StopPolicy.KILL_ALL)
     started.append(launched)
-    assert launched.wait() == (3 if ps_runs() else 1)
+    assert launched.wait() == 3
     assert gone(launched.pid("stay"))
 
 
+@NEEDS_PS
 def test_a_stop_under_leave_background_ends_the_harness_alone(
     tmp_path: Path, started: list[Launched]
 ) -> None:
@@ -538,18 +561,14 @@ def test_a_stop_under_leave_background_ends_the_harness_alone(
     stay = launched.pid("stay")
     assert alive(stay)
     found = collect_reports(reports)
-    if not ps_runs():
-        # Without ps nothing can be listed, which the report says. Review F2.
-        assert [(r.processes, r.listed) for r in found] == [((), False)]
-        return
     (report,) = found
     assert report.line_id == "alpha" and report.cause == "stopped"
     assert {pid for pid, _ in report.processes} >= {stay, launched.pid("away")}
 
 
 def test_a_launcher_without_a_target_refuses_to_start() -> None:
-    finished = subprocess.run(
-        [sys.executable, "-I", "-m", "dromon.launcher"],
+    finished = subprocess.run(  # noqa: S603
+        launcher_command(),
         env={"PATH": "/bin"},
         capture_output=True,
         timeout=60,
@@ -560,8 +579,8 @@ def test_a_launcher_without_a_target_refuses_to_start() -> None:
 
 
 def test_a_target_that_cannot_start_is_reported() -> None:
-    finished = subprocess.run(
-        [sys.executable, "-I", "-m", "dromon.launcher"],
+    finished = subprocess.run(  # noqa: S603
+        launcher_command(),
         env={"PATH": "/bin", TARGET_VARIABLE: "/no/such/harness"},
         capture_output=True,
         timeout=60,
@@ -624,10 +643,10 @@ def test_a_walk_that_cannot_read_the_table_is_never_an_empty_tree(
 ) -> None:
     """F2. A failed ps is a reason, and the launcher's walk gives None for it."""
 
-    def denied(uid: int, timeout: float = 0.0) -> list[TreeRow] | str:
-        return "ps cannot be run: denied"
+    def denied(uid: int, timeout: float = 0.0) -> list[TreeRow] | TreeReadFailure:
+        return TreeReadFailure("ps cannot be run: denied")
 
-    def empty(uid: int, timeout: float = 0.0) -> list[TreeRow] | str:
+    def empty(uid: int, timeout: float = 0.0) -> list[TreeRow] | TreeReadFailure:
         return []
 
     monkeypatch.setattr(launcher, "tree_or_reason", denied)
@@ -638,6 +657,64 @@ def test_a_walk_that_cannot_read_the_table_is_never_an_empty_tree(
     assert launcher._harness_tree(1, 2) == []  # pyright: ignore[reportPrivateUsage]
 
 
+def test_a_process_table_error_is_not_retried_as_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def failed(uid: int, timeout: float) -> TreeReadFailure:
+        nonlocal calls
+        calls += 1
+        return TreeReadFailure(
+            "ps failed with status 1 and said ps did not answer within policy",
+            timed_out=False,
+        )
+
+    monkeypatch.setattr(launcher, "tree_or_reason", failed)
+    assert launcher._harness_tree(1, 2) is None  # pyright: ignore[reportPrivateUsage]
+    assert calls == 1
+
+
+def test_a_process_still_alive_after_sigkill_makes_the_stop_unverified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = TreeRow(30, 10, 10, "blocked child")
+    waits: list[tuple[set[int], float]] = []
+    signals: list[tuple[int, int]] = []
+
+    def wait_gone(
+        _exits: ExitWatch,
+        pids: set[int],
+        seconds: float = launcher.EXIT_SECONDS,
+    ) -> set[int]:
+        waits.append((set(pids), seconds))
+        return set(pids)
+
+    def tree(_me: int, _harness: int) -> list[TreeRow]:
+        return [row]
+
+    def record_signal(pid: int, sig: int) -> None:
+        signals.append((pid, sig))
+
+    def alive_always(_pid: int) -> bool:
+        return True
+
+    monkeypatch.setattr(launcher, "_harness_tree", tree)
+    monkeypatch.setattr(launcher, "_wait_gone", wait_gone)
+    monkeypatch.setattr(launcher, "signal_group", record_signal)
+    monkeypatch.setattr(launcher, "_send", record_signal)
+    monkeypatch.setattr(launcher, "_alive", alive_always)
+
+    stopped = launcher.end_tree(1, 10, cast(ExitWatch, object()))
+
+    assert not stopped
+    assert waits == [
+        ({30}, launcher.EXIT_SECONDS),
+        ({30}, launcher.KILL_CONFIRM_SECONDS),
+    ]
+    assert (30, signal.SIGKILL) in signals
+
+
 def test_ps_failing_is_a_reason_and_not_a_tree(monkeypatch: pytest.MonkeyPatch) -> None:
     def missing(*_: object, **__: object) -> object:
         raise FileNotFoundError("no ps")
@@ -645,15 +722,16 @@ def test_ps_failing_is_a_reason_and_not_a_tree(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(processes.subprocess, "run", missing)
     assert processes.read_tree(os.getuid()) is None
     reason = processes.tree_or_reason(os.getuid())
-    assert isinstance(reason, str) and "no ps" in reason
+    assert isinstance(reason, TreeReadFailure) and "no ps" in reason.reason
 
     def refused(*_: object, **__: object) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(["ps"], 1, "", "ps: not permitted\n")
 
     monkeypatch.setattr(processes.subprocess, "run", refused)
-    assert processes.tree_or_reason(os.getuid()) == (
-        "ps failed with status 1 and said ps: not permitted"
-    )
+    reason = processes.tree_or_reason(os.getuid())
+    assert isinstance(reason, TreeReadFailure)
+    assert reason.reason == "ps failed with status 1 and said ps: not permitted"
+    assert not reason.timed_out
 
 
 def test_a_launcher_is_signalled_by_pid_as_well_as_by_group() -> None:
@@ -740,7 +818,7 @@ def test_an_exit_watch_on_a_reaped_child_sees_it_exited() -> None:
 
 def test_the_stop_fits_within_the_sdk_window_with_a_margin() -> None:
     """F5. The SDK kills the launcher SDK_CLOSE_SECONDS after its SIGTERM."""
-    assert launcher.STOP_BUDGET_SECONDS + 0.5 <= launcher.SDK_CLOSE_SECONDS
+    assert launcher.STOP_BUDGET_SECONDS + 0.25 <= launcher.SDK_CLOSE_SECONDS
     assert launcher.LAUNCHER_EXIT_SECONDS > launcher.STOP_BUDGET_SECONDS
 
 
@@ -756,6 +834,7 @@ STUBBORN = (
 """A harness that ignores SIGTERM, with a child that does too."""
 
 
+@NEEDS_PS
 def test_a_harness_that_ignores_sigterm_is_killed_within_the_sdk_window(
     tmp_path: Path, started: list[Launched]
 ) -> None:
@@ -768,7 +847,7 @@ def test_a_harness_that_ignores_sigterm_is_killed_within_the_sdk_window(
     status = launched.wait()
     took = time.monotonic() - began
     assert took < launcher.SDK_CLOSE_SECONDS
-    assert status == (128 + signal.SIGKILL if ps_runs() else 1)
+    assert status == 128 + signal.SIGKILL
     assert gone(stay)
 
 
@@ -846,6 +925,7 @@ CLOSING = (
 session of its own, when its input closes, and echoes what it reads until then."""
 
 
+@NEEDS_PS
 def test_under_leave_background_a_closed_input_does_not_reach_the_harness(
     tmp_path: Path, started: list[Launched]
 ) -> None:
@@ -870,14 +950,12 @@ def test_under_leave_background_a_closed_input_does_not_reach_the_harness(
     away = launched.pid("away")
     assert alive(away)
     found = collect_reports(reports)
-    if not ps_runs():
-        assert [(r.processes, r.listed) for r in found] == [((), False)]
-        return
     (report,) = found
     assert report.cause == "stopped"
     assert away in {pid for pid, _ in report.processes}
 
 
+@NEEDS_PS
 def test_under_kill_all_the_harness_still_sees_its_input_close(
     tmp_path: Path, started: list[Launched]
 ) -> None:
@@ -886,7 +964,7 @@ def test_under_kill_all_the_harness_still_sees_its_input_close(
     assert launched.process.stdin is not None
     launched.process.stdin.close()
     # The harness exited by itself on the end of its input, with its own status.
-    assert launched.wait() == (0 if ps_runs() else 1)
+    assert launched.wait() == 0
     assert gone(launched.pid("away"))
 
 

@@ -81,6 +81,7 @@ class _ProcessCall(Generic[_Result]):
     function: Callable[[], _Result]
     loop: asyncio.AbstractEventLoop
     future: asyncio.Future[_Result]
+    cancelled: threading.Event
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,12 +120,23 @@ class ProcessRefused(ValueError):
     """A process tool cannot do what the line asked."""
 
 
+@dataclass(frozen=True, slots=True)
+class TreeReadFailure:
+    reason: str
+    timed_out: bool = False
+
+    def __str__(self) -> str:
+        return self.reason
+
+
 class ProcessWorker:
     """Run blocking process-table inspections on one daemon thread and bounded queue.
 
     The queue contains no more than ``MAX_PENDING_PROCESS_CALLS`` waiting calls, in
     addition to the one call being run. A full queue refuses new inspections instead
-    of leaving an unbounded number of daemon tasks waiting for the worker.
+    of leaving an unbounded number of daemon tasks waiting for the worker. A queued
+    call is skipped if its caller cancels before execution. A call already running
+    cannot be stopped and may finish after its caller is cancelled.
     """
 
     def __init__(self) -> None:
@@ -138,7 +150,7 @@ class ProcessWorker:
         """Run ``function`` with its arguments, or refuse if the queue is full."""
         loop = asyncio.get_running_loop()
         future: asyncio.Future[_Result] = loop.create_future()
-        call = _ProcessCall(function, loop, future)
+        call = _ProcessCall(function, loop, future, threading.Event())
         with self._lock:
             if self._thread is None:
                 self._thread = threading.Thread(
@@ -149,12 +161,18 @@ class ProcessWorker:
                 self._queue.put_nowait(call)
             except queue.Full as error:
                 raise ProcessRefused("the process inspection queue is full") from error
-        return await future
+        try:
+            return await future
+        except asyncio.CancelledError:
+            call.cancelled.set()
+            raise
 
     def _work(self) -> None:
         while True:
             call = self._queue.get()
             try:
+                if call.cancelled.is_set():
+                    continue
                 result = call.function()
             except BaseException as error:
                 self._deliver(call, error=error)
@@ -387,12 +405,12 @@ def read_tree(uid: int, timeout: float = PS_TIMEOUT_SECONDS) -> list[TreeRow] | 
     tree, since a caller that ends what it finds must know that it found nothing
     because it could not look."""
     found = tree_or_reason(uid, timeout)
-    return None if isinstance(found, str) else found
+    return None if isinstance(found, TreeReadFailure) else found
 
 
 def tree_or_reason(
     uid: int, timeout: float = PS_TIMEOUT_SECONDS
-) -> list[TreeRow] | str:
+) -> list[TreeRow] | TreeReadFailure:
     """Every process of ``uid`` with its parent and group, or why ``ps`` could not
     list them. ``ps`` takes these fields alike on macOS and Linux."""
     try:
@@ -411,13 +429,17 @@ def tree_or_reason(
             check=False,
         )
     except OSError as error:
-        return f"ps cannot be run: {error}"
+        return TreeReadFailure(f"ps cannot be run: {error}")
     except subprocess.TimeoutExpired:
-        return f"ps did not answer within {timeout:g} seconds"
+        return TreeReadFailure(
+            f"ps did not answer within {timeout:g} seconds", timed_out=True
+        )
     if found.returncode != 0:
         said = found.stderr.strip().splitlines()
         detail = said[0][:MAX_COMMAND_CHARACTERS] if said else "nothing"
-        return f"ps failed with status {found.returncode} and said {detail}"
+        return TreeReadFailure(
+            f"ps failed with status {found.returncode} and said {detail}"
+        )
     return parse_tree(found.stdout)
 
 
