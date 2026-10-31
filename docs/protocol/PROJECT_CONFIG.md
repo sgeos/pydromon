@@ -108,7 +108,7 @@ relay = "tail"          # the route of operator ana's mail
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `version` | integer | required | Must be 1 |
-| `daemon.operator` | identifier | `operator` | The default operator |
+| `daemon.operator` | identifier | `operator` | The default operator. It also declares that operator, whom a peer may reach before that operator has sent anything, as decision 25 of [`FEDERATION.md`](../architecture/FEDERATION.md) specifies. The built-in default declares no one |
 | `daemon.tick_seconds` | number in [0, 60] | 1 | The tick cadence |
 | `daemon.require_sandbox` | boolean | `false` | Whether every Claude Code line must run with an enabled sandbox, as below |
 | `daemon.disclosure_terms` | path | none | The project's disclosure list, relative to the project root, as below |
@@ -144,9 +144,20 @@ relay = "tail"          # the route of operator ana's mail
 | `teacher` | table | none | The project's local teacher model, as [`TEACHER.md`](TEACHER.md) specifies |
 | `agents` | table | off | Which external agents may connect, and with what access, as [`AGENTS.md`](AGENTS.md) specifies |
 | `federation.listen` | boolean | `false` | Whether the daemon opens its peer socket. Validated, with no effect until the peer socket is built |
-| `federation.tls_listen` | `HOST:PORT` text | none | The address of the daemon's Transport Layer Security listener, a host name or an address with a version 6 address in brackets, and a port in [1, 65535]. Required exactly when a `tls` peer is inbound, so no network listener is configured unless a peer needs one. Every declared peer may be an inbound `tls` peer, since the transport's bound of 64 certificates one listener trusts is the bound on declared peers. Two identities made before certificates named their own key share one subject name, so one of them must be made again with `dromon peer key` before one listener trusts both. A listener that cannot start is said on standard error, and the rest of the daemon still serves |
+| `federation.tls_listen` | `HOST:PORT` text | none | The address of the daemon's Transport Layer Security listener, a host name or an address with a version 6 address in brackets, and a port in [1, 65535]. Required exactly when a `tls` peer is inbound or `remote` is open, so no network listener is configured unless a peer or the open mode needs one. Every declared peer may be an inbound `tls` peer, since the transport's bound of 64 certificates one listener trusts is the bound on declared peers. Two identities made before certificates named their own key share one subject name, so one of them must be made again with `dromon peer key` before one listener trusts both. A listener that cannot start is said on standard error, and the rest of the daemon still serves |
 | `federation.accept_unconfined` | boolean | `false` | Whether lines on an engine Dromon cannot confine may run in a project with peers, as below |
 | `federation.waiting_per_recipient` | integer in [1, 100000] | 200 | The bound on mail from all peers waiting for one local party. Validated, with no effect until peer mail is built |
+| `federation.local` | `allowlist` or `open` | `allowlist` | Whether projects of this machine reach this one only as declared peers, or also through the per-user registry, as [`FEDERATION.md`](../architecture/FEDERATION.md) specifies under open federation. `open` needs `listen` and `name`. Added on 2026-10-31. **Rollout hazard.** A daemon before this change refuses the key |
+| `federation.remote` | `allowlist` or `open` | `allowlist` | Whether the TLS listener also takes a key no declared peer pins, inbound only, which needs `tls_listen` set explicitly. The open listener uses pyOpenSSL and accepts only a self-signed Ed25519 key over TLS 1.3, as FEDERATION.md records. A daemon with `open` and no identity of its own listens on nothing over TLS. Added on 2026-10-31 |
+| `federation.name` | identifier | none | The name this daemon registers under when `local` is open, unique among live entries, and refused when it is 64 hexadecimal digits, a declared peer's name, or on the disclosure list. Required when `local` is open |
+| `federation.allowed_networks` | list of 1 to 64 address ranges | every address | The ranges, such as `192.0.2.0/24` or `2001:db8::/32`, written with no host bits set, from which the TLS listener accepts a connection, checked by the connecting address before the connection counts under the cap and before its handshake. Needs `tls_listen`. Required while `remote` is open, so a listener admits every address only when the file lists `"0.0.0.0/0"` and `"::/0"`, decided by the operator on 2026-10-31 |
+| `federation.open.reach`, `.senders` | lists of local addresses | empty | As `peers.ID.reach` and `.senders`, for every open peer on this machine that the file does not declare. Empty lists deliver nothing |
+| `federation.open.remote` | list of `NAME:PARTY` texts | empty | The parties of open peers local senders may address, with `NAME` a federation name or `*` for every open peer, and `PARTY` always named, so a line cannot guess at another project's parties |
+| `federation.open.priority_in`, `.priority_out`, `.max_body_bytes`, `.expire_hours`, `.turns_per_hour`, `.waiting` | as for `peers.ID` | as for `peers.ID` | The limits of every open peer on this machine |
+| `federation.open.remote_reach` | list of local addresses | empty | The local parties an undeclared key on another machine may send to. Such a key is inbound only and never priority |
+| `federation.open.remote_max_body_bytes`, `.remote_turns_per_hour`, `.remote_waiting` | integers | 16384, 2, 50 | The stricter limits of an undeclared key on another machine |
+| `federation.open.remote_total_turns_per_hour`, `.remote_total_waiting` | integers | 6, 500 | The turns for one local line in any hour, and the waiting notes, that all undeclared keys share, besides each key's own. One declared peer's defaults. At most 64 undeclared keys are recorded, and a new key past that is refused |
+| `federation.open.remote_total_deliveries` | integer | 60 | The `deliver` requests all undeclared keys together may make in ten minutes, whatever their answers, besides each key's own 60. One declared peer's rate. From 1 to 3,840, which is 64 keys at their own rate |
 | `peers.ID` | table | none | Another Dromon daemon, on this machine or on another, named by an identifier, as [`FEDERATION.md`](../architecture/FEDERATION.md) designs it. At most 64 |
 | `peers.ID.transport` | `unix` or `tls` | `unix` | A `unix` peer is on this machine. A `tls` peer is reached over Transport Layer Security, the second phase. Mail to it passes the same policy as mail to a `unix` peer. A key of the other transport is an error |
 | `peers.ID.socket` | absolute path | required for `unix` | The peer's `peers.sock`, at most 103 bytes, without `.` or `..` steps. Its directory is the peer's runtime directory |
@@ -167,7 +178,7 @@ relay = "tail"          # the route of operator ana's mail
 | `relays.NAME.command` | list of 1 to 64 non-empty texts | required for `command` | The argument vector, run without a shell, each argument at most 4096 bytes. A key of the other kind is an error |
 | `relays.NAME.path` | path | required for `file` | The notice file, absolute, under `~`, or relative to the project root. Its directory must exist, and it may not lie in any line's working directory except inside a directory Dromon protects, as below |
 | `relays.NAME.timeout_seconds` | number in (0, 3600] | 30 | How long a command relay may run before it and its process group are killed |
-| `operators.ID` | table | none | An operator, named by an operator identifier |
+| `operators.ID` | table | none | An operator, named by an operator identifier, and declared, so that a peer may reach it as `daemon.operator` may be reached |
 | `operators.ID.relay` | relay name | required | The relay that carries the operator's mail. An operator with no table is unrouted, and its mail waits for a client |
 | `settings` | table | none | The project's engine settings, merged under every line's, as [`SETTINGS.md`](SETTINGS.md) specifies |
 | `profiles.NAME.settings`, `lines.ID.settings` | table | none | A profile's or a line's engine settings. These merge rather than replace |
@@ -287,8 +298,12 @@ named, are protected as the project's own state and runtime directories are. Eve
 enabled sandbox denies them, the Codex profile denies those that exist, the check of
 the Grok profiles requires them, and no `workdir` may lie in or contain one, as
 [`SANDBOX.md`](SANDBOX.md) specifies. A peer whose directory is one of the project's
-own, or two peers that share one, are refused. While the project declares any peer,
-the daemon refuses a line on Pi, Cursor Agent or Antigravity, which Dromon cannot
+own, or two peers that share one, are refused. **Open federation, added on
+2026-10-31.** While `local` is open, the per-user registry joins the protected
+directories, and so do the runtime and state directories of every project it holds,
+read again at each engine build, so a project registered after the daemon started is
+denied from each line's next turn. While the project declares any peer, or either
+mode is open, the daemon refuses a line on Pi, Cursor Agent or Antigravity, which Dromon cannot
 confine, unless `federation.accept_unconfined` is true. The check runs where the
 required sandbox's does. **Why.** A line that is not confined runs as the operator's
 user and could read the peer tokens of a later step and act as a peer, and the

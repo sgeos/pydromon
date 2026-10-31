@@ -121,11 +121,14 @@ operator authority. The design keeps that without exception.
   answer a question or reach any operator request.
 - **Default deny, per peer and per direction.** A daemon accepts no peer that its
   operator has not declared, and a declared peer has both directions off until the
-  operator turns each on.
+  operator turns each on. **Amended on 2026-10-31.** An operator may open the project
+  to undeclared peers, as open federation below specifies, whose lists are empty by
+  default and so still deliver nothing until the operator names who may reach.
 - **Which local parties a peer may reach.** Inbound policy lists the local parties a
   peer may send to, by address, such as `["core", "@ana"]`. The default list is
   empty. Mail to any other local party is refused with a code that does not say whether
-  the party exists.
+  the party exists. An operator exists for `reach` only when the project file declares
+  that operator, as decision 25 decided.
 - **Which local parties may send to a peer.** Outbound policy lists the local parties
   that may send to a peer. The default list is empty. A line's `send_message` to a
   remote address it may not use is refused and records nothing, as a refusal does
@@ -383,6 +386,225 @@ listener at all.
 network address translation, discovery, and peers that reach each other only through a
 third daemon.
 
+## Open federation
+
+**Asked by the operator on 2026-10-31, round 12.** Federation may be open to every
+project of the same user on this machine, and open to keys on other machines, as well
+as limited to declared peers. `[federation] local` and `remote` each take `allowlist`,
+the default, which keeps the behaviour above exactly, or `open`. A declared peer's own
+table always governs it, in either mode.
+
+```toml
+[federation]
+listen = true
+local = "open"                      # projects of this user on this machine
+name = "harbor"                     # this daemon's name in the registry
+# remote = "open"                   # undeclared keys inbound, below
+# allowed_networks = ["192.0.2.0/24"]   # required while remote is open
+
+[federation.open]
+reach = ["core"]                    # local parties any open peer may send to
+senders = ["core"]                  # local parties that may send to open peers
+remote = ["tidepool:core", "*:@ana"]   # NAME:PARTY, NAME a federation name or *
+remote_reach = ["@ana"]             # what an undeclared key may reach
+```
+
+### The registry
+
+- **Location.** **Decided by core, for the operator's review.** A daemon whose
+  project sets `local = "open"` registers in `.local/state/dromon/registry` under the
+  home directory that the password database gives its user. **Reason.** Every daemon
+  of one user then finds the same directory whatever environment started it, since a
+  sandbox or a service manager may set `HOME` or `XDG_STATE_HOME` differently. The
+  path follows the freedesktop.org convention for state, and lies outside every
+  project, and a start whose registry lies in its own project is refused.
+- **Override.** **Decided by core, for the operator's review, round 13.**
+  `DROMON_REGISTRY_DIR`, an absolute path, replaces the location, so that tests and
+  trials never write the user's real registry. Every test sets it to a temporary
+  directory. A value that is empty, relative or holds a `.` or `..` step refuses the
+  start rather than falling back to the default. Daemons that should find each other
+  must be started with the same value. A daemon given another registry finds none of
+  the others and is found by none, which fails closed. The lines of an open daemon are
+  denied the default registry as well as the one in use.
+- **Modes.** The directory must be the user's with mode 0700 and is refused if wider,
+  never narrowed. Each entry is `NAME.json`, a regular file of mode 0600, holding the
+  federation name, the `peers.sock` path, the project root, the pid and the start
+  time the process table gives. An entry of another mode, owner or name is ignored.
+- **Lifetime.** The entry is written at start, under an advisory lock, and removed at
+  stop only if the registry still holds exactly it. An entry whose pid now has
+  another start time, or none, is stale and ignored, and a later daemon replaces it.
+  A live entry keeps its name, and a start that would take it is refused. A process
+  table that cannot be read makes no entry live, and refuses to replace one.
+- **Why `local` needs `listen` and `name`.** A daemon that does not register can be
+  neither reached nor recognized. The name is refused when it is 64 hexadecimal
+  digits, which name undeclared keys, when a declared peer has it, or when the
+  disclosure list covers it, since it leaves the project in every `hello`.
+
+### Same machine, open
+
+- **Inbound.** A `hello` on `peers.sock` without `token` names its peer by the live
+  registry entry of the `name` it announces, and only when that entry's pid is the
+  connecting process's, which the kernel gives as `LOCAL_PEERPID` on macOS and in
+  `SO_PEERCRED` on Linux. **Fact,** read on a socket pair on 2026-10-31. **Decided by
+  core, for review.** The entry is chosen by the announced name and then checked by
+  the pid, rather than found by the pid alone, so two daemons in one process, as in
+  the tests, are told apart. An entry whose socket is a declared `unix` peer's names
+  that peer, and its own table applies. Any other entry names the open peer of its
+  federation name, recorded with `peer_opened` when first seen, unless a declared peer
+  bears that name or the entry is this daemon's own. Each `deliver` checks again
+  that a policy still governs the peer.
+- **The caller's start time.** **Decided by the operator on 2026-10-31,** from
+  finding F2 of the round 12 review. The daemon reads the connecting pid's start time
+  from the process table once, when it accepts the connection, in a worker thread
+  and never on the event loop. The entry names the caller only when its start time
+  equals both that reading and the one taken at `hello`, so a pid that the caller's
+  exit freed and a later daemon took before the `hello` names nothing. A start time
+  that cannot be read at accept, from a table that cannot answer or a caller already
+  gone, refuses the `hello`. **Limit.** The table gives start times to the second, so
+  a pid reused within the second its first process started is not told apart.
+- **No bound on open peers here.** From finding R4 of the round 12 re-review.
+  Undeclared projects on this machine are not counted against `MAX_OPEN_REMOTE_PEERS`
+  and have no bound of their own, and they have no shared limits. **Reason.** Each is
+  named by a live registry entry whose pid is the caller's, the registry admits only
+  files of the same user in a directory of mode 0700, and the lines of an open
+  project are denied it, so every open peer here is a process of the user that the
+  project already trusts as far as its tokens. A name stays one peer however often
+  it connects, so the open peers here grow as the user starts daemons of new names.
+  **Inference.** A process of the user that writes registry entries under many names
+  and connects under each could still record many open peers, without limit. Such a
+  process can already read every token and act as the user, which is the exposure
+  the trust section accepts, so a bound would not change what it can do. **Hazard.**
+  The log then grows by one event for each such name.
+- **Outbound.** A line may address `NAME:PARTY` for a project of the registry that the
+  file does not declare. The send is judged by `[federation.open]` first, and only
+  mail it lets through records `peer_opened` and then `message_sent`, so a refusal
+  records nothing. The send reads the entry and not the process table, so it never
+  waits on `ps`. The forwarder reads the live entry at each connection, sends a
+  `hello` with this daemon's name and no token, and backs off while no live entry
+  exists. A declared peer with no token stored is reached the same way while this
+  daemon is open.
+- **Policy.** Every open peer on this machine takes `[federation.open]`, with `reach`,
+  `senders`, the `remote` patterns and the per-peer limits as defaults. Each list is
+  empty by default, which delivers nothing. A `remote` pattern always names its party,
+  and only the project may be `*`, so a line cannot guess at another project's
+  parties, which is the reason `remote` exists.
+- **Leaving open.** A project that returns to `allowlist` serves no open peer from its
+  next start, and its mail still waiting for one is returned with `unknown_peer`. The
+  project file never removes an open peer from the log, and a declared table of its
+  name replaces it.
+
+### Denying every registered project to lines
+
+**Decided by core, for the operator's review.** While `local` is open, the registry
+itself joins the protected directories, so no line of the project can write an entry
+and pass for a daemon. Each registered project's runtime and state directories, live
+or stale, join each line's protected set at each engine build, so a project
+registered after this daemon started is denied from each line's next turn.
+
+- **Limit.** A turn already running keeps the sandbox it started with, so a project
+  registered during that turn is not denied to it until the turn ends.
+- **Limit.** A registry that cannot be read, or holds more than 256 entries, ends the
+  turn before anything runs, which fails closed at the cost of the turn.
+- **Limit.** The Grok profile check requires every protected directory, so a Grok line
+  of an open project fails its turn until its profile denies each registered project.
+- **Inference.** A line of a project that is not open, or of a daemon older than this,
+  is not denied the registry by Dromon. Such a line that could write there could pass
+  for a daemon to an open project, as an unconfined process of the user can. This is
+  the exposure the trust section already accepts for tokens, and the unconfined-engine
+  rule applies once either mode is open.
+
+### Different machines, open
+
+- **Inbound only.** With `remote = "open"`, the TLS listener accepts a key that no
+  declared peer pins, whose SHA-256 becomes the peer's identifier and is recorded with
+  `peer_opened` when first seen. Its mail reaches only `remote_reach`, with stricter
+  defaults, 16,384 bytes of body, 2 turns per hour and 50 waiting messages, and never
+  priority. A key that a declared peer pins is never an open peer, even when that
+  peer is not inbound.
+- **A bound on keys.** **Decided by the operator on 2026-10-31,** from finding F1 of
+  the round 12 review. At most 64 undeclared keys are recorded, `MAX_OPEN_REMOTE_PEERS`,
+  which equals the most peers the file may declare. A new key past it is refused at
+  `hello` before any event is recorded, and is written to standard error. **Reason.**
+  Each new key costs one `peer_opened` event and counters of its own, so without a
+  bound one host could grow the log without limit and evade every per-key limit by
+  changing keys. **Failure mode.** The file never removes an open peer, so a host
+  that fills the bound keeps every later key out until the operator removes open
+  peers from the log or closes `remote`. No command removes an open peer yet.
+- **Shared limits.** All undeclared keys together share
+  `remote_total_turns_per_hour`, the turns they may start for one local line in any
+  hour, and `remote_total_waiting`, the notes they may have waiting, besides each
+  key's own `remote_turns_per_hour` and `remote_waiting`. **Decided by core, for the
+  operator's review.** Both are `[federation.open]` keys whose defaults, 6 and 500,
+  are one declared peer's, so every undeclared key together may do by default what
+  one declared peer may. A turn several keys started counts once against the shared
+  allowance. A note past the shared waiting bound is refused with `full`.
+- **A shared rate.** **Decided by the operator on 2026-10-31,** from finding R1 of the
+  round 12 re-review. All undeclared keys together may make `remote_total_deliveries`
+  `deliver` requests in each ten minutes, whatever their answers, besides each key's
+  own rate of 60. Its default is 60, one declared peer's rate, so 64 keys together
+  make no more requests than one declared peer may. A request past it is answered
+  `busy`, and a request answered `busy` counts against neither rate. **Decided by
+  core, for the operator's review.** The largest setting is 3,840, which is 64 keys at
+  their own rate, so the setting can tighten the bound the cap on keys already gives
+  but never loosen it. A declared peer never counts against the shared rate.
+- **No outbound.** Nothing locates an undeclared machine, so mail to another machine
+  still needs a declared peer, which names its address. An open key's parties cannot
+  be addressed, and a reply to one is refused.
+- **`tls_listen`** must be set explicitly for `remote = "open"`, and client
+  authentication stays required before any frame is read.
+- **`allowed_networks`** lists address ranges. A connection from elsewhere is closed
+  by its address before it counts under the cap and before its handshake. It applies
+  to every connection on the listener, declared peers included. **Decided by the
+  operator on 2026-10-31,** from finding F3 of the round 12 review. With `remote`
+  open, the file must list at least one range, and a file that leaves it out is
+  refused. A listener that admits every address lists both `"0.0.0.0/0"` and
+  `"::/0"`, so a listener open to the world is always a choice written in the file.
+  **Empty with `remote` closed.** From finding R2 of the round 12 re-review. A
+  project that sets `tls_listen` for its declared inbound `tls` peers and keeps
+  `remote` an allowlist may leave `allowed_networks` out, and its listener then
+  admits a connection from every address. Each connection must still complete the
+  handshake with a key that a declared peer pins, so an address outside the list
+  costs only a handshake and is never a peer. A project that wants its listener to
+  refuse other addresses before the handshake lists its ranges in either mode.
+- **Why pyOpenSSL.** **Fact,** probed on 2026-10-31 with Python 3.12 and OpenSSL
+  3.5.4 over memory buffers. A server context of Python's `ssl` that requires a
+  client certificate, or only requests one, refuses a self-signed certificate it does
+  not already trust with `CERTIFICATE_VERIFY_FAILED`, and offers no callback to decide
+  otherwise. **Decided by the operator on 2026-10-31.** The open listener therefore
+  uses `pyOpenSSL`, pinned exactly at 26.4.0 beside `cryptography`, whose verify
+  callback decides. `pyOpenSSL` serves only the listener of `remote = "open"`, which
+  takes declared and undeclared keys alike, since one port holds one TLS stack. The
+  allowlist listener stays on the standard library, unchanged, and outbound
+  connections always use it.
+- **What is accepted.** TLS 1.3 only, and a client certificate is required. It must be
+  one self-signed Ed25519 certificate inside its validity period, as `dromon peer key`
+  makes, and every other key type, an issued certificate, an expired one and a bad
+  self-signature are refused. The callback judges the certificate during the
+  handshake, and the presented certificate is judged again after it. Session tickets
+  and the server's session cache are off, so the server keeps no session a client
+  could resume to skip its certificate. `pyOpenSSL` exposes no control of the number
+  of tickets, so OpenSSL may still send a ticket, which names no session the server
+  kept. The pin, the SHA-256 digest of the key's SubjectPublicKeyInfo, then names the
+  peer as above, so a declared peer's key still names that peer.
+- **No thread per connection.** **Decided by core, accepted by the operator on
+  2026-10-31.** The listener drives `pyOpenSSL` over memory buffers on the event loop,
+  as `asyncio` drives the standard library's TLS, rather than in a worker thread. A
+  thread cannot be cancelled at the handshake's deadline, and each later read would
+  hold one while the peer is idle. The handshake must finish within the existing
+  10-second deadline for an unauthenticated connection, and counts under the
+  listener's bound of eight connections from its accept, so an open port can hold
+  neither threads nor more than eight handshakes. **Inference, not measured.** An
+  Ed25519 handshake costs the loop well under a millisecond.
+- **Porting note.** The Rust port uses `rustls`, whose client certificate verifier
+  decides the same rule without memory buffers.
+
+### Unchanged by design
+
+No peer gains operator authority, peer mail is untrusted data, questions stay local,
+the disclosure list applies to every message and name that leaves, and the
+unconfined-engine rule applies while either mode is open, as it does while a peer is
+declared.
+
 ## Delivery
 
 ### Sending
@@ -500,6 +722,7 @@ outbox in `State.outbox`. Choices the design left open, for the operator's revie
 
 1. The peer's connection is authenticated, and the daemon checks that both addresses
    follow the grammar, that inbound is on, that the recipient is in `reach` and exists,
+   an operator by the project file's declaration of decision 25,
    that the kind is `note`, that the body is within `max_body_bytes`, the rate limits
    below, and the bounds on waiting mail. `reach` is checked here whatever the sending
    daemon checked, since the token does not prove the sender.
@@ -789,6 +1012,7 @@ the outbox, the idempotency keys and each peer's policy exactly.
 | `peer_declared` | `peer_id`, `transport` of `unix` or `tls`, `policy` canonical JSON text | The peer is new or its transport or policy changes. Recorded at start and at reload from the project file. The policy holds the directions, `reach`, `senders`, the priority flags, the limits and the pin, and never a token |
 | `peer_removed` | `peer_id` | The peer is declared. Addresses through it are refused from then on, and the daemon returns every message still waiting for it with `unknown_peer` |
 | `peer_keyed` | `peer_id`, `token_sha256` | The peer is declared. The digest of the token this daemon issued for the peer, or empty to revoke it. Recorded by `dromon peer token` |
+| `peer_opened` | `peer_id`, `scope` of `local` or `remote`, `opened_at` | No peer of the name exists, or it is removed. An open peer first seen, as open federation above specifies. Added on 2026-10-31. **Rollback hazard.** A daemon before this cannot read a log holding it |
 | `message_sent` | Unchanged | Also applies to a remote recipient when its peer is declared and not removed, the sender is local and the kind is `note`. The remote party's existence is the peer's to check |
 | `message_received` | `message_id`, `sender` remote address, `recipient` local address, `body`, `reply_to` local message identifier or `null`, `origin_id`, `received_at`, `priority_asked` boolean | The sender's peer is declared and not removed, no earlier `message_received` kept has this peer and origin identifier, and the message rules of [`EVENT_LOG.md`](../protocol/EVENT_LOG.md) hold for a note, with the remote sender standing in for an existing one. Implemented in step 4, `received_at` in step 5 for the bound on the keys, and `priority_asked` in step 6 |
 | `message_prioritized` | Unchanged | Also follows a `message_received` when the receiver honours its priority, and a `message_sent` to a peer's line, which must still wait in its outbox. Step 6 |
@@ -895,7 +1119,23 @@ daemon restarts, so a peer that changes its name on each connection sends one no
 | A peer's token or key leaks | The operator issues a new token or replaces the pin, and the old one is refused at the next connection |
 | A peer refuses with crafted text | Only fixed codes are recorded and shown |
 | A message's transient failure blocks a peer's queue | By design, for order. Expiry bounds the wait, which is a week by default and an open point below |
-| A line reads another project's event log through the file system | Already possible today. Phase 1 denies declared peers' directories to every local line |
+| A line reads another project's event log through the file system | Already possible today. Phase 1 denies declared peers' directories to every local line, and an open project denies every registered project's from each line's next turn |
+| A process writes a registry entry to pass for a daemon | Every line of an open project is denied the registry. An unconfined process of the user can still write one, as it can read a token |
+| A pid in a registry entry is reused by another process | The start time no longer matches, so the entry is stale and names nothing |
+| A caller's pid is reused between its connection's accept and its `hello` | The start time read at accept differs from the entry's, so the `hello` is refused. Finding F2 of the round 12 review |
+| The start time of a caller cannot be read at accept | The `hello` without a token is refused, and the failure is written to standard error |
+| One host mints a new key for each handshake | Each key is recorded up to 64, and a new key past that is refused at `hello` with nothing recorded. The keys share one allowance of turns and one bound of waiting mail. Finding F1 of the round 12 review |
+| Many undeclared keys deliver in turn, each within its own rate | Together they make at most `remote_total_deliveries` requests in ten minutes, 60 by default, and the rest are answered `busy`. Finding R1 of the round 12 re-review |
+| A process of the user registers many names and connects under each | Each name is recorded as an open peer on this machine, without a bound, and the log grows by one event for each. Accepted, since such a process can already act as the user. Finding R4 of the round 12 re-review |
+| A project opens `remote` without `allowed_networks` | The file is refused. Every address is admitted only by listing `"0.0.0.0/0"` and `"::/0"`. Finding F3 of the round 12 review |
+| Another process connects with a live entry's name | Its pid is not the entry's, so it is refused |
+| An undeclared key sends to a party outside `remote_reach` | Refused with `refused`, as any party out of reach is |
+| A connection comes from outside `allowed_networks` | Closed by its address before the cap and before the handshake |
+| Many clients open handshakes on an open listener and stall | Each counts under the bound of eight from its accept and is closed at the 10-second deadline. None holds a thread |
+| An open listener's client presents a key other than self-signed Ed25519, or none | Refused in the handshake, before any frame is read |
+| A note names an operator who has never sent through the receiving daemon | Accepted when the project file declares the operator, which the note then records in the log. **Found on 2026-10-31,** in the first socket run of two open daemons, which refused it. Decision 25 below |
+| A note names an operator the project file does not declare | Refused with `refused`, whether or not the log holds the operator, so a peer can never create an operator. Decision 25 below |
+| A test reaches the user's real registry | Every test sets `DROMON_REGISTRY_DIR` to a temporary directory, and a test checks that it does |
 
 ## Out of scope
 
@@ -907,7 +1147,8 @@ changing the envelope's version 1, unless noted.
   accepted its mail. Receipts would also tell a peer how its mail was handled, which is
   a disclosure decision of its own.
 - Relaying through a peer, broadcast and group addresses.
-- Discovery of any kind, and different users on one machine.
+- Discovery of any kind beyond the per-user registry of open federation, and
+  different users on one machine.
 - Remote clients, remote external agents and remote `line_status`.
 - Sharing roles, seats, leases, scheduled wakes or provider budgets.
 - Key rotation, revocation lists and traversal of network address translation.
@@ -985,3 +1226,17 @@ changing the envelope's version 1, unless noted.
     `deliver`, read after an accepted answer to `hello`, on the Unix domain socket
     transport as well. A link that takes the writes and never answers leaves the
     message waiting, marked as possibly sent once a `deliver` was written.
+25. **A declared operator may receive peer mail before sending anything.** **Fact,
+    found on 2026-10-31.** A daemon held an operator only from that operator's first
+    send through it, so the first socket run of two open daemons refused a note to an
+    operator who had never sent.
+
+    **Decided by the operator on 2026-10-31.** An operator exists for `reach` when the
+    project file declares that operator, by `[daemon] operator` or by an
+    `[operators.ID]` table. A declared operator may receive peer mail before sending
+    anything, and the first such note records the operator in the log together with the
+    note, in one check, so a refused note records neither. An operator known only from
+    the log, or not at all, is refused with `refused`, so a peer can never create an
+    operator. The command line's `--operator` and the built-in default are not
+    declarations, since neither is in the file. A reload that drops an operator from
+    the file stops peer mail to that operator at once.

@@ -92,6 +92,7 @@ from dromon.model import (
     RunStatus,
     PeerDeclared,
     PeerKeyed,
+    PeerOpened,
     PeerRemoved,
     LocalAddress,
     OperatorAddress,
@@ -273,6 +274,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "peer_declared": ("peer_id", "transport", "policy"),
     "peer_removed": ("peer_id",),
     "peer_keyed": ("peer_id", "token_sha256"),
+    "peer_opened": ("peer_id", "scope", "opened_at"),
 }
 """The wire name of each event kind and its fields, in declaration order."""
 
@@ -744,6 +746,12 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "peer_id": event.peer_id,
                 "token_sha256": event.token_sha256,
             }
+        case PeerOpened():
+            return "peer_opened", {
+                "peer_id": event.peer_id,
+                "scope": event.scope,
+                "opened_at": event.opened_at,
+            }
         case _:
             assert_never(event)
 
@@ -1057,6 +1065,10 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
             return PeerRemoved(_str(data, "peer_id"))
         case "peer_keyed":
             return PeerKeyed(_str(data, "peer_id"), _str(data, "token_sha256"))
+        case "peer_opened":
+            return PeerOpened(
+                _str(data, "peer_id"), _str(data, "scope"), _str(data, "opened_at")
+            )
         case _:
             raise DecodeError(f"unknown event kind {kind!r}")
 

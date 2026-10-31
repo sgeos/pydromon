@@ -25,6 +25,7 @@ closed, because the rest of the line cannot be skipped safely.
 |---|---|---|
 | State directory | `<project>/.dromon` | Holds `events.sqlite`, the event log |
 | Runtime directory | `<project>/.dromon/run`, or `DROMON_RUNTIME_DIR` | Holds `dromond.sock`, `dromond.lock`, `dromond.log`, `lines.sock` for engines that reach their line's tools over MCP, as [`GROK.md`](GROK.md) specifies, and `agents.sock` when the project lets external agents in, as [`AGENTS.md`](AGENTS.md) specifies |
+| Registry of open federation | `.local/state/dromon/registry` under the user's home, or `DROMON_REGISTRY_DIR`, an absolute path | Holds an entry for each running daemon whose project sets `local = "open"`, as [`FEDERATION.md`](../architecture/FEDERATION.md) specifies. A malformed override refuses the start |
 
 A socket path is at most 103 bytes, the smaller of the macOS and Linux limits. A
 project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
@@ -412,7 +413,7 @@ answer every other operation `unknown_operation`, and the operator socket answer
 
 | Operation | Behaviour |
 |---|---|
-| `hello` | Arguments exactly `versions`, a list of 1 to 16 integers, `name`, an identifier the caller gives itself, advisory only, and `token`. Names the connection's peer by its token, the one `peer_token` issued, and returns `version`, the federation version chosen, today `1`. An undeclared peer and a wrong or revoked token get the one `rejected` refusal `the peer was refused`, written to standard error with the announced name. No version in common is `unsupported_version`. A second `hello` on one connection is `rejected` |
+| `hello` | Arguments exactly `versions`, a list of 1 to 16 integers, `name`, an identifier the caller gives itself, advisory only, and `token`. Names the connection's peer by its token, the one `peer_token` issued, or, while `[federation] local` is open, without `token`, by the live registry entry of `name`, whose pid must be the connecting process's, as [`FEDERATION.md`](../architecture/FEDERATION.md) specifies under open federation, and returns `version`, the federation version chosen, today `1`. An undeclared peer and a wrong or revoked token get the one `rejected` refusal `the peer was refused`, written to standard error with the announced name. No version in common is `unsupported_version`. A second `hello` on one connection is `rejected` |
 | `deliver` | Arguments exactly `origin_id`, the sending daemon's identifier for the message, `sender` and `recipient`, each a local address as its own daemon writes it, `kind`, `body`, `reply_to`, an identifier or `null`, and `priority`, a boolean. Needs a `hello` on the connection, and checks again that the peer's token is the one it presented. Returns `outcome` `accepted` with `message_id`, `duplicate` and `priority`, true when the note was recorded as priority mail, which a duplicate answers as it was first recorded, or `refused` with `code` and `retry` false, or `busy` with `retry_seconds`. Only `accepted` without `duplicate` records anything, one `message_received` |
 
 The receiver's checks run in this order. Every `deliver` counts toward the peer's rate

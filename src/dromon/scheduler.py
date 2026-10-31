@@ -138,7 +138,7 @@ from dromon.overrides import encode as encode_override
 from dromon.driver import ENGINE_OF, MODELS, Driver, DriverError, Strategy
 from dromon import priority, restart
 from dromon.priority import PriorityLimiter, PriorityRefused, peer_key
-from dromon.federation import NO_FEDERATION, FederationConfig
+from dromon.federation import NO_FEDERATION, SCOPE_LOCAL, FederationConfig
 from dromon.forwarder import PeerReport, check_outbound, outage_text
 from dromon.peering import PeerPriority, PeerTurns, Received, TurnCause, turn_cause
 from dromon import acp, antigravity, codex, cursor, grok, pi
@@ -334,6 +334,7 @@ from dromon.model import (
     MessageReturned,
     MessageUnconfirmed,
     MessageSent,
+    PeerOpened,
     LocalAddress,
     RemoteAddress,
     ReturnCode,
@@ -1068,6 +1069,10 @@ swept at least this often while the daemon is idle. **Fourth live run of N1,
 swept a kept connection's dead launcher."""
 
 
+def _never_registered(_name: str) -> bool:
+    return False
+
+
 def utc_clock() -> datetime:
     """The wall clock in Coordinated Universal Time, the scheduler's default."""
     return datetime.now(UTC)
@@ -1390,8 +1395,13 @@ def engine_factory(
     line_secrets: Mapping[str, Sequence[str]] | None = None,
     line_git_ssh: Mapping[str, GitSshAccess] | None = None,
     read_only_paths: Sequence[str] = (),
+    extra_protected: Callable[[], Sequence[Path]] | None = None,
 ) -> EngineFactory:
     """The production factory: each line on its packaged driver's engine.
+
+    ``extra_protected`` gives directories denied beside ``protected``, read at each
+    engine build, which the daemon sets to every project of the open-federation
+    registry. It may raise ``ConfigError``, which ends the turn before anything runs.
 
     ``accept_partial_isolation`` lets a Cursor Agent or Antigravity engine run, which
     only ``dromon probe`` passes, and only when the operator gives its flag. A daemon
@@ -1428,7 +1438,13 @@ def engine_factory(
         # Every adapter ends a turn gracefully when its driver answers interrupt, so
         # priority mail steers the driver rather than each engine.
         driver: Driver = priority.steered(spec.model, spec.strategy, spec.redirect)
-        workdir = resolve_workdir(spec.config.workdir, Path(root), protected)
+        # Read at each build, so a project registered for open federation after the
+        # daemon started is denied from each line's next turn.
+        protected_now = (
+            *protected,
+            *(() if extra_protected is None else extra_protected()),
+        )
+        workdir = resolve_workdir(spec.config.workdir, Path(root), protected_now)
         read_only = resolve_read_only_paths(read_only_paths, workdir)
         if read_only and driver.settings.engine not in {
             ENGINE_NAME_CLAUDE,
@@ -1439,7 +1455,7 @@ def engine_factory(
                 f"read_only_paths cannot be enforced by {driver.settings.engine}"
             )
         engine_protected = (
-            *protected,
+            *protected_now,
             *project_secret_paths(Path(root), workdir),
         )
         git_ssh = (line_git_ssh or {}).get(spec.line_id)
@@ -1628,7 +1644,7 @@ def engine_factory(
         plugin_dirs = tuple(resolve_plugin(path) for path in spec.config.plugins)
         write_protected = (*claude_dir, *plugin_dirs)
         guarded = (*guarded, *write_protected)
-        sandbox = effective(merged, workdir, protected, guarded)
+        sandbox = effective(merged, workdir, protected_now, guarded)
         if enabled and git_ssh is not None and sandbox is not None:
             denied = unreadable(git_ssh, sandbox)
             if denied is not None:
@@ -1653,7 +1669,9 @@ def engine_factory(
             mcp_tools=list(own_tools),
             session_id=spec.session_id,
             sandbox=sandbox,
-            settings=engine_settings.effective(settings, protected, write_protected),
+            settings=engine_settings.effective(
+                settings, protected_now, write_protected
+            ),
             observe=spec.observe,
             mark=spec.mark,
             task_ended=spec.task_ended,
@@ -2080,6 +2098,11 @@ class Scheduler:
         self.peer_turns = PeerTurns(clock)
         self.federation: FederationConfig = NO_FEDERATION
         """The project's peers and their policies, which the daemon sets at start."""
+        self.registered: Callable[[str], bool] = _never_registered
+        """Whether a federation name has an entry in the open-federation registry,
+        which the daemon sets while ``local`` is open. It reads the entry and not the
+        process table, so a send does not wait on ``ps``, and the forwarder finds a
+        stale entry when it connects."""
         self.on_outbox: Callable[[str, str], None] = _no_notice
         """Told each peer and message that joins its outbox, so its forwarder wakes.
         The daemon sets it to its forwarder's."""
@@ -2390,6 +2413,7 @@ class Scheduler:
         ):
             raise EventRejected("only a line raises an issue, and with an operator")
         if isinstance(recipient, RemoteAddress):
+            opening = self._opening(recipient.peer_id)
             check_outbound(
                 self._log.state,
                 self.federation,
@@ -2397,6 +2421,7 @@ class Scheduler:
                 recipient,
                 body,
                 priority=priority,
+                opening=opening,
             )
             # Decision 3 of the federation design. Mail to a peer leaves the project,
             # so an operator's is held to the disclosure list too, and so is the
@@ -2419,6 +2444,14 @@ class Scheduler:
                 except PriorityRefused as error:
                     raise EventRejected(str(error)) from error
             message_id = new_id("m")
+            if opening:
+                # A crash between the two leaves an open peer with no mail, which
+                # the next send to it uses.
+                self._log.append(
+                    PeerOpened(
+                        recipient.peer_id, SCOPE_LOCAL, format_due(self._wall_clock())
+                    )
+                )
             self._log.append(
                 MessageSent(
                     message_id,
@@ -2518,21 +2551,35 @@ class Scheduler:
         ``priority_in`` lets it. The note is priority mail only when both hold, its
         recipient is a line, and the peer, counted as one sender, and the line are
         within the rate limits of priority mail from lines. Otherwise it is ordinary
-        mail whose header says that its priority was declined."""
+        mail whose header says that its priority was declined.
+
+        An operator the log does not hold yet is recorded first, in the same check, so
+        a refused note records neither. The receiver passes only an operator the
+        project file declares, decision 25 of ``FEDERATION.md``, so this never makes
+        an operator a peer named."""
         message_id = new_id("m")
         asked = priority is not PeerPriority.NONE
-        self._log.append(
-            MessageReceived(
-                message_id,
-                sender,
-                recipient,
-                body,
-                reply_to,
-                origin_id,
-                format_due(self._wall_clock()),
-                asked,
-            )
+        event = MessageReceived(
+            message_id,
+            sender,
+            recipient,
+            body,
+            reply_to,
+            origin_id,
+            format_due(self._wall_clock()),
+            asked,
         )
+        state = self._log.state
+        if (
+            isinstance(recipient, OperatorAddress)
+            and recipient.operator_id not in state.operators
+        ):
+            registered = OperatorRegistered(recipient.operator_id)
+            trial = state.copy()
+            trial.apply(registered)
+            trial.check(event)
+            self._log.append(registered)
+        self._log.append(event)
         key = peer_key(sender.peer_id)
         honoured = (
             priority is PeerPriority.PERMITTED
@@ -4389,6 +4436,20 @@ class Scheduler:
         if _status_size(compact) <= MAX_LINE_STATUS_DEFAULT_BYTES:
             return compact
         return _truncated_line_status(full, lists_truncated=False)
+
+    def _opening(self, peer_id: str) -> bool:
+        """Whether mail to ``peer_id`` first opens it, a project of the registry
+        that the project file does not declare and the log does not hold, while
+        ``local`` is open."""
+        federation = self.federation
+        if not federation.local_open or peer_id in federation.peers:
+            return False
+        if peer_id == federation.name:
+            return False
+        known = self._log.state.peers.get(peer_id)
+        if known is not None and not known.removed:
+            return False
+        return self.registered(peer_id)
 
     def peers_for(self, line_id: str) -> list[dict[str, object]]:
         """The delivery of each peer ``line_id`` may send to, so a line whose mail

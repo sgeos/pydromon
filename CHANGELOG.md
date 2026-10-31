@@ -7,6 +7,36 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Open federation, round 12. `[federation] local` and `remote` take `allowlist`, the
+  default, which keeps the behaviour of declared peers exactly, or `open`. With
+  `local = "open"`, `listen` and a unique `name`, a daemon registers in a per-user
+  registry, `.local/state/dromon/registry` under its user's home, which must have mode
+  0700, and removes its entry at stop. `DROMON_REGISTRY_DIR`, an absolute path, moves
+  the registry, and every test sets it to a temporary directory, so that no test
+  writes the user's real one. A malformed value refuses the start rather than falling
+  back to the default. A `hello` without a token is then named by the
+  live registry entry of the announced name, whose pid and start time must match the
+  connecting process, and a line may address `NAME:PARTY` for a registered project
+  that the file does not declare. Every undeclared open peer takes the new
+  `[federation.open]` table, whose lists are empty by default, so it delivers nothing
+  until the operator names who may reach and send. The registry and every registered
+  project's directories are denied to the project's lines, read again at each engine
+  build. `allowed_networks` closes a TLS connection from outside its ranges before
+  the handshake. With `remote = "open"`, the TLS listener accepts a key no declared
+  peer pins, which reaches only `remote_reach` with stricter limits, and mail to
+  another machine still needs a declared peer. The unconfined-engine rule applies
+  while either mode is open. **Rollback hazard.** A daemon before this change cannot
+  read a log holding `peer_opened`, and refuses a project file holding the new keys.
+- The dependency `pyopenssl`, pinned exactly at 26.4.0 as `cryptography` is, for the
+  listener of `remote = "open"` alone. Python's `ssl` refuses a self-signed client
+  certificate it does not already trust and offers no callback to decide otherwise,
+  and the verify callback of pyOpenSSL lets the listener accept any self-signed
+  Ed25519 key over TLS 1.3 and refuse every other. It runs over memory buffers on the
+  event loop, so a connection holds no thread, and its handshake is bounded by the
+  10-second deadline and counted under the listener's bound of eight connections.
+  The allowlist listener and every outbound connection stay on the standard library.
+  **Rollback hazard.** The daemon imports it at start, so an environment without it
+  cannot start any daemon of this version, open or not.
 - The operator-granted capability `ViewImage`, so a line can look at a screenshot
   through whichever engine owns it. A line must name it among its `builtin_tools`, and
   without it no line can view an image on any engine. On Codex it enables `view_image`,
@@ -65,6 +95,33 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- Remote and local open federation are bounded further, from findings F1 to F3 of
+  the round 12 review, decided by the operator on 2026-10-31. At most 64 undeclared
+  remote keys are recorded, and a new key past that is refused at `hello` before any
+  event. All undeclared keys share `[federation.open] remote_total_turns_per_hour`
+  and `remote_total_waiting`, 6 and 500 by default, besides each key's own. A `hello`
+  without a token must match the entry's start time as read when its connection was
+  accepted, in a worker thread, and is refused when it cannot be read. With
+  `remote = "open"`, `allowed_networks` is required, and a world-open listener lists
+  `"0.0.0.0/0"` and `"::/0"`. A file that opens `remote` without it is now refused.
+  From finding R1 of the round 12 re-review, all undeclared keys also share
+  `remote_total_deliveries`, the `deliver` requests they may make together in ten
+  minutes, 60 by default, which is one declared peer's rate, and at most 3,840, so 64
+  keys together cannot exceed it. `FEDERATION.md` now states that an empty
+  `allowed_networks` admits every address to a TLS listener that serves declared
+  peers with `remote` closed, under the pin checks, and that undeclared projects on
+  this machine are not capped, since each is a process of the same user that a live
+  registry entry names. **Rollback hazard.** A daemon before round 12 refuses a
+  project file that holds any of the new `[federation]` keys, `local`, `remote`,
+  `name`, `allowed_networks` or the `[federation.open]` table, as an unknown key, and
+  so refuses the whole file. **Fact,** read from `_known` at 7aaec56. Removing those keys before a rollback lets the older daemon read the file,
+  though it still cannot read a log that holds `peer_opened`.
+- A peer reaches only declared operators, decision 25 of `FEDERATION.md`, decided by
+  the operator on 2026-10-31. An operator the project file declares, by `[daemon]
+  operator` or an `[operators.ID]` table, may receive peer mail before sending
+  anything, and the first note records the operator. An operator known only from the
+  log, which a peer could reach before this change, is refused with `refused`, so a
+  project that names an undeclared operator in `reach` must now declare it.
 - Leases are durable, task of 2026-10-31. `lease_acquired` records the holder, the
   acquisition and the expiry, and `lease_released` a release or a name the project
   file no longer declares, so a restart keeps a held lease until it expires, and

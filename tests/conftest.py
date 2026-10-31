@@ -12,6 +12,7 @@ from typing import cast
 from dromon import priority
 from dromon import scheduler as scheduler_module
 from dromon.processes import ProcessInfo
+from dromon.registry import REGISTRY_DIR_ENV
 from dromon.driver import Strategy
 from dromon.lineconfig import LineConfig, encode_config
 from dromon.model import (
@@ -91,6 +92,7 @@ from dromon.model import (
     RunStatus,
     PeerDeclared,
     PeerKeyed,
+    PeerOpened,
     PeerRemoved,
 )
 
@@ -315,6 +317,9 @@ SCENARIO: tuple[Event, ...] = (
     PeerDeclared("keleusma", "unix", '{"inbound":false}'),
     PeerKeyed("keleusma", ""),
     PeerRemoved("keleusma"),
+    PeerOpened("tidepool", "local", AT),
+    PeerOpened("f" * 64, "remote", AT),
+    PeerDeclared("tidepool", "unix", '{"inbound":true}'),
     LineStateChanged("alpha", LineState.STOPPED),
 )
 
@@ -385,6 +390,20 @@ def _no_real_process_table(
     node = cast(pytest.Item, request.node)  # pyright: ignore[reportUnknownMemberType]
     if node.get_closest_marker("real_processes") is None:
         monkeypatch.setattr(scheduler_module, "SystemProcesses", NoProcesses)
+
+
+@pytest.fixture(autouse=True)
+def _private_registry(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Give every test a registry of open federation of its own, which a daemon the
+    test starts as a process inherits with the environment. **Found on 2026-10-31.**
+    The first socket run of two open daemons registered them in the user's real
+    registry, and no test may write outside its temporary directories. Not created
+    here, so that the daemon's own creation of it with mode 0700 is what a test sees."""
+    monkeypatch.setenv(
+        REGISTRY_DIR_ENV, str(tmp_path_factory.mktemp("registry") / "registry")
+    )
 
 
 @pytest.fixture

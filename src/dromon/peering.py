@@ -32,7 +32,12 @@ from enum import StrEnum
 from typing import Final, cast
 
 from dromon.agents import token_digest
-from dromon.federation import TRANSPORT_UNIX, FederationConfig
+from dromon.federation import (
+    MAX_REMOTE_TOTAL_DELIVERIES,
+    SCOPE_REMOTE,
+    TRANSPORT_UNIX,
+    FederationConfig,
+)
 from dromon.model import (
     ID_PATTERN,
     MAX_TEXT_BYTES,
@@ -75,6 +80,9 @@ RATE_PER_PEER: Final = 60
 """Deliveries one peer may make in ``RATE_WINDOW_SECONDS``, the design's default of
 decision 7. Every ``deliver`` counts, whatever its answer, so a peer cannot make the
 receiver check without limit by sending refused mail."""
+_UNDECLARED: Final = "*"
+"""The one key of the receiver's shared rate, under which every undeclared remote key's
+delivery is counted."""
 
 TURN_WINDOW_SECONDS: Final = 3600.0
 MAX_TURN_CAPACITY: Final = 60
@@ -290,11 +298,17 @@ class Receiver:
         self._rate: WindowCounter[str] = WindowCounter(
             clock, RATE_WINDOW_SECONDS, RATE_PER_PEER
         )
+        self._shared_rate: WindowCounter[str] = WindowCounter(
+            clock, RATE_WINDOW_SECONDS, MAX_REMOTE_TOTAL_DELIVERIES
+        )
+        """The deliveries of every undeclared remote key together, under the one key
+        ``_UNDECLARED``, which ``remote_total_deliveries`` bounds."""
 
     def deliver(
         self,
         state: State,
         federation: FederationConfig,
+        operators: frozenset[str],
         peer_id: str,
         args: Mapping[str, object],
         receive: Receive,
@@ -305,10 +319,29 @@ class Receiver:
         answered next, as a duplicate or a conflict, so that a policy changed since
         the first delivery cannot return mail that was accepted. Then the policy,
         ``reach`` before anything that depends on the recipient, so a party the
-        peer may not reach is refused alike whether or not it exists."""
+        peer may not reach is refused alike whether or not it exists.
+
+        ``operators`` are the operators the project file declares, the only ones a
+        peer may reach, as decision 25 of ``FEDERATION.md`` decided. An operator the
+        log knows but the file does not declare is refused, so a peer can neither
+        create an operator nor reach one the project has not named.
+
+        An undeclared remote key's delivery also counts against the rate all of them
+        share, ``remote_total_deliveries``, as the operator decided on 2026-10-31 from
+        finding R1 of the round 12 re-review, so a host gains no deliveries by changing
+        keys. A delivery answered busy by either rate counts against neither."""
         if self._rate.count(peer_id) >= RATE_PER_PEER:
             return Busy(self._rate.wait(peer_id))
+        shared = federation.is_open_remote(state, peer_id)
+        if (
+            shared
+            and self._shared_rate.count(_UNDECLARED)
+            >= federation.open.remote_total_deliveries
+        ):
+            return Busy(self._shared_rate.wait(_UNDECLARED))
         self._rate.record(peer_id)
+        if shared:
+            self._shared_rate.record(_UNDECLARED)
         try:
             envelope = parse_envelope(args)
         except EnvelopeError:
@@ -317,12 +350,12 @@ class Receiver:
         earlier = state.received.get((peer_id, envelope.origin_id))
         if earlier is not None:
             return _resent(state, peer_id, earlier, sender, envelope)
-        definition = federation.peers.get(peer_id)
+        definition = federation.definition(state, peer_id)
         peer = state.peers.get(peer_id)
         if definition is None or peer is None or peer.removed or not definition.inbound:
             return Refused(Code.REFUSED)
         if envelope.recipient not in definition.reach or not _exists(
-            state, envelope.recipient
+            state, operators, envelope.recipient
         ):
             return Refused(Code.REFUSED)
         if envelope.kind != MessageKind.NOTE.value:
@@ -337,6 +370,11 @@ class Receiver:
             state.waiting_for.get(envelope.recipient, 0)
             >= federation.waiting_per_recipient
             or state.waiting_from.get(peer_id, 0) >= definition.waiting
+            or (
+                definition.open_scope == SCOPE_REMOTE
+                and _open_remote_waiting(state, federation)
+                >= federation.open.remote_total_waiting
+            )
         ):
             return Refused(Code.FULL)
         if not envelope.priority:
@@ -383,12 +421,21 @@ def _resent(
     return Refused(Code.CONFLICT)
 
 
-def _exists(state: State, address: LocalAddress) -> bool:
+def _open_remote_waiting(state: State, federation: FederationConfig) -> int:
+    """The unread notes every undeclared remote key has waiting together, which
+    ``remote_total_waiting`` bounds, finding F1 of the round 12 review. The sum runs
+    over at most ``MAX_OPEN_REMOTE_PEERS`` keys."""
+    return sum(
+        state.waiting_from.get(peer_id, 0) for peer_id in federation.open_remote(state)
+    )
+
+
+def _exists(state: State, operators: frozenset[str], address: LocalAddress) -> bool:
     match address:
         case LineAddress():
             return address.line_id in state.lines
         case OperatorAddress():
-            return address.operator_id in state.operators
+            return address.operator_id in operators
         case AgentAddress():
             agent = state.agents.get(address.agent_id)
             return agent is not None and not agent.revoked
@@ -431,11 +478,24 @@ def turn_cause(messages: Iterable[Message]) -> TurnCause:
 class PeerTurns:
     """Each peer's allowance of turns for each local line, ``turns_per_hour`` in any
     hour. A peer without an allowance, such as one no longer declared, may start
-    none."""
+    none. The undeclared remote keys also share one allowance for each line,
+    ``remote_total_turns_per_hour``, so that a host gains nothing by changing keys, as
+    the operator decided on 2026-10-31 from finding F1 of the round 12 review."""
 
     def __init__(self, clock: Callable[[], float]) -> None:
         self._allowance: dict[str, int] = {}
+        self.open_allowance: Callable[[str], int] = lambda _peer_id: 0
+        """The turns per hour of a peer not in the allowances, an open peer, which
+        the daemon reads from its policy at each use. None by default."""
+        self.shared: Callable[[str], bool] = lambda _peer_id: False
+        """Whether a peer is an undeclared remote key, which the shared allowance
+        also bounds. None by default."""
+        self.shared_allowance: Callable[[], int] = lambda: 0
+        """The turns per hour the undeclared remote keys share for each line."""
         self._starts: WindowCounter[tuple[str, str]] = WindowCounter(
+            clock, TURN_WINDOW_SECONDS, MAX_TURN_CAPACITY
+        )
+        self._shared_starts: WindowCounter[str] = WindowCounter(
             clock, TURN_WINDOW_SECONDS, MAX_TURN_CAPACITY
         )
 
@@ -449,8 +509,15 @@ class PeerTurns:
         self._allowance = dict(allowances)
 
     def may_start(self, peer_id: str, line_id: str) -> bool:
-        allowed = self._allowance.get(peer_id, 0)
-        return self._starts.count((peer_id, line_id)) < allowed
+        allowed = self._allowance.get(peer_id)
+        if allowed is None:
+            allowed = min(max(self.open_allowance(peer_id), 0), MAX_TURN_CAPACITY)
+        if self._starts.count((peer_id, line_id)) >= allowed:
+            return False
+        if not self.shared(peer_id):
+            return True
+        shared = min(max(self.shared_allowance(), 0), MAX_TURN_CAPACITY)
+        return self._shared_starts.count(line_id) < shared
 
     def starters(self, line_id: str, messages: Iterable[Message]) -> list[str]:
         """The peers whose mail among ``messages`` may start a turn of ``line_id``,
@@ -471,6 +538,12 @@ class PeerTurns:
         return bool(self.starters(line_id, listed))
 
     def record(self, line_id: str, peers: Iterable[str]) -> None:
-        """Count a turn of ``line_id`` that the mail of ``peers`` started."""
+        """Count a turn of ``line_id`` that the mail of ``peers`` started. A turn that
+        undeclared remote keys started counts once against their shared allowance,
+        however many of them started it."""
+        shared = False
         for peer_id in peers:
             self._starts.record((peer_id, line_id))
+            shared = shared or self.shared(peer_id)
+        if shared:
+            self._shared_starts.record(line_id)
