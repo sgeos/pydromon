@@ -1915,6 +1915,35 @@ class RunEnded:
         check_instant("ended_at", self.ended_at)
 
 
+class RunClearance(StrEnum):
+    """Why a lost run no longer blocks its scope. ``empty`` means reconciliation
+    found no process in its supervisor's process group or session, and ``operator``
+    that an operator cleared it after inspection."""
+
+    EMPTY = "empty"
+    OPERATOR = "operator"
+
+
+@dataclass(frozen=True, slots=True)
+class RunCleared:
+    """A lost run no longer blocks its scope, with the operator who cleared it where
+    one did. **Task of 2026-10-31.** A lost run's command may still run, so its
+    scope starts no other run until this is recorded."""
+
+    run_id: str
+    cause: RunClearance
+    operator_id: str | None
+    cleared_at: str
+
+    def __post_init__(self) -> None:
+        check_id("run_id", self.run_id)
+        check_member("cause", self.cause, RunClearance)
+        check_optional_id("operator_id", self.operator_id)
+        if (self.operator_id is not None) != (self.cause is RunClearance.OPERATOR):
+            raise InvalidField("operator_id is given exactly when an operator cleared")
+        check_instant("cleared_at", self.cleared_at)
+
+
 type Event = (
     LineCreated
     | LineStateChanged
@@ -1970,6 +1999,7 @@ type Event = (
     | LeaseReleased
     | RunStarted
     | RunEnded
+    | RunCleared
     | PeerDeclared
     | PeerRemoved
     | PeerKeyed
@@ -2127,10 +2157,20 @@ class Seat:
 
 @dataclass(frozen=True, slots=True)
 class Run:
-    """A supervised run, with its end once ``run_ended`` records it."""
+    """A supervised run, with its end once ``run_ended`` records it, and for a lost
+    run its clearance once ``run_cleared`` records it."""
 
     started: RunStarted
     ended: RunEnded | None = None
+    cleared: RunCleared | None = None
+
+    @property
+    def blocks(self) -> bool:
+        """Whether its scope may start no other run. An open run blocks, and so does
+        a lost one until it is cleared, since its command may still run."""
+        if self.ended is None:
+            return True
+        return self.ended.status is RunStatus.LOST and self.cleared is None
 
 
 type RoleTerms = tuple[str, int, tuple[str, ...], FailoverPolicy, int]
@@ -2528,6 +2568,19 @@ class State:
                     raise EventRejected(f"no run {event.run_id}")
                 if run.ended is not None:
                     raise EventRejected(f"run {event.run_id} has ended")
+            case RunCleared():
+                run = self.runs.get(event.run_id)
+                if run is None:
+                    raise EventRejected(f"no run {event.run_id}")
+                if run.ended is None or run.ended.status is not RunStatus.LOST:
+                    raise EventRejected(f"run {event.run_id} is not lost")
+                if run.cleared is not None:
+                    raise EventRejected(f"run {event.run_id} is cleared already")
+                if (
+                    event.operator_id is not None
+                    and event.operator_id not in self.operators
+                ):
+                    raise EventRejected(f"no operator {event.operator_id}")
             case PeerDeclared():
                 peer = self.peers.get(event.peer_id)
                 if (
@@ -2840,6 +2893,9 @@ class State:
             case RunEnded():
                 run = self.runs[event.run_id]
                 self.runs[event.run_id] = replace(run, ended=event)
+            case RunCleared():
+                run = self.runs[event.run_id]
+                self.runs[event.run_id] = replace(run, cleared=event)
             case PeerDeclared():
                 peer = self.peers.get(event.peer_id)
                 self.peers[event.peer_id] = (
@@ -2864,8 +2920,8 @@ class State:
 
     def _check_run_started(self, event: RunStarted) -> None:
         """A run is started once, for a line, under its role if the line is a seat,
-        by the role's owner, while no run of its scope is open, and naming the
-        scope's latest run as ``previous``."""
+        by the role's owner, while no run of its scope blocks, and naming the
+        scope's latest run as ``previous``. A lost run blocks until it is cleared."""
         if event.run_id in self.runs:
             raise EventRejected(f"run {event.run_id} exists")
         self._live_line(event.line_id)
@@ -2881,6 +2937,8 @@ class State:
         latest = self.latest_runs.get(run_scope(event.line_id, event.role_id))
         if latest is not None and self.runs[latest].ended is None:
             raise EventRejected(f"run {latest} has not ended")
+        if latest is not None and self.runs[latest].blocks:
+            raise EventRejected(f"run {latest} is lost and not cleared")
         if event.previous != latest:
             raise EventRejected(
                 f"the latest run is {latest or 'none'}, not {event.previous or 'none'}"

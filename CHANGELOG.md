@@ -22,7 +22,14 @@ All notable changes are recorded here. The format follows
   starting another. A declared command runs with the daemon's authority outside every
   sandbox, which `docs/architecture/RUNS.md` states as a trust decision for the
   operator. **Rollback hazard.** A daemon older than this cannot read a log holding
-  `run_started` or `run_ended`, and does not know of a supervisor still running.
+  `run_started`, `run_ended` or `run_cleared`, and does not know of a supervisor still
+  running.
+- Lost runs block their scope, review of 2026-10-31, R2. A lost run's command may
+  still run, so its scope starts no other run until reconciliation finds no process in
+  the supervisor's process group or session, or an operator clears it with
+  `dromon run clear RUN`, the new operator-only `run_clear` operation. Either is
+  recorded as `run_cleared`, with the operator who cleared it. A process table that
+  cannot be read keeps the run blocking.
 
 ### Changed
 
@@ -37,6 +44,19 @@ All notable changes are recorded here. The format follows
   `lease_acquired` or `lease_released`.
 
 ### Fixed
+
+- Supervised runs, review of 2026-10-31. Reading a run's output opens it without
+  blocking and reads only a regular file, so a named pipe a line puts there cannot
+  stall reconciliation on the process worker, R1. A seat that owns its role needs
+  write access to its working directory to start or stop a run, as any other line
+  does, R3. A run whose supervisor cannot be told to start is recorded as `stopped`
+  with no exit code and the caller is told nothing started, R6. The supervisor signals
+  its command's group only from the thread that waits for it, between polls that
+  found the command unreaped, so a late `SIGKILL` can no longer reach a reused group
+  identifier, R7. A `ps` that exits with status 1 and a complaint is a failure to
+  read the table, not an absent process. `ROLES.md` states that a change of owner
+  passes every lease of the former owner, including one not taken for the role, R4,
+  and `RUNS.md` states the window between checking and signalling a supervisor, R5.
 
 - A seat that does not own its role is built with its role's worktree read only on
   Claude Code and Codex, the engines that can confine it. The confining engines were

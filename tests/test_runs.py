@@ -1,6 +1,8 @@
-"""Supervised runs: the project's ``[runs]`` table, the ``run_started`` and
-``run_ended`` events, the supervisor, reconciliation after a restart and a handoff,
-a supervisor that died while the daemon was down, and a reused process identifier.
+"""Supervised runs: the project's ``[runs]`` table, the ``run_started``,
+``run_ended`` and ``run_cleared`` events, the supervisor, reconciliation after a
+restart and a handoff, a supervisor that died while the daemon was down, a reused
+process identifier, a lost run whose command survives, and the review of 2026-10-31,
+whose test gaps T1 to T8 are named where each is closed.
 ``docs/architecture/RUNS.md`` is normative."""
 
 import asyncio
@@ -10,6 +12,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import replace
 from collections.abc import Callable, Generator, Sequence
@@ -36,6 +39,8 @@ from dromon.model import (
     RoleDeclared,
     RoleNoted,
     RoleNoteKind,
+    RunCleared,
+    RunClearance,
     RunEnded,
     RunStarted,
     RunStatus,
@@ -596,7 +601,23 @@ def no_engine(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> LineEngine:
     raise AssertionError(f"no engine may start in this test, but {spec.line_id} did")
 
 
-def scheduler_on(log: EventLog, tmp_path: Path) -> Scheduler:
+def stand_in_occupied(session: int) -> bool:
+    """Whether the supervisor's own group still answers a signal, as the table's
+    search of its group and session would find it."""
+    try:
+        os.killpg(session, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def scheduler_on(
+    log: EventLog,
+    tmp_path: Path,
+    occupied: Callable[[int], bool] = stand_in_occupied,
+) -> Scheduler:
     found = Scheduler(
         log,
         no_engine,
@@ -605,6 +626,7 @@ def scheduler_on(log: EventLog, tmp_path: Path) -> Scheduler:
         root=tmp_path,
         report_dir=tmp_path / "reports",
         run_start_of=stand_in_start,
+        run_occupied=occupied,
     )
     found.set_runs({"gate": python_command("print('gate passed')")})
     return found
@@ -789,3 +811,493 @@ def test_the_tools_start_show_and_stop_a_run(project: Path) -> None:
             assert error and "unexpected argument verbose" in text
 
         asyncio.run(scenario())
+
+
+# The review of 2026-10-31. A lost run's command may survive, so it blocks its scope
+# until no process is left in its supervisor's group or session, or an operator
+# clears it. T2.
+
+
+def lost_state() -> State:
+    """Role ``core`` with run ``r-1`` lost and not cleared."""
+    state = role_state()
+    state.apply(started(role_id="core"))
+    state.apply(ended(status=RunStatus.LOST))
+    return state
+
+
+def test_a_lost_run_blocks_its_scope_until_it_is_cleared() -> None:
+    state = lost_state()
+    assert state.runs["r-1"].blocks
+    with pytest.raises(EventRejected, match="run r-1 is lost and not cleared"):
+        state.check(started("r-2", role_id="core", previous="r-1"))
+    state.apply(RunCleared("r-1", RunClearance.EMPTY, None, LATER))
+    assert not state.runs["r-1"].blocks
+    state.apply(started("r-2", role_id="core", previous="r-1"))
+
+
+def test_only_a_lost_run_is_cleared_and_only_once() -> None:
+    state = role_state()
+    state.apply(started(role_id="core"))
+    with pytest.raises(EventRejected, match="run r-1 is not lost"):
+        state.check(RunCleared("r-1", RunClearance.EMPTY, None, LATER))
+    state.apply(ended())
+    assert not state.runs["r-1"].blocks
+    with pytest.raises(EventRejected, match="run r-1 is not lost"):
+        state.check(RunCleared("r-1", RunClearance.EMPTY, None, LATER))
+    with pytest.raises(EventRejected, match="no run r-9"):
+        state.check(RunCleared("r-9", RunClearance.EMPTY, None, LATER))
+    state = lost_state()
+    with pytest.raises(EventRejected, match="no operator ben"):
+        state.check(RunCleared("r-1", RunClearance.OPERATOR, "ben", LATER))
+    state.apply(RunCleared("r-1", RunClearance.OPERATOR, "ana", LATER))
+    with pytest.raises(EventRejected, match="cleared already"):
+        state.check(RunCleared("r-1", RunClearance.EMPTY, None, LATER))
+
+
+@pytest.mark.parametrize(
+    ("cause", "operator_id"),
+    [(RunClearance.EMPTY, "ana"), (RunClearance.OPERATOR, None)],
+)
+def test_a_clearance_names_an_operator_exactly_when_one_cleared(
+    cause: RunClearance, operator_id: str | None
+) -> None:
+    with pytest.raises(InvalidField, match="exactly when an operator cleared"):
+        RunCleared("r-1", cause, operator_id, LATER)
+
+
+def test_a_lost_run_settles_only_once_its_session_is_empty() -> None:
+    lost = started(pid=4321)
+    assert runs.settle([lost], lambda session: True) == []
+    assert runs.settle([lost], lambda session: False) == ["r-1"]
+    with pytest.raises(runs.TableUnreadable):
+        runs.settle([lost], unreadable_occupied)
+
+
+def unreadable_occupied(session: int) -> bool:
+    raise runs.TableUnreadable("ps cannot be run")
+
+
+def test_the_session_search_finds_a_group_or_a_session_member() -> None:
+    def groups() -> list[tuple[int, int]]:
+        return [(10, 10), (11, 11), (12, 11)]
+
+    sessions = {10: 10, 11: 11, 12: 500}
+    assert runs.session_occupied(10, groups, sessions.__getitem__)
+    assert runs.session_occupied(500, groups, sessions.__getitem__)
+    assert not runs.session_occupied(600, groups, sessions.__getitem__)
+
+    def gone(pid: int) -> int:
+        raise ProcessLookupError(pid)
+
+    assert not runs.session_occupied(500, groups, gone)
+
+    def denied(pid: int) -> int:
+        raise PermissionError(pid)
+
+    with pytest.raises(runs.TableUnreadable, match="session of process 10"):
+        runs.session_occupied(500, groups, denied)
+
+
+@pytest.mark.parametrize("text", ["", "12 x\n", "12\n", "1 2 3\n"])
+def test_a_process_list_that_cannot_be_parsed_is_unreadable(text: str) -> None:
+    with pytest.raises(runs.TableUnreadable):
+        runs.parse_groups(text)
+
+
+def test_the_real_session_search_finds_a_live_session_member(tmp_path: Path) -> None:
+    """``getsid`` is asked of each process the stood-in list names, as on macOS,
+    whose ``ps`` gives no session."""
+    child = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
+    )
+    try:
+        groups = [(child.pid, child.pid), (os.getpid(), os.getpgid(0))]
+        assert runs.session_occupied(child.pid, lambda: groups)
+        assert not runs.session_occupied(child.pid, lambda: groups[1:])
+    finally:
+        child.kill()
+        child.wait()
+
+
+def command_occupied(pid_file: Path) -> Callable[[int], bool]:
+    """The real session search over the one process the test knows, the command
+    whose identifier ``pid_file`` holds, since ``ps -A`` cannot run in a sandbox."""
+
+    def occupied(session: int) -> bool:
+        if not pid_file.exists() or not pid_file.read_text():
+            return stand_in_occupied(session)
+        pid = int(pid_file.read_text())
+        try:
+            listed = [(pid, os.getpgid(pid))]
+        except ProcessLookupError:
+            listed = []
+        return stand_in_occupied(session) or runs.session_occupied(
+            session, lambda: listed
+        )
+
+    return occupied
+
+
+def test_a_lost_runs_surviving_command_blocks_a_successor_until_it_ends(
+    project: Path,
+) -> None:
+    """T2. The supervisor is killed, so the run is lost, and its command lives on in
+    a group of its own within the supervisor's session. The scope stays blocked
+    until the command ends, and is then cleared with cause ``empty``."""
+    pid_file = project / "command.pid"
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project, command_occupied(pid_file))
+        scheduler.set_runs(
+            {
+                "wait": python_command(
+                    f"import os, time; open({str(pid_file)!r}, 'w')"
+                    ".write(str(os.getpid())); time.sleep(60)"
+                ),
+                "gate": python_command("print('gate passed')"),
+            }
+        )
+        scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+        run = asyncio.run(scheduler.start_run("alpha", "wait", "none"))
+        child = scheduler._run_children[run.run_id]  # pyright: ignore[reportPrivateUsage]
+        try:
+            wait_for_file(pid_file)
+            child.kill()
+            child.wait(timeout=WAIT_SECONDS)
+            asyncio.run(scheduler.reconcile_runs())
+            found = log.state.runs[run.run_id]
+            assert found.ended is not None and found.ended.status is RunStatus.LOST
+            assert found.blocks and found.cleared is None
+            assert "It blocks its scope" in scheduler.run_status("alpha")
+            with pytest.raises(runs.RunRefused, match="is lost and its command may"):
+                asyncio.run(scheduler.start_run("alpha", "gate", run.run_id))
+        finally:
+            with contextlib.suppress(OSError, ValueError):
+                os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+        for _ in range(WAIT_SECONDS * 20):
+            asyncio.run(scheduler.reconcile_runs())
+            if log.state.runs[run.run_id].cleared is not None:
+                break
+            time.sleep(0.05)
+        cleared = log.state.runs[run.run_id].cleared
+        assert cleared == RunCleared(
+            run.run_id, RunClearance.EMPTY, None, cleared.cleared_at if cleared else ""
+        )
+        assert any("Run cleared" in note for note in harness_notes(log, "alpha"))
+        second = asyncio.run(scheduler.start_run("alpha", "gate", run.run_id))
+        wait_for_supervisor(scheduler, second.run_id)
+        asyncio.run(scheduler.reconcile_runs())
+
+
+def lost_on(log: EventLog, scheduler: Scheduler) -> str:
+    """A line ``alpha`` with a lost run, recorded as a restart would find it."""
+    scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+    run = replace(run_in(Path("/work")), pid=999_999)
+    log.append(run)
+    log.append(ended(run.run_id, RunStatus.LOST))
+    return run.run_id
+
+
+def test_an_unreadable_table_keeps_a_lost_run_blocking(project: Path) -> None:
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project, unreadable_occupied)
+        run_id = lost_on(log, scheduler)
+        asyncio.run(scheduler.reconcile_runs())
+        assert log.state.runs[run_id].blocks
+        with pytest.raises(runs.RunRefused, match="dromon run clear"):
+            asyncio.run(scheduler.start_run("alpha", "gate", run_id))
+
+
+def test_an_operator_clears_a_lost_run_and_is_recorded(project: Path) -> None:
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project, lambda session: True)
+        run_id = lost_on(log, scheduler)
+        asyncio.run(scheduler.reconcile_runs())
+        assert log.state.runs[run_id].blocks
+        cleared = scheduler.clear_run(ANA, run_id)
+        assert (cleared.cause, cleared.operator_id) == (RunClearance.OPERATOR, "ana")
+        assert "Cleared by operator ana" in scheduler.run_status("alpha")
+        with pytest.raises(EventRejected, match="cleared already"):
+            scheduler.clear_run(ANA, run_id)
+        with pytest.raises(EventRejected, match="no run r-9"):
+            scheduler.clear_run(ANA, "r-9")
+    with EventLog(project / "events.sqlite") as log:
+        assert log.state.runs[run_id].cleared == cleared
+
+
+def test_run_clear_is_an_operator_command(
+    project: Path, short_runtime: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The operation through the client, which only an operator reaches."""
+    import json
+
+    from dromon import cli
+    from dromon.configview import Overrides
+    from dromon.daemon import Daemon
+    from dromon.model import format_due
+    from dromon.paths import project_paths
+    from dromon.projectconfig import ProjectConfig
+    from dromon.protocol import Operation, Response
+
+    paths = project_paths(project, short_runtime)
+    paths.state_dir.mkdir(mode=0o700)
+    with EventLog(paths.event_log) as log:
+        scheduler = scheduler_on(log, project, lambda session: True)
+        run_id = lost_on(log, scheduler)
+        daemon = Daemon(
+            paths,
+            log,
+            format_due(datetime(2026, 10, 31, 9, tzinfo=UTC)),
+            scheduler,
+            project=ProjectConfig(),
+            command_line=Overrides(),
+            project_file_present=False,
+        )
+
+        def call(
+            socket: Path, operation: Operation, args: dict[str, object] | None = None
+        ) -> Response:
+            del socket
+            line = {"id": "r", "op": operation.value, "v": 1, "args": args or {}}
+            return daemon.respond((json.dumps(line) + "\n").encode())
+
+        monkeypatch.setattr(cli, "call", call)
+        refused = call(paths.socket, Operation.RUN_CLEAR, {"run_id": run_id})
+        assert refused.error_code == "bad_request"
+        base = ("--project", str(project), "--runtime-dir", str(short_runtime))
+        assert cli.main([*base, "run", "clear", run_id, "--operator", "ben"]) == 0
+        cleared = log.state.runs[run_id].cleared
+        assert cleared is not None and cleared.operator_id == "ben"
+        assert cli.main([*base, "run", "clear", run_id, "--operator", "ben"]) != 0
+
+
+# T1. A named pipe at the output path.
+
+
+def test_a_named_pipe_at_the_output_path_has_no_digest_and_does_not_block(
+    tmp_path: Path,
+) -> None:
+    """Review R1. Without ``O_NONBLOCK`` the open waits for a writer, and with it
+    the process worker. This fails on 09003fa, where the reading never returns."""
+    (tmp_path / "tmp" / "runs").mkdir(parents=True)
+    pipe = tmp_path / "tmp" / "runs" / "r-1.out"
+    os.mkfifo(pipe)
+    found: list[tuple[str | None, int | None]] = []
+    reader = threading.Thread(
+        target=lambda: found.append(runs.output_digest(tmp_path, "tmp/runs/r-1.out")),
+        daemon=True,
+    )
+    reader.start()
+    reader.join(timeout=5)
+    if reader.is_alive():
+        # Let the blocked reading return before failing, so no thread is left.
+        os.close(os.open(pipe, os.O_WRONLY | os.O_NONBLOCK))
+        reader.join(timeout=5)
+        pytest.fail("reading a named pipe's digest blocked")
+    assert found == [(None, None)]
+
+
+# T3. A read-only seat that owns its role.
+
+
+def test_a_read_only_seat_that_owns_its_role_starts_and_stops_no_run(
+    project: Path,
+) -> None:
+    """Review R3. A run writes the worktree outside the sandbox, so owning the role
+    is not enough."""
+    from dromon.lineconfig import LineConfig, WorkdirAccess
+
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+        for event in (
+            OperatorRegistered("ana"),
+            RoleDeclared("core", "."),
+            SeatBound("alpha", "core", True),
+            OwnershipChanged(
+                "core", "alpha", None, OwnershipCause.DECLARED, ANA, None, AT
+            ),
+        ):
+            log.append(event)
+        scheduler.configure_line("alpha", LineConfig(workdir_access=WorkdirAccess.READ))
+        with pytest.raises(runs.RunRefused, match="which you may only read"):
+            asyncio.run(scheduler.start_run("alpha", "gate", "none"))
+        with pytest.raises(runs.RunRefused, match="which you may only read"):
+            asyncio.run(scheduler.stop_run("alpha", "r-1"))
+        assert log.state.runs == {}
+
+
+# T4. A word to go that cannot be delivered.
+
+
+def test_a_release_to_a_supervisor_that_is_gone_is_false(tmp_path: Path) -> None:
+    found, _ = launched(tmp_path, python_command("pass"))
+    found.child.kill()
+    found.child.wait(timeout=WAIT_SECONDS)
+    assert not runs.release(found)
+
+
+def test_a_run_whose_supervisor_cannot_be_told_to_start_is_recorded_stopped(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review R6. The caller is told that nothing started, and the log says so
+    rather than calling the run lost with a command that may still run."""
+    marker = project / "ran"
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        scheduler.set_runs(
+            {"touch": python_command(f"open({str(marker)!r}, 'w').close()")}
+        )
+        scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+
+        def undelivered(launched: runs.Launched) -> bool:
+            return False
+
+        monkeypatch.setattr(runs, "release", undelivered)
+        with pytest.raises(runs.RunRefused, match="its command never started"):
+            asyncio.run(scheduler.start_run("alpha", "touch", "none"))
+        (run,) = log.state.runs.values()
+        assert run.ended is not None
+        assert (run.ended.status, run.ended.exit_code) == (RunStatus.STOPPED, None)
+        assert not run.blocks
+        assert not marker.exists()
+        assert run.started.run_id not in scheduler._run_children  # pyright: ignore[reportPrivateUsage]
+
+
+# T5. Two starts at once.
+
+
+def test_two_starts_at_once_record_one_run_and_start_one_command(
+    project: Path,
+) -> None:
+    """Both pass the scheduler's checks before either is recorded, so the log
+    refuses the second, and its supervisor is abandoned without the word to go."""
+    marker = project / "ran"
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        scheduler.set_runs(
+            {"mark": python_command(f"open({str(marker)!r}, 'a').write('ran\\n')")}
+        )
+        scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+
+        async def both() -> tuple[RunStarted | BaseException, ...]:
+            return await asyncio.gather(
+                scheduler.start_run("alpha", "mark", "none"),
+                scheduler.start_run("alpha", "mark", "none"),
+                return_exceptions=True,
+            )
+
+        results = asyncio.run(both())
+        recorded = [r for r in results if isinstance(r, RunStarted)]
+        refused = [r for r in results if isinstance(r, EventRejected)]
+        assert len(recorded) == 1 and len(refused) == 1, results
+        assert "has not ended" in str(refused[0])
+        assert list(log.state.runs) == [recorded[0].run_id]
+        wait_for_supervisor(scheduler, recorded[0].run_id)
+        assert marker.read_text() == "ran\n"
+
+
+# T6. A process table that refuses.
+
+
+@pytest.mark.parametrize(
+    ("code", "stderr", "absent"),
+    [
+        (1, "", True),
+        (0, "", True),
+        (1, "ps: permission denied\n", False),
+        (2, "", False),
+    ],
+)
+def test_ps_with_no_output_is_absent_only_when_it_says_nothing(
+    monkeypatch: pytest.MonkeyPatch, code: int, stderr: str, absent: bool
+) -> None:
+    def fake(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(["/bin/ps"], code, "", stderr)
+
+    monkeypatch.setattr(runs.subprocess, "run", fake)
+    if absent:
+        assert runs.process_start(4321) is None
+    else:
+        with pytest.raises(runs.TableUnreadable, match=f"status {code}"):
+            runs.process_start(4321)
+
+
+def test_a_denied_table_ends_no_live_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def denied(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(["/bin/ps"], 1, "", "ps: not permitted\n")
+
+    monkeypatch.setattr(runs.subprocess, "run", denied)
+    with pytest.raises(runs.TableUnreadable):
+        runs.reconcile([run_in(tmp_path)], tmp_path)
+    with pytest.raises(runs.TableUnreadable):
+        runs.process_groups()
+
+
+# T8. What a declared command runs.
+
+
+def test_a_relative_program_resolves_in_the_working_directory(tmp_path: Path) -> None:
+    """``RUNS.md`` says so, since that is where a writing line could change it."""
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    script = workdir / "build.sh"
+    script.write_text('#!/bin/sh\necho built in "$PWD"\n')
+    script.chmod(0o755)
+    found, run = launched(tmp_path, ("./build.sh",))
+    runs.release(found)
+    assert found.child.wait(timeout=WAIT_SECONDS) == 0
+    receipt = runs.read_receipt(tmp_path, run.run_id)
+    assert receipt == runs.Receipt(RunStatus.EXITED, 0, "")
+    output = (workdir / run.output_file).read_text()
+    assert output == f"built in {os.path.realpath(workdir)}\n"
+
+
+def test_the_log_records_exactly_the_declared_argv(project: Path) -> None:
+    declared = python_command("import sys; print(sys.argv)")
+    path = project / "events.sqlite"
+    with EventLog(path) as log:
+        scheduler = scheduler_on(log, project)
+        scheduler.set_runs({"show": declared})
+        scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+        run = asyncio.run(scheduler.start_run("alpha", "show", "none"))
+        assert run.argv == declared
+        wait_for_supervisor(scheduler, run.run_id)
+    with EventLog(path) as log:
+        assert log.state.runs[run.run_id].started.argv == declared
+
+
+# Review R7. The supervisor signals the group only while the command is unreaped.
+
+
+def test_a_command_that_ignores_sigterm_is_killed_after_the_grace(
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "ready"
+    child = subprocess.Popen(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+            f" open({str(ready)!r}, 'w').write('1'); time.sleep(60)",
+        ],
+        process_group=0,
+    )
+    try:
+        wait_for_file(ready)
+        supervision = runs.Supervision()
+        supervision.stopping.set()
+        assert supervision.wait(child, grace=0.2) == -signal.SIGKILL
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+def test_a_command_that_ends_unstopped_is_never_signalled(tmp_path: Path) -> None:
+    child = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-c", "pass"], process_group=0
+    )
+    assert runs.Supervision().wait(child) == 0

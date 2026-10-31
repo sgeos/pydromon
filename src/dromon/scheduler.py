@@ -297,8 +297,11 @@ from dromon.model import (
     LeaseEnd,
     LeaseReleased,
     Run,
+    RunCleared,
+    RunClearance,
     RunEnded,
     RunStarted,
+    RunStatus,
     run_scope,
     LineAwakened,
     LineSession,
@@ -1691,6 +1694,7 @@ class Scheduler:
         ),
         confining_engines: frozenset[str] = CONFINING_ENGINES,
         run_start_of: Callable[[int], str | None] = runs.process_start,
+        run_occupied: Callable[[int], bool] = runs.session_occupied,
     ) -> None:
         if not 1 <= wake_every_ticks <= MAX_WAKE_EVERY_TICKS:
             raise ValueError(f"wake_every_ticks must be in [1, {MAX_WAKE_EVERY_TICKS}]")
@@ -1821,6 +1825,7 @@ class Scheduler:
         """Separate queue so a sweep waiting on signalled children cannot occupy
         the worker that serves process inspections and stops."""
         self._process_tasks: set[asyncio.Task[None]] = set()
+        """Background process scans started during recovery, kept until they finish."""
         self._run_commands: dict[str, tuple[str, ...]] = {}
         """The commands the project declares for runs, by name."""
         self._run_children: dict[str, subprocess.Popen[bytes]] = {}
@@ -1831,8 +1836,11 @@ class Scheduler:
         self._run_start_of = run_start_of
         """When a process started, by the process table, which tells a run's
         supervisor from a later process that reuses its identifier."""
+        self._run_occupied = run_occupied
+        """Whether a process is left in a supervisor's group or session, which
+        keeps a lost run's scope blocked."""
         self._run_failure: str | None = None
-        """Background process scans started during recovery, kept until they finish."""
+        """The last reconciliation failure said on standard error, said once."""
         self._line_tokens = line_tokens
         """The tokens lines' engines reach Dromon's tools with, which each turn
         renews and revokes, or ``None`` where no engine uses them."""
@@ -3335,8 +3343,9 @@ class Scheduler:
 
     def _run_refusal(self, line_id: str) -> str | None:
         """Why ``line_id`` may not start or stop its scope's runs. A seat must own
-        its role, and any other line must have write access to its working
-        directory, since a run may write there outside the line's sandbox."""
+        its role, and every line, a seat included, must have write access to its
+        working directory, since a run may write there outside the line's sandbox.
+        So a read-only seat that owns its role cannot write its worktree by a run."""
         role_id = self._run_role(line_id)
         if role_id is not None:
             owner = self._log.state.roles[role_id].owner
@@ -3345,7 +3354,6 @@ class Scheduler:
                     f"only role {role_id}'s owner starts or stops its runs, and its"
                     f" owner is {owner or 'nobody'}"
                 )
-            return None
         if self.effective_config(line_id).workdir_access is not WorkdirAccess.WRITE:
             return "a run may write your working directory, which you may only read"
         return None
@@ -3368,6 +3376,13 @@ class Scheduler:
         if latest is not None and latest.ended is None:
             raise runs.RunRefused(
                 f"a run of yours has not ended, so no other starts: {_run_line(latest)}"
+            )
+        if latest is not None and latest.blocks:
+            raise runs.RunRefused(
+                "a run of yours is lost and its command may still run, so no other"
+                " starts until no process is left in its supervisor's group or"
+                " session, or an operator clears it with dromon run clear"
+                f" {latest.started.run_id}: {_run_line(latest)}"
             )
         latest_id = None if latest is None else latest.started.run_id
         if (previous if previous != "none" else None) != latest_id:
@@ -3412,7 +3427,24 @@ class Scheduler:
             await self._process_worker.run(lambda: runs.abandon(launched.child))
             raise
         self._run_children[run_id] = launched.child
-        runs.release(launched)
+        if not runs.release(launched):
+            await self._process_worker.run(lambda: runs.abandon(launched.child))
+            self._record_run_end(
+                runs.Finding(
+                    run_id,
+                    RunStatus.STOPPED,
+                    None,
+                    "its supervisor could not be told to start, so its command never"
+                    " started",
+                    None,
+                    None,
+                )
+            )
+            raise runs.RunRefused(
+                f"run {run_id} was recorded, but its supervisor could not be told to"
+                " start, so its command never started and the run is recorded as"
+                " stopped"
+            )
         return started
 
     async def stop_run(self, line_id: str, run_id: str) -> None:
@@ -3448,7 +3480,7 @@ class Scheduler:
             return
         if self._run_check is not None and not self._run_check.done():
             return
-        if not any(run.ended is None for run in self._log.state.runs.values()):
+        if not any(run.blocks for run in self._log.state.runs.values()):
             return
         try:
             loop = asyncio.get_running_loop()
@@ -3479,10 +3511,53 @@ class Scheduler:
                 self._run_failure = str(error)
                 print(f"dromond: runs wait, as {error}", file=sys.stderr)
             return
-        self._run_failure = None
         for finding in found:
             self._record_run_end(finding)
             runs.remove_receipt(directory, finding.run_id)
+        lost = [
+            r.started
+            for r in self._log.state.runs.values()
+            if r.ended is not None and r.blocks
+        ]
+        if lost:
+            try:
+                empty = await self._process_worker.run(
+                    lambda: runs.settle(lost, self._run_occupied)
+                )
+            except (runs.TableUnreadable, ProcessRefused) as error:
+                if self._run_failure != str(error):
+                    self._run_failure = str(error)
+                    print(f"dromond: lost runs wait, as {error}", file=sys.stderr)
+                return
+            for run_id in empty:
+                self._clear_run(run_id, None)
+        self._run_failure = None
+
+    def clear_run(self, operator: OperatorAddress, run_id: str) -> RunCleared:
+        """``operator`` clears the lost run ``run_id`` after inspecting what may be
+        left of its command, so its scope may start another. Raises
+        ``EventRejected``, recording nothing, for a run that is not lost or is
+        cleared already."""
+        run = self._log.state.runs.get(run_id)
+        if run is None:
+            raise EventRejected(f"no run {run_id}")
+        if run.ended is None or run.ended.status is not RunStatus.LOST:
+            raise EventRejected(f"run {run_id} is not lost")
+        if run.cleared is not None:
+            raise EventRejected(f"run {run_id} is cleared already")
+        self.ensure_operator(operator.operator_id)
+        return self._clear_run(run_id, operator.operator_id)
+
+    def _clear_run(self, run_id: str, operator_id: str | None) -> RunCleared:
+        """Record that ``run_id`` no longer blocks its scope, by ``operator_id`` or,
+        with ``None``, because no process is left in its supervisor's group or
+        session, and tell the scope's holder."""
+        cause = RunClearance.EMPTY if operator_id is None else RunClearance.OPERATOR
+        event = RunCleared(run_id, cause, operator_id, format_due(self._wall_clock()))
+        self._log.append(event)
+        cleared = self._log.state.runs[run_id]
+        self._note_run_holder(cleared, f"Run cleared: {_run_line(cleared)}")
+        return event
 
     def _record_run_end(self, finding: runs.Finding) -> None:
         run = self._log.state.runs.get(finding.run_id)
@@ -3501,13 +3576,18 @@ class Scheduler:
         )
         self._run_children.pop(finding.run_id, None)
         ended = self._log.state.runs[finding.run_id]
+        self._note_run_holder(ended, f"Run ended: {_run_line(ended)}")
+
+    def _note_run_holder(self, run: Run, text: str) -> None:
+        """Send ``text`` from the harness to the run's scope's present holder, the
+        role's owner, or else the line that started it."""
         role_id = run.started.role_id
         owner = None if role_id is None else self._log.state.roles.get(role_id)
         recipient = (
             run.started.line_id if owner is None or owner.owner is None else owner.owner
         )
         if recipient in self._log.state.lines:
-            self._harness_note(LineAddress(recipient), f"Run ended: {_run_line(ended)}")
+            self._harness_note(LineAddress(recipient), text)
 
     def _run_tools(self, line_id: str) -> list[SdkMcpTool[Any]]:
         """The run tools, offered while the project declares a run command or the
@@ -10146,4 +10226,21 @@ def _run_line(run: Run) -> str:
         + ("" if ended.output_digest is None else f" of SHA-256 {ended.output_digest}")
     )
     note = f". {ended.note}" if ended.note else ""
-    return f"{head}, {ended.status.value}{code} at {ended.ended_at}{digest}{note}"
+    cleared = run.cleared
+    if ended.status is not RunStatus.LOST:
+        settled = ""
+    elif cleared is None:
+        settled = (
+            ". It blocks its scope until no process is left in its supervisor's"
+            " group or session, or an operator clears it"
+        )
+    elif cleared.operator_id is None:
+        settled = (
+            f". Cleared at {cleared.cleared_at}, as no process was left in its"
+            " supervisor's group or session"
+        )
+    else:
+        settled = f". Cleared by operator {cleared.operator_id} at {cleared.cleared_at}"
+    return (
+        f"{head}, {ended.status.value}{code} at {ended.ended_at}{digest}{note}{settled}"
+    )

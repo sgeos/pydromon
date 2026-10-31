@@ -153,6 +153,14 @@ says, so a replay agrees.
 - **What does not pass.** A role left vacant, by `relinquished` or an operator, leaves
   the former owner's leases with it, since no seat would hold them. A lease held by a
   seat that does not own the role is unaffected. A retired role changes no lease.
+- **Every lease of the former owner passes.** **Decided on 2026-10-31, review R4.**
+  This includes a lease the former owner took for a purpose that has nothing to do
+  with the role, such as one taken before it became a seat. A lease records its line
+  and no role, so Dromon cannot tell which resource served the role's work, and the
+  passing does not guess. Leaving such a lease with the former owner would also leave
+  it with a seat that may have run out of budget and cannot release it, while the
+  successor can release one it does not need. The expiry still bounds every lease
+  either way. A test pins this.
 - **What was weighed.** Ending the leases at a change of owner was simpler and is
   rejected for the second reason above. Making leases the role's in general would
   change what a lease names, a project resource and not a role's, and is not needed for

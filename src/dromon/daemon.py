@@ -699,6 +699,7 @@ class Daemon:
                 | Operation.ROLE_CREATE
                 | Operation.ROLE_UPDATE
                 | Operation.ROLE_DELETE
+                | Operation.RUN_CLEAR
                 | Operation.BUDGETS
                 | Operation.BUDGET_SET
                 | Operation.AGENT_ADD
@@ -819,6 +820,16 @@ class Daemon:
                         "to": to,
                         "message_id": message_id,
                         "owner_hibernated": self.log.state.lines[owner].hibernated,
+                    }
+                case Operation.RUN_CLEAR:
+                    run_id, operator = _text_args(request.args, ("run_id", "operator"))
+                    cleared = self.scheduler.clear_run(
+                        OperatorAddress(operator), run_id
+                    )
+                    result = {
+                        "run_id": run_id,
+                        "operator": operator,
+                        "cleared_at": cleared.cleared_at,
                     }
                 case Operation.BUDGETS:
                     _text_args(request.args, ())

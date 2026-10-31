@@ -346,6 +346,29 @@ def test_a_change_of_owner_passes_the_previous_owners_leases_with_their_times(
         state.check(LeaseReleased("device", "alpha", LeaseEnd.RELEASED))
 
 
+def test_a_change_of_owner_passes_a_lease_taken_before_the_line_was_a_seat() -> None:
+    """Decided on 2026-10-31, review R4. A lease records its line and no role, so
+    every lease of the former owner passes, one taken for another purpose too, as
+    ``ROLES.md`` says. A lease left behind could not be released by its holder's
+    successor, and Dromon cannot tell which resource a lease served."""
+    state = State()
+    for event in (
+        LineCreated("alpha", HAIKU, "subscription"),
+        LineCreated("beta", HAIKU, "subscription"),
+        OperatorRegistered("ana"),
+        LeaseAcquired("printer", "alpha", AT, "2026-10-27T09:00:00Z"),
+        RoleDeclared("core", "tmp/worktrees/core"),
+        SeatBound("alpha", "core", True),
+        SeatBound("beta", "core", True),
+        OwnershipChanged("core", "alpha", None, OwnershipCause.DECLARED, ANA, None, AT),
+        OwnershipChanged(
+            "core", "beta", "alpha", OwnershipCause.OPERATOR, ANA, None, AT
+        ),
+    ):
+        state.apply(event)
+    assert state.leases["printer"].line_id == "beta"
+
+
 def test_a_role_left_vacant_leaves_its_former_owners_leases_with_it() -> None:
     state = owned_role()
     state.apply(

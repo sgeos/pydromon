@@ -84,6 +84,8 @@ from dromon.model import (
     LeaseAcquired,
     LeaseEnd,
     LeaseReleased,
+    RunCleared,
+    RunClearance,
     RunEnded,
     RunStarted,
     RunStatus,
@@ -258,6 +260,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "note",
         "ended_at",
     ),
+    "run_cleared": ("run_id", "cause", "operator_id", "cleared_at"),
     "peer_declared": ("peer_id", "transport", "policy"),
     "peer_removed": ("peer_id",),
     "peer_keyed": ("peer_id", "token_sha256"),
@@ -698,6 +701,13 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "note": event.note,
                 "ended_at": event.ended_at,
             }
+        case RunCleared():
+            return "run_cleared", {
+                "run_id": event.run_id,
+                "cause": event.cause.value,
+                "operator_id": event.operator_id,
+                "cleared_at": event.cleared_at,
+            }
         case PeerDeclared():
             return "peer_declared", {
                 "peer_id": event.peer_id,
@@ -1000,6 +1010,13 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "note"),
                 _str(data, "ended_at"),
             )
+        case "run_cleared":
+            return RunCleared(
+                _str(data, "run_id"),
+                _member(data, "cause", RunClearance),
+                _optional_str(data, "operator_id"),
+                _str(data, "cleared_at"),
+            )
         case "peer_declared":
             return PeerDeclared(
                 _str(data, "peer_id"), _str(data, "transport"), _str(data, "policy")
@@ -1130,6 +1147,7 @@ def _member[
         RoleHolder,
         LeaseEnd,
         RunStatus,
+        RunClearance,
     )
 ](data: dict[str, object], name: str, kind: type[T]) -> T:
     value = _str(data, name)
