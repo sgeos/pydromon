@@ -20,22 +20,71 @@ OPTIONS = [
 
 
 def test_a_permission_is_granted_once_and_refused_once_by_preference() -> None:
-    assert acp.permission_result(OPTIONS, True) == {
-        "outcome": {"outcome": "selected", "optionId": "once"}
-    }
-    assert acp.permission_result(OPTIONS, False) == {
-        "outcome": {"outcome": "selected", "optionId": "no"}
-    }
-    only_always = [{"optionId": "never", "kind": "reject_always"}]
-    assert acp.permission_result(only_always, False) == {
-        "outcome": {"outcome": "selected", "optionId": "never"}
-    }
-    cancelled = {"outcome": {"outcome": "cancelled"}}
-    assert acp.permission_result([OPTIONS[0]], True) == cancelled
-    assert acp.permission_result([OPTIONS[0]], False) == cancelled
-    assert acp.permission_result([{"kind": "allow_once", "optionId": ""}], True) == (
-        cancelled
+    assert acp.permission_result(OPTIONS, True, "read_file") == (
+        {"outcome": {"outcome": "selected", "optionId": "once"}},
+        None,
     )
+    assert acp.permission_result(OPTIONS, False, "read_file") == (
+        {"outcome": {"outcome": "selected", "optionId": "no"}},
+        None,
+    )
+    only_always = [{"optionId": "never", "kind": "reject_always"}]
+    assert acp.permission_result(only_always, False, "read_file") == (
+        {"outcome": {"outcome": "selected", "optionId": "never"}},
+        None,
+    )
+
+
+def test_refusal_selects_reject_when_a_valid_allow_once_is_also_offered() -> None:
+    options = [
+        {"optionId": "allow", "kind": "allow_once"},
+        {"optionId": "reject", "kind": "reject_once"},
+    ]
+
+    assert acp.permission_result(options, False, "read_file") == (
+        {"outcome": {"outcome": "selected", "optionId": "reject"}},
+        None,
+    )
+
+
+@pytest.mark.parametrize(("permitted", "intent"), [(True, "allow"), (False, "refuse")])
+def test_missing_permission_options_refuse_with_bounded_evidence(
+    permitted: bool, intent: str
+) -> None:
+    options = [
+        {"optionId": "later", "kind": "unexpected"},
+        {"optionId": "", "kind": "allow_once"},
+    ]
+    answer, refusal = acp.permission_result(options, permitted, "a" * 400)
+
+    assert answer == {"outcome": {"outcome": "cancelled"}}
+    assert refusal is not None
+    assert "ACP offered no option" in refusal
+    assert intent in refusal
+    assert "a" * acp.PERMISSION_TOOL_NAME_CHARACTERS in refusal
+    assert "kind='unexpected', optionId='later'" in refusal
+    assert "kind='allow_once', optionId=''" in refusal
+    assert len(refusal) <= acp.PERMISSION_REFUSAL_CHARACTERS
+
+
+def test_unexpected_permission_option_kinds_never_grant_broadly() -> None:
+    answer, refusal = acp.permission_result(
+        [{"optionId": "persistent", "kind": "allow_always"}], True, "write"
+    )
+
+    assert answer == {"outcome": {"outcome": "cancelled"}}
+    assert refusal is not None
+    assert "kind='allow_always', optionId='persistent'" in refusal
+
+
+def test_permission_option_evidence_bounds_option_count_and_field_lengths() -> None:
+    options = [{"optionId": "i" * 500, "kind": "k" * 500} for _ in range(20)]
+    answer, refusal = acp.permission_result(options, True, "tool")
+
+    assert answer == {"outcome": {"outcome": "cancelled"}}
+    assert refusal is not None
+    assert "… and 12 more" in refusal
+    assert len(refusal) <= acp.PERMISSION_REFUSAL_CHARACTERS
 
 
 def test_the_model_is_read_from_models_or_options() -> None:

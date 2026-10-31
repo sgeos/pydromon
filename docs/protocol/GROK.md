@@ -293,10 +293,13 @@ and workflows live in `$GROK_HOME`.
    is also accepted and counted once. A repeated announcement or another permission
    grant for an identifier already granted in the turn is refused.
 9. **Permission requests** are answered with an `allow_once` option for a permitted call
-   and a `reject` option otherwise. A tool call the line was not given, a refused
+   and a rejection option otherwise. A tool call the line was not given, a refused
    permission request, or the driver's tool budget, sends `session/cancel`, and every
-   permission request after it is answered as cancelled. Other requests from the agent
-   are answered with an error.
+   permission request after it is answered as cancelled. If the runtime offers no
+   option of the required kind, Dromon answers as cancelled, cancels and refuses the
+   turn with bounded evidence naming the tool, its intended decision and the offered
+   option kinds and identifiers. It never substitutes `allow_always` for `allow_once`.
+   Other requests from the agent are answered with an error.
 10. **Cancel.** **Re-review, N2.** After `session/cancel` Dromon waits at most
    `ABORT_SECONDS`, 60 seconds, for Grok to answer its prompt, and then leaves the
    connection, which stops Grok. An interrupted turn is reported as cancelled, and a
@@ -630,6 +633,14 @@ user's MCP servers and reports no permission mode.
    Repeat with a line without `ViewImage` and `Read` and confirm that the view is
    refused. If no request arrives for `read_file`, record that the check is after
    the fact for this tool.
+7. **Permission options.** On a permitted call of one of Dromon's tools through
+   `use_tool`, record every `session/request_permission` option's `kind` and
+   `optionId`. Repeat with a call the line is not allowed to use. Confirm that Dromon
+   chooses only `allow_once` to permit and a rejection option to refuse, and that a
+   request with only unexpected kinds is answered as cancelled and refuses the turn.
+   In particular, confirm that Dromon never chooses `allow_always` to replace
+   `allow_once`. **The ACP permission option list has not been recorded on a live Grok
+   call.**
 
 ## Not at parity
 

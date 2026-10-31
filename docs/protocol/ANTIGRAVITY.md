@@ -318,9 +318,10 @@ Run these by hand, in a throwaway directory, before the probe.
    while the session is opened.
 5. In `default`, ask the model to read `/etc/hosts`, to list a directory and to run
    `ls`. Record for each whether `session/request_permission` comes before the tool
-   runs, and the `toolCall` fields, `toolCallId`, `title`, `kind` and `status`. This
-   decides the isolation refusal. **F2 and F3.** Record every `tool_call_update` of
-   each call, and whether any changes its `title` or `kind`.
+   runs, the `toolCall` fields, `toolCallId`, `title`, `kind` and `status`, and each
+   offered option's `kind` and `optionId`. This decides the isolation refusal.
+   **F2 and F3.** Record every `tool_call_update` of each call, and whether any
+   changes its `title` or `kind`.
 6. Give the session a harmless stdio MCP server and record whether its tools reach the
    model, and how they are named in tool calls and permission requests. **F4.**
    Record whether any structured field, such as `toolName` or a field under `_meta`,
@@ -342,3 +343,9 @@ Run these by hand, in a throwaway directory, before the probe.
 12. **F9.** Record every `usage_update` of a plain turn and of a turn long enough to
     compact, whether `cost` is present and in which currency, whether it is a running
     total for the session, and whether a compaction is followed by one.
+13. **Permission option choices.** Confirm that a permitted call has an `allow_once`
+    option and a refused call has a rejection option. Record all offered kinds and
+    identifiers. With a scripted ACP agent, repeat with no option of the required kind
+    and with only unexpected kinds. Confirm that Dromon answers cancelled, cancels and
+    refuses the turn with bounded option evidence, and never substitutes `allow_always`
+    for `allow_once`.

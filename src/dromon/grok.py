@@ -1693,10 +1693,23 @@ class GrokLine:
             # request adds, so a request that omits the recorded kind keeps it.
             known = turn.calls.get(str(identifier), {})
             permitted = refusal is None and self._permits_request(known, tool_call)
-            options = cast(list[dict[str, Any]], params.get("options") or [])
-            await self._rpc().respond(
-                request_id, acp.permission_result(options, permitted)
+            label_fields = {**known, **tool_call}
+            label = grok_tool_name(label_fields) or acp.tool_label(label_fields)
+            if label == "use_tool":
+                target_name: object = known.get("target")
+                if isinstance(target_name, tuple):
+                    target_name = cast(tuple[Any, ...], target_name)[0]
+                if not isinstance(target_name, str):
+                    target = use_tool_target(label_fields.get("rawInput"))
+                    target_name = target[0] if target is not None else None
+                if isinstance(target_name, str):
+                    label = f"use_tool ({target_name})"
+            response, missing_option = acp.permission_result(
+                params.get("options"), permitted, label
             )
+            await self._rpc().respond(request_id, response)
+            if missing_option is not None:
+                refusal = refusal or missing_option
             if refusal is not None:
                 await self._cancel(turn, refusal)
             else:
