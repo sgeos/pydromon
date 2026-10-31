@@ -45,6 +45,8 @@ from dromon.ui.settings import request_of as settings_request
 from dromon.ui.settings import rows as setting_rows
 from dromon.ui.keys import Char, Key, Named
 from dromon.ui.model import (
+    LOST_POLLS,
+    LOST_SECONDS,
     MAX_ENTRIES,
     QUIT_WINDOW_SECONDS,
     ActivityLoaded,
@@ -59,6 +61,7 @@ from dromon.ui.model import (
     FetchSettings,
     FetchView,
     LinesLoaded,
+    Lost,
     Model,
     Overlay,
     Pressed,
@@ -85,6 +88,11 @@ def initial(line_id: str, operator: str, poll_seconds: float) -> Model:
 
 
 def update(model: Model, event: Event) -> Result:
+    if model.lost_since is not None and isinstance(
+        event, ViewLoaded | ActivityLoaded | LinesLoaded | SettingsLoaded | Done
+    ):
+        # The daemon answered, so the polls that found none no longer run in a row.
+        model = replace(model, lost_since=None, lost_polls=0, lost_poll_at=None)
     match event:
         case Tick(now):
             return _tick(model, now)
@@ -136,6 +144,41 @@ def update(model: Model, event: Event) -> Result:
             return polled, effects
         case Failed(text):
             return replace(model, notice=text, alarm=True), NO_EFFECTS
+        case Lost(text):
+            return _lost(model, text), NO_EFFECTS
+
+
+def _lost(model: Model, text: str) -> Model:
+    """Count a poll that found no daemon, and detach once ``LOST_POLLS`` polls in a
+    row over at least ``LOST_SECONDS`` have. **Round 9, item 6.** The fetches of one
+    poll count once. A timeout or a refusal is a ``Failed``, not a ``Lost``, since a
+    daemon that is slow under load is still there."""
+    if model.lost_since is not None and model.lost_poll_at == model.polled_at:
+        return model
+    since = model.now if model.lost_since is None else model.lost_since
+    polls = model.lost_polls + 1
+    waited = model.now - since
+    if polls >= LOST_POLLS and waited >= LOST_SECONDS:
+        message = (
+            f"{text}, and {polls} polls over {waited:.0f} seconds found none,"
+            " so the client detached"
+        )
+        return replace(
+            model,
+            notice=message,
+            alarm=True,
+            finished=True,
+            exit_message=message,
+            lost_polls=polls,
+        )
+    return replace(
+        model,
+        notice=f"{text}. Retrying, and detaching if it stays gone",
+        alarm=True,
+        lost_since=since,
+        lost_polls=polls,
+        lost_poll_at=model.polled_at,
+    )
 
 
 def _tick(model: Model, now: float) -> Result:

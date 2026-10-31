@@ -39,7 +39,7 @@ from dromon import antigravity, capabilities, codex, cursor, evidence, grok, pi
 from dromon.engine import ENGINE_NAME as CLAUDE_CODE_ENGINE
 from dromon.engine import EngineRefused
 from dromon.agents import LINE_TOKEN_ENV, TOKEN_ENV
-from dromon.lineconfig import EFFORTS
+from dromon.lineconfig import EFFORTS, can_write_workdir
 from dromon.projectconfig import ProjectConfig
 from dromon.model import AgentAccess
 from dromon.protocol import Operation, ProtocolError
@@ -759,6 +759,8 @@ def _questions(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 
 
 def _mail(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    if arguments.replies_to is not None:
+        return _replies(paths, arguments)
     args: dict[str, object] = {
         "operator": arguments.operator,
         "unread_only": arguments.unread,
@@ -785,6 +787,49 @@ def _mail(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         if entry.get("outcome") != "unanswered":
             parts.append(str(entry.get("outcome")))
         print(", ".join(parts))
+    return exits.OK
+
+
+def _replies(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Print the replies to one message with their bodies, marking none read.
+    **Round 9, item 5.** A wait loop can count and read them in one query."""
+    if arguments.sender is not None:
+        print("dromon mail: --from does not combine with --replies-to", file=sys.stderr)
+        return exits.USAGE
+    args: dict[str, object] = {
+        "operator": arguments.operator,
+        "message_id": arguments.replies_to,
+        "unread_only": arguments.unread,
+        "offset": arguments.offset,
+        "limit": arguments.limit,
+    }
+    response = _call(paths, "mail", Operation.REPLIES, args)
+    if isinstance(response, int):
+        return response
+    entries = cast(list[dict[str, object]], response.get("messages", []))
+    print(
+        f"{response.get('total')} matching of {response.get('replies')} replies to"
+        f" {response.get('message_id')}, {response.get('unread')} unread"
+    )
+    for entry in entries:
+        parts = [
+            f"{entry.get('message_id')} from {entry.get('sender')}",
+            str(entry.get("kind")),
+            "read" if entry.get("read") is True else "unread",
+        ]
+        if entry.get("outcome") != "unanswered":
+            parts.append(str(entry.get("outcome")))
+        print(", ".join(parts))
+        body = entry.get("body")
+        if isinstance(body, str):
+            for row in body.splitlines() or [""]:
+                print(f"  {row}")
+        else:
+            print(
+                f"  The body of {entry.get('body_bytes')} bytes is past this answer's"
+                f" budget. dromon read {entry.get('message_id')} opens it and marks it"
+                " read."
+            )
     return exits.OK
 
 
@@ -971,15 +1016,7 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         print(f"  effective sandbox allowWrite: {writes}")
     shared_workdirs: dict[str, list[str]] = {}
     for line_id, line in sorted(config.lines.items()):
-        tools_available = set(line.config.builtin_tools) | set(
-            line.config.allowed_tools
-        )
-        has_write_tool = line.config.tool_policy == "allow_all" or bool(
-            tools_available & {"Bash", "Write", "Edit", "NotebookEdit"}
-        )
-        # MCP servers can expose arbitrary tools, so treat any configured server as
-        # potentially capable of writing.
-        if not has_write_tool and not line.config.mcp_servers:
+        if not can_write_workdir(line.config):
             continue
         raw_workdir = line.config.workdir or "."
         workdir_path = Path(raw_workdir).expanduser()
@@ -2217,6 +2254,12 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--unread", action="store_true", help="unread only")
             command.add_argument(
                 "--from", dest="sender", default=None, help="one sender"
+            )
+            command.add_argument(
+                "--replies-to",
+                default=None,
+                metavar="MESSAGE",
+                help="the replies to one message, with their bodies, marking none read",
             )
             command.add_argument(
                 "--offset", type=int, default=0, help="matches to skip"

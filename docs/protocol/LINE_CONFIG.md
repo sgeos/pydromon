@@ -234,11 +234,24 @@ The `daemon` object holds the following, decided by the operator on 2026-10-26 i
   sentence of `commits` name it.
 - **`checkout_commit`.** The same checkout's `HEAD`, read again at every call, which costs
   a few reads of small files and no process.
-- **`stale`.** `true` when the two differ, `false` when they match, and `null` when
-  either is unknown. **`stale_note`** then says that the running daemon does not have the
-  newer code until an operator restarts it. A checkout that moved does not prove that
-  the code differs, since a commit can change only documents, so the note is a prompt to
-  check rather than a verdict.
+- **`stale`.** From 2026-10-31, `true` when the commit checked out in the daemon's own
+  checkout holds code under the daemon's package directory that differs from the code
+  of the commit it loaded, `false` when the code is the same, and `null` when either
+  commit is unknown. **Round 9, decided by core for review.** Staleness is about the
+  daemon's own checkout and never about the worktree of the line that asks. A move that
+  changes only documents is not stale, and a checkout that returns to the loaded code is
+  not stale either, so the warning clears once it no longer holds. Before, any move of
+  `HEAD` was stale, and a line in a worktree of its own saw the warning all session
+  after a commit of documents. **`stale_note`** then says that the running daemon does
+  not have the newer code until an operator restarts it, and names the daemon's own
+  checkout.
+- **`code_compared`** and **`package`.** Whether the code was compared, and the
+  package directory compared, such as `src/dromon`. The comparison runs git, through
+  `dromon.codetree`, only for a pair of commits it has not compared before, and caches
+  the answer by both commits, so a status call while `HEAD` stays runs no process. A
+  call that times out after 5 seconds is not cached. Where git cannot compare the code,
+  as outside a checkout or without git, any move of `HEAD` is stale, as it was before,
+  and `code_compared` is `false`.
 
 The `commits` object, decided by the operator on 2026-10-27 with restart to upgrade,
 gives what a review or report names, read at every call in the way `checkout_commit`
@@ -247,13 +260,44 @@ is read.
 - **`workdir`.** The full commit at `HEAD` of the checkout holding the line's working
   directory, or `null` when the directory is not allowed or not in a checkout. Each
   entry of `other_lines` gives the same for its line as `workdir_commit`.
-- **`daemon`**, **`daemon_checkout`** and **`stale`.** The `daemon` object's `commit`,
-  `checkout_commit` and `stale`, repeated so the object stands alone.
+- **`daemon`**, **`daemon_checkout`**, **`stale`**, **`code_compared`** and
+  **`package`.** The `daemon` object's `commit`, `checkout_commit`, `stale`,
+  `code_compared` and `package`, repeated so the object stands alone.
+- **`daemon_behind_worktree`.** From 2026-10-31, asked by review in round 8. `true`
+  when the daemon runs code older than the line's worktree, which is when the commit the
+  daemon loaded is an ancestor of the worktree's `HEAD` and the two differ under the
+  daemon's package directory. `false` when they do not, and `null` when it cannot be
+  said, as for a worktree of another repository, which does not hold the daemon's
+  commit. It is cached by both commits, as `stale` is. The compact view carries it
+  too.
 - **`cite`.** One sentence naming both full commits, such as `line core read its
   worktree at commit C, under the daemon at commit D.`, with the commit the daemon's
-  checkout has moved to when it is stale, so a report can quote it whole.
+  own checkout has moved to when it is stale, and a clause saying that the daemon's code
+  is older than the worktree's when it is, so a report can quote it whole.
 - **`note`.** That both commits are read from `HEAD`. Uncommitted changes in the
-  worktree are part of neither, and only `git status` shows them.
+  worktree are part of neither, and only `git status` shows them. It also says that
+  `stale` is about the daemon's own checkout.
+
+**The prompt's notice of older daemon code.** From 2026-10-31, when
+`daemon_behind_worktree` is `true`, the line's next turn leads with a notice that the
+daemon runs code from its loaded commit, older than the code at the worktree's commit,
+so what the line observes of Dromon's own behaviour is that older code until an
+operator restarts the daemon. **Decided by core, for review.** The notice is given once
+for each commit of the worktree, not at every turn, so that it does not become noise,
+and is given again once the worktree's `HEAD` moves to another commit that is still
+ahead of the daemon. `line_status` gives the answer at every call. A turn the engine
+started by itself has no Dromon prompt and so no notice.
+
+**Trust and cost of the comparison.** Git runs with the daemon's authority in the
+line's working directory, which the line may write. It is given only `rev-parse` and
+`merge-base`, which read objects and refs and neither the index nor a hook, with the
+`GIT_` variables of the daemon's environment cleared and optional locks off, and with
+commits that are object names and a checked path, so no argument can be read as an
+option. **Assumption.** A line that could write its checkout's git configuration could
+still steer git, as it could any git the operator runs, which is why every enabled
+sandbox denies that file, as the Git safety entry of
+[Working directory](#working-directory) says. The call blocks the daemon's event loop
+for at most 5 seconds, and only for a pair of commits not compared before.
 
 **`read_instructions`.** One optional argument, `full`, a boolean. The instructions are
 those the line's next turn receives as its engine adapter composes them from
@@ -649,6 +693,22 @@ session. `keep_session = true` is refused because a kept connection preserves en
 state between turns. Grok Build, Pi, Cursor Agent and Antigravity configurations are
 refused at load because their adapters do not guarantee a new session per turn.
 The setting is part of operator line configuration and is not exposed as a line tool.
+
+**Turning it on for a line that exists.** **Round 9, item 1, 2026-10-31.** When the
+project file at a reload, or `dromon configure`, turns the key on for a line that is
+between turns and has a recorded session, the daemon records `line_session_cleared` at
+once, so `dromon settings` stops showing the old session as soon as the change applies.
+A line in a turn is left to its next turn's start, since the running turn records the
+session it ran in when it ends. **A new session forgets the old context.** Every
+`line_session_cleared` and `line_rebound` also forgets the daemon's context estimate of
+the old session, with the automatic compaction and the context-warning wake it would
+start. The estimate outlived a cleared session before, so the first turn after the
+reload warned of the old session's context, could begin with a compaction, and the
+line took the warning to mean that the old session had resumed. **Inference, not
+observed live.** That warning is what the report of the old session resuming
+described, since the scheduler built the engine with no session to resume on that
+turn, as a test with a scripted engine shows. The estimate returns with the new
+session's first report.
 
 ## Standing brief
 

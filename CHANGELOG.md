@@ -7,6 +7,35 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- A line given `fresh_session_each_turn` by a reload or `dromon configure` has its
+  recorded session cleared at once when it is between turns, so `dromon settings`
+  stops showing the old session as soon as the change applies. Every cleared or
+  rebound session also forgets the daemon's context estimate of the old session, with
+  the compaction and the context-warning wake it would start. The first turn after
+  such a reload had warned of the old session's context, which the line took to mean
+  the old session had resumed, though its engine was built with none to resume.
+  Reported by another project in round 9.
+- `dromon config` warns about a shared working directory only for lines that can
+  write it, those with `workdir_access` `write` and a shell or file-write built-in or
+  a policy allowing every tool. Read-only lines and lines whose only tools come from
+  MCP servers had been named as writers. Reported by another project in round 9.
+- The daemon is stale in `line_status` only when its own checkout holds code under
+  its package directory other than the code it loaded, so a commit of documents no
+  longer warns, and the warning clears once the checkout returns to that code. Git
+  compares the trees only for commits not compared before, and caches the answer by
+  commit. The stale note names the daemon's own checkout, not the line's worktree.
+  Where the code cannot be compared, any move of `HEAD` is stale, as before.
+  Reported by another project in round 9.
+- An attached client whose daemon is gone detaches by itself once 5 polls in a row
+  over at least 10 seconds have found nothing listening, prints why, and exits with 4.
+  A slow or refusing daemon never counts. The terminal loop waits out its input
+  timeout when curses returns at once, as it does once the terminal is gone. One
+  client had polled a deleted project for days at full processor use. Reported by
+  another project in round 9.
+- `test_a_stop_under_kill_all_also_ends_a_child_that_left_the_group` and every other
+  launcher test that waits for a process to go poll to a monotonic deadline derived
+  from the launcher's own bounds, and a `ps` that times out under load counts as not
+  yet gone rather than failing the test. One run failed at a load average of 189.
 - Grok home checks now allow an empty regular `hooks-paths` file and an
   `installed-plugins` directory containing only empty regular `*.lock` files, while
   refusing symbolic links and any other contents. Grok writer profiles hold the
@@ -71,6 +100,14 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- `daemon_behind_worktree` in `line_status`, and a notice in the wake prompt once per
+  worktree commit, when the daemon runs code older than the line's worktree, which is
+  when its loaded commit is an ancestor of the worktree's `HEAD` and the two differ
+  under its package directory. Asked by review in round 8.
+- The client request `replies` and `dromon mail --replies-to MESSAGE`, which give the
+  replies in an operator's mailbox to one message with their bodies and mark none
+  read, so a wait loop can count unread replies and read them in one query. Reported
+  by another project in round 9.
 - Drivers for GPT-6.1-Sol and GPT-6.1 Terra on Codex, `gpt-6.1-sol` and
   `gpt-6.1-terra`, for every strategy, with a context window of 500,000 tokens from
   Codex's model catalogue. Required by the operator on 2026-10-30. No turn on either

@@ -186,6 +186,7 @@ from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, SandboxError, effective, merge, parse_sandbox
 from dromon import gitssh
+from dromon import codetree
 from dromon.gitssh import GitSshAccess, sandbox_layer, unreadable
 from dromon.settings import SettingsConfig
 from dromon.processes import (
@@ -1643,6 +1644,12 @@ class Scheduler:
         self._daemon_checkout = daemon_checkout
         """A directory in the daemon's own checkout, whose HEAD ``line_status`` reads
         again at each call, or ``None``."""
+        self._package: str | None = None
+        """The daemon's package directory within its checkout, once git has said."""
+        self._code_trees = codetree.CodeTrees()
+        """Git's cached answers about the code at commits, for staleness."""
+        self._behind_told: dict[str, str] = {}
+        """Each line's worktree commit whose older daemon code its prompt last told."""
         self._confining = confining_engines
         """The engines that can make a role's worktree read only to a seat, as
         ``roles.CONFINING_ENGINES`` says. A seat on any other engine waits while
@@ -1996,18 +2003,61 @@ class Scheduler:
     def _configure(self, line_id: str, config: LineConfig, *, creating: bool) -> None:
         line = self._log.state.lines.get(line_id)
         previous: str | None = None
+        fresh_before = False
         if line is not None:
             driver = Driver.for_model(line.engine, Strategy(line.strategy))
             _check_engine_supports(driver, config)
             if line.config is not None:
                 previous = decode_config(line.config).workdir
+            fresh_before = self.effective_config(line_id).fresh_session_each_turn
         self._log.append(LineConfigured(line_id, encode_config(config)))
         if not creating and line is not None and previous != config.workdir:
             self._log.append(LineSessionCleared(line_id))
+            self._forget_context(line_id)
             self._end_leases(line_id)
             if line_id in self._running:
                 self._moved.add(line_id)
+        elif not creating and line is not None and not fresh_before:
+            self._clear_for_fresh_sessions(line_id)
         self._drop_engine(line_id)
+
+    def _clear_for_fresh_sessions(self, line_id: str) -> None:
+        """Record at once that ``line_id`` no longer resumes its engine session, when
+        a configuration, from the project file or ``dromon configure``, has just
+        turned ``fresh_session_each_turn`` on and the line is between turns. No
+        client override sets it.
+
+        **Round 9, item 1.** The rule was applied only as a turn began, so
+        ``dromon settings`` went on showing the old session after a reload until
+        the next turn, which made the change look as if it had not applied. A line
+        in a turn is left to its next turn, whose start clears the session, since
+        the running turn's end records the session it ran in."""
+        line = self._log.state.lines[line_id]
+        if (
+            line_id in self._running
+            or line.engine_session is None
+            or not self.effective_config(line_id).fresh_session_each_turn
+        ):
+            return
+        self._log.append(LineSessionCleared(line_id))
+        self._forget_context(line_id)
+
+    def _forget_context(self, line_id: str) -> None:
+        """Forget the context estimate of ``line_id``'s engine session, and the
+        compaction it would start, because the line's next turn runs in a new
+        session that carries none of that context.
+
+        **Round 9, item 1.** The estimate outlived a cleared session, so the first
+        turn of a ``fresh_session_each_turn`` line after a reload warned of the old
+        session's context and could begin with a compaction, and the line took the
+        warning to mean that the old session had resumed. The estimate returns with
+        the new session's first report."""
+        self._context.pop(line_id, None)
+        self._context_source.pop(line_id, None)
+        self._auto_held.discard(line_id)
+        self._context_compaction_wakes.discard(line_id)
+        self._compaction_free_turn_used.discard(line_id)
+        self._withdraw_context_compaction_wake(line_id)
 
     def ensure_operator(self, operator_id: str) -> None:
         if operator_id not in self._log.state.operators:
@@ -3985,44 +4035,96 @@ class Scheduler:
         daemon = self.daemon_status()
         workdir = self._workdir_commit(line_id)
         started = daemon["commit"]
+        behind = self.daemon_behind(line_id)
+        # Either question asks git for the package path, which is then kept.
+        package = daemon["package"] or self._package
         cite = (
             f"line {line_id} read its worktree at commit {workdir or 'unknown'},"
             f" under the daemon at commit {started or 'unknown'}"
         )
-        if daemon["stale"]:
-            cite += (
-                f", whose checkout has since moved to {daemon['checkout_commit']}"
-                f" after the daemon loaded its code at {daemon['loaded_at']}"
-            )
+        cite += _stale_tail(
+            daemon["stale"],
+            daemon["checkout_commit"],
+            daemon["loaded_at"],
+            daemon["code_compared"],
+            package,
+        )
+        if behind is True:
+            cite += f", whose code under {package} is older than the worktree's"
         return {
             "workdir": workdir,
             "daemon": started,
             "daemon_checkout": daemon["checkout_commit"],
             "stale": daemon["stale"],
+            "code_compared": daemon["code_compared"],
+            "package": package,
+            "daemon_behind_worktree": behind,
             "cite": cite + ".",
             "note": (
                 "commits are read from HEAD, and uncommitted changes in the worktree"
-                " are not part of either"
+                " are not part of either. stale is about the daemon's own checkout,"
+                " not this worktree, and daemon_behind_worktree compares the daemon's"
+                " code with this worktree's"
             ),
         }
 
+    def _daemon_package(self) -> str | None:
+        """The path of the daemon's package within its own checkout, such as
+        ``src/dromon``, asked of git once and kept, or ``None`` when it cannot be
+        read, which is asked again at the next call."""
+        if self._package is None and self._daemon_checkout is not None:
+            self._package = codetree.package_path(self._daemon_checkout)
+        return self._package
+
     def daemon_status(self) -> dict[str, object]:
-        """The daemon's version and the commit it started from, and whether its
-        checkout has moved since, read again now from a few small files."""
+        """The daemon's version and the commit it started from, and whether the code
+        its checkout holds now differs from the code it loaded, read again now.
+
+        **Round 9, item 4. Decided by core, for review.** The daemon is stale when
+        the commit checked out in its own checkout holds code under its package
+        directory other than the commit it loaded. A move that changes only other
+        files, such as documents, is not stale, and a checkout moved back to the
+        loaded code is not stale either, so the warning clears once it no longer
+        holds. ``HEAD`` is read from small files at each call, and git is run only
+        for a commit not compared before. Where the code cannot be compared, as
+        without git, any move counts as stale, as it did before, and
+        ``code_compared`` is false."""
         current = (
             None
             if self._daemon_checkout is None
             else read_head_commit(self._daemon_checkout)
         )
         started = self._daemon_commit
-        stale = None if current is None or started is None else current != started
+        stale: bool | None = None
+        compared = False
+        package: str | None = None
+        if current is not None and started is not None:
+            stale = current != started
+            if stale and self._daemon_checkout is not None:
+                package = self._daemon_package()
+                same = (
+                    None
+                    if package is None
+                    else self._code_trees.same_code(
+                        self._daemon_checkout, started, current, package
+                    )
+                )
+                if same is not None:
+                    stale, compared = not same, True
+            elif not stale:
+                compared = True
         note: str | None = None
         if current is not None and started is not None and stale:
+            what = (
+                f"with changes to the code under {package}"
+                if compared
+                else "and whether its code changed could not be read"
+            )
             note = (
-                f"The daemon's checkout has moved from {started[:12]} to"
-                f" {current[:12]} since the daemon loaded its code at"
-                f" {self._loaded_at}, so the running daemon does not have that code"
-                " until an operator restarts it."
+                f"The daemon's own checkout, not your worktree, has moved from"
+                f" {started[:12]} to {current[:12]} {what} since the daemon loaded its"
+                f" code at {self._loaded_at}, so the running daemon does not have that"
+                " code until an operator restarts it."
             )
         return {
             "version": __version__,
@@ -4033,8 +4135,63 @@ class Scheduler:
             "loaded_at": self._loaded_at,
             "checkout_commit": current,
             "stale": stale,
+            "code_compared": compared,
+            "package": package,
             "stale_note": note,
         }
+
+    def daemon_behind(self, line_id: str) -> bool | None:
+        """Whether the daemon runs code older than the code checked out in
+        ``line_id``'s worktree: the commit it loaded is an ancestor of the
+        worktree's ``HEAD`` and the two differ under the daemon's package directory.
+        ``None`` when it cannot be said, as for a worktree of another repository,
+        which does not hold the daemon's commit.
+
+        **Round 9, item 4, asked by review in round 8.** A line working on Dromon
+        itself can then tell that what it sees of the daemon is older than its own
+        code. The answer is cached by both commits, so it costs git only after the
+        worktree's ``HEAD`` moves."""
+        started = self._daemon_commit
+        if started is None:
+            return None
+        try:
+            directory = self._workdir_of(line_id)
+        except LineToolRefused:
+            return None
+        head = read_head_commit(directory)
+        if head is None:
+            return None
+        if head == started:
+            return False
+        package = self._daemon_package()
+        if package is None:
+            return None
+        ancestor = self._code_trees.is_ancestor(directory, started, head)
+        if ancestor is not True:
+            return ancestor
+        same = self._code_trees.same_code(directory, started, head, package)
+        return None if same is None else not same
+
+    def _behind_notice(self, line_id: str) -> str | None:
+        """What ``line_id``'s next turn is told when the daemon runs code older than
+        its worktree's, once for each commit of the worktree, or ``None``.
+        **Decided by core on 2026-10-31, for review.** Told once per commit, not at
+        every turn, so the notice does not become noise. ``line_status`` gives the
+        answer at every call."""
+        if self.daemon_behind(line_id) is not True:
+            self._behind_told.pop(line_id, None)
+            return None
+        head = self._workdir_commit(line_id)
+        started = self._daemon_commit
+        if head is None or started is None or self._behind_told.get(line_id) == head:
+            return None
+        self._behind_told[line_id] = head
+        return (
+            f"The daemon runs code from {started[:12]}, older than the code under"
+            f" {self._daemon_package()} at your worktree's commit {head[:12]}. What"
+            " you observe of Dromon's own behaviour is that older code until an"
+            " operator restarts the daemon."
+        )
 
     def write_scratch(self, line_id: str, path: str, text: str) -> str:
         """Write ``text`` to ``path`` under ``tmp/`` in the line's working directory,
@@ -6348,6 +6505,7 @@ class Scheduler:
         if line_id in self._running:
             raise EventRejected(f"line {line_id} is in a turn. Interrupt it first")
         self._log.append(LineSessionCleared(line_id))
+        self._forget_context(line_id)
         self._drop_engine(line_id)
         self._end_leases(line_id)
 
@@ -6387,6 +6545,7 @@ class Scheduler:
                 LineOverridden(line_id, encode_override_document(overrides))
             )
         self._log.append(LineRebound(line_id, model, strategy.value))
+        self._forget_context(line_id)
         self._drop_engine(line_id)
         self._end_leases(line_id)
 
@@ -6680,6 +6839,7 @@ class Scheduler:
             # triggering messages have already been delivered and remain in this
             # turn's prompt. Context handoff is disabled by configuration.
             self._log.append(LineSessionCleared(line_id))
+            self._forget_context(line_id)
             self._drop_engine(line_id)
             self._end_leases(line_id)
         self._turns[line_id] = self._turns.get(line_id, 0) + 1
@@ -6760,6 +6920,9 @@ class Scheduler:
             quiet = self._quiet_notice(line_id)
             if quiet is not None:
                 prompt = f"{quiet}\n\n{prompt}"
+            behind = self._behind_notice(line_id)
+            if behind is not None:
+                prompt = f"{behind}\n\n{prompt}"
             moved = self._head_notice(line_id)
             if moved is not None:
                 prompt = f"{moved}\n\n{prompt}"
@@ -8684,6 +8847,28 @@ def _compact_brief(brief: object) -> dict[str, object] | None:
     return view
 
 
+def _stale_tail(
+    stale: object,
+    checkout: object,
+    loaded_at: object,
+    compared: object,
+    package: object,
+) -> str:
+    """The clause a cite adds when the daemon is stale, naming its own checkout so
+    that a line in a worktree of its own does not take it for that worktree."""
+    if stale is not True or checkout is None:
+        return ""
+    if compared is True:
+        return (
+            f", whose own checkout has since moved to {checkout} with changes to the"
+            f" code under {package}, after the daemon loaded its code at {loaded_at}"
+        )
+    return (
+        f", whose own checkout has since moved to {checkout} after the daemon loaded"
+        f" its code at {loaded_at}, with its code not compared"
+    )
+
+
 def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
     """Select the bounded, list-free fields shown by ``line_status`` by default."""
     autonomous = cast(dict[str, object], full["autonomous_turns"])
@@ -8696,16 +8881,22 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
     daemon_commit = _commit_name(commits.get("daemon"))
     checkout_commit = _commit_name(commits.get("daemon_checkout"))
     stale = commits.get("stale")
+    behind = commits.get("daemon_behind_worktree")
+    package = commits.get("package")
     cite = (
         f"line {full['line_id']} read its worktree at commit"
         f" {workdir_commit or 'unknown'}, under the daemon at commit"
         f" {daemon_commit or 'unknown'}"
     )
-    if stale is True and checkout_commit is not None:
-        cite += (
-            f", whose checkout has since moved to {checkout_commit}"
-            f" after the daemon loaded its code at {daemon['loaded_at']}"
-        )
+    cite += _stale_tail(
+        stale,
+        checkout_commit,
+        daemon["loaded_at"],
+        commits.get("code_compared"),
+        package,
+    )
+    if behind is True:
+        cite += f", whose code under {package} is older than the worktree's"
     return {
         "line_id": full["line_id"],
         "state": full["state"],
@@ -8749,6 +8940,7 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
             "daemon": daemon_commit,
             "daemon_checkout": checkout_commit,
             "stale": stale if type(stale) is bool else None,
+            "daemon_behind_worktree": behind if type(behind) is bool else None,
             "cite": cite + ".",
             "note": commits.get("note"),
         },

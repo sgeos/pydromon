@@ -198,6 +198,9 @@ VIEW_LIMIT: Final = 50
 VIEW_PREVIEW_CHARACTERS: Final = 600
 
 VIEW_BUDGET_BYTES: Final = 40_000
+REPLIES_BUDGET_BYTES: Final = 40_000
+"""The most bytes of bodies, as written in JSON, that one ``replies`` answer carries,
+so that it fits one protocol line with the headers of a full page."""
 """Room for messages in a ``line_view`` response, below the 64 KiB line limit."""
 
 IDLE_TIMEOUT_SECONDS: Final = 30.0
@@ -665,6 +668,7 @@ class Daemon:
                 | Operation.QUESTIONS
                 | Operation.ANSWER
                 | Operation.MAIL
+                | Operation.REPLIES
                 | Operation.READ
                 | Operation.ACKNOWLEDGE
                 | Operation.SENT
@@ -712,6 +716,8 @@ class Daemon:
                     result = self._answer(request.args)
                 case Operation.MAIL:
                     result = self._mail(request.args)
+                case Operation.REPLIES:
+                    result = self._replies(request.args)
                 case Operation.READ:
                     result = self._read(request.args)
                 case Operation.ACKNOWLEDGE:
@@ -1049,6 +1055,78 @@ class Daemon:
                 }
                 for message_id, message in page
             ],
+        }
+
+    def _replies(self, args: dict[str, object]) -> dict[str, object]:
+        """The replies in an operator's mailbox to one message, with their bodies,
+        oldest first, marking none of them read.
+
+        **Round 9, item 5.** ``read`` marks a message read, so a wait loop that
+        counted unread replies could not also read them without changing its own
+        count. This query answers both. It delivers the operator's undelivered mail
+        first, as ``mail`` does, since an operator's client showing it is its
+        delivery, and delivery is not reading. Bodies are kept within
+        ``REPLIES_BUDGET_BYTES`` so the answer fits one protocol line, and a body
+        past it is withheld, with its size, for ``read`` to open."""
+        allowed = {"operator", "message_id", "unread_only", "offset", "limit"}
+        if not {"operator", "message_id"} <= set(args) or not set(args) <= allowed:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST,
+                f"replies takes {sorted(allowed)}, with operator and message_id",
+            )
+        operator_text, message_id = _text_args(
+            {"operator": args["operator"], "message_id": args["message_id"]},
+            ("operator", "message_id"),
+        )
+        unread_only = args.get("unread_only", False)
+        offset = args.get("offset", 0)
+        limit = args.get("limit", MAX_PAGE)
+        if type(unread_only) is not bool:
+            raise ProtocolError(ErrorCode.BAD_REQUEST, "unread_only is not a boolean")
+        if type(offset) is not int or type(limit) is not int:
+            raise ProtocolError(ErrorCode.BAD_REQUEST, "offset and limit are integers")
+        if offset < 0 or not 1 <= limit <= MAX_PAGE:
+            raise InvalidField(
+                f"offset must be at least 0 and limit in [1, {MAX_PAGE}]"
+            )
+        if message_id not in self.log.state.messages:
+            raise EventRejected(f"no message {message_id}")
+        owner = OperatorAddress(operator_text)
+        self.scheduler.collect(owner)
+        found = [
+            (reply_id, message)
+            for reply_id, message in self.log.state.messages.items()
+            if message.recipient == owner and message.reply_to == message_id
+        ]
+        unread = sum(not message.read for _, message in found)
+        matching = [item for item in found if not unread_only or not item[1].read]
+        replied = replied_ids(self.log.state, owner)
+        entries: list[dict[str, object]] = []
+        budget = REPLIES_BUDGET_BYTES
+        for reply_id, message in matching[offset : offset + limit]:
+            size = len(message.body.encode("utf-8"))
+            # Measured as written, since escaping can enlarge a body sixfold.
+            written = len(json.dumps(message.body, ensure_ascii=False).encode("utf-8"))
+            shown = written <= budget
+            if shown:
+                budget -= written
+            entries.append(
+                {
+                    "message_id": reply_id,
+                    "sender": str(message.sender),
+                    "kind": message.kind.value,
+                    "read": message.read,
+                    "outcome": outcome(reply_id, message, replied),
+                    "body": message.body if shown else None,
+                    "body_bytes": size,
+                }
+            )
+        return {
+            "message_id": message_id,
+            "total": len(matching),
+            "replies": len(found),
+            "unread": unread,
+            "messages": entries,
         }
 
     def _line_view(self, args: dict[str, object]) -> dict[str, object]:

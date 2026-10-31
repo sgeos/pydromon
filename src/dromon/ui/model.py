@@ -20,6 +20,13 @@ QUIT_WINDOW_SECONDS: Final = 2.0
 RUNNING_POLL_DIVISOR: Final = 4
 """How much faster a client polls while its line runs a turn, to follow it closely."""
 MIN_POLL_SECONDS: Final = 0.1
+LOST_POLLS: Final = 5
+"""How many polls in a row may find no daemon before a client detaches by itself."""
+LOST_SECONDS: Final = 10.0
+"""How long a client goes on asking a daemon that is gone before it detaches. Both
+bounds must be passed, so a short poll interval does not detach it in a moment, and a
+long one still retries ``LOST_POLLS`` times. **Round 9, item 6.** A client whose
+daemon was gone polled for days after its project was deleted."""
 
 
 class Overlay(StrEnum):
@@ -70,6 +77,14 @@ class Model:
     """Questions already seen, or ``None`` before the first view, so that only a
     question that arrives while attached rings the bell."""
     finished: bool = False
+    lost_since: float | None = None
+    """When the polls in a row that found no daemon began, or ``None``."""
+    lost_polls: int = 0
+    """How many polls in a row found no daemon."""
+    lost_poll_at: float | None = None
+    """The poll last counted as lost, so the several fetches of one poll count once."""
+    exit_message: str | None = None
+    """Why the client detached by itself, or ``None``."""
 
     def __post_init__(self) -> None:
         if not self.line_id:
@@ -146,6 +161,13 @@ class Failed:
     text: str
 
 
+@dataclass(frozen=True, slots=True)
+class Lost:
+    """A request found nothing listening on the daemon's socket."""
+
+    text: str
+
+
 type Event = (
     Tick
     | Resized
@@ -157,6 +179,7 @@ type Event = (
     | SettingsLoaded
     | Done
     | Failed
+    | Lost
 )
 
 

@@ -37,6 +37,8 @@ class Operation(StrEnum):
     QUESTIONS = "questions"
     ANSWER = "answer"
     MAIL = "mail"
+    REPLIES = "replies"
+    """Read only. Added in round 9."""
     READ = "read"
     ACKNOWLEDGE = "acknowledge"
     SENT = "sent"
