@@ -417,6 +417,14 @@ remote_reach = ["@ana"]             # what an undeclared key may reach
   sandbox or a service manager may set `HOME` or `XDG_STATE_HOME` differently. The
   path follows the freedesktop.org convention for state, and lies outside every
   project, and a start whose registry lies in its own project is refused.
+- **Override.** **Decided by core, for the operator's review, round 13.**
+  `DROMON_REGISTRY_DIR`, an absolute path, replaces the location, so that tests and
+  trials never write the user's real registry. Every test sets it to a temporary
+  directory. A value that is empty, relative or holds a `.` or `..` step refuses the
+  start rather than falling back to the default. Daemons that should find each other
+  must be started with the same value. A daemon given another registry finds none of
+  the others and is found by none, which fails closed. The lines of an open daemon are
+  denied the default registry as well as the one in use.
 - **Modes.** The directory must be the user's with mode 0700 and is refused if wider,
   never narrowed. Each entry is `NAME.json`, a regular file of mode 0600, holding the
   federation name, the `peers.sock` path, the project root, the pid and the start
@@ -1058,6 +1066,8 @@ daemon restarts, so a peer that changes its name on each connection sends one no
 | A connection comes from outside `allowed_networks` | Closed by its address before the cap and before the handshake |
 | Many clients open handshakes on an open listener and stall | Each counts under the bound of eight from its accept and is closed at the 10-second deadline. None holds a thread |
 | An open listener's client presents a key other than self-signed Ed25519, or none | Refused in the handshake, before any frame is read |
+| A note names an operator who has never sent through the receiving daemon | Refused with `refused` at once, since a daemon holds an operator only from that operator's first send. **Found on 2026-10-31,** in the first socket run of two open daemons. By design, as for a declared peer, and decision 25 below |
+| A test reaches the user's real registry | Every test sets `DROMON_REGISTRY_DIR` to a temporary directory, and a test checks that it does |
 
 ## Out of scope
 
@@ -1148,3 +1158,11 @@ changing the envelope's version 1, unless noted.
     `deliver`, read after an accepted answer to `hello`, on the Unix domain socket
     transport as well. A link that takes the writes and never answers leaves the
     message waiting, marked as possibly sent once a `deliver` was written.
+25. **An operator who has never sent through a daemon cannot receive peer mail there.**
+    **Fact, found on 2026-10-31.** A daemon holds an operator only from that operator's
+    first send through it, and a note to a party the receiver does not hold is refused
+    with `refused`, as for a declared peer. A project that names `@ana` in `reach` or
+    `[federation.open] reach` therefore refuses mail to `@ana` until `@ana` has sent
+    once through it. The behaviour is unchanged, since `refused` hides which parties
+    exist. The alternative, to hold every operator a `reach` list names, would let a
+    project file register operators, and is the operator's to decide.

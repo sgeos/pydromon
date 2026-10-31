@@ -276,8 +276,11 @@ class Daemon:
     connect: Connector | None = None
     """How the forwarder reaches a peer, by default ``peer_connector``, which reaches
     each peer over its own transport. Tests give their own."""
-    registry_dir: Path = field(default_factory=registry.default_directory)
-    """The per-user registry of open local federation. Tests give their own."""
+    registry_dir: Path = field(
+        default_factory=lambda: registry.configured_directory(os.environ)
+    )
+    """The per-user registry of open local federation, ``DROMON_REGISTRY_DIR`` when
+    it is set. ``run`` gives the one it resolved at start, and tests give their own."""
     start_of: registry.StartOf = runs.process_start
     """When a pid started, by the process table, which tells a live registry entry
     from a stale one. Tests give their own."""
@@ -731,7 +734,7 @@ class Daemon:
         for a relay refused now, including a notice file outside the daemon's
         protected state or runtime directories, so a start or reload names it and
         changes nothing."""
-        protected_dirs(self.paths, config.federation)
+        protected_dirs(self.paths, config.federation, self.registry_dir)
         root = self.paths.root
         state_runtime_dirs = (self.paths.state_dir, self.paths.runtime_dir)
 
@@ -1193,7 +1196,7 @@ class Daemon:
         resolve_workdir(
             config.workdir,
             self.paths.root,
-            protected_dirs(self.paths, self.project.federation),
+            protected_dirs(self.paths, self.project.federation, self.registry_dir),
         )
         check_plugins(config)
         check_instructions(config.instructions, self.paths.root)
@@ -2917,10 +2920,18 @@ def protected_dirs(
         raise ConfigError(str(error)) from error
     # The registry of open local federation, which a line that could write it could
     # use to pass for a daemon. Each registered project's own directories are read
-    # at each engine build, by ``registry_protected``.
+    # at each engine build, by ``registry_protected``. The default registry is denied
+    # too when ``DROMON_REGISTRY_DIR`` moves this daemon's, so that its lines cannot
+    # write the one other daemons read.
     if federation.local_open:
-        directory = registry_dir or registry.default_directory()
-        found = (*found, Path(os.path.realpath(directory)))
+        try:
+            directory = registry_dir or registry.configured_directory(os.environ)
+        except registry.RegistryError as error:
+            raise ConfigError(str(error)) from error
+        reals = dict.fromkeys(
+            os.path.realpath(each) for each in (directory, registry.default_directory())
+        )
+        found = (*found, *(Path(real) for real in reals))
     return found
 
 
@@ -2941,7 +2952,7 @@ def open_federation(
     scheduler.peer_turns.open_allowance = turns
     if not federation.local_open:
         return
-    where = directory or registry.default_directory()
+    where = directory or registry.configured_directory(os.environ)
 
     def registered(name: str) -> bool:
         try:
@@ -3335,6 +3346,9 @@ def run(
     os.umask(0o077)
     given = overrides or Overrides()
     try:
+        # Resolved first, so that a malformed override refuses the start before any
+        # check reads the registry, and every later use reads this one.
+        registry_dir = registry.configured_directory(os.environ)
         peercred.check_supported()
         ensure_private_dir(paths.state_dir)
         ensure_private_dir(paths.runtime_dir)
@@ -3357,6 +3371,7 @@ def run(
         ValueError,
         InvalidField,
         peercred.PeerCredentialError,
+        registry.RegistryError,
     ) as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
@@ -3375,14 +3390,14 @@ def run(
                     str(paths.root),
                     project_sandbox=config.sandbox,
                     project_settings=config.settings,
-                    protected=protected_dirs(paths, config.federation),
+                    protected=protected_dirs(paths, config.federation, registry_dir),
                     line_tokens=line_tokens,
                     line_socket=paths.line_socket,
                     line_secrets=line_secrets,
                     line_git_ssh=line_git_ssh,
                     read_only_paths=config.read_only_paths,
                     extra_protected=registry_protected(
-                        paths, config.federation, registry.default_directory()
+                        paths, config.federation, registry_dir
                     ),
                 ),
                 limits=limits,
@@ -3391,7 +3406,7 @@ def run(
                 tick_seconds=tick,
                 wake_every_ticks=config.wake_every_ticks,
                 root=paths.root,
-                protected=protected_dirs(paths, config.federation),
+                protected=protected_dirs(paths, config.federation, registry_dir),
                 read_only_paths=config.read_only_paths,
                 daemon_commit=read_head_commit(Path(__file__).parent),
                 daemon_checkout=Path(__file__).parent,
@@ -3417,7 +3432,7 @@ def run(
                     for peer_id, peer in config.federation.peers.items()
                 }
             )
-            open_federation(scheduler, log, config.federation)
+            open_federation(scheduler, log, config.federation, registry_dir)
             teacher = start_teacher(config, paths)
             try:
                 daemon = Daemon(
@@ -3432,6 +3447,7 @@ def run(
                     project_file_present=file.exists(),
                     line_secrets=line_secrets,
                     hold_wakes=hold_wakes,
+                    registry_dir=registry_dir,
                 )
                 daemon.apply_project_values()
                 for notice in apply_roles(scheduler, log, config):

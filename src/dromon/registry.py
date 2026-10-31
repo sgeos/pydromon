@@ -13,6 +13,16 @@ or ``XDG_STATE_HOME`` differently. The path follows the convention for state of 
 freedesktop.org base directory specification, and lies outside every project unless a
 project's root holds the home directory, which the daemon refuses.
 
+Override. **Decided by core, for the operator's review, round 13.**
+``DROMON_REGISTRY_DIR``, an absolute path, replaces the location, so that tests and
+trials never write the user's real registry. A value that is empty, relative or holds
+a ``.`` or ``..`` step refuses the start rather than falling back to the default.
+Daemons meant to find each other must be started with the same value. A daemon given
+another registry finds none of the others and is found by none, which fails closed.
+An open daemon's lines are denied the default registry as well as the one in use, so
+that a daemon given another registry cannot let its lines write the one other daemons
+read.
+
 Trust. An entry is written by a daemon of the same user, and is read as that user's
 statement, never as proof. The directory must be the user's own with mode 0700, and is
 refused if wider, so another user can neither read nor write it. Each entry is a
@@ -36,7 +46,7 @@ import json
 import os
 import pwd
 import stat
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +67,9 @@ PEER_SOCKET_NAME: Final = "peers.sock"
 STATE_DIR_NAME: Final = ".dromon"
 ENTRY_KEYS: Final = frozenset({"version", "name", "socket", "root", "pid", "started"})
 MAX_STARTED_CHARS: Final = 64
+REGISTRY_DIR_ENV: Final = "DROMON_REGISTRY_DIR"
+"""The variable that replaces the registry's location, as the module's docstring
+decides."""
 
 type StartOf = Callable[[int], str | None]
 """When a pid started, by the process table, or ``None`` when no process has it.
@@ -118,7 +131,10 @@ class Entry:
 
 
 def _check_path(path: Path, name: str) -> None:
-    text = str(path)
+    _check_text(str(path), name)
+
+
+def _check_text(text: str, name: str) -> None:
     if not text.startswith("/") or "\x00" in text:
         raise RegistryError(f"{name} must be an absolute path")
     if len(text.encode("utf-8")) > MAX_PATH_BYTES:
@@ -163,6 +179,18 @@ def default_directory() -> Path:
     database gives, as the module's docstring decides."""
     home = pwd.getpwuid(os.getuid()).pw_dir
     return Path(home) / ".local" / "state" / "dromon" / "registry"
+
+
+def configured_directory(environ: Mapping[str, str]) -> Path:
+    """The registry this daemon uses, ``REGISTRY_DIR_ENV`` when ``environ`` sets it and
+    the default otherwise. Raises ``RegistryError`` when it is set to anything but an
+    absolute path without a ``.`` or ``..`` step, so that a mistyped override never
+    falls back to the user's real registry."""
+    given = environ.get(REGISTRY_DIR_ENV)
+    if given is None:
+        return default_directory()
+    _check_text(given, REGISTRY_DIR_ENV)
+    return Path(given)
 
 
 def check_directory(directory: Path) -> None:

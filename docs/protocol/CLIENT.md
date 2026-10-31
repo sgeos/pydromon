@@ -25,6 +25,7 @@ closed, because the rest of the line cannot be skipped safely.
 |---|---|---|
 | State directory | `<project>/.dromon` | Holds `events.sqlite`, the event log |
 | Runtime directory | `<project>/.dromon/run`, or `DROMON_RUNTIME_DIR` | Holds `dromond.sock`, `dromond.lock`, `dromond.log`, `lines.sock` for engines that reach their line's tools over MCP, as [`GROK.md`](GROK.md) specifies, and `agents.sock` when the project lets external agents in, as [`AGENTS.md`](AGENTS.md) specifies |
+| Registry of open federation | `.local/state/dromon/registry` under the user's home, or `DROMON_REGISTRY_DIR`, an absolute path | Holds an entry for each running daemon whose project sets `local = "open"`, as [`FEDERATION.md`](../architecture/FEDERATION.md) specifies. A malformed override refuses the start |
 
 A socket path is at most 103 bytes, the smaller of the macOS and Linux limits. A
 project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.

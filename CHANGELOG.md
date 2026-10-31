@@ -11,7 +11,10 @@ All notable changes are recorded here. The format follows
   default, which keeps the behaviour of declared peers exactly, or `open`. With
   `local = "open"`, `listen` and a unique `name`, a daemon registers in a per-user
   registry, `.local/state/dromon/registry` under its user's home, which must have mode
-  0700, and removes its entry at stop. A `hello` without a token is then named by the
+  0700, and removes its entry at stop. `DROMON_REGISTRY_DIR`, an absolute path, moves
+  the registry, and every test sets it to a temporary directory, so that no test
+  writes the user's real one. A malformed value refuses the start rather than falling
+  back to the default. A `hello` without a token is then named by the
   live registry entry of the announced name, whose pid and start time must match the
   connecting process, and a line may address `NAME:PARTY` for a registered project
   that the file does not declare. Every undeclared open peer takes the new

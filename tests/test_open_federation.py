@@ -50,6 +50,7 @@ from dromon.federation import (
     unconfined_refusal,
 )
 from dromon.forwarder import Link, check_outbound
+from dromon.lineconfig import ConfigError
 from dromon.model import (
     EventRejected,
     LineAddress,
@@ -235,6 +236,37 @@ def test_the_default_registry_is_under_the_users_home_not_the_environment(
     found = registry.default_directory()
     assert found.parts[-4:] == (".local", "state", "dromon", "registry")
     assert not str(found).startswith("/nowhere")
+    assert registry.configured_directory({}) == found
+
+
+def test_every_test_runs_against_a_registry_of_its_own(tmp_path: Path) -> None:
+    """The guard of ``conftest``, so that no test reaches the user's real registry."""
+    given = registry.configured_directory(os.environ)
+    assert given != registry.default_directory()
+    assert given.is_relative_to(tmp_path.parent)
+
+
+@pytest.mark.parametrize("value", ["", "relative/registry", "/a/../registry", "/a/./b"])
+def test_a_malformed_registry_override_is_refused_not_ignored(value: str) -> None:
+    with pytest.raises(registry.RegistryError, match="DROMON_REGISTRY_DIR"):
+        registry.configured_directory({registry.REGISTRY_DIR_ENV: value})
+
+
+def test_an_override_is_used_and_the_default_is_denied_as_well(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    moved = tmp_path / "elsewhere"
+    assert registry.configured_directory({registry.REGISTRY_DIR_ENV: str(moved)}) == (
+        moved
+    )
+    (tmp_path / "harbor").mkdir()
+    paths = project_paths(tmp_path / "harbor", RUNTIME[-1] / "harbor")
+    denied = protected_dirs(paths, open_config(), moved)
+    assert Path(os.path.realpath(moved)) in denied
+    assert Path(os.path.realpath(registry.default_directory())) in denied
+    monkeypatch.setenv(registry.REGISTRY_DIR_ENV, "relative")
+    with pytest.raises(ConfigError, match="DROMON_REGISTRY_DIR"):
+        protected_dirs(paths, open_config())
 
 
 # The peer's pid.
@@ -962,11 +994,17 @@ def test_an_open_daemon_registers_and_refuses_a_disclosed_or_held_name(
 def test_two_open_daemons_exchange_a_note_over_their_sockets(
     tmp_path: Path, short_runtime: Path
 ) -> None:
-    """Two daemons started as processes, each open and registered in the operator's
-    real registry, so the names carry this test's pid, exchange one operator's note
-    through their peer sockets, named by their entries and their pids."""
-    suffix = str(os.getpid())
-    names = (f"tidepool-{suffix}", f"harbor-{suffix}")
+    """Two daemons started as processes, each open and registered in the test's own
+    registry, which they inherit through ``DROMON_REGISTRY_DIR``, exchange one
+    operator's note through their peer sockets, named by their entries and their pids.
+
+    **Found on 2026-10-31.** A receiver refuses a note to a party it does not hold, and
+    a daemon holds an operator only once that operator has sent through it. The first
+    run sent to a receiver that had never seen ``@ana``, which refused the note at
+    once. So the receiver's ``@ana`` sends first, which records ``@ana`` there, and the
+    note it sends is refused by the sender, which has not seen ``@ana`` yet."""
+    registry_dir = Path(os.environ[registry.REGISTRY_DIR_ENV])
+    names = ("tidepool", "harbor")
     started: list[tuple[ProjectPaths, int]] = []
     try:
         for index, name in enumerate(names):
@@ -985,6 +1023,13 @@ def test_two_open_daemons_exchange_a_note_over_their_sockets(
             started.append((paths, client.start(paths, ["--hold-wakes"])))
         receiving, _ = started[0]
         sending, _ = started[1]
+        assert {each.name for each in registry.entries(registry_dir)} == set(names)
+        first = client.call(
+            receiving.socket,
+            Operation.SEND,
+            args={"operator": "ana", "recipient": f"{names[1]}:@ana", "body": "ping"},
+        )
+        assert first.ok, first.error_message
         sent = client.call(
             sending.socket,
             Operation.SEND,
@@ -993,13 +1038,21 @@ def test_two_open_daemons_exchange_a_note_over_their_sockets(
         assert sent.ok, sent.error_message
         deadline = time.monotonic() + 30
         found = False
+        listed = None
         while time.monotonic() < deadline and not found:
             listed = client.call(
                 receiving.socket, Operation.MAIL, args={"operator": "ana"}
             )
             found = listed.ok and f"{names[1]}:@ana" in json.dumps(listed.result)
             time.sleep(0.2)
-        assert found
+        # The runtime directories, which hold each daemon's output, are removed
+        # after the test, so a failure carries them.
+        outputs = {
+            paths.root.name: paths.daemon_output.read_text(errors="replace")
+            for paths, _ in started
+            if paths.daemon_output.exists()
+        }
+        assert found, (listed, outputs)
     finally:
         for paths, pid in started:
             if client.is_running(paths):
