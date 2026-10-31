@@ -84,6 +84,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "set": "change a project or line setting, or return it to the layers below",
     "role": "show, create, update or delete roles, read their journals, or give,"
     " vacate or ask to hand over one",
+    "run": "clear a lost supervised run after inspecting what is left of it",
     "budget": "list the providers' stated budgets, or state one",
     "reload": "read the project file again and apply its lines, limits and wake policy",
     "config": "check the project file and show what it declares",
@@ -1618,6 +1619,21 @@ def _read(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
+def _run(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Clear a lost run, so its scope may start another. Its command may still run,
+    so the operator inspects what is left of it first."""
+    run_id: str = arguments.run_id
+    args: dict[str, object] = {"run_id": run_id, "operator": arguments.operator}
+    result = _call(paths, "run clear", Operation.RUN_CLEAR, args)
+    if isinstance(result, int):
+        return result
+    print(
+        f"run {result['run_id']} cleared by {result['operator']} at"
+        f" {result['cleared_at']}"
+    )
+    return exits.OK
+
+
 def _role(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     """Show roles, read a journal entry, create, update or delete a role, or change
     or ask for a change of owner."""
@@ -1995,6 +2011,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "config": _config,
     "teacher": _teacher,
     "role": _role,
+    "run": _run,
     "budget": _budget,
     "agent": _agent,
     "peer": _peer,
@@ -2476,6 +2493,14 @@ def build_parser() -> argparse.ArgumentParser:
                 "--operator",
                 default=default_operator(),
                 help="who makes the change or the request, default %(default)s",
+            )
+        if name == "run":
+            command.add_argument("action", choices=["clear"])
+            command.add_argument("run_id", help="the lost run to clear")
+            command.add_argument(
+                "--operator",
+                default=default_operator(),
+                help="who clears it, default %(default)s",
             )
         if name == "budget":
             command.add_argument(

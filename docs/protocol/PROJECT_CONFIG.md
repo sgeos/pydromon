@@ -115,6 +115,7 @@ relay = "tail"          # the route of operator ana's mail
 | `read_only_paths` | list of relative paths | empty | Existing files or directories denied writes under every line's resolved workdir. Symbolic links are resolved and targets must remain inside that workdir |
 | `leases.names` | list of identifiers | none | The leases lines may acquire, each named once, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies |
 | `leases.ttl_seconds` | integer in [60, 86400] | 10800 | How long an acquired lease lasts unless released first |
+| `runs.commands` | table of names to arrays of text | none | The commands lines may start as supervised runs, at most 64, each name an identifier and each command its program and at most 63 arguments, never a shell string, as [`RUNS.md`](../architecture/RUNS.md) specifies. A declared command runs with the daemon's authority, outside any line's sandbox. Added on 2026-10-31 |
 | `limits.*` | as in `CLIENT.md` | 12, 2, 0 | The conversation limits of every line |
 | `wake.every_ticks` | integer in [1, 3600] | 1 | The wake policy of every line |
 | `profiles.NAME` | table | none | A reusable line template with every line key but `profile` and `session` |
@@ -245,7 +246,8 @@ relay = "tail"          # the route of operator ana's mail
   the federation and peer tables, the `[git_ssh]` table or the lines that set
   `git_ssh`, which apply only at start. Its roles are recorded as above. A line the file no longer declares returns to the
   project's limits and wake policy. The leases table is applied again, and a held lease
-  whose name the file no longer declares ends.
+  whose name the file no longer declares ends, as it also does at start. The runs table
+  is applied again, and a run already started is unaffected.
 - **Relays.** At start, and before a reload applies anything, the daemon builds each
   routed operator's relay, and refuses the start or the reload when a file relay's
   notice file lies in the working directory of any line, whether in the log or in the
