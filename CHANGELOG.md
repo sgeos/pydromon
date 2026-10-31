@@ -11,11 +11,19 @@ All notable changes are recorded here. The format follows
   existing project and workdir `secret` directories to be denied by real absolute
   path. Codex adds validated operator-granted `writable_paths` for existing absolute
   directories, only when the line has `Edit` or `Write`, and refuses grants that
-  overlap credentials or other protected paths. Codex sign-in scope remains unresolved
-  for `~/.codex/auth.json`, which is therefore withheld from its profile deny list.
+  overlap credentials or other protected paths. A Codex probe signed in with
+  `~/.codex/auth.json` denied, and that path is now denied by the profile. The operator
+  will verify that a live line command cannot read it.
   Claude Code's existing `network.allowLocalBinding` setting is documented with a
   line configuration example. Grok symlink writes outside the workdir remain
   unverified, and no external writable path grant was added.
+- The shared credential list now includes additional common stores. It is explicitly
+  incomplete, and each engine exempts only its own sign-in path. A dangling link at a
+  listed home path is denied by its absolute path. Protocol documents describe the
+  probe result and the remaining unverified Codex path behavior, and correct when and
+  where `writable_paths` are validated. Negative tests cover unsupported engines,
+  missing write tools, Git overlap, links to protected paths, dangling credentials and
+  a credential created between Codex turns.
 - Grok home checks now allow an empty regular `hooks-paths` file and an
   `installed-plugins` directory containing only empty regular `*.lock` files, while
   refusing symbolic links and any other contents. Grok writer profiles hold the

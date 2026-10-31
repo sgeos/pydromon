@@ -756,9 +756,16 @@ def _covers(paths: Sequence[Path], target: Path) -> bool:
 
 
 def _credential_paths(daemon_home: Path) -> tuple[Path, ...]:
-    """The existing shared credential paths under the daemon's real home."""
+    """Known credential paths under the daemon's real home, except Grok's sign-in."""
     real_home = Path(os.path.realpath(daemon_home))
-    return existing_real_paths([real_home / relative for relative in CREDENTIAL_PATHS])
+    grok_sign_in = Path(".grok/auth.json")
+    return existing_real_paths(
+        [
+            real_home / relative
+            for relative in CREDENTIAL_PATHS
+            if relative != grok_sign_in
+        ]
+    )
 
 
 def profile_snippet(

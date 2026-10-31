@@ -1521,10 +1521,15 @@ this configuration to write build output on a separate volume.
 }
 ```
 
-Each path must exist as a directory when the line is loaded. Dromon resolves symbolic
-links and refuses a path that overlaps a credential, secret, state or runtime path.
-The grant allows writes through the Codex permission profile. It assumes the operator
-trusts the named directory and its contents. Grok does not accept `writable_paths`.
+At line configuration load, Dromon checks only that each path is absolute and unique.
+When a Codex turn builds its permission profile, Dromon then requires each path to
+exist as a directory and resolves symbolic links. It refuses overlap with known
+credential paths, project and workdir `secret` directories, Dromon state and runtime
+directories, the workdir's Git directories, and federated peer directories. Other
+engines refuse `writable_paths` when the engine is built. The credential list is not
+complete, and a project may contain other stores. The grant allows writes through the
+Codex permission profile. It assumes the operator trusts the named directory and its
+contents.
 
 **Claude Code local binding.** The existing sandbox schema accepts
 `network.allowLocalBinding`. A line may allow a sandboxed command to bind a local

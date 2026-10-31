@@ -1069,6 +1069,27 @@ def test_codex_and_grok_protect_both_project_and_external_workdir_secrets(
         assert worktree / "secret" in engine.protected
 
 
+@pytest.mark.parametrize(
+    "model",
+    (
+        "claude-haiku-5-5",
+        "grok-4.7",
+        "pi:openai/gpt-6-luna",
+        "cursor-agent:gpt-5.6-luna-medium",
+        "antigravity:gemini-3.8-flash-high",
+    ),
+)
+def test_factory_refuses_writable_paths_for_non_codex_engines(
+    tmp_path: Path, model: str
+) -> None:
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    build = engine_factory(str(tmp_path))
+    config = LineConfig(builtin_tools=("Edit",), writable_paths=(str(allowed),))
+    with pytest.raises(EngineRefused, match="supported only for Codex lines"):
+        build(LineSpec("alpha", model, Strategy.SUBSCRIPTION, config=config), [])
+
+
 def test_the_daemon_refuses_project_tables_that_would_reach_a_codex_line() -> None:
     check_engines(parse("version = 1\n[lines.a]\nmodel = 'gpt-6-luna'\n"))
     check_engines(
@@ -1245,6 +1266,77 @@ def test_writable_path_cannot_overlap_a_shared_credential(
         server_arguments(
             [], LineConfig(builtin_tools=("Write",), writable_paths=(str(home),)), ()
         )
+
+
+def test_writable_paths_require_a_write_tool(tmp_path: Path) -> None:
+    path = tmp_path / "allowed"
+    path.mkdir()
+    with pytest.raises(EngineRefused, match="requires the Edit or Write tool"):
+        server_arguments([], LineConfig(writable_paths=(str(path),)), ())
+
+
+def test_writable_path_cannot_overlap_a_git_directory(tmp_path: Path) -> None:
+    git = tmp_path / "repo.git"
+    git.mkdir()
+    inside = git / "objects"
+    inside.mkdir()
+    for grant in (git, inside):
+        with pytest.raises(EngineRefused, match="overlaps a protected path"):
+            server_arguments(
+                [],
+                LineConfig(builtin_tools=("Edit",), writable_paths=(str(grant),)),
+                (),
+                write_protected=(git,),
+            )
+
+
+def test_writable_symlink_to_protected_directory_is_refused(tmp_path: Path) -> None:
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    link = tmp_path / "grant"
+    link.symlink_to(protected)
+    with pytest.raises(EngineRefused, match="overlaps a protected path"):
+        server_arguments(
+            [],
+            LineConfig(builtin_tools=("Edit",), writable_paths=(str(link),)),
+            (protected,),
+        )
+
+
+def test_a_dangling_credential_symlink_is_denied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tomllib
+
+    home = tmp_path / "home"
+    dangling = home / CREDENTIAL_PATHS[0]
+    dangling.parent.mkdir(parents=True)
+    dangling.symlink_to(tmp_path / "not-mounted" / "ssh")
+    monkeypatch.setattr(Path, "home", lambda: home)
+    filesystem = tomllib.loads(
+        f"profile = {profile_of(server_arguments([], LineConfig(), ()))}"
+    )["profile"]["filesystem"]
+    assert filesystem[str(dangling.absolute())] == "deny"
+
+
+def test_credential_created_between_turns_is_denied_by_the_next_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tomllib
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", lambda: home)
+    auth = home / Path(".codex/auth.json")
+    first = tomllib.loads(
+        f"profile = {profile_of(server_arguments([], LineConfig(), ()))}"
+    )["profile"]["filesystem"]
+    assert str(auth) not in first
+    auth.parent.mkdir(parents=True)
+    auth.write_text("{}")
+    second = tomllib.loads(
+        f"profile = {profile_of(server_arguments([], LineConfig(), ()))}"
+    )["profile"]["filesystem"]
+    assert second[str(auth.resolve())] == "deny"
 
 
 def test_a_thread_without_dromons_profile_is_refused() -> None:

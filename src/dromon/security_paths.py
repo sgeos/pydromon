@@ -10,8 +10,19 @@ CREDENTIAL_PATHS: Final = (
     Path(".codex/auth.json"),
     Path(".cargo/credentials.toml"),
     Path(".pi/agent/auth.json"),
+    Path(".grok/auth.json"),
+    Path(".claude.json"),
+    Path(".claude/.credentials.json"),
+    Path(".netrc"),
+    Path(".git-credentials"),
+    Path(".gnupg"),
+    Path(".npmrc"),
+    Path(".pypirc"),
+    Path(".docker/config.json"),
+    Path(".kube/config"),
+    Path(".config/gh/hosts.yml"),
 )
-"""Operator-home credential paths adapters must account for when they exist."""
+"""Known operator-home credential paths, not an exhaustive list."""
 
 
 def existing_real_paths(paths: tuple[Path, ...] | list[Path]) -> tuple[Path, ...]:
@@ -19,8 +30,12 @@ def existing_real_paths(paths: tuple[Path, ...] | list[Path]) -> tuple[Path, ...
     found: list[Path] = []
     seen: set[Path] = set()
     for path in paths:
-        if os.path.exists(path):
-            real = Path(os.path.realpath(path))
+        if os.path.lexists(path):
+            real = (
+                Path(os.path.realpath(path))
+                if os.path.exists(path)
+                else Path(os.path.abspath(path))
+            )
             if real not in seen:
                 seen.add(real)
                 found.append(real)

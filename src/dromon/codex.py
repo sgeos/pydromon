@@ -415,7 +415,11 @@ def validate_writable_paths(
     credential_guards = tuple(
         Path(os.path.realpath(home / relative)) for relative in CREDENTIAL_PATHS
     )
-    guards = (*existing_real_paths(list(protected)), *credential_guards)
+    guards = (
+        *existing_real_paths(list(protected)),
+        *credential_guards,
+        *existing_real_paths([home / relative for relative in CREDENTIAL_PATHS]),
+    )
     result: list[Path] = []
     for entry in configured:
         path = Path(entry)

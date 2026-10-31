@@ -923,13 +923,27 @@ def test_a_symlinked_credential_is_denied_by_its_real_path(tmp_path: Path) -> No
     assert str(ssh) not in snippet
 
 
-def test_profile_does_not_deny_unverified_grok_or_claude_auth_paths(
+def test_profile_exempts_only_groks_sign_in_and_denies_claude_auth(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "operator-home"
+    grok_auth = home / ".grok" / "auth.json"
+    grok_auth.parent.mkdir(parents=True)
+    grok_auth.write_text("{}")
+    claude_auth = home / ".claude.json"
+    claude_auth.write_text("{}")
     snippet = grok_module.profile_snippet(READER_PROFILE, tmp_path / "work", (), home)
     assert ".grok/auth.json" not in snippet
-    assert ".claude.json" not in snippet
+    assert str(claude_auth.resolve()) in snippet
+
+
+def test_a_dangling_grok_credential_symlink_is_denied(tmp_path: Path) -> None:
+    home = tmp_path / "operator-home"
+    dangling = home / ".npmrc"
+    home.mkdir()
+    dangling.symlink_to(tmp_path / "not-mounted" / "npmrc")
+    snippet = grok_module.profile_snippet(READER_PROFILE, tmp_path / "work", (), home)
+    assert str(dangling.absolute()) in snippet
 
 
 def test_an_existing_profile_gets_additive_advice_and_keeps_other_tables(

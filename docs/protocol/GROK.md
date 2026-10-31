@@ -322,9 +322,11 @@ file and `commondir` file cannot be held as profile entries. A writer could rewr
 pointer during a turn. The next turn resolves it again and refuses unless the resulting
 Git directories are already held read-only. Between the check and that next turn, the
 pointer files themselves remain unguarded by the profile. The bridge below still runs
-in the project root, where it finds the runtime directory. The credential list does not
-include the operator's `.grok/auth.json` or `.claude.json`. Neither path has been tested
-with a Grok line, so this does not claim that either is safe to expose.
+in the project root, where it finds the runtime directory. The shared credential list
+is not complete, and a project may contain other stores. It includes `.grok/auth.json`
+and `.claude.json`. Grok exempts only its own sign-in path, `.grok/auth.json`;
+`.claude.json` remains a required deny entry. No claim is made that the listed paths
+cover every credential store.
 **Inference, not verified.** A `read_only` entry inside a writable workspace keeps it
 read-only, as the field's name says.
 
