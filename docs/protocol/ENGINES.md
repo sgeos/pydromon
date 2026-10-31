@@ -425,19 +425,23 @@ not replaced, and the copy is refused, as below.
 
 **Codex's plan usage.** From 2026-10-27. Codex reports its account in `account/read`,
 whose `account` block is scrubbed as any other, and its plan's use under `rateLimits`.
-The Codex adapter reads nothing there, so every value but a reset time becomes a
-placeholder of its type, and a reset time becomes the fixed one. **Inference, not yet
-seen in a recording.** That Codex names the key `rateLimits` is taken from its
-app-server protocol. A person reads the first Codex recording before it becomes a
-fixture, as for any engine.
+The Codex adapter reads `credits.hasCredits` and `credits.unlimited` on a notice only
+when both `primary` and `secondary` windows are present and null, and it requires both
+credit values to be false. The scrubber preserves that shape and the null windows, but
+replaces other values by type. It cannot preserve a positive balance or usage
+percentage. **Inference, not yet seen in a recording.** That Codex names the key
+`rateLimits` is taken from its app-server protocol. A person reads the first Codex
+recording before it becomes a fixture, as for any engine.
 
 **Rate limits by a list of what is read.** Review of 2026-10-27, finding E3. The fields
 of `rate_limit_info` that the Agent SDK `0.2.174` reads, which are the six named above
-and `rateLimitType`, keep a placeholder valid for that reader. Dromon's adapter reads
-none of them. Every other field is replaced by a fixed value of its type, so a field
-that no one listed, such as a count of remaining requests, cannot pass through. Field
-and window names are kept, and an absent value, `null`, stays absent. An upgrade of the
-Agent SDK checks the list against its `RateLimitInfo`.
+and `rateLimitType`, keep a placeholder valid for that reader. Dromon reads status,
+overage status, reset time and window name to classify a rejected window, and reads
+utilization to record a positive remaining percentage for that window. It does not
+combine separate windows. Every other field is replaced by a fixed value of its type,
+so a field that no one listed, such as a count of remaining requests, cannot pass
+through. Field and window names are kept, and an absent value, `null`, stays absent. An
+upgrade of the Agent SDK checks the list against its `RateLimitInfo`.
 
 **Account values as words.** Review of 2026-10-27, finding E2. Every account value is
 replaced wherever it stands as a whole word, however short, the longest first. A value

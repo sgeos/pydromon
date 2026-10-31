@@ -155,6 +155,9 @@ def line(
     driver: Driver | None = None,
     environment: Mapping[str, str] | None = None,
     observe: Observer = ignore,
+    budget_reported: Callable[[int, str | None, str], object] = (
+        engine_module.ignore_budget_report
+    ),
 ) -> ClaudeCodeLine:
     return ClaudeCodeLine(
         driver or Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
@@ -162,6 +165,7 @@ def line(
         environment=environment or {},
         session_factory=session.factory,
         observe=observe,
+        budget_reported=budget_reported,
     )
 
 
@@ -722,10 +726,62 @@ RESETS = 1_793_199_600
 
 
 def rate_limit(
-    status: RateLimitStatus, overage: RateLimitStatus | None = None
+    status: RateLimitStatus,
+    overage: RateLimitStatus | None = None,
+    utilization: float | None = None,
 ) -> RateLimitEvent:
-    info = RateLimitInfo(status, RESETS, "five_hour", overage_status=overage)
+    info = RateLimitInfo(
+        status,
+        RESETS,
+        "five_hour",
+        utilization=utilization,
+        overage_status=overage,
+    )
     return RateLimitEvent(info, "u-1", "session-1")
+
+
+def test_a_known_positive_claude_window_reports_its_remaining_budget() -> None:
+    reports: list[tuple[int, str | None, str]] = []
+    target = line(
+        Scripted([init(), rate_limit("allowed", utilization=0.425), result()]),
+        budget_reported=lambda remaining, reset, note: reports.append(
+            (remaining, reset, note)
+        ),
+    )
+    run(target)
+    assert reports == [
+        (
+            57,
+            "2026-10-28T15:00:00Z",
+            "Claude reported 57% remaining in its five_hour rate-limit window",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "utilization"),
+    [
+        ("rejected", 0.5),
+        ("allowed", 1.0),
+        ("allowed", -0.1),
+        ("allowed", 1.1),
+        ("allowed", float("nan")),
+        ("allowed", float("inf")),
+    ],
+)
+def test_unknown_or_exhausted_windows_do_not_report_a_positive_budget(
+    status: RateLimitStatus, utilization: float
+) -> None:
+    reports: list[tuple[int, str | None, str]] = []
+    run(
+        line(
+            Scripted([init(), rate_limit(status, utilization=utilization), result()]),
+            budget_reported=lambda remaining, reset, note: reports.append(
+                (remaining, reset, note)
+            ),
+        )
+    )
+    assert reports == []
 
 
 def failed() -> ResultMessage:

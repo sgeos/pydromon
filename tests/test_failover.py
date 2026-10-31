@@ -533,6 +533,26 @@ def test_a_spent_codex_credit_states_its_provider_spent_once(world: World) -> No
     world.scheduler.credits_spent("nobody", "spent")
 
 
+def test_a_claude_window_report_states_a_positive_provider_budget(world: World) -> None:
+    reset = "2026-10-28T15:00:00Z"
+    world.scheduler.engine_budget_reported(
+        "alpha", 8, reset, "Claude reported 8% remaining in its five_hour window"
+    )
+    budget = world.log.state.budgets[CLAUDE]
+    assert (budget.remaining_percent, budget.resets_at, budget.source) == (
+        8,
+        reset,
+        BudgetSource.ENGINE,
+    )
+    assert budget.note == "Claude reported 8% remaining in its five_hour window"
+    # Repeated snapshots of an unchanged window do not grow the event log.
+    count = world.log.last_seq
+    world.scheduler.engine_budget_reported(
+        "alpha", 8, reset, "Claude reported 8% remaining in its five_hour window"
+    )
+    assert world.log.last_seq == count
+
+
 def test_an_owner_out_of_credit_between_turns_fails_over_at_once(
     world: World,
 ) -> None:

@@ -26,7 +26,7 @@ from dromon.agents import AgentError, LineTokens
 from dromon.daemon import Daemon
 from dromon.driver import Credential, Driver, Strategy
 from dromon.priority import SteeredDriver
-from dromon.engine import EngineRefused, TurnReport
+from dromon.engine import EnginePlanLimit, EngineRefused, TurnReport
 from dromon.eventlog import EventLog
 from dromon.evidence import IN, OUT, Recording, Replay, read_recording, replay_factory
 from dromon.grok import (
@@ -252,6 +252,7 @@ class FakeGrok:
         self.activity_delay = 0.0
         """Whether this Grok neither answers a cancel nor closes, so waits block."""
         self.stops = 0
+        self.prompt_error: dict[str, object] | None = None
 
     def methods(self) -> list[str]:
         return [m["method"] for m in self.sent if "method" in m]
@@ -326,6 +327,9 @@ class FakeGrok:
             self.queue.append({**reply, "result": {}})
         elif method == "session/prompt":
             self.prompt_id = sent["id"]
+            if self.prompt_error is not None:
+                self.queue.append({**reply, "error": self.prompt_error})
+                return
             self.queue.extend(self.turn)
             if self.answer_prompt:
                 self.queue.append({**reply, "result": {"stopReason": self.stop}})
@@ -1278,6 +1282,19 @@ def test_a_plain_turn_reports_text_credential_and_session(
         "fs": {"readTextFile": False, "writeTextFile": False},
         "terminal": False,
     }
+
+
+def test_an_unstructured_grok_rate_limit_error_is_not_a_plan_limit(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok()
+    server.prompt_error = {
+        "code": -32000,
+        "message": "rate_limit: request rejected; try again later",
+    }
+    with pytest.raises(EngineRefused) as raised:
+        run(line(server, project))
+    assert not isinstance(raised.value, EnginePlanLimit)
 
 
 class Tap:

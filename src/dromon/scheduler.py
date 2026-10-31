@@ -1225,6 +1225,10 @@ class LineSpec:
         default=lambda ends: None, compare=False
     )
     """Whether a task-triggered engine turn can run under scheduler control."""
+    budget_reported: Callable[[int, str | None, str], object] = field(
+        default=lambda remaining, reset, note: None, compare=False
+    )
+    """Where an engine reports a positive remaining provider-window percentage."""
 
 
 type EngineFactory = Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], LineEngine]
@@ -1526,6 +1530,7 @@ def engine_factory(
             ceiling_reached=spec.ceiling_reached,
             ceiling_settled=spec.ceiling_settled,
             consent_asked=spec.consent_asked,
+            budget_reported=spec.budget_reported,
             secret_names=lambda: tuple((line_secrets or {}).get(spec.line_id, ())),
         )
 
@@ -5467,6 +5472,50 @@ class Scheduler:
         self.activity.record(line_id, ActivityKind.NOTICE, note)
         self._budget_followed(budget)
 
+    def engine_budget_reported(
+        self,
+        line_id: str,
+        remaining_percent: int,
+        resets_at: str | None,
+        note: str,
+    ) -> None:
+        """Store a positive budget snapshot from a provider window the engine reports.
+
+        A window with no remaining percentage is left to its engine's exhausted-limit
+        path, which has stronger evidence and can safely decide whether to fail over.
+        """
+        if line_id not in self._log.state.lines:
+            return
+        provider = ENGINE_OF.get(self.model_of(line_id))
+        if provider is None or type(remaining_percent) is not int:
+            return
+        if not 1 <= remaining_percent <= 100:
+            return
+        if resets_at is not None:
+            try:
+                check_instant("resets_at", resets_at)
+            except InvalidField:
+                resets_at = None
+        previous = self._log.state.budgets.get(provider)
+        if (
+            previous is not None
+            and previous.source is BudgetSource.ENGINE
+            and previous.remaining_percent == remaining_percent
+            and previous.resets_at == resets_at
+            and previous.note == note[: MAX_BUDGET_NOTE_BYTES // 4]
+        ):
+            return
+        budget = BudgetStated(
+            provider,
+            remaining_percent,
+            resets_at,
+            BudgetSource.ENGINE,
+            note[: MAX_BUDGET_NOTE_BYTES // 4],
+            format_due(self._wall_clock()),
+        )
+        self._log.append(budget)
+        self._budget_followed(budget)
+
     # The operator's ownership commands, roles step 2 of ``docs/architecture/ROLES.md``.
 
     def roles_view(self, role_id: str | None) -> list[dict[str, object]]:
@@ -9140,6 +9189,9 @@ class Scheduler:
                 lambda: self.redirect_reason(line_id),
                 lambda note: self.credits_spent(line_id, note),
                 begin_self_started=lambda ends: self.begin_self_started(line_id, ends),
+                budget_reported=lambda remaining, reset, note: (
+                    self.engine_budget_reported(line_id, remaining, reset, note)
+                ),
             )
             engine = self._engine_factory(spec, self.own_tools(line_id))
             self._engines[line_id] = engine

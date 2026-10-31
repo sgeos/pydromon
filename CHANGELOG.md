@@ -7,6 +7,13 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- Claude Code now records the positive percentage remaining in a documented,
+  non-rejected rate-limit window, with its reset time when supplied. Grok Build's
+  documented rate-limit classes are emitted to its `StopFailure` hook, but Dromon's
+  Agent Client Protocol adapter cannot read that hook event or a documented reset
+  field, so it classifies no new Grok quota errors. `GROK.md` records the available
+  budget evidence for every engine and the evidence limits. `ROLES.md` and `ENGINES.md`
+  describe the per-window snapshot and the fields retained in scrubbed recordings.
 - A seat that does not own its role is built with its role's worktree read only on
   Claude Code and Codex, the engines that can confine it. The confining engines were
   derived from the capability table, but the step that applies a seat's read access
