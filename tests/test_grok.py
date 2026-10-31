@@ -1466,6 +1466,17 @@ def test_a_session_with_conflicting_model_fields_is_refused_before_pinning(
     assert "session/prompt" not in server.methods()
 
 
+def test_a_session_with_conflicting_models_refuses_before_it_would_pin(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok(model="grok-4.6")
+    server.extra = {"configOptions": [model_option(GROK)]}
+    with pytest.raises(EngineRefused, match="conflicting or unreadable session models"):
+        run(line(server, project))
+    assert "session/set_config_option" not in server.methods()
+    assert "session/prompt" not in server.methods()
+
+
 def test_models_without_a_config_option_cannot_be_pinned(
     project: tuple[Path, Path, Path],
 ) -> None:
@@ -2569,6 +2580,18 @@ def test_a_model_notice_after_the_model_is_pinned_refuses_the_turn(
         run(line(server, project))
     assert "session/prompt" in server.methods()
     assert "session/cancel" in server.methods()
+
+
+def test_a_held_model_notice_is_superseded_by_a_successful_pin(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok(
+        model="grok-4.6",
+        notices=[grok_notice("models/update", {"currentModelId": "grok-other"})],
+    )
+    assert run(line(server, project)).text == "done"
+    assert server.params("session/set_config_option")["value"] == {"value": GROK}
+    assert "session/cancel" not in server.methods()
 
 
 def test_an_unknown_grok_request_is_answered_with_an_error(
