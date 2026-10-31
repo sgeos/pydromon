@@ -332,6 +332,12 @@ LINE_TRANSITIONS: Final[frozenset[tuple[LineState, LineState]]] = frozenset(
 class MessageKind(StrEnum):
     NOTE = "note"
     QUESTION = "question"
+    ISSUE = "issue"
+    """A harness or operator-experience issue a line raises with an operator unasked.
+    It asks no answer, and it is open until the operator replies to it or
+    acknowledges it. ``docs/protocol/LINE_CONFIG.md`` records why it is a kind of
+    mail rather than a tracker. **Rollback hazard.** A daemon older than this kind
+    refuses a log that holds one, since its codec knows only notes and questions."""
 
 
 class ReturnCode(StrEnum):
@@ -2643,6 +2649,13 @@ class State:
             if not isinstance(event.recipient, OperatorAddress):
                 raise EventRejected("a question is addressed to an operator")
             self._live_line(event.sender.line_id)
+        if event.kind is MessageKind.ISSUE:
+            if not isinstance(event.sender, LineAddress):
+                raise EventRejected("only a line raises an issue")
+            if not isinstance(event.recipient, OperatorAddress):
+                raise EventRejected("an issue is raised with an operator")
+            if event.reply_to is not None or event.choices:
+                raise EventRejected("an issue opens a thread, and has no choices")
         if event.reply_to is not None:
             self._check_reply(event, event.reply_to)
 

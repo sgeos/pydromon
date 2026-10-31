@@ -199,6 +199,29 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- The daemon relays operators' mail. The project file's `[relays.NAME]` tables declare
+  command and file relays, and `[operators.ID] relay = NAME` routes an operator's mail
+  to one. A relayer task forwards every undelivered message to a routed operator, off
+  the event loop, records `message_delivered` only when the relay accepts it, and
+  leaves failed and unrouted mail undelivered, retrying a failure after a backoff of 5
+  to 300 seconds. A command relay that times out is killed with its process group. A
+  reload changes the routes from the next pass. Relay delivery marks nothing read, so
+  `dromon mail --unread` still lists a relayed message, and a message a client lists
+  first is not relayed. `dromon status` shows the relays and each failing notice.
+- A file relay, `kind = "file"`, appends each notice as one JSON line to a file
+  created with mode `0600`, for `tail -f`. It refuses a symbolic link, another user's
+  file and a file open to group or others, and a notice file in any line's working
+  directory outside the directories Dromon protects, at start, at reload and before
+  each write.
+- Issues from lines. `send_message` with `issue` true raises an issue with an
+  operator, recorded as a message of the new kind `issue` and relayed like any mail.
+  It is open until the operator replies to it or acknowledges it, and
+  `dromon mail --issues`, the `mail` query's `issues_only`, lists the open ones. An
+  external agent is not offered the argument. **Rollback hazard.** A daemon older than
+  this change refuses an event log that holds an issue, since its codec knows only the
+  kinds `note` and `question`, so a rollback past it needs a log from before the first
+  issue. The `[relays]` and `[operators]` tables are likewise refused by an older
+  daemon as unknown keys, which stops its start rather than its log.
 - Claude Sonnet 5.5 drivers on Claude Code for every strategy, as
   `claude-sonnet-5-5`, with the Opus 5.5 drivers' settings.
 - `daemon_behind_worktree` in `line_status`, and a notice in the wake prompt once per

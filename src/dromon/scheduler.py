@@ -365,6 +365,17 @@ SEND_TOOL_SCHEMA: Final[dict[str, object]] = {
                 " limited, and a refused one is not sent"
             ),
         },
+        "issue": {
+            "type": "boolean",
+            "description": (
+                "Optional, default false. Raise an issue with an operator, unasked,"
+                " about Dromon itself or about working under it, such as a tool that"
+                " misleads, a refusal that blocks work, or a confusing notice. It asks"
+                " no answer, and stays open in the operator's mailbox until the"
+                " operator replies to it or acknowledges it. Only to an operator, and"
+                " never as a reply"
+            ),
+        },
         REQUEST_KEY: REQUEST_KEY_PROPERTY,
     },
     "required": ["to", "body"],
@@ -376,7 +387,13 @@ CORRELATION_ARGUMENT: Final = "correlation"
 AGENT_SEND_TOOL_SCHEMA: Final[dict[str, object]] = {
     **SEND_TOOL_SCHEMA,
     "properties": {
-        **cast(dict[str, object], SEND_TOOL_SCHEMA["properties"]),
+        **{
+            name: value
+            for name, value in cast(
+                dict[str, object], SEND_TOOL_SCHEMA["properties"]
+            ).items()
+            if name != "issue"
+        },
         CORRELATION_ARGUMENT: {
             "type": "string",
             "description": (
@@ -388,7 +405,8 @@ AGENT_SEND_TOOL_SCHEMA: Final[dict[str, object]] = {
     },
 }
 """The ``send_message`` schema an external agent is given, which may carry a
-correlation key. **Queue of 2026-10-28, item A4.** A line's schema has no key."""
+correlation key. **Queue of 2026-10-28, item A4.** A line's schema has no key. An
+agent raises no issue, since an issue is a line's report on its own harness."""
 
 ASK_TOOL_NAME: Final = "ask_operator"
 
@@ -1550,6 +1568,11 @@ def _no_notice(peer_id: str, message_id: str) -> None:
     """The outbox notice before the daemon sets one, which has nothing to wake."""
 
 
+def _no_operator_mail() -> None:
+    """The operator mail notice before the daemon sets one, which has nothing to
+    wake."""
+
+
 def new_id(prefix: str) -> str:
     """A fresh identifier. Random, so identifiers never repeat across restarts."""
     return f"{prefix}-{secrets.token_hex(6)}"
@@ -1902,6 +1925,10 @@ class Scheduler:
         """Told each peer and message that joins its outbox, so its forwarder wakes.
         The daemon sets it to its forwarder's."""
         self.peer_reports: Callable[[], list[PeerReport]] = list
+        self.on_operator_mail: Callable[[], None] = _no_operator_mail
+        """Told each time mail to an operator is recorded, so the operators' relay
+        wakes. The daemon sets it to its relayer's. A path that records such mail
+        and does not call it is caught by the relayer's own periodic pass."""
         self.fault: str | None = None
         """The scheduler's last unexpected exception, until a tick completes."""
         self.faults = 0
@@ -2144,8 +2171,11 @@ class Scheduler:
         priority: bool = False,
         correlation: str | None = None,
         request: RequestStamp | None = None,
+        issue: bool = False,
     ) -> str:
-        """Record a note from ``sender``. It is delivered in a later tick.
+        """Record a note from ``sender``, or with ``issue`` an issue, which only a
+        line raises with an operator. It is delivered in a later tick, and mail to an
+        operator is offered to the operator's relay at once.
 
         ``request`` is the stamp of the keyed ``send_message`` call that sends it,
         recorded in the note's own ``message_sent``.
@@ -2168,6 +2198,10 @@ class Scheduler:
                 raise EventRejected("only an external agent's note carries a key")
             if not isinstance(recipient, LineAddress):
                 raise EventRejected("a correlation key is carried only to a line")
+        if issue and not (
+            isinstance(sender, LineAddress) and isinstance(recipient, OperatorAddress)
+        ):
+            raise EventRejected("only a line raises an issue, and with an operator")
         if isinstance(recipient, RemoteAddress):
             check_outbound(
                 self._log.state,
@@ -2226,12 +2260,14 @@ class Scheduler:
                 message_id,
                 sender,
                 recipient,
-                MessageKind.NOTE,
+                MessageKind.ISSUE if issue else MessageKind.NOTE,
                 body,
                 reply_to=reply_to,
                 request=request,
             )
         )
+        if isinstance(recipient, OperatorAddress):
+            self.on_operator_mail()
         if correlation is not None:
             self._log.append(MessageCorrelated(message_id, correlation))
         if priority and isinstance(recipient, LineAddress):
@@ -2268,6 +2304,8 @@ class Scheduler:
         self._log.append(
             MessageSent(message_id, HARNESS, recipient, MessageKind.NOTE, body)
         )
+        if isinstance(recipient, OperatorAddress):
+            self.on_operator_mail()
         if isinstance(recipient, LineAddress):
             self._remember(message_id, HARNESS, recipient, body, sent_at)
             self._failed.discard(recipient.line_id)
@@ -2319,6 +2357,8 @@ class Scheduler:
             self._priority.record(key, recipient.line_id)
             if recipient.line_id in self._running:
                 self._redirect_for.setdefault(recipient.line_id, message_id)
+        if isinstance(recipient, OperatorAddress):
+            self.on_operator_mail()
         self._sent.append(message_id)
         self._work.set()
         return Received(message_id, honoured)
@@ -2643,9 +2683,12 @@ class Scheduler:
             body: object = args.get("body")
             reply_to: object = args.get("reply_to")
             urgent: object = args.get("priority", False)
+            issue: object = args.get("issue", False)
             correlation: object = args.get(CORRELATION_ARGUMENT)
             if not isinstance(to, str) or not isinstance(body, str):
                 return _tool_error("to and body must be text")
+            if not isinstance(issue, bool):
+                return _tool_error("issue must be true or false")
             if correlation is not None and not isinstance(correlation, str):
                 return _tool_error("correlation must be text")
             if reply_to is not None and not isinstance(reply_to, str):
@@ -2672,6 +2715,7 @@ class Scheduler:
                     priority=urgent,
                     correlation=correlation,
                     request=stamp,
+                    issue=issue,
                 )
             except (InvalidField, EventRejected) as error:
                 return _tool_error(str(error))
@@ -2696,6 +2740,8 @@ class Scheduler:
         crash between the two appends a repeat says the note went without priority,
         which is then what the log holds."""
         message = self._log.state.messages.get(message_id)
+        if message is not None and message.kind is MessageKind.ISSUE:
+            return _tool_text(f"raised as issue {message_id}")
         if message is not None and message.priority:
             return _tool_text(f"sent as {message_id}, with priority")
         return _tool_text(f"sent as {message_id}")
@@ -2726,6 +2772,7 @@ class Scheduler:
                 request=request,
             )
         )
+        self.on_operator_mail()
         return message_id
 
     @property
@@ -3731,6 +3778,16 @@ class Scheduler:
             if delivered is not None:
                 parts.append(f"delivered {delivered}")
         return ", ".join(parts)
+
+    def line_workdirs(self) -> list[Path]:
+        """The resolved working directory of every line in the log, as configured
+        now, leaving out one that does not resolve, which runs nowhere. For keeping
+        an operator's notice file out of every line's reach. Round 11, item 2."""
+        found: list[Path] = []
+        for line_id in sorted(self._log.state.lines):
+            with contextlib.suppress(LineToolRefused):
+                found.append(self._workdir_of(line_id))
+        return found
 
     def _workdir_of(self, line_id: str) -> Path:
         """The line's working directory, resolved and checked, or
@@ -6218,6 +6275,22 @@ class Scheduler:
         if not (on_codex and self.effective_config(line_id).keep_session):
             return []
         return [self.list_background_tool(line_id), self.stop_background_tool(line_id)]
+
+    def relayed(self, message_id: str) -> bool:
+        """Record that an operator's relay accepted ``message_id``, and say whether
+        this recorded it. A message that a client delivered while its relay ran, or
+        that is no longer an operator's undelivered mail, is left as it is, so the
+        delivery is recorded once whichever came first. Round 11, item 1."""
+        message = self._log.state.messages.get(message_id)
+        if (
+            message is None
+            or message.delivered
+            or not isinstance(message.recipient, OperatorAddress)
+        ):
+            return False
+        self._log.append(MessageDelivered(message_id))
+        self._post_office.discard(message_id)
+        return True
 
     def collect(self, owner: OperatorAddress | AgentAddress) -> None:
         """Deliver every undelivered message for ``owner``, as its client shows them.

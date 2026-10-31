@@ -23,16 +23,25 @@ Trust boundaries.
   states the required properties, and their design is technical debt.
 """
 
+import asyncio
+import contextlib
 import json
 import os
+import signal
+import stat
 import subprocess
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import Final, Protocol
+import sys
+import traceback
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+from enum import StrEnum
+from pathlib import Path
+from typing import Final, Protocol, cast
 
 from dromon.eventlog import EventLog
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 from dromon.model import (
+    ID_PATTERN,
     MessageDelivered,
     MessageKind,
     OperatorAddress,
@@ -198,3 +207,532 @@ class CommandRelay:
             raise RelayError(
                 f"the relay command exited with status {completed.returncode}: {detail}"
             )
+
+    async def deliver(self, notice: Notice) -> None:
+        """Hand ``notice`` to the command without blocking the event loop.
+
+        The command runs in its own process group, so a timeout or a stopping daemon
+        ends it and anything it started. Standard output is discarded and at most
+        ``STDERR_KEPT`` bytes of standard error are kept for the reason, so a command
+        that writes without end cannot fill the daemon's memory. Raises
+        ``RelayError`` as ``forward`` does."""
+        payload = (encode_notice(notice) + "\n").encode("utf-8")
+        try:
+            # As in ``forward``, the argument vector is operator configuration and no
+            # shell is involved.
+            process = await asyncio.create_subprocess_exec(
+                *self._argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                env=allowlisted(self._environment, BASE_ENVIRONMENT),
+                start_new_session=True,
+            )
+        except OSError as error:
+            raise RelayError(f"the relay command could not start: {error}") from error
+        try:
+            detail = await asyncio.wait_for(_feed(process, payload), self._timeout)
+        except TimeoutError as error:
+            await _end_group(process)
+            raise RelayError(
+                f"the relay command timed out after {self._timeout}s"
+            ) from error
+        except BaseException:
+            await _end_group(process)
+            raise
+        if process.returncode != 0:
+            text = detail.decode("utf-8", errors="replace").strip()[:200]
+            raise RelayError(
+                f"the relay command exited with status {process.returncode}: {text}"
+            )
+
+
+STDERR_KEPT: Final = 4096
+"""The bytes of a relay command's standard error kept for its failure's reason."""
+
+
+async def _feed(process: "asyncio.subprocess.Process", payload: bytes) -> bytes:
+    """Write ``payload`` to the process, read its standard error to the end keeping
+    the first ``STDERR_KEPT`` bytes, and wait for it to exit. The read loop ends at
+    end of file, and the caller's timeout bounds it."""
+    stdin, stderr = process.stdin, process.stderr
+    if stdin is None or stderr is None:
+        raise RelayError("the relay command has no pipes")
+    try:
+        stdin.write(payload)
+        await stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        # A command that exits without reading its notice is judged by its status.
+        pass
+    stdin.close()
+    kept = bytearray()
+    while chunk := await stderr.read(65536):
+        if len(kept) < STDERR_KEPT:
+            kept += chunk[: STDERR_KEPT - len(kept)]
+    await process.wait()
+    return bytes(kept)
+
+
+async def _end_group(process: "asyncio.subprocess.Process") -> None:
+    """Kill the command's process group and reap the command. Porting note. Process
+    groups are POSIX, and a port to another platform needs its own way to end the
+    command's children."""
+    if process.returncode is None:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+    await asyncio.shield(process.wait())
+
+
+class FileRelay:
+    """A relay that appends each notice to one file as a line of JSON, so an
+    operator's session can follow it with ``tail -f``. Round 11, item 2.
+
+    The file is created readable and writable by its owner alone, and it is refused,
+    and the notice left pending, when it is a symbolic link, is not a regular file, is
+    owned by another user or is open to group or others, or when it lies in a line's
+    working directory outside every directory Dromon protects from lines. The last is
+    checked at every write, since a line may be configured into a new working
+    directory after the start. **Fact.** The file grows without bound. Truncating it
+    is the operator's, and ``tail -F`` follows a truncated file.
+
+    Porting note. ``O_NOFOLLOW``, ``geteuid`` and permission bits are POSIX."""
+
+    def __init__(
+        self,
+        path: Path,
+        workdirs: Callable[[], Iterable[Path]],
+        protected: Sequence[Path],
+    ) -> None:
+        if not path.is_absolute():
+            raise ValueError("a file relay's path must be absolute")
+        self._path = path
+        self._workdirs = workdirs
+        self._protected = tuple(protected)
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def forward(self, notice: Notice) -> None:
+        refusal = sink_refusal(self._path, self._workdirs(), self._protected)
+        if refusal is not None:
+            raise RelayError(refusal)
+        line = (encode_notice(notice) + "\n").encode("utf-8")
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            descriptor = os.open(self._path, flags, 0o600)
+        except OSError as error:
+            raise RelayError(f"the notice file could not be opened: {error}") from error
+        try:
+            found = os.fstat(descriptor)
+            if not stat.S_ISREG(found.st_mode):
+                raise RelayError("the notice file is not a regular file")
+            if found.st_uid != os.geteuid():
+                raise RelayError("the notice file belongs to another user")
+            if found.st_mode & 0o077:
+                raise RelayError(
+                    "the notice file is open to group or others, so it is not written"
+                )
+            written = 0
+            # Bounded by the line's length, since each write moves at least one byte.
+            while written < len(line):
+                written += os.write(descriptor, line[written:])
+            os.fsync(descriptor)
+        except OSError as error:
+            raise RelayError(
+                f"the notice file could not be written: {error}"
+            ) from error
+        finally:
+            os.close(descriptor)
+
+    async def deliver(self, notice: Notice) -> None:
+        """Append ``notice``. **Assumption.** One short append to a local file does
+        not stall the event loop noticeably, so it runs on the loop. A file on a
+        hung network mount would stall it, which is why the path is documented as
+        local."""
+        self.forward(notice)
+
+
+def sink_refusal(
+    path: Path, workdirs: Iterable[Path], protected: Sequence[Path]
+) -> str | None:
+    """Why a notice file at ``path`` may not be written, or ``None``.
+
+    **Decided by core for review, round 11.** A notice file may not lie in any line's
+    working directory, so that no line can read what is relayed to operators or write
+    a notice of its own into the file, except inside a directory Dromon protects,
+    such as ``.dromon/run``. Every enabled sandbox denies those to lines, and no line
+    may run in them. A line without a sandbox reaches the file wherever it is, which
+    no placement prevents."""
+    parent = Path(os.path.realpath(path.parent))
+    real = parent / path.name
+    if not parent.is_dir():
+        return f"the notice file's directory {path.parent} does not exist"
+    for guarded in protected:
+        if _encloses(Path(os.path.realpath(guarded)), real):
+            return None
+    for workdir in workdirs:
+        if _encloses(Path(os.path.realpath(workdir)), real):
+            return (
+                f"the notice file {path} lies in the working directory {workdir} of a"
+                " line, so a line could read or forge notices. Put it outside every"
+                " line's working directory, or under .dromon/run"
+            )
+    return None
+
+
+def _encloses(outer: Path, inner: Path) -> bool:
+    return inner == outer or outer in inner.parents
+
+
+class AsyncRelay(Protocol):
+    """A relay the daemon's relayer drives, which must not block the event loop."""
+
+    async def deliver(self, notice: Notice) -> None:
+        """As ``Relay.forward``, awaited."""
+        ...
+
+
+# The project file's relays and routes. Round 11, item 1.
+
+
+class RelayKind(StrEnum):
+    COMMAND = "command"
+    FILE = "file"
+
+
+DEFAULT_TIMEOUT_SECONDS: Final = 30.0
+MAX_RELAYS: Final = 32
+MAX_ARGUMENTS: Final = 64
+MAX_ARGUMENT_BYTES: Final = 4096
+RELAY_KEYS: Final = frozenset({"kind", "command", "path", "timeout_seconds"})
+OPERATOR_KEYS: Final = frozenset({"relay"})
+
+
+@dataclass(frozen=True, slots=True)
+class RelayDefinition:
+    """One ``[relays.NAME]`` table."""
+
+    kind: RelayKind
+    command: tuple[str, ...] = ()
+    """The argument vector of a command relay."""
+    path: str | None = None
+    """The notice file of a file relay, as written, absolute or relative to the
+    project root, or under ``~``."""
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+
+
+@dataclass(frozen=True, slots=True)
+class RelayConfig:
+    relays: dict[str, RelayDefinition] = field(
+        default_factory=dict[str, RelayDefinition]
+    )
+    routes: dict[str, str] = field(default_factory=dict[str, str])
+    """Each operator identifier with the name of its relay."""
+
+
+NO_RELAYS: Final = RelayConfig()
+
+
+class RelayConfigError(ValueError):
+    """A ``[relays]`` or ``[operators]`` table is not valid. ``key`` places it."""
+
+    def __init__(self, key: str, message: str) -> None:
+        super().__init__(f"{key} {message}")
+        self.key = key
+        self.reason = message
+
+
+def _tables(value: object, key: str) -> dict[str, dict[str, object]]:
+    if not isinstance(value, dict):
+        raise RelayConfigError(key, "must be a table")
+    found: dict[str, dict[str, object]] = {}
+    for name, table in cast(dict[object, object], value).items():
+        if not isinstance(name, str) or ID_PATTERN.fullmatch(name) is None:
+            raise RelayConfigError(f"{key}.{name}", "is not an identifier")
+        if not isinstance(table, dict):
+            raise RelayConfigError(f"{key}.{name}", "must be a table")
+        found[name] = cast(dict[str, object], table)
+    return found
+
+
+def parse_relays(relays: object, operators: object) -> RelayConfig:
+    """The ``[relays]`` and ``[operators]`` tables, either absent as ``None``.
+    Raises ``RelayConfigError``."""
+    definitions: dict[str, RelayDefinition] = {}
+    tables = {} if relays is None else _tables(relays, "relays")
+    if len(tables) > MAX_RELAYS:
+        raise RelayConfigError("relays", f"holds more than {MAX_RELAYS} relays")
+    for name, table in sorted(tables.items()):
+        definitions[name] = _relay(f"relays.{name}", table)
+    routes: dict[str, str] = {}
+    for operator_id, table in sorted(
+        ({} if operators is None else _tables(operators, "operators")).items()
+    ):
+        key = f"operators.{operator_id}"
+        unknown = sorted(set(table) - OPERATOR_KEYS)
+        if unknown:
+            raise RelayConfigError(f"{key}.{unknown[0]}", "is not a known key")
+        relay = table.get("relay")
+        if not isinstance(relay, str) or relay not in definitions:
+            raise RelayConfigError(
+                f"{key}.relay", f"must name a relay of [relays], found {relay!r}"
+            )
+        routes[operator_id] = relay
+    return RelayConfig(definitions, routes)
+
+
+def _relay(key: str, table: dict[str, object]) -> RelayDefinition:
+    unknown = sorted(set(table) - RELAY_KEYS)
+    if unknown:
+        raise RelayConfigError(f"{key}.{unknown[0]}", "is not a known key")
+    raw_kind = table.get("kind", RelayKind.COMMAND.value)
+    if raw_kind not in {kind.value for kind in RelayKind}:
+        raise RelayConfigError(f"{key}.kind", "must be command or file")
+    kind = RelayKind(cast(str, raw_kind))
+    timeout = table.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
+    if (
+        not isinstance(timeout, int | float)
+        or isinstance(timeout, bool)
+        or not 0 < timeout <= 3600
+    ):
+        raise RelayConfigError(
+            f"{key}.timeout_seconds", "must be a number in (0, 3600]"
+        )
+    if kind is RelayKind.FILE:
+        if "command" in table:
+            raise RelayConfigError(f"{key}.command", "is for a command relay")
+        path = table.get("path")
+        if not isinstance(path, str) or not path or "\x00" in path:
+            raise RelayConfigError(f"{key}.path", "must be a path to a file")
+        return RelayDefinition(kind, path=path, timeout_seconds=float(timeout))
+    if "path" in table:
+        raise RelayConfigError(f"{key}.path", "is for a file relay")
+    command = table.get("command")
+    if (
+        not isinstance(command, list)
+        or not 1 <= len(cast(list[object], command)) <= MAX_ARGUMENTS
+    ):
+        raise RelayConfigError(
+            f"{key}.command", f"must be a list of 1 to {MAX_ARGUMENTS} arguments"
+        )
+    argv: list[str] = []
+    for argument in cast(list[object], command):
+        if (
+            not isinstance(argument, str)
+            or not argument
+            or "\x00" in argument
+            or len(argument.encode("utf-8")) > MAX_ARGUMENT_BYTES
+        ):
+            raise RelayConfigError(
+                f"{key}.command",
+                f"must hold non-empty text arguments of at most {MAX_ARGUMENT_BYTES}"
+                " bytes",
+            )
+        argv.append(argument)
+    return RelayDefinition(kind, command=tuple(argv), timeout_seconds=float(timeout))
+
+
+def sink_path(definition: RelayDefinition, root: Path) -> Path:
+    """The absolute notice file of a file relay, before symbolic links resolve."""
+    if definition.path is None:
+        raise ValueError("a command relay has no notice file")
+    written = definition.path
+    if written == "~" or written.startswith("~/"):
+        return Path(os.path.expanduser(written))
+    given = Path(written)
+    return given if given.is_absolute() else root / given
+
+
+def build_routes(
+    config: RelayConfig,
+    root: Path,
+    workdirs: Callable[[], Iterable[Path]],
+    protected: Sequence[Path],
+) -> dict[str, AsyncRelay]:
+    """Each routed operator's relay. Raises ``RelayConfigError`` for a file relay
+    whose notice file is refused now, so a start or a reload names it, rather than
+    the first notice."""
+    built: dict[str, AsyncRelay] = {}
+    for name, definition in sorted(config.relays.items()):
+        if definition.kind is RelayKind.FILE:
+            path = sink_path(definition, root)
+            refusal = sink_refusal(path, workdirs(), protected)
+            if refusal is not None:
+                raise RelayConfigError(f"relays.{name}.path", refusal)
+            built[name] = FileRelay(path, workdirs, protected)
+        else:
+            built[name] = CommandRelay(definition.command, definition.timeout_seconds)
+    return {operator: built[name] for operator, name in config.routes.items()}
+
+
+# The daemon's relayer. Round 11, item 1.
+
+FIRST_BACKOFF_SECONDS: Final = 5.0
+MAX_BACKOFF_SECONDS: Final = 300.0
+SWEEP_SECONDS: Final = 60.0
+"""How often a pass runs with no notice, to forward mail that a path recorded
+without telling the relayer, and unrouted mail once a route appears."""
+MAX_REPORTED: Final = 10
+
+
+class RelayMail(Protocol):
+    """What the relayer needs of the scheduler."""
+
+    @property
+    def state(self) -> State: ...
+
+    def relayed(self, message_id: str) -> bool: ...
+
+
+@dataclass(slots=True)
+class _Failure:
+    operator_id: str
+    reason: str
+    attempts: int
+    not_before: float
+
+
+class OperatorRelayer:
+    """Forwards operators' undelivered mail through their relays, as ``RELAY.md``
+    specifies, one notice at a time, from a task of its own.
+
+    - A pass runs when mail to an operator is recorded, when the routes change, when
+      a failed notice's backoff ends, and every ``SWEEP_SECONDS`` in any case.
+    - A notice its relay accepts is recorded delivered through ``RelayMail.relayed``,
+      unless a client delivered it while the relay ran.
+    - A notice its relay refuses stays undelivered and is tried again after a
+      backoff that doubles from ``FIRST_BACKOFF_SECONDS`` to ``MAX_BACKOFF_SECONDS``.
+    - A notice whose operator has no route stays undelivered and is counted.
+
+    Memory. Backoff and failures are kept in memory, so a restart tries every
+    undelivered notice at once. Delivery is at least once, since a stop between a
+    relay's acceptance and the record forwards the notice again.
+
+    Porting note. ``step`` is one bounded pass over the mail and says how long to
+    wait, so the relayer maps onto a stream processor whose host performs the
+    relay."""
+
+    def __init__(
+        self,
+        mail: RelayMail,
+        routes: Mapping[str, AsyncRelay],
+        clock: Callable[[], float],
+    ) -> None:
+        self._mail = mail
+        self._routes = dict(routes)
+        self._clock = clock
+        self._failures: dict[str, _Failure] = {}
+        self._unrouted = 0
+        self.delivered = 0
+        """Notices recorded delivered by this relayer since the daemon started."""
+        self.ready = asyncio.Event()
+        self.ready.set()
+
+    def notify(self) -> None:
+        self.ready.set()
+
+    def set_routes(self, routes: Mapping[str, AsyncRelay]) -> None:
+        """Take the routes of a reloaded project file. A notice already handed to
+        its old relay finishes there. Failures are forgotten at every reload, changed
+        routes or not, so a changed route is tried at once."""
+        self._routes = dict(routes)
+        self._failures.clear()
+        self.ready.set()
+
+    @property
+    def routed(self) -> tuple[str, ...]:
+        return tuple(sorted(self._routes))
+
+    async def step(self) -> float:
+        """One forwarding pass, and how long until the next unless notified."""
+        unrouted = 0
+        now = self._clock()
+        for notice in pending_notices(self._mail.state):
+            relay = self._routes.get(notice.operator_id)
+            if relay is None:
+                unrouted += 1
+                continue
+            failure = self._failures.get(notice.message_id)
+            if failure is not None and failure.not_before > now:
+                continue
+            current = self._mail.state.messages.get(notice.message_id)
+            if current is None or current.delivered:
+                # A client delivered it while an earlier notice of this pass ran.
+                continue
+            try:
+                await relay.deliver(notice)
+            except RelayError as error:
+                self._fail(notice, str(error))
+                continue
+            except Exception as error:  # noqa: BLE001
+                # A defect in a relay fails its notice rather than the relayer.
+                traceback.print_exception(error, file=sys.stderr)
+                self._fail(notice, f"the relay failed unexpectedly: {error!r}")
+                continue
+            self._failures.pop(notice.message_id, None)
+            if self._mail.relayed(notice.message_id):
+                self.delivered += 1
+        self._unrouted = unrouted
+        # Mail that is no longer pending, delivered by a client or not, is forgotten.
+        pending = {notice.message_id for notice in pending_notices(self._mail.state)}
+        for message_id in [m for m in self._failures if m not in pending]:
+            del self._failures[message_id]
+        waits = [f.not_before - self._clock() for f in self._failures.values()]
+        return max(0.0, min([SWEEP_SECONDS, *waits]))
+
+    def _fail(self, notice: Notice, reason: str) -> None:
+        earlier = self._failures.get(notice.message_id)
+        attempts = 1 if earlier is None else earlier.attempts + 1
+        backoff = min(FIRST_BACKOFF_SECONDS * 2 ** (attempts - 1), MAX_BACKOFF_SECONDS)
+        self._failures[notice.message_id] = _Failure(
+            notice.operator_id, reason, attempts, self._clock() + backoff
+        )
+        print(
+            f"dromond: the relay for @{notice.operator_id} refused"
+            f" {notice.message_id}: {reason}",
+            file=sys.stderr,
+        )
+
+    def report(self) -> dict[str, object]:
+        """The relayer's state for ``dromon status``, with at most ``MAX_REPORTED``
+        failing notices, oldest attempt first."""
+        failing = sorted(self._failures.items(), key=lambda item: item[1].not_before)
+        return {
+            "routed": list(self.routed),
+            "delivered": self.delivered,
+            "unrouted": self._unrouted,
+            "failing": len(failing),
+            "failures": [
+                {
+                    "message_id": message_id,
+                    "operator": failure.operator_id,
+                    "attempts": failure.attempts,
+                    "reason": failure.reason,
+                    "retry_in_seconds": max(
+                        0.0, round(failure.not_before - self._clock(), 1)
+                    ),
+                }
+                for message_id, failure in failing[:MAX_REPORTED]
+            ],
+        }
+
+    async def run(self, stop: asyncio.Event) -> None:
+        """Forward until ``stop`` is set. A pass that raises is reported and waited
+        out, so the relayer neither dies nor spins."""
+        while not stop.is_set():
+            self.ready.clear()
+            try:
+                wait = await self.step()
+            except Exception as error:  # noqa: BLE001
+                traceback.print_exception(error, file=sys.stderr)
+                wait = FIRST_BACKOFF_SECONDS
+            waits = [
+                asyncio.ensure_future(stop.wait()),
+                asyncio.ensure_future(self.ready.wait()),
+            ]
+            await asyncio.wait(waits, timeout=wait, return_when=asyncio.FIRST_COMPLETED)
+            for pending in waits:
+                pending.cancel()
