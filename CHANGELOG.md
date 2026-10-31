@@ -30,6 +30,36 @@ All notable changes are recorded here. The format follows
 - `dromon role status`, `roles` and a seat's `role_status` show whether the project
   file declares a role, each way its table differs from a role an operator holds, and
   the lines that wait beside the owner. Round 10 review, F6.
+- Refused Codex items count toward the driver's tool budget whether first announced by
+  `item/started` or `item/completed`. Matching item identifiers are counted once
+  regardless of notice order. A refusal announced by neither notice remains invisible.
+- A launcher retries a timed-out process-table walk until its 0.75-second deadline.
+  If the table still cannot be read while stopping under `kill_all`, it reports the
+  stop as unverified and exits unsuccessfully after ending the harness's group. It
+  waits 0.25 seconds after `SIGKILL` and reports unverified if a process remains.
+  Process-table inspections and detached-process scans share a worker with a bounded
+  queue of eight calls. Launch-record sweeps use a separate worker with its own bounded
+  queue. Detached-process scan results contain only process identifiers and command
+  strings. Retiring an engine calls `Driver.close` on the owning thread, though a virtual
+  machine not closed before it becomes cyclic garbage may still be finalized on any
+  thread.
+- Process-table failures use a typed error, and only an explicit timeout triggers the
+  launcher's retry. A queued process call cancelled by its caller is skipped, though
+  a call already running cannot be cancelled.
+- Launcher tests start the source module from this checkout explicitly. Tests that need
+  a real `ps` table are marked to skip when `ps` cannot run instead of branching their
+  expected exit status on a probe result.
+
+- Grok's `list_dir` may carry the kind `other`, which Grok gives it, as a live turn of
+  58 tool calls on 2026-10-31 showed. That turn also confirmed the observed kinds of
+  `read_file`, `grep`, `run_terminal_command`, `search_tool` and `use_tool`.
+- A refused Grok `use_tool` call says why, and a file-backed one says to pass its arguments
+  inline, so the line can correct itself.
+- Grok tool calls are judged by the name Grok gives them in `_meta["x.ai/tool"]`.
+  Grok's first announcement of a call has no `kind` and no `toolName`, so every Grok
+  tool call was refused, including `search_tool`, and a later update that rewrites the
+  title would have refused the turn. A call so named is identified by that name, and
+  Grok's built-ins map to the line's tools by a table in `GROK.md`.
 - Grok sessions now set the model to the exact identifier in the driver's settings
   when `session/new` or `session/load` reports another model. Dromon requires a model
   config option, requires the `models` field and model option to agree when both are
@@ -209,6 +239,8 @@ All notable changes are recorded here. The format follows
   `role_notices`, which `dromon reload` prints, and on a start's standard error. The
   rule and its cases are in `docs/architecture/ROLES.md` and
   `docs/protocol/PROJECT_CONFIG.md`. Required by the operator in round 10.
+- Claude Sonnet 5.5 drivers on Claude Code for every strategy, as
+  `claude-sonnet-5-5`, with the Opus 5.5 drivers' settings.
 - `daemon_behind_worktree` in `line_status`, and a notice in the wake prompt once per
   worktree commit, when the daemon runs code older than the line's worktree, which is
   when its loaded commit is an ancestor of the worktree's `HEAD` and the two differ

@@ -1,5 +1,6 @@
 """The daemon's request handling, and the real daemon driven over its socket."""
 
+import asyncio
 import json
 import os
 import signal
@@ -7,13 +8,14 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
 
-from dromon import client, exits
+from dromon import client, exits, launcher
 from typing import Any, cast
 
 from claude_agent_sdk import SdkMcpTool
@@ -41,6 +43,7 @@ from dromon.protocol import (
     encode_response,
 )
 from dromon.scheduler import LineEngine, LineSpec, Scheduler
+from dromon.launcher import StopPolicy, TreeRow
 
 HAIKU = "claude-haiku-5-5"
 
@@ -106,6 +109,57 @@ def test_status_reports_the_event_log(paths: ProjectPaths) -> None:
     assert counts == {"last_seq": 3, "lines": 1, "operators": 1, "open_questions": 1}
     assert log["events"] == 3 and type(log["bytes"]) is int
     assert log["compaction"] == "none"
+
+
+def test_status_answers_while_a_process_table_read_hangs(
+    paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reports = paths.state_dir / "left"
+    reports.mkdir(parents=True)
+    launcher.write_launch(
+        reports / f"1{launcher.LAUNCH_SUFFIX}",
+        None,
+        12345,
+        "/bin/sleep",
+        StopPolicy.KILL_ALL,
+        True,
+    )
+
+    def no_answer(_pid: int) -> bool:
+        return False
+
+    monkeypatch.setattr(launcher, "_answers", no_answer)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hanging_ps() -> list[TreeRow]:
+        entered.set()
+        release.wait(2)
+        return []
+
+    with EventLog(paths.event_log) as log:
+        scheduler = Scheduler(log, no_engine, report_dir=reports, sweep_read=hanging_ps)
+        daemon = Daemon(paths, log, "2026-10-25T00:00:00Z", scheduler)
+
+        async def check() -> None:
+            started = time.monotonic()
+            sweep = asyncio.create_task(scheduler.sweep())
+            assert await asyncio.to_thread(entered.wait, 1)
+            response = daemon.respond(b'{"id":"s","op":"status","v":1}\n')
+            inspection = await scheduler._process_worker.run(  # pyright: ignore[reportPrivateUsage]
+                lambda: "inspection worker remained available"
+            )
+            elapsed = time.monotonic() - started
+            release.set()
+            await sweep
+            assert response.ok
+            assert inspection == "inspection worker remained available"
+            assert elapsed < 0.2
+
+        try:
+            asyncio.run(check())
+        finally:
+            release.set()
 
 
 def test_stop_answers_then_requests_the_stop(paths: ProjectPaths) -> None:
@@ -179,7 +233,7 @@ def test_create_line_records_the_line(paths: ProjectPaths) -> None:
             "unknown strategy",
         ),
         (
-            {"line_id": "beta", "model": "claude-sonnet-5-5", "strategy": "api"},
+            {"line_id": "beta", "model": "claude-unreleased-0-0", "strategy": "api"},
             ErrorCode.REJECTED,
             "no driver",
         ),

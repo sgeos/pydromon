@@ -300,6 +300,54 @@ to load only Dromon's server, discovery can reveal that server's tool names and
 descriptions, but does not invoke those tools. A title alone never grants either
 meta-tool.
 
+**Changed on 2026-10-31, the observed call shape.** Fact, from a Grok session log of
+another project's line on 2026-10-31. Grok's first `tool_call` for `search_tool` had no
+`kind` and no `toolName`, a `title` of `search_tool`, and `_meta["x.ai/tool"]` with
+`name` `search_tool` and `namespace` `grok_build`. Its `tool_call_update` added `kind`
+`other`, rewrote the `title` for display and added `variant` `SearchTool` to
+`rawInput`. So every Grok call was judged as the kind `other` when it was first seen,
+and refused, and a later update would have refused the turn for changing its title.
+
+A call whose `_meta["x.ai/tool"]` names the namespace `grok_build` is now judged by that
+name, which Grok writes and the model does not. `search_tool` is discovery and is
+counted as itself. `use_tool` is permitted only for one of the line's own tools in the
+inline form, with exactly `tool_name` and `tool_input` and at most a `variant` of
+`UseTool`, and is counted as that tool. Each of Grok's built-ins in the table below is permitted
+by the line's tool beside it, and every other Grok tool is refused. Such a call is
+identified by its `_meta` name alone, so its title and kind may change, but a change of
+that name, an added `toolName` or a changed `use_tool` target refuses the turn. A
+permission request is judged by the name recorded for its call. **Review G1 and G2,
+2026-10-31.** A `kind` the call carries, at first sight or in any later update, must
+be one the table below gives that tool, so a `_meta` naming one tool cannot carry a
+kind that names another, even when the line has both. **Fact, observed on 2026-10-31**
+in a Grok line turn of 58 tool calls, from each `tool_call_update`: `read_file` as
+`read`, `grep` as `search`, `run_terminal_command` as `execute`, and `list_dir`,
+`search_tool` and `use_tool` as `other`. Twenty-six `use_tool` calls of Dromon's own
+tools passed in that turn. `list_dir` was first refused for `other`, which the table now
+allows. In a later turn on 2026-10-31, nineteen inline `use_tool` calls passed, and one in the
+file-backed form, with `tool_input_file`, was refused, as intended, since Dromon cannot see
+arguments Grok reads from a file only after the call is judged. Its refusal now says to pass
+the arguments inline. Grok wrote that file under `/tmp`, which the `workspace` base of the
+writer profile lets it write. The kinds of the other built-ins are a **hypothesis**, and a call with another
+kind is refused, which may refuse too much and never grants more. A `_meta` name
+added in a later update to a call first judged without one refuses the turn. A call without that
+`_meta`, or in another namespace, is judged as before. **Hypothesis.** The table is
+read from the tool names in the session's `tool_definitions.json`, and no live call of
+each built-in, or of `use_tool`, has been recorded.
+
+| Grok tool | Permitted by | Kinds it may carry |
+|---|---|---|
+| `read_file` | `Read` | `read` |
+| `list_dir` | `Read` or `Glob` | `read`, `search`, `other` |
+| `grep` | `Grep` | `search` |
+| `search_replace`, `write` | `Edit` or `Write` | `edit` |
+| `run_terminal_command`, `get_command_or_subagent_output`, `kill_command_or_subagent` | `Bash` | `execute` |
+| `web_fetch` | `WebFetch` | `fetch` |
+| `web_search` | `WebSearch` | `fetch`, `search` |
+| `search_tool` | Always, as discovery | `other` |
+| `use_tool` | Only a tool of Dromon's MCP server, `dromon__NAME` in `tool_name` | `other` |
+| Any other | Refused | |
+
 **Changed on 2026-10-26, Antigravity review, F1 to F3, at the operator's direction.**
 Grok no longer exempts the `think` kind. A `think` call was let through uncounted, so
 any call reported with that kind escaped the tool check. It now falls under Any other

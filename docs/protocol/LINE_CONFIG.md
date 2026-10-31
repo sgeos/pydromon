@@ -391,6 +391,22 @@ tools do the same for a line.
   neither the daemon nor an engine it started and whose environment holds the line's
   mark, read again at the moment of stopping. Every other pid is refused, as are a pid
   of 1 or less, a process that has already ended and one that cannot be signalled.
+- **Process workers.** Process inspections and launch-record sweeps use separate worker
+  threads, each with at most eight queued calls behind its active call. Sweeps wait for
+  signalled processes, so isolating them keeps a long sweep from occupying the inspection
+  queue. When an inspection queue is full, the request is refused. A queued call whose
+  caller is cancelled is skipped if it has not started. A call already running cannot be
+  stopped, so a cancelled stop request may still take effect. Both queues are bounded,
+  and sweeps report a repeated queue refusal once until a sweep succeeds.
+- **Detached-process inspection.** At the end of a turn, the scan runs on the process
+  worker because its process-table reads can block. The worker receives only the process
+  table and scan inputs, then returns process identifiers and command strings. Its result
+  holds no scheduler, engine or driver reference. When an engine retires, `Driver.close`
+  releases its Keleusma virtual machine on the thread that created it, so collection
+  during the scan cannot finalize that driver through the result. A virtual machine not
+  closed before it becomes cyclic garbage may still be finalized on any thread. On macOS
+  the scan may make two `ps` calls, each with the 10-second process-table timeout, so a
+  slow table can delay other requests for up to 20 seconds.
 - **Failing closed.** A process whose environment cannot be read is not the line's.
   Reading another process's environment is specific to each operating system, through
   `ps -E` on macOS and `/proc/PID/environ` on Linux, a porting hazard that
@@ -1354,11 +1370,12 @@ daemon stops it, when the daemon stops or dies, and when the line's engine is st
   walked. Then `SIGTERM` and `SIGCONT` go to the group and to every descendant found,
   and `SIGKILL` to what remains 2 seconds later. Under `leave_background` the harness
   runs on for half a second with its input still open, then alone is stopped, listed
-  around and killed. Each walk may take half a second, and a killed harness half a
-  second more to be reaped, so a stop takes at most 4 seconds. **Fact, read from
-  Agent SDK 0.2.174.** The SDK's close closes the engine's standard input, waits 5
+  around and killed. Each walk retries within a 0.75-second deadline, and `kill_all`
+  confirms after `SIGKILL` for a further 0.25 seconds. A killed harness has half a
+  second to be reaped. These bounds sum to 4.75 seconds. **Fact, read
+  from Agent SDK 0.2.174.** The SDK's close closes the engine's standard input, waits 5
   seconds, sends `SIGTERM`, waits 5 seconds more and sends `SIGKILL`, to the launcher,
-  which therefore finishes with a second to spare. The daemon signals a launcher by
+  which therefore finishes with a quarter second to spare. The daemon signals a launcher by
   its pid and by its group, kills it 6 seconds later, and waits 2 seconds more for it,
   then reports one that is still there and goes on.
 - **A launcher that cannot finish.** **Review N1 of the stop policy's re-review,
@@ -1407,9 +1424,12 @@ daemon stops it, when the daemon stops or dies, and when the line's engine is st
 - **A walk that cannot be made refuses the turn.** **Review F2.** Under `kill_all` the
   daemon asks before each turn whether `ps` can list the process table, and refuses to
   start the turn, saying why, when it cannot. A failed walk is never taken for an
-  empty tree. A launcher whose walk fails at stop time still ends the harness's group,
-  says so on its standard error, and reports it, which the daemon records as
-  `stop_unverified`. **Review F2 of the re-review, 2026-10-27.**
+  empty tree. A typed timeout result is retried within a 0.75-second deadline. Other
+  process-table errors are not retried. If a walk still fails at stop time, the launcher
+  ends the harness's group, writes an unverified-stop report and exits unsuccessfully.
+  After `SIGKILL`, it waits another 0.25 seconds and reports an unverified stop if a
+  process still answers. The daemon records that report as `stop_unverified`.
+  **Review F2 of the re-review, 2026-10-27.**
 - **The harness's own teardown.** **Item 7 of the live check of 2026-10-26.** Under
   `leave_background` a graceful stop of the daemon still ended a background `sleep`,
   and nothing was recorded. **Fact, read from the bundled Claude Code 2.1.310.** Once
@@ -1518,8 +1538,8 @@ interrupt can be scripted with `dromon interrupt LINE`, as
    harness's group alone never reaches.
 5. The daemon killed with `SIGKILL` during such a turn leaves no harness and no
    `sleep` running. **Observed on 2026-10-26** under `kill_all`. All four processes
-   were gone within about 6 seconds, longer than the about one second this item first
-   expected. The parent check and the stop's bound account for at most 4 seconds of
+  were gone within about 6 seconds, longer than the about one second this item first
+  expected. The parent check and the stop's declared bound account for at most 5 seconds of
    it. The rest is not explained, and the observation's own resolution is not known.
 6. `leave_background` leaves the `sleep` running and records it in
    `processes.left`, after a graceful `dromon stop` and after an interrupt. **Failed

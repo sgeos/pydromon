@@ -193,6 +193,8 @@ from dromon.settings import SettingsConfig
 from dromon.processes import (
     ProcessRefused,
     ProcessTable,
+    ProcessWorker,
+    TreeReadFailure,
     UNIDENTIFIABLE,
     SystemProcesses,
     TreeRow,
@@ -1644,7 +1646,9 @@ class Scheduler:
         line_tokens: LineTokens | None = None,
         report_dir: Path | None = None,
         walk_check: Callable[[], str | None] | None = None,
-        sweep_read: Callable[[], list[TreeRow] | str] = launcher.read_rows,
+        sweep_read: Callable[[], list[TreeRow] | TreeReadFailure | str] = (
+            launcher.read_rows
+        ),
         confining_engines: frozenset[str] = CONFINING_ENGINES,
     ) -> None:
         if not 1 <= wake_every_ticks <= MAX_WAKE_EVERY_TICKS:
@@ -1771,6 +1775,12 @@ class Scheduler:
         log's ``recorded_at`` does not give one. In memory, and read again from the
         log once after a restart."""
         self._processes: ProcessTable = processes or SystemProcesses()
+        self._process_worker = ProcessWorker()
+        self._sweep_worker = ProcessWorker()
+        """Separate queue so a sweep waiting on signalled children cannot occupy
+        the worker that serves process inspections and stops."""
+        self._process_tasks: set[asyncio.Task[None]] = set()
+        """Background process scans started during recovery, kept until they finish."""
         self._line_tokens = line_tokens
         """The tokens lines' engines reach Dromon's tools with, which each turn
         renews and revokes, or ``None`` where no engine uses them."""
@@ -1943,7 +1953,7 @@ class Scheduler:
         # What launchers left running while the daemon was down, such as after a
         # crash, is recorded now.
         self.collect_left()
-        self._record_survivors()
+        self._schedule_survivor_scan()
         self._withdraw_stale_ceilings()
         self._work.set()
 
@@ -1955,14 +1965,27 @@ class Scheduler:
         if self._log.state.walk_limit != text:
             self._log.append(WalkLimited(text))
 
-    def _record_survivors(self) -> None:
-        """At start, record the processes of an earlier run that still carry a line's
-        mark, since no engine of this run has started yet. Only what the platform
-        lets the daemon see is found, which on macOS 27 is nothing. **Review F1.**"""
+    def _schedule_survivor_scan(self) -> None:
         if not self._processes_identifiable:
             return
         try:
-            found = marked_processes(self._processes, os.getpid())
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._record_survivors())
+        self._process_tasks.add(task)
+        task.add_done_callback(self._process_tasks.discard)
+
+    async def _record_survivors(self) -> None:
+        """At start, record processes of an earlier run that still carry a line's
+        mark, since no engine of this run has started yet. Inspection runs on the
+        bounded worker, and recording remains on the event loop. **Review F1.**"""
+        if not self._processes_identifiable:
+            return
+        try:
+            found = await self._process_worker.run(
+                lambda: marked_processes(self._processes, os.getpid())
+            )
         except (ProcessRefused, OSError):
             return
         for line_id, processes in sorted(found.items()):
@@ -4641,10 +4664,8 @@ class Scheduler:
                 return _tool_error(UNIDENTIFIABLE)
             mark = self.line_mark(line_id)
             try:
-                # Listing runs ps and reads environments, so it leaves the event
-                # loop free for the other lines meanwhile.
-                found = await asyncio.to_thread(
-                    line_processes, self._processes, mark, os.getpid()
+                found = await self._process_worker.run(
+                    lambda: line_processes(self._processes, mark, os.getpid())
                 )
             except ProcessRefused as error:
                 return _tool_error(str(error))
@@ -4678,8 +4699,10 @@ class Scheduler:
                 return _tool_error(UNIDENTIFIABLE)
             mark = self.line_mark(line_id)
             try:
-                done = await asyncio.to_thread(
-                    stop_line_process, self._processes, mark, os.getpid(), pid, force
+                done = await self._process_worker.run(
+                    lambda: stop_line_process(
+                        self._processes, mark, os.getpid(), pid, force
+                    )
                 )
             except ProcessRefused as error:
                 return _tool_error(str(error))
@@ -8022,9 +8045,10 @@ class Scheduler:
             is not launcher.StopPolicy.KILL_ALL
         ):
             return
-        # On the event loop's thread, not in a worker, for the reason
-        # report_detached gives. One ps of the user's processes, bounded.
-        reason = self._walk_check()
+        try:
+            reason = await self._process_worker.run(self._walk_check)
+        except ProcessRefused as error:
+            reason = str(error)
         if reason is not None:
             raise TurnRefused(
                 "the line's stop policy is kill_all, which must find everything its"
@@ -8295,16 +8319,21 @@ class Scheduler:
         """Sweep the launch records of launchers that have exited, and record what
         each sweep found, as ``launcher.sweep_launches`` says. **Review N1.** A failure
         is reported on the daemon's standard error, and the records wait for the next
-        sweep. The process table is read on the event loop's thread, for the reason
-        ``report_detached`` gives, bounded by ``PS_TIMEOUT_SECONDS``."""
+        sweep. Process-table reads and the sweep's bounded signaling waits run on a
+        separate worker, so a sweep cannot occupy the process inspection queue."""
         try:
-            found = await launcher.sweep_launches(self._report_dir, self._sweep_read)
-            if isinstance(found, str):
-                if self._sweep_failure != found:
-                    self._sweep_failure = found
+            found = await self._sweep_worker.run(
+                lambda: asyncio.run(
+                    launcher.sweep_launches(self._report_dir, self._sweep_read)
+                )
+            )
+            if isinstance(found, (TreeReadFailure, str)):
+                message = str(found)
+                if self._sweep_failure != message:
+                    self._sweep_failure = message
                     print(
                         f"dromond: launch records wait, as the process table cannot"
-                        f" be read: {found}",
+                        f" be read: {message}",
                         file=sys.stderr,
                     )
                 return
@@ -8317,6 +8346,14 @@ class Scheduler:
                 )
             for swept in found:
                 self._record_swept(swept)
+        except ProcessRefused as error:
+            message = str(error)
+            if self._sweep_failure != message:
+                self._sweep_failure = message
+                print(
+                    f"dromond: the launch-record sweep was refused: {error}",
+                    file=sys.stderr,
+                )
         except Exception as error:  # noqa: BLE001
             # Any failure, in the sweep or in recording what it did, is said, since
             # the task that runs a sweep is not awaited until the daemon stops.
@@ -8428,28 +8465,32 @@ class Scheduler:
         ended, record the line's processes that still run, found by its mark, which
         have left the engine's process tree, so that no stop reached them. Nothing is
         ended. The same set is not recorded twice in a row, and nothing is checked
-        where the platform does not let the daemon read the mark."""
+        where the platform does not let the daemon read the mark. This scan runs on
+        the process worker because its operating-system reads can block. The worker
+        receives only the process table and scan inputs, and returns only process
+        identifiers and command strings. It holds no scheduler, engine or driver
+        reference. ``Driver.close`` releases each virtual machine on its owning
+        thread when an engine retires, so collection during this scan cannot finalize
+        a still-open driver through the scan result. A virtual machine that was not
+        closed before becoming cyclic garbage may still be finalized on any thread."""
         if not self._processes_identifiable or line_id not in self._log.state.lines:
             return
         if self.kept_session(line_id).get("kept") is True:
             return
-        # On the event loop's thread, not in a worker, as engine.py reads digests. A
-        # Keleusma driver's virtual machine may be dropped only on the thread that
-        # made it, and a collection in a worker thread could drop one, which a
-        # check after every turn made happen in the tests. The look is one ps and
-        # one read of environments, each bounded by PS_TIMEOUT_SECONDS. Porting
-        # note, this is a hazard of Python's collector alone.
+        mark = self.line_mark(line_id)
+        table = self._processes
+        daemon_pid = os.getpid()
         try:
-            found = line_processes(
-                self._processes, self.line_mark(line_id), os.getpid()
+            found = await self._process_worker.run(
+                lambda: tuple(
+                    (cast(int, process["pid"]), str(process["command"]))
+                    for process in line_processes(table, mark, daemon_pid)
+                    if isinstance(process.get("pid"), int)
+                )
             )
-        except ProcessRefused:
+        except (ProcessRefused, OSError):
             return
-        processes = [
-            (cast(int, p["pid"]), str(p["command"]))
-            for p in found
-            if isinstance(p.get("pid"), int)
-        ]
+        processes = list(found)
         pids = tuple(pid for pid, _ in processes)
         if not pids:
             self._detached.pop(line_id, None)
