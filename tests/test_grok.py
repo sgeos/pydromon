@@ -19,6 +19,7 @@ from typing import Any, Final, cast
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
+from imagesamples import png
 
 from dromon import grok as grok_module
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
@@ -2945,7 +2946,7 @@ def test_a_file_backed_use_tool_is_refused_with_advice_to_pass_it_inline(
 # local image, so ViewImage permits it, narrowed to images. The rawInput key
 # target_file is an inference from the tool's definition, not an observed call.
 
-PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
+PNG_BYTES = png()
 VIEW = LineConfig(builtin_tools=("ViewImage",))
 
 
@@ -2973,7 +2974,7 @@ def test_view_image_lets_a_line_view_a_small_image_and_counts_it(
     [
         ("notes.txt", b"text", "by its name"),
         ("fake.png", b"text, not an image", "does not begin"),
-        ("big.png", PNG_BYTES + b"\x00" * (5 * 1024 * 1024), "over the limit"),
+        ("big.png", png(5 * 1024 * 1024 + 1), "over the limit"),
         ("../outside.png", b"", "does not exist|outside"),
     ],
 )
@@ -2988,13 +2989,39 @@ def test_view_image_refuses_other_files_and_oversize_images(
     assert server.params("session/cancel") == {"sessionId": "s1"}
 
 
-def test_view_image_stops_a_call_whose_input_arrives_after_its_first_notice(
+def test_view_image_refuses_a_first_notice_that_carries_no_input(
     project: tuple[Path, Path, Path],
 ) -> None:
-    (project[0] / "notes.txt").write_bytes(b"text")
+    # Review of 1045994, I2. Grok serves text through read_file, so a call whose input
+    # is not yet known could finish before a later update names the file.
+    (project[0] / "shot.png").write_bytes(PNG_BYTES)
     server = FakeGrok(
         [
             grok_call("read_file"),
+            call_update("t", kind="read", rawInput=read_input("shot.png")),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="ViewImage|names no file"):
+        run(line(server, project, config=VIEW))
+    assert server.params("session/cancel") == {"sessionId": "s1"}
+
+
+def test_a_line_with_read_may_start_a_call_before_its_input_is_known(
+    project: tuple[Path, Path, Path],
+) -> None:
+    both = LineConfig(builtin_tools=("Read", "ViewImage"))
+    server = FakeGrok([grok_call("read_file"), call_update("t", kind="read")])
+    assert run(line(server, project, config=both)).tool_uses == ("Read",)
+
+
+def test_view_image_stops_a_later_update_that_names_another_file(
+    project: tuple[Path, Path, Path],
+) -> None:
+    (project[0] / "shot.png").write_bytes(PNG_BYTES)
+    (project[0] / "notes.txt").write_bytes(b"text")
+    server = FakeGrok(
+        [
+            grok_call("read_file", raw_input=read_input("shot.png")),
             call_update("t", kind="read", rawInput=read_input("notes.txt")),
         ]
     )
@@ -3006,9 +3033,11 @@ def test_view_image_denies_a_permission_request_that_names_no_image(
     project: tuple[Path, Path, Path],
 ) -> None:
     (project[0] / "notes.txt").write_bytes(b"text")
+    (project[0] / "shot.png").write_bytes(PNG_BYTES)
+    first = grok_call("read_file", raw_input=read_input("shot.png"))
     requests = (grok_permission(), grok_permission(rawInput=read_input("notes.txt")))
     for request in requests:
-        server = FakeGrok([grok_call("read_file"), request])
+        server = FakeGrok([first, request])
         run(line(server, project, config=VIEW))
         assert server.answers()[-1]["result"]["outcome"]["optionId"] == "no"
 

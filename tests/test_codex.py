@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
+from imagesamples import png
 
 from dromon import codex as codex_module
 from dromon import evidence
@@ -1587,7 +1588,7 @@ def test_a_codex_line_given_git_ssh_sets_it_for_its_shell_commands_alone() -> No
 # Round 11. The ViewImage capability. The imageView item and its path field are an
 # inference from the Codex binary's strings, not an observed live item.
 
-PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
+PNG_BYTES = png()
 
 
 def image_line(server: FakeServer, cwd: Path, tools: tuple[str, ...]) -> CodexLine:
@@ -1609,7 +1610,7 @@ def test_a_line_given_view_image_may_view_a_small_image_in_its_workdir(
 @pytest.mark.parametrize(
     ("name", "content", "reason"),
     [
-        ("big.png", PNG_BYTES + b"\x00" * (5 * 1024 * 1024), "over the limit"),
+        ("big.png", png(5 * 1024 * 1024 + 1), "over the limit"),
         ("notes.txt", b"text", "by its name"),
         ("fake.png", b"text, not an image", "does not begin"),
     ],
@@ -1661,3 +1662,29 @@ def test_image_generation_stays_refused_for_a_line_given_view_image(
         run(image_line(server, tmp_path, ("ViewImage",)))
     arguments = server.arguments
     assert arguments[arguments.index("image_generation") - 1] == "--disable"
+
+
+class UnnamedTurn(FakeServer):
+    """A server that sends an item before the response that names the turn, and never
+    sends ``turn/started``."""
+
+    async def send(self, message: Mapping[str, object]) -> None:
+        sent = dict(message)
+        if sent.get("method") != "turn/start":
+            await super().send(message)
+            return
+        self.sent.append(sent)
+        self.queue.append(item("imageView", path="../outside.png"))
+        self.queue.append({"id": sent["id"], "result": self.result("turn/start")})
+
+
+def test_a_refused_image_before_the_turn_is_named_still_interrupts_it(
+    tmp_path: Path,
+) -> None:
+    # Review of 1045994, I3. Without the turn identifier no interrupt could be sent,
+    # and the turn ran on with the refusal recorded and nothing stopping it.
+    server = UnnamedTurn()
+    with pytest.raises(EngineRefused, match="may not view that image"):
+        run(image_line(server, tmp_path, ("ViewImage",)))
+    interrupts = [m for m in server.sent if m.get("method") == "turn/interrupt"]
+    assert [m["params"]["turnId"] for m in interrupts] == ["t1"]

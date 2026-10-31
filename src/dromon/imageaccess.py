@@ -24,13 +24,16 @@ made on the real path. **Failure mode.** The check and the engine's read are two
 so a file replaced between them is not caught, and a symbolic link swapped in is
 caught only at the check. The size limit is on the file's bytes, which bounds the
 transfer and not the model's cost, since that follows the image's dimensions, and
-Dromon does not decode an image.
+Dromon does not decode an image, only checks that the whole file is one complete
+container of the type its name claims.
 """
 
 import os
 import stat
 from pathlib import Path
 from typing import Final
+
+from dromon.imageformat import CHECKERS, container_refusal
 
 VIEW_IMAGE: Final = "ViewImage"
 """The capability's name among a line's ``builtin_tools``."""
@@ -46,24 +49,9 @@ limit, so the line can save a smaller capture."""
 MAX_PATH_CHARACTERS: Final = 4096
 """The longest path text checked. A longer one is refused unread."""
 
-MAGIC_BYTES: Final[dict[str, tuple[bytes, ...]]] = {
-    ".png": (b"\x89PNG\r\n\x1a\n",),
-    ".jpg": (b"\xff\xd8\xff",),
-    ".jpeg": (b"\xff\xd8\xff",),
-    ".gif": (b"GIF87a", b"GIF89a"),
-    ".webp": (b"RIFF",),
-}
-"""The image types a line may view, by lowercase suffix, with the opening bytes each
-must have. The content check stops a text file named ``x.png`` from being read through
-this capability. ``.svg`` is excluded because it is text that can carry instructions.
-For ``.webp`` the first four bytes only are compared and ``WEBP`` at byte 8 is checked
-by ``image_refusal``."""
-
 PROTECTED_NAMES: Final = frozenset({".dromon", ".git", "secret"})
 """Directory names under the working directory that this capability never reads from,
 whatever the engine's own profile says, since they hold state, history and secrets."""
-
-HEADER_BYTES: Final = 16
 
 
 def claude_tools(builtin_tools: tuple[str, ...]) -> list[str]:
@@ -85,7 +73,8 @@ def image_refusal(
     """Why a line may not view ``raw_path``, or ``None`` if it may. A relative path is
     taken from ``workdir``. The real path must stay inside the working directory's
     real path and outside ``PROTECTED_NAMES``, must be a regular file with an image
-    suffix and the opening bytes of that type, and must be no larger than ``limit``."""
+    suffix, no larger than ``limit``, and wholly one complete container of that type,
+    as ``dromon.imageformat`` checks. **Review of 1045994, I1.**"""
     if not isinstance(raw_path, str) or not raw_path:
         return "the image path is missing or is not text"
     if len(raw_path) > MAX_PATH_CHARACTERS or "\x00" in raw_path:
@@ -103,8 +92,7 @@ def image_refusal(
     if PROTECTED_NAMES & set(real.relative_to(root).parts):
         return f"the image {raw_path!r} is in a directory this capability never reads"
     suffix = real.suffix.lower()
-    magic = MAGIC_BYTES.get(suffix)
-    if magic is None:
+    if suffix not in CHECKERS:
         return (
             f"the file {raw_path!r} is not a png, jpg, jpeg, gif or webp image by its"
             " name"
@@ -129,11 +117,19 @@ def image_refusal(
                 f"the image {raw_path!r} is {found.st_size} bytes, over the limit"
                 f" of {limit}"
             )
-        header = os.read(descriptor, HEADER_BYTES)
+        # The whole file is read, one byte past the limit so a file that grew since
+        # the size was taken is caught, and checked as one complete container.
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            data = handle.read(limit + 1)
+    except OSError as error:
+        return f"the image {raw_path!r} cannot be read: {error.strerror}"
     finally:
         os.close(descriptor)
-    if not any(header.startswith(prefix) for prefix in magic):
-        return f"the file {raw_path!r} does not begin as a {suffix[1:]} image"
-    if suffix == ".webp" and header[8:12] != b"WEBP":
-        return f"the file {raw_path!r} does not begin as a webp image"
+    if len(data) > limit:
+        return (
+            f"the image {raw_path!r} grew past the limit of {limit} while it was read"
+        )
+    why = container_refusal(suffix, data)
+    if why is not None:
+        return f"the file {raw_path!r} {why}"
     return None

@@ -116,12 +116,20 @@ the other two providers' limits are not lower as far as the author knows, so one
 keeps every engine within the lowest. A screenshot of a user interface is far smaller.
 A path must stay inside the line's working directory, which is within what the line may
 already read, and outside `.dromon`, `.git` and `secret`. The file must be a regular file
-with a png, jpg, jpeg, gif or webp name and the opening bytes of that type, so a text
-file named `x.png` is refused. The bound is on bytes. Dromon does not decode an image,
-so it does not bound its dimensions, which set the model's cost.
+with a png, jpg, jpeg, gif or webp name, and its whole content must be one complete
+container of that type, which `dromon.imageformat` checks. A png needs correct chunk
+checksums and ends at `IEND`, a jpeg ends at its end marker, a gif at its trailer, and
+a webp has a `RIFF` length equal to the file's. A text file named `x.png`, or a file
+that begins as an image and carries anything after it, is refused. **Review of 1045994,
+I1.** The check proves the container is complete and not that its data decodes, so
+comments, text chunks and compressed data can still hold arbitrary bytes. The bound is
+on bytes. Dromon does not decode an image, so it does not bound its dimensions, which
+set the model's cost.
 
 **Failure modes.** The check and the engine's read are two steps, so a file replaced in
-between is not caught. On Codex, and on Grok when it sends no permission request, the
+between is not caught. On Claude Code the engine opens the path the line gave, not
+the real path Dromon checked, so a link or file swapped in after the check is read.
+**Review of 1045994, I4.** On Codex, and on Grok when it sends no permission request, the
 check runs after the engine has begun the call and can only stop the turn.
 
 **Claude Code.** **Inference from Claude Code's documentation, not verified through

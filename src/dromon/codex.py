@@ -1703,6 +1703,11 @@ class CodexLine:
             cast(str | None, cast(dict[str, Any], started.get("turn") or {}).get("id"))
             or turn.turn_id
         )
+        # Review of 1045994, I3. An item can arrive before the response that names the
+        # turn, and ``_interrupt`` sends nothing for a turn it cannot name, so a refusal
+        # or a stop already decided is sent now, and the turn is not left to run.
+        if turn.refusal is not None or turn.interrupted_for is not None:
+            await self._interrupt(turn, None)
         while not turn.status:
             await self._dispatch(await self._receive(), turn)
 

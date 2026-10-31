@@ -1573,11 +1573,15 @@ class GrokLine:
     ) -> str | None:
         """Why a ``read_file`` call of a line with ``ViewImage`` and without ``Read``
         is refused, or ``None``. The call must name an image that
-        ``imageaccess.image_refusal`` accepts. A call that does not yet carry its input
-        passes unless ``required``, which a permission request sets, since Grok's first
-        notice of a call may come before its input and the request is where it can
-        still be stopped. **Limit.** Whether Grok asks before a ``read_file`` is not
-        known, and without a request only an update carrying the input can stop it."""
+        ``imageaccess.image_refusal`` accepts. **Review of 1045994, I2.** A call is
+        judged when first seen and at its permission request with ``required`` set, and
+        is then refused unless its input is present, since Grok serves text through
+        the same tool and may finish the read before a later update brings the input.
+        Only a later update of a call already judged may lack it. **Limit.** Whether
+        Grok's first notice carries the input is not known, and if it does not, a
+        view-only line cannot view an image on Grok, which fails closed. Whether Grok
+        asks before a ``read_file`` is also unknown, and without a request only an
+        update carrying the input can stop a call after it began."""
         if name != "read_file" or not view_only(self.config.builtin_tools):
             return None
         raw = fields.get("rawInput")
@@ -1587,7 +1591,7 @@ class GrokLine:
         return None if why is None else f"read_file under ViewImage: {why}"[:300]
 
     def _permits_grok_tool(
-        self, name: str, tool_call: Mapping[str, Any], *, required: bool = False
+        self, name: str, tool_call: Mapping[str, Any], *, required: bool = True
     ) -> tuple[bool, str]:
         """Whether the line may make a call Grok names ``name`` in its ``_meta``, and
         the tool to count it as. ``search_tool`` only lists tools, ``use_tool`` may

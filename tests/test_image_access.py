@@ -13,6 +13,8 @@ import pytest
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import ToolPermissionContext
 
+from imagesamples import gif, jpeg, png, webp
+
 from dromon import antigravity, cursor, grok, pi
 from dromon.codex import IMAGE_FEATURE, server_arguments
 from dromon.codex import unsupported as codex_unsupported
@@ -28,7 +30,7 @@ from dromon.imageaccess import (
 from dromon.lineconfig import LineConfig, ToolPolicy
 
 CONTEXT = ToolPermissionContext(signal=None, suggestions=[])
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
+PNG = png()
 
 
 def write(path: Path, content: bytes) -> Path:
@@ -44,16 +46,17 @@ def test_a_small_png_in_the_working_directory_is_accepted(tmp_path: Path) -> Non
     assert image_refusal("b.PNG", tmp_path) is None
 
 
-@pytest.mark.parametrize(
-    ("name", "content"),
-    [
-        ("a.jpg", b"\xff\xd8\xff\xe0" + b"\x00" * 8),
-        ("a.jpeg", b"\xff\xd8\xff\xe0" + b"\x00" * 8),
-        ("a.gif", b"GIF89a" + b"\x00" * 8),
-        ("a.webp", b"RIFF\x00\x00\x00\x00WEBPVP8 "),
-    ],
-)
-def test_each_image_type_needs_its_own_opening_bytes(
+SAMPLES = [
+    ("a.png", png()),
+    ("a.jpg", jpeg()),
+    ("a.jpeg", jpeg()),
+    ("a.gif", gif()),
+    ("a.webp", webp()),
+]
+
+
+@pytest.mark.parametrize(("name", "content"), SAMPLES)
+def test_each_image_type_is_accepted_as_a_complete_container(
     tmp_path: Path, name: str, content: bytes
 ) -> None:
     write(tmp_path / name, content)
@@ -62,9 +65,79 @@ def test_each_image_type_needs_its_own_opening_bytes(
     assert "does not begin" in (image_refusal(name, tmp_path) or "")
 
 
-def test_a_riff_file_that_is_not_webp_is_refused(tmp_path: Path) -> None:
+# Review of 1045994, I1. These fail on the commit that checked 16 bytes.
+
+
+@pytest.mark.parametrize(("name", "content"), SAMPLES)
+def test_content_after_the_container_is_refused(
+    tmp_path: Path, name: str, content: bytes
+) -> None:
+    write(tmp_path / name, content + b"TOP SECRET TEXT")
+    assert image_refusal(name, tmp_path) is not None
+
+
+@pytest.mark.parametrize(("name", "content"), SAMPLES)
+def test_a_truncated_container_is_refused(
+    tmp_path: Path, name: str, content: bytes
+) -> None:
+    for cut in (len(content) - 1, len(content) // 2, 12):
+        write(tmp_path / name, content[:cut])
+        assert image_refusal(name, tmp_path) is not None, cut
+
+
+@pytest.mark.parametrize(
+    ("name", "opening"),
+    [
+        ("a.png", b"\x89PNG\r\n\x1a\n"),
+        ("a.jpg", b"\xff\xd8\xff"),
+        ("a.gif", b"GIF89a"),
+        ("a.webp", b"RIFF\x00\x00\x00\x00WEBP"),
+    ],
+)
+def test_the_opening_bytes_followed_by_text_are_refused(
+    tmp_path: Path, name: str, opening: bytes
+) -> None:
+    write(tmp_path / name, opening + b"TOP SECRET TEXT, any file's content")
+    assert image_refusal(name, tmp_path) is not None
+
+
+def test_a_png_with_a_wrong_checksum_or_content_after_iend_is_refused(
+    tmp_path: Path,
+) -> None:
+    good = png()
+    bad = bytearray(good)
+    bad[-1] ^= 0xFF
+    write(tmp_path / "crc.png", bytes(bad))
+    assert "checksum" in (image_refusal("crc.png", tmp_path) or "")
+    write(tmp_path / "tail.png", good + b"\x00")
+    assert "after the png IEND" in (image_refusal("tail.png", tmp_path) or "")
+
+
+def test_a_riff_file_that_is_not_webp_or_has_the_wrong_length_is_refused(
+    tmp_path: Path,
+) -> None:
     write(tmp_path / "a.webp", b"RIFF\x00\x00\x00\x00WAVEfmt ")
     assert "webp" in (image_refusal("a.webp", tmp_path) or "")
+    good = bytearray(webp())
+    good[4] += 1
+    write(tmp_path / "b.webp", bytes(good))
+    assert "riff length" in (image_refusal("b.webp", tmp_path) or "")
+
+
+def test_a_file_named_for_one_type_must_be_that_type(tmp_path: Path) -> None:
+    write(tmp_path / "jpeg-as.png", jpeg())
+    write(tmp_path / "png-as.jpg", png())
+    assert image_refusal("jpeg-as.png", tmp_path) is not None
+    assert image_refusal("png-as.jpg", tmp_path) is not None
+
+
+def test_a_jpeg_scan_may_hold_stuffed_and_restart_bytes(tmp_path: Path) -> None:
+    data = bytearray(jpeg())
+    scan_data = b"\x12\xff\x00\x34\xff\xd0\x56"
+    data[-4:-2] = b""
+    data[-2:] = b""
+    write(tmp_path / "a.jpg", bytes(data) + scan_data + b"\xff\xd9")
+    assert image_refusal("a.jpg", tmp_path) is None
 
 
 @pytest.mark.parametrize("name", ["a.svg", "a.pdf", "a.txt", "a", "a.png.txt"])
@@ -74,17 +147,22 @@ def test_other_suffixes_are_refused(tmp_path: Path, name: str) -> None:
 
 
 def test_the_size_limit_is_enforced_at_the_boundary(tmp_path: Path) -> None:
-    exact = write(tmp_path / "exact.png", PNG + b"\x00" * (MAX_IMAGE_BYTES - len(PNG)))
+    exact = write(tmp_path / "exact.png", png(MAX_IMAGE_BYTES))
     assert exact.stat().st_size == MAX_IMAGE_BYTES
     assert image_refusal("exact.png", tmp_path) is None
-    over = write(
-        tmp_path / "over.png", PNG + b"\x00" * (MAX_IMAGE_BYTES - len(PNG) + 1)
-    )
+    over = write(tmp_path / "over.png", png(MAX_IMAGE_BYTES + 1))
     reason = image_refusal("over.png", tmp_path) or ""
     assert "over the limit" in reason
     assert str(MAX_IMAGE_BYTES) in reason
     assert over.stat().st_size == MAX_IMAGE_BYTES + 1
     assert image_refusal("exact.png", tmp_path, limit=10) is not None
+
+
+def test_each_type_is_accepted_at_a_size_and_refused_past_it(tmp_path: Path) -> None:
+    for name, build in (("a.jpg", jpeg), ("a.gif", gif), ("a.webp", webp)):
+        write(tmp_path / name, build(100))
+        assert image_refusal(name, tmp_path) is None, name
+        assert "over the limit" in (image_refusal(name, tmp_path, limit=99) or "")
 
 
 def test_a_path_must_stay_inside_the_working_directory(tmp_path: Path) -> None:
@@ -121,6 +199,67 @@ def test_a_missing_file_a_directory_and_a_fifo_are_refused(tmp_path: Path) -> No
     fifo = tmp_path / "fifo.png"
     os.mkfifo(fifo)
     assert image_refusal("fifo.png", tmp_path) is not None
+
+
+# Review of 1045994, T2 and T4. The swaps the module can see are the ones between its
+# own steps, so each is injected between them. A swap between the module's check and
+# the engine's read cannot be tested here and is a stated limit.
+
+
+def test_a_file_swapped_for_a_fifo_between_the_stat_and_the_open_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fifo = tmp_path / "fifo.png"
+    os.mkfifo(fifo)
+    regular = write(tmp_path / "regular.png", png())
+    real_stat = os.stat
+
+    def stale(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        del path, args, kwargs
+        return real_stat(regular)
+
+    monkeypatch.setattr("dromon.imageaccess.os.stat", stale)
+    reason = image_refusal("fifo.png", tmp_path) or ""
+    assert "not a regular file" in reason
+
+
+def test_a_link_swapped_in_after_the_path_was_resolved_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    write(tmp_path / "outside.png", png())
+    link = work / "link.png"
+    link.symlink_to(tmp_path / "outside.png")
+    real_realpath = os.path.realpath
+
+    def unresolved(path: os.PathLike[str] | str, **kwargs: bool) -> str:
+        # The link itself is left as it was before the swap resolved it, as a path
+        # swapped after resolution is. The working directory still resolves.
+        text = os.fspath(path)
+        if text.endswith("link.png"):
+            return text
+        return real_realpath(text, strict=kwargs.get("strict", False))
+
+    monkeypatch.setattr("dromon.imageaccess.os.path.realpath", unresolved)
+    reason = image_refusal("link.png", work) or ""
+    assert "cannot be opened" in reason
+
+
+def test_a_file_that_grew_past_the_limit_after_its_size_was_taken_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(tmp_path / "a.png", png(200))
+    real_fstat = os.fstat
+
+    def small(descriptor: int) -> os.stat_result:
+        found = real_fstat(descriptor)
+        fields = list(tuple(found)[:10])
+        fields[6] = 10
+        return os.stat_result(tuple(fields))
+
+    monkeypatch.setattr("dromon.imageaccess.os.fstat", small)
+    assert "grew past the limit" in (image_refusal("a.png", tmp_path, limit=100) or "")
 
 
 def test_view_image_maps_to_read_for_claude_code_and_is_view_only_without_read() -> (

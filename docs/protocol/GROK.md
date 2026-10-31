@@ -460,13 +460,17 @@ logs and in `~/.grok/docs`.
   line that has `ViewImage` and not `Read`. Its `rawInput` `target_file` must pass
   `imageaccess.image_refusal`, which requires a file inside the working directory and
   outside `.dromon`, `.git` and `secret`, a regular file, a png, jpg, jpeg, gif or webp
-  by name and by opening bytes, and at most `MAX_IMAGE_BYTES`, 5 MiB. A line with `Read`
+  by name and wholly one complete container of that type, and at most
+  `MAX_IMAGE_BYTES`, 5 MiB. A line with `Read`
   already reads any file its profile allows, so `ViewImage` does not narrow it, and the
   call counts as `Read`.
-- **Where it is enforced.** At the first notice of a call when its input is present,
-  at a later update that brings the input, which cancels the turn, and at the
-  permission request, which is denied unless it names an acceptable image. A request
-  without a `rawInput` is denied, which fails closed.
+- **Where it is enforced.** At the first notice of a call, which is refused unless it
+  carries its input, since `read_file` also serves text and could finish before a
+  later update names the file. **Review of 1045994, I2.** At a later update that brings
+  the input, which cancels the turn, and at the permission request, which is denied
+  unless it names an acceptable image. A request without a `rawInput` is denied. If
+  Grok's first notice never carries the input, a line without `Read` cannot view an
+  image on Grok, which fails closed, and the verify-first item 6 below shows whether it does.
 - **Limits.** Whether Grok asks permission before `read_file` is not known, and without
   a request only an update carrying the input can stop the call, after Grok has begun
   it. The check and the read are two steps. Grok resizes and prices the image, and
@@ -568,7 +572,8 @@ user's MCP servers and reports no permission mode.
    far under 5 MiB. Create a Grok line there with `builtin_tools` of `["ViewImage"]` and
    ask it to view the file and report the word. Record `toolName`, `kind`, `rawInput`,
    every update and every permission request of the call. Confirm that the call is
-   `read_file` with kind `read`, that `rawInput` has `target_file`, whether a request
+   `read_file` with kind `read`, that `rawInput` has `target_file`, that the first
+   notice of the call carries `rawInput` and not only a later update, whether a request
    reached Dromon before the read and whether it carried `rawInput`, and that the line
    reports the word. Then repeat with a `.txt` file, a png over 5 MiB, a path outside
    the working directory and a path under `.dromon`, and confirm that each is refused.

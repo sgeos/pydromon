@@ -296,12 +296,17 @@ generating or editing an image.
   Dromon adds no entry for it.
 - **What Dromon checks.** When an `imageView` item starts, Dromon checks its `path`
   with `imageaccess.image_refusal`. The file must be inside the line's working
-  directory and outside `.dromon`, `.git` and `secret`, a regular file, a png, jpg, jpeg,
-  gif or webp by name and by opening bytes, and at most `MAX_IMAGE_BYTES`, 5 MiB. A
-  failure, or an item without a text `path`, interrupts the turn and refuses it with
-  the reason. The item counts as one use of `ViewImage` in the driver's budget.
+  directory and outside `.dromon`, `.git` and `secret`, a regular file of at most
+  `MAX_IMAGE_BYTES`, 5 MiB, a png, jpg, jpeg, gif or webp by name, and wholly one
+  complete container of that type, which `dromon.imageformat` checks over the whole file.
+  A failure, or an item without a text `path`, interrupts the turn and refuses it with
+  the reason. The item counts as one use of `ViewImage` in the driver's budget. An item
+  that arrives before the response naming the turn cannot be interrupted at once, so the
+  interrupt is sent as soon as the turn is named, and the turn is refused whatever
+  follows. **Review of 1045994, I3.**
 - **The limit that only the engine holds.** Codex emits the item as it handles the
-  call, so Dromon's check stops the turn and is not shown to prevent the read. Codex
+  call, so Dromon's check stops the turn and is not shown to prevent the read. Whether
+  the image reaches the model before the interrupt is not known. Codex
   decides how the image is resized and what it costs the model. Dromon bounds the file's
   bytes and not its dimensions.
 - **Facts and inferences.** **Fact**, the string `imageView` is in the Codex 0.164.0

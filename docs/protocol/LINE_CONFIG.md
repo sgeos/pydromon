@@ -108,9 +108,16 @@ granted.
 - Grok permits `read_file`, narrowed to images for a line without `Read`.
 - Pi, Cursor and Antigravity refuse the name, as they refuse every built-in tool.
 
-An image must be a png, jpg, jpeg, gif or webp file by name and by opening bytes,
-inside the line's working directory and outside `.dromon`, `.git` and `secret`, and at
-most 5 MiB. [`ENGINES.md`](ENGINES.md) gives the rationale, the limits that only an
+An image must be a png, jpg, jpeg, gif or webp file by name and wholly one complete
+container of that type, inside the line's working directory and outside `.dromon`,
+`.git` and `secret`, and at most 5 MiB.
+
+**Limit, a path swapped after the check.** Dromon checks the real path, and the engine
+then opens the path the line gave. A link or file swapped in between is not caught, and
+on Claude Code the engine reads the swapped path. The working directory's own
+confinement, the engine's sandbox, is what bounds that read, and Dromon does not add to
+it. The check also proves a complete container and not that the data decodes, so text
+inside an image's comment or data parts is not excluded. [`ENGINES.md`](ENGINES.md) gives the rationale, the limits that only an
 engine holds, and the steps the operator runs before relying on it. Nothing was run
 live when this was written.
 

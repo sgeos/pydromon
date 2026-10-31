@@ -13,11 +13,16 @@ All notable changes are recorded here. The format follows
   which was always disabled, and Dromon checks the path of each `imageView` item. On
   Grok it permits `read_file`, the only tool that shows a local image, narrowed to
   images. On Claude Code it offers `Read`, which the gate allows only for images. The
-  files must be png, jpg, jpeg, gif or webp by name and by opening bytes, inside the
+  files must be png, jpg, jpeg, gif or webp by name and wholly one complete container of
+  that type, checked over the whole file, inside the
   line's working directory and outside `.dromon`, `.git` and `secret`, and at most
   `imageaccess.MAX_IMAGE_BYTES`, 5 MiB. Image generation and editing stay refused on
   every engine. Pi, Cursor and Antigravity refuse the name, as they refuse every
-  built-in tool. Nothing was run live, and each engine document lists the live steps
+  built-in tool. Review of 1045994. The check reads the whole file and requires a
+  complete container, so a file that only begins as an image is refused, a Grok
+  `read_file` whose first notice carries no input is refused for a line with `ViewImage`
+  and without `Read`, and a Codex refusal decided before the turn is named is sent as an
+  interrupt once it is. Nothing was run live, and each engine document lists the live steps
   the operator runs first.
 
 ### Fixed
