@@ -37,9 +37,11 @@ import json
 import contextlib
 import fcntl
 import os
+import shutil
 import signal
 import ssl
 import sys
+import tempfile
 import time
 import traceback
 from datetime import UTC, datetime
@@ -92,7 +94,7 @@ from dromon.driver import (
     DriverError,
     Strategy,
 )
-from dromon.eventlog import EventLog, LogError, read_entries, utc_now
+from dromon.eventlog import EventLog, LogError, read_entries, snapshot, utc_now
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.mailbox import MAX_PAGE, listing, outcome, replied_ids, sent, summary
 from dromon.lineconfig import (
@@ -1904,6 +1906,7 @@ class Daemon:
             "pid": os.getpid(),
             "project": str(self.paths.root),
             "started_at": self.started_at,
+            "options": successor_args(self.command_line, self.hold_wakes),
             "event_log": {
                 "last_seq": self.log.last_seq,
                 "lines": len(state.lines),
@@ -3379,16 +3382,48 @@ def apply_project(scheduler: Scheduler, log: EventLog, config: ProjectConfig) ->
         )
 
 
+CHECK_PASSED: Final = "dromond: the start checks pass, and nothing was started"
+"""What ``dromond --check`` says when a start would get past its checks."""
+
+CHECK_PREFIX: Final = "preflight-"
+"""The prefix of the private directory a check copies the event log into."""
+
+
+def check_scratch(paths: ProjectPaths) -> Path:
+    """A new private directory under the runtime directory for a check's copy of
+    the event log, on the same file system and as private as the log. Raises
+    ``LogError``."""
+    try:
+        return Path(tempfile.mkdtemp(prefix=CHECK_PREFIX, dir=paths.runtime_dir))
+    except OSError as error:
+        raise LogError(
+            f"cannot make a directory for a copy of the log in {paths.runtime_dir}"
+        ) from error
+
+
 def run(
     paths: ProjectPaths,
     *,
     overrides: Overrides | None = None,
     hold_wakes: bool = False,
+    check_only: bool = False,
 ) -> int:
     """Run the daemon for ``paths`` in the foreground and return its exit status.
 
     The project file ``.dromon/dromon.toml``, when present, supplies lines, limits and
     the wake policy. ``overrides`` from the command line take precedence over it.
+
+    With ``check_only``, the start checks run and nothing starts, which is what
+    ``dromon restart`` asks of the installed code before it stops the running
+    daemon. The checks are this function's own, in its own order, so a check added
+    to a start is a check of the preflight too. They read the project file and a
+    copy of the event log made by ``eventlog.snapshot`` in a private directory under
+    the runtime directory, which is removed afterwards, so whatever a start would
+    append is appended to the copy. The lock, which the running daemon holds, is not
+    taken, the teacher is not brought up, the registry is not written, no socket is
+    made and none is removed, the process table is not probed, and recovery, which
+    runs in ``serve``, does not run. ``docs/protocol/RESTART.md`` says what the
+    check therefore cannot find.
     """
     os.umask(0o077)
     given = overrides or Overrides()
@@ -3408,7 +3443,7 @@ def run(
         check_engines(config)
         terms = project_terms(config, paths)
         limits, operator, tick = resolve(config, given)
-        lock = acquire_lock(paths.lock)
+        lock = None if check_only else acquire_lock(paths.lock)
     except AlreadyRunning as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.ALREADY_RUNNING
@@ -3429,8 +3464,14 @@ def run(
     launcher.configure(paths.left_reports)
     successor: list[str] | None = None
     scheduler: Scheduler | None = None
+    scratch: Path | None = None
     try:
-        with EventLog(paths.event_log) as log:
+        log_path = paths.event_log
+        if check_only:
+            scratch = check_scratch(paths)
+            log_path = scratch / paths.event_log.name
+            snapshot(paths.event_log, log_path)
+        with EventLog(log_path) as log:
             scheduler = Scheduler(
                 log,
                 engine_factory(
@@ -3457,7 +3498,9 @@ def run(
                 read_only_paths=config.read_only_paths,
                 daemon_commit=read_head_commit(Path(__file__).parent),
                 daemon_checkout=Path(__file__).parent,
-                processes_identifiable=environment_reading_works(),
+                processes_identifiable=(
+                    False if check_only else environment_reading_works()
+                ),
                 line_tokens=line_tokens,
                 report_dir=paths.left_reports,
                 walk_check=launcher.walk_unavailable,
@@ -3480,7 +3523,7 @@ def run(
                 }
             )
             open_federation(scheduler, log, config.federation, registry_dir)
-            teacher = start_teacher(config, paths)
+            teacher = None if check_only else start_teacher(config, paths)
             try:
                 daemon = Daemon(
                     paths,
@@ -3502,6 +3545,9 @@ def run(
                 # Checked here as well as in ``serve``, so a refused relay stops the
                 # start before any socket is made.
                 daemon.relay_routes(config)
+                if check_only:
+                    print(CHECK_PASSED, file=sys.stderr)
+                    return exits.OK
                 entry = open_registration(
                     paths,
                     config.federation,
@@ -3532,15 +3578,19 @@ def run(
     finally:
         if scheduler is not None:
             scheduler.stop_workers()
-        for stale in (
-            paths.socket,
-            paths.agent_socket,
-            paths.line_socket,
-            paths.peer_socket,
-        ):
-            with contextlib.suppress(FileNotFoundError):
-                stale.unlink()
-        os.close(lock)
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
+        # A check holds no lock, and the sockets are the running daemon's.
+        if lock is not None:
+            for stale in (
+                paths.socket,
+                paths.agent_socket,
+                paths.line_socket,
+                paths.peer_socket,
+            ):
+                with contextlib.suppress(FileNotFoundError):
+                    stale.unlink()
+            os.close(lock)
     if successor is not None:
         return start_successor(paths, successor)
     print("dromond: stopped", file=sys.stderr)
@@ -3596,6 +3646,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="record messages but wake no line, for maintenance and tests",
     )
     parser.add_argument(
+        "--check",
+        action="store_true",
+        help="run the start checks against the project file and a copy of the event"
+        " log, start nothing and exit, as dromon restart does before it stops the"
+        " running daemon",
+    )
+    parser.add_argument(
         "--tick-seconds",
         type=float,
         default=None,
@@ -3635,7 +3692,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.USAGE
     hold: bool = arguments.hold_wakes
-    return run(paths, overrides=overrides, hold_wakes=hold)
+    check: bool = arguments.check
+    return run(paths, overrides=overrides, hold_wakes=hold, check_only=check)
 
 
 if __name__ == "__main__":

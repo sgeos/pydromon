@@ -192,6 +192,43 @@ def read_entries(path: Path) -> list[Entry]:
         connection.close()
 
 
+def snapshot(source: Path, destination: Path) -> None:
+    """Copy the log at ``source`` to ``destination`` as one consistent picture,
+    never writing ``source``, so a check can open the copy and append to it while a
+    daemon still writes the original. ``destination`` must not exist, and is created
+    owner only, since the log holds message bodies and answers.
+
+    A ``source`` that does not exist leaves no copy, and opening ``destination``
+    then creates an empty log, as a first start would. The copy goes through
+    SQLite's online backup, which sees each committed transaction whole, where a
+    byte copy could catch a write half done. The schema version is not checked
+    here, so the code that opens the copy refuses it in its own words. Raises
+    ``LogError`` when the source cannot be read or the copy cannot be written.
+
+    Porting note. The backup is a SQLite facility, so a port that keeps SQLite keeps
+    it, and one that does not copies under the log's own writer lock."""
+    if not source.exists():
+        return
+    try:
+        descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except OSError as error:
+        raise LogError(f"cannot create a copy of the log at {destination}") from error
+    os.close(descriptor)
+    uri = f"{source.resolve().as_uri()}?mode=ro"
+    try:
+        reading = sqlite3.connect(uri, uri=True, isolation_level=None)
+        try:
+            writing = sqlite3.connect(destination, isolation_level=None)
+            try:
+                reading.backup(writing)
+            finally:
+                writing.close()
+        finally:
+            reading.close()
+    except sqlite3.Error as error:
+        raise LogError(f"cannot copy the event log at {source}: {error}") from error
+
+
 def _create_private(path: Path) -> None:
     """Create ``path`` as an empty owner-only file unless it already exists."""
     try:

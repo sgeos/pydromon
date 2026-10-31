@@ -80,17 +80,67 @@ against the rate limit, kept engine connections and their background tasks, and 
 activity that attached clients show.
 
 **A successor that does not start.** The old daemon writes the reason to `dromond.log`
-and exits, and no daemon runs until `dromon start` succeeds. **Inference.** The usual
-cause is installed code that does not import, which `dromon restart` checks before it
-sends the request, by running the installed daemon with `--version`. A failure that
-appears only after the import, such as an event log the new code refuses, is not
-caught by that check.
+and exits, and no daemon runs until `dromon start` succeeds. On 2026-10-31 a restart
+onto new rules left the project with no daemon for about eight minutes, because the new
+code refused the project for two lines that existed only in the event log, which an
+offline check of the project file could not see. The preflight below exists to catch
+such a refusal while the old daemon still serves.
+
+## The preflight
+
+**Asked for by the operator on 2026-10-31.** Before `dromon restart` sends anything that
+stops the running daemon, it runs the installed code's own start checks against the
+live state, and refuses the restart when they fail, printing the new code's own
+message and leaving the old daemon running.
+
+- **How.** The client reads `status`, whose `options` give the running daemon's
+  command line, and runs `python -m dromon.daemon --project ROOT --runtime-dir DIR
+  OPTIONS --check` on its own interpreter, which loads the code installed now, as the
+  successor will. The check is `run` in `dromon.daemon` itself with `check_only`, so
+  every check a start makes is a check of the preflight, in the same order, and a
+  check added to a start later is covered without a second list to keep.
+- **The event log is read, never written.** The check copies the log with SQLite's
+  online backup into a new directory, mode 0700, under the runtime directory, opens
+  the copy, lets whatever a start appends go to the copy, and removes the directory
+  when it ends. The backup sees each committed transaction whole, so a copy taken while
+  the old daemon writes is consistent. The copy holds message bodies, so it is never
+  placed outside the runtime directory.
+- **The reason.** The client prints the check's lines that begin `dromond:`, which are
+  the reasons a real start prints, or else its last line, as for code that does not
+  import.
+- **Its bound.** The check may take 120 seconds, since it replays the whole log as a
+  start does.
+
+| The check covers | Because |
+|---|---|
+| Code that does not import | The check runs the installed daemon module |
+| The runtime and state directories and the peers' token store | They are checked as a start checks them |
+| The project file, its sandboxes, working directories, plugins, `[git_ssh]` table, engine tables and disclosure list | They are read and checked as a start reads them |
+| An event log the new code refuses, such as an unknown schema or an event it cannot decode | The copy is opened and replayed by the new code |
+| A file that contradicts the log, a line's model or strategy, its roles, the one-writer rule, a required sandbox a line created by a client lacks | These are checked against the copy's state, which holds the lines only the log knows |
+| Applying the file's lines, roles and peers | They are applied to the copy, so an event the new code would reject is found |
+| The operators' relay routes | They are checked as a start checks them before its sockets |
+
+| Only a real start reveals | Because |
+|---|---|
+| The lock | The running daemon holds it, so the check does not take it |
+| Sockets, the TLS listener and peer connections | The check makes none, and never removes the running daemon's |
+| The open-federation registry | Registering would meet the running daemon's own entry, so the check does not write it, and the refusals of a name on the disclosure list or a registry inside the project are found only at the start |
+| The teacher | Bringing it up loads a model, so the check does not |
+| Recovery, the survivor scan and the process-table probe | They run in `serve`, or touch the process table, which the check does not |
+| Engines | No engine is built until a line's first turn, at a start as at a check |
+| What the drain records | The copy is taken before the request, so mail, lines or roles recorded during the drain are not checked. A line created during a drain can still make the successor refuse |
+| The daemon's environment | The check runs with the client's environment, and the successor with the old daemon's, so a refusal that depends on `SSH_AUTH_SOCK` or `DROMON_REGISTRY_DIR` can differ |
+| An installed checkout that moves after the check | The successor loads what is installed when it starts |
+
+**Compatibility.** A daemon from before 2026-10-31 gives no `options`, and the check
+then runs with none, which can differ from the successor's command line only in the
+limits, operator, tick and held wakes, all of which the check validates the same way.
 
 ## `dromon restart`
 
-The command checks the installed code, reads the daemon's `pid` and commit, sends
-`restart`, and polls `status` four times a second until a daemon with another `pid`
-answers. It then prints the successor's commit and the commit before, and says when
+The command reads the daemon's `pid` and commit, runs the preflight, sends `restart`,
+and polls `status` four times a second until a daemon with another `pid` answers. It then prints the successor's commit and the commit before, and says when
 they are the same. It fails when the daemon refuses the request, when the restart is
 abandoned, and when no successor answers within the wait and 70 seconds more, which
 covers the shutdown and the successor's start.
@@ -112,4 +162,7 @@ covers the shutdown and the successor's start.
 The drain is one optional record with a deadline on a monotonic clock, and the daemon's
 watch is a poll bounded by a count derived from the wait. Starting the successor is a
 detached spawn after the lock is released. A Rust or Keleusma daemon makes the same
-spawn, or leaves the start to a supervisor where the platform has one.
+spawn, or leaves the start to a supervisor where the platform has one. The preflight is
+the start path with a flag that swaps the log for a copy and stops before the first
+side effect outside the copy, so a port keeps one start path, not two. The copy uses
+SQLite's online backup, which a port that keeps SQLite keeps.

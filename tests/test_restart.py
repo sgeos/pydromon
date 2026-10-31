@@ -9,13 +9,14 @@ builds one, since no test here may start a real daemon.
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sys
 from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Final, cast
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
@@ -26,9 +27,10 @@ from dromon.configview import Overrides
 from dromon.daemon import Daemon, build_parser, start_successor, successor_args
 from dromon.driver import Strategy
 from dromon.engine import TurnReport
-from dromon.eventlog import EventLog, read_entries
+from dromon.eventlog import EventLog, read_entries, replay
 from dromon.model import LineAddress, OperatorAddress, RestartNoted
-from dromon.paths import ProjectPaths, project_paths
+from dromon.paths import ProjectPaths, ensure_private_dir, project_paths
+from dromon.projectconfig import config_path
 from dromon.protocol import (
     ErrorCode,
     Operation,
@@ -691,8 +693,13 @@ def no_sleep(seconds: float) -> None:
 @pytest.fixture
 def cli_paths(paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch) -> ProjectPaths:
     monkeypatch.setattr(cli, "RESTART_POLL_SECONDS", 0.0)
-    monkeypatch.setattr(cli, "_preflight", lambda: None)
+    monkeypatch.setattr(cli, "_preflight", passes)
     return paths
+
+
+def passes(argv: Sequence[str]) -> None:
+    """A preflight that passes, for the tests of what follows it."""
+    del argv
 
 
 def test_dromon_restart_waits_for_a_new_pid_and_names_both_commits(
@@ -805,17 +812,27 @@ def test_dromon_restart_stops_nothing_when_the_installed_code_does_not_start(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     sent: list[Operation] = []
+    checked: list[list[str]] = []
 
     def record(
         socket: Path, operation: Operation, args: dict[str, object] | None = None
     ) -> Response:
         sent.append(operation)
-        raise AssertionError("no request may be sent")
+        if operation is not Operation.STATUS:
+            raise AssertionError("only the status may be asked for")
+        found = status(1, "a" * 40)
+        found["options"] = ["--hold-wakes"]
+        return Response("r", ok=True, result=found)
+
+    def refuse(argv: Sequence[str]) -> str:
+        checked.append(list(argv))
+        return "status 1: SyntaxError"
 
     monkeypatch.setattr(cli, "call", record)
-    monkeypatch.setattr(cli, "_preflight", lambda: "status 1: SyntaxError")
+    monkeypatch.setattr(cli, "_preflight", refuse)
     assert cli._restart(cli_paths, namespace()) == exits.FAILURE  # pyright: ignore[reportPrivateUsage]
-    assert sent == []
+    assert sent == [Operation.STATUS]
+    assert checked and checked[0][-2:] == ["--hold-wakes", "--check"]
     assert "was not stopped: status 1: SyntaxError" in capsys.readouterr().err
 
 
@@ -862,7 +879,7 @@ def test_dromon_restart_crosses_the_wire_to_a_daemon_whose_rates_are_known(
 ) -> None:
     monkeypatch.setattr(restart, "POLL_SECONDS", 1e-6)
     monkeypatch.setattr(cli, "RESTART_POLL_SECONDS", 0.0)
-    monkeypatch.setattr(cli, "_preflight", lambda: None)
+    monkeypatch.setattr(cli, "_preflight", passes)
     target = make_daemon(world, paths)
     world.monotonic = 67.0
     events = world.log.last_seq - world.log.opened_seq
@@ -920,3 +937,215 @@ def test_a_response_that_cannot_be_encoded_becomes_an_internal_error(
     assert answer.error_code is ErrorCode.INTERNAL
     assert "result.rate is a float" in (answer.error_message or "")
     assert "could not be encoded" in capsys.readouterr().err
+
+
+# The preflight. ``dromon restart`` runs the installed daemon's start checks in a
+# process of their own, against the project file and a copy of the event log, before
+# it asks the running daemon for anything that stops it. The incident of 2026-10-31
+# was a project the new code refused only because of lines that were in the log and
+# not in the file, which no check of the file alone could see. These tests use a
+# contradiction of the same kind, a line whose model the log and the file disagree
+# on, which neither the file nor the log shows alone.
+
+
+CONTRADICTING: Final = 'version = 1\n[lines.alpha]\nmodel = "claude-opus-5-5"\n'
+"""A project file that gives ``alpha`` another model than the log does."""
+
+AGREEING: Final = (
+    'version = 1\n[lines.alpha]\nmodel = "claude-haiku-5-5"\n'
+    '[lines.gamma]\nmodel = "claude-haiku-5-5"\n'
+)
+"""A project file that agrees with the log and declares a new line ``gamma``, which
+a start would create and a check creates only in its copy."""
+
+
+@pytest.fixture
+def live(paths: ProjectPaths) -> Iterator[World]:
+    """A running daemon's world, whose log is the project's own event log."""
+    ensure_private_dir(paths.state_dir)
+    target = World(paths.event_log, ["alpha"])
+    yield target
+    target.log.close()
+
+
+def digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def leftovers(paths: ProjectPaths) -> list[str]:
+    return sorted(
+        p.name
+        for p in paths.runtime_dir.iterdir()
+        if p.name.startswith(daemon.CHECK_PREFIX)
+    )
+
+
+def test_the_check_refuses_what_only_the_log_contradicts_and_writes_nothing(
+    live: World, paths: ProjectPaths, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path(paths.state_dir).write_text(CONTRADICTING)
+    ensure_private_dir(paths.runtime_dir)
+    lock = daemon.acquire_lock(paths.lock)
+    paths.socket.write_text("the old daemon's socket")
+    before = digest(paths.event_log)
+    try:
+        code = daemon.run(paths, check_only=True)
+    finally:
+        os.close(lock)
+    assert code == exits.FAILURE
+    err = capsys.readouterr().err
+    assert "dromond: line alpha runs claude-haiku-5-5" in err
+    assert digest(paths.event_log) == before
+    assert paths.socket.read_text() == "the old daemon's socket"
+    assert leftovers(paths) == []
+
+
+def test_the_check_passes_and_leaves_the_log_as_it_was(
+    live: World, paths: ProjectPaths, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path(paths.state_dir).write_text(AGREEING)
+    before = digest(paths.event_log)
+    assert daemon.run(paths, check_only=True) == exits.OK
+    assert daemon.CHECK_PASSED in capsys.readouterr().err
+    assert digest(paths.event_log) == before
+    assert "gamma" not in replay(paths.event_log).lines
+    assert leftovers(paths) == []
+
+
+def test_the_check_of_a_project_with_no_log_yet_passes(
+    paths: ProjectPaths, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ensure_private_dir(paths.state_dir)
+    config_path(paths.state_dir).write_text(AGREEING)
+    assert daemon.run(paths, check_only=True) == exits.OK
+    assert not paths.event_log.exists()
+    assert daemon.CHECK_PASSED in capsys.readouterr().err
+
+
+def test_a_log_the_new_code_cannot_read_is_refused_in_its_own_words(
+    paths: ProjectPaths, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ensure_private_dir(paths.state_dir)
+    paths.event_log.write_bytes(b"not a database at all, but long enough" * 40)
+    assert daemon.run(paths, check_only=True) == exits.FAILURE
+    assert "dromond:" in capsys.readouterr().err
+    assert leftovers(paths) == []
+
+
+def test_the_status_names_the_options_a_successor_and_a_preflight_take(
+    world: World, paths: ProjectPaths
+) -> None:
+    target = make_daemon(world, paths)
+    assert target.status()["options"] == ["--tick-seconds", "0.5", "--hold-wakes"]
+
+
+def test_the_preflight_runs_the_daemon_s_check_with_the_running_options(
+    paths: ProjectPaths,
+) -> None:
+    argv = cli._preflight_argv(paths, ["--tick-seconds", "0.5"])  # pyright: ignore[reportPrivateUsage]
+    assert argv == [
+        sys.executable,
+        "-m",
+        "dromon.daemon",
+        "--project",
+        str(paths.root),
+        "--runtime-dir",
+        str(paths.runtime_dir),
+        "--tick-seconds",
+        "0.5",
+        "--check",
+    ]
+    assert cli._options_of({"options": ["--hold-wakes", 3]}) == []  # pyright: ignore[reportPrivateUsage]
+    assert cli._options_of({"options": "--hold-wakes"}) == []  # pyright: ignore[reportPrivateUsage]
+    assert cli._options_of({}) == []  # pyright: ignore[reportPrivateUsage]
+    assert cli._options_of({"options": ["--hold-wakes"]}) == ["--hold-wakes"]  # pyright: ignore[reportPrivateUsage]
+
+
+def test_the_preflight_quotes_the_daemon_s_own_refusal() -> None:
+    noisy = (
+        sys.executable,
+        "-c",
+        "import sys; print('warming up', file=sys.stderr);"
+        " print('dromond: the project file is refused: x', file=sys.stderr);"
+        " sys.exit(1)",
+    )
+    found = cli._preflight(noisy)  # pyright: ignore[reportPrivateUsage]
+    assert found == "status 1: dromond: the project file is refused: x"
+
+
+def over_the_wire(
+    target: Daemon, monkeypatch: pytest.MonkeyPatch, sent: list[Operation]
+) -> None:
+    """Give ``cli.call`` the daemon's own answers, through the codec, and make a
+    successor answer under another process id once ``restart`` is sent."""
+
+    def wire(
+        socket: Path, operation: Operation, args: dict[str, object] | None = None
+    ) -> Response:
+        del socket
+        sent.append(operation)
+        request = encode_request(Request(f"w{len(sent)}", operation, dict(args or {})))
+        response = decode_response(encode_response(target.respond(request)))
+        if operation is Operation.RESTART:
+            monkeypatch.setattr(os, "getpid", lambda: 4242)
+        return response
+
+    monkeypatch.setattr(cli, "call", wire)
+
+
+def test_a_restart_the_preflight_refuses_leaves_the_old_daemon_serving(
+    live: World,
+    paths: ProjectPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The preflight here is the real one, the installed daemon run with
+    ``--check`` in a process of its own."""
+    config_path(paths.state_dir).write_text(CONTRADICTING)
+    target = make_daemon(live, paths)
+    sent: list[Operation] = []
+    over_the_wire(target, monkeypatch, sent)
+    before = digest(paths.event_log)
+
+    async def go() -> int:
+        return cli._restart(paths, namespace())  # pyright: ignore[reportPrivateUsage]
+
+    assert asyncio.run(go()) == exits.FAILURE
+    err = capsys.readouterr().err
+    assert "the installed daemon refuses to start, so the running one was not" in err
+    assert "dromond: line alpha runs claude-haiku-5-5" in err
+    assert sent == [Operation.STATUS]
+    assert live.scheduler.restart_status() is None
+    assert not target.stop_requested.is_set()
+    still = target.respond(encode_request(Request("again", Operation.STATUS, {})))
+    assert still.ok and still.result is not None
+    assert still.result["pid"] == os.getpid()
+    assert digest(paths.event_log) == before
+
+
+def test_a_restart_the_preflight_passes_goes_on_to_the_successor(
+    live: World,
+    paths: ProjectPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(restart, "POLL_SECONDS", 1e-6)
+    monkeypatch.setattr(cli, "RESTART_POLL_SECONDS", 0.0)
+    config_path(paths.state_dir).write_text(AGREEING)
+    target = make_daemon(live, paths)
+    sent: list[Operation] = []
+    over_the_wire(target, monkeypatch, sent)
+
+    async def go() -> int:
+        stop = asyncio.Event()
+        loop = asyncio.create_task(live.scheduler.run(stop))
+        code = cli._restart(paths, namespace(wait_seconds=60))  # pyright: ignore[reportPrivateUsage]
+        await until(target.stop_requested.is_set)
+        stop.set()
+        await loop
+        return code
+
+    assert asyncio.run(go()) == exits.OK
+    assert sent[:2] == [Operation.STATUS, Operation.RESTART]
+    assert "restarted, pid 4242" in capsys.readouterr().out
+    assert "gamma" not in replay(paths.event_log).lines
