@@ -7,6 +7,11 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- Grok tool calls are judged by the name Grok gives them in `_meta["x.ai/tool"]`.
+  Grok's first announcement of a call has no `kind` and no `toolName`, so every Grok
+  tool call was refused, including `search_tool`, and a later update that rewrites the
+  title would have refused the turn. A call so named is identified by that name, and
+  Grok's built-ins map to the line's tools by a table in `GROK.md`.
 - Grok sessions now set the model to the exact identifier in the driver's settings
   when `session/new` or `session/load` reports another model. Dromon requires a model
   config option, requires the `models` field and model option to agree when both are

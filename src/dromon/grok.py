@@ -104,6 +104,84 @@ KIND_TOOLS: Final[dict[str, frozenset[str]]] = {
 }
 """Each ACP tool kind, and the built-in tools any one of which permits it."""
 
+GROK_TOOL_META: Final = "x.ai/tool"
+"""The ``_meta`` key under which Grok names each of its tool calls."""
+
+GROK_TOOL_NAMESPACE: Final = "grok_build"
+"""The namespace of Grok's own tools in ``_meta["x.ai/tool"]``."""
+
+GROK_TOOLS: Final[dict[str, frozenset[str]]] = {
+    "read_file": frozenset({"Read"}),
+    "list_dir": frozenset({"Read", "Glob"}),
+    "grep": frozenset({"Grep"}),
+    "search_replace": WRITE_TOOLS,
+    "write": WRITE_TOOLS,
+    "run_terminal_command": frozenset({"Bash"}),
+    "get_command_or_subagent_output": frozenset({"Bash"}),
+    "kill_command_or_subagent": frozenset({"Bash"}),
+    "web_fetch": frozenset({"WebFetch"}),
+    "web_search": frozenset({"WebSearch"}),
+}
+"""Each of Grok's own tools a line may use, and the built-in tools any one of which
+permits it. **Hypothesis**, read from the tool names in Grok's session
+``tool_definitions.json`` of 2026-10-31, not from a live call of each. Every other
+Grok tool, such as ``spawn_subagent``, the scheduler, ``workflow``, the plan modes,
+``ask_user_question`` and the image tools, is refused, which fails closed.
+``search_tool`` and ``use_tool`` are judged on their own in ``_permits``."""
+
+USE_TOOL_KEYS: Final = frozenset({"tool_name", "tool_input"})
+"""The keys of ``use_tool``'s documented inline form."""
+
+USE_TOOL_VARIANT: Final = "variant"
+"""A key Grok adds to a tool call's ``rawInput`` in its later updates, as the observed
+``search_tool`` update of 2026-10-31 shows. It names the call's form and is the only
+key Dromon ignores when it compares inputs."""
+
+
+def grok_tool_name(fields: Mapping[str, Any]) -> str:
+    """The name Grok gives one of its own tool calls in ``_meta["x.ai/tool"]``, or the
+    empty string when the call has none or names another namespace.
+
+    **Fact, from the session log of 2026-10-31.** Grok's first ``tool_call`` update
+    carries no ``toolName`` and no ``kind``, a ``title`` equal to the tool's name and
+    ``_meta["x.ai/tool"]`` with its ``name`` and ``namespace``, and a later
+    ``tool_call_update`` adds ``kind`` and rewrites the ``title`` for display.
+    **Inference.** Grok writes ``_meta`` itself, and the model chooses only the tool
+    and its input, so unlike a title it is not text the model or a file name can make
+    equal to another tool's name."""
+    meta = fields.get("_meta")
+    if not isinstance(meta, dict):
+        return ""
+    tool = cast(dict[str, Any], meta).get(GROK_TOOL_META)
+    if not isinstance(tool, dict):
+        return ""
+    entry = cast(dict[str, Any], tool)
+    name = entry.get("name")
+    if entry.get("namespace") != GROK_TOOL_NAMESPACE or not isinstance(name, str):
+        return ""
+    return name
+
+
+def use_tool_target(raw_value: object) -> tuple[str, dict[str, Any]] | None:
+    """The tool a ``use_tool`` input names and its arguments, in the documented inline
+    form with exactly ``tool_name`` and ``tool_input``, or ``None`` for any other form.
+    A ``variant`` string Grok adds is ignored, and the file-backed forms are refused."""
+    if not isinstance(raw_value, dict):
+        return None
+    raw = cast(dict[str, object], raw_value)
+    variant = raw.get(USE_TOOL_VARIANT, "")
+    if (
+        not isinstance(variant, str)
+        or frozenset(raw) - {USE_TOOL_VARIANT} != USE_TOOL_KEYS
+    ):
+        return None
+    target = raw.get("tool_name")
+    arguments = raw.get("tool_input")
+    if not isinstance(target, str) or not isinstance(arguments, dict):
+        return None
+    return target, cast(dict[str, Any], arguments)
+
+
 READER_PROFILE: Final = "dromon-reader"
 WRITER_PROFILE: Final = "dromon-writer"
 PROFILE_BASES: Final[dict[str, frozenset[str]]] = {
@@ -1384,6 +1462,9 @@ class GrokLine:
         could make equal to it. A call with only a title is judged by its kind, and
         any other kind than a built-in tool's is refused. No kind is exempt, since
         the review's F1 was applied to Grok on 2026-10-26."""
+        grok_name = grok_tool_name(tool_call)
+        if grok_name:
+            return self._permits_grok_tool(grok_name, tool_call)
         name = acp.tool_name(tool_call)
         kind = str(tool_call.get("kind") or "other")
         if name == "search_tool":
@@ -1413,6 +1494,44 @@ class GrokLine:
         given = allowed & set(self.config.builtin_tools)
         return bool(given), min(given) if given else kind
 
+    def _permits_grok_tool(
+        self, name: str, tool_call: Mapping[str, Any]
+    ) -> tuple[bool, str]:
+        """Whether the line may make a call Grok names ``name`` in its ``_meta``, and
+        the tool to count it as. ``search_tool`` only lists tools, ``use_tool`` may
+        run only one of the line's own tools, and a built-in is permitted by
+        ``GROK_TOOLS``. Any other name is refused."""
+        if name == "search_tool":
+            return True, name
+        if name == "use_tool":
+            found = use_tool_target(tool_call.get("rawInput"))
+            if found is None or found[0] not in self.own_tools:
+                return False, name
+            return True, found[0]
+        allowed = GROK_TOOLS.get(name)
+        if allowed is None:
+            return False, name[: acp.LABEL_CHARACTERS]
+        given = allowed & set(self.config.builtin_tools)
+        return bool(given), min(given) if given else name
+
+    def _permits_request(
+        self, known: Mapping[str, object], tool_call: Mapping[str, Any]
+    ) -> bool:
+        """Whether to grant a permission request for ``tool_call``, given what was
+        recorded of it. A call Grok named in its ``_meta`` is judged by that recorded
+        name, and a ``use_tool`` by its recorded target, which the identity check has
+        already held fixed, whether or not the request repeats them."""
+        recorded_name = known.get(GROK_TOOL_META)
+        if not isinstance(recorded_name, str):
+            return self._permits({**known, **tool_call})[0]
+        if recorded_name != "use_tool":
+            return self._permits_grok_tool(recorded_name, tool_call)[0]
+        target = known.get("target")
+        if not isinstance(target, tuple):
+            return False
+        name = cast(tuple[str, dict[str, Any]], target)[0]
+        return name in self.own_tools
+
     async def _answer(
         self, request_id: object, method: str, params: dict[str, Any], turn: _Turn
     ) -> None:
@@ -1437,7 +1556,7 @@ class GrokLine:
             # With no field changed, the call is what was recorded plus what the
             # request adds, so a request that omits the recorded kind keeps it.
             known = turn.calls.get(str(identifier), {})
-            permitted = refusal is None and self._permits({**known, **tool_call})[0]
+            permitted = refusal is None and self._permits_request(known, tool_call)
             options = cast(list[dict[str, Any]], params.get("options") or [])
             await self._rpc().respond(
                 request_id, acp.permission_result(options, permitted)
@@ -1500,9 +1619,17 @@ class GrokLine:
         call already judged."""
         if identifier in turn.calls:
             return
-        identity = acp.identity(fields)
-        if acp.tool_name(fields) == "use_tool" and "rawInput" in fields:
-            identity["rawInput"] = fields["rawInput"]
+        grok_name = grok_tool_name(fields)
+        if grok_name:
+            # A call Grok names in its _meta is identified by that name alone, since
+            # Grok rewrites the title and adds the kind in its later updates.
+            identity: dict[str, object] = {GROK_TOOL_META: grok_name}
+            if grok_name == "use_tool":
+                identity["target"] = use_tool_target(fields.get("rawInput"))
+        else:
+            identity = acp.identity(fields)
+            if acp.tool_name(fields) == "use_tool" and "rawInput" in fields:
+                identity["rawInput"] = fields["rawInput"]
         turn.calls[identifier] = identity
         permitted, name = self._permits(fields)
         if not permitted:
@@ -1521,6 +1648,9 @@ class GrokLine:
         calls: Mapping[str, Mapping[str, object]],
     ) -> str | None:
         """Check ACP identity and keep a `use_tool` target fixed after first sight."""
+        recorded_call = calls.get(identifier) if isinstance(identifier, str) else None
+        if recorded_call is not None and GROK_TOOL_META in recorded_call:
+            return GrokLine._grok_identity_refusal(identifier, fields, recorded_call)
         refusal = acp.identity_refusal(identifier, fields, calls)
         if refusal is not None or not isinstance(identifier, str):
             return refusal
@@ -1528,6 +1658,29 @@ class GrokLine:
         if recorded is None or recorded.get("toolName") != "use_tool":
             return None
         if "rawInput" in fields and fields["rawInput"] != recorded.get("rawInput"):
+            return "the engine changed the structured input of its use_tool call"
+        return None
+
+    @staticmethod
+    def _grok_identity_refusal(
+        identifier: object, fields: Mapping[str, Any], recorded: Mapping[str, object]
+    ) -> str | None:
+        """Why an update or a permission request for a call Grok named in its
+        ``_meta`` refuses the turn, or ``None``. Its title and kind may change, since
+        Grok rewrites them, but not its ``_meta`` name, a ``toolName`` it did not have,
+        or a ``use_tool`` target."""
+        label = str(identifier)[: acp.LABEL_CHARACTERS]
+        name = grok_tool_name(fields)
+        if (name and name != recorded[GROK_TOOL_META]) or "toolName" in fields:
+            return (
+                f"the engine changed the name of its tool call {label!r}, which Dromon"
+                f" checked as {recorded[GROK_TOOL_META]}"
+            )
+        if (
+            recorded[GROK_TOOL_META] == "use_tool"
+            and "rawInput" in fields
+            and use_tool_target(fields["rawInput"]) != recorded.get("target")
+        ):
             return "the engine changed the structured input of its use_tool call"
         return None
 

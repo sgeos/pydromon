@@ -300,6 +300,40 @@ to load only Dromon's server, discovery can reveal that server's tool names and
 descriptions, but does not invoke those tools. A title alone never grants either
 meta-tool.
 
+**Changed on 2026-10-31, the observed call shape.** Fact, from a Grok session log of
+another project's line on 2026-10-31. Grok's first `tool_call` for `search_tool` had no
+`kind` and no `toolName`, a `title` of `search_tool`, and `_meta["x.ai/tool"]` with
+`name` `search_tool` and `namespace` `grok_build`. Its `tool_call_update` added `kind`
+`other`, rewrote the `title` for display and added `variant` `SearchTool` to
+`rawInput`. So every Grok call was judged as the kind `other` when it was first seen,
+and refused, and a later update would have refused the turn for changing its title.
+
+A call whose `_meta["x.ai/tool"]` names the namespace `grok_build` is now judged by that
+name, which Grok writes and the model does not. `search_tool` is discovery and is
+counted as itself. `use_tool` is permitted only for one of the line's own tools in the
+inline form, with exactly `tool_name` and `tool_input` and at most a string `variant`,
+and is counted as that tool. Each of Grok's built-ins in the table below is permitted
+by the line's tool beside it, and every other Grok tool is refused. Such a call is
+identified by its `_meta` name alone, so its title and kind may change, but a change of
+that name, an added `toolName` or a changed `use_tool` target refuses the turn. A
+permission request is judged by the name recorded for its call. A call without that
+`_meta`, or in another namespace, is judged as before. **Hypothesis.** The table is
+read from the tool names in the session's `tool_definitions.json`, and no live call of
+each built-in, or of `use_tool`, has been recorded.
+
+| Grok tool | Permitted by |
+|---|---|
+| `read_file` | `Read` |
+| `list_dir` | `Read` or `Glob` |
+| `grep` | `Grep` |
+| `search_replace`, `write` | `Edit` or `Write` |
+| `run_terminal_command`, `get_command_or_subagent_output`, `kill_command_or_subagent` | `Bash` |
+| `web_fetch` | `WebFetch` |
+| `web_search` | `WebSearch` |
+| `search_tool` | Always, as discovery |
+| `use_tool` | Only a tool of Dromon's MCP server, `dromon__NAME` in `tool_name` |
+| Any other | Refused |
+
 **Changed on 2026-10-26, Antigravity review, F1 to F3, at the operator's direction.**
 Grok no longer exempts the `think` kind. A `think` call was let through uncounted, so
 any call reported with that kind escaped the tool check. It now falls under Any other
