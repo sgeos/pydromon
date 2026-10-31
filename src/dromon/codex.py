@@ -124,6 +124,7 @@ from dromon.engine_environment import (
 )
 from dromon import gitssh
 from dromon.gitssh import GitSshAccess
+from dromon.imageaccess import VIEW_IMAGE, image_refusal
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
 from dromon.model import InvalidField, format_due
 from dromon.workdir import git_directories
@@ -160,14 +161,24 @@ DISABLED_FEATURES: Final = (
     "skill_search",
     "sleep_tool",
     "tool_suggest",
-    "view_image",
 )
 """Codex features that bring tools or connectors a line was not given."""
+
+IMAGE_FEATURE: Final = "view_image"
+"""The feature behind Codex's tool that shows a local image to the model. **Round 11.**
+It was in ``DISABLED_FEATURES``. It is now disabled unless the line has ``ViewImage``,
+which enables it, and ``image_generation`` stays in ``DISABLED_FEATURES`` for every
+line."""
+
+IMAGE_ITEM: Final = "imageView"
+"""The thread item Codex emits for a ``view_image`` call. **Fact**, the string is in the
+Codex 0.164.0 binary beside ``imageGeneration``, read on 2026-10-31. **Inference**, not
+observed live, that the item carries the image's file in a string field ``path``."""
 
 SHELL_FEATURES: Final = ("shell_tool", "unified_exec")
 """The features behind Codex's shell, enabled only for a line given ``Bash``."""
 
-SUPPORTED_BUILTINS: Final = frozenset({"Bash", "Edit", "Write"})
+SUPPORTED_BUILTINS: Final = frozenset({"Bash", "Edit", "Write", VIEW_IMAGE})
 """Built-in tool names a Codex line may be given, in Dromon's vocabulary."""
 
 WRITE_TOOLS: Final = frozenset({"Edit", "Write"})
@@ -273,8 +284,8 @@ def unsupported(config: LineConfig) -> str | None:
     extra = sorted(set(config.builtin_tools) - SUPPORTED_BUILTINS)
     if extra:
         return (
-            "Codex lines support only the built-in tools Bash, Edit and Write, not "
-            + (", ".join(extra))
+            "Codex lines support only the built-in tools Bash, Edit, Write and"
+            " ViewImage, not " + (", ".join(extra))
         )
     if config.mcp_servers or config.inherit_account_mcp:
         return "Codex lines do not yet support MCP servers"
@@ -507,6 +518,8 @@ def server_arguments(
         arguments += ["-c", f"mcp_servers.{name}.enabled=false"]
     for feature in DISABLED_FEATURES:
         arguments += ["--disable", feature]
+    image = "enable" if VIEW_IMAGE in config.builtin_tools else "disable"
+    arguments += [f"--{image}", IMAGE_FEATURE]
     shell = "enable" if "Bash" in config.builtin_tools else "disable"
     for feature in SHELL_FEATURES:
         arguments += [f"--{shell}", feature]
@@ -1197,8 +1210,9 @@ class CodexLine:
             environment = engine_environment(
                 self._environment,
                 self.driver.settings.strategy,
-                # unsupported() limits Codex built-ins to Bash, Edit and Write, so
-                # Codex offers neither Claude Code's Monitor nor PowerShell tool.
+                # unsupported() limits Codex built-ins to Bash, Edit, Write and
+                # ViewImage, so Codex offers neither Claude Code's Monitor nor
+                # PowerShell tool.
                 require_shell="Bash" in self.config.builtin_tools,
             )
             # For the launcher, which removes both before the app-server starts and
@@ -1512,9 +1526,10 @@ class CodexLine:
         # The driver's budget counts refused calls even when Codex reports only
         # item/completed. Identifiers deduplicate either notice order.
         await self._act(Event("tool_use", kind), turn)
-        await self._interrupt(
-            turn, f"the engine used a tool the line was not given: {kind}"
-        )
+        reason = f"the engine used a tool the line was not given: {kind}"
+        if kind == IMAGE_ITEM and VIEW_IMAGE in self.config.builtin_tools:
+            reason = f"the line may not view that image: {self._image_refusal(item)}"
+        await self._interrupt(turn, reason)
 
     def _tool_name(self, item: Mapping[str, Any]) -> str | None:
         """The tool an item is a use of, as the driver counts it, or ``None`` for an
@@ -1526,7 +1541,16 @@ class CodexLine:
             return "Bash"
         if kind == "fileChange" and WRITE_TOOLS & set(self.config.builtin_tools):
             return "Edit"
+        if kind == IMAGE_ITEM and VIEW_IMAGE in self.config.builtin_tools:
+            return None if self._image_refusal(item) else VIEW_IMAGE
         return None
+
+    def _image_refusal(self, item: Mapping[str, Any]) -> str | None:
+        """Why the image an ``imageView`` item names may not be viewed, or ``None``.
+        **Limit.** Codex emits the item as it handles the call, so this stops the turn
+        and cannot be shown to prevent the read. What Codex may read is bounded first
+        by the permission profile."""
+        return image_refusal(item.get("path"), self.cwd)
 
     async def _act(self, event: Event, turn: _Turn) -> None:
         action = self.driver.step(event)

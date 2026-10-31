@@ -32,7 +32,7 @@ keys, duplicate keys and numbers are refused.
 
 | Key | Value | Default |
 |---|---|---|
-| `builtin_tools` | Claude Code tool names, each a capital letter followed by letters, digits or `_` | none |
+| `builtin_tools` | Claude Code tool names, each a capital letter followed by letters, digits or `_`. `ViewImage` is Dromon's own name, see [Viewing images](#viewing-images) | none |
 | `mcp_servers` | Server name to server, or a Claude Code file of the shape `{"mcpServers": {...}}` | none |
 | `tool_policy` | `allowlist` or `allow_all` | `allowlist` |
 | `allowed_tools` | Exact tool names, or `mcp__server__*` for every tool of one server | none |
@@ -94,6 +94,25 @@ engine process environment or the event log.
 - Unless `inherit_account_mcp` is set, the engine runs with strict MCP configuration,
   and a turn is refused when the engine offers a built-in tool not in `builtin_tools`
   or a tool of a server not in `mcp_servers`.
+
+## Viewing images
+
+`ViewImage` in `builtin_tools` lets a line look at a local image. It is Dromon's name,
+not a Claude Code tool, and it is the only way a line gets the ability, so a line
+without it cannot view an image on any engine. Image generation and editing are never
+granted.
+
+- Claude Code offers `Read` to the engine for it, and the gate allows `Read` only for
+  an image file, whatever the tool policy. A line that also has `Read` is not narrowed.
+- Codex enables `view_image`, and Dromon checks each image it views.
+- Grok permits `read_file`, narrowed to images for a line without `Read`.
+- Pi, Cursor and Antigravity refuse the name, as they refuse every built-in tool.
+
+An image must be a png, jpg, jpeg, gif or webp file by name and by opening bytes,
+inside the line's working directory and outside `.dromon`, `.git` and `secret`, and at
+most 5 MiB. [`ENGINES.md`](ENGINES.md) gives the rationale, the limits that only an
+engine holds, and the steps the operator runs before relying on it. Nothing was run
+live when this was written.
 
 ## Dromon's own tools
 

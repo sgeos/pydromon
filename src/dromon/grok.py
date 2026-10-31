@@ -80,6 +80,7 @@ from dromon.security_paths import CREDENTIAL_PATHS, existing_real_paths
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 from dromon import gitssh
 from dromon.gitssh import GitSshAccess
+from dromon.imageaccess import VIEW_IMAGE, image_refusal, view_only
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
 from dromon.workdir import git_directories
 
@@ -87,7 +88,17 @@ ENGINE_NAME: Final = "grok-build"
 """The engine this adapter runs, as drivers name it."""
 
 SUPPORTED_BUILTINS: Final = frozenset(
-    {"Bash", "Read", "Grep", "Glob", "Edit", "Write", "WebFetch", "WebSearch"}
+    {
+        "Bash",
+        "Read",
+        "Grep",
+        "Glob",
+        "Edit",
+        "Write",
+        "WebFetch",
+        "WebSearch",
+        VIEW_IMAGE,
+    }
 )
 """Built-in tool names a Grok line may be given, in Dromon's vocabulary."""
 
@@ -111,7 +122,7 @@ GROK_TOOL_NAMESPACE: Final = "grok_build"
 """The namespace of Grok's own tools in ``_meta["x.ai/tool"]``."""
 
 GROK_TOOLS: Final[dict[str, frozenset[str]]] = {
-    "read_file": frozenset({"Read"}),
+    "read_file": frozenset({"Read", VIEW_IMAGE}),
     "list_dir": frozenset({"Read", "Glob"}),
     "grep": frozenset({"Grep"}),
     "search_replace": WRITE_TOOLS,
@@ -127,7 +138,17 @@ permits it. **Hypothesis**, read from the tool names in Grok's session
 ``tool_definitions.json`` of 2026-10-31, not from a live call of each. Every other
 Grok tool, such as ``spawn_subagent``, the scheduler, ``workflow``, the plan modes,
 ``ask_user_question`` and the image tools, is refused, which fails closed.
-``search_tool`` and ``use_tool`` are judged on their own in ``_permits``."""
+``search_tool`` and ``use_tool`` are judged on their own in ``_permits``.
+
+**Round 11, ``ViewImage``.** **Fact**, from the same ``tool_definitions.json`` and
+its ``read_file`` description, "The tool can read PDF, PPTX, and image files. You see
+image files as images." No other tool shows a local image without generating one, since
+``image_gen``, ``image_edit``, ``image_to_video`` and ``reference_to_video`` all
+generate, and they stay refused. So ``ViewImage`` permits ``read_file``, which also
+reads text, and Dromon narrows it for a line without ``Read`` to a path that
+``imageaccess.image_refusal`` accepts. **Inference**, not observed live, that the
+call's ``rawInput`` names the file as ``target_file``, the parameter the definition
+gives."""
 
 GROK_TOOL_KINDS: Final[dict[str, frozenset[str]]] = {
     "read_file": frozenset({"read"}),
@@ -1547,8 +1568,26 @@ class GrokLine:
         given = allowed & set(self.config.builtin_tools)
         return bool(given), min(given) if given else kind
 
+    def _view_refusal(
+        self, name: str, fields: Mapping[str, Any], *, required: bool
+    ) -> str | None:
+        """Why a ``read_file`` call of a line with ``ViewImage`` and without ``Read``
+        is refused, or ``None``. The call must name an image that
+        ``imageaccess.image_refusal`` accepts. A call that does not yet carry its input
+        passes unless ``required``, which a permission request sets, since Grok's first
+        notice of a call may come before its input and the request is where it can
+        still be stopped. **Limit.** Whether Grok asks before a ``read_file`` is not
+        known, and without a request only an update carrying the input can stop it."""
+        if name != "read_file" or not view_only(self.config.builtin_tools):
+            return None
+        raw = fields.get("rawInput")
+        if not isinstance(raw, dict):
+            return "the call names no file to check" if required else None
+        why = image_refusal(cast(dict[str, Any], raw).get("target_file"), self.cwd)
+        return None if why is None else f"read_file under ViewImage: {why}"[:300]
+
     def _permits_grok_tool(
-        self, name: str, tool_call: Mapping[str, Any]
+        self, name: str, tool_call: Mapping[str, Any], *, required: bool = False
     ) -> tuple[bool, str]:
         """Whether the line may make a call Grok names ``name`` in its ``_meta``, and
         the tool to count it as. ``search_tool`` only lists tools, ``use_tool`` may
@@ -1567,6 +1606,9 @@ class GrokLine:
         if allowed is None:
             return False, name[: acp.LABEL_CHARACTERS]
         given = allowed & set(self.config.builtin_tools)
+        why = self._view_refusal(name, tool_call, required=required)
+        if why is not None:
+            return False, why
         return bool(given), min(given) if given else name
 
     def _kind_agrees(self, name: str, fields: Mapping[str, Any]) -> bool:
@@ -1591,7 +1633,7 @@ class GrokLine:
         if not isinstance(recorded_name, str):
             return self._permits({**known, **tool_call})[0]
         if recorded_name != "use_tool":
-            return self._permits_grok_tool(recorded_name, tool_call)[0]
+            return self._permits_grok_tool(recorded_name, tool_call, required=True)[0]
         target = known.get("target")
         if not isinstance(target, tuple):
             return False
@@ -1670,6 +1712,13 @@ class GrokLine:
                     )
                     return
                 turn.announced_calls.add(identifier)
+            seen = turn.calls.get(str(identifier), {})
+            why = self._view_refusal(
+                str(seen.get(GROK_TOOL_META, "")), update, required=False
+            )
+            if why is not None:
+                await self._cancel(turn, why)
+                return
             await self._record(str(identifier), update, turn)
             if acp.newly_finished(str(identifier), update, turn.finished):
                 # The safe point before the next model call that priority mail

@@ -97,6 +97,48 @@ refused write recorded in `CODEX.md`.
 read as an empty list, which passed the check that the engine offers no tool the line
 was not given. Such a report is now unknown, and refuses the turn.
 
+## Viewing images
+
+**Round 11.** A line views a local image only when an operator gives it the built-in
+tool name `ViewImage`. Without it no line can, on any engine, and image generation and
+editing are refused on every engine, `ViewImage` included. Pi, Cursor and Antigravity
+take no built-in tool, so they refuse the name.
+
+| Engine | How the capability is delivered | Enforced by Dromon | Enforced by the engine only |
+|---|---|---|---|
+| Claude Code | `ViewImage` offers `Read`. A line with `Read` is not narrowed. | The gate allows `Read` for a path `image_refusal` accepts, and denies the rest | Image resizing and the model's cost |
+| Codex | `ViewImage` enables `view_image`, disabled otherwise | The path and size of each `imageView` item, which stops the turn | What the profile lets the line read, and resizing |
+| Grok | `ViewImage` permits `read_file`, the only tool that shows a local image | `target_file` at the first notice, at an update and at the permission request | Resizing, and whether a request is sent at all |
+
+**The bounds.** `imageaccess.MAX_IMAGE_BYTES` is 5 MiB, because Anthropic's API is
+understood, from recollection and not verified here, to refuse an image over 5 MB, and
+the other two providers' limits are not lower as far as the author knows, so one bound
+keeps every engine within the lowest. A screenshot of a user interface is far smaller.
+A path must stay inside the line's working directory, which is within what the line may
+already read, and outside `.dromon`, `.git` and `secret`. The file must be a regular file
+with a png, jpg, jpeg, gif or webp name and the opening bytes of that type, so a text
+file named `x.png` is refused. The bound is on bytes. Dromon does not decode an image,
+so it does not bound its dimensions, which set the model's cost.
+
+**Failure modes.** The check and the engine's read are two steps, so a file replaced in
+between is not caught. On Codex, and on Grok when it sends no permission request, the
+check runs after the engine has begun the call and can only stop the turn.
+
+**Claude Code.** **Inference from Claude Code's documentation, not verified through
+Dromon.** `Read` returns an image to the model, so `ViewImage` needs nothing beyond
+offering `Read` and gating it. `claude_tools` maps the name, and the init check accepts
+`Read` for a line with `ViewImage`. The verify-first steps are below.
+
+**Verify first.** The operator runs these once per engine before relying on the
+capability, and the Codex and Grok steps are in [`CODEX.md`](CODEX.md) and
+[`GROK.md`](GROK.md). For Claude Code, create a line in a scratch project with
+`builtin_tools` of `["ViewImage"]`, put a small synthetic png there, 64 by 64 with a
+made up word drawn on it, and ask the line to view it and report the word. Confirm that
+the engine's init lists `Read`, that the gate allowed the call, and that the word is
+reported, which shows that `Read` delivers an image through the Agent SDK. Then ask for
+a `.txt` file, a png over 5 MiB and a path outside the working directory, and confirm
+that the gate denies each with a message naming `ViewImage`.
+
 ## Engine process environments
 
 Each external engine process starts with an explicit allowlist. The shared

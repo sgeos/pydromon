@@ -443,6 +443,38 @@ Grok's tools start, or leaves them and records them under the `leave_background`
 policy. Before this, Dromon signalled the agent process only. [`LINE_CONFIG.md`](LINE_CONFIG.md)
 specifies the stop policy.
 
+## Viewing an image
+
+**Round 11.** No line could look at an image, because Grok's image tools were refused.
+Grok's tools were searched on 2026-10-31 in the `tool_definitions.json` of its session
+logs and in `~/.grok/docs`.
+
+- **Fact.** `read_file` says "The tool can read PDF, PPTX, and image files. You see
+  image files as images." It is the only tool that shows a local image to the model.
+- **Fact.** `image_gen`, `image_edit`, `image_to_video` and `reference_to_video`
+  generate or edit, and Grok's configuration reference names `features.image_gen` and
+  `features.image_edit`. They are not in `GROK_TOOLS`, so they are refused for every
+  line, `ViewImage` included.
+- **Consequence.** `ViewImage` on a Grok line permits `read_file`, with its kind `read`
+  in `GROK_TOOL_KINDS`. Because `read_file` also reads text, Dromon narrows it for a
+  line that has `ViewImage` and not `Read`. Its `rawInput` `target_file` must pass
+  `imageaccess.image_refusal`, which requires a file inside the working directory and
+  outside `.dromon`, `.git` and `secret`, a regular file, a png, jpg, jpeg, gif or webp
+  by name and by opening bytes, and at most `MAX_IMAGE_BYTES`, 5 MiB. A line with `Read`
+  already reads any file its profile allows, so `ViewImage` does not narrow it, and the
+  call counts as `Read`.
+- **Where it is enforced.** At the first notice of a call when its input is present,
+  at a later update that brings the input, which cancels the turn, and at the
+  permission request, which is denied unless it names an acceptable image. A request
+  without a `rawInput` is denied, which fails closed.
+- **Limits.** Whether Grok asks permission before `read_file` is not known, and without
+  a request only an update carrying the input can stop the call, after Grok has begun
+  it. The check and the read are two steps. Grok resizes and prices the image, and
+  Dromon bounds bytes and not dimensions. Whether Grok delivers an image to the model
+  for the model its driver pins is also not known.
+- **Inference, not observed.** That the input names the file `target_file`, as the
+  tool's definition does. A different key denies every view of a line without `Read`.
+
 ## Not verified
 
 - That Grok honours `yoloMode` false, accepts `session/set_mode`, and names MCP tools
@@ -530,6 +562,19 @@ user's MCP servers and reports no permission mode.
    the line's home directory now holds no Claude Code or Cursor files, so a wrong
    value would expose only a project's `.claude` or `.cursor` files, and the servers
    Grok reports are checked in any case.
+
+6. **Viewing an image.** **Round 11.** Make a small synthetic image in a scratch
+   project, for example a 64 by 64 png of one colour with a made up word drawn on it,
+   far under 5 MiB. Create a Grok line there with `builtin_tools` of `["ViewImage"]` and
+   ask it to view the file and report the word. Record `toolName`, `kind`, `rawInput`,
+   every update and every permission request of the call. Confirm that the call is
+   `read_file` with kind `read`, that `rawInput` has `target_file`, whether a request
+   reached Dromon before the read and whether it carried `rawInput`, and that the line
+   reports the word. Then repeat with a `.txt` file, a png over 5 MiB, a path outside
+   the working directory and a path under `.dromon`, and confirm that each is refused.
+   Repeat with a line without `ViewImage` and `Read` and confirm that the view is
+   refused. If no request arrives for `read_file`, record that the check is after
+   the fact for this tool.
 
 ## Not at parity
 

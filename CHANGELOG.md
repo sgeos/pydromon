@@ -5,6 +5,21 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The operator-granted capability `ViewImage`, so a line can look at a screenshot
+  through whichever engine owns it. A line must name it among its `builtin_tools`, and
+  without it no line can view an image on any engine. On Codex it enables `view_image`,
+  which was always disabled, and Dromon checks the path of each `imageView` item. On
+  Grok it permits `read_file`, the only tool that shows a local image, narrowed to
+  images. On Claude Code it offers `Read`, which the gate allows only for images. The
+  files must be png, jpg, jpeg, gif or webp by name and by opening bytes, inside the
+  line's working directory and outside `.dromon`, `.git` and `secret`, and at most
+  `imageaccess.MAX_IMAGE_BYTES`, 5 MiB. Image generation and editing stay refused on
+  every engine. Pi, Cursor and Antigravity refuse the name, as they refuse every
+  built-in tool. Nothing was run live, and each engine document lists the live steps
+  the operator runs first.
+
 ### Fixed
 
 - A seat that does not own its role is built with its role's worktree read only on

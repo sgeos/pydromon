@@ -771,3 +771,24 @@ def test_a_billing_error_is_a_plan_limit_even_in_a_turn_that_succeeds() -> None:
     # Another error is not classified, so the turn ends as the engine ended it.
     other = AssistantMessage(content=[], model=MODEL, error="rate_limit")
     assert run(line(Scripted([init(), other, result()]))).subtype == "success"
+
+
+# Round 11. The ViewImage capability on Claude Code.
+
+
+def test_view_image_is_offered_to_the_engine_as_read() -> None:
+    config = LineConfig(builtin_tools=("ViewImage",))
+    session = Scripted([init(tools=["Read"]), result()])
+    run(configured(config, session))
+    assert session.options[0].tools == ["Read"]
+
+
+def test_a_line_without_view_image_or_read_is_refused_an_engine_that_offers_read() -> (
+    None
+):
+    session = Scripted([init(tools=["Read"]), say(TextBlock("x")), result()])
+    with pytest.raises(
+        EngineRefused, match="offers tools the line was not given: Read"
+    ):
+        run(configured(LineConfig(builtin_tools=("Edit",)), session))
+    assert session.interrupts == 1

@@ -139,6 +139,7 @@ from claude_agent_sdk.types import SystemPromptPreset
 
 from dromon import evidence, gitssh, launcher, redact
 from dromon.gitssh import GitSshAccess
+from dromon.imageaccess import claude_tools, image_refusal, view_only
 from dromon.capabilities import CLAUDE_CODE, version_refusal
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.ceiling import (
@@ -1643,11 +1644,15 @@ def permission_gate(
     own_tools: frozenset[str],
     sandbox: Mapping[str, object] | None = None,
     admits: Callable[[], bool] | None = None,
+    workdir: Path | None = None,
 ) -> PermissionGate:
     """A gate that applies ``config``'s policy and denies every other tool call,
     and every shell call that would leave the ``sandbox`` without its leave. With
     ``admits``, every call is denied while it returns ``False``, as it does on a kept
-    connection outside a checked Dromon turn."""
+    connection outside a checked Dromon turn. **Round 11.** For a line with
+    ``ViewImage`` and without ``Read``, ``Read`` is offered to the engine for images
+    only, so the gate allows it for a path ``imageaccess.image_refusal`` accepts in the
+    line's ``workdir`` and denies it otherwise, whatever the tool policy."""
 
     async def gate(
         tool_name: str, tool_input: dict[str, Any], context: ToolPermissionContext
@@ -1675,6 +1680,16 @@ def permission_gate(
                     f"{HUMAN_DECISION_REFUSAL}"
                 )
             )
+        if tool_name == "Read" and view_only(config.builtin_tools):
+            why = image_refusal(
+                tool_input.get("file_path"),
+                workdir if workdir is not None else Path.cwd(),
+            )
+            if why is not None:
+                return PermissionResultDeny(
+                    message=f"Dromon's ViewImage rule refuses this Read: {why}"
+                )
+            return PermissionResultAllow()
         if config.allows(tool_name, own_tools):
             return PermissionResultAllow()
         return PermissionResultDeny(
@@ -2108,7 +2123,7 @@ class ClaudeCodeLine:
             plugins.append({"type": "local", "path": str(directory)})
         return ClaudeAgentOptions(
             model=settings.model,
-            tools=list(self.config.builtin_tools),
+            tools=claude_tools(self.config.builtin_tools),
             mcp_servers=cast(dict[str, McpServerConfig], servers),
             strict_mcp_config=not self.config.inherit_account_mcp,
             can_use_tool=permission_gate(
@@ -2116,6 +2131,7 @@ class ClaudeCodeLine:
                 self.own_tools,
                 self.sandbox,
                 self._admits,
+                self.cwd,
             ),
             setting_sources=["project"] if self.config.project_settings else [],
             plugins=plugins,
@@ -2528,7 +2544,7 @@ class ClaudeCodeLine:
         """Whether the engine may offer ``tool_name`` under this configuration."""
         server = mcp_server_of(tool_name)
         if server is None:
-            return tool_name in self.config.builtin_tools
+            return tool_name in claude_tools(self.config.builtin_tools)
         if server == MCP_SERVER_NAME:
             return tool_name in self.own_tools
         return server in self.config.server_names() or self.config.inherit_account_mcp
