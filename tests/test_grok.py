@@ -2904,3 +2904,38 @@ def test_a_permission_request_whose_kind_disagrees_is_refused(
     server = FakeGrok([grok_call("read_file"), grok_permission(kind="execute")])
     with pytest.raises(EngineRefused, match="does not agree"):
         run(line(server, project, config=config))
+
+
+def test_the_observed_list_dir_sequence_is_counted_as_its_line_tool(
+    project: tuple[Path, Path, Path],
+) -> None:
+    # Observed on 2026-10-31. Grok's tool_call_update gives list_dir the kind other,
+    # which held a live turn before list_dir allowed it.
+    target = {"target_directory": "/workspace/tmp"}
+    server = FakeGrok(
+        [
+            grok_call("list_dir", ident="d", raw_input=target),
+            call_update(
+                "d",
+                kind="other",
+                title="List `tmp`",
+                rawInput={"variant": "ListDir", **target},
+                _meta=grok_meta("list_dir"),
+            ),
+        ]
+    )
+    config = LineConfig(builtin_tools=("Read",))
+    assert run(line(server, project, config=config)).tool_uses == ("Read",)
+
+
+def test_a_file_backed_use_tool_is_refused_with_advice_to_pass_it_inline(
+    project: tuple[Path, Path, Path],
+) -> None:
+    # Observed on 2026-10-31. Grok used the documented file-backed form once, and the
+    # refusal named only use_tool, so the line could not tell what to change.
+    raw = {"tool_name": "dromon__send_message", "tool_input_file": "/scratch/args.json"}
+    server = FakeGrok([grok_call("use_tool", raw_input=raw)])
+    with pytest.raises(
+        EngineRefused, match="not given: use_tool.*inline as tool_input"
+    ):
+        run(line(server, project))
