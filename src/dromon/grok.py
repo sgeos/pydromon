@@ -1071,6 +1071,10 @@ class _Turn:
     absolute_deadline: float | None = None
     servers_reported: bool = False
     """Whether Grok listed the session's MCP servers, which a prompt requires."""
+    pending_model_refusal: str | None = None
+    """A mismatching model notice received before the session model was pinned."""
+    model_pinned: bool = False
+    """Whether the opened session was confirmed to use the driver's model."""
 
 
 def grok_arguments(model: str, effort: str) -> list[str]:
@@ -1272,7 +1276,7 @@ class GrokLine:
             return None
         if method == MODELS_UPDATE:
             if "currentModelId" in params:
-                return self._model_refusal(params.get("currentModelId"))
+                return self._model_notice_refusal(params.get("currentModelId"), turn)
             return None
         if method == SESSION_NOTIFICATION:
             update = params.get("update")
@@ -1280,7 +1284,9 @@ class GrokLine:
                 isinstance(update, dict)
                 and cast(dict[str, Any], update).get("sessionUpdate") == "model_changed"
             ):
-                return self._model_refusal(cast(dict[str, Any], update).get("model_id"))
+                return self._model_notice_refusal(
+                    cast(dict[str, Any], update).get("model_id"), turn
+                )
             return None
         if method == SETTINGS_UPDATE:
             mode = params.get("permission_mode")
@@ -1320,6 +1326,26 @@ class GrokLine:
         if model != expected:
             return f"Grok switched the session's model to {model!r}, not {expected!r}"
         return None
+
+    def _model_notice_refusal(self, model: object, turn: _Turn) -> str | None:
+        refusal = self._model_refusal(model)
+        if refusal is not None and not turn.model_pinned:
+            turn.pending_model_refusal = refusal
+            return None
+        return refusal
+
+    @staticmethod
+    def _has_model_option(result: Mapping[str, Any]) -> bool:
+        options = result.get("configOptions")
+        if not isinstance(options, list):
+            return False
+        for option in cast(list[object], options):
+            if not isinstance(option, dict):
+                continue
+            entry = cast(dict[str, Any], option)
+            if (entry.get("id") or entry.get("configId")) == "model":
+                return True
+        return False
 
     def _mode_refusal(self, result: Mapping[str, Any]) -> str | None:
         """Why the session's permission mode refuses the turn, read from a
@@ -1575,13 +1601,42 @@ class GrokLine:
                 " a Grok line has only Dromon's tools"
             )
             return session_id
+        if not self._has_model_option(result):
+            turn.refusal = (
+                "Grok did not report a configOptions model option, so Dromon cannot"
+                " pin the driver's model"
+            )
+            return session_id
+        expected_model = self.driver.settings.model
         model = acp.reported_model(result)
+        model_result: Mapping[str, Any] = result
+        needs_pin = model != expected_model
+        if needs_pin:
+            try:
+                model_result = await self._rpc().call(
+                    "session/set_config_option",
+                    {
+                        "sessionId": session_id,
+                        "configId": "model",
+                        "value": {"value": expected_model},
+                    },
+                )
+            except acp.RpcError as error:
+                turn.refusal = (
+                    f"Grok refused the driver's model {expected_model!r}: {error}"
+                )
+                return session_id
+        model = acp.reported_model(model_result)
         verdict = self.driver.step(Event("init", model or ""))
         if verdict.tag is ActionTag.REFUSE:
             turn.refusal = (
                 f"the driver for {verdict.text} refuses the engine model {model!r}"
             )
             return session_id
+        if not needs_pin and turn.pending_model_refusal is not None:
+            turn.refusal = turn.pending_model_refusal
+            return session_id
+        turn.model_pinned = True
         # Refuse the turn unless the session asks before acting, switching to
         # ``default`` when Grok offers it through ACP's ``modes``.
         if isinstance(result.get("modes"), dict):

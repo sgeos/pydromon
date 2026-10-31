@@ -7,6 +7,12 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- Grok sessions now set the model to the exact identifier in the driver's settings
+  when `session/new` or `session/load` reports another model. Dromon requires a model
+  config option and checks the complete updated option list with the driver before
+  prompting. A refused selection, missing option or different response refuses the
+  turn. Tests cover new and resumed sessions, successful selection, refusal and a
+  response that still names the wrong model.
 - Grok refuses a reused tool call identifier, including a repeated permission request,
   so the same identifier cannot obtain multiple grants while counting once. Tests also
   cover raw input changes in updates, non-`other` discovery calls, and a non-marker

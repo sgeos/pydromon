@@ -212,14 +212,22 @@ and workflows live in `$GROK_HOME`.
    `x.ai/mcp/init_progress` whose `total` exceeds Dromon's servers refuses the turn
    too, as does a server list at any later point that names another server. A refusal
    counts the other servers and never names them.
-6. **Model and mode.** The response's `models.currentModelId`, or its `model` config
-   option, is handed to the driver. When the answer has `modes`, `currentModeId` must
-   be `default` or `ask`, and otherwise Dromon sends `session/set_mode` with `default`
-   if Grok offers it. Without `modes`, a `configOptions` entry of the category `mode`
-   must have one of those values. With neither, as from Grok 1.0.70, the turn rests on
-   the checks of step 2. **Changed on 2026-10-27.** Before Dromon's Grok home, such a
-   session was refused. A `current_mode_update` to another mode during the turn
-   cancels it.
+6. **Model and mode.** The model identifier comes from `driver.settings.model`, the
+   same name Dromon passes to Grok's `--model` option. It must equal the driver's model
+   name exactly. Dromon does not derive it from the engine table or accept Grok's
+   reported default as a fallback. Both `session/new` and `session/load` must report a
+   `configOptions` entry for `model`. If `acp.reported_model` does not equal the
+   driver's model, Dromon requests `session/set_config_option` with `configId` `model`
+   and `value` containing the driver's identifier. The response is the updated option
+   list, from which Dromon reads the model with `acp.reported_model` and runs the
+   driver's `init` check. A refusal, absent model option, or different model refuses
+   the turn before the prompt. This also applies when resuming a session with
+   `session/load`. When the answer has `modes`, `currentModeId` must be `default` or
+   `ask`, and otherwise Dromon sends `session/set_mode` with `default` if Grok offers
+   it. Without `modes`, a `configOptions` entry of the category `mode` must have one
+   of those values. With neither, as from Grok 1.0.70, the turn rests on the checks of
+   step 2. **Changed on 2026-10-27.** Before Dromon's Grok home, such a session was
+   refused. A `current_mode_update` to another mode during the turn cancels it.
 7. **Grok's notices.** An `x.ai/models/update` with a `currentModelId`, or an
    `x.ai/session_notification` of `model_changed`, that is not the driver's model
    refuses the turn. An `x.ai/settings/update` whose `permission_mode` is set and is
@@ -431,21 +439,27 @@ user's MCP servers and reports no permission mode.
    reads names a mode other than `default`, Dromon refuses before Grok starts, as the
    home section says.
 
-1. **MCP meta-tools.** Run a first live line turn that uses `search_tool` and then calls
+1. **Model selection.** On the first live turn, record the model in the `session/new`
+   response and confirm that a mismatch causes `session/set_config_option` to request
+   the exact identifier from the driver's model setting. Confirm that the complete
+   updated option list reports the requested model before Dromon sends the prompt.
+   Repeat with a resumed session to confirm that `session/load` follows the same rule.
+   A refused request or a response naming any other model must stop the turn.
+2. **MCP meta-tools.** Run a first live line turn that uses `search_tool` and then calls
    one Dromon tool, such as `send_message`, through `use_tool`. Record `toolName`,
    `kind`, `rawInput`, every update and the permission request. Confirm that discovery
    exposes only Dromon's server, and that the call's `rawInput` is the documented inline
    `tool_name` and `tool_input` object. Confirm that Dromon counts the underlying tool
    name toward its budget and gate. The ACP call shape has not been observed, so any
    difference is refused and must be reviewed before this check is loosened.
-2. **Kinds and updates.** Record the `kind` of each tool call a plain turn and a tool
+3. **Kinds and updates.** Record the `kind` of each tool call a plain turn and a tool
    turn carry, whether any arrives as `think`, and whether a later update repeats,
    omits, adds or changes `toolName`, `title` or `kind`. A `think` call, an added field
    and a changed field each refuse the turn.
-3. **Cancel.** Interrupt a turn and confirm that Grok answers its prompt with
+4. **Cancel.** Interrupt a turn and confirm that Grok answers its prompt with
    `stopReason` `cancelled` within `ABORT_SECONDS`, 60 seconds, after which Dromon
    stops Grok.
-4. **Compatibility switches.** **Inferences, review of read-only seats, second round,
+5. **Compatibility switches.** **Inferences, review of read-only seats, second round,
    finding 4.** Dromon sets each of these to `0`, which Grok's guide implies turns a
    scan off without giving the value.
 

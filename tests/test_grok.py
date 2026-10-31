@@ -183,6 +183,16 @@ def use_tool_input(target: str) -> dict[str, object]:
     return {"tool_name": target, "tool_input": dict[str, object]()}
 
 
+def model_option(value: str) -> dict[str, object]:
+    return {
+        "id": "model",
+        "category": "model",
+        "type": "select",
+        "currentValue": value,
+        "options": [{"value": value, "name": "Grok"}],
+    }
+
+
 def grok_notice(name: str, params: dict[str, Any]) -> dict[str, Any]:
     """One of Grok's own notices, with the ``_x.ai/`` prefix Grok 1.0.70 sent."""
     return {"jsonrpc": "2.0", "method": f"_x.ai/{name}", "params": params}
@@ -217,6 +227,10 @@ class FakeGrok:
         """Grok's own notices, sent before the session opens."""
         self.extra: dict[str, object] = {}
         """More fields of the session's answer."""
+        self.set_config_result: dict[str, object] = {
+            "configOptions": [model_option(GROK)]
+        }
+        self.set_config_error: str | None = None
         self.auth = auth
         self.model = model
         self.modes: object = (
@@ -292,7 +306,19 @@ class FakeGrok:
             if self.model is not None:
                 result["models"] = {"currentModelId": self.model}
             result.update(self.extra)
+            if self.model is not None and "configOptions" not in result:
+                result["configOptions"] = [model_option(str(self.model))]
             self.queue.append({**reply, "result": result})
+        elif method == "session/set_config_option":
+            if self.set_config_error is not None:
+                self.queue.append(
+                    {
+                        **reply,
+                        "error": {"code": -32000, "message": self.set_config_error},
+                    }
+                )
+            else:
+                self.queue.append({**reply, "result": self.set_config_result})
         elif method == "session/set_mode":
             self.queue.append({**reply, "result": {}})
         elif method == "session/prompt":
@@ -1354,8 +1380,10 @@ def test_the_next_turn_loads_the_session(project: tuple[Path, Path, Path]) -> No
     [
         (FakeGrok(auth="xai_api_key"), "authentication method 'xai_api_key'"),
         (FakeGrok(auth=None), "authentication method None"),
-        (FakeGrok(model="grok-4.5"), "refuses the engine model 'grok-4.5'"),
-        (FakeGrok(model=None), "refuses the engine model None"),
+        (
+            FakeGrok(model=None),
+            "did not report a configOptions model option",
+        ),
         (FakeGrok(modes={}), "permission mode None"),
         (
             FakeGrok(
@@ -1370,6 +1398,57 @@ def test_an_engine_that_cannot_be_confirmed_is_refused_before_the_prompt(
 ) -> None:
     with pytest.raises(EngineRefused, match=reason):
         run(line(server, project))
+    assert "session/prompt" not in server.methods()
+
+
+@pytest.mark.parametrize("session_id", [None, "s1"], ids=["new", "resumed"])
+def test_another_reported_model_is_pinned_to_the_driver_model(
+    project: tuple[Path, Path, Path], session_id: str | None
+) -> None:
+    server = FakeGrok(model="grok-4.6")
+    target = line(server, project, session_id=session_id)
+    report = run(target)
+    request = server.params("session/set_config_option")
+    assert request["sessionId"] == (session_id or "s1")
+    assert request["configId"] == "model"
+    assert request["value"] == {"value": target.driver.settings.model}
+    assert report.text == "done"
+    assert not server.methods().count("session/cancel")
+
+
+def test_grok_refusing_the_driver_model_refuses_the_turn(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok(model="grok-4.6")
+    server.set_config_error = "model is unavailable"
+    with pytest.raises(EngineRefused, match="Grok refused the driver's model"):
+        run(line(server, project))
+    assert "session/prompt" not in server.methods()
+
+
+def test_a_different_model_in_set_config_option_answer_is_refused(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok(model="grok-4.6")
+    server.set_config_result = {"configOptions": [model_option("grok-4.5")]}
+    with pytest.raises(
+        EngineRefused,
+        match="refuses the engine model 'grok-4.5'",
+    ):
+        run(line(server, project))
+    assert "session/prompt" not in server.methods()
+
+
+def test_models_without_a_config_option_cannot_be_pinned(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok(model="grok-4.6")
+    server.extra = {"configOptions": [EFFORT_OPTION]}
+    with pytest.raises(
+        EngineRefused, match="did not report a configOptions model option"
+    ):
+        run(line(server, project))
+    assert "session/set_config_option" not in server.methods()
     assert "session/prompt" not in server.methods()
 
 
@@ -2298,10 +2377,17 @@ def test_a_permission_mode_config_option_is_read_and_confirmed(
     project: tuple[Path, Path, Path],
 ) -> None:
     server = probed_grok()
-    server.extra["configOptions"] = [EFFORT_OPTION, mode_option("default")]
+    server.extra["configOptions"] = [
+        model_option(GROK),
+        EFFORT_OPTION,
+        mode_option("default"),
+    ]
     assert run(line(server, project)).text == "done"
     refused = probed_grok()
-    refused.extra["configOptions"] = [mode_option("bypassPermissions")]
+    refused.extra["configOptions"] = [
+        model_option(GROK),
+        mode_option("bypassPermissions"),
+    ]
     with pytest.raises(EngineRefused, match="permission mode 'bypassPermissions'"):
         run(line(refused, project))
     assert "session/prompt" not in refused.methods()
