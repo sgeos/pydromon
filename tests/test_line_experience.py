@@ -791,8 +791,8 @@ def test_write_scratch_refuses_large_or_disclosing_text_and_bad_arguments(
     (tmp_path / "terms").write_text("codename\n")
     world.scheduler.set_disclosure_terms(load_terms(tmp_path / "terms"))
     text, error = world.call("write_scratch", {"path": "n", "text": "the Codename"})
-    # Round 13 permits matching field names under the shared hourly limit.
-    assert (text, error) == (disclosure.field_refusal(("text",)), True)
+    # Round 4 F1 uses a generic refusal when both path and text are offered.
+    assert (text, error) == (disclosure.REFUSAL, True)
     assert not (world.root / "tmp" / "n").exists()
     text, error = world.call("write_scratch", {"path": 3, "text": "x"})
     assert error and "must be text" in text
@@ -996,7 +996,7 @@ def test_the_disclosure_check_covers_the_scratch_path(
     text, error = world.call(
         "write_scratch", {"path": "the-codename-notes.md", "text": "clean"}
     )
-    assert (text, error) == (disclosure.field_refusal(("path",)), True)
+    assert (text, error) == (disclosure.REFUSAL, True)
     assert not (world.root / "tmp").exists()
 
 
@@ -1220,7 +1220,7 @@ def test_a_refusal_for_disclosure_spends_a_check(
         "send_message": "body",
         "ask_operator": "question",
         "wake_after": "note",
-        "write_scratch": "text",
+        "write_scratch": None,
     }[name]
     assert error and text == (
         disclosure.REFUSAL

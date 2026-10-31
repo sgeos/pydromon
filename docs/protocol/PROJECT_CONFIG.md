@@ -341,11 +341,10 @@ stops the start, or refuses the reload and keeps the previous list.
   operator and is exempt. Agent names hold only lowercase letters, digits, `.`, `_` and
   `-`, so a term with a space or a capital letter matches only its folded form, and a
   term with a space matches no name.
-- **What a refusal says.** A tool refusal names the field of the call that contains a
-  listed term, such as `body` or `note`. Several matching fields are named together.
-  The shared hourly limit applies to each refused call. This intentionally gives
-  more location information per call under the operator decision of 2026-10-31.
-
+- **What a refusal says.** A tool refusal names at most one field, such as `body`
+  or `note`, only when the call offered text in that one field. A call offering
+  several fields receives a generic refusal even when only one matches. The round 4
+  review F1 rule prevents learning more than one bit from each counted refusal.
 - **Not checked.** Messages from operators, who hold authority, and the questions the
   daemon asks on a held line's behalf.
 - **Secrecy.** Terms are never logged, returned or stored. Errors about the file name
@@ -551,22 +550,27 @@ rather than merges lists, unlike Claude Code, so that a line's grant is explicit
 
 The operator may set `[daemon.disclosure_accepted]` to a mapping from project relative
 file paths to lists of lowercase Secure Hash Algorithm 256 digests. Each digest covers
-the exact UTF-8 line without its line ending. There are at most 256 paths and at most
+the exact UTF-8 line content without its line ending. A trailing carriage return
+is removed before hashing in both the gate and tool. There are at most 256 paths and at most
 256 digests per path. Absolute paths and parent traversal are refused.
 
 An acceptance applies only to that file during `check_disclosure` and the local gate
-scan. Moving the line within that file preserves acceptance. Editing the line or
+scan. Identical content anywhere in that file is exempt, including repeated lines.
+Moving the line within that file preserves acceptance. Editing the line or
 copying it to another file checks it again. Text checks and message fields receive no
 exemption. Existing private gate exceptions continue to apply for compatibility.
 
-The project file is an operator trust boundary. Lines must not be able to edit it.
-Entries contain paths and hashes, never listed terms or exact line text. An agent
-cannot turn a hash into a term without guessing its preimage. A known accepted line
-is already available to the reader of its file. Changing that line invalidates its
-hash, so the acceptance cannot be used as a template to test candidate substitutions.
-The hourly limit still bounds checks and disclosure refusals. Matching message
-field names are reported, but no file names, line numbers or
-line ranges are returned to a line. File and line locations were declined because
+The project file is an operator trust boundary. Lines are denied `.dromon`, so they
+cannot read the accepted hashes or test guesses against them offline. Someone who can
+read that configuration can test candidate short lines against a hash, so the hashes
+must not be treated as secret resistant to offline guessing. Entries contain paths
+and hashes, never listed terms or exact line text.
+
+A line able to edit an accepted file can try candidate content and observe whether
+the aggregate count drops. Each such check spends the existing hourly allowance.
+Acceptance remains scoped to content within the configured file under that limit.
+Refusals name a field only for calls offering one text field. No file names, line
+numbers or line ranges are returned to a line. File and line locations were declined because
 they would let a line narrow its own text to a listed term. Aggregate counts and
 the hourly limit remain diagnostic safeguards, not protection against a malicious
 agent. The gate reads the same project acceptance table.

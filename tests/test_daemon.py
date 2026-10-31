@@ -1157,3 +1157,29 @@ def test_bad_create_limits_leave_no_line(paths: ProjectPaths, limits: object) ->
     assert not request(paths, "create_line", args).ok
     with EventLog(paths.event_log) as log:
         assert "beta" not in log.state.lines
+
+
+def test_create_override_encoding_failure_leaves_no_line(
+    paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dromon.overrides import OverrideError, Value
+    from collections.abc import Mapping
+
+    def refuse_encoding(document: Mapping[str, Value]) -> str:
+        raise OverrideError("cannot encode the initial limits")
+
+    monkeypatch.setattr(daemon_module, "encode_override", refuse_encoding)
+    response = request(
+        paths,
+        "create_line",
+        {
+            "line_id": "beta",
+            "model": HAIKU,
+            "strategy": "api",
+            "limits": {"max_cost_usd": "30"},
+        },
+    )
+    assert not response.ok
+    assert "cannot encode" in (response.error_message or "")
+    with EventLog(paths.event_log) as log:
+        assert "beta" not in log.state.lines

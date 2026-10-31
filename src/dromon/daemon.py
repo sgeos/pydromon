@@ -155,6 +155,7 @@ from dromon.model import (
     EventRejected,
     InvalidField,
     LineAddress,
+    LineOverridden,
     Message,
     OperatorAddress,
     QuestionStatus,
@@ -1067,9 +1068,17 @@ class Daemon:
             apply_limits(self.scheduler.limits, limits_document)
         except ValueError as error:
             raise OverrideError(str(error)) from error
+        # Limits cannot change the engine or placement. Validate and encode the
+        # entire override before creation, so no later override validation can
+        # refuse a request whose line has already been recorded.
+        initial_override = (
+            LineOverridden(line_id, encode_override(limits_document))
+            if limits_document
+            else None
+        )
         self.scheduler.create_line(line_id, model, chosen, config, session)
-        for key, value in limits_document.items():
-            self.scheduler.override_line(line_id, key, value)
+        if initial_override is not None:
+            self.log.append(initial_override)
         return {"line_id": line_id}
 
     def _configure_line(self, args: dict[str, object]) -> dict[str, object]:

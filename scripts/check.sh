@@ -265,7 +265,7 @@ for hit in sys.stdin:
     if len(parts) != 3:
         continue
     path, number, text = parts
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(text.removesuffix("\r").encode("utf-8")).hexdigest()
     if digest not in accepted.get(path, []):
         print(hit, end="")
 ')" || fail "invalid project disclosure acceptance configuration"

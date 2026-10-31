@@ -192,7 +192,7 @@ def test_a_line_cannot_send_a_listed_term(
     text = cast(str, result["content"][0]["text"])
     assert result["is_error"] is True
     assert text == (
-        disclosure.field_refusal(("choices",))
+        disclosure.REFUSAL
         if field is None
         else f"the {field} field contains a term from the project's disclosure list"
     )
@@ -218,22 +218,18 @@ def test_clean_text_still_passes_every_tool(scheduler: Scheduler) -> None:
 def test_a_refusal_names_the_field_only_for_a_call_with_one(
     scheduler: Scheduler,
 ) -> None:
-    """Round 13 explicitly permits field locations within the hourly limit."""
+    """Round 4 F1 permits a field name only for one offered text field."""
     ask = scheduler.own_tools("alpha")[1]
     several = call(
         ask,
         {"question": f"{TERM} question", "choices": [f"choice {TERM.upper()}"]},
     )
     assert several["is_error"] is True
-    assert several["content"][0]["text"] == disclosure.field_refusal(
-        ("question", "choices")
-    )
+    assert several["content"][0]["text"] == disclosure.REFUSAL
     one_matching_of_two = call(
         ask, {"question": "which name?", "choices": [f"choice {TERM}"]}
     )
-    assert one_matching_of_two["content"][0]["text"] == disclosure.field_refusal(
-        ("choices",)
-    )
+    assert one_matching_of_two["content"][0]["text"] == disclosure.REFUSAL
     alone = call(ask, {"question": f"{TERM} question"})
     alone_text = cast(str, alone["content"][0]["text"])
     assert alone_text == (
@@ -246,8 +242,8 @@ def test_the_refusal_helper_names_one_field_of_one_offered() -> None:
     assert disclosure.refusal(("note",), 1) == (
         "the note field contains a term from the project's disclosure list"
     )
-    assert disclosure.refusal(("note",), 2) == disclosure.field_refusal(("note",))
-    assert disclosure.refusal(("a", "b"), 2) == disclosure.field_refusal(("a", "b"))
+    assert disclosure.refusal(("note",), 2) == disclosure.REFUSAL
+    assert disclosure.refusal(("a", "b"), 2) == disclosure.REFUSAL
     with pytest.raises(ValueError, match="at least one field"):
         disclosure.refusal((), 1)
 

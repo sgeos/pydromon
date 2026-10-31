@@ -42,3 +42,14 @@ def test_invalid_acceptance(path: str, hashes: str) -> None:
 
 def test_empty_acceptance_is_valid() -> None:
     assert parse("version = 1").disclosure_accepted == {}
+
+
+@pytest.mark.parametrize("ending", ["\n", "\r\n"])
+def test_hashes_normalize_line_endings_and_exempt_repeated_content(ending: str) -> None:
+    text = "a private token"
+    digest = sha256(text.encode("utf-8")).hexdigest()
+    assert disclosure.matching_lines(("private",), (text + ending) * 2, (digest,)) == 0
+    assert (
+        disclosure.matching_lines(("private",), text + " changed" + ending, (digest,))
+        == 1
+    )

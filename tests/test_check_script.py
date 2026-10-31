@@ -84,6 +84,15 @@ def test_disclosure_exceptions_match_the_exact_path_number_and_line(
         encoding="utf-8",
     )
     assert check_project(root).returncode == 0
+    # Batch files permit CRLF under repository hygiene. The digest excludes CR.
+    batch = root / "src/example.bat"
+    batch.write_bytes((changed_text + "\r\n").encode())
+    subprocess.run(  # noqa: S603
+        [git, "add", "src/example.bat"], cwd=root, check=True
+    )
+    with project_file.open("a", encoding="utf-8") as handle:
+        handle.write(f'"src/example.bat" = ["{digest}"]\n')
+    assert check_project(root).returncode == 0
     example.write_text(changed_text + " again\n", encoding="utf-8")
     assert check_project(root).returncode != 0
     project_file.write_text(

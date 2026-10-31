@@ -46,11 +46,17 @@ def field_refusal(fields: Iterable[str]) -> str:
 
 
 def refusal(matched: Iterable[str], offered: int) -> str:
-    """Name matching fields under the shared hourly disclosure limit."""
+    """Name a field only when the call offered text in that one field.
+
+    Round 4 review F1 bounds each counted refusal to one bit. Calls offering
+    several fields receive the generic refusal even if only one field matches.
+    """
     names = tuple(dict.fromkeys(matched))
     if not names:
         raise ValueError("a disclosure refusal must name at least one field")
-    return field_refusal(names)
+    if offered == 1 and len(names) == 1:
+        return field_refusal(names)
+    return REFUSAL
 
 
 class DisclosureError(ValueError):
@@ -140,6 +146,6 @@ def matching_lines(
     return sum(
         1
         for line in text.splitlines()
-        if sha256(line.encode("utf-8")).hexdigest() not in exemptions
+        if sha256(line.removesuffix("\r").encode("utf-8")).hexdigest() not in exemptions
         and any(term in line.casefold() for term in listed)
     )

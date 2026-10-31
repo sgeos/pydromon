@@ -739,9 +739,9 @@ to read the result.
   identifier its note will carry, as [`CLIENT.md`](CLIENT.md) specifies.
 
 **Disclosure guard.** When the project names a disclosure list, a refused tool call
-names the field that contains a listed term, such as `body` or `note`, without naming
-the term or its position. If several fields contain a listed term, all such field names
-are reported. The refusal records a disclosure check and counts against the same hourly limit as
+names a field such as `body` or `note` only when the call offers text in that one
+field. Calls offering several text fields receive a generic refusal, even if only
+one matches. Neither answer names the term or its position. The refusal records a disclosure check and counts against the same hourly limit as
 `check_disclosure`, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. A wake note
 is checked again when it fires.
 
