@@ -83,8 +83,8 @@ operator's approval, reported the subscription credential and the model
 **Claude Sonnet 5.5, verified on 2026-10-31.** Added at the operator's direction. Its
 settings copy the Opus 5.5 drivers, and a test derives them from those. One `dromon
 probe --model claude-sonnet-5-5` turn reported the subscription credential and the
-model `claude-sonnet-5-5` from Claude Code 2.1.310, and replied `ready`. Fact, that
-Claude Code also names a `[1m]` variant of the model. The context window of 1,000,000
+model `claude-sonnet-5-5` from Claude Code 2.1.310, and replied `ready`. That Claude
+Code also names a `[1m]` variant of the model. The context window of 1,000,000
 tokens is copied from the Opus drivers and is not verified.
 
 GPT-6-Luna's settings follow Codex's model catalogue as fetched on 2026-10-25, which
