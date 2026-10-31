@@ -202,6 +202,7 @@ from dromon.processes import (
     marked_processes,
     stop_line_process,
 )
+from dromon.projectconfig import ProjectConfig
 from dromon.workdir import (
     git_common_directory,
     git_write_guards,
@@ -219,8 +220,19 @@ from dromon.roles import (
     Stamp,
     budget_spent,
     check_handoff_request,
+    LinePlace,
+    RoleChange,
+    RolePlace,
+    RoleWanted,
+    file_differences,
+    placement_refusal,
+    shared_worktree,
+    shared_worktree_refusal,
+    plan_file_roles,
     plan_give,
     plan_note,
+    plan_role_retire,
+    plan_role_set,
     plan_relinquish,
     plan_take,
     recovery_ground,
@@ -241,6 +253,7 @@ from dromon.lineconfig import (
     ConfigError,
     LineConfig,
     WorkdirAccess,
+    can_write_workdir,
     check_instructions,
     decode_config,
     encode_config,
@@ -257,6 +270,7 @@ from dromon.model import (
     Sender,
     BudgetSource,
     BudgetStated,
+    RoleHolder,
     RoleNoted,
     RoleNoteKind,
     OwnershipChanged,
@@ -1666,6 +1680,9 @@ class Scheduler:
         """The engines that can make a role's worktree read only to a seat, as
         ``roles.CONFINING_ENGINES`` says. A seat on any other engine waits while
         another seat owns its role."""
+        self._project_file: ProjectConfig | None = None
+        """The project file the daemon last applied, for how a role an operator
+        holds differs from its table, or ``None`` before one is set."""
         self._retiring: set[asyncio.Task[None]] = set()
         """Kept engine connections being closed after their engine was discarded."""
         self._repeat_of: dict[str, str] = {}
@@ -1998,6 +2015,8 @@ class Scheduler:
         strategy: Strategy,
         config: LineConfig = DEFAULT_CONFIG,
         engine_session: str | None = None,
+        *,
+        placement_checked: bool = False,
     ) -> None:
         """Create a line after checking that a driver exists for it and that Dromon
         has an adapter for the driver's engine.
@@ -2005,6 +2024,11 @@ class Scheduler:
         ``engine_session`` adopts an existing engine session, recorded right after
         the line is created, so the line's first turn continues it. It must have been
         started in the line's working directory, where Claude Code keeps it.
+
+        **Round 10 review, F4.** A line that could write is refused in the worktree of
+        a role another seat owns, as ``roles.placement_refusal`` gives, unless
+        ``placement_checked`` says the caller checked the placement against the state
+        it is about to make, as a start or a reload does for the project file.
         """
         driver = Driver.for_model(model, strategy)
         if model not in MODELS:
@@ -2013,6 +2037,8 @@ class Scheduler:
                 " has no adapter yet"
             )
         _check_engine_supports(driver, config)
+        if not placement_checked:
+            self._check_placement(line_id, config, model)
         # Built first, so a malformed session refuses the line before it exists.
         adopted = (
             None if engine_session is None else LineSession(line_id, engine_session)
@@ -2023,7 +2049,9 @@ class Scheduler:
         if config != DEFAULT_CONFIG:
             self._configure(line_id, config, creating=True)
 
-    def configure_line(self, line_id: str, config: LineConfig) -> None:
+    def configure_line(
+        self, line_id: str, config: LineConfig, *, placement_checked: bool = False
+    ) -> None:
         """Replace a line's tool configuration. It applies from the line's next turn.
 
         The engine is rebuilt with the new configuration, and resumes the same engine
@@ -2031,16 +2059,34 @@ class Scheduler:
         is the exception. Claude Code keeps a session under the directory it ran in,
         so the line's next turn starts a new session, recorded as
         ``line_session_cleared``.
-        """
-        self._configure(line_id, config, creating=False)
 
-    def _configure(self, line_id: str, config: LineConfig, *, creating: bool) -> None:
+        **Round 10 review, F2 and F4.** A configuration that would move a seat out of
+        its role's worktree, or let a line that is not a seat write the worktree of a
+        role another seat owns, is refused, with the line's overrides applied over
+        it, unless ``placement_checked`` says the caller checked it, as
+        ``create_line`` says. Raises ``EventRejected``, recording nothing.
+        """
+        self._configure(
+            line_id, config, creating=False, placement_checked=placement_checked
+        )
+
+    def _configure(
+        self,
+        line_id: str,
+        config: LineConfig,
+        *,
+        creating: bool,
+        placement_checked: bool = True,
+    ) -> None:
         line = self._log.state.lines.get(line_id)
         previous: str | None = None
         fresh_before = False
         if line is not None:
             driver = Driver.for_model(line.engine, Strategy(line.strategy))
             _check_engine_supports(driver, config)
+            if not placement_checked:
+                overridden = self._overridden(line_id, config)
+                self._check_placement(line_id, overridden, self.model_of(line_id))
             if line.config is not None:
                 previous = decode_config(line.config).workdir
             fresh_before = self.effective_config(line_id).fresh_session_each_turn
@@ -3085,6 +3131,12 @@ class Scheduler:
         return found
 
     # Leases.
+
+    def set_project_file(self, config: ProjectConfig) -> None:
+        """Keep the project file the daemon applied at start or reload, which
+        ``role_view`` compares a role an operator holds against. Round 10 review,
+        F6."""
+        self._project_file = config
 
     def set_leases(self, names: Sequence[str], ttl_seconds: int) -> None:
         """Declare the project's leases, as the project file does at start and reload.
@@ -4523,11 +4575,25 @@ class Scheduler:
         as ``rooted_instructions`` says. The effective configuration keeps the paths
         as written, so a client shows and stores them unchanged.
 
-        **Technical debt.** Once ``feat/read-only-seats`` merges, a seat's engine is
-        built with its ``workdir_access`` set from ``roles.seat_access``, and the
-        engines that apply it join ``roles.CONFINING_ENGINES``. Until then a seat that
-        does not own its role is not woken beside an owner at all."""
+        A seat whose access ``roles.seat_access`` gives as read, which is every seat
+        but its role's owner, is built with ``workdir_access`` read on an engine of
+        ``roles.CONFINING_ENGINES``. Its own configuration may make it read only
+        already, and is never widened. A seat on any other engine waits while another
+        seat owns its role, as ``waits_unconfined`` says.
+
+        **Round 10 review, F7, confirmed.** ``CONFINING_ENGINES`` was derived from the
+        capability table in 2ffa0d6, but this step was never added, so a seat that
+        did not own its role ran on Claude Code or Codex with its own access, write
+        by default, beside the owner. **Failure mode.** A seat whose configuration
+        Claude Code cannot make read only, such as one with project settings or an
+        allow-all policy, now fails its turn as the engine is built, and is held,
+        rather than run as a writer."""
         config = self.effective_config(line_id)
+        if (
+            seat_access(self._log.state, line_id) == "read"
+            and ENGINE_OF.get(self.model_of(line_id)) in self._confining
+        ):
+            config = replace(config, workdir_access=WorkdirAccess.READ)
         return config if self._root is None else rooted_instructions(config, self._root)
 
     def line_instructions(self, line_id: str) -> str:
@@ -4789,6 +4855,12 @@ class Scheduler:
         state = self._log.state
         role = state.roles.get(role_id)
         if role is None:
+            retired = state.retired_roles.get(role_id)
+            if retired is not None:
+                raise EventRejected(
+                    f"role {role_id} was retired by {retired.by} at"
+                    f" {retired.retired_at}"
+                )
             raise EventRejected(f"no role {role_id}")
         seats: list[dict[str, object]] = []
         usable = self.usable_seats(role_id)
@@ -4822,9 +4894,28 @@ class Scheduler:
             entry for entry in state.role_entries.values() if entry.role_id == role_id
         ][-ROLE_STATUS_ENTRIES:]
         change = role.changed
+        held = state.role_holders.get(role_id)
+        # Round 10 review, F6. How the project file's table differs from a role an
+        # operator holds, which a start prints and a reload answers with, is shown
+        # here too, since neither reaches an operator who did not run them.
+        project = self._project_file
+        definition = None if project is None else project.roles.get(role_id)
+        differences = (
+            ()
+            if project is None
+            or definition is None
+            or state.holder_of(role_id) is not RoleHolder.OPERATOR
+            else file_differences(state, role_id, definition, project)
+        )
         return {
             "role_id": role_id,
             "workdir": role.workdir,
+            "held_by": state.holder_of(role_id).value,
+            "held": None if held is None else {"by": str(held.by), "at": held.held_at},
+            "in_project_file": definition is not None,
+            "file_differences": list(differences),
+            "beside_owner": self._beside_owner_of(role_id),
+            "order": list(role.seats),
             "handoff_seconds": role.handoff_seconds,
             "failover": role.failover.value,
             "handoff_below_percent": role.handoff_below_percent,
@@ -5070,7 +5161,7 @@ class Scheduler:
         self, line_id: str, note: str, to: str | None, back_to: str | None
     ) -> Plan:
         try:
-            return plan_relinquish(
+            plan = plan_relinquish(
                 self._log.state,
                 line_id,
                 note,
@@ -5081,6 +5172,14 @@ class Scheduler:
             )
         except RoleConflict as error:
             raise LineToolRefused(str(error)) from error
+        refusal = (
+            None
+            if plan.owner is None
+            else self._owner_place_refusal(plan.role_id, plan.owner)
+        )
+        if refusal is not None:
+            raise LineToolRefused(refusal)
+        return plan
 
     def _settle_relinquish(self, line_id: str) -> None:
         """Make the handoff ``line_id`` asked for inside the turn that just ended.
@@ -5120,6 +5219,9 @@ class Scheduler:
             raise LineToolRefused(f"line {line_id} is a seat of no role")
         role = state.roles[seat.role_id]
         owner = role.owner
+        refusal = self._owner_place_refusal(seat.role_id, line_id)
+        if refusal is not None:
+            raise LineToolRefused(refusal)
         ground = recovery_ground(
             role,
             owner_running=owner is not None and owner in self._running,
@@ -5141,8 +5243,9 @@ class Scheduler:
 
     def usable_seats(self, role_id: str) -> frozenset[str]:
         """The seats of ``role_id`` a failover or a planned handoff may pass it to,
-        which may own it, are not stopped, hibernated, held or failed, and whose
-        provider's stated budget does not show it spent."""
+        which may own it, are not stopped, hibernated, held or failed, whose
+        provider's stated budget does not show it spent, and which run in the role's
+        worktree, as an owner must, round 10 review, F2."""
         state = self._log.state
         now = self._wall_clock()
         usable: set[str] = set()
@@ -5156,6 +5259,7 @@ class Scheduler:
                 and line.held_by is None
                 and line_id not in self._failed
                 and not budget_spent(self._budget_of(line_id), now)
+                and self._owner_place_refusal(role_id, line_id) is None
             ):
                 usable.add(line_id)
         return frozenset(usable)
@@ -5391,6 +5495,11 @@ class Scheduler:
         checklist. Raises ``EventRejected``, recording nothing."""
         role = self._log.state.roles.get(role_id)
         owner = None if role is None else role.owner
+        seated = self._log.state.seats.get(seat or "")
+        if seat is not None and seated is not None and seated.role_id == role_id:
+            refusal = self._owner_place_refusal(role_id, seat)
+            if refusal is not None:
+                raise EventRejected(refusal)
         try:
             plan = plan_give(
                 self._log.state,
@@ -5429,6 +5538,9 @@ class Scheduler:
             owner = check_handoff_request(self._log.state, role_id, to)
         except RoleConflict as error:
             raise EventRejected(str(error)) from error
+        refusal = self._owner_place_refusal(role_id, to)
+        if refusal is not None:
+            raise EventRejected(refusal)
         self.check_priority(operator, LineAddress(owner))
         self.ensure_operator(operator.operator_id)
         body = (
@@ -5438,6 +5550,337 @@ class Scheduler:
             " now, reply to say why."
         )
         return owner, self.send(operator, LineAddress(owner), body, priority=True)
+
+    # The operator's role commands, round 10 of ``docs/architecture/ROLES.md``.
+
+    def _role_worktree(self, workdir: str) -> Path:
+        """``workdir`` resolved against the project root, or ``EventRejected``."""
+        if self._root is None:
+            raise EventRejected("this daemon does not know its project root")
+        try:
+            return resolve_workdir(workdir, self._root, self._protected)
+        except ConfigError as error:
+            raise EventRejected(str(error)) from error
+
+    def _runs_in(self, line_id: str, worktree: Path) -> bool:
+        """Whether ``line_id``'s effective working directory is ``worktree``."""
+        return self._role_worktree(self._line_workdir(line_id)) == worktree
+
+    def _line_workdir(self, line_id: str) -> str:
+        return self.effective_config(line_id).workdir or "."
+
+    # The one-writer invariant, round 10 review. Every path that changes where a line
+    # runs, whether it can write, or whether it is a seat checks the same rule, which
+    # ``roles.placement_refusal`` states, and a line that breaks it all the same, as
+    # one a log from before the rule left, waits rather than runs.
+
+    def _overridden(self, line_id: str, config: LineConfig) -> LineConfig:
+        """``config`` with ``line_id``'s overrides applied, as ``effective_config``
+        gives once ``config`` is its baseline."""
+        return self._overridden_by(config, self.line_overrides(line_id))
+
+    @staticmethod
+    def _overridden_by(
+        config: LineConfig, overrides: Mapping[str, Value]
+    ) -> LineConfig:
+        """``config`` with ``overrides`` applied, or ``config`` where they no longer
+        apply, as ``effective_config`` skips them."""
+        try:
+            return apply_config(config, dict(overrides))
+        except ConfigError:
+            return config
+
+    def _resolved(self, workdir: str | None) -> Path | None:
+        """``workdir`` resolved against the project root, or ``None`` where it
+        cannot be, as for a directory that is gone, in which no engine is built."""
+        if self._root is None:
+            return None
+        try:
+            return resolve_workdir(workdir, self._root, self._protected)
+        except ConfigError:
+            return None
+
+    def role_places(self, state: State | None = None) -> dict[str, RolePlace]:
+        """Each role of ``state``, or of the log, whose worktree resolves, with its
+        owner."""
+        state = self._log.state if state is None else state
+        places: dict[str, RolePlace] = {}
+        for role_id, role in sorted(state.roles.items()):
+            worktree = self._resolved(role.workdir)
+            if worktree is not None:
+                places[role_id] = RolePlace(role.workdir, worktree, role.owner)
+        return places
+
+    def line_place(
+        self,
+        config: LineConfig,
+        model: str,
+        seat_of: str | None,
+        state: State | None = None,
+        line_id: str | None = None,
+    ) -> LinePlace | None:
+        """Where a line with ``config`` on ``model`` would run, or ``None`` where its
+        directory does not resolve. An unknown model counts as one that writes. A
+        seat of ``seat_of`` that ``line_id`` does not own in ``state``, or the log,
+        does not write on an engine that confines it, as ``engine_config`` builds
+        it."""
+        directory = self._resolved(config.workdir)
+        if directory is None:
+            return None
+        state = self._log.state if state is None else state
+        engine = ENGINE_OF.get(model)
+        role = None if seat_of is None else state.roles.get(seat_of)
+        confined = (
+            role is not None and role.owner != line_id and engine in self._confining
+        )
+        writes = not confined and can_write_workdir(config, engine)
+        return LinePlace(config.workdir or ".", directory, writes, seat_of)
+
+    def _owner_place_refusal(self, role_id: str, line_id: str) -> str | None:
+        """Why ``line_id`` may not gain ``role_id`` where it runs now, or ``None``.
+        **Round 10 review, F2.** An owner runs in its role's worktree, so a seat
+        that runs elsewhere moves first."""
+        worktree = self._resolved(self._log.state.roles[role_id].workdir)
+        directory = self._resolved(self.effective_config(line_id).workdir)
+        if worktree is None or directory is None or worktree == directory:
+            return None
+        return (
+            f"line {line_id} runs in {self._line_workdir(line_id)}, not in role"
+            f" {role_id}'s worktree {self._log.state.roles[role_id].workdir}, so it"
+            f" cannot own the role. Move it with dromon configure {line_id} first"
+        )
+
+    def _check_placement(self, line_id: str, config: LineConfig, model: str) -> None:
+        """Raise ``EventRejected`` if ``line_id``, a seat of the role it is a seat of
+        now if any, may not run with ``config`` on ``model``, as
+        ``roles.placement_refusal`` decides."""
+        seat = self._log.state.seats.get(line_id)
+        place = self.line_place(
+            config, model, None if seat is None else seat.role_id, line_id=line_id
+        )
+        if place is None:
+            return
+        refusal = placement_refusal(line_id, place, self.role_places())
+        if refusal is not None:
+            raise EventRejected(refusal)
+
+    def beside_owner(self, line_id: str) -> str | None:
+        """The role whose worktree ``line_id`` could write while another seat owns
+        it and it is not a seat of the role, or ``None``. Such a line does not start
+        a turn, and a new owner's first turn waits for one in flight. **Default
+        deny.** It arises only from a log made before the rule, or from a role that
+        gained an owner while such a line ran in its worktree, since every command
+        that would place one is refused. **Cost.** It resolves the line's directory
+        and each owned role's worktree on each call, which the tick makes for each
+        line, bounded by the roles."""
+        state = self._log.state
+        if line_id in state.seats or not any(
+            role.owner is not None for role in state.roles.values()
+        ):
+            return None
+        place = self.line_place(
+            self.effective_config(line_id), self.model_of(line_id), None
+        )
+        if place is None or not place.writes:
+            return None
+        for role_id, role in self.role_places().items():
+            if role.owner is not None and role.worktree == place.directory:
+                return role_id
+        return None
+
+    def check_project_file(self, config: ProjectConfig) -> None:
+        """Raise ``EventRejected`` if applying ``config`` would leave two roles on one
+        worktree, a seat outside its role's worktree, or a line that is not a seat and
+        could write the worktree of a role another seat owns, so that a start or a
+        reload refuses the file whole, as ``roles.placement_refusal`` and
+        ``roles.shared_worktree`` give. **Round 10 review, F2, F3 and F4.**
+
+        The check reads the state the file would make. Its roles are planned on a
+        copy of the log's state, as ``plan_file_roles`` gives, and each line, the
+        file's and those only in the log, is read with the file's configuration
+        where it gives one and the line's overrides over it. A line the log made
+        before the rule, and that breaks it, refuses the file too, which names it.
+        Raises ``RoleConflict`` where the file's roles cannot be planned at all."""
+        state = self._log.state
+        plan = plan_file_roles(state, config, self.default_operator, self.wall_due())
+        trial = state.copy()
+        for line_id, definition in sorted(config.lines.items()):
+            if line_id not in trial.lines:
+                trial.apply(
+                    LineCreated(line_id, definition.model, definition.strategy.value)
+                )
+        for event in plan.events:
+            trial.apply(event)
+        places = self.role_places(trial)
+        pair = shared_worktree({role_id: p.worktree for role_id, p in places.items()})
+        if pair is not None:
+            raise EventRejected(shared_worktree_refusal(*pair, places[pair[1]].workdir))
+        for line_id in sorted(trial.lines):
+            definition = config.lines.get(line_id)
+            if line_id in state.lines:
+                baseline = (
+                    self.baseline_config(line_id)
+                    if definition is None
+                    else definition.config
+                )
+                effective = self._overridden(line_id, baseline)
+                model = self.model_of(line_id)
+            elif definition is not None:
+                effective, model = definition.config, definition.model
+            else:
+                continue
+            seat = trial.seats.get(line_id)
+            place = self.line_place(
+                effective,
+                model,
+                None if seat is None else seat.role_id,
+                state=trial,
+                line_id=line_id,
+            )
+            refusal = (
+                None if place is None else placement_refusal(line_id, place, places)
+            )
+            if refusal is not None:
+                raise EventRejected(refusal)
+
+    def _beside_owner_of(self, role_id: str) -> list[str]:
+        """The lines that wait because they could write ``role_id``'s worktree while
+        another seat owns it and are not seats of it, by identifier."""
+        if self._log.state.roles[role_id].owner is None:
+            return []
+        return [
+            line_id
+            for line_id in sorted(self._log.state.lines)
+            if self.beside_owner(line_id) == role_id
+        ]
+
+    def _unbind_refusals(self, role_id: str) -> dict[str, str]:
+        """Why each seat of ``role_id`` may not be unbound now.
+
+        **Round 10 review, F1 and F7.** A seat with a turn in flight is never unbound,
+        hibernated or not, since the turn goes on with the tools and access it began
+        with, and its role's tools and its seat's confinement would no longer
+        describe it. A seat other than the owner of an owned role, unbound, would be
+        an ordinary line in the owner's worktree, so it is refused while it could
+        write there, as ``roles.placement_refusal`` decides, whether or not it is
+        hibernated or stopped, since either can be undone. **Default deny.**"""
+        state = self._log.state
+        role = state.roles[role_id]
+        places = self.role_places()
+        refused: dict[str, str] = {}
+        for line_id in seat_order(state, role_id):
+            if line_id == role.owner:
+                continue
+            if line_id in self._running:
+                refused[line_id] = (
+                    f"line {line_id} has a turn in flight, so its seat of role"
+                    f" {role_id} is not removed. Wait for the turn to end, or stop it"
+                    f" with dromon interrupt {line_id}, and try again"
+                )
+                continue
+            if role.owner is None:
+                continue
+            place = self.line_place(
+                self.effective_config(line_id), self.model_of(line_id), None
+            )
+            refusal = (
+                None if place is None else placement_refusal(line_id, place, places)
+            )
+            if refusal is not None:
+                refused[line_id] = (
+                    f"{refusal}. Unbound, it would be such a line, so its seat is not"
+                    f" removed until it cannot write there, or role {role_id} is"
+                    " vacated"
+                )
+        return refused
+
+    def set_role(
+        self,
+        operator: OperatorAddress,
+        role_id: str,
+        wanted: RoleWanted,
+        *,
+        create: bool,
+    ) -> RoleChange:
+        """``operator`` creates ``role_id`` with ``wanted``, or changes it, as
+        ``roles.plan_role_set`` decides. The engines of the lines made seats and of
+        the seats unbound are dropped, since the role's tools and access are fixed for
+        an engine session's life. Raises ``EventRejected``, recording nothing.
+
+        **Round 10 review, F3.** A worktree that is another role's, by real path, is
+        refused, so two owners never write one directory."""
+        worktree = self._role_worktree(wanted.workdir)
+        for other, place in self.role_places().items():
+            if other != role_id and place.worktree == worktree:
+                raise EventRejected(
+                    shared_worktree_refusal(other, role_id, wanted.workdir)
+                )
+        outside = {
+            line_id: self._line_workdir(line_id)
+            for line_id, _ in wanted.seats
+            if line_id in self._log.state.lines and not self._runs_in(line_id, worktree)
+        }
+        refusals = (
+            {}
+            if create or role_id not in self._log.state.roles
+            else self._unbind_refusals(role_id)
+        )
+        try:
+            change = plan_role_set(
+                self._log.state,
+                role_id,
+                wanted,
+                operator,
+                format_due(self._wall_clock()),
+                create=create,
+                outside=outside,
+                unbind_refused=refusals,
+            )
+        except RoleConflict as error:
+            raise EventRejected(str(error)) from error
+        self._apply_role_change(change, "changed")
+        return change
+
+    def retire_role(self, operator: OperatorAddress, role_id: str) -> RoleChange:
+        """``operator`` retires ``role_id``, as ``roles.plan_role_retire`` decides.
+        Its seats stay lines, with their mail, leases and state, and their engines
+        are dropped, so their next turns are built without the role's tools. Raises
+        ``EventRejected``, recording nothing."""
+        refusals = (
+            self._unbind_refusals(role_id) if role_id in self._log.state.roles else {}
+        )
+        try:
+            change = plan_role_retire(
+                self._log.state,
+                role_id,
+                operator,
+                format_due(self._wall_clock()),
+                unbind_refused=refusals,
+            )
+        except RoleConflict as error:
+            raise EventRejected(str(error)) from error
+        self._apply_role_change(change, "retired")
+        return change
+
+    def _apply_role_change(self, change: RoleChange, verb: str) -> None:
+        for event in change.events:
+            self._log.append(event)
+        for line_id in (*change.bound, *change.unbound):
+            self._drop_engine(line_id)
+            joined = "made a seat of" if line_id in change.bound else "unbound from"
+            self.activity.record(
+                line_id,
+                ActivityKind.NOTICE,
+                f"an operator {joined} role {change.role_id}, which was {verb}",
+            )
+        self._work.set()
+
+    def retired_roles_view(self) -> list[dict[str, object]]:
+        """Every retired role, by identifier, with who retired it and when."""
+        return [
+            {"role_id": role_id, "by": str(event.by), "retired_at": event.retired_at}
+            for role_id, event in sorted(self._log.state.retired_roles.items())
+        ]
 
     def state_budget(
         self,
@@ -5492,7 +5935,11 @@ class Scheduler:
         """Whether ``line_id`` owns its role while a former writer of it has not
         finished, which is another seat whose turn in flight started as the owner,
         or whose kept connection is still closing. **Never two writers**, as
-        ``ROLES.md`` requires, so the new owner's first turn waits for both."""
+        ``ROLES.md`` requires, so the new owner's first turn waits for both.
+
+        **Round 10 review, F4.** It waits as well for a turn in flight of a line that
+        is not a seat and could write the role's worktree, which ``beside_owner``
+        names once the role has an owner."""
         state = self._log.state
         seat = state.seats.get(line_id)
         if seat is None or state.roles[seat.role_id].owner != line_id:
@@ -5505,7 +5952,11 @@ class Scheduler:
             closing = self._closing_writer.get(other)
             if closing is not None and not closing.done():
                 return True
-        return False
+        return any(
+            self.beside_owner(other) == seat.role_id
+            for other in self._running
+            if other not in state.seats
+        )
 
     def _role_notice(self, line_id: str) -> str | None:
         """What ``line_id``'s turn is told first of the latest change of its role's
@@ -6554,6 +7005,8 @@ class Scheduler:
             )
         config = apply_config(self.baseline_config(line_id), document)
         _check_engine_supports(Driver.for_model(model, Strategy(line.strategy)), config)
+        # Round 10 review, F4. A model or a tool may make the line a writer.
+        self._check_placement(line_id, config, model)
         if self._root is not None and key == "instructions":
             check_instructions(config.instructions, self._root)
         apply_limits(self._line_limits.get(line_id, self.limits), document)
@@ -6620,6 +7073,8 @@ class Scheduler:
         baseline = self.baseline_config(line_id)
         _check_engine_supports(driver, baseline)
         _check_engine_supports(driver, apply_config(baseline, overrides))
+        # Round 10 review, F4. Another engine may let the line write.
+        self._check_placement(line_id, self._overridden_by(baseline, overrides), model)
         if had_model:
             self._log.append(
                 LineOverridden(line_id, encode_override_document(overrides))
@@ -6670,6 +7125,7 @@ class Scheduler:
             and self._restart is None
             and not self._waits_for_writer(line_id)
             and not self.waits_unconfined(line_id)
+            and self.beside_owner(line_id) is None
         )
 
     def waits_unconfined(self, line_id: str) -> bool:
