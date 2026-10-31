@@ -27,6 +27,41 @@ loop and the answers Dromon gives, lives in `dromon.acp`, which the Antigravity 
 of [`ANTIGRAVITY.md`](ANTIGRAVITY.md) shares. Grok's sandbox profile, sign-in check and
 tool policy stay in `dromon.grok`.
 
+## Refusal explanations
+
+The Agent Client Protocol version 1 `RequestPermissionResponse` selects an offered
+option identifier or reports cancellation. It has no standard field for a reason.
+The local T3 Code schema in `packages/effect-acp/src/_generated/schema-v1.gen.ts`
+confirms this shape. Its metadata is an extension point whose interpretation cannot
+be assumed. A JSON Remote Procedure Call error is not a documented way to deliver a
+tool refusal to the model. Dromon therefore sends neither invented reason fields nor
+an extra prompt while a turn is active.
+
+Ordinary denials include tools absent from the line configuration, malformed
+`use_tool` inputs and image requests that fail the configured image policy. They are
+rejected once when the runtime asks before execution and offers a rejection option.
+The runtime controls what the model learns from that selection. Whether Grok shows
+a useful denial message and continues is not verified live. Dromon's own tools return
+explanatory Model Context Protocol errors for invalid arguments, disclosure refusals
+and other call failures without ending the turn. Disclosure errors never name a term.
+
+Identity changes, reused identifiers, execution without approval, execution after
+rejection, missing permission options, model or permission mode drift, undeclared
+servers, unsafe protocol messages, deadlines and driver budgets keep their turn stop.
+When a refusal raises an engine error, or a driver interruption reports its cause,
+Dromon records a bounded harness note for the next prompt. This note survives a
+restart and is checked against the disclosure list both when recorded and when
+shown. A protected cause is replaced by a generic disclosure explanation. The note
+does not wake the line or release a hold. A later reported turn retires it, while an
+unreported turn leaves it owed. Engine evidence in the cause remains untrusted data.
+The original refusal or driver cause survives a connection failure or protocol error
+during cancellation. Priority mail and restart interruptions retain their existing
+notices.
+
+A disclosure refusal while recording or rechecking a cause spends the existing
+hourly disclosure budget. Once that budget is held, subsequent causes use the same
+generic notice without revealing whether each candidate matched.
+
 ## Evidence
 
 ## Provider budgets and quota errors
@@ -291,10 +326,15 @@ and workflows live in `$GROK_HOME`.
    announcement, one permission request and subsequent updates for that identifier is
    accepted and counted once. A permission request that arrives before its announcement
    is also accepted and counted once. A repeated announcement or another permission
-   grant for an identifier already granted in the turn is refused.
+   request for an identifier already answered in the turn is refused.
 9. **Permission requests** are answered with an `allow_once` option for a permitted call
-   and a rejection option otherwise. A tool call the line was not given, a refused
-   permission request, or the driver's tool budget, sends `session/cancel`, and every
+   and a rejection option otherwise. An ordinary policy denial leaves the turn
+   running. An explicitly `pending` unauthorized call waits for its permission
+   request. A rejected call may report `pending` or `failed`. A report that it started,
+   completed or has no status stops the turn. An unauthorized call with no explicit
+   pending status, an identity change, a reused identifier, a permission request for
+   a call no longer pending, a missing permission option or the driver's tool budget
+   sends `session/cancel`, and every
    permission request after it is answered as cancelled. If the runtime offers no
    option of the required kind, Dromon answers as cancelled, cancels and refuses the
    turn with bounded evidence naming the tool, its intended decision and the offered

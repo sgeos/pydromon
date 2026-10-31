@@ -39,7 +39,8 @@ home's mode, refuses a turn when a Claude Code settings file Grok reads names an
 refuses a session that reports a mode other than the asking one, refuses one that
 loads any MCP server but Dromon's, answers
 every permission request from the line's configuration, and
-interrupts and refuses a turn in which Grok uses a tool the line was not given. Each
+rejects ordinary permission requests for tools the line was not given without
+ending the turn. An unauthorized call reported as running still stops the turn. Each
 tool call is judged when first seen, and a later update or request that changes its
 name, title or kind refuses the turn. Dromon's
 own tools reach Grok as an MCP server, ``dromon mcp --line``, through the daemon's line
@@ -1228,8 +1229,10 @@ class _Turn:
     """Each tool call's identity as first recorded, by its identifier."""
     announced_calls: set[str] = field(default_factory=set[str])
     """Identifiers first announced by a ``tool_call`` update."""
-    granted_calls: set[str] = field(default_factory=set[str])
-    """Identifiers for which a permission request has already been granted."""
+    blocked_calls: set[str] = field(default_factory=set[str])
+    rejected_calls: set[str] = field(default_factory=set[str])
+    permission_calls: set[str] = field(default_factory=set[str])
+    """Identifiers whose permission request has already been answered."""
     finished: set[str] = field(default_factory=set[str])
     """Tool calls whose update reported them finished, so each result is fed to the
     driver once."""
@@ -1367,8 +1370,18 @@ class GrokLine:
                     ) from error
                 if turn.refusal is None:
                     stop = await self._prompt(session_id, prompt, turn)
-            except acp.RpcError as error:
-                raise EngineRefused(f"the engine refused a request: {error}") from error
+            except (acp.RpcError, EngineRefused) as error:
+                # A transport failure while cancelling does not replace the stop cause.
+                if turn.refusal is not None:
+                    raise EngineRefused(turn.refusal) from error
+                if turn.interrupted_for is not None:
+                    stop = "cancelled"
+                elif isinstance(error, acp.RpcError):
+                    raise EngineRefused(
+                        f"the engine refused a request: {error}"
+                    ) from error
+                else:
+                    raise
             except TimeoutError:
                 # Closing the connection stops Grok if its turn exceeds the bound.
                 if turn.refusal is None and turn.interrupted_for is None:
@@ -1686,9 +1699,15 @@ class GrokLine:
             if (
                 refusal is None
                 and isinstance(identifier, str)
-                and identifier in turn.granted_calls
+                and identifier in turn.permission_calls
             ):
                 refusal = "the engine reused a tool call identifier after permission"
+            if (
+                refusal is None
+                and "status" in tool_call
+                and tool_call["status"] != "pending"
+            ):
+                refusal = "the engine requested permission for a tool no longer pending"
             # With no field changed, the call is what was recorded plus what the
             # request adds, so a request that omits the recorded kind keeps it.
             known = turn.calls.get(str(identifier), {})
@@ -1707,15 +1726,23 @@ class GrokLine:
             response, missing_option = acp.permission_result(
                 params.get("options"), permitted, label
             )
+            if refusal is None and missing_option is None:
+                if isinstance(identifier, str):
+                    turn.permission_calls.add(identifier)
+                    if not permitted:
+                        turn.rejected_calls.add(identifier)
+                # Count an allowed call before granting it, so the driver can stop
+                # at its budget without authorizing another execution.
+                await self._record(
+                    str(identifier), tool_call, turn, rejected=not permitted
+                )
+                if turn.cancelled:
+                    response = {"outcome": {"outcome": "cancelled"}}
             await self._rpc().respond(request_id, response)
             if missing_option is not None:
                 refusal = refusal or missing_option
             if refusal is not None:
                 await self._cancel(turn, refusal)
-            else:
-                if permitted and isinstance(identifier, str):
-                    turn.granted_calls.add(identifier)
-                await self._record(str(identifier), tool_call, turn)
         else:
             await self._rpc().refuse(request_id, method)
 
@@ -1761,19 +1788,37 @@ class GrokLine:
                 await self._cancel(turn, why)
                 return
             await self._record(str(identifier), update, turn)
+            if str(identifier) in turn.rejected_calls:
+                if not acp.waiting_for_permission(update, rejected=True):
+                    await self._cancel(turn, "the engine ran a rejected tool call")
+                return
             if acp.newly_finished(str(identifier), update, turn.finished):
                 # The safe point before the next model call that priority mail
                 # takes, as ``dromon.priority`` describes.
                 await self._act(Event(TOOL_RESULT), turn)
 
     async def _record(
-        self, identifier: str, fields: Mapping[str, Any], turn: _Turn
+        self,
+        identifier: str,
+        fields: Mapping[str, Any],
+        turn: _Turn,
+        *,
+        rejected: bool = False,
     ) -> None:
         """Record a tool call the first time it is seen and judge it then, counting
-        it if it is permitted and cancelling the turn if not. A later update or
+        it if permitted. A denied pending call waits for its permission request.
+        An unauthorized call that starts cancels the turn. A later update or
         permission request for it has passed ``acp.identity_refusal``, so it is the
         call already judged."""
         if identifier in turn.calls:
+            if (
+                identifier in turn.blocked_calls
+                and identifier not in turn.rejected_calls
+                and not acp.waiting_for_permission(fields)
+            ):
+                await self._cancel(
+                    turn, "the engine started a tool the line was not given"
+                )
             return
         grok_name = grok_tool_name(fields)
         if grok_name:
@@ -1789,6 +1834,9 @@ class GrokLine:
         turn.calls[identifier] = identity
         permitted, name = self._permits(fields)
         if not permitted:
+            turn.blocked_calls.add(identifier)
+            if rejected or acp.waiting_for_permission(fields):
+                return
             await self._cancel(
                 turn,
                 f"the engine used a tool the line was not given: {name}"

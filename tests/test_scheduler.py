@@ -20,7 +20,7 @@ from claude_agent_sdk import SdkMcpTool
 from dromon import scheduler as scheduler_module
 from dromon.activity import ActivityKind
 from dromon.driver import Driver, DriverError, Event, Strategy
-from dromon.engine import ClaudeCodeLine, EnginePlanLimit, TurnReport
+from dromon.engine import ClaudeCodeLine, EnginePlanLimit, EngineRefused, TurnReport
 from dromon.eventlog import EventLog, read_entries
 from dromon.gitssh import GitSshAccess
 from dromon.lineconfig import ConfigError, LineConfig, ToolPolicy, encode_config
@@ -79,6 +79,8 @@ class Scripted:
         self.gate: asyncio.Event | None = None
         self.fail = False
         self.plan_limit: str | None = None
+        self.refusal: str | None = None
+        self.interrupted_for: str | None = None
         self.cost: float | None = None
 
     async def run_turn(self, prompt: str) -> TurnReport:
@@ -87,6 +89,8 @@ class Scripted:
             await self.gate.wait()
         if self.fail:
             raise RuntimeError("the engine broke")
+        if self.refusal is not None:
+            raise EngineRefused(self.refusal)
         if self.plan_limit is not None:
             raise EnginePlanLimit(self.plan_limit)
         calls = self.turns.pop(0) if self.turns else []
@@ -101,7 +105,15 @@ class Scripted:
             self.results.append(await tool.handler(args))
         assert self.session_id is not None
         return TurnReport(
-            "success", 1, "ok", (), None, None, self.session_id, None, self.cost
+            "success",
+            1,
+            "ok",
+            (),
+            self.interrupted_for,
+            None,
+            self.session_id,
+            None,
+            self.cost,
         )
 
 
@@ -1822,3 +1834,92 @@ def test_dromon_status_prints_the_schedulers_fault_only_while_it_lasts() -> None
     assert row({"fault": "Faulty: x", "faults": 3}) == (
         "scheduler fault Faulty: x, 3 since the daemon started"
     )
+
+
+@pytest.mark.parametrize(
+    "cause",
+    [
+        "the engine reused a tool call identifier",
+        "the engine changed the kind of a tool call",
+    ],
+)
+def test_engine_refusal_cause_reaches_the_next_prompt(
+    make_world: MakeWorld, cause: str
+) -> None:
+    target = make_world({"alpha": [[], []]})
+    target.engine("alpha").refusal = cause
+    run(target, send(target, "alpha", "first"))
+    (question_id,) = questions_for(target)
+    assert len(target.engines["alpha"].prompts) == 1
+    target.engine("alpha").refusal = None
+    target.scheduler.send(ANA, LineAddress("alpha"), "continue", reply_to=question_id)
+    run(target, send(target, "alpha", "after"))
+    assert cause in target.engines["alpha"].prompts[1]
+    run(target, send(target, "alpha", "one more"))
+    assert (
+        "Dromon stopped the previous engine turn"
+        not in target.engines["alpha"].prompts[-1]
+    )
+
+
+def test_driver_budget_cause_is_owed_without_an_extra_wake(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": [[], []]})
+    target.engine("alpha").interrupted_for = "tool_budget"
+    run(target, send(target, "alpha", "first"))
+    assert len(target.engines["alpha"].prompts) == 1
+    target.engine("alpha").interrupted_for = None
+    run(target, send(target, "alpha", "next"))
+    assert "tool_budget" in target.engines["alpha"].prompts[-1]
+    run(target, send(target, "alpha", "one more"))
+    assert (
+        "Dromon stopped the previous engine turn"
+        not in target.engines["alpha"].prompts[-1]
+    )
+
+
+def test_stop_notice_survives_replay_and_filters_before_truncating(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": []})
+    hidden = "synthetic-protected-value"
+    target.scheduler.set_disclosure_terms([hidden])
+    target.scheduler._note_engine_stop(  # pyright: ignore[reportPrivateUsage]
+        "alpha", "x" * scheduler_module.MAX_FAILURE_TEXT + hidden
+    )
+    with EventLog(target.path) as replayed:
+        notices = Scheduler(replayed, World.build_nothing)
+        notice = notices._engine_stop_notice("alpha")  # pyright: ignore[reportPrivateUsage]
+        assert notice is not None and "disclosure guard" in notice
+        assert hidden not in notice
+        notices.stop_workers()
+
+
+def test_stop_notice_is_rechecked_after_disclosure_reload(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": []})
+    target.scheduler._note_engine_stop("alpha", "a synthetic engine cause")  # pyright: ignore[reportPrivateUsage]
+    target.scheduler.set_disclosure_terms(["synthetic"])
+    notice = target.scheduler._engine_stop_notice("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert notice is not None and "disclosure guard" in notice
+    assert "synthetic" not in notice
+
+
+def test_stop_notice_filter_spends_the_existing_disclosure_budget(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": []})
+    target.scheduler.set_disclosure_terms(["synthetic-protected-value"])
+    for _ in range(scheduler_module.MAX_DISCLOSURE_CHECKS + 1):
+        target.scheduler._note_engine_stop("alpha", "synthetic-protected-value")  # pyright: ignore[reportPrivateUsage]
+    assert (
+        len(target.log.state.disclosure_checks["alpha"])
+        == scheduler_module.MAX_DISCLOSURE_CHECKS
+    )
+    assert target.log.state.lines["alpha"].held_by is not None
+    target.scheduler._note_engine_stop("alpha", "a later candidate")  # pyright: ignore[reportPrivateUsage]
+    notice = target.scheduler._engine_stop_notice("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert notice is not None and "disclosure guard" in notice
+    assert "later candidate" not in notice

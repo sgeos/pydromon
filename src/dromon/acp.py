@@ -150,13 +150,25 @@ class Client:
         )
 
 
+def waiting_for_permission(
+    fields: Mapping[str, Any], *, rejected: bool = False
+) -> bool:
+    """Only explicit pending calls, or failed rejected calls, are safe to leave.
+    Missing status is not evidence that execution has not started."""
+    return fields.get("status") == "pending" or (
+        rejected and fields.get("status") == "failed"
+    )
+
+
 def permission_result(
     options: object, permitted: bool, tool_name: str
 ) -> tuple[dict[str, object], str | None]:
     """The answer to ``session/request_permission``. Only a single use is ever granted,
-    so no grant outlives the call. A refusal prefers a single rejection. If no option
-    of the intended kind is offered, answer as cancelled and return bounded evidence
-    so the adapter can cancel and refuse the turn rather than leave it running."""
+    so no grant outlives the call. A refusal prefers a single rejection. ACP version
+    1 carries only an option identifier, with no standard model-visible reason.
+    Metadata and RPC errors do not establish that a model receives an explanation.
+    If no option of the intended kind is offered, answer as cancelled and return
+    bounded evidence so the adapter can cancel rather than leave the turn running."""
     wanted = ("allow_once",) if permitted else ("reject_once", "reject_always")
     if isinstance(options, Sequence) and not isinstance(options, (str, bytes)):
         offered = cast(Sequence[Any], options)

@@ -1731,6 +1731,10 @@ def new_id(prefix: str) -> str:
     return f"{prefix}-{secrets.token_hex(6)}"
 
 
+ENGINE_STOP_NOTE: Final = "Dromon stopped the previous engine turn. "
+"""A harness note retained for the next reported turn without waking the line."""
+
+
 def compose_prompt(
     line_id: str,
     new: list[tuple[str, Message]],
@@ -8267,6 +8271,9 @@ class Scheduler:
                 notes=self._notes(messages),
                 operator=self.last_operator(line_id),
             )
+            stopped = self._engine_stop_notice(line_id)
+            if stopped is not None:
+                prompt = f"{stopped}\n\n{prompt}"
             quiet = self._quiet_notice(line_id)
             if quiet is not None:
                 prompt = f"{quiet}\n\n{prompt}"
@@ -8329,6 +8336,7 @@ class Scheduler:
         report: TurnReport | None = None
         ending = "cancelled"
         failed = False
+        stop_cause: str | None = None
         engine: LineEngine | None = None
         mailed = self._operator_mail(line_id)
         sent = self._line_mail(line_id)
@@ -8368,6 +8376,7 @@ class Scheduler:
                 if redirected == restart.REASON:
                     self._note_restart(line_id)
             elif report.interrupted_for is not None:
+                stop_cause = f"The driver interrupted it for {report.interrupted_for}."
                 ending += f", interrupted by its driver: {report.interrupted_for}"
             elif turn_outcome(report) == FAILED:
                 ending = f"failed: the engine ended the turn as {report.subtype}"
@@ -8394,6 +8403,8 @@ class Scheduler:
             # The boundary between the scheduler and an engine. Any engine failure
             # ends only this turn, and is reported rather than crashing the daemon.
             self._failed.add(line_id)
+            if isinstance(error, EngineRefused):
+                stop_cause = str(error)
             ending = f"failed: {error}"
             failed = True
             print(f"dromond: line {line_id} turn failed: {error}", file=sys.stderr)
@@ -8433,6 +8444,8 @@ class Scheduler:
                         True if report is None else None,
                     )
                 )
+            if stop_cause is not None and line is not None:
+                self._note_engine_stop(line_id, stop_cause)
             # A handoff asked for in the turn takes effect now that it has ended,
             # however it ended.
             self._settle_relinquish(line_id)
@@ -8510,6 +8523,44 @@ class Scheduler:
             for message in self._log.state.messages.values()
             if message.sender == address and message.recipient != address
         )
+
+    def _safe_stop_notice(self, line_id: str, cause: str) -> str:
+        """Filter the entire notice before bounding it, including engine evidence.
+        Recheck stored notices when the disclosure list changes between turns."""
+        notice = (ENGINE_STOP_NOTE + cause).encode("utf-8", "replace").decode("utf-8")
+        if self.refuse_disclosed(line_id, ("cause", notice)) is not None:
+            return ENGINE_STOP_NOTE + "The cause was withheld by the disclosure guard."
+        return _cut(notice, MAX_FAILURE_TEXT)
+
+    def _note_engine_stop(self, line_id: str, cause: str) -> None:
+        """Persist a cause without waking the line or clearing its failure state.
+        Delivery after the turn end keeps it owed until a later engine report,
+        including across a restart or a failure before the next prompt arrives."""
+        message_id = new_id("m")
+        self._log.append(
+            MessageSent(
+                message_id,
+                HARNESS,
+                LineAddress(line_id),
+                MessageKind.NOTE,
+                self._safe_stop_notice(line_id, cause),
+            )
+        )
+        self._log.append(MessageDelivered(message_id))
+
+    def _engine_stop_notice(self, line_id: str) -> str | None:
+        current = self._log.state.reported_turn_ends.get(line_id, 0)
+        notice: str | None = None
+        for message in self._log.state.messages.values():
+            if (
+                message.sender == HARNESS
+                and message.recipient == LineAddress(line_id)
+                and message.body.startswith(ENGINE_STOP_NOTE)
+                and message.reported_ends_at_delivery is not None
+                and message.reported_ends_at_delivery >= current
+            ):
+                notice = message.body[len(ENGINE_STOP_NOTE) :]
+        return None if notice is None else self._safe_stop_notice(line_id, notice)
 
     def _note_quiet(self, line_id: str, sent: int) -> None:
         """**Item B1 of 2026-10-28.** Remember for ``line_id``'s next prompt that its

@@ -134,6 +134,15 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- Grok and Antigravity reject ordinary tool permission requests without cancelling
+  the turn when a rejection option is available. Identity changes, reused permission
+  identifiers, execution without approval, missing options and driver budgets still
+  stop it. Budgets are checked before granting a new call. Engine refusals and driver
+  interruptions leave a bounded, disclosure-filtered cause in the next prompt through
+  a durable harness note that does not wake the line. Agent Client Protocol version 1
+  defines no custom reason field, so a model-visible explanation for a selected
+  rejection remains runtime-dependent and unverified live.
+
 - ACP adapters now cancel and refuse a turn when the runtime omits the permission
   option needed for Dromon's intended decision. The refusal names the tool, whether
   Dromon intended to allow or refuse it, and bounded evidence of the offered option
