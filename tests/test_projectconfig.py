@@ -184,7 +184,7 @@ BAD: list[tuple[str, str, str, int | None]] = [
     ),
     (
         "an unknown model",
-        "version = 1\n\n[lines.alpha]\nmodel = 'claude-sonnet-5-5'\n",
+        "version = 1\n\n[lines.alpha]\nmodel = 'claude-unreleased-0-0'\n",
         "lines.alpha.model: must be one of",
         3,
     ),

@@ -43,6 +43,7 @@ ENGINE_OF: Final[dict[str, str]] = {
     "claude-opus-5-5": "claude-code",
     "claude-haiku-5-5": "claude-code",
     "claude-fable-5-1": "claude-code",
+    "claude-sonnet-5-5": "claude-code",
     "gpt-6-luna": "codex",
     "gpt-6.1-sol": "codex",
     "gpt-6.1-terra": "codex",

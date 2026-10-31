@@ -169,6 +169,8 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Claude Sonnet 5.5 drivers on Claude Code for every strategy, as
+  `claude-sonnet-5-5`, with the Opus 5.5 drivers' settings.
 - `daemon_behind_worktree` in `line_status`, and a notice in the wake prompt once per
   worktree commit, when the daemon runs code older than the line's worktree, which is
   when its loaded commit is an ancestor of the worktree's `HEAD` and the two differ

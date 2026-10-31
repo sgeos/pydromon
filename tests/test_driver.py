@@ -192,7 +192,7 @@ def test_many_decisions_run_on_one_driver() -> None:
 
 def test_an_unknown_model_has_no_driver() -> None:
     with pytest.raises(DriverError, match="no driver"):
-        Driver.for_model("claude-sonnet-5-5")
+        Driver.for_model("claude-unreleased-0-0")
 
 
 # The host's checks on a defective driver.
@@ -297,21 +297,23 @@ def test_subscription_drivers_allow_a_development_turn(model: str) -> None:
     assert settings.max_turns >= DEVELOPMENT_TURNS
 
 
-def test_fable_follows_the_opus_drivers_on_claude_code() -> None:
-    # No live turn has run on Claude Fable 5.1, so its settings copy Opus 5.5's,
-    # which are the development-scale ones on a subscription and small otherwise.
-    assert ENGINE_OF["claude-fable-5-1"] == "claude-code"
+@pytest.mark.parametrize("model", ["claude-fable-5-1", "claude-sonnet-5-5"])
+def test_fable_and_sonnet_follow_the_opus_drivers_on_claude_code(model: str) -> None:
+    # Claude Fable 5.1 and Claude Sonnet 5.5 copy Opus 5.5's settings, which are the
+    # development-scale ones on a subscription and small otherwise. Neither has a
+    # verified context window of its own.
+    assert ENGINE_OF[model] == "claude-code"
     for strategy in Strategy:
-        fable = Driver.for_model("claude-fable-5-1", strategy).settings
+        copied = Driver.for_model(model, strategy).settings
         opus = Driver.for_model(OPUS, strategy).settings
-        assert fable.model == "claude-fable-5-1"
+        assert copied.model == model
         assert (
-            fable.engine,
-            fable.strategy,
-            fable.effort,
-            fable.max_turns,
-            fable.tool_budget,
-            fable.context_window,
+            copied.engine,
+            copied.strategy,
+            copied.effort,
+            copied.max_turns,
+            copied.tool_budget,
+            copied.context_window,
         ) == (
             opus.engine,
             opus.strategy,
