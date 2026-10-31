@@ -52,7 +52,7 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 | `configure_line` | Arguments `line_id` and `config`. Replaces the line's configuration from its next turn. A changed `workdir` also appends `line_session_cleared`. Refused when the `workdir` is not allowed, or when the project requires a sandbox and the line would run on Claude Code without one |
 | `questions` | Optionally `operator`. Result `{"questions": [...]}`, the open questions for that operator, or for all when omitted, oldest first, each with `question_id`, `line`, `operator`, `text` and `choices`. Listing marks each question delivered, because the client has shown it |
 | `mail` | Arguments `operator`, and optionally `unread_only`, `sender`, `offset` and `limit`, at most 50. `unread_only` selects the messages `unread` counts, which leave out the operator's own notes, from the round 6 review. Delivers the operator's undelivered mail, then returns `total`, `unread`, `unanswered`, from 2026-10-30 `own_notes`, which is 0 for an operator since an operator cannot send itself a note, and `messages`, a page of headers with `message_id`, `sender`, `kind`, `reply_to`, `read` and `outcome`, one of `replied`, `acknowledged` and `unanswered`, oldest first. A note the harness wrote has `sender` `!dromon`, from 2026-10-28, and may be acknowledged but not replied to. No argument of any request may name `!dromon`, `sender` included, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies |
-| `replies` | From 2026-10-31, round 9. Arguments `operator` and `message_id`, which must name a message the log holds, and optionally `unread_only`, `offset` and `limit`, at most 50. Delivers the operator's undelivered mail, as `mail` does, then returns `message_id`, `replies`, the count of messages in the operator's mailbox whose `reply_to` is that message, `unread`, how many of those are unread, `total`, how many match `unread_only`, and `messages`, a page of them oldest first with `message_id`, `sender`, `kind`, `read`, `outcome`, `body` and `body_bytes`. Marks nothing read, so a wait loop can count unread replies and read them in one query. Bodies are kept within a 40,000 byte budget as written in JSON, and a body past it is `null`, with its size in `body_bytes`, for `read` to open |
+| `replies` | From 2026-10-31, round 9. Arguments `operator` and `message_id`, which must name a message the log holds, and optionally `unread_only`, `offset` and `limit`, at most 50. Delivers the operator's undelivered mail, as `mail` does, which appends `message_delivered` events, so the query is not read-only in the log, then returns `message_id`, `replies`, the count of messages in the operator's mailbox whose `reply_to` is that message, `unread`, how many of those are unread, `total`, how many match `unread_only`, `left_out`, how many entries of the page did not fit, and `messages`, a page of them oldest first with `message_id`, `sender`, `kind`, `read`, `outcome`, `body` and `body_bytes`. Marks nothing read, so a wait loop can count unread replies and read them in one query. Each entry is counted against a 40,000 byte budget as written in JSON, its fields as well as its body, with the echoed `message_id`, so the answer fits one protocol line whatever its fields hold, as round 9's review, F13, asked. A body past what is left is `null`, with its size in `body_bytes`, for `read` to open. An entry whose fields alone do not fit is left out with every entry after it, and counted in `left_out`, so `offset` plus the entries given starts the next page. A `message_id` the log does not hold is refused as `no message`, which tells an operator whether an identifier exists. **Accepted by the operator in the review, F12,** since identifiers are random and the socket is the operator's own |
 | `acknowledge` | Arguments `operator` and `message_id`. Marks a message in the operator's mailbox dealt with, without a reply |
 | `sent` | Arguments `operator`, and optionally `unanswered_only`, `offset` and `limit`. Returns `total` and `messages`, the operator's sent mail with `message_id`, `recipient`, `kind`, `delivered`, `read`, `outcome` and `delivery`. `delivery` is `waiting`, `delivered` or `read` for local mail, and `waiting for peer`, `delivered to peer`, `returned` with its code, or `unconfirmed` for mail to a peer, added on 2026-10-28 |
 | `read` | Arguments `operator` and `message_id`. Returns the message with its `body` and `choices`, and marks it read the first time |
@@ -146,11 +146,11 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromon configure LINE` | Sends `configure_line` with the tool options below. No option means the default configuration | 0, 4, or 1 |
 | `dromon send RECIPIENT BODY` | Sends `send`, with `--operator`, default the login name, `--reply-to`, and `--priority`, which sends priority mail. Prints `message_id` and the identifier, and then `priority mail` on a second line only for priority mail | 0, 4, or 1 |
 | `dromon questions` | Sends `questions` for `--operator`, default the login name, or for every operator with `--all`, and prints each question with its choices | 0, 4, or 1 |
-| `dromon mail` | Sends `mail`, with `--operator`, `--unread`, `--from ADDRESS`, `--offset N` and `--limit N`, default 20. With `--replies-to MESSAGE`, from 2026-10-31, sends `replies` instead, with `--unread`, `--offset` and `--limit`, and prints each reply's header and body, marking none read. `--from` does not combine with it | 0, 4, or 1, and 2 for `--from` with `--replies-to` |
+| `dromon mail` | Sends `mail`, with `--operator`, `--unread`, `--from ADDRESS`, `--offset N` and `--limit N`, default 20. With `--replies-to MESSAGE`, from 2026-10-31, sends `replies` instead, with `--unread`, `--offset` and `--limit`, and prints each reply's header and body, marking none read, then how many did not fit and the `--offset` that gives them. `--from` does not combine with it | 0, 4, or 1, and 2 for `--from` with `--replies-to` |
 | `dromon read MESSAGE` | Sends `read` and prints the message | 0, 4, or 1 |
 | `dromon ack MESSAGE` | Sends `acknowledge` | 0, 4, or 1 |
 | `dromon sent` | Sends `sent`, with `--operator`, `--unanswered`, `--offset N` and `--limit N`, and prints each message's fate | 0, 4, or 1 |
-| `dromon attach LINE` | Opens an interactive client attached to the line, in the terminal or in a Tk window with `--gui`, speaking for `--operator` and refreshing every `--poll-seconds`, default 1, and four times as often while the line runs a turn. Text sends a message. The commands, keys and panes are those of the attached client section below. Any number may attach at once. From 2026-10-31, a client whose daemon is gone, so that nothing listens on its socket, retries, and detaches by itself once at least 5 polls in a row over at least 10 seconds have found none, printing why on standard error. A daemon that is slow or refuses a request is still there, and never detaches a client | 0, 2 on a poll interval that is not positive, or 4 when it detached because the daemon was gone |
+| `dromon attach LINE` | Opens an interactive client attached to the line, in the terminal or in a Tk window with `--gui`, speaking for `--operator` and refreshing every `--poll-seconds`, default 1, and four times as often while the line runs a turn. Text sends a message. The commands, keys and panes are those of the attached client section below. Any number may attach at once. From 2026-10-31, a client whose daemon is gone retries, and detaches by itself once at least 5 polls in a row have found none, over at least 10 seconds with its socket file missing or 60 seconds of refused connections, printing why on standard error. A daemon that is slow or refuses a request is still there, and never detaches a client | 0, 2 on a poll interval that is not positive, or 4 when it detached because the daemon was gone |
 | `dromon release LINE` | Sends `release` | 0, 4, or 1 |
 | `dromon interrupt LINE` | Sends `interrupt`, as Escape does in an attached client, and prints whether a turn was in flight. A line with none is not a failure, since its turn may have ended as the request was made | 0, 4, or 1 |
 | `dromon hibernate LINE` | Sends `hibernate`, and says whether a turn in flight finishes first | 0, 4, or 1 |
@@ -279,13 +279,26 @@ The client rings the platform's bell once when a question arrives while it is at
 It replaces every control character in what it shows, except the line break, so that no
 message body or engine output can drive the terminal.
 
-**A daemon that is gone, round 9, 2026-10-31.** A client that finds nothing listening
-on the daemon's socket shows that it is retrying, and detaches by itself once at least
-`LOST_POLLS`, 5, polls in a row over at least `LOST_SECONDS`, 10 seconds, have found
-none. Both bounds must pass, so a short poll interval does not detach it at once and a
-long one still retries 5 times. The fetches of one poll count once, and any answer from
-the daemon starts the count again. A timeout or a refused request is a failure shown as
-before and never counts, since a daemon slow under load is still there. The reason is
+**A daemon that is gone, round 9, 2026-10-31.** A client whose connection to the
+daemon's socket fails shows that it is retrying, and detaches by itself once at least
+`LOST_POLLS`, 5, polls in a row have failed so and one of two bounds has passed. Both
+the count and the bound must pass, so a short poll interval does not detach it at once
+and a long one still retries 5 times. The fetches of one poll count once, and any
+answer from the daemon starts the count again. A timeout or a request the daemon
+refuses is a failure shown as before and never counts, since a daemon slow under load
+is still there.
+
+- **The socket file is missing.** The bound is `LOST_SECONDS`, 10 seconds, of polls in
+  a row that found it missing, which only a stopped daemon or a deleted project leaves.
+- **The connection is refused.** **Round 9 review, F14, decided by the operator.** The
+  bound is `REFUSED_SECONDS`, 60 seconds, of failed polls in all, since on Darwin a
+  connection to a Unix socket whose listen backlog is full is refused, so a live
+  daemon whose event loop is busy may refuse several clients at once. A daemon that
+  crashed leaves its socket file behind and refuses every connection, so its clients
+  still detach, after a minute. A refusal starts the 10 second bound again, so it runs
+  only over polls that all found the file missing.
+
+The reason is
 printed on standard error once the screen is restored, and `dromon attach` exits with
 4. The terminal's loop also waits out the rest of its 50 millisecond input timeout
 whenever curses returns at once without a key, as it does once the terminal is gone, so

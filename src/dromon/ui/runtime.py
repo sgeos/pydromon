@@ -66,12 +66,17 @@ MAX_STEPS: Final = 64
 
 class Unreachable(Exception):
     """The daemon could not be asked, with the reason to show. ``gone`` says that
-    nothing listens on its socket, as when the daemon stopped or its project was
-    deleted, rather than that a daemon was slow or answered badly."""
+    nothing accepted the connection, as when the daemon stopped or its project was
+    deleted, rather than that a daemon was slow or answered badly. ``missing`` says
+    that the socket file itself is absent, which only a daemon that is gone leaves,
+    while a refusal may come from a live daemon whose backlog is full."""
 
-    def __init__(self, reason: str, *, gone: bool = False) -> None:
+    def __init__(
+        self, reason: str, *, gone: bool = False, missing: bool = False
+    ) -> None:
         super().__init__(reason)
         self.gone = gone
+        self.missing = missing
 
 
 class Daemon(Protocol):
@@ -249,7 +254,9 @@ class Runtime:
         try:
             response = self._daemon.call(operation, args)
         except Unreachable as error:
-            return Lost(str(error)) if error.gone else Failed(str(error))
+            if error.gone:
+                return Lost(str(error), missing=error.missing)
+            return Failed(str(error))
         if not response.ok:
             return Failed(f"{operation}: {response.error_message or 'refused'}")
         return response.result or {}

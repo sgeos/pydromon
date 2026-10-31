@@ -248,10 +248,25 @@ The `daemon` object holds the following, decided by the operator on 2026-10-26 i
 - **`code_compared`** and **`package`.** Whether the code was compared, and the
   package directory compared, such as `src/dromon`. The comparison runs git, through
   `dromon.codetree`, only for a pair of commits it has not compared before, and caches
-  the answer by both commits, so a status call while `HEAD` stays runs no process. A
-  call that times out after 5 seconds is not cached. Where git cannot compare the code,
-  as outside a checkout or without git, any move of `HEAD` is stale, as it was before,
-  and `code_compared` is `false`.
+  the answer by both commits, so a status call while `HEAD` stays runs no process.
+  Where git cannot compare the code, as outside a checkout or without git, any move of
+  `HEAD` is stale, as it was before, and `code_compared` is `false`.
+- **No wait on git.** **Round 9 review, F4 and F6, decided by the operator.** A status
+  or a prompt never waits on git. Each answer comes from the cache, and a question not
+  answered yet is answered as unknown at once and queued for one worker thread, which
+  runs git off the daemon's event loop, one command at a time, at most 16 questions
+  queued. Until git answers for a new pair of commits, `stale` is therefore `true` with
+  `code_compared` `false`, as without git, and the next call after the answer says
+  what the code shows. Local git answers within milliseconds, so the window is short.
+  A definite answer is kept until 256 newer answers push it out. An answer git could
+  not give, a command past its 5 second timeout, a git that could not be started, or
+  an error status, is kept for 60 seconds and then asked again. **Why 60 seconds.** A
+  git that hangs, as on a stalled volume, holds the worker for 5 seconds at each try,
+  so one try a minute for each question keeps at most one such git running and the
+  worker idle most of the time, while a git that recovers is seen within a minute.
+  Before, a timeout was never kept, so every status poll ran git again on the event
+  loop and stalled every client for up to 5 seconds, and a git that could not be
+  started was kept until a restart.
 
 The `commits` object, decided by the operator on 2026-10-27 with restart to upgrade,
 gives what a review or report names, read at every call in the way `checkout_commit`
@@ -266,10 +281,15 @@ is read.
 - **`daemon_behind_worktree`.** From 2026-10-31, asked by review in round 8. `true`
   when the daemon runs code older than the line's worktree, which is when the commit the
   daemon loaded is an ancestor of the worktree's `HEAD` and the two differ under the
-  daemon's package directory. `false` when they do not, and `null` when it cannot be
-  said, as for a worktree of another repository, which does not hold the daemon's
-  commit. It is cached by both commits, as `stale` is. The compact view carries it
-  too.
+  daemon's package directory. `false` when the worktree's `HEAD` is the daemon's commit
+  or descends from it with the same code there. `null` when it cannot be said, as for
+  a worktree of another repository, which does not hold the daemon's commit, and while
+  git has not yet answered. **Round 9 review, F5.** It is also `null` for a worktree
+  whose `HEAD` does not descend from the daemon's commit, as on an unrelated branch or
+  at an older commit, whose code the daemon may hold more of, or other code than, the
+  worktree. It was `false` there before, which said the daemon was not behind a
+  worktree whose code it may not contain. It is cached by both commits, as `stale` is.
+  The compact view carries it too.
 - **`cite`.** One sentence naming both full commits, such as `line core read its
   worktree at commit C, under the daemon at commit D.`, with the commit the daemon's
   own checkout has moved to when it is stale, and a clause saying that the daemon's code
@@ -286,7 +306,12 @@ operator restarts the daemon. **Decided by core, for review.** The notice is giv
 for each commit of the worktree, not at every turn, so that it does not become noise,
 and is given again once the worktree's `HEAD` moves to another commit that is still
 ahead of the daemon. `line_status` gives the answer at every call. A turn the engine
-started by itself has no Dromon prompt and so no notice.
+started by itself has no Dromon prompt and so no notice. **Round 9 review, F9.** The
+record of what was told is held in the daemon's memory, not in the event log, so a
+daemon restarted while the worktree is still ahead tells the notice once again, at the
+line's first turn after the restart. Since a prompt does not wait on git, the first
+turn after the worktree's `HEAD` moves may find git's answer not yet given, and the
+notice then leads the turn after.
 
 **Trust and cost of the comparison.** Git runs with the daemon's authority in the
 line's working directory, which the line may write. It is given only `rev-parse` and
@@ -296,8 +321,12 @@ commits that are object names and a checked path, so no argument can be read as 
 option. **Assumption.** A line that could write its checkout's git configuration could
 still steer git, as it could any git the operator runs, which is why every enabled
 sandbox denies that file, as the Git safety entry of
-[Working directory](#working-directory) says. The call blocks the daemon's event loop
-for at most 5 seconds, and only for a pair of commits not compared before.
+[Working directory](#working-directory) says. Git runs on the worker thread, never on
+the daemon's event loop, so a git that hangs delays only its own answer, by at most 5
+seconds a try and one try a minute, as the entry on waiting above says. **Failure
+mode.** The worker is a daemon thread, so it never holds the daemon's exit, and a git
+it is running when the daemon exits is left to end by itself, which a command that
+only reads does without harm.
 
 **`read_instructions`.** One optional argument, `full`, a boolean. The instructions are
 those the line's next turn receives as its engine adapter composes them from
@@ -695,11 +724,17 @@ refused at load because their adapters do not guarantee a new session per turn.
 The setting is part of operator line configuration and is not exposed as a line tool.
 
 **Turning it on for a line that exists.** **Round 9, item 1, 2026-10-31.** When the
-project file at a reload, or `dromon configure`, turns the key on for a line that is
-between turns and has a recorded session, the daemon records `line_session_cleared` at
-once, so `dromon settings` stops showing the old session as soon as the change applies.
-A line in a turn is left to its next turn's start, since the running turn records the
-session it ran in when it ends. **A new session forgets the old context.** Every
+project file at a reload, or `dromon configure`, turns the key on for a line that
+has a recorded session, the daemon records `line_session_cleared` at once, so
+`dromon settings` stops showing the old session as soon as the change applies. **Round
+9 review, F1, decided by the operator.** A line in a turn is cleared at once as well,
+and the turn in flight, which runs in the session the line no longer resumes, records
+neither that session, nor its context estimate, nor a compaction it reports, nor a
+compaction wake when it ends. The same holds for a turn in flight when `workdir`
+changes. Before, a line in a turn was left to its next turn's start, and the turn's
+end stored its estimate again, so a line moved to another worktree during a long turn
+was warned of, and could be woken to compact, context its next session did not hold.
+**A new session forgets the old context.** Every
 `line_session_cleared` and `line_rebound` also forgets the daemon's context estimate of
 the old session, with the automatic compaction and the context-warning wake it would
 start. The estimate outlived a cleared session before, so the first turn after the
@@ -1599,7 +1634,8 @@ state stays in the project.
 - **Sessions.** Claude Code keeps a session under the directory it ran in. When a
   line's `workdir` changes, by `configure_line` or by the project file at start or
   reload, the daemon appends `line_session_cleared`, so the line's next turn starts a
-  new session. A turn in flight at the change does not record its session. The
+  new session. A turn in flight at the change does not record its session, its
+  context estimate or a compaction wake, as round 9's review, F1, decided. The
   comparison is of the stored text, so writing the same directory another way also
   starts a new session, including a first explicit `workdir` that names the project
   root. Other configuration changes keep the session.

@@ -34,7 +34,7 @@ from dromon.client import (
 )
 from dromon.paths import PathError, ProjectPaths, ensure_private_dir, project_paths
 from dromon.disclosure import DisclosureError, load_terms
-from dromon.driver import MODELS, Credential, Driver, DriverError, Strategy
+from dromon.driver import ENGINE_OF, MODELS, Credential, Driver, DriverError, Strategy
 from dromon import antigravity, capabilities, codex, cursor, evidence, grok, pi
 from dromon.engine import ENGINE_NAME as CLAUDE_CODE_ENGINE
 from dromon.engine import EngineRefused
@@ -830,6 +830,12 @@ def _replies(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
                 f" budget. dromon read {entry.get('message_id')} opens it and marks it"
                 " read."
             )
+    left_out = response.get("left_out")
+    if type(left_out) is int and left_out > 0:
+        print(
+            f"{left_out} more did not fit this answer. --offset"
+            f" {arguments.offset + len(entries)} gives them."
+        )
     return exits.OK
 
 
@@ -1016,7 +1022,7 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         print(f"  effective sandbox allowWrite: {writes}")
     shared_workdirs: dict[str, list[str]] = {}
     for line_id, line in sorted(config.lines.items()):
-        if not can_write_workdir(line.config):
+        if not can_write_workdir(line.config, ENGINE_OF.get(line.model)):
             continue
         raw_workdir = line.config.workdir or "."
         workdir_path = Path(raw_workdir).expanduser()

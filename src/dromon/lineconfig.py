@@ -368,24 +368,59 @@ class LineConfig:
 
 DEFAULT_CONFIG: Final = LineConfig()
 
+CLAUDE_CODE_ENGINE: Final = "claude-code"
+"""The engine name of Claude Code, as ``dromon.engine.ENGINE_NAME`` gives it, which a
+test holds equal, since that module imports this one."""
+
 WRITING_TOOLS: Final = frozenset({"Bash", "Write", "Edit", "NotebookEdit"})
-"""The built-in tools with which an engine can change files, a shell among them."""
+"""The built-in tools with which a Claude Code line can change files, a shell among
+them."""
+
+WORKSPACE_WRITE_TOOLS: Final = frozenset({"Edit", "Write"})
+"""The built-in tools that make the workspace writable in the sandbox profile of a
+Codex or Grok line, as ``codex.WRITE_TOOLS`` and ``grok.WRITE_TOOLS`` are, which a
+test holds equal. They are repeated here because both engine modules import this
+one."""
+
+SANDBOXED_WRITERS: Final[dict[str, frozenset[str]]] = {
+    "codex": WORKSPACE_WRITE_TOOLS,
+    "grok-build": WORKSPACE_WRITE_TOOLS,
+}
+"""The engines whose own sandbox makes the workspace read-only unless the line has one
+of these built-in tools, whatever its tool policy, so a shell alone cannot write it."""
+
+UNCONFINED_ENGINES: Final = frozenset({"pi", "cursor-agent", "antigravity"})
+"""The engines that cannot confine a line to reading its working directory, and that
+refuse ``workdir_access = "read"``, so any line of theirs can write it."""
 
 
-def can_write_workdir(config: LineConfig) -> bool:
-    """Whether a line with ``config`` can write its working directory, for the
-    warning of ``dromon config`` about writers that share one.
+def can_write_workdir(config: LineConfig, engine: str | None) -> bool:
+    """Whether a line with ``config`` on ``engine`` can write its working
+    directory, for the warning of ``dromon config`` about writers that share one.
 
     **Round 9, item 2.** A line writes its working directory only when its access
-    is ``write`` and it has a tool that changes files, a writing built-in or a
-    policy that allows every tool. A line with ``workdir_access = "read"`` is
-    confined to reading it by its engine. A line whose only tools come from MCP
-    servers is not counted, since such a server is the operator's own program with
-    the tools it declares, and not a file tool of the engine. **Assumption.** A
-    server that writes the working directory itself is not detected, and the
-    warning remains a warning, as it always was."""
+    is ``write``. A line with ``workdir_access = "read"`` is confined to reading it
+    by its engine. On Claude Code it then also needs a tool that changes files, a
+    writing built-in or a policy that allows every tool. A line whose only tools
+    come from MCP servers is not counted, since such a server is the operator's own
+    program with the tools it declares, and not a file tool of the engine.
+    **Assumption.** A server that writes the working directory itself is not
+    detected, and the warning remains a warning, as it always was.
+
+    **Round 9 review, F16 and F17.** The answer follows each engine's own
+    confinement. A Codex or Grok line writes only with ``Edit`` or ``Write``, since
+    its sandbox keeps the workspace read-only otherwise, even under ``allow_all``,
+    and a shell alone cannot write there. A Pi, Cursor or Antigravity line with
+    write access counts as a writer, since those engines cannot confine a line to
+    reading. An engine Dromon does not know, given as ``None`` or by a name not
+    listed here, is counted as a writer, so the warning errs toward being given."""
     if config.workdir_access is not WorkdirAccess.WRITE:
         return False
+    sandboxed = SANDBOXED_WRITERS.get(engine or "")
+    if sandboxed is not None:
+        return bool(set(config.builtin_tools) & sandboxed)
+    if engine in UNCONFINED_ENGINES or engine != CLAUDE_CODE_ENGINE:
+        return True
     if config.tool_policy is ToolPolicy.ALLOW_ALL:
         return True
     names = set(config.builtin_tools) | set(config.allowed_tools)

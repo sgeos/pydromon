@@ -26,7 +26,15 @@ LOST_SECONDS: Final = 10.0
 """How long a client goes on asking a daemon that is gone before it detaches. Both
 bounds must be passed, so a short poll interval does not detach it in a moment, and a
 long one still retries ``LOST_POLLS`` times. **Round 9, item 6.** A client whose
-daemon was gone polled for days after its project was deleted."""
+daemon was gone polled for days after its project was deleted. It applies to polls
+that found the socket file missing."""
+REFUSED_SECONDS: Final = 60.0
+"""How long refused connections must go on before a client detaches, when its socket
+file is still there. **Round 9 review, F14, decided by the operator.** On Darwin a
+connection to a Unix socket whose listen backlog is full is refused, so a live daemon
+whose event loop is busy can refuse several clients at once, while a daemon that
+crashed leaves its socket file behind and refuses every connection. A minute is long
+past any such stall, and still ends a client whose daemon crashed."""
 
 
 class Overlay(StrEnum):
@@ -79,6 +87,9 @@ class Model:
     finished: bool = False
     lost_since: float | None = None
     """When the polls in a row that found no daemon began, or ``None``."""
+    missing_since: float | None = None
+    """When the polls in a row that found the socket file missing began, or ``None``,
+    which a refused connection resets."""
     lost_polls: int = 0
     """How many polls in a row found no daemon."""
     lost_poll_at: float | None = None
@@ -163,9 +174,12 @@ class Failed:
 
 @dataclass(frozen=True, slots=True)
 class Lost:
-    """A request found nothing listening on the daemon's socket."""
+    """A request found nothing accepting connections on the daemon's socket.
+    ``missing`` says the socket file was absent, and otherwise the connection was
+    refused."""
 
     text: str
+    missing: bool = False
 
 
 type Event = (

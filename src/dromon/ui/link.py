@@ -24,6 +24,12 @@ class SocketDaemon:
         try:
             return call(self._socket, operation, TIMEOUT_SECONDS, args)
         except DaemonNotRunning as error:
-            raise Unreachable("the daemon is not running", gone=True) from error
+            if error.missing:
+                raise Unreachable(
+                    "the daemon is not running and its socket is gone",
+                    gone=True,
+                    missing=True,
+                ) from error
+            raise Unreachable("the daemon refused the connection", gone=True) from error
         except (ProtocolError, TimeoutError, OSError) as error:
             raise Unreachable(f"the daemon did not answer: {error}") from error

@@ -14,10 +14,21 @@ operator's direction, the format is expected to grow as large as a multi-agent p
 needs, so it is strict and versioned from the start.
 
 After printing the summary, `dromon config` warns when two lines that can write resolve
-to the same workdir. A line can write it when its `workdir_access` is `write` and it has
-a shell or file-write built-in, `Bash`, `Write`, `Edit` or `NotebookEdit`, or a tool
-policy that allows every tool. Assign writing lines separate worktrees to avoid
-concurrent edits to one checkout. **Round 9, 2026-10-31.** A line with
+to the same workdir. A line can write it only when its `workdir_access` is `write`, and
+then as its engine confines it. **Round 9 review, F16 and F17, decided by the
+operator.**
+
+- **Claude Code.** With a shell or file-write built-in, `Bash`, `Write`, `Edit` or
+  `NotebookEdit`, or a tool policy that allows every tool.
+- **Codex and Grok Build.** With `Edit` or `Write` only, since their sandbox keeps the
+  workspace read-only otherwise. A shell alone cannot write there, and a policy that
+  allows every tool does not change that.
+- **Pi, Cursor Agent and Antigravity.** Always, since these engines cannot confine a
+  line to reading its working directory and refuse `workdir_access = "read"`.
+- **An engine Dromon does not know.** Always, so the warning errs toward being given.
+
+Assign writing lines separate worktrees to avoid concurrent edits to one checkout.
+**Round 9, 2026-10-31.** A line with
 `workdir_access = "read"`, which its engine confines to reading, and a line whose only
 tools come from Model Context Protocol (MCP) servers are no longer counted, since the
 warning named read-only reviewers and a player with only its game's tools as writers.
