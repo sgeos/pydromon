@@ -149,7 +149,11 @@ and workflows live in `$GROK_HOME`.
   is its own default home. Dromon refuses a turn when the line's home directory holds
   any of them, a file when present and a folder when it holds anything. So Grok cannot
   read the operator's own `~/.claude/settings.json`, which Grok has no setting to stop
-  it reading.
+  it reading. **Not established by the installed guides.** They do not say whether
+  Grok creates a `.grok` entry in this isolated `HOME` on start. **Operator report, not
+  independently verified.** The entry most likely came from manual Grok initialization,
+  rather than a Dromon-run turn. No code allowance is added. A live Dromon turn will
+  establish whether Grok creates the entry in this isolated home.
 - **Claude Code's settings.** Grok's permissions guide says it also reads Claude
   Code's `defaultMode` from `~/.claude/settings.json`, `settings.local.json`, Claude
   Code's managed settings, and each project level up to the repository's root, and it
@@ -225,9 +229,13 @@ and workflows live in `$GROK_HOME`.
 8. **`session/prompt`** with the wake prompt. Message chunks are text and thought
    chunks are thinking. A tool call is judged against the line's tools when it is first
    seen, in a `tool_call`, a `tool_call_update` or a permission request, and its
-   `toolName`, `title` and `kind` are recorded then. A later update or request that
-   gives any of them another value, or one the call did not have, refuses the turn, as
-   does a call without an identifier.
+   `toolName`, `title` and `kind` are recorded then. For `use_tool`, the checked
+   `rawInput` is recorded too. A later update or request that changes a recorded field
+   refuses the turn, as does a call without an identifier. The normal order of one
+   announcement, one permission request and subsequent updates for that identifier is
+   accepted and counted once. A permission request that arrives before its announcement
+   is also accepted and counted once. A repeated announcement or another permission
+   grant for an identifier already granted in the turn is refused.
 9. **Permission requests** are answered with an `allow_once` option for a permitted call
    and a `reject` option otherwise. A tool call the line was not given, a refused
    permission request, or the driver's tool budget, sends `session/cancel`, and every
@@ -256,10 +264,27 @@ and workflows live in `$GROK_HOME`.
 **Changed on 2026-10-26, Antigravity review, F4.** A call is one of Dromon's own tools
 only when its structured `toolName` names it. Before, the shared client fell back to
 the call's `title`, which a file name or the model can make equal to a Dromon tool's
-name. A call with only a title is now judged by its kind as in the table, so one of
-the kind `other` is refused. This fails closed. Grok's tool calls are expected to
-carry `toolName`, as Not verified below says, so a Grok line that uses its own tools
-is unaffected if that holds, and refused if it does not.
+name. A call with only a title is judged by its kind as in the table, so one of the
+kind `other` is refused. This fails closed.
+
+**Fact, read on 2026-10-31** in Grok's installed `07-mcp-servers.md` under Tool
+Discovery. `search_tool` discovers available integration tools by name or description.
+`use_tool` calls a discovered integration tool by its fully qualified name. The guide's
+inline input example is an object with exactly `tool_name` and `tool_input`, where
+`tool_name` is a qualified catalog key such as `github__create_issue`. The guide also
+documents file-backed input forms, which Dromon refuses. The installed
+`14-headless-mode.md` shows ACP calls carry `rawInput`. **Not verified.** No recorded
+Grok ACP call establishes that its `use_tool` raw input has the documented inline
+shape. Dromon accepts only `rawInput` with exactly those two fields, a `tool_name`
+equal to one of this line's own `dromon__NAME` tools, and object-valued `tool_input`.
+It requires the ACP `kind` to be `other`, rejects a missing or ambiguous target, and
+keeps the checked input fixed across the permission request. It counts the underlying
+Dromon tool for the driver's budget and the report. `search_tool` is allowed only as
+discovery and is counted as `search_tool`; the guide describes it as finding available
+tools, while `use_tool` performs the integration call. Since the session is required
+to load only Dromon's server, discovery can reveal that server's tool names and
+descriptions, but does not invoke those tools. A title alone never grants either
+meta-tool.
 
 **Changed on 2026-10-26, Antigravity review, F1 to F3, at the operator's direction.**
 Grok no longer exempts the `think` kind. A `think` call was let through uncounted, so
@@ -281,7 +306,8 @@ directories. This example assumes every listed credential path exists.
 ```toml
 [profiles.dromon-reader]
 extends = "read-only"
-deny = [".dromon", "/placeholder/operator-home/.ssh", "/placeholder/operator-home/.aws",
+deny = [".dromon", "/placeholder/project/secret", "/placeholder/worktree/secret",
+        "/placeholder/operator-home/.ssh", "/placeholder/operator-home/.aws",
         "/placeholder/operator-home/.codex/auth.json",
         "/placeholder/operator-home/.cargo/credentials.toml",
         "/placeholder/operator-home/.pi/agent/auth.json"]
@@ -289,7 +315,8 @@ deny = [".dromon", "/placeholder/operator-home/.ssh", "/placeholder/operator-hom
 [profiles.dromon-writer]
 extends = "workspace"
 read_only = ["/placeholder/worktree/gitdir", "/placeholder/repository/gitdir"]
-deny = [".dromon", "/placeholder/operator-home/.ssh", "/placeholder/operator-home/.aws",
+deny = [".dromon", "/placeholder/project/secret", "/placeholder/worktree/secret",
+        "/placeholder/operator-home/.ssh", "/placeholder/operator-home/.aws",
         "/placeholder/operator-home/.codex/auth.json",
         "/placeholder/operator-home/.cargo/credentials.toml",
         "/placeholder/operator-home/.pi/agent/auth.json"]
@@ -308,23 +335,33 @@ That Grok reads `sandbox.toml` from `GROK_HOME`, as it reads `config.toml`, and 
 the built-in `read-only` base denies every write to the workspace. The profile names are fixed, so Grok lines in different working
 directories share one definition of each, whose entries must cover every one of their
 Git directory and every protected directory by its real path. Dromon writes the file
-for the first line only. If a profile already exists, refusal advice lists values to
-add to its arrays and says to leave other tables and entries as they are. If a profile
+for the first line only. If a profile already exists, refusal advice lists only missing
+values to add to its arrays and says to leave other tables and entries as they are. If a profile
 is missing, the advice gives its complete table. A new profile includes only credential
 paths that exist when the file is written. If one is created later, the next turn is
 refused and its refusal advice names the path. A credential path that is a symbolic
-link is denied by its own path under the daemon home. **Not verified.** Whether Grok
-matches a deny entry through a symbolic link. Writer lines do not commit, so their Git
+link is denied by its resolved target path. **Not verified.** Whether Grok matches a
+deny entry through a symbolic link. Writer lines do not commit, so their Git
 directories remain read-only. For a linked worktree, the `.git` pointer
 file and `commondir` file cannot be held as profile entries. A writer could rewrite a
 pointer during a turn. The next turn resolves it again and refuses unless the resulting
 Git directories are already held read-only. Between the check and that next turn, the
 pointer files themselves remain unguarded by the profile. The bridge below still runs
-in the project root, where it finds the runtime directory. The credential list does not
-include the operator's `.grok/auth.json` or `.claude.json`. Neither path has been tested
-with a Grok line, so this does not claim that either is safe to expose.
+in the project root, where it finds the runtime directory. The shared credential list
+is not complete, and a project may contain other stores. It includes `.grok/auth.json`
+and `.claude.json`. Grok exempts only its own sign-in path, `.grok/auth.json`;
+`.claude.json` remains a required deny entry. No claim is made that the listed paths
+cover every credential store.
 **Inference, not verified.** A `read_only` entry inside a writable workspace keeps it
 read-only, as the field's name says.
+
+Existing `secret` directories under both the project root and the line's working
+directory are also required deny entries, by real absolute path. This covers a line
+working in a worktree whose project root is elsewhere. Grok's profile has no
+`writable_paths` setting in Dromon. **Not verified.** Whether the Grok profile blocks a
+write through a symbolic link from the worktree to a target outside it. Dromon has no
+evidence that this matches Codex's reported gap, and this change does not add an
+external write grant to Grok.
 
 ## Dromon's tools
 
@@ -394,13 +431,13 @@ user's MCP servers and reports no permission mode.
    reads names a mode other than `default`, Dromon refuses before Grok starts, as the
    home section says.
 
-1. **Tool names.** Run a turn that calls one of Dromon's tools, such as
-   `send_message`, and record its `tool_call`, its `tool_call_update` messages and any
-   permission request. Confirm that each carries `toolName` as `dromon__send_message`.
-   A tool of Dromon's is recognised only by that structured field, never by a title. If
-   Grok names its MCP tools only in titles, every use of them is refused and a Grok line
-   cannot use its own tools, and the rule is to be revisited rather than loosened by
-   reading titles.
+1. **MCP meta-tools.** Run a first live line turn that uses `search_tool` and then calls
+   one Dromon tool, such as `send_message`, through `use_tool`. Record `toolName`,
+   `kind`, `rawInput`, every update and the permission request. Confirm that discovery
+   exposes only Dromon's server, and that the call's `rawInput` is the documented inline
+   `tool_name` and `tool_input` object. Confirm that Dromon counts the underlying tool
+   name toward its budget and gate. The ACP call shape has not been observed, so any
+   difference is refused and must be reviewed before this check is loosened.
 2. **Kinds and updates.** Record the `kind` of each tool call a plain turn and a tool
    turn carry, whether any arrives as `think`, and whether a later update repeats,
    omits, adds or changes `toolName`, `title` or `kind`. A `think` call, an added field

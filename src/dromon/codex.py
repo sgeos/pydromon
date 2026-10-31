@@ -114,6 +114,7 @@ from dromon.ceiling import (
 )
 from dromon.launcher import STOP_POLICY_VARIABLE, StopPolicy
 from dromon.processes import MARK_VARIABLE
+from dromon.security_paths import CREDENTIAL_PATHS, existing_real_paths
 from dromon.engine_environment import (
     BASE_ENVIRONMENT,
     SHELL_VARIABLE,
@@ -125,6 +126,7 @@ from dromon import gitssh
 from dromon.gitssh import GitSshAccess
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
 from dromon.model import InvalidField, format_due
+from dromon.workdir import git_directories
 
 ENGINE_NAME: Final = "codex"
 """The engine this adapter runs, as drivers name it."""
@@ -360,12 +362,16 @@ def _toml_string(text: str) -> str:
     return json.dumps(text)
 
 
-def permission_profile(config: LineConfig, protected: Sequence[Path]) -> str:
+def permission_profile(
+    config: LineConfig,
+    protected: Sequence[Path],
+    write_protected: Sequence[Path] = (),
+) -> str:
     """The ``dromon-line`` profile for ``config``, as an inline TOML table.
 
     The workspace is writable only with a write tool, ``.git`` is readable but not
-    writable, and each ``protected`` directory that exists is denied, as its real path,
-    since Codex enforces the path the operating system sees.
+    writable, each existing protected path is denied by its real path, and each
+    validated operator-granted directory is writable.
     """
     workspace = (
         "write"
@@ -374,15 +380,66 @@ def permission_profile(config: LineConfig, protected: Sequence[Path]) -> str:
         else "read"
     )
     scratch = ', "tmp"="write"' if config.workdir_access is WorkdirAccess.READ else ""
+    granted = validate_writable_paths(
+        config.writable_paths,
+        (*protected, *write_protected),
+        config.builtin_tools,
+    )
+    denied = existing_real_paths(
+        [
+            *protected,
+            *(Path.home() / relative for relative in CREDENTIAL_PATHS),
+        ]
+    )
     entries = [
         f'":workspace_roots"={{"."="{workspace}", ".git"="read"{scratch}}}',
-        *(
-            f'{_toml_string(os.path.realpath(directory))}="deny"'
-            for directory in protected
-            if os.path.exists(directory)
-        ),
+        *(f'{_toml_string(str(directory))}="deny"' for directory in denied),
+        *(f'{_toml_string(str(directory))}="write"' for directory in granted),
     ]
     return f'{{extends=":workspace", filesystem={{{", ".join(entries)}}}}}'
+
+
+def validate_writable_paths(
+    configured: Sequence[str],
+    protected: Sequence[Path],
+    tools: Sequence[str],
+) -> tuple[Path, ...]:
+    """Validate the absolute directories an operator grants a Codex line to write.
+
+    A grant may not overlap a protected directory or known credential path. The checks
+    use real paths so a symbolic link cannot make an overlapping grant look separate.
+    """
+    if configured and not WRITE_TOOLS.intersection(tools):
+        raise EngineRefused("writable_paths requires the Edit or Write tool")
+    home = Path.home()
+    credential_guards = tuple(
+        Path(os.path.realpath(home / relative)) for relative in CREDENTIAL_PATHS
+    )
+    guards = (
+        *existing_real_paths(list(protected)),
+        *credential_guards,
+        *existing_real_paths([home / relative for relative in CREDENTIAL_PATHS]),
+    )
+    result: list[Path] = []
+    for entry in configured:
+        path = Path(entry)
+        if not path.is_absolute():
+            raise EngineRefused(f"writable path {entry!r} must be absolute")
+        try:
+            real = path.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise EngineRefused(
+                f"writable path {entry!r} does not exist: {error}"
+            ) from error
+        if not real.is_dir():
+            raise EngineRefused(f"writable path {entry!r} is not a directory")
+        for guard in guards:
+            if real == guard or real in guard.parents or guard in real.parents:
+                raise EngineRefused(
+                    f"writable path {entry!r} overlaps a protected path {guard}"
+                )
+        result.append(real)
+    return tuple(sorted(set(result)))
 
 
 SESSION_SEPARATOR: Final = ":"
@@ -415,6 +472,7 @@ def server_arguments(
     protected: Sequence[Path] = (),
     mark: str | None = None,
     variables: Mapping[str, str] | None = None,
+    write_protected: Sequence[Path] = (),
 ) -> list[str]:
     """The ``codex app-server`` arguments that isolate a line configured as ``config``
     from the operator's ``servers``, from every tool it was not given, and from the
@@ -457,7 +515,8 @@ def server_arguments(
     # quoted keys inside the inline table value.
     arguments += [
         "-c",
-        f"permissions.{PROFILE_NAME}={permission_profile(config, protected)}",
+        f"permissions.{PROFILE_NAME}="
+        f"{permission_profile(config, protected, write_protected)}",
     ]
     return arguments
 
@@ -1152,6 +1211,7 @@ class CodexLine:
                 self.protected,
                 self.mark,
                 variables,
+                git_directories(self.cwd) or (),
             )
             instructions = read_instructions(self.config.instructions, self.cwd)
         except Exception:

@@ -76,6 +76,7 @@ from dromon.engine import EngineRefused, TurnReport, read_instructions
 from dromon import launcher
 from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
+from dromon.security_paths import CREDENTIAL_PATHS, existing_real_paths
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 from dromon import gitssh
 from dromon.gitssh import GitSshAccess
@@ -567,13 +568,53 @@ def check_project(workspace: Path) -> None:
         str(directory / name)
         for directory in _project_levels(workspace)
         for name in REFUSED_PROJECT_ENTRIES
-        if _loading_entries(directory, (name,))
+        if (
+            not _project_claude_directory_is_safe(directory / name)
+            if name == ".claude"
+            else _loading_entries(directory, (name,))
+        )
     ]
     if found:
         raise EngineRefused(
             "Grok would load project configuration or instructions Dromon has not"
             " read from " + ", ".join(found)
         )
+
+
+def _project_claude_directory_is_safe(directory: Path) -> bool:
+    """Allow only Claude Code's empty `.cc-writes` marker in a project directory."""
+    try:
+        info = directory.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError as error:
+        raise EngineRefused(
+            f"cannot inspect Grok project entry {directory}: {error}"
+        ) from error
+    if stat.S_ISLNK(info.st_mode):
+        return False
+    if not stat.S_ISDIR(info.st_mode):
+        return False
+    try:
+        children = list(directory.iterdir())
+    except OSError as error:
+        raise EngineRefused(
+            f"cannot inspect Grok project entry {directory}: {error}"
+        ) from error
+    if not children:
+        return True
+    if len(children) != 1 or children[0].name != ".cc-writes":
+        return False
+    marker = children[0]
+    try:
+        marker_info = marker.lstat()
+        if not stat.S_ISDIR(marker_info.st_mode):
+            return False
+        return not any(True for _ in marker.iterdir())
+    except OSError as error:
+        raise EngineRefused(
+            f"cannot inspect Grok project entry {marker}: {error}"
+        ) from error
 
 
 def claude_mode_refusal(home: Path, workspace: Path) -> str | None:
@@ -754,20 +795,17 @@ def _covers(paths: Sequence[Path], target: Path) -> bool:
     return False
 
 
-GROK_CREDENTIAL_PATHS: Final = (
-    Path(".ssh"),
-    Path(".aws"),
-    Path(".codex/auth.json"),
-    Path(".cargo/credentials.toml"),
-    Path(".pi/agent/auth.json"),
-)
-"""Operator-home credentials Grok profiles must deny, when each path exists."""
-
-
 def _credential_paths(daemon_home: Path) -> tuple[Path, ...]:
-    """The configured credential paths under the daemon's real home directory."""
+    """Known credential paths under the daemon's real home, except Grok's sign-in."""
     real_home = Path(os.path.realpath(daemon_home))
-    return tuple(real_home / relative for relative in GROK_CREDENTIAL_PATHS)
+    grok_sign_in = Path(".grok/auth.json")
+    return existing_real_paths(
+        [
+            real_home / relative
+            for relative in CREDENTIAL_PATHS
+            if relative != grok_sign_in
+        ]
+    )
 
 
 def profile_snippet(
@@ -837,21 +875,38 @@ def check_profile(
     if profile is None:
         advice = f" Add this new table to {file}:\n\n{full_snippet}"
     else:
-        deny_values = [".dromon"] + [
+        required_deny_values = [".dromon"] + [
             str(Path(os.path.realpath(path)))
             for path in protected
             if not _covers([workspace / ".dromon"], path)
         ]
-        deny_values.extend(
+        required_deny_values.extend(
             str(path)
             for path in _credential_paths(daemon_home)
             if os.path.lexists(path)
         )
+        denied = [
+            path
+            for entry in _entries(profile, "deny")
+            if (path := _resolve(entry, workspace, home)) is not None
+        ]
+        deny_values = [
+            entry
+            for entry in required_deny_values
+            if (path := _resolve(entry, workspace, home)) is None
+            or not _covers(denied, path)
+        ]
         git = git_directories(workspace)
         read_only_values = (
             []
             if name != WRITER_PROFILE or git is None
-            else [str(path) for path in sorted(set(git))]
+            else [
+                str(path)
+                for path in sorted(set(git))
+                if not _covers(
+                    [Path(entry) for entry in _entries(profile, "read_only")], path
+                )
+            ]
         )
         advice = "".join(
             (
@@ -861,10 +916,10 @@ def check_profile(
                 str(file),
                 ". Add missing entries to its deny and read_only arrays, creating"
                 " either array if the profile has none, and leave every other profile"
-                " table and entry as it is. Required "
+                " table and entry as it is. Missing "
                 "deny entries are ",
                 json.dumps(deny_values),
-                "; required read_only entries are ",
+                "; missing read_only entries are ",
                 json.dumps(read_only_values),
             )
         )
@@ -1003,6 +1058,10 @@ class _Turn:
         default_factory=dict[str, dict[str, object]]
     )
     """Each tool call's identity as first recorded, by its identifier."""
+    announced_calls: set[str] = field(default_factory=set[str])
+    """Identifiers first announced by a ``tool_call`` update."""
+    granted_calls: set[str] = field(default_factory=set[str])
+    """Identifiers for which a permission request has already been granted."""
     finished: set[str] = field(default_factory=set[str])
     """Tool calls whose update reported them finished, so each result is fed to the
     driver once."""
@@ -1291,9 +1350,28 @@ class GrokLine:
         any other kind than a built-in tool's is refused. No kind is exempt, since
         the review's F1 was applied to Grok on 2026-10-26."""
         name = acp.tool_name(tool_call)
-        if name in self.own_tools:
-            return True, name
         kind = str(tool_call.get("kind") or "other")
+        if name == "search_tool":
+            return tool_call.get("kind") == "other", "search_tool"
+        if name == "use_tool":
+            raw_value = tool_call.get("rawInput")
+            if not isinstance(raw_value, dict):
+                return False, "use_tool"
+            raw = cast(dict[str, object], raw_value)
+            if set(raw) != {"tool_name", "tool_input"}:
+                return False, "use_tool"
+            target = raw.get("tool_name")
+            arguments = raw.get("tool_input")
+            if (
+                tool_call.get("kind") != "other"
+                or not isinstance(target, str)
+                or target not in self.own_tools
+                or not isinstance(arguments, dict)
+            ):
+                return False, "use_tool"
+            return True, target
+        if name in self.own_tools:
+            return kind == "other", name
         allowed = KIND_TOOLS.get(kind)
         if allowed is None:
             return False, acp.tool_label(tool_call)
@@ -1314,7 +1392,13 @@ class GrokLine:
                 )
                 return
             identifier = tool_call.get("toolCallId")
-            refusal = acp.identity_refusal(identifier, tool_call, turn.calls)
+            refusal = self._identity_refusal(identifier, tool_call, turn.calls)
+            if (
+                refusal is None
+                and isinstance(identifier, str)
+                and identifier in turn.granted_calls
+            ):
+                refusal = "the engine reused a tool call identifier after permission"
             # With no field changed, the call is what was recorded plus what the
             # request adds, so a request that omits the recorded kind keeps it.
             known = turn.calls.get(str(identifier), {})
@@ -1326,6 +1410,8 @@ class GrokLine:
             if refusal is not None:
                 await self._cancel(turn, refusal)
             else:
+                if permitted and isinstance(identifier, str):
+                    turn.granted_calls.add(identifier)
                 await self._record(str(identifier), tool_call, turn)
         else:
             await self._rpc().refuse(request_id, method)
@@ -1352,10 +1438,18 @@ class GrokLine:
             # Antigravity review, F1 to F3, applied to Grok on 2026-10-26. No kind is
             # exempt, and every update to a call is compared with its record.
             identifier = update.get("toolCallId")
-            refusal = acp.identity_refusal(identifier, update, turn.calls)
+            refusal = self._identity_refusal(identifier, update, turn.calls)
             if refusal is not None:
                 await self._cancel(turn, refusal)
                 return
+            if kind == "tool_call" and isinstance(identifier, str):
+                if identifier in turn.announced_calls:
+                    await self._cancel(
+                        turn,
+                        "the engine reused a tool call identifier within the turn",
+                    )
+                    return
+                turn.announced_calls.add(identifier)
             await self._record(str(identifier), update, turn)
             if acp.newly_finished(str(identifier), update, turn.finished):
                 # The safe point before the next model call that priority mail
@@ -1371,7 +1465,10 @@ class GrokLine:
         call already judged."""
         if identifier in turn.calls:
             return
-        turn.calls[identifier] = acp.identity(fields)
+        identity = acp.identity(fields)
+        if acp.tool_name(fields) == "use_tool" and "rawInput" in fields:
+            identity["rawInput"] = fields["rawInput"]
+        turn.calls[identifier] = identity
         permitted, name = self._permits(fields)
         if not permitted:
             await self._cancel(
@@ -1381,6 +1478,23 @@ class GrokLine:
         turn.tool_uses.append(name)
         self._observe(ActivityKind.TOOL, name)
         await self._act(Event("tool_use", name), turn)
+
+    @staticmethod
+    def _identity_refusal(
+        identifier: object,
+        fields: Mapping[str, Any],
+        calls: Mapping[str, Mapping[str, object]],
+    ) -> str | None:
+        """Check ACP identity and keep a `use_tool` target fixed after first sight."""
+        refusal = acp.identity_refusal(identifier, fields, calls)
+        if refusal is not None or not isinstance(identifier, str):
+            return refusal
+        recorded = calls.get(identifier)
+        if recorded is None or recorded.get("toolName") != "use_tool":
+            return None
+        if "rawInput" in fields and fields["rawInput"] != recorded.get("rawInput"):
+            return "the engine changed the structured input of its use_tool call"
+        return None
 
     async def _act(self, event: Event, turn: _Turn) -> None:
         action = self.driver.step(event)
