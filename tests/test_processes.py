@@ -114,6 +114,36 @@ def test_process_worker_close_rejects_new_calls() -> None:
     asyncio.run(exercise())
 
 
+def test_process_worker_reports_when_a_running_call_outlasts_close_bound() -> None:
+    worker = ProcessWorker()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked() -> str:
+        entered.set()
+        release.wait(5)
+        return "finished"
+
+    async def exercise() -> None:
+        running = asyncio.create_task(worker.run(blocked))
+        assert await asyncio.to_thread(entered.wait, 1)
+        assert worker.close(timeout=0.01) is False
+        with pytest.raises(ProcessRefused, match="worker is stopped"):
+            await worker.run(lambda: "late")
+        release.set()
+        assert await running == "finished"
+        thread = worker._thread  # pyright: ignore[reportPrivateUsage]
+        assert thread is not None
+        await asyncio.to_thread(thread.join, 1)
+        assert not thread.is_alive()
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release.set()
+        worker.close(timeout=1)
+
+
 class FakeTable:
     """A process table the test writes, which records the signals sent."""
 

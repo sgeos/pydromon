@@ -414,6 +414,31 @@ def test_dromon_wait_polls_and_prints_a_reply_without_reading_it(
     )
 
 
+def test_dromon_wait_reports_replies_left_out_by_the_size_bound(
+    tmp_path: Path,
+    short_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def reply_call(
+        socket: Path,
+        operation: Operation,
+        *,
+        timeout_seconds: float,
+        args: dict[str, object],
+    ) -> Response:
+        del socket, timeout_seconds, args
+        assert operation is Operation.REPLIES
+        return Response("r", True, result={"messages": [], "replies": 1, "left_out": 1})
+
+    monkeypatch.setattr(cli, "call", reply_call)
+    monkeypatch.setattr(cli.time, "monotonic", cast(Any, lambda: 1.0))
+    paths = project_paths(tmp_path, short_runtime)
+
+    assert cli._wait(paths, wait_arguments()) == 0  # pyright: ignore[reportPrivateUsage]
+    assert "1 matching reply did not fit" in capsys.readouterr().out
+
+
 def test_dromon_wait_times_out_nonzero(
     tmp_path: Path,
     short_runtime: Path,

@@ -1632,7 +1632,18 @@ to an empty list. Claude Code, Codex and Grok Build enforce the paths. Pi, Curso
 and Antigravity refuse to start a line while the setting is non-empty because their
 adapters cannot enforce it. Dromon checks the configured paths again whenever it builds
 an engine, and refuses a missing path or a symbolic link whose target leaves the
-workdir.
+workdir. Dromon's `write_scratch` tool also refuses a target at or below a configured
+read-only path, including paths under `tmp/`. Codex profiles add explicit read entries
+under the `tmp/` write grant and retain read-only parents around protected descendants.
+The test suite checks the generated profile, not Codex's runtime precedence for these
+overlapping entries.
+
+These engine rules are based on resolved paths when the engine is built. Dromon has not
+verified how Claude Code or Codex applies them after a writable parent is renamed, or
+when a line creates a new symbolic link that points into a read-only path. Until those
+cases are checked against the live engines, do not rely on `read_only_paths` to prevent
+those operations. The setting does not freeze directory names or re-resolve links on
+every engine file operation.
 
 **Codex writable paths.** An operator may name additional absolute directories with
 `writable_paths` for a Codex line given `Edit` or `Write`. For example, a line may use

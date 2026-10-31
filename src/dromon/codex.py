@@ -392,13 +392,12 @@ def permission_profile(
         ]
     )
     read_only = existing_real_paths(list(write_protected))
+    # A protected descendant must stay denied without dropping the broader read
+    # grant. A protected ancestor, or the same path, already denies this entry.
     read_only = tuple(
         path
         for path in read_only
-        if not any(
-            path == guard or path in guard.parents or guard in path.parents
-            for guard in denied
-        )
+        if not any(guard == path or guard in path.parents for guard in denied)
     )
     entries = [
         f'":workspace_roots"={{"."="{workspace}", ".git"="read"{scratch}}}',

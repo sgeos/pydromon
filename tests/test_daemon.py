@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from dromon import client, exits, launcher
+from dromon import client, daemon as daemon_module, exits, launcher
 from typing import Any, cast
 
 from claude_agent_sdk import SdkMcpTool
@@ -160,7 +160,7 @@ def test_status_answers_while_a_process_table_read_hangs(
             asyncio.run(check())
         finally:
             release.set()
-            assert scheduler.stop_workers()
+        assert scheduler.stop_workers()
 
 
 def test_stopping_a_daemon_joins_its_process_workers(paths: ProjectPaths) -> None:
@@ -185,6 +185,41 @@ def test_stopping_a_daemon_joins_its_process_workers(paths: ProjectPaths) -> Non
             assert sweep_thread is not None and not sweep_thread.is_alive()
 
         asyncio.run(exercise())
+
+
+def test_daemon_run_finally_joins_a_process_worker_with_a_running_call(
+    paths: ProjectPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    worker_thread: list[threading.Thread] = []
+
+    def blocked_inspection() -> None:
+        entered.set()
+        release.wait(5)
+
+    async def fake_serve(daemon: Daemon) -> None:
+        task = asyncio.create_task(
+            daemon.scheduler._process_worker.run(  # pyright: ignore[reportPrivateUsage]
+                blocked_inspection
+            )
+        )
+        assert await asyncio.to_thread(entered.wait, 1)
+        thread = daemon.scheduler._process_worker._thread  # pyright: ignore[reportPrivateUsage]
+        assert thread is not None
+        worker_thread.append(thread)
+        timer = threading.Timer(0.05, release.set)
+        timer.start()
+        task.cancel()
+
+    monkeypatch.setattr(daemon_module, "serve", fake_serve)
+    monkeypatch.setattr(daemon_module, "environment_reading_works", lambda: False)
+
+    assert daemon_module.run(paths) == exits.OK
+    assert worker_thread and not worker_thread[0].is_alive()
+    assert "dromond: stopped" in capsys.readouterr().err
 
 
 def test_stop_answers_then_requests_the_stop(paths: ProjectPaths) -> None:

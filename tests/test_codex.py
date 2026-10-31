@@ -44,7 +44,7 @@ from dromon.launcher import (
     LAUNCH_VARIABLES,
     STOP_POLICY_VARIABLE,
 )
-from dromon.lineconfig import LineConfig, config_from_document
+from dromon.lineconfig import LineConfig, WorkdirAccess, config_from_document
 from dromon.security_paths import CREDENTIAL_PATHS, project_secret_paths
 from dromon.gitssh import COMMAND_VARIABLE, GitSshAccess, ssh_command
 from dromon.grok import GrokLine
@@ -1233,6 +1233,31 @@ def test_a_read_only_workdir_profile_keeps_tmp_writable() -> None:
         ".git": "read",
         "tmp": "write",
     }
+
+
+def test_read_only_entries_under_tmp_keep_their_read_grant_and_protected_denies(
+    tmp_path: Path,
+) -> None:
+    import tomllib
+
+    reports = tmp_path / "work" / "tmp" / "reports"
+    reports.mkdir(parents=True)
+    protected = reports / "private"
+    protected.mkdir()
+    text = profile_of(
+        server_arguments(
+            [],
+            LineConfig(
+                builtin_tools=("Bash", "Edit"), workdir_access=WorkdirAccess.READ
+            ),
+            (protected,),
+            write_protected=(reports,),
+        )
+    )
+    filesystem = tomllib.loads(f"profile = {text}")["profile"]["filesystem"]
+    assert filesystem[":workspace_roots"]["tmp"] == "write"
+    assert filesystem[str(reports.resolve())] == "read"
+    assert filesystem[str(protected.resolve())] == "deny"
 
 
 def test_the_profile_denies_each_protected_directory_that_exists(

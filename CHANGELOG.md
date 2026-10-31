@@ -21,6 +21,11 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- `write_scratch` refuses targets covered by project `read_only_paths`. Codex keeps
+  read-only parent entries while denying protected descendants and makes read-only
+  entries under `tmp/` explicit. `dromon wait` reports replies left out by the response
+  size bound. Documentation states that worker joins are bounded and that engine
+  enforcement after parent renames or newly created symbolic links is unverified.
 - The process-inspection and launch-record-sweep workers now stop when their scheduler
   or daemon stops. Shutdown rejects new inspections, drops queued calls, and joins each
   worker for at most one second. A process-table read already in progress cannot be

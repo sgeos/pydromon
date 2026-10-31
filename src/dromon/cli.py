@@ -893,8 +893,21 @@ def _wait(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
                 print(f"dromon wait: {response.error_message}", file=sys.stderr)
                 return exits.FAILURE
             entries = response.result.get("messages")
-            if isinstance(entries, list) and entries:
-                _print_wait_replies(arguments.replies_to, cast(list[object], entries))
+            replies = response.result.get("replies")
+            left_out = response.result.get("left_out")
+            if (isinstance(entries, list) and entries) or (
+                type(replies) is int and replies > 0
+            ):
+                _print_wait_replies(
+                    arguments.replies_to,
+                    cast(list[object], entries) if isinstance(entries, list) else [],
+                )
+                if type(left_out) is int and left_out > 0:
+                    noun = "reply" if left_out == 1 else "replies"
+                    print(
+                        f"{left_out} matching {noun} did not fit this answer."
+                        " Use dromon mail --replies-to to page through them."
+                    )
                 return exits.OK
         remaining = deadline - time.monotonic()
         if remaining <= 0:

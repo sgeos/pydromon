@@ -692,6 +692,39 @@ def test_write_scratch_writes_under_tmp_creating_directories(world: World) -> No
 
 
 @pytest.mark.parametrize(
+    ("read_only", "target"),
+    [
+        ("tmp/reports", "reports/locked.md"),
+        ("tmp/reports/locked.md", "reports/locked.md"),
+    ],
+)
+def test_write_scratch_tool_call_refuses_a_read_only_target(
+    world: World, read_only: str, target: str
+) -> None:
+    protected = world.root / read_only
+    protected.parent.mkdir(parents=True, exist_ok=True)
+    if read_only.endswith(".md"):
+        protected.write_text("original", encoding="utf-8")
+    else:
+        protected.mkdir(exist_ok=True)
+    world.scheduler = Scheduler(
+        world.log,
+        world.build,
+        tick_seconds=0,
+        wall_clock=world.clock,
+        root=world.root,
+        read_only_paths=(read_only,),
+    )
+
+    response, error = world.call("write_scratch", {"path": target, "text": "new"})
+
+    assert error is True
+    assert "read_only_paths" in response
+    if read_only.endswith(".md"):
+        assert protected.read_text(encoding="utf-8") == "original"
+
+
+@pytest.mark.parametrize(
     ("path", "message"),
     [
         ("/etc/passwd", "relative path under tmp/"),

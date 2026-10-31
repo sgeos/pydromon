@@ -1680,6 +1680,7 @@ class Scheduler:
         wall_clock: Callable[[], datetime] = utc_clock,
         root: Path | None = None,
         protected: Sequence[Path] = (),
+        read_only_paths: Sequence[str] = (),
         daemon_commit: str | None = None,
         daemon_checkout: Path | None = None,
         processes: ProcessTable | None = None,
@@ -1703,6 +1704,9 @@ class Scheduler:
         """The project root, against which a line's working directory resolves, or
         ``None`` where the scheduler runs without a project, as in some tests."""
         self._protected = tuple(protected)
+        self._read_only_paths = tuple(read_only_paths)
+        """Project paths kept read only by each supported engine and the scratch
+        tool."""
         self._daemon_commit = daemon_commit
         """The commit the daemon's own checkout had at start, if it runs from one."""
         self._loaded_at = format_due(wall_clock())
@@ -4348,6 +4352,15 @@ class Scheduler:
         if refusal is not None:
             raise LineToolRefused(refusal)
         workdir = self._workdir_of(line_id)
+        read_only = resolve_read_only_paths(self._read_only_paths, workdir)
+        target = Path(os.path.normpath(workdir / SCRATCH_DIRECTORY / Path(*parts)))
+        if any(
+            protected_path == target
+            or protected_path in target.parents
+            or target in protected_path.parents
+            for protected_path in read_only
+        ):
+            raise LineToolRefused(f"{path} is under a project read_only_paths entry")
         # Every component is opened relative to its parent's descriptor without
         # following links, so no link swapped in at any level can redirect the
         # write, however the race falls.

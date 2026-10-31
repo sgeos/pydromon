@@ -131,6 +131,10 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
   `dromond.lock`. A second daemon exits with status 5 and changes nothing.
 - The lock holder removes a socket file left by a crash before listening.
 - `stop`, SIGTERM and SIGINT end the daemon cleanly with status 0.
+- On the normal shutdown path, the process and sweep workers finish before the daemon
+  returns. Each join is bounded to one second. If an in-flight process-table call
+  exceeds that bound, shutdown reports the worker as still running and the daemon may
+  return while its daemon thread finishes later.
 
 ## Commands
 

@@ -2729,6 +2729,7 @@ def run(
                 wake_every_ticks=config.wake_every_ticks,
                 root=paths.root,
                 protected=protected_dirs(paths, config.federation),
+                read_only_paths=config.read_only_paths,
                 daemon_commit=read_head_commit(Path(__file__).parent),
                 daemon_checkout=Path(__file__).parent,
                 processes_identifiable=environment_reading_works(),

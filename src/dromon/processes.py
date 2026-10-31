@@ -179,6 +179,8 @@ class ProcessWorker:
 
         A call already running cannot be interrupted. ``False`` means it did not
         finish within ``timeout``; its daemon thread will exit after that call returns.
+        The daemon's normal stop path joins each worker, but cannot guarantee this
+        within the bound when an in-flight call is still running.
         """
         if timeout < 0:
             raise ValueError("worker join timeout must not be negative")
