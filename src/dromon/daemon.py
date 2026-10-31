@@ -2706,6 +2706,7 @@ def run(
     }
     launcher.configure(paths.left_reports)
     successor: list[str] | None = None
+    scheduler: Scheduler | None = None
     try:
         with EventLog(paths.event_log) as log:
             scheduler = Scheduler(
@@ -2785,6 +2786,8 @@ def run(
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
     finally:
+        if scheduler is not None:
+            scheduler.stop_workers()
         for stale in (
             paths.socket,
             paths.agent_socket,

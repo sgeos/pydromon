@@ -1817,6 +1817,8 @@ class Scheduler:
         self._sweep_worker = ProcessWorker()
         """Separate queue so a sweep waiting on signalled children cannot occupy
         the worker that serves process inspections and stops."""
+        self._workers_stopped = False
+        self._workers_joined = True
         self._process_tasks: set[asyncio.Task[None]] = set()
         """Background process scans started during recovery, kept until they finish."""
         self._line_tokens = line_tokens
@@ -6912,7 +6914,30 @@ class Scheduler:
                 turn.cancel()
             if self._running:
                 await asyncio.gather(*self._running.values(), return_exceptions=True)
-            await self.close_engines()
+            try:
+                await self.close_engines()
+            finally:
+                self.stop_workers()
+
+    def stop_workers(self) -> bool:
+        """Stop process-table workers when their daemon or test scheduler stops."""
+        if self._workers_stopped:
+            return self._workers_joined
+        self._workers_stopped = True
+        joined = True
+        for worker_name, worker in (
+            ("process inspection", self._process_worker),
+            ("launch-record sweep", self._sweep_worker),
+        ):
+            if not worker.close():
+                joined = False
+                print(
+                    f"dromond: {worker_name} worker did not stop within its join"
+                    " timeout; its running process call cannot be interrupted",
+                    file=sys.stderr,
+                )
+        self._workers_joined = joined
+        return joined
 
     async def _fault_found(self, error: Exception, stop: asyncio.Event) -> None:
         """The watch, as the forwarder has one. An exception that no rule expects is

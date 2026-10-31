@@ -70,6 +70,7 @@ def test_process_worker_refuses_calls_past_its_bounded_queue() -> None:
         asyncio.run(exercise())
     finally:
         release.set()
+        assert worker.close()
 
 
 def test_process_worker_skips_a_queued_call_after_its_caller_cancels() -> None:
@@ -98,7 +99,19 @@ def test_process_worker_skips_a_queued_call_after_its_caller_cancels() -> None:
         asyncio.run(exercise())
     finally:
         release.set()
+        assert worker.close()
     assert ran == []
+
+
+def test_process_worker_close_rejects_new_calls() -> None:
+    worker = ProcessWorker()
+    assert worker.close()
+
+    async def exercise() -> None:
+        with pytest.raises(ProcessRefused, match="worker is stopped"):
+            await worker.run(lambda: None)
+
+    asyncio.run(exercise())
 
 
 class FakeTable:

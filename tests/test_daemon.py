@@ -160,6 +160,31 @@ def test_status_answers_while_a_process_table_read_hangs(
             asyncio.run(check())
         finally:
             release.set()
+            assert scheduler.stop_workers()
+
+
+def test_stopping_a_daemon_joins_its_process_workers(paths: ProjectPaths) -> None:
+    paths.state_dir.mkdir(mode=0o700)
+    with EventLog(paths.event_log) as log:
+        scheduler = Scheduler(log, no_engine)
+        daemon = Daemon(paths, log, "2026-10-25T00:00:00Z", scheduler)
+
+        async def exercise() -> None:
+            await scheduler._process_worker.run(  # pyright: ignore[reportPrivateUsage]
+                lambda: None
+            )
+            await scheduler._sweep_worker.run(  # pyright: ignore[reportPrivateUsage]
+                lambda: None
+            )
+            process_thread = scheduler._process_worker._thread  # pyright: ignore[reportPrivateUsage]
+            sweep_thread = scheduler._sweep_worker._thread  # pyright: ignore[reportPrivateUsage]
+            response = daemon.respond(b'{"id":"s","op":"stop","v":1}\n')
+            assert response.ok and daemon.stop_requested.is_set()
+            await scheduler.run(daemon.stop_requested)
+            assert process_thread is not None and not process_thread.is_alive()
+            assert sweep_thread is not None and not sweep_thread.is_alive()
+
+        asyncio.run(exercise())
 
 
 def test_stop_answers_then_requests_the_stop(paths: ProjectPaths) -> None:

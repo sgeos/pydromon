@@ -21,6 +21,11 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- The process-inspection and launch-record-sweep workers now stop when their scheduler
+  or daemon stops. Shutdown rejects new inspections, drops queued calls, and joins each
+  worker for at most one second. A process-table read already in progress cannot be
+  interrupted and may outlive that bound, after which its worker exits. This also
+  closes workers when startup validation refuses a daemon before its service loop.
 - Refused Codex items count toward the driver's tool budget whether first announced by
   `item/started` or `item/completed`. Matching item identifiers are counted once
   regardless of notice order. A refusal announced by neither notice remains invisible.
