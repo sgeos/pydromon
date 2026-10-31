@@ -4,38 +4,35 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-30, own notes retired, and several files in one disclosure check
+## 2026-10-30, Grok lines in a team, and drivers for Sol and Terra
 
-**Done, merged in pull requests 91 and 92.**
+**Done, merged in pull requests 94 and 95.**
 
-- **Own notes.** A line's own notes leave its count once a turn of the line ends
-  after their delivery. A worker line in another project counted 62, and core 87,
-  nearly all fired wakes and task notes already dealt with. The rule is read from
-  the event log, so every view and a restarted daemon agree. A turn whose engine
-  returned no report retires nothing, and its end is recorded with `unreported`.
-- **Disclosure checks.** `check_disclosure` takes up to eight files as one check.
-  Each file is counted on its own and the counts summed, and no answer says which
-  file matched. Its description says it covers only the project's configured list.
-- **The operator in the prompt.** The wake prompt names the operator that
-  `ask_operator` reaches when `to` is omitted, as at the turn's start.
+- **Grok in a team.** Another project running Grok lines in worktrees found three
+  defects. Dromon refused the empty `hooks-paths` file and the empty lock in
+  `installed-plugins` that Grok writes on every start, so every second turn failed.
+  The writer profile named a worktree's `.git` file, which Grok refuses. The
+  suggested profiles denied no credentials. Dromon now admits only those two empty
+  records, holds a worktree's git directories read-only, and requires the operator's
+  SSH, Codex, Cargo and Pi credentials, and AWS when present, to be denied by absolute
+  path. A refusal of a profile shared by several projects names only the entries to
+  add.
+- **Sol and Terra.** Codex drivers for `gpt-6.1-sol` and `gpt-6.1-terra`, for every
+  strategy, with the catalogue's context window of 500,000 tokens and Luna's other
+  settings.
 
-**Found by review.** A note delivered into a turn whose prompt was never composed
-was retired unseen. A term could span two files. The prompt's operator could change
-during the turn. A daemon before this round cannot read a log holding `unreported`,
-which the protocol now warns of. All were fixed or documented before merge.
+**Outside the repository.** Dromon's shared Grok profile gained denials for the
+Cargo and Pi credentials, with a backup beside it. The checks of pull request 95,
+run offline against that profile and the other project's Grok worktree, pass for the
+reader and the writer, and the home check passes with Grok's empty records present.
 
-**Verified.** Full gates outside the sandbox and continuous integration passed on
-both pull requests. The daemon was restarted onto `2caeb4f`. Replaying this
-project's log and the other project's log read-only under the new rule gives every
-line 0 own notes. No line has yet run a turn on the new code.
+**Verified.** Full gates outside the sandbox and continuous integration on both pull
+requests. The daemon was restarted onto `b0cd881`.
 
-**Round 8 reports.** core was satisfied, and asks first again for a read-only tool
-for its own event log entries. engines was not satisfied, since a stale brief led
-its resumed context after a new task arrived. Two generic compaction notices it
-cited were scheduled at 18:08Z, before the fix of round 7 was loaded at 18:36Z.
-review was not satisfied, since its daemon was stale against the checkout while it
-reviewed. Both dissatisfied lines point at stale context, which is the best next
-iteration with the event log tool.
+**Not verified.** A Grok turn on the new code, and any turn on Sol or Terra. The
+other project's daemon still runs code from before pull request 95 until it is
+restarted.
 
-**Not verified.** Any of this round's changes in a live turn. The other project's
-daemon runs the code it loaded before this round.
+**Also this session.** A stray attach client from 2026-10-25, whose project had been
+deleted, used a full core until it was stopped. An attach client that loses its
+daemon should exit, which is not yet fixed. Dependabot showed no alerts.

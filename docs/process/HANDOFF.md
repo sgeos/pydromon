@@ -31,11 +31,11 @@ seats on Opus, Haiku and GPT-6-Luna. Upgrades use `dromon restart`.
 
 ## Open
 
-- **Grok.** Signed in by the operator on 2026-10-30. One probe turn succeeded from a
-  directory outside the repository, with `cached_token` and no MCP servers. Grok sent
-  `x.ai/mcp_initialized`, not the `init_progress` that `GROK.md` expects. The main
-  checkout is refused, since its `.claude` holds a Claude Code write marker. Steps 1
-  to 4 of Verify first need a Grok line turn. The operator treats it as a subscription.
+- **Grok.** Signed in on 2026-10-30. One probe turn passed outside the repository,
+  and Grok sent `x.ai/mcp_initialized`, not the `init_progress` of `GROK.md`. The main
+  checkout is refused for its `.claude` write marker. Pull request 95 fixed repeated
+  turns, worktree profiles and credential denials, unrun live. Verify first steps 1
+  to 4 need a Grok line turn. The operator treats it as a subscription.
 - **Keleusma.** Ready for its four lines, with the live trial passed in a line's
   sandbox. The migration, the `full-gate` lease, cost holds, the HTTPS remote and push
   authority are the operator's, per `KELEUSMA_DOGFOOD.md`. Deferred by the operator on
@@ -56,8 +56,10 @@ seats on Opus, Haiku and GPT-6-Luna. Upgrades use `dromon restart`.
 - **Parity gaps.** No credential masking, approval reviewer, plugins, language servers
   or MCP OAuth, and Linux not verified live, per `SANDBOX.md` and `SETTINGS.md`.
 - **Unrun engines.** Pi, Cursor Agent and Antigravity, each with a verify-first list.
+  GPT-6.1-Sol and GPT-6.1 Terra have Codex drivers, no live turn.
 - **Flaky tests.** Tests that wait on the clock may remain.
 - **Clients.** Polling, no token meter, Tk checked only withdrawn.
+  An attach client spins once its daemon is gone.
 - **Git over SSH.** Works only for a line whose sandbox is disabled, by the operator's
   test of 2026-10-29 inside a Claude Code sandbox. On 2026-10-30 a push from a script
   to a private test repository succeeded with the command `gitssh` builds, a deploy
