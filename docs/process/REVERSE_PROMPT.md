@@ -4,35 +4,36 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-30, Grok lines in a team, and drivers for Sol and Terra
+## 2026-10-31, rounds 9 to 11
 
-**Done, merged in pull requests 94 and 95.**
+**Done, merged in pull requests 97 to 110.**
 
-- **Grok in a team.** Another project running Grok lines in worktrees found three
-  defects. Dromon refused the empty `hooks-paths` file and the empty lock in
-  `installed-plugins` that Grok writes on every start, so every second turn failed.
-  The writer profile named a worktree's `.git` file, which Grok refuses. The
-  suggested profiles denied no credentials. Dromon now admits only those two empty
-  records, holds a worktree's git directories read-only, and requires the operator's
-  SSH, Codex, Cargo and Pi credentials, and AWS when present, to be denied by absolute
-  path. A refusal of a profile shared by several projects names only the entries to
-  add.
-- **Sol and Terra.** Codex drivers for `gpt-6.1-sol` and `gpt-6.1-terra`, for every
-  strategy, with the catalogue's context window of 500,000 tokens and Luna's other
-  settings.
+- **Confinement.** Codex and Grok lines are denied a shared list of credential paths
+  and the project's secret directories by real path. A live Codex line turn was refused
+  `secret/`, `~/.ssh` and `~/.codex/auth.json`. `read_only_paths` makes paths in every
+  line's workdir unwritable on each engine, and this project now protects
+  `docs/process` and `docs/roadmap` with it.
+- **Grok.** Tool calls are judged by Grok's own `_meta` name and kind, Dromon's tools
+  are reached through `use_tool`, and the driver's model is requested per session. A
+  Grok line in another project ran turns of 58 and more tool calls on the result.
+- **Team.** Roles can be created, updated and deleted at run time, under one writer
+  per worktree. The `capabilities` role was created that way on a new Claude Sonnet 5.5
+  driver. Read lines get their own scratch.
+- **Operator.** Mail is pushed through a file relay that the operator follows, lines
+  raise issues, and `dromon wait` waits for a reply without polling.
+- **Durability.** Leases survive a restart and pass with a role, and declared commands
+  run under a supervisor that a successor and a restart reconcile.
+- **Gaps from another project's planned team.** `ViewImage` on Claude Code, Codex and
+  Grok, budget windows for Claude Code, and no Grok quota classification without a
+  documented shape.
 
-**Outside the repository.** Dromon's shared Grok profile gained denials for the
-Cargo and Pi credentials, with a backup beside it. The checks of pull request 95,
-run offline against that profile and the other project's Grok worktree, pass for the
-reader and the writer, and the home check passes with Grok's empty records present.
+**Verified.** Full gates outside the sandbox and continuous integration on every pull
+request, with reviews and re-reviews by the review line. Probe turns on Sol, Terra and
+Sonnet 5.5, and a live Codex confinement check.
 
-**Verified.** Full gates outside the sandbox and continuous integration on both pull
-requests. The daemon was restarted onto `b0cd881`.
+**Not verified.** The items under Unverified live in `HANDOFF.md`.
 
-**Not verified.** A Grok turn on the new code, and any turn on Sol or Terra. The
-other project's daemon still runs code from before pull request 95 until it is
-restarted.
-
-**Also this session.** A stray attach client from 2026-10-25, whose project had been
-deleted, used a full core until it was stopped. An attach client that loses its
-daemon should exit, which is not yet fixed. Dependabot showed no alerts.
+**Also this session.** A restart onto the one-writer rule left no daemon for about
+eight minutes, since two log-only legacy lines could write the project root. They are
+declared read-only in the project file now. Every line and the operator wrote an
+experience report, and two of four lines are satisfied.
