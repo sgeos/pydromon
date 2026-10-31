@@ -400,7 +400,7 @@ listen = true
 local = "open"                      # projects of this user on this machine
 name = "harbor"                     # this daemon's name in the registry
 # remote = "open"                   # undeclared keys inbound, below
-# allowed_networks = ["192.0.2.0/24"]
+# allowed_networks = ["192.0.2.0/24"]   # required while remote is open
 
 [federation.open]
 reach = ["core"]                    # local parties any open peer may send to
@@ -453,6 +453,15 @@ remote_reach = ["@ana"]             # what an undeclared key may reach
   federation name, recorded with `peer_opened` when first seen, unless a declared peer
   bears that name or the entry is this daemon's own. Each `deliver` checks again
   that a policy still governs the peer.
+- **The caller's start time.** **Decided by the operator on 2026-10-31,** from
+  finding F2 of the round 12 review. The daemon reads the connecting pid's start time
+  from the process table once, when it accepts the connection, in a worker thread
+  and never on the event loop. The entry names the caller only when its start time
+  equals both that reading and the one taken at `hello`, so a pid that the caller's
+  exit freed and a later daemon took before the `hello` names nothing. A start time
+  that cannot be read at accept, from a table that cannot answer or a caller already
+  gone, refuses the `hello`. **Limit.** The table gives start times to the second, so
+  a pid reused within the second its first process started is not told apart.
 - **Outbound.** A line may address `NAME:PARTY` for a project of the registry that the
   file does not declare. The send is judged by `[federation.open]` first, and only
   mail it lets through records `peer_opened` and then `message_sent`, so a refusal
@@ -499,6 +508,24 @@ registered after this daemon started is denied from each line's next turn.
   defaults, 16,384 bytes of body, 2 turns per hour and 50 waiting messages, and never
   priority. A key that a declared peer pins is never an open peer, even when that
   peer is not inbound.
+- **A bound on keys.** **Decided by the operator on 2026-10-31,** from finding F1 of
+  the round 12 review. At most 64 undeclared keys are recorded, `MAX_OPEN_REMOTE_PEERS`,
+  which equals the most peers the file may declare. A new key past it is refused at
+  `hello` before any event is recorded, and is written to standard error. **Reason.**
+  Each new key costs one `peer_opened` event and counters of its own, so without a
+  bound one host could grow the log without limit and evade every per-key limit by
+  changing keys. **Failure mode.** The file never removes an open peer, so a host
+  that fills the bound keeps every later key out until the operator removes open
+  peers from the log or closes `remote`. No command removes an open peer yet.
+- **Shared limits.** All undeclared keys together share
+  `remote_total_turns_per_hour`, the turns they may start for one local line in any
+  hour, and `remote_total_waiting`, the notes they may have waiting, besides each
+  key's own `remote_turns_per_hour` and `remote_waiting`. **Decided by core, for the
+  operator's review.** Both are `[federation.open]` keys whose defaults, 6 and 500,
+  are one declared peer's, so every undeclared key together may do by default what
+  one declared peer may. A turn several keys started counts once against the shared
+  allowance. A note past the shared waiting bound is refused with `full`. The rate of
+  `deliver` requests stays per key, which the bound on keys limits.
 - **No outbound.** Nothing locates an undeclared machine, so mail to another machine
   still needs a declared peer, which names its address. An open key's parties cannot
   be addressed, and a reply to one is refused.
@@ -506,7 +533,13 @@ registered after this daemon started is denied from each line's next turn.
   authentication stays required before any frame is read.
 - **`allowed_networks`** lists address ranges. A connection from elsewhere is closed
   by its address before it counts under the cap and before its handshake. It applies
-  to every connection on the listener, declared peers included.
+  to every connection on the listener, declared peers included. **Decided by the
+  operator on 2026-10-31,** from finding F3 of the round 12 review. With `remote`
+  open, the file must list at least one range, and a file that leaves it out is
+  refused. A listener that admits every address lists both `"0.0.0.0/0"` and
+  `"::/0"`, so a listener open to the world is always a choice written in the file.
+  With `remote` an allowlist, leaving it out still admits every address, since only
+  the declared pins complete a handshake there.
 - **Why pyOpenSSL.** **Fact,** probed on 2026-10-31 with Python 3.12 and OpenSSL
   3.5.4 over memory buffers. A server context of Python's `ssl` that requires a
   client certificate, or only requests one, refuses a self-signed certificate it does
@@ -1063,6 +1096,10 @@ daemon restarts, so a peer that changes its name on each connection sends one no
 | A line reads another project's event log through the file system | Already possible today. Phase 1 denies declared peers' directories to every local line, and an open project denies every registered project's from each line's next turn |
 | A process writes a registry entry to pass for a daemon | Every line of an open project is denied the registry. An unconfined process of the user can still write one, as it can read a token |
 | A pid in a registry entry is reused by another process | The start time no longer matches, so the entry is stale and names nothing |
+| A caller's pid is reused between its connection's accept and its `hello` | The start time read at accept differs from the entry's, so the `hello` is refused. Finding F2 of the round 12 review |
+| The start time of a caller cannot be read at accept | The `hello` without a token is refused, and the failure is written to standard error |
+| One host mints a new key for each handshake | Each key is recorded up to 64, and a new key past that is refused at `hello` with nothing recorded. The keys share one allowance of turns and one bound of waiting mail. Finding F1 of the round 12 review |
+| A project opens `remote` without `allowed_networks` | The file is refused. Every address is admitted only by listing `"0.0.0.0/0"` and `"::/0"`. Finding F3 of the round 12 review |
 | Another process connects with a live entry's name | Its pid is not the entry's, so it is refused |
 | An undeclared key sends to a party outside `remote_reach` | Refused with `refused`, as any party out of reach is |
 | A connection comes from outside `allowed_networks` | Closed by its address before the cap and before the handshake |

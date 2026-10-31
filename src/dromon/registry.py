@@ -311,15 +311,25 @@ def entries(directory: Path) -> list[Entry]:
     return [entry for entry in found if entry is not None]
 
 
-def find(directory: Path, name: str, pid: int, start_of: StartOf) -> Entry | None:
-    """The live entry for ``name`` whose daemon is ``pid``, or ``None``. A table that
-    cannot be read finds none."""
+def find(
+    directory: Path, name: str, pid: int, started: str, start_of: StartOf
+) -> Entry | None:
+    """The live entry for ``name`` whose daemon is ``pid``, which started at
+    ``started``, or ``None``. ``started`` is the caller's start time, read when its
+    connection was accepted, and the table is read again here, so the entry names
+    the connecting process only when both reads give the entry's start time. Decided
+    by the operator on 2026-10-31, from finding F2 of the round 12 review, since a pid
+    alone may be reused between the accept and the ``hello``. A table that cannot be
+    read finds none.
+
+    **Limit.** ``lstart`` has a resolution of one second, so a pid reused within the
+    second its first process started is not told apart."""
     try:
         check_directory(directory)
     except RegistryError:
         return None
     entry = read_entry(directory, name)
-    if entry is None or entry.pid != pid:
+    if entry is None or entry.pid != pid or entry.started != started:
         return None
     try:
         return entry if is_live(entry, start_of) else None

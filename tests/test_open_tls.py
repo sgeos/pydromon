@@ -309,6 +309,7 @@ def no_engine(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> LineEngine:
 REMOTE_OPEN = {
     "tls_listen": "127.0.0.1:7411",
     "remote": "open",
+    "allowed_networks": ["127.0.0.0/8", "::1/128"],
     "open": {"reach": ["core"], "remote_reach": ["@ana"]},
 }
 

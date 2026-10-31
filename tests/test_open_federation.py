@@ -11,6 +11,7 @@ import json
 import os
 import socket
 import stat
+import threading
 import time
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
@@ -36,8 +37,14 @@ from dromon.driver import Strategy
 from dromon.eventlog import EventLog
 from dromon.federation import (
     DEFAULT_REMOTE_MAX_BODY_BYTES,
+    DEFAULT_REMOTE_TOTAL_TURNS_PER_HOUR,
+    DEFAULT_REMOTE_TOTAL_WAITING,
     DEFAULT_REMOTE_TURNS_PER_HOUR,
     DEFAULT_REMOTE_WAITING,
+    DEFAULT_TURNS_PER_HOUR,
+    DEFAULT_WAITING,
+    MAX_OPEN_REMOTE_PEERS,
+    MAX_PEERS,
     NO_FEDERATION,
     SCOPE_LOCAL,
     SCOPE_REMOTE,
@@ -80,6 +87,11 @@ PIN = "a" * 64
 OTHER_PIN = "b" * 64
 CORE = LineAddress("core")
 ALPHA = LineAddress("alpha")
+
+
+LOOPBACK: list[object] = ["127.0.0.0/8", "::1/128"]
+"""The ranges a remote open listener of these tests accepts, which the file must list,
+finding F3 of the round 12 review."""
 
 
 def fixed_start(*pids: int) -> registry.StartOf:
@@ -179,7 +191,9 @@ def test_a_registry_wider_than_its_owner_is_refused(
         registry.register(directory, entry("harbor", tmp_path), fixed_start())
     with pytest.raises(registry.RegistryError, match="mode 750"):
         registry.entries(directory)
-    assert registry.find(directory, "harbor", os.getpid(), fixed_start()) is None
+    assert (
+        registry.find(directory, "harbor", os.getpid(), STARTED, fixed_start()) is None
+    )
 
 
 def test_a_registry_that_is_a_link_is_refused(directory: Path, tmp_path: Path) -> None:
@@ -218,14 +232,18 @@ def test_find_needs_the_callers_pid_and_a_live_start_time(
     one whose pid now has another start time, both find nothing."""
     mine = entry("harbor", tmp_path, pid=4001)
     registry.register(directory, mine, fixed_start(4001))
-    assert registry.find(directory, "harbor", 4001, fixed_start(4001)) == mine
-    assert registry.find(directory, "harbor", 4002, fixed_start(4001, 4002)) is None
+    assert registry.find(directory, "harbor", 4001, STARTED, fixed_start(4001)) == mine
+    assert (
+        registry.find(directory, "harbor", 4002, STARTED, fixed_start(4001, 4002))
+        is None
+    )
 
     def reused(_pid: int) -> str | None:
         return "Sun Nov  1 00:00:00 2026"
 
-    assert registry.find(directory, "harbor", 4001, reused) is None
-    assert registry.find(directory, "harbor", 4001, unreadable) is None
+    assert registry.find(directory, "harbor", 4001, STARTED, reused) is None
+    assert registry.find(directory, "harbor", 4001, STARTED, unreadable) is None
+    assert registry.find(directory, "harbor", 4001, EARLIER, fixed_start(4001)) is None
     assert registry.live_entry(directory, "harbor", fixed_start()) is None
 
 
@@ -315,6 +333,10 @@ def test_allowlist_is_the_default_of_both_modes_and_changes_nothing() -> None:
         ({"local": "wide"}, "must be allowlist or open"),
         ({"local": "open", "listen": True, "name": PIN}, "64 hexadecimal"),
         ({"remote": "open"}, "tls_listen must name"),
+        (
+            {"tls_listen": "127.0.0.1:7411", "remote": "open"},
+            "remote is open, so federation.allowed_networks must list",
+        ),
         (
             {"tls_listen": "127.0.0.1:7411", "remote": "open", "allowed_networks": []},
             "1 to 64 address ranges",
@@ -421,6 +443,22 @@ def test_allowed_networks_admit_only_their_ranges() -> None:
     assert not parsed.admits("198.51.100.1")
     assert not parsed.admits("not an address")
     assert NO_FEDERATION.admits("198.51.100.1")
+
+
+def test_a_world_open_listener_is_written_down() -> None:
+    """Decided by the operator on 2026-10-31, finding F3 of the round 12 review. With
+    ``remote`` open, leaving ``allowed_networks`` out is refused, so a listener that
+    admits every address is one whose file lists both whole ranges. Only then does
+    it admit them all."""
+    table: dict[str, object] = {"tls_listen": "[::]:7411", "remote": "open"}
+    with pytest.raises(FederationError, match='"0.0.0.0/0" and "::/0"'):
+        parse_federation(table, None)
+    world = parse_federation({**table, "allowed_networks": ["0.0.0.0/0", "::/0"]}, None)
+    for host in ("198.51.100.1", "::ffff:203.0.113.5", "2001:db8::1", "::1"):
+        assert world.admits(host)
+    only_v4 = parse_federation({**table, "allowed_networks": ["0.0.0.0/0"]}, None)
+    assert only_v4.admits("198.51.100.1")
+    assert not only_v4.admits("2001:db8::1")
 
 
 @dataclass
@@ -584,7 +622,7 @@ def test_an_open_daemon_names_a_registered_caller_by_its_entry(
     ) as daemon:
         caller = entry("harbor", tmp_path / "harbor")
         registry.register(directory, caller, fixed_start(os.getpid()))
-        session = PeerSession(daemon, peer_pid=os.getpid())
+        session = PeerSession(daemon, peer_pid=os.getpid(), peer_started=STARTED)
         greeted = ask(session, open_hello("harbor"))
         assert greeted.ok, greeted.error_message
         assert session.registered and session.peer_id == "harbor"
@@ -610,7 +648,7 @@ def test_an_open_peer_sending_outside_its_reach_is_refused(
         registry.register(
             directory, entry("harbor", tmp_path / "harbor"), fixed_start(os.getpid())
         )
-        session = PeerSession(daemon, peer_pid=os.getpid())
+        session = PeerSession(daemon, peer_pid=os.getpid(), peer_started=STARTED)
         assert ask(session, open_hello("harbor")).ok
         refused = ask(session, frame("deliver", note("review")))
         assert refused.result is not None
@@ -645,11 +683,104 @@ def test_each_refusal_of_a_hello_without_a_token(
         elif case != "no_entry":
             caller = entry("harbor", tmp_path / "harbor", pid=pid)
             registry.register(directory, caller, fixed_start(pid))
-        session = PeerSession(daemon, peer_pid=pid + 1 if case == "other_pid" else pid)
+        session = PeerSession(
+            daemon,
+            peer_pid=pid + 1 if case == "other_pid" else pid,
+            peer_started=STARTED,
+        )
         greeted = ask(session, open_hello("reef" if case == "wrong_name" else name))
         assert not greeted.ok
         assert session.peer_id is None
         assert not any(peer.scope for peer in daemon.log.state.peers.values())
+
+
+EARLIER = "Fri Oct 30 23:59:59 2026"
+"""A start time other than ``STARTED``, that of a process whose pid was reused."""
+
+
+def test_a_pid_reused_between_accept_and_hello_is_refused(
+    directory: Path, tmp_path: Path
+) -> None:
+    """Decided by the operator on 2026-10-31, finding F2 of the round 12 review. The
+    caller's pid started at ``EARLIER`` when its connection was accepted. By the
+    hello, a daemon of the announced name holds that pid with ``STARTED`` and has
+    registered it. The pid and the entry agree at the hello, and the start time read
+    at accept does not, so the hello is refused and records no open peer."""
+    pid = os.getpid()
+    answers = iter([EARLIER, STARTED, STARTED])
+    receiver = open_config(name="tidepool", open=RECEIVER_OPEN)
+    with daemon_for(
+        tmp_path / "tidepool", receiver, directory, fixed_start(pid)
+    ) as daemon:
+        registry.register(
+            directory, entry("harbor", tmp_path / "harbor", pid=pid), fixed_start(pid)
+        )
+        daemon.start_of = lambda _pid: next(answers)
+        session = PeerSession(daemon, peer_pid=pid)
+        asyncio.run(session.read_peer_start())
+        assert session.peer_started == EARLIER
+        greeted = ask(session, open_hello("harbor"))
+        assert not greeted.ok
+        assert session.peer_id is None
+        assert "harbor" not in daemon.log.state.peers
+
+
+def test_the_start_time_is_read_once_off_the_event_loop(
+    directory: Path, tmp_path: Path
+) -> None:
+    """The start time is read in a worker thread, never on the event loop's, and
+    a caller whose start time matches at accept and at the hello is named."""
+    pid = os.getpid()
+    threads: list[int] = []
+
+    def table(found: int) -> str | None:
+        threads.append(threading.get_ident())
+        return STARTED if found == pid else None
+
+    receiver = open_config(name="tidepool", open=RECEIVER_OPEN)
+    with daemon_for(
+        tmp_path / "tidepool", receiver, directory, fixed_start(pid)
+    ) as daemon:
+        registry.register(
+            directory, entry("harbor", tmp_path / "harbor", pid=pid), fixed_start(pid)
+        )
+        daemon.start_of = table
+        session = PeerSession(daemon, peer_pid=pid)
+
+        async def accept_and_greet() -> tuple[int, Response]:
+            await session.read_peer_start()
+            return threading.get_ident(), await session.respond(open_hello("harbor"))
+
+        loop_thread, greeted = asyncio.run(accept_and_greet())
+        assert greeted.ok, greeted.error_message
+        assert session.peer_id == "harbor"
+        assert len(threads) == 2
+        assert loop_thread not in threads
+
+
+@pytest.mark.parametrize("table", ["unreadable", "gone"])
+def test_a_start_time_that_cannot_be_read_at_accept_is_refused(
+    table: str, directory: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A process table that cannot answer, and a caller gone before its start time
+    is read, both leave the start time unread, and the hello is refused."""
+    pid = os.getpid()
+    receiver = open_config(name="tidepool", open=RECEIVER_OPEN)
+    with daemon_for(
+        tmp_path / "tidepool", receiver, directory, fixed_start(pid)
+    ) as daemon:
+        registry.register(
+            directory, entry("harbor", tmp_path / "harbor", pid=pid), fixed_start(pid)
+        )
+        daemon.start_of = unreadable if table == "unreadable" else fixed_start()
+        session = PeerSession(daemon, peer_pid=pid)
+        asyncio.run(session.read_peer_start())
+        assert session.peer_started is None
+        daemon.start_of = fixed_start(pid)
+        assert not ask(session, open_hello("harbor")).ok
+        assert "harbor" not in daemon.log.state.peers
+    if table == "unreadable":
+        assert "could not be read" in capsys.readouterr().err
 
 
 def test_a_registered_declared_peer_is_governed_by_its_own_table(
@@ -670,7 +801,7 @@ def test_a_registered_declared_peer_is_governed_by_its_own_table(
         tmp_path / "tidepool", receiver, directory, fixed_start(os.getpid())
     ) as daemon:
         registry.register(directory, caller, fixed_start(os.getpid()))
-        session = PeerSession(daemon, peer_pid=os.getpid())
+        session = PeerSession(daemon, peer_pid=os.getpid(), peer_started=STARTED)
         assert ask(session, open_hello("harbor")).ok
         assert session.peer_id == "kin"
         refused = ask(session, frame("deliver", note()))
@@ -702,7 +833,9 @@ class Bridge:
 
     async def connect(self, peer_id: str, definition: PeerDefinition) -> Link:
         self.sockets.append(definition.socket)
-        return SessionLink(PeerSession(self.receiver, peer_pid=os.getpid()))
+        return SessionLink(
+            PeerSession(self.receiver, peer_pid=os.getpid(), peer_started=STARTED)
+        )
 
 
 def deliver_all(sender: Daemon) -> None:
@@ -874,6 +1007,7 @@ def test_an_unknown_remote_key_reaches_only_remote_reach(
         {
             "tls_listen": "127.0.0.1:7411",
             "remote": "open",
+            "allowed_networks": LOOPBACK,
             "open": {"reach": ["core"], "remote_reach": ["@ana"]},
         },
         None,
@@ -897,6 +1031,128 @@ def test_an_unknown_remote_key_reaches_only_remote_reach(
         assert too_large.result["code"] == "too_large"
 
 
+def remote_open(**open_keys: object) -> FederationConfig:
+    return parse_federation(
+        {
+            "tls_listen": "127.0.0.1:7411",
+            "remote": "open",
+            "allowed_networks": LOOPBACK,
+            "open": {"remote_reach": ["@ana"], **open_keys},
+        },
+        None,
+    )
+
+
+def minted(index: int) -> str:
+    """The pin of the ``index``th key a host mints, distinct from ``PIN``."""
+    return f"{index + 1:064x}"
+
+
+def test_a_host_that_mints_keys_past_the_cap_is_refused_before_any_event(
+    directory: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Decided by the operator on 2026-10-31, finding F1 of the round 12 review. One
+    host presents a fresh key at each handshake. Each key up to the cap is recorded
+    as an open peer, the next is refused with nothing appended to the log, and a key
+    recorded already still names its peer."""
+    assert MAX_OPEN_REMOTE_PEERS == MAX_PEERS
+    hello = frame("hello", {"versions": [1], "name": "far"})
+    with daemon_for(
+        tmp_path / "harbor", remote_open(), directory, fixed_start()
+    ) as daemon:
+        for index in range(MAX_OPEN_REMOTE_PEERS):
+            assert ask(PeerSession(daemon, pin_sha256=minted(index)), hello).ok
+        opened = daemon.log.state.peers
+        assert len([p for p in opened.values() if p.scope == SCOPE_REMOTE]) == (
+            MAX_OPEN_REMOTE_PEERS
+        )
+        before = daemon.log.last_seq
+        past = minted(MAX_OPEN_REMOTE_PEERS)
+        refused = ask(PeerSession(daemon, pin_sha256=past), hello)
+        assert not refused.ok
+        assert daemon.log.last_seq == before
+        assert past not in daemon.log.state.peers
+        assert ask(PeerSession(daemon, pin_sha256=minted(0)), hello).ok
+        assert daemon.log.last_seq == before
+    assert "undeclared keys are recorded already" in capsys.readouterr().err
+
+
+def test_every_undeclared_key_shares_one_bound_on_waiting_mail(
+    directory: Path, tmp_path: Path
+) -> None:
+    """Each key may have 10 notes waiting, and all of them together 3. The first key
+    fills the shared bound, so the second key's first note is refused as full, and a
+    declared limit of its own would not have stopped it."""
+    federation = remote_open(remote_waiting=10, remote_total_waiting=3)
+    hello = frame("hello", {"versions": [1], "name": "far"})
+    with daemon_for(
+        tmp_path / "harbor", federation, directory, fixed_start()
+    ) as daemon:
+        first = PeerSession(daemon, pin_sha256=minted(0))
+        second = PeerSession(daemon, pin_sha256=minted(1))
+        assert ask(first, hello).ok and ask(second, hello).ok
+        for index in range(3):
+            sent = ask(first, frame("deliver", note("@ana", origin_id=f"o{index}")))
+            assert sent.result is not None and sent.result["outcome"] == "accepted"
+        full = ask(second, frame("deliver", note("@ana", origin_id="p0")))
+        assert full.result is not None and full.result["code"] == "full"
+        assert daemon.log.state.waiting_from.get(minted(1), 0) == 0
+
+
+def test_the_scheduler_is_given_the_allowance_the_undeclared_keys_share(
+    directory: Path, tmp_path: Path
+) -> None:
+    federation = remote_open(remote_total_turns_per_hour=4)
+    with daemon_for(
+        tmp_path / "harbor", federation, directory, fixed_start()
+    ) as daemon:
+        daemon.log.append(PeerOpened(PIN, SCOPE_REMOTE, AT))
+        turns = daemon.scheduler.peer_turns
+        assert turns.shared(PIN)
+        assert not turns.shared(OTHER_PIN)
+        assert turns.shared_allowance() == 4
+
+
+def test_the_shared_bounds_default_to_one_declared_peers_and_are_checked() -> None:
+    parsed = remote_open().open
+    assert (parsed.remote_total_turns_per_hour, parsed.remote_total_waiting) == (
+        DEFAULT_REMOTE_TOTAL_TURNS_PER_HOUR,
+        DEFAULT_REMOTE_TOTAL_WAITING,
+    )
+    assert (DEFAULT_REMOTE_TOTAL_TURNS_PER_HOUR, DEFAULT_REMOTE_TOTAL_WAITING) == (
+        DEFAULT_TURNS_PER_HOUR,
+        DEFAULT_WAITING,
+    )
+    for key in ("remote_total_turns_per_hour", "remote_total_waiting"):
+        with pytest.raises(FederationError, match=f"open.{key} must be"):
+            remote_open(**{key: 0})
+
+
+def test_only_an_undeclared_remote_key_is_an_open_remote_peer() -> None:
+    federation = parse_federation(
+        {
+            "tls_listen": "127.0.0.1:7411",
+            "local": "open",
+            "listen": True,
+            "name": "harbor",
+            "remote": "open",
+            "allowed_networks": LOOPBACK,
+        },
+        {"kin": {"socket": "/srv/k/run/peers.sock"}},
+    )
+    state = State()
+    state.apply(PeerOpened(PIN, SCOPE_REMOTE, AT))
+    state.apply(PeerOpened(OTHER_PIN, SCOPE_REMOTE, AT))
+    state.apply(PeerRemoved(OTHER_PIN))
+    state.apply(PeerOpened("tidepool", SCOPE_LOCAL, AT))
+    for event in plan_peers(state, federation):
+        state.apply(event)
+    assert federation.open_remote(state) == [PIN]
+    assert federation.is_open_remote(state, PIN)
+    for other in (OTHER_PIN, "tidepool", "kin", "nobody"):
+        assert not federation.is_open_remote(state, other)
+
+
 def test_a_key_a_declared_peer_pins_is_never_an_open_peer(
     directory: Path, tmp_path: Path
 ) -> None:
@@ -904,6 +1160,7 @@ def test_a_key_a_declared_peer_pins_is_never_an_open_peer(
         {
             "tls_listen": "127.0.0.1:7411",
             "remote": "open",
+            "allowed_networks": LOOPBACK,
             "open": {"remote_reach": ["@ana"]},
         },
         {
@@ -933,7 +1190,14 @@ def test_an_unknown_key_is_refused_while_remote_is_an_allowlist(
 
 
 def test_an_outbound_check_never_lets_mail_reach_an_undeclared_key() -> None:
-    remote = parse_federation({"tls_listen": "127.0.0.1:7411", "remote": "open"}, None)
+    remote = parse_federation(
+        {
+            "tls_listen": "127.0.0.1:7411",
+            "remote": "open",
+            "allowed_networks": LOOPBACK,
+        },
+        None,
+    )
     state = State()
     state.apply(PeerOpened(PIN, SCOPE_REMOTE, AT))
     with pytest.raises(EventRejected, match="is off"):

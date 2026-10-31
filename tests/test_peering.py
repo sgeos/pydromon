@@ -936,6 +936,30 @@ def test_a_peer_starts_at_most_its_turns_per_hour_for_one_line() -> None:
     assert turns.may_wake("alpha", peer_mail)
 
 
+def test_undeclared_keys_share_one_allowance_of_turns_for_each_line() -> None:
+    """Decided by the operator on 2026-10-31, finding F1 of the round 12 review. Two
+    undeclared keys of 5 turns each share 2 for each line, and a declared peer is not
+    bound by what they share. A turn both keys started counts once."""
+    clock = Clock()
+    turns = PeerTurns(clock)
+    keys = (RemoteAddress("k1", ANA), RemoteAddress("k2", ANA))
+    turns.set_allowances({PEER: 5})
+    turns.open_allowance = lambda _peer_id: 5
+    turns.shared = lambda peer_id: peer_id in {key.peer_id for key in keys}
+    turns.shared_allowance = lambda: 2
+    first, second = ([note(key)] for key in keys)
+    turns.record("alpha", turns.starters("alpha", first))
+    turns.record("alpha", turns.starters("alpha", [*first, *second]))
+    assert turns.starters("alpha", [*first, *second]) == []
+    assert not turns.may_wake("alpha", second)
+    assert turns.may_wake("beta", second)
+    assert turns.may_wake("alpha", [note(KAIZEN)])
+    turns.record("beta", turns.starters("beta", [*first, *second]))
+    assert turns.may_wake("beta", first)
+    clock.now += TURN_WINDOW_SECONDS
+    assert turns.may_wake("alpha", second)
+
+
 def test_an_undeclared_peer_starts_no_turn() -> None:
     turns = PeerTurns(Clock())
     assert not turns.may_wake("alpha", [note(KAIZEN)])

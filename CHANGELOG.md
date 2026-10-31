@@ -95,6 +95,15 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- Remote and local open federation are bounded further, from findings F1 to F3 of
+  the round 12 review, decided by the operator on 2026-10-31. At most 64 undeclared
+  remote keys are recorded, and a new key past that is refused at `hello` before any
+  event. All undeclared keys share `[federation.open] remote_total_turns_per_hour`
+  and `remote_total_waiting`, 6 and 500 by default, besides each key's own. A `hello`
+  without a token must match the entry's start time as read when its connection was
+  accepted, in a worker thread, and is refused when it cannot be read. With
+  `remote = "open"`, `allowed_networks` is required, and a world-open listener lists
+  `"0.0.0.0/0"` and `"::/0"`. A file that opens `remote` without it is now refused.
 - A peer reaches only declared operators, decision 25 of `FEDERATION.md`, decided by
   the operator on 2026-10-31. An operator the project file declares, by `[daemon]
   operator` or an `[operators.ID]` table, may receive peer mail before sending

@@ -32,7 +32,7 @@ from enum import StrEnum
 from typing import Final, cast
 
 from dromon.agents import token_digest
-from dromon.federation import TRANSPORT_UNIX, FederationConfig
+from dromon.federation import SCOPE_REMOTE, TRANSPORT_UNIX, FederationConfig
 from dromon.model import (
     ID_PATTERN,
     MAX_TEXT_BYTES,
@@ -343,6 +343,11 @@ class Receiver:
             state.waiting_for.get(envelope.recipient, 0)
             >= federation.waiting_per_recipient
             or state.waiting_from.get(peer_id, 0) >= definition.waiting
+            or (
+                definition.open_scope == SCOPE_REMOTE
+                and _open_remote_waiting(state, federation)
+                >= federation.open.remote_total_waiting
+            )
         ):
             return Refused(Code.FULL)
         if not envelope.priority:
@@ -387,6 +392,15 @@ def _resent(
         file=sys.stderr,
     )
     return Refused(Code.CONFLICT)
+
+
+def _open_remote_waiting(state: State, federation: FederationConfig) -> int:
+    """The unread notes every undeclared remote key has waiting together, which
+    ``remote_total_waiting`` bounds, finding F1 of the round 12 review. The sum runs
+    over at most ``MAX_OPEN_REMOTE_PEERS`` keys."""
+    return sum(
+        state.waiting_from.get(peer_id, 0) for peer_id in federation.open_remote(state)
+    )
 
 
 def _exists(state: State, operators: frozenset[str], address: LocalAddress) -> bool:
@@ -437,14 +451,24 @@ def turn_cause(messages: Iterable[Message]) -> TurnCause:
 class PeerTurns:
     """Each peer's allowance of turns for each local line, ``turns_per_hour`` in any
     hour. A peer without an allowance, such as one no longer declared, may start
-    none."""
+    none. The undeclared remote keys also share one allowance for each line,
+    ``remote_total_turns_per_hour``, so that a host gains nothing by changing keys, as
+    the operator decided on 2026-10-31 from finding F1 of the round 12 review."""
 
     def __init__(self, clock: Callable[[], float]) -> None:
         self._allowance: dict[str, int] = {}
         self.open_allowance: Callable[[str], int] = lambda _peer_id: 0
         """The turns per hour of a peer not in the allowances, an open peer, which
         the daemon reads from its policy at each use. None by default."""
+        self.shared: Callable[[str], bool] = lambda _peer_id: False
+        """Whether a peer is an undeclared remote key, which the shared allowance
+        also bounds. None by default."""
+        self.shared_allowance: Callable[[], int] = lambda: 0
+        """The turns per hour the undeclared remote keys share for each line."""
         self._starts: WindowCounter[tuple[str, str]] = WindowCounter(
+            clock, TURN_WINDOW_SECONDS, MAX_TURN_CAPACITY
+        )
+        self._shared_starts: WindowCounter[str] = WindowCounter(
             clock, TURN_WINDOW_SECONDS, MAX_TURN_CAPACITY
         )
 
@@ -461,7 +485,12 @@ class PeerTurns:
         allowed = self._allowance.get(peer_id)
         if allowed is None:
             allowed = min(max(self.open_allowance(peer_id), 0), MAX_TURN_CAPACITY)
-        return self._starts.count((peer_id, line_id)) < allowed
+        if self._starts.count((peer_id, line_id)) >= allowed:
+            return False
+        if not self.shared(peer_id):
+            return True
+        shared = min(max(self.shared_allowance(), 0), MAX_TURN_CAPACITY)
+        return self._shared_starts.count(line_id) < shared
 
     def starters(self, line_id: str, messages: Iterable[Message]) -> list[str]:
         """The peers whose mail among ``messages`` may start a turn of ``line_id``,
@@ -482,6 +511,12 @@ class PeerTurns:
         return bool(self.starters(line_id, listed))
 
     def record(self, line_id: str, peers: Iterable[str]) -> None:
-        """Count a turn of ``line_id`` that the mail of ``peers`` started."""
+        """Count a turn of ``line_id`` that the mail of ``peers`` started. A turn that
+        undeclared remote keys started counts once against their shared allowance,
+        however many of them started it."""
+        shared = False
         for peer_id in peers:
             self._starts.record((peer_id, line_id))
+            shared = shared or self.shared(peer_id)
+        if shared:
+            self._shared_starts.record(line_id)

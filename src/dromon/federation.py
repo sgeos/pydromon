@@ -105,6 +105,8 @@ OPEN_KEYS: Final = frozenset(
         "remote_max_body_bytes",
         "remote_turns_per_hour",
         "remote_waiting",
+        "remote_total_turns_per_hour",
+        "remote_total_waiting",
     }
 )
 DEFAULT_REMOTE_MAX_BODY_BYTES: Final = 16384
@@ -162,6 +164,18 @@ PEER_SOCKET_NAME: Final = "peers.sock"
 STATE_DIR_NAME: Final = ".dromon"
 
 MAX_PEERS: Final = 64
+MAX_OPEN_REMOTE_PEERS: Final = MAX_PEERS
+"""The most undeclared keys remote open federation records, decided by the operator on
+2026-10-31 from finding F1 of the round 12 review, and set by core. A new key past it is
+refused at ``hello`` before any event is recorded. **Reason.** Each new key appends one
+``peer_opened`` event and gets rate and turn counters of its own, so without a bound a
+host could grow the log without limit and evade every per-key limit by changing keys.
+It equals ``MAX_PEERS``, so the undeclared keys never outnumber the peers the file may
+declare, the receiver's per-key counters hold at most this many times
+``RATE_PER_PEER`` times, and the aggregate checks sum over at most this many keys.
+**Failure mode.** An open peer is never removed by the file, so a host that fills the
+cap keeps every later key out until the operator removes open peers or closes
+``remote``."""
 MAX_PARTIES: Final = 256
 """The most addresses one of ``reach``, ``senders`` or ``remote`` may list."""
 MAX_SOCKET_PATH_BYTES: Final = 103
@@ -175,6 +189,13 @@ DEFAULT_TURNS_PER_HOUR: Final = 6
 MAX_TURNS_PER_HOUR: Final = 60
 DEFAULT_WAITING: Final = 500
 DEFAULT_WAITING_PER_RECIPIENT: Final = 200
+DEFAULT_REMOTE_TOTAL_TURNS_PER_HOUR: Final = DEFAULT_TURNS_PER_HOUR
+DEFAULT_REMOTE_TOTAL_WAITING: Final = DEFAULT_WAITING
+"""Decided by the operator on 2026-10-31, from finding F1 of the round 12 review. All
+undeclared keys together share these, besides each key's own ``remote_turns_per_hour``
+and ``remote_waiting``, so changing keys gains nothing past them. Their defaults, set
+by core, are one declared peer's, so every undeclared key together may do by default
+what one declared peer may."""
 MAX_WAITING: Final = 100_000
 
 UNCONFINED_ENGINES: Final = frozenset({"pi", "cursor-agent", "antigravity"})
@@ -291,6 +312,11 @@ class OpenPolicy:
     remote_max_body_bytes: int = DEFAULT_REMOTE_MAX_BODY_BYTES
     remote_turns_per_hour: int = DEFAULT_REMOTE_TURNS_PER_HOUR
     remote_waiting: int = DEFAULT_REMOTE_WAITING
+    remote_total_turns_per_hour: int = DEFAULT_REMOTE_TOTAL_TURNS_PER_HOUR
+    """The turns all undeclared keys together may start for one local line in any
+    hour."""
+    remote_total_waiting: int = DEFAULT_REMOTE_TOTAL_WAITING
+    """The unread notes all undeclared keys together may have waiting."""
 
     def local_definition(self, peer_id: str) -> PeerDefinition:
         """The definition of the open peer ``peer_id`` on this machine. Its socket
@@ -357,7 +383,8 @@ class FederationConfig:
     open: OpenPolicy = field(default_factory=OpenPolicy)
     allowed_networks: tuple[Network, ...] = ()
     """The address ranges the TLS listener accepts connections from, every range
-    when empty."""
+    when empty. With ``remote`` open the file must list at least one, as
+    ``parse_federation`` requires."""
 
     @property
     def local_open(self) -> bool:
@@ -387,6 +414,23 @@ class FederationConfig:
         if peer.scope == SCOPE_REMOTE and self.remote_open:
             return self.open.remote_definition(peer_id)
         return None
+
+    def open_remote(self, state: State) -> list[str]:
+        """The undeclared keys ``state`` records that this policy governs as open
+        remote peers, in name order. Bounded by the log's peers, of which at most
+        ``MAX_OPEN_REMOTE_PEERS`` are open remote ones."""
+        return [
+            peer_id
+            for peer_id, peer in sorted(state.peers.items())
+            if peer.scope == SCOPE_REMOTE
+            and not peer.removed
+            and peer_id not in self.peers
+        ]
+
+    def is_open_remote(self, state: State, peer_id: str) -> bool:
+        """Whether ``peer_id`` is an undeclared key the open policy governs now."""
+        definition = self.definition(state, peer_id)
+        return definition is not None and definition.open_scope == SCOPE_REMOTE
 
     def admits(self, host: str) -> bool:
         """Whether the TLS listener accepts a connection from ``host``, an address
@@ -455,6 +499,14 @@ def parse_federation(federation: object, peers: object) -> FederationConfig:
             " and federation.remote is not open"
         )
     networks = _networks(table.get("allowed_networks"))
+    if remote == MODE_OPEN and not networks:
+        # Decided by the operator on 2026-10-31, finding F3 of the round 12 review.
+        raise FederationError(
+            "federation.remote is open, so federation.allowed_networks must list the"
+            " address ranges the listener accepts. To accept every address, list"
+            ' "0.0.0.0/0" and "::/0", so that a listener open to the world is always'
+            " written down"
+        )
     if networks and tls_listen is None:
         raise FederationError(
             "federation.allowed_networks bounds the TLS listener, so"
@@ -591,6 +643,20 @@ def _open_policy(value: object) -> OpenPolicy:
             f"{key}.remote_waiting",
             "remote_waiting",
             DEFAULT_REMOTE_WAITING,
+            MAX_WAITING,
+        ),
+        remote_total_turns_per_hour=_count(
+            table,
+            f"{key}.remote_total_turns_per_hour",
+            "remote_total_turns_per_hour",
+            DEFAULT_REMOTE_TOTAL_TURNS_PER_HOUR,
+            MAX_TURNS_PER_HOUR,
+        ),
+        remote_total_waiting=_count(
+            table,
+            f"{key}.remote_total_waiting",
+            "remote_total_waiting",
+            DEFAULT_REMOTE_TOTAL_WAITING,
             MAX_WAITING,
         ),
     )

@@ -53,6 +53,7 @@ from OpenSSL.SSL import Context as OpenSSLContext
 
 from dromon import __version__, exits, peercred, registry, restart, runs
 from dromon.federation import (
+    MAX_OPEN_REMOTE_PEERS,
     NO_FEDERATION,
     PEERS_DIR_NAME,
     PIN_PATTERN,
@@ -597,7 +598,8 @@ class Daemon:
         pin names it. Otherwise, while ``remote`` is open, the pin names an open peer
         of its own, first recorded with ``peer_opened`` when ``record`` is true, unless
         a declared peer pins that key or bears that name, since a declared table always
-        governs its own peer."""
+        governs its own peer. A new key is refused once ``MAX_OPEN_REMOTE_PEERS``
+        undeclared keys are recorded."""
         federation = self.project.federation
         state = self.log.state
         declared = pinned_peer(federation, state, pin)
@@ -611,6 +613,14 @@ class Daemon:
         if known is not None and not known.removed:
             return pin if known.scope == SCOPE_REMOTE else None
         if not record:
+            return None
+        if len(federation.open_remote(state)) >= MAX_OPEN_REMOTE_PEERS:
+            # Refused before anything is recorded, finding F1 of the round 12 review.
+            print(
+                f"dromond: refused a new remote key, since {MAX_OPEN_REMOTE_PEERS}"
+                " undeclared keys are recorded already",
+                file=sys.stderr,
+            )
             return None
         self.log.append(PeerOpened(pin, SCOPE_REMOTE, format_due(datetime.now(UTC))))
         return pin
@@ -1945,6 +1955,10 @@ class PeerSession:
     peer_pid: int | None = None
     """On the socket, the pid of the connecting process, which open local federation
     matches against the registry, or ``None`` when it could not be read."""
+    peer_started: str | None = None
+    """The start time of ``peer_pid`` by the process table, read once at accept by
+    ``read_peer_start``, or ``None`` when it was not or could not be read, which
+    refuses a hello without a token."""
     entry: registry.Entry | None = None
     """The live registry entry of the name a hello without a token announced, whose
     pid is ``peer_pid``, found before ``hello`` is judged."""
@@ -1955,6 +1969,22 @@ class PeerSession:
         if self.peer_id is None and self.peer_pid is not None:
             await self._find_entry(line)
         return self.daemon.respond_peer(self, line)
+
+    async def read_peer_start(self) -> None:
+        """Read the start time of ``peer_pid`` at accept, in a worker thread, since it
+        reads the process table, and only while ``local`` is open. A table that
+        cannot be read leaves it unread, so the registry names no caller."""
+        self.peer_started = None
+        pid = self.peer_pid
+        if pid is None or not self.daemon.project.federation.local_open:
+            return
+        try:
+            self.peer_started = await asyncio.to_thread(self.daemon.start_of, pid)
+        except Exception as error:  # noqa: BLE001, any failure refuses the caller
+            print(
+                f"dromond: the start time of pid {pid} could not be read: {error}",
+                file=sys.stderr,
+            )
 
     async def _find_entry(self, line: bytes) -> None:
         """Find the registry entry a hello without a token claims, in a worker
@@ -1978,13 +2008,15 @@ class PeerSession:
         if "token" in cast(dict[str, object], args):
             return
         pid = self.peer_pid
-        if pid is None:
+        started = self.peer_started
+        if pid is None or started is None:
             return
         self.entry = await asyncio.to_thread(
             registry.find,
             self.daemon.registry_dir,
             name,
             pid,
+            started,
             self.daemon.start_of,
         )
 
@@ -2673,6 +2705,15 @@ async def serve(daemon: Daemon) -> None:
         with contextlib.suppress(FileNotFoundError):
             peer_path.unlink()
 
+        async def peer_serve(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            # The caller's start time is read at accept, before any line, so a pid
+            # reused before the hello does not match the entry, finding F2.
+            session = PeerSession(daemon, peer_pid=_peer_pid(writer))
+            await session.read_peer_start()
+            await peer_connection(daemon, reader, writer, session)
+
         async def peer_accept(
             reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         ) -> None:
@@ -2681,14 +2722,7 @@ async def serve(daemon: Daemon) -> None:
                 await peer_cap.admit(
                     writer,
                     lambda: _guarded(
-                        writer,
-                        own_uid,
-                        lambda: peer_connection(
-                            daemon,
-                            reader,
-                            writer,
-                            PeerSession(daemon, peer_pid=_peer_pid(writer)),
-                        ),
+                        writer, own_uid, lambda: peer_serve(reader, writer)
                     ),
                 )
             finally:
@@ -2949,14 +2983,20 @@ def open_federation(
     directory: Path | None = None,
 ) -> None:
     """Give the scheduler what open federation needs at each use, the open peers'
-    turns per hour from ``[federation.open]`` and, while ``local`` is open, whether a
-    name is registered."""
+    turns per hour from ``[federation.open]``, the allowance the undeclared remote
+    keys share, and, while ``local`` is open, whether a name is registered."""
 
     def turns(peer_id: str) -> int:
         definition = federation.definition(log.state, peer_id)
         return 0 if definition is None else definition.turns_per_hour
 
     scheduler.peer_turns.open_allowance = turns
+    scheduler.peer_turns.shared = lambda peer_id: federation.is_open_remote(
+        log.state, peer_id
+    )
+    scheduler.peer_turns.shared_allowance = lambda: (
+        federation.open.remote_total_turns_per_hour
+    )
     if not federation.local_open:
         return
     where = directory or registry.configured_directory(os.environ)
