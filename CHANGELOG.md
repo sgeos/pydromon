@@ -7,6 +7,26 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- Refused Codex items count toward the driver's tool budget whether first announced by
+  `item/started` or `item/completed`. Matching item identifiers are counted once
+  regardless of notice order. A refusal announced by neither notice remains invisible.
+- A launcher retries a timed-out process-table walk until its 0.75-second deadline.
+  If the table still cannot be read while stopping under `kill_all`, it reports the
+  stop as unverified and exits unsuccessfully after ending the harness's group. It
+  waits 0.25 seconds after `SIGKILL` and reports unverified if a process remains.
+  Process-table inspections and detached-process scans share a worker with a bounded
+  queue of eight calls. Launch-record sweeps use a separate worker with its own bounded
+  queue. Detached-process scan results contain only process identifiers and command
+  strings. Retiring an engine calls `Driver.close` on the owning thread, though a virtual
+  machine not closed before it becomes cyclic garbage may still be finalized on any
+  thread.
+- Process-table failures use a typed error, and only an explicit timeout triggers the
+  launcher's retry. A queued process call cancelled by its caller is skipped, though
+  a call already running cannot be cancelled.
+- Launcher tests start the source module from this checkout explicitly. Tests that need
+  a real `ps` table are marked to skip when `ps` cannot run instead of branching their
+  expected exit status on a probe result.
+
 - Grok's `list_dir` may carry the kind `other`, which Grok gives it, as a live turn of
   58 tool calls on 2026-10-31 showed. That turn also confirmed the observed kinds of
   `read_file`, `grep`, `run_terminal_command`, `search_tool` and `use_tool`.

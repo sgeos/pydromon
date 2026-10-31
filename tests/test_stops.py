@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import signal
+import threading
 import time
 from collections.abc import Callable, Coroutine, Iterator, Sequence
 from pathlib import Path
@@ -158,7 +159,9 @@ class World:
         table: Table | None = None,
         identifiable: bool = True,
         walk_check: Callable[[], str | None] | None = None,
-        sweep_read: Callable[[], list[TreeRow] | str] = launcher.read_rows,
+        sweep_read: Callable[
+            [], list[TreeRow] | launcher.TreeReadFailure | str
+        ] = launcher.read_rows,
         create: bool = True,
     ) -> None:
         self.log = EventLog(path)
@@ -581,6 +584,30 @@ def test_detached_processes_found_by_the_mark_are_recorded_once(
     monkeypatch.setattr(os, "getpid", lambda: DAEMON)
     world = worlds(Engine())
     marked(world, 4300, 4301)
+    event_loop_thread = threading.get_ident()
+    scan_results: list[object] = []
+    worker = cast(Any, world.scheduler)._process_worker
+    run_worker = worker.run
+
+    async def capture_result(function: Callable[[], object]) -> object:
+        result = await run_worker(function)
+        scan_results.append(result)
+        return result
+
+    monkeypatch.setattr(worker, "run", capture_result)
+    environments = world.table.environments
+    own_processes = world.table.own_processes
+
+    def read_environments() -> dict[int, list[str]]:
+        assert threading.get_ident() != event_loop_thread
+        return environments()
+
+    def read_processes() -> Sequence[ProcessInfo]:
+        assert threading.get_ident() != event_loop_thread
+        return own_processes()
+
+    monkeypatch.setattr(world.table, "environments", read_environments)
+    monkeypatch.setattr(world.table, "own_processes", read_processes)
 
     async def check() -> None:
         await world.scheduler.report_detached("alpha")
@@ -592,6 +619,17 @@ def test_detached_processes_found_by_the_mark_are_recorded_once(
     found = world.log.state.lines["alpha"].left
     assert found is not None and found.cause == "detached"
     assert found.pids == (4300, 4301)
+    assert scan_results == [((4300, "nohup work 4300"), (4301, "nohup work 4301"))] * 2
+
+    def assert_scan_data(value: object) -> None:
+        if type(value) is tuple:
+            for item in cast(tuple[object, ...], value):
+                assert_scan_data(item)
+        else:
+            assert type(value) in (int, str)
+
+    for result in scan_results:
+        assert_scan_data(result)
     events = [
         n for k, n in activity(world) if k is ActivityKind.NOTICE and "detached" in n
     ]
@@ -647,7 +685,15 @@ def test_the_startup_scan_records_survivors_of_an_earlier_run(
         4401: [f"{MARK_VARIABLE}=ghost.earlier"],
         4402: [f"{MARK_VARIABLE}=alpha.earlier"],
     }
-    world.scheduler.recover()
+
+    async def recover_and_wait() -> None:
+        world.scheduler.recover()
+        for _ in range(100):
+            if world.log.state.lines["alpha"].left is not None:
+                return
+            await asyncio.sleep(0.01)
+
+    asyncio.run(recover_and_wait())
     left = world.log.state.lines["alpha"].left
     assert left == ProcessesLeft("alpha", "detached", (4400,), ("setsid sleep 86400",))
     blind = worlds(Engine(), identifiable=False, table=world.table)
