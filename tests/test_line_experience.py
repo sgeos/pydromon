@@ -33,6 +33,7 @@ from dromon.limits import Limits
 from dromon import scheduler as scheduler_module
 from dromon.mailbox import MailSummary, listing, summary
 from dromon.model import (
+    HoldCause,
     HARNESS,
     DISCLOSURE_CHECK_WINDOW_SECONDS,
     MAX_DISCLOSURE_CHECKS,
@@ -180,7 +181,9 @@ def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
     scheduler.set_leases(["gate"], 600)
     scheduler.acquire_lease("beta", "gate")
     message_id, due = scheduler.schedule_wake("alpha", 120, "later")
-    question = scheduler.hold("alpha", "was held for this test")
+    question = scheduler.hold(
+        "alpha", "was held for this test", cause=HoldCause.AUTONOMOUS_TURNS
+    )
     text, error = world.call("line_status")
     assert not error
     status = json.loads(text)
@@ -230,16 +233,20 @@ def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
         "tasks": [],
     }
     assert full["leases"] == []
-    assert full["other_lines"] == [
-        {
-            "line_id": "beta",
-            "state": "idle",
-            "held": False,
-            "hibernated": False,
-            "workdir_commit": None,
-            "leases": ["gate"],
-        }
-    ]
+    (beta,) = full["other_lines"]
+    assert isinstance(beta.pop("since"), str)
+    assert beta == {
+        "line_id": "beta",
+        "state": "idle",
+        "condition": "idle",
+        "held": False,
+        "hold_cause": None,
+        "hibernated": False,
+        "unread": 0,
+        "oldest_unread_age_seconds": None,
+        "workdir_commit": None,
+        "leases": ["gate"],
+    }
     assert full["commits"]["workdir"] is None
     assert full["commits"]["daemon"] == COMMIT
     for secret in ("a private body", "jotter", "s3", "was held for this test"):
@@ -1297,7 +1304,9 @@ def test_a_spent_limit_holds_the_line_and_answers_nothing_more(
 
 def test_a_line_held_already_is_not_held_twice(world: World, tmp_path: Path) -> None:
     listed(world, tmp_path)
-    world.scheduler.hold("alpha", "passed a test limit")
+    world.scheduler.hold(
+        "alpha", "passed a test limit", cause=HoldCause.AUTONOMOUS_TURNS
+    )
     for _ in range(MAX_DISCLOSURE_CHECKS):
         world.call("wake_after", {"seconds": 60, "note": "codename"})
     text, error = world.call("wake_after", {"seconds": 60, "note": "clean"})
@@ -1589,7 +1598,9 @@ def test_read_instructions_refuses_bad_arguments_and_missing_files(
 
 
 def test_a_reply_to_a_hold_question_is_not_counted_unanswered(world: World) -> None:
-    question = world.scheduler.hold("alpha", "was held for this test")
+    question = world.scheduler.hold(
+        "alpha", "was held for this test", cause=HoldCause.AUTONOMOUS_TURNS
+    )
     operator = cast(OperatorAddress, world.log.state.messages[question].recipient)
     reply = world.scheduler.answer(operator, question, "resume")
     request = world.scheduler.send(ANA, LineAddress("alpha"), "a real request")

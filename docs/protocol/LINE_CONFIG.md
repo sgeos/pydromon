@@ -232,6 +232,43 @@ lists of leases, recent turns, other lines, kept-session tasks and left processe
 a `lists` object. With both arguments true, the tool returns the full diagnostic object
 and those lists. No mode returns a configuration document or message body.
 
+**Other lines.** From 2026-10-31, asked by the operator after a line held back work it
+had planned for a peer, because its status gave it no reliable view of that peer. Each
+entry of `other_lines` is a read-only view of one other line of the daemon, never of
+the line asking, with these fields.
+
+| Field | Meaning |
+|---|---|
+| `line_id` | The other line |
+| `state` | `idle`, `running` or `stopped`, as the event log records it |
+| `condition` | One word for where the line stands, by the precedence `line_status` gives the line's own: `running`, `hibernated`, `held`, `failed`, `waiting` on a question it asked an operator, or `idle` |
+| `held` | Whether the line is held |
+| `hold_cause` | The short cause of the hold, or `null` when it is not held: `autonomous_turns`, `cost`, `disclosure_checks`, `git_ssh_changed`, `plan_limit`, `inferred_limit`, `turn_failed` or `stopped`. A hold recorded before causes were gives `unrecorded` |
+| `hibernated` | Whether an operator hibernated the line |
+| `since` | When the line last was created, started or ended a turn, was held or released, or was hibernated or awakened, to the second in Coordinated Universal Time, or `null` when the log's time does not parse |
+| `unread` | How many messages to the line it has not opened, its own notes left out |
+| `oldest_unread_age_seconds` | Whole seconds since the oldest of those was sent, or `null` when there is none |
+| `workdir_commit` | The commit at `HEAD` of the line's working directory |
+| `leases` | The names of the leases the line holds |
+
+- **Never the mail.** The view gives a count and an age, and never a message's body,
+  sender, identifier or subject. A hold gives its closed cause and never the hold
+  question, whose text is mail to an operator and may carry an engine's error.
+- **Mail still waiting.** **Decided by core, for review.** `unread` counts mail not yet
+  delivered with mail delivered and unopened, since a held or hibernated line's mail
+  waits undelivered, and leaving it out would show such a line with nothing waiting.
+  It therefore differs from the line's own `unread`, which counts delivered mail only.
+- **The cause is recorded.** The cause is written in the `line_held` event, as
+  [`EVENT_LOG.md`](EVENT_LOG.md) gives it, so it survives a restart.
+- **The times are the log's.** `since` and the age are read from the `recorded_at` of
+  the event log's entries, which the daemon keeps beside its state as it replays and
+  appends, so they also survive a restart and need no scan of the log. **Limits.**
+  `since` does not move when a line comes to wait on a question or when its turn
+  fails, since neither changes its state, hold or hibernation, so for `waiting` and
+  `failed` it names the latest change before. The times follow the daemon's clock, so
+  a clock that stepped gives a wrong age, and an age that would be negative is given
+  as 0.
+
 When Dromon refuses a tool call, the error names the permission layer or setting that
 refused it, such as the line's `tool_policy` or
 `sandbox.allowUnsandboxedCommands=false`. When Claude Code reports a sandbox refusal,

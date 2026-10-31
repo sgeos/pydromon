@@ -34,7 +34,19 @@ from types import TracebackType
 from typing import Final, Self
 
 from dromon.codec import DecodeError, decode, encode
-from dromon.model import Event, EventRejected, State
+from dromon.model import (
+    Event,
+    EventRejected,
+    LineAwakened,
+    LineCreated,
+    LineHeld,
+    LineHibernated,
+    LineReleased,
+    LineStateChanged,
+    MessageReceived,
+    MessageSent,
+    State,
+)
 
 SCHEMA_VERSION: Final = 1
 """Stored in ``PRAGMA user_version``. A log with any other version is refused."""
@@ -91,9 +103,10 @@ class EventLog:
         self._connection = sqlite3.connect(path, isolation_level=None)
         self._clock = clock
         self.path = path
+        self._times = RecordedTimes()
         try:
             _initialize(self._connection)
-            self._state, self._last_seq = _replay(self._connection)
+            self._state, self._last_seq = _replay(self._connection, self._times)
         except BaseException:
             self._connection.close()
             raise
@@ -136,6 +149,12 @@ class EventLog:
         return total
 
     @property
+    def times(self) -> "RecordedTimes":
+        """When the events this log holds were recorded, as far as views need it.
+        The model never reads it."""
+        return self._times
+
+    @property
     def last_seq(self) -> int:
         """The sequence number of the newest event, or 0 for an empty log."""
         return self._last_seq
@@ -165,7 +184,49 @@ class EventLog:
                 raise LogCorrupt(f"the log assigned {cursor.lastrowid}, not {expected}")
         self._state.apply(event)
         self._last_seq = expected
-        return Entry(expected, recorded_at, event)
+        entry = Entry(expected, recorded_at, event)
+        self._times.note(entry)
+        return entry
+
+
+LINE_CHANGES: Final = (
+    LineCreated,
+    LineStateChanged,
+    LineHeld,
+    LineReleased,
+    LineHibernated,
+    LineAwakened,
+)
+"""The events that change whether a line is running, idle, held or hibernated, whose
+time ``RecordedTimes.line_changed`` keeps."""
+
+
+class RecordedTimes:
+    """The ``recorded_at`` of each line's latest ``LINE_CHANGES`` event and of each
+    message's first event, kept as the log is replayed and appended to.
+
+    **Task of 2026-10-31.** Lines are shown how long another line has stood as it
+    is and how old its oldest unread mail is, and reading the whole log for each
+    ``line_status`` would cost a full scan each time. The times are the clock's
+    text, never parsed here, and the model never reads them, so replay stays
+    deterministic. They follow the clock, which may step backwards, so an age read
+    from them can be wrong by as much as the clock was. One entry is kept for every
+    message the log holds, as ``State.messages`` keeps the message itself.
+    **Porting note.** A port keeps the same two maps beside its state."""
+
+    def __init__(self) -> None:
+        self.line_changed: dict[str, str] = {}
+        """When each line last started or stopped running, was held or released,
+        or was hibernated or awakened, or was created."""
+        self.message_recorded: dict[str, str] = {}
+        """When each message was sent or received, by its identifier."""
+
+    def note(self, entry: Entry) -> None:
+        event = entry.event
+        if isinstance(event, LINE_CHANGES):
+            self.line_changed[event.line_id] = entry.recorded_at
+        elif isinstance(event, MessageSent | MessageReceived):
+            self.message_recorded.setdefault(event.message_id, entry.recorded_at)
 
 
 def replay(path: Path) -> State:
@@ -293,8 +354,11 @@ def _entries(connection: sqlite3.Connection) -> Iterator[Entry]:
         expected += 1
 
 
-def _replay(connection: sqlite3.Connection) -> tuple[State, int]:
-    """Apply every stored event to an empty state inside one read transaction."""
+def _replay(
+    connection: sqlite3.Connection, times: RecordedTimes | None = None
+) -> tuple[State, int]:
+    """Apply every stored event to an empty state inside one read transaction, and
+    note their times in ``times`` when it is given."""
     state = State()
     last_seq = 0
     with _transaction(connection, "BEGIN") as reading:
@@ -305,5 +369,7 @@ def _replay(connection: sqlite3.Connection) -> tuple[State, int]:
                 raise LogCorrupt(
                     f"event {entry.seq} does not apply: {error}"
                 ) from error
+            if times is not None:
+                times.note(entry)
             last_seq = entry.seq
     return state, last_seq

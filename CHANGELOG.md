@@ -7,6 +7,19 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- A read-only view of every other line in `line_status`. Each entry of `other_lines`
+  now also gives the line's `condition`, the short `hold_cause` of a hold, `since`, when
+  its state, hold or hibernation last changed, and its `unread` count with
+  `oldest_unread_age_seconds`, and never a message's body, sender or identifier, nor
+  the hold question. A line had held back work it planned for a peer because its
+  status gave no reliable view of the peer. `line_held` takes an optional `cause`,
+  left out of the wire when absent, so an older log still decodes and an older hold
+  shows `unrecorded`. The times are the event log's `recorded_at`, kept beside the
+  state as the log is replayed and appended, so they survive a restart. **Decided by
+  core, for review.** `unread` here counts mail still waiting for delivery, since a
+  held line's mail waits undelivered. **Rollback hazard.** A daemon before this change
+  refuses a log holding a `line_held` with a cause. See
+  [`LINE_CONFIG.md`](docs/protocol/LINE_CONFIG.md).
 - Open federation, round 12. `[federation] local` and `remote` take `allowlist`, the
   default, which keeps the behaviour of declared peers exactly, or `open`. With
   `local = "open"`, `listen` and a unique `name`, a daemon registers in a per-user

@@ -369,6 +369,22 @@ LINE_TRANSITIONS: Final[frozenset[tuple[LineState, LineState]]] = frozenset(
 """Every permitted change of a line's state. A change to the same state is not one."""
 
 
+class HoldCause(StrEnum):
+    """Why the daemon held a line, in one word another line may read. **Task of
+    2026-10-31.** A line's hold question is mail to an operator, and its text may
+    carry an engine's error, so other lines are shown this closed word and never the
+    text. A hold recorded before the field has no cause."""
+
+    AUTONOMOUS_TURNS = "autonomous_turns"
+    COST = "cost"
+    DISCLOSURE_CHECKS = "disclosure_checks"
+    GIT_SSH_CHANGED = "git_ssh_changed"
+    PLAN_LIMIT = "plan_limit"
+    INFERRED_LIMIT = "inferred_limit"
+    TURN_FAILED = "turn_failed"
+    STOPPED = "stopped"
+
+
 class MessageKind(StrEnum):
     NOTE = "note"
     QUESTION = "question"
@@ -606,10 +622,12 @@ class ProjectOverridden:
 
 @dataclass(frozen=True, slots=True)
 class LineHeld:
-    """The daemon stopped waking a line until an operator answers ``question_id``."""
+    """The daemon stopped waking a line until an operator answers ``question_id``,
+    for ``cause``, or for a cause not recorded when ``cause`` is ``None``."""
 
     line_id: str
     question_id: str
+    cause: HoldCause | None = None
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
@@ -2116,6 +2134,8 @@ class Line:
     """The engine session the line's next turn resumes, if one was recorded."""
     held_by: str | None = None
     """The question whose answer releases the line, while the line is held."""
+    hold_cause: HoldCause | None = None
+    """The cause its ``line_held`` recorded, while the line is held."""
     overrides: str | None = None
     """The latest ``line_overridden`` text, or ``None`` when nothing was overridden."""
     rebound: bool = False
@@ -2787,11 +2807,13 @@ class State:
                 self.lines[event.line_id] = replace(line, config=event.config)
             case LineHeld():
                 line = self.lines[event.line_id]
-                self.lines[event.line_id] = replace(line, held_by=event.question_id)
+                self.lines[event.line_id] = replace(
+                    line, held_by=event.question_id, hold_cause=event.cause
+                )
                 self.hold_questions.add(event.question_id)
             case LineReleased():
                 line = self.lines[event.line_id]
-                self.lines[event.line_id] = replace(line, held_by=None)
+                self.lines[event.line_id] = replace(line, held_by=None, hold_cause=None)
             case LineHibernated():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, hibernated=True)

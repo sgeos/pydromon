@@ -290,6 +290,8 @@ from dromon.model import (
     HarnessAddress,
     InvalidField,
     LineAddress,
+    HoldCause,
+    Line,
     LineConfigured,
     LineCreated,
     LineHeld,
@@ -4258,6 +4260,7 @@ class Scheduler:
                 line_id,
                 f"has an estimated cost of ${total:.2f} since its last release, over"
                 f" the budget of ${limits.max_cost_usd:.2f}",
+                cause=HoldCause.COST,
             )
 
     def _remember(
@@ -4473,12 +4476,21 @@ class Scheduler:
         except LineToolRefused:
             workdir = None
         pending = state.scheduled.get(line_id)
+        now = self._wall_clock()
+        unread = _unread_by_line(state, self._log.times.message_recorded)
         others: list[dict[str, object]] = [
             {
                 "line_id": other_id,
                 "state": other.state.value,
+                "condition": self.condition(other_id),
                 "held": other.held_by is not None,
+                "hold_cause": _hold_cause(other),
                 "hibernated": other.hibernated,
+                "since": _recorded_time_of(self._log.times.line_changed.get(other_id)),
+                "unread": unread.get(other_id, (0, None))[0],
+                "oldest_unread_age_seconds": _age_seconds(
+                    unread.get(other_id, (0, None))[1], now
+                ),
                 "workdir_commit": self._workdir_commit(other_id),
                 "leases": [str(lease["name"]) for lease in self.leases_of(other_id)],
             }
@@ -5139,6 +5151,7 @@ class Scheduler:
                 f"reached the limit of {MAX_DISCLOSURE_CHECKS} disclosure checks and"
                 f" refusals in {DISCLOSURE_CHECK_WINDOW_SECONDS} seconds, so a"
                 " further answer could reveal more of the list",
+                cause=HoldCause.DISCLOSURE_CHECKS,
             )
         return DISCLOSURE_HELD
 
@@ -7963,8 +7976,9 @@ class Scheduler:
 
     # Conversation limits.
 
-    def hold(self, line_id: str, reason: str) -> str:
-        """Hold ``line_id`` and ask an operator whether to resume it."""
+    def hold(self, line_id: str, reason: str, *, cause: HoldCause) -> str:
+        """Hold ``line_id`` and ask an operator whether to resume it. ``reason`` goes
+        to the operator alone, and ``cause`` is recorded for other lines to read."""
         operator = self.last_operator(line_id) or self._default_operator
         self.ensure_operator(operator.operator_id)
         question_id = self.ask(
@@ -7974,7 +7988,7 @@ class Scheduler:
             " this question to resume it, or leave it held.",
             ("resume",),
         )
-        self._log.append(LineHeld(line_id, question_id))
+        self._log.append(LineHeld(line_id, question_id, cause))
         print(
             f"dromond: line {line_id} held, asking {operator}: {reason}",
             file=sys.stderr,
@@ -8030,6 +8044,7 @@ class Scheduler:
         cost = self._cost.get(line_id, 0.0)
         limits = self.limits_for(line_id)
         reason: str | None = None
+        hold_cause = HoldCause.AUTONOMOUS_TURNS
         if count_autonomous and turns >= limits.max_autonomous_turns:
             reason = f"took {turns} turns in a row without mail from an operator"
         elif cost > limits.max_cost_usd:
@@ -8037,9 +8052,10 @@ class Scheduler:
                 f"has an estimated cost of ${cost:.2f} since its last release, over"
                 f" the budget of ${limits.max_cost_usd:.2f}"
             )
+            hold_cause = HoldCause.COST
         line = self._log.state.lines[line_id]
         if reason is not None and line.held_by is None:
-            self.hold(line_id, reason)
+            self.hold(line_id, reason, cause=hold_cause)
 
     def step(self) -> None:
         """Run one tick: update every line once, then move the sent queue to the post
@@ -8378,16 +8394,22 @@ class Scheduler:
             self._count_interrupted(line_id, engine)
             raise
         except GitSshChanged as error:
-            self.hold(line_id, str(error))
+            self.hold(line_id, str(error), cause=HoldCause.GIT_SSH_CHANGED)
             ending = f"held: the line {error}"
         except EnginePlanLimit as error:
             if error.may_move_role:
                 self.plan_limit_reached(line_id, error)
-                self._plan_held[line_id] = self.hold(line_id, str(error))
+                self._plan_held[line_id] = self.hold(
+                    line_id, str(error), cause=HoldCause.PLAN_LIMIT
+                )
             else:
                 # Inferred wording holds and asks, and is never a ground to move a
                 # role, so it records no budget and no plan hold.
-                self.hold(line_id, f"{error}{INFERRED_LIMIT_NOTE}")
+                self.hold(
+                    line_id,
+                    f"{error}{INFERRED_LIMIT_NOTE}",
+                    cause=HoldCause.INFERRED_LIMIT,
+                )
             ending = f"held: {error}"
             print(f"dromond: line {line_id} held: {error}", file=sys.stderr)
         except Exception as error:  # noqa: BLE001
@@ -8844,7 +8866,9 @@ class Scheduler:
             else ending[:MAX_FAILURE_TEXT] + "..."
         )
         self.hold(
-            line_id, f"had a turn fail and sent no operator mail during it. {cut}"
+            line_id,
+            f"had a turn fail and sent no operator mail during it. {cut}",
+            cause=HoldCause.TURN_FAILED,
         )
 
     async def _check_walk(self, line_id: str) -> None:
@@ -8992,7 +9016,7 @@ class Scheduler:
             self._log.append(WakeWithdrawn(line_id, pending.message_id))
             self._compact_wake.pop(line_id, None)
         if self._log.state.lines[line_id].held_by is None:
-            self.hold(line_id, STOPPED_REASON)
+            self.hold(line_id, STOPPED_REASON, cause=HoldCause.STOPPED)
         engine = self._engines.get(line_id)
         if not isinstance(engine, HaltingEngine):
             return
@@ -9486,9 +9510,15 @@ class Scheduler:
                 if isinstance(error, EnginePlanLimit):
                     if error.may_move_role:
                         self.plan_limit_reached(line_id, error)
-                        self._plan_held[line_id] = self.hold(line_id, str(error))
+                        self._plan_held[line_id] = self.hold(
+                            line_id, str(error), cause=HoldCause.PLAN_LIMIT
+                        )
                     else:
-                        self.hold(line_id, f"{error}{INFERRED_LIMIT_NOTE}")
+                        self.hold(
+                            line_id,
+                            f"{error}{INFERRED_LIMIT_NOTE}",
+                            cause=HoldCause.INFERRED_LIMIT,
+                        )
                     ending = f"held: {error}"
                 else:
                     self._failed.add(line_id)
@@ -10259,6 +10289,74 @@ def _stale_tail(
         f", whose own checkout has since moved to {checkout} after the daemon loaded"
         f" its code at {loaded_at}, with its code not compared"
     )
+
+
+HOLD_CAUSE_UNRECORDED: Final = "unrecorded"
+"""The hold cause shown for a line held by a ``line_held`` written before causes
+were recorded."""
+
+
+def _hold_cause(line: Line) -> str | None:
+    """The short cause of ``line``'s hold for another line to read, or ``None`` when
+    it is not held. **Task of 2026-10-31.** Never the hold question's text, which is
+    mail to an operator."""
+    if line.held_by is None:
+        return None
+    if line.hold_cause is None:
+        return HOLD_CAUSE_UNRECORDED
+    return line.hold_cause.value
+
+
+def _unread_by_line(
+    state: State, recorded: dict[str, str]
+) -> dict[str, tuple[int, str | None]]:
+    """For each line, how many messages to it it has not opened and when the oldest
+    was recorded, by one pass over the messages in log order.
+
+    **Task of 2026-10-31, decided by core for review.** Mail still waiting for
+    delivery counts with mail delivered and unopened, since a held or hibernated
+    line's mail waits undelivered, and leaving it out would show such a line as
+    having nothing waiting. The line's own notes are left out, as its own unread
+    count leaves them out. Nothing of a message but its count and age leaves here,
+    so no line sees another line's mail."""
+    found: dict[str, tuple[int, str | None]] = {}
+    for message_id, message in state.messages.items():
+        recipient = message.recipient
+        if (
+            not isinstance(recipient, LineAddress)
+            or message.read
+            or message.sender == recipient
+        ):
+            continue
+        count, oldest = found.get(recipient.line_id, (0, None))
+        if count == 0:
+            oldest = recorded.get(message_id)
+        found[recipient.line_id] = (count + 1, oldest)
+    return found
+
+
+def _recorded_time_of(recorded_at: str | None) -> str | None:
+    """``recorded_at`` from the event log as a due time, to the second, or ``None``
+    when it is absent or does not parse."""
+    if recorded_at is None:
+        return None
+    try:
+        return format_due(datetime.fromisoformat(recorded_at))
+    except (ValueError, InvalidField):
+        return None
+
+
+def _age_seconds(recorded_at: str | None, now: datetime) -> int | None:
+    """Whole seconds from ``recorded_at`` to ``now``, at least 0, since a clock
+    that stepped backwards would otherwise give a negative age, or ``None`` when
+    the time is absent or does not parse."""
+    if recorded_at is None:
+        return None
+    try:
+        then = datetime.fromisoformat(recorded_at)
+        return max(0, int((now - then).total_seconds()))
+    except (ValueError, TypeError):
+        return None
 
 
 def _compact_line_status(full: dict[str, object]) -> dict[str, object]:

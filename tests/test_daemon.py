@@ -25,6 +25,7 @@ from dromon.daemon import AlreadyRunning, Daemon, acquire_lock
 from dromon.driver import Strategy
 from dromon.eventlog import EventLog
 from dromon.model import (
+    HoldCause,
     LineAddress,
     LineCreated,
     MessageKind,
@@ -600,7 +601,9 @@ def test_release_resumes_a_held_line_and_status_shows_holds(
     with EventLog(paths.event_log) as log:
         scheduler = held_scheduler(log)
         scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
-        question_id = scheduler.hold("alpha", "was held by a test")
+        question_id = scheduler.hold(
+            "alpha", "was held by a test", cause=HoldCause.AUTONOMOUS_TURNS
+        )
     status = request(paths, "status", {})
     assert status.result is not None
     (line,) = cast(list[dict[str, object]], status.result["lines"])

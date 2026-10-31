@@ -26,6 +26,7 @@ from dromon.gitssh import GitSshAccess
 from dromon.lineconfig import ConfigError, LineConfig, ToolPolicy, encode_config
 from dromon.overrides import OverrideError
 from dromon.model import (
+    HoldCause,
     AgentAccess,
     AgentAddress,
     AgentRegistered,
@@ -642,7 +643,9 @@ def test_answering_a_hold_question_releases_the_line(make_world: MakeWorld) -> N
 
 def test_release_resumes_a_held_line(make_world: MakeWorld) -> None:
     target = make_world({"alpha": [[] for _ in range(10)]})
-    target.scheduler.hold("alpha", "was held by a test")
+    target.scheduler.hold(
+        "alpha", "was held by a test", cause=HoldCause.AUTONOMOUS_TURNS
+    )
     run(target, send(target, "alpha", "waiting"))
     assert target.engines == {}
     target.scheduler.release("alpha")
@@ -687,7 +690,9 @@ def test_a_hold_asks_the_default_operator_when_none_messaged(
     make_world: MakeWorld,
 ) -> None:
     target = make_world({"alpha": []}, hold_wakes=True)
-    question_id = target.scheduler.hold("alpha", "was held by a test")
+    question_id = target.scheduler.hold(
+        "alpha", "was held by a test", cause=HoldCause.AUTONOMOUS_TURNS
+    )
     recipient = target.log.state.messages[question_id].recipient
     assert recipient == OperatorAddress("operator")
 
