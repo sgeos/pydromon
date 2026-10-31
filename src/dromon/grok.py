@@ -129,6 +129,27 @@ Grok tool, such as ``spawn_subagent``, the scheduler, ``workflow``, the plan mod
 ``ask_user_question`` and the image tools, is refused, which fails closed.
 ``search_tool`` and ``use_tool`` are judged on their own in ``_permits``."""
 
+GROK_TOOL_KINDS: Final[dict[str, frozenset[str]]] = {
+    "read_file": frozenset({"read"}),
+    "list_dir": frozenset({"read", "search"}),
+    "grep": frozenset({"search"}),
+    "search_replace": frozenset({"edit"}),
+    "write": frozenset({"edit"}),
+    "run_terminal_command": frozenset({"execute"}),
+    "get_command_or_subagent_output": frozenset({"execute"}),
+    "kill_command_or_subagent": frozenset({"execute"}),
+    "web_fetch": frozenset({"fetch"}),
+    "web_search": frozenset({"fetch", "search"}),
+    "search_tool": frozenset({"other"}),
+    "use_tool": frozenset({"other"}),
+}
+"""The ACP kinds each Grok tool may carry, so a call's kind must agree with its own
+name, not merely with some tool of the line. **Review of d29174d, 2026-10-31.**
+Observed only for ``search_tool``, as ``other``. Every other entry is a
+**hypothesis** from the tool's purpose, and a call with another kind is refused,
+which may refuse too much until Grok's real kinds are recorded, and never grants
+more."""
+
 USE_TOOL_KEYS: Final = frozenset({"tool_name", "tool_input"})
 """The keys of ``use_tool``'s documented inline form."""
 
@@ -141,9 +162,6 @@ USE_TOOL_VARIANT_VALUE: Final = "UseTool"
 """The only ``variant`` a ``use_tool`` input may carry. **Inference**, from the observed
 ``SearchTool`` of ``search_tool``, not from a recorded ``use_tool`` call, so another
 value is refused, which fails closed."""
-
-META_TOOLS: Final = frozenset({"search_tool", "use_tool"})
-"""Grok's two tools that reach MCP servers, whose ACP kind is ``other``."""
 
 
 def grok_tool_name(fields: Mapping[str, Any]) -> str:
@@ -1525,18 +1543,12 @@ class GrokLine:
         return bool(given), min(given) if given else name
 
     def _kind_agrees(self, name: str, fields: Mapping[str, Any]) -> bool:
-        """Whether a ``kind`` the call carries is one the line may also use, so a
-        ``_meta`` name cannot let through a call whose kind says another tool. A call
-        without a kind agrees. ``search_tool`` and ``use_tool`` must be ``other``, and
-        a built-in must have a kind that ``KIND_TOOLS`` permits for this line.
-        **Review G1, 2026-10-31.**"""
+        """Whether a ``kind`` the call carries is one ``GROK_TOOL_KINDS`` gives its
+        name, so a ``_meta`` name cannot let through a call whose kind says another
+        tool. A call without a kind agrees. **Review G1, 2026-10-31.**"""
         if "kind" not in fields:
             return True
-        kind = fields.get("kind")
-        if name in META_TOOLS:
-            return kind == "other"
-        allowed = KIND_TOOLS.get(str(kind))
-        return allowed is not None and bool(allowed & set(self.config.builtin_tools))
+        return fields.get("kind") in GROK_TOOL_KINDS.get(name, frozenset[str]())
 
     def _permits_request(
         self, known: Mapping[str, object], tool_call: Mapping[str, Any]

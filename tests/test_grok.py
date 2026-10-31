@@ -2839,3 +2839,46 @@ def test_a_grok_name_added_in_a_later_update_is_refused(
     )
     with pytest.raises(EngineRefused, match="in a later update"):
         run(line(server, project, config=given))
+
+
+@pytest.mark.parametrize(
+    ("name", "kind", "given"),
+    [
+        # Review of d29174d, PA. A kind naming another of the line's tools still
+        # disagrees with the call's own name.
+        ("read_file", "execute", ("Read", "Bash")),
+        # PB to PD. A built-in with a kind not in its row of GROK_TOOL_KINDS is
+        # refused, which fails closed until Grok's real kinds are recorded.
+        ("run_terminal_command", "other", ("Bash",)),
+        ("web_search", "read", ("WebSearch",)),
+    ],
+)
+def test_a_grok_kind_must_be_one_its_own_name_allows(
+    project: tuple[Path, Path, Path], name: str, kind: str, given: tuple[str, ...]
+) -> None:
+    event = grok_call(name)
+    event["params"]["update"]["kind"] = kind
+    config = LineConfig(builtin_tools=given)
+    with pytest.raises(EngineRefused, match=f"not given: {name}"):
+        run(line(FakeGrok([event]), project, config=config))
+
+
+@pytest.mark.parametrize(
+    ("name", "kind", "given", "counted"),
+    [
+        ("list_dir", "search", ("Glob",), "Glob"),
+        ("web_search", "search", ("WebSearch",), "WebSearch"),
+        ("run_terminal_command", "execute", ("Bash",), "Bash"),
+    ],
+)
+def test_a_grok_kind_its_name_allows_is_accepted(
+    project: tuple[Path, Path, Path],
+    name: str,
+    kind: str,
+    given: tuple[str, ...],
+    counted: str,
+) -> None:
+    event = grok_call(name)
+    event["params"]["update"]["kind"] = kind
+    config = LineConfig(builtin_tools=given)
+    assert run(line(FakeGrok([event]), project, config=config)).tool_uses == (counted,)

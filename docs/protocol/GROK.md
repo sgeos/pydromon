@@ -318,26 +318,27 @@ identified by its `_meta` name alone, so its title and kind may change, but a ch
 that name, an added `toolName` or a changed `use_tool` target refuses the turn. A
 permission request is judged by the name recorded for its call. **Review G1 and G2,
 2026-10-31.** A `kind` the call carries, at first sight or in any later update, must
-also be permitted. `search_tool` and `use_tool` must be `other`, and a built-in needs
-a kind the line may use by the ACP table above, so a `_meta` naming one tool cannot
-carry a kind that names another. A `_meta` name added in a later update to a call first
-judged without one refuses the turn. A call without that
+be one the table below gives that tool, so a `_meta` naming one tool cannot carry a
+kind that names another, even when the line has both. **Hypothesis.** Only the `other`
+of `search_tool` is observed, and a call with another kind is refused, which may refuse
+too much until Grok's real kinds are recorded, and never grants more. A `_meta` name
+added in a later update to a call first judged without one refuses the turn. A call without that
 `_meta`, or in another namespace, is judged as before. **Hypothesis.** The table is
 read from the tool names in the session's `tool_definitions.json`, and no live call of
 each built-in, or of `use_tool`, has been recorded.
 
-| Grok tool | Permitted by |
-|---|---|
-| `read_file` | `Read` |
-| `list_dir` | `Read` or `Glob` |
-| `grep` | `Grep` |
-| `search_replace`, `write` | `Edit` or `Write` |
-| `run_terminal_command`, `get_command_or_subagent_output`, `kill_command_or_subagent` | `Bash` |
-| `web_fetch` | `WebFetch` |
-| `web_search` | `WebSearch` |
-| `search_tool` | Always, as discovery |
-| `use_tool` | Only a tool of Dromon's MCP server, `dromon__NAME` in `tool_name` |
-| Any other | Refused |
+| Grok tool | Permitted by | Kinds it may carry |
+|---|---|---|
+| `read_file` | `Read` | `read` |
+| `list_dir` | `Read` or `Glob` | `read`, `search` |
+| `grep` | `Grep` | `search` |
+| `search_replace`, `write` | `Edit` or `Write` | `edit` |
+| `run_terminal_command`, `get_command_or_subagent_output`, `kill_command_or_subagent` | `Bash` | `execute` |
+| `web_fetch` | `WebFetch` | `fetch` |
+| `web_search` | `WebSearch` | `fetch`, `search` |
+| `search_tool` | Always, as discovery | `other` |
+| `use_tool` | Only a tool of Dromon's MCP server, `dromon__NAME` in `tool_name` | `other` |
+| Any other | Refused | |
 
 **Changed on 2026-10-26, Antigravity review, F1 to F3, at the operator's direction.**
 Grok no longer exempts the `think` kind. A `think` call was let through uncounted, so
