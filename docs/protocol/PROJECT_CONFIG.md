@@ -108,7 +108,7 @@ relay = "tail"          # the route of operator ana's mail
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `version` | integer | required | Must be 1 |
-| `daemon.operator` | identifier | `operator` | The default operator |
+| `daemon.operator` | identifier | `operator` | The default operator. It also declares that operator, whom a peer may reach before that operator has sent anything, as decision 25 of [`FEDERATION.md`](../architecture/FEDERATION.md) specifies. The built-in default declares no one |
 | `daemon.tick_seconds` | number in [0, 60] | 1 | The tick cadence |
 | `daemon.require_sandbox` | boolean | `false` | Whether every Claude Code line must run with an enabled sandbox, as below |
 | `daemon.disclosure_terms` | path | none | The project's disclosure list, relative to the project root, as below |
@@ -176,7 +176,7 @@ relay = "tail"          # the route of operator ana's mail
 | `relays.NAME.command` | list of 1 to 64 non-empty texts | required for `command` | The argument vector, run without a shell, each argument at most 4096 bytes. A key of the other kind is an error |
 | `relays.NAME.path` | path | required for `file` | The notice file, absolute, under `~`, or relative to the project root. Its directory must exist, and it may not lie in any line's working directory except inside a directory Dromon protects, as below |
 | `relays.NAME.timeout_seconds` | number in (0, 3600] | 30 | How long a command relay may run before it and its process group are killed |
-| `operators.ID` | table | none | An operator, named by an operator identifier |
+| `operators.ID` | table | none | An operator, named by an operator identifier, and declared, so that a peer may reach it as `daemon.operator` may be reached |
 | `operators.ID.relay` | relay name | required | The relay that carries the operator's mail. An operator with no table is unrouted, and its mail waits for a client |
 | `settings` | table | none | The project's engine settings, merged under every line's, as [`SETTINGS.md`](SETTINGS.md) specifies |
 | `profiles.NAME.settings`, `lines.ID.settings` | table | none | A profile's or a line's engine settings. These merge rather than replace |

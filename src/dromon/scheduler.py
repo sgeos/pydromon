@@ -2551,21 +2551,35 @@ class Scheduler:
         ``priority_in`` lets it. The note is priority mail only when both hold, its
         recipient is a line, and the peer, counted as one sender, and the line are
         within the rate limits of priority mail from lines. Otherwise it is ordinary
-        mail whose header says that its priority was declined."""
+        mail whose header says that its priority was declined.
+
+        An operator the log does not hold yet is recorded first, in the same check, so
+        a refused note records neither. The receiver passes only an operator the
+        project file declares, decision 25 of ``FEDERATION.md``, so this never makes
+        an operator a peer named."""
         message_id = new_id("m")
         asked = priority is not PeerPriority.NONE
-        self._log.append(
-            MessageReceived(
-                message_id,
-                sender,
-                recipient,
-                body,
-                reply_to,
-                origin_id,
-                format_due(self._wall_clock()),
-                asked,
-            )
+        event = MessageReceived(
+            message_id,
+            sender,
+            recipient,
+            body,
+            reply_to,
+            origin_id,
+            format_due(self._wall_clock()),
+            asked,
         )
+        state = self._log.state
+        if (
+            isinstance(recipient, OperatorAddress)
+            and recipient.operator_id not in state.operators
+        ):
+            registered = OperatorRegistered(recipient.operator_id)
+            trial = state.copy()
+            trial.apply(registered)
+            trial.check(event)
+            self._log.append(registered)
+        self._log.append(event)
         key = peer_key(sender.peer_id)
         honoured = (
             priority is PeerPriority.PERMITTED

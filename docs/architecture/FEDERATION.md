@@ -127,7 +127,8 @@ operator authority. The design keeps that without exception.
 - **Which local parties a peer may reach.** Inbound policy lists the local parties a
   peer may send to, by address, such as `["core", "@ana"]`. The default list is
   empty. Mail to any other local party is refused with a code that does not say whether
-  the party exists.
+  the party exists. An operator exists for `reach` only when the project file declares
+  that operator, as decision 25 decided.
 - **Which local parties may send to a peer.** Outbound policy lists the local parties
   that may send to a peer. The default list is empty. A line's `send_message` to a
   remote address it may not use is refused and records nothing, as a refusal does
@@ -662,6 +663,7 @@ outbox in `State.outbox`. Choices the design left open, for the operator's revie
 
 1. The peer's connection is authenticated, and the daemon checks that both addresses
    follow the grammar, that inbound is on, that the recipient is in `reach` and exists,
+   an operator by the project file's declaration of decision 25,
    that the kind is `note`, that the body is within `max_body_bytes`, the rate limits
    below, and the bounds on waiting mail. `reach` is checked here whatever the sending
    daemon checked, since the token does not prove the sender.
@@ -1066,7 +1068,8 @@ daemon restarts, so a peer that changes its name on each connection sends one no
 | A connection comes from outside `allowed_networks` | Closed by its address before the cap and before the handshake |
 | Many clients open handshakes on an open listener and stall | Each counts under the bound of eight from its accept and is closed at the 10-second deadline. None holds a thread |
 | An open listener's client presents a key other than self-signed Ed25519, or none | Refused in the handshake, before any frame is read |
-| A note names an operator who has never sent through the receiving daemon | Refused with `refused` at once, since a daemon holds an operator only from that operator's first send. **Found on 2026-10-31,** in the first socket run of two open daemons. By design, as for a declared peer, and decision 25 below |
+| A note names an operator who has never sent through the receiving daemon | Accepted when the project file declares the operator, which the note then records in the log. **Found on 2026-10-31,** in the first socket run of two open daemons, which refused it. Decision 25 below |
+| A note names an operator the project file does not declare | Refused with `refused`, whether or not the log holds the operator, so a peer can never create an operator. Decision 25 below |
 | A test reaches the user's real registry | Every test sets `DROMON_REGISTRY_DIR` to a temporary directory, and a test checks that it does |
 
 ## Out of scope
@@ -1158,11 +1161,17 @@ changing the envelope's version 1, unless noted.
     `deliver`, read after an accepted answer to `hello`, on the Unix domain socket
     transport as well. A link that takes the writes and never answers leaves the
     message waiting, marked as possibly sent once a `deliver` was written.
-25. **An operator who has never sent through a daemon cannot receive peer mail there.**
-    **Fact, found on 2026-10-31.** A daemon holds an operator only from that operator's
-    first send through it, and a note to a party the receiver does not hold is refused
-    with `refused`, as for a declared peer. A project that names `@ana` in `reach` or
-    `[federation.open] reach` therefore refuses mail to `@ana` until `@ana` has sent
-    once through it. The behaviour is unchanged, since `refused` hides which parties
-    exist. The alternative, to hold every operator a `reach` list names, would let a
-    project file register operators, and is the operator's to decide.
+25. **A declared operator may receive peer mail before sending anything.** **Fact,
+    found on 2026-10-31.** A daemon held an operator only from that operator's first
+    send through it, so the first socket run of two open daemons refused a note to an
+    operator who had never sent.
+
+    **Decided by the operator on 2026-10-31.** An operator exists for `reach` when the
+    project file declares that operator, by `[daemon] operator` or by an
+    `[operators.ID]` table. A declared operator may receive peer mail before sending
+    anything, and the first such note records the operator in the log together with the
+    note, in one check, so a refused note records neither. An operator known only from
+    the log, or not at all, is refused with `refused`, so a peer can never create an
+    operator. The command line's `--operator` and the built-in default are not
+    declarations, since neither is in the file. A reload that drops an operator from
+    the file stops peer mail to that operator at once.

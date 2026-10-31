@@ -333,7 +333,8 @@ def daemon_for(
             log,
             AT,
             scheduler,
-            project=ProjectConfig(federation=federation),
+            # The file declares ``ana``, whom a peer may reach, decision 25.
+            project=ProjectConfig(operator="ana", federation=federation),
             command_line=Overrides(),
             project_file_present=False,
         )

@@ -73,7 +73,8 @@ from dromon.peering import (
     outcome_result,
     turn_cause,
 )
-from dromon.projectconfig import ProjectConfig
+from dromon.projectconfig import ProjectConfig, declared_operators
+from dromon.relay import parse_relays
 from dromon.protocol import MAX_LINE_BYTES, Operation, Request, Response
 from dromon.scheduler import PRIORITY_DECLINED, LineEngine, LineSpec, Scheduler
 from dromon.tls_link import server_context_for, tls_connector
@@ -82,6 +83,8 @@ PEER = "keleusma"
 KAIZEN = RemoteAddress(PEER, LineAddress("kaizen"))
 ALPHA = LineAddress("alpha")
 ANA = OperatorAddress("ana")
+DECLARED: frozenset[str] = frozenset({"ana"})
+"""The operators the tests' project file declares, decision 25 of ``FEDERATION.md``."""
 TOKEN = "T" * 43
 
 
@@ -316,9 +319,10 @@ def judge(
     federation: FederationConfig,
     args: dict[str, object],
     receiver: Receiver | None = None,
+    operators: frozenset[str] = DECLARED,
 ) -> object:
     return (receiver or Receiver(Clock())).deliver(
-        state, federation, PEER, args, Recorder(state)
+        state, federation, operators, PEER, args, Recorder(state)
     )
 
 
@@ -326,10 +330,10 @@ def test_a_note_is_accepted_once_and_a_resend_is_a_duplicate() -> None:
     state = peer_state()
     receiver = Receiver(Clock())
     recorder = Recorder(state)
-    first = receiver.deliver(state, config(), PEER, envelope(), recorder)
+    first = receiver.deliver(state, config(), DECLARED, PEER, envelope(), recorder)
     assert first == Accepted("r1", duplicate=False)
     assert state.messages["r1"].sender == KAIZEN
-    again = receiver.deliver(state, config(), PEER, envelope(), recorder)
+    again = receiver.deliver(state, config(), DECLARED, PEER, envelope(), recorder)
     assert again == Accepted("r1", duplicate=True)
     assert recorder.count == 1
 
@@ -338,11 +342,11 @@ def test_a_resend_is_a_duplicate_even_after_the_policy_closes() -> None:
     state = peer_state()
     receiver = Receiver(Clock())
     recorder = Recorder(state)
-    receiver.deliver(state, config(), PEER, envelope(), recorder)
+    receiver.deliver(state, config(), DECLARED, PEER, envelope(), recorder)
     closed = config(inbound=False)
-    assert receiver.deliver(state, closed, PEER, envelope(), recorder) == Accepted(
-        "r1", duplicate=True
-    )
+    assert receiver.deliver(
+        state, closed, DECLARED, PEER, envelope(), recorder
+    ) == Accepted("r1", duplicate=True)
 
 
 @pytest.mark.parametrize(
@@ -360,8 +364,10 @@ def test_a_different_message_under_one_origin_is_a_conflict(
     state = peer_state()
     receiver = Receiver(Clock())
     recorder = Recorder(state)
-    receiver.deliver(state, config(), PEER, envelope(), recorder)
-    outcome = receiver.deliver(state, config(), PEER, envelope(**change), recorder)
+    receiver.deliver(state, config(), DECLARED, PEER, envelope(), recorder)
+    outcome = receiver.deliver(
+        state, config(), DECLARED, PEER, envelope(**change), recorder
+    )
     assert outcome == Refused(Code.CONFLICT)
     assert recorder.count == 1
     assert "origin identifier o1" in capsys.readouterr().err
@@ -422,6 +428,33 @@ def test_a_party_out_of_reach_and_a_missing_one_are_refused_alike() -> None:
     assert outside == missing == Refused(Code.REFUSED)
 
 
+@pytest.mark.parametrize("operator_id", ["ana", "bo"])
+def test_an_operator_the_project_does_not_declare_is_refused(operator_id: str) -> None:
+    """Decided by the operator on 2026-10-31, decision 25 of ``FEDERATION.md``. ``ana``
+    is known from the log and ``bo`` not at all, and neither is declared, so both are
+    refused as a missing line is, and nothing is recorded."""
+    state = peer_state()
+    reach = config(reach=["alpha", f"@{operator_id}"])
+    args = envelope(recipient=f"@{operator_id}")
+    undeclared = judge(state, reach, args, operators=frozenset({"cy"}))
+    missing = judge(state, config(reach=["ghost"]), envelope(recipient="ghost"))
+    assert undeclared == missing == Refused(Code.REFUSED)
+    assert state.received == {}
+    assert ("bo" in state.operators) is False
+
+
+def test_the_declared_operators_are_the_files_operator_and_its_routes() -> None:
+    relays = parse_relays(
+        {"note": {"kind": "file", "path": "notes/operators.txt"}},
+        {"cy": {"relay": "note"}},
+    )
+    assert declared_operators(ProjectConfig()) == frozenset()
+    assert declared_operators(ProjectConfig(operator="bo")) == {"bo"}
+    assert declared_operators(ProjectConfig(relays=relays)) == set(relays.routes)
+    both = ProjectConfig(operator="bo", relays=relays)
+    assert declared_operators(both) == {"bo", *relays.routes}
+
+
 def test_a_removed_peer_is_refused() -> None:
     state = peer_state(removed=True)
     assert judge(state, config(), envelope()) == Refused(Code.REFUSED)
@@ -455,20 +488,24 @@ def test_waiting_mail_is_bounded_per_peer_and_per_recipient() -> None:
     per_peer = config(waiting=2)
     for origin in ("o1", "o2"):
         outcome = receiver.deliver(
-            state, per_peer, PEER, envelope(origin_id=origin), recorder
+            state, per_peer, DECLARED, PEER, envelope(origin_id=origin), recorder
         )
         assert isinstance(outcome, Accepted)
-    full = receiver.deliver(state, per_peer, PEER, envelope(origin_id="o3"), recorder)
+    full = receiver.deliver(
+        state, per_peer, DECLARED, PEER, envelope(origin_id="o3"), recorder
+    )
     assert full == Refused(Code.FULL)
     state.apply(MessageDelivered("r1"))
-    again = receiver.deliver(state, per_peer, PEER, envelope(origin_id="o3"), recorder)
+    again = receiver.deliver(
+        state, per_peer, DECLARED, PEER, envelope(origin_id="o3"), recorder
+    )
     assert isinstance(again, Accepted)
     per_recipient = parse_federation(
         {"waiting_per_recipient": 2},
         {PEER: {"socket": "/s/run/peers.sock", "inbound": True, "reach": ["alpha"]}},
     )
     refused = receiver.deliver(
-        state, per_recipient, PEER, envelope(origin_id="o4"), recorder
+        state, per_recipient, DECLARED, PEER, envelope(origin_id="o4"), recorder
     )
     assert refused == Refused(Code.FULL)
 
@@ -481,13 +518,15 @@ def test_every_delivery_counts_toward_the_rate_limit() -> None:
     for index in range(RATE_PER_PEER):
         args = envelope(origin_id=f"o{index}") if index % 2 else envelope(kind="x")
         assert not isinstance(
-            receiver.deliver(state, config(), PEER, args, recorder), Busy
+            receiver.deliver(state, config(), DECLARED, PEER, args, recorder), Busy
         )
-    busy = receiver.deliver(state, config(), PEER, envelope(origin_id="late"), recorder)
+    busy = receiver.deliver(
+        state, config(), DECLARED, PEER, envelope(origin_id="late"), recorder
+    )
     assert busy == Busy(int(RATE_WINDOW_SECONDS))
     clock.now += RATE_WINDOW_SECONDS
     accepted = receiver.deliver(
-        state, config(), PEER, envelope(origin_id="late"), recorder
+        state, config(), DECLARED, PEER, envelope(origin_id="late"), recorder
     )
     assert isinstance(accepted, Accepted)
 
@@ -597,6 +636,56 @@ def test_a_peer_says_hello_and_delivers_a_note(paths: ProjectPaths) -> None:
         assert message_id in [mid for mid, _ in daemon.scheduler.pending("alpha")]
         again = peer_ask(session, line("deliver", envelope()))
         assert again.result is not None and again.result["duplicate"] is True
+
+
+def test_a_declared_operator_receives_before_sending_anything(
+    paths: ProjectPaths,
+) -> None:
+    """Decided by the operator on 2026-10-31, decision 25 of ``FEDERATION.md``. ``bo``
+    is declared by the project file and has never sent, so the log does not hold
+    ``bo`` until the first note, which records ``bo`` and is then accepted."""
+    federation = config(reach=["alpha", "@bo"])
+    bo = OperatorAddress("bo")
+    with attached(paths, federation) as daemon:
+        daemon.project = ProjectConfig(operator=bo.operator_id, federation=federation)
+        assert bo.operator_id not in daemon.log.state.operators
+        session = PeerSession(daemon)
+        assert peer_ask(session, hello()).ok
+        delivered = peer_ask(session, line("deliver", envelope(recipient=str(bo))))
+        assert delivered.ok and delivered.result is not None
+        assert delivered.result["outcome"] == "accepted", delivered.result
+        message = daemon.log.state.messages[cast(str, delivered.result["message_id"])]
+        assert (message.sender, message.recipient) == (KAIZEN, bo)
+        assert bo.operator_id in daemon.log.state.operators
+
+
+def test_an_operator_known_only_from_the_log_is_refused_over_the_socket(
+    paths: ProjectPaths,
+) -> None:
+    """``attached`` records ``ana`` in the log, as a send through the daemon would,
+    and its project file declares no operator."""
+    with attached(paths, config()) as daemon:
+        assert declared_operators(daemon.project) == frozenset()
+        assert ANA.operator_id in daemon.log.state.operators
+        session = PeerSession(daemon)
+        assert peer_ask(session, hello()).ok
+        refused = peer_ask(session, line("deliver", envelope(recipient=str(ANA))))
+        assert refused.result is not None and refused.result["code"] == "refused"
+        assert daemon.log.state.received == {}
+
+
+def test_a_refused_note_to_a_new_operator_records_neither(
+    paths: ProjectPaths,
+) -> None:
+    """The scheduler records an operator the log does not hold together with the
+    note, so a note the log refuses leaves no operator behind."""
+    with attached(paths, config()) as daemon:
+        before = daemon.log.last_seq
+        stranger = RemoteAddress("nobody", parse_address("kaizen"))
+        with pytest.raises(EventRejected, match="no peer"):
+            daemon.scheduler.receive(stranger, OperatorAddress("bo"), "hi", None, "o1")
+        assert "bo" not in daemon.log.state.operators
+        assert daemon.log.last_seq == before
 
 
 def test_deliver_needs_a_hello_and_hello_is_given_once(paths: ProjectPaths) -> None:
@@ -1048,7 +1137,7 @@ def test_the_receiver_passes_on_what_priority_the_policy_permits(
     state = peer_state()
     recorder = Recorder(state)
     outcome = Receiver(Clock()).deliver(
-        state, config(**keys), PEER, envelope(priority=asked), recorder
+        state, config(**keys), DECLARED, PEER, envelope(priority=asked), recorder
     )
     assert outcome == Accepted("r1", False, honoured)
     assert recorder.priorities == [expected]
@@ -1061,8 +1150,12 @@ def test_a_resend_is_answered_with_the_priority_first_recorded() -> None:
     receiver = Receiver(Clock())
     recorder = Recorder(state)
     permitting = config(priority_in=True)
-    receiver.deliver(state, permitting, PEER, envelope(priority=True), recorder)
-    again = receiver.deliver(state, config(), PEER, envelope(priority=True), recorder)
+    receiver.deliver(
+        state, permitting, DECLARED, PEER, envelope(priority=True), recorder
+    )
+    again = receiver.deliver(
+        state, config(), DECLARED, PEER, envelope(priority=True), recorder
+    )
     assert again == Accepted("r1", True, True)
     assert recorder.count == 1
 

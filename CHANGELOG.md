@@ -95,6 +95,12 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- A peer reaches only declared operators, decision 25 of `FEDERATION.md`, decided by
+  the operator on 2026-10-31. An operator the project file declares, by `[daemon]
+  operator` or an `[operators.ID]` table, may receive peer mail before sending
+  anything, and the first note records the operator. An operator known only from the
+  log, which a peer could reach before this change, is refused with `refused`, so a
+  project that names an undeclared operator in `reach` must now declare it.
 - Leases are durable, task of 2026-10-31. `lease_acquired` records the holder, the
   acquisition and the expiry, and `lease_released` a release or a name the project
   file no longer declares, so a restart keeps a held lease until it expires, and

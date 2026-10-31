@@ -293,6 +293,18 @@ def config_path(state_dir: Path) -> Path:
     return state_dir / CONFIG_FILE_NAME
 
 
+def declared_operators(config: ProjectConfig) -> frozenset[str]:
+    """The operators ``config`` declares, by ``[daemon] operator`` or an
+    ``[operators.ID]`` table. Decided by the operator on 2026-10-31, decision 25 of
+    ``docs/architecture/FEDERATION.md``. A declared operator exists for a peer's
+    ``reach`` before that operator has sent anything. The command line's operator and
+    the built-in default are not declarations, since neither is in the file."""
+    declared = set(config.relays.routes)
+    if config.operator is not None:
+        declared.add(config.operator)
+    return frozenset(declared)
+
+
 _LOCATION = re.compile(r"\(at line (\d+), column (\d+)\)")
 
 

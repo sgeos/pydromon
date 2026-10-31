@@ -521,7 +521,8 @@ def daemon_for(
             log,
             AT,
             scheduler,
-            project=ProjectConfig(federation=federation),
+            # The file declares ``ana``, whom a peer may reach, decision 25.
+            project=ProjectConfig(operator="ana", federation=federation),
             command_line=Overrides(),
             project_file_present=False,
             registry_dir=directory,
@@ -998,11 +999,11 @@ def test_two_open_daemons_exchange_a_note_over_their_sockets(
     registry, which they inherit through ``DROMON_REGISTRY_DIR``, exchange one
     operator's note through their peer sockets, named by their entries and their pids.
 
-    **Found on 2026-10-31.** A receiver refuses a note to a party it does not hold, and
-    a daemon holds an operator only once that operator has sent through it. The first
-    run sent to a receiver that had never seen ``@ana``, which refused the note at
-    once. So the receiver's ``@ana`` sends first, which records ``@ana`` there, and the
-    note it sends is refused by the sender, which has not seen ``@ana`` yet."""
+    **Found on 2026-10-31.** The first run sent to a receiver that had never seen
+    ``@ana``, which refused the note at once, since a daemon held an operator only once
+    that operator had sent through it. Decision 25 of ``FEDERATION.md`` lets an operator
+    the project file declares receive first, so the receiver declares ``@ana`` by
+    ``[daemon] operator`` and nobody sends through it."""
     registry_dir = Path(os.environ[registry.REGISTRY_DIR_ENV])
     names = ("tidepool", "harbor")
     started: list[tuple[ProjectPaths, int]] = []
@@ -1014,7 +1015,8 @@ def test_two_open_daemons_exchange_a_note_over_their_sockets(
             paths.state_dir.mkdir(mode=0o700)
             other = names[1 - index]
             (paths.state_dir / "dromon.toml").write_text(
-                'version = 1\n[federation]\nlisten = true\nlocal = "open"\n'
+                'version = 1\n[daemon]\noperator = "ana"\n'
+                '[federation]\nlisten = true\nlocal = "open"\n'
                 f'name = "{name}"\n'
                 "[federation.open]\n"
                 'reach = ["@ana"]\nsenders = ["@ana"]\n'
@@ -1024,12 +1026,6 @@ def test_two_open_daemons_exchange_a_note_over_their_sockets(
         receiving, _ = started[0]
         sending, _ = started[1]
         assert {each.name for each in registry.entries(registry_dir)} == set(names)
-        first = client.call(
-            receiving.socket,
-            Operation.SEND,
-            args={"operator": "ana", "recipient": f"{names[1]}:@ana", "body": "ping"},
-        )
-        assert first.ok, first.error_message
         sent = client.call(
             sending.socket,
             Operation.SEND,

@@ -102,7 +102,13 @@ from dromon.lineconfig import (
     config_from_document,
     decode_config,
 )
-from dromon.projectconfig import ConfigFileError, ProjectConfig, config_path, load
+from dromon.projectconfig import (
+    ConfigFileError,
+    ProjectConfig,
+    config_path,
+    declared_operators,
+    load,
+)
 from dromon.sandbox import SandboxConfig, SandboxError, effective, merge
 from dromon import gitssh
 from dromon.gitssh import GitSshAccess, GitSshError, sandbox_layer, unreadable
@@ -670,6 +676,7 @@ class Daemon:
             outcome = self.receiver.deliver(
                 self.log.state,
                 self.project.federation,
+                declared_operators(self.project),
                 peer_id,
                 request.args,
                 self.scheduler.receive,

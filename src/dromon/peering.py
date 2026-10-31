@@ -295,6 +295,7 @@ class Receiver:
         self,
         state: State,
         federation: FederationConfig,
+        operators: frozenset[str],
         peer_id: str,
         args: Mapping[str, object],
         receive: Receive,
@@ -305,7 +306,12 @@ class Receiver:
         answered next, as a duplicate or a conflict, so that a policy changed since
         the first delivery cannot return mail that was accepted. Then the policy,
         ``reach`` before anything that depends on the recipient, so a party the
-        peer may not reach is refused alike whether or not it exists."""
+        peer may not reach is refused alike whether or not it exists.
+
+        ``operators`` are the operators the project file declares, the only ones a
+        peer may reach, as decision 25 of ``FEDERATION.md`` decided. An operator the
+        log knows but the file does not declare is refused, so a peer can neither
+        create an operator nor reach one the project has not named."""
         if self._rate.count(peer_id) >= RATE_PER_PEER:
             return Busy(self._rate.wait(peer_id))
         self._rate.record(peer_id)
@@ -322,7 +328,7 @@ class Receiver:
         if definition is None or peer is None or peer.removed or not definition.inbound:
             return Refused(Code.REFUSED)
         if envelope.recipient not in definition.reach or not _exists(
-            state, envelope.recipient
+            state, operators, envelope.recipient
         ):
             return Refused(Code.REFUSED)
         if envelope.kind != MessageKind.NOTE.value:
@@ -383,12 +389,12 @@ def _resent(
     return Refused(Code.CONFLICT)
 
 
-def _exists(state: State, address: LocalAddress) -> bool:
+def _exists(state: State, operators: frozenset[str], address: LocalAddress) -> bool:
     match address:
         case LineAddress():
             return address.line_id in state.lines
         case OperatorAddress():
-            return address.operator_id in state.operators
+            return address.operator_id in operators
         case AgentAddress():
             agent = state.agents.get(address.agent_id)
             return agent is not None and not agent.revoked
