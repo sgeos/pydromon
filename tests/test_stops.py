@@ -647,7 +647,15 @@ def test_the_startup_scan_records_survivors_of_an_earlier_run(
         4401: [f"{MARK_VARIABLE}=ghost.earlier"],
         4402: [f"{MARK_VARIABLE}=alpha.earlier"],
     }
-    world.scheduler.recover()
+
+    async def recover_and_wait() -> None:
+        world.scheduler.recover()
+        for _ in range(100):
+            if world.log.state.lines["alpha"].left is not None:
+                return
+            await asyncio.sleep(0.01)
+
+    asyncio.run(recover_and_wait())
     left = world.log.state.lines["alpha"].left
     assert left == ProcessesLeft("alpha", "detached", (4400,), ("setsid sleep 86400",))
     blind = worlds(Engine(), identifiable=False, table=world.table)

@@ -5,6 +5,7 @@ import asyncio
 import json
 import signal
 import subprocess
+import threading
 from collections.abc import Generator, Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -21,6 +22,8 @@ from dromon.processes import (
     MAX_COMMAND_CHARACTERS,
     ProcessInfo,
     ProcessRefused,
+    ProcessWorker,
+    MAX_PENDING_PROCESS_CALLS,
     SystemProcesses,
     line_processes,
     parse_ps,
@@ -35,6 +38,38 @@ LAUNCHER = 1500
 """The launcher the daemon starts, whose child is the engine."""
 MARK = "alpha.0123abcd"
 OTHER = "beta.0123abcd"
+
+
+def test_process_worker_refuses_calls_past_its_bounded_queue() -> None:
+    worker = ProcessWorker()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked() -> str:
+        entered.set()
+        release.wait(5)
+        return "finished"
+
+    async def exercise() -> None:
+        running = asyncio.create_task(worker.run(blocked))
+        assert await asyncio.to_thread(entered.wait, 1)
+        queued = [
+            asyncio.create_task(worker.run(lambda index=index: str(index)))
+            for index in range(MAX_PENDING_PROCESS_CALLS)
+        ]
+        await asyncio.sleep(0)
+        with pytest.raises(ProcessRefused, match="queue is full"):
+            await worker.run(lambda: str("overflow"))
+        release.set()
+        assert await running == "finished"
+        assert await asyncio.gather(*queued) == [
+            str(index) for index in range(len(queued))
+        ]
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release.set()
 
 
 class FakeTable:

@@ -193,6 +193,7 @@ from dromon.settings import SettingsConfig
 from dromon.processes import (
     ProcessRefused,
     ProcessTable,
+    ProcessWorker,
     UNIDENTIFIABLE,
     SystemProcesses,
     TreeRow,
@@ -1754,6 +1755,9 @@ class Scheduler:
         log's ``recorded_at`` does not give one. In memory, and read again from the
         log once after a restart."""
         self._processes: ProcessTable = processes or SystemProcesses()
+        self._process_worker = ProcessWorker()
+        self._process_tasks: set[asyncio.Task[None]] = set()
+        """Background process scans started during recovery, kept until they finish."""
         self._line_tokens = line_tokens
         """The tokens lines' engines reach Dromon's tools with, which each turn
         renews and revokes, or ``None`` where no engine uses them."""
@@ -1926,7 +1930,7 @@ class Scheduler:
         # What launchers left running while the daemon was down, such as after a
         # crash, is recorded now.
         self.collect_left()
-        self._record_survivors()
+        self._schedule_survivor_scan()
         self._withdraw_stale_ceilings()
         self._work.set()
 
@@ -1938,14 +1942,27 @@ class Scheduler:
         if self._log.state.walk_limit != text:
             self._log.append(WalkLimited(text))
 
-    def _record_survivors(self) -> None:
-        """At start, record the processes of an earlier run that still carry a line's
-        mark, since no engine of this run has started yet. Only what the platform
-        lets the daemon see is found, which on macOS 27 is nothing. **Review F1.**"""
+    def _schedule_survivor_scan(self) -> None:
         if not self._processes_identifiable:
             return
         try:
-            found = marked_processes(self._processes, os.getpid())
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._record_survivors())
+        self._process_tasks.add(task)
+        task.add_done_callback(self._process_tasks.discard)
+
+    async def _record_survivors(self) -> None:
+        """At start, record processes of an earlier run that still carry a line's
+        mark, since no engine of this run has started yet. Inspection runs on the
+        bounded worker, and recording remains on the event loop. **Review F1.**"""
+        if not self._processes_identifiable:
+            return
+        try:
+            found = await self._process_worker.run(
+                lambda: marked_processes(self._processes, os.getpid())
+            )
         except (ProcessRefused, OSError):
             return
         for line_id, processes in sorted(found.items()):
@@ -4575,10 +4592,8 @@ class Scheduler:
                 return _tool_error(UNIDENTIFIABLE)
             mark = self.line_mark(line_id)
             try:
-                # Listing runs ps and reads environments, so it leaves the event
-                # loop free for the other lines meanwhile.
-                found = await asyncio.to_thread(
-                    line_processes, self._processes, mark, os.getpid()
+                found = await self._process_worker.run(
+                    lambda: line_processes(self._processes, mark, os.getpid())
                 )
             except ProcessRefused as error:
                 return _tool_error(str(error))
@@ -4612,8 +4627,10 @@ class Scheduler:
                 return _tool_error(UNIDENTIFIABLE)
             mark = self.line_mark(line_id)
             try:
-                done = await asyncio.to_thread(
-                    stop_line_process, self._processes, mark, os.getpid(), pid, force
+                done = await self._process_worker.run(
+                    lambda: stop_line_process(
+                        self._processes, mark, os.getpid(), pid, force
+                    )
                 )
             except ProcessRefused as error:
                 return _tool_error(str(error))
@@ -7566,9 +7583,10 @@ class Scheduler:
             is not launcher.StopPolicy.KILL_ALL
         ):
             return
-        # On the event loop's thread, not in a worker, for the reason
-        # report_detached gives. One ps of the user's processes, bounded.
-        reason = self._walk_check()
+        try:
+            reason = await self._process_worker.run(self._walk_check)
+        except ProcessRefused as error:
+            reason = str(error)
         if reason is not None:
             raise TurnRefused(
                 "the line's stop policy is kill_all, which must find everything its"
@@ -7839,10 +7857,14 @@ class Scheduler:
         """Sweep the launch records of launchers that have exited, and record what
         each sweep found, as ``launcher.sweep_launches`` says. **Review N1.** A failure
         is reported on the daemon's standard error, and the records wait for the next
-        sweep. The process table is read on the event loop's thread, for the reason
-        ``report_detached`` gives, bounded by ``PS_TIMEOUT_SECONDS``."""
+        sweep. Process-table reads and the sweep's bounded signaling waits run on the
+        process worker, so status requests and other event-loop work continue."""
         try:
-            found = await launcher.sweep_launches(self._report_dir, self._sweep_read)
+            found = await self._process_worker.run(
+                lambda: asyncio.run(
+                    launcher.sweep_launches(self._report_dir, self._sweep_read)
+                )
+            )
             if isinstance(found, str):
                 if self._sweep_failure != found:
                     self._sweep_failure = found
@@ -7861,6 +7883,12 @@ class Scheduler:
                 )
             for swept in found:
                 self._record_swept(swept)
+        except ProcessRefused as error:
+            self._sweep_failure = str(error)
+            print(
+                f"dromond: the launch-record sweep was refused: {error}",
+                file=sys.stderr,
+            )
         except Exception as error:  # noqa: BLE001
             # Any failure, in the sweep or in recording what it did, is said, since
             # the task that runs a sweep is not awaited until the daemon stops.
@@ -7977,15 +8005,10 @@ class Scheduler:
             return
         if self.kept_session(line_id).get("kept") is True:
             return
-        # On the event loop's thread, not in a worker, as engine.py reads digests. A
-        # Keleusma driver's virtual machine may be dropped only on the thread that
-        # made it, and a collection in a worker thread could drop one, which a
-        # check after every turn made happen in the tests. The look is one ps and
-        # one read of environments, each bounded by PS_TIMEOUT_SECONDS. Porting
-        # note, this is a hazard of Python's collector alone.
         try:
-            found = line_processes(
-                self._processes, self.line_mark(line_id), os.getpid()
+            mark = self.line_mark(line_id)
+            found = await self._process_worker.run(
+                lambda: line_processes(self._processes, mark, os.getpid())
             )
         except ProcessRefused:
             return

@@ -13,6 +13,10 @@ engine each launcher started, as ``dromon.launcher`` describes, and
 moment of stopping. Claude Code, Codex and Grok Build scope their own process
 controls to the agent's own session in the same way.
 
+Execution. Daemon calls run on one worker thread with a bounded queue. Process-table
+inspection can be slow under load, so it must not block the daemon's event loop or
+allow an unbounded backlog of requests.
+
 Failure modes. A process whose environment cannot be read is not the line's, so every
 check fails closed. A process that ends between the check and the signal is reported
 as gone. A pid reused by another process after the check is the race every signal by
@@ -26,16 +30,20 @@ port must provide the same call for its platforms. The process listing uses ``ps
 with fields that macOS and Linux share.
 """
 
+import asyncio
+import contextlib
 import os
-import time
+import queue
+import threading
 import secrets
 import signal
 import subprocess
 import sys
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Protocol
+from typing import Any, Final, Generic, Protocol, TypeVar, cast
 
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 
@@ -60,6 +68,19 @@ PROBE_PAUSE_SECONDS: Final = 0.05
 
 MAX_COMMAND_CHARACTERS: Final = 200
 PS_TIMEOUT_SECONDS: Final = 10.0
+
+MAX_PENDING_PROCESS_CALLS: Final = 8
+"""At most eight process inspections wait behind the one running worker call."""
+
+_Result = TypeVar("_Result")
+_MISSING: Final = object()
+
+
+@dataclass(slots=True)
+class _ProcessCall(Generic[_Result]):
+    function: Callable[[], _Result]
+    loop: asyncio.AbstractEventLoop
+    future: asyncio.Future[_Result]
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +117,69 @@ class ProcessTable(Protocol):
 
 class ProcessRefused(ValueError):
     """A process tool cannot do what the line asked."""
+
+
+class ProcessWorker:
+    """Run blocking process-table inspections on one daemon thread and bounded queue.
+
+    The queue contains no more than ``MAX_PENDING_PROCESS_CALLS`` waiting calls, in
+    addition to the one call being run. A full queue refuses new inspections instead
+    of leaving an unbounded number of daemon tasks waiting for the worker.
+    """
+
+    def __init__(self) -> None:
+        self._queue: queue.Queue[_ProcessCall[Any]] = queue.Queue(
+            maxsize=MAX_PENDING_PROCESS_CALLS
+        )
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    async def run(self, function: Callable[[], _Result]) -> _Result:
+        """Run ``function`` with its arguments, or refuse if the queue is full."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[_Result] = loop.create_future()
+        call = _ProcessCall(function, loop, future)
+        with self._lock:
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._work, name="dromon-processes", daemon=True
+                )
+                self._thread.start()
+            try:
+                self._queue.put_nowait(call)
+            except queue.Full as error:
+                raise ProcessRefused("the process inspection queue is full") from error
+        return await future
+
+    def _work(self) -> None:
+        while True:
+            call = self._queue.get()
+            try:
+                result = call.function()
+            except BaseException as error:
+                self._deliver(call, error=error)
+            else:
+                self._deliver(call, result=result)
+            finally:
+                self._queue.task_done()
+
+    @staticmethod
+    def _deliver(
+        call: _ProcessCall[_Result],
+        *,
+        result: object = _MISSING,
+        error: BaseException | None = None,
+    ) -> None:
+        def finish() -> None:
+            if call.future.done():
+                return
+            if error is not None:
+                call.future.set_exception(error)
+            else:
+                call.future.set_result(cast(_Result, result))
+
+        with contextlib.suppress(RuntimeError):
+            call.loop.call_soon_threadsafe(finish)
 
 
 def read_environments(uid: int) -> dict[int, list[str]]:

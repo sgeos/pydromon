@@ -872,6 +872,30 @@ def test_a_tool_the_line_was_not_given_interrupts_and_refuses_the_turn() -> None
     assert server.params("turn/interrupt") == {"threadId": "th", "turnId": "t1"}
 
 
+def test_refused_tool_calls_count_against_the_driver_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = line(FakeServer())
+    turn = codex_module._Turn(turn_id="t1")  # pyright: ignore[reportPrivateUsage]
+    sent: list[dict[str, object]] = []
+
+    async def send(message: Mapping[str, object]) -> None:
+        sent.append(dict(message))
+
+    monkeypatch.setattr(target, "_send", send)
+
+    async def calls() -> None:
+        for _ in range(luna().settings.tool_budget + 1):
+            await target._item_started(  # pyright: ignore[reportPrivateUsage]
+                {"type": "mcpToolCall"}, turn
+            )
+
+    asyncio.run(calls())
+    assert turn.interrupted_for == "tool_budget"
+    assert turn.refusal == "the engine used a tool the line was not given: mcpToolCall"
+    assert sum(message.get("method") == "turn/interrupt" for message in sent) == 1
+
+
 def test_the_shell_counts_as_bash_only_for_a_line_given_bash() -> None:
     with pytest.raises(EngineRefused, match="not given: commandExecution"):
         run(line(FakeServer([item("commandExecution", command="ls")])))

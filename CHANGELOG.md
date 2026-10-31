@@ -7,6 +7,15 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- Codex calls refused before execution count toward the driver's tool budget. The
+  adapter reports each refusal as tool use before interrupting the turn and sends at
+  most one interrupt for the resulting budget exhaustion.
+- A launcher retries a timed-out process-table walk until its 0.75-second deadline.
+  If the table still cannot be read while stopping under `kill_all`, it reports the
+  stop as unverified and exits unsuccessfully after ending the harness's group.
+  Daemon process-table inspections and launch-record sweeps use one worker thread with
+  at most eight queued calls, so a slow `ps` call does not block the event loop.
+
 - Grok sessions now set the model to the exact identifier in the driver's settings
   when `session/new` or `session/load` reports another model. Dromon requires a model
   config option, requires the `models` field and model option to agree when both are

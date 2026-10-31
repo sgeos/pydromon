@@ -85,9 +85,10 @@ by ``waitid`` with ``WNOWAIT`` on Linux and by ``kqueue`` elsewhere.
   own child and stays unreaped until the launcher exits. Elsewhere the window remains,
   and is narrowed by repeating the walk before the last round.
 - The walk runs ``ps``. Under ``KILL_ALL`` the daemon refuses to start a turn when
-  ``ps`` cannot run, and a launcher whose walk fails at stop time still ends the
-  harness's group, says so on its standard error, and reports it to the daemon,
-  which records it in the event log. **Review F2.**
+  ``ps`` cannot run. A walk that times out is retried within a 0.75-second deadline.
+  If it still fails at stop time, the launcher ends the harness's group, writes an
+  unverified-stop report and exits unsuccessfully. The daemon records the report in
+  the event log. **Review F2.**
 - A launcher that is itself killed with ``SIGKILL`` cannot act, and leaves its
   harness running, and stopped if the kill came between ``SIGSTOP`` and ``SIGCONT``.
   The daemon's sweep of its launch record then continues the group and ends or
@@ -217,7 +218,10 @@ launcher, so a launcher that has not finished its stop within 5 seconds of the
 ``SIGTERM`` is killed, and its harness is left running."""
 
 WALK_SECONDS: Final = 0.5
-"""How long one walk of the process table may take before it counts as failed."""
+"""How long one attempt to read the process table may take."""
+
+WALK_DEADLINE_SECONDS: Final = 0.75
+"""The total bound for retries of one process-table walk at launcher stop."""
 
 EXIT_SECONDS: Final = 2.0
 """How long what the launcher terminated may take to exit before it is killed."""
@@ -231,11 +235,11 @@ the daemon's close or stop and its freeze, so that it can write out what it queu
 Five of Claude Code's transcript drains, as the module's account of review N2 says."""
 
 STOP_BUDGET_SECONDS: Final = (
-    FLUSH_SECONDS + 2 * WALK_SECONDS + EXIT_SECONDS + REAP_SECONDS
+    FLUSH_SECONDS + 2 * WALK_DEADLINE_SECONDS + EXIT_SECONDS + REAP_SECONDS
 )
-"""The longest a launcher's stop takes, the flush grace, two walks, one wait and the
-reap, which must leave a margin within ``SDK_CLOSE_SECONDS``. ``KILL_ALL`` has no
-grace, so its stop is shorter."""
+"""The longest a launcher's stop takes, the flush grace, two walk deadlines, one wait
+and the reap, which must leave a margin within ``SDK_CLOSE_SECONDS``. ``KILL_ALL`` has
+no grace, so its stop is shorter."""
 
 LAUNCHER_EXIT_SECONDS: Final = STOP_BUDGET_SECONDS + 2.0
 """How long the daemon waits for a launcher it signalled before it kills it."""
@@ -1035,9 +1039,16 @@ def _harness_tree(me: int, harness: int) -> list[TreeRow] | None:
     which on Linux includes the orphans it adopted, and the members of the harness's
     own group, without the launcher and the harness. ``None`` when the process table
     cannot be read, which is never an empty tree."""
-    rows = tree_or_reason(os.getuid(), WALK_SECONDS)
-    if isinstance(rows, str):
-        return None
+    deadline = time.monotonic() + WALK_DEADLINE_SECONDS
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        rows = tree_or_reason(os.getuid(), min(WALK_SECONDS, remaining))
+        if not isinstance(rows, str):
+            break
+        if not rows.startswith("ps did not answer within "):
+            return None
     found = {row.pid: row for row in descendants(rows, me)}
     found.update({row.pid: row for row in rows if row.pgid == harness})
     found.pop(me, None)
@@ -1422,11 +1433,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     os.close(null)
     closed = None if relay is None else relay.closed
     cause = watch(exits, parent, wakeup, stopping, closed)
+    stop_verified = True
     if policy is StopPolicy.KILL_ALL:
-        if not end_tree(me, child.pid, exits):
+        stop_verified = end_tree(me, child.pid, exits)
+        if not stop_verified:
             print(
-                "dromon-launch: the process table could not be read, so only the"
-                " harness's group was ended",
+                "dromon-launch: the process table could not be read, so stopping"
+                " the harness tree is unverified",
                 file=sys.stderr,
             )
             if report is not None:
@@ -1438,7 +1451,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     exits.close()
     if record is not None:
         write_launch(record, mark, child.pid, target, policy, done=True)
-    return reap(child)
+    status = reap(child)
+    return 1 if policy is StopPolicy.KILL_ALL and not stop_verified else status
 
 
 def _report_left(

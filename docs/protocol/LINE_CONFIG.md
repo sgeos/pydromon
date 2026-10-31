@@ -391,6 +391,11 @@ tools do the same for a line.
   neither the daemon nor an engine it started and whose environment holds the line's
   mark, read again at the moment of stopping. Every other pid is refused, as are a pid
   of 1 or less, a process that has already ended and one that cannot be signalled.
+- **The process worker.** Each daemon runs process-table inspections and launch-record
+  sweeps on one worker thread, with at most eight calls queued behind the active call.
+  When that queue is full, a process inspection is refused and a launch-record sweep is
+  deferred to the next sweep. This keeps a slow `ps` call from blocking client requests
+  on the event loop.
 - **Failing closed.** A process whose environment cannot be read is not the line's.
   Reading another process's environment is specific to each operating system, through
   `ps -E` on macOS and `/proc/PID/environ` on Linux, a porting hazard that
@@ -1354,11 +1359,11 @@ daemon stops it, when the daemon stops or dies, and when the line's engine is st
   walked. Then `SIGTERM` and `SIGCONT` go to the group and to every descendant found,
   and `SIGKILL` to what remains 2 seconds later. Under `leave_background` the harness
   runs on for half a second with its input still open, then alone is stopped, listed
-  around and killed. Each walk may take half a second, and a killed harness half a
-  second more to be reaped, so a stop takes at most 4 seconds. **Fact, read from
-  Agent SDK 0.2.174.** The SDK's close closes the engine's standard input, waits 5
+  around and killed. Each walk retries within a 0.75-second deadline, and a killed
+  harness has half a second to be reaped. These bounds sum to 4.5 seconds. **Fact, read
+  from Agent SDK 0.2.174.** The SDK's close closes the engine's standard input, waits 5
   seconds, sends `SIGTERM`, waits 5 seconds more and sends `SIGKILL`, to the launcher,
-  which therefore finishes with a second to spare. The daemon signals a launcher by
+  which therefore finishes with half a second to spare. The daemon signals a launcher by
   its pid and by its group, kills it 6 seconds later, and waits 2 seconds more for it,
   then reports one that is still there and goes on.
 - **A launcher that cannot finish.** **Review N1 of the stop policy's re-review,
@@ -1407,9 +1412,10 @@ daemon stops it, when the daemon stops or dies, and when the line's engine is st
 - **A walk that cannot be made refuses the turn.** **Review F2.** Under `kill_all` the
   daemon asks before each turn whether `ps` can list the process table, and refuses to
   start the turn, saying why, when it cannot. A failed walk is never taken for an
-  empty tree. A launcher whose walk fails at stop time still ends the harness's group,
-  says so on its standard error, and reports it, which the daemon records as
-  `stop_unverified`. **Review F2 of the re-review, 2026-10-27.**
+  empty tree. A walk that times out is retried within a 0.75-second deadline. If it still
+  fails at stop time, the launcher ends the harness's group, writes an unverified-stop
+  report and exits unsuccessfully. The daemon records that report as `stop_unverified`.
+  **Review F2 of the re-review, 2026-10-27.**
 - **The harness's own teardown.** **Item 7 of the live check of 2026-10-26.** Under
   `leave_background` a graceful stop of the daemon still ended a background `sleep`,
   and nothing was recorded. **Fact, read from the bundled Claude Code 2.1.310.** Once
@@ -1518,8 +1524,8 @@ interrupt can be scripted with `dromon interrupt LINE`, as
    harness's group alone never reaches.
 5. The daemon killed with `SIGKILL` during such a turn leaves no harness and no
    `sleep` running. **Observed on 2026-10-26** under `kill_all`. All four processes
-   were gone within about 6 seconds, longer than the about one second this item first
-   expected. The parent check and the stop's bound account for at most 4 seconds of
+  were gone within about 6 seconds, longer than the about one second this item first
+  expected. The parent check and the stop's declared bound account for at most 5 seconds of
    it. The rest is not explained, and the observation's own resolution is not known.
 6. `leave_background` leaves the `sleep` running and records it in
    `processes.left`, after a graceful `dromon stop` and after an interrupt. **Failed

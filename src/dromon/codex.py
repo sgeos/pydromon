@@ -897,6 +897,8 @@ class _Turn:
     turn that did not complete as a plan limit rather than as a failure."""
     turn_id: str | None = None
     status: str = ""
+    interrupt_sent: bool = False
+    """Whether Dromon already sent this turn's single interrupt request."""
     tools_changed: bool = False
     """Whether this turn started a new thread because Dromon's tools changed."""
     calls: list[dict[str, int]] = field(default_factory=list[dict[str, int]])
@@ -1489,6 +1491,9 @@ class CodexLine:
             return
         name = self._tool_name(item)
         if name is None:
+            # The driver's budget counts tool attempts, including a call Dromon
+            # refuses before Codex can run it.
+            await self._act(Event("tool_use", kind), turn)
             await self._interrupt(
                 turn, f"the engine used a tool the line was not given: {kind}"
             )
@@ -1518,8 +1523,9 @@ class CodexLine:
     async def _interrupt(self, turn: _Turn, refusal: str | None) -> None:
         if refusal is not None and turn.refusal is None:
             turn.refusal = refusal
-        if turn.turn_id is None or turn.status:
+        if turn.interrupt_sent or turn.turn_id is None or turn.status:
             return
+        turn.interrupt_sent = True
         self._next_id += 1
         await self._send(
             {

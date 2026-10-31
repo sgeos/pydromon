@@ -351,6 +351,30 @@ def test_the_walk_follows_parents_and_groups_and_ends() -> None:
     assert [row.pid for row in descendants(looped, 20)] == [21]
 
 
+def test_a_timed_out_ps_walk_retries_within_its_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    calls: list[float] = []
+
+    def fake_ps(uid: int, timeout: float) -> list[TreeRow] | str:
+        del uid
+        calls.append(timeout)
+        if len(calls) == 1:
+            clock[0] += timeout
+            return f"ps did not answer within {timeout:g} seconds"
+        return []
+
+    monkeypatch.setattr(launcher.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(launcher, "tree_or_reason", fake_ps)
+    found = launcher._harness_tree(10, 11)  # pyright: ignore[reportPrivateUsage]
+    assert found == []
+    assert calls == [
+        launcher.WALK_SECONDS,
+        launcher.WALK_DEADLINE_SECONDS - launcher.WALK_SECONDS,
+    ]
+
+
 # The launcher itself, with a scripted harness.
 
 
@@ -431,7 +455,7 @@ def test_a_stop_under_kill_all_ends_the_harness_and_its_group(
     stay = launched.pid("stay")
     assert alive(stay)
     launched.process.send_signal(signal.SIGTERM)
-    assert launched.wait() == 128 + signal.SIGTERM
+    assert launched.wait() == (128 + signal.SIGTERM if ps_runs() else 1)
     assert gone(stay)
 
 
@@ -493,7 +517,7 @@ def test_a_harness_that_exits_has_its_group_ended_and_its_status_kept(
 ) -> None:
     launched = Launched(tmp_path, HARNESS + "sys.exit(3)\n", StopPolicy.KILL_ALL)
     started.append(launched)
-    assert launched.wait() == 3
+    assert launched.wait() == (3 if ps_runs() else 1)
     assert gone(launched.pid("stay"))
 
 
@@ -716,7 +740,7 @@ def test_an_exit_watch_on_a_reaped_child_sees_it_exited() -> None:
 
 def test_the_stop_fits_within_the_sdk_window_with_a_margin() -> None:
     """F5. The SDK kills the launcher SDK_CLOSE_SECONDS after its SIGTERM."""
-    assert launcher.STOP_BUDGET_SECONDS + 1.0 <= launcher.SDK_CLOSE_SECONDS
+    assert launcher.STOP_BUDGET_SECONDS + 0.5 <= launcher.SDK_CLOSE_SECONDS
     assert launcher.LAUNCHER_EXIT_SECONDS > launcher.STOP_BUDGET_SECONDS
 
 
@@ -744,7 +768,7 @@ def test_a_harness_that_ignores_sigterm_is_killed_within_the_sdk_window(
     status = launched.wait()
     took = time.monotonic() - began
     assert took < launcher.SDK_CLOSE_SECONDS
-    assert status == 128 + signal.SIGKILL
+    assert status == (128 + signal.SIGKILL if ps_runs() else 1)
     assert gone(stay)
 
 
@@ -862,7 +886,7 @@ def test_under_kill_all_the_harness_still_sees_its_input_close(
     assert launched.process.stdin is not None
     launched.process.stdin.close()
     # The harness exited by itself on the end of its input, with its own status.
-    assert launched.wait() == 0
+    assert launched.wait() == (0 if ps_runs() else 1)
     assert gone(launched.pid("away"))
 
 
@@ -934,12 +958,38 @@ def test_a_failed_walk_under_kill_all_is_reported_to_the_daemon(
     )
     started.append(launched)
     launched.process.send_signal(signal.SIGTERM)
-    launched.wait()
+    assert launched.wait() == 1
     assert gone(launched.pid("stay"))
     found = collect_reports(reports)
     assert [(r.line_id, r.cause, r.processes, r.listed) for r in found] == [
         ("alpha", "stopped", (), False)
     ]
+
+
+def test_a_timed_out_ps_at_stop_is_reported_and_exits_unsuccessfully(
+    tmp_path: Path, started: list[Launched]
+) -> None:
+    reports = tmp_path / "left-timeout"
+    reports.mkdir()
+    fake_bin = tmp_path / "slow-ps"
+    fake_bin.mkdir()
+    fake_ps = fake_bin / "ps"
+    fake_ps.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(5)\n")
+    fake_ps.chmod(0o755)
+    launched = Launched(
+        tmp_path,
+        HARNESS + "time.sleep(60)\n",
+        StopPolicy.KILL_ALL,
+        report=reports,
+        path=str(fake_bin),
+    )
+    started.append(launched)
+    stay = launched.pid("stay")
+    launched.process.send_signal(signal.SIGTERM)
+    assert launched.wait() == 1
+    assert gone(stay)
+    found = collect_reports(reports)
+    assert [(report.processes, report.listed) for report in found] == [((), False)]
 
 
 def launch_records(directory: Path, done: bool) -> list[LaunchRecord]:

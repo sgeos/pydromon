@@ -223,8 +223,8 @@ rejected: writing outside of the project", its shell read of `.dromon` failed, a
 the epagoge project the line ran the project's full gate, which passed.
 
 **Fact, observed the same day.** Codex emits no item for an edit it rejects or for that
-shell read, so Dromon's driver cannot count a call that Codex refuses before running
-it.
+shell read. Dromon records the refusal as a tool use before interrupting the turn, so
+refused calls count against the driver's tool budget even though Codex did not run them.
 
 **Not verified.** Whether Codex profiles prevent shell writes through a symbolic link
 that points outside the working directory. Dromon does not claim that the current
@@ -317,7 +317,7 @@ turn. `dromon probe --model gpt-6-luna` reported the subscription credential.
   already matches the lock. A tool that stats the state directory, as pytest's
   collection did, fails with `Operation not permitted`, because the profile denies its
   metadata too, so pydromon's pytest configuration ignores `.dromon`.
-- A call Codex refuses before running it is invisible to the driver's tool budget.
+- Calls Codex refuses before running them count against the driver's tool budget.
 - Codex reports no cost, so cost limits do not count a Codex line's turns, and the
   driver's `max_turns` is not enforced. The tool budget still interrupts a turn.
 - The app-server and dynamic tools are experimental, so a Codex update may break the
