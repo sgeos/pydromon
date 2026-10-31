@@ -14,9 +14,12 @@ All notable changes are recorded here. The format follows
   If the table still cannot be read while stopping under `kill_all`, it reports the
   stop as unverified and exits unsuccessfully after ending the harness's group. It
   waits 0.25 seconds after `SIGKILL` and reports unverified if a process remains.
-  Daemon process-table inspections and launch-record sweeps use separate worker threads with
-  bounded queues of eight calls each. The detached-process scan remains on the
-  event-loop thread to preserve Keleusma finalizer affinity.
+  Process-table inspections and detached-process scans share a worker with a bounded
+  queue of eight calls. Launch-record sweeps use a separate worker with its own bounded
+  queue. Detached-process scan results contain only process identifiers and command
+  strings. Retiring an engine calls `Driver.close` on the owning thread, though a virtual
+  machine not closed before it becomes cyclic garbage may still be finalized on any
+  thread.
 - Process-table failures use a typed error, and only an explicit timeout triggers the
   launcher's retry. A queued process call cancelled by its caller is skipped, though
   a call already running cannot be cancelled.

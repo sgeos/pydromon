@@ -8009,21 +8009,32 @@ class Scheduler:
         ended, record the line's processes that still run, found by its mark, which
         have left the engine's process tree, so that no stop reached them. Nothing is
         ended. The same set is not recorded twice in a row, and nothing is checked
-        where the platform does not let the daemon read the mark. This scan stays on
-        the event-loop thread because collection can run in any worker thread, and a
-        Keleusma virtual machine must be finalized on the thread that created it. Its
-        operating-system reads have the process-table timeout."""
+        where the platform does not let the daemon read the mark. This scan runs on
+        the process worker because its operating-system reads can block. The worker
+        receives only the process table and scan inputs, and returns only process
+        identifiers and command strings. It holds no scheduler, engine or driver
+        reference. ``Driver.close`` releases each virtual machine on its owning
+        thread when an engine retires, so collection during this scan cannot finalize
+        a still-open driver through the scan result. A virtual machine that was not
+        closed before becoming cyclic garbage may still be finalized on any thread."""
         if not self._processes_identifiable or line_id not in self._log.state.lines:
             return
         if self.kept_session(line_id).get("kept") is True:
             return
         mark = self.line_mark(line_id)
-        found = line_processes(self._processes, mark, os.getpid())
-        processes = [
-            (cast(int, p["pid"]), str(p["command"]))
-            for p in found
-            if isinstance(p.get("pid"), int)
-        ]
+        table = self._processes
+        daemon_pid = os.getpid()
+        try:
+            found = await self._process_worker.run(
+                lambda: tuple(
+                    (cast(int, process["pid"]), str(process["command"]))
+                    for process in line_processes(table, mark, daemon_pid)
+                    if isinstance(process.get("pid"), int)
+                )
+            )
+        except (ProcessRefused, OSError):
+            return
+        processes = list(found)
         pids = tuple(pid for pid, _ in processes)
         if not pids:
             self._detached.pop(line_id, None)

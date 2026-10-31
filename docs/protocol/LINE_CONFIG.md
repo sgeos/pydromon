@@ -398,13 +398,15 @@ tools do the same for a line.
   caller is cancelled is skipped if it has not started. A call already running cannot be
   stopped, so a cancelled stop request may still take effect. Both queues are bounded,
   and sweeps report a repeated queue refusal once until a sweep succeeds.
-- **Detached-process inspection.** At the end of a turn, the detached-process scan stays
-  on the event-loop thread. Python garbage collection can run on the thread doing the
-  scan, and a Keleusma virtual machine must be finalized on the thread that created it.
-  This exception preserves that affinity. On macOS the scan may make two `ps` calls,
-  each with the 10-second process-table timeout, so a slow table can delay other requests
-  for up to 20 seconds. This behavior remains a latency risk until the scan can preserve
-  the affinity safely.
+- **Detached-process inspection.** At the end of a turn, the scan runs on the process
+  worker because its process-table reads can block. The worker receives only the process
+  table and scan inputs, then returns process identifiers and command strings. Its result
+  holds no scheduler, engine or driver reference. When an engine retires, `Driver.close`
+  releases its Keleusma virtual machine on the thread that created it, so collection
+  during the scan cannot finalize that driver through the result. A virtual machine not
+  closed before it becomes cyclic garbage may still be finalized on any thread. On macOS
+  the scan may make two `ps` calls, each with the 10-second process-table timeout, so a
+  slow table can delay other requests for up to 20 seconds.
 - **Failing closed.** A process whose environment cannot be read is not the line's.
   Reading another process's environment is specific to each operating system, through
   `ps -E` on macOS and `/proc/PID/environ` on Linux, a porting hazard that

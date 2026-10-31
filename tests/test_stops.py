@@ -585,15 +585,25 @@ def test_detached_processes_found_by_the_mark_are_recorded_once(
     world = worlds(Engine())
     marked(world, 4300, 4301)
     event_loop_thread = threading.get_ident()
+    scan_results: list[object] = []
+    worker = cast(Any, world.scheduler)._process_worker
+    run_worker = worker.run
+
+    async def capture_result(function: Callable[[], object]) -> object:
+        result = await run_worker(function)
+        scan_results.append(result)
+        return result
+
+    monkeypatch.setattr(worker, "run", capture_result)
     environments = world.table.environments
     own_processes = world.table.own_processes
 
     def read_environments() -> dict[int, list[str]]:
-        assert threading.get_ident() == event_loop_thread
+        assert threading.get_ident() != event_loop_thread
         return environments()
 
     def read_processes() -> Sequence[ProcessInfo]:
-        assert threading.get_ident() == event_loop_thread
+        assert threading.get_ident() != event_loop_thread
         return own_processes()
 
     monkeypatch.setattr(world.table, "environments", read_environments)
@@ -609,6 +619,17 @@ def test_detached_processes_found_by_the_mark_are_recorded_once(
     found = world.log.state.lines["alpha"].left
     assert found is not None and found.cause == "detached"
     assert found.pids == (4300, 4301)
+    assert scan_results == [((4300, "nohup work 4300"), (4301, "nohup work 4301"))] * 2
+
+    def assert_scan_data(value: object) -> None:
+        if type(value) is tuple:
+            for item in cast(tuple[object, ...], value):
+                assert_scan_data(item)
+        else:
+            assert type(value) in (int, str)
+
+    for result in scan_results:
+        assert_scan_data(result)
     events = [
         n for k, n in activity(world) if k is ActivityKind.NOTICE and "detached" in n
     ]
