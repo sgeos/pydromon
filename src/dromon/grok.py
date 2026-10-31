@@ -131,7 +131,7 @@ Grok tool, such as ``spawn_subagent``, the scheduler, ``workflow``, the plan mod
 
 GROK_TOOL_KINDS: Final[dict[str, frozenset[str]]] = {
     "read_file": frozenset({"read"}),
-    "list_dir": frozenset({"read", "search"}),
+    "list_dir": frozenset({"read", "search", "other"}),
     "grep": frozenset({"search"}),
     "search_replace": frozenset({"edit"}),
     "write": frozenset({"edit"}),
@@ -145,10 +145,12 @@ GROK_TOOL_KINDS: Final[dict[str, frozenset[str]]] = {
 }
 """The ACP kinds each Grok tool may carry, so a call's kind must agree with its own
 name, not merely with some tool of the line. **Review of d29174d, 2026-10-31.**
-Observed only for ``search_tool``, as ``other``. Every other entry is a
-**hypothesis** from the tool's purpose, and a call with another kind is refused,
-which may refuse too much until Grok's real kinds are recorded, and never grants
-more."""
+**Fact, observed on 2026-10-31** in a Grok line turn of 58 tool calls, from each
+call's ``tool_call_update``: ``read_file`` as ``read``, ``grep`` as ``search``,
+``run_terminal_command`` as ``execute``, ``list_dir``, ``search_tool`` and
+``use_tool`` as ``other``. The other entries are a **hypothesis** from the tool's
+purpose. A call with another kind is refused, which may refuse too much and never
+grants more, since what a call may do is decided by its name."""
 
 USE_TOOL_KEYS: Final = frozenset({"tool_name", "tool_input"})
 """The keys of ``use_tool``'s documented inline form."""

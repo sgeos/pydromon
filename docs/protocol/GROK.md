@@ -319,9 +319,13 @@ that name, an added `toolName` or a changed `use_tool` target refuses the turn. 
 permission request is judged by the name recorded for its call. **Review G1 and G2,
 2026-10-31.** A `kind` the call carries, at first sight or in any later update, must
 be one the table below gives that tool, so a `_meta` naming one tool cannot carry a
-kind that names another, even when the line has both. **Hypothesis.** Only the `other`
-of `search_tool` is observed, and a call with another kind is refused, which may refuse
-too much until Grok's real kinds are recorded, and never grants more. A `_meta` name
+kind that names another, even when the line has both. **Fact, observed on 2026-10-31**
+in a Grok line turn of 58 tool calls, from each `tool_call_update`: `read_file` as
+`read`, `grep` as `search`, `run_terminal_command` as `execute`, and `list_dir`,
+`search_tool` and `use_tool` as `other`. Twenty-six `use_tool` calls of Dromon's own
+tools passed in that turn. `list_dir` was first refused for `other`, which the table now
+allows. The kinds of the other built-ins are a **hypothesis**, and a call with another
+kind is refused, which may refuse too much and never grants more. A `_meta` name
 added in a later update to a call first judged without one refuses the turn. A call without that
 `_meta`, or in another namespace, is judged as before. **Hypothesis.** The table is
 read from the tool names in the session's `tool_definitions.json`, and no live call of
@@ -330,7 +334,7 @@ each built-in, or of `use_tool`, has been recorded.
 | Grok tool | Permitted by | Kinds it may carry |
 |---|---|---|
 | `read_file` | `Read` | `read` |
-| `list_dir` | `Read` or `Glob` | `read`, `search` |
+| `list_dir` | `Read` or `Glob` | `read`, `search`, `other` |
 | `grep` | `Grep` | `search` |
 | `search_replace`, `write` | `Edit` or `Write` | `edit` |
 | `run_terminal_command`, `get_command_or_subagent_output`, `kill_command_or_subagent` | `Bash` | `execute` |
