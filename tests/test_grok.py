@@ -1486,6 +1486,14 @@ def test_search_tool_is_counted_as_discovery_only(
     assert report.tool_uses == ("search_tool",)
 
 
+def test_search_tool_with_a_non_other_kind_is_refused(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok([tool_call("read", "search_tool")])
+    with pytest.raises(EngineRefused, match="not given: search_tool"):
+        run(line(server, project))
+
+
 def test_use_tool_calls_only_the_named_line_tool_and_counts_that_tool(
     project: tuple[Path, Path, Path],
 ) -> None:
@@ -1570,6 +1578,67 @@ def test_use_tool_target_cannot_change_after_it_is_counted(
     )
     with pytest.raises(EngineRefused, match="changed the structured input"):
         run(line(server, project))
+
+
+def test_use_tool_update_cannot_change_raw_input(
+    project: tuple[Path, Path, Path],
+) -> None:
+    original = use_tool_input("dromon__send_message")
+    changed = use_tool_input("dromon__read_mail")
+    server = FakeGrok(
+        [
+            tool_call("other", "use_tool", raw_input=original),
+            call_update("t", rawInput=changed),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="changed the structured input"):
+        run(line(server, project))
+
+
+def test_reused_tool_call_identifier_is_refused_before_a_second_grant(
+    project: tuple[Path, Path, Path],
+) -> None:
+    raw = use_tool_input("dromon__send_message")
+    server = FakeGrok(
+        [
+            tool_call("other", "use_tool", ident="reused", raw_input=raw),
+            permission(
+                "other", "use_tool", request_id="first", ident="reused", raw_input=raw
+            ),
+            tool_call("other", "use_tool", ident="reused", raw_input=raw),
+            permission(
+                "other", "use_tool", request_id="second", ident="reused", raw_input=raw
+            ),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="reused a tool call identifier"):
+        run(line(server, project))
+    answers = server.answers()
+    assert answers[0]["result"]["outcome"]["optionId"] == "yes"
+    assert answers[1]["result"]["outcome"]["outcome"] == "cancelled"
+    assert server.methods().count("session/cancel") == 1
+
+
+def test_repeated_permission_request_for_a_granted_call_is_refused(
+    project: tuple[Path, Path, Path],
+) -> None:
+    raw = use_tool_input("dromon__send_message")
+    server = FakeGrok(
+        [
+            tool_call("other", "use_tool", ident="same", raw_input=raw),
+            permission(
+                "other", "use_tool", request_id="first", ident="same", raw_input=raw
+            ),
+            permission(
+                "other", "use_tool", request_id="again", ident="same", raw_input=raw
+            ),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="reused a tool call identifier"):
+        run(line(server, project))
+    answers = server.answers()
+    assert answers[0]["result"]["outcome"]["optionId"] == "yes"
+    assert answers[1]["result"]["outcome"]["optionId"] == "no"
 
 
 def test_a_title_never_names_one_of_dromons_tools(
@@ -2166,6 +2235,13 @@ def test_claude_cc_writes_marker_is_the_only_nonempty_project_claude_entry_allow
     marker.mkdir()
 
     (claude / "settings.json").write_text("{}")
+    with pytest.raises(EngineRefused, match="project configuration"):
+        check_project(workspace)
+
+
+def test_a_lone_non_marker_claude_directory_is_refused(tmp_path: Path) -> None:
+    workspace = tmp_path / "work"
+    (workspace / ".claude" / "skills").mkdir(parents=True)
     with pytest.raises(EngineRefused, match="project configuration"):
         check_project(workspace)
 

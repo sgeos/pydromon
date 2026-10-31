@@ -1058,6 +1058,10 @@ class _Turn:
         default_factory=dict[str, dict[str, object]]
     )
     """Each tool call's identity as first recorded, by its identifier."""
+    announced_calls: set[str] = field(default_factory=set[str])
+    """Identifiers first announced by a ``tool_call`` update."""
+    granted_calls: set[str] = field(default_factory=set[str])
+    """Identifiers for which a permission request has already been granted."""
     finished: set[str] = field(default_factory=set[str])
     """Tool calls whose update reported them finished, so each result is fed to the
     driver once."""
@@ -1389,6 +1393,12 @@ class GrokLine:
                 return
             identifier = tool_call.get("toolCallId")
             refusal = self._identity_refusal(identifier, tool_call, turn.calls)
+            if (
+                refusal is None
+                and isinstance(identifier, str)
+                and identifier in turn.granted_calls
+            ):
+                refusal = "the engine reused a tool call identifier after permission"
             # With no field changed, the call is what was recorded plus what the
             # request adds, so a request that omits the recorded kind keeps it.
             known = turn.calls.get(str(identifier), {})
@@ -1400,6 +1410,8 @@ class GrokLine:
             if refusal is not None:
                 await self._cancel(turn, refusal)
             else:
+                if permitted and isinstance(identifier, str):
+                    turn.granted_calls.add(identifier)
                 await self._record(str(identifier), tool_call, turn)
         else:
             await self._rpc().refuse(request_id, method)
@@ -1430,6 +1442,14 @@ class GrokLine:
             if refusal is not None:
                 await self._cancel(turn, refusal)
                 return
+            if kind == "tool_call" and isinstance(identifier, str):
+                if identifier in turn.announced_calls:
+                    await self._cancel(
+                        turn,
+                        "the engine reused a tool call identifier within the turn",
+                    )
+                    return
+                turn.announced_calls.add(identifier)
             await self._record(str(identifier), update, turn)
             if acp.newly_finished(str(identifier), update, turn.finished):
                 # The safe point before the next model call that priority mail

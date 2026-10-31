@@ -1323,13 +1323,14 @@ def test_writable_path_cannot_overlap_a_dangling_credential_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
-    home.mkdir()
-    dangling = home / ".netrc"
+    cargo = home / ".cargo"
+    cargo.mkdir(parents=True)
+    dangling = cargo / "credentials.toml"
     dangling.symlink_to(tmp_path / "not-mounted" / "netrc")
     monkeypatch.setattr(Path, "home", lambda: home)
     with pytest.raises(EngineRefused, match="overlaps a protected path"):
         server_arguments(
-            [], LineConfig(builtin_tools=("Write",), writable_paths=(str(home),)), ()
+            [], LineConfig(builtin_tools=("Write",), writable_paths=(str(cargo),)), ()
         )
 
 

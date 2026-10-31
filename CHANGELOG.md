@@ -7,6 +7,11 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- Grok refuses a reused tool call identifier, including a repeated permission request,
+  so the same identifier cannot obtain multiple grants while counting once. Tests also
+  cover raw input changes in updates, non-`other` discovery calls, and a non-marker
+  `.claude` directory. The Codex dangling-credential overlap test now isolates the
+  `.cargo` guard it is intended to cover.
 - Grok lines may use `search_tool` for discovery and `use_tool` for a qualified tool
   served by that line's Dromon MCP server. Dromon checks the documented inline input
   shape, refuses file-backed or ambiguous targets, keeps the target fixed through the
