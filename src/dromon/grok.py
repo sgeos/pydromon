@@ -1335,6 +1335,15 @@ class GrokLine:
         return refusal
 
     @staticmethod
+    def _consistent_reported_model(result: Mapping[str, Any]) -> str | None:
+        """Return the session model only when every reported model field agrees."""
+        model = acp.reported_model(result)
+        values = acp.model_values(result)
+        if model is None or not values or any(value != model for value in values):
+            return None
+        return model
+
+    @staticmethod
     def _has_model_option(result: Mapping[str, Any]) -> bool:
         options = result.get("configOptions")
         if not isinstance(options, list):
@@ -1608,7 +1617,10 @@ class GrokLine:
             )
             return session_id
         expected_model = self.driver.settings.model
-        model = acp.reported_model(result)
+        model = self._consistent_reported_model(result)
+        if model is None:
+            turn.refusal = "Grok reported conflicting or unreadable session models"
+            return session_id
         model_result: Mapping[str, Any] = result
         needs_pin = model != expected_model
         if needs_pin:
@@ -1626,7 +1638,10 @@ class GrokLine:
                     f"Grok refused the driver's model {expected_model!r}: {error}"
                 )
                 return session_id
-        model = acp.reported_model(model_result)
+        model = self._consistent_reported_model(model_result)
+        if model is None:
+            turn.refusal = "Grok reported conflicting or unreadable session models"
+            return session_id
         verdict = self.driver.step(Event("init", model or ""))
         if verdict.tag is ActionTag.REFUSE:
             turn.refusal = (

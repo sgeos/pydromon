@@ -220,9 +220,15 @@ and workflows live in `$GROK_HOME`.
    driver's model, Dromon requests `session/set_config_option` with `configId` `model`
    and `value` containing the driver's identifier. The response is the updated option
    list, from which Dromon reads the model with `acp.reported_model` and runs the
-   driver's `init` check. A refusal, absent model option, or different model refuses
-   the turn before the prompt. This also applies when resuming a session with
-   `session/load`. When the answer has `modes`, `currentModeId` must be `default` or
+   driver's `init` check. If both `models.currentModelId` and the model option report a
+   value, they must agree. Dromon refuses conflicting or unreadable model reports
+   rather than choosing one field. A refusal, absent model option, or different model
+   refuses the turn before the prompt. This also applies when resuming a session with
+   `session/load`. A successful pin supersedes a mismatching model notice held before
+   its response. The response follows the notice in the session stream and reports the
+   updated options, so Dromon treats it as the later account of the session state. A
+   mismatching notice received after that response refuses the turn. When the answer
+   has `modes`, `currentModeId` must be `default` or
    `ask`, and otherwise Dromon sends `session/set_mode` with `default` if Grok offers
    it. Without `modes`, a `configOptions` entry of the category `mode` must have one
    of those values. With neither, as from Grok 1.0.70, the turn rests on the checks of

@@ -225,6 +225,8 @@ class FakeGrok:
         no such notice."""
         self.notices = list(notices)
         """Grok's own notices, sent before the session opens."""
+        self.after_set_config_notices: list[dict[str, Any]] = []
+        """Grok's notices queued after the model option update."""
         self.extra: dict[str, object] = {}
         """More fields of the session's answer."""
         self.set_config_result: dict[str, object] = {
@@ -319,6 +321,7 @@ class FakeGrok:
                 )
             else:
                 self.queue.append({**reply, "result": self.set_config_result})
+                self.queue.extend(self.after_set_config_notices)
         elif method == "session/set_mode":
             self.queue.append({**reply, "result": {}})
         elif method == "session/prompt":
@@ -1439,6 +1442,30 @@ def test_a_different_model_in_set_config_option_answer_is_refused(
     assert "session/prompt" not in server.methods()
 
 
+def test_a_set_config_option_answer_with_conflicting_model_fields_is_refused(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok(model="grok-4.6")
+    server.set_config_result = {
+        "models": {"currentModelId": GROK},
+        "configOptions": [model_option("grok-4.5")],
+    }
+    with pytest.raises(EngineRefused, match="conflicting or unreadable session models"):
+        run(line(server, project))
+    assert "session/prompt" not in server.methods()
+
+
+def test_a_session_with_conflicting_model_fields_is_refused_before_pinning(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok(model=GROK)
+    server.extra = {"configOptions": [model_option("grok-4.6")]}
+    with pytest.raises(EngineRefused, match="conflicting or unreadable session models"):
+        run(line(server, project))
+    assert "session/set_config_option" not in server.methods()
+    assert "session/prompt" not in server.methods()
+
+
 def test_models_without_a_config_option_cannot_be_pinned(
     project: tuple[Path, Path, Path],
 ) -> None:
@@ -2529,6 +2556,19 @@ def test_groks_identified_notices_that_agree_let_the_turn_run(
     ]
     server = FakeGrok(notices=notices)
     assert run(line(server, project)).text == "done"
+
+
+def test_a_model_notice_after_the_model_is_pinned_refuses_the_turn(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok(model="grok-4.6")
+    server.after_set_config_notices = [
+        grok_notice("models/update", {"currentModelId": "grok-other"})
+    ]
+    with pytest.raises(EngineRefused, match="model to 'grok-other'"):
+        run(line(server, project))
+    assert "session/prompt" in server.methods()
+    assert "session/cancel" in server.methods()
 
 
 def test_an_unknown_grok_request_is_answered_with_an_error(
