@@ -28,8 +28,120 @@ All notable changes are recorded here. The format follows
   ViewImage is not to be enabled on a Grok line until the first read_file notice is
   shown to carry its input. Nothing was run live, and each engine document lists the live steps
   the operator runs first.
+- Supervised runs, task of 2026-10-31. The project file's `[runs.commands]` table
+  declares commands, each an array, and the line tools `start_run`, `run_status` and
+  `stop_run` start one as a run that outlives the turn, the seat and a daemon restart.
+  A supervisor, `python -m dromon.runs`, runs it in a session of its own and writes a
+  receipt when it ends. The event log records `run_started`, with the supervisor's
+  process identifier and its start time from the process table, and `run_ended`, with
+  the receipt and the output's digest. The daemon reconciles open runs on its process
+  worker at start and at each rest, so a run that ended while the daemon was down is
+  recorded, a supervisor that died without a receipt ends as `lost`, and a process
+  identifier now held by another process is not taken for the supervisor. A run
+  belongs to its role, only the owner starts or stops one, and `start_run` names the
+  latest run as `previous`, so a successor seat reads its predecessor's record before
+  starting another. A declared command runs with the daemon's authority outside every
+  sandbox, which `docs/architecture/RUNS.md` states as a trust decision for the
+  operator. **Rollback hazard.** A daemon older than this cannot read a log holding
+  `run_started`, `run_ended` or `run_cleared`, and does not know of a supervisor still
+  running.
+- Lost runs block their scope, review of 2026-10-31, R2. A lost run's command may
+  still run, so its scope starts no other run until reconciliation finds no process in
+  the supervisor's process group or session, or an operator clears it with
+  `dromon run clear RUN`, the new operator-only `run_clear` operation. Either is
+  recorded as `run_cleared`, with the operator who cleared it. A process table that
+  cannot be read keeps the run blocking.
+- Project configuration may name relative `read_only_paths` that must exist inside each
+  line's resolved workdir. Claude Code, Codex and Grok Build lines enforce those paths
+  through their engine restrictions; Pi, Cursor Agent and Antigravity lines refuse the
+  configuration because they cannot enforce it. Symbolic links resolving outside the
+  workdir and missing paths are refused. The list defaults to empty. The project
+  configuration example names `docs/process` and `docs/roadmap` as suggested protected
+  paths, but this change does not alter `.dromon/dromon.toml`.
+- `dromon wait --replies-to MESSAGE --timeout SECONDS [--from LINE]` polls the existing
+  replies query in the client, with each request bounded by the remaining timeout. It
+  returns the reply without marking it read, and reports timeout, invalid source and
+  daemon loss as failures.
+
+### Changed
+
+- Leases are durable, task of 2026-10-31. `lease_acquired` records the holder, the
+  acquisition and the expiry, and `lease_released` a release or a name the project
+  file no longer declares, so a restart keeps a held lease until it expires, and
+  expiry stays its bound. A cleared session or a rebind ends a line's leases as the
+  event log applies it. A change of a role's owner from one seat to another passes the
+  previous owner's leases to the new owner with the same times, as `ROLES.md` records
+  as decided. A start whose project file no longer declares a held lease's name now
+  ends it. **Rollback hazard.** A daemon older than this cannot read a log holding
+  `lease_acquired` or `lease_released`.
 
 ### Fixed
+
+- Supervised runs, review of 2026-10-31. Reading a run's output opens it without
+  blocking and reads only a regular file, so a named pipe a line puts there cannot
+  stall reconciliation on the process worker, R1. A seat that owns its role needs
+  write access to its working directory to start or stop a run, as any other line
+  does, R3. A run whose supervisor cannot be told to start is recorded as `stopped`
+  with no exit code and the caller is told nothing started, R6. The supervisor signals
+  its command's group only from the thread that waits for it, between polls that
+  found the command unreaped, so a late `SIGKILL` can no longer reach a reused group
+  identifier, R7. A `ps` that exits with status 1 and a complaint is a failure to
+  read the table, not an absent process. `ROLES.md` states that a change of owner
+  passes every lease of the former owner, including one not taken for the role, R4,
+  and `RUNS.md` states the window between checking and signalling a supervisor, R5.
+- `write_scratch` refuses targets covered by project `read_only_paths` in the
+  scratch directory it actually uses, including a seat's `tmp/lines/LINE`. Codex keeps
+  read-only parent entries while denying protected descendants and makes read-only
+  entries under `tmp/` explicit. `dromon wait` reports replies left out by the response
+  size bound. Documentation states that worker joins are bounded and that engine
+  enforcement after parent renames or newly created symbolic links is unverified.
+- The process-inspection and launch-record-sweep workers now stop when their scheduler
+  or daemon stops. Shutdown rejects new inspections, drops queued calls, and joins each
+  worker for at most one second. A process-table read already in progress cannot be
+  interrupted and may outlive that bound, after which its worker exits. This also
+  closes workers when startup validation refuses a daemon before its service loop.
+- A line can be created on, or rebound to, the packaged Pi model. The log checked a
+  line's model as an identifier, which refuses the colon and slash of the
+  engine-qualified names of Pi, Cursor Agent and Antigravity, so no Pi line could be
+  created. The `engine` field of `line_created` and `line_rebound` is now a model
+  name, an identifier or one with a colon and the harness's own identifier, as
+  [`EVENT_LOG.md`](docs/protocol/EVENT_LOG.md) gives it. Every other field stays an
+  identifier. Cursor Agent and Antigravity lines are still refused by their adapters,
+  which allow them only in `dromon probe`, and their names no longer stand in the way
+  once that refusal is lifted. **Rollback hazard.** A daemon before this change
+  refuses a log holding such a line as corrupt.
+- A Codex line's turn is refused when any directory of its own scratch, `tmp`,
+  `tmp/lines` or `tmp/lines/LINE`, is a symbolic link or not a directory, checked
+  by `lstat` each turn before its permission profile is built, so the owner of a
+  role's worktree cannot redirect a read seat's grant into its own scratch. Review
+  of ebedeed, R1.
+- A Codex line with write access, no `Edit` or `Write` and a shell is granted its
+  own scratch, where `write_scratch` writes for it, as a read line is. Review of
+  ebedeed, G3.
+- A line that does not write its working directory, a seat that does not own its
+  role among them, has a scratch of its own, `tmp/lines/LINE`, for `write_scratch`
+  and for the Codex read profile, which granted the whole of `tmp/` before. Either
+  let a read-only seat, or a line with no writing tool, write a file of the owner's
+  scratch, which stays `tmp/`. The tool's description says where each scratch is.
+  Round 10 re-review, N1 and N2. **Behaviour change.** A line that is no role's seat
+  and has no writing tool now writes under `tmp/lines/LINE` too, so its reports move
+  there.
+- A seat on an engine that cannot confine it, such as Grok, whose turn began while
+  its role was vacant, no longer runs on beside a seat that then takes the role or is
+  given it. The new owner's first turn waits for that turn, and for the seat's kept
+  connection to close. Round 10 re-review, N3.
+- A role's worktree inside another role's, or holding it, is refused as a shared one
+  is, by `dromon role create` and `update` and in the project file, and a line that
+  could write a directory inside an owned worktree, or one holding it, is refused or
+  held as one in the worktree is. Round 10 re-review, N4. **Rollout hazard.** A
+  project file with a role on the project root and another below it, or with a
+  writing line on the root beside an owned role below it, is now refused whole at a
+  start or a reload.
+- Bound issue volume per line, ran different operators' relays concurrently while
+  preserving each operator's notice order, and restricted file relays to protected
+  state/runtime directories. File relay FIFO opens are nonblocking. Command relay
+  success now follows the command's exit status even when a child holds standard error
+  open. A child that starts a new session can still escape timeout process-group kills.
 
 - A seat that does not own its role is built with its role's worktree read only on
   Claude Code and Codex, the engines that can confine it. The confining engines were
@@ -246,6 +358,29 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- The daemon relays operators' mail. The project file's `[relays.NAME]` tables declare
+  command and file relays, and `[operators.ID] relay = NAME` routes an operator's mail
+  to one. A relayer task forwards every undelivered message to a routed operator, off
+  the event loop, records `message_delivered` only when the relay accepts it, and
+  leaves failed and unrouted mail undelivered, retrying a failure after a backoff of 5
+  to 300 seconds. A command relay that times out is killed with its process group. A
+  reload changes the routes from the next pass. Relay delivery marks nothing read, so
+  `dromon mail --unread` still lists a relayed message, and a message a client lists
+  first is not relayed. `dromon status` shows the relays and each failing notice.
+- A file relay, `kind = "file"`, appends each notice as one JSON line to a file
+  created with mode `0600`, for `tail -f`. It refuses a symbolic link, another user's
+  file and a file open to group or others, and a notice file in any line's working
+  directory outside the directories Dromon protects, at start, at reload and before
+  each write.
+- Issues from lines. `send_message` with `issue` true raises an issue with an
+  operator, recorded as a message of the new kind `issue` and relayed like any mail.
+  It is open until the operator replies to it or acknowledges it, and
+  `dromon mail --issues`, the `mail` query's `issues_only`, lists the open ones. An
+  external agent is not offered the argument. **Rollback hazard.** A daemon older than
+  this change refuses an event log that holds an issue, since its codec knows only the
+  kinds `note` and `question`, so a rollback past it needs a log from before the first
+  issue. The `[relays]` and `[operators]` tables are likewise refused by an older
+  daemon as unknown keys, which stops its start rather than its log.
 - `dromon role create`, `dromon role update` and `dromon role delete`, with the client
   operations `role_create`, `role_update` and `role_delete`, so an operator changes the
   team while the daemon runs. Update adds, removes and reorders seats and changes any

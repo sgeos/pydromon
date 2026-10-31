@@ -23,6 +23,7 @@ state by replaying the same log.
 | Value | Rule |
 |---|---|
 | Identifier | 1 to 64 ASCII characters from `a` to `z`, `0` to `9`, `.`, `_` and `-`, starting with a letter or digit. Compared bytewise |
+| Model name | An identifier, or an engine-qualified name, an identifier, `:`, and 1 to 128 ASCII characters from `a` to `z`, `0` to `9`, `.`, `_`, `-` and `/`, starting with a letter or digit, such as `pi:openai/gpt-6-luna`. Compared bytewise. The identifier form alone refused the packaged Pi, Cursor Agent and Antigravity models until 2026-10-31 |
 | Line address | A line's identifier, such as `alpha` |
 | Operator address | `@` followed by an operator's identifier, such as `@ana`. `@` never appears in an identifier, so the two kinds of address cannot collide |
 | Agent address | `&` followed by an external agent's identifier, such as `&claude-main`. `&` never appears in an identifier |
@@ -46,6 +47,9 @@ state by replaying the same log.
 | Failover policy | `automatic` or `ask` |
 | Entry kind | `handoff`, `recovery` or `note` |
 | Budget source | `operator` or `engine` |
+| Lease end | `released` or `undeclared` |
+| Run status | `exited`, `stopped` or `lost` |
+| Run clearance | `empty` or `operator` |
 
 Identifiers are never reused within their kind, even after a line stops or a question
 closes. A resent event is therefore rejected rather than applied twice. Lines and
@@ -79,12 +83,12 @@ Each event has a kind and fields, all required. An optional value is written as 
 
 | Kind | Fields | Applies when |
 |---|---|---|
-| `line_created` | `line_id`, `engine` and `strategy` identifiers | The line does not exist. The new line is idle. The engine names the model, and the strategy names the driver's credential strategy |
+| `line_created` | `line_id` and `strategy` identifiers, `engine` model name | The line does not exist. The new line is idle. The engine names the model, and the strategy names the driver's credential strategy. **Rollback hazard.** A daemon before 2026-10-31 refuses a log holding a model name with `:`, such as a Pi line's, as corrupt |
 | `line_state_changed` | `line_id`, `state` | The line exists and the change is in the transition table |
 | `line_configured` | `line_id`, `config` text of at most 262,144 bytes | The line exists. The text is the canonical JSON of [`LINE_CONFIG.md`](LINE_CONFIG.md), validated by the daemon before it appends, and replaces any earlier configuration |
 | `line_session` | `line_id`, `engine_session` text of 1 to 256 bytes | The line exists. Records the engine session the line's next turn resumes, so a restarted daemon continues the line's conversation. Appended after a turn, or right after `line_created` when the line adopts an existing session |
-| `line_session_cleared` | `line_id` | The line exists. Its next turn starts a new engine session, as an operator asked with `clear_session`, because the line's `workdir` changed, or at the start of each turn when `fresh_session_each_turn` is set, and from 2026-10-31 also when a configuration turns `fresh_session_each_turn` on for a line that has a recorded session, which from round 9's review, F1, includes a line in a turn, whose turn then records no `line_session` when it ends. The engine keeps the old session. The line is owed a context handoff for `cleared`, which configuration may opt out of. With `fresh_session_each_turn`, the event is appended after that turn's mail is delivered and before its engine starts, so replay and restart cannot resume the preceding session |
-| `line_rebound` | `line_id`, `engine` and `strategy` identifiers | The line exists and its current engine and strategy are not both these. The line now runs this model with this driver strategy, as an operator asked with `rebind_line`. Its identity, mailbox, configuration and overrides stay, and its next turn starts a new engine session. The project file's check compares with this binding. The line is owed a context handoff for `rebound` |
+| `line_session_cleared` | `line_id` | The line exists. Its next turn starts a new engine session, as an operator asked with `clear_session`, because the line's `workdir` changed, or at the start of each turn when `fresh_session_each_turn` is set, and from 2026-10-31 also when a configuration turns `fresh_session_each_turn` on for a line that has a recorded session, which from round 9's review, F1, includes a line in a turn, whose turn then records no `line_session` when it ends. The engine keeps the old session. The line is owed a context handoff for `cleared`, which configuration may opt out of. From 2026-10-31 it also ends every lease the line holds, as the lease rules below say. With `fresh_session_each_turn`, the event is appended after that turn's mail is delivered and before its engine starts, so replay and restart cannot resume the preceding session |
+| `line_rebound` | `line_id` and `strategy` identifiers, `engine` model name | The line exists and its current engine and strategy are not both these. The line now runs this model with this driver strategy, as an operator asked with `rebind_line`. Its identity, mailbox, configuration and overrides stay, and its next turn starts a new engine session. The project file's check compares with this binding. The line is owed a context handoff for `rebound`. From 2026-10-31 it also ends every lease the line holds |
 | `line_overridden` | `line_id`, `overrides` text of at most 262,144 bytes | The line exists. The text is the canonical JSON of the line's override document, as [`CLIENT.md`](CLIENT.md) specifies under settings, validated by the daemon before it appends, and replaces any earlier overrides of the line |
 | `project_overridden` | `overrides` text of at most 262,144 bytes | Always. The project's override document, replacing any earlier one |
 | `line_held` | `line_id`, `question_id` | The line exists and is not held, and the question is open and from the line. The daemon wakes the line no more until it is released |
@@ -129,6 +133,11 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `role_noted` | `role_id`, `entry_id`, `line_id`, `kind` entry kind, `body` text of 1 to 65,536 bytes, `workdir_commit` and `daemon_commit` commits, `noted_at` time | No entry has the identifier, the role exists, so a retired role takes no entry, and the line is its seat. A `handoff` or `recovery` entry is by the role's current owner, and a `note` by any seat. The daemon stamps both commits itself from `HEAD`. Added on 2026-10-27 |
 | `brief_set` | `line_id`, `task` text of 1 to 4,096 bytes, `decisions` and `next_action` text of at most 4,096 bytes, `artifacts` an array of at most 32 paths, each of 1 to 1,024 bytes on one line, `workdir_commit` and `daemon_commit` commits, `set_at` time | The line exists. The text fields and paths together are at most 16,384 bytes. Replaces the line's previous standing brief, which only `set_brief` records, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies. The text is the line's own and untrusted. The daemon stamps both commits and the time itself, and leaves a commit empty when it cannot read it. Added on 2026-10-29 |
 | `budget_stated` | `provider` identifier, `remaining_percent` a whole number from 0 to 100 or `null`, `resets_at` time or `null`, not both `null`, `source` budget source, `note` text of at most 1,024 bytes, `stated_at` time | Always. Replaces the provider's earlier statement. It is a snapshot and later turns do not adjust it. Added on 2026-10-27 |
+| `lease_acquired` | `name` and `line_id` identifiers, `acquired_at` and `expires` times, `expires` the later | The line exists, and no lease is recorded under the name or the recorded one's `expires` is not after this `acquired_at`. Records the line as the lease's holder until `expires`, replacing an expired one. See the lease rules below. **Rollback hazard.** A daemon older than 2026-10-31 does not know the kind, so once one is recorded, it cannot read the log. Added on 2026-10-31 |
+| `lease_released` | `name` and `line_id` identifiers, `cause` lease end | The line holds the lease under the name, expired or not. Ends it. `released` is the holder's own `release_lease`, and `undeclared` is recorded by a reload or a start whose project file no longer declares the name. **Rollback hazard.** As for `lease_acquired`. Added on 2026-10-31 |
+| `run_started` | `run_id` and `line_id` identifiers, `role_id` and `previous` identifiers or `null`, `command` identifier, `argv` an array of 1 to 64 texts of at most 1,024 bytes each, the first not empty, `workdir` an absolute path and `output_file` a path relative to it, each of at most 1,024 bytes, `pid` a whole number above 1 and below 2^31, `process_started` and `started_at` times | No run has the identifier and the line is not stopped. `role_id` is the role the line is a seat of, or `null` when it is none, and a seat owns its role. The run's scope is its role, or its line when it has none. No run of the scope is open, the scope's latest run is not `lost` without a `run_cleared`, and `previous` is the scope's latest run, or `null` when it has none. `pid` and `process_started` name the run's supervisor, as [`RUNS.md`](../architecture/RUNS.md) specifies. **Rollback hazard.** As for `lease_acquired`. Added on 2026-10-31 |
+| `run_ended` | `run_id` identifier, `status` run status, `exit_code` a 32-bit whole number or `null`, `null` for `lost`, `output_digest` a SHA-256 digest or `null`, `output_bytes` a whole number or `null`, given whenever the digest is, `note` text of at most 1,024 bytes, `ended_at` time | The run exists and has not ended. Ends it with what its receipt or the process table showed. **Rollback hazard.** As for `lease_acquired`. Added on 2026-10-31 |
+| `run_cleared` | `run_id` identifier, `cause` run clearance, `operator_id` identifier or `null`, given exactly when `cause` is `operator`, `cleared_at` time | The run exists, has ended as `lost` and is not cleared, and `operator_id`, when given, is a registered operator. A lost run's command may still run, so its scope starts no other run until this is recorded, with `empty` when reconciliation found no process in the supervisor's process group or session, and `operator` when an operator cleared it with `run_clear` after inspection, as [`RUNS.md`](../architecture/RUNS.md) specifies. **Rollback hazard.** As for `lease_acquired`. A daemon older than this review also lets a lost run's scope start another run while its command may still run. Added on 2026-10-31, in the review of that day |
 | `peer_declared` | `peer_id` identifier, `transport` of `unix` or `tls`, `policy` text of at most 65,536 bytes | The peer is new, was removed, or this changes its transport or policy. Recorded at start from the project file's `[peers]` table, as [`FEDERATION.md`](../architecture/FEDERATION.md) specifies. The policy is canonical JSON of every key of the peer's table but `transport`, and never holds a token. A peer declared again after its removal starts with no token. Added on 2026-10-28 |
 | `peer_removed` | `peer_id` | The peer is declared and not removed. Recorded at start when the project file no longer declares it. Clears its token digest. Added on 2026-10-28 |
 | `peer_keyed` | `peer_id`, `token_sha256` a SHA-256 digest or empty | The peer is declared and not removed, and an empty digest, which revokes the token, requires a token to revoke. The digest is of the token this daemon issued for the peer to present. Only the digest is ever stored. Added on 2026-10-28 |
@@ -215,6 +224,21 @@ The model checks that a change is consistent. The daemon checks that its maker h
 authority, such as the harness-observed exhaustion that a seat's own recovery needs. Only
 the daemon records a `failover`, on the same grounds, under the role's `automatic`
 policy.
+
+**Lease rules.** **Task of 2026-10-31.** A lease is in the log from its
+`lease_acquired`, so a restart keeps its holder, its acquisition and its expiry. Expiry
+is its bound and needs no event. The daemon compares `expires` with its wall clock, and
+the next `lease_acquired` under the name replaces an expired lease. Three other events
+change leases as they apply, with no event of their own, so a replay agrees with the
+daemon that recorded them.
+
+1. `line_session_cleared` and `line_rebound` end every lease of their line, as the
+   daemon ended them in its memory before this date.
+2. `ownership_changed` with both `previous` and `owner` passes every lease that
+   `previous` holds to `owner`, keeping `acquired_at` and `expires`. **Decided on
+   2026-10-31,** as [`ROLES.md`](../architecture/ROLES.md) records.
+3. `ownership_changed` that leaves the role vacant, or names no `previous`, changes no
+   lease.
 
 **Line transitions.** `idle` to `running`, `running` to `idle`, `idle` to `stopped`,
 `running` to `stopped`, and `stopped` to `idle`. No other change is permitted, including

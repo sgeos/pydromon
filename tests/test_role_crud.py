@@ -9,6 +9,7 @@ what it leaves, as ``docs/architecture/ROLES.md`` states."""
 import asyncio
 import json
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -54,6 +55,9 @@ BEN = OperatorAddress("ben")
 NOW = datetime(2026, 10, 31, 9, 0, 0, tzinfo=UTC)
 AT = format_due(NOW)
 DOCS = "tmp/worktrees/docs"
+TREE = "tmp/worktrees/core"
+"""Role core's worktree in the desk. **Round 10 re-review, N4.** It was the project
+root, which now holds every other role's worktree, so a second role there is refused."""
 WRITER = LineConfig(builtin_tools=("Read", "Edit"))
 
 
@@ -76,14 +80,15 @@ def start_scheduler(log: EventLog, root: Path) -> Scheduler:
 
 
 class Desk:
-    """A daemon over a real event log, with role core on the project root, seats
-    alpha, beta and gamma, alpha its owner, beta hibernated and gamma unable to own,
-    a line delta on the root that is a seat of no role, and lines echo and fox in the
-    worktree of a role yet to be made. The client's requests reach it directly."""
+    """A daemon over a real event log, with role core on ``TREE``, seats alpha, beta
+    and gamma, alpha its owner, beta hibernated and gamma unable to own, a line delta
+    there that is a seat of no role, and lines echo and fox in the worktree of a role
+    yet to be made. The client's requests reach it directly."""
 
     def __init__(self, paths: ProjectPaths) -> None:
         self.paths = paths
         (paths.root / DOCS).mkdir(parents=True)
+        (paths.root / TREE).mkdir(parents=True)
         self.log = EventLog(paths.event_log)
         self.scheduler = start_scheduler(self.log, paths.root)
         self.daemon = Daemon(
@@ -97,16 +102,20 @@ class Desk:
         )
         self.scheduler.ensure_operator("ana")
         for line_id in ("alpha", "beta", "delta"):
-            self.scheduler.create_line(line_id, HAIKU, Strategy.SUBSCRIPTION)
+            self.scheduler.create_line(
+                line_id, HAIKU, Strategy.SUBSCRIPTION, LineConfig(workdir=TREE)
+            )
         # gamma may write its working directory, so it is refused leave of an owned
         # role while it runs in the owner's worktree.
-        self.scheduler.create_line("gamma", HAIKU, Strategy.SUBSCRIPTION, WRITER)
+        self.scheduler.create_line(
+            "gamma", HAIKU, Strategy.SUBSCRIPTION, replace(WRITER, workdir=TREE)
+        )
         for line_id in ("echo", "fox"):
             self.scheduler.create_line(
                 line_id, HAIKU, Strategy.SUBSCRIPTION, LineConfig(workdir=DOCS)
             )
         for event in (
-            RoleDeclared("core", ".", seats=("alpha", "beta", "gamma")),
+            RoleDeclared("core", TREE, seats=("alpha", "beta", "gamma")),
             SeatBound("alpha", "core", True),
             SeatBound("beta", "core", True),
             SeatBound("gamma", "core", False),
@@ -242,7 +251,7 @@ def test_a_created_seat_is_offered_the_role_tools_and_its_engine_is_rebuilt(
 @pytest.mark.parametrize(
     ("argv", "message"),
     [
-        (("core", "--workdir", ".", "--seats", "delta"), "role core exists"),
+        (("core", "--workdir", TREE, "--seats", "delta"), "role core exists"),
         (("docs", "--workdir", DOCS, "--seats", "echo,nobody"), "no line nobody"),
         (("docs", "--workdir", DOCS, "--seats", "echo,delta"), "line delta runs in"),
         (("docs", "--workdir", ".", "--seats", "delta"), "roles core and docs would"),
@@ -333,7 +342,7 @@ def test_update_changes_terms_and_reorders_adds_and_removes_seats(
         (("--no-own", "alpha"), "must give the role up"),
         (("--seats", "alpha,beta"), "Unbound, it would be such a line"),
         (("--workdir", DOCS, "--seats", "echo,fox"), "line alpha owns role core"),
-        (("--workdir", DOCS), "runs in ., not in the role's worktree"),
+        (("--workdir", DOCS), f"runs in {TREE}, not in the role's worktree"),
         (("--handoff-seconds", "3600"), "role core is so already"),
         (("--seats", "alpha,beta,gamma"), "role core is so already"),
         (("--no-own", "delta"), "name only seats of the role, not delta"),
@@ -812,7 +821,7 @@ def test_an_idle_writer_is_refused_leave_until_it_cannot_write(
     desk.scheduler.hibernate("gamma")
     status, _, err = dromon("role", "update", "core", "--seats", "alpha,beta")
     assert status == exits.FAILURE
-    assert "line gamma could write ., the worktree of role core, which alpha" in err
+    assert f"line gamma could write {TREE}, the worktree of role core, which" in err
     reader = LineConfig(
         builtin_tools=("Read", "Edit"), workdir_access=WorkdirAccess.READ
     )
@@ -826,11 +835,11 @@ def test_a_second_role_may_not_share_a_worktree(desk: Desk, dromon: Run) -> None
     """F3, the review's probe, by create, by update and by real path."""
     before = desk.log.last_seq
     status, _, err = dromon(
-        "role", "create", "dup", "--workdir", ".", "--seats", "delta"
+        "role", "create", "dup", "--workdir", TREE, "--seats", "delta"
     )
     assert status == exits.FAILURE
-    assert "roles core and dup would share the worktree ., so two owners" in err
-    (desk.paths.root / "tmp/alias").symlink_to(desk.paths.root)
+    assert f"roles core and dup would share the worktree {TREE}, so two owners" in err
+    (desk.paths.root / "tmp/alias").symlink_to(desk.paths.root / TREE)
     status, _, err = dromon(
         "role", "create", "dup", "--workdir", "tmp/alias", "--seats", "delta"
     )
@@ -840,6 +849,52 @@ def test_a_second_role_may_not_share_a_worktree(desk: Desk, dromon: Run) -> None
     assert dromon("role", "vacate", "core")[0] == exits.OK
     status, _, err = dromon("role", "update", "core", "--workdir", DOCS)
     assert status == exits.FAILURE and "roles core and docs would share" in err
+
+
+def test_a_role_worktree_may_not_lie_inside_another_or_hold_it(
+    desk: Desk, dromon: Run
+) -> None:
+    """Round 10 re-review, N4. Worktrees were compared for equality only, so a role
+    inside another's worktree, or one holding it, had two owners for the inner one.
+    Each direction is refused, by create and by update, and by real path."""
+    inner = f"{TREE}/sub"
+    (desk.paths.root / inner).mkdir()
+    (desk.paths.root / "tmp/inner-alias").symlink_to(desk.paths.root / inner)
+    before = desk.log.last_seq
+    for workdir in (inner, "tmp/inner-alias", ".", "tmp/worktrees"):
+        status, _, err = dromon(
+            "role", "create", "dup", "--workdir", workdir, "--seats", "delta"
+        )
+        assert status == exits.FAILURE, workdir
+        assert "roles core and dup would have worktrees one inside the other" in err
+    assert desk.log.last_seq == before
+    assert create_docs(dromon)[0] == exits.OK
+    status, _, err = dromon("role", "update", "docs", "--workdir", inner)
+    assert status == exits.FAILURE
+    assert "roles core and docs would have worktrees one inside the other" in err
+    assert desk.log.state.roles["docs"].workdir == DOCS
+
+
+def test_a_writer_inside_an_owned_worktree_is_refused_and_waits(
+    desk: Desk, dromon: Run
+) -> None:
+    """Round 10 re-review, N4. A writer that is not a seat, in a directory inside the
+    owner's worktree, was neither refused nor held. It is now, and the owner's first
+    turn waits for one in flight, as for a writer in the worktree itself."""
+    inner = f"{TREE}/sub"
+    (desk.paths.root / inner).mkdir()
+    with pytest.raises(EventRejected, match=f"which overlaps {TREE}, the worktree"):
+        desk.scheduler.configure_line("fox", replace(WRITER, workdir=inner))
+    # A reader there is allowed, and one a log made before the rule waits.
+    desk.scheduler.configure_line("fox", LineConfig(workdir=inner))
+    assert desk.scheduler.beside_owner("fox") is None
+    desk.log.append(
+        LineConfigured("fox", encode_config(replace(WRITER, workdir=inner)))
+    )
+    assert desk.scheduler.beside_owner("fox") == "core"
+    assert not desk.scheduler._eligible("fox")  # pyright: ignore[reportPrivateUsage]
+    in_flight(desk, "fox")
+    assert desk.scheduler._waits_for_writer("alpha")  # pyright: ignore[reportPrivateUsage]
 
 
 def test_the_owner_may_not_be_configured_out_of_the_role_worktree(desk: Desk) -> None:
@@ -877,21 +932,22 @@ def test_a_writer_that_is_not_a_seat_may_not_join_an_owned_worktree(
 ) -> None:
     """F4, the review's probe, by configure, by create and by an override."""
     before = desk.log.last_seq
-    with pytest.raises(EventRejected, match="line fox could write ., the worktree"):
-        desk.scheduler.configure_line(
-            "fox", LineConfig(workdir=".", builtin_tools=("Read", "Edit"))
-        )
-    with pytest.raises(EventRejected, match="line hotel could write ., the worktree"):
+    with pytest.raises(EventRejected, match=f"line fox could write {TREE}, the work"):
+        desk.scheduler.configure_line("fox", replace(WRITER, workdir=TREE))
+    # On the project root, hotel holds the worktree, round 10 re-review, N4.
+    with pytest.raises(
+        EventRejected, match=f"line hotel could write ., which overlaps {TREE}, the"
+    ):
         desk.scheduler.create_line("hotel", HAIKU, Strategy.SUBSCRIPTION, WRITER)
     assert "hotel" not in desk.log.state.lines
-    with pytest.raises(EventRejected, match="line delta could write ., the worktree"):
+    with pytest.raises(EventRejected, match=f"line delta could write {TREE}, the"):
         desk.scheduler.override_line("delta", "builtin_tools", ["Read", "Edit"])
     assert desk.log.last_seq == before
     # A line confined to reading may join, and so may any line once the role is vacant.
     desk.scheduler.configure_line(
         "fox",
         LineConfig(
-            workdir=".",
+            workdir=TREE,
             builtin_tools=("Read", "Edit"),
             workdir_access=WorkdirAccess.READ,
         ),
@@ -926,7 +982,7 @@ def test_a_seat_is_not_moved_between_roles_by_a_command(
     )
     assert status == exits.FAILURE
     assert "line echo runs in tmp/worktrees/docs, not in the role's worktree" in err
-    desk.scheduler.configure_line("echo", LineConfig(workdir="."))
+    desk.scheduler.configure_line("echo", LineConfig(workdir=TREE))
     before = desk.log.last_seq
     status, _, err = dromon(
         "role", "update", "core", "--seats", "alpha,beta,gamma,echo"

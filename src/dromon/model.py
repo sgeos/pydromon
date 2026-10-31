@@ -27,7 +27,25 @@ from enum import StrEnum
 from typing import Final, assert_never
 
 ID_PATTERN: Final = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
-"""Identifiers and engine names. ASCII only, so every port compares them bytewise."""
+"""Identifiers. ASCII only, so every port compares them bytewise."""
+
+MODEL_PATTERN: Final = re.compile(
+    r"[a-z0-9][a-z0-9._-]{0,63}(:[a-z0-9][a-z0-9._/-]{0,127})?"
+)
+"""The model a line runs, the ``engine`` field of ``line_created`` and ``line_rebound``.
+It is an identifier, or an engine-qualified name as ``dromon.driver.ENGINE_OF`` gives
+it, an identifier, one colon and the harness's own identifier, which may also hold
+``/``, as Pi's ``openai/gpt-6-luna`` does.
+
+The colon and the slash are needed so that a line can be created on Pi, Cursor Agent or
+Antigravity at all, which the identifier pattern refused until 2026-10-31. Nothing else
+changes. The name stays ASCII and lowercase, so every port still compares it bytewise,
+it holds at most one colon, so the engine is the text before it, and it never begins
+with ``@``, ``&`` or ``!``, so it never reads as an address.
+
+**Assumption.** No harness identifier in the packaged catalogue holds an uppercase
+letter or a character outside this set. A model that did would need this pattern
+widened, which is a change to the log's grammar."""
 
 OPERATOR_PREFIX: Final = "@"
 """Marks an operator address. It never appears in an identifier, so a line address and
@@ -41,6 +59,16 @@ TOKEN_HASH: Final = re.compile(r"[0-9a-f]{64}")
 
 MAX_TEXT_BYTES: Final = 1024 * 1024
 """Upper bound on the UTF-8 size of a message body."""
+
+MAX_OPEN_ISSUES_PER_LINE: Final = 5
+"""At most five unclosed issues from one line may burden an operator."""
+
+ISSUE_RATE_WINDOW_MESSAGES: Final = 20
+MAX_ISSUES_PER_LINE_IN_WINDOW: Final = 3
+"""At most three issues in a line's last twenty sent messages, including the new one.
+This replay-deterministic rate limit does not depend on wall-clock time, so it slows a
+line by messages, not by time. ``MAX_OPEN_ISSUES_PER_LINE`` is the bound that holds,
+since only an operator frees an open slot."""
 
 MAX_CONFIG_BYTES: Final = 256 * 1024
 """Upper bound on the UTF-8 size of a line's stored tool configuration."""
@@ -83,6 +111,12 @@ def check_id(name: str, value: object) -> None:
     """Raise ``InvalidField`` unless ``value`` is a valid identifier."""
     if not isinstance(value, str) or ID_PATTERN.fullmatch(value) is None:
         raise InvalidField(f"{name} is not a valid identifier: {value!r}")
+
+
+def check_model(name: str, value: object) -> None:
+    """Raise ``InvalidField`` unless ``value`` is a valid model name."""
+    if not isinstance(value, str) or MODEL_PATTERN.fullmatch(value) is None:
+        raise InvalidField(f"{name} is not a valid model name: {value!r}")
 
 
 def check_optional_id(name: str, value: object) -> None:
@@ -338,6 +372,12 @@ LINE_TRANSITIONS: Final[frozenset[tuple[LineState, LineState]]] = frozenset(
 class MessageKind(StrEnum):
     NOTE = "note"
     QUESTION = "question"
+    ISSUE = "issue"
+    """A harness or operator-experience issue a line raises with an operator unasked.
+    It asks no answer, and it is open until the operator replies to it or
+    acknowledges it. ``docs/protocol/LINE_CONFIG.md`` records why it is a kind of
+    mail rather than a tracker. **Rollback hazard.** A daemon older than this kind
+    refuses a log that holds one, since its codec knows only notes and questions."""
 
 
 class ReturnCode(StrEnum):
@@ -435,7 +475,7 @@ class LineCreated:
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
-        check_id("engine", self.engine)
+        check_model("engine", self.engine)
         check_id("strategy", self.strategy)
 
 
@@ -536,7 +576,7 @@ class LineRebound:
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
-        check_id("engine", self.engine)
+        check_model("engine", self.engine)
         check_id("strategy", self.strategy)
 
 
@@ -1755,6 +1795,195 @@ class BudgetStated:
         check_instant("stated_at", self.stated_at)
 
 
+@dataclass(frozen=True, slots=True)
+class LeaseAcquired:
+    """A line took a lease the project declares, from ``acquired_at`` until
+    ``expires``. **Task of 2026-10-31.** A lease is an event, so a restart keeps its
+    holder and both times, and expiry stays its bound. A lease that has expired needs
+    no event to end. The next acquisition of its name replaces it, so the state holds
+    at most one lease for each name ever declared.
+
+    A lease also ends without an event of its own, as applying another event ends
+    it. ``line_session_cleared`` and ``line_rebound`` end every lease of their line,
+    as the daemon ended them in memory before. ``ownership_changed`` from one seat to
+    another passes the previous owner's leases to the new owner, keeping both
+    times, so the role's resource stays guarded across a change of seat and the
+    successor can release it. **Decided on 2026-10-31,** as ``ROLES.md`` records."""
+
+    name: str
+    line_id: str
+    acquired_at: str
+    expires: str
+
+    def __post_init__(self) -> None:
+        check_id("name", self.name)
+        check_id("line_id", self.line_id)
+        check_instant("acquired_at", self.acquired_at)
+        check_instant("expires", self.expires)
+        if parse_due(self.expires) <= parse_due(self.acquired_at):
+            raise InvalidField("a lease expires after it is acquired")
+
+
+class LeaseEnd(StrEnum):
+    """Why ``lease_released`` ended a lease. An operator's reload or restart with a
+    project file that no longer declares the name ends it as ``undeclared``."""
+
+    RELEASED = "released"
+    UNDECLARED = "undeclared"
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseReleased:
+    """A line's lease ended before it expired, or a lease whose name the project no
+    longer declares ended, expired or not. **Task of 2026-10-31.**"""
+
+    name: str
+    line_id: str
+    cause: LeaseEnd
+
+    def __post_init__(self) -> None:
+        check_id("name", self.name)
+        check_id("line_id", self.line_id)
+        check_member("cause", self.cause, LeaseEnd)
+
+
+MAX_RUN_ARGUMENTS: Final = 64
+MAX_RUN_ARGUMENT_BYTES: Final = 1024
+MAX_RUN_NOTE_BYTES: Final = 1024
+
+
+class RunStatus(StrEnum):
+    """How a supervised run ended. ``exited`` and ``stopped`` come from the receipt
+    its supervisor wrote, ``stopped`` when ``stop_run`` asked it to end. ``lost``
+    means that its supervisor is gone without a receipt, or that its process
+    identifier now belongs to another process, so how the command ended is
+    unknown."""
+
+    EXITED = "exited"
+    STOPPED = "stopped"
+    LOST = "lost"
+
+
+def run_scope(line_id: str, role_id: str | None) -> tuple[str, str]:
+    """Whose runs a run counts among. A seat's run is its role's, so a successor
+    seat finds it, and any other line's run is its own."""
+    return ("role", role_id) if role_id is not None else ("line", line_id)
+
+
+@dataclass(frozen=True, slots=True)
+class RunStarted:
+    """The daemon started a project-declared command for a line under a supervisor,
+    with the supervisor's process identifier and the start time the process table
+    gives for it, which together tell the supervisor from a later process that
+    reuses the identifier. **Task of 2026-10-31.** ``previous`` is the latest run of
+    the same scope when this one started, or ``None`` for the first, so a run is
+    started only by a line that has seen its predecessor's record.
+    ``docs/architecture/RUNS.md`` is normative."""
+
+    run_id: str
+    line_id: str
+    role_id: str | None
+    previous: str | None
+    command: str
+    """The name the project file declares the command under."""
+    argv: tuple[str, ...]
+    workdir: str
+    """The absolute working directory the command runs in."""
+    output_file: str
+    """Where its output goes, relative to ``workdir``."""
+    pid: int
+    process_started: str
+    started_at: str
+
+    def __post_init__(self) -> None:
+        check_id("run_id", self.run_id)
+        check_id("line_id", self.line_id)
+        check_optional_id("role_id", self.role_id)
+        check_optional_id("previous", self.previous)
+        check_id("command", self.command)
+        if not 0 < len(self.argv) <= MAX_RUN_ARGUMENTS:
+            raise InvalidField(f"argv must hold 1 to {MAX_RUN_ARGUMENTS} arguments")
+        for argument in self.argv:
+            check_text("an argument", argument, MAX_RUN_ARGUMENT_BYTES)
+        if not self.argv[0]:
+            raise InvalidField("argv names no program")
+        check_text("workdir", self.workdir, MAX_TASK_PATH_BYTES)
+        if not self.workdir.startswith("/"):
+            raise InvalidField(f"workdir is not absolute: {self.workdir!r}")
+        check_text("output_file", self.output_file, MAX_TASK_PATH_BYTES)
+        if type(self.pid) is not int or not 1 < self.pid < 2**31:
+            raise InvalidField("pid must be a whole number above 1")
+        check_instant("process_started", self.process_started)
+        check_instant("started_at", self.started_at)
+
+
+@dataclass(frozen=True, slots=True)
+class RunEnded:
+    """A supervised run ended, with its supervisor's receipt where one was found,
+    the SHA-256 digest and size of its output file where the daemon could read it,
+    and a note on what was found. **Task of 2026-10-31.**"""
+
+    run_id: str
+    status: RunStatus
+    exit_code: int | None
+    output_digest: str | None
+    output_bytes: int | None
+    note: str
+    ended_at: str
+
+    def __post_init__(self) -> None:
+        check_id("run_id", self.run_id)
+        check_member("status", self.status, RunStatus)
+        code = self.exit_code
+        if code is not None and (
+            type(code) is not int or not -MAX_EXIT_CODE <= code < MAX_EXIT_CODE
+        ):
+            raise InvalidField("exit_code must be null or a 32-bit whole number")
+        if self.status is RunStatus.LOST and code is not None:
+            raise InvalidField("a lost run has no exit code")
+        digest = self.output_digest
+        if digest is not None and DIGEST_PATTERN.fullmatch(digest) is None:
+            raise InvalidField("output_digest must be null or a SHA-256 hex digest")
+        size = self.output_bytes
+        if size is not None and (
+            type(size) is not int or not 0 <= size <= MAX_TASK_OUTPUT_BYTES
+        ):
+            raise InvalidField("output_bytes must be null or a whole number")
+        if digest is not None and size is None:
+            raise InvalidField("output_digest is given with output_bytes")
+        check_text("note", self.note, MAX_RUN_NOTE_BYTES)
+        check_instant("ended_at", self.ended_at)
+
+
+class RunClearance(StrEnum):
+    """Why a lost run no longer blocks its scope. ``empty`` means reconciliation
+    found no process in its supervisor's process group or session, and ``operator``
+    that an operator cleared it after inspection."""
+
+    EMPTY = "empty"
+    OPERATOR = "operator"
+
+
+@dataclass(frozen=True, slots=True)
+class RunCleared:
+    """A lost run no longer blocks its scope, with the operator who cleared it where
+    one did. **Task of 2026-10-31.** A lost run's command may still run, so its
+    scope starts no other run until this is recorded."""
+
+    run_id: str
+    cause: RunClearance
+    operator_id: str | None
+    cleared_at: str
+
+    def __post_init__(self) -> None:
+        check_id("run_id", self.run_id)
+        check_member("cause", self.cause, RunClearance)
+        check_optional_id("operator_id", self.operator_id)
+        if (self.operator_id is not None) != (self.cause is RunClearance.OPERATOR):
+            raise InvalidField("operator_id is given exactly when an operator cleared")
+        check_instant("cleared_at", self.cleared_at)
+
+
 type Event = (
     LineCreated
     | LineStateChanged
@@ -1806,6 +2035,11 @@ type Event = (
     | RoleNoted
     | BriefSet
     | BudgetStated
+    | LeaseAcquired
+    | LeaseReleased
+    | RunStarted
+    | RunEnded
+    | RunCleared
     | PeerDeclared
     | PeerRemoved
     | PeerKeyed
@@ -1961,6 +2195,24 @@ class Seat:
     may_own: bool
 
 
+@dataclass(frozen=True, slots=True)
+class Run:
+    """A supervised run, with its end once ``run_ended`` records it, and for a lost
+    run its clearance once ``run_cleared`` records it."""
+
+    started: RunStarted
+    ended: RunEnded | None = None
+    cleared: RunCleared | None = None
+
+    @property
+    def blocks(self) -> bool:
+        """Whether its scope may start no other run. An open run blocks, and so does
+        a lost one until it is cleared, since its command may still run."""
+        if self.ended is None:
+            return True
+        return self.ended.status is RunStatus.LOST and self.cleared is None
+
+
 type RoleTerms = tuple[str, int, tuple[str, ...], FailoverPolicy, int]
 
 
@@ -2108,6 +2360,16 @@ class State:
     role_holders: dict[str, RoleHeld] = field(default_factory=dict[str, RoleHeld])
     """Each role's latest ``role_held``. A role with no entry is held by the file.
     Round 10."""
+    leases: dict[str, LeaseAcquired] = field(default_factory=dict[str, LeaseAcquired])
+    """Each lease by name, with its present holder, which may have expired. Task of
+    2026-10-31."""
+    runs: dict[str, Run] = field(default_factory=dict[str, Run])
+    """Every supervised run, keyed by run, in the order started. Like messages they
+    are kept, so a run identifier is never reused. Task of 2026-10-31."""
+    latest_runs: dict[tuple[str, str], str] = field(
+        default_factory=dict[tuple[str, str], str]
+    )
+    """Each scope's latest run, by ``run_scope``."""
 
     def holder_of(self, role_id: str) -> RoleHolder:
         """What decides ``role_id``'s terms and seats now."""
@@ -2157,6 +2419,9 @@ class State:
             {slot: dict(acts) for slot, acts in self.requests.items()},
             dict(self.retired_roles),
             dict(self.role_holders),
+            dict(self.leases),
+            dict(self.runs),
+            dict(self.latest_runs),
         )
 
     def open_questions(self, operator_id: str) -> list[str]:
@@ -2319,6 +2584,43 @@ class State:
                 self._line(event.line_id)
             case BudgetStated():
                 pass
+            case LeaseAcquired():
+                self._line(event.line_id)
+                held = self.leases.get(event.name)
+                if held is not None and parse_due(held.expires) > parse_due(
+                    event.acquired_at
+                ):
+                    raise EventRejected(
+                        f"lease {event.name} is held by line {held.line_id} until"
+                        f" {held.expires}"
+                    )
+            case LeaseReleased():
+                held = self.leases.get(event.name)
+                if held is None or held.line_id != event.line_id:
+                    raise EventRejected(
+                        f"line {event.line_id} holds no lease {event.name}"
+                    )
+            case RunStarted():
+                self._check_run_started(event)
+            case RunEnded():
+                run = self.runs.get(event.run_id)
+                if run is None:
+                    raise EventRejected(f"no run {event.run_id}")
+                if run.ended is not None:
+                    raise EventRejected(f"run {event.run_id} has ended")
+            case RunCleared():
+                run = self.runs.get(event.run_id)
+                if run is None:
+                    raise EventRejected(f"no run {event.run_id}")
+                if run.ended is None or run.ended.status is not RunStatus.LOST:
+                    raise EventRejected(f"run {event.run_id} is not lost")
+                if run.cleared is not None:
+                    raise EventRejected(f"run {event.run_id} is cleared already")
+                if (
+                    event.operator_id is not None
+                    and event.operator_id not in self.operators
+                ):
+                    raise EventRejected(f"no operator {event.operator_id}")
             case PeerDeclared():
                 peer = self.peers.get(event.peer_id)
                 if (
@@ -2377,6 +2679,7 @@ class State:
                 self.lines[event.line_id] = replace(
                     line, engine_session=None, handoff="cleared"
                 )
+                self._end_leases(event.line_id)
             case LineRebound():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(
@@ -2387,6 +2690,7 @@ class State:
                     rebound=True,
                     handoff="rebound",
                 )
+                self._end_leases(event.line_id)
             case ContextHandedOff():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, handoff=None)
@@ -2608,6 +2912,10 @@ class State:
                     if seat.role_id == event.role_id
                 }
                 self.role_change_ended_turns[event.role_id] = set()
+                if event.previous is not None and event.owner is not None:
+                    for name, lease in list(self.leases.items()):
+                        if lease.line_id == event.previous:
+                            self.leases[name] = replace(lease, line_id=event.owner)
             case RoleNoted():
                 self.role_entries[event.entry_id] = event
             case BriefSet():
@@ -2615,6 +2923,19 @@ class State:
                 self.mail_since_brief.pop(event.line_id, None)
             case BudgetStated():
                 self.budgets[event.provider] = event
+            case LeaseAcquired():
+                self.leases[event.name] = event
+            case LeaseReleased():
+                del self.leases[event.name]
+            case RunStarted():
+                self.runs[event.run_id] = Run(event)
+                self.latest_runs[run_scope(event.line_id, event.role_id)] = event.run_id
+            case RunEnded():
+                run = self.runs[event.run_id]
+                self.runs[event.run_id] = replace(run, ended=event)
+            case RunCleared():
+                run = self.runs[event.run_id]
+                self.runs[event.run_id] = replace(run, cleared=event)
             case PeerDeclared():
                 peer = self.peers.get(event.peer_id)
                 self.peers[event.peer_id] = (
@@ -2632,6 +2953,36 @@ class State:
                 )
             case _:
                 assert_never(event)
+
+    def _end_leases(self, line_id: str) -> None:
+        for name in [n for n, lease in self.leases.items() if lease.line_id == line_id]:
+            del self.leases[name]
+
+    def _check_run_started(self, event: RunStarted) -> None:
+        """A run is started once, for a line, under its role if the line is a seat,
+        by the role's owner, while no run of its scope blocks, and naming the
+        scope's latest run as ``previous``. A lost run blocks until it is cleared."""
+        if event.run_id in self.runs:
+            raise EventRejected(f"run {event.run_id} exists")
+        self._live_line(event.line_id)
+        seat = self.seats.get(event.line_id)
+        role_id = None if seat is None else seat.role_id
+        if event.role_id != role_id:
+            raise EventRejected(
+                f"line {event.line_id}'s run belongs to"
+                f" {'no role' if role_id is None else f'role {role_id}'}"
+            )
+        if role_id is not None and self.roles[role_id].owner != event.line_id:
+            raise EventRejected(f"line {event.line_id} does not own role {role_id}")
+        latest = self.latest_runs.get(run_scope(event.line_id, event.role_id))
+        if latest is not None and self.runs[latest].ended is None:
+            raise EventRejected(f"run {latest} has not ended")
+        if latest is not None and self.runs[latest].blocks:
+            raise EventRejected(f"run {latest} is lost and not cleared")
+        if event.previous != latest:
+            raise EventRejected(
+                f"the latest run is {latest or 'none'}, not {event.previous or 'none'}"
+            )
 
     # Lookups that turn a missing identifier into a rejection.
 
@@ -2756,8 +3107,46 @@ class State:
             if not isinstance(event.recipient, OperatorAddress):
                 raise EventRejected("a question is addressed to an operator")
             self._live_line(event.sender.line_id)
+        if event.kind is MessageKind.ISSUE:
+            if not isinstance(event.sender, LineAddress):
+                raise EventRejected("only a line raises an issue")
+            if not isinstance(event.recipient, OperatorAddress):
+                raise EventRejected("an issue is raised with an operator")
+            if event.reply_to is not None or event.choices:
+                raise EventRejected("an issue opens a thread, and has no choices")
+            self._check_issue_limits(event.sender.line_id)
         if event.reply_to is not None:
             self._check_reply(event, event.reply_to)
+
+    def _check_issue_limits(self, line_id: str) -> None:
+        """Bound a line's open issues and issue rate using replayed message order."""
+        sender = LineAddress(line_id)
+        replies = {
+            (message.sender, message.reply_to)
+            for message in self.messages.values()
+            if message.reply_to is not None
+        }
+        open_issues = sum(
+            message.kind is MessageKind.ISSUE
+            and message.sender == sender
+            and not message.acknowledged
+            and (message.recipient, message_id) not in replies
+            for message_id, message in self.messages.items()
+        )
+        if open_issues >= MAX_OPEN_ISSUES_PER_LINE:
+            raise EventRejected(
+                f"at most {MAX_OPEN_ISSUES_PER_LINE} issues may remain open;"
+                " wait for an operator reply or acknowledgment"
+            )
+        recent = [
+            message for message in self.messages.values() if message.sender == sender
+        ][-(ISSUE_RATE_WINDOW_MESSAGES - 1) :]
+        issue_count = sum(message.kind is MessageKind.ISSUE for message in recent)
+        if issue_count >= MAX_ISSUES_PER_LINE_IN_WINDOW:
+            raise EventRejected(
+                f"at most {MAX_ISSUES_PER_LINE_IN_WINDOW} issues are allowed in"
+                f" {ISSUE_RATE_WINDOW_MESSAGES} sent messages; wait for a reply"
+            )
 
     def _check_harness_note(self, event: MessageSent) -> None:
         """The harness sends notes on its own account to a line or an operator of

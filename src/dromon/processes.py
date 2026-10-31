@@ -15,7 +15,9 @@ controls to the agent's own session in the same way.
 
 Execution. Daemon calls run on one worker thread with a bounded queue. Process-table
 inspection can be slow under load, so it must not block the daemon's event loop or
-allow an unbounded backlog of requests.
+allow an unbounded backlog of requests. Stopping the daemon closes the queue, rejects
+new calls and joins each worker for at most one second. A process-table call already in
+progress cannot be interrupted; when it returns, its daemon thread exits.
 
 Failure modes. A process whose environment cannot be read is not the line's, so every
 check fails closed. A process that ends between the check and the signal is reported
@@ -71,6 +73,8 @@ PS_TIMEOUT_SECONDS: Final = 10.0
 
 MAX_PENDING_PROCESS_CALLS: Final = 8
 """At most eight process inspections wait behind the one running worker call."""
+PROCESS_WORKER_JOIN_SECONDS: Final = 1.0
+"""Bound on waiting for a process worker to finish when its daemon stops."""
 
 _Result = TypeVar("_Result")
 _MISSING: Final = object()
@@ -140,11 +144,12 @@ class ProcessWorker:
     """
 
     def __init__(self) -> None:
-        self._queue: queue.Queue[_ProcessCall[Any]] = queue.Queue(
+        self._queue: queue.Queue[_ProcessCall[Any] | None] = queue.Queue(
             maxsize=MAX_PENDING_PROCESS_CALLS
         )
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._closed = False
 
     async def run(self, function: Callable[[], _Result]) -> _Result:
         """Run ``function`` with its arguments, or refuse if the queue is full."""
@@ -152,6 +157,8 @@ class ProcessWorker:
         future: asyncio.Future[_Result] = loop.create_future()
         call = _ProcessCall(function, loop, future, threading.Event())
         with self._lock:
+            if self._closed:
+                raise ProcessRefused("the process worker is stopped")
             if self._thread is None:
                 self._thread = threading.Thread(
                     target=self._work, name="dromon-processes", daemon=True
@@ -167,9 +174,47 @@ class ProcessWorker:
             call.cancelled.set()
             raise
 
+    def close(self, timeout: float = PROCESS_WORKER_JOIN_SECONDS) -> bool:
+        """Reject new calls, cancel queued calls and join the worker for a bounded time.
+
+        A call already running cannot be interrupted. ``False`` means it did not
+        finish within ``timeout``; its daemon thread will exit after that call returns.
+        The daemon's normal stop path joins each worker, but cannot guarantee this
+        within the bound when an in-flight call is still running.
+        """
+        if timeout < 0:
+            raise ValueError("worker join timeout must not be negative")
+        with self._lock:
+            thread = self._thread
+            if not self._closed:
+                self._closed = True
+                if thread is not None:
+                    while True:
+                        try:
+                            call = self._queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        self._queue.task_done()
+                        if call is not None:
+                            call.cancelled.set()
+                            self._deliver(
+                                call,
+                                error=ProcessRefused("the process worker is stopped"),
+                            )
+                    self._queue.put_nowait(None)
+        if thread is None:
+            return True
+        if thread is threading.current_thread():
+            return False
+        thread.join(timeout)
+        return not thread.is_alive()
+
     def _work(self) -> None:
         while True:
             call = self._queue.get()
+            if call is None:
+                self._queue.task_done()
+                return
             try:
                 if call.cancelled.is_set():
                     continue

@@ -23,6 +23,7 @@ from dromon.model import (
     HarnessAddress,
     LineAddress,
     Message,
+    MessageKind,
     RemoteAddress,
     State,
 )
@@ -138,6 +139,14 @@ def is_answered(message_id: str, message: Message, replied: set[str]) -> bool:
     return message_id in replied or message.acknowledged
 
 
+def is_open_issue(message_id: str, message: Message, replied: set[str]) -> bool:
+    """Whether ``message`` is an issue its recipient has not yet closed by a reply
+    or an acknowledgement."""
+    return message.kind is MessageKind.ISSUE and not is_answered(
+        message_id, message, replied
+    )
+
+
 def summary(state: State, owner: Address, new: int) -> MailSummary:
     """The counts for ``owner``'s mailbox after ``new`` messages arrived, the one
     rule every view uses, the wake prompt, ``line_status``, ``list_mail`` and the
@@ -250,10 +259,15 @@ def listing(
     unread_only: bool = False,
     own_notes_only: bool = False,
     sender: Address | None = None,
+    issues_only: bool = False,
     offset: int = 0,
     limit: int = MAX_PAGE,
 ) -> tuple[list[tuple[str, Message]], int]:
     """A page of ``owner``'s mailbox, oldest first, and the number of matches in all.
+
+    ``issues_only`` selects the open issues, those of kind ``issue`` that the owner
+    has neither replied to nor acknowledged, which is how an operator lists the
+    issues lines raised and sees one close.
 
     **Review r6, finding 1.** ``unread_only`` selects exactly what ``summary`` counts
     in ``unread``, and ``own_notes_only`` exactly what it counts in ``own_notes``, so
@@ -265,7 +279,7 @@ def listing(
         raise ValueError(
             "unread_only and own_notes_only select different messages, so give one"
         )
-    replied = replied_ids(state, owner) if own_notes_only else set[str]()
+    replied = replied_ids(state, owner) if own_notes_only or issues_only else set[str]()
     matches = [
         (message_id, message)
         for message_id, message in mailbox(state, owner)
@@ -275,6 +289,7 @@ def listing(
             or counts_own_note(state, message_id, message, owner, replied)
         )
         and (sender is None or message.sender == sender)
+        and (not issues_only or is_open_issue(message_id, message, replied))
     ]
     return matches[offset : offset + limit], len(matches)
 

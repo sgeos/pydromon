@@ -1063,6 +1063,43 @@ def write_reader(home: Path, table: str) -> None:
     )
 
 
+def test_grok_profile_must_hold_configured_paths_read_only(
+    project: tuple[Path, Path, Path],
+) -> None:
+    workspace, home, state = project
+    readonly = workspace / "docs" / "process"
+    readonly.mkdir(parents=True)
+    daemon_home = operator_home(home)
+    write_reader(home, 'extends = "read-only"\ndeny = [".dromon"]')
+    config = LineConfig(builtin_tools=("Bash",))
+    with pytest.raises(EngineRefused, match="required paths read-only"):
+        check_profile(
+            config,
+            workspace,
+            (state,),
+            home,
+            home / HOME_DIR,
+            daemon_home,
+            (readonly,),
+        )
+    write_reader(
+        home,
+        f'extends = "read-only"\ndeny = [".dromon"]\nread_only = ["{readonly}"]',
+    )
+    assert (
+        check_profile(
+            config,
+            workspace,
+            (state,),
+            home,
+            home / HOME_DIR,
+            daemon_home,
+            (readonly,),
+        )
+        == READER_PROFILE
+    )
+
+
 @pytest.mark.parametrize(
     ("table", "reason"),
     [

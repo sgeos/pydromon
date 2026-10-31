@@ -55,8 +55,13 @@ take turns at a shared resource. ``acquire_lease`` succeeds only while no line h
 the name, and otherwise reports the holder and when its lease ends, so one acquisition
 lasts at most one time to live, by the wall clock. ``release_lease`` gives it up. A
 lease ends when released, when its time to live passes, or when its holder's session is
-cleared or the holder is rebound. Leases live only in the daemon's memory, so a restart
-drops every one, which suits a resource a crashed daemon no longer uses.
+cleared or the holder is rebound, and passes to the new owner when its holder's role
+changes owner. Leases are events, so a restart keeps each one until it expires. Task
+of 2026-10-31.
+
+Runs. A project may declare commands that a line starts as supervised runs, which
+outlive the turn, the seat and the daemon, as ``dromon.runs`` and
+``docs/architecture/RUNS.md`` say. Their reconciliation runs on the process worker.
 
 Rebinding. An operator may move a line to another model and strategy, keeping its
 identity, mailbox, configuration and overrides. ``line_rebound`` records it, the model
@@ -143,6 +148,8 @@ from dromon.security_paths import project_secret_paths
 from dromon.handoff import Handoff
 from dromon.handoff import select as select_handoff
 from dromon import requestkeys
+from dromon import runs
+from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 from dromon.requestkeys import (
     REQUEST_KEY,
     REQUEST_KEY_PROPERTY,
@@ -207,6 +214,7 @@ from dromon.workdir import (
     git_common_directory,
     git_write_guards,
     read_head_commit,
+    resolve_read_only_paths,
     resolve_workdir,
 )
 from dromon.roles import (
@@ -225,6 +233,7 @@ from dromon.roles import (
     RolePlace,
     RoleWanted,
     file_differences,
+    overlapping,
     placement_refusal,
     shared_worktree,
     shared_worktree_refusal,
@@ -286,6 +295,16 @@ from dromon.model import (
     LineHibernated,
     LineOverridden,
     LineReleased,
+    LeaseAcquired,
+    LeaseEnd,
+    LeaseReleased,
+    Run,
+    RunCleared,
+    RunClearance,
+    RunEnded,
+    RunStarted,
+    RunStatus,
+    run_scope,
     LineAwakened,
     LineSession,
     LineSessionCleared,
@@ -379,6 +398,17 @@ SEND_TOOL_SCHEMA: Final[dict[str, object]] = {
                 " limited, and a refused one is not sent"
             ),
         },
+        "issue": {
+            "type": "boolean",
+            "description": (
+                "Optional, default false. Raise an issue with an operator, unasked,"
+                " about Dromon itself or about working under it, such as a tool that"
+                " misleads, a refusal that blocks work, or a confusing notice. It asks"
+                " no answer, and stays open in the operator's mailbox until the"
+                " operator replies to it or acknowledges it. Only to an operator, and"
+                " never as a reply"
+            ),
+        },
         REQUEST_KEY: REQUEST_KEY_PROPERTY,
     },
     "required": ["to", "body"],
@@ -390,7 +420,13 @@ CORRELATION_ARGUMENT: Final = "correlation"
 AGENT_SEND_TOOL_SCHEMA: Final[dict[str, object]] = {
     **SEND_TOOL_SCHEMA,
     "properties": {
-        **cast(dict[str, object], SEND_TOOL_SCHEMA["properties"]),
+        **{
+            name: value
+            for name, value in cast(
+                dict[str, object], SEND_TOOL_SCHEMA["properties"]
+            ).items()
+            if name != "issue"
+        },
         CORRELATION_ARGUMENT: {
             "type": "string",
             "description": (
@@ -402,7 +438,8 @@ AGENT_SEND_TOOL_SCHEMA: Final[dict[str, object]] = {
     },
 }
 """The ``send_message`` schema an external agent is given, which may carry a
-correlation key. **Queue of 2026-10-28, item A4.** A line's schema has no key."""
+correlation key. **Queue of 2026-10-28, item A4.** A line's schema has no key. An
+agent raises no issue, since an issue is a line's report on its own harness."""
 
 ASK_TOOL_NAME: Final = "ask_operator"
 
@@ -449,10 +486,36 @@ class LeaseRefused(ValueError):
     """A lease cannot be acquired or released as asked."""
 
 
-@dataclass(frozen=True, slots=True)
-class Lease:
-    holder: str
-    expires: datetime
+START_RUN_TOOL_NAME: Final = "start_run"
+RUN_STATUS_TOOL_NAME: Final = "run_status"
+STOP_RUN_TOOL_NAME: Final = "stop_run"
+RUN_ID_VARIABLE: Final = "DROMON_RUN_ID"
+"""The run's identifier, in its command's environment."""
+MAX_RUNS_SHOWN: Final = 10
+
+START_RUN_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "command": {"type": "string", "description": "A command the project declares"},
+        "previous": {
+            "type": "string",
+            "description": "The latest run run_status names, or none if it names none",
+        },
+    },
+    "required": ["command", "previous"],
+    "additionalProperties": False,
+}
+RUN_STATUS_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
+STOP_RUN_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {"run_id": {"type": "string", "description": "The open run"}},
+    "required": ["run_id"],
+    "additionalProperties": False,
+}
 
 
 WAKE_TOOL_NAME: Final = "wake_after"
@@ -495,6 +558,12 @@ MIN_RATE_SECONDS: Final = 60
 
 MAX_SCRATCH_BYTES: Final = 256 * 1024
 SCRATCH_DIRECTORY: Final = "tmp"
+LINES_SCRATCH_DIRECTORY: Final = "lines"
+"""**Round 10 re-review, N1 and N2.** The directory under ``tmp/`` that holds a scratch
+of its own, ``tmp/lines/LINE``, for each line that does not write its working
+directory, so such a line never writes a file of the line that does, such as a role's
+owner, whose scratch is ``tmp/`` itself. A line's identifier matches ``ID_PATTERN``, so
+it is one path component."""
 
 MAX_DIGEST_BYTES: Final = 16 * 1024 * 1024
 """The largest task output ``task_recorded`` digests. A larger one is recorded with no
@@ -819,7 +888,7 @@ WRITE_SCRATCH_SCHEMA: Final[dict[str, object]] = {
     "properties": {
         "path": {
             "type": "string",
-            "description": "A path relative to tmp/ in your working directory",
+            "description": "A path relative to your scratch directory",
         },
         "text": {"type": "string", "description": "The file's whole new content"},
     },
@@ -1232,25 +1301,24 @@ type EngineFactory = Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], LineEngine]
 
 
 def _claude_read_access_refusal(
-    config: LineConfig, settings: SettingsConfig | None
+    config: LineConfig,
+    settings: SettingsConfig | None,
+    target: str = "read-only working directory",
 ) -> str | None:
     """Reject Claude settings and tools that could write outside the sandbox."""
     if config.mcp_servers or config.inherit_account_mcp:
-        return (
-            "Claude Code cannot confine configured MCP servers to a read-only"
-            " working directory"
-        )
+        return f"Claude Code cannot confine configured MCP servers to {target}"
     if config.tool_policy.value == "allow_all" or any(
         pattern.startswith("mcp__") for pattern in config.allowed_tools
     ):
         return (
-            "Claude Code read-only workdirs do not allow an allow-all policy or"
+            f"Claude Code cannot enforce {target} with an allow-all policy or"
             " additional MCP tools"
         )
     if config.project_settings or config.plugins:
-        return "Claude Code read-only workdirs do not allow project settings or plugins"
+        return f"Claude Code cannot enforce {target} with project settings or plugins"
     if settings is not None and settings.document().get("hooks"):
-        return "Claude Code read-only workdirs do not allow command hooks"
+        return f"Claude Code cannot enforce {target} with command hooks"
     return None
 
 
@@ -1293,6 +1361,17 @@ def _claude_read_sandbox_refusal(layers: Sequence[SandboxConfig | None]) -> str 
     return None
 
 
+def _read_only_path_rules(paths: Sequence[Path]) -> list[str]:
+    """Deny Claude Code's file-writing tools on each path and its descendants."""
+    rules = {
+        f"{tool}(/" + str(path) + suffix + ")"
+        for path in paths
+        for tool in ("Write", "Edit", "NotebookEdit")
+        for suffix in ("", "/**")
+    }
+    return sorted(rules)
+
+
 def engine_factory(
     root: str,
     *,
@@ -1305,6 +1384,7 @@ def engine_factory(
     accept_unverified_credential: bool = False,
     line_secrets: Mapping[str, Sequence[str]] | None = None,
     line_git_ssh: Mapping[str, GitSshAccess] | None = None,
+    read_only_paths: Sequence[str] = (),
 ) -> EngineFactory:
     """The production factory: each line on its packaged driver's engine.
 
@@ -1344,6 +1424,15 @@ def engine_factory(
         # priority mail steers the driver rather than each engine.
         driver: Driver = priority.steered(spec.model, spec.strategy, spec.redirect)
         workdir = resolve_workdir(spec.config.workdir, Path(root), protected)
+        read_only = resolve_read_only_paths(read_only_paths, workdir)
+        if read_only and driver.settings.engine not in {
+            ENGINE_NAME_CLAUDE,
+            codex.ENGINE_NAME,
+            grok.ENGINE_NAME,
+        }:
+            raise EngineRefused(
+                f"read_only_paths cannot be enforced by {driver.settings.engine}"
+            )
         engine_protected = (
             *protected,
             *project_secret_paths(Path(root), workdir),
@@ -1355,6 +1444,15 @@ def engine_factory(
                     "Codex lines take no sandbox or settings, and the project file"
                     " sets one for every line"
                 )
+            # Review of ebedeed, G3. A line whose Codex workspace is read has its
+            # own, with read access as before, or with write access, no writing tool
+            # and a shell, the one tool that could write it. A line with neither
+            # touches nothing of its workdir at its build.
+            needs_scratch = not can_write_workdir(spec.config, codex.ENGINE_NAME) and (
+                spec.config.workdir_access is WorkdirAccess.READ
+                or "Bash" in spec.config.builtin_tools
+            )
+            scratch = own_scratch(workdir, spec.line_id) if needs_scratch else None
             return CodexLine(
                 driver,
                 workdir,
@@ -1363,6 +1461,7 @@ def engine_factory(
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
                 protected=engine_protected,
+                write_protected=read_only,
                 observe=spec.observe,
                 mark=spec.mark,
                 task_ended=spec.task_ended,
@@ -1371,6 +1470,7 @@ def engine_factory(
                 ceiling_reached=spec.ceiling_reached,
                 ceiling_settled=spec.ceiling_settled,
                 credits_spent=spec.credits_spent,
+                scratch=scratch,
             )
         if driver.settings.engine == grok.ENGINE_NAME:
             if spec.config.writable_paths:
@@ -1389,6 +1489,7 @@ def engine_factory(
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
                 protected=engine_protected,
+                read_only_paths=read_only,
                 bridge=bridge,
                 line_token=token,
                 observe=spec.observe,
@@ -1490,10 +1591,33 @@ def engine_factory(
                 }
             )
             settings = engine_settings.merge([settings, restrictions])
+        if read_only:
+            refusal = _claude_read_access_refusal(
+                spec.config, settings, "read_only_paths"
+            )
+            if refusal is not None:
+                raise EngineRefused(refusal)
+            if SHELL_TOOLS & set(spec.config.builtin_tools):
+                refusal = _claude_read_sandbox_refusal(
+                    [project_sandbox, spec.config.sandbox]
+                )
+                if refusal is not None:
+                    raise EngineRefused(refusal)
+                path_sandbox = parse_sandbox(
+                    {
+                        "enabled": True,
+                        "failIfUnavailable": True,
+                        "allowUnsandboxedCommands": False,
+                        "filesystem": {"denyWrite": [str(path) for path in read_only]},
+                    },
+                    operator=True,
+                )
+                merged = merge([merged, path_sandbox])
         enabled = merged is not None and merged.enabled
         if enabled and git_ssh is not None:
             merged = merge([merged, sandbox_layer(git_ssh)])
         guarded = git_write_guards(workdir) if enabled else ()
+        guarded = (*guarded, *read_only)
         # A line that loads project settings or plugins must not write what it loads.
         claude_dir = (workdir / ".claude",) if spec.config.project_settings else ()
         plugin_dirs = tuple(resolve_plugin(path) for path in spec.config.plugins)
@@ -1507,6 +1631,15 @@ def engine_factory(
                     f"the line's sandbox denies reading {denied}, which ssh needs for"
                     " the project's [git_ssh] table"
                 )
+        if read_only:
+            settings = engine_settings.merge(
+                [
+                    settings,
+                    engine_settings.parse_settings(
+                        {"permissions": {"deny": _read_only_path_rules(read_only)}}
+                    ),
+                ]
+            )
         return ClaudeCodeLine(
             driver,
             workdir,
@@ -1562,6 +1695,11 @@ def _check_engine_supports(driver: Driver, config: LineConfig) -> None:
 
 def _no_notice(peer_id: str, message_id: str) -> None:
     """The outbox notice before the daemon sets one, which has nothing to wake."""
+
+
+def _no_operator_mail() -> None:
+    """The operator mail notice before the daemon sets one, which has nothing to
+    wake."""
 
 
 def new_id(prefix: str) -> str:
@@ -1639,6 +1777,7 @@ class Scheduler:
         wall_clock: Callable[[], datetime] = utc_clock,
         root: Path | None = None,
         protected: Sequence[Path] = (),
+        read_only_paths: Sequence[str] = (),
         daemon_commit: str | None = None,
         daemon_checkout: Path | None = None,
         processes: ProcessTable | None = None,
@@ -1650,6 +1789,8 @@ class Scheduler:
             launcher.read_rows
         ),
         confining_engines: frozenset[str] = CONFINING_ENGINES,
+        run_start_of: Callable[[int], str | None] = runs.process_start,
+        run_occupied: Callable[[int], bool] = runs.session_occupied,
     ) -> None:
         if not 1 <= wake_every_ticks <= MAX_WAKE_EVERY_TICKS:
             raise ValueError(f"wake_every_ticks must be in [1, {MAX_WAKE_EVERY_TICKS}]")
@@ -1662,6 +1803,9 @@ class Scheduler:
         """The project root, against which a line's working directory resolves, or
         ``None`` where the scheduler runs without a project, as in some tests."""
         self._protected = tuple(protected)
+        self._read_only_paths = tuple(read_only_paths)
+        """Project paths kept read only by each supported engine and the scratch
+        tool."""
         self._daemon_commit = daemon_commit
         """The commit the daemon's own checkout had at start, if it runs from one."""
         self._loaded_at = format_due(wall_clock())
@@ -1779,8 +1923,25 @@ class Scheduler:
         self._sweep_worker = ProcessWorker()
         """Separate queue so a sweep waiting on signalled children cannot occupy
         the worker that serves process inspections and stops."""
+        self._workers_stopped = False
+        self._workers_joined = True
         self._process_tasks: set[asyncio.Task[None]] = set()
         """Background process scans started during recovery, kept until they finish."""
+        self._run_commands: dict[str, tuple[str, ...]] = {}
+        """The commands the project declares for runs, by name."""
+        self._run_children: dict[str, subprocess.Popen[bytes]] = {}
+        """The supervisors this daemon started, by run, so each is reaped. A
+        restarted daemon has none, since an orphaned supervisor is reaped by the
+        system."""
+        self._run_check: asyncio.Task[None] | None = None
+        self._run_start_of = run_start_of
+        """When a process started, by the process table, which tells a run's
+        supervisor from a later process that reuses its identifier."""
+        self._run_occupied = run_occupied
+        """Whether a process is left in a supervisor's group or session, which
+        keeps a lost run's scope blocked."""
+        self._run_failure: str | None = None
+        """The last reconciliation failure said on standard error, said once."""
         self._line_tokens = line_tokens
         """The tokens lines' engines reach Dromon's tools with, which each turn
         renews and revokes, or ``None`` where no engine uses them."""
@@ -1826,8 +1987,6 @@ class Scheduler:
         """The project's disclosure terms, case folded. Never logged or returned."""
         self._lease_names: frozenset[str] = frozenset()
         self._lease_ttl = DEFAULT_LEASE_TTL_SECONDS
-        self._leases: dict[str, Lease] = {}
-        """Held leases by name. In memory only, so a restart drops them."""
         self._git_ssh: dict[str, GitSshAccess] = {}
         """The ``[git_ssh]`` access of each line given it, checked before its turns."""
         self.limits = limits
@@ -1852,10 +2011,10 @@ class Scheduler:
         """What each role's operator was last told of a failover that found no seat,
         so the same is not told at every turn's end. Lost at a restart, after which
         it is told once again."""
-        self._turn_owned: set[str] = set()
-        """Lines whose turn in flight started while they owned their role, so their
-        engine was built as the role's writer. No other seat's turn as owner starts
-        while one runs, so a role never has two writers."""
+        self._writer_turns: set[str] = set()
+        """Seats whose turn in flight started as a writer of their role's worktree,
+        as ``_turn_writes`` judges it. No other seat's turn as owner starts while one
+        runs, so a role never has two writers."""
         self._closing_writer: dict[str, asyncio.Task[None]] = {}
         """The closing of a former owner's kept engine connection, which the new
         owner's first turn waits for, since a kept connection's background tasks
@@ -1919,6 +2078,10 @@ class Scheduler:
         """Told each peer and message that joins its outbox, so its forwarder wakes.
         The daemon sets it to its forwarder's."""
         self.peer_reports: Callable[[], list[PeerReport]] = list
+        self.on_operator_mail: Callable[[], None] = _no_operator_mail
+        """Told each time mail to an operator is recorded, so the operators' relay
+        wakes. The daemon sets it to its relayer's. A path that records such mail
+        and does not call it is caught by the relayer's own periodic pass."""
         self.fault: str | None = None
         """The scheduler's last unexpected exception, until a tick completes."""
         self.faults = 0
@@ -2094,7 +2257,6 @@ class Scheduler:
         if not creating and line is not None and previous != config.workdir:
             self._log.append(LineSessionCleared(line_id))
             self._forget_context(line_id)
-            self._end_leases(line_id)
         elif not creating and line is not None and not fresh_before:
             self._clear_for_fresh_sessions(line_id)
         self._drop_engine(line_id)
@@ -2190,8 +2352,11 @@ class Scheduler:
         priority: bool = False,
         correlation: str | None = None,
         request: RequestStamp | None = None,
+        issue: bool = False,
     ) -> str:
-        """Record a note from ``sender``. It is delivered in a later tick.
+        """Record a note from ``sender``, or with ``issue`` an issue, which only a
+        line raises with an operator. It is delivered in a later tick, and mail to an
+        operator is offered to the operator's relay at once.
 
         ``request`` is the stamp of the keyed ``send_message`` call that sends it,
         recorded in the note's own ``message_sent``.
@@ -2214,6 +2379,10 @@ class Scheduler:
                 raise EventRejected("only an external agent's note carries a key")
             if not isinstance(recipient, LineAddress):
                 raise EventRejected("a correlation key is carried only to a line")
+        if issue and not (
+            isinstance(sender, LineAddress) and isinstance(recipient, OperatorAddress)
+        ):
+            raise EventRejected("only a line raises an issue, and with an operator")
         if isinstance(recipient, RemoteAddress):
             check_outbound(
                 self._log.state,
@@ -2272,12 +2441,14 @@ class Scheduler:
                 message_id,
                 sender,
                 recipient,
-                MessageKind.NOTE,
+                MessageKind.ISSUE if issue else MessageKind.NOTE,
                 body,
                 reply_to=reply_to,
                 request=request,
             )
         )
+        if isinstance(recipient, OperatorAddress):
+            self.on_operator_mail()
         if correlation is not None:
             self._log.append(MessageCorrelated(message_id, correlation))
         if priority and isinstance(recipient, LineAddress):
@@ -2314,6 +2485,8 @@ class Scheduler:
         self._log.append(
             MessageSent(message_id, HARNESS, recipient, MessageKind.NOTE, body)
         )
+        if isinstance(recipient, OperatorAddress):
+            self.on_operator_mail()
         if isinstance(recipient, LineAddress):
             self._remember(message_id, HARNESS, recipient, body, sent_at)
             self._failed.discard(recipient.line_id)
@@ -2365,6 +2538,8 @@ class Scheduler:
             self._priority.record(key, recipient.line_id)
             if recipient.line_id in self._running:
                 self._redirect_for.setdefault(recipient.line_id, message_id)
+        if isinstance(recipient, OperatorAddress):
+            self.on_operator_mail()
         self._sent.append(message_id)
         self._work.set()
         return Received(message_id, honoured)
@@ -2689,9 +2864,12 @@ class Scheduler:
             body: object = args.get("body")
             reply_to: object = args.get("reply_to")
             urgent: object = args.get("priority", False)
+            issue: object = args.get("issue", False)
             correlation: object = args.get(CORRELATION_ARGUMENT)
             if not isinstance(to, str) or not isinstance(body, str):
                 return _tool_error("to and body must be text")
+            if not isinstance(issue, bool):
+                return _tool_error("issue must be true or false")
             if correlation is not None and not isinstance(correlation, str):
                 return _tool_error("correlation must be text")
             if reply_to is not None and not isinstance(reply_to, str):
@@ -2718,6 +2896,7 @@ class Scheduler:
                     priority=urgent,
                     correlation=correlation,
                     request=stamp,
+                    issue=issue,
                 )
             except (InvalidField, EventRejected) as error:
                 return _tool_error(str(error))
@@ -2742,6 +2921,8 @@ class Scheduler:
         crash between the two appends a repeat says the note went without priority,
         which is then what the log holds."""
         message = self._log.state.messages.get(message_id)
+        if message is not None and message.kind is MessageKind.ISSUE:
+            return _tool_text(f"raised as issue {message_id}")
         if message is not None and message.priority:
             return _tool_text(f"sent as {message_id}, with priority")
         return _tool_text(f"sent as {message_id}")
@@ -2772,6 +2953,7 @@ class Scheduler:
                 request=request,
             )
         )
+        self.on_operator_mail()
         return message_id
 
     @property
@@ -3151,14 +3333,17 @@ class Scheduler:
             )
         self._lease_names = frozenset(names)
         self._lease_ttl = ttl_seconds
-        for name in [n for n in self._leases if n not in self._lease_names]:
-            del self._leases[name]
+        leases = self._log.state.leases
+        for name in sorted(n for n in leases if n not in self._lease_names):
+            self._log.append(
+                LeaseReleased(name, leases[name].line_id, LeaseEnd.UNDECLARED)
+            )
 
-    def _live_lease(self, name: str) -> Lease | None:
-        """The lease held under ``name``, ending it first if its time has passed."""
-        lease = self._leases.get(name)
-        if lease is not None and lease.expires <= self._wall_clock():
-            del self._leases[name]
+    def _live_lease(self, name: str) -> LeaseAcquired | None:
+        """The lease held under ``name``, or ``None`` once its time has passed. An
+        expired lease needs no event, since the next acquisition replaces it."""
+        lease = self._log.state.leases.get(name)
+        if lease is not None and parse_due(lease.expires) <= self._wall_clock():
             return None
         return lease
 
@@ -3174,43 +3359,38 @@ class Scheduler:
                 f"the project declares no lease {name!r}. Declared leases: {declared}"
             )
         held = self._live_lease(name)
-        if held is not None and held.holder == line_id:
+        if held is not None and held.line_id == line_id:
             raise LeaseRefused(
-                f"you hold lease {name} already, until {format_due(held.expires)}."
+                f"you hold lease {name} already, until {held.expires}."
                 " A lease is not renewed. Acquire it again once it has expired"
             )
         if held is not None:
             raise LeaseRefused(
-                f"lease {name} is held by line {held.holder} until"
-                f" {format_due(held.expires)}"
+                f"lease {name} is held by line {held.line_id} until {held.expires}"
             )
         now = self._wall_clock().astimezone(UTC)
         start = now.replace(microsecond=0)
         if start < now:
             start += timedelta(seconds=1)
-        expires = start + timedelta(seconds=self._lease_ttl)
-        self._leases[name] = Lease(line_id, expires)
-        return format_due(expires)
+        expires = format_due(start + timedelta(seconds=self._lease_ttl))
+        self._log.append(LeaseAcquired(name, line_id, format_due(start), expires))
+        return expires
 
     def release_lease(self, line_id: str, name: str) -> None:
         """End ``line_id``'s lease ``name``. Raises ``LeaseRefused`` unless it holds
         it."""
         held = self._live_lease(name)
-        if held is None or held.holder != line_id:
+        if held is None or held.line_id != line_id:
             raise LeaseRefused(f"line {line_id} holds no lease {name!r}")
-        del self._leases[name]
-
-    def _end_leases(self, line_id: str) -> None:
-        for name in [n for n, lease in self._leases.items() if lease.holder == line_id]:
-            del self._leases[name]
+        self._log.append(LeaseReleased(name, line_id, LeaseEnd.RELEASED))
 
     def leases_of(self, line_id: str) -> list[dict[str, object]]:
         """The leases ``line_id`` holds, by name, with when each expires."""
         held: list[dict[str, object]] = []
-        for name in sorted(self._leases):
+        for name in sorted(self._log.state.leases):
             lease = self._live_lease(name)
-            if lease is not None and lease.holder == line_id:
-                held.append({"name": name, "expires": format_due(lease.expires)})
+            if lease is not None and lease.line_id == line_id:
+                held.append({"name": name, "expires": lease.expires})
         return held
 
     def _lease_tool(self, line_id: str, acquire: bool) -> SdkMcpTool[Any]:
@@ -3259,6 +3439,352 @@ class Scheduler:
     def release_lease_tool(self, line_id: str) -> SdkMcpTool[Any]:
         """The ``release_lease`` tool for ``line_id``."""
         return self._lease_tool(line_id, acquire=False)
+
+    # Supervised runs. Task of 2026-10-31, as ``docs/architecture/RUNS.md`` says.
+
+    def set_runs(self, commands: Mapping[str, Sequence[str]]) -> None:
+        """Declare the commands lines may start as runs, as the project file does at
+        start and reload. A run already started is unaffected."""
+        self._run_commands = {name: tuple(argv) for name, argv in commands.items()}
+
+    def _run_role(self, line_id: str) -> str | None:
+        seat = self._log.state.seats.get(line_id)
+        return None if seat is None else seat.role_id
+
+    def _scope_runs(self, line_id: str) -> list[Run]:
+        """The runs of ``line_id``'s scope, oldest first."""
+        scope = run_scope(line_id, self._run_role(line_id))
+        return [
+            run
+            for run in self._log.state.runs.values()
+            if run_scope(run.started.line_id, run.started.role_id) == scope
+        ]
+
+    def _latest_run(self, line_id: str) -> Run | None:
+        latest = self._log.state.latest_runs.get(
+            run_scope(line_id, self._run_role(line_id))
+        )
+        return None if latest is None else self._log.state.runs[latest]
+
+    def _run_refusal(self, line_id: str) -> str | None:
+        """Why ``line_id`` may not start or stop its scope's runs. A seat must own
+        its role, and every line, a seat included, must have write access to its
+        working directory, since a run may write there outside the line's sandbox.
+        So a read-only seat that owns its role cannot write its worktree by a run."""
+        role_id = self._run_role(line_id)
+        if role_id is not None:
+            owner = self._log.state.roles[role_id].owner
+            if owner != line_id:
+                return (
+                    f"only role {role_id}'s owner starts or stops its runs, and its"
+                    f" owner is {owner or 'nobody'}"
+                )
+        if self.effective_config(line_id).workdir_access is not WorkdirAccess.WRITE:
+            return "a run may write your working directory, which you may only read"
+        return None
+
+    async def start_run(self, line_id: str, command: str, previous: str) -> RunStarted:
+        """Start the declared ``command`` for ``line_id`` as a supervised run.
+        ``previous`` must name its scope's latest run, or be ``none`` when it has
+        none, so that a successor seat has read its predecessor's record first.
+        Raises ``runs.RunRefused``."""
+        argv = self._run_commands.get(command)
+        if argv is None:
+            declared = ", ".join(sorted(self._run_commands)) or "none"
+            raise runs.RunRefused(
+                f"the project declares no run command {command!r}. Declared: {declared}"
+            )
+        refusal = self._run_refusal(line_id)
+        if refusal is not None:
+            raise runs.RunRefused(refusal)
+        latest = self._latest_run(line_id)
+        if latest is not None and latest.ended is None:
+            raise runs.RunRefused(
+                f"a run of yours has not ended, so no other starts: {_run_line(latest)}"
+            )
+        if latest is not None and latest.blocks:
+            raise runs.RunRefused(
+                "a run of yours is lost and its command may still run, so no other"
+                " starts until no process is left in its supervisor's group or"
+                " session, or an operator clears it with dromon run clear"
+                f" {latest.started.run_id}: {_run_line(latest)}"
+            )
+        latest_id = None if latest is None else latest.started.run_id
+        if (previous if previous != "none" else None) != latest_id:
+            seen = "none" if latest is None else _run_line(latest)
+            raise runs.RunRefused(
+                f"previous must name the latest run, so you start one only after"
+                f" reading its record. The latest is {seen}"
+            )
+        if self._report_dir is None:
+            raise runs.RunRefused("this daemon has no report directory for receipts")
+        directory = self._report_dir
+        run_id = new_id("r")
+        try:
+            workdir = Path(os.path.realpath(self._workdir_of(line_id)))
+        except LineToolRefused as error:
+            raise runs.RunRefused(str(error)) from error
+        environment = {
+            **allowlisted(os.environ, BASE_ENVIRONMENT),
+            RUN_ID_VARIABLE: run_id,
+        }
+        launched = await self._process_worker.run(
+            lambda: runs.launch(
+                directory, run_id, workdir, argv, environment, self._run_start_of
+            )
+        )
+        started = RunStarted(
+            run_id,
+            line_id,
+            self._run_role(line_id),
+            latest_id,
+            command,
+            argv,
+            str(workdir),
+            launched.output_file,
+            launched.child.pid,
+            launched.process_started,
+            format_due(self._wall_clock()),
+        )
+        try:
+            self._log.append(started)
+        except BaseException:
+            await self._process_worker.run(lambda: runs.abandon(launched.child))
+            raise
+        self._run_children[run_id] = launched.child
+        if not runs.release(launched):
+            await self._process_worker.run(lambda: runs.abandon(launched.child))
+            self._record_run_end(
+                runs.Finding(
+                    run_id,
+                    RunStatus.STOPPED,
+                    None,
+                    "its supervisor could not be told to start, so its command never"
+                    " started",
+                    None,
+                    None,
+                )
+            )
+            raise runs.RunRefused(
+                f"run {run_id} was recorded, but its supervisor could not be told to"
+                " start, so its command never started and the run is recorded as"
+                " stopped"
+            )
+        return started
+
+    async def stop_run(self, line_id: str, run_id: str) -> None:
+        """Ask the supervisor of ``line_id``'s open run ``run_id`` to stop its
+        command. Raises ``runs.RunRefused`` or ``runs.TableUnreadable``."""
+        refusal = self._run_refusal(line_id)
+        if refusal is not None:
+            raise runs.RunRefused(refusal)
+        latest = self._latest_run(line_id)
+        if latest is None or latest.started.run_id != run_id or latest.ended:
+            raise runs.RunRefused(f"run {run_id} is not your scope's open run")
+        await self._process_worker.run(
+            lambda: runs.signal_run(latest.started, self._run_start_of)
+        )
+
+    def run_status(self, line_id: str) -> str:
+        """The latest runs of ``line_id``'s scope, newest first, with their
+        receipts, and the commands the project declares."""
+        found = self._scope_runs(line_id)[-MAX_RUNS_SHOWN:]
+        declared = ", ".join(sorted(self._run_commands)) or "none"
+        if not found:
+            return f"no runs yet, so previous is none. Declared commands: {declared}"
+        lines = [_run_line(run) for run in reversed(found)]
+        return (
+            f"previous is {found[-1].started.run_id}. Declared commands: {declared}.\n"
+            + "\n".join(lines)
+        )
+
+    def check_runs(self) -> None:
+        """Start a reconciliation of the runs that have not ended, unless one is
+        under way, there are none, or there is no event loop."""
+        if self._report_dir is None:
+            return
+        if self._run_check is not None and not self._run_check.done():
+            return
+        if not any(run.blocks for run in self._log.state.runs.values()):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._run_check = loop.create_task(self.reconcile_runs())
+
+    async def reconcile_runs(self) -> None:
+        """Reconcile the open runs against their receipts and the process table, on
+        the process worker, and record each end found, as ``runs.reconcile`` says.
+        A table that cannot be read is said once on the daemon's standard error, and
+        ends nothing."""
+        directory = self._report_dir
+        if directory is None:
+            return
+        open_runs = [
+            r.started for r in self._log.state.runs.values() if r.ended is None
+        ]
+        children = dict(self._run_children)
+        try:
+            found = await self._process_worker.run(
+                lambda: runs.reconcile(
+                    open_runs, directory, self._run_start_of, children
+                )
+            )
+        except (runs.TableUnreadable, ProcessRefused) as error:
+            if self._run_failure != str(error):
+                self._run_failure = str(error)
+                print(f"dromond: runs wait, as {error}", file=sys.stderr)
+            return
+        for finding in found:
+            self._record_run_end(finding)
+            runs.remove_receipt(directory, finding.run_id)
+        lost = [
+            r.started
+            for r in self._log.state.runs.values()
+            if r.ended is not None and r.blocks
+        ]
+        if lost:
+            try:
+                empty = await self._process_worker.run(
+                    lambda: runs.settle(lost, self._run_occupied)
+                )
+            except (runs.TableUnreadable, ProcessRefused) as error:
+                if self._run_failure != str(error):
+                    self._run_failure = str(error)
+                    print(f"dromond: lost runs wait, as {error}", file=sys.stderr)
+                return
+            for run_id in empty:
+                self._clear_run(run_id, None)
+        self._run_failure = None
+
+    def clear_run(self, operator: OperatorAddress, run_id: str) -> RunCleared:
+        """``operator`` clears the lost run ``run_id`` after inspecting what may be
+        left of its command, so its scope may start another. Raises
+        ``EventRejected``, recording nothing, for a run that is not lost or is
+        cleared already."""
+        run = self._log.state.runs.get(run_id)
+        if run is None:
+            raise EventRejected(f"no run {run_id}")
+        if run.ended is None or run.ended.status is not RunStatus.LOST:
+            raise EventRejected(f"run {run_id} is not lost")
+        if run.cleared is not None:
+            raise EventRejected(f"run {run_id} is cleared already")
+        self.ensure_operator(operator.operator_id)
+        return self._clear_run(run_id, operator.operator_id)
+
+    def _clear_run(self, run_id: str, operator_id: str | None) -> RunCleared:
+        """Record that ``run_id`` no longer blocks its scope, by ``operator_id`` or,
+        with ``None``, because no process is left in its supervisor's group or
+        session, and tell the scope's holder."""
+        cause = RunClearance.EMPTY if operator_id is None else RunClearance.OPERATOR
+        event = RunCleared(run_id, cause, operator_id, format_due(self._wall_clock()))
+        self._log.append(event)
+        cleared = self._log.state.runs[run_id]
+        self._note_run_holder(cleared, f"Run cleared: {_run_line(cleared)}")
+        return event
+
+    def _record_run_end(self, finding: runs.Finding) -> None:
+        run = self._log.state.runs.get(finding.run_id)
+        if run is None or run.ended is not None:
+            return
+        self._log.append(
+            RunEnded(
+                finding.run_id,
+                finding.status,
+                finding.exit_code,
+                finding.output_digest,
+                finding.output_bytes,
+                finding.note,
+                format_due(self._wall_clock()),
+            )
+        )
+        self._run_children.pop(finding.run_id, None)
+        ended = self._log.state.runs[finding.run_id]
+        self._note_run_holder(ended, f"Run ended: {_run_line(ended)}")
+
+    def _note_run_holder(self, run: Run, text: str) -> None:
+        """Send ``text`` from the harness to the run's scope's present holder, the
+        role's owner, or else the line that started it."""
+        role_id = run.started.role_id
+        owner = None if role_id is None else self._log.state.roles.get(role_id)
+        recipient = (
+            run.started.line_id if owner is None or owner.owner is None else owner.owner
+        )
+        if recipient in self._log.state.lines:
+            self._harness_note(LineAddress(recipient), text)
+
+    def _run_tools(self, line_id: str) -> list[SdkMcpTool[Any]]:
+        """The run tools, offered while the project declares a run command or the
+        line's scope has a run to read."""
+        if not self._run_commands and not self._scope_runs(line_id):
+            return []
+
+        async def start(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, START_RUN_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            command, previous = args.get("command"), args.get("previous")
+            if not isinstance(command, str) or not isinstance(previous, str):
+                return _tool_error("command and previous must be text")
+            try:
+                started = await self.start_run(line_id, command, previous)
+            except (runs.RunRefused, EventRejected, ProcessRefused) as error:
+                return _tool_error(str(error))
+            return _tool_text(
+                f"started run {started.run_id} of {command}, writing"
+                f" {started.output_file}. Its end is sent to its scope's holder."
+            )
+
+        async def status(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, RUN_STATUS_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            return _tool_text(self.run_status(line_id))
+
+        async def stop(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, STOP_RUN_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            run_id = args.get("run_id")
+            if not isinstance(run_id, str):
+                return _tool_error("run_id must be text")
+            try:
+                await self.stop_run(line_id, run_id)
+            except (runs.RunRefused, runs.TableUnreadable, ProcessRefused) as error:
+                return _tool_error(str(error))
+            return _tool_text(
+                f"asked run {run_id}'s supervisor to stop it. Its end is recorded"
+                " once its receipt is read"
+            )
+
+        return [
+            SdkMcpTool(
+                name=START_RUN_TOOL_NAME,
+                description=(
+                    "Start a command the project declares as a supervised run, which"
+                    " outlives your turn, your seat and a daemon restart. Read"
+                    " run_status first and name its latest run as previous."
+                ),
+                input_schema=START_RUN_SCHEMA,
+                handler=start,
+            ),
+            SdkMcpTool(
+                name=RUN_STATUS_TOOL_NAME,
+                description=(
+                    "Show the latest supervised runs of your role, or your own if you"
+                    " hold none, with their receipts and output files."
+                ),
+                input_schema=RUN_STATUS_SCHEMA,
+                handler=status,
+            ),
+            SdkMcpTool(
+                name=STOP_RUN_TOOL_NAME,
+                description="Stop your scope's open supervised run.",
+                input_schema=STOP_RUN_SCHEMA,
+                handler=stop,
+            ),
+        ]
 
     # What a line sees of itself and of the daemon.
 
@@ -3783,6 +4309,16 @@ class Scheduler:
             if delivered is not None:
                 parts.append(f"delivered {delivered}")
         return ", ".join(parts)
+
+    def line_workdirs(self) -> list[Path]:
+        """The resolved working directory of every line in the log, as configured
+        now, leaving out one that does not resolve, which runs nowhere. For keeping
+        an operator's notice file out of every line's reach. Round 11, item 2."""
+        found: list[Path] = []
+        for line_id in sorted(self._log.state.lines):
+            with contextlib.suppress(LineToolRefused):
+                found.append(self._workdir_of(line_id))
+        return found
 
     def _workdir_of(self, line_id: str) -> Path:
         """The line's working directory, resolved and checked, or
@@ -4325,12 +4861,37 @@ class Scheduler:
             " operator restarts the daemon."
         )
 
+    def scratch_parts(self, line_id: str) -> tuple[str, ...]:
+        """The components, relative to ``line_id``'s working directory, of the
+        scratch ``write_scratch`` writes for it. **Round 10 re-review, N1.** That is
+        ``tmp/`` for a role's owner and for a line that is not a seat and could write
+        its working directory, as ``line_place`` judges it, and ``tmp/lines/LINE``
+        for every other line, a seat that does not own its role among them, whatever
+        its engine. **Decided by core on 2026-10-31, for review.** An owner keeps
+        ``tmp/`` even with no writing tool, since it holds the role's write ownership
+        and its reports stay where they were. A line's scratch moves when it gains or
+        loses its role or a writing tool. **Default deny.** A line whose directory
+        does not resolve has a scratch of its own."""
+        state = self._log.state
+        seat = state.seats.get(line_id)
+        if seat is not None:
+            writes = state.roles[seat.role_id].owner == line_id
+        else:
+            place = self.line_place(
+                self.effective_config(line_id), self.model_of(line_id), None
+            )
+            writes = place is not None and place.writes
+        if writes:
+            return (SCRATCH_DIRECTORY,)
+        return (SCRATCH_DIRECTORY, LINES_SCRATCH_DIRECTORY, line_id)
+
     def write_scratch(self, line_id: str, path: str, text: str) -> str:
-        """Write ``text`` to ``path`` under ``tmp/`` in the line's working directory,
-        creating directories, and return the path written, relative to the working
-        directory. Refused for an absolute path, ``..``, a path that resolves outside
-        ``tmp/``, a target that is a symbolic link or a directory, text over
-        ``MAX_SCRATCH_BYTES``, and text the disclosure list covers."""
+        """Write ``text`` to ``path`` under the line's scratch in its working
+        directory, as ``scratch_parts`` gives it, creating directories, and return the
+        path written, relative to the working directory. Refused for an absolute path,
+        ``..``, a path that resolves outside the scratch, a target that is a symbolic
+        link or a directory, text over ``MAX_SCRATCH_BYTES``, and text the disclosure
+        list covers."""
         if not path or "\x00" in path or path.startswith(("/", "~")):
             raise LineToolRefused("path must be a relative path under tmp/")
         parts = Path(path).parts
@@ -4343,6 +4904,16 @@ class Scheduler:
         if refusal is not None:
             raise LineToolRefused(refusal)
         workdir = self._workdir_of(line_id)
+        scratch = self.scratch_parts(line_id)
+        read_only = resolve_read_only_paths(self._read_only_paths, workdir)
+        target = Path(os.path.normpath(workdir.joinpath(*scratch, *parts)))
+        if any(
+            protected_path == target
+            or protected_path in target.parents
+            or target in protected_path.parents
+            for protected_path in read_only
+        ):
+            raise LineToolRefused(f"{path} is under a project read_only_paths entry")
         # Every component is opened relative to its parent's descriptor without
         # following links, so no link swapped in at any level can redirect the
         # write, however the race falls.
@@ -4353,7 +4924,7 @@ class Scheduler:
                 f"cannot open the working directory: {error.strerror}"
             ) from error
         try:
-            names = [SCRATCH_DIRECTORY, *parts[:-1]]
+            names = [*scratch, *parts[:-1]]
             for index, name in enumerate(names):
                 entered = _enter(parent, name, path, scratch_root=index == 0)
                 os.close(parent)
@@ -4375,7 +4946,7 @@ class Scheduler:
             os.close(parent)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
-        return f"{SCRATCH_DIRECTORY}/{Path(*parts)}"
+        return str(Path(*scratch, *parts))
 
     def check_disclosure(
         self,
@@ -4990,12 +5561,28 @@ class Scheduler:
         one's next turn is built with its new access. The former owner's kept
         connection closes before the new owner's first turn starts. A successor by a
         handoff is awakened and sent a note from the former owner, which wakes it once
-        the former owner's turn has ended."""
-        for line_id in (plan.previous, plan.owner):
+        the former owner's turn has ended.
+
+        **Round 10 re-review, N3.** A role that gains an owner also drops the engine
+        of each other seat whose engine cannot confine it, since such a seat may
+        have been built with its own access while the role was vacant, and its kept
+        connection closes before the new owner's first turn too. Its next turn waits,
+        as ``waits_unconfined`` says."""
+        unconfined = (
+            ()
+            if plan.owner is None
+            else tuple(
+                line_id
+                for line_id in seat_order(self._log.state, plan.role_id)
+                if line_id not in (plan.previous, plan.owner)
+                and self._unconfined(line_id)
+            )
+        )
+        for line_id in (plan.previous, plan.owner, *unconfined):
             if line_id is None:
                 continue
             closing = self._drop_engine(line_id)
-            if line_id == plan.previous and closing is not None:
+            if line_id != plan.owner and closing is not None:
                 self._closing_writer[line_id] = closing
                 closing.add_done_callback(lambda _: self._work.set())
             self.activity.record(
@@ -5666,7 +6253,9 @@ class Scheduler:
 
     def beside_owner(self, line_id: str) -> str | None:
         """The role whose worktree ``line_id`` could write while another seat owns
-        it and it is not a seat of the role, or ``None``. Such a line does not start
+        it and it is not a seat of the role, or ``None``. A line in a directory inside
+        the worktree, or one holding it, counts, as ``roles.overlapping`` judges,
+        **round 10 re-review, N4**. Such a line does not start
         a turn, and a new owner's first turn waits for one in flight. **Default
         deny.** It arises only from a log made before the rule, or from a role that
         gained an owner while such a line ran in its worktree, since every command
@@ -5684,7 +6273,7 @@ class Scheduler:
         if place is None or not place.writes:
             return None
         for role_id, role in self.role_places().items():
-            if role.owner is not None and role.worktree == place.directory:
+            if role.owner is not None and overlapping(role.worktree, place.directory):
                 return role_id
         return None
 
@@ -5714,7 +6303,12 @@ class Scheduler:
         places = self.role_places(trial)
         pair = shared_worktree({role_id: p.worktree for role_id, p in places.items()})
         if pair is not None:
-            raise EventRejected(shared_worktree_refusal(*pair, places[pair[1]].workdir))
+            first, second = places[pair[0]], places[pair[1]]
+            raise EventRejected(
+                shared_worktree_refusal(
+                    *pair, second.workdir, first.worktree != second.worktree
+                )
+            )
         for line_id in sorted(trial.lines):
             definition = config.lines.get(line_id)
             if line_id in state.lines:
@@ -5808,12 +6402,15 @@ class Scheduler:
         an engine session's life. Raises ``EventRejected``, recording nothing.
 
         **Round 10 review, F3.** A worktree that is another role's, by real path, is
-        refused, so two owners never write one directory."""
+        refused, so two owners never write one directory. **Re-review, N4.** So is
+        one inside another role's worktree, or one that holds it."""
         worktree = self._role_worktree(wanted.workdir)
         for other, place in self.role_places().items():
-            if other != role_id and place.worktree == worktree:
+            if other != role_id and overlapping(place.worktree, worktree):
                 raise EventRejected(
-                    shared_worktree_refusal(other, role_id, wanted.workdir)
+                    shared_worktree_refusal(
+                        other, role_id, wanted.workdir, place.worktree != worktree
+                    )
                 )
         outside = {
             line_id: self._line_workdir(line_id)
@@ -5931,11 +6528,33 @@ class Scheduler:
             ],
         }
 
+    def _unconfined(self, line_id: str) -> bool:
+        """Whether ``line_id``'s engine cannot confine it to reading its role's
+        worktree. An unknown model counts as one that cannot."""
+        return ENGINE_OF.get(self.model_of(line_id), "") not in self._confining
+
+    def _turn_writes(self, line_id: str) -> bool:
+        """Whether a turn ``line_id`` starts now runs as a writer of its role's
+        worktree, which is a turn of the role's owner, or of a seat of a vacant role
+        whose engine cannot confine it, since such a seat runs with its own access.
+        **Round 10 re-review, N3.** Only the owner's turns were counted before, so a
+        seat on Pi, Cursor or Antigravity whose turn began while the role was vacant
+        went on writing after another seat took the role, and the new owner's first
+        turn did not wait for it. **Default deny.** A seat of a vacant role on such an
+        engine is counted whether or not its own configuration can write."""
+        state = self._log.state
+        seat = state.seats.get(line_id)
+        if seat is None:
+            return False
+        owner = state.roles[seat.role_id].owner
+        return owner == line_id or (owner is None and self._unconfined(line_id))
+
     def _waits_for_writer(self, line_id: str) -> bool:
         """Whether ``line_id`` owns its role while a former writer of it has not
-        finished, which is another seat whose turn in flight started as the owner,
-        or whose kept connection is still closing. **Never two writers**, as
-        ``ROLES.md`` requires, so the new owner's first turn waits for both.
+        finished, which is another seat whose turn in flight started as a writer,
+        as ``_turn_writes`` judges it, or whose kept connection is still closing.
+        **Never two writers**, as ``ROLES.md`` requires, so the new owner's first
+        turn waits for both.
 
         **Round 10 review, F4.** It waits as well for a turn in flight of a line that
         is not a seat and could write the role's worktree, which ``beside_owner``
@@ -5947,7 +6566,7 @@ class Scheduler:
         for other, its in state.seats.items():
             if other == line_id or its.role_id != seat.role_id:
                 continue
-            if other in self._turn_owned:
+            if other in self._writer_turns:
                 return True
             closing = self._closing_writer.get(other)
             if closing is not None and not closing.done():
@@ -6407,7 +7026,9 @@ class Scheduler:
 
     def write_scratch_tool(self, line_id: str) -> SdkMcpTool[Any]:
         """The ``write_scratch`` tool for ``line_id``, which writes only under its own
-        working directory's ``tmp/``."""
+        scratch, as ``scratch_parts`` gives it. The description is fixed for the
+        engine session's life, and the scratch can move with ownership, so it states
+        the rule and each result names the path written."""
 
         async def handler(args: dict[str, Any]) -> dict[str, Any]:
             unexpected = _unexpected(args, WRITE_SCRATCH_SCHEMA)
@@ -6426,9 +7047,14 @@ class Scheduler:
         return SdkMcpTool(
             name=WRITE_SCRATCH_TOOL_NAME,
             description=(
-                "Write a scratch or report file under tmp/ in your working directory,"
+                "Write a scratch or report file under your scratch directory,"
                 " replacing it whole, without needing a file-writing tool. The path is"
-                " relative to tmp/, and the text is at most 256 KiB."
+                " relative to it, and the text is at most 256 KiB. Your scratch is"
+                " tmp/ in your working directory while you own your role, or are no"
+                " role's seat and can write the directory, and tmp/lines/<your line"
+                " id>/ otherwise, so that you never write the owner's files. The"
+                " owner's scratch is tmp/, which you may read. The result names the"
+                " path written."
             ),
             input_schema=WRITE_SCRATCH_SCHEMA,
             handler=handler,
@@ -6564,6 +7190,7 @@ class Scheduler:
             self.wake_tool(line_id),
             self.acquire_lease_tool(line_id),
             self.release_lease_tool(line_id),
+            *self._run_tools(line_id),
             self.line_status_tool(line_id),
             self.read_instructions_tool(line_id),
             self.write_scratch_tool(line_id),
@@ -6669,6 +7296,22 @@ class Scheduler:
         if not (on_codex and self.effective_config(line_id).keep_session):
             return []
         return [self.list_background_tool(line_id), self.stop_background_tool(line_id)]
+
+    def relayed(self, message_id: str) -> bool:
+        """Record that an operator's relay accepted ``message_id``, and say whether
+        this recorded it. A message that a client delivered while its relay ran, or
+        that is no longer an operator's undelivered mail, is left as it is, so the
+        delivery is recorded once whichever came first. Round 11, item 1."""
+        message = self._log.state.messages.get(message_id)
+        if (
+            message is None
+            or message.delivered
+            or not isinstance(message.recipient, OperatorAddress)
+        ):
+            return False
+        self._log.append(MessageDelivered(message_id))
+        self._post_office.discard(message_id)
+        return True
 
     def collect(self, owner: OperatorAddress | AgentAddress) -> None:
         """Deliver every undelivered message for ``owner``, as its client shows them.
@@ -7040,7 +7683,6 @@ class Scheduler:
         self._log.append(LineSessionCleared(line_id))
         self._forget_context(line_id)
         self._drop_engine(line_id)
-        self._end_leases(line_id)
 
     def rebind_line(self, line_id: str, model: str, strategy: Strategy) -> None:
         """Move ``line_id`` to ``model`` with ``strategy``, keeping its identity,
@@ -7082,7 +7724,6 @@ class Scheduler:
         self._log.append(LineRebound(line_id, model, strategy.value))
         self._forget_context(line_id)
         self._drop_engine(line_id)
-        self._end_leases(line_id)
 
     def set_project(
         self, limits: Limits, operator: str, tick_seconds: float, wake_every_ticks: int
@@ -7313,7 +7954,30 @@ class Scheduler:
                 turn.cancel()
             if self._running:
                 await asyncio.gather(*self._running.values(), return_exceptions=True)
-            await self.close_engines()
+            try:
+                await self.close_engines()
+            finally:
+                self.stop_workers()
+
+    def stop_workers(self) -> bool:
+        """Stop process-table workers when their daemon or test scheduler stops."""
+        if self._workers_stopped:
+            return self._workers_joined
+        self._workers_stopped = True
+        joined = True
+        for worker_name, worker in (
+            ("process inspection", self._process_worker),
+            ("launch-record sweep", self._sweep_worker),
+        ):
+            if not worker.close():
+                joined = False
+                print(
+                    f"dromond: {worker_name} worker did not stop within its join"
+                    " timeout; its running process call cannot be interrupted",
+                    file=sys.stderr,
+                )
+        self._workers_joined = joined
+        return joined
 
     async def _fault_found(self, error: Exception, stop: asyncio.Event) -> None:
         """The watch, as the forwarder has one. An exception that no rule expects is
@@ -7377,7 +8041,6 @@ class Scheduler:
             self._log.append(LineSessionCleared(line_id))
             self._forget_context(line_id)
             self._drop_engine(line_id)
-            self._end_leases(line_id)
         self._turns[line_id] = self._turns.get(line_id, 0) + 1
         address = LineAddress(line_id)
         cause = turn_cause(message for _, message in messages)
@@ -7478,9 +8141,8 @@ class Scheduler:
         except Exception as error:  # noqa: BLE001
             compaction, owed, refused = None, None, error
             prompt = f"the prompt could not be composed: {error}"
-        seat = self._log.state.seats.get(line_id)
-        if seat is not None and self._log.state.roles[seat.role_id].owner == line_id:
-            self._turn_owned.add(line_id)
+        if self._turn_writes(line_id):
+            self._writer_turns.add(line_id)
         keys = sorted({m.correlation for _, m in messages if m.correlation is not None})
         task = asyncio.get_running_loop().create_task(
             self._turn(
@@ -7607,7 +8269,7 @@ class Scheduler:
             self._correlate(line_id, keys, report)
             self._note_quiet(line_id, sent)
             self._running.pop(line_id, None)
-            self._turn_owned.discard(line_id)
+            self._writer_turns.discard(line_id)
             self._last_turn_end[line_id] = self._clock()
             if line is not None:
                 # Round 8 review, ON1. With no report the prompt may never have
@@ -8301,6 +8963,7 @@ class Scheduler:
                     report.line_id, report.cause, report.processes, report.more
                 )
         self._start_sweep()
+        self.check_runs()
 
     def _start_sweep(self) -> None:
         """Start a sweep of the launch records, unless one is under way or there is
@@ -8629,9 +9292,8 @@ class Scheduler:
         self._log.append(LineStateChanged(line_id, LineState.RUNNING))
         self._turns[line_id] = self._turns.get(line_id, 0) + 1
         self._counting[line_id] = True
-        seat = self._log.state.seats.get(line_id)
-        if seat is not None and self._log.state.roles[seat.role_id].owner == line_id:
-            self._turn_owned.add(line_id)
+        if self._turn_writes(line_id):
+            self._writer_turns.add(line_id)
         self.activity.record(
             line_id,
             ActivityKind.TURN_STARTED,
@@ -8740,7 +9402,7 @@ class Scheduler:
             if line is not None and line.state is LineState.RUNNING:
                 self._log.append(LineStateChanged(line_id, LineState.IDLE))
             self._running.pop(line_id, None)
-            self._turn_owned.discard(line_id)
+            self._writer_turns.discard(line_id)
             self._last_turn_end[line_id] = self._clock()
             if line is not None:
                 # Round 8 review, ON1, as in ``_turn``. An engine turn that failed or
@@ -9181,6 +9843,33 @@ def _unexpected(args: dict[str, Any], schema: dict[str, object]) -> str | None:
     if extra:
         return "unexpected argument " + ", ".join(extra)
     return None
+
+
+def own_scratch(workdir: Path, line_id: str) -> Path:
+    """Create ``tmp/lines/LINE`` under ``workdir`` for ``line_id`` if it is missing,
+    walking each component without following a link, as ``write_scratch`` does, and
+    return its path. **Round 10 re-review, N2.** The directory exists before the
+    engine starts, so its sandbox can grant it by real path. Raises
+    ``EngineRefused`` for a link or a file in the way, or any other failure."""
+    names = (SCRATCH_DIRECTORY, LINES_SCRATCH_DIRECTORY, line_id)
+    try:
+        parent = os.open(workdir, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as error:
+        raise EngineRefused(
+            f"cannot open the working directory {workdir}: {error.strerror}"
+        ) from error
+    try:
+        for index, name in enumerate(names):
+            entered = _enter(parent, name, "/".join(names), scratch_root=index == 0)
+            os.close(parent)
+            parent = entered
+    except LineToolRefused as error:
+        raise EngineRefused(
+            f"the line's own scratch cannot be made: {error}"
+        ) from error
+    finally:
+        os.close(parent)
+    return workdir.joinpath(*names)
 
 
 def _enter(parent: int, name: str, path: str, *, scratch_root: bool) -> int:
@@ -9805,3 +10494,42 @@ def _tool_text(text: str) -> dict[str, Any]:
 
 def _tool_error(text: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}], "is_error": True}
+
+
+def _run_line(run: Run) -> str:
+    """One run as a line reads it, with its receipt once it has ended."""
+    started = run.started
+    head = (
+        f"run {started.run_id} of {started.command} by line {started.line_id},"
+        f" started {started.started_at}, output {started.output_file} in"
+        f" {started.workdir}"
+    )
+    ended = run.ended
+    if ended is None:
+        return f"{head}, still running as process {started.pid}"
+    code = "" if ended.exit_code is None else f" with exit code {ended.exit_code}"
+    digest = (
+        ""
+        if ended.output_bytes is None
+        else f", {ended.output_bytes} bytes of output"
+        + ("" if ended.output_digest is None else f" of SHA-256 {ended.output_digest}")
+    )
+    note = f". {ended.note}" if ended.note else ""
+    cleared = run.cleared
+    if ended.status is not RunStatus.LOST:
+        settled = ""
+    elif cleared is None:
+        settled = (
+            ". It blocks its scope until no process is left in its supervisor's"
+            " group or session, or an operator clears it"
+        )
+    elif cleared.operator_id is None:
+        settled = (
+            f". Cleared at {cleared.cleared_at}, as no process was left in its"
+            " supervisor's group or session"
+        )
+    else:
+        settled = f". Cleared by operator {cleared.operator_id} at {cleared.cleared_at}"
+    return (
+        f"{head}, {ended.status.value}{code} at {ended.ended_at}{digest}{note}{settled}"
+    )

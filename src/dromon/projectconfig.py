@@ -44,6 +44,8 @@ from dromon.model import (
     DEFAULT_HANDOFF_BELOW_PERCENT,
     DEFAULT_HANDOFF_SECONDS,
     MAX_ROLE_SEATS,
+    MAX_RUN_ARGUMENT_BYTES,
+    MAX_RUN_ARGUMENTS,
     FailoverPolicy,
     ID_PATTERN,
     MAX_HANDOFF_SECONDS,
@@ -64,6 +66,7 @@ from dromon.federation import (
     parse_federation,
 )
 from dromon.gitssh import GitSshConfig, GitSshError, parse_git_ssh
+from dromon.relay import NO_RELAYS, RelayConfig, RelayConfigError, parse_relays
 from dromon.teacher import TeacherConfig, TeacherError, parse_teacher
 
 CONFIG_FILE_NAME: Final = "dromon.toml"
@@ -85,9 +88,13 @@ TOP_KEYS: Final = frozenset(
         "peers",
         "git_ssh",
         "leases",
+        "runs",
+        "read_only_paths",
         "profiles",
         "lines",
         "roles",
+        "relays",
+        "operators",
     }
 )
 DAEMON_KEYS: Final = frozenset(
@@ -98,6 +105,8 @@ LIMIT_KEYS: Final = frozenset(
 )
 WAKE_KEYS: Final = frozenset({"every_ticks"})
 LEASE_KEYS: Final = frozenset({"names", "ttl_seconds"})
+RUN_KEYS: Final = frozenset({"commands"})
+MAX_RUN_COMMANDS: Final = 64
 ROLE_KEYS: Final = frozenset(
     {
         "workdir",
@@ -114,6 +123,7 @@ DEFAULT_LEASE_TTL: Final = 10800
 MIN_LEASE_TTL: Final = 60
 MAX_LEASE_TTL: Final = 86400
 MAX_LEASES: Final = 256
+MAX_READ_ONLY_PATHS: Final = 256
 TOOL_KEYS: Final = frozenset(
     {
         "builtin_tools",
@@ -265,8 +275,18 @@ class ProjectConfig:
     """The leases the project's lines may acquire, by name."""
     lease_ttl_seconds: int = DEFAULT_LEASE_TTL
     """How long an acquired lease lasts unless it is released first."""
+    run_commands: dict[str, tuple[str, ...]] = field(
+        default_factory=dict[str, tuple[str, ...]]
+    )
+    """The commands lines may start as supervised runs, by name, each as its
+    program and arguments. ``docs/architecture/RUNS.md`` is normative."""
+    read_only_paths: tuple[str, ...] = ()
+    """Project-relative-path entries denied write access under every line's workdir."""
     lines: dict[str, LineDefinition] = field(default_factory=dict[str, LineDefinition])
     roles: dict[str, RoleDefinition] = field(default_factory=dict[str, RoleDefinition])
+    relays: RelayConfig = NO_RELAYS
+    """The project's relays to operators and each operator's route, none by
+    default, so operators' mail waits for a client as before."""
 
 
 def config_path(state_dir: Path) -> Path:
@@ -407,6 +427,8 @@ class _Reader:
             except GitSshError as error:
                 raise self.fail(error.key, str(error)) from error
         lease_names, lease_ttl = self.leases(top.get("leases", {}))
+        run_commands = self.runs(top.get("runs", {}))
+        read_only_paths = self.read_only_paths(top.get("read_only_paths", []))
         profiles = self.profiles(top.get("profiles", {}))
         lines_table = top.get("lines", {})
         if not isinstance(lines_table, dict):
@@ -420,6 +442,10 @@ class _Reader:
                     "is true, but the file has no [git_ssh] table to give the line",
                 )
         roles = self.roles(top.get("roles", {}), lines)
+        try:
+            relays = parse_relays(top.get("relays"), top.get("operators"))
+        except RelayConfigError as error:
+            raise self.fail(error.key, error.reason) from error
         return ProjectConfig(
             operator=operator,
             tick_seconds=tick,
@@ -435,9 +461,42 @@ class _Reader:
             disclosure_terms=terms,
             lease_names=lease_names,
             lease_ttl_seconds=lease_ttl,
+            run_commands=run_commands,
+            read_only_paths=read_only_paths,
             lines=lines,
             roles=roles,
+            relays=relays,
         )
+
+    def read_only_paths(self, value: object) -> tuple[str, ...]:
+        """Relative paths to protect under each line's resolved workdir."""
+        if (
+            not isinstance(value, list)
+            or len(cast(list[object], value)) > MAX_READ_ONLY_PATHS
+        ):
+            raise self.fail(
+                "read_only_paths",
+                f"must be a list of at most {MAX_READ_ONLY_PATHS} paths",
+            )
+        found: set[str] = set()
+        for item in cast(list[object], value):
+            if (
+                not isinstance(item, str)
+                or not item
+                or len(item) > 4096
+                or "\x00" in item
+            ):
+                raise self.fail("read_only_paths", "entries must be non-empty paths")
+            path = Path(item)
+            if path.is_absolute() or ".." in path.parts:
+                raise self.fail(
+                    "read_only_paths",
+                    f"path {item!r} must be relative and stay inside each workdir",
+                )
+            if item in found:
+                raise self.fail("read_only_paths", f"names path {item!r} twice")
+            found.add(item)
+        return tuple(sorted(found))
 
     def limits(self, value: object, key: str, base: Limits) -> Limits:
         document = self.table(value, key, LIMIT_KEYS)
@@ -474,6 +533,43 @@ class _Reader:
                 f"must be a whole number from {MIN_LEASE_TTL} to {MAX_LEASE_TTL}",
             )
         return tuple(sorted(found)), ttl
+
+    def runs(self, value: object) -> dict[str, tuple[str, ...]]:
+        """The ``[runs]`` table, as each declared command's program and arguments.
+        A command is an array, never a shell string, so a name runs exactly what
+        the operator wrote."""
+        document = self.table(value, "runs", RUN_KEYS)
+        commands = document.get("commands", {})
+        if not isinstance(commands, dict):
+            raise self.fail("runs.commands", "must be a table")
+        table = cast(dict[str, object], commands)
+        if len(table) > MAX_RUN_COMMANDS:
+            raise self.fail("runs.commands", f"declares more than {MAX_RUN_COMMANDS}")
+        found: dict[str, tuple[str, ...]] = {}
+        for name, argv in sorted(table.items()):
+            key = f"runs.commands.{name}"
+            if ID_PATTERN.fullmatch(name) is None:
+                raise self.fail(key, f"{name!r} is not an identifier")
+            if not isinstance(argv, list) or not argv:
+                raise self.fail(key, "must be a non-empty array of strings")
+            items = cast(list[object], argv)
+            if len(items) > MAX_RUN_ARGUMENTS:
+                raise self.fail(key, f"has more than {MAX_RUN_ARGUMENTS} arguments")
+            for item in items:
+                if (
+                    not isinstance(item, str)
+                    or "\x00" in item
+                    or len(item.encode()) > MAX_RUN_ARGUMENT_BYTES
+                ):
+                    raise self.fail(
+                        key,
+                        f"holds {item!r}, which is not text of at most"
+                        f" {MAX_RUN_ARGUMENT_BYTES} bytes without a null",
+                    )
+            if not items[0]:
+                raise self.fail(key, "names no program")
+            found[name] = tuple(cast(list[str], items))
+        return found
 
     def roles(
         self, value: object, lines: dict[str, LineDefinition]

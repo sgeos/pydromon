@@ -965,6 +965,7 @@ def profile_snippet(
     workspace: Path,
     protected: Sequence[Path],
     daemon_home: Path | None = None,
+    read_only_paths: Sequence[Path] = (),
 ) -> str:
     """The full ``sandbox.toml`` table for a new Dromon profile."""
     daemon_home = Path.home() if daemon_home is None else daemon_home
@@ -980,14 +981,24 @@ def profile_snippet(
     if name == WRITER_PROFILE:
         lines.append('extends = "workspace"')
         git = git_directories(workspace)
-        directories = () if git is None else tuple(sorted(set(git)))
+        directories = set(read_only_paths)
+        if git is not None:
+            directories.update(git)
         lines.append(
             "read_only = ["
-            + ", ".join(json.dumps(str(path)) for path in directories)
+            + ", ".join(json.dumps(str(path)) for path in sorted(directories))
             + "]"
         )
     else:
         lines.append('extends = "read-only"')
+        if read_only_paths:
+            lines.append(
+                "read_only = ["
+                + ", ".join(
+                    json.dumps(str(path)) for path in sorted(set(read_only_paths))
+                )
+                + "]"
+            )
     lines.append(f"deny = [{', '.join(json.dumps(entry) for entry in deny)}]")
     return "\n".join(lines)
 
@@ -1004,6 +1015,7 @@ def check_profile(
     home: Path,
     grok_home: Path,
     daemon_home: Path | None = None,
+    read_only_paths: Sequence[Path] = (),
 ) -> str:
     """The name of the Grok profile the line runs under, after checking that it denies
     every ``protected`` directory and, for a writer, keeps ``.git`` read-only. Raises
@@ -1023,7 +1035,9 @@ def check_profile(
     file = grok_home / "sandbox.toml"
     profiles = _load_profiles(file)
     profile = profiles.get(name)
-    full_snippet = profile_snippet(name, workspace, protected, daemon_home)
+    full_snippet = profile_snippet(
+        name, workspace, protected, daemon_home, read_only_paths
+    )
     if profile is None:
         advice = f" Add this new table to {file}:\n\n{full_snippet}"
     else:
@@ -1049,17 +1063,13 @@ def check_profile(
             or not _covers(denied, path)
         ]
         git = git_directories(workspace)
-        read_only_values = (
-            []
-            if name != WRITER_PROFILE or git is None
-            else [
-                str(path)
-                for path in sorted(set(git))
-                if not _covers(
-                    [Path(entry) for entry in _entries(profile, "read_only")], path
-                )
-            ]
-        )
+        required_read_only = set(read_only_paths)
+        if name == WRITER_PROFILE and git is not None:
+            required_read_only.update(git)
+        held = [Path(entry) for entry in _entries(profile, "read_only")]
+        read_only_values = [
+            str(path) for path in sorted(required_read_only) if not _covers(held, path)
+        ]
         advice = "".join(
             (
                 " Update only the ",
@@ -1113,14 +1123,17 @@ def check_profile(
             + advice
         )
     git = git_directories(workspace)
+    required_read_only = set(read_only_paths)
     if name == WRITER_PROFILE and git is not None:
+        required_read_only.update(git)
+    if required_read_only:
         held = [Path(entry) for entry in _entries(profile, "read_only")]
-        required_git_dirs = tuple(set(git))
-        unheld = [path for path in required_git_dirs if not _covers(held, path)]
+        unheld = [path for path in required_read_only if not _covers(held, path)]
         if unheld:
+            description = "required paths" if read_only_paths else "git directories"
             raise EngineRefused(
-                f"the Grok sandbox profile {name} does not hold git directories"
-                " read-only: " + ", ".join(map(str, unheld)) + "." + advice
+                f"the Grok sandbox profile {name} does not hold {description}"
+                " read-only: " + ", ".join(map(str, sorted(unheld))) + "." + advice
             )
     return name
 
@@ -1255,6 +1268,7 @@ class GrokLine:
         mcp_tools: Sequence[SdkMcpTool[Any]] = (),
         session_id: str | None = None,
         protected: Sequence[Path] = (),
+        read_only_paths: Sequence[Path] = (),
         bridge: Sequence[str] = (),
         line_token: str | None = None,
         environment: Mapping[str, str] | None = None,
@@ -1275,6 +1289,7 @@ class GrokLine:
         self.own_tools = acp.own_tool_names([tool.name for tool in mcp_tools])
         self.session_id = session_id
         self.protected = tuple(protected)
+        self.read_only_paths = tuple(read_only_paths)
         self.bridge = tuple(bridge)
         self.line_token = line_token
         self._environment = os.environ if environment is None else environment
@@ -1312,7 +1327,13 @@ class GrokLine:
         environment["GROK_HOME"] = str(grok_home)
         environment["HOME"] = str(user_home)
         environment["GROK_SANDBOX"] = check_profile(
-            self.config, self.cwd, self.protected, user_home, grok_home, self._home
+            self.config,
+            self.cwd,
+            self.protected,
+            user_home,
+            grok_home,
+            self._home,
+            self.read_only_paths,
         )
         effort = self.config.effort or self.driver.settings.effort
         if effort not in EFFORTS:

@@ -3,6 +3,7 @@ list that keeps listed terms out of what lines and agents send."""
 
 import asyncio
 import json
+import threading
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -481,6 +482,9 @@ def test_dromond_stops_on_an_unreadable_disclosure_list(
 def test_dromond_stops_on_an_unsandboxed_line_when_one_is_required(
     paths: ProjectPaths, short_runtime: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    existing_workers = {
+        thread for thread in threading.enumerate() if thread.name == "dromon-processes"
+    }
     write_file(
         paths,
         "[daemon]\nrequire_sandbox = true\n[lines.alpha]\nmodel = 'claude-haiku-5-5'\n",
@@ -489,6 +493,11 @@ def test_dromond_stops_on_an_unsandboxed_line_when_one_is_required(
     assert "line alpha would run on Claude Code" in capsys.readouterr().err
     with EventLog(paths.event_log) as log:
         assert "alpha" not in log.state.lines
+    assert {
+        thread
+        for thread in threading.enumerate()
+        if thread.name == "dromon-processes" and thread.is_alive()
+    } <= existing_workers
 
 
 # Anonymous agents name themselves, so their names are held to the list.
