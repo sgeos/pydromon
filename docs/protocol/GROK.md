@@ -366,7 +366,9 @@ in a Grok line turn of 58 tool calls, from each `tool_call_update`: `read_file` 
 `read`, `grep` as `search`, `run_terminal_command` as `execute`, and `list_dir`,
 `search_tool` and `use_tool` as `other`. Twenty-six `use_tool` calls of Dromon's own
 tools passed in that turn. `list_dir` was first refused for `other`, which the table now
-allows. In a later turn on 2026-10-31, nineteen inline `use_tool` calls passed, and one in the
+allows. A later turn on 2026-10-31 showed `get_command_or_subagent_output` as `other` too, with Grok's
+`_meta` kind `background_task_action`, which `kill_command_or_subagent` shares, so `other`
+is allowed for both, observed for the first and inferred for the second. In a later turn on 2026-10-31, nineteen inline `use_tool` calls passed, and one in the
 file-backed form, with `tool_input_file`, was refused, as intended, since Dromon cannot see
 arguments Grok reads from a file only after the call is judged. Its refusal now says to pass
 the arguments inline. Grok wrote that file under `/tmp`, which the `workspace` base of the
@@ -383,7 +385,8 @@ each built-in, or of `use_tool`, has been recorded.
 | `list_dir` | `Read` or `Glob` | `read`, `search`, `other` |
 | `grep` | `Grep` | `search` |
 | `search_replace`, `write` | `Edit` or `Write` | `edit` |
-| `run_terminal_command`, `get_command_or_subagent_output`, `kill_command_or_subagent` | `Bash` | `execute` |
+| `run_terminal_command` | `Bash` | `execute` |
+| `get_command_or_subagent_output`, `kill_command_or_subagent` | `Bash` | `execute`, `other` |
 | `web_fetch` | `WebFetch` | `fetch` |
 | `web_search` | `WebSearch` | `fetch`, `search` |
 | `search_tool` | Always, as discovery | `other` |

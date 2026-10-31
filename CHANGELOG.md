@@ -77,6 +77,9 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- Grok's `get_command_or_subagent_output` may carry the kind `other`, which a live turn
+  on 2026-10-31 showed, and so may `kill_command_or_subagent`, which shares its Grok
+  category. Both still need `Bash`.
 - Claude Code now records the positive percentage remaining in a documented,
   non-rejected rate-limit window, with its reset time when supplied. It retains each
   named window and shows the lowest remaining percentage among unexpired windows. A
