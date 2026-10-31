@@ -12,6 +12,7 @@ from typing import cast
 from dromon import priority
 from dromon import scheduler as scheduler_module
 from dromon.processes import ProcessInfo
+from dromon.fleet import HOSTS_FILE_ENV
 from dromon.registry import REGISTRY_DIR_ENV
 from dromon.driver import Strategy
 from dromon.lineconfig import LineConfig, encode_config
@@ -403,6 +404,11 @@ def _private_registry(
     here, so that the daemon's own creation of it with mode 0700 is what a test sees."""
     monkeypatch.setenv(
         REGISTRY_DIR_ENV, str(tmp_path_factory.mktemp("registry") / "registry")
+    )
+    # The fleet index lies inside the registry, so it is private too, and so is the
+    # hosts file of the fleet. Round 13.
+    monkeypatch.setenv(
+        HOSTS_FILE_ENV, str(tmp_path_factory.mktemp("hosts") / "hosts.toml")
     )
 
 

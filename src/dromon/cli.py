@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Final, cast
 
 import dromon
-from dromon import __version__, exits, restart
+from dromon import __version__, exits, fleet, registry, restart, runs
 from dromon import proposals as proposal_store
 from dromon.client import (
     REQUEST_TIMEOUT_SECONDS,
@@ -33,7 +33,13 @@ from dromon.client import (
     start,
     stop,
 )
-from dromon.paths import PathError, ProjectPaths, ensure_private_dir, project_paths
+from dromon.paths import (
+    STATE_DIR_NAME,
+    PathError,
+    ProjectPaths,
+    ensure_private_dir,
+    project_paths,
+)
 from dromon.disclosure import DisclosureError, load_terms
 from dromon.driver import ENGINE_OF, MODELS, Credential, Driver, DriverError, Strategy
 from dromon import antigravity, capabilities, codex, cursor, evidence, grok, pi
@@ -95,6 +101,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     " this daemon's key",
     "mcp": "serve an external agent over MCP on standard input and output",
     "proposal": "list or show proposed changes from session lines",
+    "fleet": "list every daemon of this user on this machine, and reach each by name",
 }
 """Planned subcommands and their one-line help, in display order."""
 
@@ -1021,23 +1028,35 @@ def _sent(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 
 def _attach(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     """Wire a platform, the shared runtime and the daemon's socket together."""
-    from dromon.ui.link import SocketDaemon
+    from dromon.ui.link import FleetProjects, SocketDaemon
 
     if not arguments.poll_seconds > 0:
         print("dromon attach: --poll-seconds must be positive", file=sys.stderr)
         return exits.USAGE
     daemon = SocketDaemon(paths)
+    # The fleet index, through which /project moves to another project. Round 13,
+    # item 4. An override that is malformed leaves the client without it, and the
+    # client still attaches to this project.
+    try:
+        projects = FleetProjects(fleet.configured_index(os.environ), fleet_start_of)
+    except fleet.FleetError as error:
+        print(f"dromon attach: no fleet index, {error}", file=sys.stderr)
+        projects = None
+    given = (
+        daemon,
+        arguments.line_id,
+        arguments.operator,
+        arguments.poll_seconds,
+        projects,
+        paths.root.name,
+    )
     if arguments.gui:
         from dromon.ui import window
 
-        return window.run(
-            daemon, arguments.line_id, arguments.operator, arguments.poll_seconds
-        )
+        return window.run(*given)
     from dromon.ui import terminal
 
-    return terminal.run(
-        daemon, arguments.line_id, arguments.operator, arguments.poll_seconds
-    )
+    return terminal.run(*given)
 
 
 def _disclosure_summary(terms: str | None, root: Path) -> str:
@@ -1983,6 +2002,276 @@ def _proposal(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
+# The fleet, every daemon of this user on this machine. Round 13. Each command reads
+# the fleet index and sends the operation its single-project command sends, to the
+# daemon's own operator socket and nowhere else, so it adds no authority.
+
+FLEET_TIMEOUT_SECONDS: Final = 2.0
+"""How long a fleet command waits for each daemon, so one that hangs delays the rest by
+at most this, for each of its requests."""
+
+fleet_start_of: registry.StartOf = runs.process_start
+"""How the client reads a daemon's start time, which a test replaces, since a sandbox
+denies ``ps``."""
+
+
+class _NoAnswer(Exception):
+    """A daemon of the fleet did not answer, or refused, with the reason."""
+
+
+def _fleet_ask(
+    entry: fleet.IndexEntry, operation: Operation, args: dict[str, object]
+) -> dict[str, object]:
+    """One request to ``entry``'s own socket. Raises ``_NoAnswer``."""
+    try:
+        response = call(entry.socket, operation, FLEET_TIMEOUT_SECONDS, args)
+    except DaemonNotRunning as error:
+        raise _NoAnswer(f"not answering, {error}") from error
+    except (ProtocolError, TimeoutError, OSError) as error:
+        raise _NoAnswer(f"not answering, {error}") from error
+    if not response.ok or response.result is None:
+        raise _NoAnswer(f"refused {operation}, {response.error_message}")
+    return response.result
+
+
+def _fleet_verified(entry: fleet.IndexEntry) -> dict[str, object]:
+    """The status of ``entry``'s daemon, once it says the pid and root the index
+    names. Raises ``_NoAnswer``."""
+    status = _fleet_ask(entry, Operation.STATUS, {})
+    try:
+        fleet.verify(entry, status)
+    except fleet.FleetError as error:
+        raise _NoAnswer(str(error)) from error
+    return status
+
+
+def _fleet_survey(command: str) -> list[fleet.Indexed] | None:
+    try:
+        return fleet.survey(fleet.configured_index(os.environ), fleet_start_of)
+    except fleet.FleetError as error:
+        print(f"dromon fleet {command}: {error}", file=sys.stderr)
+        return None
+
+
+def _fleet_paths(entry: fleet.IndexEntry) -> ProjectPaths:
+    """The paths of ``entry``'s project, whose socket is the one the index names."""
+    return ProjectPaths(entry.root, entry.root / STATE_DIR_NAME, entry.socket.parent)
+
+
+def _fleet_mapping(value: object) -> Mapping[str, object]:
+    """``value`` as a mapping, or an empty one, since a daemon's answer is data."""
+    return cast(Mapping[str, object], value) if isinstance(value, dict) else {}
+
+
+def _fleet_count(value: object, key: str) -> object:
+    return _fleet_mapping(value).get(key)
+
+
+def _fleet_row(indexed: fleet.Indexed, operator: str) -> tuple[str, bool]:
+    """The row of ``fleet list`` for one daemon, and whether it answered. A stale or
+    unknown entry is shown and never asked."""
+    entry = indexed.entry
+    if indexed.liveness is not fleet.Liveness.LIVE:
+        return f"{entry.name}: {indexed.liveness}, pid {entry.pid}, not asked", True
+    try:
+        status = _fleet_verified(entry)
+        mail = _fleet_ask(
+            entry,
+            Operation.MAIL,
+            {"operator": operator, "issues_only": True, "limit": 1},
+        )
+    except _NoAnswer as error:
+        return f"{entry.name}: {error}", False
+    daemon = status.get("daemon")
+    stale = _fleet_count(daemon, "stale")
+    commit = _fleet_count(daemon, "commit")
+    behind = (
+        ", behind its checkout"
+        if stale is True
+        else ""
+        if stale is False
+        else ", whether behind its checkout is unknown"
+    )
+    log = status.get("event_log")
+    return (
+        f"{entry.name}: running, commit"
+        f" {str(commit)[:12] if isinstance(commit, str) else 'unknown'},"
+        f" {_fleet_count(log, 'lines')} lines,"
+        f" {_fleet_count(log, 'open_questions')} open questions,"
+        f" {mail.get('unread')} unread, {mail.get('total')} open issues{behind}"
+    ), True
+
+
+def _fleet_list(arguments: argparse.Namespace) -> int:
+    found = _fleet_survey("list")
+    if found is None:
+        return exits.FAILURE
+    if not found:
+        print("no daemon is in the fleet index")
+        return exits.OK
+    answered = True
+    for indexed in found:
+        row, ok = _fleet_row(indexed, arguments.operator)
+        answered = answered and ok
+        print(row)
+        print(f"    {indexed.entry.root}")
+    return exits.OK if answered else exits.FAILURE
+
+
+def _fleet_each(
+    command: str,
+    found: list[fleet.Indexed],
+    ask: Callable[[fleet.IndexEntry], None],
+) -> int:
+    """Run ``ask`` on each live daemon, reporting one that does not answer and going
+    on with the rest. A stale or unknown entry is reported and never asked."""
+    answered = True
+    for indexed in found:
+        entry = indexed.entry
+        if indexed.liveness is not fleet.Liveness.LIVE:
+            print(f"{entry.name}: {indexed.liveness}, not asked", file=sys.stderr)
+            continue
+        try:
+            _fleet_verified(entry)
+            ask(entry)
+        except _NoAnswer as error:
+            answered = False
+            print(f"dromon fleet {command}: {entry.name}: {error}", file=sys.stderr)
+    return exits.OK if answered else exits.FAILURE
+
+
+def _fleet_questions(arguments: argparse.Namespace) -> int:
+    found = _fleet_survey("questions")
+    if found is None:
+        return exits.FAILURE
+    args: dict[str, object] = {} if arguments.all else {"operator": arguments.operator}
+
+    def ask(entry: fleet.IndexEntry) -> None:
+        result = _fleet_ask(entry, Operation.QUESTIONS, args)
+        listed = result.get("questions")
+        for item in cast(list[object], listed) if isinstance(listed, list) else []:
+            question = _fleet_mapping(item)
+            print(
+                f"{entry.name}:{question.get('question_id')} from"
+                f" {question.get('line')} to {question.get('operator')}"
+            )
+            for text_line in str(question.get("text", "")).splitlines() or [""]:
+                print(f"    {text_line}")
+
+    return _fleet_each("questions", found, ask)
+
+
+def _fleet_mail(arguments: argparse.Namespace, issues: bool) -> int:
+    command = "issues" if issues else "mail"
+    found = _fleet_survey(command)
+    if found is None:
+        return exits.FAILURE
+    args: dict[str, object] = {"operator": arguments.operator, "limit": arguments.limit}
+    if issues:
+        args["issues_only"] = True
+    elif arguments.unread:
+        args["unread_only"] = True
+
+    def ask(entry: fleet.IndexEntry) -> None:
+        result = _fleet_ask(entry, Operation.MAIL, args)
+        listed = result.get("messages")
+        messages = cast(list[object], listed) if isinstance(listed, list) else []
+        if messages:
+            print(f"{entry.name}: {result.get('total')} matching")
+        for item in messages:
+            message = _fleet_mapping(item)
+            state = "read" if message.get("read") is True else "unread"
+            print(
+                f"{entry.name}:{message.get('message_id')} from"
+                f" {message.get('sender')}, {message.get('kind')}, {state}"
+            )
+
+    return _fleet_each(command, found, ask)
+
+
+def _fleet_target(command: str, project: str) -> fleet.IndexEntry | None:
+    """The live, verified daemon ``project`` names, or ``None`` once the reason is
+    printed."""
+    found = _fleet_survey(command)
+    if found is None:
+        return None
+    try:
+        entry = fleet.resolve(found, project)
+        _fleet_verified(entry)
+    except (fleet.FleetError, _NoAnswer) as error:
+        print(f"dromon fleet {command}: {error}", file=sys.stderr)
+        return None
+    return entry
+
+
+def _fleet_routed(
+    command: str, target: str, what: str
+) -> tuple[ProjectPaths, str] | None:
+    """The paths of the daemon ``target``, ``PROJECT:ITEM``, names, and the item."""
+    try:
+        project, item = fleet.split_target(target, what)
+    except fleet.FleetError as error:
+        print(f"dromon fleet {command}: {error}", file=sys.stderr)
+        return None
+    entry = _fleet_target(command, project)
+    return None if entry is None else (_fleet_paths(entry), item)
+
+
+def _fleet_hosts() -> int:
+    try:
+        hosts = fleet.read_hosts(fleet.configured_hosts_file(os.environ))
+    except fleet.FleetError as error:
+        print(f"dromon fleet hosts: {error}", file=sys.stderr)
+        return exits.FAILURE
+    if not hosts:
+        print("no host is configured")
+    for host in hosts.values():
+        print(f"{host.name}: ssh {host.destination}, {host.remote_dromon} there")
+    print(
+        "Reaching these hosts is designed and not implemented, as"
+        " docs/architecture/FLEET.md says"
+    )
+    return exits.OK
+
+
+def _fleet(arguments: argparse.Namespace) -> int:
+    """``dromon fleet``, which needs no project of its own."""
+    action: str = arguments.fleet_action
+    match action:
+        case "list":
+            return _fleet_list(arguments)
+        case "questions":
+            return _fleet_questions(arguments)
+        case "mail" | "issues":
+            return _fleet_mail(arguments, action == "issues")
+        case "hosts":
+            return _fleet_hosts()
+        case "status" | "restart":
+            entry = _fleet_target(action, arguments.project_name)
+            if entry is None:
+                return exits.FAILURE
+            handler = _status if action == "status" else _restart
+            return handler(_fleet_paths(entry), arguments)
+        case "answer":
+            routed = _fleet_routed(action, arguments.target, "QUESTION")
+            if routed is None:
+                return exits.FAILURE
+            arguments.question_id = routed[1]
+            return _answer(routed[0], arguments)
+        case "send":
+            routed = _fleet_routed(action, arguments.target, "RECIPIENT")
+            if routed is None:
+                return exits.FAILURE
+            arguments.recipient = routed[1]
+            return _send(routed[0], arguments)
+        case _:
+            routed = _fleet_routed(action, arguments.target, "MESSAGE")
+            if routed is None:
+                return exits.FAILURE
+            arguments.message_id = routed[1]
+            return _read(routed[0], arguments)
+
+
 IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]] = {
     "start": _start,
     "status": _status,
@@ -2017,6 +2306,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "peer": _peer,
     "mcp": _mcp,
     "proposal": _proposal,
+    "fleet": lambda _paths, arguments: _fleet(arguments),
 }
 
 
@@ -2183,6 +2473,84 @@ def _add_tool_options(command: argparse.ArgumentParser) -> None:
     )
 
 
+FLEET_COMMANDS: Final[dict[str, str]] = {
+    "list": "each daemon with its state, commit, lines, questions, mail and issues",
+    "questions": "the open questions of every daemon, each named PROJECT:QUESTION",
+    "mail": "an operator's mail in every daemon, each named PROJECT:MESSAGE",
+    "issues": "the open issues lines raised in every daemon",
+    "answer": "answer PROJECT:QUESTION",
+    "send": "send to PROJECT:LINE, or PROJECT:@OPERATOR",
+    "read": "open PROJECT:MESSAGE",
+    "status": "show one project's daemon, as dromon status does",
+    "restart": "restart one project's daemon, as dromon restart does",
+    "hosts": "list the hosts of other machines in the per-user hosts file",
+}
+
+
+def _add_fleet_commands(command: argparse.ArgumentParser) -> None:
+    """The subcommands of ``dromon fleet``, each taking the options of the command it
+    sends for one project."""
+    actions = command.add_subparsers(
+        dest="fleet_action", metavar="ACTION", required=True
+    )
+    for action, help_text in FLEET_COMMANDS.items():
+        sub = actions.add_parser(action, help=help_text, description=help_text)
+        if action != "hosts":
+            sub.add_argument(
+                "--operator",
+                default=default_operator(),
+                help="the operator, default %(default)s",
+            )
+        if action in ("status", "restart"):
+            sub.add_argument(
+                "project_name",
+                metavar="PROJECT",
+                help="the project, by its name or its root",
+            )
+        if action in ("answer", "send", "read"):
+            what = {"answer": "QUESTION", "send": "LINE", "read": "MESSAGE"}[action]
+            sub.add_argument(
+                "target", metavar=f"PROJECT:{what}", help="the project and the item"
+            )
+        if action in ("answer", "send"):
+            sub.add_argument("body", help="the text")
+        if action == "questions":
+            sub.add_argument(
+                "--all", action="store_true", help="list every operator's questions"
+            )
+        if action in ("mail", "issues"):
+            sub.add_argument(
+                "--limit",
+                type=int,
+                default=20,
+                help="at most this many from each daemon, default 20",
+            )
+        if action == "mail":
+            sub.add_argument("--unread", action="store_true", help="unread only")
+        if action == "send":
+            sub.add_argument("--reply-to", default=None, help="the message answered")
+            sub.add_argument(
+                "--priority",
+                action="store_true",
+                help="end the line's running turn at a safe point and lead its next",
+            )
+        if action == "status":
+            sub.add_argument(
+                "--correlation",
+                metavar="KEY",
+                help="also total the turns and cost recorded under this key",
+            )
+        if action == "restart":
+            sub.add_argument("--interrupt", action="store_true")
+            sub.add_argument(
+                "--wait-seconds",
+                type=int,
+                default=restart.DEFAULT_WAIT_SECONDS,
+                metavar="SECONDS",
+            )
+            sub.add_argument("--end-tasks", action="store_true")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Return the argument parser for ``dromon``."""
     parser = argparse.ArgumentParser(
@@ -2202,6 +2570,8 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     for name, help_text in SUBCOMMANDS.items():
         command = commands.add_parser(name, help=help_text, description=help_text)
+        if name == "fleet":
+            _add_fleet_commands(command)
         if name == "rebind":
             command.add_argument("line_id", help="the line to move")
             command.add_argument(
@@ -2656,6 +3026,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if handler is None:
         print(f"dromon {command}: not implemented in this version", file=sys.stderr)
         return exits.NOT_IMPLEMENTED
+    if command == "fleet":
+        # The fleet needs no project of its own, so a client run outside one works.
+        return _fleet(arguments)
     project: Path = arguments.project
     runtime_dir: Path | None = arguments.runtime_dir
     try:

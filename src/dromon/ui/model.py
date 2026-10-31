@@ -96,6 +96,11 @@ class Model:
     """The poll last counted as lost, so the several fetches of one poll count once."""
     exit_message: str | None = None
     """Why the client detached by itself, or ``None``."""
+    project: str | None = None
+    """The attached project's name, or ``None`` when the client was given none."""
+    projects: tuple[tuple[str, str], ...] = ()
+    """The projects of the fleet index, each with its state, from the last
+    ``/projects``, which ``/project`` completes from."""
 
     def __post_init__(self) -> None:
         if not self.line_id:
@@ -163,6 +168,20 @@ class LinesLoaded:
 
 
 @dataclass(frozen=True, slots=True)
+class ProjectOpened:
+    """The runtime now speaks to ``project``'s daemon, which has ``lines``."""
+
+    project: str
+    line_id: str
+    lines: tuple[LineSummary, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectsLoaded:
+    projects: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class Done:
     text: str
 
@@ -191,6 +210,8 @@ type Event = (
     | ActivityLoaded
     | LinesLoaded
     | SettingsLoaded
+    | ProjectOpened
+    | ProjectsLoaded
     | Done
     | Failed
     | Lost
@@ -229,6 +250,21 @@ class Request:
 
 
 @dataclass(frozen=True, slots=True)
+class OpenProject:
+    """Speak to another project's daemon from now on, once it answers."""
+
+    project: str
+    line_id: str | None
+    current: str
+    """The attached line, kept when the other project has a line of that name."""
+
+
+@dataclass(frozen=True, slots=True)
+class FetchProjects:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
 class Bell:
     pass
 
@@ -239,5 +275,13 @@ class Exit:
 
 
 type Effect = (
-    FetchView | FetchActivity | FetchLines | FetchSettings | Request | Bell | Exit
+    FetchView
+    | FetchActivity
+    | FetchLines
+    | FetchSettings
+    | Request
+    | OpenProject
+    | FetchProjects
+    | Bell
+    | Exit
 )

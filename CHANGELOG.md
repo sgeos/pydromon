@@ -7,6 +7,27 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- The operator's fleet, round 13, as `docs/architecture/FLEET.md` specifies. Every
+  daemon, whatever its federation mode, writes an entry in a per-user fleet index at
+  start and removes it at stop. The entry holds the project root, its operator socket,
+  the pid, the start time and the daemon's commit. The index is the directory `index`
+  inside the open-federation registry, so `DROMON_REGISTRY_DIR` moves it as well, with
+  mode 0700 and entries of mode 0600. Every line of every project is denied it. A
+  daemon whose entry cannot be written starts unlisted and says so. `dromon fleet list`,
+  `questions`, `mail`, `issues`, `answer`, `send`, `read`, `status` and `restart` read
+  the index and send the existing operations to each daemon's own operator socket,
+  after `status` has shown that the daemon answering is the one the entry names, and
+  take `PROJECT:ID` or `PROJECT:LINE`. A stale or unknown entry is shown and never
+  asked, and a daemon that does not answer is reported while the rest go on. The
+  attached client's `/projects` lists the index and `/project PROJECT [LINE]` moves to
+  another project without restarting. A per-user hosts file,
+  `.config/dromon/hosts.toml` or `DROMON_HOSTS_FILE`, names other machines, which
+  `dromon fleet hosts` lists. It holds no credential. Reaching those machines through
+  the operator's own SSH is designed and not implemented. **Rollback hazard.** An
+  older daemon writes no entry, so `dromon fleet` does not see it, and an older client
+  has no `fleet` command. The index directory an older release leaves is harmless and
+  may be removed. **Operational note.** A Grok line's profile must deny the index once
+  it exists, as for every protected directory.
 - Open federation, round 12. `[federation] local` and `remote` take `allowlist`, the
   default, which keeps the behaviour of declared peers exactly, or `open`. With
   `local = "open"`, `listen` and a unique `name`, a daemon registers in a per-user

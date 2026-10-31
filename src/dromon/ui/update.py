@@ -34,12 +34,14 @@ from dromon.ui.commands import (
     Set,
     ShowLines,
     ShowPane,
+    ShowProjects,
     ShowSettings,
     Switch,
+    SwitchProject,
     parse_input,
     suggest,
 )
-from dromon.ui.data import View
+from dromon.ui.data import LineSummary, View
 from dromon.ui.settings import command_key, prefill, values_for
 from dromon.ui.settings import request_of as settings_request
 from dromon.ui.settings import rows as setting_rows
@@ -59,13 +61,17 @@ from dromon.ui.model import (
     Failed,
     FetchActivity,
     FetchLines,
+    FetchProjects,
     FetchSettings,
     FetchView,
     LinesLoaded,
     Lost,
     Model,
+    OpenProject,
     Overlay,
     Pressed,
+    ProjectOpened,
+    ProjectsLoaded,
     Request,
     Resized,
     SettingsLoaded,
@@ -79,18 +85,27 @@ type Result = tuple[Model, tuple[Effect, ...]]
 NO_EFFECTS: Final[tuple[Effect, ...]] = ()
 
 
-def initial(line_id: str, operator: str, poll_seconds: float) -> Model:
+def initial(
+    line_id: str, operator: str, poll_seconds: float, project: str | None = None
+) -> Model:
     return Model(
         line_id,
         operator,
         poll_seconds,
         notice=f"attached to {line_id} as @{operator}. ? for shortcuts",
+        project=project,
     )
 
 
 def update(model: Model, event: Event) -> Result:
     if model.lost_since is not None and isinstance(
-        event, ViewLoaded | ActivityLoaded | LinesLoaded | SettingsLoaded | Done
+        event,
+        ViewLoaded
+        | ActivityLoaded
+        | LinesLoaded
+        | SettingsLoaded
+        | ProjectOpened
+        | Done,
     ):
         # The daemon answered, so the polls that found none no longer run in a row.
         model = replace(
@@ -143,6 +158,14 @@ def update(model: Model, event: Event) -> Result:
             count = len(setting_rows(settings))
             row = min(model.setting_row, max(count - 1, 0))
             return replace(model, settings=settings, setting_row=row), NO_EFFECTS
+        case ProjectOpened(project, line_id, lines):
+            return _opened(model, project, line_id, lines)
+        case ProjectsLoaded(projects):
+            listed = ", ".join(f"{name} {state}" for name, state in projects)
+            notice = f"projects: {listed}" if projects else "the fleet index is empty"
+            return replace(
+                model, projects=projects, notice=notice, alarm=False
+            ), NO_EFFECTS
         case Done(text):
             polled, effects = _poll(replace(model, notice=text, alarm=False))
             # Any request may change a setting, so the settings are fetched again.
@@ -285,6 +308,7 @@ def _choices(model: Model) -> Choices:
         )
     return Choices(
         lines=lines,
+        projects=model.projects,
         questions=questions,
         messages=messages,
         settings=settings_pool,
@@ -495,6 +519,11 @@ def _command(model: Model, command: Command) -> Result:
             return opened, (FetchSettings(model.line_id),)
         case Switch(line_id):
             return _switch(model, line_id)
+        case SwitchProject(project, line_id):
+            opening = replace(model, notice=f"opening {project}", alarm=False)
+            return opening, (OpenProject(project, line_id, model.line_id),)
+        case ShowProjects():
+            return model, (FetchProjects(),)
         case ShowLines():
             picked = next(
                 (
@@ -538,8 +567,34 @@ def _switch(model: Model, line_id: str) -> Result:
         pane=model.pane,
         now=model.now,
         notice=f"attached to {line_id} as @{model.operator}",
+        project=model.project,
+        projects=model.projects,
     )
     return _poll(switched)
+
+
+def _opened(
+    model: Model, project: str, line_id: str, lines: tuple[LineSummary, ...]
+) -> Result:
+    """Attach to ``line_id`` of ``project``, whose daemon the runtime now speaks to.
+    Everything fetched from the other daemon is dropped, and the input history
+    stays. The runtime performs effects one at a time and switched before this
+    event, so no result of the other daemon arrives after it."""
+    opened = Model(
+        line_id,
+        model.operator,
+        model.poll_seconds,
+        width=model.width,
+        height=model.height,
+        lines=lines,
+        history=model.history,
+        pane=model.pane,
+        now=model.now,
+        notice=f"attached to {line_id} of {project} as @{model.operator}",
+        project=project,
+        projects=model.projects,
+    )
+    return _poll(opened)
 
 
 def _cycle(model: Model, step: int) -> Result:

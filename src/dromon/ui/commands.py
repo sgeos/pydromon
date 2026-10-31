@@ -54,6 +54,23 @@ class ShowLines:
 
 
 @dataclass(frozen=True, slots=True)
+class SwitchProject:
+    """Attach to a line of another project in the fleet index, without restarting the
+    client. Round 13, item 4."""
+
+    project: str
+    """The project, by its name or its root."""
+    line_id: str | None
+    """The line, or ``None`` for the attached line's name when the project has it and
+    its first line otherwise."""
+
+
+@dataclass(frozen=True, slots=True)
+class ShowProjects:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
 class ShowPane:
     pane: Pane
 
@@ -125,6 +142,8 @@ type Command = (
     | Interrupt
     | Switch
     | ShowLines
+    | SwitchProject
+    | ShowProjects
     | ShowPane
     | ShowSettings
     | Set
@@ -158,6 +177,8 @@ class Argument(StrEnum):
     QUESTION = "question"
     MESSAGE = "message"
     LINE = "line"
+    PROJECT = "project"
+    """A project of the fleet index."""
     NEW_LINE = "new_line"
     """A name not yet in use, which nothing completes."""
     SETTING = "setting"
@@ -209,6 +230,13 @@ SPECS: Final = (
     Spec("/reload", "/reload", "read the project file again"),
     Spec("/line", "/line LINE", "attach to another line", (Argument.LINE,)),
     Spec("/lines", "/lines", "list the daemon's lines"),
+    Spec(
+        "/project",
+        "/project PROJECT [LINE]",
+        "attach to a line of another project in the fleet index",
+        (Argument.PROJECT,),
+    ),
+    Spec("/projects", "/projects", "list the projects of the fleet index"),
     Spec("/activity", "/activity", "show what the engine is doing"),
     Spec("/mail", "/mail", "show the line's messages"),
     Spec("/help", "/help", "show commands and keys"),
@@ -264,6 +292,11 @@ def parse_input(text: str) -> Command | None:
             if not rest or " " in rest:
                 return Invalid(_usage(word))
             return Switch(rest)
+        case "/project":
+            parts = rest.split()
+            if len(parts) not in (1, 2):
+                return Invalid(_usage(word))
+            return SwitchProject(parts[0], parts[1] if len(parts) == 2 else None)
         case "/model" | "/effort":
             key = word[1:]
             if not rest:
@@ -296,7 +329,7 @@ def parse_input(text: str) -> Command | None:
                     return ClearSession()
                 case _:
                     return ReloadProject()
-        case "/release" | "/interrupt" | "/lines" | "/activity" | "/mail":
+        case "/release" | "/interrupt" | "/lines" | "/projects" | "/activity" | "/mail":
             if rest:
                 return Invalid(_usage(word))
             match word:
@@ -306,6 +339,8 @@ def parse_input(text: str) -> Command | None:
                     return Interrupt()
                 case "/lines":
                     return ShowLines()
+                case "/projects":
+                    return ShowProjects()
                 case "/activity":
                     return ShowPane(Pane.ACTIVITY)
                 case _:
@@ -324,6 +359,7 @@ class Choices:
     a value and a description."""
 
     lines: tuple[tuple[str, str], ...] = ()
+    projects: tuple[tuple[str, str], ...] = ()
     questions: tuple[tuple[str, str], ...] = ()
     messages: tuple[tuple[str, str], ...] = ()
     settings: tuple[tuple[str, str], ...] = ()
@@ -343,6 +379,8 @@ class Choices:
                 return self.messages
             case Argument.LINE:
                 return self.lines
+            case Argument.PROJECT:
+                return self.projects
             case Argument.SETTING:
                 return self.settings
             case Argument.LINE_MODEL:
