@@ -104,6 +104,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    CLIJSONDecodeError,
     McpSdkServerConfig,
     McpServerConfig,
     Message,
@@ -827,6 +828,61 @@ DIED_NOTE: Final = (
     " one was lost. Check for partial output before starting again."
 )
 
+MAX_MESSAGE_CHARACTERS: Final = 32 * 1024 * 1024
+"""The longest single message, in characters, that the Agent SDK reads from Claude
+Code, passed as ``ClaudeAgentOptions.max_buffer_size``. The SDK's default of 1 MiB
+ended a line's turn, inferred to be on a tool result that carried a file of about
+1 MB, and again on a two-line Edit of a 2.5 MB file. The SDK counts the characters
+of one line of the engine's output, not its bytes, despite its message.
+
+Claude Code 2.1.310, as bundled with Agent SDK 0.2.174, was read to show why. Its
+user message in the stream carries ``tool_use_result``, which its schema describes
+as the tool's full output object and not the text the model is sent. The output of
+Edit holds ``originalFile``, the file's contents before the edit, as well as the
+patch, and the output of a Write that replaces a file holds both the old and the new
+content. Its code that empties those fields was found only where it stores copies of
+results on disk, not on the path that writes the stream, so an Edit's message is
+inferred to be at least as long as the file it edits, whatever the size of the edit.
+
+The bound is 32 MiB, over ten times the largest file a line was seen to edit, which
+leaves room for a result that carries a file twice and for the escapes of its JSON
+form. Memory is the cost. While one message is read the SDK holds its chunks, the
+joined text, the split line and then the parsed object, which is inferred to be
+about four copies, so a message at the bound holds some 130 MB of ASCII text, and up
+to four times that for text whose characters need four bytes each, until the
+message has been handled. Each line reads its own engine, so
+the worst case grows with the number of lines whose engines send such a message at
+once. A larger bound only moves the failure to a larger file, and a message past
+this one ends the turn with ``MESSAGE_TOO_LONG``."""
+
+MESSAGE_TOO_LONG: Final = (
+    "the engine sent one message longer than Dromon's limit of"
+    f" {MAX_MESSAGE_CHARACTERS} characters, MAX_MESSAGE_CHARACTERS, so the Agent SDK"
+    " stopped reading the engine and the turn ended. The likely cause is a tool result"
+    " that carries a large file, such as an Edit, a Write or a Read of a file of"
+    " several megabytes, since Claude Code's Edit result carries the whole original"
+    " file however small the edit."
+    " Work on a smaller file, or change a large one with a command that does not"
+    " print it."
+)
+"""Why a turn ended when the SDK refused an engine message over
+``MAX_MESSAGE_CHARACTERS``, where before the turn said only that the engine's
+process ended."""
+
+TOO_LONG_PREFIX: Final = "JSON message exceeded maximum buffer size"
+"""How Agent SDK 0.2.174 begins the error it raises for a message over its buffer
+size. Porting hazard: the SDK gives that error no type of its own, so an SDK upgrade
+must check that this text still matches, which a test derives from the SDK."""
+
+
+def message_too_long(error: BaseException) -> bool:
+    """Whether ``error`` is the SDK's refusal of an engine message longer than its
+    buffer size, as opposed to output it could not decode."""
+    return isinstance(error, CLIJSONDecodeError) and error.line.startswith(
+        TOO_LONG_PREFIX
+    )
+
+
 SELF_STARTED_NOTE: Final = (
     "Dromon note: between your turns the engine began a turn by itself, most likely"
     " because a background task ended. Only Dromon starts turns, so it was"
@@ -1439,6 +1495,9 @@ class _Connection:
     ``INTERRUPTED_KIND``, so the result it ends with is reported as that kind."""
     ceiling: Ceiling | None = None
     """Where the connection stands against ``keep_session_max_seconds``."""
+    ended_by: str | None = None
+    """Why the pump stopped reading, when Dromon can say more than that the engine's
+    process ended, as ``MESSAGE_TOO_LONG`` does."""
 
 
 def check_environment(environment: Mapping[str, str], strategy: Strategy) -> None:
@@ -2074,6 +2133,7 @@ class ClaudeCodeLine:
             ),
             cli_path=self._launcher(),
             system_prompt=self._system_prompt(),
+            max_buffer_size=MAX_MESSAGE_CHARACTERS,
         )
 
     def _selected_shell(self) -> str | None:
@@ -2163,6 +2223,10 @@ class ClaudeCodeLine:
                     result = None
                 if result is not None and turn.refusal is None:
                     self.driver.step(Event("result", result.subtype, result.num_turns))
+        except CLIJSONDecodeError as error:
+            if message_too_long(error):
+                raise EngineRefused(MESSAGE_TOO_LONG) from error
+            raise
         finally:
             self._turn = None
         cost = None if result is None else self._measure(result)
@@ -2802,16 +2866,21 @@ class ClaudeCodeLine:
                     self._spent_alone(message, SELF_STARTED_KIND)
                 if not await self._interrupt(connection):
                     return
-        except Exception:  # noqa: BLE001, S110
+        except Exception as error:  # noqa: BLE001
             # The engine's process or its transport ended. The connection is
-            # marked dead below, and the next turn resumes in a new process.
-            pass
+            # marked dead below, and the next turn resumes in a new process. A
+            # message too long for the SDK is named, so the turn can say why.
+            if message_too_long(error):
+                connection.ended_by = MESSAGE_TOO_LONG
         finally:
             if connection.self_started_finish is not None:
                 await self._finish_self_started(
                     connection,
                     None,
-                    EngineRefused("the engine ended during its self-started turn"),
+                    EngineRefused(
+                        connection.ended_by
+                        or "the engine ended during its self-started turn"
+                    ),
                 )
             connection.alive = False
             if connection.inbox is not None:
@@ -3208,8 +3277,13 @@ class ClaudeCodeLine:
                 connection.drained = INTERRUPTED_KIND
                 self._settle(connection)
             raise
-        except Exception:
+        except Exception as error:
             await self.close()
+            if connection.ended_by is not None:
+                # A compaction that ended the pump leaves the prompt's own query to
+                # fail on the dead connection, which would hide the cause.
+                self._notes.append(DIED_NOTE)
+                raise EngineRefused(connection.ended_by) from error
             raise
         finally:
             self._turn = None
@@ -3223,7 +3297,9 @@ class ClaudeCodeLine:
             self._notes.append(DIED_NOTE)
             if turn.refusal is not None:
                 raise EngineRefused(turn.refusal)
-            raise EngineRefused("the engine's process ended during the turn")
+            raise EngineRefused(
+                connection.ended_by or "the engine's process ended during the turn"
+            )
         cost = self._measure(result)
         if turn.refusal is not None:
             await self.close()

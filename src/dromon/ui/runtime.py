@@ -14,10 +14,12 @@ one event each, and events that follow a fetch yield no further fetch, so the bo
 never reached in practice, and reaching it drops the rest rather than looping.
 """
 
+import sys
 from collections import deque
 from collections.abc import Callable, Mapping
 from typing import Final, Protocol
 
+from dromon import exits
 from dromon.protocol import Operation, Response
 from dromon.ui.commands import (
     Acknowledge,
@@ -46,6 +48,7 @@ from dromon.ui.model import (
     FetchSettings,
     FetchView,
     LinesLoaded,
+    Lost,
     Model,
     Pressed,
     Request,
@@ -62,7 +65,18 @@ MAX_STEPS: Final = 64
 
 
 class Unreachable(Exception):
-    """The daemon could not be asked, with the reason to show."""
+    """The daemon could not be asked, with the reason to show. ``gone`` says that
+    nothing accepted the connection, as when the daemon stopped or its project was
+    deleted, rather than that a daemon was slow or answered badly. ``missing`` says
+    that the socket file itself is absent, which only a daemon that is gone leaves,
+    while a refusal may come from a live daemon whose backlog is full."""
+
+    def __init__(
+        self, reason: str, *, gone: bool = False, missing: bool = False
+    ) -> None:
+        super().__init__(reason)
+        self.gone = gone
+        self.missing = missing
 
 
 class Daemon(Protocol):
@@ -111,6 +125,17 @@ def request_of(
             return Operation.RELOAD_PROJECT, {}, "reloaded the project file"
 
 
+def detached_status(runtime: "Runtime | None", status: int) -> int:
+    """The exit status of a client that has stopped, printing why it detached by
+    itself once the platform has restored the screen, so the message stays readable.
+    **Round 9, item 6.**"""
+    message = None if runtime is None else runtime.exit_message
+    if message is None:
+        return status
+    print(f"dromon attach: {message}", file=sys.stderr)
+    return exits.NOT_RUNNING
+
+
 def notice_of(
     command: DaemonCommand, line_id: str, done: str, result: Mapping[str, object]
 ) -> str:
@@ -151,6 +176,12 @@ class Runtime:
     def finished(self) -> bool:
         return self._model.finished
 
+    @property
+    def exit_message(self) -> str | None:
+        """Why the client detached by itself, for the platform to print once the
+        screen is restored, or ``None`` when the operator detached."""
+        return self._model.exit_message
+
     def tick(self, now: float) -> None:
         self.dispatch(Tick(now))
 
@@ -185,30 +216,30 @@ class Runtime:
         match effect:
             case FetchView(line_id):
                 response = self._ask(Operation.LINE_VIEW, {"line_id": line_id})
-                if isinstance(response, Failed):
+                if isinstance(response, Failed | Lost):
                     return response
                 return ViewLoaded(line_id, view_of(response))
             case FetchActivity(line_id, after):
                 response = self._ask(
                     Operation.LINE_ACTIVITY, {"line_id": line_id, "after": after}
                 )
-                if isinstance(response, Failed):
+                if isinstance(response, Failed | Lost):
                     return response
                 return ActivityLoaded(line_id, activity_of(response))
             case FetchLines():
                 response = self._ask(Operation.STATUS, {})
-                if isinstance(response, Failed):
+                if isinstance(response, Failed | Lost):
                     return response
                 return LinesLoaded(lines_of(response))
             case Request(command, line_id, operator):
                 operation, args, done = request_of(command, line_id, operator)
                 response = self._ask(operation, args)
-                if isinstance(response, Failed):
+                if isinstance(response, Failed | Lost):
                     return response
                 return Done(notice_of(command, line_id, done, response))
             case FetchSettings(line_id):
                 response = self._ask(Operation.SETTINGS, {"line_id": line_id})
-                if isinstance(response, Failed):
+                if isinstance(response, Failed | Lost):
                     return response
                 return SettingsLoaded(line_id, settings_of(response))
             case Bell():
@@ -219,10 +250,12 @@ class Runtime:
 
     def _ask(
         self, operation: Operation, args: dict[str, object]
-    ) -> dict[str, object] | Failed:
+    ) -> dict[str, object] | Failed | Lost:
         try:
             response = self._daemon.call(operation, args)
         except Unreachable as error:
+            if error.gone:
+                return Lost(str(error), missing=error.missing)
             return Failed(str(error))
         if not response.ok:
             return Failed(f"{operation}: {response.error_message or 'refused'}")

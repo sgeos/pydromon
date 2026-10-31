@@ -13,6 +13,58 @@ All notable changes are recorded here. The format follows
   prompting. A refused selection, missing option or different response refuses the
   turn. Tests cover new and resumed sessions, successful selection, refusal and a
   response that still names the wrong model.
+- A Claude Code line reads engine messages of up to `MAX_MESSAGE_CHARACTERS`, 32 MiB of
+  characters, which Dromon now passes to the Agent SDK as its buffer size in place of
+  its default of 1 MiB. A turn whose engine still sends a longer message ends with a
+  refusal that names the limit and a tool result carrying a large file, such as an
+  Edit, a Write or a Read, as the likely cause, where it said only that the engine's
+  process ended. Claude Code 2.1.310 was read to put an Edit's whole original file in
+  its stream message, however small the edit. The bound, its memory cost and that
+  reading are in `docs/protocol/ENGINES.md`. Reported by another project, whose line
+  ended its turn on an Edit of a 2.5 MB file.
+- A line given `fresh_session_each_turn` by a reload or `dromon configure` has its
+  recorded session cleared at once, so `dromon settings` stops showing the old
+  session as soon as the change applies. A turn in flight at that change, or at a
+  change of `workdir`, records neither its session, its context estimate, a compaction
+  nor a compaction wake when it ends, since they belong to the session the line no
+  longer resumes. Required by the operator in the round 9 review, F1. Every cleared or
+  rebound session also forgets the daemon's context estimate of the old session, with
+  the compaction and the context-warning wake it would start. The first turn after
+  such a reload had warned of the old session's context, which the line took to mean
+  the old session had resumed, though its engine was built with none to resume.
+  Reported by another project in round 9.
+- `dromon config` warns about a shared working directory only for lines that can
+  write it, as each engine confines them. A line needs `workdir_access` `write`, and
+  on Claude Code a shell or file-write built-in or a policy allowing every tool, on
+  Codex and Grok Build `Edit` or `Write`, whatever its policy, while a Pi, Cursor
+  Agent or Antigravity line with write access always counts. Read-only lines and lines
+  whose only tools come from MCP servers had been named as writers. Reported by
+  another project in round 9, and the engines' rules required by the operator in its
+  review, F16 and F17.
+- The daemon is stale in `line_status` only when its own checkout holds code under
+  its package directory other than the code it loaded, so a commit of documents no
+  longer warns, and the warning clears once the checkout returns to that code. Git
+  compares the trees only for commits not compared before, and caches the answer by
+  commit. The stale note names the daemon's own checkout, not the line's worktree.
+  Where the code cannot be compared, any move of `HEAD` is stale, as before.
+  Reported by another project in round 9. Git runs on a worker thread, never on the
+  daemon's event loop, so a status or a prompt never waits on it, and an answer git
+  could not give, a timeout, a git that could not start or an error status, is kept
+  for 60 seconds and then asked again. Required by the operator in the round 9
+  review, F4 and F6.
+- An attached client whose daemon is gone detaches by itself once 5 polls in a row
+  have found nothing listening, over at least 10 seconds with the socket file missing
+  or 60 seconds of refused connections, prints why, and exits with 4. A refusal waits
+  the longer bound because a live daemon with a full backlog may refuse connections
+  on Darwin, as the operator required in the round 9 review, F14. A slow daemon, or
+  one that refuses a request, never counts. The terminal loop waits out its input
+  timeout when curses returns at once, as it does once the terminal is gone. One
+  client had polled a deleted project for days at full processor use. Reported by
+  another project in round 9.
+- `test_a_stop_under_kill_all_also_ends_a_child_that_left_the_group` and every other
+  launcher test that waits for a process to go poll to a monotonic deadline derived
+  from the launcher's own bounds, and a `ps` that times out under load counts as not
+  yet gone rather than failing the test. One run failed at a load average of 189.
 - Grok refuses a reused tool call identifier, including a repeated permission request,
   so the same identifier cannot obtain multiple grants while counting once. Tests also
   cover raw input changes in updates, non-`other` discovery calls, and a non-marker
@@ -115,6 +167,21 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- `daemon_behind_worktree` in `line_status`, and a notice in the wake prompt once per
+  worktree commit, when the daemon runs code older than the line's worktree, which is
+  when its loaded commit is an ancestor of the worktree's `HEAD` and the two differ
+  under its package directory. Asked by review in round 8. It is `null` for a
+  worktree that does not descend from the daemon's commit, as on an unrelated branch,
+  where it had said `false`, as the round 9 review, F5, required. The notice is told
+  once again after a daemon restart, since the record of it is held in memory.
+- The client request `replies` and `dromon mail --replies-to MESSAGE`, which give the
+  replies in an operator's mailbox to one message with their bodies and mark none
+  read, so a wait loop can count unread replies and read them in one query. Reported
+  by another project in round 9. It delivers the operator's mail as `mail` does, so it
+  appends `message_delivered` events. Every entry's fields count against its byte
+  budget with the bodies, so an answer fits one protocol line whatever its fields
+  hold, and entries that do not fit are counted in `left_out` for a later page, as the
+  round 9 review, F11 and F13, required.
 - Drivers for GPT-6.1-Sol and GPT-6.1 Terra on Codex, `gpt-6.1-sol` and
   `gpt-6.1-terra`, for every strategy, with a context window of 500,000 tokens from
   Codex's model catalogue. Required by the operator on 2026-10-30. No turn on either

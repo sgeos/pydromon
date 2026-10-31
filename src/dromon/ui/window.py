@@ -18,7 +18,7 @@ from typing import Final
 
 from dromon.ui.keys import Key, Named, from_text
 from dromon.ui.render import Frame, Style
-from dromon.ui.runtime import Daemon, Runtime
+from dromon.ui.runtime import Daemon, Runtime, detached_status
 
 PUMP_MILLISECONDS: Final = 50
 COLUMNS: Final = 110
@@ -189,4 +189,4 @@ def run(daemon: Daemon, line_id: str, operator: str, poll_seconds: float) -> int
     window = Window(root, runtime)
     root.after(0, window.pump)
     root.mainloop()
-    return 0
+    return detached_status(runtime, 0)

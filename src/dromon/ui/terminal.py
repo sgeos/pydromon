@@ -24,7 +24,7 @@ from typing import Final, Protocol
 
 from dromon.ui.keys import Key, Named, from_text
 from dromon.ui.render import Frame, Style
-from dromon.ui.runtime import Daemon, Runtime
+from dromon.ui.runtime import Daemon, Runtime, detached_status
 
 INPUT_TIMEOUT_MS: Final = 50
 ESCAPE_DELAY_MS: Final = 25
@@ -150,8 +150,14 @@ def loop(
     runtime: Runtime,
     attributes: Mapping[Style, int],
     clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> int:
-    """Draw, read keys and run the runtime until the model finishes."""
+    """Draw, read keys and run the runtime until the model finishes.
+
+    **Round 9, item 6.** A read with no key waits out the rest of
+    ``INPUT_TIMEOUT_MS`` when curses returned at once, as it does once the terminal
+    is gone, so a pass never spins. The runtime detaches by itself once its daemon
+    has been gone for its bound."""
     screen.timeout(INPUT_TIMEOUT_MS)
     while not runtime.finished:
         height, width = screen.getmaxyx()
@@ -162,9 +168,13 @@ def loop(
         if runtime.finished:
             break
         draw(screen, runtime.frame(), attributes)
+        began = clock()
         try:
             first = screen.get_wch()
         except curses.error:
+            rest = INPUT_TIMEOUT_MS / 1000 - (clock() - began)
+            if rest > 0:
+                sleep(rest)
             continue
         for key in translate(_pending(screen, first)):
             runtime.press(key)
@@ -174,7 +184,10 @@ def loop(
 
 
 def run(daemon: Daemon, line_id: str, operator: str, poll_seconds: float) -> int:
-    """Attach in the terminal until the operator detaches. Returns an exit status."""
+    """Attach in the terminal until the operator detaches, or until the daemon has
+    been gone for the runtime's bound. Returns an exit status, ``exits.NOT_RUNNING``
+    with a message on standard error in the second case."""
+    runtimes: list[Runtime] = []
 
     def main(window: curses.window) -> int:
         window.keypad(True)
@@ -184,9 +197,11 @@ def run(daemon: Daemon, line_id: str, operator: str, poll_seconds: float) -> int
         curses.set_escdelay(ESCAPE_DELAY_MS)
         attributes = palette(curses.has_colors())
         runtime = Runtime(daemon, line_id, operator, poll_seconds, curses.beep)
+        runtimes.append(runtime)
         return loop(window, runtime, attributes)
 
     try:
-        return curses.wrapper(main)
+        status = curses.wrapper(main)
     except KeyboardInterrupt:
         return 0
+    return detached_status(runtimes[0] if runtimes else None, status)
