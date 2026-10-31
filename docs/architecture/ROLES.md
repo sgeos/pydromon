@@ -43,6 +43,9 @@ a restart and a port carries it unchanged.
 |---|---|---|
 | `role_declared` | `role_id`, `workdir`, `handoff_seconds`, `seats`, `failover`, `handoff_below_percent` | A role, its worktree relative to the project root, how long a planned handoff may take, an hour by default, its seats in the order a failover follows, its failover policy, and the budget below which its owner is asked to prepare a handoff |
 | `seat_bound` | `line_id`, `role_id`, `may_own` | A line becomes a seat of a role. `may_own` false makes a seat that may read and advise but never own |
+| `seat_unbound` | `line_id`, `role_id` | A line stops being a seat of its role, by an operator's command. Never the owner. Added in round 10 |
+| `role_retired` | `role_id`, `by`, `retired_at` | An operator retires a vacant role with no seat left. Added in round 10 |
+| `role_held` | `role_id`, `holder`, `by`, `held_at` | Whether the project file or an operator's commands decide the role's terms and seats from now. `holder` is `file` or `operator`. Added in round 10 |
 | `ownership_changed` | `role_id`, `owner` or null, `previous` or null, `cause`, `by`, `entry_id` or null, `changed_at`, `back_to` or null | Every change of owner. `cause` is `declared`, `handoff`, `recovery`, `operator`, `relinquished` or `failover`. `by` is the operator or seat that made it. `back_to` is a handoff's seat to return to |
 | `role_noted` | `role_id`, `entry_id`, `line_id`, `kind`, `body`, `workdir_commit`, `daemon_commit`, `noted_at` | A journal entry. `kind` is `handoff`, `recovery` or `note`. The daemon stamps both commits itself, read from `HEAD`, so the stamp is observed and not claimed |
 | `budget_stated` | `provider`, `remaining_percent` or null, `resets_at` or null, `source`, `note`, `stated_at` | A provider's budget. `source` is `operator` or `engine` |
@@ -59,9 +62,9 @@ events whose time matters carry it. The normative rules are in
 
 **Declared in the project file.** A role and its seats are declared in
 `.dromon/dromon.toml`, which an operator owns, in the way lines are declared today, and
-the daemon records the events at start. A client can also declare them, as it creates
-lines. The first owner is the seat the file names as `owner`, recorded with cause
-`declared`.
+the daemon records the events at start. An operator can also create, change and retire
+them from a client while the daemon runs, as the section on changing the team gives.
+The first owner is the seat the file names as `owner`, recorded with cause `declared`.
 
 ```toml
 [roles.core]
@@ -76,6 +79,90 @@ handoff_below_percent = 10   # the default, or 0 for never
 model = "grok-4.7"
 may_own = false   # until an operator probe has run Grok live in Dromon
 ```
+
+## Changing the team at run time
+
+**Round 10, 2026-10-31.** An operator changes the team while the daemon runs with
+`dromon role create`, `dromon role update` and `dromon role delete`, which
+[`CLIENT.md`](../protocol/CLIENT.md) specifies. Each is an operator's operation on the
+client socket only. No line's own tools and no external agent's tools create, change or
+retire a role, and a test pins that. `dromon role status` reads every term.
+
+- **Create** declares a role with its worktree, its seats in failover order, which
+  seats may not own it, and the other terms `role_declared` holds, then binds each
+  seat. The role starts vacant, and an operator gives it with `dromon role take`.
+- **Update** changes any term. Its seat list replaces the seats and the order, so it
+  adds, removes and reorders them, and a seat it keeps keeps its `may_own` unless the
+  command changes it. A removed seat is recorded with `seat_unbound`.
+- **Delete** unbinds every seat with `seat_unbound` and then records `role_retired`.
+
+**Refusals.** The owner's seat is never unbound and an owned role is never retired. The
+refusal says to vacate the role with `dromon role vacate` or hand it over first, and
+the model refuses both events as well. The owner is never barred from owning, and an
+owned role's worktree never moves, as before. A seat other than the owner of an owned
+role is not unbound while its line runs in the role's worktree, could write it and is
+neither hibernated nor stopped, because once unbound it would run beside the owner as
+an ordinary line outside the rule of one writer. Hibernating it, or vacating the role,
+first lets it go. This is default deny. A command that changes nothing is refused.
+
+**Lines are never created or changed implicitly.** A role command creates no line,
+binds only lines that exist, and changes no line's configuration. A seat must already
+run in the role's worktree, as the project file requires, so a seat elsewhere is
+refused with the command that moves it, `dromon configure`. No separate command to
+remove a line is needed, since a role command never needs a line to be gone, only no
+longer a seat. **Inference.** Removing a line from the team is therefore an update
+that leaves it out, followed by hibernating or stopping the line if it should not run.
+
+**What a retired role leaves.**
+
+- **The seats stay lines,** with their configuration, mailbox, sessions, leases and
+  state. A hibernated alternate stays hibernated. Each one's engine is dropped, so its
+  next turn is built without the role's tools.
+- **The journal stays in the log.** `dromon role entry ID` still reads any entry, with
+  its role. No new entry can be written, since the model takes entries only for a role
+  that exists.
+- **Leases are the line's, not the role's.** A lease names a resource of the project,
+  such as the full gate, so a seat's lease outlives its role and ends as any lease
+  does, by release, by its time to live, or when its holder's session is cleared or the
+  line rebound.
+- **The identifier is not reused.** **Decided.** A retired role's identifier is never
+  declared again. The log never reuses an identifier within its kind, and a role's
+  journal entries, its ownership history and the notices of its former owners are all
+  keyed by it, so a new role under the old name would read as the old one's
+  continuation. `dromon role status` lists retired roles, and a new role takes another
+  name.
+
+**The project file and the commands.** **Decided.** A run-time change wins over the
+file, and the file never undoes it silently. Each role is held either by the file or by
+an operator, which `role_held` records. A role with no `role_held` is the file's, as
+every role was before round 10. A role command records `operator`. At a start and at a
+reload the file is then applied to each role as follows, and every role the file leaves
+as it is gets a notice, which a reload returns as `role_notices` and `dromon reload`
+prints, and a start prints to the daemon's standard error.
+
+| The role is | The file's table | What a start or a reload does |
+|---|---|---|
+| Only in the log, held by an operator | Absent | Nothing, and no notice, since the file never declared it |
+| Only in the log, held by the file | Absent, dropped from the file | Nothing, since the file never retires a role. The notice says to retire it with `dromon role delete` |
+| Only in the file | Present | Declares the role, binds its seats and records its first owner, as before |
+| Retired | Present | Nothing, since the identifier is not reused. The notice says to remove the table |
+| In both, held by the file | The same terms | Nothing |
+| In both, held by the file | Different terms | Applies the file, as before, refused whole where the model refuses |
+| In both, held by an operator | The same terms | Records `role_held` with `file`, and the notice says the file holds the role again |
+| In both, held by an operator | Different terms | Nothing. The notice names who changed the role and when, and each term and seat that differs, and says to change the file to agree or to change the role with `dromon role update` |
+
+The terms compared are the worktree, the handoff time, the failover order and policy,
+the handoff threshold, each bound seat and its `may_own`. The file's `owner` is left
+out, since it names only a first owner. A seat the file gives a role it holds, which an
+operator has made a seat of a role the operator holds, is left out, with a notice, and
+the rest of the file applies. **Inference.** The way to make a run-time change
+permanent is to write it into the file, after which the next reload finds the two
+agree and the file holds the role again.
+
+**Rollback hazard.** A daemon older than round 10 does not know `seat_unbound`,
+`role_retired` or `role_held`, so once any of them is in the log, the older daemon
+cannot read the log at all, as for the `unreported` field of `line_turn_ended`. A
+rollback past round 10 needs a log without them.
 
 ## What write ownership means
 
@@ -510,6 +597,8 @@ them.
    profiles wait for the engines role's branch to merge.
 5. The question at an owner that does not hand over within `handoff_seconds`, and
    providers that are not engines, such as Pi's.
+6. Creating, changing and retiring roles at run time, with the rule between the file
+   and the commands. Done in round 10.
 
 ## Porting notes
 

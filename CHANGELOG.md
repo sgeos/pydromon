@@ -169,6 +169,23 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- `dromon role create`, `dromon role update` and `dromon role delete`, with the client
+  operations `role_create`, `role_update` and `role_delete`, so an operator changes the
+  team while the daemon runs. Update adds, removes and reorders seats and changes any
+  term. Delete unbinds every seat and retires the role, whose seats stay lines with
+  their leases, whose journal stays readable, and whose identifier is never declared
+  again. The owner's seat is never unbound and an owned role is never retired, and the
+  refusal says to vacate or hand over first. A seat of an owned role that could write
+  its worktree is not unbound while it runs, since it would then write beside the
+  owner. No line is created or reconfigured, and no line or external agent can call
+  these. `dromon role status` shows every term, who holds the role and the retired
+  roles. The new events `seat_unbound`, `role_retired` and `role_held` are rollback
+  hazards, since an older daemon cannot read a log that holds one. A run-time change
+  wins over the project file, which a start or a reload no longer applies to that role
+  until its table agrees, and every role the file leaves is reported in the reload's
+  `role_notices`, which `dromon reload` prints, and on a start's standard error. The
+  rule and its cases are in `docs/architecture/ROLES.md` and
+  `docs/protocol/PROJECT_CONFIG.md`. Required by the operator in round 10.
 - `daemon_behind_worktree` in `line_status`, and a notice in the wake prompt once per
   worktree commit, when the daemon runs code older than the line's worktree, which is
   when its loaded commit is an ancestor of the worktree's `HEAD` and the two differ

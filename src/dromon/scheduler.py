@@ -217,8 +217,12 @@ from dromon.roles import (
     Stamp,
     budget_spent,
     check_handoff_request,
+    RoleChange,
+    RoleWanted,
     plan_give,
     plan_note,
+    plan_role_retire,
+    plan_role_set,
     plan_relinquish,
     plan_take,
     recovery_ground,
@@ -239,6 +243,7 @@ from dromon.lineconfig import (
     ConfigError,
     LineConfig,
     WorkdirAccess,
+    can_write_workdir,
     check_instructions,
     decode_config,
     encode_config,
@@ -4766,6 +4771,12 @@ class Scheduler:
         state = self._log.state
         role = state.roles.get(role_id)
         if role is None:
+            retired = state.retired_roles.get(role_id)
+            if retired is not None:
+                raise EventRejected(
+                    f"role {role_id} was retired by {retired.by} at"
+                    f" {retired.retired_at}"
+                )
             raise EventRejected(f"no role {role_id}")
         seats: list[dict[str, object]] = []
         usable = self.usable_seats(role_id)
@@ -4799,9 +4810,13 @@ class Scheduler:
             entry for entry in state.role_entries.values() if entry.role_id == role_id
         ][-ROLE_STATUS_ENTRIES:]
         change = role.changed
+        held = state.role_holders.get(role_id)
         return {
             "role_id": role_id,
             "workdir": role.workdir,
+            "held_by": state.holder_of(role_id).value,
+            "held": None if held is None else {"by": str(held.by), "at": held.held_at},
+            "order": list(role.seats),
             "handoff_seconds": role.handoff_seconds,
             "failover": role.failover.value,
             "handoff_below_percent": role.handoff_below_percent,
@@ -5415,6 +5430,131 @@ class Scheduler:
             " now, reply to say why."
         )
         return owner, self.send(operator, LineAddress(owner), body, priority=True)
+
+    # The operator's role commands, round 10 of ``docs/architecture/ROLES.md``.
+
+    def _role_worktree(self, workdir: str) -> Path:
+        """``workdir`` resolved against the project root, or ``EventRejected``."""
+        if self._root is None:
+            raise EventRejected("this daemon does not know its project root")
+        try:
+            return resolve_workdir(workdir, self._root, self._protected)
+        except ConfigError as error:
+            raise EventRejected(str(error)) from error
+
+    def _runs_in(self, line_id: str, worktree: Path) -> bool:
+        """Whether ``line_id``'s effective working directory is ``worktree``."""
+        return self._role_worktree(self._line_workdir(line_id)) == worktree
+
+    def _line_workdir(self, line_id: str) -> str:
+        return self.effective_config(line_id).workdir or "."
+
+    def _unbind_refusals(self, role_id: str) -> dict[str, str]:
+        """Why each seat of ``role_id`` may not be unbound now. A seat other than
+        the owner of an owned role, unbound, would run beside the owner as an
+        ordinary line, outside the role's rule of one writer, so it is refused while
+        its line runs in the worktree, may write it and is neither hibernated nor
+        stopped. **Default deny.** Hibernating it, or vacating the role, first lets
+        it go."""
+        state = self._log.state
+        role = state.roles[role_id]
+        if role.owner is None:
+            return {}
+        worktree = self._role_worktree(role.workdir)
+        refused: dict[str, str] = {}
+        for line_id in seat_order(state, role_id):
+            line = state.lines[line_id]
+            if (
+                line_id == role.owner
+                or line.hibernated
+                or line.state is LineState.STOPPED
+                or not can_write_workdir(
+                    self.effective_config(line_id),
+                    ENGINE_OF.get(self.model_of(line_id)),
+                )
+                or not self._runs_in(line_id, worktree)
+            ):
+                continue
+            refused[line_id] = (
+                f"line {line_id}, unbound, would run beside {role.owner}, the owner of"
+                f" role {role_id}, as an ordinary line that may write the role's"
+                f" worktree. Hibernate it with dromon hibernate {line_id}, or vacate"
+                " the role, before its seat is removed"
+            )
+        return refused
+
+    def set_role(
+        self,
+        operator: OperatorAddress,
+        role_id: str,
+        wanted: RoleWanted,
+        *,
+        create: bool,
+    ) -> RoleChange:
+        """``operator`` creates ``role_id`` with ``wanted``, or changes it, as
+        ``roles.plan_role_set`` decides. The engines of the lines made seats and of
+        the seats unbound are dropped, since the role's tools and access are fixed for
+        an engine session's life. Raises ``EventRejected``, recording nothing."""
+        worktree = self._role_worktree(wanted.workdir)
+        outside = {
+            line_id: self._line_workdir(line_id)
+            for line_id, _ in wanted.seats
+            if line_id in self._log.state.lines and not self._runs_in(line_id, worktree)
+        }
+        refusals = (
+            {}
+            if create or role_id not in self._log.state.roles
+            else self._unbind_refusals(role_id)
+        )
+        try:
+            change = plan_role_set(
+                self._log.state,
+                role_id,
+                wanted,
+                operator,
+                format_due(self._wall_clock()),
+                create=create,
+                outside=outside,
+                unbind_refused=refusals,
+            )
+        except RoleConflict as error:
+            raise EventRejected(str(error)) from error
+        self._apply_role_change(change, "changed")
+        return change
+
+    def retire_role(self, operator: OperatorAddress, role_id: str) -> RoleChange:
+        """``operator`` retires ``role_id``, as ``roles.plan_role_retire`` decides.
+        Its seats stay lines, with their mail, leases and state, and their engines
+        are dropped, so their next turns are built without the role's tools. Raises
+        ``EventRejected``, recording nothing."""
+        try:
+            change = plan_role_retire(
+                self._log.state, role_id, operator, format_due(self._wall_clock())
+            )
+        except RoleConflict as error:
+            raise EventRejected(str(error)) from error
+        self._apply_role_change(change, "retired")
+        return change
+
+    def _apply_role_change(self, change: RoleChange, verb: str) -> None:
+        for event in change.events:
+            self._log.append(event)
+        for line_id in (*change.bound, *change.unbound):
+            self._drop_engine(line_id)
+            joined = "made a seat of" if line_id in change.bound else "unbound from"
+            self.activity.record(
+                line_id,
+                ActivityKind.NOTICE,
+                f"an operator {joined} role {change.role_id}, which was {verb}",
+            )
+        self._work.set()
+
+    def retired_roles_view(self) -> list[dict[str, object]]:
+        """Every retired role, by identifier, with who retired it and when."""
+        return [
+            {"role_id": role_id, "by": str(event.by), "retired_at": event.retired_at}
+            for role_id, event in sorted(self._log.state.retired_roles.items())
+        ]
 
     def state_budget(
         self,
