@@ -1679,6 +1679,51 @@ def test_permission_requests_follow_the_lines_tools(
     assert answers["p2"] == answers["p3"] == {"outcome": "cancelled"}
 
 
+@pytest.mark.parametrize(
+    ("kind", "name", "raw_input", "options", "intent"),
+    [
+        (
+            "other",
+            "use_tool",
+            use_tool_input("dromon__send_message"),
+            [{"optionId": "broad", "kind": "allow_always"}],
+            "allow",
+        ),
+        (
+            "edit",
+            "search_replace",
+            None,
+            [{"optionId": "yes", "kind": "allow_once"}],
+            "refuse",
+        ),
+    ],
+)
+def test_missing_permission_choice_cancels_and_refuses_with_evidence(
+    project: tuple[Path, Path, Path],
+    kind: str,
+    name: str,
+    raw_input: object | None,
+    options: list[dict[str, str]],
+    intent: str,
+) -> None:
+    request = permission(kind, name=name, raw_input=raw_input)
+    request["params"]["options"] = options
+    server = FakeGrok([request])
+
+    with pytest.raises(EngineRefused) as raised:
+        run(line(server, project, config=LineConfig(builtin_tools=("Read",))))
+
+    message = str(raised.value)
+    expected_tool = "use_tool (dromon__send_message)" if name == "use_tool" else name
+    assert expected_tool in message
+    assert intent in message
+    assert options[0]["kind"] in message
+    assert options[0]["optionId"] in message
+    answers = server.answers()
+    assert answers[0]["result"]["outcome"] == {"outcome": "cancelled"}
+    assert server.methods().count("session/cancel") == 1
+
+
 def test_the_turn_is_reported_to_the_observer_as_it_streams(
     project: tuple[Path, Path, Path],
 ) -> None:

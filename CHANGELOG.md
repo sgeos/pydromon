@@ -77,6 +77,10 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- ACP adapters now cancel and refuse a turn when the runtime omits the permission
+  option needed for Dromon's intended decision. The refusal names the tool, whether
+  Dromon intended to allow or refuse it, and bounded evidence of the offered option
+  kinds and identifiers. An `allow_always` option never substitutes for `allow_once`.
 - Grok's `get_command_or_subagent_output` may carry the kind `other`, which a live turn
   on 2026-10-31 showed, and so may `kill_command_or_subagent`, which shares its Grok
   category. Both still need `Bash`.

@@ -1119,6 +1119,36 @@ def test_a_request_after_a_cancel_is_answered_as_cancelled(
     assert interrupted.answer("p1")["result"] == {"outcome": {"outcome": "cancelled"}}
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "options", "intent"),
+    [
+        (OWN, [{"optionId": "broad", "kind": "allow_always"}], "allow"),
+        ("shell", [{"optionId": "yes", "kind": "allow_once"}], "refuse"),
+    ],
+)
+def test_missing_permission_choice_cancels_and_refuses_with_evidence(
+    home: Path,
+    runtime: Path,
+    tool_name: str,
+    options: list[dict[str, str]],
+    intent: str,
+) -> None:
+    request = permission("running a tool", tool_name=tool_name)
+    request["params"]["options"] = options
+    server = FakeRuntime([request])
+
+    with pytest.raises(EngineRefused) as raised:
+        run(line(server, home, runtime, tools=True))
+
+    message = str(raised.value)
+    assert f"tool '{tool_name}'" in message
+    assert intent in message
+    assert options[0]["kind"] in message
+    assert options[0]["optionId"] in message
+    assert server.answer("p1")["result"] == {"outcome": {"outcome": "cancelled"}}
+    assert server.methods().count("session/cancel") == 1
+
+
 def test_a_question_from_the_runtime_is_cancelled_and_refuses_the_turn(
     home: Path, runtime: Path
 ) -> None:
