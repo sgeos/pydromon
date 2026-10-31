@@ -48,7 +48,9 @@ MAX_OPEN_ISSUES_PER_LINE: Final = 5
 ISSUE_RATE_WINDOW_MESSAGES: Final = 20
 MAX_ISSUES_PER_LINE_IN_WINDOW: Final = 3
 """At most three issues in a line's last twenty sent messages, including the new one.
-This replay-deterministic rate limit does not depend on wall-clock time."""
+This replay-deterministic rate limit does not depend on wall-clock time, so it slows a
+line by messages, not by time. ``MAX_OPEN_ISSUES_PER_LINE`` is the bound that holds,
+since only an operator frees an open slot."""
 
 MAX_CONFIG_BYTES: Final = 256 * 1024
 """Upper bound on the UTF-8 size of a line's stored tool configuration."""

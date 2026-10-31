@@ -148,7 +148,13 @@ reply, and receives each through the operator's relay like any other mail, as
 - **Rate.** A line may have at most five open issues and at most three issues in its
   last twenty sent messages. Both bounds are enforced by replay, so acknowledging an
   issue frees an open slot but does not reset the rate limit. When a bound is reached,
-  the line is told to wait for an operator reply or acknowledgment.
+  the line is told to wait for an operator reply or acknowledgment. **Decided on
+  2026-10-31, from the relay re-review.** The open cap is the real bound, since a slot
+  frees only by an operator's reply or acknowledgment, so the issues an operator is
+  sent are bounded by the operator's own actions. The window counts messages, not time,
+  so a line that sends ordinary messages between issues is not slowed by it. A rule by
+  time would need a time on each message event, which the model does not record, and
+  was not added.
 - **Rollback hazard.** A daemon older than this kind cannot read an event log that
   holds an issue, since its codec refuses an unknown message kind, so a rollback past
   it needs the log from before the first issue.

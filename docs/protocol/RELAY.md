@@ -118,8 +118,9 @@ involved.
   with the error's description, the trace goes to the daemon's standard error, and
   the relayer goes on.
 - A line may have at most five open issues. It may raise at most three issues in its
-  last twenty sent messages. These limits are checked by event replay, so a restart
-  cannot reset them. When a limit is reached, `send_message` tells the line to wait
+  last twenty sent messages, a window of messages, not of time. These limits are
+  checked by event replay, so a restart cannot reset them. The open cap is the bound
+  that holds, since only an operator's reply or acknowledgment frees a slot. When a limit is reached, `send_message` tells the line to wait
   for an operator reply or acknowledgment.
 - `dromon status` reports the routed operators, how many notices were relayed since
   the start, how many wait unrouted, and each failing notice with its attempts, its
