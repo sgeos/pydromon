@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import os
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -31,7 +32,12 @@ from dromon.daemon import Daemon, build_parser, start_successor, successor_args
 from dromon.driver import Strategy
 from dromon.engine import TurnReport
 from dromon.eventlog import EventLog, read_entries, replay
-from dromon.model import LineAddress, OperatorAddress, RestartNoted
+from dromon.model import (
+    LineAddress,
+    OperatorAddress,
+    OperatorRegistered,
+    RestartNoted,
+)
 from dromon.paths import ProjectPaths, ensure_private_dir, project_paths
 from dromon.projectconfig import config_path
 from dromon.protocol import (
@@ -992,29 +998,103 @@ def aged(directory: Path, seconds: float) -> Path:
     return directory
 
 
-def test_a_snapshot_copies_in_steps_with_a_pause_between(
+def schema_of(path: Path) -> tuple[list[tuple[str, str]], int]:
+    connection = sqlite3.connect(path)
+    try:
+        found = connection.execute(
+            "SELECT name, sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name"
+        ).fetchall()
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        return found, version
+    finally:
+        connection.close()
+
+
+def test_a_snapshot_copies_in_ranges_and_keeps_the_schema_exact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Audit's finding P1. The copy holds the live log's read lock one step at a
-    time, so the daemon's commits wait for a step, not for the whole copy."""
+    """Audit's finding P1. The copy holds the live log's read lock one range at a
+    time, so the daemon's commits wait for a range, not for the whole copy."""
     source = tmp_path / "events.sqlite"
-    world = World(source, [f"line{n}" for n in range(30)])
+    world = World(source, [f"line{n}" for n in range(10)])
     world.log.close()
     pauses: list[float] = []
     monkeypatch.setattr(eventlog.time, "sleep", pauses.append)
     copy = tmp_path / "copy.sqlite"
-    eventlog.snapshot(source, copy, pages=1, pause_seconds=0.25)
+    eventlog.snapshot(source, copy, rows=3, pause_seconds=0.25)
     assert len(pauses) > 3 and set(pauses) == {0.25}
     assert replay(copy) == replay(source)
+    assert read_entries(copy) == read_entries(source)
+    assert schema_of(copy) == schema_of(source)
     assert stat.S_IMODE(copy.stat().st_mode) == 0o600
+    with EventLog(copy) as reopened:
+        reopened.append(OperatorRegistered("zed"))
+        assert reopened.last_seq == len(read_entries(source)) + 1
+    connection = sqlite3.connect(copy)
+    try:
+        with pytest.raises(sqlite3.DatabaseError, match="append-only"):
+            connection.execute("DELETE FROM events")
+    finally:
+        connection.close()
 
 
-def test_a_snapshot_past_its_bound_is_refused(tmp_path: Path) -> None:
+def test_a_snapshot_finishes_while_the_daemon_writes_and_leaves_its_writes_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The source is written between every two ranges, as a busy daemon writes. A
+    backup would start again at each write. The copy holds the log as it stood when
+    the copy began, and finishes."""
+    source = tmp_path / "events.sqlite"
+    world = World(source, [f"line{n}" for n in range(10)])
+    before = read_entries(source)
+    written: list[str] = []
+
+    def daemon_writes(seconds: float) -> None:
+        del seconds
+        line_id = f"during{len(written)}"
+        world.scheduler.create_line(line_id, HAIKU, Strategy.SUBSCRIPTION)
+        written.append(line_id)
+
+    monkeypatch.setattr(eventlog.time, "sleep", daemon_writes)
+    copy = tmp_path / "copy.sqlite"
+    try:
+        eventlog.snapshot(source, copy, rows=2)
+    finally:
+        world.log.close()
+    assert len(written) >= len(before) // 2
+    assert read_entries(copy) == before
+    assert len(read_entries(source)) > len(before)
+    assert not set(written) & set(replay(copy).lines)
+
+
+def test_a_snapshot_copies_a_table_a_later_version_adds_whole(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "events.sqlite"
     world = World(source, ["alpha"])
     world.log.close()
-    with pytest.raises(eventlog.LogError, match="took more than"):
-        eventlog.snapshot(source, tmp_path / "copy.sqlite", bound_seconds=-1.0)
+    connection = sqlite3.connect(source)
+    try:
+        connection.execute('CREATE TABLE "odd ""name""" (x INTEGER)')
+        connection.executemany('INSERT INTO "odd ""name""" VALUES (?)', [(1,), (2,)])
+        connection.commit()
+    finally:
+        connection.close()
+    copy = tmp_path / "copy.sqlite"
+    eventlog.snapshot(source, copy)
+    assert schema_of(copy) == schema_of(source)
+    connection = sqlite3.connect(copy)
+    try:
+        found = connection.execute('SELECT x FROM "odd ""name""" ORDER BY x').fetchall()
+    finally:
+        connection.close()
+    assert found == [(1,), (2,)]
+    assert read_entries(copy) == read_entries(source)
+
+
+def test_a_snapshot_copies_at_least_one_row_at_a_time(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="at least one row"):
+        eventlog.snapshot(tmp_path / "a", tmp_path / "b", rows=0)
 
 
 def test_a_sweep_removes_old_check_directories_and_nothing_else(

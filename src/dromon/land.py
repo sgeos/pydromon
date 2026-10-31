@@ -33,8 +33,10 @@ The steps, in order, each stopping the command when it fails.
    holds no listed term, since a hook or template could add either.
 6. Run the full gate, ``scripts/check.sh`` with no arguments, in the worktree.
    The gate and the hooks the commit runs are the branch's own code, run as the
-   operator outside any sandbox. The plan says so, and when the branch changes a
-   path under ``scripts/`` the command asks before staging even with ``--yes``.
+   operator outside any sandbox, and the gate reaches all of it, the tests,
+   ``conftest.py``, ``pyproject.toml`` and ``uv.lock`` included. The plan says so,
+   and when the branch changes a path under ``scripts/``, which holds the gate and
+   the hooks, the command asks before staging even with ``--yes``.
 7. Ask, then push the branch to the remote, never forcing, with ``--no-verify``,
    because the pre-push hook would run the same gate on the same commit again. The
    commit is checked to be the one gated, and the refspec names that commit.
@@ -762,8 +764,9 @@ def describe(plan: Plan, request: Request) -> str:
     if plan.fork is not None:
         lines.append(f"  the push carries the commits since {plan.fork}")
     lines.append(
-        "  land runs the branch's own scripts/check.sh and git hooks as you, outside"
-        " any sandbox"
+        "  land runs the branch's whole gate and its git hooks as you, outside any"
+        " sandbox, which is all of the branch's code they reach: scripts/check.sh,"
+        " the tests, conftest.py, pyproject.toml and uv.lock"
     )
     if plan.gate_changed:
         lines.append(

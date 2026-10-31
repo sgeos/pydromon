@@ -453,7 +453,8 @@ def test_the_plan_always_says_whose_gate_runs(repo: Path, terms: Path) -> None:
     said = Said()
     assert lander(repo, said, terms_files=(terms,), dry_run=True).land() == exits.OK
     out = "\n".join(said.out)
-    assert "runs the branch's own scripts/check.sh and git hooks as you" in out
+    assert "runs the branch's whole gate and its git hooks as you" in out
+    assert "the tests, conftest.py, pyproject.toml and uv.lock" in out
     assert "even with --yes" not in out
 
 
@@ -637,6 +638,24 @@ def test_a_resolved_merge_lands_and_carries_the_base_s_protected_change(
     assert git(remote, "rev-parse", "refs/heads/feat/thing") == git(
         merging, "rev-parse", "HEAD"
     )
+
+
+def test_a_term_a_committed_merge_resolution_adds_is_found_by_the_net_diff(
+    merging: Path, terms: Path
+) -> None:
+    """Audit's re-review of L3. A merge commit's own diff is not read, so the net
+    diff since the fork is the only screen of what its resolution adds. Here no
+    other commit holds the term, so only that screen can find it."""
+    write(merging, "src/a.py", f"a = 1\nb = '{TERM}'\nc = 3\n")
+    git(merging, "add", "src/a.py")
+    git(merging, "commit", "-q", "--no-edit")
+    fork = git(merging, "merge-base", "HEAD", "refs/remotes/origin/main")[:12]
+    write(merging, "src/new.py", "x = 1\n")
+    said = Said()
+    code = lander(merging, said, terms_files=(terms,), dry_run=True).land()
+    assert code == exits.FAILURE
+    assert said.err[:-1] == [f"the branch since {fork}, src/a.py:2"]
+    assert all(TERM not in line.casefold() for line in said.out + said.err)
 
 
 def test_a_merge_that_changes_a_protected_path_itself_is_refused(

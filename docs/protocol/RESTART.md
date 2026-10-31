@@ -99,20 +99,25 @@ message and leaving the old daemon running.
   successor will. The check is `run` in `dromon.daemon` itself with `check_only`, so
   every check a start makes is a check of the preflight, in the same order, and a
   check added to a start later is covered without a second list to keep.
-- **The event log is read, never written.** The check copies the log with SQLite's
-  online backup into a new directory, mode 0700, under the runtime directory, opens
+- **The event log is read, never written.** The check copies the log, as the next
+  item describes, into a new directory, mode 0700, under the runtime directory, opens
   the copy, lets whatever a start appends go to the copy, and removes the directory
-  when it ends. The backup sees each committed transaction whole, so a copy taken while
-  the old daemon writes is consistent. The copy holds message bodies, so it is never
+  when it ends. Each range is read in one statement, which sees committed events
+  only, so a copy taken while the old daemon writes is consistent. The copy holds message bodies, so it is never
   placed outside the runtime directory.
 - **A preflight can briefly delay the daemon's writes.** The log keeps SQLite's
-  rollback journal, in which a reader's lock keeps a writer's commit waiting. The
-  copy is therefore made 64 pages at a time, 256 KiB at the default page size, with a
-  pause of 2 milliseconds and no lock between steps, so a commit of the running
-  daemon waits at most for one step, not for the whole copy, decided by the operator
-  on 2026-10-31 after audit's finding P1. A write between steps restarts the copy, so
-  a copy is bounded at 60 seconds and refuses past it, which refuses a restart that
-  might have succeeded, failing closed.
+  rollback journal, in which a reader's lock keeps a writer's commit waiting.
+  SQLite's online backup starts again whenever the source is written between its
+  steps, so on a busy, large log it would never finish, as audit's re-review of P1
+  found. The copy is therefore made from the schema and the rows, decided by the
+  operator on 2026-10-31. The schema's statements and its version are copied
+  exactly. The newest sequence number is read once, and the events up to it are
+  copied 2,000 at a time by sequence number, each range one statement with a pause
+  of 1 millisecond and no lock after it. The events table is append only, so a
+  range once read never changes, and an event the daemon appends during the copy
+  lies above the bound and is left out, as anything recorded during the drain is.
+  The copy finishes in a number of statements fixed when it begins, and a commit of
+  the running daemon waits at most for one range.
 - **Leftover copies are swept.** A check removes its own directory as it ends. A check
   the client kills at its bound cannot, so the client sweeps the preflight directories
   after a timeout, each check sweeps those older than the bound, and each start, which
@@ -185,5 +190,6 @@ watch is a poll bounded by a count derived from the wait. Starting the successor
 detached spawn after the lock is released. A Rust or Keleusma daemon makes the same
 spawn, or leaves the start to a supervisor where the platform has one. The preflight is
 the start path with a flag that swaps the log for a copy and stops before the first
-side effect outside the copy, so a port keeps one start path, not two. The copy uses
-SQLite's online backup, which a port that keeps SQLite keeps.
+side effect outside the copy, so a port keeps one start path, not two. The copy is the
+schema and the events below a sequence bound read once, which a port with any store can
+make.

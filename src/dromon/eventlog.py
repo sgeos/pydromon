@@ -193,58 +193,57 @@ def read_entries(path: Path) -> list[Entry]:
         connection.close()
 
 
-SNAPSHOT_PAGES: Final = 64
-"""Pages a snapshot copies in one step. A step holds the live log's read lock, which
-keeps the daemon's next commit waiting, so a small step bounds that wait. At SQLite's
-default page size of 4,096 bytes a step is 256 KiB, which a local disk reads in a few
-milliseconds."""
+SNAPSHOT_ROWS: Final = 2000
+"""Events a snapshot copies in one statement. A statement holds the live log's read
+lock while it reads, which keeps the daemon's next commit waiting, so a small range
+bounds that wait. An event is about 400 bytes on average in the logs observed, so a
+range is under a megabyte."""
 
-SNAPSHOT_PAUSE_SECONDS: Final = 0.002
-"""The pause after each step, with no lock held, in which a waiting commit of the
+SNAPSHOT_PAUSE_SECONDS: Final = 0.001
+"""The pause after each range, with no lock held, in which a waiting commit of the
 daemon goes through."""
-
-SNAPSHOT_BOUND_SECONDS: Final = 60.0
-"""The longest a snapshot may take. A write between steps restarts SQLite's backup
-from the first page, so a log written faster than it can be copied would never
-finish, and the bound turns that into a refusal."""
-
-
-class _CopyTooSlow(Exception):
-    """Raised from the backup's progress callback once the bound passes, which ends
-    the backup."""
 
 
 def snapshot(
     source: Path,
     destination: Path,
     *,
-    pages: int = SNAPSHOT_PAGES,
+    rows: int = SNAPSHOT_ROWS,
     pause_seconds: float = SNAPSHOT_PAUSE_SECONDS,
-    bound_seconds: float = SNAPSHOT_BOUND_SECONDS,
 ) -> None:
-    """Copy the log at ``source`` to ``destination`` as one consistent picture,
-    never writing ``source``, so a check can open the copy and append to it while a
-    daemon still writes the original. ``destination`` must not exist, and is created
-    owner only, since the log holds message bodies and answers.
+    """Copy the log at ``source`` to ``destination`` as it stood when the copy
+    began, never writing ``source``, so a check can open the copy and append to it
+    while a daemon still writes the original. ``destination`` must not exist, and is
+    created owner only, since the log holds message bodies and answers.
 
-    A ``source`` that does not exist leaves no copy, and opening ``destination``
-    then creates an empty log, as a first start would. The copy goes through
-    SQLite's online backup, which sees each committed transaction whole, where a
-    byte copy could catch a write half done. The schema version is not checked
-    here, so the code that opens the copy refuses it in its own words. Raises
-    ``LogError`` when the source cannot be read, the copy cannot be written, or the
-    copy takes longer than ``bound_seconds``.
+    **Decided by the operator on 2026-10-31, after audit's re-review of P1.** The
+    log keeps SQLite's rollback journal, in which a reader's lock keeps a writer's
+    commit waiting, and SQLite's online backup starts again from the first page
+    whenever the source is written between its steps, so on a busy, large log it
+    would never finish. The copy is therefore made from the schema and the rows. The
+    schema's statements and ``user_version`` are copied exactly. The newest sequence
+    number is read once, and the events up to it are copied in ranges of ``rows`` by
+    sequence number, each one statement with a pause of ``pause_seconds`` and no lock
+    after it. The table is append only, its triggers refuse an update or a delete,
+    so a range once read never changes, and an event appended during the copy lies
+    above the bound and is left out. The copy therefore finishes in a number of
+    statements fixed when it begins, and the daemon's commits wait at most for one
+    range. A snapshot can still delay a daemon's write by that much.
 
-    **Decided by the operator on 2026-10-31, after audit's finding P1.** The log
-    keeps SQLite's rollback journal, in which a reader's lock keeps a writer's commit
-    waiting. The copy is therefore made ``pages`` at a time, with a pause of
-    ``pause_seconds`` and no lock between steps, so the daemon's commits wait at most
-    one step, not the whole copy. A snapshot can still delay a daemon's write by that
-    much. The defaults are ``SNAPSHOT_PAGES``, ``SNAPSHOT_PAUSE_SECONDS`` and
-    ``SNAPSHOT_BOUND_SECONDS``.
+    A ``source`` that does not exist, or holds no schema yet, leaves the copy empty,
+    and opening ``destination`` then creates an empty log, as a first start would.
+    The schema version is not checked here, so the code that opens the copy refuses
+    an unknown one in its own words. Any table other than ``events``, which no
+    version holds yet, is copied whole in one statement. The schema's statements are
+    the log's own, from an owner-only file the daemon wrote, and are trusted as the
+    log is. Raises ``LogError`` when the source cannot be read or the copy cannot be
+    written.
 
-    Porting note. The backup is a SQLite facility, so a port that keeps SQLite keeps
-    it, and one that does not copies under the log's own writer lock."""
+    Porting note. The copy is plain SQL over an attached database, which a port
+    that keeps SQLite keeps. A port with another store copies the events below a
+    sequence bound read once, as here."""
+    if rows < 1:
+        raise ValueError("a snapshot copies at least one row at a time")
     if not source.exists():
         return
     try:
@@ -252,32 +251,70 @@ def snapshot(
     except OSError as error:
         raise LogError(f"cannot create a copy of the log at {destination}") from error
     os.close(descriptor)
-    uri = f"{source.resolve().as_uri()}?mode=ro"
-    deadline = time.monotonic() + bound_seconds
-
-    def pace(status: int, remaining: int, total: int) -> None:
-        del status, remaining, total
-        if time.monotonic() > deadline:
-            raise _CopyTooSlow
-        time.sleep(pause_seconds)
-
     try:
-        reading = sqlite3.connect(uri, uri=True, isolation_level=None)
+        copying = sqlite3.connect(
+            destination.resolve().as_uri(), uri=True, isolation_level=None
+        )
         try:
-            writing = sqlite3.connect(destination, isolation_level=None)
-            try:
-                reading.backup(writing, pages=pages, progress=pace)
-            finally:
-                writing.close()
+            copying.execute(
+                "ATTACH DATABASE ? AS source", (f"{source.resolve().as_uri()}?mode=ro",)
+            )
+            tables = _copy_schema(copying)
+            if "events" in tables:
+                _copy_events(copying, rows, pause_seconds)
+            for table in sorted(tables - {"events"}):
+                # The name is the log's own, from its schema, quoted as an
+                # identifier, which SQL cannot take as a parameter.
+                name = table.replace('"', '""')
+                copying.execute(
+                    f'INSERT INTO main."{name}" SELECT * FROM source."{name}"'  # noqa: S608
+                )
+            copying.execute("DETACH DATABASE source")
         finally:
-            reading.close()
-    except _CopyTooSlow as error:
-        raise LogError(
-            f"the copy of the event log at {source} took more than"
-            f" {bound_seconds:g} seconds"
-        ) from error
+            copying.close()
     except sqlite3.Error as error:
         raise LogError(f"cannot copy the event log at {source}: {error}") from error
+
+
+def _copy_schema(copying: sqlite3.Connection) -> set[str]:
+    """Create the attached source's schema in the copy, statement for statement,
+    with its ``user_version``, and give the names of its tables. SQLite's own
+    objects, such as ``sqlite_sequence``, are made by SQLite itself."""
+    found: list[tuple[str, str, str]] = copying.execute(
+        "SELECT type, name, sql FROM source.sqlite_schema"
+        " WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+        " ORDER BY rowid"
+    ).fetchall()
+    version: int = copying.execute("PRAGMA source.user_version").fetchone()[0]
+    with _transaction(copying, "BEGIN IMMEDIATE") as creating:
+        for _, _, statement in found:
+            creating.execute(statement)
+        creating.execute(f"PRAGMA main.user_version = {int(version)}")
+    return {name for kind, name, _ in found if kind == "table"}
+
+
+def _copy_events(copying: sqlite3.Connection, rows: int, pause_seconds: float) -> None:
+    """Copy the events up to the newest sequence number when the copy begins, in
+    ranges of ``rows``. The loop is bounded by the count of ranges that bound needs,
+    and a copy that stops short of it is refused."""
+    bound: int = copying.execute(
+        "SELECT coalesce(max(seq), 0) FROM source.events"
+    ).fetchone()[0]
+    copied = 0
+    for _ in range(bound // rows + 1):
+        if copied >= bound:
+            break
+        copying.execute(
+            "INSERT INTO main.events SELECT * FROM source.events"
+            " WHERE seq > ? AND seq <= ? ORDER BY seq LIMIT ?",
+            (copied, bound, rows),
+        )
+        copied = copying.execute(
+            "SELECT coalesce(max(seq), 0) FROM main.events"
+        ).fetchone()[0]
+        time.sleep(pause_seconds)
+    if copied != bound:
+        raise LogError(f"the copy of the log stopped at event {copied} of {bound}")
 
 
 def _create_private(path: Path) -> None:

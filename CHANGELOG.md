@@ -10,16 +10,18 @@ All notable changes are recorded here. The format follows
 - A restart preflight, round 13. `dromon restart` now reads `status`, then runs the
   installed daemon's own start checks in a process of their own, `dromond --check`
   with the running daemon's command-line options, against the project file and a copy
-  of the event log made by SQLite's online backup in a private directory under the
+  of the event log in a private directory under the
   runtime directory, and refuses the restart with the new code's own message while
   the old daemon keeps serving. The check never writes the live log, takes no lock,
   makes and removes no socket, and starts nothing. `status` gives the new field
   `options`. `docs/protocol/RESTART.md` tables what the check covers and what only a
   real start reveals, which includes anything recorded during the drain. It replaces
   the import check by `--version`. Prompted by the restart of 2026-10-31 that left no
-  daemon for about eight minutes. After audit's review, the copy is made 64 pages at
-  a time with a short pause and no lock between steps, so a preflight delays the
-  daemon's commits by at most one step, and is bounded at 60 seconds. Preflight
+  daemon for about eight minutes. After audit's reviews, the copy is not a SQLite
+  backup, which starts again at every write to the source, but the exact schema and
+  the events up to the sequence number read when it begins, copied 2,000 at a time
+  with a short pause and no lock between ranges, so it finishes on a busy log and
+  delays the daemon's commits by at most one range. Preflight
   directories that a killed check left are swept after a client's timeout, by each
   check when older than its bound, and by each start.
 - `dromon land WORKTREE`, round 13, one operator command that takes a line's finished
