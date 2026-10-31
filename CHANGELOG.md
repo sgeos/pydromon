@@ -7,6 +7,16 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Runtime line creation accepts limits, kept session and compaction options.
+  Configuration accepts workdir access and the project summary shows operator routing,
+  relays, supervised runs, read only paths and federation policy.
+- Disclosure refusals name message fields. Checks return only aggregate counts,
+  without file names or line locations.
+  Older daemons refuse the new `disclosure_accepted` key, so remove that table
+  before rolling back. Operator accepted occurrences use file paths and exact line
+  content hashes shared by the daemon and gate. Text and messages retain disclosure checks and the hourly limit.
+- The gate reports bounded groups of skipped and deselected tests with their reasons.
+
 - Open federation, round 12. `[federation] local` and `remote` take `allowlist`, the
   default, which keeps the behaviour of declared peers exactly, or `open`. With
   `local = "open"`, `listen` and a unique `name`, a daemon registers in a per-user
