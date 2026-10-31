@@ -240,6 +240,35 @@ if [[ -f "$terms_file" ]]; then
     done < "$terms_file"
     if ((${#patterns[@]} > 0)); then
         hits="$(git grep -n -I -i -F "${patterns[@]}" -- . || true)"
+        # Operator hashes exempt only the configured file and exact line.
+        hits="$(printf '%s\n' "$hits" | python3 -I -c '
+import hashlib
+import pathlib
+import sys
+import tomllib
+
+config = pathlib.Path(".dromon/dromon.toml")
+accepted = {}
+if config.exists():
+    accepted = tomllib.loads(config.read_text(encoding="utf-8")).get("daemon", {}).get("disclosure_accepted", {})
+if not isinstance(accepted, dict) or len(accepted) > 256:
+    sys.exit("invalid disclosure_accepted table")
+for path, hashes in accepted.items():
+    if (not path or pathlib.Path(path).is_absolute() or ".." in pathlib.Path(path).parts
+        or "\\" in path or "\x00" in path or not isinstance(hashes, list)
+        or not 1 <= len(hashes) <= 256
+        or any(not isinstance(h, str) or len(h) != 64
+               or any(c not in "0123456789abcdef" for c in h) for h in hashes)):
+        sys.exit("invalid disclosure_accepted entry")
+for hit in sys.stdin:
+    parts = hit.rstrip("\n").split(":", 2)
+    if len(parts) != 3:
+        continue
+    path, number, text = parts
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if digest not in accepted.get(path, []):
+        print(hit, end="")
+')" || fail "invalid project disclosure acceptance configuration"
         accepted_pairs=()
         if [[ -f "$accepted_file" ]]; then
             accepted_line=0
@@ -321,5 +350,5 @@ pass "pyright strict, for Linux and macOS"
 
 # Warnings are errors. pytest exits non-zero when it collects nothing, so an empty
 # selection fails here rather than passing.
-uv run --no-sync pytest -W error "$@"
+uv run --no-sync pytest -W error -p dromon.testreport "$@"
 pass "pytest"

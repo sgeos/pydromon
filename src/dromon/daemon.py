@@ -128,6 +128,7 @@ from dromon.configview import (
 )
 from dromon.overrides import (
     Layer,
+    apply_limits,
     OverrideError,
     Scope,
     Value,
@@ -1037,7 +1038,9 @@ class Daemon:
         return Response(request.request_id, True, result=result)
 
     def _create_line(self, args: dict[str, object]) -> dict[str, object]:
-        texts = {key: value for key, value in args.items() if key != "config"}
+        texts = {
+            key: value for key, value in args.items() if key not in ("config", "limits")
+        }
         names = ("line_id", "model", "strategy")
         if "engine_session" in texts:
             names += ("engine_session",)
@@ -1051,7 +1054,22 @@ class Daemon:
         config = _config_arg(args) if "config" in args else DEFAULT_CONFIG
         self._check_workdir(config)
         check_sandbox_required(self.project, line_id, model, config)
+        raw_limits = args.get("limits", {})
+        if not isinstance(raw_limits, dict):
+            raise OverrideError("limits must be an object")
+        limits_document: dict[str, Value] = {}
+        for key, value in cast(dict[str, object], raw_limits).items():
+            if key not in ("max_autonomous_turns", "max_cost_usd", "cooldown_seconds"):
+                raise OverrideError("unknown line limit key")
+            full_key = "limits." + key
+            limits_document[full_key] = check(spec_of(Scope.LINE, full_key), value)
+        try:
+            apply_limits(self.scheduler.limits, limits_document)
+        except ValueError as error:
+            raise OverrideError(str(error)) from error
         self.scheduler.create_line(line_id, model, chosen, config, session)
+        for key, value in limits_document.items():
+            self.scheduler.override_line(line_id, key, value)
         return {"line_id": line_id}
 
     def _configure_line(self, args: dict[str, object]) -> dict[str, object]:
@@ -1625,6 +1643,7 @@ class Daemon:
             }
         )
         self.scheduler.set_disclosure_terms(terms)
+        self.scheduler.set_disclosure_accepted(config.disclosure_accepted)
         self.scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
         self.scheduler.set_runs(config.run_commands)
         self.project = config
@@ -3464,6 +3483,7 @@ def run(
             )
             scheduler.record_walk_gap(launcher.walk_gap())
             scheduler.set_disclosure_terms(terms)
+            scheduler.set_disclosure_accepted(config.disclosure_accepted)
             scheduler.set_git_ssh(line_git_ssh)
             scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
             scheduler.set_runs(config.run_commands)

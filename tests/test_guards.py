@@ -192,7 +192,7 @@ def test_a_line_cannot_send_a_listed_term(
     text = cast(str, result["content"][0]["text"])
     assert result["is_error"] is True
     assert text == (
-        disclosure.REFUSAL
+        disclosure.field_refusal(("choices",))
         if field is None
         else f"the {field} field contains a term from the project's disclosure list"
     )
@@ -218,20 +218,22 @@ def test_clean_text_still_passes_every_tool(scheduler: Scheduler) -> None:
 def test_a_refusal_names_the_field_only_for_a_call_with_one(
     scheduler: Scheduler,
 ) -> None:
-    """Review r4, finding F1. Naming each matching field of a call with several would
-    answer one bit per field in one counted refusal, so a call that offers text in
-    several fields is refused without naming any, and one that offers one names it."""
+    """Round 13 explicitly permits field locations within the hourly limit."""
     ask = scheduler.own_tools("alpha")[1]
     several = call(
         ask,
         {"question": f"{TERM} question", "choices": [f"choice {TERM.upper()}"]},
     )
     assert several["is_error"] is True
-    assert several["content"][0]["text"] == disclosure.REFUSAL
+    assert several["content"][0]["text"] == disclosure.field_refusal(
+        ("question", "choices")
+    )
     one_matching_of_two = call(
         ask, {"question": "which name?", "choices": [f"choice {TERM}"]}
     )
-    assert one_matching_of_two["content"][0]["text"] == disclosure.REFUSAL
+    assert one_matching_of_two["content"][0]["text"] == disclosure.field_refusal(
+        ("choices",)
+    )
     alone = call(ask, {"question": f"{TERM} question"})
     alone_text = cast(str, alone["content"][0]["text"])
     assert alone_text == (
@@ -244,8 +246,8 @@ def test_the_refusal_helper_names_one_field_of_one_offered() -> None:
     assert disclosure.refusal(("note",), 1) == (
         "the note field contains a term from the project's disclosure list"
     )
-    assert disclosure.refusal(("note",), 2) == disclosure.REFUSAL
-    assert disclosure.refusal(("a", "b"), 2) == disclosure.REFUSAL
+    assert disclosure.refusal(("note",), 2) == disclosure.field_refusal(("note",))
+    assert disclosure.refusal(("a", "b"), 2) == disclosure.field_refusal(("a", "b"))
     with pytest.raises(ValueError, match="at least one field"):
         disclosure.refusal((), 1)
 
@@ -685,3 +687,36 @@ def test_instruction_paths_are_checked_where_a_configuration_arrives(
         reloaded = client.refused("reload_project", {})
         assert "lines.alpha.instructions" in reloaded
         assert "for line alpha" in reloaded
+
+
+def test_file_acceptance_preserves_counts_and_hides_locations(
+    tmp_path: Path,
+) -> None:
+    from hashlib import sha256
+
+    text = f"accepted {TERM}"
+    (tmp_path / "a.txt").write_text(text + "\n" + TERM + "\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text(text, encoding="utf-8")
+    with EventLog(tmp_path / "events.sqlite") as log:
+        target = Scheduler(log, no_engine, root=tmp_path, hold_wakes=True)
+        target.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+        target.set_disclosure_terms((TERM.casefold(),))
+        target.set_disclosure_accepted({"a.txt": (sha256(text.encode()).hexdigest(),)})
+        assert target.check_disclosure("alpha", None, "a.txt")[0] == 1
+        assert target.check_disclosure("alpha", None, "b.txt")[0] == 1
+        assert target.check_disclosure("alpha", text, None)[0] == 1
+        result = call(
+            target.check_disclosure_tool("alpha"), {"paths": ["a.txt", "b.txt"]}
+        )
+        answer = result["content"][0]["text"]
+        assert answer.startswith("fail, 2 lines hold")
+        assert "a.txt" not in answer and "b.txt" not in answer
+        assert "Locations" not in answer
+        assert ":1" not in answer and ":2" not in answer
+        single = call(target.check_disclosure_tool("alpha"), {"path": "a.txt"})
+        single_answer = single["content"][0]["text"]
+        assert single_answer.startswith("fail, 1 line holds")
+        assert "a.txt" not in single_answer and ":2" not in single_answer
+        assert TERM not in answer
+        target.set_disclosure_accepted({})
+        assert target.check_disclosure("alpha", None, "a.txt")[0] == 2

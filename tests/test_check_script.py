@@ -1,5 +1,6 @@
 """Repository hygiene checks, including exact disclosure exceptions."""
 
+from hashlib import sha256
 import shutil
 import subprocess
 from pathlib import Path
@@ -72,3 +73,21 @@ def test_disclosure_exceptions_match_the_exact_path_number_and_line(
     assert refused.returncode != 0
     assert "src/example.py:1" in refused.stderr
     assert changed_text not in refused.stderr
+
+    # Replace the legacy private acceptance with the operator project table.
+    (root / "secret/disclosure-accepted.txt").unlink()
+    (root / ".dromon").mkdir()
+    digest = sha256(changed_text.encode()).hexdigest()
+    project_file = root / ".dromon/dromon.toml"
+    project_file.write_text(
+        f'version = 1\n[daemon.disclosure_accepted]\n"src/example.py" = ["{digest}"]\n',
+        encoding="utf-8",
+    )
+    assert check_project(root).returncode == 0
+    example.write_text(changed_text + " again\n", encoding="utf-8")
+    assert check_project(root).returncode != 0
+    project_file.write_text(
+        'version = 1\n[daemon.disclosure_accepted]\n"src/example.py" = ["bad"]\n',
+        encoding="utf-8",
+    )
+    assert check_project(root).returncode != 0

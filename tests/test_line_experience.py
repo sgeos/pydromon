@@ -791,9 +791,8 @@ def test_write_scratch_refuses_large_or_disclosing_text_and_bad_arguments(
     (tmp_path / "terms").write_text("codename\n")
     world.scheduler.set_disclosure_terms(load_terms(tmp_path / "terms"))
     text, error = world.call("write_scratch", {"path": "n", "text": "the Codename"})
-    # A path and a text are both offered, so the refusal names neither, per review r4
-    # finding F1.
-    assert (text, error) == (disclosure.REFUSAL, True)
+    # Round 13 permits matching field names under the shared hourly limit.
+    assert (text, error) == (disclosure.field_refusal(("text",)), True)
     assert not (world.root / "tmp" / "n").exists()
     text, error = world.call("write_scratch", {"path": 3, "text": "x"})
     assert error and "must be text" in text
@@ -997,7 +996,7 @@ def test_the_disclosure_check_covers_the_scratch_path(
     text, error = world.call(
         "write_scratch", {"path": "the-codename-notes.md", "text": "clean"}
     )
-    assert (text, error) == (disclosure.REFUSAL, True)
+    assert (text, error) == (disclosure.field_refusal(("path",)), True)
     assert not (world.root / "tmp").exists()
 
 
@@ -1052,7 +1051,9 @@ def test_check_disclosure_checks_multiple_files_as_one_call(
     assert len(checks(world)) == 1
     assert checks(world)[0].matched_lines == 3
     assert f"You have {MAX_DISCLOSURE_CHECKS - 1} of" in text
-    assert "readme" not in text and "codename" not in text.casefold()
+    assert "readme-a.md" not in text and "readme-b.md" not in text
+    assert "review-a.md" not in text
+    assert "codename" not in text.casefold()
 
 
 def test_check_disclosure_does_not_match_across_file_boundaries(
@@ -1153,11 +1154,11 @@ def test_check_disclosure_refuses_without_a_list_or_one_input(
         ("~/notes", "relative path"),
         ("../escape.md", "may not contain .."),
         (".dromon/secret.md", "Dromon protects"),
-        ("link.md", "cannot read link.md"),
-        ("linked/escape.md", "cannot read linked/escape.md"),
+        ("link.md", "cannot read the supplied file"),
+        ("linked/escape.md", "cannot read the supplied file"),
         ("hard.md", "more than one name"),
         ("folder", "not a regular file"),
-        ("missing.md", "cannot read missing.md"),
+        ("missing.md", "cannot read the supplied file"),
     ],
 )
 def test_check_disclosure_reads_only_the_lines_own_files(
@@ -1173,6 +1174,7 @@ def test_check_disclosure_reads_only_the_lines_own_files(
     (world.root / "folder").mkdir()
     text, error = world.call("check_disclosure", {"path": path})
     assert error and message in text
+    assert path not in text
     assert checks(world) == []
 
 
@@ -1184,7 +1186,8 @@ def test_check_disclosure_refuses_a_missing_path_in_a_list(
     text, error = world.call(
         "check_disclosure", {"paths": ["present.md", "missing.md"]}
     )
-    assert error and "cannot read missing.md" in text
+    assert error and "cannot read the supplied file" in text
+    assert "present.md" not in text and "missing.md" not in text
     assert checks(world) == []
 
 
@@ -1217,7 +1220,7 @@ def test_a_refusal_for_disclosure_spends_a_check(
         "send_message": "body",
         "ask_operator": "question",
         "wake_after": "note",
-        "write_scratch": None,
+        "write_scratch": "text",
     }[name]
     assert error and text == (
         disclosure.REFUSAL
