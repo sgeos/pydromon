@@ -10,6 +10,8 @@ All notable changes are recorded here. The format follows
 - Grok's `list_dir` may carry the kind `other`, which Grok gives it, as a live turn of
   58 tool calls on 2026-10-31 showed. That turn also confirmed the observed kinds of
   `read_file`, `grep`, `run_terminal_command`, `search_tool` and `use_tool`.
+- A refused Grok `use_tool` call says why, and a file-backed one says to pass its arguments
+  inline, so the line can correct itself.
 - Grok tool calls are judged by the name Grok gives them in `_meta["x.ai/tool"]`.
   Grok's first announcement of a call has no `kind` and no `toolName`, so every Grok
   tool call was refused, including `search_tool`, and a later update that rewrites the

@@ -210,6 +210,31 @@ def use_tool_target(raw_value: object) -> tuple[str, dict[str, Any]] | None:
     return target, cast(dict[str, Any], arguments)
 
 
+USE_TOOL_FILE_KEYS: Final = frozenset({"tool_input_file", "file"})
+"""The keys of ``use_tool``'s file-backed forms, which Grok's guide documents."""
+
+
+def use_tool_advice(fields: Mapping[str, Any]) -> str:
+    """What a refused ``use_tool`` call should have been, so the line can correct
+    itself, or the empty string for any other call. A file-backed input is refused
+    because Dromon cannot see the arguments when it judges the call, which Grok reads
+    from the file only afterwards."""
+    if grok_tool_name(fields) != "use_tool":
+        return ""
+    raw = fields.get("rawInput")
+    if isinstance(raw, dict) and USE_TOOL_FILE_KEYS & frozenset(
+        cast(dict[str, Any], raw)
+    ):
+        return (
+            ", since its input names a file, whose arguments Dromon cannot check."
+            " Pass them inline as tool_input with tool_name"
+        )
+    return (
+        ", since its input is not one of this line's dromon__ tools in the inline form"
+        " with tool_name and tool_input"
+    )
+
+
 READER_PROFILE: Final = "dromon-reader"
 WRITER_PROFILE: Final = "dromon-writer"
 PROFILE_BASES: Final[dict[str, frozenset[str]]] = {
@@ -1675,7 +1700,9 @@ class GrokLine:
         permitted, name = self._permits(fields)
         if not permitted:
             await self._cancel(
-                turn, f"the engine used a tool the line was not given: {name}"
+                turn,
+                f"the engine used a tool the line was not given: {name}"
+                + use_tool_advice(fields),
             )
             return
         turn.tool_uses.append(name)

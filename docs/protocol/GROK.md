@@ -324,7 +324,11 @@ in a Grok line turn of 58 tool calls, from each `tool_call_update`: `read_file` 
 `read`, `grep` as `search`, `run_terminal_command` as `execute`, and `list_dir`,
 `search_tool` and `use_tool` as `other`. Twenty-six `use_tool` calls of Dromon's own
 tools passed in that turn. `list_dir` was first refused for `other`, which the table now
-allows. The kinds of the other built-ins are a **hypothesis**, and a call with another
+allows. In a later turn on 2026-10-31, nineteen inline `use_tool` calls passed, and one in the
+file-backed form, with `tool_input_file`, was refused, as intended, since Dromon cannot see
+arguments Grok reads from a file only after the call is judged. Its refusal now says to pass
+the arguments inline. Grok wrote that file under `/tmp`, which the `workspace` base of the
+writer profile lets it write. The kinds of the other built-ins are a **hypothesis**, and a call with another
 kind is refused, which may refuse too much and never grants more. A `_meta` name
 added in a later update to a call first judged without one refuses the turn. A call without that
 `_meta`, or in another namespace, is judged as before. **Hypothesis.** The table is
