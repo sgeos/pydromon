@@ -13,7 +13,7 @@ import pytest
 from claude_agent_sdk import SdkMcpTool
 
 from dromon import cli
-from dromon.codex import CodexLine
+from dromon.codex import CodexLine, server_arguments
 from dromon.configview import Overrides
 from dromon.daemon import Daemon, check_sandboxes, protected_dirs
 from dromon.driver import Driver, Strategy
@@ -46,6 +46,7 @@ from dromon.workdir import (
     MAX_POINTER_BYTES,
     git_common_directory,
     git_write_guards,
+    resolve_read_only_paths,
     resolve_workdir,
 )
 
@@ -139,6 +140,29 @@ def test_a_workdir_resolves_relative_absolute_and_home_paths(
     assert resolve_workdir("~", root, protected) == home
     (root / "link").symlink_to(home / "trees")
     assert resolve_workdir("link", root, protected) == home / "trees"
+
+
+def test_read_only_paths_resolve_real_files_and_reject_escapes(
+    tmp_path: Path,
+) -> None:
+    workdir = real(tmp_path / "work")
+    protected = workdir / "docs" / "process"
+    protected.mkdir(parents=True)
+    file = workdir / "NOTICE"
+    file.write_text("read only\n")
+    outside = real(tmp_path / "outside")
+    outside.mkdir()
+    (workdir / "external").symlink_to(outside)
+    assert resolve_read_only_paths(("docs/process", "NOTICE"), workdir) == (
+        file,
+        protected,
+    )
+    with pytest.raises(ConfigError, match="resolves outside"):
+        resolve_read_only_paths(("external",), workdir)
+    with pytest.raises(ConfigError, match="does not exist"):
+        resolve_read_only_paths(("missing",), workdir)
+    with pytest.raises(ConfigError, match="stay inside"):
+        resolve_read_only_paths(("../outside",), workdir)
 
 
 @pytest.mark.parametrize(
@@ -354,6 +378,67 @@ def test_a_claude_line_runs_in_its_workdir_with_its_paths_resolved_there(
     assert str(root / ".dromon") in sandbox["filesystem"]["denyRead"]
     default = build(haiku_spec(DEFAULT_CONFIG), [])
     assert isinstance(default, ClaudeCodeLine) and default.cwd == root
+
+
+def test_project_read_only_paths_are_enforced_by_claude_codex_and_grok(
+    tmp_path: Path,
+) -> None:
+    root = real(tmp_path / "project")
+    readonly = root / "docs" / "process"
+    readonly.mkdir(parents=True)
+    build = engine_factory(str(root), read_only_paths=("docs/process",))
+
+    claude = build(haiku_spec(LineConfig(builtin_tools=("Bash", "Edit", "Write"))), [])
+    assert isinstance(claude, ClaudeCodeLine)
+    sandbox = cast(dict[str, object], claude.sandbox)
+    filesystem = cast(dict[str, list[str]], sandbox["filesystem"])
+    assert str(readonly) in filesystem["denyWrite"]
+    settings = cast(dict[str, object], claude.settings)
+    deny = cast(dict[str, list[str]], settings["permissions"])["deny"]
+    assert f"Edit(/{readonly}/**)" in deny
+    assert f"Write(/{readonly}/**)" in deny
+    assert f"NotebookEdit(/{readonly}/**)" in deny
+
+    codex = build(
+        LineSpec(
+            "alpha",
+            "gpt-6-luna",
+            Strategy.SUBSCRIPTION,
+            LineConfig(builtin_tools=("Edit",)),
+        ),
+        [],
+    )
+    assert isinstance(codex, CodexLine)
+    assert codex.write_protected == (readonly,)
+    profile = server_arguments(
+        [], codex.config, codex.protected, write_protected=codex.write_protected
+    )[-1]
+    assert f'"{readonly}"="read"' in profile
+
+    grok = build(
+        LineSpec("alpha", "grok-4.7", Strategy.SUBSCRIPTION),
+        [],
+    )
+    assert isinstance(grok, GrokLine)
+    assert grok.read_only_paths == (readonly,)
+
+
+@pytest.mark.parametrize(
+    "model",
+    (
+        "pi:openai/gpt-6-luna",
+        "cursor-agent:gpt-5.6-luna-medium",
+        "antigravity:gemini-3.8-flash-high",
+    ),
+)
+def test_engines_that_cannot_enforce_read_only_paths_refuse_to_start(
+    tmp_path: Path, model: str
+) -> None:
+    root = real(tmp_path / "project")
+    (root / "docs" / "process").mkdir(parents=True)
+    build = engine_factory(str(root), read_only_paths=("docs/process",))
+    with pytest.raises(EngineRefused, match="read_only_paths cannot be enforced"):
+        build(LineSpec("alpha", model, Strategy.SUBSCRIPTION), [])
 
 
 def test_read_access_forces_claude_confinement_and_denies_file_writes(

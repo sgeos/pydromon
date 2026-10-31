@@ -118,6 +118,29 @@ def test_a_minimal_file_takes_the_defaults() -> None:
     assert config.limits == DEFAULT_LIMITS
 
 
+def test_project_read_only_paths_default_empty_and_parse_as_relative_paths() -> None:
+    assert parse("version = 1\n").read_only_paths == ()
+    config = parse('version = 1\nread_only_paths = ["docs/process", "docs/roadmap"]\n')
+    assert config.read_only_paths == ("docs/process", "docs/roadmap")
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ('["/etc"]', "relative"),
+        ('["../secret"]', "stay inside"),
+        ('["docs", "docs"]', "twice"),
+        ('[""]', "non-empty"),
+        ('"docs"', "list"),
+    ],
+)
+def test_project_read_only_paths_reject_invalid_entries(
+    value: str, message: str
+) -> None:
+    with pytest.raises(ConfigFileError, match=f"read_only_paths.*{message}"):
+        parse(f"version = 1\nread_only_paths = {value}\n")
+
+
 def test_a_project_grants_only_named_mcp_secrets_to_each_line() -> None:
     config = parse(
         """\

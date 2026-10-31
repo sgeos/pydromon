@@ -3,6 +3,9 @@
 Cursor Agent refuses a line configured with `workdir_access: read`, because its
 adapter cannot confine writes to the working directory.
 
+It also refuses a project with non-empty `read_only_paths`, because it cannot confine
+writes to selected paths under a line's workdir.
+
 > **Navigation**: [Protocol](./README.md) | [Documentation Root](../README.md)
 
 **Status.** Draft, written on 2026-10-26. Normative for Dromon's side. The Python module
@@ -171,6 +174,7 @@ attempted.
   `inherit_account_mcp`.
 - `claude_code_prompt`, `project_settings`, `plugins`, a sandbox or settings document,
   `allow_compact` and `keep_session`.
+- A project with non-empty `read_only_paths`.
 - An existing chat to resume, by step 1 of a probe turn.
 
 ## Not verified

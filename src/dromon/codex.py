@@ -411,9 +411,18 @@ def permission_profile(
             *(Path.home() / relative for relative in CREDENTIAL_PATHS),
         ]
     )
+    read_only = existing_real_paths(list(write_protected))
+    # A protected descendant must stay denied without dropping the broader read
+    # grant. A protected ancestor, or the same path, already denies this entry.
+    read_only = tuple(
+        path
+        for path in read_only
+        if not any(guard == path or guard in path.parents for guard in denied)
+    )
     entries = [
         f'":workspace_roots"={{"."="{workspace}", ".git"="read"}}',
         *(f'{_toml_string(str(directory))}="deny"' for directory in denied),
+        *(f'{_toml_string(str(directory))}="read"' for directory in read_only),
         *(f'{_toml_string(str(directory))}="write"' for directory in granted),
         *(f'{directory}="write"' for directory in own),
     ]
@@ -1122,6 +1131,7 @@ class CodexLine:
         mcp_tools: Sequence[SdkMcpTool[Any]] = (),
         session_id: str | None = None,
         protected: Sequence[Path] = (),
+        write_protected: Sequence[Path] = (),
         environment: Mapping[str, str] | None = None,
         connection_factory: ConnectionFactory = _app_server,
         server_lister: ServerLister = list_servers,
@@ -1151,6 +1161,7 @@ class CodexLine:
         self.mcp_tools = {tool.name: tool for tool in mcp_tools}
         self.session_id = session_id
         self.protected = tuple(protected)
+        self.write_protected = tuple(write_protected)
         self._environment = os.environ if environment is None else environment
         self._connect = connection_factory
         self._list_servers = server_lister
@@ -1292,7 +1303,7 @@ class CodexLine:
                 self.protected,
                 self.mark,
                 variables,
-                git_directories(self.cwd) or (),
+                (*self.write_protected, *(git_directories(self.cwd) or ())),
                 scratch,
             )
             instructions = read_instructions(self.config.instructions, self.cwd)

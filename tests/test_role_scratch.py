@@ -49,6 +49,7 @@ from dromon.scheduler import (
     LINES_SCRATCH_DIRECTORY,
     SCRATCH_DIRECTORY,
     LineEngine,
+    LineToolRefused,
     LineSpec,
     Scheduler,
     engine_factory,
@@ -100,9 +101,17 @@ class World:
     delta runs in ``OTHER`` with no writing tool and gamma there with one, and
     neither is a seat."""
 
-    def __init__(self, root: Path, *, vacant: bool = False) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        vacant: bool = False,
+        read_only_paths: Sequence[str] = (),
+    ) -> None:
         (root / TREE).mkdir(parents=True)
         (root / OTHER).mkdir(parents=True)
+        for relative in read_only_paths:
+            (root / TREE / relative).mkdir(parents=True)
         self.root = root
         self.log = EventLog(root / "events.sqlite")
         self.events: list[str] = []
@@ -117,6 +126,7 @@ class World:
             default_operator="ana",
             root=root,
             protected=(root / ".dromon",),
+            read_only_paths=read_only_paths,
         )
         self.scheduler.ensure_operator("ana")
         seats = {"alpha": HAIKU, "beta": HAIKU, "gina": GROK}
@@ -215,6 +225,29 @@ def test_a_read_seat_writes_only_its_own_scratch(world: World) -> None:
     # A line that is not a seat and has no writing tool has one of its own too.
     assert world.scheduler.write_scratch("delta", "x", "y") == "tmp/lines/delta/x"
     assert (world.root / OTHER / "tmp/lines/delta/x").read_text() == "y"
+
+
+def test_write_scratch_enforces_read_only_paths_under_owner_scratch(
+    tmp_path: Path,
+) -> None:
+    world = World(tmp_path / "project", read_only_paths=("tmp/protected",))
+    try:
+        with pytest.raises(LineToolRefused, match="read_only_paths"):
+            world.scheduler.write_scratch("alpha", "protected/notes.md", "blocked")
+    finally:
+        world.log.close()
+
+
+def test_write_scratch_enforces_read_only_paths_under_seat_scratch(
+    tmp_path: Path,
+) -> None:
+    relative = "tmp/lines/beta/protected"
+    world = World(tmp_path / "project", read_only_paths=(relative,))
+    try:
+        with pytest.raises(LineToolRefused, match="read_only_paths"):
+            world.scheduler.write_scratch("beta", "protected/notes.md", "blocked")
+    finally:
+        world.log.close()
 
 
 def test_a_link_in_place_of_the_own_scratch_is_refused(
@@ -343,6 +376,32 @@ def test_a_codex_shell_with_write_access_is_granted_only_its_own_scratch(
     assert filesystem[":workspace_roots"] == {".": "read", ".git": "read"}
     written = sorted(k for k, v in filesystem.items() if v == "write")
     assert written == [os.path.realpath(tmp_path / TREE / "tmp/lines/india")]
+
+
+def test_codex_profile_keeps_read_only_paths_under_its_own_scratch(
+    tmp_path: Path,
+) -> None:
+    """A read-only descendant stays protected when its scratch is writable."""
+    import tomllib
+
+    from dromon.codex import checked_scratch, server_arguments
+
+    workdir = tmp_path / TREE
+    scratch = workdir / "tmp/lines/beta"
+    protected = scratch / "protected"
+    protected.mkdir(parents=True)
+    config = LineConfig(workdir=TREE)
+    grant = checked_scratch(workdir, scratch)
+    arguments = server_arguments(
+        [], config, (), write_protected=(protected,), scratch=grant
+    )
+    profile = next(a for a in arguments if a.startswith("permissions."))
+    filesystem = tomllib.loads(f"profile = {profile.split('=', 1)[1]}")["profile"][
+        "filesystem"
+    ]
+
+    assert filesystem[os.path.realpath(scratch)] == "write"
+    assert filesystem[os.path.realpath(protected)] == "read"
 
 
 # N3, a turn begun while the role was vacant.

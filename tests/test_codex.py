@@ -45,7 +45,7 @@ from dromon.launcher import (
     LAUNCH_VARIABLES,
     STOP_POLICY_VARIABLE,
 )
-from dromon.lineconfig import LineConfig, config_from_document
+from dromon.lineconfig import LineConfig, WorkdirAccess, config_from_document
 from dromon.security_paths import CREDENTIAL_PATHS, project_secret_paths
 from dromon.gitssh import COMMAND_VARIABLE, GitSshAccess, ssh_command
 from dromon.grok import GrokLine
@@ -1340,6 +1340,31 @@ def test_the_grant_names_the_checked_path_under_the_real_workdir(
     )
     with pytest.raises(EngineRefused, match="not inside its working directory"):
         checked_scratch(alias, tmp_path / "elsewhere")
+
+
+def test_read_only_entries_under_tmp_keep_read_grants_around_protected_denies(
+    tmp_path: Path,
+) -> None:
+    import tomllib
+
+    reports = tmp_path / "work" / "tmp" / "reports"
+    reports.mkdir(parents=True)
+    protected = reports / "private"
+    protected.mkdir()
+    text = profile_of(
+        server_arguments(
+            [],
+            LineConfig(
+                builtin_tools=("Bash", "Edit"), workdir_access=WorkdirAccess.READ
+            ),
+            (protected,),
+            write_protected=(reports,),
+        )
+    )
+    filesystem = tomllib.loads(f"profile = {text}")["profile"]["filesystem"]
+    assert "tmp" not in filesystem[":workspace_roots"]
+    assert filesystem[str(reports.resolve())] == "read"
+    assert filesystem[str(protected.resolve())] == "deny"
 
 
 def test_the_profile_denies_each_protected_directory_that_exists(

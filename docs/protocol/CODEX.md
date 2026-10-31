@@ -212,6 +212,9 @@ extends = ":workspace"
 - `.git` is always `read`, so a Codex line never commits. Codex documents that a
   profile extending `:workspace` keeps `.git` read-only, and a reported issue says it
   does not, so Dromon states it.
+- The project's `read_only_paths` entries are resolved under this line's workdir and
+  added as real paths with mode `read`. A `writable_paths` grant that overlaps one is
+  refused.
 - Each protected directory that exists, the state directory and the runtime
   directory, is denied as its real path.
 - Existing operator paths `.ssh`, `.aws`, `.codex/auth.json`,

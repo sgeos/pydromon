@@ -5,8 +5,33 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Project configuration may name relative `read_only_paths` that must exist inside each
+  line's resolved workdir. Claude Code, Codex and Grok Build lines enforce those paths
+  through their engine restrictions; Pi, Cursor Agent and Antigravity lines refuse the
+  configuration because they cannot enforce it. Symbolic links resolving outside the
+  workdir and missing paths are refused. The list defaults to empty. The project
+  configuration example names `docs/process` and `docs/roadmap` as suggested protected
+  paths, but this change does not alter `.dromon/dromon.toml`.
+- `dromon wait --replies-to MESSAGE --timeout SECONDS [--from LINE]` polls the existing
+  replies query in the client, with each request bounded by the remaining timeout. It
+  returns the reply without marking it read, and reports timeout, invalid source and
+  daemon loss as failures.
+
 ### Fixed
 
+- `write_scratch` refuses targets covered by project `read_only_paths` in the
+  scratch directory it actually uses, including a seat's `tmp/lines/LINE`. Codex keeps
+  read-only parent entries while denying protected descendants and makes read-only
+  entries under `tmp/` explicit. `dromon wait` reports replies left out by the response
+  size bound. Documentation states that worker joins are bounded and that engine
+  enforcement after parent renames or newly created symbolic links is unverified.
+- The process-inspection and launch-record-sweep workers now stop when their scheduler
+  or daemon stops. Shutdown rejects new inspections, drops queued calls, and joins each
+  worker for at most one second. A process-table read already in progress cannot be
+  interrupted and may outlive that bound, after which its worker exits. This also
+  closes workers when startup validation refuses a daemon before its service loop.
 - A line can be created on, or rebound to, the packaged Pi model. The log checked a
   line's model as an identifier, which refuses the colon and slash of the
   engine-qualified names of Pi, Cursor Agent and Antigravity, so no Pi line could be

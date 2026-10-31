@@ -3,6 +3,9 @@
 Pi refuses a line configured with `workdir_access: read`, because its adapter cannot
 confine writes to the working directory.
 
+Pi also refuses a project with non-empty `read_only_paths`, because its adapter cannot
+confine writes to selected paths under a line's workdir.
+
 > **Navigation**: [Protocol](./README.md) | [Documentation Root](../README.md)
 
 **Status.** Draft, written on 2026-10-26. Normative for Dromon's side. The Python module
