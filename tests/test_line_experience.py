@@ -674,7 +674,18 @@ def test_a_failure_composing_the_prompt_holds_the_line(
 # R5, write_scratch.
 
 
+WRITING = LineConfig(builtin_tools=("Read", "Edit"))
+"""A line that can write its working directory, whose scratch is ``tmp/`` itself, as
+``Scheduler.scratch_parts`` gives it. A line without a writing tool has a scratch of
+its own under ``tmp/lines``, which ``test_role_scratch`` covers."""
+
+
+def as_writer(world: World) -> None:
+    world.scheduler.configure_line("alpha", WRITING)
+
+
 def test_write_scratch_writes_under_tmp_creating_directories(world: World) -> None:
+    as_writer(world)
     text, error = world.call(
         "write_scratch", {"path": "reports/round1.md", "text": "Report.\n"}
     )
@@ -685,7 +696,9 @@ def test_write_scratch_writes_under_tmp_creating_directories(world: World) -> No
     assert (world.root / "tmp" / "reports" / "round1.md").read_text() == "Report.\n"
     world.call("write_scratch", {"path": "reports/round1.md", "text": "Again.\n"})
     assert (world.root / "tmp" / "reports" / "round1.md").read_text() == "Again.\n"
-    world.scheduler.configure_line("alpha", LineConfig(workdir="tree"))
+    world.scheduler.configure_line(
+        "alpha", LineConfig(workdir="tree", builtin_tools=WRITING.builtin_tools)
+    )
     (world.root / "tree").mkdir()
     world.call("write_scratch", {"path": "x.txt", "text": "in the tree"})
     assert (world.root / "tree" / "tmp" / "x.txt").read_text() == "in the tree"
@@ -694,8 +707,8 @@ def test_write_scratch_writes_under_tmp_creating_directories(world: World) -> No
 @pytest.mark.parametrize(
     ("read_only", "target"),
     [
-        ("tmp/reports", "reports/locked.md"),
-        ("tmp/reports/locked.md", "reports/locked.md"),
+        ("tmp/lines/alpha/reports", "reports/locked.md"),
+        ("tmp/lines/alpha/reports/locked.md", "reports/locked.md"),
     ],
 )
 def test_write_scratch_tool_call_refuses_a_read_only_target(
@@ -746,6 +759,7 @@ def test_write_scratch_refuses_paths_outside_tmp(
 def test_write_scratch_refuses_links_out_and_link_targets(
     world: World, tmp_path: Path
 ) -> None:
+    as_writer(world)
     outside = tmp_path / "outside"
     outside.mkdir()
     scratch = world.root / "tmp"
@@ -940,6 +954,7 @@ def test_a_link_swapped_in_mid_walk_cannot_redirect_the_write(
 ) -> None:
     """The directory is created, then replaced by a link to outside before it is
     opened, as a racing process would. The open without following refuses it."""
+    as_writer(world)
     outside = tmp_path / "outside"
     outside.mkdir()
     real_mkdir = os.mkdir
@@ -963,6 +978,7 @@ def test_a_link_swapped_in_mid_walk_cannot_redirect_the_write(
 
 
 def test_a_file_in_the_way_of_a_directory_is_refused(world: World) -> None:
+    as_writer(world)
     (world.root / "tmp").mkdir()
     (world.root / "tmp" / "plain").write_text("a file")
     text, error = world.call("write_scratch", {"path": "plain/y.txt", "text": "z"})

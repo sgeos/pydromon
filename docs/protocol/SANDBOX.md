@@ -87,7 +87,8 @@ plugins, or command hooks could bypass those controls, and when the project's or
 line's sandbox sets `allowUnsandboxedCommands` true, `failIfUnavailable` false,
 `excludedCommands`, which run outside the sandbox, or `filesystem.disabled`. Review of
 read-only seats, findings 1 and 2. Dromon's `write_scratch` tool remains
-available for scratch files under `tmp`.
+available for scratch files, under the line's own `tmp/lines/LINE`, as
+[`LINE_CONFIG.md`](LINE_CONFIG.md) specifies.
 
 When a line's turn starts, Dromon merges the layers and derives the settings it hands to
 Claude Code. Nothing is passed when no layer sets anything, and the line then has no

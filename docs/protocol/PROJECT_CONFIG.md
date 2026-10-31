@@ -92,6 +92,17 @@ seats = ["beta", "gamma"]
 handoff_seconds = 3600  # the default
 failover = "automatic"  # the default, or "ask"
 handoff_below_percent = 10  # the default, or 0 for never
+
+[relays.tail]
+kind = "file"           # one JSON line per notice, for tail -f
+path = ".dromon/run/notices.jsonl"
+
+[relays.mail]
+command = ["/usr/local/bin/notify-by-mail", "--to", "ana"]
+timeout_seconds = 30    # the default, in (0, 3600]
+
+[operators.ana]
+relay = "tail"          # the route of operator ana's mail
 ```
 
 | Key | Type | Default | Meaning |
@@ -150,6 +161,13 @@ handoff_below_percent = 10  # the default, or 0 for never
 | `peers.ID.waiting` | integer in [1, 100000] | 500 | The bound on mail from the peer waiting for all local parties |
 | `sandbox` | table | none | The project's sandbox, merged under every line's, as [`SANDBOX.md`](SANDBOX.md) specifies |
 | `profiles.NAME.sandbox`, `lines.ID.sandbox` | table | none | A profile's or a line's sandbox. These merge rather than replace |
+| `relays.NAME` | table | none | A relay to operators, named by an identifier, as [`RELAY.md`](RELAY.md) specifies. At most 32. Added on 2026-10-31 |
+| `relays.NAME.kind` | `command` or `file` | `command` | A command relay runs a command once per notice. A file relay appends each notice to one file |
+| `relays.NAME.command` | list of 1 to 64 non-empty texts | required for `command` | The argument vector, run without a shell, each argument at most 4096 bytes. A key of the other kind is an error |
+| `relays.NAME.path` | path | required for `file` | The notice file, absolute, under `~`, or relative to the project root. Its directory must exist, and it may not lie in any line's working directory except inside a directory Dromon protects, as below |
+| `relays.NAME.timeout_seconds` | number in (0, 3600] | 30 | How long a command relay may run before it and its process group are killed |
+| `operators.ID` | table | none | An operator, named by an operator identifier |
+| `operators.ID.relay` | relay name | required | The relay that carries the operator's mail. An operator with no table is unrouted, and its mail waits for a client |
 | `settings` | table | none | The project's engine settings, merged under every line's, as [`SETTINGS.md`](SETTINGS.md) specifies |
 | `profiles.NAME.settings`, `lines.ID.settings` | table | none | A profile's or a line's engine settings. These merge rather than replace |
 
@@ -184,8 +202,31 @@ handoff_below_percent = 10  # the default, or 0 for never
   recovery or a relinquishment. The events are checked against the log before any is
   appended, so a file that moves an owned role's worktree, bars its current owner from
   owning it, or makes a seat of another role's seat is refused, and the start or the
-  reload with it. The log has no event that unbinds a seat or retires a role, so one
-  the file drops stays in the log as it was. Added on 2026-10-27.
+  reload with it. The file never unbinds a seat or retires a role, so one the file
+  drops stays in the log as it was. Added on 2026-10-27.
+- **Roles changed at run time.** **Round 10, 2026-10-31.** An operator's `dromon role
+  create`, `update` or `delete` wins over the file, and the file never undoes it
+  silently. A role a command changed is held by the operator, which `role_held`
+  records, and a start or a reload leaves it as it is while the file's table for it
+  differs, with a notice naming each term and seat that differs. Once the table agrees,
+  the role is held by the file again, with a notice, and later changes to the file
+  apply. A retired role's table is never applied, since a role identifier is not
+  reused, and a role the file dropped stays, with a notice to retire it with `dromon
+  role delete`. A role created by a command and absent from the file gets no notice. A
+  seat the file names that an operator bound to a role the operator holds is left
+  out, with a notice, and the rest of the file applies. A reload returns the notices
+  as `role_notices`, and a start prints them. The cases are tabulated in
+  [`ROLES.md`](../architecture/ROLES.md). A role that returns to the file is given the
+  file's `owner` in the same pass, where it never had an owner, and `dromon role
+  status` shows each difference of a role an operator holds.
+- **The one-writer rule.** **Round 10 review, 2026-10-31.** A file is refused whole, at
+  a start and at a reload, if the state it would make has two roles on one worktree,
+  compared by real path, which the refusal names, or an owning seat outside its role's
+  worktree, or a line that is not a seat of a role and could write that role's
+  worktree while another seat owns it, which the refusal names with the reason. The
+  check reads the lines only in the log as well, with their overrides, so a line that
+  a log made before the rule refuses the file until it is moved, made read only or
+  made a seat. The rule is stated in [`ROLES.md`](../architecture/ROLES.md).
 - **Located errors.** Every error names the file. A syntax error carries its line and
   column. Any other error carries the dotted key path and the line of its table or key
   when it can be found. The daemon refuses to start on an invalid file.
@@ -205,6 +246,16 @@ handoff_below_percent = 10  # the default, or 0 for never
   `git_ssh`, which apply only at start. Its roles are recorded as above. A line the file no longer declares returns to the
   project's limits and wake policy. The leases table is applied again, and a held lease
   whose name the file no longer declares ends.
+- **Relays.** At start, and before a reload applies anything, the daemon builds each
+  routed operator's relay, and refuses the start or the reload when a file relay's
+  notice file lies in the working directory of any line, whether in the log or in the
+  file, outside the directories Dromon protects. A reload may add, change or remove
+  relays and routes, and they apply from the relayer's next pass. A notice already
+  handed to its old relay finishes there. **Decided by core for review, on
+  2026-10-31.** A notice file under `.dromon`, such as `.dromon/run/notices.jsonl`,
+  is allowed although `.dromon` lies in the project root, which is a line's working
+  directory, because every enabled sandbox denies `.dromon` to lines and no line may
+  run in it. A line without a sandbox reaches the file wherever it is.
 - **Lines on other engines.** A project file whose own `[sandbox]` or `[settings]`
   table would reach a line on any engine but Claude Code is refused at start, since
   only Claude Code honours either document.

@@ -104,23 +104,60 @@ argument outside a tool's schema is refused.
 
 | Tool | Effect |
 |---|---|
-| `send_message` | Sends a note to a line, an operator or the line itself, delivered in a later tick. With `priority` true, a note to another line is priority mail, rate limited, as [`PRIORITY.md`](PRIORITY.md) specifies |
+| `send_message` | Sends a note to a line, an operator or the line itself, delivered in a later tick. With `priority` true, a note to another line is priority mail, rate limited, as [`PRIORITY.md`](PRIORITY.md) specifies. With `issue` true, from 2026-10-31, it raises an issue with an operator, as below |
 | `ask_operator` | Asks an operator a question, which never pauses the line |
 | `wake_after` | Schedules one wake for the line, optionally tied to a running background task, as below |
 | `list_mail`, `read_mail`, `acknowledge_mail` | Page through, open and acknowledge the line's mailbox |
 | `list_sent` | Lists what became of the line's sent mail |
 | `acquire_lease`, `release_lease` | Take and give up a lease the project declares, as below |
 | `line_status` | Shows a compact read-only status by default, with diagnostic detail and long lists available by argument, as below |
-| `role_status` | Offered only to a seat of a role. Shows the role's worktree, failover policy, handoff threshold, owner, the seat a failover would pass it to now and the latest change of owner, its seats in the failover order with whether each is usable for a failover, their condition, worktree access, whether each waits because its engine cannot confine it, model, provider and stated budget, each seat's latest three background task ends with the digest of their output, and its latest five journal entries, the newest with its body, read only, as [`ROLES.md`](../architecture/ROLES.md) describes. Added on 2026-10-27, and the task ends on 2026-10-28 |
+| `role_status` | Offered only to a seat of a role. Shows the role's worktree, whether the project file or an operator holds it, its declared failover order, failover policy, handoff threshold, owner, the seat a failover would pass it to now and the latest change of owner, its seats in the failover order with whether each is usable for a failover, their condition, worktree access, whether each waits because its engine cannot confine it, model, provider and stated budget, each seat's latest three background task ends with the digest of their output, and its latest five journal entries, the newest with its body, read only, as [`ROLES.md`](../architecture/ROLES.md) describes. Added on 2026-10-27, the task ends on 2026-10-28, the holder and the order on 2026-10-31 in round 10, and whether the project file declares the role, how a role an operator holds differs from it, and the lines that wait beside the owner, in the round 10 review |
 | `record_role_note` | Offered only to a seat. Records a journal entry of `kind` `note`, by any seat, or `recovery`, by the owner, which the daemon stamps with the role worktree's commit, its own commit and the time. A handoff entry is written only by `relinquish_ownership`. Added on 2026-10-27 |
 | `relinquish_ownership` | Offered only to a seat, and refused unless it owns its role. Records the handoff `note` as a handoff entry and gives the role to the seat `to`, or with no `to` to the seat the handoff that gave it the role named as `back_to`, or else leaves it vacant. A return to a seat that can no longer own the role leaves it vacant and says so. Called inside the owner's own turn, which is how a seat calls it, the request is checked at once and the change is made when that turn ends, with the entry stamped then, and the tool says so. A second call in the same turn is refused. A change that no longer applies when the turn ends is not made, and the operator is told. A successor is awakened and sent a note from the harness, `!dromon`, saying the former owner handed it the role, and the former owner's engine is dropped, so its next turn is built read only. `back_to`, which needs `to`, is the seat the role returns to when the successor next relinquishes without naming one. Added on 2026-10-27 |
 | `take_ownership` | Offered only to a seat that may own its role. Takes the role, with cause `recovery`, only on a ground the harness observes, which is a vacant role, an owner held at a plan limit its engine reported in this daemon run from a shape observed live or typed by the Agent SDK, never from inferred wording, or an owner whose provider budget is recorded as 0 percent with no reset time passed, and never while the owner has a turn in flight. The `reason` of 1 to 4,096 bytes and the ground are recorded as a note entry that the change rests on. Added on 2026-10-27 |
 | `set_brief` | Records the line's standing brief, its `task`, its open `decisions`, the `artifacts` its task concerns and its `next_action`, as one `brief_set` event that replaces its previous brief and that the daemon stamps with the time, the worktree's commit and its own. Only `task` is required. Each text field is at most 4,096 bytes, at most 32 paths are named, each on one line and at most 1,024 bytes, and the whole is at most 16,384 bytes. An unknown key is refused, and the text is checked against the disclosure list as `record_role_note` is. The brief leads the line's first turn after its engine session is new, is shown by `line_status`, and fills the role transition package where a journal entry is silent, as below. Added on 2026-10-29 |
 | `propose_change` | Records a proposed patch, file list and message for operator review; it does not change project files |
 | `read_instructions` | Shows the instructions the line's next turn receives, as below |
-| `write_scratch` | Writes a file under `tmp/` in the line's working directory, as below |
+| `write_scratch` | Writes a file under the line's scratch in its working directory, `tmp/` or `tmp/lines/LINE`, as below |
 | `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term or the file that matched. Files are checked independently, so a match cannot span files. The combined content is at most 1 MiB. One call, including a list, spends one recorded check, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. Added on 2026-10-28 |
 | `list_processes`, `stop_process` | List and stop the processes the line started, as below |
+
+**Issues.** **Round 11, item 3, decided by core for review on 2026-10-31.** A line
+raises a harness or operator-experience issue unasked with `send_message` and `issue`
+true, addressed to an operator. The daemon records it as a message of kind `issue`,
+which is open until the operator replies to it or acknowledges it. The operator lists
+the open issues with `dromon mail --issues`, closes one with `dromon ack` or with a
+reply, and receives each through the operator's relay like any other mail, as
+[`RELAY.md`](RELAY.md) specifies.
+
+- **Why a kind of mail.** An issue then has what mail already has, an identifier, a
+  sender, durable storage, delivery through the relay, the disclosure check, request
+  keys, and a closing act in acknowledgement or reply, so the change is one value of
+  the message kind, one tool argument and one listing filter. A separate tracker
+  would need its own events, states, listing and relay path for the same lifecycle.
+- **Why not a field on `ask_operator`.** A question asks for an answer, holds a place
+  in the operator's question queue and may supersede an earlier question, and an issue
+  asks for nothing. Raising one as a question would put reports in the queue of
+  decisions the operator owes.
+- **Why not a convention in a note's text.** A prefix cannot be listed reliably, and a
+  line that forgot it would raise nothing.
+- **Limits.** Only a line raises an issue, only with an operator, and never as a reply,
+  since an issue opens its own thread. An external agent's `send_message` has no
+  `issue` argument. An issue has no severity, label or state beyond open and closed,
+  and no event marks it reopened. A further issue is a new message.
+- **Rate.** A line may have at most five open issues and at most three issues in its
+  last twenty sent messages. Both bounds are enforced by replay, so acknowledging an
+  issue frees an open slot but does not reset the rate limit. When a bound is reached,
+  the line is told to wait for an operator reply or acknowledgment. **Decided on
+  2026-10-31, from the relay re-review.** The open cap is the real bound, since a slot
+  frees only by an operator's reply or acknowledgment, so the issues an operator is
+  sent are bounded by the operator's own actions. The window counts messages, not time,
+  so a line that sends ordinary messages between issues is not slowed by it. A rule by
+  time would need a time on each message event, which the model does not record, and
+  was not added.
+- **Rollback hazard.** A daemon older than this kind cannot read an event log that
+  holds an issue, since its codec refuses an unknown message kind, so a rollback past
+  it needs the log from before the first issue.
 
 **Decided by the operator on 2026-10-26**, from the lines' own reports, for what follows
 in this section.
@@ -347,7 +384,7 @@ unreadable instruction file is reported as the turn would refuse it.
 - **Whole text.** With `full` set to `true` the tool returns the composed text itself. A
   `full` that is not a boolean is refused.
 
-**`write_scratch`.** Arguments `path`, relative to `tmp/` in the line's working
+**`write_scratch`.** Arguments `path`, relative to the line's scratch in its working
 directory, and `text`, at most 262,144 bytes of UTF-8, which replaces the file whole.
 The daemon writes the file, so a line without `Write` can keep its own notes and
 reports. It creates `tmp/` and the directories under it. It refuses an absolute path,
@@ -359,6 +396,17 @@ file the same way. So a `tmp/` or a directory under it that is a link, or that a
 process swaps for a link at any moment, refuses the write instead of redirecting it,
 as does a file in a directory's place. Text or a path that the project's disclosure
 list covers is refused, and nothing is written.
+
+- **Whose scratch.** **Decided by the operator on 2026-10-31, round 10 re-review, N1.**
+  A line's scratch is `tmp/` while it owns its role, or is no role's seat and could
+  write its working directory, as `lineconfig.can_write_workdir` judges. Every other
+  line, a seat that does not own its role among them, has a scratch of its own,
+  `tmp/lines/LINE`, so it never writes a file of the owner, whose scratch is `tmp/`
+  and which it may read. The tool's description states the rule, and each result names
+  the path written. **Decided by core, for review.** An owner keeps `tmp/` even with no
+  writing tool, so a role's reports stay where they were. A line's scratch moves when
+  it gains or loses its role or a writing tool, and what it wrote before stays where
+  it was written.
 
 **Processes.** **Decided by the operator on 2026-10-26.** Claude Code, Codex and Grok
 Build each scope their own process controls to the agent's own session, and these
@@ -1619,7 +1667,10 @@ line and asks an operator, unless the line mailed an operator during the turn.
 
 `workdir_access` defaults to `write`. With `read`, Claude Code and Codex apply their
 engine sandbox or permission profile to prevent writes under the working directory.
-Dromon's `write_scratch` tool is the supported write path under `tmp`. Pi, Cursor Agent
+Dromon's `write_scratch` tool is the supported write path, into the line's scratch as
+above, which for a line that does not own a role is its own `tmp/lines/LINE`. That
+directory is also the one a Codex line in this mode may write, checked for links on
+every turn, as [`CODEX.md`](CODEX.md) records. Pi, Cursor Agent
 and Antigravity refuse to start in this mode because their adapters cannot enforce it.
 Grok refuses it too until a live probe shows its reader profile deny a write to the
 worktree, as [`GROK.md`](GROK.md) records. Claude Code also refuses configurations with mechanisms that can

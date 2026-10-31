@@ -64,6 +64,7 @@ from dromon.federation import (
     parse_federation,
 )
 from dromon.gitssh import GitSshConfig, GitSshError, parse_git_ssh
+from dromon.relay import NO_RELAYS, RelayConfig, RelayConfigError, parse_relays
 from dromon.teacher import TeacherConfig, TeacherError, parse_teacher
 
 CONFIG_FILE_NAME: Final = "dromon.toml"
@@ -89,6 +90,8 @@ TOP_KEYS: Final = frozenset(
         "profiles",
         "lines",
         "roles",
+        "relays",
+        "operators",
     }
 )
 DAEMON_KEYS: Final = frozenset(
@@ -271,6 +274,9 @@ class ProjectConfig:
     """Project-relative-path entries denied write access under every line's workdir."""
     lines: dict[str, LineDefinition] = field(default_factory=dict[str, LineDefinition])
     roles: dict[str, RoleDefinition] = field(default_factory=dict[str, RoleDefinition])
+    relays: RelayConfig = NO_RELAYS
+    """The project's relays to operators and each operator's route, none by
+    default, so operators' mail waits for a client as before."""
 
 
 def config_path(state_dir: Path) -> Path:
@@ -425,6 +431,10 @@ class _Reader:
                     "is true, but the file has no [git_ssh] table to give the line",
                 )
         roles = self.roles(top.get("roles", {}), lines)
+        try:
+            relays = parse_relays(top.get("relays"), top.get("operators"))
+        except RelayConfigError as error:
+            raise self.fail(error.key, error.reason) from error
         return ProjectConfig(
             operator=operator,
             tick_seconds=tick,
@@ -443,6 +453,7 @@ class _Reader:
             read_only_paths=read_only_paths,
             lines=lines,
             roles=roles,
+            relays=relays,
         )
 
     def read_only_paths(self, value: object) -> tuple[str, ...]:

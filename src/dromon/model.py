@@ -27,7 +27,25 @@ from enum import StrEnum
 from typing import Final, assert_never
 
 ID_PATTERN: Final = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
-"""Identifiers and engine names. ASCII only, so every port compares them bytewise."""
+"""Identifiers. ASCII only, so every port compares them bytewise."""
+
+MODEL_PATTERN: Final = re.compile(
+    r"[a-z0-9][a-z0-9._-]{0,63}(:[a-z0-9][a-z0-9._/-]{0,127})?"
+)
+"""The model a line runs, the ``engine`` field of ``line_created`` and ``line_rebound``.
+It is an identifier, or an engine-qualified name as ``dromon.driver.ENGINE_OF`` gives
+it, an identifier, one colon and the harness's own identifier, which may also hold
+``/``, as Pi's ``openai/gpt-6-luna`` does.
+
+The colon and the slash are needed so that a line can be created on Pi, Cursor Agent or
+Antigravity at all, which the identifier pattern refused until 2026-10-31. Nothing else
+changes. The name stays ASCII and lowercase, so every port still compares it bytewise,
+it holds at most one colon, so the engine is the text before it, and it never begins
+with ``@``, ``&`` or ``!``, so it never reads as an address.
+
+**Assumption.** No harness identifier in the packaged catalogue holds an uppercase
+letter or a character outside this set. A model that did would need this pattern
+widened, which is a change to the log's grammar."""
 
 OPERATOR_PREFIX: Final = "@"
 """Marks an operator address. It never appears in an identifier, so a line address and
@@ -41,6 +59,16 @@ TOKEN_HASH: Final = re.compile(r"[0-9a-f]{64}")
 
 MAX_TEXT_BYTES: Final = 1024 * 1024
 """Upper bound on the UTF-8 size of a message body."""
+
+MAX_OPEN_ISSUES_PER_LINE: Final = 5
+"""At most five unclosed issues from one line may burden an operator."""
+
+ISSUE_RATE_WINDOW_MESSAGES: Final = 20
+MAX_ISSUES_PER_LINE_IN_WINDOW: Final = 3
+"""At most three issues in a line's last twenty sent messages, including the new one.
+This replay-deterministic rate limit does not depend on wall-clock time, so it slows a
+line by messages, not by time. ``MAX_OPEN_ISSUES_PER_LINE`` is the bound that holds,
+since only an operator frees an open slot."""
 
 MAX_CONFIG_BYTES: Final = 256 * 1024
 """Upper bound on the UTF-8 size of a line's stored tool configuration."""
@@ -83,6 +111,12 @@ def check_id(name: str, value: object) -> None:
     """Raise ``InvalidField`` unless ``value`` is a valid identifier."""
     if not isinstance(value, str) or ID_PATTERN.fullmatch(value) is None:
         raise InvalidField(f"{name} is not a valid identifier: {value!r}")
+
+
+def check_model(name: str, value: object) -> None:
+    """Raise ``InvalidField`` unless ``value`` is a valid model name."""
+    if not isinstance(value, str) or MODEL_PATTERN.fullmatch(value) is None:
+        raise InvalidField(f"{name} is not a valid model name: {value!r}")
 
 
 def check_optional_id(name: str, value: object) -> None:
@@ -302,6 +336,12 @@ def check_local_address(name: str, value: object) -> None:
         raise InvalidField(f"{name} is not a local address: {value!r}")
 
 
+def check_operator_address(name: str, value: object) -> None:
+    """Raise ``InvalidField`` unless ``value`` is an operator address."""
+    if not isinstance(value, OperatorAddress):
+        raise InvalidField(f"{name} is not an operator address: {value!r}")
+
+
 def check_remote_address(name: str, value: object) -> None:
     """Raise ``InvalidField`` unless ``value`` is a remote address."""
     if not isinstance(value, RemoteAddress):
@@ -332,6 +372,12 @@ LINE_TRANSITIONS: Final[frozenset[tuple[LineState, LineState]]] = frozenset(
 class MessageKind(StrEnum):
     NOTE = "note"
     QUESTION = "question"
+    ISSUE = "issue"
+    """A harness or operator-experience issue a line raises with an operator unasked.
+    It asks no answer, and it is open until the operator replies to it or
+    acknowledges it. ``docs/protocol/LINE_CONFIG.md`` records why it is a kind of
+    mail rather than a tracker. **Rollback hazard.** A daemon older than this kind
+    refuses a log that holds one, since its codec knows only notes and questions."""
 
 
 class ReturnCode(StrEnum):
@@ -429,7 +475,7 @@ class LineCreated:
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
-        check_id("engine", self.engine)
+        check_model("engine", self.engine)
         check_id("strategy", self.strategy)
 
 
@@ -530,7 +576,7 @@ class LineRebound:
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
-        check_id("engine", self.engine)
+        check_model("engine", self.engine)
         check_id("strategy", self.strategy)
 
 
@@ -1379,6 +1425,16 @@ class OwnershipCause(StrEnum):
     the next usable seat, under the role's automatic failover policy."""
 
 
+class RoleHolder(StrEnum):
+    """What decides a role's terms and seats, which ``role_held`` records. A role
+    with no ``role_held`` is held by the file, as every role was before round 10."""
+
+    FILE = "file"
+    """The project file, which a start and a reload apply to the role."""
+    OPERATOR = "operator"
+    """An operator's ``dromon role`` command, which the file no longer undoes."""
+
+
 class RoleNoteKind(StrEnum):
     HANDOFF = "handoff"
     RECOVERY = "recovery"
@@ -1487,6 +1543,57 @@ class SeatBound:
         check_id("role_id", self.role_id)
         if type(self.may_own) is not bool:
             raise InvalidField("may_own must be true or false")
+
+
+@dataclass(frozen=True, slots=True)
+class SeatUnbound:
+    """A line stops being a seat of its role, by an operator's command. The line stays
+    a line, with its configuration, mailbox, leases and state, and only the role's
+    tools and its place in the role leave it. An owner cannot be unbound, so its
+    role is vacated or handed over first. Round 10."""
+
+    line_id: str
+    role_id: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_id("role_id", self.role_id)
+
+
+@dataclass(frozen=True, slots=True)
+class RoleRetired:
+    """An operator retires a role that is vacant and has no seat left. Its journal
+    stays in the log, readable entry by entry, and its identifier is never declared
+    again, as every identifier of the log is never reused. Round 10."""
+
+    role_id: str
+    by: OperatorAddress
+    retired_at: str
+
+    def __post_init__(self) -> None:
+        check_id("role_id", self.role_id)
+        check_operator_address("by", self.by)
+        check_instant("retired_at", self.retired_at)
+
+
+@dataclass(frozen=True, slots=True)
+class RoleHeld:
+    """Whether the project file or an operator's commands decide a role's terms and
+    seats from now. A command that changes a role records ``operator``, and a start or
+    a reload records ``file`` once the file's table agrees with the role again, as
+    ``docs/architecture/ROLES.md`` gives. ``by`` is the operator who made the change,
+    or the project's operator for the file. Round 10."""
+
+    role_id: str
+    holder: RoleHolder
+    by: OperatorAddress
+    held_at: str
+
+    def __post_init__(self) -> None:
+        check_id("role_id", self.role_id)
+        check_member("holder", self.holder, RoleHolder)
+        check_operator_address("by", self.by)
+        check_instant("held_at", self.held_at)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1732,6 +1839,9 @@ type Event = (
     | ContextHandedOff
     | RoleDeclared
     | SeatBound
+    | SeatUnbound
+    | RoleRetired
+    | RoleHeld
     | OwnershipChanged
     | RoleNoted
     | BriefSet
@@ -2030,6 +2140,20 @@ class State:
     ``MAX_REQUEST_KEYS_PER_PARTY`` for each party and tool. Replay rebuilds it from
     the events alone, so the bound holds after a restart as before it."""
 
+    retired_roles: dict[str, RoleRetired] = field(
+        default_factory=dict[str, RoleRetired]
+    )
+    """Every retired role, keyed by role, whose identifier is never declared again.
+    Bounded by the roles ever declared. Round 10."""
+    role_holders: dict[str, RoleHeld] = field(default_factory=dict[str, RoleHeld])
+    """Each role's latest ``role_held``. A role with no entry is held by the file.
+    Round 10."""
+
+    def holder_of(self, role_id: str) -> RoleHolder:
+        """What decides ``role_id``'s terms and seats now."""
+        held = self.role_holders.get(role_id)
+        return RoleHolder.FILE if held is None else held.holder
+
     def copy(self) -> "State":
         """Return an independent snapshot. The records are frozen, so maps suffice."""
         return State(
@@ -2071,6 +2195,8 @@ class State:
             dict(self.briefs),
             dict(self.mail_since_brief),
             {slot: dict(acts) for slot, acts in self.requests.items()},
+            dict(self.retired_roles),
+            dict(self.role_holders),
         )
 
     def open_questions(self, operator_id: str) -> list[str]:
@@ -2214,6 +2340,17 @@ class State:
                 self._check_role_declared(event)
             case SeatBound():
                 self._check_seat_bound(event)
+            case SeatUnbound():
+                self._check_seat_unbound(event)
+            case RoleRetired():
+                self._check_role_retired(event)
+            case RoleHeld():
+                self._role(event.role_id)
+                self._require_party(event.by)
+                if self.holder_of(event.role_id) is event.holder:
+                    raise EventRejected(
+                        f"role {event.role_id} is held by the {event.holder} already"
+                    )
             case OwnershipChanged():
                 self._check_ownership_changed(event)
             case RoleNoted():
@@ -2484,6 +2621,22 @@ class State:
                     self.role_change_turn_starts[event.role_id][event.line_id] = (
                         self.turn_start_counts.get(event.line_id, 0)
                     )
+            case SeatUnbound():
+                del self.seats[event.line_id]
+                self.role_change_turn_starts.get(event.role_id, {}).pop(
+                    event.line_id, None
+                )
+                self.role_change_ended_turns.get(event.role_id, set()).discard(
+                    event.line_id
+                )
+            case RoleRetired():
+                del self.roles[event.role_id]
+                self.role_change_turn_starts.pop(event.role_id, None)
+                self.role_change_ended_turns.pop(event.role_id, None)
+                self.role_holders.pop(event.role_id, None)
+                self.retired_roles[event.role_id] = event
+            case RoleHeld():
+                self.role_holders[event.role_id] = event
             case OwnershipChanged():
                 role = self.roles[event.role_id]
                 self.roles[event.role_id] = replace(
@@ -2643,8 +2796,46 @@ class State:
             if not isinstance(event.recipient, OperatorAddress):
                 raise EventRejected("a question is addressed to an operator")
             self._live_line(event.sender.line_id)
+        if event.kind is MessageKind.ISSUE:
+            if not isinstance(event.sender, LineAddress):
+                raise EventRejected("only a line raises an issue")
+            if not isinstance(event.recipient, OperatorAddress):
+                raise EventRejected("an issue is raised with an operator")
+            if event.reply_to is not None or event.choices:
+                raise EventRejected("an issue opens a thread, and has no choices")
+            self._check_issue_limits(event.sender.line_id)
         if event.reply_to is not None:
             self._check_reply(event, event.reply_to)
+
+    def _check_issue_limits(self, line_id: str) -> None:
+        """Bound a line's open issues and issue rate using replayed message order."""
+        sender = LineAddress(line_id)
+        replies = {
+            (message.sender, message.reply_to)
+            for message in self.messages.values()
+            if message.reply_to is not None
+        }
+        open_issues = sum(
+            message.kind is MessageKind.ISSUE
+            and message.sender == sender
+            and not message.acknowledged
+            and (message.recipient, message_id) not in replies
+            for message_id, message in self.messages.items()
+        )
+        if open_issues >= MAX_OPEN_ISSUES_PER_LINE:
+            raise EventRejected(
+                f"at most {MAX_OPEN_ISSUES_PER_LINE} issues may remain open;"
+                " wait for an operator reply or acknowledgment"
+            )
+        recent = [
+            message for message in self.messages.values() if message.sender == sender
+        ][-(ISSUE_RATE_WINDOW_MESSAGES - 1) :]
+        issue_count = sum(message.kind is MessageKind.ISSUE for message in recent)
+        if issue_count >= MAX_ISSUES_PER_LINE_IN_WINDOW:
+            raise EventRejected(
+                f"at most {MAX_ISSUES_PER_LINE_IN_WINDOW} issues are allowed in"
+                f" {ISSUE_RATE_WINDOW_MESSAGES} sent messages; wait for a reply"
+            )
 
     def _check_harness_note(self, event: MessageSent) -> None:
         """The harness sends notes on its own account to a line or an operator of
@@ -2877,6 +3068,12 @@ class State:
         return seat
 
     def _check_role_declared(self, event: RoleDeclared) -> None:
+        retired = self.retired_roles.get(event.role_id)
+        if retired is not None:
+            raise EventRejected(
+                f"role {event.role_id} was retired by {retired.by} at"
+                f" {retired.retired_at}, and a role identifier is never declared again"
+            )
         role = self.roles.get(event.role_id)
         if role is None:
             return
@@ -2904,6 +3101,32 @@ class State:
             raise EventRejected(
                 f"line {event.line_id} owns role {event.role_id}, so it must give"
                 " the role up before it can be barred from owning it"
+            )
+
+    def _check_seat_unbound(self, event: SeatUnbound) -> None:
+        role = self._role(event.role_id)
+        self._seat(event.line_id, event.role_id)
+        if role.owner == event.line_id:
+            raise EventRejected(
+                f"line {event.line_id} owns role {event.role_id}, so the role is"
+                " vacated or handed over before the seat is unbound"
+            )
+
+    def _check_role_retired(self, event: RoleRetired) -> None:
+        role = self._role(event.role_id)
+        self._require_party(event.by)
+        if role.owner is not None:
+            raise EventRejected(
+                f"role {event.role_id} is owned by {role.owner}, so it is vacated or"
+                " handed over before it is retired"
+            )
+        bound = sorted(
+            line for line, seat in self.seats.items() if seat.role_id == event.role_id
+        )
+        if bound:
+            raise EventRejected(
+                f"role {event.role_id} still has seats {', '.join(bound)}, which are"
+                " unbound before it is retired"
             )
 
     def _check_ownership_changed(self, event: OwnershipChanged) -> None:

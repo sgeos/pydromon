@@ -102,7 +102,8 @@ from dromon.sandbox import SandboxConfig, SandboxError, effective, merge
 from dromon import gitssh
 from dromon.gitssh import GitSshAccess, GitSshError, sandbox_layer, unreadable
 from dromon.processes import environment_reading_works
-from dromon.roles import RoleConflict, plan_roles
+from dromon.roles import RoleConflict, RoleWanted, plan_file_roles, seat_order
+from dromon.relay import AsyncRelay, OperatorRelayer, RelayConfigError, build_routes
 from dromon.workdir import git_write_guards, read_head_commit, resolve_workdir
 from dromon.configview import (
     OVERRIDE,
@@ -126,6 +127,9 @@ from dromon.overrides import decode as decode_override
 from dromon.overrides import encode as encode_override
 from dromon.model import (
     ID_PATTERN,
+    DEFAULT_HANDOFF_BELOW_PERCENT,
+    DEFAULT_HANDOFF_SECONDS,
+    FailoverPolicy,
     PeerKeyed,
     ProjectOverridden,
     AgentAccess,
@@ -260,6 +264,8 @@ class Daemon:
     each peer over its own transport. Tests give their own."""
     successor: list[str] | None = field(default=None, init=False)
     """The options a successor starts with, once a restart is ready to stop."""
+    relayer: OperatorRelayer | None = field(default=None, init=False)
+    """The operators' relayer, once ``serve`` has made it."""
     _watches: set["asyncio.Task[None]"] = field(
         default_factory=lambda: set[asyncio.Task[None]](), init=False, repr=False
     )
@@ -286,7 +292,9 @@ class Daemon:
 
     def apply_project_values(self) -> None:
         """Give the scheduler the project-wide values the layers resolve to. Stored
-        overrides that no longer resolve are skipped, so they cannot stop a start."""
+        overrides that no longer resolve are skipped, so they cannot stop a start.
+        The scheduler is given the file too, for ``role_view``."""
+        self.scheduler.set_project_file(self.project)
         try:
             values = project_values(self.project_layers())
         except (ValueError, InvalidField) as error:
@@ -620,6 +628,31 @@ class Daemon:
         self.scheduler.peer_reports = forwarder.reports
         return forwarder
 
+    def relay_routes(self, config: ProjectConfig) -> dict[str, AsyncRelay]:
+        """The relay of each operator ``config`` routes. Raises ``ProjectMismatch``
+        for a relay refused now, including a notice file outside the daemon's
+        protected state or runtime directories, so a start or reload names it and
+        changes nothing."""
+        protected_dirs(self.paths, config.federation)
+        root = self.paths.root
+        state_runtime_dirs = (self.paths.state_dir, self.paths.runtime_dir)
+
+        try:
+            return build_routes(config.relays, root, state_runtime_dirs)
+        except RelayConfigError as error:
+            raise ProjectMismatch(f"the project file is refused: {error}") from error
+
+    def operator_relayer(self) -> OperatorRelayer:
+        """The relayer for the project's operators, which the scheduler tells of each
+        message to an operator. Made with no routes as well, so ``dromon status``
+        reports the unrouted mail."""
+        relayer = OperatorRelayer(
+            self.scheduler, self.relay_routes(self.project), time.monotonic
+        )
+        self.scheduler.on_operator_mail = relayer.notify
+        self.relayer = relayer
+        return relayer
+
     def execute(self, request: Request) -> Response:
         """Answer one decoded request with operator authority."""
         match request.operation:
@@ -691,6 +724,9 @@ class Daemon:
                 | Operation.ROLE_TAKE
                 | Operation.ROLE_VACATE
                 | Operation.ROLE_HANDOFF
+                | Operation.ROLE_CREATE
+                | Operation.ROLE_UPDATE
+                | Operation.ROLE_DELETE
                 | Operation.BUDGETS
                 | Operation.BUDGET_SET
                 | Operation.AGENT_ADD
@@ -773,9 +809,21 @@ class Daemon:
                     values = _text_args(request.args, names)
                     roles = self.scheduler.roles_view(values[0] if values else None)
                     result = {"roles": cast(object, roles)}
+                    if not values:
+                        retired = self.scheduler.retired_roles_view()
+                        result["retired"] = cast(object, retired)
                 case Operation.ROLE_ENTRY:
                     (entry_id,) = _text_args(request.args, ("entry_id",))
                     result = self.scheduler.role_entry(entry_id)
+                case Operation.ROLE_CREATE:
+                    result = self._role_set(request.args, create=True)
+                case Operation.ROLE_UPDATE:
+                    result = self._role_set(request.args, create=False)
+                case Operation.ROLE_DELETE:
+                    role_id, operator = _text_args(
+                        request.args, ("role_id", "operator")
+                    )
+                    result = self._role_delete(role_id, operator)
                 case Operation.ROLE_TAKE:
                     role_id, seat, operator = _text_args(
                         request.args, ("role_id", "seat", "operator")
@@ -942,6 +990,52 @@ class Daemon:
             **lost,
         }
 
+    def _role_set(self, args: dict[str, object], *, create: bool) -> dict[str, object]:
+        """An operator's ``role_create`` or ``role_update``, as ``role_wanted``
+        reads its arguments. The response is the role as ``roles`` shows it, with the
+        lines made seats and the seats unbound, and warns of the background tasks
+        their kept engine connections close with, read before the change."""
+        role_id, operator = _text_args(
+            {key: args.get(key) for key in ("role_id", "operator")},
+            ("role_id", "operator"),
+        )
+        wanted = role_wanted(self.log.state, role_id, args, create=create)
+        current = {
+            line_id
+            for line_id, seat in self.log.state.seats.items()
+            if seat.role_id == role_id
+        }
+        moving = sorted(current ^ {line_id for line_id, _ in wanted.seats})
+        lost = self.tasks_lost(moving)
+        change = self.scheduler.set_role(
+            OperatorAddress(operator), role_id, wanted, create=create
+        )
+        return {
+            "role": self.scheduler.role_view(role_id),
+            "bound": list(change.bound),
+            "unbound": list(change.unbound),
+            **lost,
+        }
+
+    def _role_delete(self, role_id: str, operator: str) -> dict[str, object]:
+        """An operator's ``role_delete``. The response names the seats unbound, which
+        stay lines, and warns of the background tasks their kept engine connections
+        close with, read before the change."""
+        seats = sorted(
+            line_id
+            for line_id, seat in self.log.state.seats.items()
+            if seat.role_id == role_id
+        )
+        lost = self.tasks_lost(seats)
+        change = self.scheduler.retire_role(OperatorAddress(operator), role_id)
+        retired = self.log.state.retired_roles[role_id]
+        return {
+            "role_id": role_id,
+            "unbound": list(change.unbound),
+            "retired_at": retired.retired_at,
+            **lost,
+        }
+
     def _budget_set(self, args: dict[str, object]) -> dict[str, object]:
         """An operator's statement of a provider's budget, with ``provider`` and
         optionally ``remaining_percent``, a whole number, ``resets_at``, a time in
@@ -1011,8 +1105,16 @@ class Daemon:
         return {"message_id": message_id}
 
     def _mail(self, args: dict[str, object]) -> dict[str, object]:
-        """A page of an operator's mailbox, with its summary. Listing delivers."""
-        allowed = {"operator", "unread_only", "sender", "offset", "limit"}
+        """A page of an operator's mailbox, with its summary. Listing delivers.
+        issues_only lists the open issues lines raised. Round 11, item 3."""
+        allowed = {
+            "operator",
+            "unread_only",
+            "sender",
+            "issues_only",
+            "offset",
+            "limit",
+        }
         if "operator" not in args or not set(args) <= allowed:
             raise ProtocolError(
                 ErrorCode.BAD_REQUEST, f"mail takes {sorted(allowed)}, with operator"
@@ -1022,8 +1124,11 @@ class Daemon:
         offset = args.get("offset", 0)
         limit = args.get("limit", MAX_PAGE)
         sender = args.get("sender")
-        if type(unread_only) is not bool:
-            raise ProtocolError(ErrorCode.BAD_REQUEST, "unread_only is not a boolean")
+        issues_only = args.get("issues_only", False)
+        if type(unread_only) is not bool or type(issues_only) is not bool:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST, "unread_only and issues_only are booleans"
+            )
         if type(offset) is not int or type(limit) is not int:
             raise ProtocolError(ErrorCode.BAD_REQUEST, "offset and limit are integers")
         if sender is not None and not isinstance(sender, str):
@@ -1036,6 +1141,7 @@ class Daemon:
                 owner,
                 unread_only=unread_only,
                 sender=None if sender is None else parse_any_address(sender),
+                issues_only=issues_only,
                 offset=offset,
                 limit=limit,
             )
@@ -1375,6 +1481,7 @@ class Daemon:
             raise OverrideError(str(error)) from error
         check_project(self.log, config)
         check_roles(self.scheduler, self.log, config)
+        routes = self.relay_routes(config)
         terms = project_terms(config, self.paths)
         check_lines_sandboxed(config, self.log, self.scheduler)
         for line_id in sorted(set(self.project.lines) - set(config.lines)):
@@ -1393,12 +1500,15 @@ class Daemon:
         self.project = config
         self.project_file_present = present
         self.apply_project_values()
-        apply_roles(self.scheduler, self.log, config)
+        notices = apply_roles(self.scheduler, self.log, config)
+        if self.relayer is not None:
+            self.relayer.set_routes(routes)
         return {
             "file": str(file),
             "present": present,
             "lines": sorted(config.lines),
             "roles": sorted(config.roles),
+            "role_notices": list(notices),
         }
 
     def _agent_add(self, args: dict[str, object]) -> dict[str, object]:
@@ -1679,6 +1789,7 @@ class Daemon:
             "peers": [
                 report.wire(detail=True) for report in self.scheduler.peer_reports()
             ],
+            "relays": None if self.relayer is None else self.relayer.report(),
             "agents": {
                 "listen": self.agents.listen,
                 "anonymous": self.agents.anonymous.value,
@@ -1783,6 +1894,139 @@ def _config_arg(args: dict[str, object]) -> LineConfig:
     if not isinstance(value, dict):
         raise ProtocolError(ErrorCode.BAD_REQUEST, "config is not an object")
     return config_from_document(cast(dict[str, object], value))
+
+
+ROLE_CREATE_ARGS: Final = frozenset(
+    {
+        "role_id",
+        "operator",
+        "workdir",
+        "seats",
+        "no_own",
+        "handoff_seconds",
+        "failover",
+        "handoff_below_percent",
+    }
+)
+"""What ``role_create`` takes. ``role_id``, ``operator``, ``workdir`` and ``seats``
+are required."""
+
+ROLE_UPDATE_ARGS: Final = ROLE_CREATE_ARGS | {"may_own"}
+"""What ``role_update`` takes. Only ``role_id`` and ``operator`` are required, and
+any other argument given changes that term."""
+
+
+def _names_arg(args: dict[str, object], name: str) -> tuple[str, ...]:
+    """The array of strings ``name`` of ``args``, empty when absent, or
+    ``ProtocolError``. Bounded by the request's line limit."""
+    value = args.get(name, [])
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) for item in cast(list[object], value)
+    ):
+        raise ProtocolError(ErrorCode.BAD_REQUEST, f"{name} is not a list of strings")
+    return tuple(cast(list[str], value))
+
+
+def role_wanted(
+    state: State, role_id: str, args: dict[str, object], *, create: bool
+) -> RoleWanted:
+    """The terms ``role_create`` or ``role_update`` asks for, or ``ProtocolError``.
+
+    A create gives the worktree and the seats in failover order, and may give the
+    other terms ``role_declared`` holds, which default as the project file's do. An
+    update starts from the role as it stands. ``seats``, when given, replaces the
+    seats and the order, so it adds, removes and reorders them, and a seat it keeps
+    keeps its ``may_own``. ``no_own`` and ``may_own`` name seats that may not, or may,
+    own the role. Whether the change applies is ``roles.plan_role_set``'s."""
+    allowed = ROLE_CREATE_ARGS if create else ROLE_UPDATE_ARGS
+    required = {"role_id", "operator"}
+    if create:
+        required |= {"workdir", "seats"}
+    if not required <= set(args) <= allowed:
+        operation = "role_create" if create else "role_update"
+        raise ProtocolError(
+            ErrorCode.BAD_REQUEST,
+            f"{operation} takes {sorted(allowed)}, with {sorted(required)}",
+        )
+    role = state.roles.get(role_id)
+    if not create and role is None:
+        retired = state.retired_roles.get(role_id)
+        detail = "" if retired is None else f", which was retired by {retired.by}"
+        raise EventRejected(f"no role {role_id}{detail}")
+    for name in ("handoff_seconds", "handoff_below_percent"):
+        if name in args and type(args[name]) is not int:
+            raise ProtocolError(ErrorCode.BAD_REQUEST, f"{name} is not a whole number")
+    for name in ("workdir", "failover"):
+        if name in args and not isinstance(args[name], str):
+            raise ProtocolError(ErrorCode.BAD_REQUEST, f"{name} is not a string")
+    failover_text = args.get("failover")
+    failover = None
+    if failover_text is not None:
+        try:
+            failover = FailoverPolicy(cast(str, failover_text))
+        except ValueError as error:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST,
+                "failover is one of " + ", ".join(p.value for p in FailoverPolicy),
+            ) from error
+    no_own = set(_names_arg(args, "no_own"))
+    may_own = set(_names_arg(args, "may_own"))
+    if no_own & may_own:
+        raise ProtocolError(
+            ErrorCode.BAD_REQUEST,
+            "no_own and may_own both name " + ", ".join(sorted(no_own & may_own)),
+        )
+    current: dict[str, bool] = {}
+    if role is not None:
+        current = {
+            line_id: state.seats[line_id].may_own
+            for line_id in seat_order(state, role_id)
+        }
+    if "seats" in args:
+        order = _names_arg(args, "seats")
+        if len(set(order)) != len(order):
+            raise ProtocolError(ErrorCode.BAD_REQUEST, "seats names a line twice")
+        names: tuple[str, ...] = order
+    else:
+        order = () if role is None else role.seats
+        names = tuple(current)
+    unknown = sorted((no_own | may_own) - set(names))
+    if unknown:
+        raise ProtocolError(
+            ErrorCode.BAD_REQUEST,
+            "no_own and may_own name only seats of the role, not " + ", ".join(unknown),
+        )
+    seats = tuple(
+        (
+            line_id,
+            line_id not in no_own
+            and (line_id in may_own or current.get(line_id, True)),
+        )
+        for line_id in names
+    )
+    return RoleWanted(
+        workdir=cast(str, args.get("workdir", "" if role is None else role.workdir)),
+        handoff_seconds=cast(
+            int,
+            args.get(
+                "handoff_seconds",
+                DEFAULT_HANDOFF_SECONDS if role is None else role.handoff_seconds,
+            ),
+        ),
+        failover=failover
+        or (FailoverPolicy.AUTOMATIC if role is None else role.failover),
+        handoff_below_percent=cast(
+            int,
+            args.get(
+                "handoff_below_percent",
+                DEFAULT_HANDOFF_BELOW_PERCENT
+                if role is None
+                else role.handoff_below_percent,
+            ),
+        ),
+        order=order,
+        seats=seats,
+    )
 
 
 def _text_args(args: dict[str, object], names: tuple[str, ...]) -> tuple[str, ...]:
@@ -2252,11 +2496,14 @@ async def serve(daemon: Daemon) -> None:
         servers.append(tls_listener)
     # Made before any task starts, so that a log it cannot read stops the start cleanly.
     forwarder = daemon.forwarder()
+    relayer = daemon.operator_relayer()
     daemon.scheduler.recover()
     scheduling = asyncio.create_task(daemon.scheduler.run(daemon.stop_requested))
     forwarding = asyncio.create_task(forwarder.run(daemon.stop_requested))
+    relaying = asyncio.create_task(relayer.run(daemon.stop_requested))
     scheduling.add_done_callback(watch_task("scheduler", daemon.stop_requested))
     forwarding.add_done_callback(watch_task("forwarder", daemon.stop_requested))
+    relaying.add_done_callback(watch_task("relayer", daemon.stop_requested))
     try:
         # The umask already gives 0600, and this states it rather than relying on it.
         socket_path.chmod(0o600)
@@ -2269,6 +2516,11 @@ async def serve(daemon: Daemon) -> None:
         # sockets open.
         with contextlib.suppress(Exception):
             await forwarding
+        # A relay command still running is killed with its process group, and its
+        # notice stays undelivered for the next start.
+        relaying.cancel()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await relaying
         for listening in servers:
             listening.close()
         for writer in list(writers):
@@ -2608,23 +2860,33 @@ def check_roles(scheduler: Scheduler, log: EventLog, config: ProjectConfig) -> N
     """Raise ``ProjectMismatch`` if the file's roles cannot be recorded, so that
     nothing is applied from such a file, as ``check_project`` does for lines."""
     try:
-        plan_roles(log.state, config, scheduler.default_operator, scheduler.wall_due())
-    except RoleConflict as error:
-        raise ProjectMismatch(str(error)) from error
+        plan_file_roles(
+            log.state, config, scheduler.default_operator, scheduler.wall_due()
+        )
+        # Round 10 review, F2, F3 and F4. The one-writer rule, on the state the file
+        # would make, so a file that breaks it is refused whole.
+        scheduler.check_project_file(config)
+    except (RoleConflict, EventRejected) as error:
+        raise ProjectMismatch(f"the project file is refused: {error}") from error
 
 
-def apply_roles(scheduler: Scheduler, log: EventLog, config: ProjectConfig) -> None:
-    """Record the file's roles, seats and first owners, as ``roles.plan_roles``
-    describes. It runs after ``apply_project``, which creates the seats' lines, and
-    after the project's operator is set, who is recorded as declaring an owner."""
+def apply_roles(
+    scheduler: Scheduler, log: EventLog, config: ProjectConfig
+) -> tuple[str, ...]:
+    """Record the file's roles, seats and first owners, as
+    ``roles.plan_file_roles`` describes, and return its notices of the roles the file
+    leaves as they are, which a reload answers with and a start prints. It runs
+    after ``apply_project``, which creates the seats' lines, and after the project's
+    operator is set, who is recorded as declaring an owner."""
     try:
-        events = plan_roles(
+        plan = plan_file_roles(
             log.state, config, scheduler.default_operator, scheduler.wall_due()
         )
     except RoleConflict as error:
         raise ProjectMismatch(str(error)) from error
-    for event in events:
+    for event in plan.events:
         log.append(event)
+    return plan.notices
 
 
 def apply_project(scheduler: Scheduler, log: EventLog, config: ProjectConfig) -> None:
@@ -2647,6 +2909,7 @@ def apply_project(scheduler: Scheduler, log: EventLog, config: ProjectConfig) ->
                 definition.strategy,
                 definition.config,
                 definition.session,
+                placement_checked=True,
             )
         else:
             stored = (
@@ -2655,7 +2918,9 @@ def apply_project(scheduler: Scheduler, log: EventLog, config: ProjectConfig) ->
                 else decode_config(existing.config)
             )
             if stored != definition.config:
-                scheduler.configure_line(line_id, definition.config)
+                scheduler.configure_line(
+                    line_id, definition.config, placement_checked=True
+                )
         scheduler.set_line_policy(
             line_id, definition.limits, definition.wake_every_ticks
         )
@@ -2769,7 +3034,11 @@ def run(
                     hold_wakes=hold_wakes,
                 )
                 daemon.apply_project_values()
-                apply_roles(scheduler, log, config)
+                for notice in apply_roles(scheduler, log, config):
+                    print(f"dromond: {notice}", file=sys.stderr)
+                # Checked here as well as in ``serve``, so a refused relay stops the
+                # start before any socket is made.
+                daemon.relay_routes(config)
                 asyncio.run(serve(daemon))
                 successor = daemon.successor
             finally:
