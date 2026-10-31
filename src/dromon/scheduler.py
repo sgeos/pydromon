@@ -4968,11 +4968,17 @@ class Scheduler:
             format_due(self._wall_clock()),
         )
 
-    def _budget_of(self, line_id: str) -> BudgetStated | None:
+    def _budget_of(
+        self, line_id: str, now: datetime | None = None
+    ) -> BudgetStated | None:
         """The stated budget of ``line_id``'s provider. Until the budget step, each
-        engine is its own provider."""
+        engine is its own provider. Expired window snapshots are absent."""
         engine = ENGINE_OF.get(self.model_of(line_id))
-        return None if engine is None else self._log.state.budgets.get(engine)
+        if engine is None:
+            return None
+        return self._log.state.effective_budget(
+            engine, self._wall_clock() if now is None else now
+        )
 
     def _plan_limited(self, line_id: str) -> bool:
         """Whether ``line_id`` is held, still, by the hold of a plan limit its engine
@@ -5413,6 +5419,10 @@ class Scheduler:
         in flight is failed over once that turn ends, as every owner is."""
         said: list[str] = []
         state = self._log.state
+        effective = state.effective_budget(budget.provider, self._wall_clock())
+        if effective is None:
+            return said
+        budget = effective
         for role_id, role in sorted(state.roles.items()):
             owner = role.owner
             if owner is None or ENGINE_OF.get(self.model_of(owner)) != budget.provider:
@@ -5475,7 +5485,7 @@ class Scheduler:
         if provider is None:
             return
         now = self._wall_clock()
-        if budget_spent(self._log.state.budgets.get(provider), now):
+        if budget_spent(self._log.state.effective_budget(provider, now), now):
             return
         budget = BudgetStated(
             provider,
@@ -5515,8 +5525,8 @@ class Scheduler:
             except InvalidField:
                 resets_at = None
         state = self._log.state
-        previous = state.budgets.get(provider)
         now = self._wall_clock()
+        previous = state.effective_budget(provider, now)
         if budget_spent(previous, now):
             return
         previous_window = state.budget_windows.get(provider, {}).get(window)
@@ -5537,7 +5547,9 @@ class Scheduler:
             window,
         )
         self._log.append(budget)
-        self._budget_followed(self._log.state.budgets[provider])
+        effective = self._log.state.effective_budget(provider, now)
+        if effective is not None:
+            self._budget_followed(effective)
 
     # The operator's ownership commands, roles step 2 of ``docs/architecture/ROLES.md``.
 
@@ -5991,16 +6003,22 @@ class Scheduler:
         """Each provider's stated budget, with whether it shows the provider spent
         now, and the providers a budget may be stated for."""
         now = self._wall_clock()
-        return {
-            "providers": sorted(set(ENGINE_OF.values())),
-            "budgets": [
+        budgets: list[dict[str, object]] = []
+        providers = set(self._log.state.budgets) | set(self._log.state.budget_windows)
+        for provider in sorted(providers):
+            budget = self._log.state.effective_budget(provider, now)
+            if budget is None:
+                continue
+            budgets.append(
                 {
                     "provider": provider,
                     **_budget_view(budget),
                     "spent": budget_spent(budget, now),
                 }
-                for provider, budget in sorted(self._log.state.budgets.items())
-            ],
+            )
+        return {
+            "providers": sorted(set(ENGINE_OF.values())),
+            "budgets": budgets,
         }
 
     def _waits_for_writer(self, line_id: str) -> bool:

@@ -2153,6 +2153,27 @@ class State:
         held = self.role_holders.get(role_id)
         return RoleHolder.FILE if held is None else held.holder
 
+    def effective_budget(self, provider: str, now: datetime) -> BudgetStated | None:
+        """The provider's latest unwindowed statement, or its lowest remaining
+        window snapshot whose reset has not passed at ``now``. A provider with only
+        expired window snapshots has no effective budget."""
+        windows = self.budget_windows.get(provider)
+        if windows is None:
+            return self.budgets.get(provider)
+        active = [
+            budget
+            for budget in windows.values()
+            if budget.resets_at is None or now < parse_due(budget.resets_at)
+        ]
+        if not active:
+            return None
+        return min(
+            active,
+            key=lambda budget: (
+                101 if budget.remaining_percent is None else budget.remaining_percent
+            ),
+        )
+
     def copy(self) -> "State":
         """Return an independent snapshot. The records are frozen, so maps suffice."""
         return State(
@@ -2372,7 +2393,9 @@ class State:
                         f"role {event.role_id} threshold changed before the"
                         " handoff request"
                     )
-                budget = self.budgets.get(event.provider)
+                budget = self.effective_budget(
+                    event.provider, parse_due(event.requested_at)
+                )
                 if (
                     budget is None
                     or budget.remaining_percent != event.remaining_percent
@@ -2703,8 +2726,10 @@ class State:
                             else budget.remaining_percent
                         ),
                     )
-                current = self.budgets[event.provider]
-                if current.remaining_percent is not None:
+                current = self.effective_budget(
+                    event.provider, parse_due(event.stated_at)
+                )
+                if current is not None and current.remaining_percent is not None:
                     for role_id, role in self.roles.items():
                         if current.remaining_percent > role.handoff_below_percent:
                             self.budget_handoffs.discard((event.provider, role_id))

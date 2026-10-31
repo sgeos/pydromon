@@ -12,6 +12,8 @@ All notable changes are recorded here. The format follows
   named window and shows the lowest remaining percentage among unexpired windows. A
   positive snapshot cannot replace a recorded zero before its reset. Handoff requests
   are recorded once per crossing below the role threshold and re-armed only above it.
+  A daemon predating round 11 cannot read the log after a `budget_handoff_requested`
+  event is recorded.
   Percentage conversion is exact and rounds toward less remaining. Grok Build's
   documented rate-limit classes are emitted to its `StopFailure` hook, but Dromon's
   Agent Client Protocol adapter cannot read that hook event or a documented reset

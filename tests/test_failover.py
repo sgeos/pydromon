@@ -655,15 +655,34 @@ def test_budget_state_keeps_the_lowest_unexpired_window_and_its_reset(
         replayed.close()
 
 
+def test_status_omits_a_window_after_its_reset_time(world: World) -> None:
+    reset = format_due(START + timedelta(hours=1))
+    world.scheduler.engine_budget_reported("alpha", 40, reset, "five hour", "five_hour")
+
+    world.now = START + timedelta(hours=2)
+
+    assert world.log.state.effective_budget(CLAUDE, world.now) is None
+    provider_budgets = cast(
+        list[dict[str, object]], world.scheduler.budgets_view()["budgets"]
+    )
+    assert all(entry["provider"] != CLAUDE for entry in provider_budgets)
+    role_seats = cast(
+        list[dict[str, object]], world.scheduler.role_view("core")["seats"]
+    )
+    alpha = next(seat for seat in role_seats if seat["line_id"] == "alpha")
+    assert alpha["budget"] is None
+
+
 def test_handoff_notice_is_once_per_crossing_below_threshold(world: World) -> None:
-    world.scheduler.engine_budget_reported("alpha", 9, AT, "nine", "five_hour")
+    reset = format_due(START + timedelta(days=1))
+    world.scheduler.engine_budget_reported("alpha", 9, reset, "nine", "five_hour")
     assert len(world.mail(HARNESS, "alpha")) == 1
-    world.scheduler.engine_budget_reported("alpha", 8, AT, "eight", "five_hour")
-    world.scheduler.engine_budget_reported("alpha", 10, AT, "ten", "five_hour")
-    world.scheduler.engine_budget_reported("alpha", 11, AT, "eleven", "five_hour")
+    world.scheduler.engine_budget_reported("alpha", 8, reset, "eight", "five_hour")
+    world.scheduler.engine_budget_reported("alpha", 10, reset, "ten", "five_hour")
+    world.scheduler.engine_budget_reported("alpha", 11, reset, "eleven", "five_hour")
     assert len(world.mail(HARNESS, "alpha")) == 1
 
-    world.scheduler.engine_budget_reported("alpha", 9, AT, "nine again", "five_hour")
+    world.scheduler.engine_budget_reported("alpha", 9, reset, "nine again", "five_hour")
     assert len(world.mail(HARNESS, "alpha")) == 2
 
 
