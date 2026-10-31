@@ -516,7 +516,13 @@ configuration.
 remaining percentage, a reset time or both. An engine reports a positive remaining
 percentage where its documented signal identifies one provider window. Claude Code's
 typed rate-limit event gives window utilization and reset time, so Dromon records the
-positive remainder rounded down for that window without combining separate windows.
+positive remainder rounded toward less remaining, using integer arithmetic. Window
+snapshots are kept separately in the event log, and the provider budget is the lowest
+remaining percentage among windows whose resets have not passed, with that window's
+reset time. A positive report cannot replace a stated zero while its reset has not
+passed. A role owner receives one handoff request when its provider budget crosses
+below the role threshold. It is re-armed only after the provider budget rises above
+the threshold.
 An engine also reports a spent budget at a plan limit, which becomes `budget_stated`
 with `remaining_percent` 0, `source` `engine`, and the reset time where one was given
 in the model's form. **Implemented.** The classification of each engine is as follows,

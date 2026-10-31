@@ -437,8 +437,11 @@ recording before it becomes a fixture, as for any engine.
 of `rate_limit_info` that the Agent SDK `0.2.174` reads, which are the six named above
 and `rateLimitType`, keep a placeholder valid for that reader. Dromon reads status,
 overage status, reset time and window name to classify a rejected window, and reads
-utilization to record a positive remaining percentage for that window. It does not
-combine separate windows. Every other field is replaced by a fixed value of its type,
+utilization to record a positive remaining percentage for that window. It records
+each window separately and exposes the lowest unexpired remaining percentage, with
+that window's reset. Percentage conversion uses integer arithmetic rounded toward
+less remaining. A positive snapshot cannot replace a stored zero before its reset.
+Every other field is replaced by a fixed value of its type,
 so a field that no one listed, such as a count of remaining requests, cannot pass
 through. Field and window names are kept, and an absent value, `null`, stays absent. An
 upgrade of the Agent SDK checks the list against its `RateLimitInfo`.

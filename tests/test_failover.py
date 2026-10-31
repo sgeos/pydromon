@@ -4,7 +4,7 @@ budget asks for, and the plan limits an engine reports as its provider's budget.
 
 import asyncio
 from collections.abc import Callable, Coroutine, Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -427,6 +427,18 @@ def test_a_low_budget_asks_the_owner_to_prepare_a_handoff(world: World) -> None:
     assert world.owner() == "alpha"
 
 
+def test_an_operator_budget_asks_only_on_threshold_crossings(world: World) -> None:
+    world.state_budget(CLAUDE, 9)
+    assert len(world.mail(HARNESS, "alpha")) == 1
+    world.state_budget(CLAUDE, 8)
+    world.state_budget(CLAUDE, 10)
+    world.state_budget(CLAUDE, 11)
+    assert len(world.mail(HARNESS, "alpha")) == 1
+
+    world.state_budget(CLAUDE, 9)
+    assert len(world.mail(HARNESS, "alpha")) == 2
+
+
 def test_a_low_budget_with_no_usable_seat_asks_nothing(world: World) -> None:
     # Beta's provider is spent, gamma is hibernated, and delta may not own the role.
     world.state_budget(CODEX, 0)
@@ -536,7 +548,11 @@ def test_a_spent_codex_credit_states_its_provider_spent_once(world: World) -> No
 def test_a_claude_window_report_states_a_positive_provider_budget(world: World) -> None:
     reset = "2026-10-28T15:00:00Z"
     world.scheduler.engine_budget_reported(
-        "alpha", 8, reset, "Claude reported 8% remaining in its five_hour window"
+        "alpha",
+        8,
+        reset,
+        "Claude reported 8% remaining in its five_hour window",
+        "five_hour",
     )
     budget = world.log.state.budgets[CLAUDE]
     assert (budget.remaining_percent, budget.resets_at, budget.source) == (
@@ -548,9 +564,107 @@ def test_a_claude_window_report_states_a_positive_provider_budget(world: World) 
     # Repeated snapshots of an unchanged window do not grow the event log.
     count = world.log.last_seq
     world.scheduler.engine_budget_reported(
-        "alpha", 8, reset, "Claude reported 8% remaining in its five_hour window"
+        "alpha",
+        8,
+        reset,
+        "Claude reported 8% remaining in its five_hour window",
+        "five_hour",
     )
     assert world.log.last_seq == count
+
+
+def test_a_spent_five_hour_window_is_not_replaced_by_a_positive_seven_day_window(
+    world: World,
+) -> None:
+    reset = format_due(START.replace(hour=15))
+    world.scheduler.plan_limit_reached(
+        "alpha",
+        EnginePlanLimit(
+            "Claude five-hour limit reached",
+            reset,
+            may_move_role=True,
+            window="five_hour",
+        ),
+    )
+    count = world.log.last_seq
+
+    world.scheduler.engine_budget_reported(
+        "alpha",
+        80,
+        format_due(START + timedelta(days=7)),
+        "Claude reported 80% remaining in its seven_day window",
+        "seven_day",
+    )
+
+    assert world.log.last_seq == count
+    budget = world.log.state.budgets[CLAUDE]
+    assert (budget.remaining_percent, budget.resets_at, budget.window) == (
+        0,
+        reset,
+        "five_hour",
+    )
+
+    world.now = START + timedelta(hours=6)
+    world.scheduler.engine_budget_reported(
+        "alpha",
+        80,
+        format_due(START + timedelta(days=7)),
+        "Claude reported 80% remaining in its seven_day window",
+        "seven_day",
+    )
+    budget = world.log.state.budgets[CLAUDE]
+    assert (budget.remaining_percent, budget.window) == (80, "seven_day")
+
+
+def test_budget_state_keeps_the_lowest_unexpired_window_and_its_reset(
+    world: World,
+) -> None:
+    five_hour_reset = format_due(START.replace(hour=14))
+    seven_day_reset = format_due(START + timedelta(days=7))
+    world.scheduler.engine_budget_reported(
+        "alpha", 40, five_hour_reset, "five hour", "five_hour"
+    )
+    world.scheduler.engine_budget_reported(
+        "alpha", 8, seven_day_reset, "seven day", "seven_day"
+    )
+    budget = world.log.state.budgets[CLAUDE]
+    assert (budget.remaining_percent, budget.resets_at, budget.window) == (
+        8,
+        seven_day_reset,
+        "seven_day",
+    )
+
+    world.scheduler.engine_budget_reported(
+        "alpha", 70, seven_day_reset, "seven day updated", "seven_day"
+    )
+    budget = world.log.state.budgets[CLAUDE]
+    assert (budget.remaining_percent, budget.resets_at, budget.window) == (
+        40,
+        five_hour_reset,
+        "five_hour",
+    )
+    assert set(world.log.state.budget_windows[CLAUDE]) == {"five_hour", "seven_day"}
+    replayed = EventLog(world.log.path)
+    try:
+        assert replayed.state.budgets[CLAUDE] == budget
+        assert set(replayed.state.budget_windows[CLAUDE]) == {
+            "five_hour",
+            "seven_day",
+        }
+    finally:
+        replayed.close()
+
+
+def test_handoff_notice_is_once_per_crossing_below_threshold(world: World) -> None:
+    world.scheduler.engine_budget_reported("alpha", 9, AT, "nine", "five_hour")
+    assert len(world.mail(HARNESS, "alpha")) == 1
+    world.scheduler.engine_budget_reported("alpha", 8, AT, "eight", "five_hour")
+    world.scheduler.engine_budget_reported("alpha", 10, AT, "ten", "five_hour")
+    world.scheduler.engine_budget_reported("alpha", 11, AT, "eleven", "five_hour")
+    assert len(world.mail(HARNESS, "alpha")) == 1
+
+    world.scheduler.engine_budget_reported("alpha", 9, AT, "nine again", "five_hour")
+    assert len(world.mail(HARNESS, "alpha")) == 2
 
 
 def test_an_owner_out_of_credit_between_turns_fails_over_at_once(

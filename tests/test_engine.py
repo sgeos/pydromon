@@ -155,7 +155,7 @@ def line(
     driver: Driver | None = None,
     environment: Mapping[str, str] | None = None,
     observe: Observer = ignore,
-    budget_reported: Callable[[int, str | None, str], object] = (
+    budget_reported: Callable[[int, str | None, str, str], object] = (
         engine_module.ignore_budget_report
     ),
 ) -> ClaudeCodeLine:
@@ -741,11 +741,11 @@ def rate_limit(
 
 
 def test_a_known_positive_claude_window_reports_its_remaining_budget() -> None:
-    reports: list[tuple[int, str | None, str]] = []
+    reports: list[tuple[int, str | None, str, str]] = []
     target = line(
         Scripted([init(), rate_limit("allowed", utilization=0.425), result()]),
-        budget_reported=lambda remaining, reset, note: reports.append(
-            (remaining, reset, note)
+        budget_reported=lambda remaining, reset, note, window: reports.append(
+            (remaining, reset, note, window)
         ),
     )
     run(target)
@@ -754,6 +754,37 @@ def test_a_known_positive_claude_window_reports_its_remaining_budget() -> None:
             57,
             "2026-10-28T15:00:00Z",
             "Claude reported 57% remaining in its five_hour rate-limit window",
+            "five_hour",
+        )
+    ]
+
+
+@pytest.mark.parametrize("utilized_percent", range(100))
+def test_claude_window_whole_percent_rounding_is_exact(
+    utilized_percent: int,
+) -> None:
+    reports: list[tuple[int, str | None, str, str]] = []
+    run(
+        line(
+            Scripted(
+                [
+                    init(),
+                    rate_limit("allowed", utilization=utilized_percent / 100),
+                    result(),
+                ]
+            ),
+            budget_reported=lambda remaining, reset, note, window: reports.append(
+                (remaining, reset, note, window)
+            ),
+        )
+    )
+    assert reports == [
+        (
+            100 - utilized_percent,
+            "2026-10-28T15:00:00Z",
+            "Claude reported "
+            f"{100 - utilized_percent}% remaining in its five_hour rate-limit window",
+            "five_hour",
         )
     ]
 
@@ -772,12 +803,12 @@ def test_a_known_positive_claude_window_reports_its_remaining_budget() -> None:
 def test_unknown_or_exhausted_windows_do_not_report_a_positive_budget(
     status: RateLimitStatus, utilization: float
 ) -> None:
-    reports: list[tuple[int, str | None, str]] = []
+    reports: list[tuple[int, str | None, str, str]] = []
     run(
         line(
             Scripted([init(), rate_limit(status, utilization=utilization), result()]),
-            budget_reported=lambda remaining, reset, note: reports.append(
-                (remaining, reset, note)
+            budget_reported=lambda remaining, reset, note, window: reports.append(
+                (remaining, reset, note, window)
             ),
         )
     )

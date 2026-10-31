@@ -80,6 +80,7 @@ from dromon.model import (
     BriefSet,
     RequestStamp,
     BudgetStated,
+    BudgetHandoffRequested,
     BudgetSource,
     PeerDeclared,
     PeerKeyed,
@@ -227,6 +228,14 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "source",
         "note",
         "stated_at",
+        "window",
+    ),
+    "budget_handoff_requested": (
+        "provider",
+        "role_id",
+        "remaining_percent",
+        "threshold",
+        "requested_at",
     ),
     "peer_declared": ("peer_id", "transport", "policy"),
     "peer_removed": ("peer_id",),
@@ -323,6 +332,8 @@ def _upgraded(kind: str, data: object) -> object:
         }
     if kind == "wake_scheduled" and "task_id" not in fields:
         fields = {**fields, "task_id": None}
+    if kind == "budget_stated" and "window" not in fields:
+        fields = {**fields, "window": None}
     if kind in OMITTED_WHEN_NULL:
         fields = {
             **{name: None for name in OMITTED_WHEN_NULL[kind] if name not in fields},
@@ -335,13 +346,16 @@ OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
     "message_sent": ("request",),
     "wake_scheduled": ("request",),
     "line_turn_ended": ("unreported",),
+    "budget_stated": ("window",),
 }
 """The fields left out of the wire when they are null, which a log written before
 them never held, so decoding reads an absent one as null. **Task of 2026-10-29,
 round 5.** The request key of a keyed call is recorded in the event of its act, and
-an event of a call without a key is written as before it. **Porting hazard.** A port
-must omit these fields when null, not write them as null, so that its log stays
-readable by a daemon that predates them, and must read an absent one as null."""
+an event of a call without a key is written as before it. The ``window`` field was
+added to ``budget_stated`` on 2026-10-31. **Porting hazard.** A port must omit these
+fields when null, not write them as null, so that its log stays readable by a daemon
+that predates them, and must read an absent one as null. A daemon predating ``window``
+does not read an event that names one."""
 
 
 def _without_nulls(kind: str, data: dict[str, object]) -> dict[str, object]:
@@ -630,6 +644,15 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "source": event.source.value,
                 "note": event.note,
                 "stated_at": event.stated_at,
+                "window": event.window,
+            }
+        case BudgetHandoffRequested():
+            return "budget_handoff_requested", {
+                "provider": event.provider,
+                "role_id": event.role_id,
+                "remaining_percent": event.remaining_percent,
+                "threshold": event.threshold,
+                "requested_at": event.requested_at,
             }
         case PeerDeclared():
             return "peer_declared", {
@@ -895,6 +918,15 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _member(data, "source", BudgetSource),
                 _str(data, "note"),
                 _str(data, "stated_at"),
+                _optional_str(data, "window"),
+            )
+        case "budget_handoff_requested":
+            return BudgetHandoffRequested(
+                _str(data, "provider"),
+                _str(data, "role_id"),
+                _int(data, "remaining_percent"),
+                _int(data, "threshold"),
+                _str(data, "requested_at"),
             )
         case "peer_declared":
             return PeerDeclared(

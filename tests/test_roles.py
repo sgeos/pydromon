@@ -21,6 +21,7 @@ from dromon.model import (
     AgentRegistered,
     BudgetSource,
     BudgetStated,
+    BudgetHandoffRequested,
     Event,
     EventRejected,
     InvalidField,
@@ -436,6 +437,25 @@ def test_an_ownership_change_carries_its_addresses_as_text() -> None:
     document = json.loads(encode(event))
     assert document["data"]["by"] == "alpha"
     assert json.loads(encode(changed("alpha", None, DECLARED)))["data"]["by"] == "@ana"
+    assert decode(encode(event)) == event
+
+
+def test_budget_window_round_trips_and_older_events_decode_without_one() -> None:
+    event = BudgetStated(
+        "claude-code", 7, AT, BudgetSource.ENGINE, "seven day", AT, "seven_day"
+    )
+    document = json.loads(encode(event))
+    assert document["data"]["window"] == "seven_day"
+    assert decode(encode(event)) == event
+
+    document["data"].pop("window")
+    assert decode(json.dumps(document)) == BudgetStated(
+        "claude-code", 7, AT, BudgetSource.ENGINE, "seven day", AT
+    )
+
+
+def test_budget_handoff_request_round_trips() -> None:
+    event = BudgetHandoffRequested("claude-code", "core", 9, 10, AT)
     assert decode(encode(event)) == event
 
 

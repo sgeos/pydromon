@@ -86,6 +86,7 @@ failures from the SDK propagate unchanged.
 
 import asyncio
 import contextlib
+from decimal import Decimal
 import hashlib
 import importlib.metadata
 import json
@@ -306,11 +307,17 @@ class EnginePlanLimit(EngineRefused):
     not say holds only, which is default deny."""
 
     def __init__(
-        self, message: str, resets_at: str | None = None, *, may_move_role: bool = False
+        self,
+        message: str,
+        resets_at: str | None = None,
+        *,
+        may_move_role: bool = False,
+        window: str | None = None,
     ) -> None:
         super().__init__(message)
         self.resets_at = resets_at
         self.may_move_role = may_move_role
+        self.window = window
 
 
 BILLING_ERROR: Final = "billing_error"
@@ -349,12 +356,13 @@ def rejected_limit(info: RateLimitInfo) -> EnginePlanLimit | None:
         f"Claude subscription plan limit reached in its {window} window{suffix}",
         resets_at,
         may_move_role=True,
+        window=window if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", window) else None,
     )
 
 
 def remaining_window_budget(
     info: RateLimitInfo,
-) -> tuple[int, str | None, str] | None:
+) -> tuple[int, str | None, str, str] | None:
     """The positive remaining percentage of the reported Claude rate-limit window.
 
     ``utilization`` is a fraction of this window, not an account-wide total. A
@@ -376,7 +384,7 @@ def remaining_window_budget(
         or info.status not in {"allowed", "allowed_warning"}
     ):
         return None
-    remaining = math.floor((1 - utilization) * 100)
+    remaining = 100 - math.ceil(Decimal(str(utilization)) * 100)
     if not 1 <= remaining <= 100:
         return None
     resets_at: str | None = None
@@ -386,10 +394,13 @@ def remaining_window_budget(
         except (OverflowError, OSError, ValueError):
             resets_at = None
     window = info.rate_limit_type or "unnamed"
+    if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", window) is None:
+        window = "unnamed"
     return (
         remaining,
         resets_at,
         f"Claude reported {remaining}% remaining in its {window} rate-limit window",
+        window,
     )
 
 
@@ -1434,15 +1445,15 @@ type SpentBetween = Callable[[str, float | None, Mapping[str, int] | None], obje
 """Where an engine reports what a turn outside Dromon's own cost: its kind, its cost
 and its tokens, where the engine reports them."""
 
-type BudgetReported = Callable[[int, str | None, str], object]
+type BudgetReported = Callable[[int, str | None, str, str], object]
 """Where an engine reports a positive remaining percentage for one provider window."""
 
 
 def ignore_budget_report(
-    remaining_percent: int, resets_at: str | None, note: str
+    remaining_percent: int, resets_at: str | None, note: str, window: str
 ) -> None:
     """The default for an engine whose budget snapshots nobody follows."""
-    del remaining_percent, resets_at, note
+    del remaining_percent, resets_at, note, window
 
 
 type SelfStartedFinish = Callable[[TurnReport | None, Exception | None], object]

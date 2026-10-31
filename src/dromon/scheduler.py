@@ -270,6 +270,7 @@ from dromon.model import (
     Sender,
     BudgetSource,
     BudgetStated,
+    BudgetHandoffRequested,
     RoleHolder,
     RoleNoted,
     RoleNoteKind,
@@ -1225,8 +1226,8 @@ class LineSpec:
         default=lambda ends: None, compare=False
     )
     """Whether a task-triggered engine turn can run under scheduler control."""
-    budget_reported: Callable[[int, str | None, str], object] = field(
-        default=lambda remaining, reset, note: None, compare=False
+    budget_reported: Callable[[int, str | None, str, str], object] = field(
+        default=lambda remaining, reset, note, window: None, compare=False
     )
     """Where an engine reports a positive remaining provider-window percentage."""
 
@@ -5363,7 +5364,13 @@ class Scheduler:
         wakes a line as autonomous mail, without claiming an operator's or another
         line's authority."""
         role = self._log.state.roles[role_id]
-        if role.owner is None or not below_handoff_threshold(role, budget):
+        if (
+            role.owner is None
+            or budget.remaining_percent is None
+            or not below_handoff_threshold(role, budget)
+        ):
+            return None
+        if (budget.provider, role_id) in self._log.state.budget_handoffs:
             return None
         to = self.next_seat(role_id)
         stated = (
@@ -5384,6 +5391,15 @@ class Scheduler:
             f" relinquish_ownership with to set to {to} and a handoff note."
             f" {HANDOFF_TEMPLATE} If you cannot hand it over now, tell the operator"
             " why.",
+        )
+        self._log.append(
+            BudgetHandoffRequested(
+                budget.provider,
+                role_id,
+                budget.remaining_percent,
+                role.handoff_below_percent,
+                format_due(self._wall_clock()),
+            )
         )
         return (
             f"Role {role_id}'s owner {role.owner} was asked to prepare a handoff to"
@@ -5443,6 +5459,7 @@ class Scheduler:
                 BudgetSource.ENGINE,
                 note,
                 format_due(self._wall_clock()),
+                error.window,
             )
         )
 
@@ -5478,6 +5495,7 @@ class Scheduler:
         remaining_percent: int,
         resets_at: str | None,
         note: str,
+        window: str,
     ) -> None:
         """Store a positive budget snapshot from a provider window the engine reports.
 
@@ -5496,13 +5514,17 @@ class Scheduler:
                 check_instant("resets_at", resets_at)
             except InvalidField:
                 resets_at = None
-        previous = self._log.state.budgets.get(provider)
+        state = self._log.state
+        previous = state.budgets.get(provider)
+        now = self._wall_clock()
+        if budget_spent(previous, now):
+            return
+        previous_window = state.budget_windows.get(provider, {}).get(window)
         if (
-            previous is not None
-            and previous.source is BudgetSource.ENGINE
-            and previous.remaining_percent == remaining_percent
-            and previous.resets_at == resets_at
-            and previous.note == note[: MAX_BUDGET_NOTE_BYTES // 4]
+            previous_window is not None
+            and previous_window.remaining_percent == remaining_percent
+            and previous_window.resets_at == resets_at
+            and previous_window.note == note[: MAX_BUDGET_NOTE_BYTES // 4]
         ):
             return
         budget = BudgetStated(
@@ -5511,10 +5533,11 @@ class Scheduler:
             resets_at,
             BudgetSource.ENGINE,
             note[: MAX_BUDGET_NOTE_BYTES // 4],
-            format_due(self._wall_clock()),
+            format_due(now),
+            window,
         )
         self._log.append(budget)
-        self._budget_followed(budget)
+        self._budget_followed(self._log.state.budgets[provider])
 
     # The operator's ownership commands, roles step 2 of ``docs/architecture/ROLES.md``.
 
@@ -9189,8 +9212,8 @@ class Scheduler:
                 lambda: self.redirect_reason(line_id),
                 lambda note: self.credits_spent(line_id, note),
                 begin_self_started=lambda ends: self.begin_self_started(line_id, ends),
-                budget_reported=lambda remaining, reset, note: (
-                    self.engine_budget_reported(line_id, remaining, reset, note)
+                budget_reported=lambda remaining, reset, note, window: (
+                    self.engine_budget_reported(line_id, remaining, reset, note, window)
                 ),
             )
             engine = self._engine_factory(spec, self.own_tools(line_id))
