@@ -200,8 +200,31 @@ relay = "tail"          # the route of operator ana's mail
   recovery or a relinquishment. The events are checked against the log before any is
   appended, so a file that moves an owned role's worktree, bars its current owner from
   owning it, or makes a seat of another role's seat is refused, and the start or the
-  reload with it. The log has no event that unbinds a seat or retires a role, so one
-  the file drops stays in the log as it was. Added on 2026-10-27.
+  reload with it. The file never unbinds a seat or retires a role, so one the file
+  drops stays in the log as it was. Added on 2026-10-27.
+- **Roles changed at run time.** **Round 10, 2026-10-31.** An operator's `dromon role
+  create`, `update` or `delete` wins over the file, and the file never undoes it
+  silently. A role a command changed is held by the operator, which `role_held`
+  records, and a start or a reload leaves it as it is while the file's table for it
+  differs, with a notice naming each term and seat that differs. Once the table agrees,
+  the role is held by the file again, with a notice, and later changes to the file
+  apply. A retired role's table is never applied, since a role identifier is not
+  reused, and a role the file dropped stays, with a notice to retire it with `dromon
+  role delete`. A role created by a command and absent from the file gets no notice. A
+  seat the file names that an operator bound to a role the operator holds is left
+  out, with a notice, and the rest of the file applies. A reload returns the notices
+  as `role_notices`, and a start prints them. The cases are tabulated in
+  [`ROLES.md`](../architecture/ROLES.md). A role that returns to the file is given the
+  file's `owner` in the same pass, where it never had an owner, and `dromon role
+  status` shows each difference of a role an operator holds.
+- **The one-writer rule.** **Round 10 review, 2026-10-31.** A file is refused whole, at
+  a start and at a reload, if the state it would make has two roles on one worktree,
+  compared by real path, which the refusal names, or an owning seat outside its role's
+  worktree, or a line that is not a seat of a role and could write that role's
+  worktree while another seat owns it, which the refusal names with the reason. The
+  check reads the lines only in the log as well, with their overrides, so a line that
+  a log made before the rule refuses the file until it is moved, made read only or
+  made a seat. The rule is stated in [`ROLES.md`](../architecture/ROLES.md).
 - **Located errors.** Every error names the file. A syntax error carries its line and
   column. Any other error carries the dotted key path and the line of its table or key
   when it can be found. The daemon refuses to start on an invalid file.

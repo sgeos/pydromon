@@ -67,6 +67,10 @@ from dromon.model import (
     WalkLimited,
     RoleDeclared,
     SeatBound,
+    SeatUnbound,
+    RoleRetired,
+    RoleHeld,
+    RoleHolder,
     OwnershipChanged,
     DEFAULT_HANDOFF_BELOW_PERCENT,
     FailoverPolicy,
@@ -81,6 +85,7 @@ from dromon.model import (
     PeerKeyed,
     PeerRemoved,
     LocalAddress,
+    OperatorAddress,
     RemoteAddress,
     ReturnCode,
     Sender,
@@ -182,6 +187,9 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "handoff_below_percent",
     ),
     "seat_bound": ("line_id", "role_id", "may_own"),
+    "seat_unbound": ("line_id", "role_id"),
+    "role_retired": ("role_id", "by", "retired_at"),
+    "role_held": ("role_id", "holder", "by", "held_at"),
     "ownership_changed": (
         "role_id",
         "owner",
@@ -566,6 +574,21 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "role_id": event.role_id,
                 "may_own": event.may_own,
             }
+        case SeatUnbound():
+            return "seat_unbound", {"line_id": event.line_id, "role_id": event.role_id}
+        case RoleRetired():
+            return "role_retired", {
+                "role_id": event.role_id,
+                "by": str(event.by),
+                "retired_at": event.retired_at,
+            }
+        case RoleHeld():
+            return "role_held", {
+                "role_id": event.role_id,
+                "holder": event.holder.value,
+                "by": str(event.by),
+                "held_at": event.held_at,
+            }
         case OwnershipChanged():
             return "ownership_changed", {
                 "role_id": event.role_id,
@@ -816,6 +839,21 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
             return SeatBound(
                 _str(data, "line_id"), _str(data, "role_id"), _bool(data, "may_own")
             )
+        case "seat_unbound":
+            return SeatUnbound(_str(data, "line_id"), _str(data, "role_id"))
+        case "role_retired":
+            return RoleRetired(
+                _str(data, "role_id"),
+                _operator(data, "by"),
+                _str(data, "retired_at"),
+            )
+        case "role_held":
+            return RoleHeld(
+                _str(data, "role_id"),
+                _member(data, "holder", RoleHolder),
+                _operator(data, "by"),
+                _str(data, "held_at"),
+            )
         case "ownership_changed":
             return OwnershipChanged(
                 _str(data, "role_id"),
@@ -951,6 +989,13 @@ def _address(data: dict[str, object], name: str) -> LocalAddress:
     return parse_address(_str(data, name))
 
 
+def _operator(data: dict[str, object], name: str) -> OperatorAddress:
+    address = parse_address(_str(data, name))
+    if not isinstance(address, OperatorAddress):
+        raise DecodeError(f"{name} is not an operator address")
+    return address
+
+
 def _any_address(data: dict[str, object], name: str) -> Address:
     return parse_any_address(_str(data, name))
 
@@ -978,6 +1023,7 @@ def _member[
         BudgetSource,
         FailoverPolicy,
         ReturnCode,
+        RoleHolder,
     )
 ](data: dict[str, object], name: str, kind: type[T]) -> T:
     value = _str(data, name)

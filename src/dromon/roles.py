@@ -11,10 +11,16 @@ whose worktree or handoff time changed is declared again, which the model allows
 while the role is vacant if the worktree moved. A seat absent from the log, or whose
 ``may_own`` changed, is bound. The file's ``owner`` is recorded, with cause
 ``declared``, only while the role has never had an owner, so a restart does not undo
-a handoff, a recovery or a relinquishment. The log has no event that unbinds a seat or
-retires a role, so a seat or a role dropped from the file stays in the log as it was.
-**Technical debt.** An unbinding event is for a later step, once the operator decides
-what becomes of a removed seat's ownership.
+a handoff, a recovery or a relinquishment. The file never unbinds a seat or retires a
+role, so a seat or a role dropped from the file stays in the log as it was, and a
+start or a reload says so.
+
+**Round 10.** An operator creates, changes and retires roles at run time with the
+``dromon role`` commands, planned by ``plan_role_set`` and ``plan_role_retire``, which
+record ``seat_unbound``, ``role_retired`` and ``role_held``. A role a command changed is
+held by the operator, and the file does not change it again until its table agrees
+with it, as ``plan_file_roles`` gives and ``ROLES.md`` states. No line can call these,
+since they are offered only on the operator's client socket.
 
 The ownership tools and the operator's ownership commands are planned here too, as
 plain functions of the state and of the facts the scheduler observes, which a port
@@ -25,13 +31,17 @@ worktree, and whether a seat whose engine cannot confine it may run, are decided
 as well.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Final, Literal
 
 from dromon.model import (
+    MAX_ROLE_SEATS,
     BudgetStated,
     Event,
+    FailoverPolicy,
     EventRejected,
     InvalidField,
     LineAddress,
@@ -43,16 +53,20 @@ from dromon.model import (
     OwnershipChanged,
     Role,
     RoleDeclared,
+    RoleHeld,
+    RoleHolder,
     RoleNoted,
+    RoleRetired,
     RoleNoteKind,
     Seat,
     SeatBound,
+    SeatUnbound,
     State,
     parse_due,
     role_terms,
 )
 from dromon.capabilities import Known, TABLES
-from dromon.projectconfig import ProjectConfig
+from dromon.projectconfig import ProjectConfig, RoleDefinition
 
 
 class RoleConflict(ValueError):
@@ -84,16 +98,83 @@ class Plan:
     """What the caller is told beyond the change itself, possibly empty."""
 
 
+@dataclass(frozen=True, slots=True)
+class FilePlan:
+    """What a start or a reload records from the project file's roles, and what it
+    tells the operator of the roles it leaves as they are."""
+
+    events: tuple[Event, ...]
+    notices: tuple[str, ...]
+
+
 def plan_roles(
     state: State, config: ProjectConfig, by: OperatorAddress, at: str
 ) -> tuple[Event, ...]:
+    """The events of ``plan_file_roles``, without its notices."""
+    return plan_file_roles(state, config, by, at).events
+
+
+def file_differences(
+    state: State, role_id: str, definition: RoleDefinition, config: ProjectConfig
+) -> tuple[str, ...]:
+    """How ``config``'s table for ``role_id`` differs from the role in ``state``,
+    term by term and seat by seat, empty when they agree. The file's ``owner`` is
+    left out, since the file names only a first owner. Bounded by the seats of the
+    two, at most ``2 * MAX_ROLE_SEATS``."""
+    role = state.roles[role_id]
+    found: list[str] = []
+    terms = (
+        ("workdir", definition.workdir, role.workdir),
+        ("handoff_seconds", definition.handoff_seconds, role.handoff_seconds),
+        ("failover", definition.failover.value, role.failover.value),
+        (
+            "handoff_below_percent",
+            definition.handoff_below_percent,
+            role.handoff_below_percent,
+        ),
+        ("seats", ", ".join(definition.seats), ", ".join(role.seats)),
+    )
+    for name, written, recorded in terms:
+        if written != recorded:
+            found.append(f"{name} is {written} in the file and {recorded} in the log")
+    bound = {
+        line_id: seat.may_own
+        for line_id, seat in state.seats.items()
+        if seat.role_id == role_id
+    }
+    wanted = {line_id: config.lines[line_id].may_own for line_id in definition.seats}
+    for line_id in sorted(set(bound) | set(wanted)):
+        if line_id not in bound:
+            found.append(f"line {line_id} is a seat in the file and not in the log")
+        elif line_id not in wanted:
+            found.append(f"line {line_id} is a seat in the log and not in the file")
+        elif bound[line_id] != wanted[line_id]:
+            found.append(
+                f"line {line_id} has may_own {str(wanted[line_id]).lower()} in the"
+                f" file and {str(bound[line_id]).lower()} in the log"
+            )
+    return tuple(found)
+
+
+def plan_file_roles(
+    state: State, config: ProjectConfig, by: OperatorAddress, at: str
+) -> FilePlan:
     """The events that bring ``state`` in line with ``config``'s roles, each checked
-    against the state the ones before it leave, or ``RoleConflict`` naming the role.
+    against the state the ones before it leave, or ``RoleConflict`` naming the role,
+    with a notice for each role the file does not change, as ``ROLES.md`` gives.
 
     ``by`` is the operator a declared ownership is recorded as made by, the project's
     operator, registered first if the log does not know it. ``at`` is its time, in
     the model's due-time format. A line the file declares and the log lacks is assumed
-    to be created first, as the daemon does, so the plan can be made before it is."""
+    to be created first, as the daemon does, so the plan can be made before it is.
+
+    **Round 10.** A retired role is never declared again, so its table is left out. A
+    role an operator holds, because a ``dromon role`` command changed it, is left as
+    it is while its table differs, and returns to the file, with ``role_held``, once
+    the table agrees with it, in a pass that also records the file's first owner of a
+    role that never had one. A seat the file names that an operator bound to another
+    role is left out. A role the file held and no longer declares stays as it was,
+    since the file never retires a role."""
     trial = state.copy()
     for line_id, definition in sorted(config.lines.items()):
         if line_id not in trial.lines:
@@ -101,6 +182,7 @@ def plan_roles(
                 LineCreated(line_id, definition.model, definition.strategy.value)
             )
     events: list[Event] = []
+    notices: list[str] = []
 
     def add(role_id: str, event: Event) -> None:
         try:
@@ -110,8 +192,42 @@ def plan_roles(
         trial.apply(event)
         events.append(event)
 
+    def register() -> None:
+        if by.operator_id not in trial.operators:
+            add("of the file", OperatorRegistered(by.operator_id))
+
     for role_id, definition in sorted(config.roles.items()):
+        retired = trial.retired_roles.get(role_id)
+        if retired is not None:
+            notices.append(
+                f"role {role_id} was retired by {retired.by} at {retired.retired_at},"
+                " and a role identifier is never declared again, so the project"
+                " file's table for it is not applied. Remove the table from the file"
+            )
+            continue
         role = trial.roles.get(role_id)
+        if role is not None and trial.holder_of(role_id) is RoleHolder.OPERATOR:
+            held = trial.role_holders[role_id]
+            differences = file_differences(trial, role_id, definition, config)
+            if differences:
+                notices.append(
+                    f"role {role_id} was changed by {held.by} at {held.held_at} with"
+                    " dromon role, which the project file does not undo, so its table"
+                    " is not applied. "
+                    + ". ".join(d[0].upper() + d[1:] for d in differences)
+                    + ". Change the file to agree, and the file holds the role again,"
+                    f" or change the role with dromon role update {role_id}"
+                )
+                continue
+            register()
+            add(role_id, RoleHeld(role_id, RoleHolder.FILE, by, at))
+            notices.append(
+                f"role {role_id} agrees with the project file again, so the file"
+                " holds it from now"
+            )
+            # Round 10 review, F5. The pass goes on, so the file's first owner is
+            # recorded now rather than at the next start or reload. The terms and
+            # seats agree, so the steps before the owner's add nothing.
         declared = RoleDeclared(
             role_id,
             definition.workdir,
@@ -124,20 +240,208 @@ def plan_roles(
             add(role_id, declared)
         for line_id in definition.seats:
             may_own = config.lines[line_id].may_own
-            if trial.seats.get(line_id) != Seat(role_id, may_own):
+            seat = trial.seats.get(line_id)
+            if (
+                seat is not None
+                and seat.role_id != role_id
+                and trial.holder_of(seat.role_id) is RoleHolder.OPERATOR
+            ):
+                notices.append(
+                    f"line {line_id} is a seat of role {seat.role_id}, which an"
+                    " operator holds, so the project file's seat of role"
+                    f" {role_id} for it is not bound"
+                )
+                continue
+            if seat != Seat(role_id, may_own):
                 add(role_id, SeatBound(line_id, role_id, may_own))
         role = trial.roles[role_id]
         if definition.owner is None or role.changed is not None:
             continue
-        if by.operator_id not in trial.operators:
-            add(role_id, OperatorRegistered(by.operator_id))
+        register()
         add(
             role_id,
             OwnershipChanged(
                 role_id, definition.owner, None, OwnershipCause.DECLARED, by, None, at
             ),
         )
-    return tuple(events)
+    for role_id in sorted(set(trial.roles) - set(config.roles)):
+        if trial.holder_of(role_id) is RoleHolder.FILE:
+            notices.append(
+                f"role {role_id} is no longer in the project file, which does not"
+                " retire a role, so it stays as it was. Retire it with dromon role"
+                f" delete {role_id}"
+            )
+    return FilePlan(tuple(events), tuple(notices))
+
+
+@dataclass(frozen=True, slots=True)
+class RoleWanted:
+    """A role's terms as an operator's command asks for them. ``order`` is the
+    declared order a failover follows, and ``seats`` each seat to be bound, with its
+    ``may_own``, in that order."""
+
+    workdir: str
+    handoff_seconds: int
+    failover: FailoverPolicy
+    handoff_below_percent: int
+    order: tuple[str, ...]
+    seats: tuple[tuple[str, bool], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RoleChange:
+    """The events a role command appends, in order, and the lines it made seats of
+    the role and the ones it unbound, whose engines are rebuilt, since the role's
+    tools are offered only to a seat."""
+
+    events: tuple[Event, ...]
+    role_id: str
+    bound: tuple[str, ...]
+    unbound: tuple[str, ...]
+
+
+def _no_role(state: State, role_id: str) -> RoleConflict:
+    """The refusal for a role that is not in ``state``, which says when it was
+    retired if it was."""
+    retired = state.retired_roles.get(role_id)
+    if retired is None:
+        return RoleConflict(f"no role {role_id}")
+    return RoleConflict(
+        f"role {role_id} was retired by {retired.by} at {retired.retired_at}"
+    )
+
+
+def plan_role_set(
+    state: State,
+    role_id: str,
+    wanted: RoleWanted,
+    by: OperatorAddress,
+    at: str,
+    *,
+    create: bool,
+    outside: Mapping[str, str],
+    unbind_refused: Mapping[str, str],
+) -> RoleChange:
+    """The operator ``by`` creates ``role_id`` with ``wanted``, or changes it to
+    ``wanted``, which may add, remove and reorder its seats. The role is held by the
+    operator from then on, as ``plan_file_roles`` respects. No line is created and
+    no line's configuration changes, so a seat must already run in the role's
+    worktree, and ``outside`` gives where each wanted seat that does not runs.
+    ``unbind_refused`` gives why a seat may not be unbound now, which the scheduler
+    decides. The owner is never unbound, nor barred from owning, so its role is
+    vacated or handed over first. Raises ``RoleConflict``, recording nothing."""
+    role = state.roles.get(role_id)
+    if create:
+        if role_id in state.retired_roles:
+            raise RoleConflict(
+                f"{_no_role(state, role_id)}, and a role identifier is never declared"
+                " again. Choose another name"
+            )
+        if role is not None:
+            raise RoleConflict(
+                f"role {role_id} exists. Change it with dromon role update {role_id}"
+            )
+    elif role is None:
+        raise _no_role(state, role_id)
+    if not 1 <= len(wanted.seats) <= MAX_ROLE_SEATS:
+        raise RoleConflict(
+            f"a role has 1 to {MAX_ROLE_SEATS} seats. Retire it with dromon role"
+            " delete instead of leaving it none"
+        )
+    for line_id, _ in wanted.seats:
+        if line_id not in state.lines:
+            raise RoleConflict(
+                f"no line {line_id}. A role command creates no line, so create it"
+                " first with dromon create"
+            )
+        if line_id in outside:
+            raise RoleConflict(
+                f"line {line_id} runs in {outside[line_id]}, not in the role's"
+                f" worktree {wanted.workdir}. A role command changes no line, so move"
+                f" it first with dromon configure {line_id}"
+            )
+    current = {
+        line_id: seat.may_own
+        for line_id, seat in state.seats.items()
+        if seat.role_id == role_id
+    }
+    kept = {line_id for line_id, _ in wanted.seats}
+    removed = (
+        []
+        if role is None
+        else [line_id for line_id in seat_order(state, role_id) if line_id not in kept]
+    )
+    if role is not None and role.owner in removed:
+        raise RoleConflict(
+            f"line {role.owner} owns role {role_id}. Vacate the role with dromon role"
+            f" vacate {role_id}, or hand it over, before its seat is removed"
+        )
+    for line_id in removed:
+        if line_id in unbind_refused:
+            raise RoleConflict(unbind_refused[line_id])
+    events: list[Event] = [SeatUnbound(line_id, role_id) for line_id in removed]
+    try:
+        declared = RoleDeclared(
+            role_id,
+            wanted.workdir,
+            wanted.handoff_seconds,
+            wanted.order,
+            wanted.failover,
+            wanted.handoff_below_percent,
+        )
+    except InvalidField as error:
+        raise RoleConflict(str(error)) from error
+    if role is None or role_terms(role) != role_terms(declared):
+        events.append(declared)
+    bound: list[str] = []
+    for line_id, may_own in wanted.seats:
+        if current.get(line_id) != may_own:
+            events.append(SeatBound(line_id, role_id, may_own))
+            if line_id not in current:
+                bound.append(line_id)
+    if not events:
+        raise RoleConflict(f"role {role_id} is so already")
+    if by.operator_id not in state.operators:
+        events.insert(0, OperatorRegistered(by.operator_id))
+    if state.holder_of(role_id) is not RoleHolder.OPERATOR:
+        events.append(RoleHeld(role_id, RoleHolder.OPERATOR, by, at))
+    return RoleChange(_checked(state, events), role_id, tuple(bound), tuple(removed))
+
+
+def plan_role_retire(
+    state: State,
+    role_id: str,
+    by: OperatorAddress,
+    at: str,
+    *,
+    unbind_refused: Mapping[str, str],
+) -> RoleChange:
+    """The operator ``by`` retires ``role_id``, which unbinds each of its seats first,
+    as the model requires. An owned role is refused, so it is vacated or handed over
+    first, and so is a role a seat of which may not be unbound now, as
+    ``unbind_refused`` gives from the scheduler. The seats stay lines, the journal
+    stays in the log, and the identifier is never declared again. Raises
+    ``RoleConflict``, recording nothing."""
+    role = state.roles.get(role_id)
+    if role is None:
+        raise _no_role(state, role_id)
+    if role.owner is not None:
+        raise RoleConflict(
+            f"line {role.owner} owns role {role_id}. Vacate the role with dromon role"
+            f" vacate {role_id}, or hand it over, before it is deleted"
+        )
+    seats = seat_order(state, role_id)
+    for line_id in seats:
+        if line_id in unbind_refused:
+            raise RoleConflict(unbind_refused[line_id])
+    events: list[Event] = [SeatUnbound(line_id, role_id) for line_id in seats]
+    if by.operator_id not in state.operators:
+        events.insert(0, OperatorRegistered(by.operator_id))
+    try:
+        events.append(RoleRetired(role_id, by, at))
+    except InvalidField as error:
+        raise RoleConflict(str(error)) from error
+    return RoleChange(_checked(state, events), role_id, (), seats)
 
 
 def _seat_of(state: State, line_id: str) -> tuple[str, Seat, Role]:
@@ -457,6 +761,97 @@ def waits_unconfined(
         return False
     owner = state.roles[seat.role_id].owner
     return owner is not None and owner != line_id and engine not in confining
+
+
+@dataclass(frozen=True, slots=True)
+class RolePlace:
+    """Where a role's worktree is and who owns it, as a placement check reads them.
+    ``worktree`` is the real path the daemon resolved, and ``workdir`` the path as
+    written, which a refusal names."""
+
+    workdir: str
+    worktree: Path
+    owner: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class LinePlace:
+    """Where a line would run, whether it could write there, and the role it is a
+    seat of, if any, as a placement check reads them. ``workdir`` is as written and
+    ``directory`` the real path the daemon resolved."""
+
+    workdir: str
+    directory: Path
+    writes: bool
+    seat_of: str | None
+
+
+def placement_refusal(
+    line_id: str, line: LinePlace, places: Mapping[str, RolePlace]
+) -> str | None:
+    """Why ``line_id`` may not run as ``line`` describes, among the roles of
+    ``places``, or ``None``. **Round 10 review, F2 and F4.** The one-writer rule is the
+    invariant. An owner runs only in its role's worktree, and a line that could
+    write does not run in the worktree of a role another seat owns unless it is a
+    seat of that role, where its access is read. A seat that does not own its role
+    may run elsewhere, as it must while a vacant role is moved, and is then read as
+    any line there, with ``writes`` as its own role's confinement leaves it. It
+    gains its role only once it runs in the worktree, as the scheduler checks.
+    Worktrees are compared by real path. Bounded by the roles of ``places``.
+
+    **Not covered.** A worktree inside another, such as a role on the project root
+    and another below it, is not a shared worktree here, since the operator's rule
+    compares real paths for equality."""
+    if line.seat_of is not None:
+        place = places.get(line.seat_of)
+        # A worktree that does not resolve builds no engine, so nothing runs there.
+        if place is None or line.directory == place.worktree:
+            return None
+        if place.owner == line_id:
+            return (
+                f"line {line_id} owns role {line.seat_of}, so it runs in the role's"
+                f" worktree {place.workdir}, not in {line.workdir}. Vacate the role"
+                f" with dromon role vacate {line.seat_of}, or hand it over, first"
+            )
+    if not line.writes:
+        return None
+    for role_id, place in sorted(places.items()):
+        if (
+            role_id == line.seat_of
+            or place.owner is None
+            or line.directory != place.worktree
+        ):
+            continue
+        return (
+            f"line {line_id} could write {line.workdir}, the worktree of role"
+            f" {role_id}, which {place.owner} owns, and is not a seat of the role."
+            f" Make it a seat with dromon role update {role_id}, configure it with"
+            " workdir_access read, or give it another workdir"
+        )
+    return None
+
+
+def shared_worktree(places: Mapping[str, Path]) -> tuple[str, str] | None:
+    """The first two roles of ``places``, by identifier, whose worktrees are the same
+    real path, or ``None``. **Round 10 review, F3.** Two roles on one worktree would
+    have two owners writing it. Bounded by the roles of ``places``."""
+    seen: dict[Path, str] = {}
+    for role_id, worktree in sorted(places.items()):
+        other = seen.get(worktree)
+        if other is not None:
+            return other, role_id
+        seen[worktree] = role_id
+    return None
+
+
+def shared_worktree_refusal(first: str, second: str, workdir: str) -> str:
+    """The refusal for roles ``first`` and ``second`` sharing ``workdir``, named in
+    identifier order."""
+    first, second = sorted((first, second))
+    return (
+        f"roles {first} and {second} would share the worktree {workdir}, so two"
+        " owners could write it. Give each role its own worktree"
+    )
 
 
 def seat_order(state: State, role_id: str) -> tuple[str, ...]:

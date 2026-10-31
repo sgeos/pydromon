@@ -80,7 +80,8 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "rebind": "move a line to another model and strategy, keeping its identity",
     "settings": "show the project's settings, and a line's, with where each comes from",
     "set": "change a project or line setting, or return it to the layers below",
-    "role": "show roles and their journals, or give, vacate or ask to hand over one",
+    "role": "show, create, update or delete roles, read their journals, or give,"
+    " vacate or ask to hand over one",
     "budget": "list the providers' stated budgets, or state one",
     "reload": "read the project file again and apply its lines, limits and wake policy",
     "config": "check the project file and show what it declares",
@@ -1476,8 +1477,19 @@ def _set(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 
 
 def _reload(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Reload the project file, and print each role the file left as it was, one
+    notice to a line, since a run-time change of a role is not undone silently."""
     del arguments
-    return _request(paths, "reload", Operation.RELOAD_PROJECT, {})
+    result = _call(paths, "reload", Operation.RELOAD_PROJECT, {})
+    if isinstance(result, int):
+        return result
+    notices = cast(list[object], result.get("role_notices", []))
+    for key, value in sorted(result.items()):
+        if key != "role_notices":
+            print(f"{key} {value}")
+    for notice in notices:
+        print(f"notice: {notice}")
+    return exits.OK
 
 
 def _read(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
@@ -1500,7 +1512,8 @@ def _read(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 
 
 def _role(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
-    """Show roles, read a journal entry, or change or ask for a change of owner."""
+    """Show roles, read a journal entry, create, update or delete a role, or change
+    or ask for a change of owner."""
     action: str = arguments.action
     name: str | None = arguments.name
     command = f"role {action}"
@@ -1509,10 +1522,14 @@ def _role(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         what = "the journal entry" if action == "entry" else "the role"
         print(f"dromon {command}: name {what}", file=sys.stderr)
         return exits.USAGE
-    needed = {"take": "seat", "handoff": "to"}.get(action)
+    needed = {"take": "seat", "handoff": "to", "create": "workdir"}.get(action)
+    if action == "create" and arguments.seats is None:
+        needed = "seats"
     if needed is not None and getattr(arguments, needed) is None:
         print(f"dromon {command}: give --{needed}", file=sys.stderr)
         return exits.USAGE
+    if action in ("create", "update", "delete"):
+        return _role_change(paths, arguments, command)
     match action:
         case "status":
             operation = Operation.ROLES
@@ -1535,10 +1552,16 @@ def _role(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     match action:
         case "status":
             roles = cast(list[dict[str, object]], result["roles"])
+            retired = cast(list[dict[str, object]], result.get("retired", []))
             if not roles:
                 print("no roles are declared")
             for role in roles:
                 _print_role(role)
+            for gone in retired:
+                print(
+                    f"retired role {gone['role_id']}, by {gone['by']} at"
+                    f" {gone['retired_at']}"
+                )
         case "entry":
             print(
                 f"entry {result['entry_id']} of role {result['role_id']}, a"
@@ -1568,8 +1591,74 @@ def _role(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
+ROLE_TERMS: Final = (
+    "workdir",
+    "seats",
+    "no_own",
+    "may_own",
+    "handoff_seconds",
+    "failover",
+    "handoff_below_percent",
+)
+"""Each term option of ``dromon role create`` and ``update``, whose attribute is
+also its argument of ``role_create`` and ``role_update``."""
+
+
+def _role_change(
+    paths: ProjectPaths, arguments: argparse.Namespace, command: str
+) -> int:
+    """``dromon role create``, ``update`` or ``delete``, which only an operator may
+    run, through the client socket."""
+    action: str = arguments.action
+    args: dict[str, object] = {
+        "role_id": arguments.name,
+        "operator": arguments.operator,
+    }
+    if action == "delete":
+        result = _call(paths, command, Operation.ROLE_DELETE, args)
+        if isinstance(result, int):
+            return result
+        unbound = cast(list[str], result["unbound"])
+        print(
+            f"role {result['role_id']} retired at {result['retired_at']}"
+            + (
+                f", seats {', '.join(unbound)} unbound and still lines"
+                if unbound
+                else ""
+            )
+        )
+        if "warning" in result:
+            print(f"warning: {result['warning']}")
+        return exits.OK
+    for key in ROLE_TERMS:
+        value: object = getattr(arguments, key)
+        if value is None:
+            continue
+        if key == "seats":
+            value = [
+                part.strip() for part in cast(str, value).split(",") if part.strip()
+            ]
+        args[key] = value
+    if action == "create" and "may_own" in args:
+        print(f"dromon {command}: --may-own is for update", file=sys.stderr)
+        return exits.USAGE
+    operation = Operation.ROLE_CREATE if action == "create" else Operation.ROLE_UPDATE
+    result = _call(paths, command, operation, args)
+    if isinstance(result, int):
+        return result
+    _print_role(cast(Mapping[str, object], result["role"]))
+    for label, key in (("made seats", "bound"), ("unbound, still lines", "unbound")):
+        lines = cast(list[str], result[key])
+        if lines:
+            print(f"{label}: {', '.join(lines)}")
+    if "warning" in result:
+        print(f"warning: {result['warning']}")
+    return exits.OK
+
+
 def _print_role(role: Mapping[str, object]) -> None:
-    """One role of ``roles``, with its seats and the latest journal entries."""
+    """One role of ``roles``, with every term, its seats and the latest journal
+    entries."""
     print(
         f"role {role['role_id']} in {role['workdir']}, owner"
         f" {role['owner'] or 'none, vacant'}, handoff within"
@@ -1588,6 +1677,14 @@ def _print_role(role: Mapping[str, object]) -> None:
             f" {change['changed_at']}, from {change['previous'] or 'no seat'} to"
             f" {change['owner'] or 'no seat'}{back}"
         )
+    held = cast(Mapping[str, object] | None, role["held"])
+    order = cast(list[str], role["order"])
+    print(
+        f"  held by the {role['held_by']}"
+        + ("" if held is None else f", since {held['by']} at {held['at']}")
+        + ", failover order "
+        + (", ".join(order) or "none declared")
+    )
     for seat in cast(list[Mapping[str, object]], role["seats"]):
         marks = [str(seat["condition"])]
         if seat["owner"] is True:
@@ -1611,6 +1708,14 @@ def _print_role(role: Mapping[str, object]) -> None:
         print(
             f"  entry {entry['entry_id']}, a {entry['kind']} by {entry['line_id']} at"
             f" {entry['noted_at']}, {entry['chars']} characters"
+        )
+    # Round 10 review, F6 and F4. Printed last, so the lines above keep their places.
+    for difference in cast(list[str], role["file_differences"]):
+        print(f"  the project file is not applied, since {difference}")
+    for line_id in cast(list[str], role["beside_owner"]):
+        print(
+            f"  line {line_id} waits, since it could write the worktree and is not a"
+            " seat"
         )
 
 
@@ -2194,7 +2299,16 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "role":
             command.add_argument(
                 "action",
-                choices=["status", "entry", "take", "vacate", "handoff"],
+                choices=[
+                    "status",
+                    "entry",
+                    "take",
+                    "vacate",
+                    "handoff",
+                    "create",
+                    "update",
+                    "delete",
+                ],
                 nargs="?",
                 default="status",
                 help="default %(default)s",
@@ -2206,6 +2320,47 @@ def build_parser() -> argparse.ArgumentParser:
                 " the journal entry",
             )
             command.add_argument("--seat", help="for take, the seat given the role")
+            command.add_argument(
+                "--workdir", help="for create and update, the role's worktree"
+            )
+            command.add_argument(
+                "--seats",
+                help="for create and update, the seats in failover order, separated"
+                " by commas, each a line that exists. For update it replaces the"
+                " seats, so it adds, removes and reorders them",
+            )
+            command.add_argument(
+                "--no-own",
+                action="append",
+                default=None,
+                help="for create and update, a seat that may not own the role,"
+                " repeatable",
+            )
+            command.add_argument(
+                "--may-own",
+                action="append",
+                default=None,
+                help="for update, a seat that may own the role again, repeatable",
+            )
+            command.add_argument(
+                "--handoff-seconds",
+                type=int,
+                default=None,
+                help="for create and update, how long a planned handoff may take",
+            )
+            command.add_argument(
+                "--failover",
+                choices=["automatic", "ask"],
+                default=None,
+                help="for create and update, the failover policy",
+            )
+            command.add_argument(
+                "--handoff-below-percent",
+                type=int,
+                default=None,
+                help="for create and update, the stated budget below which the owner"
+                " is asked to prepare a handoff, 0 for never",
+            )
             command.add_argument(
                 "--to", help="for handoff, the seat the owner is asked to hand it to"
             )

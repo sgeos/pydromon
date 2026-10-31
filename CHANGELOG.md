@@ -13,6 +13,29 @@ All notable changes are recorded here. The format follows
   success now follows the command's exit status even when a child holds standard error
   open. A child that starts a new session can still escape timeout process-group kills.
 
+- A seat that does not own its role is built with its role's worktree read only on
+  Claude Code and Codex, the engines that can confine it. The confining engines were
+  derived from the capability table, but the step that applies a seat's read access
+  to its engine was never added, so such a seat ran with its own access, write by
+  default, beside the owner. A seat whose configuration Claude Code cannot make read
+  only now fails its turn as the engine is built and is held. Round 10 review, F7.
+- The one-writer rule holds on every path, at the operator's decision of 2026-10-31.
+  A seat with a turn in flight is never unbound, hibernated or not, by `dromon role
+  update` or `delete`, for an owned or a vacant role. A writer seat of an owned role is
+  not unbound while it could write the worktree, hibernated or not. An owning seat is
+  never configured out of its role's worktree, and a seat that runs elsewhere does not
+  gain its role by a give, a take, a handoff or a failover. A line that is not a seat
+  of a role is refused, by `dromon create`, `configure`, `set`, `rebind` and the
+  project file, where it could write the worktree of a role another seat owns, and one
+  a log left there before the rule waits, and is named by `dromon role status`. Two
+  roles never share a worktree, compared by real path, at `dromon role create` and
+  `update` and in the project file, which is refused whole at a start or a reload
+  naming both roles. Round 10 review, F1 to F4.
+- A role that returns to the project file is given the file's first owner in the same
+  pass, rather than at the next start or reload. Round 10 review, F5.
+- `dromon role status`, `roles` and a seat's `role_status` show whether the project
+  file declares a role, each way its table differs from a role an operator holds, and
+  the lines that wait beside the owner. Round 10 review, F6.
 - Refused Codex items count toward the driver's tool budget whether first announced by
   `item/started` or `item/completed`. Matching item identifiers are counted once
   regardless of notice order. A refusal announced by neither notice remains invisible.
@@ -228,6 +251,23 @@ All notable changes are recorded here. The format follows
   kinds `note` and `question`, so a rollback past it needs a log from before the first
   issue. The `[relays]` and `[operators]` tables are likewise refused by an older
   daemon as unknown keys, which stops its start rather than its log.
+- `dromon role create`, `dromon role update` and `dromon role delete`, with the client
+  operations `role_create`, `role_update` and `role_delete`, so an operator changes the
+  team while the daemon runs. Update adds, removes and reorders seats and changes any
+  term. Delete unbinds every seat and retires the role, whose seats stay lines with
+  their leases, whose journal stays readable, and whose identifier is never declared
+  again. The owner's seat is never unbound and an owned role is never retired, and the
+  refusal says to vacate or hand over first. A seat of an owned role that could write
+  its worktree is not unbound while it runs, since it would then write beside the
+  owner. No line is created or reconfigured, and no line or external agent can call
+  these. `dromon role status` shows every term, who holds the role and the retired
+  roles. The new events `seat_unbound`, `role_retired` and `role_held` are rollback
+  hazards, since an older daemon cannot read a log that holds one. A run-time change
+  wins over the project file, which a start or a reload no longer applies to that role
+  until its table agrees, and every role the file leaves is reported in the reload's
+  `role_notices`, which `dromon reload` prints, and on a start's standard error. The
+  rule and its cases are in `docs/architecture/ROLES.md` and
+  `docs/protocol/PROJECT_CONFIG.md`. Required by the operator in round 10.
 - Claude Sonnet 5.5 drivers on Claude Code for every strategy, as
   `claude-sonnet-5-5`, with the Opus 5.5 drivers' settings.
 - `daemon_behind_worktree` in `line_status`, and a notice in the wake prompt once per
