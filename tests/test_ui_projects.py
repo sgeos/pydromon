@@ -28,6 +28,7 @@ from dromon.ui.model import (
     OpenProject,
     Pressed,
     ProjectOpened,
+    ProjectRow,
     ProjectsLoaded,
 )
 from dromon.ui.render import frame, text_of
@@ -71,8 +72,10 @@ class Projects:
     def __init__(self, daemons: dict[str, Daemon]) -> None:
         self.daemons = daemons
 
-    def names(self) -> tuple[tuple[str, str], ...]:
-        return tuple((name, "live") for name in sorted(self.daemons))
+    def names(self) -> tuple[ProjectRow, ...]:
+        return tuple(
+            ProjectRow(name, "live", f"/srv/{name}") for name in sorted(self.daemons)
+        )
 
     def open(self, project: str) -> Daemon:
         found = self.daemons.get(project)
@@ -97,11 +100,48 @@ def summary(line_id: str) -> LineSummary:
 
 def test_project_commands_are_parsed() -> None:
     assert parse_input("/project tide") == SwitchProject("tide", None)
-    assert parse_input("/project tide core") == SwitchProject("tide", "core")
+    assert parse_input("/project tide:core") == SwitchProject("tide", "core")
     assert isinstance(parse_input("/project"), Invalid)
-    assert isinstance(parse_input("/project a b c"), Invalid)
+    assert isinstance(parse_input("/project :core"), Invalid)
+    assert isinstance(parse_input("/project tide:a b"), Invalid)
     assert parse_input("/projects") == ShowProjects()
     assert isinstance(parse_input("/projects extra"), Invalid)
+
+
+def test_a_root_is_never_split_on_its_spaces() -> None:
+    """Review of 7ff033f, G4. The target is the rest of the input whole, and the line
+    follows its last colon, as the fleet commands take ``PROJECT:LINE``."""
+    assert parse_input("/project /srv/my tide") == SwitchProject("/srv/my tide", None)
+    assert parse_input("/project /srv/my tide:core") == SwitchProject(
+        "/srv/my tide", "core"
+    )
+    assert parse_input("/project my tide") == SwitchProject("my tide", None)
+    assert parse_input("/project /srv/a:b:") == SwitchProject("/srv/a:b", None)
+    assert parse_input("/project /srv/a:b:core") == SwitchProject("/srv/a:b", "core")
+
+
+SHARED: tuple[ProjectRow, ...] = (
+    ProjectRow("harbor", "live", "/a/harbor"),
+    ProjectRow("harbor", "stale", "/b/harbor"),
+    ProjectRow("tide", "live", "/srv/tide"),
+)
+
+
+def test_a_shared_name_is_listed_and_completed_with_its_roots() -> None:
+    """Review of 7ff033f, G4. Two projects that share a name are told apart by their
+    roots, which ``/project`` completes to, since the name alone is refused."""
+    loaded, _ = update(initial("core", "ana", 1.0, "tide"), ProjectsLoaded(SHARED))
+    assert loaded.notice == (
+        "projects: harbor live at /a/harbor, harbor stale at /b/harbor, tide live"
+    )
+    choices = _choices(loaded)
+    assert choices.projects == (
+        ("/a/harbor", "harbor live"),
+        ("/b/harbor", "harbor stale"),
+        ("tide", "live"),
+    )
+    labels = [s.label for s in suggest("/project /a", choices)]
+    assert labels == ["/a/harbor"]
 
 
 def entered(model: Model, text: str) -> tuple[Model, tuple[Effect, ...]]:
@@ -113,15 +153,16 @@ def entered(model: Model, text: str) -> tuple[Model, tuple[Effect, ...]]:
 
 def test_a_switch_asks_the_runtime_and_keeps_the_client_until_it_answers() -> None:
     model = initial("core", "ana", 1.0, "harbor")
-    moved, effects = update(model, ProjectsLoaded((("tide", "live"),)))
-    assert moved.projects == (("tide", "live"),)
+    rows = (ProjectRow("tide", "live", "/srv/tide"),)
+    moved, effects = update(model, ProjectsLoaded(rows))
+    assert moved.projects == rows
     assert "tide live" in moved.notice
     asked, effects = entered(moved, "/project tide")
     assert effects == (OpenProject("tide", None, "core"),)
     assert asked.project == "harbor" and asked.line_id == "core"
     opened, effects = update(asked, ProjectOpened("tide", "alpha", (summary("alpha"),)))
     assert (opened.project, opened.line_id) == ("tide", "alpha")
-    assert opened.view is None and opened.projects == (("tide", "live"),)
+    assert opened.view is None and opened.projects == rows
     assert FetchView("alpha") in effects
     _, effects = entered(opened, "/projects")
     assert effects == (FetchProjects(),)
@@ -130,7 +171,10 @@ def test_a_switch_asks_the_runtime_and_keeps_the_client_until_it_answers() -> No
 def test_project_names_complete_and_the_bar_names_the_project() -> None:
     model = replace(
         initial("core", "ana", 1.0, "harbor"),
-        projects=(("tide", "live"), ("harbor", "live")),
+        projects=(
+            ProjectRow("tide", "live", "/srv/tide"),
+            ProjectRow("harbor", "live", "/srv/harbor"),
+        ),
         width=60,
         height=16,
     )
@@ -179,7 +223,7 @@ def test_a_project_that_cannot_be_opened_leaves_the_client_where_it_was(
     harbor = LinesDaemon("core")
     projects = Projects({"tide": LinesDaemon("beta"), "empty": LinesDaemon()})
     client = Runtime(harbor, "core", "ana", 1.0, projects=projects, project="harbor")
-    typed(client, f"/project {project} {line_id or ''}".strip())
+    typed(client, f"/project {project}:{line_id or ''}")
     assert (client.model.project, client.model.line_id) == ("harbor", "core")
     assert reason in client.model.notice and client.model.alarm
     client.tick(100.0)
@@ -231,7 +275,7 @@ def test_the_port_opens_a_live_project_through_its_own_socket(
 ) -> None:
     entry, sockets = indexed
     port = FleetProjects(fleet.configured_index(os.environ), {102: STARTED}.get)
-    assert port.names() == (("tide", "live"),)
+    assert port.names() == (ProjectRow("tide", "live", str(entry.root)),)
     port.open("tide")
     assert sockets == [entry.socket]
 

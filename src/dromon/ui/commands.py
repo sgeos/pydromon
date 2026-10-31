@@ -232,7 +232,7 @@ SPECS: Final = (
     Spec("/lines", "/lines", "list the daemon's lines"),
     Spec(
         "/project",
-        "/project PROJECT [LINE]",
+        "/project PROJECT[:LINE]",
         "attach to a line of another project in the fleet index",
         (Argument.PROJECT,),
     ),
@@ -269,6 +269,21 @@ def _usage(name: str) -> str:
     raise KeyError(name)
 
 
+def _project(rest: str) -> SwitchProject | Invalid:
+    """``/project PROJECT[:LINE]``. **Review of 7ff033f, G4.** The rest of the input
+    is the target whole, spaces and all, so a root that holds a space stays one root,
+    and the line follows the last colon, as the fleet commands take ``PROJECT:LINE``.
+    No line identifier holds a colon, so a root that holds one is given with its line,
+    or with a final colon and no line."""
+    project, colon, line_id = rest.rpartition(":")
+    if not colon:
+        project, line_id = rest, ""
+    project = project.strip()
+    if not project or " " in line_id.strip():
+        return Invalid(_usage("/project"))
+    return SwitchProject(project, line_id.strip() or None)
+
+
 def parse_input(text: str) -> Command | None:
     """The command ``text`` names, or ``None`` for empty input."""
     stripped = text.strip()
@@ -293,10 +308,7 @@ def parse_input(text: str) -> Command | None:
                 return Invalid(_usage(word))
             return Switch(rest)
         case "/project":
-            parts = rest.split()
-            if len(parts) not in (1, 2):
-                return Invalid(_usage(word))
-            return SwitchProject(parts[0], parts[1] if len(parts) == 2 else None)
+            return _project(rest)
         case "/model" | "/effort":
             key = word[1:]
             if not rest:

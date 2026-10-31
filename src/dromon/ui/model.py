@@ -37,6 +37,18 @@ crashed leaves its socket file behind and refuses every connection. A minute is 
 past any such stall, and still ends a client whose daemon crashed."""
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectRow:
+    """A project of the fleet index as ``/projects`` lists it. Round 13, item 4."""
+
+    name: str
+    state: str
+    """Its entry's liveness, ``live``, ``stale`` or ``unknown``."""
+    root: str
+    """Its root, which tells apart two projects that share a name. **Review of
+    7ff033f, G4.**"""
+
+
 class Overlay(StrEnum):
     NONE = "none"
     HELP = "help"
@@ -98,9 +110,9 @@ class Model:
     """Why the client detached by itself, or ``None``."""
     project: str | None = None
     """The attached project's name, or ``None`` when the client was given none."""
-    projects: tuple[tuple[str, str], ...] = ()
-    """The projects of the fleet index, each with its state, from the last
-    ``/projects``, which ``/project`` completes from."""
+    projects: tuple[ProjectRow, ...] = ()
+    """The projects of the fleet index from the last ``/projects``, which
+    ``/project`` completes from."""
 
     def __post_init__(self) -> None:
         if not self.line_id:
@@ -178,7 +190,7 @@ class ProjectOpened:
 
 @dataclass(frozen=True, slots=True)
 class ProjectsLoaded:
-    projects: tuple[tuple[str, str], ...]
+    projects: tuple[ProjectRow, ...]
 
 
 @dataclass(frozen=True, slots=True)

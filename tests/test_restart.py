@@ -663,9 +663,14 @@ class Daemons:
         self.status_calls = 0
 
     def __call__(
-        self, socket: Path, operation: Operation, args: dict[str, object] | None = None
+        self,
+        socket: Path,
+        operation: Operation,
+        args: dict[str, object] | None = None,
+        *,
+        timeout_seconds: float = client.REQUEST_TIMEOUT_SECONDS,
     ) -> Response:
-        del socket
+        del socket, timeout_seconds
         self.sent.append((operation, dict(args or {})))
         if operation is Operation.RESTART:
             return Response("r", ok=True, result=self.restarted)
@@ -870,9 +875,13 @@ def test_dromon_restart_crosses_the_wire_to_a_daemon_whose_rates_are_known(
     sent: list[Operation] = []
 
     def wire(
-        socket: Path, operation: Operation, args: dict[str, object] | None = None
+        socket: Path,
+        operation: Operation,
+        args: dict[str, object] | None = None,
+        *,
+        timeout_seconds: float = client.REQUEST_TIMEOUT_SECONDS,
     ) -> Response:
-        del socket
+        del socket, timeout_seconds
         sent.append(operation)
         request = encode_request(Request(f"w{len(sent)}", operation, dict(args or {})))
         response = decode_response(encode_response(target.respond(request)))

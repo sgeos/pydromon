@@ -348,21 +348,38 @@ def _installed_commit() -> str | None:
     return read_head_commit(Path(dromon.__file__).parent)
 
 
-def _restart(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+def _restart(
+    paths: ProjectPaths,
+    arguments: argparse.Namespace,
+    entry: fleet.IndexEntry | None = None,
+) -> int:
     """Ask the daemon to restart, then wait until its successor answers and say
     which commit it runs. The daemon starts its successor itself, so a client that
-    leaves early does not stop the restart."""
+    leaves early does not stop the restart.
+
+    ``entry`` is given by ``dromon fleet restart``. **Review of 7ff033f, G1.** The
+    daemon's status is then checked against it once more before the restart is asked,
+    and the successor is the daemon the index then lists for the same root, under
+    another pid, live by its start time, and saying that pid and root, rather than
+    whichever process answers the socket under another pid."""
+    command = "restart" if entry is None else "fleet restart"
     problem = _preflight()
     if problem is not None:
         print(
-            "dromon restart: the installed daemon does not start, so the running one"
-            f" was not stopped: {problem}",
+            f"dromon {command}: the installed daemon does not start, so the running"
+            f" one was not stopped: {problem}",
             file=sys.stderr,
         )
         return exits.FAILURE
-    before = _call(paths, "restart", Operation.STATUS, {})
+    before = _call(paths, command, Operation.STATUS, {})
     if isinstance(before, int):
         return before
+    if entry is not None:
+        try:
+            fleet.verify(entry, before)
+        except fleet.FleetError as error:
+            print(f"dromon {command}: {error}", file=sys.stderr)
+            return exits.FAILURE
     wait: int = arguments.wait_seconds
     args: dict[str, object] = {
         "operator": arguments.operator,
@@ -373,37 +390,66 @@ def _restart(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     }
     if arguments.end_tasks:
         args["end_tasks"] = True
-    answer = _call(paths, "restart", Operation.RESTART, args)
+    answer = _call(paths, command, Operation.RESTART, args)
     if isinstance(answer, int):
         return answer
     warning = answer.get("warning")
     if isinstance(warning, str):
-        print(f"dromon restart: {warning}")
+        print(f"dromon {command}: {warning}")
     running = answer.get("running")
     count = len(cast(list[object], running)) if isinstance(running, list) else 0
     print(
-        f"dromon restart: draining, with {count} turns running, for at most"
+        f"dromon {command}: draining, with {count} turns running, for at most"
         f" {wait} seconds. The installed code is at commit"
         f" {_installed_commit() or 'unknown'}"
     )
-    return _await_successor(paths, before, wait)
+    if entry is None:
+        return _await_successor(paths, before, wait)
+    return _await_successor(
+        paths, before, wait, _fleet_successor(entry), FLEET_TIMEOUT_SECONDS
+    )
 
 
 def _await_successor(
-    paths: ProjectPaths, before: Mapping[str, object], wait: float
+    paths: ProjectPaths,
+    before: Mapping[str, object],
+    wait: float,
+    successor: Callable[[Mapping[str, object]], bool] | None = None,
+    request_seconds: float = REQUEST_TIMEOUT_SECONDS,
 ) -> int:
-    """Poll until a daemon with another process id answers, or the restart is
-    abandoned, or the bound passes. Bounded by its count of polls."""
+    """Poll until a daemon with another process id answers, and ``successor``, when
+    given, says that its status is the successor's, or the restart is abandoned, or
+    the bound passes.
+
+    **Review of 7ff033f, G2.** Bounded by its count of polls and by a deadline, and
+    each request waits at most ``request_seconds`` and never past the deadline. A
+    daemon that accepts and never answers made each poll wait out a whole request
+    before, so the count of polls alone let one hold the client for hours. It now
+    holds it for at most the drain wait, plus the shutdown and startup bounds of
+    ``SHUTDOWN_TIMEOUT_SECONDS`` and ``STARTUP_TIMEOUT_SECONDS``, plus one poll's
+    sleep."""
     bound = wait + SHUTDOWN_TIMEOUT_SECONDS + STARTUP_TIMEOUT_SECONDS
+    deadline = time.monotonic() + bound
     polls = math.ceil(bound / max(RESTART_POLL_SECONDS, 0.01)) + 1
     for _ in range(polls):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            response = call(paths.socket, Operation.STATUS)
+            response = call(
+                paths.socket,
+                Operation.STATUS,
+                timeout_seconds=min(request_seconds, remaining),
+            )
         except (DaemonNotRunning, ProtocolError, TimeoutError, OSError):
             time.sleep(RESTART_POLL_SECONDS)
             continue
         result = response.result or {}
-        if response.ok and result.get("pid") != before.get("pid"):
+        if (
+            response.ok
+            and result.get("pid") != before.get("pid")
+            and (successor is None or successor(result))
+        ):
             print(_restarted(before, result))
             return exits.OK
         state = result.get("restart")
@@ -417,9 +463,14 @@ def _await_successor(
                 )
                 return exits.FAILURE
         time.sleep(RESTART_POLL_SECONDS)
+    awaited = (
+        "no restarted daemon answered"
+        if successor is None
+        else "no restarted daemon that the fleet index lists for this root answered"
+    )
     print(
-        f"dromon restart: no restarted daemon answered within {bound:g} seconds."
-        f" See {paths.daemon_output}",
+        f"dromon restart: {awaited} within {bound:g} seconds. See"
+        f" {paths.daemon_output}",
         file=sys.stderr,
     )
     return exits.FAILURE
@@ -2045,6 +2096,33 @@ def _fleet_verified(entry: fleet.IndexEntry) -> dict[str, object]:
     return status
 
 
+def _fleet_successor(
+    entry: fleet.IndexEntry,
+) -> Callable[[Mapping[str, object]], bool]:
+    """Whether a status is that of ``entry``'s successor, the daemon the index now
+    lists for ``entry``'s root and socket under another pid, live by its start time,
+    whose status gives that pid and root. Review of 7ff033f, G1. A successor that
+    could not be listed is therefore never confirmed, and the wait reports that."""
+
+    def confirmed(status: Mapping[str, object]) -> bool:
+        try:
+            found = fleet.entry_of(fleet.configured_index(os.environ), entry.root)
+            if (
+                found is None
+                or found.pid == entry.pid
+                or found.root != entry.root
+                or found.socket != entry.socket
+                or fleet.liveness(found, fleet_start_of) is not fleet.Liveness.LIVE
+            ):
+                return False
+            fleet.verify(found, status)
+        except fleet.FleetError:
+            return False
+        return True
+
+    return confirmed
+
+
 def _fleet_survey(command: str) -> list[fleet.Indexed] | None:
     try:
         return fleet.survey(fleet.configured_index(os.environ), fleet_start_of)
@@ -2250,8 +2328,9 @@ def _fleet(arguments: argparse.Namespace) -> int:
             entry = _fleet_target(action, arguments.project_name)
             if entry is None:
                 return exits.FAILURE
-            handler = _status if action == "status" else _restart
-            return handler(_fleet_paths(entry), arguments)
+            if action == "status":
+                return _status(_fleet_paths(entry), arguments)
+            return _restart(_fleet_paths(entry), arguments, entry)
         case "answer":
             routed = _fleet_routed(action, arguments.target, "QUESTION")
             if routed is None:

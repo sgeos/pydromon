@@ -54,6 +54,7 @@ from dromon.ui.model import (
     OpenProject,
     Pressed,
     ProjectOpened,
+    ProjectRow,
     ProjectsLoaded,
     Request,
     Resized,
@@ -93,9 +94,9 @@ class Projects(Protocol):
     """The port to the fleet index, through which a client moves between projects.
     Round 13, item 4. It reaches each daemon only through that daemon's own socket."""
 
-    def names(self) -> tuple[tuple[str, str], ...]:
-        """Each project of the index with its state, which raises ``Unreachable``
-        when the index cannot be read."""
+    def names(self) -> tuple[ProjectRow, ...]:
+        """Each project of the index with its state and root, which raises
+        ``Unreachable`` when the index cannot be read."""
         ...
 
     def open(self, project: str) -> Daemon:

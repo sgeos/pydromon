@@ -34,6 +34,11 @@ index only tells the client where each socket is.
   table gives, and the commit the daemon loaded its code from. The directory must be
   the user's with mode 0700, and is refused if wider, never narrowed. An entry of
   another mode, owner or file name is ignored. At most 256 entries are read.
+- **The name is the root's.** **Review of 7ff033f, G3.** An entry whose name is not
+  the last step of its root is refused when it is made, and so is never written or
+  read, and `verify` refuses it again. Otherwise a writer of the index could publish a
+  live daemon under another project's name, and the operator's command for that
+  project would reach it.
 - **One root, one entry.** **Decided by core.** The daemon that starts last for a root
   replaces its entry, since one project runs one daemon under its lock, and an entry a
   dead daemon left is stale anyway. A daemon removes only an entry that is still
@@ -46,10 +51,19 @@ index only tells the client where each socket is.
 - **Lines are denied the index.** The index in use and the default one join every
   line's protected directories in every project, whatever its federation mode, so no
   line can write an entry that would direct the operator's commands to a socket of its
-  choosing. **Consequence.** A Grok line's profile must deny the index once the
-  directory exists, as for every protected directory, and the line's turn fails with
-  the entry to add until it does. **Inference.** The index lies inside the registry,
-  so an open project's lines, which are denied the registry, were denied it already.
+  choosing. **Inference.** The index lies inside the registry, so an open project's
+  lines, which are denied the registry, were denied it already.
+- **The daemon makes the index at start.** **Review of 7ff033f, G5.** Codex's profile
+  denies a protected path only when it exists, and Grok's check requires only those
+  that exist, so a line of either could otherwise make the index before any daemon
+  had. The daemon therefore makes the index in use, with mode 0700, before any engine
+  is built. A failure is written to standard error and the daemon starts, as one that
+  cannot be listed does. **Decided by core, for the operator's review.**
+  **Consequence.** A Grok line's turns fail, with the entry to add, until its profile
+  denies the index. **Limit.** A daemon given `DROMON_REGISTRY_DIR` does not make the
+  default index, since that would reach outside the override, so a Codex or Grok line
+  of such a daemon could make the default one, which a client without the override
+  reads. Claude Code's sandbox denies the path whether or not it exists.
 
 ## Staleness and trust
 
@@ -60,6 +74,9 @@ index only tells the client where each socket is.
 - **Verified before use.** A live entry is reached only after the daemon answering its
   socket gives, in `status`, the pid and the project root the entry names. A socket
   that another process now holds is so refused before anything else is sent to it.
+  **Limit.** The check and the operation are separate connections, so a process of
+  the user that replaces the socket between them is not caught, which is within the
+  exposure the next item accepts.
 - **Who can write it.** An entry is a statement by a process of the user, never proof.
   An unconfined process of the user could write one, as it could read the operator
   socket itself, which is the exposure the trust section of `CLIENT.md` already
@@ -77,19 +94,39 @@ index only tells the client where each socket is.
 - **A daemon that does not answer** is reported, on standard output for `list` and on
   standard error for the others, and the command goes on with the rest. The exit
   status is then 1, so a script can tell.
-- **Bounded waits.** Each request waits at most 2 seconds, so a daemon that hangs
-  delays the rest by at most that for each of its requests.
+- **Bounded waits.** Each request a fleet command makes itself waits at most 2
+  seconds, so a daemon that hangs delays the rest by at most that for each of them. A
+  routed command's own operation waits as its single-project command does, at most 5
+  seconds. **Review of 7ff033f, G2.**
 - **Side effect.** `fleet list` and `fleet mail` send `mail`, and listing delivers
   waiting operator mail, as `dromon mail` does.
 - **Restart.** `fleet restart` runs `dromon restart`, whose check that the installed
   daemon imports reads this client's installation. **Limit.** The successor runs the
   interpreter the daemon itself runs, so the check speaks for it only when both run
   from the same installation.
+- **The successor.** **Review of 7ff033f, G1.** `fleet restart` checks the daemon's
+  status against its entry again before it asks for the restart. It then takes as the
+  successor only the daemon the index lists for the same root and socket under
+  another pid, live by its start time, whose status gives that pid and root. Any
+  other process that answers the socket under another pid is not taken for it.
+  **Consequence.** A successor that could not be listed is never confirmed, and the
+  command reports that no listed successor answered.
+- **What a hang costs.** **Review of 7ff033f, G2.** The wait for the successor ends
+  at a deadline, the drain wait plus 70 seconds for the shutdown and startup bounds,
+  and each status waits at most 2 seconds and never past the deadline. A daemon that
+  accepts and never answers therefore holds `fleet restart` for at most that plus one
+  poll, after the preflight's 60 seconds at most and the two requests before the
+  wait. `dromon restart` waits the same way, with 5 seconds for each status.
 
 ## The attached client
 
-`/projects` lists the index's projects with their states, and `/project PROJECT [LINE]`
-attaches to a line of another project without restarting the client. The client moves
+`/projects` lists the index's projects with their states, and `/project
+PROJECT[:LINE]` attaches to a line of another project without restarting the client.
+**Review of 7ff033f, G4.** A name two projects share is listed with each root beside
+it, and completes to the roots, since the name alone is refused. The target is the
+rest of the input whole, so a root that holds a space stays one root, and the line
+follows the last colon, as the fleet commands take it. A root that holds a colon is
+given with its line, or with a final colon and no line. The client moves
 only once the other daemon answers through its own socket, passes the verification
 above, and has the line, so a project that cannot be reached leaves it where it was.
 Without a line it keeps the line's name when the other project has it, and takes that
@@ -161,7 +198,10 @@ the 103 bytes a socket path allows is avoided by the short private directory.
 | Another process holds an indexed socket | `status` gives another pid or root, so nothing else is sent |
 | A daemon hangs | Each request waits at most 2 seconds, the daemon is reported, and the rest go on |
 | Two projects share a name | The name is refused and the root tells them apart |
-| A line writes an entry | Every line is denied the index, in every project |
+| A line writes an entry | Every line is denied the index, in every project, which the daemon makes at start so that every engine's sandbox denies it |
+| An entry names a live daemon under another project's name | The name must be the root's last step, so the entry is refused |
+| Another process answers a restarting daemon's socket | `fleet restart` takes only the successor the index lists, so it waits on and reports |
+| A daemon accepts and never answers a restart's polls | The wait ends at its deadline |
 | The index cannot be written at start | The daemon starts unlisted, and says so on standard error |
 | The index is wider than 0700 | It is refused, and the commands report the reason |
 | A test reaches the real index or hosts file | Every test sets `DROMON_REGISTRY_DIR` and `DROMON_HOSTS_FILE`, and a test checks both |
@@ -174,6 +214,8 @@ the 103 bytes a socket path allows is avoided by the short private directory.
   verification step is tested against daemons that give another pid.
 - The terminal and the window were not driven by hand through `/project`. The runtime
   and the state machine are tested.
+- The Codex profile and the Grok profile check are tested to deny the index the
+  daemon made. No real Codex or Grok turn has been run against it.
 
 **Porting note.** Plain files, the registry's lock and bounded reads, and one request
 per daemon at a time, which map onto Rust and onto Keleusma's bounded stream

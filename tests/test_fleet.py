@@ -6,18 +6,25 @@ recorded with the socket it was sent to, so that a test can show no operation re
 a daemon except through the socket its own index entry names.
 """
 
+import inspect
+import math
 import os
 import stat
+import tomllib
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import pytest
 
-from dromon import cli, exits, fleet, registry
-from dromon.daemon import fleet_registration, protected_dirs
+from dromon import cli, exits, fleet, grok, registry
+from dromon import daemon as daemon_module
+from dromon.codex import server_arguments
+from dromon.lineconfig import LineConfig
+from dromon.daemon import fleet_registration, make_index, protected_dirs
+from dromon.engine import EngineRefused
 from dromon.federation import NO_FEDERATION
-from dromon.paths import project_paths
+from dromon.paths import ProjectPaths, project_paths
 from dromon.protocol import ErrorCode, Operation, Response
 
 STARTED = "Sat Oct 31 00:00:00 2026"
@@ -54,6 +61,7 @@ class Fleet:
     calls: list[tuple[Path, Operation, dict[str, object]]] = field(
         default_factory=list[tuple[Path, Operation, dict[str, object]]]
     )
+    timeouts: list[float] = field(default_factory=list[float])
 
     def add(
         self, root: Path, pid: int, *, live: bool = True, answers: bool = True
@@ -77,7 +85,7 @@ class Fleet:
         timeout_seconds: float = 5.0,
         args: dict[str, object] | None = None,
     ) -> Response:
-        del timeout_seconds
+        self.timeouts.append(timeout_seconds)
         given = dict(args or {})
         self.calls.append((socket_path, operation, given))
         handler = self.handlers.get(socket_path)
@@ -229,6 +237,7 @@ def test_a_wide_index_is_refused(tmp_path: Path) -> None:
         ({"socket": Path("/run/peers.sock")}, "dromond.sock"),
         ({"pid": 0}, "positive"),
         ({"commit": "not hex"}, "hexadecimal"),
+        ({"name": "tide"}, "not the last step of the root"),
     ],
 )
 def test_an_entry_is_checked(changes: dict[str, object], reason: str) -> None:
@@ -262,9 +271,17 @@ def test_liveness_reads_the_start_time_and_never_trusts_an_unreadable_table(
 # The daemon's side.
 
 
-def test_a_daemon_registers_whatever_its_federation_mode(tmp_path: Path) -> None:
-    (tmp_path / "harbor").mkdir()
-    paths = project_paths(tmp_path / "harbor", tmp_path / "run")
+def harbor_paths(short_runtime: Path) -> ProjectPaths:
+    """A project beside the short runtime directory, so its socket path stays under
+    the limit wherever the temporary directory is, as a macOS one outside a sandbox
+    is not."""
+    root = short_runtime.parent / "harbor"
+    root.mkdir()
+    return project_paths(root, short_runtime)
+
+
+def test_a_daemon_registers_whatever_its_federation_mode(short_runtime: Path) -> None:
+    paths = harbor_paths(short_runtime)
     entry = fleet_registration(
         paths,
         registry.configured_directory(os.environ),
@@ -277,10 +294,9 @@ def test_a_daemon_registers_whatever_its_federation_mode(tmp_path: Path) -> None
 
 
 def test_a_daemon_that_cannot_be_listed_starts_unlisted(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    short_runtime: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    (tmp_path / "harbor").mkdir()
-    paths = project_paths(tmp_path / "harbor", tmp_path / "run")
+    paths = harbor_paths(short_runtime)
 
     def unreadable(_pid: int) -> str | None:
         raise RuntimeError("ps is denied")
@@ -292,13 +308,104 @@ def test_a_daemon_that_cannot_be_listed_starts_unlisted(
     assert fleet.read_index(index()) == []
 
 
-def test_every_line_is_denied_the_index_whatever_the_mode(tmp_path: Path) -> None:
-    (tmp_path / "harbor").mkdir()
-    paths = project_paths(tmp_path / "harbor", tmp_path / "run")
+def test_every_line_is_denied_the_index_whatever_the_mode(
+    short_runtime: Path,
+) -> None:
+    paths = harbor_paths(short_runtime)
     denied = protected_dirs(paths, NO_FEDERATION)
     assert Path(os.path.realpath(index())) in denied
     default = fleet.index_directory(registry.default_directory())
     assert Path(os.path.realpath(default)) in denied
+
+
+def test_an_entry_whose_name_is_not_its_roots_is_never_read_or_verified(
+    tmp_path: Path,
+) -> None:
+    """Review of 7ff033f, G3."""
+    root = tmp_path / "harbor"
+    entry = entry_for(root, 101)
+    forged = entry.text().replace('"name":"harbor"', '"name":"tide"')
+    with pytest.raises(fleet.FleetError, match="not the last step"):
+        fleet.parse_index_entry(forged)
+    directory = fleet.ensure_index(registry.configured_directory(os.environ))
+    path = directory / f"{entry.key}{registry.ENTRY_SUFFIX}"
+    registry.write_private(path, forged.encode("utf-8"))
+    assert fleet.read_index_entry(path) is None
+    assert fleet.read_index(directory) == []
+    bypassed = entry_for(root, 101)
+    object.__setattr__(bypassed, "name", "tide")
+    with pytest.raises(fleet.FleetError, match="not the one the index names"):
+        fleet.verify(bypassed, {"pid": 101, "project": str(root)})
+
+
+def test_the_daemon_makes_the_index_owner_only_before_any_engine(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Review of 7ff033f, G5. ``run`` calls ``make_index`` before the scheduler, and
+    so any engine, is built."""
+    directory = registry.configured_directory(os.environ)
+    assert not index().exists()
+    assert make_index(directory)
+    assert stat.S_IMODE(index().stat().st_mode) == 0o700
+    assert make_index(directory), "a second start finds it made"
+    index().chmod(0o755)
+    assert not make_index(directory)
+    assert "must have mode 700" in capsys.readouterr().err
+    source = inspect.getsource(daemon_module.run)
+    assert source.index("make_index(registry_dir)") < source.index("Scheduler(")
+
+
+def test_the_codex_profile_denies_the_index_once_the_daemon_has_made_it(
+    short_runtime: Path,
+) -> None:
+    """Review of 7ff033f, G5. Codex drops a protected path that does not exist, so
+    the denial holds only once ``make_index`` has made the directory."""
+    paths = harbor_paths(short_runtime)
+    real = os.path.realpath(index())
+
+    def filesystem() -> dict[str, object]:
+        protected = protected_dirs(paths, NO_FEDERATION)
+        text = server_arguments([], LineConfig(), protected)
+        entry = next(a for a in text if a.startswith("permissions.dromon-line="))
+        profile = entry.removeprefix("permissions.dromon-line=")
+        return tomllib.loads(f"profile = {profile}")["profile"]["filesystem"]
+
+    assert real not in filesystem()
+    assert make_index(registry.configured_directory(os.environ))
+    assert filesystem()[real] == "deny"
+
+
+def test_the_grok_profile_check_requires_the_index(short_runtime: Path) -> None:
+    """Review of 7ff033f, G5. A Grok profile that does not deny the index is refused
+    with the entry to add, and one that does is taken."""
+    paths = harbor_paths(short_runtime)
+    workspace = paths.root.resolve()
+    (workspace / ".dromon").mkdir()
+    assert make_index(registry.configured_directory(os.environ))
+    protected = protected_dirs(paths, NO_FEDERATION)
+    real = os.path.realpath(index())
+    home = short_runtime.parent / "home"
+    daemon_home = short_runtime.parent / "operator-home"
+    (home / grok.HOME_DIR).mkdir(parents=True)
+    sandbox = home / grok.HOME_DIR / "sandbox.toml"
+    without = tuple(path for path in protected if str(path) != real)
+    sandbox.write_text(
+        grok.profile_snippet(grok.READER_PROFILE, workspace, without, daemon_home)
+    )
+    with pytest.raises(EngineRefused) as refused:
+        grok.check_profile(
+            LineConfig(), workspace, protected, home, home / grok.HOME_DIR, daemon_home
+        )
+    assert real in str(refused.value)
+    sandbox.write_text(
+        grok.profile_snippet(grok.READER_PROFILE, workspace, protected, daemon_home)
+    )
+    assert (
+        grok.check_profile(
+            LineConfig(), workspace, protected, home, home / grok.HOME_DIR, daemon_home
+        )
+        == grok.READER_PROFILE
+    )
 
 
 # The commands.
@@ -465,8 +572,11 @@ def test_fleet_status_and_restart_use_the_single_project_commands(
     found, harbor, _ = two
     seen: list[Path] = []
 
-    def restarted(paths: cli.ProjectPaths, arguments: object) -> int:
+    def restarted(
+        paths: cli.ProjectPaths, arguments: object, entry: fleet.IndexEntry
+    ) -> int:
         del arguments
+        assert entry == harbor
         seen.append(paths.socket)
         return exits.OK
 
@@ -476,6 +586,183 @@ def test_fleet_status_and_restart_use_the_single_project_commands(
     assert cli.main(["fleet", "status", "tide"]) == exits.OK
     assert "running, pid 102" in capsys.readouterr().out
     assert found.calls[-1][1] is Operation.STATUS
+
+
+# Review of 7ff033f, G1 and G2. ``fleet restart`` confirms its successor through the
+# index, and its wait is bounded.
+
+
+def status_of(entry: fleet.IndexEntry, pid: int) -> Response:
+    return Response("r", True, result={"pid": pid, "project": str(entry.root)})
+
+
+@dataclass
+class Restarting:
+    """``entry``'s daemon, which says ``before`` until it is asked to restart, and
+    then whatever ``after`` gives for each status."""
+
+    entry: fleet.IndexEntry
+    after: Callable[[int], Response]
+    before: int = 0
+    restarts: int = 0
+    polls: int = 0
+
+    def __post_init__(self) -> None:
+        self.before = self.entry.pid
+
+    def __call__(self, operation: Operation, args: dict[str, object]) -> Response:
+        del args
+        if operation is Operation.RESTART:
+            self.restarts += 1
+            return Response("r", True, result={"restarting": True, "running": []})
+        if self.restarts == 0:
+            return status_of(self.entry, self.before)
+        self.polls += 1
+        return self.after(self.polls)
+
+
+def no_sleep(seconds: float) -> None:
+    del seconds
+
+
+@pytest.fixture
+def restarting(
+    two: tuple[Fleet, fleet.IndexEntry, fleet.IndexEntry],
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Fleet, fleet.IndexEntry]:
+    monkeypatch.setattr(cli, "_preflight", lambda: None)
+    monkeypatch.setattr(cli, "RESTART_POLL_SECONDS", 1000.0)
+    monkeypatch.setattr(cli.time, "sleep", no_sleep)
+    found, harbor, _ = two
+    return found, harbor
+
+
+def test_fleet_restart_confirms_the_successor_through_its_own_index_entry(
+    restarting: tuple[Fleet, fleet.IndexEntry],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    found, harbor = restarting
+    monkeypatch.setattr(cli, "RESTART_POLL_SECONDS", 0.0)
+    successor = replace(harbor, pid=201)
+
+    def after(poll: int) -> Response:
+        if poll == 1:
+            # Another process on the socket, under a pid the index does not list.
+            return status_of(harbor, 999)
+        if poll == 2:
+            fleet.write_index_entry(index(), successor)
+            found.table[201] = STARTED
+        return status_of(harbor, 201)
+
+    daemon_of = Restarting(harbor, after)
+    found.handlers[harbor.socket] = daemon_of
+    assert cli.main(["fleet", "restart", "harbor"]) == exits.OK
+    assert daemon_of.polls == 2
+    assert "restarted, pid 201" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("listed", "live", "says"),
+    [
+        (None, False, 999),
+        (201, True, 999),
+        (201, False, 201),
+    ],
+    ids=["unlisted", "listed-but-another-pid-answers", "listed-but-stale"],
+)
+def test_fleet_restart_never_takes_another_pid_on_the_socket_for_the_successor(
+    restarting: tuple[Fleet, fleet.IndexEntry],
+    capsys: pytest.CaptureFixture[str],
+    listed: int | None,
+    live: bool,
+    says: int,
+) -> None:
+    found, harbor = restarting
+
+    def after(poll: int) -> Response:
+        if poll == 1 and listed is not None:
+            fleet.write_index_entry(index(), replace(harbor, pid=listed))
+            if live:
+                found.table[listed] = STARTED
+        return status_of(harbor, says)
+
+    daemon_of = Restarting(harbor, after)
+    found.handlers[harbor.socket] = daemon_of
+    assert cli.main(["fleet", "restart", "harbor", "--wait-seconds", "1"]) == (
+        exits.FAILURE
+    )
+    assert daemon_of.restarts == 1 and daemon_of.polls >= 1
+    err = capsys.readouterr().err
+    assert "no restarted daemon that the fleet index lists for this root" in err
+
+
+def test_fleet_restart_asks_nothing_of_a_daemon_that_changed_since_it_was_verified(
+    restarting: tuple[Fleet, fleet.IndexEntry],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    found, harbor = restarting
+    statuses = iter([harbor.pid, 999])
+
+    def changing(operation: Operation, args: dict[str, object]) -> Response:
+        del args
+        assert operation is Operation.STATUS, "nothing but status may be sent"
+        return status_of(harbor, next(statuses))
+
+    found.handlers[harbor.socket] = changing
+    assert cli.main(["fleet", "restart", "harbor"]) == exits.FAILURE
+    assert "not the one the index names" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("fleet_restart", [False, True])
+def test_the_wait_for_a_successor_is_bounded_however_long_requests_hang(
+    two: tuple[Fleet, fleet.IndexEntry, fleet.IndexEntry],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fleet_restart: bool,
+) -> None:
+    """A daemon that accepts and never answers. The clock runs on by each timeout
+    the client gives, and the wait ends by its deadline, not by its count of polls."""
+    _, harbor, _ = two
+    clock = [0.0]
+    timeouts: list[float] = []
+
+    def hangs(
+        socket_path: Path,
+        operation: Operation,
+        timeout_seconds: float = 5.0,
+        args: dict[str, object] | None = None,
+    ) -> Response:
+        del socket_path, operation, args
+        timeouts.append(timeout_seconds)
+        clock[0] += timeout_seconds
+        raise TimeoutError("no answer")
+
+    def sleep(seconds: float) -> None:
+        clock[0] += seconds
+
+    monkeypatch.setattr(cli, "call", hangs)
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(cli.time, "sleep", sleep)
+    wait = 30
+    successor = cli._fleet_successor(harbor) if fleet_restart else None  # pyright: ignore[reportPrivateUsage]
+    request = (
+        cli.FLEET_TIMEOUT_SECONDS if fleet_restart else cli.REQUEST_TIMEOUT_SECONDS
+    )
+    code = cli._await_successor(  # pyright: ignore[reportPrivateUsage]
+        cli._fleet_paths(harbor),  # pyright: ignore[reportPrivateUsage]
+        {"pid": harbor.pid},
+        wait,
+        successor,
+        request,
+    )
+    assert code == exits.FAILURE
+    bound = wait + cli.SHUTDOWN_TIMEOUT_SECONDS + cli.STARTUP_TIMEOUT_SECONDS
+    assert clock[0] <= bound + cli.RESTART_POLL_SECONDS
+    assert timeouts and max(timeouts) <= request
+    polls = math.ceil(bound / cli.RESTART_POLL_SECONDS) + 1
+    assert len(timeouts) < polls, "the deadline, not the count, ended the wait"
+    assert "within" in capsys.readouterr().err
 
 
 def test_a_shared_name_is_refused_until_the_root_is_given(

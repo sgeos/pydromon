@@ -71,6 +71,7 @@ from dromon.ui.model import (
     Overlay,
     Pressed,
     ProjectOpened,
+    ProjectRow,
     ProjectsLoaded,
     Request,
     Resized,
@@ -161,7 +162,12 @@ def update(model: Model, event: Event) -> Result:
         case ProjectOpened(project, line_id, lines):
             return _opened(model, project, line_id, lines)
         case ProjectsLoaded(projects):
-            listed = ", ".join(f"{name} {state}" for name, state in projects)
+            shared = _shared_names(projects)
+            listed = ", ".join(
+                f"{row.name} {row.state}"
+                + (f" at {row.root}" if row.name in shared else "")
+                for row in projects
+            )
             notice = f"projects: {listed}" if projects else "the fleet index is empty"
             return replace(
                 model, projects=projects, notice=notice, alarm=False
@@ -277,6 +283,24 @@ def _scrolled(model: Model, rows: int) -> Model:
     return replace(model, scroll=min(max(model.scroll + rows, 0), limit))
 
 
+def _shared_names(projects: tuple[ProjectRow, ...]) -> frozenset[str]:
+    """The names more than one project of the index has."""
+    names = [row.name for row in projects]
+    return frozenset(name for name in names if names.count(name) > 1)
+
+
+def _project_choices(projects: tuple[ProjectRow, ...]) -> tuple[tuple[str, str], ...]:
+    """What ``/project`` completes to. **Review of 7ff033f, G4.** A name two projects
+    share completes to each root, beside the name, since the name alone is refused."""
+    shared = _shared_names(projects)
+    return tuple(
+        (row.root, f"{row.name} {row.state}")
+        if row.name in shared
+        else (row.name, row.state)
+        for row in projects
+    )
+
+
 def _choices(model: Model) -> Choices:
     view = model.view
     lines = tuple((line.line_id, f"{line.state}, {line.model}") for line in model.lines)
@@ -308,7 +332,7 @@ def _choices(model: Model) -> Choices:
         )
     return Choices(
         lines=lines,
-        projects=model.projects,
+        projects=_project_choices(model.projects),
         questions=questions,
         messages=messages,
         settings=settings_pool,

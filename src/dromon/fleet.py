@@ -81,6 +81,13 @@ class IndexEntry:
                 registry.check_absolute(str(path), what)
             except registry.RegistryError as error:
                 raise FleetError(str(error)) from error
+        # Review of 7ff033f, G3. A name other than the root's last step would let a
+        # writer of the index publish a live daemon under a name of its choosing, so
+        # the operator's command for one project would reach another.
+        if self.name != self.root.name:
+            raise FleetError(
+                f"the name {self.name!r} is not the last step of the root {self.root}"
+            )
         if self.socket.name != OPERATOR_SOCKET_NAME:
             raise FleetError(f"socket must name a file {OPERATOR_SOCKET_NAME}")
         if type(self.pid) is not int or self.pid <= 0:
@@ -186,6 +193,25 @@ def denied_indexes(registry_dir: Path) -> tuple[Path, ...]:
     return tuple(Path(real) for real in reals)
 
 
+def ensure_index(registry_dir: Path) -> Path:
+    """Create the index in ``registry_dir`` with mode 0700 when it is missing, and
+    return it. Raises ``FleetError`` when it cannot be made or is wider.
+
+    **Review of 7ff033f, G5.** Codex's profile denies a protected path only when it
+    exists, and Grok's check requires only those that exist, so the daemon makes the
+    index before any engine is built, and every line's sandbox then denies it. Only
+    the index in use is made. **Limit.** A daemon given ``DROMON_REGISTRY_DIR`` leaves
+    the default index unmade, so a Codex or Grok line of such a daemon could make the
+    default one, which a client without the override reads. Making it would reach
+    outside the override, which no test may do."""
+    directory = index_directory(registry_dir)
+    try:
+        registry.ensure_directory(directory)
+    except registry.RegistryError as error:
+        raise FleetError(f"the fleet index {directory}: {error}") from error
+    return directory
+
+
 def _entry_path(directory: Path, key: str) -> Path:
     return directory / f"{key}{registry.ENTRY_SUFFIX}"
 
@@ -232,6 +258,18 @@ def read_index_entry(path: Path) -> IndexEntry | None:
     except (UnicodeDecodeError, FleetError):
         return None
     return entry if path.name == f"{entry.key}{registry.ENTRY_SUFFIX}" else None
+
+
+def entry_of(directory: Path, root: Path) -> IndexEntry | None:
+    """The valid entry the index holds for ``root``, or ``None``. Raises
+    ``FleetError`` when the index fails its check."""
+    if not os.path.lexists(directory):
+        return None
+    try:
+        registry.check_directory(directory)
+    except registry.RegistryError as error:
+        raise FleetError(str(error)) from error
+    return read_index_entry(_entry_path(directory, entry_key(root)))
 
 
 def read_index(directory: Path) -> list[IndexEntry]:
@@ -329,8 +367,14 @@ def resolve(found: list[Indexed], project: str) -> IndexEntry:
 
 def verify(entry: IndexEntry, status: Mapping[str, object]) -> None:
     """Refuse a daemon whose ``status`` does not give the pid and project root that
-    ``entry`` names, so a socket another daemon now holds is never taken for it."""
-    if status.get("pid") != entry.pid or status.get("project") != str(entry.root):
+    ``entry`` names, so a socket another daemon now holds is never taken for it. The
+    entry's name is checked again here, though every entry is checked when it is made,
+    so that the rule holds for the entry that is used, wherever it came from."""
+    if (
+        entry.name != entry.root.name
+        or status.get("pid") != entry.pid
+        or status.get("project") != str(entry.root)
+    ):
         raise FleetError(
             f"the daemon answering {entry.socket} is not the one the index names for"
             f" {entry.name}, so nothing is sent"

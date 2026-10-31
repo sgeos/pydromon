@@ -3104,6 +3104,22 @@ def open_registration(
     return entry
 
 
+def make_index(registry_dir: Path) -> bool:
+    """Make the fleet index before any engine is built, so that every line's sandbox
+    denies a directory that exists, and say whether it is there. Review of 7ff033f,
+    G5. **Decided by core, for the operator's review.** A failure is written to
+    standard error and the daemon starts, as one that cannot be listed does. A
+    directory refused for a wider mode exists, so it is denied. **Inference, not
+    verified.** A directory the daemon cannot make, its lines, which run as the same
+    user with less access, cannot make either, unless the cause passes."""
+    try:
+        fleet.ensure_index(registry_dir)
+    except fleet.FleetError as error:
+        print(f"dromond: {error}", file=sys.stderr)
+        return False
+    return True
+
+
 def fleet_registration(
     paths: ProjectPaths,
     registry_dir: Path,
@@ -3473,6 +3489,7 @@ def run(
         line_id: definition.secret_names for line_id, definition in config.lines.items()
     }
     launcher.configure(paths.left_reports)
+    make_index(registry_dir)
     successor: list[str] | None = None
     scheduler: Scheduler | None = None
     daemon_commit = read_head_commit(Path(__file__).parent)

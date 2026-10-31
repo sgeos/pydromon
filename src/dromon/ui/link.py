@@ -14,6 +14,7 @@ from dromon import fleet, registry
 from dromon.client import DaemonNotRunning, call
 from dromon.paths import STATE_DIR_NAME, ProjectPaths
 from dromon.protocol import Operation, ProtocolError, Response
+from dromon.ui.model import ProjectRow
 from dromon.ui.runtime import Daemon, Unreachable
 
 TIMEOUT_SECONDS: Final = 2.0
@@ -54,9 +55,12 @@ class FleetProjects:
         except fleet.FleetError as error:
             raise Unreachable(str(error)) from error
 
-    def names(self) -> tuple[tuple[str, str], ...]:
+    def names(self) -> tuple[ProjectRow, ...]:
         return tuple(
-            (indexed.entry.name, indexed.liveness.value) for indexed in self._survey()
+            ProjectRow(
+                indexed.entry.name, indexed.liveness.value, str(indexed.entry.root)
+            )
+            for indexed in self._survey()
         )
 
     def open(self, project: str) -> Daemon:
