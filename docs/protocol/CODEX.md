@@ -190,6 +190,19 @@ extends = ":workspace"
   does not, so Dromon states it.
 - Each protected directory that exists, the state directory and the runtime
   directory, is denied as its real path.
+- Existing operator paths `.ssh`, `.aws`, `.codex/auth.json`,
+  `.cargo/credentials.toml` and `.pi/agent/auth.json` from the shared
+  `dromon.security_paths` list are denied by real absolute path. **Probe pending.** The
+  operator will verify that Codex can still sign in with the profile denying
+  `~/.codex/auth.json` and record the result. If sign-in fails, this deny will be
+  removed.
+- Existing `secret` directories under both the project root and the line's working
+  directory are denied by real absolute path. This includes a worktree whose project
+  root is elsewhere.
+- An operator may set `writable_paths` to existing absolute directories for a Codex
+  line given `Edit` or `Write`. Dromon resolves symbolic links, then refuses a grant
+  that overlaps a credential or protected path. The operator is responsible for
+  trusting each granted directory and its contents.
 - Network access is off, as `:workspace` leaves it, so a Codex line cannot reach a
   local teacher.
 - Codex's `:workspace` also leaves `$TMPDIR` and `/tmp` writable.
@@ -208,6 +221,10 @@ the epagoge project the line ran the project's full gate, which passed.
 **Fact, observed the same day.** Codex emits no item for an edit it rejects or for that
 shell read, so Dromon's driver cannot count a call that Codex refuses before running
 it.
+
+**Not verified.** Whether Codex profiles prevent shell writes through a symbolic link
+that points outside the working directory. Dromon does not claim that the current
+profile prevents that path.
 
 ## Credentials
 

@@ -76,6 +76,7 @@ from dromon.engine import EngineRefused, TurnReport, read_instructions
 from dromon import launcher
 from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
+from dromon.security_paths import CREDENTIAL_PATHS, existing_real_paths
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 from dromon import gitssh
 from dromon.gitssh import GitSshAccess
@@ -754,20 +755,10 @@ def _covers(paths: Sequence[Path], target: Path) -> bool:
     return False
 
 
-GROK_CREDENTIAL_PATHS: Final = (
-    Path(".ssh"),
-    Path(".aws"),
-    Path(".codex/auth.json"),
-    Path(".cargo/credentials.toml"),
-    Path(".pi/agent/auth.json"),
-)
-"""Operator-home credentials Grok profiles must deny, when each path exists."""
-
-
 def _credential_paths(daemon_home: Path) -> tuple[Path, ...]:
-    """The configured credential paths under the daemon's real home directory."""
+    """The existing shared credential paths under the daemon's real home."""
     real_home = Path(os.path.realpath(daemon_home))
-    return tuple(real_home / relative for relative in GROK_CREDENTIAL_PATHS)
+    return existing_real_paths([real_home / relative for relative in CREDENTIAL_PATHS])
 
 
 def profile_snippet(

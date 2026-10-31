@@ -45,7 +45,9 @@ from dromon.launcher import (
     STOP_POLICY_VARIABLE,
 )
 from dromon.lineconfig import LineConfig, config_from_document
+from dromon.security_paths import CREDENTIAL_PATHS, project_secret_paths
 from dromon.gitssh import COMMAND_VARIABLE, GitSshAccess, ssh_command
+from dromon.grok import GrokLine
 from dromon.model import format_due
 from dromon.projectconfig import parse
 from dromon.sandbox import parse_sandbox
@@ -1049,6 +1051,24 @@ def test_the_factory_builds_each_line_on_its_drivers_engine() -> None:
         sandboxed(LineSpec("alpha", LUNA, Strategy.SUBSCRIPTION), [])
 
 
+def test_codex_and_grok_protect_both_project_and_external_workdir_secrets(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    worktree = tmp_path / "worktrees" / "line"
+    (root / "secret").mkdir(parents=True)
+    (worktree / "secret").mkdir(parents=True)
+    build = engine_factory(str(root))
+    for model, engine_type in ((LUNA, CodexLine), ("grok-4.7", GrokLine)):
+        config = LineConfig(workdir=str(worktree))
+        engine = build(
+            LineSpec("alpha", model, Strategy.SUBSCRIPTION, config=config), []
+        )
+        assert isinstance(engine, engine_type)
+        assert root / "secret" in engine.protected
+        assert worktree / "secret" in engine.protected
+
+
 def test_the_daemon_refuses_project_tables_that_would_reach_a_codex_line() -> None:
     check_engines(parse("version = 1\n[lines.a]\nmodel = 'gpt-6-luna'\n"))
     check_engines(
@@ -1147,6 +1167,84 @@ def test_the_profile_denies_each_protected_directory_that_exists(
     odd.mkdir()
     with pytest.raises(EngineRefused, match="control character"):
         server_arguments([], LineConfig(), (odd,))
+
+
+def test_the_profile_denies_existing_credentials_and_both_project_secret_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tomllib
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", lambda: home)
+    existing_credentials: list[Path] = []
+    for relative in CREDENTIAL_PATHS:
+        path = home / relative
+        if relative == CREDENTIAL_PATHS[1]:
+            continue
+        if relative in (Path(".ssh"), Path(".aws")):
+            path.mkdir(parents=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        existing_credentials.append(path)
+    root = tmp_path / "project"
+    root.mkdir()
+    worktree = tmp_path / "worktrees" / "line"
+    worktree.mkdir(parents=True)
+    root_secret = root / "secret"
+    root_secret.mkdir()
+    workdir_secret = worktree / "secret"
+    workdir_secret.mkdir()
+    missing = home / CREDENTIAL_PATHS[1]
+    protected = project_secret_paths(root, worktree)
+    text = profile_of(server_arguments([], LineConfig(), (*protected, missing)))
+    filesystem = tomllib.loads(f"profile = {text}")["profile"]["filesystem"]
+    for credential in existing_credentials:
+        assert filesystem[str(credential.resolve())] == "deny"
+    assert filesystem[str(root_secret.resolve())] == "deny"
+    assert filesystem[str(workdir_secret.resolve())] == "deny"
+    assert str(missing) not in filesystem
+
+
+def test_writable_paths_are_granted_only_for_valid_unprotected_directories(
+    tmp_path: Path,
+) -> None:
+    import tomllib
+
+    allowed = tmp_path / "scratch"
+    allowed.mkdir()
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    inside = protected / "inside"
+    inside.mkdir()
+    file = tmp_path / "file"
+    file.write_text("data")
+    config = LineConfig(builtin_tools=("Edit",), writable_paths=(str(allowed),))
+    text = profile_of(server_arguments([], config, (protected,)))
+    filesystem = tomllib.loads(f"profile = {text}")["profile"]["filesystem"]
+    assert filesystem[str(allowed.resolve())] == "write"
+    assert filesystem[str(protected.resolve())] == "deny"
+
+    for invalid in (tmp_path / "absent", file, protected, inside, tmp_path):
+        with pytest.raises(EngineRefused, match="writable path"):
+            server_arguments(
+                [],
+                LineConfig(builtin_tools=("Edit",), writable_paths=(str(invalid),)),
+                (protected,),
+            )
+
+
+def test_writable_path_cannot_overlap_a_shared_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    ssh = home / CREDENTIAL_PATHS[0]
+    ssh.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    with pytest.raises(EngineRefused, match="overlaps a protected path"):
+        server_arguments(
+            [], LineConfig(builtin_tools=("Write",), writable_paths=(str(home),)), ()
+        )
 
 
 def test_a_thread_without_dromons_profile_is_refused() -> None:

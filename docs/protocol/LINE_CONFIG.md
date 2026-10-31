@@ -46,6 +46,7 @@ keys, duplicate keys and numbers are refused.
 | `instructions` | At most 16 distinct files, such as `CLAUDE.md`, whose text is appended to the system prompt at each turn. A relative path is resolved against the project root, whatever the line's `workdir`, and `~` against the home directory. A line whose `workdir` is a worktree of another branch reads the root's file for a relative path, so it names its own file by absolute path. Omitted when empty | none |
 | `workdir` | The directory the line's engine runs in, as the working directory section below specifies. Omitted when unset | the project root |
 | `workdir_access` | `write` or `read`; read confines the working directory to reads, with the scratch exception below | `write` |
+| `writable_paths` | Existing absolute directories a Codex line may write when given `Edit` or `Write`. Refused on other engines | none |
 | `keep_session` | Keep a Claude Code or Codex line's engine connected between turns, as the kept sessions section below specifies. Refused on Grok lines. Omitted when false | `false` |
 | `fresh_session_each_turn` | Start each turn in a new Claude Code or Codex engine session, without a context handoff or standing brief. Refused with `keep_session`, with explicit `context_handoff = true`, and on adapters that cannot start a new session each turn. Omitted when false | `false` |
 | `keep_session_idle_seconds` | Seconds a kept connection waits for the next turn before it closes, a whole number from 60 to 86,400. Omitted at its default | `1800` |
@@ -1508,6 +1509,38 @@ and Antigravity refuse to start in this mode because their adapters cannot enfor
 Grok refuses it too until a live probe shows its reader profile deny a write to the
 worktree, as [`GROK.md`](GROK.md) records. Claude Code also refuses configurations with mechanisms that can
 bypass its sandbox, as specified in [`SANDBOX.md`](SANDBOX.md).
+
+**Codex writable paths.** An operator may name additional absolute directories with
+`writable_paths` for a Codex line given `Edit` or `Write`. For example, a line may use
+this configuration to write build output on a separate volume.
+
+```json
+{
+  "builtin_tools": ["Bash", "Edit"],
+  "writable_paths": ["/Volumes/build-output"]
+}
+```
+
+Each path must exist as a directory when the line is loaded. Dromon resolves symbolic
+links and refuses a path that overlaps a credential, secret, state or runtime path.
+The grant allows writes through the Codex permission profile. It assumes the operator
+trusts the named directory and its contents. Grok does not accept `writable_paths`.
+
+**Claude Code local binding.** The existing sandbox schema accepts
+`network.allowLocalBinding`. A line may allow a sandboxed command to bind a local
+network port with a setting such as this.
+
+```json
+{
+  "sandbox": {
+    "enabled": true,
+    "network": {"allowLocalBinding": true}
+  }
+}
+```
+
+This setting does not grant Unix socket access, which remains controlled by
+`network.allowUnixSockets`.
 
 **Decided by the operator on 2026-10-25.** Each line's engine runs in its own working
 directory, so that a line can work in a git worktree of its own while the daemon's

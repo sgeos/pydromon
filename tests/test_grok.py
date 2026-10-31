@@ -54,6 +54,7 @@ from dromon.grok import (
 )
 from dromon.capabilities import Known
 from dromon.lineconfig import LineConfig, WorkdirAccess
+from dromon.security_paths import CREDENTIAL_PATHS
 from dromon.gitssh import COMMAND_VARIABLE, GitSshAccess, ssh_command
 from dromon.mcp import Bridge
 from dromon.protocol import Response
@@ -891,7 +892,20 @@ def test_credentials_created_later_are_named_in_refusal_advice(tmp_path: Path) -
     assert str(credential) in message.split("Required deny entries are ", 1)[1]
 
 
-def test_a_symlinked_credential_is_denied_by_its_own_path(tmp_path: Path) -> None:
+def test_grok_profile_derives_existing_credential_denies_from_shared_list(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "operator-home"
+    existing = home / CREDENTIAL_PATHS[-1]
+    existing.parent.mkdir(parents=True)
+    existing.write_text("placeholder")
+    missing = home / CREDENTIAL_PATHS[0]
+    snippet = grok_module.profile_snippet(READER_PROFILE, tmp_path / "work", (), home)
+    assert str(existing.resolve()) in snippet
+    assert str(missing) not in snippet
+
+
+def test_a_symlinked_credential_is_denied_by_its_real_path(tmp_path: Path) -> None:
     workspace = (tmp_path / "work").resolve()
     state = workspace / ".dromon"
     state.mkdir(parents=True)
@@ -905,8 +919,8 @@ def test_a_symlinked_credential_is_denied_by_its_own_path(tmp_path: Path) -> Non
     snippet = grok_module.profile_snippet(
         READER_PROFILE, workspace, (state,), daemon_home
     )
-    assert str(ssh) in snippet
-    assert str(target) not in snippet
+    assert str(target.resolve()) in snippet
+    assert str(ssh) not in snippet
 
 
 def test_profile_does_not_deny_unverified_grok_or_claude_auth_paths(

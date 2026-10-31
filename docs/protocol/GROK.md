@@ -281,7 +281,8 @@ directories. This example assumes every listed credential path exists.
 ```toml
 [profiles.dromon-reader]
 extends = "read-only"
-deny = [".dromon", "/placeholder/operator-home/.ssh", "/placeholder/operator-home/.aws",
+deny = [".dromon", "/placeholder/project/secret", "/placeholder/worktree/secret",
+        "/placeholder/operator-home/.ssh", "/placeholder/operator-home/.aws",
         "/placeholder/operator-home/.codex/auth.json",
         "/placeholder/operator-home/.cargo/credentials.toml",
         "/placeholder/operator-home/.pi/agent/auth.json"]
@@ -289,7 +290,8 @@ deny = [".dromon", "/placeholder/operator-home/.ssh", "/placeholder/operator-hom
 [profiles.dromon-writer]
 extends = "workspace"
 read_only = ["/placeholder/worktree/gitdir", "/placeholder/repository/gitdir"]
-deny = [".dromon", "/placeholder/operator-home/.ssh", "/placeholder/operator-home/.aws",
+deny = [".dromon", "/placeholder/project/secret", "/placeholder/worktree/secret",
+        "/placeholder/operator-home/.ssh", "/placeholder/operator-home/.aws",
         "/placeholder/operator-home/.codex/auth.json",
         "/placeholder/operator-home/.cargo/credentials.toml",
         "/placeholder/operator-home/.pi/agent/auth.json"]
@@ -313,8 +315,8 @@ add to its arrays and says to leave other tables and entries as they are. If a p
 is missing, the advice gives its complete table. A new profile includes only credential
 paths that exist when the file is written. If one is created later, the next turn is
 refused and its refusal advice names the path. A credential path that is a symbolic
-link is denied by its own path under the daemon home. **Not verified.** Whether Grok
-matches a deny entry through a symbolic link. Writer lines do not commit, so their Git
+link is denied by its resolved target path. **Not verified.** Whether Grok matches a
+deny entry through a symbolic link. Writer lines do not commit, so their Git
 directories remain read-only. For a linked worktree, the `.git` pointer
 file and `commondir` file cannot be held as profile entries. A writer could rewrite a
 pointer during a turn. The next turn resolves it again and refuses unless the resulting
@@ -325,6 +327,14 @@ include the operator's `.grok/auth.json` or `.claude.json`. Neither path has bee
 with a Grok line, so this does not claim that either is safe to expose.
 **Inference, not verified.** A `read_only` entry inside a writable workspace keeps it
 read-only, as the field's name says.
+
+Existing `secret` directories under both the project root and the line's working
+directory are also required deny entries, by real absolute path. This covers a line
+working in a worktree whose project root is elsewhere. Grok's profile has no
+`writable_paths` setting in Dromon. **Not verified.** Whether the Grok profile blocks a
+write through a symbolic link from the worktree to a target outside it. Dromon has no
+evidence that this matches Codex's reported gap, and this change does not add an
+external write grant to Grok.
 
 ## Dromon's tools
 
