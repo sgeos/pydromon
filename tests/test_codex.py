@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
+from imagesamples import png
 
 from dromon import codex as codex_module
 from dromon import evidence
@@ -1067,7 +1068,7 @@ def test_a_redirected_provider_is_always_refused() -> None:
     [
         (
             LineConfig(builtin_tools=("Read", "Bash")),
-            "only the built-in tools Bash, Edit and Write, not Read",
+            "only the built-in tools Bash, Edit, Write and ViewImage, not Read",
         ),
         (LineConfig(inherit_account_mcp=True), "do not yet support MCP servers"),
         (
@@ -1714,3 +1715,138 @@ def test_a_codex_line_given_git_ssh_sets_it_for_its_shell_commands_alone() -> No
     assert COMMAND_VARIABLE not in plain.environment
     with pytest.raises(EngineRefused, match="not a bare TOML key"):
         server_arguments([], LineConfig(), (), None, {"A.B": "x"})
+
+
+# Round 11. The ViewImage capability. The imageView item and its path field are an
+# inference from the Codex binary's strings, not an observed live item.
+
+PNG_BYTES = png()
+
+
+def image_line(server: FakeServer, cwd: Path, tools: tuple[str, ...]) -> CodexLine:
+    target = line(server, config=LineConfig(builtin_tools=tools))
+    target.cwd = cwd
+    return target
+
+
+def test_a_line_given_view_image_may_view_a_small_image_in_its_workdir(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "shot.png").write_bytes(PNG_BYTES)
+    server = FakeServer([item("imageView", path="shot.png"), completed()])
+    report = run(image_line(server, tmp_path, ("ViewImage",)))
+    assert report.tool_uses == ("ViewImage",)
+    assert server.arguments[server.arguments.index("view_image") - 1] == "--enable"
+
+
+@pytest.mark.parametrize(
+    ("name", "content", "reason"),
+    [
+        ("big.png", png(5 * 1024 * 1024 + 1), "over the limit"),
+        ("notes.txt", b"text", "by its name"),
+        ("fake.png", b"text, not an image", "does not begin"),
+    ],
+)
+def test_an_image_over_the_limit_or_not_an_image_refuses_the_turn(
+    tmp_path: Path, name: str, content: bytes, reason: str
+) -> None:
+    (tmp_path / name).write_bytes(content)
+    server = FakeServer([item("imageView", path=name), completed()])
+    with pytest.raises(EngineRefused, match=f"may not view that image.*{reason}"):
+        run(image_line(server, tmp_path, ("ViewImage",)))
+
+
+def test_an_image_item_without_a_path_or_outside_the_workdir_is_refused(
+    tmp_path: Path,
+) -> None:
+    for fields in ({}, {"path": "../outside.png"}, {"path": 3}):
+        server = FakeServer([item("imageView", **fields), completed()])
+        with pytest.raises(EngineRefused, match="may not view that image"):
+            run(image_line(server, tmp_path, ("ViewImage",)))
+
+
+def test_a_line_without_view_image_cannot_view_an_image(tmp_path: Path) -> None:
+    (tmp_path / "shot.png").write_bytes(PNG_BYTES)
+    for tools in ((), ("Bash",), ("Edit", "Write")):
+        server = FakeServer([item("imageView", path="shot.png"), completed()])
+        with pytest.raises(EngineRefused, match="not given: imageView"):
+            run(
+                image_line(
+                    server,
+                    tmp_path,
+                    tools,
+                )
+                if "Bash" not in tools
+                else line(
+                    server,
+                    config=LineConfig(builtin_tools=tools),
+                    environment={"SHELL": "/bin/bash"},
+                )
+            )
+        assert server.arguments[server.arguments.index("view_image") - 1] == "--disable"
+
+
+def test_image_generation_stays_refused_for_a_line_given_view_image(
+    tmp_path: Path,
+) -> None:
+    server = FakeServer([item("imageGeneration"), completed()])
+    with pytest.raises(EngineRefused, match="not given: imageGeneration"):
+        run(image_line(server, tmp_path, ("ViewImage",)))
+    arguments = server.arguments
+    assert arguments[arguments.index("image_generation") - 1] == "--disable"
+
+
+class UnnamedTurn(FakeServer):
+    """A server that sends ``before`` ahead of the response that names the turn, and
+    never sends ``turn/started`` for it."""
+
+    def __init__(self, before: Sequence[dict[str, Any]]) -> None:
+        super().__init__()
+        self.before = list(before)
+
+    async def send(self, message: Mapping[str, object]) -> None:
+        sent = dict(message)
+        if sent.get("method") != "turn/start":
+            await super().send(message)
+            return
+        self.sent.append(sent)
+        self.queue.extend(self.before)
+        self.queue.append({"id": sent["id"], "result": self.result("turn/start")})
+
+
+def interrupted_turns(server: FakeServer) -> list[str]:
+    return [
+        m["params"]["turnId"]
+        for m in server.sent
+        if m.get("method") == "turn/interrupt"
+    ]
+
+
+def test_a_refused_image_before_the_turn_is_named_still_interrupts_it(
+    tmp_path: Path,
+) -> None:
+    # Review of 1045994, I3. Without the turn identifier no interrupt could be sent,
+    # and the turn ran on with the refusal recorded and nothing stopping it.
+    server = UnnamedTurn([item("imageView", path="../outside.png")])
+    with pytest.raises(EngineRefused, match="may not view that image"):
+        run(image_line(server, tmp_path, ("ViewImage",)))
+    assert interrupted_turns(server) == ["t1"]
+
+
+def test_a_foreign_turn_started_does_not_name_the_lines_turn(tmp_path: Path) -> None:
+    # Review of d00da44, T6 and I3b. A turn/started for another thread arrives first.
+    foreign = notice("turn/started", threadId="other", turn={"id": "foreign"})
+    server = UnnamedTurn([foreign, item("imageView", path="../outside.png")])
+    with pytest.raises(EngineRefused, match="may not view that image"):
+        run(image_line(server, tmp_path, ("ViewImage",)))
+    assert interrupted_turns(server) == ["t1"]
+
+
+def test_a_budget_stop_before_the_turn_is_named_is_sent_once_it_is() -> None:
+    # Review of d00da44, T10. The same early interrupt serves a stop the driver
+    # decided, not only a refusal.
+    budget = luna().settings.tool_budget
+    server = UnnamedTurn([item("dynamicToolCall", tool="record")] * (budget + 3))
+    report = run(line(server))
+    assert report.interrupted_for == "tool_budget"
+    assert interrupted_turns(server) == ["t1"]

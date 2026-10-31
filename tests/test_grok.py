@@ -20,6 +20,7 @@ from typing import Any, Final, cast
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
+from imagesamples import png
 
 from dromon import grok as grok_module
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
@@ -3069,3 +3070,155 @@ def test_a_file_backed_use_tool_is_refused_with_advice_to_pass_it_inline(
         EngineRefused, match="not given: use_tool.*inline as tool_input"
     ):
         run(line(server, project))
+
+
+# Round 11. The ViewImage capability. Grok's read_file is the only tool that shows a
+# local image, so ViewImage permits it, narrowed to images. The rawInput key
+# target_file is an inference from the tool's definition, not an observed call.
+
+PNG_BYTES = png()
+VIEW = LineConfig(builtin_tools=("ViewImage",))
+
+
+def read_input(path: str) -> dict[str, object]:
+    return {"target_file": path}
+
+
+def test_view_image_lets_a_line_view_a_small_image_and_counts_it(
+    project: tuple[Path, Path, Path],
+) -> None:
+    (project[0] / "shot.png").write_bytes(PNG_BYTES)
+    server = FakeGrok(
+        [
+            grok_call("read_file", raw_input=read_input("shot.png")),
+            call_update("t", kind="read"),
+            grok_permission(rawInput=read_input("shot.png")),
+        ]
+    )
+    assert run(line(server, project, config=VIEW)).tool_uses == ("ViewImage",)
+    assert server.answers()[-1]["result"]["outcome"]["optionId"] == "yes"
+
+
+@pytest.mark.parametrize(
+    ("name", "content", "reason"),
+    [
+        ("notes.txt", b"text", "by its name"),
+        ("fake.png", b"text, not an image", "does not begin"),
+        ("big.png", png(5 * 1024 * 1024 + 1), "over the limit"),
+        ("../outside.png", b"", "does not exist|outside"),
+    ],
+)
+def test_view_image_refuses_other_files_and_oversize_images(
+    project: tuple[Path, Path, Path], name: str, content: bytes, reason: str
+) -> None:
+    if not name.startswith(".."):
+        (project[0] / name).write_bytes(content)
+    server = FakeGrok([grok_call("read_file", raw_input=read_input(name))])
+    with pytest.raises(EngineRefused, match=f"not given: .*ViewImage.*{reason}"):
+        run(line(server, project, config=VIEW))
+    assert server.params("session/cancel") == {"sessionId": "s1"}
+
+
+def test_view_image_refuses_a_first_notice_that_carries_no_input(
+    project: tuple[Path, Path, Path],
+) -> None:
+    # Review of 1045994, I2. Grok serves text through read_file, so a call whose input
+    # is not yet known could finish before a later update names the file.
+    (project[0] / "shot.png").write_bytes(PNG_BYTES)
+    server = FakeGrok(
+        [
+            grok_call("read_file"),
+            call_update("t", kind="read", rawInput=read_input("shot.png")),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="ViewImage|names no file"):
+        run(line(server, project, config=VIEW))
+    assert server.params("session/cancel") == {"sessionId": "s1"}
+
+
+def test_a_view_only_line_proceeds_when_the_first_notice_carries_the_input(
+    project: tuple[Path, Path, Path],
+) -> None:
+    # Review of d00da44, T9. The path the fail-closed rule leaves open: the input on
+    # the first notice, then updates that do not repeat it.
+    (project[0] / "shot.png").write_bytes(PNG_BYTES)
+    server = FakeGrok(
+        [
+            grok_call("read_file", raw_input=read_input("shot.png")),
+            call_update("t", kind="read"),
+            call_update("t", status="completed"),
+        ]
+    )
+    report = run(line(server, project, config=VIEW))
+    assert report.tool_uses == ("ViewImage",)
+    assert "session/cancel" not in server.methods()
+
+
+def test_a_line_with_read_may_start_a_call_before_its_input_is_known(
+    project: tuple[Path, Path, Path],
+) -> None:
+    both = LineConfig(builtin_tools=("Read", "ViewImage"))
+    server = FakeGrok([grok_call("read_file"), call_update("t", kind="read")])
+    assert run(line(server, project, config=both)).tool_uses == ("Read",)
+
+
+def test_view_image_stops_a_later_update_that_names_another_file(
+    project: tuple[Path, Path, Path],
+) -> None:
+    (project[0] / "shot.png").write_bytes(PNG_BYTES)
+    (project[0] / "notes.txt").write_bytes(b"text")
+    server = FakeGrok(
+        [
+            grok_call("read_file", raw_input=read_input("shot.png")),
+            call_update("t", kind="read", rawInput=read_input("notes.txt")),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="ViewImage.*by its name"):
+        run(line(server, project, config=VIEW))
+
+
+def test_view_image_denies_a_permission_request_that_names_no_image(
+    project: tuple[Path, Path, Path],
+) -> None:
+    (project[0] / "notes.txt").write_bytes(b"text")
+    (project[0] / "shot.png").write_bytes(PNG_BYTES)
+    first = grok_call("read_file", raw_input=read_input("shot.png"))
+    requests = (grok_permission(), grok_permission(rawInput=read_input("notes.txt")))
+    for request in requests:
+        server = FakeGrok([first, request])
+        run(line(server, project, config=VIEW))
+        assert server.answers()[-1]["result"]["outcome"]["optionId"] == "no"
+
+
+def test_a_line_with_read_is_not_narrowed_by_view_image(
+    project: tuple[Path, Path, Path],
+) -> None:
+    (project[0] / "notes.txt").write_bytes(b"text")
+    both = LineConfig(builtin_tools=("Read", "ViewImage"))
+    server = FakeGrok([grok_call("read_file", raw_input=read_input("notes.txt"))])
+    assert run(line(server, project, config=both)).tool_uses == ("Read",)
+
+
+@pytest.mark.parametrize(
+    "tools", [(), ("Bash",), ("Edit", "Write"), ("Glob", "Grep", "WebFetch")]
+)
+def test_a_line_without_view_image_or_read_cannot_view_an_image(
+    project: tuple[Path, Path, Path], tools: tuple[str, ...]
+) -> None:
+    (project[0] / "shot.png").write_bytes(PNG_BYTES)
+    server = FakeGrok([grok_call("read_file", raw_input=read_input("shot.png"))])
+    with pytest.raises(EngineRefused, match="not given: read_file"):
+        run(line(server, project, config=LineConfig(builtin_tools=tools)))
+
+
+@pytest.mark.parametrize(
+    "name", ["image_gen", "image_edit", "image_to_video", "reference_to_video"]
+)
+def test_view_image_never_permits_image_generation_or_editing(
+    project: tuple[Path, Path, Path], name: str
+) -> None:
+    both = LineConfig(builtin_tools=("Read", "ViewImage"))
+    for config in (VIEW, both):
+        server = FakeGrok([grok_call(name)])
+        with pytest.raises(EngineRefused, match=f"not given: {name}"):
+            run(line(server, project, config=config))

@@ -32,7 +32,7 @@ keys, duplicate keys and numbers are refused.
 
 | Key | Value | Default |
 |---|---|---|
-| `builtin_tools` | Claude Code tool names, each a capital letter followed by letters, digits or `_` | none |
+| `builtin_tools` | Claude Code tool names, each a capital letter followed by letters, digits or `_`. `ViewImage` is Dromon's own name, see [Viewing images](#viewing-images) | none |
 | `mcp_servers` | Server name to server, or a Claude Code file of the shape `{"mcpServers": {...}}` | none |
 | `tool_policy` | `allowlist` or `allow_all` | `allowlist` |
 | `allowed_tools` | Exact tool names, or `mcp__server__*` for every tool of one server | none |
@@ -94,6 +94,49 @@ engine process environment or the event log.
 - Unless `inherit_account_mcp` is set, the engine runs with strict MCP configuration,
   and a turn is refused when the engine offers a built-in tool not in `builtin_tools`
   or a tool of a server not in `mcp_servers`.
+
+## Viewing images
+
+`ViewImage` in `builtin_tools` lets a line look at a local image. It is Dromon's name,
+not a Claude Code tool, and it is the only way a line gets the ability, so a line
+without it cannot view an image on any engine. Image generation and editing are never
+granted.
+
+- Claude Code offers `Read` to the engine for it, and the gate allows `Read` only for
+  a file that passes the image check, whatever the tool policy. A line that also has `Read` is not narrowed.
+- Codex enables `view_image`, and Dromon checks each image it views.
+- Grok permits `read_file`, narrowed to files that pass the image check for a line
+  without `Read`. **Do not enable `ViewImage` on a Grok line until the verify-first item
+  6 of [`GROK.md`](GROK.md) has shown that Grok's first `read_file` notice carries its
+  input.** Until then the line fails closed and cannot view any image.
+- Pi, Cursor and Antigravity refuse the name, as they refuse every built-in tool.
+
+An image must be a png, jpg, jpeg, gif or webp file by name and wholly one complete
+container of that type, inside the line's working directory and outside `.dromon`,
+`.git` and `secret`, and at most 5 MiB.
+
+**Limit, a path swapped after the check.** Dromon checks the real path, and the engine
+then opens the path the line gave. A link or file swapped in between is not caught, and
+on Claude Code the engine reads the swapped path. The working directory's own
+confinement, the engine's sandbox, is what bounds that read, and Dromon does not add to
+it.
+
+**What the check does not bound.** Dromon proves that a file is one complete container
+of the type its name claims, and nothing about what the container holds. It does not
+decode the image and does not prove that its data is a picture. A well-formed container
+can carry up to 5 MiB of chosen bytes with correct checksums, in text and comment parts
+such as a png `tEXt` chunk, a jpeg comment, a gif comment extension and webp metadata,
+and in its compressed or entropy-coded data. A line given `ViewImage` can therefore
+have such a file delivered to its engine, if the file is inside the working directory
+and passes the other checks. What the engine and the model make of those bytes is
+outside Dromon's control. The capability bounds which files are delivered and how large
+they are, not what they contain. `test_a_complete_container_may_still_carry_arbitrary_bytes`
+pins this, so a later change that refuses such files is deliberate. **Review of d00da44,
+I1.**
+
+[`ENGINES.md`](ENGINES.md) gives the rationale, the limits that only an engine holds,
+and the steps the operator runs before relying on it. Nothing was run live when this
+was written.
 
 ## Dromon's own tools
 

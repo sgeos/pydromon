@@ -177,7 +177,9 @@ app-server. Dromon starts it with these arguments.
 - `--disable` for `apps`, `browser_use`, `browser_use_external`, `computer_use`,
   `goals`, `hooks`, `image_generation`, `in_app_browser`, `memories`, `multi_agent`,
   `plugins`, `remote_plugin`, `skill_mcp_dependency_install`, `skill_search`,
-  `sleep_tool`, `tool_suggest` and `view_image`.
+  `sleep_tool` and `tool_suggest`.
+- `view_image` enabled only for a line given `ViewImage`, and disabled otherwise.
+  See [Viewing an image](#viewing-an-image).
 - `shell_tool` and `unified_exec` enabled only for a line given `Bash`, and disabled
   otherwise.
 - `-c web_search="disabled"`.
@@ -294,7 +296,7 @@ driver. **Fact, observed on 2026-10-25.** The operator's environment sets
 
 | Configuration | On a Codex line |
 |---|---|
-| `builtin_tools` | `Bash`, which enables Codex's shell, and `Edit` or `Write`, which make the workspace writable for Codex's file changes and its shell |
+| `builtin_tools` | `Bash`, which enables Codex's shell, `Edit` or `Write`, which make the workspace writable for Codex's file changes and its shell, and `ViewImage`, which enables `view_image` |
 | `mcp_servers`, `inherit_account_mcp` | Refused, not yet supported |
 | `sandbox`, `settings` | Refused, including the project's own tables, which `dromond` checks at start |
 | `tool_policy`, `allowed_tools` | Accepted, with no effect beyond Dromon's own tools |
@@ -306,6 +308,62 @@ driver. **Fact, observed on 2026-10-25.** The operator's environment sets
 
 A configuration a Codex line cannot run is refused when the line is created or
 configured.
+
+## Viewing an image
+
+**Round 11.** `view_image` was disabled for every line, so no Codex line could look
+at an image. A line given `ViewImage` among its `builtin_tools` now starts the
+app-server with `--enable view_image`, and every other line with `--disable view_image`,
+as before. `image_generation` stays disabled for every line, and nothing here permits
+generating or editing an image.
+
+- **What the line may read.** `view_image` reads through Codex's own file access, so
+  it can read what the `dromon-line` permission profile lets the line read and no more,
+  and the profile denies Dromon's state, the runtime directory and the credential paths.
+  Dromon adds no entry for it.
+- **What Dromon checks.** When an `imageView` item starts, Dromon checks its `path`
+  with `imageaccess.image_refusal`. The file must be inside the line's working
+  directory and outside `.dromon`, `.git` and `secret`, a regular file of at most
+  `MAX_IMAGE_BYTES`, 5 MiB, a png, jpg, jpeg, gif or webp by name, and wholly one
+  complete container of that type, which `dromon.imageformat` checks over the whole file.
+  A failure, or an item without a text `path`, interrupts the turn and refuses it with
+  the reason. The item counts as one use of `ViewImage` in the driver's budget. An item
+  that arrives before the response naming the turn cannot be interrupted at once, so the
+  interrupt is sent as soon as the turn is named, and the turn is refused whatever
+  follows. **Review of 1045994, I3.**
+- **The limit that only the engine holds.** Codex emits the item as it handles the
+  call, so Dromon's check stops the turn and is not shown to prevent the read. Whether
+  the image reaches the model before the interrupt is not known. Codex
+  decides how the image is resized and what it costs the model. Dromon bounds the file's
+  bytes and not its dimensions.
+- **Facts and inferences.** **Fact**, the string `imageView` is in the Codex 0.164.0
+  binary beside `imageGeneration`, read on 2026-10-31. **Inference, not observed**,
+  that the item has a string field `path` and that the app-server starts it before the
+  image is read. Both are checked by the steps below, and a different field name refuses
+  every view, which fails closed.
+
+### Verify first, viewing an image
+
+The operator runs these once, with Codex signed in to the plan, before relying on the
+capability. Nothing here is run by a line.
+
+1. Make a small synthetic image in a scratch project, for example a 64 by 64 png of
+   one colour, with a text drawn on it that a model could not guess, such as a made up
+   word. Keep it far under 5 MiB.
+2. Create a Codex line there with `builtin_tools` of `["ViewImage"]` and
+   `workdir_access` `read`, and ask it to view the file and report the word.
+3. Record the turn with the probe's recording and confirm four things. The
+   app-server's `config/read` reports `view_image` enabled and `image_generation`
+   disabled. An `imageView` item arrives with a text `path`, and its name and field are
+   as `IMAGE_ITEM` assumes. The line reports the word. The report counts one
+   `ViewImage` use.
+4. Repeat with a line without `ViewImage` and confirm that it cannot view the file,
+   and that the arguments carry `--disable view_image`.
+5. Repeat with a file named `.txt` and with a png over 5 MiB and confirm that each turn
+   is refused with the reason. Repeat with a path outside the working directory, and
+   with a path under `.dromon`, and confirm the same.
+6. Note whether the item arrives before or after the image is read. If after, the
+   limit above stands as written, and if before, record it here.
 
 ## Verification
 

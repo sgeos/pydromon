@@ -7,6 +7,27 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- The operator-granted capability `ViewImage`, so a line can look at a screenshot
+  through whichever engine owns it. A line must name it among its `builtin_tools`, and
+  without it no line can view an image on any engine. On Codex it enables `view_image`,
+  which was always disabled, and Dromon checks the path of each `imageView` item. On
+  Grok it permits `read_file`, the only tool that shows a local image, narrowed to
+  files that pass the image check. On Claude Code it offers `Read`, which the gate allows only for files that pass the image check. The
+  files must be png, jpg, jpeg, gif or webp by name and wholly one complete container of
+  that type, checked over the whole file, inside the
+  line's working directory and outside `.dromon`, `.git` and `secret`, and at most
+  `imageaccess.MAX_IMAGE_BYTES`, 5 MiB. Image generation and editing stay refused on
+  every engine. Pi, Cursor and Antigravity refuse the name, as they refuse every
+  built-in tool. Review of 1045994. The check reads the whole file and requires a
+  complete container, so a file that only begins as an image is refused, a Grok
+  `read_file` whose first notice carries no input is refused for a line with `ViewImage`
+  and without `Read`, and a Codex refusal decided before the turn is named is sent as an
+  interrupt once it is, for a notice about this line's thread only. The check proves
+  a complete container and not that its data is a picture, so a text chunk or compressed
+  data can still carry chosen bytes, which `LINE_CONFIG.md` states and a test pins.
+  ViewImage is not to be enabled on a Grok line until the first read_file notice is
+  shown to carry its input. Nothing was run live, and each engine document lists the live steps
+  the operator runs first.
 - Supervised runs, task of 2026-10-31. The project file's `[runs.commands]` table
   declares commands, each an array, and the line tools `start_run`, `run_status` and
   `stop_run` start one as a run that outlives the turn, the seat and a daemon restart.
