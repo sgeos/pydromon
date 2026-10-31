@@ -1679,6 +1679,66 @@ def test_permission_requests_follow_the_lines_tools(
     assert answers["p2"] == answers["p3"] == {"outcome": "cancelled"}
 
 
+@pytest.mark.parametrize(
+    ("kind", "name", "raw_input", "options", "intent"),
+    [
+        (
+            "other",
+            "use_tool",
+            use_tool_input("dromon__send_message"),
+            [{"optionId": "broad", "kind": "allow_always"}],
+            "allow",
+        ),
+        (
+            "edit",
+            "search_replace",
+            None,
+            [{"optionId": "yes", "kind": "allow_once"}],
+            "refuse",
+        ),
+    ],
+)
+def test_missing_permission_choice_cancels_and_refuses_with_evidence(
+    project: tuple[Path, Path, Path],
+    kind: str,
+    name: str,
+    raw_input: object | None,
+    options: list[dict[str, str]],
+    intent: str,
+) -> None:
+    request = permission(kind, name=name, raw_input=raw_input)
+    request["params"]["options"] = options
+    server = FakeGrok([request])
+
+    with pytest.raises(EngineRefused) as raised:
+        run(line(server, project, config=LineConfig(builtin_tools=("Read",))))
+
+    message = str(raised.value)
+    expected_tool = "use_tool (dromon__send_message)" if name == "use_tool" else name
+    assert expected_tool in message
+    assert intent in message
+    assert options[0]["kind"] in message
+    assert options[0]["optionId"] in message
+    answers = server.answers()
+    assert answers[0]["result"]["outcome"] == {"outcome": "cancelled"}
+    assert server.methods().count("session/cancel") == 1
+
+
+def test_missing_permission_option_preserves_an_earlier_identity_refusal(
+    project: tuple[Path, Path, Path],
+) -> None:
+    request = permission("other", "different_name")
+    request["params"]["options"] = []
+    server = FakeGrok([tool_call("other", "dromon__send_message"), request])
+
+    with pytest.raises(EngineRefused) as raised:
+        run(line(server, project, config=LineConfig(builtin_tools=("Read",))))
+
+    assert "changed the toolName" in str(raised.value)
+    assert "ACP offered no option" not in str(raised.value)
+    assert server.answers()[0]["result"]["outcome"] == {"outcome": "cancelled"}
+
+
 def test_the_turn_is_reported_to_the_observer_as_it_streams(
     project: tuple[Path, Path, Path],
 ) -> None:
@@ -3222,3 +3282,35 @@ def test_view_image_never_permits_image_generation_or_editing(
         server = FakeGrok([grok_call(name)])
         with pytest.raises(EngineRefused, match=f"not given: {name}"):
             run(line(server, project, config=config))
+
+
+def test_the_observed_task_output_sequence_is_counted_as_bash(
+    project: tuple[Path, Path, Path],
+) -> None:
+    # Observed on 2026-10-31. Grok's tool_call_update gives
+    # get_command_or_subagent_output the kind other, which held a live turn.
+    raw = {"task_ids": ["t1"], "timeout_ms": 180000}
+    server = FakeGrok(
+        [
+            grok_call("get_command_or_subagent_output", ident="o", raw_input=raw),
+            call_update(
+                "o",
+                kind="other",
+                title="Get task output",
+                rawInput={"variant": "TaskOutput", **raw},
+                _meta=grok_meta("get_command_or_subagent_output"),
+            ),
+        ]
+    )
+    config = LineConfig(builtin_tools=("Bash",))
+    assert run(line(server, project, config=config)).tool_uses == ("Bash",)
+
+
+def test_a_task_tool_of_kind_other_still_needs_bash(
+    project: tuple[Path, Path, Path],
+) -> None:
+    event = grok_call("kill_command_or_subagent")
+    event["params"]["update"]["kind"] = "other"
+    config = LineConfig(builtin_tools=("Read",))
+    with pytest.raises(EngineRefused, match="not given: kill_command_or_subagent"):
+        run(line(FakeGrok([event]), project, config=config))

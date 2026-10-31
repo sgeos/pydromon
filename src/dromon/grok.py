@@ -157,8 +157,8 @@ GROK_TOOL_KINDS: Final[dict[str, frozenset[str]]] = {
     "search_replace": frozenset({"edit"}),
     "write": frozenset({"edit"}),
     "run_terminal_command": frozenset({"execute"}),
-    "get_command_or_subagent_output": frozenset({"execute"}),
-    "kill_command_or_subagent": frozenset({"execute"}),
+    "get_command_or_subagent_output": frozenset({"execute", "other"}),
+    "kill_command_or_subagent": frozenset({"execute", "other"}),
     "web_fetch": frozenset({"fetch"}),
     "web_search": frozenset({"fetch", "search"}),
     "search_tool": frozenset({"other"}),
@@ -169,7 +169,10 @@ name, not merely with some tool of the line. **Review of d29174d, 2026-10-31.**
 **Fact, observed on 2026-10-31** in a Grok line turn of 58 tool calls, from each
 call's ``tool_call_update``: ``read_file`` as ``read``, ``grep`` as ``search``,
 ``run_terminal_command`` as ``execute``, ``list_dir``, ``search_tool`` and
-``use_tool`` as ``other``. The other entries are a **hypothesis** from the tool's
+``use_tool`` as ``other``, and in a later turn ``get_command_or_subagent_output`` as
+``other``, with Grok's own ``_meta`` kind ``background_task_action``.
+``kill_command_or_subagent`` shares that ``_meta`` kind, so ``other`` is **inferred**
+for it, not observed. The other entries are a **hypothesis** from the tool's
 purpose. A call with another kind is refused, which may refuse too much and never
 grants more, since what a call may do is decided by its name."""
 
@@ -1690,10 +1693,23 @@ class GrokLine:
             # request adds, so a request that omits the recorded kind keeps it.
             known = turn.calls.get(str(identifier), {})
             permitted = refusal is None and self._permits_request(known, tool_call)
-            options = cast(list[dict[str, Any]], params.get("options") or [])
-            await self._rpc().respond(
-                request_id, acp.permission_result(options, permitted)
+            label_fields = {**known, **tool_call}
+            label = grok_tool_name(label_fields) or acp.tool_label(label_fields)
+            if label == "use_tool":
+                target_name: object = known.get("target")
+                if isinstance(target_name, tuple):
+                    target_name = cast(tuple[Any, ...], target_name)[0]
+                if not isinstance(target_name, str):
+                    target = use_tool_target(label_fields.get("rawInput"))
+                    target_name = target[0] if target is not None else None
+                if isinstance(target_name, str):
+                    label = f"use_tool ({target_name})"
+            response, missing_option = acp.permission_result(
+                params.get("options"), permitted, label
             )
+            await self._rpc().respond(request_id, response)
+            if missing_option is not None:
+                refusal = refusal or missing_option
             if refusal is not None:
                 await self._cancel(turn, refusal)
             else:

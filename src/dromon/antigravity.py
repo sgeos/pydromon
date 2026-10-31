@@ -913,7 +913,7 @@ class AntigravityLine:
     ) -> None:
         raw: object = params.get("toolCall")
         tool_call = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
-        options = cast(list[dict[str, Any]], params.get("options") or [])
+        options = params.get("options")
         identifier = tool_call.get("toolCallId")
         question = isinstance(identifier, str) and identifier.startswith(
             QUESTION_PREFIX
@@ -934,7 +934,12 @@ class AntigravityLine:
         permitted = (
             refusal is None and acp.tool_name({**known, **tool_call}) in self.own_tools
         )
-        await self._rpc().respond(request_id, acp.permission_result(options, permitted))
+        response, missing_option = acp.permission_result(
+            options, permitted, acp.tool_label(tool_call)
+        )
+        await self._rpc().respond(request_id, response)
+        if missing_option is not None:
+            refusal = refusal or missing_option
         if refusal is not None:
             await self._cancel(turn, refusal)
             return

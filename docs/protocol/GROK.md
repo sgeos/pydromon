@@ -293,10 +293,13 @@ and workflows live in `$GROK_HOME`.
    is also accepted and counted once. A repeated announcement or another permission
    grant for an identifier already granted in the turn is refused.
 9. **Permission requests** are answered with an `allow_once` option for a permitted call
-   and a `reject` option otherwise. A tool call the line was not given, a refused
+   and a rejection option otherwise. A tool call the line was not given, a refused
    permission request, or the driver's tool budget, sends `session/cancel`, and every
-   permission request after it is answered as cancelled. Other requests from the agent
-   are answered with an error.
+   permission request after it is answered as cancelled. If the runtime offers no
+   option of the required kind, Dromon answers as cancelled, cancels and refuses the
+   turn with bounded evidence naming the tool, its intended decision and the offered
+   option kinds and identifiers. It never substitutes `allow_always` for `allow_once`.
+   Other requests from the agent are answered with an error.
 10. **Cancel.** **Re-review, N2.** After `session/cancel` Dromon waits at most
    `ABORT_SECONDS`, 60 seconds, for Grok to answer its prompt, and then leaves the
    connection, which stops Grok. An interrupted turn is reported as cancelled, and a
@@ -366,7 +369,9 @@ in a Grok line turn of 58 tool calls, from each `tool_call_update`: `read_file` 
 `read`, `grep` as `search`, `run_terminal_command` as `execute`, and `list_dir`,
 `search_tool` and `use_tool` as `other`. Twenty-six `use_tool` calls of Dromon's own
 tools passed in that turn. `list_dir` was first refused for `other`, which the table now
-allows. In a later turn on 2026-10-31, nineteen inline `use_tool` calls passed, and one in the
+allows. A later turn on 2026-10-31 showed `get_command_or_subagent_output` as `other` too, with Grok's
+`_meta` kind `background_task_action`, which `kill_command_or_subagent` shares, so `other`
+is allowed for both, observed for the first and inferred for the second. In a later turn on 2026-10-31, nineteen inline `use_tool` calls passed, and one in the
 file-backed form, with `tool_input_file`, was refused, as intended, since Dromon cannot see
 arguments Grok reads from a file only after the call is judged. Its refusal now says to pass
 the arguments inline. Grok wrote that file under `/tmp`, which the `workspace` base of the
@@ -383,7 +388,8 @@ each built-in, or of `use_tool`, has been recorded.
 | `list_dir` | `Read` or `Glob` | `read`, `search`, `other` |
 | `grep` | `Grep` | `search` |
 | `search_replace`, `write` | `Edit` or `Write` | `edit` |
-| `run_terminal_command`, `get_command_or_subagent_output`, `kill_command_or_subagent` | `Bash` | `execute` |
+| `run_terminal_command` | `Bash` | `execute` |
+| `get_command_or_subagent_output`, `kill_command_or_subagent` | `Bash` | `execute`, `other` |
 | `web_fetch` | `WebFetch` | `fetch` |
 | `web_search` | `WebSearch` | `fetch`, `search` |
 | `search_tool` | Always, as discovery | `other` |
@@ -627,6 +633,14 @@ user's MCP servers and reports no permission mode.
    Repeat with a line without `ViewImage` and `Read` and confirm that the view is
    refused. If no request arrives for `read_file`, record that the check is after
    the fact for this tool.
+7. **Permission options.** On a permitted call of one of Dromon's tools through
+   `use_tool`, record every `session/request_permission` option's `kind` and
+   `optionId`. Repeat with a call the line is not allowed to use. Confirm that Dromon
+   chooses only `allow_once` to permit and a rejection option to refuse, and that a
+   request with only unexpected kinds is answered as cancelled and refuses the turn.
+   In particular, confirm that Dromon never chooses `allow_always` to replace
+   `allow_once`. **The ACP permission option list has not been recorded on a live Grok
+   call.**
 
 ## Not at parity
 

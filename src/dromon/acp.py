@@ -38,6 +38,15 @@ Dromon governs through permission requests and tool updates."""
 
 METHOD_NOT_FOUND: Final = -32601
 
+PERMISSION_OPTION_COUNT: Final = 8
+"""At most this many offered permission options are named in a refusal."""
+PERMISSION_OPTION_FIELD_CHARACTERS: Final = 40
+"""The most of an offered option kind or identifier included in a refusal."""
+PERMISSION_TOOL_NAME_CHARACTERS: Final = 120
+"""The most of a tool name included in a missing-option refusal."""
+PERMISSION_REFUSAL_CHARACTERS: Final = 1200
+"""The maximum length of evidence retained when no permission option is usable."""
+
 MCP_SERVER_NAME: Final = "dromon"
 """The name under which a line's own tools reach the agent, as ``dromon__TOOL``."""
 
@@ -142,19 +151,64 @@ class Client:
 
 
 def permission_result(
-    options: Sequence[Mapping[str, Any]], permitted: bool
-) -> dict[str, object]:
+    options: object, permitted: bool, tool_name: str
+) -> tuple[dict[str, object], str | None]:
     """The answer to ``session/request_permission``. Only a single use is ever granted,
-    so no grant outlives the call. A refusal prefers a single rejection, and with no
-    option to choose the request is answered as cancelled, which the agent must treat
-    as not granted."""
+    so no grant outlives the call. A refusal prefers a single rejection. If no option
+    of the intended kind is offered, answer as cancelled and return bounded evidence
+    so the adapter can cancel and refuse the turn rather than leave it running."""
     wanted = ("allow_once",) if permitted else ("reject_once", "reject_always")
-    for kind in wanted:
-        for option in options:
-            chosen = option.get("optionId")
-            if option.get("kind") == kind and isinstance(chosen, str) and chosen:
-                return {"outcome": {"outcome": "selected", "optionId": chosen}}
-    return {"outcome": {"outcome": "cancelled"}}
+    if isinstance(options, Sequence) and not isinstance(options, (str, bytes)):
+        offered = cast(Sequence[Any], options)
+        for kind in wanted:
+            for option in offered:
+                if not isinstance(option, Mapping):
+                    continue
+                entry = cast(Mapping[str, Any], option)
+                chosen = entry.get("optionId")
+                if entry.get("kind") == kind and isinstance(chosen, str) and chosen:
+                    return (
+                        {"outcome": {"outcome": "selected", "optionId": chosen}},
+                        None,
+                    )
+    intent = "allow" if permitted else "refuse"
+    label = tool_name[:PERMISSION_TOOL_NAME_CHARACTERS] or "an unnamed tool"
+    evidence = _permission_options_evidence(cast(object, options))
+    message = (
+        f"ACP offered no option for Dromon to {intent} tool {label!r}; "
+        f"offered kinds and ids: {evidence}"
+    )[:PERMISSION_REFUSAL_CHARACTERS]
+    return {"outcome": {"outcome": "cancelled"}}, message
+
+
+def _permission_options_evidence(options: object) -> str:
+    if not isinstance(options, Sequence) or isinstance(options, (str, bytes)):
+        return "<invalid option list>"
+    offered = cast(Sequence[Any], options)
+    if not offered:
+        return "<none>"
+    entries: list[str] = []
+    for option in offered[:PERMISSION_OPTION_COUNT]:
+        if not isinstance(option, Mapping):
+            entries.append("<non-object>")
+            continue
+        entry = cast(Mapping[str, Any], option)
+        kind = entry.get("kind")
+        identifier = entry.get("optionId")
+        kind_text = (
+            kind[:PERMISSION_OPTION_FIELD_CHARACTERS]
+            if isinstance(kind, str)
+            else "<missing>"
+        )
+        identifier_text = (
+            identifier[:PERMISSION_OPTION_FIELD_CHARACTERS]
+            if isinstance(identifier, str)
+            else "<missing>"
+        )
+        entries.append(f"kind={kind_text!r}, optionId={identifier_text!r}")
+    if len(offered) > PERMISSION_OPTION_COUNT:
+        entries.append(f"… and {len(offered) - PERMISSION_OPTION_COUNT} more")
+    return ", ".join(entries)
 
 
 LABEL_CHARACTERS: Final = 200
