@@ -311,12 +311,17 @@ and refused, and a later update would have refused the turn for changing its tit
 A call whose `_meta["x.ai/tool"]` names the namespace `grok_build` is now judged by that
 name, which Grok writes and the model does not. `search_tool` is discovery and is
 counted as itself. `use_tool` is permitted only for one of the line's own tools in the
-inline form, with exactly `tool_name` and `tool_input` and at most a string `variant`,
-and is counted as that tool. Each of Grok's built-ins in the table below is permitted
+inline form, with exactly `tool_name` and `tool_input` and at most a `variant` of
+`UseTool`, and is counted as that tool. Each of Grok's built-ins in the table below is permitted
 by the line's tool beside it, and every other Grok tool is refused. Such a call is
 identified by its `_meta` name alone, so its title and kind may change, but a change of
 that name, an added `toolName` or a changed `use_tool` target refuses the turn. A
-permission request is judged by the name recorded for its call. A call without that
+permission request is judged by the name recorded for its call. **Review G1 and G2,
+2026-10-31.** A `kind` the call carries, at first sight or in any later update, must
+also be permitted. `search_tool` and `use_tool` must be `other`, and a built-in needs
+a kind the line may use by the ACP table above, so a `_meta` naming one tool cannot
+carry a kind that names another. A `_meta` name added in a later update to a call first
+judged without one refuses the turn. A call without that
 `_meta`, or in another namespace, is judged as before. **Hypothesis.** The table is
 read from the tool names in the session's `tool_definitions.json`, and no live call of
 each built-in, or of `use_tool`, has been recorded.

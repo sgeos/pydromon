@@ -137,6 +137,14 @@ USE_TOOL_VARIANT: Final = "variant"
 ``search_tool`` update of 2026-10-31 shows. It names the call's form and is the only
 key Dromon ignores when it compares inputs."""
 
+USE_TOOL_VARIANT_VALUE: Final = "UseTool"
+"""The only ``variant`` a ``use_tool`` input may carry. **Inference**, from the observed
+``SearchTool`` of ``search_tool``, not from a recorded ``use_tool`` call, so another
+value is refused, which fails closed."""
+
+META_TOOLS: Final = frozenset({"search_tool", "use_tool"})
+"""Grok's two tools that reach MCP servers, whose ACP kind is ``other``."""
+
 
 def grok_tool_name(fields: Mapping[str, Any]) -> str:
     """The name Grok gives one of its own tool calls in ``_meta["x.ai/tool"]``, or the
@@ -165,13 +173,13 @@ def grok_tool_name(fields: Mapping[str, Any]) -> str:
 def use_tool_target(raw_value: object) -> tuple[str, dict[str, Any]] | None:
     """The tool a ``use_tool`` input names and its arguments, in the documented inline
     form with exactly ``tool_name`` and ``tool_input``, or ``None`` for any other form.
-    A ``variant`` string Grok adds is ignored, and the file-backed forms are refused."""
+    A ``variant`` of ``UseTool`` is ignored, and the file-backed forms are refused."""
     if not isinstance(raw_value, dict):
         return None
     raw = cast(dict[str, object], raw_value)
-    variant = raw.get(USE_TOOL_VARIANT, "")
+    variant = raw.get(USE_TOOL_VARIANT, USE_TOOL_VARIANT_VALUE)
     if (
-        not isinstance(variant, str)
+        variant != USE_TOOL_VARIANT_VALUE
         or frozenset(raw) - {USE_TOOL_VARIANT} != USE_TOOL_KEYS
     ):
         return None
@@ -1501,6 +1509,8 @@ class GrokLine:
         the tool to count it as. ``search_tool`` only lists tools, ``use_tool`` may
         run only one of the line's own tools, and a built-in is permitted by
         ``GROK_TOOLS``. Any other name is refused."""
+        if not self._kind_agrees(name, tool_call):
+            return False, name[: acp.LABEL_CHARACTERS]
         if name == "search_tool":
             return True, name
         if name == "use_tool":
@@ -1513,6 +1523,20 @@ class GrokLine:
             return False, name[: acp.LABEL_CHARACTERS]
         given = allowed & set(self.config.builtin_tools)
         return bool(given), min(given) if given else name
+
+    def _kind_agrees(self, name: str, fields: Mapping[str, Any]) -> bool:
+        """Whether a ``kind`` the call carries is one the line may also use, so a
+        ``_meta`` name cannot let through a call whose kind says another tool. A call
+        without a kind agrees. ``search_tool`` and ``use_tool`` must be ``other``, and
+        a built-in must have a kind that ``KIND_TOOLS`` permits for this line.
+        **Review G1, 2026-10-31.**"""
+        if "kind" not in fields:
+            return True
+        kind = fields.get("kind")
+        if name in META_TOOLS:
+            return kind == "other"
+        allowed = KIND_TOOLS.get(str(kind))
+        return allowed is not None and bool(allowed & set(self.config.builtin_tools))
 
     def _permits_request(
         self, known: Mapping[str, object], tool_call: Mapping[str, Any]
@@ -1641,8 +1665,8 @@ class GrokLine:
         self._observe(ActivityKind.TOOL, name)
         await self._act(Event("tool_use", name), turn)
 
-    @staticmethod
     def _identity_refusal(
+        self,
         identifier: object,
         fields: Mapping[str, Any],
         calls: Mapping[str, Mapping[str, object]],
@@ -1650,7 +1674,14 @@ class GrokLine:
         """Check ACP identity and keep a `use_tool` target fixed after first sight."""
         recorded_call = calls.get(identifier) if isinstance(identifier, str) else None
         if recorded_call is not None and GROK_TOOL_META in recorded_call:
-            return GrokLine._grok_identity_refusal(identifier, fields, recorded_call)
+            return self._grok_identity_refusal(identifier, fields, recorded_call)
+        if recorded_call is not None and grok_tool_name(fields):
+            # Review G2. A _meta name added later to a call first judged without one
+            # would never be judged, so it refuses the turn.
+            return (
+                "the engine named its tool call"
+                f" {str(identifier)[: acp.LABEL_CHARACTERS]!r} in a later update"
+            )
         refusal = acp.identity_refusal(identifier, fields, calls)
         if refusal is not None or not isinstance(identifier, str):
             return refusal
@@ -1661,14 +1692,16 @@ class GrokLine:
             return "the engine changed the structured input of its use_tool call"
         return None
 
-    @staticmethod
     def _grok_identity_refusal(
-        identifier: object, fields: Mapping[str, Any], recorded: Mapping[str, object]
+        self,
+        identifier: object,
+        fields: Mapping[str, Any],
+        recorded: Mapping[str, object],
     ) -> str | None:
         """Why an update or a permission request for a call Grok named in its
         ``_meta`` refuses the turn, or ``None``. Its title and kind may change, since
         Grok rewrites them, but not its ``_meta`` name, a ``toolName`` it did not have,
-        or a ``use_tool`` target."""
+        or a ``use_tool`` target, and a kind it adds must agree with its name."""
         label = str(identifier)[: acp.LABEL_CHARACTERS]
         name = grok_tool_name(fields)
         if (name and name != recorded[GROK_TOOL_META]) or "toolName" in fields:
@@ -1682,6 +1715,12 @@ class GrokLine:
             and use_tool_target(fields["rawInput"]) != recorded.get("target")
         ):
             return "the engine changed the structured input of its use_tool call"
+        if not self._kind_agrees(str(recorded[GROK_TOOL_META]), fields):
+            return (
+                f"the engine gave its tool call {label!r} the kind"
+                f" {str(fields.get('kind'))[: acp.LABEL_CHARACTERS]!r}, which does not"
+                f" agree with {recorded[GROK_TOOL_META]}"
+            )
         return None
 
     async def _act(self, event: Event, turn: _Turn) -> None:

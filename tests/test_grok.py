@@ -2753,6 +2753,11 @@ def test_a_grok_use_tool_runs_only_the_line_tool_it_names(
         {"tool_name": "dromon__send_message", "tool_input_file": "/outside.json"},
         {"file": "/outside.json"},
         {"tool_name": "dromon__send_message", "tool_input": {}, "variant": 1},
+        {
+            "tool_name": "dromon__send_message",
+            "tool_input": {},
+            "variant": "FileBacked",
+        },
         {"tool_name": "dromon__send_message", "tool_input": {}, "server": "x"},
     ),
 )
@@ -2795,3 +2800,42 @@ def test_a_permission_request_is_judged_by_the_recorded_grok_name(
     granted = FakeGrok([grok_call("read_file"), grok_permission()])
     run(line(granted, project, config=given))
     assert granted.answers()[-1]["result"]["outcome"]["optionId"] == "yes"
+
+
+def test_a_grok_kind_that_disagrees_with_its_name_is_refused_at_first_sight(
+    project: tuple[Path, Path, Path],
+) -> None:
+    # Review G1. A read-only line must not run a call whose kind says execute, even
+    # when its _meta says read_file.
+    event = grok_call("read_file")
+    event["params"]["update"]["kind"] = "execute"
+    given = LineConfig(builtin_tools=("Read",))
+    with pytest.raises(EngineRefused, match="not given: read_file"):
+        run(line(FakeGrok([event]), project, config=given))
+
+
+@pytest.mark.parametrize(
+    ("name", "kind"), [("read_file", "execute"), ("search_tool", "read")]
+)
+def test_a_grok_kind_added_later_must_agree_with_its_name(
+    project: tuple[Path, Path, Path], name: str, kind: str
+) -> None:
+    given = LineConfig(builtin_tools=("Read",))
+    server = FakeGrok([grok_call(name), call_update("t", kind=kind)])
+    with pytest.raises(EngineRefused, match="does not agree"):
+        run(line(server, project, config=given))
+
+
+def test_a_grok_name_added_in_a_later_update_is_refused(
+    project: tuple[Path, Path, Path],
+) -> None:
+    # Review G2. A call first judged by its kind cannot be renamed by a later _meta.
+    given = LineConfig(builtin_tools=("Read",))
+    server = FakeGrok(
+        [
+            tool_call("read", ident="t"),
+            call_update("t", _meta=grok_meta("run_terminal_command")),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="in a later update"):
+        run(line(server, project, config=given))
