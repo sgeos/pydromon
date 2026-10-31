@@ -1548,7 +1548,10 @@ class GrokLine:
         tool. A call without a kind agrees. **Review G1, 2026-10-31.**"""
         if "kind" not in fields:
             return True
-        return fields.get("kind") in GROK_TOOL_KINDS.get(name, frozenset[str]())
+        kind = fields.get("kind")
+        # Review G-A. A kind that is not text, such as a list, is refused rather than
+        # left to raise before the permission request is answered.
+        return isinstance(kind, str) and kind in GROK_TOOL_KINDS.get(name, frozenset())
 
     def _permits_request(
         self, known: Mapping[str, object], tool_call: Mapping[str, Any]

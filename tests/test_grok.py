@@ -2882,3 +2882,25 @@ def test_a_grok_kind_its_name_allows_is_accepted(
     event["params"]["update"]["kind"] = kind
     config = LineConfig(builtin_tools=given)
     assert run(line(FakeGrok([event]), project, config=config)).tool_uses == (counted,)
+
+
+@pytest.mark.parametrize("kind", [["read"], {"kind": "read"}, 3])
+def test_a_grok_kind_that_is_not_text_is_refused(
+    project: tuple[Path, Path, Path], kind: object
+) -> None:
+    # Review G-A. A non-string kind once raised TypeError before Dromon answered.
+    event = grok_call("read_file")
+    event["params"]["update"]["kind"] = kind
+    config = LineConfig(builtin_tools=("Read",))
+    with pytest.raises(EngineRefused, match="not given: read_file"):
+        run(line(FakeGrok([event]), project, config=config))
+
+
+def test_a_permission_request_whose_kind_disagrees_is_refused(
+    project: tuple[Path, Path, Path],
+) -> None:
+    # Review G-B. The permission path judges the kind against the recorded name too.
+    config = LineConfig(builtin_tools=("Read", "Bash"))
+    server = FakeGrok([grok_call("read_file"), grok_permission(kind="execute")])
+    with pytest.raises(EngineRefused, match="does not agree"):
+        run(line(server, project, config=config))
