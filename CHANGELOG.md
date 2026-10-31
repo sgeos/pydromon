@@ -7,6 +7,14 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- Grok sessions now set the model to the exact identifier in the driver's settings
+  when `session/new` or `session/load` reports another model. Dromon requires a model
+  config option, requires the `models` field and model option to agree when both are
+  reported, and checks the complete updated option list with the driver before
+  prompting. Conflicting or unreadable model reports refuse the turn. A successful
+  pin supersedes a mismatching notice held before its response, while a later mismatch
+  refuses the turn. Tests cover new and resumed sessions, successful selection,
+  refusal, conflicting model reports and a post-pin model notice.
 - A Claude Code line reads engine messages of up to `MAX_MESSAGE_CHARACTERS`, 32 MiB of
   characters, which Dromon now passes to the Agent SDK as its buffer size in place of
   its default of 1 MiB. A turn whose engine still sends a longer message ends with a
