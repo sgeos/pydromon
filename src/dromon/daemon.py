@@ -200,6 +200,11 @@ VIEW_PREVIEW_CHARACTERS: Final = 600
 VIEW_BUDGET_BYTES: Final = 40_000
 """Room for messages in a ``line_view`` response, below the 64 KiB line limit."""
 
+REPLIES_BUDGET_BYTES: Final = 40_000
+"""The most bytes, as written in JSON, of the entries and the echoed identifier that
+one ``replies`` answer carries, fields and bodies alike, so that it fits one protocol
+line of 64 KiB with the response's own fields and counts to spare."""
+
 IDLE_TIMEOUT_SECONDS: Final = 30.0
 """A connection that sends nothing for this long is closed."""
 
@@ -665,6 +670,7 @@ class Daemon:
                 | Operation.QUESTIONS
                 | Operation.ANSWER
                 | Operation.MAIL
+                | Operation.REPLIES
                 | Operation.READ
                 | Operation.ACKNOWLEDGE
                 | Operation.SENT
@@ -712,6 +718,8 @@ class Daemon:
                     result = self._answer(request.args)
                 case Operation.MAIL:
                     result = self._mail(request.args)
+                case Operation.REPLIES:
+                    result = self._replies(request.args)
                 case Operation.READ:
                     result = self._read(request.args)
                 case Operation.ACKNOWLEDGE:
@@ -1049,6 +1057,97 @@ class Daemon:
                 }
                 for message_id, message in page
             ],
+        }
+
+    def _replies(self, args: dict[str, object]) -> dict[str, object]:
+        """The replies in an operator's mailbox to one message, with their bodies,
+        oldest first, marking none of them read.
+
+        **Round 9, item 5.** ``read`` marks a message read, so a wait loop that
+        counted unread replies could not also read them without changing its own
+        count. This query answers both. It is not read-only in the log. It delivers
+        the operator's undelivered mail first, as ``mail`` and ``collect`` do, since
+        an operator's client showing it is its delivery, and so it appends
+        ``message_delivered`` events. Delivery is not reading, and no message is
+        marked read. Round 9 review, F11.
+
+        **Round 9 review, F13.** Each entry as written, its fields as well as its
+        body, and the echoed identifier are counted against
+        ``REPLIES_BUDGET_BYTES``, so the answer fits one protocol line whatever its
+        fields hold. A body past what is left is withheld, with its size, for
+        ``read`` to open, and an entry whose fields alone do not fit is left out with
+        every entry after it, counted in ``left_out``, for a later page to give."""
+        allowed = {"operator", "message_id", "unread_only", "offset", "limit"}
+        if not {"operator", "message_id"} <= set(args) or not set(args) <= allowed:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST,
+                f"replies takes {sorted(allowed)}, with operator and message_id",
+            )
+        operator_text, message_id = _text_args(
+            {"operator": args["operator"], "message_id": args["message_id"]},
+            ("operator", "message_id"),
+        )
+        unread_only = args.get("unread_only", False)
+        offset = args.get("offset", 0)
+        limit = args.get("limit", MAX_PAGE)
+        if type(unread_only) is not bool:
+            raise ProtocolError(ErrorCode.BAD_REQUEST, "unread_only is not a boolean")
+        if type(offset) is not int or type(limit) is not int:
+            raise ProtocolError(ErrorCode.BAD_REQUEST, "offset and limit are integers")
+        if offset < 0 or not 1 <= limit <= MAX_PAGE:
+            raise InvalidField(
+                f"offset must be at least 0 and limit in [1, {MAX_PAGE}]"
+            )
+        if message_id not in self.log.state.messages:
+            # Round 9 review, F12, accepted by the operator. This tells any operator
+            # who holds the socket whether an identifier exists. Identifiers are
+            # random, so the signal is low, and the socket is the operator's own.
+            raise EventRejected(f"no message {message_id}")
+        owner = OperatorAddress(operator_text)
+        self.scheduler.collect(owner)
+        found = [
+            (reply_id, message)
+            for reply_id, message in self.log.state.messages.items()
+            if message.recipient == owner and message.reply_to == message_id
+        ]
+        unread = sum(not message.read for _, message in found)
+        matching = [item for item in found if not unread_only or not item[1].read]
+        replied = replied_ids(self.log.state, owner)
+        entries: list[dict[str, object]] = []
+        left_out = 0
+        budget = REPLIES_BUDGET_BYTES - _written(message_id)
+        for reply_id, message in matching[offset : offset + limit]:
+            entry: dict[str, object] = {
+                "message_id": reply_id,
+                "sender": str(message.sender),
+                "kind": message.kind.value,
+                "read": message.read,
+                "outcome": outcome(reply_id, message, replied),
+                "body": None,
+                "body_bytes": len(message.body.encode("utf-8")),
+            }
+            # The comma that separates it from the entry before.
+            fields = _written(entry) + 1
+            if left_out or fields > budget:
+                # Entries stay in order, so once one is left out so is every later
+                # one, and the next page begins at the first left out.
+                left_out += 1
+                continue
+            budget -= fields
+            # Measured as written, since escaping can enlarge a body sixfold, and in
+            # place of the ``null`` already counted.
+            body = _written(message.body) - _written(None)
+            if body <= budget:
+                entry["body"] = message.body
+                budget -= body
+            entries.append(entry)
+        return {
+            "message_id": message_id,
+            "total": len(matching),
+            "replies": len(found),
+            "unread": unread,
+            "left_out": left_out,
+            "messages": entries,
         }
 
     def _line_view(self, args: dict[str, object]) -> dict[str, object]:
@@ -1643,6 +1742,12 @@ def _landed(found: Mapping[str, object], was_set: bool) -> dict[str, object]:
         "source": found["source"],
         "shadowed": was_set and found["source"] != OVERRIDE,
     }
+
+
+def _written(value: object) -> int:
+    """The bytes ``value`` takes in a protocol line, which is written compactly and
+    without escaping beyond JSON's own, as ``dromon.protocol`` writes it."""
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode())
 
 
 def _question_summary(message_id: str, message: Message) -> dict[str, object]:

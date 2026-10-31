@@ -1456,9 +1456,11 @@ def test_line_status_cites_the_worktree_and_daemon_commits(
     compact = json.loads(compact_text)
     loaded_at = compact["daemon"]["loaded_at"]
     assert loaded_at == world.scheduler.daemon_status()["loaded_at"]
+    # Round 9, item 4. The cite names the daemon's own checkout, and a fake checkout
+    # that git cannot read is stale on its moved HEAD alone, which the cite says.
     stale_tail = (
-        f", whose checkout has since moved to {moved} after the daemon loaded its"
-        f" code at {loaded_at}."
+        f", whose own checkout has since moved to {moved} after the daemon loaded its"
+        f" code at {loaded_at}, with its code not compared."
     )
     assert compact["commits"]["stale"] is True
     assert compact["commits"]["cite"].endswith(stale_tail)

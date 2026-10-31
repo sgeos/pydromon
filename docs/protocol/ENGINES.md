@@ -246,6 +246,51 @@ unverified. Without the flag the refusal names it. The flag is refused without
 **Never a credential store.** No check opens a credential file itself. A test runs
 Pi's check with its `auth.json` made unreadable, and the check still succeeds.
 
+## The longest Claude Code message
+
+The Agent SDK reads Claude Code's output one line of JSON at a time, and refuses a line
+longer than its buffer size, whose default is 1 MiB. **Fact.** It counts the
+characters of the line, not its bytes, although its error says bytes. A refusal stops
+the SDK reading the engine, so the turn ends, and a kept connection is closed.
+
+**What was seen, 2026-10-31.** A Claude Code line of another project ended its turn on
+that refusal, inferred to be on a tool result that carried a file of about 1 MB, and
+again after a two-line Edit of a 2.5 MB file. Each turn then said only that the
+engine's process ended.
+
+**Why an Edit is large.** Read in Claude Code 2.1.310, as bundled with Agent SDK
+0.2.174, without running it. **Fact.** Its schema for a user message in the stream
+describes `tool_use_result` as the tool's full output object, not the text the model
+is sent, and its stream writer copies the tool's output there. Edit's output holds
+`originalFile`, the file's contents before the edit, beside the patch, and a Write
+that replaces a file holds both the old and the new content. The code that empties
+those fields was found only where Claude Code stores copies of results on disk, under
+its `toolResultCopiesOnDisk` setting. **Inference.** An Edit's message is at least as
+long as the file it edits, however small the edit. No live turn confirmed it.
+
+**The bound.** `dromon.engine.MAX_MESSAGE_CHARACTERS`, 32 MiB of characters, is
+passed as `ClaudeAgentOptions.max_buffer_size` on every Claude Code turn. It is over
+ten times the largest file a line was seen to edit, which leaves room for a result
+that carries a file twice and for the escapes of its JSON form. **Inference.** While
+it reads one message the SDK holds about four copies of it, its chunks, the joined
+text, the split line and the parsed object, so one message at the bound costs some
+130 MB of memory for ASCII text, and up to four times that for text whose characters
+take four bytes each. Each line reads its own engine, so the worst case grows with the
+number of lines that receive such a message at once. A larger bound would only move
+the failure to a larger file.
+
+**A message past the bound.** The turn ends with `EngineRefused` and the text of
+`MESSAGE_TOO_LONG`, which names the limit and gives a tool result that carries a large
+file, such as an Edit, a Write or a Read of a file of several megabytes, as the likely
+cause. That holds for a one-shot turn and for a kept connection's turn, whose reader
+records the cause before the connection is marked dead, which tests cover. A
+self-started turn Dromon admitted is given the same text, which no test covers yet.
+The next turn starts a new engine, and its prompt says the old one
+ended. Any other error the SDK raises ends the turn as before. **Porting hazard.** The
+SDK gives the refusal no type of its own, so `dromon.engine.TOO_LONG_PREFIX` matches
+the start of its text, and a test takes that text from the SDK's own reader, so an SDK
+upgrade that changes it fails there.
+
 ## Probe evidence
 
 `dromon probe --record` writes every frame the adapter sent and received during its

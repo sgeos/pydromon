@@ -33,7 +33,15 @@ POLL_INTERVAL_SECONDS: Final = 0.05
 
 
 class DaemonNotRunning(Exception):
-    """No daemon accepts connections on the project's socket."""
+    """No daemon accepts connections on the project's socket. ``missing`` says that
+    the socket file itself is absent, which a stopped daemon or a deleted project
+    leaves, rather than that a connection to it was refused. **Round 9 review, F14.**
+    A refusal can also come from a live daemon whose listen backlog is full, as on
+    Darwin, so an attached client weighs the two differently."""
+
+    def __init__(self, reason: str, *, missing: bool = False) -> None:
+        super().__init__(reason)
+        self.missing = missing
 
 
 class DaemonFailed(Exception):
@@ -58,7 +66,10 @@ def call(
         try:
             connection.connect(str(socket_path))
         except (FileNotFoundError, ConnectionRefusedError) as error:
-            raise DaemonNotRunning(f"no daemon listens on {socket_path}") from error
+            raise DaemonNotRunning(
+                f"no daemon listens on {socket_path}",
+                missing=isinstance(error, FileNotFoundError),
+            ) from error
         connection.sendall(encode_request(request))
         line = _read_line(connection)
     response = decode_response(line)

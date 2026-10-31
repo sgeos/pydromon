@@ -122,17 +122,33 @@ def alive(pid: int) -> bool:
             timeout=10,
             check=False,
         ).stdout.strip()
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
+        # A ps slowed past its bound, as under heavy load, has not shown the process
+        # gone, so it counts as alive and the caller asks again within its deadline.
         return True
     return not state.startswith("Z")
 
 
-def gone(pid: int) -> bool:
-    for _ in range(200):
+GONE_SECONDS = 4 * (launcher.LAUNCHER_EXIT_SECONDS + launcher.KILLED_EXIT_SECONDS)
+"""How long a process the launcher ended may take to be gone, read from the launcher's
+own bounds. **Round 9, item 7.** The daemon waits ``LAUNCHER_EXIT_SECONDS`` for a
+launcher and ``KILLED_EXIT_SECONDS`` more once it kills one, so a process the stop
+ended is gone well within their sum, and the factor is the margin for a machine so
+loaded that one run at a load average of 189 failed a wait of a fixed number of polls.
+The check is unchanged, since the process must still be gone, and only how long the
+test waits to see it is derived."""
+
+
+def gone(pid: int, seconds: float = GONE_SECONDS) -> bool:
+    """Whether ``pid`` is gone, polled until a monotonic deadline ``seconds`` away,
+    whatever each poll costs."""
+    deadline = time.monotonic() + seconds
+    while True:
         if not alive(pid):
             return True
+        if time.monotonic() >= deadline:
+            return False
         time.sleep(0.05)
-    return False
 
 
 RECORD_SECONDS = 30
