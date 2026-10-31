@@ -103,6 +103,7 @@ from dromon import gitssh
 from dromon.gitssh import GitSshAccess, GitSshError, sandbox_layer, unreadable
 from dromon.processes import environment_reading_works
 from dromon.roles import RoleConflict, RoleWanted, plan_file_roles, seat_order
+from dromon.relay import AsyncRelay, OperatorRelayer, RelayConfigError, build_routes
 from dromon.workdir import git_write_guards, read_head_commit, resolve_workdir
 from dromon.configview import (
     OVERRIDE,
@@ -263,6 +264,8 @@ class Daemon:
     each peer over its own transport. Tests give their own."""
     successor: list[str] | None = field(default=None, init=False)
     """The options a successor starts with, once a restart is ready to stop."""
+    relayer: OperatorRelayer | None = field(default=None, init=False)
+    """The operators' relayer, once ``serve`` has made it."""
     _watches: set["asyncio.Task[None]"] = field(
         default_factory=lambda: set[asyncio.Task[None]](), init=False, repr=False
     )
@@ -624,6 +627,31 @@ class Daemon:
         self.scheduler.on_outbox = forwarder.notify
         self.scheduler.peer_reports = forwarder.reports
         return forwarder
+
+    def relay_routes(self, config: ProjectConfig) -> dict[str, AsyncRelay]:
+        """The relay of each operator ``config`` routes. Raises ``ProjectMismatch``
+        for a relay refused now, including a notice file outside the daemon's
+        protected state or runtime directories, so a start or reload names it and
+        changes nothing."""
+        protected_dirs(self.paths, config.federation)
+        root = self.paths.root
+        state_runtime_dirs = (self.paths.state_dir, self.paths.runtime_dir)
+
+        try:
+            return build_routes(config.relays, root, state_runtime_dirs)
+        except RelayConfigError as error:
+            raise ProjectMismatch(f"the project file is refused: {error}") from error
+
+    def operator_relayer(self) -> OperatorRelayer:
+        """The relayer for the project's operators, which the scheduler tells of each
+        message to an operator. Made with no routes as well, so ``dromon status``
+        reports the unrouted mail."""
+        relayer = OperatorRelayer(
+            self.scheduler, self.relay_routes(self.project), time.monotonic
+        )
+        self.scheduler.on_operator_mail = relayer.notify
+        self.relayer = relayer
+        return relayer
 
     def execute(self, request: Request) -> Response:
         """Answer one decoded request with operator authority."""
@@ -1088,8 +1116,16 @@ class Daemon:
         return {"message_id": message_id}
 
     def _mail(self, args: dict[str, object]) -> dict[str, object]:
-        """A page of an operator's mailbox, with its summary. Listing delivers."""
-        allowed = {"operator", "unread_only", "sender", "offset", "limit"}
+        """A page of an operator's mailbox, with its summary. Listing delivers.
+        issues_only lists the open issues lines raised. Round 11, item 3."""
+        allowed = {
+            "operator",
+            "unread_only",
+            "sender",
+            "issues_only",
+            "offset",
+            "limit",
+        }
         if "operator" not in args or not set(args) <= allowed:
             raise ProtocolError(
                 ErrorCode.BAD_REQUEST, f"mail takes {sorted(allowed)}, with operator"
@@ -1099,8 +1135,11 @@ class Daemon:
         offset = args.get("offset", 0)
         limit = args.get("limit", MAX_PAGE)
         sender = args.get("sender")
-        if type(unread_only) is not bool:
-            raise ProtocolError(ErrorCode.BAD_REQUEST, "unread_only is not a boolean")
+        issues_only = args.get("issues_only", False)
+        if type(unread_only) is not bool or type(issues_only) is not bool:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST, "unread_only and issues_only are booleans"
+            )
         if type(offset) is not int or type(limit) is not int:
             raise ProtocolError(ErrorCode.BAD_REQUEST, "offset and limit are integers")
         if sender is not None and not isinstance(sender, str):
@@ -1113,6 +1152,7 @@ class Daemon:
                 owner,
                 unread_only=unread_only,
                 sender=None if sender is None else parse_any_address(sender),
+                issues_only=issues_only,
                 offset=offset,
                 limit=limit,
             )
@@ -1154,7 +1194,14 @@ class Daemon:
         fields hold. A body past what is left is withheld, with its size, for
         ``read`` to open, and an entry whose fields alone do not fit is left out with
         every entry after it, counted in ``left_out``, for a later page to give."""
-        allowed = {"operator", "message_id", "unread_only", "offset", "limit"}
+        allowed = {
+            "operator",
+            "message_id",
+            "sender",
+            "unread_only",
+            "offset",
+            "limit",
+        }
         if not {"operator", "message_id"} <= set(args) or not set(args) <= allowed:
             raise ProtocolError(
                 ErrorCode.BAD_REQUEST,
@@ -1181,11 +1228,22 @@ class Daemon:
             # random, so the signal is low, and the socket is the operator's own.
             raise EventRejected(f"no message {message_id}")
         owner = OperatorAddress(operator_text)
+        sender_text = args.get("sender")
+        sender: LineAddress | None = None
+        if sender_text is not None:
+            if not isinstance(sender_text, str):
+                raise ProtocolError(ErrorCode.BAD_REQUEST, "sender is not text")
+            address = parse_any_address(sender_text)
+            if not isinstance(address, LineAddress):
+                raise ProtocolError(ErrorCode.BAD_REQUEST, "sender must name a line")
+            sender = address
         self.scheduler.collect(owner)
         found = [
             (reply_id, message)
             for reply_id, message in self.log.state.messages.items()
-            if message.recipient == owner and message.reply_to == message_id
+            if message.recipient == owner
+            and message.reply_to == message_id
+            and (sender is None or message.sender == sender)
         ]
         unread = sum(not message.read for _, message in found)
         matching = [item for item in found if not unread_only or not item[1].read]
@@ -1434,6 +1492,7 @@ class Daemon:
             raise OverrideError(str(error)) from error
         check_project(self.log, config)
         check_roles(self.scheduler, self.log, config)
+        routes = self.relay_routes(config)
         terms = project_terms(config, self.paths)
         check_lines_sandboxed(config, self.log, self.scheduler)
         for line_id in sorted(set(self.project.lines) - set(config.lines)):
@@ -1454,6 +1513,8 @@ class Daemon:
         self.project_file_present = present
         self.apply_project_values()
         notices = apply_roles(self.scheduler, self.log, config)
+        if self.relayer is not None:
+            self.relayer.set_routes(routes)
         return {
             "file": str(file),
             "present": present,
@@ -1740,6 +1801,7 @@ class Daemon:
             "peers": [
                 report.wire(detail=True) for report in self.scheduler.peer_reports()
             ],
+            "relays": None if self.relayer is None else self.relayer.report(),
             "agents": {
                 "listen": self.agents.listen,
                 "anonymous": self.agents.anonymous.value,
@@ -2446,11 +2508,14 @@ async def serve(daemon: Daemon) -> None:
         servers.append(tls_listener)
     # Made before any task starts, so that a log it cannot read stops the start cleanly.
     forwarder = daemon.forwarder()
+    relayer = daemon.operator_relayer()
     daemon.scheduler.recover()
     scheduling = asyncio.create_task(daemon.scheduler.run(daemon.stop_requested))
     forwarding = asyncio.create_task(forwarder.run(daemon.stop_requested))
+    relaying = asyncio.create_task(relayer.run(daemon.stop_requested))
     scheduling.add_done_callback(watch_task("scheduler", daemon.stop_requested))
     forwarding.add_done_callback(watch_task("forwarder", daemon.stop_requested))
+    relaying.add_done_callback(watch_task("relayer", daemon.stop_requested))
     try:
         # The umask already gives 0600, and this states it rather than relying on it.
         socket_path.chmod(0o600)
@@ -2463,6 +2528,11 @@ async def serve(daemon: Daemon) -> None:
         # sockets open.
         with contextlib.suppress(Exception):
             await forwarding
+        # A relay command still running is killed with its process group, and its
+        # notice stays undelivered for the next start.
+        relaying.cancel()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await relaying
         for listening in servers:
             listening.close()
         for writer in list(writers):
@@ -2913,6 +2983,7 @@ def run(
     }
     launcher.configure(paths.left_reports)
     successor: list[str] | None = None
+    scheduler: Scheduler | None = None
     try:
         with EventLog(paths.event_log) as log:
             scheduler = Scheduler(
@@ -2926,6 +2997,7 @@ def run(
                     line_socket=paths.line_socket,
                     line_secrets=line_secrets,
                     line_git_ssh=line_git_ssh,
+                    read_only_paths=config.read_only_paths,
                 ),
                 limits=limits,
                 default_operator=operator,
@@ -2934,6 +3006,7 @@ def run(
                 wake_every_ticks=config.wake_every_ticks,
                 root=paths.root,
                 protected=protected_dirs(paths, config.federation),
+                read_only_paths=config.read_only_paths,
                 daemon_commit=read_head_commit(Path(__file__).parent),
                 daemon_checkout=Path(__file__).parent,
                 processes_identifiable=environment_reading_works(),
@@ -2976,6 +3049,9 @@ def run(
                 daemon.apply_project_values()
                 for notice in apply_roles(scheduler, log, config):
                     print(f"dromond: {notice}", file=sys.stderr)
+                # Checked here as well as in ``serve``, so a refused relay stops the
+                # start before any socket is made.
+                daemon.relay_routes(config)
                 asyncio.run(serve(daemon))
                 successor = daemon.successor
             finally:
@@ -2993,6 +3069,8 @@ def run(
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
     finally:
+        if scheduler is not None:
+            scheduler.stop_workers()
         for stale in (
             paths.socket,
             paths.agent_socket,

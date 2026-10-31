@@ -80,6 +80,40 @@ def resolve_workdir(workdir: str | None, root: Path, protected: Sequence[Path]) 
     return real
 
 
+def resolve_read_only_paths(paths: Sequence[str], workdir: Path) -> tuple[Path, ...]:
+    """Resolve existing relative file or directory paths inside ``workdir``.
+
+    Both the workdir and each target are compared as real paths, so a symbolic link
+    cannot make a configured path point outside the line's workdir. A missing path
+    refuses the line rather than silently leaving a typo unprotected.
+    """
+    root = Path(os.path.realpath(workdir))
+    found: set[Path] = set()
+    for entry in paths:
+        relative = Path(entry)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ConfigError(
+                f"read_only_paths entry {entry!r} must be relative and stay inside"
+                " the workdir"
+            )
+        try:
+            resolved = (root / relative).resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ConfigError(
+                f"read_only_paths entry {entry!r} does not exist: {error}"
+            ) from error
+        if resolved != root and root not in resolved.parents:
+            raise ConfigError(
+                f"read_only_paths entry {entry!r} resolves outside the workdir"
+            )
+        if not resolved.is_file() and not resolved.is_dir():
+            raise ConfigError(
+                f"read_only_paths entry {entry!r} is not a file or directory"
+            )
+        found.add(resolved)
+    return tuple(sorted(found))
+
+
 def _pointer(file: Path, prefix: str) -> str:
     """The path a git pointer file holds, after ``prefix``, or ``SandboxError``."""
     try:

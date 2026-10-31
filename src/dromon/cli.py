@@ -23,6 +23,7 @@ import dromon
 from dromon import __version__, exits, restart
 from dromon import proposals as proposal_store
 from dromon.client import (
+    REQUEST_TIMEOUT_SECONDS,
     SHUTDOWN_TIMEOUT_SECONDS,
     STARTUP_TIMEOUT_SECONDS,
     DaemonFailed,
@@ -70,6 +71,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "questions": "list open operator questions",
     "answer": "answer an operator question",
     "mail": "look through an operator's mailbox",
+    "wait": "wait for a reply to one of an operator's messages",
     "read": "open a message in an operator's mailbox",
     "ack": "acknowledge a message without replying",
     "sent": "show what became of the mail an operator sent",
@@ -159,10 +161,41 @@ def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     for entry in peers:
         if isinstance(entry, dict):
             print(_peer_row(cast(Mapping[str, object], entry)))
+    relays = result.get("relays")
+    if isinstance(relays, dict):
+        for row in _relay_rows(cast(Mapping[str, object], relays)):
+            print(row)
     totals = result.get("correlation")
     if isinstance(totals, dict):
         print(_correlation_row(cast(Mapping[str, object], totals)))
     return exits.OK
+
+
+def _relay_rows(relays: Mapping[str, object]) -> list[str]:
+    """The lines of ``dromon status`` for the operators' relays: who is routed,
+    what was relayed, what waits unrouted, and each failing notice with its reason.
+    Nothing is printed for a project with no route and no operator mail waiting."""
+    routed = relays.get("routed")
+    names = cast(list[object], routed) if isinstance(routed, list) else []
+    unrouted = relays.get("unrouted")
+    if not names and not unrouted:
+        return []
+    rows = [
+        "relays for "
+        + (", ".join(f"@{name}" for name in names) if names else "no operator")
+        + f", {relays.get('delivered')} relayed since the start,"
+        f" {unrouted} waiting unrouted, {relays.get('failing')} failing"
+    ]
+    found = relays.get("failures")
+    for entry in cast(list[object], found) if isinstance(found, list) else []:
+        if isinstance(entry, dict):
+            failure = cast(Mapping[str, object], entry)
+            rows.append(
+                f"  {failure.get('message_id')} for @{failure.get('operator')},"
+                f" attempt {failure.get('attempts')}, again in"
+                f" {failure.get('retry_in_seconds')}s: {failure.get('reason')}"
+            )
+    return rows
 
 
 def _correlation_row(totals: Mapping[str, object]) -> str:
@@ -771,6 +804,8 @@ def _mail(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     }
     if arguments.sender is not None:
         args["sender"] = arguments.sender
+    if arguments.issues:
+        args["issues_only"] = True
     response = _call(paths, "mail", Operation.MAIL, args)
     if isinstance(response, int):
         return response
@@ -839,6 +874,111 @@ def _replies(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             f" {arguments.offset + len(entries)} gives them."
         )
     return exits.OK
+
+
+WAIT_POLL_SECONDS: Final = 0.5
+MAX_WAIT_SECONDS: Final = 86400.0
+
+
+def _wait(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Poll the bounded replies query until a matching reply arrives or time expires.
+
+    Polling is in the client process. Each socket call has a timeout no longer than the
+    remaining wait, so neither the daemon's event loop nor this client waits without a
+    bound.
+    """
+    timeout: float = arguments.timeout
+    if not math.isfinite(timeout) or not 0 < timeout <= MAX_WAIT_SECONDS:
+        print(
+            f"dromon wait: --timeout must be greater than 0 and at most"
+            f" {MAX_WAIT_SECONDS:g} seconds",
+            file=sys.stderr,
+        )
+        return exits.USAGE
+    deadline = time.monotonic() + timeout
+    args: dict[str, object] = {
+        "operator": arguments.operator,
+        "message_id": arguments.replies_to,
+        "limit": 50,
+    }
+    if arguments.sender is not None:
+        args["sender"] = arguments.sender
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return _wait_timeout(arguments.replies_to, timeout)
+        try:
+            response = call(
+                paths.socket,
+                Operation.REPLIES,
+                timeout_seconds=min(REQUEST_TIMEOUT_SECONDS, remaining),
+                args=args,
+            )
+        except DaemonNotRunning:
+            print(f"dromon wait: daemon stopped for {paths.root}", file=sys.stderr)
+            return exits.NOT_RUNNING
+        except TimeoutError:
+            if time.monotonic() >= deadline:
+                return _wait_timeout(arguments.replies_to, timeout)
+        except (ProtocolError, OSError) as error:
+            print(f"dromon wait: {error}", file=sys.stderr)
+            return exits.FAILURE
+        else:
+            if not response.ok or response.result is None:
+                print(f"dromon wait: {response.error_message}", file=sys.stderr)
+                return exits.FAILURE
+            entries = response.result.get("messages")
+            replies = response.result.get("replies")
+            left_out = response.result.get("left_out")
+            if (isinstance(entries, list) and entries) or (
+                type(replies) is int and replies > 0
+            ):
+                _print_wait_replies(
+                    arguments.replies_to,
+                    cast(list[object], entries) if isinstance(entries, list) else [],
+                )
+                if type(left_out) is int and left_out > 0:
+                    noun = "reply" if left_out == 1 else "replies"
+                    print(
+                        f"{left_out} matching {noun} did not fit this answer."
+                        " Use dromon mail --replies-to to page through them."
+                    )
+                return exits.OK
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return _wait_timeout(arguments.replies_to, timeout)
+        time.sleep(min(WAIT_POLL_SECONDS, remaining))
+
+
+def _wait_timeout(message_id: str, timeout: float) -> int:
+    print(
+        f"dromon wait: timed out after {timeout:g} seconds waiting for a reply to"
+        f" {message_id}",
+        file=sys.stderr,
+    )
+    return exits.FAILURE
+
+
+def _print_wait_replies(message_id: str, value: object) -> None:
+    """Print reply bodies returned by the query without marking them read."""
+    if not isinstance(value, list):
+        return
+    for entry in cast(list[object], value):
+        if not isinstance(entry, dict):
+            continue
+        reply = cast(dict[str, object], entry)
+        reply_id = reply.get("message_id")
+        sender = reply.get("sender")
+        print(f"reply {reply_id} from {sender} to {message_id}")
+        body = reply.get("body")
+        if isinstance(body, str):
+            for row in body.splitlines() or [""]:
+                print(f"  {row}")
+        else:
+            print(
+                f"  The {reply.get('body_bytes')} byte body did not fit the reply"
+                " query. Use dromon read to open it."
+            )
 
 
 def _ack(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
@@ -1855,6 +1995,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "questions": _questions,
     "answer": _answer,
     "mail": _mail,
+    "wait": _wait,
     "read": _read,
     "ack": _ack,
     "sent": _sent,
@@ -2430,14 +2571,37 @@ def build_parser() -> argparse.ArgumentParser:
                 default=default_operator(),
                 help="the operator answering, default %(default)s",
             )
-        if name in ("mail", "read", "ack", "sent"):
+        if name in ("mail", "read", "ack", "sent", "wait"):
             command.add_argument(
                 "--operator",
                 default=default_operator(),
                 help="whose mailbox, default %(default)s",
             )
+        if name == "wait":
+            command.add_argument(
+                "--replies-to", required=True, metavar="MESSAGE", help="the message"
+            )
+            command.add_argument(
+                "--from",
+                dest="sender",
+                default=None,
+                metavar="LINE",
+                help="wait only for a reply from this line",
+            )
+            command.add_argument(
+                "--timeout",
+                type=float,
+                default=300.0,
+                metavar="SECONDS",
+                help="maximum wait, default 300 seconds",
+            )
         if name == "mail":
             command.add_argument("--unread", action="store_true", help="unread only")
+            command.add_argument(
+                "--issues",
+                action="store_true",
+                help="open issues lines raised, closed by a reply or dromon ack",
+            )
             command.add_argument(
                 "--from", dest="sender", default=None, help="one sender"
             )

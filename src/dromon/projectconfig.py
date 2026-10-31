@@ -66,6 +66,7 @@ from dromon.federation import (
     parse_federation,
 )
 from dromon.gitssh import GitSshConfig, GitSshError, parse_git_ssh
+from dromon.relay import NO_RELAYS, RelayConfig, RelayConfigError, parse_relays
 from dromon.teacher import TeacherConfig, TeacherError, parse_teacher
 
 CONFIG_FILE_NAME: Final = "dromon.toml"
@@ -88,9 +89,12 @@ TOP_KEYS: Final = frozenset(
         "git_ssh",
         "leases",
         "runs",
+        "read_only_paths",
         "profiles",
         "lines",
         "roles",
+        "relays",
+        "operators",
     }
 )
 DAEMON_KEYS: Final = frozenset(
@@ -119,6 +123,7 @@ DEFAULT_LEASE_TTL: Final = 10800
 MIN_LEASE_TTL: Final = 60
 MAX_LEASE_TTL: Final = 86400
 MAX_LEASES: Final = 256
+MAX_READ_ONLY_PATHS: Final = 256
 TOOL_KEYS: Final = frozenset(
     {
         "builtin_tools",
@@ -275,8 +280,13 @@ class ProjectConfig:
     )
     """The commands lines may start as supervised runs, by name, each as its
     program and arguments. ``docs/architecture/RUNS.md`` is normative."""
+    read_only_paths: tuple[str, ...] = ()
+    """Project-relative-path entries denied write access under every line's workdir."""
     lines: dict[str, LineDefinition] = field(default_factory=dict[str, LineDefinition])
     roles: dict[str, RoleDefinition] = field(default_factory=dict[str, RoleDefinition])
+    relays: RelayConfig = NO_RELAYS
+    """The project's relays to operators and each operator's route, none by
+    default, so operators' mail waits for a client as before."""
 
 
 def config_path(state_dir: Path) -> Path:
@@ -418,6 +428,7 @@ class _Reader:
                 raise self.fail(error.key, str(error)) from error
         lease_names, lease_ttl = self.leases(top.get("leases", {}))
         run_commands = self.runs(top.get("runs", {}))
+        read_only_paths = self.read_only_paths(top.get("read_only_paths", []))
         profiles = self.profiles(top.get("profiles", {}))
         lines_table = top.get("lines", {})
         if not isinstance(lines_table, dict):
@@ -431,6 +442,10 @@ class _Reader:
                     "is true, but the file has no [git_ssh] table to give the line",
                 )
         roles = self.roles(top.get("roles", {}), lines)
+        try:
+            relays = parse_relays(top.get("relays"), top.get("operators"))
+        except RelayConfigError as error:
+            raise self.fail(error.key, error.reason) from error
         return ProjectConfig(
             operator=operator,
             tick_seconds=tick,
@@ -447,9 +462,41 @@ class _Reader:
             lease_names=lease_names,
             lease_ttl_seconds=lease_ttl,
             run_commands=run_commands,
+            read_only_paths=read_only_paths,
             lines=lines,
             roles=roles,
+            relays=relays,
         )
+
+    def read_only_paths(self, value: object) -> tuple[str, ...]:
+        """Relative paths to protect under each line's resolved workdir."""
+        if (
+            not isinstance(value, list)
+            or len(cast(list[object], value)) > MAX_READ_ONLY_PATHS
+        ):
+            raise self.fail(
+                "read_only_paths",
+                f"must be a list of at most {MAX_READ_ONLY_PATHS} paths",
+            )
+        found: set[str] = set()
+        for item in cast(list[object], value):
+            if (
+                not isinstance(item, str)
+                or not item
+                or len(item) > 4096
+                or "\x00" in item
+            ):
+                raise self.fail("read_only_paths", "entries must be non-empty paths")
+            path = Path(item)
+            if path.is_absolute() or ".." in path.parts:
+                raise self.fail(
+                    "read_only_paths",
+                    f"path {item!r} must be relative and stay inside each workdir",
+                )
+            if item in found:
+                raise self.fail("read_only_paths", f"names path {item!r} twice")
+            found.add(item)
+        return tuple(sorted(found))
 
     def limits(self, value: object, key: str, base: Limits) -> Limits:
         document = self.table(value, key, LIMIT_KEYS)

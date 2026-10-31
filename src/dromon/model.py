@@ -27,7 +27,25 @@ from enum import StrEnum
 from typing import Final, assert_never
 
 ID_PATTERN: Final = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
-"""Identifiers and engine names. ASCII only, so every port compares them bytewise."""
+"""Identifiers. ASCII only, so every port compares them bytewise."""
+
+MODEL_PATTERN: Final = re.compile(
+    r"[a-z0-9][a-z0-9._-]{0,63}(:[a-z0-9][a-z0-9._/-]{0,127})?"
+)
+"""The model a line runs, the ``engine`` field of ``line_created`` and ``line_rebound``.
+It is an identifier, or an engine-qualified name as ``dromon.driver.ENGINE_OF`` gives
+it, an identifier, one colon and the harness's own identifier, which may also hold
+``/``, as Pi's ``openai/gpt-6-luna`` does.
+
+The colon and the slash are needed so that a line can be created on Pi, Cursor Agent or
+Antigravity at all, which the identifier pattern refused until 2026-10-31. Nothing else
+changes. The name stays ASCII and lowercase, so every port still compares it bytewise,
+it holds at most one colon, so the engine is the text before it, and it never begins
+with ``@``, ``&`` or ``!``, so it never reads as an address.
+
+**Assumption.** No harness identifier in the packaged catalogue holds an uppercase
+letter or a character outside this set. A model that did would need this pattern
+widened, which is a change to the log's grammar."""
 
 OPERATOR_PREFIX: Final = "@"
 """Marks an operator address. It never appears in an identifier, so a line address and
@@ -41,6 +59,16 @@ TOKEN_HASH: Final = re.compile(r"[0-9a-f]{64}")
 
 MAX_TEXT_BYTES: Final = 1024 * 1024
 """Upper bound on the UTF-8 size of a message body."""
+
+MAX_OPEN_ISSUES_PER_LINE: Final = 5
+"""At most five unclosed issues from one line may burden an operator."""
+
+ISSUE_RATE_WINDOW_MESSAGES: Final = 20
+MAX_ISSUES_PER_LINE_IN_WINDOW: Final = 3
+"""At most three issues in a line's last twenty sent messages, including the new one.
+This replay-deterministic rate limit does not depend on wall-clock time, so it slows a
+line by messages, not by time. ``MAX_OPEN_ISSUES_PER_LINE`` is the bound that holds,
+since only an operator frees an open slot."""
 
 MAX_CONFIG_BYTES: Final = 256 * 1024
 """Upper bound on the UTF-8 size of a line's stored tool configuration."""
@@ -83,6 +111,12 @@ def check_id(name: str, value: object) -> None:
     """Raise ``InvalidField`` unless ``value`` is a valid identifier."""
     if not isinstance(value, str) or ID_PATTERN.fullmatch(value) is None:
         raise InvalidField(f"{name} is not a valid identifier: {value!r}")
+
+
+def check_model(name: str, value: object) -> None:
+    """Raise ``InvalidField`` unless ``value`` is a valid model name."""
+    if not isinstance(value, str) or MODEL_PATTERN.fullmatch(value) is None:
+        raise InvalidField(f"{name} is not a valid model name: {value!r}")
 
 
 def check_optional_id(name: str, value: object) -> None:
@@ -338,6 +372,12 @@ LINE_TRANSITIONS: Final[frozenset[tuple[LineState, LineState]]] = frozenset(
 class MessageKind(StrEnum):
     NOTE = "note"
     QUESTION = "question"
+    ISSUE = "issue"
+    """A harness or operator-experience issue a line raises with an operator unasked.
+    It asks no answer, and it is open until the operator replies to it or
+    acknowledges it. ``docs/protocol/LINE_CONFIG.md`` records why it is a kind of
+    mail rather than a tracker. **Rollback hazard.** A daemon older than this kind
+    refuses a log that holds one, since its codec knows only notes and questions."""
 
 
 class ReturnCode(StrEnum):
@@ -435,7 +475,7 @@ class LineCreated:
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
-        check_id("engine", self.engine)
+        check_model("engine", self.engine)
         check_id("strategy", self.strategy)
 
 
@@ -536,7 +576,7 @@ class LineRebound:
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
-        check_id("engine", self.engine)
+        check_model("engine", self.engine)
         check_id("strategy", self.strategy)
 
 
@@ -3067,8 +3107,46 @@ class State:
             if not isinstance(event.recipient, OperatorAddress):
                 raise EventRejected("a question is addressed to an operator")
             self._live_line(event.sender.line_id)
+        if event.kind is MessageKind.ISSUE:
+            if not isinstance(event.sender, LineAddress):
+                raise EventRejected("only a line raises an issue")
+            if not isinstance(event.recipient, OperatorAddress):
+                raise EventRejected("an issue is raised with an operator")
+            if event.reply_to is not None or event.choices:
+                raise EventRejected("an issue opens a thread, and has no choices")
+            self._check_issue_limits(event.sender.line_id)
         if event.reply_to is not None:
             self._check_reply(event, event.reply_to)
+
+    def _check_issue_limits(self, line_id: str) -> None:
+        """Bound a line's open issues and issue rate using replayed message order."""
+        sender = LineAddress(line_id)
+        replies = {
+            (message.sender, message.reply_to)
+            for message in self.messages.values()
+            if message.reply_to is not None
+        }
+        open_issues = sum(
+            message.kind is MessageKind.ISSUE
+            and message.sender == sender
+            and not message.acknowledged
+            and (message.recipient, message_id) not in replies
+            for message_id, message in self.messages.items()
+        )
+        if open_issues >= MAX_OPEN_ISSUES_PER_LINE:
+            raise EventRejected(
+                f"at most {MAX_OPEN_ISSUES_PER_LINE} issues may remain open;"
+                " wait for an operator reply or acknowledgment"
+            )
+        recent = [
+            message for message in self.messages.values() if message.sender == sender
+        ][-(ISSUE_RATE_WINDOW_MESSAGES - 1) :]
+        issue_count = sum(message.kind is MessageKind.ISSUE for message in recent)
+        if issue_count >= MAX_ISSUES_PER_LINE_IN_WINDOW:
+            raise EventRejected(
+                f"at most {MAX_ISSUES_PER_LINE_IN_WINDOW} issues are allowed in"
+                f" {ISSUE_RATE_WINDOW_MESSAGES} sent messages; wait for a reply"
+            )
 
     def _check_harness_note(self, event: MessageSent) -> None:
         """The harness sends notes on its own account to a line or an operator of

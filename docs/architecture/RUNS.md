@@ -35,6 +35,11 @@ resolves against that working directory, and a bare name such as `make` through 
 daemon's `PATH`. An operator who wants a command whose code no line can write declares
 it by an absolute path outside every line's working directory.
 
+A declared command must not daemonize, by `setsid` or otherwise, because a process that
+leaves the supervisor's session is not found when a lost run is reconciled, so the run
+is cleared automatically while that process may still run, as the lost run section
+below says. **Decided by the operator, 2026-10-31.**
+
 ## Trust
 
 A run executes with the daemon's authority and outside every engine sandbox. That is
