@@ -289,7 +289,9 @@ class Daemon:
 
     def apply_project_values(self) -> None:
         """Give the scheduler the project-wide values the layers resolve to. Stored
-        overrides that no longer resolve are skipped, so they cannot stop a start."""
+        overrides that no longer resolve are skipped, so they cannot stop a start.
+        The scheduler is given the file too, for ``role_view``."""
+        self.scheduler.set_project_file(self.project)
         try:
             values = project_values(self.project_layers())
         except (ValueError, InvalidField) as error:
@@ -2791,8 +2793,11 @@ def check_roles(scheduler: Scheduler, log: EventLog, config: ProjectConfig) -> N
         plan_file_roles(
             log.state, config, scheduler.default_operator, scheduler.wall_due()
         )
-    except RoleConflict as error:
-        raise ProjectMismatch(str(error)) from error
+        # Round 10 review, F2, F3 and F4. The one-writer rule, on the state the file
+        # would make, so a file that breaks it is refused whole.
+        scheduler.check_project_file(config)
+    except (RoleConflict, EventRejected) as error:
+        raise ProjectMismatch(f"the project file is refused: {error}") from error
 
 
 def apply_roles(
@@ -2834,6 +2839,7 @@ def apply_project(scheduler: Scheduler, log: EventLog, config: ProjectConfig) ->
                 definition.strategy,
                 definition.config,
                 definition.session,
+                placement_checked=True,
             )
         else:
             stored = (
@@ -2842,7 +2848,9 @@ def apply_project(scheduler: Scheduler, log: EventLog, config: ProjectConfig) ->
                 else decode_config(existing.config)
             )
             if stored != definition.config:
-                scheduler.configure_line(line_id, definition.config)
+                scheduler.configure_line(
+                    line_id, definition.config, placement_checked=True
+                )
         scheduler.set_line_policy(
             line_id, definition.limits, definition.wake_every_ticks
         )

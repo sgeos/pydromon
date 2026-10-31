@@ -34,6 +34,7 @@ as well.
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Final, Literal
 
 from dromon.model import (
@@ -170,7 +171,8 @@ def plan_file_roles(
     **Round 10.** A retired role is never declared again, so its table is left out. A
     role an operator holds, because a ``dromon role`` command changed it, is left as
     it is while its table differs, and returns to the file, with ``role_held``, once
-    the table agrees with it. A seat the file names that an operator bound to another
+    the table agrees with it, in a pass that also records the file's first owner of a
+    role that never had one. A seat the file names that an operator bound to another
     role is left out. A role the file held and no longer declares stays as it was,
     since the file never retires a role."""
     trial = state.copy()
@@ -223,7 +225,9 @@ def plan_file_roles(
                 f"role {role_id} agrees with the project file again, so the file"
                 " holds it from now"
             )
-            continue
+            # Round 10 review, F5. The pass goes on, so the file's first owner is
+            # recorded now rather than at the next start or reload. The terms and
+            # seats agree, so the steps before the owner's add nothing.
         declared = RoleDeclared(
             role_id,
             definition.workdir,
@@ -405,12 +409,19 @@ def plan_role_set(
 
 
 def plan_role_retire(
-    state: State, role_id: str, by: OperatorAddress, at: str
+    state: State,
+    role_id: str,
+    by: OperatorAddress,
+    at: str,
+    *,
+    unbind_refused: Mapping[str, str],
 ) -> RoleChange:
     """The operator ``by`` retires ``role_id``, which unbinds each of its seats first,
     as the model requires. An owned role is refused, so it is vacated or handed over
-    first. The seats stay lines, the journal stays in the log, and the identifier is
-    never declared again. Raises ``RoleConflict``, recording nothing."""
+    first, and so is a role a seat of which may not be unbound now, as
+    ``unbind_refused`` gives from the scheduler. The seats stay lines, the journal
+    stays in the log, and the identifier is never declared again. Raises
+    ``RoleConflict``, recording nothing."""
     role = state.roles.get(role_id)
     if role is None:
         raise _no_role(state, role_id)
@@ -420,6 +431,9 @@ def plan_role_retire(
             f" vacate {role_id}, or hand it over, before it is deleted"
         )
     seats = seat_order(state, role_id)
+    for line_id in seats:
+        if line_id in unbind_refused:
+            raise RoleConflict(unbind_refused[line_id])
     events: list[Event] = [SeatUnbound(line_id, role_id) for line_id in seats]
     if by.operator_id not in state.operators:
         events.insert(0, OperatorRegistered(by.operator_id))
@@ -747,6 +761,97 @@ def waits_unconfined(
         return False
     owner = state.roles[seat.role_id].owner
     return owner is not None and owner != line_id and engine not in confining
+
+
+@dataclass(frozen=True, slots=True)
+class RolePlace:
+    """Where a role's worktree is and who owns it, as a placement check reads them.
+    ``worktree`` is the real path the daemon resolved, and ``workdir`` the path as
+    written, which a refusal names."""
+
+    workdir: str
+    worktree: Path
+    owner: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class LinePlace:
+    """Where a line would run, whether it could write there, and the role it is a
+    seat of, if any, as a placement check reads them. ``workdir`` is as written and
+    ``directory`` the real path the daemon resolved."""
+
+    workdir: str
+    directory: Path
+    writes: bool
+    seat_of: str | None
+
+
+def placement_refusal(
+    line_id: str, line: LinePlace, places: Mapping[str, RolePlace]
+) -> str | None:
+    """Why ``line_id`` may not run as ``line`` describes, among the roles of
+    ``places``, or ``None``. **Round 10 review, F2 and F4.** The one-writer rule is the
+    invariant. An owner runs only in its role's worktree, and a line that could
+    write does not run in the worktree of a role another seat owns unless it is a
+    seat of that role, where its access is read. A seat that does not own its role
+    may run elsewhere, as it must while a vacant role is moved, and is then read as
+    any line there, with ``writes`` as its own role's confinement leaves it. It
+    gains its role only once it runs in the worktree, as the scheduler checks.
+    Worktrees are compared by real path. Bounded by the roles of ``places``.
+
+    **Not covered.** A worktree inside another, such as a role on the project root
+    and another below it, is not a shared worktree here, since the operator's rule
+    compares real paths for equality."""
+    if line.seat_of is not None:
+        place = places.get(line.seat_of)
+        # A worktree that does not resolve builds no engine, so nothing runs there.
+        if place is None or line.directory == place.worktree:
+            return None
+        if place.owner == line_id:
+            return (
+                f"line {line_id} owns role {line.seat_of}, so it runs in the role's"
+                f" worktree {place.workdir}, not in {line.workdir}. Vacate the role"
+                f" with dromon role vacate {line.seat_of}, or hand it over, first"
+            )
+    if not line.writes:
+        return None
+    for role_id, place in sorted(places.items()):
+        if (
+            role_id == line.seat_of
+            or place.owner is None
+            or line.directory != place.worktree
+        ):
+            continue
+        return (
+            f"line {line_id} could write {line.workdir}, the worktree of role"
+            f" {role_id}, which {place.owner} owns, and is not a seat of the role."
+            f" Make it a seat with dromon role update {role_id}, configure it with"
+            " workdir_access read, or give it another workdir"
+        )
+    return None
+
+
+def shared_worktree(places: Mapping[str, Path]) -> tuple[str, str] | None:
+    """The first two roles of ``places``, by identifier, whose worktrees are the same
+    real path, or ``None``. **Round 10 review, F3.** Two roles on one worktree would
+    have two owners writing it. Bounded by the roles of ``places``."""
+    seen: dict[Path, str] = {}
+    for role_id, worktree in sorted(places.items()):
+        other = seen.get(worktree)
+        if other is not None:
+            return other, role_id
+        seen[worktree] = role_id
+    return None
+
+
+def shared_worktree_refusal(first: str, second: str, workdir: str) -> str:
+    """The refusal for roles ``first`` and ``second`` sharing ``workdir``, named in
+    identifier order."""
+    first, second = sorted((first, second))
+    return (
+        f"roles {first} and {second} would share the worktree {workdir}, so two"
+        " owners could write it. Give each role its own worktree"
+    )
 
 
 def seat_order(state: State, role_id: str) -> tuple[str, ...]:

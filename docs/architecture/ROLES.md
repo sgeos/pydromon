@@ -99,16 +99,24 @@ retire a role, and a test pins that. `dromon role status` reads every term.
 **Refusals.** The owner's seat is never unbound and an owned role is never retired. The
 refusal says to vacate the role with `dromon role vacate` or hand it over first, and
 the model refuses both events as well. The owner is never barred from owning, and an
-owned role's worktree never moves, as before. A seat other than the owner of an owned
-role is not unbound while its line runs in the role's worktree, could write it and is
-neither hibernated nor stopped, because once unbound it would run beside the owner as
-an ordinary line outside the rule of one writer. Hibernating it, or vacating the role,
-first lets it go. This is default deny. A command that changes nothing is refused.
+owned role's worktree never moves, as before. **Decided by the operator on
+2026-10-31, round 10 review, F1.** A seat with a turn in flight is never unbound,
+hibernated or not, by an update or a delete, and whether or not the role has an owner,
+since the turn goes on with the tools and access it began with. The refusal says to
+wait for the turn or stop it with `dromon interrupt`. A seat other than the owner of an
+owned role is not unbound while it could write the role's worktree, because once
+unbound it would be a writer there beside the owner, and the one-writer rule below
+refuses that. Hibernating or stopping it no longer lets it go, since either can be
+undone. Configuring it read only, moving it elsewhere, or vacating the role does. This
+is default deny. A command that changes nothing is refused.
 
 **Lines are never created or changed implicitly.** A role command creates no line,
 binds only lines that exist, and changes no line's configuration. A seat must already
-run in the role's worktree, as the project file requires, so a seat elsewhere is
-refused with the command that moves it, `dromon configure`. No separate command to
+run in the role's worktree when it is bound, as the project file requires, so a seat
+elsewhere is refused with the command that moves it, `dromon configure`. A seat that
+does not own the role may be moved elsewhere afterwards, as the seats of a vacant role
+are before the role is moved, and it then gains the role only once it runs in the
+worktree again. No separate command to
 remove a line is needed, since a role command never needs a line to be gone, only no
 longer a seat. **Inference.** Removing a line from the team is therefore an update
 that leaves it out, followed by hibernating or stopping the line if it should not run.
@@ -159,6 +167,63 @@ the rest of the file applies. **Inference.** The way to make a run-time change
 permanent is to write it into the file, after which the next reload finds the two
 agree and the file holds the role again.
 
+**Round 10 review, F5 and F6.** A role that returns to the file is given the file's
+first owner in the same pass, where it never had one, rather than at the next start or
+reload. `dromon role status` and a seat's `role_status` show who holds each role,
+whether the project file declares it, and, for a role an operator holds, each term and
+seat that differs from the file, since a notice reaches only whoever ran the start or
+the reload.
+
+### The one-writer rule on every path
+
+**Decided by the operator on 2026-10-31, round 10 review.** The one-writer rule is the
+invariant, and every path that can break it refuses, saying what to do instead.
+`roles.placement_refusal` states the rule once, and every path below applies it.
+
+- **An owner runs in its role's worktree.** A configuration, from `dromon configure`
+  or the project file, that would move the owning seat elsewhere is refused, and the
+  refusal says to vacate the role or hand it over first. A seat that runs elsewhere is
+  refused the role by a give, a take, a handoff and a handoff request, and is not
+  usable for a failover, until it is moved back. F2.
+- **A writer in an owned worktree is a seat of its role.** A line that is not a seat
+  of a role, and could write that role's worktree while another seat owns the role, is
+  refused by `dromon create`, `dromon configure`, `dromon set` for a model or a tool,
+  `dromon rebind`, the project file, and the unbinding of a seat. Whether it could
+  write is `lineconfig.can_write_workdir`, which reads its access, its tools and its
+  engine, so a line configured with `workdir_access` read may join. A seat that does
+  not own its role counts as not writing on an engine that confines it. F4.
+- **Two roles never share a worktree.** `dromon role create` and `update`, and the
+  project file, refuse a worktree that is another role's, compared by real path, so a
+  symbolic link does not hide it. A file that declares it, within itself or against a
+  role only in the log, is refused whole at a start and at a reload, naming both
+  roles. F3.
+- **A line the rule did not place still cannot write beside an owner.** A line that a
+  log made before the rule left in an owned worktree, or one that was there before
+  the role gained an owner, does not start a turn, and a new owner's first turn waits
+  for one in flight. `dromon role status` names it. This is default deny.
+- **A seat that does not own its role is built read only.** **Fact, round 10 review,
+  F7.** The confining engines were derived from the capability table in 2ffa0d6, but
+  the step that builds a seat's engine with its read access was never added, so until
+  this round a seat that did not own its role ran on Claude Code or Codex with its own
+  access, which is write by default, beside the owner. The engine of such a seat is
+  now built with `workdir_access` read, and its own configuration is never widened.
+  **Failure mode.** A seat whose configuration Claude Code refuses for a read-only
+  working directory, such as one with project settings, plugins, an allow-all policy
+  or MCP servers, now fails its turn as its engine is built and is held, rather than
+  running as a writer.
+
+The project file is checked against the state it would make. Its roles are planned on
+a copy of the log's state, and each line, the file's and those only in the log, is
+read with the file's configuration where it gives one and the line's overrides over
+it. A line the log made before the rule refuses the file too, and the refusal names
+it, since the rule is not loosened for an existing file.
+
+**Not covered.** A worktree inside another, such as a role on the project root and
+another below it, is not treated as shared, since the rule compares real paths for
+equality. A seat on an engine that cannot confine it runs while its role is vacant,
+as before, and is then read as a writer wherever it runs. The checks resolve real
+paths on the file system, which a port must do the same way.
+
 **Rollback hazard.** A daemon older than round 10 does not know `seat_unbound`,
 `role_retired` or `role_held`, so once any of them is in the log, the older daemon
 cannot read the log at all, as for the `unreported` field of `line_turn_ended`. A
@@ -183,16 +248,15 @@ role. Its mail waits, as a hibernated line's does, until it owns the role or the
 lets it run unconfined. This is default deny. Which adapters can confine a seat is for
 the engines role to establish, and the capability table is where it is recorded.
 **Implemented,** except the operator's leave to run unconfined, which is not built.
-**Fact.** The engines role's read-only seats are on a branch not yet merged, so the
-daemon counts no engine as able to confine a seat, and a seat runs only while it owns
-its role or the role is vacant. A seat of a vacant role runs so that it can take the
-role. Once the branch merges, the engines whose capability table entry says they can
-make the worktree read only are counted, and their seats are built with read access.
-**Decided by the operator on 2026-10-27.** The merge derives the set from the
-capability table's entries that give `read_only_workdir` as yes, and does not type it
-in by hand, so the set cannot fall out of step with the table. Grok's entry is
-unknown, so Grok stays out of the set until an operator probe confirms it. Until the
-merge the set stays empty, which `roles.CONFINING_ENGINES` records.
+A seat of a vacant role runs so that it can take the role. The engines whose
+capability table entry says they can make the worktree read only are counted, and
+their seats are built with read access. **Decided by the operator on 2026-10-27.** The
+set is derived from the capability table's entries that give `read_only_workdir` as
+yes, and is not typed in by hand, so the set cannot fall out of step with the table.
+Grok's entry is unknown, so Grok stays out of the set until an operator probe confirms
+it. **Fact.** The set holds Claude Code and Codex since 2ffa0d6, and their seats are
+built with read access only since the round 10 review, as the one-writer rule above
+records.
 
 **Never two writers.** A take while the owner runs is refused, and the operator who
 must take it now sends `interrupt` first. **Decided by the operator on 2026-10-27.** An
@@ -506,9 +570,12 @@ line without a role behaves exactly as today.
 ## Failure modes
 
 - **Two writers.** Prevented by the sandbox where an engine can confine a seat, by not
-  waking a seat that cannot be confined, and by never changing owner during a turn. A
-  process that outlived its engine on a platform that cannot see it remains possible,
-  and is said to the new owner.
+  waking a seat that cannot be confined, by never changing owner during a turn, and by
+  the one-writer rule on every path that places a line, binds or unbinds a seat, or
+  declares a role. A process that outlived its engine on a platform that cannot see
+  it remains possible, and is said to the new owner. A writer that does not go through
+  Dromon, such as the operator's own session in a role's worktree, is outside the
+  rule.
 - **A stale handoff.** The stamp is observed, but its content can be out of date. The
   checklist requires content checks as well as ancestry.
 - **An inherited dirty tree.** The successor records what it found and does not adopt

@@ -6,6 +6,7 @@ daemon and scheduler over a real event log. The new events, ``seat_unbound``,
 restart, and a reload of the project file against a role an operator changed reports
 what it leaves, as ``docs/architecture/ROLES.md`` states."""
 
+import asyncio
 import json
 from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime
@@ -18,12 +19,13 @@ from claude_agent_sdk import SdkMcpTool
 from dromon import cli, exits
 from dromon.agents import DAEMON_TOOLS
 from dromon.configview import Overrides
-from dromon.daemon import Daemon, apply_roles
+from dromon.daemon import Daemon, ProjectMismatch, apply_roles, check_roles
 from dromon.driver import Strategy
 from dromon.eventlog import EventLog
-from dromon.lineconfig import LineConfig
+from dromon.lineconfig import LineConfig, WorkdirAccess, encode_config
 from dromon.model import (
     EventRejected,
+    LineConfigured,
     LineCreated,
     OperatorAddress,
     OperatorRegistered,
@@ -243,7 +245,7 @@ def test_a_created_seat_is_offered_the_role_tools_and_its_engine_is_rebuilt(
         (("core", "--workdir", ".", "--seats", "delta"), "role core exists"),
         (("docs", "--workdir", DOCS, "--seats", "echo,nobody"), "no line nobody"),
         (("docs", "--workdir", DOCS, "--seats", "echo,delta"), "line delta runs in"),
-        (("docs", "--workdir", ".", "--seats", "alpha"), "is a seat of role core"),
+        (("docs", "--workdir", ".", "--seats", "delta"), "roles core and docs would"),
         (("docs", "--workdir", DOCS, "--seats", ""), "a role has 1 to 16 seats"),
         (("docs", "--workdir", "../out", "--seats", "echo"), "workdir"),
         (("docs", "--workdir", DOCS, "--seats", "echo,echo"), "names a line twice"),
@@ -309,7 +311,7 @@ def test_update_changes_terms_and_reorders_adds_and_removes_seats(
     assert status == exits.OK, err
     assert desk.log.state.roles["core"].handoff_seconds == 900
     assert desk.log.state.holder_of("core") is RoleHolder.OPERATOR
-    # beta is hibernated, so it may leave an owned role. delta joins, ahead of alpha.
+    # beta cannot write, so it may leave an owned role. delta joins, ahead of alpha.
     status, out, err = dromon("role", "update", "core", "--seats", "delta,alpha,gamma")
     assert status == exits.OK, err
     assert desk.seats("core") == {"alpha": True, "gamma": False, "delta": True}
@@ -329,7 +331,7 @@ def test_update_changes_terms_and_reorders_adds_and_removes_seats(
     [
         (("--seats", "beta,gamma"), "Vacate the role with dromon role vacate core"),
         (("--no-own", "alpha"), "must give the role up"),
-        (("--seats", "alpha,beta"), "Hibernate it with dromon hibernate gamma"),
+        (("--seats", "alpha,beta"), "Unbound, it would be such a line"),
         (("--workdir", DOCS, "--seats", "echo,fox"), "line alpha owns role core"),
         (("--workdir", DOCS), "runs in ., not in the role's worktree"),
         (("--handoff-seconds", "3600"), "role core is so already"),
@@ -745,3 +747,325 @@ def test_no_line_tool_and_no_agent_tool_changes_a_role(desk: Desk) -> None:
     for word in ("create", "update", "delete", "retire", "declare", "bind"):
         assert not [name for name in names if "role" in name and word in name], word
     assert all("role" not in spec.name for spec in DAEMON_TOOLS)
+
+
+# Round 10 review. The one-writer rule is the invariant, and every path that can break
+# it refuses. Each test below failed on 99184f7, which the review read.
+
+
+def in_flight(desk: Desk, line_id: str) -> None:
+    """Mark a turn of ``line_id`` as in flight, as a running turn's task does."""
+    running = desk.scheduler._running  # pyright: ignore[reportPrivateUsage]
+    running[line_id] = cast("asyncio.Task[None]", object())
+
+
+def test_a_hibernated_seat_with_a_turn_in_flight_is_refused_leave(desk: Desk) -> None:
+    """F1, the review's first probe. Hibernating lets the turn finish, so it no longer
+    exempts the seat."""
+    desk.scheduler.hibernate("gamma")
+    in_flight(desk, "gamma")
+    refusals = desk.scheduler._unbind_refusals("core")  # pyright: ignore[reportPrivateUsage]
+    assert "line gamma has a turn in flight" in refusals["gamma"]
+
+
+def test_the_command_refuses_a_hibernated_seat_with_a_turn_in_flight(
+    desk: Desk, dromon: Run
+) -> None:
+    """F1, the review's second probe, through ``dromon role update``."""
+    desk.scheduler.hibernate("gamma")
+    in_flight(desk, "gamma")
+    before = desk.log.last_seq
+    status, _, err = dromon("role", "update", "core", "--seats", "alpha,beta")
+    assert status == exits.FAILURE
+    assert "line gamma has a turn in flight" in err
+    assert "dromon interrupt gamma" in err
+    assert desk.log.last_seq == before and "gamma" in desk.seats("core")
+
+
+def test_a_running_seat_is_refused_for_its_turn_first(desk: Desk, dromon: Run) -> None:
+    """F1, the review's control, which now names the turn rather than hibernation."""
+    in_flight(desk, "gamma")
+    status, _, err = dromon("role", "update", "core", "--seats", "alpha,beta")
+    assert status == exits.FAILURE and "line gamma has a turn in flight" in err
+
+
+def test_a_seat_of_a_vacant_role_with_a_turn_in_flight_is_not_unbound(
+    desk: Desk, dromon: Run
+) -> None:
+    """F7. The rule holds for a role nobody owns, by update and by delete, since the
+    turn goes on with the tools and access it began with."""
+    assert dromon("role", "vacate", "core")[0] == exits.OK
+    in_flight(desk, "beta")
+    before = desk.log.last_seq
+    status, _, err = dromon("role", "update", "core", "--seats", "alpha,gamma")
+    assert status == exits.FAILURE and "line beta has a turn in flight" in err
+    status, _, err = dromon("role", "delete", "core")
+    assert status == exits.FAILURE and "line beta has a turn in flight" in err
+    assert desk.log.last_seq == before and "core" in desk.log.state.roles
+
+
+def test_an_idle_writer_is_refused_leave_until_it_cannot_write(
+    desk: Desk, dromon: Run
+) -> None:
+    """F1 and F4. A hibernated writer, unbound, would be a writer beside the owner
+    once awakened, so it is refused until it is read only."""
+    desk.scheduler.hibernate("gamma")
+    status, _, err = dromon("role", "update", "core", "--seats", "alpha,beta")
+    assert status == exits.FAILURE
+    assert "line gamma could write ., the worktree of role core, which alpha" in err
+    reader = LineConfig(
+        builtin_tools=("Read", "Edit"), workdir_access=WorkdirAccess.READ
+    )
+    desk.scheduler.configure_line("gamma", reader)
+    status, _, err = dromon("role", "update", "core", "--seats", "alpha,beta")
+    assert status == exits.OK, err
+    assert "gamma" not in desk.seats("core")
+
+
+def test_a_second_role_may_not_share_a_worktree(desk: Desk, dromon: Run) -> None:
+    """F3, the review's probe, by create, by update and by real path."""
+    before = desk.log.last_seq
+    status, _, err = dromon(
+        "role", "create", "dup", "--workdir", ".", "--seats", "delta"
+    )
+    assert status == exits.FAILURE
+    assert "roles core and dup would share the worktree ., so two owners" in err
+    (desk.paths.root / "tmp/alias").symlink_to(desk.paths.root)
+    status, _, err = dromon(
+        "role", "create", "dup", "--workdir", "tmp/alias", "--seats", "delta"
+    )
+    assert status == exits.FAILURE and "roles core and dup would share" in err
+    assert desk.log.last_seq == before
+    assert create_docs(dromon)[0] == exits.OK
+    assert dromon("role", "vacate", "core")[0] == exits.OK
+    status, _, err = dromon("role", "update", "core", "--workdir", DOCS)
+    assert status == exits.FAILURE and "roles core and docs would share" in err
+
+
+def test_the_owner_may_not_be_configured_out_of_the_role_worktree(desk: Desk) -> None:
+    """F2, the review's probe, by the scheduler and by the client's operation."""
+    before = desk.log.last_seq
+    with pytest.raises(EventRejected, match="line alpha owns role core, so it runs"):
+        desk.scheduler.configure_line("alpha", LineConfig(workdir=DOCS))
+    response = desk.ask(
+        "configure_line", {"line_id": "alpha", "config": {"workdir": DOCS}}
+    )
+    assert not response.ok
+    assert "Vacate the role with dromon role vacate core" in str(response.error_message)
+    assert desk.log.last_seq == before
+
+
+def test_a_seat_that_runs_elsewhere_does_not_gain_its_role(
+    desk: Desk, dromon: Run
+) -> None:
+    """F2. A seat that does not own its role may move, as a vacant role's seats do
+    before the role moves, but it gains the role only in the worktree."""
+    desk.scheduler.awaken("beta")
+    desk.scheduler.configure_line("beta", LineConfig(workdir=DOCS))
+    assert "beta" not in desk.scheduler.usable_seats("core")
+    status, _, err = dromon("role", "handoff", "core", "--to", "beta")
+    assert status == exits.FAILURE and "so it cannot own the role" in err
+    assert dromon("role", "vacate", "core")[0] == exits.OK
+    status, _, err = dromon("role", "take", "core", "--seat", "beta")
+    assert status == exits.FAILURE
+    assert "line beta runs in tmp/worktrees/docs, not in role core's worktree" in err
+    assert desk.log.state.roles["core"].owner is None
+
+
+def test_a_writer_that_is_not_a_seat_may_not_join_an_owned_worktree(
+    desk: Desk,
+) -> None:
+    """F4, the review's probe, by configure, by create and by an override."""
+    before = desk.log.last_seq
+    with pytest.raises(EventRejected, match="line fox could write ., the worktree"):
+        desk.scheduler.configure_line(
+            "fox", LineConfig(workdir=".", builtin_tools=("Read", "Edit"))
+        )
+    with pytest.raises(EventRejected, match="line hotel could write ., the worktree"):
+        desk.scheduler.create_line("hotel", HAIKU, Strategy.SUBSCRIPTION, WRITER)
+    assert "hotel" not in desk.log.state.lines
+    with pytest.raises(EventRejected, match="line delta could write ., the worktree"):
+        desk.scheduler.override_line("delta", "builtin_tools", ["Read", "Edit"])
+    assert desk.log.last_seq == before
+    # A line confined to reading may join, and so may any line once the role is vacant.
+    desk.scheduler.configure_line(
+        "fox",
+        LineConfig(
+            workdir=".",
+            builtin_tools=("Read", "Edit"),
+            workdir_access=WorkdirAccess.READ,
+        ),
+    )
+
+
+def test_a_writer_left_beside_an_owner_waits_and_is_shown(
+    desk: Desk, dromon: Run
+) -> None:
+    """F4. A log made before the rule can hold such a line, which waits, and the
+    owner's first turn waits for one in flight."""
+    desk.log.append(LineConfigured("delta", encode_config(WRITER)))
+    assert desk.scheduler.beside_owner("delta") == "core"
+    assert not desk.scheduler._eligible("delta")  # pyright: ignore[reportPrivateUsage]
+    status, out, _ = dromon("role", "status", "core")
+    assert status == exits.OK
+    assert (
+        "line delta waits, since it could write the worktree and is not a seat" in out
+    )
+    in_flight(desk, "delta")
+    assert desk.scheduler._waits_for_writer("alpha")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_seat_is_not_moved_between_roles_by_a_command(
+    desk: Desk, dromon: Run
+) -> None:
+    """The review's test gap. A seat of one role is refused as a seat of another,
+    first for where it runs and then by the model."""
+    assert create_docs(dromon)[0] == exits.OK
+    status, _, err = dromon(
+        "role", "update", "core", "--seats", "alpha,beta,gamma,echo"
+    )
+    assert status == exits.FAILURE
+    assert "line echo runs in tmp/worktrees/docs, not in the role's worktree" in err
+    desk.scheduler.configure_line("echo", LineConfig(workdir="."))
+    before = desk.log.last_seq
+    status, _, err = dromon(
+        "role", "update", "core", "--seats", "alpha,beta,gamma,echo"
+    )
+    assert status == exits.FAILURE and "line echo is a seat of role docs" in err
+    assert desk.log.last_seq == before
+    assert desk.seats("docs") == {"echo": True, "fox": False}
+
+
+def test_a_seat_that_does_not_own_its_role_is_built_read_only(desk: Desk) -> None:
+    """F7, confirmed. The confining engines were derived from the capability table,
+    but a seat's engine was built with its own access, so gamma wrote beside alpha."""
+    assert desk.scheduler.engine_config("gamma").workdir_access is WorkdirAccess.READ
+    assert desk.scheduler.engine_config("alpha").workdir_access is WorkdirAccess.WRITE
+    assert desk.scheduler.engine_config("delta").workdir_access is WorkdirAccess.WRITE
+    desk.scheduler.give_ownership(ANA, "core", None)
+    assert desk.scheduler.engine_config("alpha").workdir_access is WorkdirAccess.READ
+
+
+def test_a_role_returning_to_the_file_records_its_first_owner_in_one_pass() -> None:
+    """F5, the review's probe. The pass that returns the role to the file records the
+    file's first owner too, rather than at the next start or reload."""
+    config = parse(project(CORE + 'owner = "core"\n'))
+    state = State()
+    for event in (
+        OperatorRegistered("ana"),
+        LineCreated("core", HAIKU, "subscription"),
+        LineCreated("core-luna", HAIKU, "subscription"),
+        LineCreated("other", HAIKU, "subscription"),
+        RoleDeclared("core", WORKTREE, seats=("core", "core-luna")),
+        SeatBound("core", "core", True),
+        SeatBound("core-luna", "core", True),
+        RoleHeld("core", RoleHolder.OPERATOR, ANA, AT),
+    ):
+        state.apply(event)
+    plan = plan_file_roles(state, config, ANA, AT)
+    assert [type(event) for event in plan.events] == [RoleHeld, OwnershipChanged]
+    for event in plan.events:
+        state.apply(event)
+    assert state.roles["core"].owner == "core"
+    assert state.holder_of("core") is RoleHolder.FILE
+
+
+def test_role_status_shows_the_hold_and_how_the_file_differs(
+    reloads: Reloads,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """F6. A notice reaches only the operator who started or reloaded, so the role's
+    status shows the difference too, to the client and to a seat's role_status."""
+    assert reloads.reload(CORE) == []
+    response = reloads.ask(
+        "role_update", {"role_id": "core", "operator": "ben", "handoff_seconds": 900}
+    )
+    assert response.ok, response.error_message
+    assert len(reloads.reload(CORE)) == 1
+    response = reloads.ask("roles", {"role_id": "core"})
+    assert response.ok and response.result is not None
+    role = cast(list[dict[str, object]], response.result["roles"])[0]
+    difference = "handoff_seconds is 3600 in the file and 900 in the log"
+    assert (role["held_by"], role["in_project_file"]) == ("operator", True)
+    assert role["file_differences"] == [difference]
+
+    def call(
+        socket: Path, operation: Operation, args: dict[str, object] | None = None
+    ) -> Response:
+        del socket
+        return reloads.ask(operation.value, args)
+
+    monkeypatch.setattr(cli, "call", call)
+    root = ["--project", str(reloads.paths.root)]
+    runtime = ["--runtime-dir", str(reloads.paths.runtime_dir)]
+    assert cli.main([*root, *runtime, "role", "status", "core"]) == exits.OK
+    out = capsys.readouterr().out
+    assert f"the project file is not applied, since {difference}" in out
+    assert reloads.reload(CORE + "handoff_seconds = 900\n")
+    response = reloads.ask("roles", {"role_id": "core"})
+    assert response.result is not None
+    role = cast(list[dict[str, object]], response.result["roles"])[0]
+    assert (role["held_by"], role["file_differences"]) == ("file", [])
+
+
+def refused_reload(reloads: Reloads, text: str) -> str:
+    """Write ``text`` as the project file, reload, and return the refusal, checking
+    that nothing was recorded."""
+    reloads.file.write_text(text)
+    before = reloads.log.last_seq
+    response = reloads.ask("reload_project")
+    assert not response.ok
+    assert reloads.log.last_seq == before
+    return str(response.error_message)
+
+
+def test_a_file_with_two_roles_on_one_worktree_is_refused_whole(
+    reloads: Reloads,
+) -> None:
+    """F3, for the file, at a reload, naming both roles."""
+    twin = CORE.replace('"core", "core-luna"', '"core"') + (
+        f'[roles.twin]\nworkdir = "{WORKTREE}"\nseats = ["core-luna"]\n'
+    )
+    error = refused_reload(reloads, project(twin))
+    assert f"roles core and twin would share the worktree {WORKTREE}" in error
+    assert not reloads.log.state.roles and not reloads.log.state.lines
+
+
+def test_a_file_role_on_a_role_only_in_the_log_is_refused(reloads: Reloads) -> None:
+    """F3, between the file and a role an operator created."""
+    assert reloads.reload("") == []
+    response = reloads.ask(
+        "role_create",
+        {"role_id": "desk", "operator": "ana", "workdir": ".", "seats": ["other"]},
+    )
+    assert response.ok, response.error_message
+    error = refused_reload(reloads, project(CORE.replace(WORKTREE, ".")))
+    assert "roles core and desk would share the worktree ." in error
+
+
+WRITING_OTHER = LINES.replace(
+    'workdir = "."', f'workdir = "{WORKTREE}"\nbuiltin_tools = ["Read", "Edit"]'
+)
+
+
+def test_a_file_writer_beside_the_files_owner_is_refused_at_reload_and_start(
+    reloads: Reloads,
+) -> None:
+    """F4, for the file. The refusal names the line and why, at a reload, and at a
+    start through ``check_roles``, before anything is applied."""
+    text = project(CORE + 'owner = "core"\n', WRITING_OTHER)
+    error = refused_reload(reloads, text)
+    assert "the project file is refused: line other could write" in error
+    assert "the worktree of role core, which core owns" in error
+    scheduler = start_scheduler(reloads.log, reloads.paths.root)
+    with pytest.raises(ProjectMismatch, match="line other could write"):
+        check_roles(scheduler, reloads.log, parse(text))
+    # Without an owner the file applies, and the line waits once the role is given.
+    reloads.file.write_text(project(CORE, WRITING_OTHER))
+    response = reloads.ask("reload_project")
+    assert response.ok, response.error_message
+    scheduler = reloads.daemon.scheduler
+    assert scheduler.beside_owner("other") is None
+    scheduler.give_ownership(ANA, "core", "core")
+    assert scheduler.beside_owner("other") == "core"

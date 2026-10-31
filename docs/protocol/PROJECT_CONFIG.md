@@ -196,7 +196,17 @@ handoff_below_percent = 10  # the default, or 0 for never
   seat the file names that an operator bound to a role the operator holds is left
   out, with a notice, and the rest of the file applies. A reload returns the notices
   as `role_notices`, and a start prints them. The cases are tabulated in
-  [`ROLES.md`](../architecture/ROLES.md).
+  [`ROLES.md`](../architecture/ROLES.md). A role that returns to the file is given the
+  file's `owner` in the same pass, where it never had an owner, and `dromon role
+  status` shows each difference of a role an operator holds.
+- **The one-writer rule.** **Round 10 review, 2026-10-31.** A file is refused whole, at
+  a start and at a reload, if the state it would make has two roles on one worktree,
+  compared by real path, which the refusal names, or an owning seat outside its role's
+  worktree, or a line that is not a seat of a role and could write that role's
+  worktree while another seat owns it, which the refusal names with the reason. The
+  check reads the lines only in the log as well, with their overrides, so a line that
+  a log made before the rule refuses the file until it is moved, made read only or
+  made a seat. The rule is stated in [`ROLES.md`](../architecture/ROLES.md).
 - **Located errors.** Every error names the file. A syntax error carries its line and
   column. Any other error carries the dotted key path and the line of its table or key
   when it can be found. The daemon refuses to start on an invalid file.

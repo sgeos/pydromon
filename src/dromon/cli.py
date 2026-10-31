@@ -1676,6 +1676,14 @@ def _print_role(role: Mapping[str, object]) -> None:
             f"  entry {entry['entry_id']}, a {entry['kind']} by {entry['line_id']} at"
             f" {entry['noted_at']}, {entry['chars']} characters"
         )
+    # Round 10 review, F6 and F4. Printed last, so the lines above keep their places.
+    for difference in cast(list[str], role["file_differences"]):
+        print(f"  the project file is not applied, since {difference}")
+    for line_id in cast(list[str], role["beside_owner"]):
+        print(
+            f"  line {line_id} waits, since it could write the worktree and is not a"
+            " seat"
+        )
 
 
 def _budget_text(budget: Mapping[str, object]) -> str:

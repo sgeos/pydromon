@@ -7,6 +7,29 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- A seat that does not own its role is built with its role's worktree read only on
+  Claude Code and Codex, the engines that can confine it. The confining engines were
+  derived from the capability table, but the step that applies a seat's read access
+  to its engine was never added, so such a seat ran with its own access, write by
+  default, beside the owner. A seat whose configuration Claude Code cannot make read
+  only now fails its turn as the engine is built and is held. Round 10 review, F7.
+- The one-writer rule holds on every path, at the operator's decision of 2026-10-31.
+  A seat with a turn in flight is never unbound, hibernated or not, by `dromon role
+  update` or `delete`, for an owned or a vacant role. A writer seat of an owned role is
+  not unbound while it could write the worktree, hibernated or not. An owning seat is
+  never configured out of its role's worktree, and a seat that runs elsewhere does not
+  gain its role by a give, a take, a handoff or a failover. A line that is not a seat
+  of a role is refused, by `dromon create`, `configure`, `set`, `rebind` and the
+  project file, where it could write the worktree of a role another seat owns, and one
+  a log left there before the rule waits, and is named by `dromon role status`. Two
+  roles never share a worktree, compared by real path, at `dromon role create` and
+  `update` and in the project file, which is refused whole at a start or a reload
+  naming both roles. Round 10 review, F1 to F4.
+- A role that returns to the project file is given the file's first owner in the same
+  pass, rather than at the next start or reload. Round 10 review, F5.
+- `dromon role status`, `roles` and a seat's `role_status` show whether the project
+  file declares a role, each way its table differs from a role an operator holds, and
+  the lines that wait beside the owner. Round 10 review, F6.
 - Grok sessions now set the model to the exact identifier in the driver's settings
   when `session/new` or `session/load` reports another model. Dromon requires a model
   config option, requires the `models` field and model option to agree when both are
