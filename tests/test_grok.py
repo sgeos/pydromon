@@ -1764,6 +1764,25 @@ def test_a_call_is_judged_and_counted_once_when_first_seen(
     assert "session/cancel" not in server.methods()
 
 
+def test_tool_call_permission_and_updates_are_counted_once_in_acp_order(
+    project: tuple[Path, Path, Path],
+) -> None:
+    raw = use_tool_input("dromon__send_message")
+    server = FakeGrok(
+        [
+            tool_call("other", "use_tool", ident="call", raw_input=raw),
+            permission("other", "use_tool", ident="call", raw_input=raw),
+            call_update("call", status="in_progress"),
+            call_update("call", status="completed"),
+            chunk("done"),
+        ]
+    )
+    report = run(line(server, project))
+    assert report.tool_uses == ("dromon__send_message",)
+    assert server.answers()[0]["result"]["outcome"]["optionId"] == "yes"
+    assert "session/cancel" not in server.methods()
+
+
 def test_an_update_seen_first_is_judged_by_its_own_fields(
     project: tuple[Path, Path, Path],
 ) -> None:

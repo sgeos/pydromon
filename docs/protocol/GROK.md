@@ -231,7 +231,11 @@ and workflows live in `$GROK_HOME`.
    seen, in a `tool_call`, a `tool_call_update` or a permission request, and its
    `toolName`, `title` and `kind` are recorded then. For `use_tool`, the checked
    `rawInput` is recorded too. A later update or request that changes a recorded field
-   refuses the turn, as does a call without an identifier.
+   refuses the turn, as does a call without an identifier. The normal order of one
+   announcement, one permission request and subsequent updates for that identifier is
+   accepted and counted once. A permission request that arrives before its announcement
+   is also accepted and counted once. A repeated announcement or another permission
+   grant for an identifier already granted in the turn is refused.
 9. **Permission requests** are answered with an `allow_once` option for a permitted call
    and a `reject` option otherwise. A tool call the line was not given, a refused
    permission request, or the driver's tool budget, sends `session/cancel`, and every
