@@ -26,6 +26,7 @@ from dromon.codex import (
     CodexLine,
     Connection,
     TOOLS_CHANGED_NOTE,
+    checked_scratch,
     default_cache_home,
     split_session,
     engine_environment,
@@ -51,7 +52,7 @@ from dromon.grok import GrokLine
 from dromon.model import format_due
 from dromon.projectconfig import parse
 from dromon.sandbox import parse_sandbox
-from dromon.scheduler import LineSpec, engine_factory
+from dromon.scheduler import LineSpec, engine_factory, own_scratch
 from dromon.settings import parse_settings, reserved_variable
 
 LUNA = "gpt-6-luna"
@@ -1220,19 +1221,125 @@ def test_the_profile_writes_only_with_a_write_tool_and_never_git(
         }
 
 
-def test_a_read_only_workdir_profile_keeps_tmp_writable() -> None:
+def test_a_read_only_workdir_profile_writes_only_the_lines_own_scratch(
+    tmp_path: Path,
+) -> None:
+    """Round 10 re-review, N2. The read profile granted the whole of ``tmp/``, the
+    owner's scratch, so a read-only seat could write the owner's files there."""
+    import os
     import tomllib
 
     config = config_from_document(
         {"builtin_tools": ["Bash", "Edit", "Write"], "workdir_access": "read"}
     )
-    text = profile_of(server_arguments([], config, ()))
-    profile = tomllib.loads(f"profile = {text}")["profile"]
-    assert profile["filesystem"][":workspace_roots"] == {
-        ".": "read",
-        ".git": "read",
-        "tmp": "write",
-    }
+    scratch = tmp_path / "tmp" / "lines" / "beta"
+    scratch.mkdir(parents=True)
+    scratch = checked_scratch(tmp_path, scratch)
+    text = profile_of(server_arguments([], config, (), scratch=scratch))
+    filesystem = tomllib.loads(f"profile = {text}")["profile"]["filesystem"]
+    assert filesystem[":workspace_roots"] == {".": "read", ".git": "read"}
+    assert filesystem[os.path.realpath(scratch)] == "write"
+    assert "tmp" not in str(filesystem[":workspace_roots"])
+    # A read line given no scratch writes nothing, and a writer is granted none.
+    bare = tomllib.loads(f"profile = {profile_of(server_arguments([], config, ()))}")
+    assert all(v != "write" for v in bare["profile"]["filesystem"].values())
+    writer = config_from_document({"builtin_tools": ["Edit"]})
+    text = profile_of(server_arguments([], writer, (), scratch=scratch))
+    filesystem = tomllib.loads(f"profile = {text}")["profile"]["filesystem"]
+    assert os.path.realpath(scratch) not in filesystem
+
+
+def scratch_line(server: FakeServer, workdir: Path, config: LineConfig) -> CodexLine:
+    """A Codex line in ``workdir`` with its own scratch, as the factory builds it."""
+
+    @asynccontextmanager
+    async def connect(
+        arguments: list[str], cwd: Path, env: Mapping[str, str]
+    ) -> AsyncGenerator[Connection]:
+        del cwd, env
+        server.arguments = arguments
+        yield server
+
+    return CodexLine(
+        luna(),
+        workdir,
+        config=config,
+        mcp_tools=[RECORD],
+        environment={"SHELL": "/bin/sh"},
+        connection_factory=connect,
+        server_lister=lambda env: [],
+        scratch=own_scratch(workdir, "beta"),
+    )
+
+
+def granted(arguments: list[str]) -> list[str]:
+    import tomllib
+
+    text = profile_of(arguments)
+    filesystem = tomllib.loads(f"profile = {text}")["profile"]["filesystem"]
+    return sorted(k for k, v in filesystem.items() if v == "write")
+
+
+@pytest.mark.parametrize("component", ["tmp", "tmp/lines", "tmp/lines/beta"])
+@pytest.mark.parametrize("swap", ["link", "file"])
+def test_a_scratch_component_swapped_after_a_turn_refuses_the_next(
+    tmp_path: Path, component: str, swap: str
+) -> None:
+    """Review of ebedeed, R1 and G1. The owner of a role's worktree can replace a
+    directory of a read seat's scratch between its turns. The profile's grant named
+    the scratch by its real path, so a link to the owner's ``tmp/`` would have
+    granted the seat that instead. Each turn now checks every component by lstat
+    before it builds the profile, and the turn is refused with nothing granted."""
+    import os
+
+    workdir = tmp_path / "tree"
+    workdir.mkdir()
+    reader = config_from_document({"builtin_tools": ["Bash"], "workdir_access": "read"})
+    server = FakeServer()
+    target = scratch_line(server, workdir, reader)
+    run(target)
+    real = os.path.realpath(workdir / "tmp/lines/beta")
+    assert granted(server.arguments) == [real]
+    victim = workdir / component
+    victim.rename(tmp_path / "moved")
+    if swap == "link":
+        victim.symlink_to(workdir / "tmp" if component != "tmp" else tmp_path)
+    else:
+        victim.write_text("in the way")
+    server.arguments = []
+    kind = "a symbolic link" if swap == "link" else "not a directory"
+    with pytest.raises(EngineRefused, match=f"{component} is {kind}"):
+        run(target)
+    assert server.arguments == []
+
+
+def test_a_missing_scratch_component_refuses_the_turn(tmp_path: Path) -> None:
+    workdir = tmp_path / "tree"
+    workdir.mkdir()
+    reader = config_from_document({"builtin_tools": ["Bash"], "workdir_access": "read"})
+    server = FakeServer()
+    target = scratch_line(server, workdir, reader)
+    (workdir / "tmp/lines/beta").rmdir()
+    with pytest.raises(EngineRefused, match="tmp/lines/beta cannot be read"):
+        run(target)
+
+
+def test_the_grant_names_the_checked_path_under_the_real_workdir(
+    tmp_path: Path,
+) -> None:
+    """A workdir reached through a link is resolved once, and the grant is the
+    checked components below it, so no later lookup follows a link inside."""
+    import os
+
+    real = tmp_path / "real"
+    (real / "tmp/lines/beta").mkdir(parents=True)
+    (tmp_path / "alias").symlink_to(real)
+    alias = tmp_path / "alias"
+    assert checked_scratch(alias, alias / "tmp/lines/beta") == Path(
+        os.path.realpath(real), "tmp/lines/beta"
+    )
+    with pytest.raises(EngineRefused, match="not inside its working directory"):
+        checked_scratch(alias, tmp_path / "elsewhere")
 
 
 def test_the_profile_denies_each_protected_directory_that_exists(
