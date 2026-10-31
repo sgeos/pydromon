@@ -279,6 +279,7 @@ from dromon.model import (
     Sender,
     BudgetSource,
     BudgetStated,
+    BudgetHandoffRequested,
     RoleHolder,
     RoleNoted,
     RoleNoteKind,
@@ -1294,6 +1295,10 @@ class LineSpec:
         default=lambda ends: None, compare=False
     )
     """Whether a task-triggered engine turn can run under scheduler control."""
+    budget_reported: Callable[[int, str | None, str, str], object] = field(
+        default=lambda remaining, reset, note, window: None, compare=False
+    )
+    """Where an engine reports a positive remaining provider-window percentage."""
 
 
 type EngineFactory = Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], LineEngine]
@@ -1659,6 +1664,7 @@ def engine_factory(
             ceiling_reached=spec.ceiling_reached,
             ceiling_settled=spec.ceiling_settled,
             consent_asked=spec.consent_asked,
+            budget_reported=spec.budget_reported,
             secret_names=lambda: tuple((line_secrets or {}).get(spec.line_id, ())),
         )
 
@@ -5533,11 +5539,17 @@ class Scheduler:
             format_due(self._wall_clock()),
         )
 
-    def _budget_of(self, line_id: str) -> BudgetStated | None:
+    def _budget_of(
+        self, line_id: str, now: datetime | None = None
+    ) -> BudgetStated | None:
         """The stated budget of ``line_id``'s provider. Until the budget step, each
-        engine is its own provider."""
+        engine is its own provider. Expired window snapshots are absent."""
         engine = ENGINE_OF.get(self.model_of(line_id))
-        return None if engine is None else self._log.state.budgets.get(engine)
+        if engine is None:
+            return None
+        return self._log.state.effective_budget(
+            engine, self._wall_clock() if now is None else now
+        )
 
     def _plan_limited(self, line_id: str) -> bool:
         """Whether ``line_id`` is held, still, by the hold of a plan limit its engine
@@ -5945,7 +5957,13 @@ class Scheduler:
         wakes a line as autonomous mail, without claiming an operator's or another
         line's authority."""
         role = self._log.state.roles[role_id]
-        if role.owner is None or not below_handoff_threshold(role, budget):
+        if (
+            role.owner is None
+            or budget.remaining_percent is None
+            or not below_handoff_threshold(role, budget)
+        ):
+            return None
+        if (budget.provider, role_id) in self._log.state.budget_handoffs:
             return None
         to = self.next_seat(role_id)
         stated = (
@@ -5967,6 +5985,15 @@ class Scheduler:
             f" {HANDOFF_TEMPLATE} If you cannot hand it over now, tell the operator"
             " why.",
         )
+        self._log.append(
+            BudgetHandoffRequested(
+                budget.provider,
+                role_id,
+                budget.remaining_percent,
+                role.handoff_below_percent,
+                format_due(self._wall_clock()),
+            )
+        )
         return (
             f"Role {role_id}'s owner {role.owner} was asked to prepare a handoff to"
             f" {to}, since {stated}."
@@ -5979,6 +6006,10 @@ class Scheduler:
         in flight is failed over once that turn ends, as every owner is."""
         said: list[str] = []
         state = self._log.state
+        effective = state.effective_budget(budget.provider, self._wall_clock())
+        if effective is None:
+            return said
+        budget = effective
         for role_id, role in sorted(state.roles.items()):
             owner = role.owner
             if owner is None or ENGINE_OF.get(self.model_of(owner)) != budget.provider:
@@ -6025,6 +6056,7 @@ class Scheduler:
                 BudgetSource.ENGINE,
                 note,
                 format_due(self._wall_clock()),
+                error.window,
             )
         )
 
@@ -6040,7 +6072,7 @@ class Scheduler:
         if provider is None:
             return
         now = self._wall_clock()
-        if budget_spent(self._log.state.budgets.get(provider), now):
+        if budget_spent(self._log.state.effective_budget(provider, now), now):
             return
         budget = BudgetStated(
             provider,
@@ -6053,6 +6085,58 @@ class Scheduler:
         self._log.append(budget)
         self.activity.record(line_id, ActivityKind.NOTICE, note)
         self._budget_followed(budget)
+
+    def engine_budget_reported(
+        self,
+        line_id: str,
+        remaining_percent: int,
+        resets_at: str | None,
+        note: str,
+        window: str,
+    ) -> None:
+        """Store a positive budget snapshot from a provider window the engine reports.
+
+        A window with no remaining percentage is left to its engine's exhausted-limit
+        path, which has stronger evidence and can safely decide whether to fail over.
+        """
+        if line_id not in self._log.state.lines:
+            return
+        provider = ENGINE_OF.get(self.model_of(line_id))
+        if provider is None or type(remaining_percent) is not int:
+            return
+        if not 1 <= remaining_percent <= 100:
+            return
+        if resets_at is not None:
+            try:
+                check_instant("resets_at", resets_at)
+            except InvalidField:
+                resets_at = None
+        state = self._log.state
+        now = self._wall_clock()
+        previous = state.effective_budget(provider, now)
+        if budget_spent(previous, now):
+            return
+        previous_window = state.budget_windows.get(provider, {}).get(window)
+        if (
+            previous_window is not None
+            and previous_window.remaining_percent == remaining_percent
+            and previous_window.resets_at == resets_at
+            and previous_window.note == note[: MAX_BUDGET_NOTE_BYTES // 4]
+        ):
+            return
+        budget = BudgetStated(
+            provider,
+            remaining_percent,
+            resets_at,
+            BudgetSource.ENGINE,
+            note[: MAX_BUDGET_NOTE_BYTES // 4],
+            format_due(now),
+            window,
+        )
+        self._log.append(budget)
+        effective = self._log.state.effective_budget(provider, now)
+        if effective is not None:
+            self._budget_followed(effective)
 
     # The operator's ownership commands, roles step 2 of ``docs/architecture/ROLES.md``.
 
@@ -6516,16 +6600,22 @@ class Scheduler:
         """Each provider's stated budget, with whether it shows the provider spent
         now, and the providers a budget may be stated for."""
         now = self._wall_clock()
-        return {
-            "providers": sorted(set(ENGINE_OF.values())),
-            "budgets": [
+        budgets: list[dict[str, object]] = []
+        providers = set(self._log.state.budgets) | set(self._log.state.budget_windows)
+        for provider in sorted(providers):
+            budget = self._log.state.effective_budget(provider, now)
+            if budget is None:
+                continue
+            budgets.append(
                 {
                     "provider": provider,
                     **_budget_view(budget),
                     "spent": budget_spent(budget, now),
                 }
-                for provider, budget in sorted(self._log.state.budgets.items())
-            ],
+            )
+        return {
+            "providers": sorted(set(ENGINE_OF.values())),
+            "budgets": budgets,
         }
 
     def _unconfined(self, line_id: str) -> bool:
@@ -9802,6 +9892,9 @@ class Scheduler:
                 lambda: self.redirect_reason(line_id),
                 lambda note: self.credits_spent(line_id, note),
                 begin_self_started=lambda ends: self.begin_self_started(line_id, ends),
+                budget_reported=lambda remaining, reset, note, window: (
+                    self.engine_budget_reported(line_id, remaining, reset, note, window)
+                ),
             )
             engine = self._engine_factory(spec, self.own_tools(line_id))
             self._engines[line_id] = engine

@@ -559,16 +559,26 @@ the Grok plan. An engine maps to one provider, and Pi's provider is read from it
 configuration.
 
 **Sources.** An operator states a budget with `dromon budget set PROVIDER` and a
-remaining percentage, a reset time or both. An engine reports one when it stops at a
-plan limit, which becomes `budget_stated` with `remaining_percent` 0, `source`
-`engine`, and the reset time where one was given in the model's form. **Implemented.**
-The classification of each engine is as follows, and each rests on a shape that is on
-record. Only Codex's camel-case shapes were observed live, by the operator on
-2026-10-27, from a Codex app-server probe with no credit left.
+remaining percentage, a reset time or both. An engine reports a positive remaining
+percentage where its documented signal identifies one provider window. Claude Code's
+typed rate-limit event gives window utilization and reset time, so Dromon records the
+positive remainder rounded toward less remaining, using integer arithmetic. Window
+snapshots are kept separately in the event log, and the provider budget is the lowest
+remaining percentage among windows whose resets have not passed, with that window's
+reset time. A positive report cannot replace a stated zero while its reset has not
+passed. A role owner receives one handoff request when its provider budget crosses
+below the role threshold. It is re-armed only after the provider budget rises above
+the threshold.
+An engine also reports a spent budget at a plan limit, which becomes `budget_stated`
+with `remaining_percent` 0, `source` `engine`, and the reset time where one was given
+in the model's form. **Implemented.** The classification of each engine is as follows,
+and each rests on a shape that is on record. Only Codex's camel-case exhausted-credit
+shapes were observed live, by the operator on 2026-10-27, from a Codex app-server probe
+with no credit left.
 
 | Engine | Classified as budget exhausted | Source of the shape |
 |---|---|---|
-| Claude Code | A failed turn while the engine's latest `rate_limit_event` has status `rejected` and its overage is not `allowed` or `allowed_warning`, with its reset time. An assistant message whose `error` is `billing_error`, in any turn | The `RateLimitInfo` and `AssistantMessageError` types of the installed Agent SDK |
+| Claude Code | A failed turn while the engine's latest `rate_limit_event` has status `rejected` and its overage is not `allowed` or `allowed_warning`, with its reset time. An assistant message whose `error` is `billing_error`, in any turn. A non-rejected event also reports a positive remaining percentage for its reported window | The `RateLimitInfo` and `AssistantMessageError` types of the installed Agent SDK |
 | Codex | A turn that does not complete after an `error` notice, or with a `turn.error`, whose `codexErrorInfo` is `usageLimitExceeded`, with the reset time read from its message. Before any turn fails, an `account/rateLimits/updated` notice whose `credits` has `hasCredits` and `unlimited` both false and whose `primary` and `secondary` windows are both null, which records the budget at 0 with no reset at once. The older snake-case codes and phrases of [`CODEX.md`](../protocol/CODEX.md) hold the line and ask, but record no budget and never move a role | The camel-case shapes observed live on 2026-10-27. The snake-case codes and phrases are inferred and unverified |
 | Grok, Pi, Cursor, Antigravity | Nothing. A failed turn holds the line as before | No shape is on record |
 

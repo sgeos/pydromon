@@ -29,6 +29,48 @@ tool policy stay in `dromon.grok`.
 
 ## Evidence
 
+## Provider budgets and quota errors
+
+**Facts, read on 2026-10-31** in Grok Build's bundled guides. The `StopFailure` hook
+receives an `error` category. Grok documents `rate_limit`, `authentication_failed`,
+`invalid_request`, `server_error`, `max_output_tokens` and `unknown`. Capacity failures
+with HTTP status 503 or 529 are categorized as `rate_limit`. This category does not
+distinguish a spent plan from a transient rate limit. The hook input may also carry
+`errorDetails`, but the guide does not define a quota-exhaustion category, a reset field
+or a mapping from those details to a reset time.
+
+**Fact.** Those hook fields are not a documented ACP `session/update` or
+`session/prompt` response. Dromon's Grok home registers no hooks, and the ACP adapter
+reads no hook event. A generic JSON-RPC error therefore does not establish that a plan
+is exhausted, even if its text contains `quota` or `rate_limit`. Dromon classifies no
+new Grok plan limit and extracts no reset time. The turn still fails as an ordinary
+engine refusal, which does not fail a role over.
+
+**Facts, read on 2026-10-31.** Grok's `/usage` view in the interactive interface shows
+the account allowance, while `grok usage` reads persisted session token and cost
+totals. The local guide does not describe an ACP-accessible account allowance. Dromon
+uses ACP in a non-interactive process, so neither surface provides a remaining provider
+budget it can read without spending.
+
+The following table records whether each engine reports a remaining provider budget on
+a surface Dromon can read without spending. A window's token or request utilization is
+not treated as a provider budget unless the engine's documented report identifies that
+budget.
+
+| Engine | Readable budget evidence | Dromon behavior |
+|---|---|---|
+| Claude Code | The Agent SDK types and recorded probe expose utilization and reset time for a rate-limit window. | Dromon records a positive remainder for the reported window. It does not combine separate windows. A rejected window is handled by the existing plan-limit path after a failed turn. |
+| Codex | The recorded no-credit notice reports `hasCredits` false and `unlimited` false, but no remaining percentage. No positive balance shape is recorded in the repository fixtures. | Dromon records the observed no-credit state and reads a reset from the usage-limit message wording, under the local-time assumption in `CODEX.md`. It does not infer a positive balance. |
+| Grok Build | The interactive `/usage` view includes account allowance. ACP and `grok usage` do not document a readable remaining provider budget. | No remaining provider budget or quota-error shape is wired. |
+| Pi | Reports per-call token usage and estimated cost, not remaining provider allowance. | No remaining provider budget is wired. |
+| Cursor Agent | Its protocol reports no token usage or cost. | No remaining provider budget is wired. |
+| Antigravity | Its ACP `usage_update` reports context and token use, and may report session cost. | No remaining provider budget is wired. |
+
+**Limit.** The repository has no recorded Grok quota failure. The documented hook
+category is not evidence of what the ACP adapter receives, so a live Grok turn or a
+recorded ACP response would be needed before adding a classifier. This task uses no
+live probe and spends no Grok usage.
+
 **Facts, read on 2026-10-25** in Grok Build's bundled guide, `~/.grok/docs/user-guide`,
 and its `README.md`.
 

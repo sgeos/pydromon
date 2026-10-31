@@ -14,6 +14,7 @@ import tomllib
 from collections import deque
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final, cast
 
@@ -26,7 +27,7 @@ from dromon.agents import AgentError, LineTokens
 from dromon.daemon import Daemon
 from dromon.driver import Credential, Driver, Strategy
 from dromon.priority import SteeredDriver
-from dromon.engine import EngineRefused, TurnReport
+from dromon.engine import EnginePlanLimit, EngineRefused, TurnReport
 from dromon.eventlog import EventLog
 from dromon.evidence import IN, OUT, Recording, Replay, read_recording, replay_factory
 from dromon.grok import (
@@ -58,7 +59,17 @@ from dromon.security_paths import CREDENTIAL_PATHS
 from dromon.gitssh import COMMAND_VARIABLE, GitSshAccess, ssh_command
 from dromon.mcp import Bridge
 from dromon.protocol import Response
-from dromon.model import LineAddress, LineCreated, OperatorRegistered
+from dromon.model import (
+    LineAddress,
+    LineCreated,
+    OperatorAddress,
+    OperatorRegistered,
+    OwnershipCause,
+    OwnershipChanged,
+    RoleDeclared,
+    SeatBound,
+    format_due,
+)
 from dromon.paths import project_paths
 from dromon.sandbox import parse_sandbox
 from dromon.scheduler import LineEngine, LineSpec, Scheduler, engine_factory
@@ -252,6 +263,7 @@ class FakeGrok:
         self.activity_delay = 0.0
         """Whether this Grok neither answers a cancel nor closes, so waits block."""
         self.stops = 0
+        self.prompt_error: dict[str, object] | None = None
 
     def methods(self) -> list[str]:
         return [m["method"] for m in self.sent if "method" in m]
@@ -326,6 +338,9 @@ class FakeGrok:
             self.queue.append({**reply, "result": {}})
         elif method == "session/prompt":
             self.prompt_id = sent["id"]
+            if self.prompt_error is not None:
+                self.queue.append({**reply, "error": self.prompt_error})
+                return
             self.queue.extend(self.turn)
             if self.answer_prompt:
                 self.queue.append({**reply, "result": {"stopReason": self.stop}})
@@ -1315,6 +1330,84 @@ def test_a_plain_turn_reports_text_credential_and_session(
         "fs": {"readTextFile": False, "writeTextFile": False},
         "terminal": False,
     }
+
+
+def test_an_unstructured_grok_rate_limit_error_is_not_a_plan_limit(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok()
+    server.prompt_error = {
+        "code": -32000,
+        "message": "rate_limit: request rejected; try again later",
+    }
+    with pytest.raises(EngineRefused) as raised:
+        run(line(server, project))
+    assert not isinstance(raised.value, EnginePlanLimit)
+
+
+def test_a_grok_rate_limit_lookalike_does_not_fail_its_role_over(
+    project: tuple[Path, Path, Path],
+) -> None:
+    workspace, _, _ = project
+    server = FakeGrok()
+    server.prompt_error = {
+        "code": -32000,
+        "message": "rate_limit: request rejected; try again later",
+    }
+
+    class Idle:
+        session_id: str | None = None
+
+        async def run_turn(self, prompt: str) -> TurnReport:
+            del prompt
+            return TurnReport(
+                "success", 1, "ok", (), None, None, "idle-session", None, None
+            )
+
+    def build(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> LineEngine:
+        del tools
+        return line(server, project) if spec.line_id == "alpha" else Idle()
+
+    log = EventLog(workspace / ".dromon" / "grok-role.sqlite")
+    scheduler = Scheduler(
+        log,
+        build,
+        tick_seconds=0,
+        wall_clock=lambda: datetime(2026, 10, 31, 9, 0, tzinfo=UTC),
+        root=workspace,
+    )
+    scheduler.ensure_operator("ana")
+    scheduler.create_line("alpha", GROK, Strategy.SUBSCRIPTION)
+    scheduler.create_line("beta", "claude-haiku-5-5", Strategy.SUBSCRIPTION)
+    log.append(RoleDeclared("core", ".", 3600, ("alpha", "beta")))
+    log.append(SeatBound("alpha", "core", True))
+    log.append(SeatBound("beta", "core", True))
+    log.append(
+        OwnershipChanged(
+            "core",
+            "alpha",
+            None,
+            OwnershipCause.DECLARED,
+            OperatorAddress("ana"),
+            None,
+            format_due(datetime(2026, 10, 31, 9, 0, tzinfo=UTC)),
+        )
+    )
+
+    async def turn() -> None:
+        stop = asyncio.Event()
+        loop = asyncio.create_task(scheduler.run(stop))
+        scheduler.send(OperatorAddress("ana"), LineAddress("alpha"), "try")
+        await scheduler.idle()
+        stop.set()
+        await loop
+
+    try:
+        asyncio.run(turn())
+        assert log.state.roles["core"].owner == "alpha"
+        assert grok_module.ENGINE_NAME not in log.state.budgets
+    finally:
+        log.close()
 
 
 class Tap:

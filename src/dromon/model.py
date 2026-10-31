@@ -1766,7 +1766,8 @@ class BriefSet:
 @dataclass(frozen=True, slots=True)
 class BudgetStated:
     """What remains of a provider's plan, as an operator states it or an engine
-    reports it at a plan limit, replacing the provider's earlier statement. It is a
+    reports it at a plan limit, replacing the provider's earlier statement. An engine
+    may name a window, whose snapshot is kept beside other unexpired windows. It is a
     snapshot with its time, never adjusted by later turns, since a turn's cost does
     not convert reliably to a plan's percentage."""
 
@@ -1776,6 +1777,7 @@ class BudgetStated:
     source: BudgetSource
     note: str
     stated_at: str
+    window: str | None = None
 
     def __post_init__(self) -> None:
         check_id("provider", self.provider)
@@ -1793,6 +1795,33 @@ class BudgetStated:
         check_member("source", self.source, BudgetSource)
         check_text("note", self.note, MAX_BUDGET_NOTE_BYTES)
         check_instant("stated_at", self.stated_at)
+        check_optional_id("window", self.window)
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetHandoffRequested:
+    """The harness asked a role's owner to prepare a handoff after its provider
+    budget crossed below the role threshold. A budget above the threshold re-arms it."""
+
+    provider: str
+    role_id: str
+    remaining_percent: int
+    threshold: int
+    requested_at: str
+
+    def __post_init__(self) -> None:
+        check_id("provider", self.provider)
+        check_id("role_id", self.role_id)
+        if (
+            type(self.remaining_percent) is not int
+            or not 1 <= self.remaining_percent <= 100
+        ):
+            raise InvalidField("remaining_percent must be a whole number from 1 to 100")
+        if type(self.threshold) is not int or not 0 <= self.threshold <= 100:
+            raise InvalidField("threshold must be a whole number from 0 to 100")
+        if self.remaining_percent >= self.threshold:
+            raise InvalidField("remaining_percent is not below threshold")
+        check_instant("requested_at", self.requested_at)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2035,6 +2064,7 @@ type Event = (
     | RoleNoted
     | BriefSet
     | BudgetStated
+    | BudgetHandoffRequested
     | LeaseAcquired
     | LeaseReleased
     | RunStarted
@@ -2266,7 +2296,16 @@ class State:
     role_entries: dict[str, RoleNoted] = field(default_factory=dict[str, RoleNoted])
     """Every role's journal entries, keyed by entry, in the order they were noted."""
     budgets: dict[str, BudgetStated] = field(default_factory=dict[str, BudgetStated])
-    """Each provider's latest stated budget, keyed by provider."""
+    """Each provider's effective budget, the latest unwindowed statement or lowest
+    remaining percentage among its unexpired engine windows, keyed by provider."""
+    budget_windows: dict[str, dict[str, BudgetStated]] = field(
+        default_factory=dict[str, dict[str, BudgetStated]]
+    )
+    """Each engine-reported provider window, keyed by provider and window, so a
+    provider's visible budget is the most constrained unexpired window."""
+    budget_handoffs: set[tuple[str, str]] = field(default_factory=set[tuple[str, str]])
+    """Provider-role pairs whose owner has been asked to hand off after a low-budget
+    crossing. Rebuilt from budget and request events; cleared only above threshold."""
     peers: dict[str, Peer] = field(default_factory=dict[str, Peer])
     """Every peer ever declared, keyed by peer, including removed ones."""
     received: dict[tuple[str, str], str] = field(
@@ -2376,6 +2415,27 @@ class State:
         held = self.role_holders.get(role_id)
         return RoleHolder.FILE if held is None else held.holder
 
+    def effective_budget(self, provider: str, now: datetime) -> BudgetStated | None:
+        """The provider's latest unwindowed statement, or its lowest remaining
+        window snapshot whose reset has not passed at ``now``. A provider with only
+        expired window snapshots has no effective budget."""
+        windows = self.budget_windows.get(provider)
+        if windows is None:
+            return self.budgets.get(provider)
+        active = [
+            budget
+            for budget in windows.values()
+            if budget.resets_at is None or now < parse_due(budget.resets_at)
+        ]
+        if not active:
+            return None
+        return min(
+            active,
+            key=lambda budget: (
+                101 if budget.remaining_percent is None else budget.remaining_percent
+            ),
+        )
+
     def copy(self) -> "State":
         """Return an independent snapshot. The records are frozen, so maps suffice."""
         return State(
@@ -2394,6 +2454,11 @@ class State:
             dict(self.seats),
             dict(self.role_entries),
             dict(self.budgets),
+            {
+                provider: dict(windows)
+                for provider, windows in self.budget_windows.items()
+            },
+            set(self.budget_handoffs),
             dict(self.peers),
             dict(self.received),
             dict(self.received_times),
@@ -2584,6 +2649,32 @@ class State:
                 self._line(event.line_id)
             case BudgetStated():
                 pass
+            case BudgetHandoffRequested():
+                role = self.roles.get(event.role_id)
+                if role is None or role.owner is None:
+                    raise EventRejected(f"role {event.role_id} has no owner")
+                if role.handoff_below_percent != event.threshold:
+                    raise EventRejected(
+                        f"role {event.role_id} threshold changed before the"
+                        " handoff request"
+                    )
+                budget = self.effective_budget(
+                    event.provider, parse_due(event.requested_at)
+                )
+                if (
+                    budget is None
+                    or budget.remaining_percent != event.remaining_percent
+                ):
+                    raise EventRejected(
+                        f"provider {event.provider} budget changed before the"
+                        " handoff request"
+                    )
+                key = (event.provider, event.role_id)
+                if key in self.budget_handoffs:
+                    raise EventRejected(
+                        f"role {event.role_id} was already asked at this budget"
+                        " crossing"
+                    )
             case LeaseAcquired():
                 self._line(event.line_id)
                 held = self.leases.get(event.name)
@@ -2922,7 +3013,36 @@ class State:
                 self.briefs[event.line_id] = event
                 self.mail_since_brief.pop(event.line_id, None)
             case BudgetStated():
-                self.budgets[event.provider] = event
+                if event.window is None:
+                    self.budget_windows.pop(event.provider, None)
+                    self.budgets[event.provider] = event
+                else:
+                    windows = self.budget_windows.setdefault(event.provider, {})
+                    stated = parse_due(event.stated_at)
+                    for name, budget in tuple(windows.items()):
+                        if (
+                            budget.resets_at is not None
+                            and parse_due(budget.resets_at) <= stated
+                        ):
+                            del windows[name]
+                    windows[event.window] = event
+                    self.budgets[event.provider] = min(
+                        windows.values(),
+                        key=lambda budget: (
+                            101
+                            if budget.remaining_percent is None
+                            else budget.remaining_percent
+                        ),
+                    )
+                current = self.effective_budget(
+                    event.provider, parse_due(event.stated_at)
+                )
+                if current is not None and current.remaining_percent is not None:
+                    for role_id, role in self.roles.items():
+                        if current.remaining_percent > role.handoff_below_percent:
+                            self.budget_handoffs.discard((event.provider, role_id))
+            case BudgetHandoffRequested():
+                self.budget_handoffs.add((event.provider, event.role_id))
             case LeaseAcquired():
                 self.leases[event.name] = event
             case LeaseReleased():

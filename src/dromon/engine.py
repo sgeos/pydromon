@@ -86,9 +86,11 @@ failures from the SDK propagate unchanged.
 
 import asyncio
 import contextlib
+from decimal import Decimal
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import re
 import sys
@@ -305,11 +307,17 @@ class EnginePlanLimit(EngineRefused):
     not say holds only, which is default deny."""
 
     def __init__(
-        self, message: str, resets_at: str | None = None, *, may_move_role: bool = False
+        self,
+        message: str,
+        resets_at: str | None = None,
+        *,
+        may_move_role: bool = False,
+        window: str | None = None,
     ) -> None:
         super().__init__(message)
         self.resets_at = resets_at
         self.may_move_role = may_move_role
+        self.window = window
 
 
 BILLING_ERROR: Final = "billing_error"
@@ -348,6 +356,51 @@ def rejected_limit(info: RateLimitInfo) -> EnginePlanLimit | None:
         f"Claude subscription plan limit reached in its {window} window{suffix}",
         resets_at,
         may_move_role=True,
+        window=window if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", window) else None,
+    )
+
+
+def remaining_window_budget(
+    info: RateLimitInfo,
+) -> tuple[int, str | None, str, str] | None:
+    """The positive remaining percentage of the reported Claude rate-limit window.
+
+    ``utilization`` is a fraction of this window, not an account-wide total. A
+    rejected window is reported through ``EnginePlanLimit`` after a failed turn, and
+    a zero snapshot would trigger failover even when overage is available, so this
+    helper reports only a known positive remainder. Invalid or absent values are
+    ignored rather than rounded into an asserted budget.
+    """
+    utilization = info.utilization
+    if isinstance(utilization, bool) or not isinstance(utilization, int | float):
+        return None
+    try:
+        finite = math.isfinite(utilization)
+    except OverflowError:
+        return None
+    if (
+        not finite
+        or not 0 <= utilization < 1
+        or info.status not in {"allowed", "allowed_warning"}
+    ):
+        return None
+    remaining = 100 - math.ceil(Decimal(str(utilization)) * 100)
+    if not 1 <= remaining <= 100:
+        return None
+    resets_at: str | None = None
+    if type(info.resets_at) is int:
+        try:
+            resets_at = format_due(datetime.fromtimestamp(info.resets_at, UTC))
+        except (OverflowError, OSError, ValueError):
+            resets_at = None
+    window = info.rate_limit_type or "unnamed"
+    if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", window) is None:
+        window = "unnamed"
+    return (
+        remaining,
+        resets_at,
+        f"Claude reported {remaining}% remaining in its {window} rate-limit window",
+        window,
     )
 
 
@@ -1392,6 +1445,17 @@ type SpentBetween = Callable[[str, float | None, Mapping[str, int] | None], obje
 """Where an engine reports what a turn outside Dromon's own cost: its kind, its cost
 and its tokens, where the engine reports them."""
 
+type BudgetReported = Callable[[int, str | None, str, str], object]
+"""Where an engine reports a positive remaining percentage for one provider window."""
+
+
+def ignore_budget_report(
+    remaining_percent: int, resets_at: str | None, note: str, window: str
+) -> None:
+    """The default for an engine whose budget snapshots nobody follows."""
+    del remaining_percent, resets_at, note, window
+
+
 type SelfStartedFinish = Callable[[TurnReport | None, Exception | None], object]
 """Where a Dromon scheduler settles a turn the engine began after a task ended."""
 
@@ -1980,6 +2044,7 @@ class ClaudeCodeLine:
             [Mapping[str, int | str | None]], object
         ] = ignore_compaction,
         spent_between: SpentBetween = ignore_spent,
+        budget_reported: BudgetReported = ignore_budget_report,
         ceiling_reached: Ask = no_operator,
         ceiling_settled: Settle = nothing_to_settle,
         consent_asked: Callable[[str], object] = no_consent_question,
@@ -2021,6 +2086,8 @@ class ClaudeCodeLine:
         to a later turn."""
         self._spent_between = spent_between
         """Called with the cost of a result that ends a turn outside Dromon's own."""
+        self._budget_reported = budget_reported
+        """Called when the engine reports positive remaining provider-window budget."""
         self._usage: dict[str, int] | None = None
         self._source: str | None = None
         """What the last measured turn's cost and usage came from."""
@@ -2418,6 +2485,9 @@ class ClaudeCodeLine:
             self._surface(message.subtype)
         elif isinstance(message, RateLimitEvent):
             self._limit = rejected_limit(message.rate_limit_info)
+            budget = remaining_window_budget(message.rate_limit_info)
+            if budget is not None:
+                self._budget_reported(*budget)
         elif isinstance(message, AssistantMessage):
             if message.error == BILLING_ERROR:
                 turn.billing = True

@@ -774,7 +774,9 @@ READ_RATE_LIMIT_FIELDS: Final[Mapping[str, object]] = {
 }
 """The fields of ``rate_limit_info`` the Agent SDK reads, as its ``RateLimitInfo``
 of ``claude-agent-sdk`` 0.2.174 names them, each with the placeholder that keeps it
-valid there. Dromon's adapter reads none of them. An SDK upgrade checks this list."""
+valid there. Dromon reads status, reset time, window name, overage status and
+utilization. It uses utilization for a positive remaining-window snapshot. An SDK
+upgrade checks this list."""
 RATE_LIMIT_WINDOWS: Final = frozenset(
     {"five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "overage"}
 )
@@ -784,9 +786,10 @@ RATE_LIMIT_KEYS: Final = frozenset({"rate_limit_info", "rateLimits"})
 """The keys whose values report an account's usage. ``rate_limit_info`` is Claude
 Code's. ``rateLimits`` is Codex's, in its rate limit read and notice. **Inference, not
 yet seen in a recording.** That Codex names it so is taken from its app-server
-protocol, and the Codex adapter reads nothing in it, so every value but a reset time
-becomes a placeholder of its type. A person reads the first Codex recording before it
-becomes a fixture, as for any engine."""
+protocol. The Codex adapter reads the no-credit notice's ``credits.hasCredits`` and
+``credits.unlimited`` fields and requires null ``primary`` and ``secondary`` windows.
+The scrubber preserves object shape and nulls but replaces values by type. A person
+reads the first Codex recording before it becomes a fixture, as for any engine."""
 
 
 def _rate_limit_value(key: str, value: object) -> object:

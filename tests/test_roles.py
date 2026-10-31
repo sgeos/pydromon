@@ -10,6 +10,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
+import dromon.codec as codec
 from dromon.codec import DecodeError, decode, encode
 from dromon.model import (
     DEFAULT_HANDOFF_SECONDS,
@@ -21,6 +22,7 @@ from dromon.model import (
     AgentRegistered,
     BudgetSource,
     BudgetStated,
+    BudgetHandoffRequested,
     Event,
     EventRejected,
     InvalidField,
@@ -437,6 +439,46 @@ def test_an_ownership_change_carries_its_addresses_as_text() -> None:
     assert document["data"]["by"] == "alpha"
     assert json.loads(encode(changed("alpha", None, DECLARED)))["data"]["by"] == "@ana"
     assert decode(encode(event)) == event
+
+
+def test_budget_window_round_trips_and_older_events_decode_without_one() -> None:
+    event = BudgetStated(
+        "claude-code", 7, AT, BudgetSource.ENGINE, "seven day", AT, "seven_day"
+    )
+    document = json.loads(encode(event))
+    assert document["data"]["window"] == "seven_day"
+    assert decode(encode(event)) == event
+
+    document["data"].pop("window")
+    assert decode(json.dumps(document)) == BudgetStated(
+        "claude-code", 7, AT, BudgetSource.ENGINE, "seven day", AT
+    )
+
+
+def test_budget_handoff_request_round_trips() -> None:
+    event = BudgetHandoffRequested("claude-code", "core", 9, 10, AT)
+    assert decode(encode(event)) == event
+
+
+def test_nonnull_window_is_refused_by_the_pre_window_codec_shape() -> None:
+    """Apply the previous exact-key schema to the new payload without old code."""
+    event = BudgetStated(
+        "claude-code", 7, AT, BudgetSource.ENGINE, "seven day", AT, "seven_day"
+    )
+    document = json.loads(encode(event))
+    previous_fields = (
+        "provider",
+        "remaining_percent",
+        "resets_at",
+        "source",
+        "note",
+        "stated_at",
+    )
+    data = cast(dict[str, object], document["data"])
+    with pytest.raises(DecodeError, match="keys"):
+        codec._object(  # pyright: ignore[reportPrivateUsage]
+            data, "previous budget_stated data", previous_fields
+        )
 
 
 # The role_status view and tool.
