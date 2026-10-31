@@ -3222,3 +3222,35 @@ def test_view_image_never_permits_image_generation_or_editing(
         server = FakeGrok([grok_call(name)])
         with pytest.raises(EngineRefused, match=f"not given: {name}"):
             run(line(server, project, config=config))
+
+
+def test_the_observed_task_output_sequence_is_counted_as_bash(
+    project: tuple[Path, Path, Path],
+) -> None:
+    # Observed on 2026-10-31. Grok's tool_call_update gives
+    # get_command_or_subagent_output the kind other, which held a live turn.
+    raw = {"task_ids": ["t1"], "timeout_ms": 180000}
+    server = FakeGrok(
+        [
+            grok_call("get_command_or_subagent_output", ident="o", raw_input=raw),
+            call_update(
+                "o",
+                kind="other",
+                title="Get task output",
+                rawInput={"variant": "TaskOutput", **raw},
+                _meta=grok_meta("get_command_or_subagent_output"),
+            ),
+        ]
+    )
+    config = LineConfig(builtin_tools=("Bash",))
+    assert run(line(server, project, config=config)).tool_uses == ("Bash",)
+
+
+def test_a_task_tool_of_kind_other_still_needs_bash(
+    project: tuple[Path, Path, Path],
+) -> None:
+    event = grok_call("kill_command_or_subagent")
+    event["params"]["update"]["kind"] = "other"
+    config = LineConfig(builtin_tools=("Read",))
+    with pytest.raises(EngineRefused, match="not given: kill_command_or_subagent"):
+        run(line(FakeGrok([event]), project, config=config))

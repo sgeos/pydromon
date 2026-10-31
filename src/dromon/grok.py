@@ -157,8 +157,8 @@ GROK_TOOL_KINDS: Final[dict[str, frozenset[str]]] = {
     "search_replace": frozenset({"edit"}),
     "write": frozenset({"edit"}),
     "run_terminal_command": frozenset({"execute"}),
-    "get_command_or_subagent_output": frozenset({"execute"}),
-    "kill_command_or_subagent": frozenset({"execute"}),
+    "get_command_or_subagent_output": frozenset({"execute", "other"}),
+    "kill_command_or_subagent": frozenset({"execute", "other"}),
     "web_fetch": frozenset({"fetch"}),
     "web_search": frozenset({"fetch", "search"}),
     "search_tool": frozenset({"other"}),
@@ -169,7 +169,10 @@ name, not merely with some tool of the line. **Review of d29174d, 2026-10-31.**
 **Fact, observed on 2026-10-31** in a Grok line turn of 58 tool calls, from each
 call's ``tool_call_update``: ``read_file`` as ``read``, ``grep`` as ``search``,
 ``run_terminal_command`` as ``execute``, ``list_dir``, ``search_tool`` and
-``use_tool`` as ``other``. The other entries are a **hypothesis** from the tool's
+``use_tool`` as ``other``, and in a later turn ``get_command_or_subagent_output`` as
+``other``, with Grok's own ``_meta`` kind ``background_task_action``.
+``kill_command_or_subagent`` shares that ``_meta`` kind, so ``other`` is **inferred**
+for it, not observed. The other entries are a **hypothesis** from the tool's
 purpose. A call with another kind is refused, which may refuse too much and never
 grants more, since what a call may do is decided by its name."""
 
