@@ -462,6 +462,19 @@ remote_reach = ["@ana"]             # what an undeclared key may reach
   that cannot be read at accept, from a table that cannot answer or a caller already
   gone, refuses the `hello`. **Limit.** The table gives start times to the second, so
   a pid reused within the second its first process started is not told apart.
+- **No bound on open peers here.** From finding R4 of the round 12 re-review.
+  Undeclared projects on this machine are not counted against `MAX_OPEN_REMOTE_PEERS`
+  and have no bound of their own, and they have no shared limits. **Reason.** Each is
+  named by a live registry entry whose pid is the caller's, the registry admits only
+  files of the same user in a directory of mode 0700, and the lines of an open
+  project are denied it, so every open peer here is a process of the user that the
+  project already trusts as far as its tokens. A name stays one peer however often
+  it connects, so the open peers here grow as the user starts daemons of new names.
+  **Inference.** A process of the user that writes registry entries under many names
+  and connects under each could still record many open peers, without limit. Such a
+  process can already read every token and act as the user, which is the exposure
+  the trust section accepts, so a bound would not change what it can do. **Hazard.**
+  The log then grows by one event for each such name.
 - **Outbound.** A line may address `NAME:PARTY` for a project of the registry that the
   file does not declare. The send is judged by `[federation.open]` first, and only
   mail it lets through records `peer_opened` and then `message_sent`, so a refusal
@@ -524,8 +537,16 @@ registered after this daemon started is denied from each line's next turn.
   operator's review.** Both are `[federation.open]` keys whose defaults, 6 and 500,
   are one declared peer's, so every undeclared key together may do by default what
   one declared peer may. A turn several keys started counts once against the shared
-  allowance. A note past the shared waiting bound is refused with `full`. The rate of
-  `deliver` requests stays per key, which the bound on keys limits.
+  allowance. A note past the shared waiting bound is refused with `full`.
+- **A shared rate.** **Decided by the operator on 2026-10-31,** from finding R1 of the
+  round 12 re-review. All undeclared keys together may make `remote_total_deliveries`
+  `deliver` requests in each ten minutes, whatever their answers, besides each key's
+  own rate of 60. Its default is 60, one declared peer's rate, so 64 keys together
+  make no more requests than one declared peer may. A request past it is answered
+  `busy`, and a request answered `busy` counts against neither rate. **Decided by
+  core, for the operator's review.** The largest setting is 3,840, which is 64 keys at
+  their own rate, so the setting can tighten the bound the cap on keys already gives
+  but never loosen it. A declared peer never counts against the shared rate.
 - **No outbound.** Nothing locates an undeclared machine, so mail to another machine
   still needs a declared peer, which names its address. An open key's parties cannot
   be addressed, and a reply to one is refused.
@@ -538,8 +559,13 @@ registered after this daemon started is denied from each line's next turn.
   open, the file must list at least one range, and a file that leaves it out is
   refused. A listener that admits every address lists both `"0.0.0.0/0"` and
   `"::/0"`, so a listener open to the world is always a choice written in the file.
-  With `remote` an allowlist, leaving it out still admits every address, since only
-  the declared pins complete a handshake there.
+  **Empty with `remote` closed.** From finding R2 of the round 12 re-review. A
+  project that sets `tls_listen` for its declared inbound `tls` peers and keeps
+  `remote` an allowlist may leave `allowed_networks` out, and its listener then
+  admits a connection from every address. Each connection must still complete the
+  handshake with a key that a declared peer pins, so an address outside the list
+  costs only a handshake and is never a peer. A project that wants its listener to
+  refuse other addresses before the handshake lists its ranges in either mode.
 - **Why pyOpenSSL.** **Fact,** probed on 2026-10-31 with Python 3.12 and OpenSSL
   3.5.4 over memory buffers. A server context of Python's `ssl` that requires a
   client certificate, or only requests one, refuses a self-signed certificate it does
@@ -1099,6 +1125,8 @@ daemon restarts, so a peer that changes its name on each connection sends one no
 | A caller's pid is reused between its connection's accept and its `hello` | The start time read at accept differs from the entry's, so the `hello` is refused. Finding F2 of the round 12 review |
 | The start time of a caller cannot be read at accept | The `hello` without a token is refused, and the failure is written to standard error |
 | One host mints a new key for each handshake | Each key is recorded up to 64, and a new key past that is refused at `hello` with nothing recorded. The keys share one allowance of turns and one bound of waiting mail. Finding F1 of the round 12 review |
+| Many undeclared keys deliver in turn, each within its own rate | Together they make at most `remote_total_deliveries` requests in ten minutes, 60 by default, and the rest are answered `busy`. Finding R1 of the round 12 re-review |
+| A process of the user registers many names and connects under each | Each name is recorded as an open peer on this machine, without a bound, and the log grows by one event for each. Accepted, since such a process can already act as the user. Finding R4 of the round 12 re-review |
 | A project opens `remote` without `allowed_networks` | The file is refused. Every address is admitted only by listing `"0.0.0.0/0"` and `"::/0"`. Finding F3 of the round 12 review |
 | Another process connects with a live entry's name | Its pid is not the entry's, so it is refused |
 | An undeclared key sends to a party outside `remote_reach` | Refused with `refused`, as any party out of reach is |

@@ -37,6 +37,7 @@ from dromon.driver import Strategy
 from dromon.eventlog import EventLog
 from dromon.federation import (
     DEFAULT_REMOTE_MAX_BODY_BYTES,
+    DEFAULT_REMOTE_TOTAL_DELIVERIES,
     DEFAULT_REMOTE_TOTAL_TURNS_PER_HOUR,
     DEFAULT_REMOTE_TOTAL_WAITING,
     DEFAULT_REMOTE_TURNS_PER_HOUR,
@@ -45,6 +46,7 @@ from dromon.federation import (
     DEFAULT_WAITING,
     MAX_OPEN_REMOTE_PEERS,
     MAX_PEERS,
+    MAX_REMOTE_TOTAL_DELIVERIES,
     NO_FEDERATION,
     SCOPE_LOCAL,
     SCOPE_REMOTE,
@@ -70,6 +72,15 @@ from dromon.model import (
     State,
 )
 from dromon.paths import ProjectPaths, project_paths
+from dromon.peering import (
+    RATE_PER_PEER,
+    RATE_WINDOW_SECONDS,
+    Accepted,
+    Busy,
+    Outcome,
+    Received,
+    Receiver,
+)
 from dromon.projectconfig import ProjectConfig
 from dromon.protocol import (
     Operation,
@@ -1126,6 +1137,74 @@ def test_the_shared_bounds_default_to_one_declared_peers_and_are_checked() -> No
     for key in ("remote_total_turns_per_hour", "remote_total_waiting"):
         with pytest.raises(FederationError, match=f"open.{key} must be"):
             remote_open(**{key: 0})
+
+
+def stub_receive(*_args: object) -> Received:
+    """Records nothing, so no delivery is a resend and none fills a waiting bound."""
+    return Received("m1", False)
+
+
+@pytest.mark.parametrize("allowance", [None, 5])
+def test_every_undeclared_key_shares_one_rate_of_deliveries(
+    allowance: int | None,
+) -> None:
+    """Decided by the operator on 2026-10-31, finding R1 of the round 12 re-review.
+    The most undeclared keys there may be deliver in turn, each far within its own
+    rate, and together they make no more deliveries in one window than the shared
+    rate, by default one declared peer's. A declared peer is not slowed by them, and
+    the shared rate comes back when the window passes."""
+    chosen = {} if allowance is None else {"remote_total_deliveries": allowance}
+    federation = parse_federation(
+        {
+            "tls_listen": "127.0.0.1:7411",
+            "remote": "open",
+            "allowed_networks": LOOPBACK,
+            "open": {"remote_reach": ["@ana"], **chosen},
+        },
+        {"kin": {"socket": "/srv/k/run/peers.sock", "inbound": True}},
+    )
+    expected = RATE_PER_PEER if allowance is None else allowance
+    now = [0.0]
+    receiver = Receiver(lambda: now[0])
+    state = State()
+    keys = [minted(index) for index in range(MAX_OPEN_REMOTE_PEERS)]
+    for key in keys:
+        state.apply(PeerOpened(key, SCOPE_REMOTE, AT))
+    for event in plan_peers(state, federation):
+        state.apply(event)
+    operators = frozenset({"ana"})
+
+    def deliver(peer_id: str, origin_id: str) -> Outcome:
+        args = note("@ana", origin_id=origin_id)
+        return receiver.deliver(
+            state, federation, operators, peer_id, args, stub_receive
+        )
+
+    rounds = 2
+    assert rounds < RATE_PER_PEER < rounds * MAX_OPEN_REMOTE_PEERS
+    answers = [deliver(key, f"o{round_}") for round_ in range(rounds) for key in keys]
+    passed = [answer for answer in answers if not isinstance(answer, Busy)]
+    assert len(passed) == expected
+    assert all(isinstance(answer, Accepted) for answer in passed)
+    assert answers[expected] == Busy(int(RATE_WINDOW_SECONDS))
+    assert not isinstance(deliver("kin", "k0"), Busy)
+    now[0] += RATE_WINDOW_SECONDS
+    assert isinstance(deliver(keys[-1], "late"), Accepted)
+
+
+def test_the_shared_rate_defaults_to_one_declared_peers_and_never_loosens() -> None:
+    """The default is one declared peer's rate, which ``federation`` writes as a
+    number, and the largest setting is what the cap's keys could make without it."""
+    assert DEFAULT_REMOTE_TOTAL_DELIVERIES == RATE_PER_PEER
+    assert remote_open().open.remote_total_deliveries == RATE_PER_PEER
+    assert MAX_REMOTE_TOTAL_DELIVERIES == MAX_OPEN_REMOTE_PEERS * RATE_PER_PEER
+    widest = remote_open(remote_total_deliveries=MAX_REMOTE_TOTAL_DELIVERIES)
+    assert widest.open.remote_total_deliveries == MAX_REMOTE_TOTAL_DELIVERIES
+    for value in (0, MAX_REMOTE_TOTAL_DELIVERIES + 1, "60"):
+        with pytest.raises(
+            FederationError, match="open.remote_total_deliveries must be"
+        ):
+            remote_open(remote_total_deliveries=value)
 
 
 def test_only_an_undeclared_remote_key_is_an_open_remote_peer() -> None:

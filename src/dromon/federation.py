@@ -107,6 +107,7 @@ OPEN_KEYS: Final = frozenset(
         "remote_waiting",
         "remote_total_turns_per_hour",
         "remote_total_waiting",
+        "remote_total_deliveries",
     }
 )
 DEFAULT_REMOTE_MAX_BODY_BYTES: Final = 16384
@@ -196,6 +197,18 @@ undeclared keys together share these, besides each key's own ``remote_turns_per_
 and ``remote_waiting``, so changing keys gains nothing past them. Their defaults, set
 by core, are one declared peer's, so every undeclared key together may do by default
 what one declared peer may."""
+DEFAULT_REMOTE_TOTAL_DELIVERIES: Final = 60
+"""The deliveries all undeclared keys together may make in each window of
+``peering.RATE_WINDOW_SECONDS``, decided by the operator on 2026-10-31 from finding R1
+of the round 12 re-review. By default it is one declared peer's
+``peering.RATE_PER_PEER``, written here as a number because ``peering`` imports this
+module, and a test checks that the two are equal."""
+MAX_REMOTE_TOTAL_DELIVERIES: Final = (
+    MAX_OPEN_REMOTE_PEERS * DEFAULT_REMOTE_TOTAL_DELIVERIES
+)
+"""The largest ``remote_total_deliveries``, which is what ``MAX_OPEN_REMOTE_PEERS`` keys
+at their own rate could make without it, so the setting can tighten that bound but
+never loosen it. It is also the capacity of the receiver's shared counter."""
 MAX_WAITING: Final = 100_000
 
 UNCONFINED_ENGINES: Final = frozenset({"pi", "cursor-agent", "antigravity"})
@@ -317,6 +330,9 @@ class OpenPolicy:
     hour."""
     remote_total_waiting: int = DEFAULT_REMOTE_TOTAL_WAITING
     """The unread notes all undeclared keys together may have waiting."""
+    remote_total_deliveries: int = DEFAULT_REMOTE_TOTAL_DELIVERIES
+    """The deliveries all undeclared keys together may make in each window of
+    ``peering.RATE_WINDOW_SECONDS``, whatever their answers."""
 
     def local_definition(self, peer_id: str) -> PeerDefinition:
         """The definition of the open peer ``peer_id`` on this machine. Its socket
@@ -658,6 +674,13 @@ def _open_policy(value: object) -> OpenPolicy:
             "remote_total_waiting",
             DEFAULT_REMOTE_TOTAL_WAITING,
             MAX_WAITING,
+        ),
+        remote_total_deliveries=_count(
+            table,
+            f"{key}.remote_total_deliveries",
+            "remote_total_deliveries",
+            DEFAULT_REMOTE_TOTAL_DELIVERIES,
+            MAX_REMOTE_TOTAL_DELIVERIES,
         ),
     )
 

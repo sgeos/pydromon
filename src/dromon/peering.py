@@ -32,7 +32,12 @@ from enum import StrEnum
 from typing import Final, cast
 
 from dromon.agents import token_digest
-from dromon.federation import SCOPE_REMOTE, TRANSPORT_UNIX, FederationConfig
+from dromon.federation import (
+    MAX_REMOTE_TOTAL_DELIVERIES,
+    SCOPE_REMOTE,
+    TRANSPORT_UNIX,
+    FederationConfig,
+)
 from dromon.model import (
     ID_PATTERN,
     MAX_TEXT_BYTES,
@@ -75,6 +80,9 @@ RATE_PER_PEER: Final = 60
 """Deliveries one peer may make in ``RATE_WINDOW_SECONDS``, the design's default of
 decision 7. Every ``deliver`` counts, whatever its answer, so a peer cannot make the
 receiver check without limit by sending refused mail."""
+_UNDECLARED: Final = "*"
+"""The one key of the receiver's shared rate, under which every undeclared remote key's
+delivery is counted."""
 
 TURN_WINDOW_SECONDS: Final = 3600.0
 MAX_TURN_CAPACITY: Final = 60
@@ -290,6 +298,11 @@ class Receiver:
         self._rate: WindowCounter[str] = WindowCounter(
             clock, RATE_WINDOW_SECONDS, RATE_PER_PEER
         )
+        self._shared_rate: WindowCounter[str] = WindowCounter(
+            clock, RATE_WINDOW_SECONDS, MAX_REMOTE_TOTAL_DELIVERIES
+        )
+        """The deliveries of every undeclared remote key together, under the one key
+        ``_UNDECLARED``, which ``remote_total_deliveries`` bounds."""
 
     def deliver(
         self,
@@ -311,10 +324,24 @@ class Receiver:
         ``operators`` are the operators the project file declares, the only ones a
         peer may reach, as decision 25 of ``FEDERATION.md`` decided. An operator the
         log knows but the file does not declare is refused, so a peer can neither
-        create an operator nor reach one the project has not named."""
+        create an operator nor reach one the project has not named.
+
+        An undeclared remote key's delivery also counts against the rate all of them
+        share, ``remote_total_deliveries``, as the operator decided on 2026-10-31 from
+        finding R1 of the round 12 re-review, so a host gains no deliveries by changing
+        keys. A delivery answered busy by either rate counts against neither."""
         if self._rate.count(peer_id) >= RATE_PER_PEER:
             return Busy(self._rate.wait(peer_id))
+        shared = federation.is_open_remote(state, peer_id)
+        if (
+            shared
+            and self._shared_rate.count(_UNDECLARED)
+            >= federation.open.remote_total_deliveries
+        ):
+            return Busy(self._shared_rate.wait(_UNDECLARED))
         self._rate.record(peer_id)
+        if shared:
+            self._shared_rate.record(_UNDECLARED)
         try:
             envelope = parse_envelope(args)
         except EnvelopeError:

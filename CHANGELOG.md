@@ -104,6 +104,18 @@ All notable changes are recorded here. The format follows
   accepted, in a worker thread, and is refused when it cannot be read. With
   `remote = "open"`, `allowed_networks` is required, and a world-open listener lists
   `"0.0.0.0/0"` and `"::/0"`. A file that opens `remote` without it is now refused.
+  From finding R1 of the round 12 re-review, all undeclared keys also share
+  `remote_total_deliveries`, the `deliver` requests they may make together in ten
+  minutes, 60 by default, which is one declared peer's rate, and at most 3,840, so 64
+  keys together cannot exceed it. `FEDERATION.md` now states that an empty
+  `allowed_networks` admits every address to a TLS listener that serves declared
+  peers with `remote` closed, under the pin checks, and that undeclared projects on
+  this machine are not capped, since each is a process of the same user that a live
+  registry entry names. **Rollback hazard.** A daemon before round 12 refuses a
+  project file that holds any of the new `[federation]` keys, `local`, `remote`,
+  `name`, `allowed_networks` or the `[federation.open]` table, as an unknown key, and
+  so refuses the whole file. **Fact,** read from `_known` at 7aaec56. Removing those keys before a rollback lets the older daemon read the file,
+  though it still cannot read a log that holds `peer_opened`.
 - A peer reaches only declared operators, decision 25 of `FEDERATION.md`, decided by
   the operator on 2026-10-31. An operator the project file declares, by `[daemon]
   operator` or an `[operators.ID]` table, may receive peer mail before sending
