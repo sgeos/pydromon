@@ -39,6 +39,9 @@ subscription draws on a plan's limits while API usage is charged for every token
 | `claude_fable_5_1_subscription.kel` | Claude Fable 5.1 | subscription | high | 200 | 400 |
 | `claude_fable_5_1_api.kel` | Claude Fable 5.1 | api | medium | 4 | 20 |
 | `claude_fable_5_1_flexible.kel` | Claude Fable 5.1 | flexible | medium | 4 | 20 |
+| `claude_sonnet_5_5_subscription.kel` | Claude Sonnet 5.5 | subscription | high | 200 | 400 |
+| `claude_sonnet_5_5_api.kel` | Claude Sonnet 5.5 | api | medium | 4 | 20 |
+| `claude_sonnet_5_5_flexible.kel` | Claude Sonnet 5.5 | flexible | medium | 4 | 20 |
 | `gpt_6_luna_subscription.kel` | GPT-6-Luna on Codex | subscription | medium | 200 | 400 |
 | `gpt_6_luna_api.kel` | GPT-6-Luna on Codex | api | low | 2 | 10 |
 | `gpt_6_luna_flexible.kel` | GPT-6-Luna on Codex | flexible | low | 2 | 10 |
@@ -76,6 +79,13 @@ Keleusma's proofs line. One `dromon probe --model claude-fable-5-1` turn, run wi
 operator's approval, reported the subscription credential and the model
 `claude-fable-5-1` from Claude Code 2.1.310, and replied `ready`. Its context window of
 1,000,000 tokens is copied from the Opus drivers and is not verified.
+
+**Claude Sonnet 5.5, verified on 2026-10-31.** Added at the operator's direction. Its
+settings copy the Opus 5.5 drivers, and a test derives them from those. One `dromon
+probe --model claude-sonnet-5-5` turn reported the subscription credential and the
+model `claude-sonnet-5-5` from Claude Code 2.1.310, and replied `ready`. Fact, that
+Claude Code also names a `[1m]` variant of the model. The context window of 1,000,000
+tokens is copied from the Opus drivers and is not verified.
 
 GPT-6-Luna's settings follow Codex's model catalogue as fetched on 2026-10-25, which
 gives it a default effort of medium and a context window of 272,000 tokens, and for a

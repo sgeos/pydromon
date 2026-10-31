@@ -841,7 +841,7 @@ def test_a_line_needs_a_packaged_driver(make_world: MakeWorld) -> None:
     target = make_world({})
     with pytest.raises(DriverError, match="no driver"):
         target.scheduler.create_line(
-            "gamma", "claude-sonnet-5-5", Strategy.SUBSCRIPTION
+            "gamma", "claude-unreleased-0-0", Strategy.SUBSCRIPTION
         )
     assert "gamma" not in target.log.state.lines
 
@@ -1665,6 +1665,7 @@ def test_a_line_switches_models_only_within_its_engine(make_world: MakeWorld) ->
         "claude-opus-5-5",
         "claude-haiku-5-5",
         "claude-fable-5-1",
+        "claude-sonnet-5-5",
     )
     target.scheduler.override_line("alpha", "model", "claude-opus-5-5")
     assert target.scheduler.model_of("alpha") == "claude-opus-5-5"

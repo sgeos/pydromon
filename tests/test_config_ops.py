@@ -94,7 +94,12 @@ def test_settings_report_each_value_with_its_layer(paths: ProjectPaths) -> None:
         )
         model = client.entry("line", "model")
         assert (model["value"], model["source"]) == (HAIKU, "created")
-        assert model["choices"] == ["claude-opus-5-5", HAIKU, "claude-fable-5-1"]
+        assert model["choices"] == [
+            "claude-opus-5-5",
+            HAIKU,
+            "claude-fable-5-1",
+            "claude-sonnet-5-5",
+        ]
         effort = client.entry("line", "effort")
         assert effort["source"] == "driver" and effort["editable"] is True
         strategy = client.entry("line", "strategy")
