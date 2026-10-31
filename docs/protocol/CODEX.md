@@ -122,6 +122,23 @@ that a read line can write its own scratch and not `tmp/` beside it. This settin
 part of the stored thread fingerprint, so a resumed thread with different access is
 replaced before a turn starts.
 
+**Changed on 2026-10-31, review of ebedeed, R1.** The owner of a role's worktree can
+replace `tmp`, `tmp/lines` or `tmp/lines/LINE` between a read seat's turns, and a
+grant made by real path would then follow a link into the owner's scratch. Each turn
+therefore checks every one of those components with `lstat` before it builds the
+profile, and refuses the turn when one is a symbolic link, is not a directory, or
+cannot be read. The grant is the real path of the working directory joined with the
+checked components, so no lookup after the check follows a link inside it.
+**Residual risk, not probed.** A swap after the check and before Codex applies the
+profile is not seen, and whether it would redirect the grant depends on how Codex
+resolves the path at its start.
+
+**Changed on 2026-10-31, review of ebedeed, G3.** A line with `workdir_access: write`
+and no `Edit` or `Write` has a read workspace too. When it has `Bash`, the one tool
+that could use a grant, it is given its own scratch as a read line is, which is where
+`write_scratch` writes for it. A line with neither a shell nor read access is given
+none, and its build touches nothing of its working directory.
+
 **Decided by the operator on 2026-10-26.** **Fact, observed live on 2026-10-26.** A
 resumed thread saw none of the tools Dromon added after it started.
 

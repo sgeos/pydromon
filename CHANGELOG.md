@@ -7,6 +7,24 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- A line can be created on, or rebound to, the packaged Pi model. The log checked a
+  line's model as an identifier, which refuses the colon and slash of the
+  engine-qualified names of Pi, Cursor Agent and Antigravity, so no Pi line could be
+  created. The `engine` field of `line_created` and `line_rebound` is now a model
+  name, an identifier or one with a colon and the harness's own identifier, as
+  [`EVENT_LOG.md`](docs/protocol/EVENT_LOG.md) gives it. Every other field stays an
+  identifier. Cursor Agent and Antigravity lines are still refused by their adapters,
+  which allow them only in `dromon probe`, and their names no longer stand in the way
+  once that refusal is lifted. **Rollback hazard.** A daemon before this change
+  refuses a log holding such a line as corrupt.
+- A Codex line's turn is refused when any directory of its own scratch, `tmp`,
+  `tmp/lines` or `tmp/lines/LINE`, is a symbolic link or not a directory, checked
+  by `lstat` each turn before its permission profile is built, so the owner of a
+  role's worktree cannot redirect a read seat's grant into its own scratch. Review
+  of ebedeed, R1.
+- A Codex line with write access, no `Edit` or `Write` and a shell is granted its
+  own scratch, where `write_scratch` writes for it, as a read line is. Review of
+  ebedeed, G3.
 - A line that does not write its working directory, a seat that does not own its
   role among them, has a scratch of its own, `tmp/lines/LINE`, for `write_scratch`
   and for the Codex read profile, which granted the whole of `tmp/` before. Either

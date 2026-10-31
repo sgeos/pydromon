@@ -27,7 +27,25 @@ from enum import StrEnum
 from typing import Final, assert_never
 
 ID_PATTERN: Final = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
-"""Identifiers and engine names. ASCII only, so every port compares them bytewise."""
+"""Identifiers. ASCII only, so every port compares them bytewise."""
+
+MODEL_PATTERN: Final = re.compile(
+    r"[a-z0-9][a-z0-9._-]{0,63}(:[a-z0-9][a-z0-9._/-]{0,127})?"
+)
+"""The model a line runs, the ``engine`` field of ``line_created`` and ``line_rebound``.
+It is an identifier, or an engine-qualified name as ``dromon.driver.ENGINE_OF`` gives
+it, an identifier, one colon and the harness's own identifier, which may also hold
+``/``, as Pi's ``openai/gpt-6-luna`` does.
+
+The colon and the slash are needed so that a line can be created on Pi, Cursor Agent or
+Antigravity at all, which the identifier pattern refused until 2026-10-31. Nothing else
+changes. The name stays ASCII and lowercase, so every port still compares it bytewise,
+it holds at most one colon, so the engine is the text before it, and it never begins
+with ``@``, ``&`` or ``!``, so it never reads as an address.
+
+**Assumption.** No harness identifier in the packaged catalogue holds an uppercase
+letter or a character outside this set. A model that did would need this pattern
+widened, which is a change to the log's grammar."""
 
 OPERATOR_PREFIX: Final = "@"
 """Marks an operator address. It never appears in an identifier, so a line address and
@@ -83,6 +101,12 @@ def check_id(name: str, value: object) -> None:
     """Raise ``InvalidField`` unless ``value`` is a valid identifier."""
     if not isinstance(value, str) or ID_PATTERN.fullmatch(value) is None:
         raise InvalidField(f"{name} is not a valid identifier: {value!r}")
+
+
+def check_model(name: str, value: object) -> None:
+    """Raise ``InvalidField`` unless ``value`` is a valid model name."""
+    if not isinstance(value, str) or MODEL_PATTERN.fullmatch(value) is None:
+        raise InvalidField(f"{name} is not a valid model name: {value!r}")
 
 
 def check_optional_id(name: str, value: object) -> None:
@@ -435,7 +459,7 @@ class LineCreated:
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
-        check_id("engine", self.engine)
+        check_model("engine", self.engine)
         check_id("strategy", self.strategy)
 
 
@@ -536,7 +560,7 @@ class LineRebound:
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
-        check_id("engine", self.engine)
+        check_model("engine", self.engine)
         check_id("strategy", self.strategy)
 
 

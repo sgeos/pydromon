@@ -1362,11 +1362,15 @@ def engine_factory(
                     "Codex lines take no sandbox or settings, and the project file"
                     " sets one for every line"
                 )
-            scratch = (
-                own_scratch(workdir, spec.line_id)
-                if spec.config.workdir_access is WorkdirAccess.READ
-                else None
+            # Review of ebedeed, G3. A line whose Codex workspace is read has its
+            # own, with read access as before, or with write access, no writing tool
+            # and a shell, the one tool that could write it. A line with neither
+            # touches nothing of its workdir at its build.
+            needs_scratch = not can_write_workdir(spec.config, codex.ENGINE_NAME) and (
+                spec.config.workdir_access is WorkdirAccess.READ
+                or "Bash" in spec.config.builtin_tools
             )
+            scratch = own_scratch(workdir, spec.line_id) if needs_scratch else None
             return CodexLine(
                 driver,
                 workdir,

@@ -233,6 +233,49 @@ def test_a_link_in_place_of_the_own_scratch_is_refused(
     assert list(outside.iterdir()) == []
 
 
+def test_a_seats_scratch_moves_when_it_gains_its_role_and_back(world: World) -> None:
+    """Review of ebedeed, G2. The scratch follows ownership both ways, through
+    ``write_scratch`` itself, and a file written under one scratch stays there."""
+    write = world.scheduler.write_scratch
+    assert write("beta", "notes.md", "as a seat") == "tmp/lines/beta/notes.md"
+    world.scheduler.give_ownership(ANA, "core", "beta")
+    assert write("beta", "notes.md", "as the owner") == "tmp/notes.md"
+    assert write("alpha", "notes.md", "as a seat") == "tmp/lines/alpha/notes.md"
+    world.scheduler.give_ownership(ANA, "core", "alpha")
+    assert write("beta", "later.md", "a seat again") == "tmp/lines/beta/later.md"
+    tree = world.root / TREE
+    assert (tree / "tmp/notes.md").read_text() == "as the owner"
+    assert (world.scratch("beta") / "notes.md").read_text() == "as a seat"
+    assert (world.scratch("beta") / "later.md").read_text() == "a seat again"
+    assert (world.scratch("alpha") / "notes.md").read_text() == "as a seat"
+
+
+def test_write_access_without_a_writing_tool_has_a_scratch_of_its_own(
+    world: World,
+) -> None:
+    """Review of ebedeed, G3. Write access alone does not make a line a writer, so a
+    line with it and no writing tool has its own scratch, unless it owns its role."""
+    parts = world.scheduler.scratch_parts
+    own = (SCRATCH_DIRECTORY, LINES_SCRATCH_DIRECTORY)
+    shell = LineConfig(workdir=OTHER, builtin_tools=("Bash",))
+    world.scheduler.create_line("hotel", HAIKU, Strategy.SUBSCRIPTION, shell)
+    world.scheduler.create_line("india", LUNA, Strategy.SUBSCRIPTION, shell)
+    for line_id in ("delta", "hotel", "india"):
+        config = world.scheduler.effective_config(line_id)
+        assert config.workdir_access is WorkdirAccess.WRITE
+        assert not set(config.builtin_tools) & {"Edit", "Write"}
+    # On Claude Code a shell writes, and on Codex it does not.
+    assert (parts("delta"), parts("hotel"), parts("india")) == (
+        (*own, "delta"),
+        (SCRATCH_DIRECTORY,),
+        (*own, "india"),
+    )
+    assert world.scheduler.write_scratch("india", "x", "y") == "tmp/lines/india/x"
+    # An owner with write access and no writing tool keeps the owner's scratch.
+    assert world.scheduler.effective_config("alpha").builtin_tools == ()
+    assert parts("alpha") == (SCRATCH_DIRECTORY,)
+
+
 def test_the_tool_says_where_each_scratch_is(world: World) -> None:
     tool = next(
         t for t in world.scheduler.own_tools("beta") if t.name == "write_scratch"
@@ -274,6 +317,32 @@ def test_a_codex_read_line_is_built_with_its_own_scratch(tmp_path: Path) -> None
     engine = build(LineSpec("alpha", LUNA, Strategy.SUBSCRIPTION, writer), [])
     assert isinstance(engine, CodexLine) and engine.scratch is None
     assert not (tmp_path / TREE / "tmp/lines/alpha").exists()
+
+
+def test_a_codex_shell_with_write_access_is_granted_only_its_own_scratch(
+    tmp_path: Path,
+) -> None:
+    """Review of ebedeed, G3. Write access with no writing tool leaves a Codex
+    workspace read, so the line is built and granted its own scratch, as
+    ``write_scratch`` gives it, and nothing else of the workdir."""
+    import tomllib
+
+    from dromon.codex import checked_scratch, server_arguments
+
+    (tmp_path / TREE).mkdir(parents=True)
+    build = engine_factory(str(tmp_path))
+    shell = LineConfig(workdir=TREE, builtin_tools=("Bash",))
+    assert shell.workdir_access is WorkdirAccess.WRITE
+    engine = build(LineSpec("india", LUNA, Strategy.SUBSCRIPTION, shell), [])
+    assert isinstance(engine, CodexLine) and engine.scratch is not None
+    grant = checked_scratch(engine.cwd, engine.scratch)
+    arguments = server_arguments([], shell, (), scratch=grant)
+    profile = next(a for a in arguments if a.startswith("permissions."))
+    text = profile.split("=", 1)[1]
+    filesystem = tomllib.loads(f"profile = {text}")["profile"]["filesystem"]
+    assert filesystem[":workspace_roots"] == {".": "read", ".git": "read"}
+    written = sorted(k for k, v in filesystem.items() if v == "write")
+    assert written == [os.path.realpath(tmp_path / TREE / "tmp/lines/india")]
 
 
 # N3, a turn begun while the role was vacant.
@@ -382,6 +451,37 @@ def test_shared_worktree_finds_a_nested_pair_by_identifier() -> None:
     )
     assert "one inside the other" in shared_worktree_refusal("b", "a", "x", True)
     assert "would share the worktree x" in shared_worktree_refusal("b", "a", "x")
+
+
+def test_the_nested_refusals_read_in_full() -> None:
+    """Review of ebedeed, G4. The whole text of each nested refusal, since an
+    operator acts on it, beside the equal case it extends."""
+    assert shared_worktree_refusal("docs", "core", "tmp/worktrees/core", True) == (
+        "roles core and docs would have worktrees one inside the other,"
+        " tmp/worktrees/core among them, so two owners could write the inner one."
+        " Give each role a worktree outside the other's"
+    )
+    assert shared_worktree_refusal("docs", "core", "tmp/worktrees/core") == (
+        "roles core and docs would share the worktree tmp/worktrees/core, so two"
+        " owners could write it. Give each role its own worktree"
+    )
+    root = Path("/p")
+    places = {"core": RolePlace(TREE, root / TREE, "alpha")}
+    nested = placement_refusal(
+        "gamma", LinePlace(f"{TREE}/sub", root / TREE / "sub", True, None), places
+    )
+    assert nested == (
+        f"line gamma could write {TREE}/sub, which overlaps {TREE}, the worktree of"
+        " role core, which alpha owns, and is not a seat of the role. Make it a seat"
+        " with dromon role update core, configure it with workdir_access read, or"
+        " give it another workdir"
+    )
+    equal = placement_refusal("gamma", LinePlace(TREE, root / TREE, True, None), places)
+    assert equal == (
+        f"line gamma could write {TREE}, the worktree of role core, which alpha owns,"
+        " and is not a seat of the role. Make it a seat with dromon role update core,"
+        " configure it with workdir_access read, or give it another workdir"
+    )
 
 
 def test_a_writer_holding_or_inside_an_owned_worktree_is_refused() -> None:

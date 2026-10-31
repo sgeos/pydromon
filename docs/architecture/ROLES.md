@@ -246,7 +246,11 @@ writes, so it can prepare a handoff, and it writes only a scratch directory of i
 `tmp/lines/LINE` in the worktree, with `write_scratch` or, on Codex, its own tools.
 **Changed by the operator on 2026-10-31, round 10 re-review, N1 and N2.** It wrote the
 whole of `tmp/` before, which is the owner's scratch, so it could change a file of the
-owner there. The owner's scratch is `tmp/`, which every seat may read. What it reads in the middle of
+owner there. The owner's scratch is `tmp/`, which every seat may read. **Decided by
+the operator on 2026-10-31, review of ebedeed, R2.** An owner configured with read
+access writes `tmp/` only through `write_scratch`, and its engine does not grant its
+shell `tmp/`, which is intended. On Codex each turn checks the seat's own scratch for links before
+granting it, so the owner cannot redirect that grant into `tmp/`. What it reads in the middle of
 the owner's change may be inconsistent, which the recovery checklist accounts for. Ownership is read when a seat's turn starts. An ownership
 change drops the engine of every seat whose access changed, so the next turn builds a
 new session with the new profile, since a sandbox is fixed for an engine session's

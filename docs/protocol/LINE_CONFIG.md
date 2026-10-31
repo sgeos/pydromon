@@ -1632,7 +1632,8 @@ line and asks an operator, unless the line mailed an operator during the turn.
 engine sandbox or permission profile to prevent writes under the working directory.
 Dromon's `write_scratch` tool is the supported write path, into the line's scratch as
 above, which for a line that does not own a role is its own `tmp/lines/LINE`. That
-directory is also the one a Codex line in this mode may write. Pi, Cursor Agent
+directory is also the one a Codex line in this mode may write, checked for links on
+every turn, as [`CODEX.md`](CODEX.md) records. Pi, Cursor Agent
 and Antigravity refuse to start in this mode because their adapters cannot enforce it.
 Grok refuses it too until a live probe shows its reader profile deny a write to the
 worktree, as [`GROK.md`](GROK.md) records. Claude Code also refuses configurations with mechanisms that can

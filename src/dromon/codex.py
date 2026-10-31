@@ -374,14 +374,20 @@ def permission_profile(
     writable, each existing protected path is denied by its real path, and each
     validated operator-granted directory is writable.
 
-    **Round 10 re-review, N2.** A line with ``workdir_access`` read may write only
-    ``scratch``, its own directory under ``tmp/lines/``, given by its real path, and
-    nothing else of the workdir. It was given the whole of ``tmp/`` before, which is
-    the owner's scratch when the workdir is a role's worktree, so a read-only seat
-    could write the owner's files there. A read line given no ``scratch`` has none.
+    **Round 10 re-review, N2.** A line whose workspace is read may write only
+    ``scratch``, its own directory under ``tmp/lines/``, and nothing else of the
+    workdir. It was given the whole of ``tmp/`` before, which is the owner's scratch
+    when the workdir is a role's worktree, so a read-only seat could write the
+    owner's files there. A read line given no ``scratch`` has none.
     **Assumption.** Codex grants a directory below a read workspace root by its
     absolute path, as it does for ``writable_paths``. No operator probe has confirmed
     it for a directory inside the workspace.
+
+    **Review of ebedeed, R1.** ``scratch`` is the path ``checked_scratch`` returned
+    for this turn, granted as it is, so no lookup after the check follows a link.
+    **Review of ebedeed, G3.** A line with write access and no writing tool has a
+    read workspace too, and is granted its own scratch as a read line is, which is
+    where ``write_scratch`` writes for it.
     """
     workspace = (
         "write"
@@ -390,8 +396,8 @@ def permission_profile(
         else "read"
     )
     own = (
-        (_toml_string(os.path.realpath(scratch)),)
-        if scratch is not None and config.workdir_access is WorkdirAccess.READ
+        (_toml_string(str(scratch)),)
+        if scratch is not None and workspace == "read"
         else ()
     )
     granted = validate_writable_paths(
@@ -412,6 +418,50 @@ def permission_profile(
         *(f'{directory}="write"' for directory in own),
     ]
     return f'{{extends=":workspace", filesystem={{{", ".join(entries)}}}}}'
+
+
+def checked_scratch(cwd: Path, scratch: Path) -> Path:
+    """The path to grant a line for its own ``scratch`` under its working directory
+    ``cwd``, or ``EngineRefused``.
+
+    **Review of ebedeed, R1.** The owner of a role's worktree can write ``tmp/`` and
+    so replace any directory of a read seat's ``tmp/lines/LINE`` between its turns.
+    Each component, ``tmp``, ``tmp/lines`` and ``tmp/lines/LINE``, is therefore
+    checked by ``lstat`` before each turn's profile is built, and a link or anything
+    but a directory refuses the turn, so the grant cannot be redirected into the
+    owner's scratch. The grant is the real path of ``cwd`` joined with the checked
+    components, rather than the real path of ``scratch``, so no lookup after the
+    check follows a link inside the workdir.
+
+    **Residual risk.** A swap after the check and before Codex applies the profile
+    is not seen. Whether that redirects the grant depends on how Codex resolves a
+    profile's path when it starts, which is not probed. A swap after Codex starts
+    does not, because a path-based sandbox checks the resolved target. Bounded by
+    the components of ``scratch`` below ``cwd``."""
+    try:
+        parts = scratch.relative_to(cwd).parts
+    except ValueError as error:
+        raise EngineRefused(
+            f"the line's scratch {scratch} is not inside its working directory {cwd}"
+        ) from error
+    if not parts or any(part in (".", "..") for part in parts):
+        raise EngineRefused(f"the line's scratch {scratch} is not below {cwd}")
+    for depth in range(1, len(parts) + 1):
+        component = "/".join(parts[:depth])
+        try:
+            mode = os.lstat(cwd.joinpath(*parts[:depth])).st_mode
+        except OSError as error:
+            raise EngineRefused(
+                f"the line's scratch {component} cannot be read: {error.strerror}"
+            ) from error
+        if stat.S_ISLNK(mode):
+            raise EngineRefused(
+                f"the line's scratch {component} is a symbolic link, so its grant"
+                " could be redirected. Put a directory in its place"
+            )
+        if not stat.S_ISDIR(mode):
+            raise EngineRefused(f"the line's scratch {component} is not a directory")
+    return Path(os.path.realpath(cwd)).joinpath(*parts)
 
 
 def validate_writable_paths(
@@ -1229,6 +1279,13 @@ class CodexLine:
             variables = gitssh.environment(self.git_ssh)
             if SHELL_VARIABLE in environment:
                 variables[SHELL_VARIABLE] = environment[SHELL_VARIABLE]
+            # Review of ebedeed, R1. Checked on every turn, since the owner can swap
+            # a component between turns.
+            scratch = (
+                None
+                if self.scratch is None
+                else checked_scratch(self.cwd, self.scratch)
+            )
             arguments = server_arguments(
                 self._list_servers(environment),
                 self.config,
@@ -1236,7 +1293,7 @@ class CodexLine:
                 self.mark,
                 variables,
                 git_directories(self.cwd) or (),
-                self.scratch,
+                scratch,
             )
             instructions = read_instructions(self.config.instructions, self.cwd)
         except Exception:
