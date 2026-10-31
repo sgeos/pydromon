@@ -139,6 +139,7 @@ from dromon.peering import PeerPriority, PeerTurns, Received, TurnCause, turn_ca
 from dromon import acp, antigravity, codex, cursor, grok, pi
 from dromon.agents import LineTokens
 from dromon import capabilities, launcher, redact
+from dromon.security_paths import project_secret_paths
 from dromon.handoff import Handoff
 from dromon.handoff import select as select_handoff
 from dromon import requestkeys
@@ -1327,6 +1328,10 @@ def engine_factory(
         # priority mail steers the driver rather than each engine.
         driver: Driver = priority.steered(spec.model, spec.strategy, spec.redirect)
         workdir = resolve_workdir(spec.config.workdir, Path(root), protected)
+        engine_protected = (
+            *protected,
+            *project_secret_paths(Path(root), workdir),
+        )
         git_ssh = (line_git_ssh or {}).get(spec.line_id)
         if driver.settings.engine == codex.ENGINE_NAME:
             if project_sandbox is not None or project_settings is not None:
@@ -1341,7 +1346,7 @@ def engine_factory(
                 config=spec.config,
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
-                protected=protected,
+                protected=engine_protected,
                 observe=spec.observe,
                 mark=spec.mark,
                 task_ended=spec.task_ended,
@@ -1352,6 +1357,8 @@ def engine_factory(
                 credits_spent=spec.credits_spent,
             )
         if driver.settings.engine == grok.ENGINE_NAME:
+            if spec.config.writable_paths:
+                raise EngineRefused("writable_paths is supported only for Codex lines")
             if project_sandbox is not None or project_settings is not None:
                 raise EngineRefused(
                     "Grok lines take no sandbox or settings, and the project file"
@@ -1365,12 +1372,14 @@ def engine_factory(
                 config=spec.config,
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
-                protected=protected,
+                protected=engine_protected,
                 bridge=bridge,
                 line_token=token,
                 observe=spec.observe,
                 mark=spec.mark,
             )
+        if spec.config.writable_paths:
+            raise EngineRefused("writable_paths is supported only for Codex lines")
         if driver.settings.engine == pi.ENGINE_NAME:
             if project_sandbox is not None or project_settings is not None:
                 raise EngineRefused(

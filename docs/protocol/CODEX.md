@@ -190,6 +190,23 @@ extends = ":workspace"
   does not, so Dromon states it.
 - Each protected directory that exists, the state directory and the runtime
   directory, is denied as its real path.
+- Existing operator paths `.ssh`, `.aws`, `.codex/auth.json`,
+  `.cargo/credentials.toml`, `.pi/agent/auth.json`, `.grok/auth.json`, `.claude.json`,
+  `.claude/.credentials.json`, `.netrc`, `.git-credentials`, `.gnupg`, `.npmrc`,
+  `.pypirc`, `.docker/config.json`, `.kube/config` and `.config/gh/hosts.yml` from the
+  shared `dromon.security_paths` list are denied by real absolute path. The list is not
+  complete, and a project may contain other credential stores. **Fact, operator probe
+  reported on 2026-10-31.** On 2026-10-31 a probe turn on `gpt-6-luna` signed in with
+  `~/.codex/auth.json` denied. **Inference.** This suggests that the app-server reads
+  its sign-in file outside the line sandbox. Whether a command in a live line is
+  refused access to that file remains unverified.
+- Existing `secret` directories under both the project root and the line's working
+  directory are denied by real absolute path. This includes a worktree whose project
+  root is elsewhere.
+- An operator may set `writable_paths` to existing absolute directories for a Codex
+  line given `Edit` or `Write`. Dromon resolves symbolic links, then refuses a grant
+  that overlaps a credential or protected path. The operator is responsible for
+  trusting each granted directory and its contents.
 - Network access is off, as `:workspace` leaves it, so a Codex line cannot reach a
   local teacher.
 - Codex's `:workspace` also leaves `$TMPDIR` and `/tmp` writable.
@@ -208,6 +225,32 @@ the epagoge project the line ran the project's full gate, which passed.
 **Fact, observed the same day.** Codex emits no item for an edit it rejects or for that
 shell read, so Dromon's driver cannot count a call that Codex refuses before running
 it.
+
+**Not verified.** Whether Codex profiles prevent shell writes through a symbolic link
+that points outside the working directory. Dromon does not claim that the current
+profile prevents that path.
+
+**Not verified.** Whether a symbolic link inside the workspace that points to a
+denied credential path is denied by the profile. Dromon has not tested that path.
+
+**Not verified.** How Codex matches deny entries on case-insensitive filesystems. The
+profile uses real absolute paths, but Dromon has not tested a case variant of a
+credential path.
+
+**Known window.** Credential and secret paths that do not exist when a turn's profile
+is built are absent from that profile. Dromon rebuilds the profile for each turn, so a
+path created during one turn is denied by the next profile, but the current turn may
+still access it.
+
+**Known window.** A protected path created during a turn is absent from that turn's
+profile and is guarded when the next profile is built. A protected path that appears
+inside an operator-granted directory may therefore be accessible for the rest of that
+turn.
+
+**Not verified.** A writable grant resolves its path when the profile is built. If an
+ancestor of the granted directory is then renamed and replaced by a symbolic link, the
+grant may follow the new target. The line does not normally control the granted
+directory's ancestors, and Dromon has not reproduced this case.
 
 ## Credentials
 

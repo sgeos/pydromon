@@ -301,6 +301,8 @@ class LineConfig:
     root."""
     workdir_access: WorkdirAccess = WorkdirAccess.WRITE
     """Whether the engine may write its workdir, as enforced by its confinement."""
+    writable_paths: tuple[str, ...] = ()
+    """Absolute directories an operator grants a Codex line permission to write."""
     project_settings: bool = False
     """Whether a Claude Code line also loads Claude Code's project setting source, the
     working directory's ``.claude/settings.json`` and what it brings."""
@@ -455,6 +457,8 @@ def encode_config(config: LineConfig) -> str:
         document["workdir"] = config.workdir
     if config.workdir_access is not WorkdirAccess.WRITE:
         document["workdir_access"] = config.workdir_access.value
+    if config.writable_paths:
+        document["writable_paths"] = list(config.writable_paths)
     if config.project_settings:
         document["project_settings"] = True
     if config.plugins:
@@ -646,6 +650,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         "instructions",
         "workdir",
         "workdir_access",
+        "writable_paths",
         "project_settings",
         "plugins",
         "keep_session",
@@ -710,6 +715,12 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
     workdir_access = _choice(
         document, "workdir_access", WorkdirAccess, WorkdirAccess.WRITE
     )
+    writable_paths = _texts(document.get("writable_paths", []), "writable_paths")
+    if len(writable_paths) != len(set(writable_paths)):
+        _fail("writable_paths names a directory twice")
+    for path in writable_paths:
+        if not Path(path).is_absolute():
+            _fail(f"writable path {path!r} must be absolute")
     project_settings = document.get("project_settings", False)
     if type(project_settings) is not bool:
         _fail("project_settings must be a boolean")
@@ -791,6 +802,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         instructions=instructions,
         workdir=workdir,
         workdir_access=workdir_access,
+        writable_paths=tuple(sorted(writable_paths)),
         project_settings=project_settings,
         plugins=plugins,
         keep_session=keep,

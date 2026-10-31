@@ -50,6 +50,18 @@ def test_read_only_workdir_access_round_trips_and_defaults_to_write() -> None:
     assert decode_config(encode_config(config)) == config
 
 
+def test_writable_paths_are_absolute_distinct_and_round_trip() -> None:
+    paths = ["/Volumes/build", "/Volumes/cache"]
+    config = config_from_document({"writable_paths": paths})
+    assert config.writable_paths == tuple(paths)
+    assert decode_config(encode_config(config)) == config
+    for invalid in ("relative/build", "~/build"):
+        with pytest.raises(ConfigError, match="must be absolute"):
+            config_from_document({"writable_paths": [invalid]})
+    with pytest.raises(ConfigError, match="twice"):
+        config_from_document({"writable_paths": [paths[0], paths[0]]})
+
+
 def test_fresh_session_each_turn_implies_context_handoff_is_off() -> None:
     config = config_from_document({"fresh_session_each_turn": True})
     assert config.fresh_session_each_turn

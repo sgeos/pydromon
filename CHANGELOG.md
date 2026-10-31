@@ -59,6 +59,44 @@ All notable changes are recorded here. The format follows
   launcher test that waits for a process to go poll to a monotonic deadline derived
   from the launcher's own bounds, and a `ps` that times out under load counts as not
   yet gone rather than failing the test. One run failed at a load average of 189.
+- Grok refuses a reused tool call identifier, including a repeated permission request,
+  so the same identifier cannot obtain multiple grants while counting once. Tests also
+  cover raw input changes in updates, non-`other` discovery calls, and a non-marker
+  `.claude` directory. The Codex dangling-credential overlap test now isolates the
+  `.cargo` guard it is intended to cover. The normal ACP order of announcement,
+  permission request and updates is accepted and counted once, as is a permission
+  request that arrives before the announcement.
+- Grok lines may use `search_tool` for discovery and `use_tool` for a qualified tool
+  served by that line's Dromon MCP server. Dromon checks the documented inline input
+  shape, refuses file-backed or ambiguous targets, keeps the target fixed through the
+  permission request, and counts the underlying Dromon tool against its budget. The
+  ACP call shape remains unverified pending a first live line turn. Grok project checks
+  allow only a real, empty `.claude/.cc-writes` marker and refuse other contents. The
+  local guides do not establish whether Grok creates `.grok` in its isolated home, so
+  no allowance was added for that path.
+- Grok refusal advice for an existing sandbox profile now lists only missing deny and
+  read-only entries. Tests check that an existing credential is omitted while a
+  missing one is named. Codex writable-path validation also has a test that refuses a
+  home-directory grant when `.netrc` is a dangling symbolic link. The Grok `.grok`
+  marker remains unresolved pending a live Dromon turn, and the Codex probe conclusion
+  is labeled as an inference.
+- Codex and Grok profiles now share the operator credential path list and require
+  existing project and workdir `secret` directories to be denied by real absolute
+  path. Codex adds validated operator-granted `writable_paths` for existing absolute
+  directories, only when the line has `Edit` or `Write`, and refuses grants that
+  overlap credentials or other protected paths. A Codex probe signed in with
+  `~/.codex/auth.json` denied, and that path is now denied by the profile. The operator
+  will verify that a live line command cannot read it.
+  Claude Code's existing `network.allowLocalBinding` setting is documented with a
+  line configuration example. Grok symlink writes outside the workdir remain
+  unverified, and no external writable path grant was added.
+- The shared credential list now includes additional common stores. It is explicitly
+  incomplete, and each engine exempts only its own sign-in path. A dangling link at a
+  listed home path is denied by its absolute path. Protocol documents describe the
+  probe result and the remaining unverified Codex path behavior, and correct when and
+  where `writable_paths` are validated. Negative tests cover unsupported engines,
+  missing write tools, Git overlap, links to protected paths, dangling credentials and
+  a credential created between Codex turns.
 - Grok home checks now allow an empty regular `hooks-paths` file and an
   `installed-plugins` directory containing only empty regular `*.lock` files, while
   refusing symbolic links and any other contents. Grok writer profiles hold the

@@ -54,6 +54,7 @@ from dromon.grok import (
 )
 from dromon.capabilities import Known
 from dromon.lineconfig import LineConfig, WorkdirAccess
+from dromon.security_paths import CREDENTIAL_PATHS
 from dromon.gitssh import COMMAND_VARIABLE, GitSshAccess, ssh_command
 from dromon.mcp import Bridge
 from dromon.protocol import Response
@@ -126,15 +127,21 @@ def chunk(text: str) -> dict[str, Any]:
     )
 
 
-def tool_call(kind: str, name: str = "", ident: str = "t") -> dict[str, Any]:
-    return note(
-        {
-            "sessionUpdate": "tool_call",
-            "toolCallId": ident,
-            "kind": kind,
-            "toolName": name,
-        }
-    )
+def tool_call(
+    kind: str,
+    name: str = "",
+    ident: str = "t",
+    raw_input: object | None = None,
+) -> dict[str, Any]:
+    update: dict[str, Any] = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": ident,
+        "kind": kind,
+        "toolName": name,
+    }
+    if raw_input is not None:
+        update["rawInput"] = raw_input
+    return note(update)
 
 
 def call_update(ident: object, **fields: object) -> dict[str, Any]:
@@ -143,15 +150,26 @@ def call_update(ident: object, **fields: object) -> dict[str, Any]:
 
 
 def permission(
-    kind: str, name: str = "", request_id: str = "p1", ident: str = "t"
+    kind: str,
+    name: str = "",
+    request_id: str = "p1",
+    ident: str = "t",
+    raw_input: object | None = None,
 ) -> dict[str, Any]:
+    tool_call_fields: dict[str, Any] = {
+        "toolCallId": ident,
+        "kind": kind,
+        "toolName": name,
+    }
+    if raw_input is not None:
+        tool_call_fields["rawInput"] = raw_input
     return {
         "jsonrpc": "2.0",
         "id": request_id,
         "method": "session/request_permission",
         "params": {
             "sessionId": "s1",
-            "toolCall": {"toolCallId": ident, "kind": kind, "toolName": name},
+            "toolCall": tool_call_fields,
             "options": [
                 {"optionId": "yes", "kind": "allow_once", "name": "Allow"},
                 {"optionId": "always", "kind": "allow_always", "name": "Always"},
@@ -159,6 +177,10 @@ def permission(
             ],
         },
     }
+
+
+def use_tool_input(target: str) -> dict[str, object]:
+    return {"tool_name": target, "tool_input": dict[str, object]()}
 
 
 def grok_notice(name: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -888,10 +910,23 @@ def test_credentials_created_later_are_named_in_refusal_advice(tmp_path: Path) -
         )
     message = str(raised.value)
     assert str(credential) in message
-    assert str(credential) in message.split("Required deny entries are ", 1)[1]
+    assert str(credential) in message.split("Missing deny entries are ", 1)[1]
 
 
-def test_a_symlinked_credential_is_denied_by_its_own_path(tmp_path: Path) -> None:
+def test_grok_profile_derives_existing_credential_denies_from_shared_list(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "operator-home"
+    existing = home / CREDENTIAL_PATHS[-1]
+    existing.parent.mkdir(parents=True)
+    existing.write_text("placeholder")
+    missing = home / CREDENTIAL_PATHS[0]
+    snippet = grok_module.profile_snippet(READER_PROFILE, tmp_path / "work", (), home)
+    assert str(existing.resolve()) in snippet
+    assert str(missing) not in snippet
+
+
+def test_a_symlinked_credential_is_denied_by_its_real_path(tmp_path: Path) -> None:
     workspace = (tmp_path / "work").resolve()
     state = workspace / ".dromon"
     state.mkdir(parents=True)
@@ -905,17 +940,31 @@ def test_a_symlinked_credential_is_denied_by_its_own_path(tmp_path: Path) -> Non
     snippet = grok_module.profile_snippet(
         READER_PROFILE, workspace, (state,), daemon_home
     )
-    assert str(ssh) in snippet
-    assert str(target) not in snippet
+    assert str(target.resolve()) in snippet
+    assert str(ssh) not in snippet
 
 
-def test_profile_does_not_deny_unverified_grok_or_claude_auth_paths(
+def test_profile_exempts_only_groks_sign_in_and_denies_claude_auth(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "operator-home"
+    grok_auth = home / ".grok" / "auth.json"
+    grok_auth.parent.mkdir(parents=True)
+    grok_auth.write_text("{}")
+    claude_auth = home / ".claude.json"
+    claude_auth.write_text("{}")
     snippet = grok_module.profile_snippet(READER_PROFILE, tmp_path / "work", (), home)
     assert ".grok/auth.json" not in snippet
-    assert ".claude.json" not in snippet
+    assert str(claude_auth.resolve()) in snippet
+
+
+def test_a_dangling_grok_credential_symlink_is_denied(tmp_path: Path) -> None:
+    home = tmp_path / "operator-home"
+    dangling = home / ".npmrc"
+    home.mkdir()
+    dangling.symlink_to(tmp_path / "not-mounted" / "npmrc")
+    snippet = grok_module.profile_snippet(READER_PROFILE, tmp_path / "work", (), home)
+    assert str(dangling.absolute()) in snippet
 
 
 def test_an_existing_profile_gets_additive_advice_and_keeps_other_tables(
@@ -943,12 +992,38 @@ def test_an_existing_profile_gets_additive_advice_and_keeps_other_tables(
     message = str(raised.value)
     assert "leave every other profile table and entry as it is" in message
     assert "creating either array if the profile has none" in message
-    assert "Required deny entries" in message
-    assert "required read_only entries are []" in message
+    assert "Missing deny entries" in message
+    assert "missing read_only entries are []" in message
+    assert "missing read_only entries are []" in message
     assert "Remove unsupported keys" not in message
     assert "Set extends" not in message
     assert f"\n[profiles.{READER_PROFILE}]" not in message
     assert "\n[profiles.other-project]" not in message
+
+
+def test_existing_profile_advice_lists_only_missing_deny_entries(
+    tmp_path: Path,
+) -> None:
+    workspace = (tmp_path / "work").resolve()
+    state = workspace / ".dromon"
+    state.mkdir(parents=True)
+    home = tmp_path / "home"
+    daemon_home = operator_home(home)
+    existing = daemon_home / ".ssh"
+    existing.mkdir(parents=True)
+    missing = daemon_home / ".netrc"
+    missing.write_text("placeholder")
+    write_reader(
+        home,
+        f'extends = "read-only"\ndeny = [".dromon", "{existing}"]',
+    )
+    with pytest.raises(EngineRefused) as raised:
+        check_profile(
+            LineConfig(), workspace, (state,), home, home / HOME_DIR, daemon_home
+        )
+    advice = str(raised.value).split("Missing deny entries are ", 1)[1]
+    assert str(missing) in advice
+    assert str(existing) not in advice
 
 
 def write_reader(home: Path, table: str) -> None:
@@ -1404,6 +1479,168 @@ def test_tool_calls_are_counted_and_others_cancel_the_turn(
         run(line(foreign, project))
 
 
+def test_search_tool_is_counted_as_discovery_only(
+    project: tuple[Path, Path, Path],
+) -> None:
+    report = run(line(FakeGrok([tool_call("other", "search_tool")]), project))
+    assert report.tool_uses == ("search_tool",)
+
+
+def test_search_tool_with_a_non_other_kind_is_refused(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok([tool_call("read", "search_tool")])
+    with pytest.raises(EngineRefused, match="not given: search_tool"):
+        run(line(server, project))
+
+
+def test_use_tool_calls_only_the_named_line_tool_and_counts_that_tool(
+    project: tuple[Path, Path, Path],
+) -> None:
+    raw = use_tool_input("dromon__send_message")
+    server = FakeGrok(
+        [
+            tool_call("other", "search_tool", ident="search"),
+            tool_call("other", "use_tool", ident="invoke", raw_input=raw),
+            permission("other", "use_tool", ident="invoke", raw_input=raw),
+        ]
+    )
+    report = run(line(server, project))
+    assert report.tool_uses == ("search_tool", "dromon__send_message")
+    assert server.answers()[-1]["result"]["outcome"]["optionId"] == "yes"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        {"tool_name": "other__send_message", "tool_input": {}},
+        {"tool_name": "dromon__not_given", "tool_input": {}},
+        {"tool_name": "dromon__send_message"},
+        {
+            "tool_name": "dromon__send_message",
+            "tool_input": [],
+        },
+        {
+            "tool_name": "dromon__send_message",
+            "tool_input": {},
+            "tool_input_file": "/outside/args.json",
+        },
+        {
+            "tool_name": "dromon__send_message",
+            "server_name": "other",
+            "tool_input": {},
+        },
+    ),
+)
+def test_use_tool_refuses_unlisted_or_ambiguous_structured_targets(
+    project: tuple[Path, Path, Path], raw: object
+) -> None:
+    server = FakeGrok([tool_call("other", "use_tool", raw_input=raw)])
+    with pytest.raises(EngineRefused, match="not given: use_tool"):
+        run(line(server, project))
+
+
+def test_use_tool_refuses_a_title_only_target(project: tuple[Path, Path, Path]) -> None:
+    event = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "t",
+        "kind": "other",
+        "title": "use_tool",
+        "rawInput": use_tool_input("dromon__send_message"),
+    }
+    with pytest.raises(EngineRefused, match="not given: use_tool"):
+        run(line(FakeGrok([note(event)]), project))
+
+
+def test_use_tool_requires_an_explicit_other_kind(
+    project: tuple[Path, Path, Path],
+) -> None:
+    event = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "t",
+        "toolName": "use_tool",
+        "rawInput": use_tool_input("dromon__send_message"),
+    }
+    with pytest.raises(EngineRefused, match="not given: use_tool"):
+        run(line(FakeGrok([note(event)]), project))
+
+
+def test_use_tool_target_cannot_change_after_it_is_counted(
+    project: tuple[Path, Path, Path],
+) -> None:
+    original = use_tool_input("dromon__send_message")
+    changed = use_tool_input("other__send_message")
+    server = FakeGrok(
+        [
+            tool_call("other", "use_tool", raw_input=original),
+            permission("other", "use_tool", raw_input=changed),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="changed the structured input"):
+        run(line(server, project))
+
+
+def test_use_tool_update_cannot_change_raw_input(
+    project: tuple[Path, Path, Path],
+) -> None:
+    original = use_tool_input("dromon__send_message")
+    changed = use_tool_input("dromon__read_mail")
+    server = FakeGrok(
+        [
+            tool_call("other", "use_tool", raw_input=original),
+            call_update("t", rawInput=changed),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="changed the structured input"):
+        run(line(server, project))
+
+
+def test_reused_tool_call_identifier_is_refused_before_a_second_grant(
+    project: tuple[Path, Path, Path],
+) -> None:
+    raw = use_tool_input("dromon__send_message")
+    server = FakeGrok(
+        [
+            tool_call("other", "use_tool", ident="reused", raw_input=raw),
+            permission(
+                "other", "use_tool", request_id="first", ident="reused", raw_input=raw
+            ),
+            tool_call("other", "use_tool", ident="reused", raw_input=raw),
+            permission(
+                "other", "use_tool", request_id="second", ident="reused", raw_input=raw
+            ),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="reused a tool call identifier"):
+        run(line(server, project))
+    answers = server.answers()
+    assert answers[0]["result"]["outcome"]["optionId"] == "yes"
+    assert answers[1]["result"]["outcome"]["outcome"] == "cancelled"
+    assert server.methods().count("session/cancel") == 1
+
+
+def test_repeated_permission_request_for_a_granted_call_is_refused(
+    project: tuple[Path, Path, Path],
+) -> None:
+    raw = use_tool_input("dromon__send_message")
+    server = FakeGrok(
+        [
+            tool_call("other", "use_tool", ident="same", raw_input=raw),
+            permission(
+                "other", "use_tool", request_id="first", ident="same", raw_input=raw
+            ),
+            permission(
+                "other", "use_tool", request_id="again", ident="same", raw_input=raw
+            ),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="reused a tool call identifier"):
+        run(line(server, project))
+    answers = server.answers()
+    assert answers[0]["result"]["outcome"]["optionId"] == "yes"
+    assert answers[1]["result"]["outcome"]["optionId"] == "no"
+
+
 def test_a_title_never_names_one_of_dromons_tools(
     project: tuple[Path, Path, Path],
 ) -> None:
@@ -1527,6 +1764,25 @@ def test_a_call_is_judged_and_counted_once_when_first_seen(
     assert "session/cancel" not in server.methods()
 
 
+def test_tool_call_permission_and_updates_are_counted_once_in_acp_order(
+    project: tuple[Path, Path, Path],
+) -> None:
+    raw = use_tool_input("dromon__send_message")
+    server = FakeGrok(
+        [
+            tool_call("other", "use_tool", ident="call", raw_input=raw),
+            permission("other", "use_tool", ident="call", raw_input=raw),
+            call_update("call", status="in_progress"),
+            call_update("call", status="completed"),
+            chunk("done"),
+        ]
+    )
+    report = run(line(server, project))
+    assert report.tool_uses == ("dromon__send_message",)
+    assert server.answers()[0]["result"]["outcome"]["optionId"] == "yes"
+    assert "session/cancel" not in server.methods()
+
+
 def test_an_update_seen_first_is_judged_by_its_own_fields(
     project: tuple[Path, Path, Path],
 ) -> None:
@@ -1549,6 +1805,23 @@ def test_the_driver_budget_cancels_a_turn_once(
     assert report.interrupted_for == "tool_budget"
     assert report.subtype == "cancelled"
     assert server.methods().count("session/cancel") == 1
+
+
+def test_use_tool_target_counts_toward_the_driver_tool_budget(
+    project: tuple[Path, Path, Path],
+) -> None:
+    budget = grok().settings.tool_budget
+    raw = use_tool_input("dromon__send_message")
+    server = FakeGrok(
+        [
+            tool_call("other", "use_tool", ident=f"t{i}", raw_input=raw)
+            for i in range(budget + 2)
+        ]
+    )
+    report = run(line(server, project))
+    assert report.interrupted_for == "tool_budget"
+    assert report.tool_uses
+    assert set(report.tool_uses) == {"dromon__send_message"}
 
 
 def test_a_cancel_grok_ignores_ends_the_turn_and_stops_grok(
@@ -1955,7 +2228,50 @@ def test_a_project_harness_directory_refuses_the_turn_before_grok_starts(
     server = probed_grok()
     with pytest.raises(EngineRefused, match="project configuration"):
         run(line(server, project))
-    assert server.methods() == []
+
+
+def test_claude_cc_writes_marker_is_the_only_nonempty_project_claude_entry_allowed(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "work"
+    claude = workspace / ".claude"
+    marker = claude / ".cc-writes"
+    marker.mkdir(parents=True)
+    check_project(workspace)
+
+    (marker / "record").write_text("")
+    with pytest.raises(EngineRefused, match="project configuration"):
+        check_project(workspace)
+    (marker / "record").unlink()
+    marker.rmdir()
+
+    target = tmp_path / "target"
+    target.mkdir()
+    marker.symlink_to(target)
+    with pytest.raises(EngineRefused, match="project configuration"):
+        check_project(workspace)
+    marker.unlink()
+    marker.mkdir()
+
+    (claude / "settings.json").write_text("{}")
+    with pytest.raises(EngineRefused, match="project configuration"):
+        check_project(workspace)
+
+
+def test_a_lone_non_marker_claude_directory_is_refused(tmp_path: Path) -> None:
+    workspace = tmp_path / "work"
+    (workspace / ".claude" / "skills").mkdir(parents=True)
+    with pytest.raises(EngineRefused, match="project configuration"):
+        check_project(workspace)
+
+
+def test_cc_writes_marker_must_be_a_real_directory(tmp_path: Path) -> None:
+    workspace = tmp_path / "work"
+    marker = workspace / ".claude" / ".cc-writes"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("")
+    with pytest.raises(EngineRefused, match="project configuration"):
+        check_project(workspace)
 
 
 def test_another_harness_in_grok_home_directory_refuses_the_turn(
