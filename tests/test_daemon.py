@@ -233,7 +233,7 @@ def test_create_line_records_the_line(paths: ProjectPaths) -> None:
             "unknown strategy",
         ),
         (
-            {"line_id": "beta", "model": "claude-sonnet-5-5", "strategy": "api"},
+            {"line_id": "beta", "model": "claude-unreleased-0-0", "strategy": "api"},
             ErrorCode.REJECTED,
             "no driver",
         ),
