@@ -7,6 +7,20 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- Grok lines may use `search_tool` for discovery and `use_tool` for a qualified tool
+  served by that line's Dromon MCP server. Dromon checks the documented inline input
+  shape, refuses file-backed or ambiguous targets, keeps the target fixed through the
+  permission request, and counts the underlying Dromon tool against its budget. The
+  ACP call shape remains unverified pending a first live line turn. Grok project checks
+  allow only a real, empty `.claude/.cc-writes` marker and refuse other contents. The
+  local guides do not establish whether Grok creates `.grok` in its isolated home, so
+  no allowance was added for that path.
+- Grok refusal advice for an existing sandbox profile now lists only missing deny and
+  read-only entries. Tests check that an existing credential is omitted while a
+  missing one is named. Codex writable-path validation also has a test that refuses a
+  home-directory grant when `.netrc` is a dangling symbolic link. The Grok `.grok`
+  marker remains unresolved pending a live Dromon turn, and the Codex probe conclusion
+  is labeled as an inference.
 - Codex and Grok profiles now share the operator credential path list and require
   existing project and workdir `secret` directories to be denied by real absolute
   path. Codex adds validated operator-granted `writable_paths` for existing absolute

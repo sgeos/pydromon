@@ -196,10 +196,10 @@ extends = ":workspace"
   `.pypirc`, `.docker/config.json`, `.kube/config` and `.config/gh/hosts.yml` from the
   shared `dromon.security_paths` list are denied by real absolute path. The list is not
   complete, and a project may contain other credential stores. **Fact, operator probe
-  reported on 2026-10-31.** On 2026-10-30 a probe turn on `gpt-6-luna` signed in with
-  `~/.codex/auth.json` denied. This shows that the app-server reads its sign-in file
-  outside the line sandbox. Whether a command in a live line is refused access to that
-  file remains unverified.
+  reported on 2026-10-31.** On 2026-10-31 a probe turn on `gpt-6-luna` signed in with
+  `~/.codex/auth.json` denied. **Inference.** This suggests that the app-server reads
+  its sign-in file outside the line sandbox. Whether a command in a live line is
+  refused access to that file remains unverified.
 - Existing `secret` directories under both the project root and the line's working
   directory are denied by real absolute path. This includes a worktree whose project
   root is elsewhere.

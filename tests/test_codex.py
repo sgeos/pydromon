@@ -1319,6 +1319,20 @@ def test_a_dangling_credential_symlink_is_denied(
     assert filesystem[str(dangling.absolute())] == "deny"
 
 
+def test_writable_path_cannot_overlap_a_dangling_credential_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    dangling = home / ".netrc"
+    dangling.symlink_to(tmp_path / "not-mounted" / "netrc")
+    monkeypatch.setattr(Path, "home", lambda: home)
+    with pytest.raises(EngineRefused, match="overlaps a protected path"):
+        server_arguments(
+            [], LineConfig(builtin_tools=("Write",), writable_paths=(str(home),)), ()
+        )
+
+
 def test_credential_created_between_turns_is_denied_by_the_next_profile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
