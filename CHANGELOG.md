@@ -12,7 +12,7 @@ All notable changes are recorded here. The format follows
   without it no line can view an image on any engine. On Codex it enables `view_image`,
   which was always disabled, and Dromon checks the path of each `imageView` item. On
   Grok it permits `read_file`, the only tool that shows a local image, narrowed to
-  images. On Claude Code it offers `Read`, which the gate allows only for images. The
+  files that pass the image check. On Claude Code it offers `Read`, which the gate allows only for files that pass the image check. The
   files must be png, jpg, jpeg, gif or webp by name and wholly one complete container of
   that type, checked over the whole file, inside the
   line's working directory and outside `.dromon`, `.git` and `secret`, and at most
@@ -22,7 +22,11 @@ All notable changes are recorded here. The format follows
   complete container, so a file that only begins as an image is refused, a Grok
   `read_file` whose first notice carries no input is refused for a line with `ViewImage`
   and without `Read`, and a Codex refusal decided before the turn is named is sent as an
-  interrupt once it is. Nothing was run live, and each engine document lists the live steps
+  interrupt once it is, for a notice about this line's thread only. The check proves
+  a complete container and not that its data is a picture, so a text chunk or compressed
+  data can still carry chosen bytes, which `LINE_CONFIG.md` states and a test pins.
+  ViewImage is not to be enabled on a Grok line until the first read_file notice is
+  shown to carry its input. Nothing was run live, and each engine document lists the live steps
   the operator runs first.
 
 ### Fixed

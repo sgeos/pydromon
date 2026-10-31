@@ -464,6 +464,10 @@ logs and in `~/.grok/docs`.
   `MAX_IMAGE_BYTES`, 5 MiB. A line with `Read`
   already reads any file its profile allows, so `ViewImage` does not narrow it, and the
   call counts as `Read`.
+- **Do not enable it yet.** `ViewImage` is not to be enabled for a Grok line until the
+  verify-first item 6 below shows that Grok's first `read_file` notice carries its
+  input. Until then it fails closed, and a line given it cannot view any image on Grok.
+  **Review of d00da44, I2.**
 - **Where it is enforced.** At the first notice of a call, which is refused unless it
   carries its input, since `read_file` also serves text and could finish before a
   later update names the file. **Review of 1045994, I2.** At a later update that brings

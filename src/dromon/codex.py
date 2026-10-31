@@ -1415,8 +1415,12 @@ class CodexLine:
                     turn, f"the engine rerouted the turn to the model {model!r}"
                 )
         elif method == "turn/started":
+            # Review of d00da44, I3b. A notice about another thread must not name this
+            # line's turn, or an interrupt decided before the response arrives would
+            # go to a turn that is not the line's.
             started = cast(dict[str, Any], params.get("turn") or {})
-            turn.turn_id = turn.turn_id or cast(str | None, started.get("id"))
+            if self._this_thread(params):
+                turn.turn_id = turn.turn_id or cast(str | None, started.get("id"))
         elif method == "turn/completed":
             completed = cast(dict[str, Any], params.get("turn") or {})
             turn.status = str(completed.get("status") or "")

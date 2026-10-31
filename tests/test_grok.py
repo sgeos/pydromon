@@ -3006,6 +3006,24 @@ def test_view_image_refuses_a_first_notice_that_carries_no_input(
     assert server.params("session/cancel") == {"sessionId": "s1"}
 
 
+def test_a_view_only_line_proceeds_when_the_first_notice_carries_the_input(
+    project: tuple[Path, Path, Path],
+) -> None:
+    # Review of d00da44, T9. The path the fail-closed rule leaves open: the input on
+    # the first notice, then updates that do not repeat it.
+    (project[0] / "shot.png").write_bytes(PNG_BYTES)
+    server = FakeGrok(
+        [
+            grok_call("read_file", raw_input=read_input("shot.png")),
+            call_update("t", kind="read"),
+            call_update("t", status="completed"),
+        ]
+    )
+    report = run(line(server, project, config=VIEW))
+    assert report.tool_uses == ("ViewImage",)
+    assert "session/cancel" not in server.methods()
+
+
 def test_a_line_with_read_may_start_a_call_before_its_input_is_known(
     project: tuple[Path, Path, Path],
 ) -> None:

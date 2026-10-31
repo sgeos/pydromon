@@ -13,7 +13,7 @@ import pytest
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import ToolPermissionContext
 
-from imagesamples import gif, jpeg, png, webp
+from imagesamples import gif, jpeg, png, png_carrying, png_with_raw_data, webp
 
 from dromon import antigravity, cursor, grok, pi
 from dromon.codex import IMAGE_FEATURE, server_arguments
@@ -99,6 +99,22 @@ def test_the_opening_bytes_followed_by_text_are_refused(
 ) -> None:
     write(tmp_path / name, opening + b"TOP SECRET TEXT, any file's content")
     assert image_refusal(name, tmp_path) is not None
+
+
+def test_a_complete_container_may_still_carry_arbitrary_bytes(tmp_path: Path) -> None:
+    # Review of d00da44, T7 and I1b. This pins a limit and does not endorse it. The
+    # check proves a container is complete, not that its data is a picture, so a text
+    # chunk and compressed data can hold up to the size limit of chosen bytes. A later
+    # change that refuses these is deliberate and edits this test.
+    secret = b"TOP SECRET TEXT"
+    write(tmp_path / "text.png", png_carrying(secret))
+    write(tmp_path / "raw.png", png_with_raw_data(secret))
+    assert image_refusal("text.png", tmp_path) is None
+    assert image_refusal("raw.png", tmp_path) is None
+    comment = bytearray(jpeg(100))
+    comment[comment.index(b"\xff\xfe") + 4 :][:20] = secret.ljust(20, b" ")
+    write(tmp_path / "comment.jpg", bytes(comment))
+    assert image_refusal("comment.jpg", tmp_path) is None
 
 
 def test_a_png_with_a_wrong_checksum_or_content_after_iend_is_refused(

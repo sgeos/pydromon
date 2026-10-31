@@ -120,11 +120,22 @@ with a png, jpg, jpeg, gif or webp name, and its whole content must be one compl
 container of that type, which `dromon.imageformat` checks. A png needs correct chunk
 checksums and ends at `IEND`, a jpeg ends at its end marker, a gif at its trailer, and
 a webp has a `RIFF` length equal to the file's. A text file named `x.png`, or a file
-that begins as an image and carries anything after it, is refused. **Review of 1045994,
-I1.** The check proves the container is complete and not that its data decodes, so
-comments, text chunks and compressed data can still hold arbitrary bytes. The bound is
-on bytes. Dromon does not decode an image, so it does not bound its dimensions, which
-set the model's cost.
+that begins as an image and carries anything after it, is refused. The bound is on
+bytes. Dromon does not decode an image, so it does not bound its dimensions, which set
+the model's cost.
+
+**What the check does not bound.** Dromon proves that a file is one complete container
+of the type its name claims, and nothing about what the container holds. It does not
+decode the image and does not prove that its data is a picture. A well-formed container
+can carry up to 5 MiB of chosen bytes with correct checksums, in text and comment parts
+such as a png `tEXt` chunk, a jpeg comment, a gif comment extension and webp metadata,
+and in its compressed or entropy-coded data. A line given `ViewImage` can therefore have
+such a file delivered to its engine, if the file is inside the working directory and
+passes the other checks. What the engine and the model make of those bytes is outside
+Dromon's control. The capability bounds which files are delivered and how large they
+are, not what they contain. `test_a_complete_container_may_still_carry_arbitrary_bytes`
+pins this, so a later change that refuses such files is deliberate. **Review of d00da44,
+I1.**
 
 **Failure modes.** The check and the engine's read are two steps, so a file replaced in
 between is not caught. On Claude Code the engine opens the path the line gave, not

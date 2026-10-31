@@ -103,9 +103,12 @@ without it cannot view an image on any engine. Image generation and editing are 
 granted.
 
 - Claude Code offers `Read` to the engine for it, and the gate allows `Read` only for
-  an image file, whatever the tool policy. A line that also has `Read` is not narrowed.
+  a file that passes the image check, whatever the tool policy. A line that also has `Read` is not narrowed.
 - Codex enables `view_image`, and Dromon checks each image it views.
-- Grok permits `read_file`, narrowed to images for a line without `Read`.
+- Grok permits `read_file`, narrowed to files that pass the image check for a line
+  without `Read`. **Do not enable `ViewImage` on a Grok line until the verify-first item
+  6 of [`GROK.md`](GROK.md) has shown that Grok's first `read_file` notice carries its
+  input.** Until then the line fails closed and cannot view any image.
 - Pi, Cursor and Antigravity refuse the name, as they refuse every built-in tool.
 
 An image must be a png, jpg, jpeg, gif or webp file by name and wholly one complete
@@ -116,10 +119,24 @@ container of that type, inside the line's working directory and outside `.dromon
 then opens the path the line gave. A link or file swapped in between is not caught, and
 on Claude Code the engine reads the swapped path. The working directory's own
 confinement, the engine's sandbox, is what bounds that read, and Dromon does not add to
-it. The check also proves a complete container and not that the data decodes, so text
-inside an image's comment or data parts is not excluded. [`ENGINES.md`](ENGINES.md) gives the rationale, the limits that only an
-engine holds, and the steps the operator runs before relying on it. Nothing was run
-live when this was written.
+it.
+
+**What the check does not bound.** Dromon proves that a file is one complete container
+of the type its name claims, and nothing about what the container holds. It does not
+decode the image and does not prove that its data is a picture. A well-formed container
+can carry up to 5 MiB of chosen bytes with correct checksums, in text and comment parts
+such as a png `tEXt` chunk, a jpeg comment, a gif comment extension and webp metadata,
+and in its compressed or entropy-coded data. A line given `ViewImage` can therefore
+have such a file delivered to its engine, if the file is inside the working directory
+and passes the other checks. What the engine and the model make of those bytes is
+outside Dromon's control. The capability bounds which files are delivered and how large
+they are, not what they contain. `test_a_complete_container_may_still_carry_arbitrary_bytes`
+pins this, so a later change that refuses such files is deliberate. **Review of d00da44,
+I1.**
+
+[`ENGINES.md`](ENGINES.md) gives the rationale, the limits that only an engine holds,
+and the steps the operator runs before relying on it. Nothing was run live when this
+was written.
 
 ## Dromon's own tools
 

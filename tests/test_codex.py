@@ -1665,8 +1665,12 @@ def test_image_generation_stays_refused_for_a_line_given_view_image(
 
 
 class UnnamedTurn(FakeServer):
-    """A server that sends an item before the response that names the turn, and never
-    sends ``turn/started``."""
+    """A server that sends ``before`` ahead of the response that names the turn, and
+    never sends ``turn/started`` for it."""
+
+    def __init__(self, before: Sequence[dict[str, Any]]) -> None:
+        super().__init__()
+        self.before = list(before)
 
     async def send(self, message: Mapping[str, object]) -> None:
         sent = dict(message)
@@ -1674,8 +1678,16 @@ class UnnamedTurn(FakeServer):
             await super().send(message)
             return
         self.sent.append(sent)
-        self.queue.append(item("imageView", path="../outside.png"))
+        self.queue.extend(self.before)
         self.queue.append({"id": sent["id"], "result": self.result("turn/start")})
+
+
+def interrupted_turns(server: FakeServer) -> list[str]:
+    return [
+        m["params"]["turnId"]
+        for m in server.sent
+        if m.get("method") == "turn/interrupt"
+    ]
 
 
 def test_a_refused_image_before_the_turn_is_named_still_interrupts_it(
@@ -1683,8 +1695,26 @@ def test_a_refused_image_before_the_turn_is_named_still_interrupts_it(
 ) -> None:
     # Review of 1045994, I3. Without the turn identifier no interrupt could be sent,
     # and the turn ran on with the refusal recorded and nothing stopping it.
-    server = UnnamedTurn()
+    server = UnnamedTurn([item("imageView", path="../outside.png")])
     with pytest.raises(EngineRefused, match="may not view that image"):
         run(image_line(server, tmp_path, ("ViewImage",)))
-    interrupts = [m for m in server.sent if m.get("method") == "turn/interrupt"]
-    assert [m["params"]["turnId"] for m in interrupts] == ["t1"]
+    assert interrupted_turns(server) == ["t1"]
+
+
+def test_a_foreign_turn_started_does_not_name_the_lines_turn(tmp_path: Path) -> None:
+    # Review of d00da44, T6 and I3b. A turn/started for another thread arrives first.
+    foreign = notice("turn/started", threadId="other", turn={"id": "foreign"})
+    server = UnnamedTurn([foreign, item("imageView", path="../outside.png")])
+    with pytest.raises(EngineRefused, match="may not view that image"):
+        run(image_line(server, tmp_path, ("ViewImage",)))
+    assert interrupted_turns(server) == ["t1"]
+
+
+def test_a_budget_stop_before_the_turn_is_named_is_sent_once_it_is() -> None:
+    # Review of d00da44, T10. The same early interrupt serves a stop the driver
+    # decided, not only a refusal.
+    budget = luna().settings.tool_budget
+    server = UnnamedTurn([item("dynamicToolCall", tool="record")] * (budget + 3))
+    report = run(line(server))
+    assert report.interrupted_for == "tool_budget"
+    assert interrupted_turns(server) == ["t1"]

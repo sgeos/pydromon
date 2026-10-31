@@ -19,8 +19,9 @@ structure and checks that nothing precedes or follows it.
 
 **Limits.** This proves the container is complete, not that the bytes decode as an
 image. Entropy-coded and compressed data, comments and text chunks can still hold
-arbitrary bytes, which a decoder renders as noise or ignores. It is a bound on what a
-view-only line can read through the capability, not a decoder.
+arbitrary bytes, which a decoder renders as noise or ignores. It is a bound on which
+files a view-only line can have delivered, not on their content, and not a decoder.
+A test, ``test_a_complete_container_may_still_carry_arbitrary_bytes``, pins that.
 
 **Porting note.** Each loop advances its position by at least one byte and ends at the
 data's length, so it is bounded by the file size, at most ``MAX_IMAGE_BYTES``.

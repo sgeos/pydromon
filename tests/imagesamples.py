@@ -72,3 +72,23 @@ def webp(size: int | None = None) -> bytes:
         body = b"\x2f" + b"\x00" * (size - 12 - 8 - 1)
     chunk = b"VP8L" + struct.pack("<I", len(body)) + body + b"\x00" * (len(body) & 1)
     return b"RIFF" + struct.pack("<I", 4 + len(chunk)) + b"WEBP" + chunk
+
+
+def png_carrying(text: bytes) -> bytes:
+    """A png whose ``tEXt`` chunk holds ``text``, with a correct checksum."""
+    header = _chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0))
+    data = _chunk(b"IDAT", zlib.compress(b"\x00\x00"))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + header
+        + _chunk(b"tEXt", b"Comment\x00" + text)
+        + data
+        + _chunk(b"IEND", b"")
+    )
+
+
+def png_with_raw_data(text: bytes) -> bytes:
+    """A png whose ``IDAT`` chunk holds ``text`` and not a compressed stream, with a
+    correct checksum."""
+    header = _chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0))
+    return b"\x89PNG\r\n\x1a\n" + header + _chunk(b"IDAT", text) + _chunk(b"IEND", b"")
