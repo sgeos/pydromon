@@ -199,6 +199,48 @@ def test_code_trees_compare_code_and_ancestry_and_refuse_bad_names(
     assert trees.settle(0)
 
 
+def test_git_variables_in_the_daemons_environment_do_not_change_an_answer(
+    repository: Repository, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 9 re-review, mutation H. ``codetree._git`` clears every ``GIT_``
+    variable, so a ``GIT_DIR`` or ``GIT_INDEX_FILE`` in the daemon's environment
+    cannot point its questions at another repository. Here they name a decoy, which
+    an unfiltered git does answer from, and the answers for the real repository are
+    those it gives with neither variable set."""
+    root = repository.root
+    package = root / "src" / "dromon"
+    loaded, docs, code = repository.loaded, repository.docs, repository.code
+
+    def answers() -> tuple[object, ...]:
+        trees = codetree.CodeTrees()
+        return (
+            asked(trees, lambda: trees.package_path(package)),
+            asked(trees, lambda: trees.same_code(root, loaded, docs, "src/dromon")),
+            asked(trees, lambda: trees.same_code(root, loaded, code, "src/dromon")),
+            asked(trees, lambda: trees.is_ancestor(root, loaded, code)),
+            asked(trees, lambda: trees.is_ancestor(root, code, loaded)),
+        )
+
+    for name in [name for name in os.environ if name.startswith("GIT_")]:
+        monkeypatch.delenv(name)
+    clean = answers()
+    assert clean == ("src/dromon", True, False, True, False)
+    decoy = Repository(tmp_path.resolve() / "decoy", seed="decoy\n")
+    monkeypatch.setenv("GIT_DIR", str(decoy.root / ".git"))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(decoy.root / ".git" / "index"))
+    # The variables take effect for a git that keeps them, so the test would see
+    # the filter go.
+    unfiltered = subprocess.run(  # noqa: S603
+        ["git", "-C", str(root), "rev-parse", "HEAD"],  # noqa: S607
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    assert unfiltered.stdout.strip() == decoy.code != repository.code
+    assert answers() == clean
+
+
 def test_an_answer_is_given_without_waiting_and_kept(
     repository: Repository, monkeypatch: pytest.MonkeyPatch
 ) -> None:
