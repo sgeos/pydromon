@@ -6,6 +6,21 @@
 Normative for Dromon's side. The Python modules are `dromon.capabilities` and
 `dromon.evidence`.
 
+## Project read-only paths
+
+The project setting `read_only_paths` names existing files or directories relative to
+each line's resolved workdir. The daemon resolves real paths and refuses a missing
+target or one that leaves the workdir. Claude Code adds sandbox write denials and file
+tool permission denials. Codex marks each path `read` in its permission profile. Grok
+requires each path in the profile's `read_only` array before starting its line. Pi,
+Cursor Agent and Antigravity refuse a non-empty setting because their adapters cannot
+confine writes to selected paths. The list defaults to empty.
+
+**Inference for Grok.** The adapter checks that Grok's profile contains each path in
+`read_only`, but no live run has verified that Grok prevents writes through those
+entries. The operator should verify this before relying on path-level protection for a
+Grok line.
+
 ## Capability tables
 
 Each engine has one `EngineTable` in `dromon.capabilities`, and a port carries the

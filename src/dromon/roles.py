@@ -786,6 +786,15 @@ class LinePlace:
     seat_of: str | None
 
 
+def overlapping(first: Path, second: Path) -> bool:
+    """Whether the real paths ``first`` and ``second`` are one directory, or one
+    lies inside the other. **Round 10 re-review, N4.** A line in either can write
+    files of the other, so the one-writer rule compares worktrees this way. Both are
+    real paths the daemon resolved, so a link cannot make two look apart. Bounded by
+    the depth of the paths."""
+    return first == second or first in second.parents or second in first.parents
+
+
 def placement_refusal(
     line_id: str, line: LinePlace, places: Mapping[str, RolePlace]
 ) -> str | None:
@@ -799,9 +808,11 @@ def placement_refusal(
     gains its role only once it runs in the worktree, as the scheduler checks.
     Worktrees are compared by real path. Bounded by the roles of ``places``.
 
-    **Not covered.** A worktree inside another, such as a role on the project root
-    and another below it, is not a shared worktree here, since the operator's rule
-    compares real paths for equality."""
+    **Round 10 re-review, N4.** A line that could write a directory inside the
+    worktree of a role another seat owns, or one that holds that worktree, such as
+    the project root above a role's worktree under ``tmp/worktrees``, is refused as
+    one in the worktree itself is, by ``overlapping``. A seat still runs only in its
+    own role's worktree, by equality."""
     if line.seat_of is not None:
         place = places.get(line.seat_of)
         # A worktree that does not resolve builds no engine, so nothing runs there.
@@ -819,11 +830,16 @@ def placement_refusal(
         if (
             role_id == line.seat_of
             or place.owner is None
-            or line.directory != place.worktree
+            or not overlapping(line.directory, place.worktree)
         ):
             continue
+        where = (
+            "the worktree"
+            if line.directory == place.worktree
+            else f"which overlaps {place.workdir}, the worktree"
+        )
         return (
-            f"line {line_id} could write {line.workdir}, the worktree of role"
+            f"line {line_id} could write {line.workdir}, {where} of role"
             f" {role_id}, which {place.owner} owns, and is not a seat of the role."
             f" Make it a seat with dromon role update {role_id}, configure it with"
             " workdir_access read, or give it another workdir"
@@ -833,21 +849,31 @@ def placement_refusal(
 
 def shared_worktree(places: Mapping[str, Path]) -> tuple[str, str] | None:
     """The first two roles of ``places``, by identifier, whose worktrees are the same
-    real path, or ``None``. **Round 10 review, F3.** Two roles on one worktree would
-    have two owners writing it. Bounded by the roles of ``places``."""
-    seen: dict[Path, str] = {}
-    for role_id, worktree in sorted(places.items()):
-        other = seen.get(worktree)
-        if other is not None:
-            return other, role_id
-        seen[worktree] = role_id
+    real path, or one inside the other, as ``overlapping`` judges, or ``None``.
+    **Round 10 review, F3, and re-review, N4.** Two roles on one worktree, or one
+    nested in another's, would have two owners writing the inner one. Bounded by
+    the square of the number of roles, which a project file holds few of."""
+    ordered = sorted(places.items())
+    for index, (first, worktree) in enumerate(ordered):
+        for second, other in ordered[index + 1 :]:
+            if overlapping(worktree, other):
+                return first, second
     return None
 
 
-def shared_worktree_refusal(first: str, second: str, workdir: str) -> str:
-    """The refusal for roles ``first`` and ``second`` sharing ``workdir``, named in
+def shared_worktree_refusal(
+    first: str, second: str, workdir: str, nested: bool = False
+) -> str:
+    """The refusal for roles ``first`` and ``second`` sharing ``workdir``, or, when
+    ``nested``, with worktrees one inside the other, ``workdir`` among them, named in
     identifier order."""
     first, second = sorted((first, second))
+    if nested:
+        return (
+            f"roles {first} and {second} would have worktrees one inside the other,"
+            f" {workdir} among them, so two owners could write the inner one. Give"
+            " each role a worktree outside the other's"
+        )
     return (
         f"roles {first} and {second} would share the worktree {workdir}, so two"
         " owners could write it. Give each role its own worktree"

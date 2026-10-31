@@ -366,12 +366,28 @@ def permission_profile(
     config: LineConfig,
     protected: Sequence[Path],
     write_protected: Sequence[Path] = (),
+    scratch: Path | None = None,
 ) -> str:
     """The ``dromon-line`` profile for ``config``, as an inline TOML table.
 
     The workspace is writable only with a write tool, ``.git`` is readable but not
     writable, each existing protected path is denied by its real path, and each
     validated operator-granted directory is writable.
+
+    **Round 10 re-review, N2.** A line whose workspace is read may write only
+    ``scratch``, its own directory under ``tmp/lines/``, and nothing else of the
+    workdir. It was given the whole of ``tmp/`` before, which is the owner's scratch
+    when the workdir is a role's worktree, so a read-only seat could write the
+    owner's files there. A read line given no ``scratch`` has none.
+    **Assumption.** Codex grants a directory below a read workspace root by its
+    absolute path, as it does for ``writable_paths``. No operator probe has confirmed
+    it for a directory inside the workspace.
+
+    **Review of ebedeed, R1.** ``scratch`` is the path ``checked_scratch`` returned
+    for this turn, granted as it is, so no lookup after the check follows a link.
+    **Review of ebedeed, G3.** A line with write access and no writing tool has a
+    read workspace too, and is granted its own scratch as a read line is, which is
+    where ``write_scratch`` writes for it.
     """
     workspace = (
         "write"
@@ -379,7 +395,11 @@ def permission_profile(
         and WRITE_TOOLS & set(config.builtin_tools)
         else "read"
     )
-    scratch = ', "tmp"="write"' if config.workdir_access is WorkdirAccess.READ else ""
+    own = (
+        (_toml_string(str(scratch)),)
+        if scratch is not None and workspace == "read"
+        else ()
+    )
     granted = validate_writable_paths(
         config.writable_paths,
         (*protected, *write_protected),
@@ -391,12 +411,66 @@ def permission_profile(
             *(Path.home() / relative for relative in CREDENTIAL_PATHS),
         ]
     )
+    read_only = existing_real_paths(list(write_protected))
+    # A protected descendant must stay denied without dropping the broader read
+    # grant. A protected ancestor, or the same path, already denies this entry.
+    read_only = tuple(
+        path
+        for path in read_only
+        if not any(guard == path or guard in path.parents for guard in denied)
+    )
     entries = [
-        f'":workspace_roots"={{"."="{workspace}", ".git"="read"{scratch}}}',
+        f'":workspace_roots"={{"."="{workspace}", ".git"="read"}}',
         *(f'{_toml_string(str(directory))}="deny"' for directory in denied),
+        *(f'{_toml_string(str(directory))}="read"' for directory in read_only),
         *(f'{_toml_string(str(directory))}="write"' for directory in granted),
+        *(f'{directory}="write"' for directory in own),
     ]
     return f'{{extends=":workspace", filesystem={{{", ".join(entries)}}}}}'
+
+
+def checked_scratch(cwd: Path, scratch: Path) -> Path:
+    """The path to grant a line for its own ``scratch`` under its working directory
+    ``cwd``, or ``EngineRefused``.
+
+    **Review of ebedeed, R1.** The owner of a role's worktree can write ``tmp/`` and
+    so replace any directory of a read seat's ``tmp/lines/LINE`` between its turns.
+    Each component, ``tmp``, ``tmp/lines`` and ``tmp/lines/LINE``, is therefore
+    checked by ``lstat`` before each turn's profile is built, and a link or anything
+    but a directory refuses the turn, so the grant cannot be redirected into the
+    owner's scratch. The grant is the real path of ``cwd`` joined with the checked
+    components, rather than the real path of ``scratch``, so no lookup after the
+    check follows a link inside the workdir.
+
+    **Residual risk.** A swap after the check and before Codex applies the profile
+    is not seen. Whether that redirects the grant depends on how Codex resolves a
+    profile's path when it starts, which is not probed. A swap after Codex starts
+    does not, because a path-based sandbox checks the resolved target. Bounded by
+    the components of ``scratch`` below ``cwd``."""
+    try:
+        parts = scratch.relative_to(cwd).parts
+    except ValueError as error:
+        raise EngineRefused(
+            f"the line's scratch {scratch} is not inside its working directory {cwd}"
+        ) from error
+    if not parts or any(part in (".", "..") for part in parts):
+        raise EngineRefused(f"the line's scratch {scratch} is not below {cwd}")
+    for depth in range(1, len(parts) + 1):
+        component = "/".join(parts[:depth])
+        try:
+            mode = os.lstat(cwd.joinpath(*parts[:depth])).st_mode
+        except OSError as error:
+            raise EngineRefused(
+                f"the line's scratch {component} cannot be read: {error.strerror}"
+            ) from error
+        if stat.S_ISLNK(mode):
+            raise EngineRefused(
+                f"the line's scratch {component} is a symbolic link, so its grant"
+                " could be redirected. Put a directory in its place"
+            )
+        if not stat.S_ISDIR(mode):
+            raise EngineRefused(f"the line's scratch {component} is not a directory")
+    return Path(os.path.realpath(cwd)).joinpath(*parts)
 
 
 def validate_writable_paths(
@@ -473,12 +547,14 @@ def server_arguments(
     mark: str | None = None,
     variables: Mapping[str, str] | None = None,
     write_protected: Sequence[Path] = (),
+    scratch: Path | None = None,
 ) -> list[str]:
     """The ``codex app-server`` arguments that isolate a line configured as ``config``
     from the operator's ``servers``, from every tool it was not given, and from the
     ``protected`` directories, and that give the line's shell commands its process
     ``mark`` and the further ``variables``, such as ``dromon.gitssh.environment``
-    gives.
+    gives. A read line may write its own ``scratch``, as ``permission_profile``
+    says.
 
     The mark goes through Codex's ``shell_environment_policy.set``, which applies to
     the commands Codex runs and not to Codex's own processes, so the app-server and its
@@ -516,7 +592,7 @@ def server_arguments(
     arguments += [
         "-c",
         f"permissions.{PROFILE_NAME}="
-        f"{permission_profile(config, protected, write_protected)}",
+        f"{permission_profile(config, protected, write_protected, scratch)}",
     ]
     return arguments
 
@@ -1055,6 +1131,7 @@ class CodexLine:
         mcp_tools: Sequence[SdkMcpTool[Any]] = (),
         session_id: str | None = None,
         protected: Sequence[Path] = (),
+        write_protected: Sequence[Path] = (),
         environment: Mapping[str, str] | None = None,
         connection_factory: ConnectionFactory = _app_server,
         server_lister: ServerLister = list_servers,
@@ -1071,6 +1148,7 @@ class CodexLine:
         ceiling_reached: Ask = no_operator,
         ceiling_settled: Settle = nothing_to_settle,
         credits_spent: Callable[[str], object] = ignore_credits,
+        scratch: Path | None = None,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -1083,6 +1161,7 @@ class CodexLine:
         self.mcp_tools = {tool.name: tool for tool in mcp_tools}
         self.session_id = session_id
         self.protected = tuple(protected)
+        self.write_protected = tuple(write_protected)
         self._environment = os.environ if environment is None else environment
         self._connect = connection_factory
         self._list_servers = server_lister
@@ -1092,6 +1171,8 @@ class CodexLine:
         """The agent and pinned hosts of the project's ``[git_ssh]`` table, if the
         line was given them."""
         """The process mark every process of this line inherits, if issued."""
+        self.scratch = scratch
+        """The line's own scratch directory, which a read line may write, if given."""
         self._next_id = 0
         self._thread_id = ""
         self._connection: Connection | None = None
@@ -1209,13 +1290,21 @@ class CodexLine:
             variables = gitssh.environment(self.git_ssh)
             if SHELL_VARIABLE in environment:
                 variables[SHELL_VARIABLE] = environment[SHELL_VARIABLE]
+            # Review of ebedeed, R1. Checked on every turn, since the owner can swap
+            # a component between turns.
+            scratch = (
+                None
+                if self.scratch is None
+                else checked_scratch(self.cwd, self.scratch)
+            )
             arguments = server_arguments(
                 self._list_servers(environment),
                 self.config,
                 self.protected,
                 self.mark,
                 variables,
-                git_directories(self.cwd) or (),
+                (*self.write_protected, *(git_directories(self.cwd) or ())),
+                scratch,
             )
             instructions = read_instructions(self.config.instructions, self.cwd)
         except Exception:

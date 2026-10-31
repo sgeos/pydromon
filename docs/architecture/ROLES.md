@@ -133,6 +133,38 @@ that leaves it out, followed by hibernating or stopping the line if it should no
   such as the full gate, so a seat's lease outlives its role and ends as any lease
   does, by release, by its time to live, or when its holder's session is cleared or the
   line rebound.
+
+**Leases and runs across a change of owner.** **Decided on 2026-10-31, at the
+operator's request to decide and record it.** A lease stays a line's, as above, with
+one exception. When `ownership_changed` passes a role from one seat to another, every
+lease the previous owner holds passes to the new owner, keeping its acquisition and its
+expiry. The event log applies this itself, as [`EVENT_LOG.md`](../protocol/EVENT_LOG.md)
+says, so a replay agrees.
+
+- **Why it passes.** A role's owner takes a lease to guard a resource its work uses,
+  such as a device that a long run drives. A run is the role's, as
+  [`RUNS.md`](RUNS.md) says, so it keeps using the resource after the seat changes. A
+  lease left with the former owner would bar the successor until it expired, and a
+  former owner that ran out of budget cannot release it. A lease that ended with the
+  change would let another line take the resource while the role's run still used it.
+- **Why expiry is kept.** Passing renews nothing, so a lease still lasts at most one
+  time to live from its acquisition, and the successor acquires it again once it
+  expires, as any holder does.
+- **What does not pass.** A role left vacant, by `relinquished` or an operator, leaves
+  the former owner's leases with it, since no seat would hold them. A lease held by a
+  seat that does not own the role is unaffected. A retired role changes no lease.
+- **Every lease of the former owner passes.** **Decided on 2026-10-31, review R4.**
+  This includes a lease the former owner took for a purpose that has nothing to do
+  with the role, such as one taken before it became a seat. A lease records its line
+  and no role, so Dromon cannot tell which resource served the role's work, and the
+  passing does not guess. Leaving such a lease with the former owner would also leave
+  it with a seat that may have run out of budget and cannot release it, while the
+  successor can release one it does not need. The expiry still bounds every lease
+  either way. A test pins this.
+- **What was weighed.** Ending the leases at a change of owner was simpler and is
+  rejected for the second reason above. Making leases the role's in general would
+  change what a lease names, a project resource and not a role's, and is not needed for
+  the case the operator raised.
 - **The identifier is not reused.** **Decided.** A retired role's identifier is never
   declared again. The log never reuses an identifier within its kind, and a role's
   journal entries, its ownership history and the notices of its former owners are all
@@ -196,7 +228,12 @@ invariant, and every path that can break it refuses, saying what to do instead.
   project file, refuse a worktree that is another role's, compared by real path, so a
   symbolic link does not hide it. A file that declares it, within itself or against a
   role only in the log, is refused whole at a start and at a reload, naming both
-  roles. F3.
+  roles. F3. **Round 10 re-review, N4.** A worktree inside another role's, or one
+  that holds it, is refused the same way, so a role on the project root excludes
+  every other role, whose worktrees all lie below it. The placement rule above
+  reads a line in a directory inside an owned worktree, or one holding it, as a line
+  in the worktree itself, so a writer on the project root is refused once any role
+  below it has an owner.
 - **A line the rule did not place still cannot write beside an owner.** A line that a
   log made before the rule left in an owned worktree, or one that was there before
   the role gained an owner, does not start a turn, and a new owner's first turn waits
@@ -218,11 +255,13 @@ read with the file's configuration where it gives one and the line's overrides o
 it. A line the log made before the rule refuses the file too, and the refusal names
 it, since the rule is not loosened for an existing file.
 
-**Not covered.** A worktree inside another, such as a role on the project root and
-another below it, is not treated as shared, since the rule compares real paths for
-equality. A seat on an engine that cannot confine it runs while its role is vacant,
-as before, and is then read as a writer wherever it runs. The checks resolve real
-paths on the file system, which a port must do the same way.
+A seat on an engine that cannot confine it runs while its role is vacant, as
+before, and is then read as a writer wherever it runs. **Round 10 re-review, N3.** Its
+turn in flight is a writer's, so a seat that takes the role, or is given it, waits for
+that turn to end before its own first turn as the owner, and the kept connection of
+each such seat is closed first, as a former owner's is. The take itself is not
+refused, since a seat of a vacant role runs so that it can take the role. The checks
+resolve real paths on the file system, which a port must do the same way.
 
 **Rollback hazard.** A daemon older than round 10 does not know `seat_unbound`,
 `role_retired` or `role_held`, so once any of them is in the log, the older daemon
@@ -235,8 +274,15 @@ rollback past round 10 needs a log without them.
 worktree writable. Every other seat of the role runs with it read only, through the
 sandbox profile each engine adapter already builds. **Decided on 2026-10-27.** A seat
 that does not own the role may read the worktree at any time, also while the owner
-writes, so it can prepare a handoff, and it writes only the worktree's scratch
-directory `tmp/`, with `write_scratch` or its own tools. What it reads in the middle of
+writes, so it can prepare a handoff, and it writes only a scratch directory of its own,
+`tmp/lines/LINE` in the worktree, with `write_scratch` or, on Codex, its own tools.
+**Changed by the operator on 2026-10-31, round 10 re-review, N1 and N2.** It wrote the
+whole of `tmp/` before, which is the owner's scratch, so it could change a file of the
+owner there. The owner's scratch is `tmp/`, which every seat may read. **Decided by
+the operator on 2026-10-31, review of ebedeed, R2.** An owner configured with read
+access writes `tmp/` only through `write_scratch`, and its engine does not grant its
+shell `tmp/`, which is intended. On Codex each turn checks the seat's own scratch for links before
+granting it, so the owner cannot redirect that grant into `tmp/`. What it reads in the middle of
 the owner's change may be inconsistent, which the recovery checklist accounts for. Ownership is read when a seat's turn starts. An ownership
 change drops the engine of every seat whose access changed, so the next turn builds a
 new session with the new profile, since a sandbox is fixed for an engine session's
