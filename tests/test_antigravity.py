@@ -1149,6 +1149,22 @@ def test_missing_permission_choice_cancels_and_refuses_with_evidence(
     assert server.methods().count("session/cancel") == 1
 
 
+def test_missing_permission_option_preserves_an_earlier_identity_refusal(
+    home: Path, runtime: Path
+) -> None:
+    request = permission(RUNNING, tool_name=OWN)
+    request["params"]["toolCall"]["title"] = "changed title"
+    request["params"]["options"] = []
+    server = FakeRuntime([own(), request])
+
+    with pytest.raises(EngineRefused) as raised:
+        run(line(server, home, runtime, tools=True))
+
+    assert "changed the title" in str(raised.value)
+    assert "ACP offered no option" not in str(raised.value)
+    assert server.answer("p1")["result"] == {"outcome": {"outcome": "cancelled"}}
+
+
 def test_a_question_from_the_runtime_is_cancelled_and_refuses_the_turn(
     home: Path, runtime: Path
 ) -> None:

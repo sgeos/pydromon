@@ -1724,6 +1724,21 @@ def test_missing_permission_choice_cancels_and_refuses_with_evidence(
     assert server.methods().count("session/cancel") == 1
 
 
+def test_missing_permission_option_preserves_an_earlier_identity_refusal(
+    project: tuple[Path, Path, Path],
+) -> None:
+    request = permission("other", "different_name")
+    request["params"]["options"] = []
+    server = FakeGrok([tool_call("other", "dromon__send_message"), request])
+
+    with pytest.raises(EngineRefused) as raised:
+        run(line(server, project, config=LineConfig(builtin_tools=("Read",))))
+
+    assert "changed the toolName" in str(raised.value)
+    assert "ACP offered no option" not in str(raised.value)
+    assert server.answers()[0]["result"]["outcome"] == {"outcome": "cancelled"}
+
+
 def test_the_turn_is_reported_to_the_observer_as_it_streams(
     project: tuple[Path, Path, Path],
 ) -> None:

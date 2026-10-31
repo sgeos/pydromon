@@ -1709,7 +1709,7 @@ class GrokLine:
             )
             await self._rpc().respond(request_id, response)
             if missing_option is not None:
-                refusal = missing_option
+                refusal = refusal or missing_option
             if refusal is not None:
                 await self._cancel(turn, refusal)
             else:

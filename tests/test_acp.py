@@ -35,6 +35,18 @@ def test_a_permission_is_granted_once_and_refused_once_by_preference() -> None:
     )
 
 
+def test_refusal_selects_reject_when_a_valid_allow_once_is_also_offered() -> None:
+    options = [
+        {"optionId": "allow", "kind": "allow_once"},
+        {"optionId": "reject", "kind": "reject_once"},
+    ]
+
+    assert acp.permission_result(options, False, "read_file") == (
+        {"outcome": {"outcome": "selected", "optionId": "reject"}},
+        None,
+    )
+
+
 @pytest.mark.parametrize(("permitted", "intent"), [(True, "allow"), (False, "refuse")])
 def test_missing_permission_options_refuse_with_bounded_evidence(
     permitted: bool, intent: str
