@@ -104,7 +104,7 @@ argument outside a tool's schema is refused.
 
 | Tool | Effect |
 |---|---|
-| `send_message` | Sends a note to a line, an operator or the line itself, delivered in a later tick. With `priority` true, a note to another line is priority mail, rate limited, as [`PRIORITY.md`](PRIORITY.md) specifies |
+| `send_message` | Sends a note to a line, an operator or the line itself, delivered in a later tick. With `priority` true, a note to another line is priority mail, rate limited, as [`PRIORITY.md`](PRIORITY.md) specifies. With `issue` true, from 2026-10-31, it raises an issue with an operator, as below |
 | `ask_operator` | Asks an operator a question, which never pauses the line |
 | `wake_after` | Schedules one wake for the line, optionally tied to a running background task, as below |
 | `list_mail`, `read_mail`, `acknowledge_mail` | Page through, open and acknowledge the line's mailbox |
@@ -121,6 +121,43 @@ argument outside a tool's schema is refused.
 | `write_scratch` | Writes a file under the line's scratch in its working directory, `tmp/` or `tmp/lines/LINE`, as below |
 | `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term or the file that matched. Files are checked independently, so a match cannot span files. The combined content is at most 1 MiB. One call, including a list, spends one recorded check, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. Added on 2026-10-28 |
 | `list_processes`, `stop_process` | List and stop the processes the line started, as below |
+
+**Issues.** **Round 11, item 3, decided by core for review on 2026-10-31.** A line
+raises a harness or operator-experience issue unasked with `send_message` and `issue`
+true, addressed to an operator. The daemon records it as a message of kind `issue`,
+which is open until the operator replies to it or acknowledges it. The operator lists
+the open issues with `dromon mail --issues`, closes one with `dromon ack` or with a
+reply, and receives each through the operator's relay like any other mail, as
+[`RELAY.md`](RELAY.md) specifies.
+
+- **Why a kind of mail.** An issue then has what mail already has, an identifier, a
+  sender, durable storage, delivery through the relay, the disclosure check, request
+  keys, and a closing act in acknowledgement or reply, so the change is one value of
+  the message kind, one tool argument and one listing filter. A separate tracker
+  would need its own events, states, listing and relay path for the same lifecycle.
+- **Why not a field on `ask_operator`.** A question asks for an answer, holds a place
+  in the operator's question queue and may supersede an earlier question, and an issue
+  asks for nothing. Raising one as a question would put reports in the queue of
+  decisions the operator owes.
+- **Why not a convention in a note's text.** A prefix cannot be listed reliably, and a
+  line that forgot it would raise nothing.
+- **Limits.** Only a line raises an issue, only with an operator, and never as a reply,
+  since an issue opens its own thread. An external agent's `send_message` has no
+  `issue` argument. An issue has no severity, label or state beyond open and closed,
+  and no event marks it reopened. A further issue is a new message.
+- **Rate.** A line may have at most five open issues and at most three issues in its
+  last twenty sent messages. Both bounds are enforced by replay, so acknowledging an
+  issue frees an open slot but does not reset the rate limit. When a bound is reached,
+  the line is told to wait for an operator reply or acknowledgment. **Decided on
+  2026-10-31, from the relay re-review.** The open cap is the real bound, since a slot
+  frees only by an operator's reply or acknowledgment, so the issues an operator is
+  sent are bounded by the operator's own actions. The window counts messages, not time,
+  so a line that sends ordinary messages between issues is not slowed by it. A rule by
+  time would need a time on each message event, which the model does not record, and
+  was not added.
+- **Rollback hazard.** A daemon older than this kind cannot read an event log that
+  holds an issue, since its codec refuses an unknown message kind, so a rollback past
+  it needs the log from before the first issue.
 
 **Decided by the operator on 2026-10-26**, from the lines' own reports, for what follows
 in this section.

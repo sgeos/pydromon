@@ -91,6 +91,17 @@ seats = ["beta", "gamma"]
 handoff_seconds = 3600  # the default
 failover = "automatic"  # the default, or "ask"
 handoff_below_percent = 10  # the default, or 0 for never
+
+[relays.tail]
+kind = "file"           # one JSON line per notice, for tail -f
+path = ".dromon/run/notices.jsonl"
+
+[relays.mail]
+command = ["/usr/local/bin/notify-by-mail", "--to", "ana"]
+timeout_seconds = 30    # the default, in (0, 3600]
+
+[operators.ana]
+relay = "tail"          # the route of operator ana's mail
 ```
 
 | Key | Type | Default | Meaning |
@@ -148,6 +159,13 @@ handoff_below_percent = 10  # the default, or 0 for never
 | `peers.ID.waiting` | integer in [1, 100000] | 500 | The bound on mail from the peer waiting for all local parties |
 | `sandbox` | table | none | The project's sandbox, merged under every line's, as [`SANDBOX.md`](SANDBOX.md) specifies |
 | `profiles.NAME.sandbox`, `lines.ID.sandbox` | table | none | A profile's or a line's sandbox. These merge rather than replace |
+| `relays.NAME` | table | none | A relay to operators, named by an identifier, as [`RELAY.md`](RELAY.md) specifies. At most 32. Added on 2026-10-31 |
+| `relays.NAME.kind` | `command` or `file` | `command` | A command relay runs a command once per notice. A file relay appends each notice to one file |
+| `relays.NAME.command` | list of 1 to 64 non-empty texts | required for `command` | The argument vector, run without a shell, each argument at most 4096 bytes. A key of the other kind is an error |
+| `relays.NAME.path` | path | required for `file` | The notice file, absolute, under `~`, or relative to the project root. Its directory must exist, and it may not lie in any line's working directory except inside a directory Dromon protects, as below |
+| `relays.NAME.timeout_seconds` | number in (0, 3600] | 30 | How long a command relay may run before it and its process group are killed |
+| `operators.ID` | table | none | An operator, named by an operator identifier |
+| `operators.ID.relay` | relay name | required | The relay that carries the operator's mail. An operator with no table is unrouted, and its mail waits for a client |
 | `settings` | table | none | The project's engine settings, merged under every line's, as [`SETTINGS.md`](SETTINGS.md) specifies |
 | `profiles.NAME.settings`, `lines.ID.settings` | table | none | A profile's or a line's engine settings. These merge rather than replace |
 
@@ -226,6 +244,16 @@ handoff_below_percent = 10  # the default, or 0 for never
   `git_ssh`, which apply only at start. Its roles are recorded as above. A line the file no longer declares returns to the
   project's limits and wake policy. The leases table is applied again, and a held lease
   whose name the file no longer declares ends.
+- **Relays.** At start, and before a reload applies anything, the daemon builds each
+  routed operator's relay, and refuses the start or the reload when a file relay's
+  notice file lies in the working directory of any line, whether in the log or in the
+  file, outside the directories Dromon protects. A reload may add, change or remove
+  relays and routes, and they apply from the relayer's next pass. A notice already
+  handed to its old relay finishes there. **Decided by core for review, on
+  2026-10-31.** A notice file under `.dromon`, such as `.dromon/run/notices.jsonl`,
+  is allowed although `.dromon` lies in the project root, which is a line's working
+  directory, because every enabled sandbox denies `.dromon` to lines and no line may
+  run in it. A line without a sandbox reaches the file wherever it is.
 - **Lines on other engines.** A project file whose own `[sandbox]` or `[settings]`
   table would reach a line on any engine but Claude Code is refused at start, since
   only Claude Code honours either document.

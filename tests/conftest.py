@@ -146,6 +146,7 @@ SCENARIO: tuple[Event, ...] = (
     MessageSent("m3", ALPHA, BEN, NOTE, "thank you", reply_to="m2"),
     MessageSent("m7", ALPHA, BEN, NOTE, "keyed", request=RequestStamp("k1", "b" * 64)),
     MessageSent("h1", HARNESS, BEN, NOTE, "a note the harness wrote"),
+    MessageSent("i1", ALPHA, BEN, MessageKind.ISSUE, "a tool's refusal misleads"),
     AgentRegistered("probe", AgentAccess.MESSAGE, "0" * 64),
     MessageSent("m4", PROBE, BETA, NOTE, "from an agent"),
     MessageCorrelated("m4", "game-7.round-2"),

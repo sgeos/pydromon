@@ -158,10 +158,41 @@ def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     for entry in peers:
         if isinstance(entry, dict):
             print(_peer_row(cast(Mapping[str, object], entry)))
+    relays = result.get("relays")
+    if isinstance(relays, dict):
+        for row in _relay_rows(cast(Mapping[str, object], relays)):
+            print(row)
     totals = result.get("correlation")
     if isinstance(totals, dict):
         print(_correlation_row(cast(Mapping[str, object], totals)))
     return exits.OK
+
+
+def _relay_rows(relays: Mapping[str, object]) -> list[str]:
+    """The lines of ``dromon status`` for the operators' relays: who is routed,
+    what was relayed, what waits unrouted, and each failing notice with its reason.
+    Nothing is printed for a project with no route and no operator mail waiting."""
+    routed = relays.get("routed")
+    names = cast(list[object], routed) if isinstance(routed, list) else []
+    unrouted = relays.get("unrouted")
+    if not names and not unrouted:
+        return []
+    rows = [
+        "relays for "
+        + (", ".join(f"@{name}" for name in names) if names else "no operator")
+        + f", {relays.get('delivered')} relayed since the start,"
+        f" {unrouted} waiting unrouted, {relays.get('failing')} failing"
+    ]
+    found = relays.get("failures")
+    for entry in cast(list[object], found) if isinstance(found, list) else []:
+        if isinstance(entry, dict):
+            failure = cast(Mapping[str, object], entry)
+            rows.append(
+                f"  {failure.get('message_id')} for @{failure.get('operator')},"
+                f" attempt {failure.get('attempts')}, again in"
+                f" {failure.get('retry_in_seconds')}s: {failure.get('reason')}"
+            )
+    return rows
 
 
 def _correlation_row(totals: Mapping[str, object]) -> str:
@@ -770,6 +801,8 @@ def _mail(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     }
     if arguments.sender is not None:
         args["sender"] = arguments.sender
+    if arguments.issues:
+        args["issues_only"] = True
     response = _call(paths, "mail", Operation.MAIL, args)
     if isinstance(response, int):
         return response
@@ -2413,6 +2446,11 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if name == "mail":
             command.add_argument("--unread", action="store_true", help="unread only")
+            command.add_argument(
+                "--issues",
+                action="store_true",
+                help="open issues lines raised, closed by a reply or dromon ack",
+            )
             command.add_argument(
                 "--from", dest="sender", default=None, help="one sender"
             )
