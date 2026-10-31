@@ -133,6 +133,30 @@ that leaves it out, followed by hibernating or stopping the line if it should no
   such as the full gate, so a seat's lease outlives its role and ends as any lease
   does, by release, by its time to live, or when its holder's session is cleared or the
   line rebound.
+
+**Leases and runs across a change of owner.** **Decided on 2026-10-31, at the
+operator's request to decide and record it.** A lease stays a line's, as above, with
+one exception. When `ownership_changed` passes a role from one seat to another, every
+lease the previous owner holds passes to the new owner, keeping its acquisition and its
+expiry. The event log applies this itself, as [`EVENT_LOG.md`](../protocol/EVENT_LOG.md)
+says, so a replay agrees.
+
+- **Why it passes.** A role's owner takes a lease to guard a resource its work uses,
+  such as a device that a long run drives. A run is the role's, as
+  [`RUNS.md`](RUNS.md) says, so it keeps using the resource after the seat changes. A
+  lease left with the former owner would bar the successor until it expired, and a
+  former owner that ran out of budget cannot release it. A lease that ended with the
+  change would let another line take the resource while the role's run still used it.
+- **Why expiry is kept.** Passing renews nothing, so a lease still lasts at most one
+  time to live from its acquisition, and the successor acquires it again once it
+  expires, as any holder does.
+- **What does not pass.** A role left vacant, by `relinquished` or an operator, leaves
+  the former owner's leases with it, since no seat would hold them. A lease held by a
+  seat that does not own the role is unaffected. A retired role changes no lease.
+- **What was weighed.** Ending the leases at a change of owner was simpler and is
+  rejected for the second reason above. Making leases the role's in general would
+  change what a lease names, a project resource and not a role's, and is not needed for
+  the case the operator raised.
 - **The identifier is not reused.** **Decided.** A retired role's identifier is never
   declared again. The log never reuses an identifier within its kind, and a role's
   journal entries, its ownership history and the notices of its former owners are all

@@ -16,6 +16,26 @@ from dromon.daemon import Daemon
 from dromon.driver import Strategy
 from dromon.eventlog import EventLog
 from dromon.lineconfig import LineConfig
+from dromon.model import (
+    EventRejected,
+    InvalidField,
+    LeaseAcquired,
+    LeaseEnd,
+    LeaseReleased,
+    LineAddress,
+    LineCreated,
+    LineRebound,
+    LineSessionCleared,
+    OperatorAddress,
+    OperatorRegistered,
+    OwnershipCause,
+    OwnershipChanged,
+    RoleDeclared,
+    RoleNoted,
+    RoleNoteKind,
+    SeatBound,
+    State,
+)
 from dromon.paths import ProjectPaths, project_paths
 from dromon.projectconfig import (
     ConfigFileError,
@@ -35,6 +55,9 @@ from dromon.scheduler import (
 
 HAIKU = "claude-haiku-5-5"
 START = datetime(2026, 10, 26, 9, 0, 0, tzinfo=UTC)
+AT = "2026-10-27T05:00:00Z"
+ANA = OperatorAddress("ana")
+ALPHA_ADDRESS = LineAddress("alpha")
 
 
 # The project file.
@@ -173,15 +196,179 @@ def test_undeclaring_a_name_ends_its_lease_and_the_ttl_is_checked(
             scheduler.set_leases(["ci"], ttl)
 
 
-def test_leases_live_in_memory_so_a_restart_drops_them(
+def test_a_lease_is_an_event_with_its_holder_and_both_times(
     scheduler: Scheduler, clock: Clock
 ) -> None:
-    scheduler.acquire_lease("alpha", "gate")
+    """Task of 2026-10-31. The acquisition is the start rounded up to the second,
+    which the expiry counts from."""
+    clock.now += timedelta(microseconds=1)
+    expires = scheduler.acquire_lease("alpha", "gate")
     log = scheduler._log  # pyright: ignore[reportPrivateUsage]
-    restarted = Scheduler(log, no_engine, hold_wakes=True, wall_clock=clock)
-    restarted.set_leases(["gate", "ci"], 600)
-    assert restarted.leases_of("alpha") == []
-    assert restarted.acquire_lease("beta", "gate")
+    assert log.state.leases["gate"] == LeaseAcquired(
+        "gate", "alpha", "2026-10-26T09:00:01Z", expires
+    )
+    assert expires == "2026-10-26T09:10:01Z"
+    scheduler.release_lease("alpha", "gate")
+    assert "gate" not in log.state.leases
+
+
+def test_a_restart_while_a_lease_is_held_keeps_it_until_it_expires(
+    tmp_path: Path, clock: Clock
+) -> None:
+    """Task of 2026-10-31. The restarted daemon reads the log from its file, so the
+    holder, the acquisition and the expiry survive, and expiry stays the bound."""
+    path = tmp_path / "restart.sqlite"
+    with EventLog(path) as log:
+        before = Scheduler(log, no_engine, hold_wakes=True, wall_clock=clock)
+        for line_id in ("alpha", "beta"):
+            before.create_line(line_id, HAIKU, Strategy.SUBSCRIPTION)
+        before.set_leases(["gate", "ci"], 600)
+        expires = before.acquire_lease("alpha", "gate")
+        held = log.state.leases["gate"]
+    clock.now += timedelta(seconds=300)
+    with EventLog(path) as log:
+        after = Scheduler(log, no_engine, hold_wakes=True, wall_clock=clock)
+        after.set_leases(["gate", "ci"], 600)
+        assert log.state.leases["gate"] == held
+        assert after.leases_of("alpha") == [{"name": "gate", "expires": expires}]
+        with pytest.raises(LeaseRefused, match=f"held by line alpha until {expires}"):
+            after.acquire_lease("beta", "gate")
+        with pytest.raises(LeaseRefused, match="already"):
+            after.acquire_lease("alpha", "gate")
+        clock.now += timedelta(seconds=300)
+        assert after.leases_of("alpha") == []
+        assert after.acquire_lease("beta", "gate")
+        assert log.state.leases["gate"].line_id == "beta"
+
+
+def test_a_restart_that_no_longer_declares_a_name_ends_its_lease(
+    tmp_path: Path, clock: Clock
+) -> None:
+    path = tmp_path / "restart.sqlite"
+    with EventLog(path) as log:
+        before = Scheduler(log, no_engine, hold_wakes=True, wall_clock=clock)
+        before.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+        before.set_leases(["gate", "ci"], 600)
+        before.acquire_lease("alpha", "gate")
+        before.acquire_lease("alpha", "ci")
+        # One that has expired ends too, so the state holds only declared names.
+        clock.now += timedelta(seconds=601)
+    with EventLog(path) as log:
+        after = Scheduler(log, no_engine, hold_wakes=True, wall_clock=clock)
+        after.set_leases(["ci"], 600)
+        assert set(log.state.leases) == {"ci"}
+    # The end is an event, so a later start sees it without applying the file.
+    with EventLog(path) as log:
+        assert set(log.state.leases) == {"ci"}
+
+
+def test_the_log_refuses_a_second_holder_before_expiry_by_the_events_times() -> None:
+    state = State()
+    state.apply(LineCreated("alpha", HAIKU, "subscription"))
+    state.apply(LineCreated("beta", HAIKU, "subscription"))
+    first = LeaseAcquired(
+        "gate", "alpha", "2026-10-26T09:00:00Z", "2026-10-26T09:10:00Z"
+    )
+    state.apply(first)
+    with pytest.raises(EventRejected, match="held by line alpha until"):
+        state.check(
+            LeaseAcquired(
+                "gate", "beta", "2026-10-26T09:09:59Z", "2026-10-26T09:20:00Z"
+            )
+        )
+    with pytest.raises(EventRejected, match="line beta holds no lease gate"):
+        state.check(LeaseReleased("gate", "beta", LeaseEnd.RELEASED))
+    with pytest.raises(EventRejected, match="no line"):
+        state.check(LeaseAcquired("ci", "gamma", first.acquired_at, first.expires))
+    with pytest.raises(InvalidField, match="expires after it is acquired"):
+        LeaseAcquired("gate", "beta", first.expires, first.expires)
+    state.apply(
+        LeaseAcquired("gate", "beta", "2026-10-26T09:10:00Z", "2026-10-26T09:20:00Z")
+    )
+    assert state.leases["gate"].line_id == "beta"
+
+
+def owned_role() -> State:
+    """A role ``core`` with seats ``alpha``, its owner, and ``beta``, and a lease
+    held by each."""
+    state = State()
+    for event in (
+        LineCreated("alpha", HAIKU, "subscription"),
+        LineCreated("beta", HAIKU, "subscription"),
+        OperatorRegistered("ana"),
+        RoleDeclared("core", "tmp/worktrees/core"),
+        SeatBound("alpha", "core", True),
+        SeatBound("beta", "core", True),
+        OwnershipChanged("core", "alpha", None, OwnershipCause.DECLARED, ANA, None, AT),
+        LeaseAcquired("gate", "alpha", AT, "2026-10-27T08:00:00Z"),
+        LeaseAcquired("device", "alpha", AT, "2026-10-27T09:00:00Z"),
+        LeaseAcquired("ci", "beta", AT, "2026-10-27T08:00:00Z"),
+    ):
+        state.apply(event)
+    return state
+
+
+@pytest.mark.parametrize(
+    ("cause", "by"),
+    [
+        (OwnershipCause.HANDOFF, LineAddress("alpha")),
+        (OwnershipCause.OPERATOR, OperatorAddress("ana")),
+        (OwnershipCause.RECOVERY, OperatorAddress("ana")),
+    ],
+)
+def test_a_change_of_owner_passes_the_previous_owners_leases_with_their_times(
+    cause: OwnershipCause, by: LineAddress | OperatorAddress
+) -> None:
+    """Decided on 2026-10-31. The successor holds the resource its predecessor was
+    using, with the same expiry, so nothing else takes it in between and nothing
+    renews it."""
+    state = owned_role()
+    before = dict(state.leases)
+    entry = None
+    if cause is OwnershipCause.HANDOFF:
+        entry = "e1"
+        state.apply(
+            RoleNoted("core", entry, "alpha", RoleNoteKind.HANDOFF, "go", "", "", AT)
+        )
+    state.apply(OwnershipChanged("core", "beta", "alpha", cause, by, entry, AT))
+    assert {name: lease.line_id for name, lease in state.leases.items()} == {
+        "gate": "beta",
+        "device": "beta",
+        "ci": "beta",
+    }
+    for name in ("gate", "device"):
+        assert (state.leases[name].acquired_at, state.leases[name].expires) == (
+            before[name].acquired_at,
+            before[name].expires,
+        )
+    state.apply(LeaseReleased("gate", "beta", LeaseEnd.RELEASED))
+    with pytest.raises(EventRejected, match="line alpha holds no lease device"):
+        state.check(LeaseReleased("device", "alpha", LeaseEnd.RELEASED))
+
+
+def test_a_role_left_vacant_leaves_its_former_owners_leases_with_it() -> None:
+    state = owned_role()
+    state.apply(
+        OwnershipChanged(
+            "core", None, "alpha", OwnershipCause.RELINQUISHED, ALPHA_ADDRESS, None, AT
+        )
+    )
+    assert state.leases["gate"].line_id == "alpha"
+    state.apply(
+        OwnershipChanged("core", "beta", None, OwnershipCause.OPERATOR, ANA, None, AT)
+    )
+    assert state.leases["gate"].line_id == "alpha"
+    assert state.leases["ci"].line_id == "beta"
+
+
+def test_a_cleared_session_or_rebind_ends_the_leases_in_the_log_itself() -> None:
+    """The model ends them as it applies the event, so a replay agrees with the
+    daemon that recorded it and no second event is needed."""
+    state = owned_role()
+    state.apply(LineSessionCleared("alpha"))
+    assert set(state.leases) == {"ci"}
+    state.apply(LineRebound("beta", "claude-opus-5-5", "subscription"))
+    assert state.leases == {}
 
 
 # The tools.

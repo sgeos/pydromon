@@ -81,6 +81,12 @@ from dromon.model import (
     RequestStamp,
     BudgetStated,
     BudgetSource,
+    LeaseAcquired,
+    LeaseEnd,
+    LeaseReleased,
+    RunEnded,
+    RunStarted,
+    RunStatus,
     PeerDeclared,
     PeerKeyed,
     PeerRemoved,
@@ -227,6 +233,30 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "source",
         "note",
         "stated_at",
+    ),
+    "lease_acquired": ("name", "line_id", "acquired_at", "expires"),
+    "lease_released": ("name", "line_id", "cause"),
+    "run_started": (
+        "run_id",
+        "line_id",
+        "role_id",
+        "previous",
+        "command",
+        "argv",
+        "workdir",
+        "output_file",
+        "pid",
+        "process_started",
+        "started_at",
+    ),
+    "run_ended": (
+        "run_id",
+        "status",
+        "exit_code",
+        "output_digest",
+        "output_bytes",
+        "note",
+        "ended_at",
     ),
     "peer_declared": ("peer_id", "transport", "policy"),
     "peer_removed": ("peer_id",),
@@ -631,6 +661,43 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "note": event.note,
                 "stated_at": event.stated_at,
             }
+        case LeaseAcquired():
+            return "lease_acquired", {
+                "name": event.name,
+                "line_id": event.line_id,
+                "acquired_at": event.acquired_at,
+                "expires": event.expires,
+            }
+        case LeaseReleased():
+            return "lease_released", {
+                "name": event.name,
+                "line_id": event.line_id,
+                "cause": event.cause.value,
+            }
+        case RunStarted():
+            return "run_started", {
+                "run_id": event.run_id,
+                "line_id": event.line_id,
+                "role_id": event.role_id,
+                "previous": event.previous,
+                "command": event.command,
+                "argv": list(event.argv),
+                "workdir": event.workdir,
+                "output_file": event.output_file,
+                "pid": event.pid,
+                "process_started": event.process_started,
+                "started_at": event.started_at,
+            }
+        case RunEnded():
+            return "run_ended", {
+                "run_id": event.run_id,
+                "status": event.status.value,
+                "exit_code": event.exit_code,
+                "output_digest": event.output_digest,
+                "output_bytes": event.output_bytes,
+                "note": event.note,
+                "ended_at": event.ended_at,
+            }
         case PeerDeclared():
             return "peer_declared", {
                 "peer_id": event.peer_id,
@@ -896,6 +963,43 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "note"),
                 _str(data, "stated_at"),
             )
+        case "lease_acquired":
+            return LeaseAcquired(
+                _str(data, "name"),
+                _str(data, "line_id"),
+                _str(data, "acquired_at"),
+                _str(data, "expires"),
+            )
+        case "lease_released":
+            return LeaseReleased(
+                _str(data, "name"),
+                _str(data, "line_id"),
+                _member(data, "cause", LeaseEnd),
+            )
+        case "run_started":
+            return RunStarted(
+                _str(data, "run_id"),
+                _str(data, "line_id"),
+                _optional_str(data, "role_id"),
+                _optional_str(data, "previous"),
+                _str(data, "command"),
+                tuple(_list(data, "argv", str)),
+                _str(data, "workdir"),
+                _str(data, "output_file"),
+                _int(data, "pid"),
+                _str(data, "process_started"),
+                _str(data, "started_at"),
+            )
+        case "run_ended":
+            return RunEnded(
+                _str(data, "run_id"),
+                _member(data, "status", RunStatus),
+                _optional_int(data, "exit_code"),
+                _optional_str(data, "output_digest"),
+                _optional_int(data, "output_bytes"),
+                _str(data, "note"),
+                _str(data, "ended_at"),
+            )
         case "peer_declared":
             return PeerDeclared(
                 _str(data, "peer_id"), _str(data, "transport"), _str(data, "policy")
@@ -1024,6 +1128,8 @@ def _member[
         FailoverPolicy,
         ReturnCode,
         RoleHolder,
+        LeaseEnd,
+        RunStatus,
     )
 ](data: dict[str, object], name: str, kind: type[T]) -> T:
     value = _str(data, name)

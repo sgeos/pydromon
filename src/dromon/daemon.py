@@ -1438,6 +1438,7 @@ class Daemon:
         )
         self.scheduler.set_disclosure_terms(terms)
         self.scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
+        self.scheduler.set_runs(config.run_commands)
         self.project = config
         self.project_file_present = present
         self.apply_project_values()
@@ -2933,6 +2934,7 @@ def run(
             scheduler.set_disclosure_terms(terms)
             scheduler.set_git_ssh(line_git_ssh)
             scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
+            scheduler.set_runs(config.run_commands)
             check_lines_sandboxed(config, log, scheduler)
             check_roles(scheduler, log, config)
             apply_project(scheduler, log, config)

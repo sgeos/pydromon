@@ -55,8 +55,13 @@ take turns at a shared resource. ``acquire_lease`` succeeds only while no line h
 the name, and otherwise reports the holder and when its lease ends, so one acquisition
 lasts at most one time to live, by the wall clock. ``release_lease`` gives it up. A
 lease ends when released, when its time to live passes, or when its holder's session is
-cleared or the holder is rebound. Leases live only in the daemon's memory, so a restart
-drops every one, which suits a resource a crashed daemon no longer uses.
+cleared or the holder is rebound, and passes to the new owner when its holder's role
+changes owner. Leases are events, so a restart keeps each one until it expires. Task
+of 2026-10-31.
+
+Runs. A project may declare commands that a line starts as supervised runs, which
+outlive the turn, the seat and the daemon, as ``dromon.runs`` and
+``docs/architecture/RUNS.md`` say. Their reconciliation runs on the process worker.
 
 Rebinding. An operator may move a line to another model and strategy, keeping its
 identity, mailbox, configuration and overrides. ``line_rebound`` records it, the model
@@ -143,6 +148,8 @@ from dromon.security_paths import project_secret_paths
 from dromon.handoff import Handoff
 from dromon.handoff import select as select_handoff
 from dromon import requestkeys
+from dromon import runs
+from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 from dromon.requestkeys import (
     REQUEST_KEY,
     REQUEST_KEY_PROPERTY,
@@ -286,6 +293,13 @@ from dromon.model import (
     LineHibernated,
     LineOverridden,
     LineReleased,
+    LeaseAcquired,
+    LeaseEnd,
+    LeaseReleased,
+    Run,
+    RunEnded,
+    RunStarted,
+    run_scope,
     LineAwakened,
     LineSession,
     LineSessionCleared,
@@ -449,10 +463,36 @@ class LeaseRefused(ValueError):
     """A lease cannot be acquired or released as asked."""
 
 
-@dataclass(frozen=True, slots=True)
-class Lease:
-    holder: str
-    expires: datetime
+START_RUN_TOOL_NAME: Final = "start_run"
+RUN_STATUS_TOOL_NAME: Final = "run_status"
+STOP_RUN_TOOL_NAME: Final = "stop_run"
+RUN_ID_VARIABLE: Final = "DROMON_RUN_ID"
+"""The run's identifier, in its command's environment."""
+MAX_RUNS_SHOWN: Final = 10
+
+START_RUN_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "command": {"type": "string", "description": "A command the project declares"},
+        "previous": {
+            "type": "string",
+            "description": "The latest run run_status names, or none if it names none",
+        },
+    },
+    "required": ["command", "previous"],
+    "additionalProperties": False,
+}
+RUN_STATUS_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
+STOP_RUN_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {"run_id": {"type": "string", "description": "The open run"}},
+    "required": ["run_id"],
+    "additionalProperties": False,
+}
 
 
 WAKE_TOOL_NAME: Final = "wake_after"
@@ -1650,6 +1690,7 @@ class Scheduler:
             launcher.read_rows
         ),
         confining_engines: frozenset[str] = CONFINING_ENGINES,
+        run_start_of: Callable[[int], str | None] = runs.process_start,
     ) -> None:
         if not 1 <= wake_every_ticks <= MAX_WAKE_EVERY_TICKS:
             raise ValueError(f"wake_every_ticks must be in [1, {MAX_WAKE_EVERY_TICKS}]")
@@ -1780,6 +1821,17 @@ class Scheduler:
         """Separate queue so a sweep waiting on signalled children cannot occupy
         the worker that serves process inspections and stops."""
         self._process_tasks: set[asyncio.Task[None]] = set()
+        self._run_commands: dict[str, tuple[str, ...]] = {}
+        """The commands the project declares for runs, by name."""
+        self._run_children: dict[str, subprocess.Popen[bytes]] = {}
+        """The supervisors this daemon started, by run, so each is reaped. A
+        restarted daemon has none, since an orphaned supervisor is reaped by the
+        system."""
+        self._run_check: asyncio.Task[None] | None = None
+        self._run_start_of = run_start_of
+        """When a process started, by the process table, which tells a run's
+        supervisor from a later process that reuses its identifier."""
+        self._run_failure: str | None = None
         """Background process scans started during recovery, kept until they finish."""
         self._line_tokens = line_tokens
         """The tokens lines' engines reach Dromon's tools with, which each turn
@@ -1826,8 +1878,6 @@ class Scheduler:
         """The project's disclosure terms, case folded. Never logged or returned."""
         self._lease_names: frozenset[str] = frozenset()
         self._lease_ttl = DEFAULT_LEASE_TTL_SECONDS
-        self._leases: dict[str, Lease] = {}
-        """Held leases by name. In memory only, so a restart drops them."""
         self._git_ssh: dict[str, GitSshAccess] = {}
         """The ``[git_ssh]`` access of each line given it, checked before its turns."""
         self.limits = limits
@@ -2094,7 +2144,6 @@ class Scheduler:
         if not creating and line is not None and previous != config.workdir:
             self._log.append(LineSessionCleared(line_id))
             self._forget_context(line_id)
-            self._end_leases(line_id)
         elif not creating and line is not None and not fresh_before:
             self._clear_for_fresh_sessions(line_id)
         self._drop_engine(line_id)
@@ -3151,14 +3200,17 @@ class Scheduler:
             )
         self._lease_names = frozenset(names)
         self._lease_ttl = ttl_seconds
-        for name in [n for n in self._leases if n not in self._lease_names]:
-            del self._leases[name]
+        leases = self._log.state.leases
+        for name in sorted(n for n in leases if n not in self._lease_names):
+            self._log.append(
+                LeaseReleased(name, leases[name].line_id, LeaseEnd.UNDECLARED)
+            )
 
-    def _live_lease(self, name: str) -> Lease | None:
-        """The lease held under ``name``, ending it first if its time has passed."""
-        lease = self._leases.get(name)
-        if lease is not None and lease.expires <= self._wall_clock():
-            del self._leases[name]
+    def _live_lease(self, name: str) -> LeaseAcquired | None:
+        """The lease held under ``name``, or ``None`` once its time has passed. An
+        expired lease needs no event, since the next acquisition replaces it."""
+        lease = self._log.state.leases.get(name)
+        if lease is not None and parse_due(lease.expires) <= self._wall_clock():
             return None
         return lease
 
@@ -3174,43 +3226,38 @@ class Scheduler:
                 f"the project declares no lease {name!r}. Declared leases: {declared}"
             )
         held = self._live_lease(name)
-        if held is not None and held.holder == line_id:
+        if held is not None and held.line_id == line_id:
             raise LeaseRefused(
-                f"you hold lease {name} already, until {format_due(held.expires)}."
+                f"you hold lease {name} already, until {held.expires}."
                 " A lease is not renewed. Acquire it again once it has expired"
             )
         if held is not None:
             raise LeaseRefused(
-                f"lease {name} is held by line {held.holder} until"
-                f" {format_due(held.expires)}"
+                f"lease {name} is held by line {held.line_id} until {held.expires}"
             )
         now = self._wall_clock().astimezone(UTC)
         start = now.replace(microsecond=0)
         if start < now:
             start += timedelta(seconds=1)
-        expires = start + timedelta(seconds=self._lease_ttl)
-        self._leases[name] = Lease(line_id, expires)
-        return format_due(expires)
+        expires = format_due(start + timedelta(seconds=self._lease_ttl))
+        self._log.append(LeaseAcquired(name, line_id, format_due(start), expires))
+        return expires
 
     def release_lease(self, line_id: str, name: str) -> None:
         """End ``line_id``'s lease ``name``. Raises ``LeaseRefused`` unless it holds
         it."""
         held = self._live_lease(name)
-        if held is None or held.holder != line_id:
+        if held is None or held.line_id != line_id:
             raise LeaseRefused(f"line {line_id} holds no lease {name!r}")
-        del self._leases[name]
-
-    def _end_leases(self, line_id: str) -> None:
-        for name in [n for n, lease in self._leases.items() if lease.holder == line_id]:
-            del self._leases[name]
+        self._log.append(LeaseReleased(name, line_id, LeaseEnd.RELEASED))
 
     def leases_of(self, line_id: str) -> list[dict[str, object]]:
         """The leases ``line_id`` holds, by name, with when each expires."""
         held: list[dict[str, object]] = []
-        for name in sorted(self._leases):
+        for name in sorted(self._log.state.leases):
             lease = self._live_lease(name)
-            if lease is not None and lease.holder == line_id:
-                held.append({"name": name, "expires": format_due(lease.expires)})
+            if lease is not None and lease.line_id == line_id:
+                held.append({"name": name, "expires": lease.expires})
         return held
 
     def _lease_tool(self, line_id: str, acquire: bool) -> SdkMcpTool[Any]:
@@ -3259,6 +3306,280 @@ class Scheduler:
     def release_lease_tool(self, line_id: str) -> SdkMcpTool[Any]:
         """The ``release_lease`` tool for ``line_id``."""
         return self._lease_tool(line_id, acquire=False)
+
+    # Supervised runs. Task of 2026-10-31, as ``docs/architecture/RUNS.md`` says.
+
+    def set_runs(self, commands: Mapping[str, Sequence[str]]) -> None:
+        """Declare the commands lines may start as runs, as the project file does at
+        start and reload. A run already started is unaffected."""
+        self._run_commands = {name: tuple(argv) for name, argv in commands.items()}
+
+    def _run_role(self, line_id: str) -> str | None:
+        seat = self._log.state.seats.get(line_id)
+        return None if seat is None else seat.role_id
+
+    def _scope_runs(self, line_id: str) -> list[Run]:
+        """The runs of ``line_id``'s scope, oldest first."""
+        scope = run_scope(line_id, self._run_role(line_id))
+        return [
+            run
+            for run in self._log.state.runs.values()
+            if run_scope(run.started.line_id, run.started.role_id) == scope
+        ]
+
+    def _latest_run(self, line_id: str) -> Run | None:
+        latest = self._log.state.latest_runs.get(
+            run_scope(line_id, self._run_role(line_id))
+        )
+        return None if latest is None else self._log.state.runs[latest]
+
+    def _run_refusal(self, line_id: str) -> str | None:
+        """Why ``line_id`` may not start or stop its scope's runs. A seat must own
+        its role, and any other line must have write access to its working
+        directory, since a run may write there outside the line's sandbox."""
+        role_id = self._run_role(line_id)
+        if role_id is not None:
+            owner = self._log.state.roles[role_id].owner
+            if owner != line_id:
+                return (
+                    f"only role {role_id}'s owner starts or stops its runs, and its"
+                    f" owner is {owner or 'nobody'}"
+                )
+            return None
+        if self.effective_config(line_id).workdir_access is not WorkdirAccess.WRITE:
+            return "a run may write your working directory, which you may only read"
+        return None
+
+    async def start_run(self, line_id: str, command: str, previous: str) -> RunStarted:
+        """Start the declared ``command`` for ``line_id`` as a supervised run.
+        ``previous`` must name its scope's latest run, or be ``none`` when it has
+        none, so that a successor seat has read its predecessor's record first.
+        Raises ``runs.RunRefused``."""
+        argv = self._run_commands.get(command)
+        if argv is None:
+            declared = ", ".join(sorted(self._run_commands)) or "none"
+            raise runs.RunRefused(
+                f"the project declares no run command {command!r}. Declared: {declared}"
+            )
+        refusal = self._run_refusal(line_id)
+        if refusal is not None:
+            raise runs.RunRefused(refusal)
+        latest = self._latest_run(line_id)
+        if latest is not None and latest.ended is None:
+            raise runs.RunRefused(
+                f"a run of yours has not ended, so no other starts: {_run_line(latest)}"
+            )
+        latest_id = None if latest is None else latest.started.run_id
+        if (previous if previous != "none" else None) != latest_id:
+            seen = "none" if latest is None else _run_line(latest)
+            raise runs.RunRefused(
+                f"previous must name the latest run, so you start one only after"
+                f" reading its record. The latest is {seen}"
+            )
+        if self._report_dir is None:
+            raise runs.RunRefused("this daemon has no report directory for receipts")
+        directory = self._report_dir
+        run_id = new_id("r")
+        try:
+            workdir = Path(os.path.realpath(self._workdir_of(line_id)))
+        except LineToolRefused as error:
+            raise runs.RunRefused(str(error)) from error
+        environment = {
+            **allowlisted(os.environ, BASE_ENVIRONMENT),
+            RUN_ID_VARIABLE: run_id,
+        }
+        launched = await self._process_worker.run(
+            lambda: runs.launch(
+                directory, run_id, workdir, argv, environment, self._run_start_of
+            )
+        )
+        started = RunStarted(
+            run_id,
+            line_id,
+            self._run_role(line_id),
+            latest_id,
+            command,
+            argv,
+            str(workdir),
+            launched.output_file,
+            launched.child.pid,
+            launched.process_started,
+            format_due(self._wall_clock()),
+        )
+        try:
+            self._log.append(started)
+        except BaseException:
+            await self._process_worker.run(lambda: runs.abandon(launched.child))
+            raise
+        self._run_children[run_id] = launched.child
+        runs.release(launched)
+        return started
+
+    async def stop_run(self, line_id: str, run_id: str) -> None:
+        """Ask the supervisor of ``line_id``'s open run ``run_id`` to stop its
+        command. Raises ``runs.RunRefused`` or ``runs.TableUnreadable``."""
+        refusal = self._run_refusal(line_id)
+        if refusal is not None:
+            raise runs.RunRefused(refusal)
+        latest = self._latest_run(line_id)
+        if latest is None or latest.started.run_id != run_id or latest.ended:
+            raise runs.RunRefused(f"run {run_id} is not your scope's open run")
+        await self._process_worker.run(
+            lambda: runs.signal_run(latest.started, self._run_start_of)
+        )
+
+    def run_status(self, line_id: str) -> str:
+        """The latest runs of ``line_id``'s scope, newest first, with their
+        receipts, and the commands the project declares."""
+        found = self._scope_runs(line_id)[-MAX_RUNS_SHOWN:]
+        declared = ", ".join(sorted(self._run_commands)) or "none"
+        if not found:
+            return f"no runs yet, so previous is none. Declared commands: {declared}"
+        lines = [_run_line(run) for run in reversed(found)]
+        return (
+            f"previous is {found[-1].started.run_id}. Declared commands: {declared}.\n"
+            + "\n".join(lines)
+        )
+
+    def check_runs(self) -> None:
+        """Start a reconciliation of the runs that have not ended, unless one is
+        under way, there are none, or there is no event loop."""
+        if self._report_dir is None:
+            return
+        if self._run_check is not None and not self._run_check.done():
+            return
+        if not any(run.ended is None for run in self._log.state.runs.values()):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._run_check = loop.create_task(self.reconcile_runs())
+
+    async def reconcile_runs(self) -> None:
+        """Reconcile the open runs against their receipts and the process table, on
+        the process worker, and record each end found, as ``runs.reconcile`` says.
+        A table that cannot be read is said once on the daemon's standard error, and
+        ends nothing."""
+        directory = self._report_dir
+        if directory is None:
+            return
+        open_runs = [
+            r.started for r in self._log.state.runs.values() if r.ended is None
+        ]
+        children = dict(self._run_children)
+        try:
+            found = await self._process_worker.run(
+                lambda: runs.reconcile(
+                    open_runs, directory, self._run_start_of, children
+                )
+            )
+        except (runs.TableUnreadable, ProcessRefused) as error:
+            if self._run_failure != str(error):
+                self._run_failure = str(error)
+                print(f"dromond: runs wait, as {error}", file=sys.stderr)
+            return
+        self._run_failure = None
+        for finding in found:
+            self._record_run_end(finding)
+            runs.remove_receipt(directory, finding.run_id)
+
+    def _record_run_end(self, finding: runs.Finding) -> None:
+        run = self._log.state.runs.get(finding.run_id)
+        if run is None or run.ended is not None:
+            return
+        self._log.append(
+            RunEnded(
+                finding.run_id,
+                finding.status,
+                finding.exit_code,
+                finding.output_digest,
+                finding.output_bytes,
+                finding.note,
+                format_due(self._wall_clock()),
+            )
+        )
+        self._run_children.pop(finding.run_id, None)
+        ended = self._log.state.runs[finding.run_id]
+        role_id = run.started.role_id
+        owner = None if role_id is None else self._log.state.roles.get(role_id)
+        recipient = (
+            run.started.line_id if owner is None or owner.owner is None else owner.owner
+        )
+        if recipient in self._log.state.lines:
+            self._harness_note(LineAddress(recipient), f"Run ended: {_run_line(ended)}")
+
+    def _run_tools(self, line_id: str) -> list[SdkMcpTool[Any]]:
+        """The run tools, offered while the project declares a run command or the
+        line's scope has a run to read."""
+        if not self._run_commands and not self._scope_runs(line_id):
+            return []
+
+        async def start(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, START_RUN_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            command, previous = args.get("command"), args.get("previous")
+            if not isinstance(command, str) or not isinstance(previous, str):
+                return _tool_error("command and previous must be text")
+            try:
+                started = await self.start_run(line_id, command, previous)
+            except (runs.RunRefused, EventRejected, ProcessRefused) as error:
+                return _tool_error(str(error))
+            return _tool_text(
+                f"started run {started.run_id} of {command}, writing"
+                f" {started.output_file}. Its end is sent to its scope's holder."
+            )
+
+        async def status(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, RUN_STATUS_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            return _tool_text(self.run_status(line_id))
+
+        async def stop(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, STOP_RUN_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            run_id = args.get("run_id")
+            if not isinstance(run_id, str):
+                return _tool_error("run_id must be text")
+            try:
+                await self.stop_run(line_id, run_id)
+            except (runs.RunRefused, runs.TableUnreadable, ProcessRefused) as error:
+                return _tool_error(str(error))
+            return _tool_text(
+                f"asked run {run_id}'s supervisor to stop it. Its end is recorded"
+                " once its receipt is read"
+            )
+
+        return [
+            SdkMcpTool(
+                name=START_RUN_TOOL_NAME,
+                description=(
+                    "Start a command the project declares as a supervised run, which"
+                    " outlives your turn, your seat and a daemon restart. Read"
+                    " run_status first and name its latest run as previous."
+                ),
+                input_schema=START_RUN_SCHEMA,
+                handler=start,
+            ),
+            SdkMcpTool(
+                name=RUN_STATUS_TOOL_NAME,
+                description=(
+                    "Show the latest supervised runs of your role, or your own if you"
+                    " hold none, with their receipts and output files."
+                ),
+                input_schema=RUN_STATUS_SCHEMA,
+                handler=status,
+            ),
+            SdkMcpTool(
+                name=STOP_RUN_TOOL_NAME,
+                description="Stop your scope's open supervised run.",
+                input_schema=STOP_RUN_SCHEMA,
+                handler=stop,
+            ),
+        ]
 
     # What a line sees of itself and of the daemon.
 
@@ -6564,6 +6885,7 @@ class Scheduler:
             self.wake_tool(line_id),
             self.acquire_lease_tool(line_id),
             self.release_lease_tool(line_id),
+            *self._run_tools(line_id),
             self.line_status_tool(line_id),
             self.read_instructions_tool(line_id),
             self.write_scratch_tool(line_id),
@@ -7040,7 +7362,6 @@ class Scheduler:
         self._log.append(LineSessionCleared(line_id))
         self._forget_context(line_id)
         self._drop_engine(line_id)
-        self._end_leases(line_id)
 
     def rebind_line(self, line_id: str, model: str, strategy: Strategy) -> None:
         """Move ``line_id`` to ``model`` with ``strategy``, keeping its identity,
@@ -7082,7 +7403,6 @@ class Scheduler:
         self._log.append(LineRebound(line_id, model, strategy.value))
         self._forget_context(line_id)
         self._drop_engine(line_id)
-        self._end_leases(line_id)
 
     def set_project(
         self, limits: Limits, operator: str, tick_seconds: float, wake_every_ticks: int
@@ -7377,7 +7697,6 @@ class Scheduler:
             self._log.append(LineSessionCleared(line_id))
             self._forget_context(line_id)
             self._drop_engine(line_id)
-            self._end_leases(line_id)
         self._turns[line_id] = self._turns.get(line_id, 0) + 1
         address = LineAddress(line_id)
         cause = turn_cause(message for _, message in messages)
@@ -8301,6 +8620,7 @@ class Scheduler:
                     report.line_id, report.cause, report.processes, report.more
                 )
         self._start_sweep()
+        self.check_runs()
 
     def _start_sweep(self) -> None:
         """Start a sweep of the launch records, unless one is under way or there is
@@ -9805,3 +10125,25 @@ def _tool_text(text: str) -> dict[str, Any]:
 
 def _tool_error(text: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}], "is_error": True}
+
+
+def _run_line(run: Run) -> str:
+    """One run as a line reads it, with its receipt once it has ended."""
+    started = run.started
+    head = (
+        f"run {started.run_id} of {started.command} by line {started.line_id},"
+        f" started {started.started_at}, output {started.output_file} in"
+        f" {started.workdir}"
+    )
+    ended = run.ended
+    if ended is None:
+        return f"{head}, still running as process {started.pid}"
+    code = "" if ended.exit_code is None else f" with exit code {ended.exit_code}"
+    digest = (
+        ""
+        if ended.output_bytes is None
+        else f", {ended.output_bytes} bytes of output"
+        + ("" if ended.output_digest is None else f" of SHA-256 {ended.output_digest}")
+    )
+    note = f". {ended.note}" if ended.note else ""
+    return f"{head}, {ended.status.value}{code} at {ended.ended_at}{digest}{note}"

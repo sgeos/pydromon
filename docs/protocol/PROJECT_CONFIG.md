@@ -102,6 +102,7 @@ handoff_below_percent = 10  # the default, or 0 for never
 | `daemon.disclosure_terms` | path | none | The project's disclosure list, relative to the project root, as below |
 | `leases.names` | list of identifiers | none | The leases lines may acquire, each named once, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies |
 | `leases.ttl_seconds` | integer in [60, 86400] | 10800 | How long an acquired lease lasts unless released first |
+| `runs.commands` | table of names to arrays of text | none | The commands lines may start as supervised runs, at most 64, each name an identifier and each command its program and at most 63 arguments, never a shell string, as [`RUNS.md`](../architecture/RUNS.md) specifies. A declared command runs with the daemon's authority, outside any line's sandbox. Added on 2026-10-31 |
 | `limits.*` | as in `CLIENT.md` | 12, 2, 0 | The conversation limits of every line |
 | `wake.every_ticks` | integer in [1, 3600] | 1 | The wake policy of every line |
 | `profiles.NAME` | table | none | A reusable line template with every line key but `profile` and `session` |
@@ -225,7 +226,8 @@ handoff_below_percent = 10  # the default, or 0 for never
   the federation and peer tables, the `[git_ssh]` table or the lines that set
   `git_ssh`, which apply only at start. Its roles are recorded as above. A line the file no longer declares returns to the
   project's limits and wake policy. The leases table is applied again, and a held lease
-  whose name the file no longer declares ends.
+  whose name the file no longer declares ends, as it also does at start. The runs table
+  is applied again, and a run already started is unaffected.
 - **Lines on other engines.** A project file whose own `[sandbox]` or `[settings]`
   table would reach a line on any engine but Claude Code is refused at start, since
   only Claude Code honours either document.

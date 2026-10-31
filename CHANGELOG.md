@@ -5,6 +5,37 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Supervised runs, task of 2026-10-31. The project file's `[runs.commands]` table
+  declares commands, each an array, and the line tools `start_run`, `run_status` and
+  `stop_run` start one as a run that outlives the turn, the seat and a daemon restart.
+  A supervisor, `python -m dromon.runs`, runs it in a session of its own and writes a
+  receipt when it ends. The event log records `run_started`, with the supervisor's
+  process identifier and its start time from the process table, and `run_ended`, with
+  the receipt and the output's digest. The daemon reconciles open runs on its process
+  worker at start and at each rest, so a run that ended while the daemon was down is
+  recorded, a supervisor that died without a receipt ends as `lost`, and a process
+  identifier now held by another process is not taken for the supervisor. A run
+  belongs to its role, only the owner starts or stops one, and `start_run` names the
+  latest run as `previous`, so a successor seat reads its predecessor's record before
+  starting another. A declared command runs with the daemon's authority outside every
+  sandbox, which `docs/architecture/RUNS.md` states as a trust decision for the
+  operator. **Rollback hazard.** A daemon older than this cannot read a log holding
+  `run_started` or `run_ended`, and does not know of a supervisor still running.
+
+### Changed
+
+- Leases are durable, task of 2026-10-31. `lease_acquired` records the holder, the
+  acquisition and the expiry, and `lease_released` a release or a name the project
+  file no longer declares, so a restart keeps a held lease until it expires, and
+  expiry stays its bound. A cleared session or a rebind ends a line's leases as the
+  event log applies it. A change of a role's owner from one seat to another passes the
+  previous owner's leases to the new owner with the same times, as `ROLES.md` records
+  as decided. A start whose project file no longer declares a held lease's name now
+  ends it. **Rollback hazard.** A daemon older than this cannot read a log holding
+  `lease_acquired` or `lease_released`.
+
 ### Fixed
 
 - A seat that does not own its role is built with its role's worktree read only on

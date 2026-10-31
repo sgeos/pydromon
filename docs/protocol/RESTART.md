@@ -72,8 +72,10 @@ the event log as any start does, so the following survive.
 | Scheduled wakes | They are in the log, and one that fell due during the drain fires at the successor's first tick |
 | Mail and notes | Undelivered messages start in the successor's post office |
 | Holds and questions | They are in the log |
+| Leases | They are in the log from 2026-10-31, each until it expires |
+| Supervised runs | They are in the log from 2026-10-31, and their supervisors run in sessions of their own, so a run outlives the restart and is reconciled once the successor starts, as [`RUNS.md`](../architecture/RUNS.md) specifies |
 
-The following do not survive, as for any stop. Leases, the counts of priority mail
+The following do not survive, as for any stop. The counts of priority mail
 against the rate limit, kept engine connections and their background tasks, and the
 activity that attached clients show.
 

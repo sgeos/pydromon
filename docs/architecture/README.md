@@ -7,3 +7,4 @@
 - [`KELEUSMA_DOGFOOD.md`](KELEUSMA_DOGFOOD.md), what Dromon needed to run Keleusma's lines, how it was built and tried, and the project file that results.
 - [`FEDERATION.md`](FEDERATION.md), messages and wakes between Dromon daemons, first on one machine and then across machines. Proposed on 2026-10-28, for the operator's review.
 - [`ROLES.md`](ROLES.md), roles with seats on several providers, one write owner at a time, planned handoff and recovery. Approved on 2026-10-27, and its first step is built.
+- [`RUNS.md`](RUNS.md), supervised runs, a project-declared command that outlives its turn, its seat and the daemon, with a durable record of its supervisor and its receipt. Specified and built on 2026-10-31.
