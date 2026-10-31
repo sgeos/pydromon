@@ -206,6 +206,7 @@ from dromon.workdir import (
     git_common_directory,
     git_write_guards,
     read_head_commit,
+    resolve_read_only_paths,
     resolve_workdir,
 )
 from dromon.roles import (
@@ -1218,25 +1219,24 @@ type EngineFactory = Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], LineEngine]
 
 
 def _claude_read_access_refusal(
-    config: LineConfig, settings: SettingsConfig | None
+    config: LineConfig,
+    settings: SettingsConfig | None,
+    target: str = "read-only working directory",
 ) -> str | None:
     """Reject Claude settings and tools that could write outside the sandbox."""
     if config.mcp_servers or config.inherit_account_mcp:
-        return (
-            "Claude Code cannot confine configured MCP servers to a read-only"
-            " working directory"
-        )
+        return f"Claude Code cannot confine configured MCP servers to {target}"
     if config.tool_policy.value == "allow_all" or any(
         pattern.startswith("mcp__") for pattern in config.allowed_tools
     ):
         return (
-            "Claude Code read-only workdirs do not allow an allow-all policy or"
+            f"Claude Code cannot enforce {target} with an allow-all policy or"
             " additional MCP tools"
         )
     if config.project_settings or config.plugins:
-        return "Claude Code read-only workdirs do not allow project settings or plugins"
+        return f"Claude Code cannot enforce {target} with project settings or plugins"
     if settings is not None and settings.document().get("hooks"):
-        return "Claude Code read-only workdirs do not allow command hooks"
+        return f"Claude Code cannot enforce {target} with command hooks"
     return None
 
 
@@ -1279,6 +1279,17 @@ def _claude_read_sandbox_refusal(layers: Sequence[SandboxConfig | None]) -> str 
     return None
 
 
+def _read_only_path_rules(paths: Sequence[Path]) -> list[str]:
+    """Deny Claude Code's file-writing tools on each path and its descendants."""
+    rules = {
+        f"{tool}(/" + str(path) + suffix + ")"
+        for path in paths
+        for tool in ("Write", "Edit", "NotebookEdit")
+        for suffix in ("", "/**")
+    }
+    return sorted(rules)
+
+
 def engine_factory(
     root: str,
     *,
@@ -1291,6 +1302,7 @@ def engine_factory(
     accept_unverified_credential: bool = False,
     line_secrets: Mapping[str, Sequence[str]] | None = None,
     line_git_ssh: Mapping[str, GitSshAccess] | None = None,
+    read_only_paths: Sequence[str] = (),
 ) -> EngineFactory:
     """The production factory: each line on its packaged driver's engine.
 
@@ -1330,6 +1342,15 @@ def engine_factory(
         # priority mail steers the driver rather than each engine.
         driver: Driver = priority.steered(spec.model, spec.strategy, spec.redirect)
         workdir = resolve_workdir(spec.config.workdir, Path(root), protected)
+        read_only = resolve_read_only_paths(read_only_paths, workdir)
+        if read_only and driver.settings.engine not in {
+            ENGINE_NAME_CLAUDE,
+            codex.ENGINE_NAME,
+            grok.ENGINE_NAME,
+        }:
+            raise EngineRefused(
+                f"read_only_paths cannot be enforced by {driver.settings.engine}"
+            )
         engine_protected = (
             *protected,
             *project_secret_paths(Path(root), workdir),
@@ -1349,6 +1370,7 @@ def engine_factory(
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
                 protected=engine_protected,
+                write_protected=read_only,
                 observe=spec.observe,
                 mark=spec.mark,
                 task_ended=spec.task_ended,
@@ -1375,6 +1397,7 @@ def engine_factory(
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
                 protected=engine_protected,
+                read_only_paths=read_only,
                 bridge=bridge,
                 line_token=token,
                 observe=spec.observe,
@@ -1476,10 +1499,33 @@ def engine_factory(
                 }
             )
             settings = engine_settings.merge([settings, restrictions])
+        if read_only:
+            refusal = _claude_read_access_refusal(
+                spec.config, settings, "read_only_paths"
+            )
+            if refusal is not None:
+                raise EngineRefused(refusal)
+            if SHELL_TOOLS & set(spec.config.builtin_tools):
+                refusal = _claude_read_sandbox_refusal(
+                    [project_sandbox, spec.config.sandbox]
+                )
+                if refusal is not None:
+                    raise EngineRefused(refusal)
+                path_sandbox = parse_sandbox(
+                    {
+                        "enabled": True,
+                        "failIfUnavailable": True,
+                        "allowUnsandboxedCommands": False,
+                        "filesystem": {"denyWrite": [str(path) for path in read_only]},
+                    },
+                    operator=True,
+                )
+                merged = merge([merged, path_sandbox])
         enabled = merged is not None and merged.enabled
         if enabled and git_ssh is not None:
             merged = merge([merged, sandbox_layer(git_ssh)])
         guarded = git_write_guards(workdir) if enabled else ()
+        guarded = (*guarded, *read_only)
         # A line that loads project settings or plugins must not write what it loads.
         claude_dir = (workdir / ".claude",) if spec.config.project_settings else ()
         plugin_dirs = tuple(resolve_plugin(path) for path in spec.config.plugins)
@@ -1493,6 +1539,15 @@ def engine_factory(
                     f"the line's sandbox denies reading {denied}, which ssh needs for"
                     " the project's [git_ssh] table"
                 )
+        if read_only:
+            settings = engine_settings.merge(
+                [
+                    settings,
+                    engine_settings.parse_settings(
+                        {"permissions": {"deny": _read_only_path_rules(read_only)}}
+                    ),
+                ]
+            )
         return ClaudeCodeLine(
             driver,
             workdir,

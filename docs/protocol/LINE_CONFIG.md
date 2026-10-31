@@ -1625,6 +1625,15 @@ Grok refuses it too until a live probe shows its reader profile deny a write to 
 worktree, as [`GROK.md`](GROK.md) records. Claude Code also refuses configurations with mechanisms that can
 bypass its sandbox, as specified in [`SANDBOX.md`](SANDBOX.md).
 
+**Project `read_only_paths`.** The project file may name existing files and directories
+relative to each line's resolved workdir. Their real paths must stay inside that
+workdir. The setting applies to every line and has no per-line override. It defaults
+to an empty list. Claude Code, Codex and Grok Build enforce the paths. Pi, Cursor Agent
+and Antigravity refuse to start a line while the setting is non-empty because their
+adapters cannot enforce it. Dromon checks the configured paths again whenever it builds
+an engine, and refuses a missing path or a symbolic link whose target leaves the
+workdir.
+
 **Codex writable paths.** An operator may name additional absolute directories with
 `writable_paths` for a Codex line given `Edit` or `Write`. For example, a line may use
 this configuration to write build output on a separate volume.

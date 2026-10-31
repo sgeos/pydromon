@@ -388,7 +388,8 @@ Before each turn Dromon checks that the profile extends `read-only` for a reader
 `workspace` or `strict` for a writer, that its `deny` entries cover the state and runtime
 directories and any existing credential paths as absolute paths under the daemon's
 real home, never through `~`, that a writer's `read_only` entries cover both the
-worktree's Git directory and the common Git directory, and that
+worktree's Git directory and the common Git directory, that the project's
+`read_only_paths` are held by `read_only` for each line's workdir, and that
 the profile sets no key but `extends`, `deny`, `read_only` and `restrict_network`, so a
 `read_write` grant is refused. The workspace is the line's working directory. Only the
 home's `sandbox.toml` is read, and a project's own `.grok`, where its `sandbox.toml`

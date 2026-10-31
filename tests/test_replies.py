@@ -16,6 +16,7 @@ from claude_agent_sdk import SdkMcpTool
 from dromon import cli
 from dromon import daemon as daemon_module
 from dromon.daemon import REPLIES_BUDGET_BYTES, Daemon
+from dromon.client import DaemonNotRunning
 from dromon.eventlog import EventLog
 from dromon.model import (
     ID_PATTERN,
@@ -114,6 +115,19 @@ def test_replies_gives_the_bodies_and_marks_nothing_read(paths: ProjectPaths) ->
         assert again.result is not None
         assert [m["message_id"] for m in entries(again)] == ["m-2"]
         assert again.result["unread"] == 1
+
+
+def test_replies_can_filter_to_one_line(paths: ProjectPaths) -> None:
+    replies_log(paths.event_log)
+    with EventLog(paths.event_log) as log:
+        response = ask(
+            held_daemon(paths, log),
+            "replies",
+            {"operator": "ana", "message_id": "m-q", "sender": "alpha"},
+        )
+        assert response.ok and response.result is not None
+        assert response.result["replies"] == 2
+        assert [item["message_id"] for item in entries(response)] == ["m-1", "m-2"]
 
 
 @pytest.mark.parametrize(
@@ -326,3 +340,166 @@ def test_dromon_mail_replies_to_prints_bodies_through_the_replies_request(
 def test_the_parser_takes_replies_to() -> None:
     parsed = cli.build_parser().parse_args(["mail", "--replies-to", "m-q", "--unread"])
     assert (parsed.replies_to, parsed.unread) == ("m-q", True)
+
+
+def wait_arguments(**overrides: object) -> argparse.Namespace:
+    values: dict[str, object] = {
+        "operator": "ana",
+        "replies_to": "m-q",
+        "sender": "alpha",
+        "timeout": 10.0,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def test_dromon_wait_polls_and_prints_a_reply_without_reading_it(
+    tmp_path: Path,
+    short_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    responses = [
+        Response("r", True, result={"messages": []}),
+        Response(
+            "r",
+            True,
+            result={
+                "messages": [
+                    {
+                        "message_id": "m-reply",
+                        "sender": "alpha",
+                        "body": "ready\nnow",
+                        "body_bytes": 10,
+                    }
+                ]
+            },
+        ),
+    ]
+    asked: list[tuple[Operation, dict[str, object]]] = []
+
+    def fake_call(
+        socket: Path,
+        operation: Operation,
+        *,
+        timeout_seconds: float,
+        args: dict[str, object],
+    ) -> Response:
+        assert socket
+        assert 0 < timeout_seconds <= 10.0
+        asked.append((operation, args))
+        return responses.pop(0)
+
+    monkeypatch.setattr(cli, "call", fake_call)
+    monkeypatch.setattr(cli.time, "monotonic", cast(Any, lambda: 1.0))
+
+    def no_sleep(seconds: float) -> None:
+        del seconds
+
+    monkeypatch.setattr(cli.time, "sleep", no_sleep)
+    paths = project_paths(tmp_path, short_runtime)
+    assert cli._wait(paths, wait_arguments()) == 0  # pyright: ignore[reportPrivateUsage]
+    assert asked == [
+        (
+            Operation.REPLIES,
+            {"operator": "ana", "message_id": "m-q", "sender": "alpha", "limit": 50},
+        ),
+        (
+            Operation.REPLIES,
+            {"operator": "ana", "message_id": "m-q", "sender": "alpha", "limit": 50},
+        ),
+    ]
+    assert capsys.readouterr().out == (
+        "reply m-reply from alpha to m-q\n  ready\n  now\n"
+    )
+
+
+def test_dromon_wait_times_out_nonzero(
+    tmp_path: Path,
+    short_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    now = [0.0]
+
+    def fake_call(
+        socket: Path,
+        operation: Operation,
+        *,
+        timeout_seconds: float,
+        args: dict[str, object],
+    ) -> Response:
+        del socket, operation, timeout_seconds, args
+        return Response("r", True, result={"messages": []})
+
+    monkeypatch.setattr(cli, "call", fake_call)
+    monkeypatch.setattr(cli.time, "monotonic", cast(Any, lambda: now[0]))
+
+    def advance(seconds: float) -> None:
+        now[0] += seconds
+
+    monkeypatch.setattr(cli.time, "sleep", advance)
+    paths = project_paths(tmp_path, short_runtime)
+    assert (
+        cli._wait(paths, wait_arguments(timeout=0.75)) == 1  # pyright: ignore[reportPrivateUsage]
+    )
+    assert "timed out" in capsys.readouterr().err
+
+
+def test_dromon_wait_refuses_a_missing_message_without_waiting(
+    tmp_path: Path,
+    short_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def missing_call(
+        socket: Path,
+        operation: Operation,
+        *,
+        timeout_seconds: float,
+        args: dict[str, object],
+    ) -> Response:
+        del socket, operation, timeout_seconds, args
+        return Response("r", False, error_message="no message m-q")
+
+    monkeypatch.setattr(
+        cli,
+        "call",
+        missing_call,
+    )
+    paths = project_paths(tmp_path, short_runtime)
+    assert cli._wait(paths, wait_arguments()) == 1  # pyright: ignore[reportPrivateUsage]
+    assert "no message m-q" in capsys.readouterr().err
+
+
+def test_dromon_wait_reports_a_daemon_that_stops_while_waiting(
+    tmp_path: Path,
+    short_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    responses = [Response("r", True, result={"messages": []})]
+
+    def fake_call(*args: object, **kwargs: object) -> Response:
+        del args, kwargs
+        if responses:
+            return responses.pop()
+        raise DaemonNotRunning("stopped")
+
+    monkeypatch.setattr(cli, "call", cast(Any, fake_call))
+    monkeypatch.setattr(cli.time, "monotonic", cast(Any, lambda: 1.0))
+
+    def no_sleep(seconds: float) -> None:
+        del seconds
+
+    monkeypatch.setattr(cli.time, "sleep", no_sleep)
+    paths = project_paths(tmp_path, short_runtime)
+    assert cli._wait(paths, wait_arguments()) == 4  # pyright: ignore[reportPrivateUsage]
+    assert "daemon stopped" in capsys.readouterr().err
+
+
+def test_the_parser_takes_wait_options() -> None:
+    parsed = cli.build_parser().parse_args(
+        ["wait", "--replies-to", "m-q", "--from", "alpha", "--timeout", "5"]
+    )
+    assert (parsed.replies_to, parsed.sender, parsed.timeout) == ("m-q", "alpha", 5.0)

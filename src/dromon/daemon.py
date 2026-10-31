@@ -1077,7 +1077,14 @@ class Daemon:
         fields hold. A body past what is left is withheld, with its size, for
         ``read`` to open, and an entry whose fields alone do not fit is left out with
         every entry after it, counted in ``left_out``, for a later page to give."""
-        allowed = {"operator", "message_id", "unread_only", "offset", "limit"}
+        allowed = {
+            "operator",
+            "message_id",
+            "sender",
+            "unread_only",
+            "offset",
+            "limit",
+        }
         if not {"operator", "message_id"} <= set(args) or not set(args) <= allowed:
             raise ProtocolError(
                 ErrorCode.BAD_REQUEST,
@@ -1104,11 +1111,22 @@ class Daemon:
             # random, so the signal is low, and the socket is the operator's own.
             raise EventRejected(f"no message {message_id}")
         owner = OperatorAddress(operator_text)
+        sender_text = args.get("sender")
+        sender: LineAddress | None = None
+        if sender_text is not None:
+            if not isinstance(sender_text, str):
+                raise ProtocolError(ErrorCode.BAD_REQUEST, "sender is not text")
+            address = parse_any_address(sender_text)
+            if not isinstance(address, LineAddress):
+                raise ProtocolError(ErrorCode.BAD_REQUEST, "sender must name a line")
+            sender = address
         self.scheduler.collect(owner)
         found = [
             (reply_id, message)
             for reply_id, message in self.log.state.messages.items()
-            if message.recipient == owner and message.reply_to == message_id
+            if message.recipient == owner
+            and message.reply_to == message_id
+            and (sender is None or message.sender == sender)
         ]
         unread = sum(not message.read for _, message in found)
         matching = [item for item in found if not unread_only or not item[1].read]
@@ -2701,6 +2719,7 @@ def run(
                     line_socket=paths.line_socket,
                     line_secrets=line_secrets,
                     line_git_ssh=line_git_ssh,
+                    read_only_paths=config.read_only_paths,
                 ),
                 limits=limits,
                 default_operator=operator,

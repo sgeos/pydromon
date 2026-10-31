@@ -85,6 +85,7 @@ TOP_KEYS: Final = frozenset(
         "peers",
         "git_ssh",
         "leases",
+        "read_only_paths",
         "profiles",
         "lines",
         "roles",
@@ -114,6 +115,7 @@ DEFAULT_LEASE_TTL: Final = 10800
 MIN_LEASE_TTL: Final = 60
 MAX_LEASE_TTL: Final = 86400
 MAX_LEASES: Final = 256
+MAX_READ_ONLY_PATHS: Final = 256
 TOOL_KEYS: Final = frozenset(
     {
         "builtin_tools",
@@ -265,6 +267,8 @@ class ProjectConfig:
     """The leases the project's lines may acquire, by name."""
     lease_ttl_seconds: int = DEFAULT_LEASE_TTL
     """How long an acquired lease lasts unless it is released first."""
+    read_only_paths: tuple[str, ...] = ()
+    """Project-relative-path entries denied write access under every line's workdir."""
     lines: dict[str, LineDefinition] = field(default_factory=dict[str, LineDefinition])
     roles: dict[str, RoleDefinition] = field(default_factory=dict[str, RoleDefinition])
 
@@ -407,6 +411,7 @@ class _Reader:
             except GitSshError as error:
                 raise self.fail(error.key, str(error)) from error
         lease_names, lease_ttl = self.leases(top.get("leases", {}))
+        read_only_paths = self.read_only_paths(top.get("read_only_paths", []))
         profiles = self.profiles(top.get("profiles", {}))
         lines_table = top.get("lines", {})
         if not isinstance(lines_table, dict):
@@ -435,9 +440,40 @@ class _Reader:
             disclosure_terms=terms,
             lease_names=lease_names,
             lease_ttl_seconds=lease_ttl,
+            read_only_paths=read_only_paths,
             lines=lines,
             roles=roles,
         )
+
+    def read_only_paths(self, value: object) -> tuple[str, ...]:
+        """Relative paths to protect under each line's resolved workdir."""
+        if (
+            not isinstance(value, list)
+            or len(cast(list[object], value)) > MAX_READ_ONLY_PATHS
+        ):
+            raise self.fail(
+                "read_only_paths",
+                f"must be a list of at most {MAX_READ_ONLY_PATHS} paths",
+            )
+        found: set[str] = set()
+        for item in cast(list[object], value):
+            if (
+                not isinstance(item, str)
+                or not item
+                or len(item) > 4096
+                or "\x00" in item
+            ):
+                raise self.fail("read_only_paths", "entries must be non-empty paths")
+            path = Path(item)
+            if path.is_absolute() or ".." in path.parts:
+                raise self.fail(
+                    "read_only_paths",
+                    f"path {item!r} must be relative and stay inside each workdir",
+                )
+            if item in found:
+                raise self.fail("read_only_paths", f"names path {item!r} twice")
+            found.add(item)
+        return tuple(sorted(found))
 
     def limits(self, value: object, key: str, base: Limits) -> Limits:
         document = self.table(value, key, LIMIT_KEYS)

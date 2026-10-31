@@ -5,6 +5,20 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Project configuration may name relative `read_only_paths` that must exist inside each
+  line's resolved workdir. Claude Code, Codex and Grok Build lines enforce those paths
+  through their engine restrictions; Pi, Cursor Agent and Antigravity lines refuse the
+  configuration because they cannot enforce it. Symbolic links resolving outside the
+  workdir and missing paths are refused. The list defaults to empty. The project
+  configuration example names `docs/process` and `docs/roadmap` as suggested protected
+  paths, but this change does not alter `.dromon/dromon.toml`.
+- `dromon wait --replies-to MESSAGE --timeout SECONDS [--from LINE]` polls the existing
+  replies query in the client, with each request bounded by the remaining timeout. It
+  returns the reply without marking it read, and reports timeout, invalid source and
+  daemon loss as failures.
+
 ### Fixed
 
 - Refused Codex items count toward the driver's tool budget whether first announced by

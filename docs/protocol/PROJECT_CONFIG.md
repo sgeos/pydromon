@@ -43,6 +43,7 @@ The file is TOML version 1.0, encoded in UTF-8, at most 4 MiB.
 
 ```toml
 version = 1
+read_only_paths = ["docs/process", "docs/roadmap"]
 
 [daemon]
 operator = "ana"        # who hears about a held line no operator has messaged
@@ -100,6 +101,7 @@ handoff_below_percent = 10  # the default, or 0 for never
 | `daemon.tick_seconds` | number in [0, 60] | 1 | The tick cadence |
 | `daemon.require_sandbox` | boolean | `false` | Whether every Claude Code line must run with an enabled sandbox, as below |
 | `daemon.disclosure_terms` | path | none | The project's disclosure list, relative to the project root, as below |
+| `read_only_paths` | list of relative paths | empty | Existing files or directories denied writes under every line's resolved workdir. Symbolic links are resolved and targets must remain inside that workdir |
 | `leases.names` | list of identifiers | none | The leases lines may acquire, each named once, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies |
 | `leases.ttl_seconds` | integer in [60, 86400] | 10800 | How long an acquired lease lasts unless released first |
 | `limits.*` | as in `CLIENT.md` | 12, 2, 0 | The conversation limits of every line |
