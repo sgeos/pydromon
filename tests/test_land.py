@@ -343,6 +343,120 @@ def test_a_term_found_only_after_staging_is_refused_and_left_staged(
     assert git(repo, "log", "--oneline").count("\n") == 0
 
 
+@pytest.mark.parametrize("content", ["", "# only a comment\n\n"])
+def test_a_list_with_no_terms_refuses_unless_the_operator_says_so(
+    repo: Path, tmp_path: Path, content: str
+) -> None:
+    """Audit's finding L1. An emptied list once screened nothing and said the
+    operator had asked for that."""
+    empty = tmp_path / "empty.txt"
+    empty.write_text(content)
+    write(repo, "src/a.py", "changed\n")
+    said = Said()
+    code = lander(repo, said, terms_files=(empty,), dry_run=True).land()
+    assert code == exits.FAILURE
+    assert "holds no terms" in "\n".join(said.err)
+    said = Said()
+    code = lander(
+        repo, said, terms_files=(empty,), dry_run=True, without_list=True
+    ).land()
+    assert code == exits.OK
+    assert "since --without-disclosure-list was given" in "\n".join(said.out)
+
+
+def test_a_missing_second_list_refuses(repo: Path, terms: Path, tmp_path: Path) -> None:
+    write(repo, "src/a.py", "changed\n")
+    typo = tmp_path / "typo.txt"
+    said = Said()
+    code = lander(repo, said, terms_files=(terms, typo), dry_run=True).land()
+    assert code == exits.FAILURE
+    assert str(typo) in "\n".join(said.err)
+
+
+def test_a_term_in_an_earlier_commit_is_found_though_a_later_one_removed_it(
+    repo: Path, terms: Path
+) -> None:
+    """Audit's finding L3. The push carries every commit since the branch left the
+    remote base, so each is screened, not only the uncommitted diff."""
+    write(repo, "src/leak.py", f"a = '{TERM}'\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "add it")
+    first = git(repo, "rev-parse", "HEAD")[:12]
+    write(repo, "src/leak.py", "a = 'clean'\n")
+    git(repo, "commit", "-q", "-am", f"remove {TERM.upper()}")
+    second = git(repo, "rev-parse", "HEAD")[:12]
+    write(repo, "src/a.py", "changed\n")
+    said = Said()
+    code = lander(repo, said, terms_files=(terms,), dry_run=True).land()
+    assert code == exits.FAILURE
+    assert f"commit {first}, src/leak.py:1" in said.err
+    assert f"commit {second}, the message, line 1" in said.err
+    assert all(TERM not in line.casefold() for line in said.out + said.err)
+
+
+def test_a_term_in_the_branch_name_is_found(repo: Path, terms: Path) -> None:
+    git(repo, "switch", "-q", "-c", f"feat/{TERM}")
+    write(repo, "src/a.py", "changed\n")
+    said = Said()
+    code = lander(repo, said, terms_files=(terms,), dry_run=True).land()
+    assert code == exits.FAILURE
+    assert "the branch name" in said.err
+
+
+def test_an_unknown_remote_base_is_refused(repo: Path, terms: Path) -> None:
+    write(repo, "src/a.py", "changed\n")
+    said = Said()
+    code = lander(repo, said, terms_files=(terms,), base="trunk").land()
+    assert code == exits.FAILURE
+    assert "refs/remotes/origin/trunk is not known" in "\n".join(said.err)
+
+
+def test_a_term_a_hook_adds_to_the_message_is_caught_before_the_gate(
+    repo: Path, remote: Path, terms: Path, tmp_path: Path
+) -> None:
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    hook = hooks / "commit-msg"
+    hook.write_text(f'#!/bin/sh\nprintf "\\nsee {TERM}\\n" >> "$1"\n')
+    hook.chmod(hook.stat().st_mode | stat.S_IXUSR)
+    git(repo, "config", "core.hooksPath", str(hooks))
+    write(repo, "src/a.py", "changed\n")
+    said = Said()
+    runner = Recording()
+    code = lander(repo, said, runner, terms_files=(terms,), yes=True).land()
+    assert code == exits.FAILURE
+    err = "\n".join(said.err)
+    assert "the stored commit message, line 5" in err
+    assert TERM not in err
+    assert land.GATE not in runner.calls
+    assert git(remote, "branch", "--list", "feat/thing") == ""
+
+
+def test_a_change_to_the_gate_is_asked_about_even_with_yes(
+    repo: Path, terms: Path
+) -> None:
+    """Audit's finding L5. The gate and the hooks are the branch's own code, run as
+    the operator, so a change to them is asked about whatever ``--yes`` says."""
+    write(repo, "scripts/check.sh", "#!/bin/sh\nexit 0\n")
+    said = Said()
+    code = lander(repo, said, terms_files=(terms,), yes=True).land()
+    assert code == exits.FAILURE
+    assert len(said.asked) == 1
+    assert "scripts/check.sh" in said.asked[0]
+    assert "outside any sandbox" in said.asked[0]
+    assert "asks before running them, even with --yes" in "\n".join(said.out)
+    assert staged(repo) == ""
+
+
+def test_the_plan_always_says_whose_gate_runs(repo: Path, terms: Path) -> None:
+    write(repo, "src/a.py", "changed\n")
+    said = Said()
+    assert lander(repo, said, terms_files=(terms,), dry_run=True).land() == exits.OK
+    out = "\n".join(said.out)
+    assert "runs the branch's own scripts/check.sh and git hooks as you" in out
+    assert "even with --yes" not in out
+
+
 # The whole command.
 
 
@@ -476,9 +590,28 @@ def merging(repo: Path) -> Iterator[Path]:
     write(repo, "src/a.py", "a = 1\nb = 'main'\nc = 3\n")
     write(repo, "docs/process/HANDOFF.md", "one\ntwo\nthree\n")
     git(repo, "commit", "-q", "-am", "main moves on")
+    git(repo, "push", "-q", "origin", "main")
     git(repo, "switch", "-q", "feat/thing")
     git(repo, "merge", "main", check=False)
     yield repo
+
+
+def test_a_merge_of_an_unpublished_branch_carries_nothing(
+    repo: Path, terms: Path
+) -> None:
+    """Audit's finding L2. A branch that is not in the remote base's history cannot
+    carry a protected change, even unchanged."""
+    git(repo, "switch", "-q", "-c", "rogue")
+    write(repo, "docs/process/HANDOFF.md", "rewritten by a rogue branch\n")
+    git(repo, "commit", "-q", "-am", "rogue")
+    git(repo, "switch", "-q", "feat/thing")
+    git(repo, "merge", "--no-commit", "--no-ff", "rogue")
+    said = Said()
+    code = lander(repo, said, terms_files=(terms,), dry_run=True).land()
+    assert code == exits.FAILURE
+    err = "\n".join(said.err)
+    assert "docs/process/HANDOFF.md" in err
+    assert "carried by the merge" not in "\n".join(said.out)
 
 
 def test_an_unresolved_merge_is_refused(merging: Path, terms: Path) -> None:

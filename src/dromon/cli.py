@@ -308,7 +308,7 @@ def _stop(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
-PREFLIGHT_TIMEOUT_SECONDS: Final = 120.0
+PREFLIGHT_TIMEOUT_SECONDS: Final = restart.CHECK_SECONDS
 """How long the installed daemon's start checks may take. They replay the whole
 event log, as a start does."""
 
@@ -348,11 +348,13 @@ def _options_of(status: Mapping[str, object]) -> list[str]:
     return [str(option) for option in found]
 
 
-def _preflight(argv: Sequence[str]) -> str | None:
+def _preflight(argv: Sequence[str], runtime_dir: Path | None = None) -> str | None:
     """Why the installed daemon would not start, or ``None``. A restart whose
     successor refuses to start leaves no daemon running, so this is checked before
     the old daemon is asked to stop. The reason is the daemon's own, its lines that
-    begin ``dromond:``, or else its last line, as for code that does not import."""
+    begin ``dromond:``, or else its last line, as for code that does not import. A
+    check that times out is killed, which leaves its copy of the log, so the
+    preflight directories in ``runtime_dir`` are then swept."""
     try:
         done = subprocess.run(  # noqa: S603
             list(argv),
@@ -361,7 +363,11 @@ def _preflight(argv: Sequence[str]) -> str | None:
             timeout=PREFLIGHT_TIMEOUT_SECONDS,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except subprocess.TimeoutExpired as error:
+        if runtime_dir is not None:
+            restart.sweep_checks(runtime_dir, None)
+        return str(error)
+    except OSError as error:
         return str(error)
     if done.returncode == 0:
         return None
@@ -386,7 +392,7 @@ def _restart(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     before = _call(paths, "restart", Operation.STATUS, {})
     if isinstance(before, int):
         return before
-    problem = _preflight(_preflight_argv(paths, _options_of(before)))
+    problem = _preflight(_preflight_argv(paths, _options_of(before)), paths.runtime_dir)
     if problem is not None:
         print(
             "dromon restart: the installed daemon refuses to start, so the running"

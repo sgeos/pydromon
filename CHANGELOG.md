@@ -17,7 +17,11 @@ All notable changes are recorded here. The format follows
   `options`. `docs/protocol/RESTART.md` tables what the check covers and what only a
   real start reveals, which includes anything recorded during the drain. It replaces
   the import check by `--version`. Prompted by the restart of 2026-10-31 that left no
-  daemon for about eight minutes.
+  daemon for about eight minutes. After audit's review, the copy is made 64 pages at
+  a time with a short pause and no lock between steps, so a preflight delays the
+  daemon's commits by at most one step, and is bounded at 60 seconds. Preflight
+  directories that a killed check left are swept after a client's timeout, by each
+  check when older than its bound, and by each start.
 - `dromon land WORKTREE`, round 13, one operator command that takes a line's finished
   worktree to a pull request. It shows the plan with every path to stage, refuses
   protected paths under `docs/process`, `docs/roadmap`, `secret` and `.dromon`
@@ -26,7 +30,12 @@ All notable changes are recorded here. The format follows
   only, then asks, stages, commits with the operator's message, runs the full gate,
   asks, pushes without force, asks, and opens the pull request with `gh`. `--dry-run`
   changes nothing, and `--yes` answers every question. It never merges and never adds
-  a `Co-Authored-By` trailer, and refuses a commit that a hook gave one.
+  a `Co-Authored-By` trailer, and refuses a commit that a hook gave one. After
+  audit's review, it also screens every commit the push carries since the branch
+  left the remote base, their messages and the branch name, refuses an empty list or
+  a missing `--terms` file, lets only a merge of the published base carry a protected
+  path, re-screens the stored message after hooks, and asks before running a branch
+  that changes `scripts/`, even with `--yes`.
 - Open federation, round 12. `[federation] local` and `remote` take `allowlist`, the
   default, which keeps the behaviour of declared peers exactly, or `open`. With
   `local = "open"`, `listen` and a unique `name`, a daemon registers in a per-user

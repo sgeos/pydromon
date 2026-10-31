@@ -12,7 +12,10 @@ import asyncio
 import hashlib
 import json
 import os
+import stat
+import subprocess
 import sys
+import time
 from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,7 +24,7 @@ from typing import Any, Final, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import cli, client, daemon, exits, restart
+from dromon import cli, client, daemon, eventlog, exits, restart
 from dromon.activity import ActivityKind
 from dromon.configview import Overrides
 from dromon.daemon import Daemon, build_parser, start_successor, successor_args
@@ -697,9 +700,9 @@ def cli_paths(paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch) -> ProjectPa
     return paths
 
 
-def passes(argv: Sequence[str]) -> None:
+def passes(argv: Sequence[str], runtime_dir: Path | None = None) -> None:
     """A preflight that passes, for the tests of what follows it."""
-    del argv
+    del argv, runtime_dir
 
 
 def test_dromon_restart_waits_for_a_new_pid_and_names_both_commits(
@@ -824,7 +827,8 @@ def test_dromon_restart_stops_nothing_when_the_installed_code_does_not_start(
         found["options"] = ["--hold-wakes"]
         return Response("r", ok=True, result=found)
 
-    def refuse(argv: Sequence[str]) -> str:
+    def refuse(argv: Sequence[str], runtime_dir: Path | None = None) -> str:
+        assert runtime_dir == cli_paths.runtime_dir
         checked.append(list(argv))
         return "status 1: SyntaxError"
 
@@ -976,8 +980,108 @@ def leftovers(paths: ProjectPaths) -> list[str]:
     return sorted(
         p.name
         for p in paths.runtime_dir.iterdir()
-        if p.name.startswith(daemon.CHECK_PREFIX)
+        if p.name.startswith(restart.CHECK_PREFIX)
     )
+
+
+def aged(directory: Path, seconds: float) -> Path:
+    """Make ``directory``, dated ``seconds`` ago."""
+    directory.mkdir(mode=0o700)
+    then = time.time() - seconds
+    os.utime(directory, (then, then))
+    return directory
+
+
+def test_a_snapshot_copies_in_steps_with_a_pause_between(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit's finding P1. The copy holds the live log's read lock one step at a
+    time, so the daemon's commits wait for a step, not for the whole copy."""
+    source = tmp_path / "events.sqlite"
+    world = World(source, [f"line{n}" for n in range(30)])
+    world.log.close()
+    pauses: list[float] = []
+    monkeypatch.setattr(eventlog.time, "sleep", pauses.append)
+    copy = tmp_path / "copy.sqlite"
+    eventlog.snapshot(source, copy, pages=1, pause_seconds=0.25)
+    assert len(pauses) > 3 and set(pauses) == {0.25}
+    assert replay(copy) == replay(source)
+    assert stat.S_IMODE(copy.stat().st_mode) == 0o600
+
+
+def test_a_snapshot_past_its_bound_is_refused(tmp_path: Path) -> None:
+    source = tmp_path / "events.sqlite"
+    world = World(source, ["alpha"])
+    world.log.close()
+    with pytest.raises(eventlog.LogError, match="took more than"):
+        eventlog.snapshot(source, tmp_path / "copy.sqlite", bound_seconds=-1.0)
+
+
+def test_a_sweep_removes_old_check_directories_and_nothing_else(
+    tmp_path: Path,
+) -> None:
+    """Audit's finding P2."""
+    old = aged(tmp_path / f"{restart.CHECK_PREFIX}old", restart.CHECK_SECONDS + 5)
+    (old / "events.sqlite").write_text("a copy")
+    then = time.time() - restart.CHECK_SECONDS - 5
+    os.utime(old, (then, then))
+    young = aged(tmp_path / f"{restart.CHECK_PREFIX}young", 1)
+    other = aged(tmp_path / "keep-me", restart.CHECK_SECONDS + 5)
+    plain = tmp_path / f"{restart.CHECK_PREFIX}file"
+    plain.write_text("not a directory")
+    target = aged(tmp_path / "target", restart.CHECK_SECONDS + 5)
+    link = tmp_path / f"{restart.CHECK_PREFIX}link"
+    link.symlink_to(target)
+    assert restart.sweep_checks(tmp_path, restart.CHECK_SECONDS) == 1
+    assert not old.exists()
+    assert young.exists() and other.exists() and plain.exists()
+    assert link.is_symlink() and target.exists()
+    assert restart.sweep_checks(tmp_path, None) == 1
+    assert not young.exists()
+    assert restart.sweep_checks(tmp_path / "absent", None) == 0
+
+
+def test_a_check_sweeps_what_a_killed_check_left(
+    live: World, paths: ProjectPaths
+) -> None:
+    config_path(paths.state_dir).write_text(AGREEING)
+    ensure_private_dir(paths.runtime_dir)
+    killed = aged(
+        paths.runtime_dir / f"{restart.CHECK_PREFIX}killed", restart.CHECK_SECONDS + 5
+    )
+    running = aged(paths.runtime_dir / f"{restart.CHECK_PREFIX}running", 1)
+    assert daemon.run(paths, check_only=True) == exits.OK
+    assert not killed.exists()
+    assert running.exists()
+
+
+def test_a_start_sweeps_every_check_directory(
+    paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def no_serve(target: Daemon) -> None:
+        del target
+
+    monkeypatch.setattr(daemon, "serve", no_serve)
+    monkeypatch.setattr(daemon, "environment_reading_works", lambda: False)
+    ensure_private_dir(paths.runtime_dir)
+    young = aged(paths.runtime_dir / f"{restart.CHECK_PREFIX}young", 1)
+    assert daemon.run(paths) == exits.OK
+    assert not young.exists()
+
+
+def test_a_preflight_that_times_out_sweeps_its_copy(
+    paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ensure_private_dir(paths.runtime_dir)
+    left = aged(paths.runtime_dir / f"{restart.CHECK_PREFIX}left", 1)
+
+    def slow(*args: object, **kwargs: object) -> object:
+        raise subprocess.TimeoutExpired("dromond", restart.CHECK_SECONDS)
+
+    monkeypatch.setattr(cli.subprocess, "run", slow)
+    found = cli._preflight(["dromond"], paths.runtime_dir)  # pyright: ignore[reportPrivateUsage]
+    assert found is not None and "timed out" in found
+    assert not left.exists()
 
 
 def test_the_check_refuses_what_only_the_log_contradicts_and_writes_nothing(

@@ -13,21 +13,28 @@ The steps, in order, each stopping the command when it fails.
    stage.
 2. Refuse protected paths. A path under ``docs/process``, ``docs/roadmap``,
    ``secret`` or ``.dromon`` refuses the whole command, compared without regard to
-   case, since macOS file systems ignore it. During a merge, a tracked path whose
-   content is the incoming commit's own is not refused, because it is the base's
-   change, which the merge carries and the line did not write.
-3. Screen. The diff of what would be committed, and the commit message, pull request
-   title and body, are checked against the disclosure list. A match is reported by
-   file and line, or by text and line, never by its content or the term. The gate's
-   accepted matches, by path, line and exact text, are honoured for the diff.
+   case, since macOS file systems ignore it. During a merge of a commit in the
+   history of the remote base, a tracked path whose content is the incoming
+   commit's own is not refused, because it is the base's change, which the merge
+   carries and the line did not write. A merge of any other commit carries nothing.
+3. Screen. Every commit the push carries, from where the branch left the remote
+   base, by its message and its own diff, the net diff since then, the branch name,
+   the diff of what would be committed, and the commit message, pull request title
+   and body, are checked against the disclosure list, which must exist and hold a
+   term unless ``--without-disclosure-list`` is given. A match is reported by file
+   and line, or by text and line, never by its content or the term. The gate's
+   accepted matches, by path, line and exact text, are honoured for the diffs.
 4. With ``--dry-run`` the command stops here, having changed nothing. Otherwise it
    asks, then stages exactly the listed paths and checks that the index holds those
    and no others, then screens the staged diff again, since that is what is
    committed.
 5. Commit with the operator's message, which may not carry a ``Co-Authored-By``
-   trailer, and check that the commit made carries none, since a hook or template
-   could add one.
+   trailer, and check that the commit made carries none and that its stored message
+   holds no listed term, since a hook or template could add either.
 6. Run the full gate, ``scripts/check.sh`` with no arguments, in the worktree.
+   The gate and the hooks the commit runs are the branch's own code, run as the
+   operator outside any sandbox. The plan says so, and when the branch changes a
+   path under ``scripts/`` the command asks before staging even with ``--yes``.
 7. Ask, then push the branch to the remote, never forcing, with ``--no-verify``,
    because the pre-push hook would run the same gate on the same commit again. The
    commit is checked to be the one gated, and the refspec names that commit.
@@ -44,8 +51,8 @@ terminal, is answered no.
   ``dromon.disclosure`` does. ``scripts/check.sh`` matches with ``git grep -i``,
   which folds ASCII only, so the two can differ for other scripts, in the direction
   of this screen finding more. A staged path whose name holds a term is reported
-  without its name, by count. Removed lines are not screened, since they leave the
-  tree, though they stay in the history the push carries.
+  without its name, by count. Removed lines are not screened, since a line a commit
+  removes was added by an earlier commit, which is screened if the push carries it.
 - The screen of a dry run reads the working tree, and untracked files through
   ``git diff --no-index``. The screen after staging reads the index, which is what
   the commit holds, so a file changed between the two is screened again.
@@ -115,6 +122,12 @@ _DIFF: Final = (
     "--no-renames",
 )
 """How every screened diff is read, as added lines with no context."""
+
+_SHOW: Final = ("-c", "core.quotePath=false", "show", "--format=", *_DIFF[3:])
+"""How one commit's own diff is read, in the form ``_DIFF`` gives."""
+
+MAX_COMMITS: Final = 1000
+"""The most commits land screens on one branch, so the screen is bounded."""
 
 
 class LandError(Exception):
@@ -218,6 +231,12 @@ class Plan:
     refusals: tuple[str, ...]
     carried: frozenset[str] = frozenset()
     """Protected paths a merge carries unchanged from the incoming commit."""
+    fork: str | None = None
+    """Where the branch left the remote base, from which every commit the push
+    carries is screened, or ``None`` when the remote base is not known."""
+    gate_changed: tuple[str, ...] = ()
+    """Paths under ``scripts/`` the branch changes against ``fork``, which hold the
+    gate and the hooks that land runs as the operator."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,6 +349,17 @@ class Lander:
                 "the merge leaves unmerged paths, which the line must resolve: "
                 + ", ".join(unmerged)
             )
+        remote_base = f"refs/remotes/{self.request.remote}/{self.request.base}"
+        fork = self._fork(remote_base)
+        if fork is None:
+            refusals.append(
+                f"the remote base {remote_base} is not known or shares no history"
+                " with HEAD, so land cannot tell which commits the push carries."
+                " Fetch it first"
+            )
+        # Audit's finding L2. Only a merge of the published base may carry a
+        # protected path, so a merge of any other branch cannot.
+        published = merging is not None and self._ancestor(merging, remote_base)
         carried: set[str] = set()
         protected: list[str] = []
         for change in changes:
@@ -337,6 +367,7 @@ class Lander:
                 continue
             if (
                 merging is not None
+                and published
                 and not change.untracked
                 and self._carried(merging, change.path)
             ):
@@ -358,25 +389,58 @@ class Lander:
             tuple(changes),
             tuple(refusals),
             frozenset(carried),
+            fork,
+            () if fork is None else self._gate_changes(fork, changes),
         )
 
+    def _fork(self, remote_base: str) -> str | None:
+        done = self.run(
+            ["git", "merge-base", "HEAD", remote_base], self.request.worktree
+        )
+        found = done.stdout.strip()
+        return found if done.code == 0 and found else None
+
+    def _ancestor(self, commit: str, of: str) -> bool:
+        """Whether ``commit`` is in the history of ``of``. Any failure, such as an
+        unknown ref, is no."""
+        done = self.run(
+            ["git", "merge-base", "--is-ancestor", commit, of], self.request.worktree
+        )
+        return done.code == 0
+
+    def _gate_changes(self, fork: str, changes: Sequence[Change]) -> tuple[str, ...]:
+        """The paths under ``scripts/`` that differ from ``fork`` in the commits or
+        the working tree, or that are new. Audit's finding L5."""
+        listed = self.git("diff", "--name-only", "-z", "--no-renames", fork)
+        names = {name for name in listed.split("\0") if name}
+        names |= {change.path for change in changes}
+        return tuple(sorted(n for n in names if n.casefold().startswith("scripts/")))
+
     def load_lists(self) -> None:
-        """Read the disclosure lists, or refuse unless the operator said there is
-        none. Errors name files only."""
-        present = [path for path in self.request.terms_files if path.is_file()]
-        if not present and not self.request.without_list:
-            raise LandError(
-                "no disclosure list was found at "
-                + (", ".join(str(p) for p in self.request.terms_files) or "no path")
-                + ", so nothing could be screened. Give --terms, or"
-                " --without-disclosure-list to land unscreened"
-            )
+        """Read the disclosure lists. Unless the operator gave
+        ``--without-disclosure-list``, every list named must be a file and together
+        they must hold a term, so a mistyped path or an emptied list refuses rather
+        than screening nothing. **Decided by the operator on 2026-10-31, after
+        audit's finding L1.** Errors name files only."""
+        lists = self.request.terms_files
+        present = [path for path in lists if path.is_file()]
+        missing = [str(path) for path in lists if not path.is_file()]
+        unscreened = (
+            ", so nothing could be screened. Give --terms naming a list with terms,"
+            " or --without-disclosure-list to land unscreened"
+        )
+        if not self.request.without_list and (missing or not lists):
+            named = ", ".join(missing) or "no path"
+            raise LandError(f"no disclosure list was found at {named}{unscreened}")
         found: set[str] = set()
         try:
             for path in present:
                 found.update(load_terms(path))
         except DisclosureError as error:
             raise LandError(str(error)) from error
+        if not found and not self.request.without_list:
+            named = ", ".join(str(path) for path in present)
+            raise LandError(f"the disclosure list {named} holds no terms{unscreened}")
         self.terms = tuple(sorted(found))
         accepted = self.request.accepted_file
         if accepted is not None and accepted.is_file():
@@ -400,6 +464,48 @@ class Lander:
                 raise LandError(f"git diff could not read the untracked file {path}")
             parts.append(done.stdout)
         return self.screen("\n".join(parts))
+
+    def screen_history(self, plan: Plan) -> list[str]:
+        """Where the commits the push carries hold a listed term, each commit from
+        the fork to ``HEAD`` by its message and its own diff, the net diff from the
+        fork, which holds what a merge resolved, and the branch name, which the push
+        publishes. **Decided by the operator on 2026-10-31, after audit's finding
+        L3.** A merge commit's own diff is not read, since what it brings from the
+        base is published already and its resolution is in the net diff. Line
+        numbers in a commit's diff are that commit's, which the accepted matches,
+        written for the current tree, may not name."""
+        if not self.terms or plan.fork is None:
+            return []
+        found: list[str] = []
+        if _holds(self.terms, plan.branch):
+            found.append("the branch name")
+        listed = self.git("rev-list", "--reverse", "--parents", f"{plan.fork}..HEAD")
+        commits = [line.split() for line in listed.splitlines() if line.strip()]
+        if len(commits) > MAX_COMMITS:
+            raise LandError(
+                f"the branch carries {len(commits)} commits, more than the"
+                f" {MAX_COMMITS} land screens"
+            )
+        for ids in commits:
+            short = ids[0][:12]
+            message = self.git("log", "-1", "--format=%B", ids[0])
+            found += [
+                f"commit {short}, {where}"
+                for where in text_matches(self.terms, {"message": message})
+            ]
+            if len(ids) > 2:
+                continue
+            diff = self.git(*_SHOW, ids[0])
+            found += [
+                f"commit {short}, {where}"
+                for where in diff_matches(self.terms, self.accepted, diff)
+            ]
+        net = self.git(*_DIFF, plan.fork, "HEAD")
+        found += [
+            f"the branch since {plan.fork[:12]}, {where}"
+            for where in diff_matches(self.terms, self.accepted, net)
+        ]
+        return found
 
     def screen(self, diff: str) -> list[str]:
         """Where the diff and the operator's texts hold a listed term."""
@@ -454,6 +560,14 @@ class Lander:
                 f"commit {commit} carries a Co-Authored-By trailer that a hook or"
                 " template added. It was not pushed. Amend it or reset it"
             )
+        # A hook may also have changed the message the screen read.
+        stored = text_matches(self.terms, {"stored commit message": made})
+        if stored:
+            raise LandError(
+                f"{', '.join(stored)} of commit {commit} holds a term from the"
+                " disclosure list, which a hook or template added. It was not"
+                " pushed. Amend it or reset it"
+            )
         return commit
 
     # The whole command.
@@ -470,7 +584,7 @@ class Lander:
                     self.warn(f"dromon land: refused, {refusal}")
                 return exits.FAILURE
             self.load_lists()
-            found = self.screen_worktree(plan)
+            found = self.screen_history(plan) + self.screen_worktree(plan)
             if found:
                 self._report(found, staged=False)
                 return exits.FAILURE
@@ -482,6 +596,15 @@ class Lander:
                 f"Stage {len(plan.changes)} paths and commit them on {plan.branch}?"
             )
             if not self._agree(question):
+                self.say("dromon land: declined, so nothing was staged")
+                return exits.FAILURE
+            # Audit's finding L5. The commit runs the branch's hooks and the gate is
+            # the branch's own script, so a change to either is asked about even
+            # with --yes.
+            if plan.gate_changed and not self.ask(
+                f"The branch changes {', '.join(plan.gate_changed)}, which land runs"
+                " as you outside any sandbox. Run them?"
+            ):
                 self.say("dromon land: declined, so nothing was staged")
                 return exits.FAILURE
             self.stage(plan)
@@ -564,7 +687,10 @@ class Lander:
 
     def _screened(self) -> str:
         if not self.terms:
-            return "dromon land: not screened, as --without-disclosure-list asked"
+            return (
+                "dromon land: not screened, since --without-disclosure-list was given"
+                " and no list with terms was found"
+            )
         return "dromon land: the disclosure screen found no listed term"
 
     def _report(self, found: Sequence[str], *, staged: bool) -> None:
@@ -633,6 +759,18 @@ def describe(plan: Plan, request: Request) -> str:
         lines.append(f"  {number:>4} {change.code} {change.path}{note}")
     message = request.message.strip()
     first = message.splitlines()[0] if message else ""
+    if plan.fork is not None:
+        lines.append(f"  the push carries the commits since {plan.fork}")
+    lines.append(
+        "  land runs the branch's own scripts/check.sh and git hooks as you, outside"
+        " any sandbox"
+    )
+    if plan.gate_changed:
+        lines.append(
+            f"  the branch changes {len(plan.gate_changed)} paths under scripts/,"
+            " so land asks before running them, even with --yes:"
+        )
+        lines += [f"       {path}" for path in plan.gate_changed]
     lines += [
         f"  commit message {first!r}",
         f"  then the gate {' '.join(request.gate)}",

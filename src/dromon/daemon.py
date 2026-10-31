@@ -3385,16 +3385,17 @@ def apply_project(scheduler: Scheduler, log: EventLog, config: ProjectConfig) ->
 CHECK_PASSED: Final = "dromond: the start checks pass, and nothing was started"
 """What ``dromond --check`` says when a start would get past its checks."""
 
-CHECK_PREFIX: Final = "preflight-"
-"""The prefix of the private directory a check copies the event log into."""
-
 
 def check_scratch(paths: ProjectPaths) -> Path:
     """A new private directory under the runtime directory for a check's copy of
-    the event log, on the same file system and as private as the log. Raises
-    ``LogError``."""
+    the event log, on the same file system and as private as the log, after
+    sweeping the directories killed checks left, as ``restart.sweep_checks``
+    describes. Raises ``LogError``."""
+    restart.sweep_checks(paths.runtime_dir, restart.CHECK_SECONDS)
     try:
-        return Path(tempfile.mkdtemp(prefix=CHECK_PREFIX, dir=paths.runtime_dir))
+        return Path(
+            tempfile.mkdtemp(prefix=restart.CHECK_PREFIX, dir=paths.runtime_dir)
+        )
     except OSError as error:
         raise LogError(
             f"cannot make a directory for a copy of the log in {paths.runtime_dir}"
@@ -3462,6 +3463,10 @@ def run(
         line_id: definition.secret_names for line_id, definition in config.lines.items()
     }
     launcher.configure(paths.left_reports)
+    if lock is not None:
+        # A start holds the lock, so no check of its own runs, and any preflight
+        # directory left is a killed check's copy of the log.
+        restart.sweep_checks(paths.runtime_dir, None)
     successor: list[str] | None = None
     scheduler: Scheduler | None = None
     scratch: Path | None = None

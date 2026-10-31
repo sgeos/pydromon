@@ -105,6 +105,26 @@ message and leaving the old daemon running.
   when it ends. The backup sees each committed transaction whole, so a copy taken while
   the old daemon writes is consistent. The copy holds message bodies, so it is never
   placed outside the runtime directory.
+- **A preflight can briefly delay the daemon's writes.** The log keeps SQLite's
+  rollback journal, in which a reader's lock keeps a writer's commit waiting. The
+  copy is therefore made 64 pages at a time, 256 KiB at the default page size, with a
+  pause of 2 milliseconds and no lock between steps, so a commit of the running
+  daemon waits at most for one step, not for the whole copy, decided by the operator
+  on 2026-10-31 after audit's finding P1. A write between steps restarts the copy, so
+  a copy is bounded at 60 seconds and refuses past it, which refuses a restart that
+  might have succeeded, failing closed.
+- **Leftover copies are swept.** A check removes its own directory as it ends. A check
+  the client kills at its bound cannot, so the client sweeps the preflight directories
+  after a timeout, each check sweeps those older than the bound, and each start, which
+  holds the lock, sweeps them all, decided by the operator on 2026-10-31 after audit's
+  finding P2. Only directories whose names begin `preflight-` are removed, never a
+  link. **Assumption.** Two clients checking at once are rare. One whose check times
+  out sweeps the other's copy too, which makes the other check fail, closed.
+- **The interpreter can differ.** The check runs on the interpreter `dromon` runs on,
+  and the successor on the one the old daemon runs on. When the two are different
+  environments, such as a client installed with pipx and a daemon in the project's
+  virtual environment, the check tests other installed code than the successor loads.
+  Run `dromon restart` from the environment the daemon was started from.
 - **The reason.** The client prints the check's lines that begin `dromond:`, which are
   the reasons a real start prints, or else its last line, as for code that does not
   import.
@@ -132,6 +152,7 @@ message and leaving the old daemon running.
 | What the drain records | The copy is taken before the request, so mail, lines or roles recorded during the drain are not checked. A line created during a drain can still make the successor refuse |
 | The daemon's environment | The check runs with the client's environment, and the successor with the old daemon's, so a refusal that depends on `SSH_AUTH_SOCK` or `DROMON_REGISTRY_DIR` can differ |
 | An installed checkout that moves after the check | The successor loads what is installed when it starts |
+| Another interpreter's installed code | The check runs on the client's interpreter, and the successor on the old daemon's |
 
 **Compatibility.** A daemon from before 2026-10-31 gives no `options`, and the check
 then runs with none, which can differ from the successor's command line only in the

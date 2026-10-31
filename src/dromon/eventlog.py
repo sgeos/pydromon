@@ -26,6 +26,7 @@ Assumptions and failure modes.
 
 import os
 import sqlite3
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -192,7 +193,35 @@ def read_entries(path: Path) -> list[Entry]:
         connection.close()
 
 
-def snapshot(source: Path, destination: Path) -> None:
+SNAPSHOT_PAGES: Final = 64
+"""Pages a snapshot copies in one step. A step holds the live log's read lock, which
+keeps the daemon's next commit waiting, so a small step bounds that wait. At SQLite's
+default page size of 4,096 bytes a step is 256 KiB, which a local disk reads in a few
+milliseconds."""
+
+SNAPSHOT_PAUSE_SECONDS: Final = 0.002
+"""The pause after each step, with no lock held, in which a waiting commit of the
+daemon goes through."""
+
+SNAPSHOT_BOUND_SECONDS: Final = 60.0
+"""The longest a snapshot may take. A write between steps restarts SQLite's backup
+from the first page, so a log written faster than it can be copied would never
+finish, and the bound turns that into a refusal."""
+
+
+class _CopyTooSlow(Exception):
+    """Raised from the backup's progress callback once the bound passes, which ends
+    the backup."""
+
+
+def snapshot(
+    source: Path,
+    destination: Path,
+    *,
+    pages: int = SNAPSHOT_PAGES,
+    pause_seconds: float = SNAPSHOT_PAUSE_SECONDS,
+    bound_seconds: float = SNAPSHOT_BOUND_SECONDS,
+) -> None:
     """Copy the log at ``source`` to ``destination`` as one consistent picture,
     never writing ``source``, so a check can open the copy and append to it while a
     daemon still writes the original. ``destination`` must not exist, and is created
@@ -203,7 +232,16 @@ def snapshot(source: Path, destination: Path) -> None:
     SQLite's online backup, which sees each committed transaction whole, where a
     byte copy could catch a write half done. The schema version is not checked
     here, so the code that opens the copy refuses it in its own words. Raises
-    ``LogError`` when the source cannot be read or the copy cannot be written.
+    ``LogError`` when the source cannot be read, the copy cannot be written, or the
+    copy takes longer than ``bound_seconds``.
+
+    **Decided by the operator on 2026-10-31, after audit's finding P1.** The log
+    keeps SQLite's rollback journal, in which a reader's lock keeps a writer's commit
+    waiting. The copy is therefore made ``pages`` at a time, with a pause of
+    ``pause_seconds`` and no lock between steps, so the daemon's commits wait at most
+    one step, not the whole copy. A snapshot can still delay a daemon's write by that
+    much. The defaults are ``SNAPSHOT_PAGES``, ``SNAPSHOT_PAUSE_SECONDS`` and
+    ``SNAPSHOT_BOUND_SECONDS``.
 
     Porting note. The backup is a SQLite facility, so a port that keeps SQLite keeps
     it, and one that does not copies under the log's own writer lock."""
@@ -215,16 +253,29 @@ def snapshot(source: Path, destination: Path) -> None:
         raise LogError(f"cannot create a copy of the log at {destination}") from error
     os.close(descriptor)
     uri = f"{source.resolve().as_uri()}?mode=ro"
+    deadline = time.monotonic() + bound_seconds
+
+    def pace(status: int, remaining: int, total: int) -> None:
+        del status, remaining, total
+        if time.monotonic() > deadline:
+            raise _CopyTooSlow
+        time.sleep(pause_seconds)
+
     try:
         reading = sqlite3.connect(uri, uri=True, isolation_level=None)
         try:
             writing = sqlite3.connect(destination, isolation_level=None)
             try:
-                reading.backup(writing)
+                reading.backup(writing, pages=pages, progress=pace)
             finally:
                 writing.close()
         finally:
             reading.close()
+    except _CopyTooSlow as error:
+        raise LogError(
+            f"the copy of the event log at {source} took more than"
+            f" {bound_seconds:g} seconds"
+        ) from error
     except sqlite3.Error as error:
         raise LogError(f"cannot copy the event log at {source}: {error}") from error
 
