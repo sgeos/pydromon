@@ -43,14 +43,19 @@ import secrets
 import sys
 import traceback
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Final, Protocol, cast
 
 from dromon.eventlog import Entry
-from dromon.federation import TRANSPORT_UNIX, FederationConfig, PeerDefinition
+from dromon.federation import (
+    SCOPE_LOCAL,
+    TRANSPORT_UNIX,
+    FederationConfig,
+    PeerDefinition,
+)
 from dromon.model import (
     ID_PATTERN,
     Address,
@@ -144,14 +149,23 @@ def check_outbound(
     body: str,
     *,
     priority: bool,
+    opening: bool = False,
 ) -> None:
     """Raise ``EventRejected`` unless this daemon's policy lets ``sender`` send ``body``
     to ``recipient`` now. A refusal records nothing. The model checks the rest, that
-    the peer is declared and that its outbox has room."""
+    the peer is declared and that its outbox has room. ``opening`` judges a project of
+    the open-federation registry that the log does not hold yet, by
+    ``[federation.open]``, so that its ``peer_opened`` is recorded only for mail the
+    policy lets through."""
     peer_id = recipient.peer_id
-    definition = federation.peers.get(peer_id)
     peer = state.peers.get(peer_id)
-    if definition is None or peer is None or peer.removed:
+    if opening:
+        definition: PeerDefinition | None = federation.open.local_definition(peer_id)
+    else:
+        definition = federation.definition(state, peer_id)
+        if peer is None or peer.removed:
+            definition = None
+    if definition is None:
         raise EventRejected(f"no peer {peer_id}")
     if not definition.outbound:
         raise EventRejected(f"mail to peer {peer_id} is off")
@@ -200,12 +214,17 @@ def announced_name(root: Path, discloses: Callable[[str], bool]) -> str:
 
 
 def orphaned(state: State, federation: FederationConfig) -> list[str]:
-    """The mail waiting for a peer that is removed or no longer declared, which is
-    returned with ``unknown_peer``, oldest first within each peer."""
+    """The mail waiting for a peer that is removed or no longer declared, or for an
+    open peer whose mode is no longer open, which is returned with ``unknown_peer``,
+    oldest first within each peer."""
     found: list[str] = []
     for peer_id, waiting in state.outbox.items():
         peer = state.peers.get(peer_id)
-        if peer_id not in federation.peers or peer is None or peer.removed:
+        if (
+            federation.definition(state, peer_id) is None
+            or peer is None
+            or peer.removed
+        ):
             found.extend(waiting)
     return found
 
@@ -290,6 +309,25 @@ async def connect_unix(peer_id: str, definition: PeerDefinition) -> Link:
     except (OSError, TimeoutError) as error:
         raise LinkError(f"could not connect to peer {peer_id}: {error}") from error
     return UnixLink(reader, writer)
+
+
+def registered_connector(
+    connect: Connector, locate: Callable[[str], Awaitable[Path | None]]
+) -> Connector:
+    """``connect``, reaching an open local peer at the socket its live registry entry
+    names, which ``locate`` reads when each link opens, so a peer that restarted at
+    another socket, or stopped, is found as it is now. A peer with no live entry is a
+    transient failure that backs off, as a peer that is down is."""
+
+    async def reach(peer_id: str, definition: PeerDefinition) -> Link:
+        if definition.open_scope != SCOPE_LOCAL:
+            return await connect(peer_id, definition)
+        socket = await locate(peer_id)
+        if socket is None:
+            raise LinkError(f"peer {peer_id} has no live entry in the registry")
+        return await connect(peer_id, replace(definition, socket=socket))
+
+    return reach
 
 
 class Phase(StrEnum):
@@ -379,6 +417,9 @@ class PeerForwarder:
     name: str
     clock: Callable[[], float]
     wall_clock: Callable[[], datetime]
+    open_name: str | None = None
+    """This daemon's federation name while ``local`` is open, which a hello without
+    a token announces, or ``None``."""
     sent_at: dict[str, datetime] = field(default_factory=dict[str, datetime])
     possibly_sent: set[str] = field(default_factory=set[str])
     """Messages a copy of which may have reached the peer without an answer."""
@@ -531,12 +572,18 @@ class PeerForwarder:
             return self.link
         args: dict[str, object] = {"versions": [FEDERATION_VERSION], "name": self.name}
         # Only the socket needs a token. Over TLS the pinned key names this daemon,
-        # so a token stored for the peer is neither read nor sent.
+        # so a token stored for the peer is neither read nor sent. An open peer, or
+        # a declared one with no token stored while this daemon is open, names this
+        # daemon by its registry entry, so its hello carries the federation name and
+        # no token.
         if self.definition.transport == TRANSPORT_UNIX:
-            token = self.token()
-            if token is None:
+            token = None if self.definition.open_scope else self.token()
+            if token is not None:
+                args["token"] = token
+            elif self.open_name is not None:
+                args["name"] = self.open_name
+            else:
                 raise LinkError(f"no token is stored for peer {self.peer_id}")
-            args["token"] = token
         link = await self.connect(self.peer_id, self.definition)
         try:
             response = await link.exchange(
@@ -713,35 +760,83 @@ class Forwarder:
         sent_at: Mapping[str, datetime],
     ) -> None:
         """Every message waiting at start is marked as possibly sent, since a copy
-        may have left before the restart."""
+        may have left before the restart. An open peer with mail waiting gets its
+        forwarder here too, and one first sent to while the daemon runs gets it at
+        that notice."""
         self.peers: dict[str, PeerForwarder] = {}
+        self._outbox = outbox
+        self._federation = federation
+        self._connect = connect
+        self._token = token
+        self._name = name
+        self._clock = clock
+        self._wall_clock = wall_clock
+        self._stop: asyncio.Event | None = None
+        self._open_tasks: set[asyncio.Task[None]] = set()
         state = outbox.state
-        for peer_id, definition in sorted(federation.peers.items()):
+        wanted = sorted(set(federation.peers) | set(state.outbox))
+        for peer_id in wanted:
+            definition = federation.definition(state, peer_id)
+            if definition is None:
+                continue
             waiting = state.outbox.get(peer_id, {})
-            self.peers[peer_id] = PeerForwarder(
+            self.peers[peer_id] = self._make(
                 peer_id,
                 definition,
-                outbox,
-                connect,
-                _token_for(token, peer_id),
-                name,
-                clock,
-                wall_clock,
                 sent_at={m: sent_at[m] for m in waiting if m in sent_at},
                 possibly_sent=set(waiting),
             )
 
+    def _make(
+        self,
+        peer_id: str,
+        definition: PeerDefinition,
+        sent_at: dict[str, datetime],
+        possibly_sent: set[str],
+    ) -> PeerForwarder:
+        return PeerForwarder(
+            peer_id,
+            definition,
+            self._outbox,
+            self._connect,
+            _token_for(self._token, peer_id),
+            self._name,
+            self._clock,
+            self._wall_clock,
+            open_name=self._federation.name if self._federation.local_open else None,
+            sent_at=sent_at,
+            possibly_sent=possibly_sent,
+        )
+
     def reports(self) -> list[PeerReport]:
-        """Each declared peer's report, in name order."""
+        """Each peer's report, declared or open, in name order."""
         return [self.peers[peer_id].report() for peer_id in sorted(self.peers)]
 
     def notify(self, peer_id: str, message_id: str) -> None:
+        """Wake ``peer_id``'s forwarder for ``message_id``, first making one for an
+        open peer that has none, which runs at once when the forwarder runs."""
         forwarder = self.peers.get(peer_id)
-        if forwarder is not None:
-            forwarder.notify(message_id)
+        if forwarder is None:
+            definition = self._federation.definition(self._outbox.state, peer_id)
+            if definition is None or not definition.open_scope:
+                return
+            forwarder = self._make(peer_id, definition, {}, set())
+            self.peers[peer_id] = forwarder
+            if self._stop is not None:
+                task = asyncio.get_running_loop().create_task(forwarder.run(self._stop))
+                self._open_tasks.add(task)
+        forwarder.notify(message_id)
 
     async def run(self, stop: asyncio.Event) -> None:
-        await asyncio.gather(*(peer.run(stop) for peer in self.peers.values()))
+        """Run every forwarder until ``stop``. An open peer's forwarder made while
+        this runs is awaited after ``stop``, so an exception it lets through, which
+        its own watch makes unexpected, is seen then rather than at once."""
+        self._stop = stop
+        await asyncio.gather(
+            *(peer.run(stop) for peer in list(self.peers.values())), stop.wait()
+        )
+        if self._open_tasks:
+            await asyncio.gather(*self._open_tasks)
 
 
 def _token_for(

@@ -91,6 +91,7 @@ from dromon.model import (
     RunStatus,
     PeerDeclared,
     PeerKeyed,
+    PeerOpened,
     PeerRemoved,
 )
 
@@ -315,6 +316,9 @@ SCENARIO: tuple[Event, ...] = (
     PeerDeclared("keleusma", "unix", '{"inbound":false}'),
     PeerKeyed("keleusma", ""),
     PeerRemoved("keleusma"),
+    PeerOpened("tidepool", "local", AT),
+    PeerOpened("f" * 64, "remote", AT),
+    PeerDeclared("tidepool", "unix", '{"inbound":true}'),
     LineStateChanged("alpha", LineState.STOPPED),
 )
 

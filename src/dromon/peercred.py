@@ -44,6 +44,11 @@ UCRED: Final = struct.Struct("=iII")
 """Linux's ``struct ucred``, a pid, a user identifier and a group identifier."""
 
 LOCAL_PEERCRED: Final[int | None] = getattr(socket, "LOCAL_PEERCRED", None)
+LOCAL_PEERPID: Final = 2
+"""``LOCAL_PEERPID`` of macOS's ``sys/un.h``, unnamed in Python, at ``SOL_LOCAL``. It
+gives the pid of the process that connected, as a 32-bit ``pid_t``. **Fact,** read on
+a socket pair on 2026-10-31 with Python 3.12, which gave the test's own pid."""
+PID: Final = struct.Struct("=i")
 SO_PEERCRED: Final[int | None] = getattr(socket, "SO_PEERCRED", None)
 
 
@@ -100,6 +105,41 @@ def peer_uid(sock: CredentialSocket) -> int:
     raise PeerCredentialError(
         "this platform offers neither LOCAL_PEERCRED nor SO_PEERCRED"
     )
+
+
+def peer_pid(sock: CredentialSocket) -> int:
+    """The pid of the process at the other end of ``sock``, as the kernel recorded it
+    when that process connected, which open local federation matches against the
+    registry. ``LOCAL_PEERPID`` on macOS, and the pid of ``SO_PEERCRED`` on Linux.
+
+    Raises ``PeerCredentialError`` when it cannot be read or is not positive. A
+    platform with ``LOCAL_PEERCRED`` but not ``LOCAL_PEERPID`` refuses here, which a
+    caller takes as no pid, so open federation fails closed there."""
+    try:
+        if LOCAL_PEERCRED is not None:
+            raw = sock.getsockopt(SOL_LOCAL, LOCAL_PEERPID, PID.size)
+            if len(raw) < PID.size:
+                raise PeerCredentialError(
+                    f"the peer pid was {len(raw)} bytes, too short to read"
+                )
+            (pid,) = PID.unpack_from(raw)
+        elif SO_PEERCRED is not None:
+            raw = sock.getsockopt(socket.SOL_SOCKET, SO_PEERCRED, UCRED.size)
+            if len(raw) < UCRED.size:
+                raise PeerCredentialError(
+                    f"the peer credentials were {len(raw)} bytes, too short to read"
+                )
+            pid, _uid, _gid = UCRED.unpack_from(raw)
+        else:
+            raise PeerCredentialError(
+                "this platform offers neither LOCAL_PEERPID nor SO_PEERCRED"
+            )
+    except OSError as error:
+        reason = error.strerror or type(error).__name__
+        raise PeerCredentialError(f"the peer pid cannot be read: {reason}") from error
+    if pid <= 0:
+        raise PeerCredentialError(f"the peer pid {pid} is not a process")
+    return pid
 
 
 def refusal(sock: CredentialSocket, own_uid: int) -> str | None:

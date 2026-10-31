@@ -70,8 +70,50 @@ from dromon.model import (
 )
 
 FEDERATION_KEYS: Final = frozenset(
-    {"listen", "tls_listen", "accept_unconfined", "waiting_per_recipient"}
+    {
+        "listen",
+        "tls_listen",
+        "accept_unconfined",
+        "waiting_per_recipient",
+        "local",
+        "remote",
+        "name",
+        "open",
+        "allowed_networks",
+    }
 )
+MODE_ALLOWLIST: Final = "allowlist"
+"""Only declared peers, as before 2026-10-31. The default of both modes."""
+MODE_OPEN: Final = "open"
+MODES: Final = (MODE_ALLOWLIST, MODE_OPEN)
+SCOPE_LOCAL: Final = "local"
+"""An open peer on this machine, found in the per-user registry."""
+SCOPE_REMOTE: Final = "remote"
+"""An open peer on another machine, named by the pin of the key it presented."""
+OPEN_KEYS: Final = frozenset(
+    {
+        "reach",
+        "senders",
+        "remote",
+        "priority_in",
+        "priority_out",
+        "max_body_bytes",
+        "expire_hours",
+        "turns_per_hour",
+        "waiting",
+        "remote_reach",
+        "remote_max_body_bytes",
+        "remote_turns_per_hour",
+        "remote_waiting",
+    }
+)
+DEFAULT_REMOTE_MAX_BODY_BYTES: Final = 16384
+"""The largest body an undeclared key may send, a quarter of a declared peer's."""
+DEFAULT_REMOTE_TURNS_PER_HOUR: Final = 2
+DEFAULT_REMOTE_WAITING: Final = 50
+MAX_NETWORKS: Final = 64
+"""The most address ranges ``allowed_networks`` may list."""
+ANY_PEER: Final = "*"
 PEER_KEYS: Final = frozenset(
     {
         "transport",
@@ -195,6 +237,9 @@ class PeerDefinition:
     expire_hours: int = DEFAULT_EXPIRE_HOURS
     turns_per_hour: int = DEFAULT_TURNS_PER_HOUR
     waiting: int = DEFAULT_WAITING
+    open_scope: str = ""
+    """Empty for a declared peer, or ``SCOPE_LOCAL`` or ``SCOPE_REMOTE`` for an open
+    peer, whose definition ``OpenPolicy`` makes from ``[federation.open]``."""
 
     def directories(self) -> tuple[Path, ...]:
         """The peer's directories that local lines are denied, its runtime directory
@@ -209,6 +254,92 @@ class PeerDefinition:
 
 
 @dataclass(frozen=True, slots=True)
+class RemotePattern:
+    """An entry of ``[federation.open] remote``, ``NAME:PARTY``, which lets local
+    senders address ``PARTY`` of the open peer ``NAME``, or of every open peer when
+    ``NAME`` is ``*``. The party is always named, so a line cannot guess at the
+    parties of a project it may reach, as the design's reason for ``remote`` says."""
+
+    peer: str | None
+    """The open peer's federation name, or ``None`` for every open peer."""
+    party: LocalAddress
+
+    def matches(self, peer_id: str) -> bool:
+        return self.peer is None or self.peer == peer_id
+
+    def __str__(self) -> str:
+        return f"{ANY_PEER if self.peer is None else self.peer}:{self.party}"
+
+
+@dataclass(frozen=True, slots=True)
+class OpenPolicy:
+    """``[federation.open]``, the policy of every peer that is open and not declared.
+    Every list is empty by default, so an open project delivers nothing until its
+    operator names who may reach and send. The ``remote_`` keys govern undeclared keys
+    on other machines, with stricter limits by default."""
+
+    reach: tuple[LocalAddress, ...] = ()
+    senders: tuple[LocalAddress, ...] = ()
+    remote: tuple[RemotePattern, ...] = ()
+    priority_in: bool = False
+    priority_out: bool = False
+    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
+    expire_hours: int = DEFAULT_EXPIRE_HOURS
+    turns_per_hour: int = DEFAULT_TURNS_PER_HOUR
+    waiting: int = DEFAULT_WAITING
+    remote_reach: tuple[LocalAddress, ...] = ()
+    remote_max_body_bytes: int = DEFAULT_REMOTE_MAX_BODY_BYTES
+    remote_turns_per_hour: int = DEFAULT_REMOTE_TURNS_PER_HOUR
+    remote_waiting: int = DEFAULT_REMOTE_WAITING
+
+    def local_definition(self, peer_id: str) -> PeerDefinition:
+        """The definition of the open peer ``peer_id`` on this machine. Its socket
+        is the registry's, read when the forwarder connects, so it is ``None`` here."""
+        parties = {
+            str(pattern.party): pattern.party
+            for pattern in self.remote
+            if pattern.matches(peer_id)
+        }
+        return PeerDefinition(
+            peer_id=peer_id,
+            socket=None,
+            inbound=True,
+            outbound=True,
+            reach=self.reach,
+            senders=self.senders,
+            remote=tuple(parties[text] for text in sorted(parties)),
+            priority_in=self.priority_in,
+            priority_out=self.priority_out,
+            max_body_bytes=self.max_body_bytes,
+            expire_hours=self.expire_hours,
+            turns_per_hour=self.turns_per_hour,
+            waiting=self.waiting,
+            open_scope=SCOPE_LOCAL,
+        )
+
+    def remote_definition(self, peer_id: str) -> PeerDefinition:
+        """The definition of an undeclared key on another machine, whose identifier
+        is its pin. Inbound only, since nothing locates an undeclared machine, and
+        without priority."""
+        return PeerDefinition(
+            peer_id=peer_id,
+            socket=None,
+            transport=TRANSPORT_TLS,
+            pin_sha256=peer_id,
+            inbound=True,
+            outbound=False,
+            reach=self.remote_reach,
+            max_body_bytes=self.remote_max_body_bytes,
+            turns_per_hour=self.remote_turns_per_hour,
+            waiting=self.remote_waiting,
+            open_scope=SCOPE_REMOTE,
+        )
+
+
+type Network = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+@dataclass(frozen=True, slots=True)
 class FederationConfig:
     """The project's ``[federation]`` table and its peers. Empty by default."""
 
@@ -218,6 +349,58 @@ class FederationConfig:
     peers: dict[str, PeerDefinition] = field(default_factory=dict[str, PeerDefinition])
     tls_listen: tuple[str, int] | None = None
     """The host and port of this daemon's TLS listener, or ``None`` for none."""
+    local: str = MODE_ALLOWLIST
+    remote: str = MODE_ALLOWLIST
+    name: str | None = None
+    """This daemon's federation name, which its registry entry holds, required when
+    ``local`` is open."""
+    open: OpenPolicy = field(default_factory=OpenPolicy)
+    allowed_networks: tuple[Network, ...] = ()
+    """The address ranges the TLS listener accepts connections from, every range
+    when empty."""
+
+    @property
+    def local_open(self) -> bool:
+        return self.local == MODE_OPEN
+
+    @property
+    def remote_open(self) -> bool:
+        return self.remote == MODE_OPEN
+
+    @property
+    def any_open(self) -> bool:
+        return self.local_open or self.remote_open
+
+    def definition(self, state: State, peer_id: str) -> PeerDefinition | None:
+        """The policy that governs ``peer_id`` now. A declared peer's own table
+        always wins. Otherwise an open peer the log records, in a mode that is still
+        open, takes ``[federation.open]``. Anything else has none, so a project that
+        returns to the allowlist stops serving its open peers at once."""
+        declared = self.peers.get(peer_id)
+        if declared is not None:
+            return declared
+        peer = state.peers.get(peer_id)
+        if peer is None or peer.removed:
+            return None
+        if peer.scope == SCOPE_LOCAL and self.local_open:
+            return self.open.local_definition(peer_id)
+        if peer.scope == SCOPE_REMOTE and self.remote_open:
+            return self.open.remote_definition(peer_id)
+        return None
+
+    def admits(self, host: str) -> bool:
+        """Whether the TLS listener accepts a connection from ``host``, an address
+        as the socket gives it. Every address when ``allowed_networks`` is empty, and
+        no text that is not an address otherwise."""
+        if not self.allowed_networks:
+            return True
+        try:
+            address = ipaddress.ip_address(host.split("%", 1)[0])
+        except ValueError:
+            return False
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+            address = address.ipv4_mapped
+        return any(address in network for network in self.allowed_networks)
 
 
 NO_FEDERATION: Final = FederationConfig()
@@ -243,6 +426,10 @@ def parse_federation(federation: object, peers: object) -> FederationConfig:
         raise FederationError(f"peers declares more than {MAX_PEERS} peers")
     for peer_id, value in sorted(named.items()):
         found[peer_id] = _peer(peer_id, value)
+    local = _mode(table, "local")
+    remote = _mode(table, "remote")
+    name = _federation_name(table, found, local == MODE_OPEN, listen)
+    open_policy = _open_policy(table.get("open"))
     raw_listen = table.get("tls_listen")
     tls_listen = (
         None if raw_listen is None else _host_port(raw_listen, "federation.tls_listen")
@@ -257,9 +444,21 @@ def parse_federation(federation: object, peers: object) -> FederationConfig:
             f"peers.{inbound_tls[0]} is an inbound tls peer, so federation.tls_listen"
             " must name the address to listen on"
         )
-    if tls_listen is not None and not inbound_tls:
+    if remote == MODE_OPEN and tls_listen is None:
+        raise FederationError(
+            "federation.remote is open, so federation.tls_listen must name the"
+            " address to listen on, which is never chosen by default"
+        )
+    if tls_listen is not None and not inbound_tls and remote != MODE_OPEN:
         raise FederationError(
             "federation.tls_listen opens a network listener, but no tls peer is inbound"
+            " and federation.remote is not open"
+        )
+    networks = _networks(table.get("allowed_networks"))
+    if networks and tls_listen is None:
+        raise FederationError(
+            "federation.allowed_networks bounds the TLS listener, so"
+            " federation.tls_listen must be set"
         )
     if len(inbound_tls) > MAX_INBOUND_TLS:
         raise FederationError(
@@ -278,8 +477,180 @@ def parse_federation(federation: object, peers: object) -> FederationConfig:
             )
         pins[peer.pin_sha256] = peer_id
     return FederationConfig(
-        listen, unconfined, per_recipient, found, tls_listen=tls_listen
+        listen,
+        unconfined,
+        per_recipient,
+        found,
+        tls_listen=tls_listen,
+        local=local,
+        remote=remote,
+        name=name,
+        open=open_policy,
+        allowed_networks=networks,
     )
+
+
+def _mode(table: dict[str, object], name: str) -> str:
+    value = table.get(name, MODE_ALLOWLIST)
+    if value not in MODES:
+        raise FederationError(
+            f"federation.{name} must be {MODE_ALLOWLIST} or {MODE_OPEN}"
+        )
+    return cast(str, value)
+
+
+def _federation_name(
+    table: dict[str, object],
+    peers: dict[str, PeerDefinition],
+    local_open: bool,
+    listen: bool,
+) -> str | None:
+    """``[federation] name``, required when ``local`` is open, which also needs
+    ``listen``, since a daemon that does not register can be neither reached nor
+    recognized. A name shaped like a pin, or a declared peer's, is refused, since
+    either would make an address ambiguous."""
+    value = table.get("name")
+    if value is None:
+        if local_open:
+            raise FederationError(
+                "federation.local is open, so federation.name must give the name"
+                " this project registers under"
+            )
+        return None
+    if not isinstance(value, str) or ID_PATTERN.fullmatch(value) is None:
+        raise FederationError("federation.name must be an identifier")
+    if PIN_PATTERN.fullmatch(value) is not None:
+        raise FederationError(
+            "federation.name may not be 64 hexadecimal digits, which name the"
+            " undeclared keys of remote open federation"
+        )
+    if value in peers:
+        raise FederationError(f"federation.name {value} is also a declared peer's name")
+    if local_open and not listen:
+        raise FederationError(
+            "federation.local is open, so federation.listen must be true, since"
+            " an open daemon registers its peers.sock"
+        )
+    return value
+
+
+def _open_policy(value: object) -> OpenPolicy:
+    """``[federation.open]``, absent or a table of ``OPEN_KEYS``."""
+    if value is None:
+        return OpenPolicy()
+    key = "federation.open"
+    table = _table(value, key)
+    _known(table, key, OPEN_KEYS)
+    return OpenPolicy(
+        reach=_parties(table, key, "reach"),
+        senders=_parties(table, key, "senders"),
+        remote=_patterns(table, key),
+        priority_in=_flag(table, key, "priority_in"),
+        priority_out=_flag(table, key, "priority_out"),
+        max_body_bytes=_count(
+            table,
+            f"{key}.max_body_bytes",
+            "max_body_bytes",
+            DEFAULT_MAX_BODY_BYTES,
+            MAX_TEXT_BYTES,
+        ),
+        expire_hours=_count(
+            table,
+            f"{key}.expire_hours",
+            "expire_hours",
+            DEFAULT_EXPIRE_HOURS,
+            MAX_EXPIRE_HOURS,
+        ),
+        turns_per_hour=_count(
+            table,
+            f"{key}.turns_per_hour",
+            "turns_per_hour",
+            DEFAULT_TURNS_PER_HOUR,
+            MAX_TURNS_PER_HOUR,
+        ),
+        waiting=_count(
+            table, f"{key}.waiting", "waiting", DEFAULT_WAITING, MAX_WAITING
+        ),
+        remote_reach=_parties(table, key, "remote_reach"),
+        remote_max_body_bytes=_count(
+            table,
+            f"{key}.remote_max_body_bytes",
+            "remote_max_body_bytes",
+            DEFAULT_REMOTE_MAX_BODY_BYTES,
+            MAX_TEXT_BYTES,
+        ),
+        remote_turns_per_hour=_count(
+            table,
+            f"{key}.remote_turns_per_hour",
+            "remote_turns_per_hour",
+            DEFAULT_REMOTE_TURNS_PER_HOUR,
+            MAX_TURNS_PER_HOUR,
+        ),
+        remote_waiting=_count(
+            table,
+            f"{key}.remote_waiting",
+            "remote_waiting",
+            DEFAULT_REMOTE_WAITING,
+            MAX_WAITING,
+        ),
+    )
+
+
+def _patterns(table: dict[str, object], key: str) -> tuple[RemotePattern, ...]:
+    """``remote``, a list of ``NAME:PARTY`` texts, distinct and sorted."""
+    value = table.get("remote", [])
+    if not isinstance(value, list) or len(cast(list[object], value)) > MAX_PARTIES:
+        raise FederationError(
+            f"{key}.remote must be a list of at most {MAX_PARTIES} NAME:PARTY texts"
+        )
+    found: dict[str, RemotePattern] = {}
+    for item in cast(list[object], value):
+        if not isinstance(item, str):
+            raise FederationError(f"{key}.remote holds {item!r}, not a text")
+        peer, colon, party_text = item.partition(":")
+        if not colon or (peer != ANY_PEER and ID_PATTERN.fullmatch(peer) is None):
+            raise FederationError(
+                f"{key}.remote holds {item!r}, which is not NAME:PARTY with NAME a"
+                f" federation name or {ANY_PEER}"
+            )
+        try:
+            party = parse_address(party_text)
+        except InvalidField as error:
+            raise FederationError(
+                f"{key}.remote holds {item!r}, whose party is not an address"
+            ) from error
+        if item in found:
+            raise FederationError(f"{key}.remote names {item!r} twice")
+        found[item] = RemotePattern(None if peer == ANY_PEER else peer, party)
+    return tuple(found[text] for text in sorted(found))
+
+
+def _networks(value: object) -> tuple[Network, ...]:
+    """``allowed_networks``, address ranges such as ``192.0.2.0/24``, written
+    exactly, with no host bits set, so a range means what it says."""
+    if value is None:
+        return ()
+    key = "federation.allowed_networks"
+    if not isinstance(value, list) or not 0 < len(cast(list[object], value)) <= (
+        MAX_NETWORKS
+    ):
+        raise FederationError(
+            f"{key} must be a list of 1 to {MAX_NETWORKS} address ranges"
+        )
+    found: list[Network] = []
+    for item in cast(list[object], value):
+        if not isinstance(item, str):
+            raise FederationError(f"{key} holds {item!r}, not a text")
+        try:
+            network = ipaddress.ip_network(item, strict=True)
+        except ValueError as error:
+            raise FederationError(
+                f"{key} holds {item!r}, which is not an address range"
+            ) from error
+        if network in found:
+            raise FederationError(f"{key} names {item!r} twice")
+        found.append(network)
+    return tuple(found)
 
 
 def _peer(peer_id: str, value: object) -> PeerDefinition:
@@ -511,12 +882,13 @@ def unconfined_refusal(
     ``None`` when it may. ``sandboxed`` says whether the line's merged sandbox is
     enabled, which confines an engine of ``SANDBOXED_ENGINES``. Decision 9 of the
     design, and the operator's decision on its first open point."""
-    if not federation.peers or federation.accept_unconfined:
+    if not (federation.peers or federation.any_open) or federation.accept_unconfined:
         return None
     if engine in SANDBOXED_ENGINES and not sandboxed:
         return (
             f"line {line_id} runs on {engine} without an enabled sandbox, so Dromon"
-            " cannot confine it, and the project declares peers. Enable its sandbox,"
+            " cannot confine it, and the project has peers or open federation. Enable"
+            " its sandbox,"
             " or set accept_unconfined = true in [federation] to accept that the line"
             " could act as a peer"
         )
@@ -524,7 +896,8 @@ def unconfined_refusal(
         return None
     return (
         f"line {line_id} runs on {engine}, which Dromon cannot confine, and the"
-        " project declares peers. Set accept_unconfined = true in [federation]"
+        " project has peers or open federation. Set accept_unconfined = true in"
+        " [federation]"
         " to accept that the line could act as a peer"
     )
 
@@ -592,7 +965,9 @@ def plan_peers(state: State, federation: FederationConfig) -> tuple[Event, ...]:
         ):
             wanted.append(declared)
     for peer_id, known in sorted(trial.peers.items()):
-        if not known.removed and peer_id not in federation.peers:
+        # An open peer is the registry's or a key's, never the file's, so the file
+        # does not remove it. A declared table of its name replaces it above.
+        if not known.removed and not known.scope and peer_id not in federation.peers:
             wanted.append(PeerRemoved(peer_id))
     for event in wanted:
         try:
@@ -759,6 +1134,13 @@ def read_certificate(path: Path) -> bytes:
     """The bytes of a peer's public certificate file, held to the store's ownership
     and mode rules and to the identity files' size limit. Raises ``FederationError``.
     The bytes are not parsed here, since ``dromon.federation_tls`` checks them."""
+    return _read_owned(path, MAX_IDENTITY_FILE_BYTES)
+
+
+def read_store_key(path: Path) -> bytes:
+    """The bytes of this daemon's private key file, held to the same rules as
+    ``read_certificate``, for the open listener, which loads its identity itself.
+    Raises ``FederationError``."""
     return _read_owned(path, MAX_IDENTITY_FILE_BYTES)
 
 

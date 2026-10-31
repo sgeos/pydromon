@@ -530,6 +530,7 @@ dependencies = [
     { name = "claude-agent-sdk" },
     { name = "cryptography" },
     { name = "pykeleusma" },
+    { name = "pyopenssl" },
 ]
 
 [package.dev-dependencies]
@@ -544,6 +545,7 @@ requires-dist = [
     { name = "claude-agent-sdk", specifier = "==0.2.174" },
     { name = "cryptography", specifier = "==50.0.2" },
     { name = "pykeleusma", specifier = "==0.2.2.0" },
+    { name = "pyopenssl", specifier = "==26.4.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -606,6 +608,19 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/08/db/4839045c1a7d6d19c6b19c9cebcc437a2162652c6a9ea4500199efff295c/pykeleusma-0.2.2.0-cp315-cp315t-musllinux_1_2_x86_64.whl", hash = "sha256:dc74df24b12e1700bdf5d593838d9e6f1a846da839aaf7a9eeaf10f09a09b9b8", size = 1960959, upload-time = "2026-10-26T21:14:49.938Z" },
     { url = "https://files.pythonhosted.org/packages/dd/14/2eea9b7129c78e277e407964a7c68d7482e6c47b27876c6543ac526872da/pykeleusma-0.2.2.0-cp315-cp315t-win_amd64.whl", hash = "sha256:0353017321e1f4e838d0b3c62bc64e9e812a01356714743b9042d404d49d0f75", size = 1570290, upload-time = "2026-10-26T21:14:51.249Z" },
     { url = "https://files.pythonhosted.org/packages/49/91/fb68f7fe51237d01bf3b8ad698ec3d7e1c8a5f8d12b9c30a706a7a93ba9a/pykeleusma-0.2.2.0-cp315-cp315t-win_arm64.whl", hash = "sha256:54136f42aec7d4a3d067867ade89c6456d39f9524e790ab1ce136e0e4f2d5354", size = 1454830, upload-time = "2026-10-26T21:14:52.687Z" },
+]
+
+[[package]]
+name = "pyopenssl"
+version = "26.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3f/e8/7325d258199b159eb2c03fe32107533e2832e70e63f4fb88a6aa00023201/pyopenssl-26.4.0.tar.gz", hash = "sha256:28dfcce0162b9211413e26dfbfdf1d24317fbeba18fc93c12400a1856b2a0bc7", size = 182046, upload-time = "2026-08-01T19:50:50.512Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/51/ad/2cf6d3fa2fae5c79e1ed9960c0d42badd0f94d81dd12b50604cdc839e648/pyopenssl-26.4.0-py3-none-any.whl", hash = "sha256:f0eb0cb2d581d3ad2b9c489468485e7f2ab6727d08401bcf9d824c3caddf3c1c", size = 56026, upload-time = "2026-08-01T19:50:48.94Z" },
 ]
 
 [[package]]

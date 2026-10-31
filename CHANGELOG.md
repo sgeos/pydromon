@@ -7,6 +7,33 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- Open federation, round 12. `[federation] local` and `remote` take `allowlist`, the
+  default, which keeps the behaviour of declared peers exactly, or `open`. With
+  `local = "open"`, `listen` and a unique `name`, a daemon registers in a per-user
+  registry, `.local/state/dromon/registry` under its user's home, which must have mode
+  0700, and removes its entry at stop. A `hello` without a token is then named by the
+  live registry entry of the announced name, whose pid and start time must match the
+  connecting process, and a line may address `NAME:PARTY` for a registered project
+  that the file does not declare. Every undeclared open peer takes the new
+  `[federation.open]` table, whose lists are empty by default, so it delivers nothing
+  until the operator names who may reach and send. The registry and every registered
+  project's directories are denied to the project's lines, read again at each engine
+  build. `allowed_networks` closes a TLS connection from outside its ranges before
+  the handshake. With `remote = "open"`, the TLS listener accepts a key no declared
+  peer pins, which reaches only `remote_reach` with stricter limits, and mail to
+  another machine still needs a declared peer. The unconfined-engine rule applies
+  while either mode is open. **Rollback hazard.** A daemon before this change cannot
+  read a log holding `peer_opened`, and refuses a project file holding the new keys.
+- The dependency `pyopenssl`, pinned exactly at 26.4.0 as `cryptography` is, for the
+  listener of `remote = "open"` alone. Python's `ssl` refuses a self-signed client
+  certificate it does not already trust and offers no callback to decide otherwise,
+  and the verify callback of pyOpenSSL lets the listener accept any self-signed
+  Ed25519 key over TLS 1.3 and refuse every other. It runs over memory buffers on the
+  event loop, so a connection holds no thread, and its handshake is bounded by the
+  10-second deadline and counted under the listener's bound of eight connections.
+  The allowlist listener and every outbound connection stay on the standard library.
+  **Rollback hazard.** The daemon imports it at start, so an environment without it
+  cannot start any daemon of this version, open or not.
 - The operator-granted capability `ViewImage`, so a line can look at a screenshot
   through whichever engine owns it. A line must name it among its `builtin_tools`, and
   without it no line can view an image on any engine. On Codex it enables `view_image`,

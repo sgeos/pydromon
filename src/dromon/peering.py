@@ -317,7 +317,7 @@ class Receiver:
         earlier = state.received.get((peer_id, envelope.origin_id))
         if earlier is not None:
             return _resent(state, peer_id, earlier, sender, envelope)
-        definition = federation.peers.get(peer_id)
+        definition = federation.definition(state, peer_id)
         peer = state.peers.get(peer_id)
         if definition is None or peer is None or peer.removed or not definition.inbound:
             return Refused(Code.REFUSED)
@@ -435,6 +435,9 @@ class PeerTurns:
 
     def __init__(self, clock: Callable[[], float]) -> None:
         self._allowance: dict[str, int] = {}
+        self.open_allowance: Callable[[str], int] = lambda _peer_id: 0
+        """The turns per hour of a peer not in the allowances, an open peer, which
+        the daemon reads from its policy at each use. None by default."""
         self._starts: WindowCounter[tuple[str, str]] = WindowCounter(
             clock, TURN_WINDOW_SECONDS, MAX_TURN_CAPACITY
         )
@@ -449,7 +452,9 @@ class PeerTurns:
         self._allowance = dict(allowances)
 
     def may_start(self, peer_id: str, line_id: str) -> bool:
-        allowed = self._allowance.get(peer_id, 0)
+        allowed = self._allowance.get(peer_id)
+        if allowed is None:
+            allowed = min(max(self.open_allowance(peer_id), 0), MAX_TURN_CAPACITY)
         return self._starts.count((peer_id, line_id)) < allowed
 
     def starters(self, line_id: str, messages: Iterable[Message]) -> list[str]:

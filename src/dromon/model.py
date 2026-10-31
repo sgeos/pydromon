@@ -877,6 +877,30 @@ class PeerKeyed:
             raise InvalidField("token_sha256 is not a SHA-256 hex digest")
 
 
+PEER_SCOPES: Final = frozenset({"local", "remote"})
+"""Where an open peer was found, the per-user registry or a TLS key that no declared
+peer pins. ``docs/architecture/FEDERATION.md`` specifies both under open federation."""
+
+
+@dataclass(frozen=True, slots=True)
+class PeerOpened:
+    """An open peer first seen, which the project file does not declare. ``local``
+    names a daemon of the per-user registry by its federation name, and ``remote``
+    names an undeclared key on another machine by its pin. Its policy is the
+    project file's ``[federation.open]``, read at each use, so nothing of it is
+    recorded here."""
+
+    peer_id: str
+    scope: str
+    opened_at: str
+
+    def __post_init__(self) -> None:
+        check_id("peer_id", self.peer_id)
+        if self.scope not in PEER_SCOPES:
+            raise InvalidField(f"scope is not a peer scope: {self.scope!r}")
+        check_instant("opened_at", self.opened_at)
+
+
 MAX_REQUEST_KEY_CHARS: Final = 128
 """The longest request key a keyed tool call may give, in characters."""
 MAX_REQUEST_KEYS_PER_PARTY: Final = 256
@@ -2073,6 +2097,7 @@ type Event = (
     | PeerDeclared
     | PeerRemoved
     | PeerKeyed
+    | PeerOpened
 )
 
 
@@ -2185,6 +2210,8 @@ class Peer:
     token_sha256: str = ""
     """The digest of the token the peer presents, or empty when none is issued."""
     removed: bool = False
+    scope: str = ""
+    """Empty for a declared peer, or the ``peer_opened`` scope of an open one."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -2724,8 +2751,19 @@ class State:
                 self._peer(event.peer_id)
             case PeerKeyed():
                 peer = self._peer(event.peer_id)
+                if peer.scope:
+                    raise EventRejected(
+                        f"peer {event.peer_id} is open, and an open peer has no token"
+                    )
                 if not event.token_sha256 and not peer.token_sha256:
                     raise EventRejected(f"peer {event.peer_id} has no token to revoke")
+            case PeerOpened():
+                peer = self.peers.get(event.peer_id)
+                if peer is not None and not peer.removed:
+                    raise EventRejected(
+                        f"peer {event.peer_id} is "
+                        + ("open already" if peer.scope else "declared")
+                    )
             case _:
                 assert_never(event)
 
@@ -3058,9 +3096,11 @@ class State:
                 self.runs[event.run_id] = replace(run, cleared=event)
             case PeerDeclared():
                 peer = self.peers.get(event.peer_id)
+                # A declared table replaces an open peer of its name whole, so its
+                # own policy governs from then on.
                 self.peers[event.peer_id] = (
                     Peer(event.transport, event.policy)
-                    if peer is None or peer.removed
+                    if peer is None or peer.removed or peer.scope
                     else replace(peer, transport=event.transport, policy=event.policy)
                 )
             case PeerRemoved():
@@ -3070,6 +3110,10 @@ class State:
                 peer = self.peers[event.peer_id]
                 self.peers[event.peer_id] = replace(
                     peer, token_sha256=event.token_sha256
+                )
+            case PeerOpened():
+                self.peers[event.peer_id] = Peer(
+                    "unix" if event.scope == "local" else "tls", "", scope=event.scope
                 )
             case _:
                 assert_never(event)

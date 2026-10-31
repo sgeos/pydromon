@@ -46,14 +46,18 @@ from datetime import UTC, datetime
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, cast
+from typing import Any, Final, Protocol, cast
 
 from claude_agent_sdk import SdkMcpTool
+from OpenSSL.SSL import Context as OpenSSLContext
 
-from dromon import __version__, exits, peercred, restart
+from dromon import __version__, exits, peercred, registry, restart, runs
 from dromon.federation import (
     NO_FEDERATION,
     PEERS_DIR_NAME,
+    PIN_PATTERN,
+    SCOPE_LOCAL,
+    SCOPE_REMOTE,
     FederationError,
     FederationConfig,
     check_token_store,
@@ -61,6 +65,7 @@ from dromon.federation import (
     format_host_port,
     peer_directories,
     plan_peers,
+    read_identity,
     store_token,
     stored_token,
     unconfined_refusal,
@@ -131,7 +136,9 @@ from dromon.model import (
     DEFAULT_HANDOFF_SECONDS,
     FailoverPolicy,
     PeerKeyed,
+    PeerOpened,
     ProjectOverridden,
+    format_due,
     AgentAccess,
     AgentAddress,
     AgentRegistered,
@@ -155,9 +162,16 @@ from dromon.forwarder import (
     Forwarder,
     announced_name,
     orphaned,
+    registered_connector,
     sent_times,
 )
 from dromon.federation_tls import TLS_HANDSHAKE_TIMEOUT_SECONDS
+from dromon.open_tls import (
+    OpenTlsStream,
+    RawReader,
+    RawWriter,
+    open_server_context,
+)
 from dromon.tls_link import (
     peer_connector,
     pinned_peer,
@@ -262,6 +276,11 @@ class Daemon:
     connect: Connector | None = None
     """How the forwarder reaches a peer, by default ``peer_connector``, which reaches
     each peer over its own transport. Tests give their own."""
+    registry_dir: Path = field(default_factory=registry.default_directory)
+    """The per-user registry of open local federation. Tests give their own."""
+    start_of: registry.StartOf = runs.process_start
+    """When a pid started, by the process table, which tells a live registry entry
+    from a stale one. Tests give their own."""
     successor: list[str] | None = field(default=None, init=False)
     """The options a successor starts with, once a restart is ready to stop."""
     relayer: OperatorRelayer | None = field(default=None, init=False)
@@ -516,7 +535,17 @@ class Daemon:
                 ErrorCode.REJECTED,
                 "hello was already given on this connection",
             )
+        federation = self.project.federation
         keys = HELLO_KEYS - {"token"} if session.pin_sha256 else HELLO_KEYS
+        # On the socket of an open daemon, a hello without a token names its peer by
+        # the registry entry of the announced name, whose pid must be the caller's.
+        registered = (
+            not session.pin_sha256
+            and federation.local_open
+            and frozenset(args) == HELLO_KEYS - {"token"}
+        )
+        if registered:
+            keys = HELLO_KEYS - {"token"}
         if frozenset(args) != keys:
             return _refusal(
                 request.request_id,
@@ -535,11 +564,12 @@ class Daemon:
                 ErrorCode.UNSUPPORTED_VERSION,
                 "no federation version in common",
             )
-        peer_id = (
-            pinned_peer(self.project.federation, self.log.state, session.pin_sha256)
-            if session.pin_sha256
-            else identify(self.log.state, args["token"])
-        )
+        if session.pin_sha256:
+            peer_id = self._pinned(session.pin_sha256, record=True)
+        elif registered:
+            peer_id = self._registered(session, name)
+        else:
+            peer_id = identify(self.log.state, args["token"])
         if peer_id is None:
             print(
                 f"dromond: refused a peer's hello, announced as {name}",
@@ -547,8 +577,60 @@ class Daemon:
             )
             return _refusal(request.request_id, ErrorCode.REJECTED, PEER_REFUSED)
         session.peer_id = peer_id
-        session.token_sha256 = self.log.state.peers[peer_id].token_sha256
+        session.registered = registered
+        session.token_sha256 = (
+            "" if registered else self.log.state.peers[peer_id].token_sha256
+        )
         return Response(request.request_id, ok=True, result={"version": version})
+
+    def _pinned(self, pin: str, *, record: bool) -> str | None:
+        """The peer the key of ``pin`` names. An inbound declared ``tls`` peer's
+        pin names it. Otherwise, while ``remote`` is open, the pin names an open peer
+        of its own, first recorded with ``peer_opened`` when ``record`` is true, unless
+        a declared peer pins that key or bears that name, since a declared table always
+        governs its own peer."""
+        federation = self.project.federation
+        state = self.log.state
+        declared = pinned_peer(federation, state, pin)
+        if declared is not None or not federation.remote_open:
+            return declared
+        if PIN_PATTERN.fullmatch(pin) is None or pin in federation.peers:
+            return None
+        if any(peer.pin_sha256 == pin for peer in federation.peers.values()):
+            return None
+        known = state.peers.get(pin)
+        if known is not None and not known.removed:
+            return pin if known.scope == SCOPE_REMOTE else None
+        if not record:
+            return None
+        self.log.append(PeerOpened(pin, SCOPE_REMOTE, format_due(datetime.now(UTC))))
+        return pin
+
+    def _registered(self, session: "PeerSession", name: str) -> str | None:
+        """The peer that a hello without a token names, by the registry entry
+        ``session.entry`` that ``PeerSession.respond`` found for the announced
+        ``name`` and the caller's pid. An entry whose socket is a declared ``unix``
+        peer's names that peer, whose own table governs. Any other entry names the
+        open peer of its federation name, first recorded with ``peer_opened``, unless
+        a declared peer has that name or the entry is this daemon's own."""
+        entry = session.entry
+        federation = self.project.federation
+        state = self.log.state
+        if entry is None or entry.name != name:
+            return None
+        if _same_path(entry.socket, self.paths.peer_socket):
+            return None
+        for peer_id, peer in sorted(federation.peers.items()):
+            if peer.socket is not None and _same_path(peer.socket, entry.socket):
+                known = state.peers.get(peer_id)
+                return None if known is None or known.removed else peer_id
+        if name in federation.peers or name == federation.name:
+            return None
+        known = state.peers.get(name)
+        if known is not None and not known.removed:
+            return name if known.scope == SCOPE_LOCAL else None
+        self.log.append(PeerOpened(name, SCOPE_LOCAL, format_due(datetime.now(UTC))))
+        return name
 
     def _deliver(self, session: "PeerSession", request: Request) -> Response:
         """Judge one delivery from the connection's peer. The peer's token, or over
@@ -561,10 +643,16 @@ class Daemon:
             )
         peer = self.log.state.peers.get(peer_id)
         if session.pin_sha256:
-            named = pinned_peer(
-                self.project.federation, self.log.state, session.pin_sha256
-            )
+            named = self._pinned(session.pin_sha256, record=False)
             lost = named != peer_id
+        elif session.registered:
+            # The registry named the caller at hello. Its peer is lost when it is
+            # removed, or when no policy governs it any more.
+            lost = (
+                peer is None
+                or peer.removed
+                or self.project.federation.definition(self.log.state, peer_id) is None
+            )
         else:
             lost = (
                 peer is None
@@ -610,13 +698,23 @@ class Daemon:
             sent_times(read_entries(self.paths.event_log), waiting) if waiting else {}
         )
         store = self.paths.state_dir / PEERS_DIR_NAME
+
+        async def locate(name: str) -> Path | None:
+            entry = await asyncio.to_thread(
+                registry.live_entry, self.registry_dir, name, self.start_of
+            )
+            return None if entry is None else entry.socket
+
         forwarder = Forwarder(
             self.scheduler,
             federation,
-            (
-                peer_connector(self.paths.state_dir, store)
-                if self.connect is None
-                else self.connect
+            registered_connector(
+                (
+                    peer_connector(self.paths.state_dir, store)
+                    if self.connect is None
+                    else self.connect
+                ),
+                locate,
             ),
             lambda peer_id: _outbound_token(store, peer_id),
             announced_name(self.paths.root, self.scheduler.discloses),
@@ -1834,9 +1932,51 @@ class PeerSession:
     pin_sha256: str = ""
     """Over TLS, the pin of the key the peer presented in its handshake, which names
     it at ``hello`` and again at each ``deliver``. Empty on the socket."""
+    peer_pid: int | None = None
+    """On the socket, the pid of the connecting process, which open local federation
+    matches against the registry, or ``None`` when it could not be read."""
+    entry: registry.Entry | None = None
+    """The live registry entry of the name a hello without a token announced, whose
+    pid is ``peer_pid``, found before ``hello`` is judged."""
+    registered: bool = False
+    """Whether ``hello`` named the peer by the registry rather than a token or pin."""
 
     async def respond(self, line: bytes) -> Response:
+        if self.peer_id is None and self.peer_pid is not None:
+            await self._find_entry(line)
         return self.daemon.respond_peer(self, line)
+
+    async def _find_entry(self, line: bytes) -> None:
+        """Find the registry entry a hello without a token claims, in a worker
+        thread, since telling a live entry from a stale one reads the process table.
+        Only an open daemon looks, and only for a well-formed name."""
+        self.entry = None
+        if not self.daemon.project.federation.local_open:
+            return
+        try:
+            document = json.loads(line)
+        except ValueError:
+            return
+        if not isinstance(document, dict):
+            return
+        args = cast(dict[str, object], document).get("args")
+        if not isinstance(args, dict):
+            return
+        name = cast(dict[str, object], args).get("name")
+        if not isinstance(name, str) or ID_PATTERN.fullmatch(name) is None:
+            return
+        if "token" in cast(dict[str, object], args):
+            return
+        pid = self.peer_pid
+        if pid is None:
+            return
+        self.entry = await asyncio.to_thread(
+            registry.find,
+            self.daemon.registry_dir,
+            name,
+            pid,
+            self.daemon.start_of,
+        )
 
 
 def correlation_totals(state: State, key: str) -> dict[str, object]:
@@ -2057,7 +2197,29 @@ def _text_args(args: dict[str, object], names: tuple[str, ...]) -> tuple[str, ..
     return tuple(values)
 
 
-async def _write(writer: asyncio.StreamWriter, response: Response) -> None:
+class PeerReader(Protocol):
+    """What a peer connection reads from, an ``asyncio`` stream or the open
+    listener's ``OpenTlsStream``."""
+
+    async def readline(self) -> bytes: ...
+
+    async def read(self, n: int = -1) -> bytes: ...
+
+
+class PeerWriter(Protocol):
+    """What a connection writes answers to, an ``asyncio`` stream or the open
+    listener's ``OpenTlsStream``."""
+
+    def write(self, data: bytes) -> None: ...
+
+    async def drain(self) -> None: ...
+
+    def close(self) -> None: ...
+
+    async def wait_closed(self) -> None: ...
+
+
+async def _write(writer: PeerWriter, response: Response) -> None:
     """Write ``response``, or, when it cannot be encoded, such as a result over the
     line limit or one holding a float, an internal error that names the request, so
     the client learns why instead of finding the connection closed."""
@@ -2134,7 +2296,7 @@ class LineReader:
     limit can stay small. The peer socket's stream is limited to the ``hello`` line,
     and an identified peer's larger lines are read through this."""
 
-    def __init__(self, reader: asyncio.StreamReader, limit: int) -> None:
+    def __init__(self, reader: PeerReader, limit: int) -> None:
         self._reader = reader
         self._limit = limit
         self._buffer = bytearray()
@@ -2163,8 +2325,8 @@ class LineReader:
 
 async def peer_connection(
     daemon: Daemon,
-    reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
+    reader: PeerReader,
+    writer: PeerWriter,
     session: "PeerSession",
 ) -> None:
     """Serve one connection on the peer socket. Its first line must arrive within
@@ -2240,7 +2402,32 @@ async def tls_peer_connection(
     await peer_connection(daemon, reader, writer, PeerSession(daemon, pin_sha256=pin))
 
 
-async def _closed(writer: asyncio.StreamWriter) -> None:
+async def open_tls_peer_connection(
+    daemon: Daemon,
+    reader: RawReader,
+    writer: RawWriter,
+    context: OpenSSLContext,
+) -> None:
+    """Serve one connection on the open TLS listener, which ``remote = "open"``
+    makes. The handshake must finish within ``TLS_HANDSHAKE_TIMEOUT_SECONDS`` and
+    present a self-signed Ed25519 key, which ``dromon.open_tls`` judges, before any
+    frame is read. The key's pin then names the peer, a declared one whose pin it is
+    or else an open peer of its own, as ``Daemon._pinned`` decides at ``hello``."""
+    stream = OpenTlsStream(context, reader, writer, MAX_HELLO_LINE_BYTES)
+    try:
+        pin = await asyncio.wait_for(stream.handshake(), TLS_HANDSHAKE_TIMEOUT_SECONDS)
+    except (OSError, TimeoutError) as error:
+        # ``OpenTlsError`` is a ``ConnectionError``, so an ``OSError``.
+        print(
+            f"dromond: refused an open tls connection, its handshake failed: {error!r}",
+            file=sys.stderr,
+        )
+        await _closed(writer)
+        return
+    await peer_connection(daemon, stream, stream, PeerSession(daemon, pin_sha256=pin))
+
+
+async def _closed(writer: PeerWriter) -> None:
     writer.close()
     with contextlib.suppress(OSError):
         await writer.wait_closed()
@@ -2487,7 +2674,10 @@ async def serve(daemon: Daemon) -> None:
                         writer,
                         own_uid,
                         lambda: peer_connection(
-                            daemon, reader, writer, PeerSession(daemon)
+                            daemon,
+                            reader,
+                            writer,
+                            PeerSession(daemon, peer_pid=_peer_pid(writer)),
                         ),
                     ),
                 )
@@ -2546,6 +2736,28 @@ async def serve(daemon: Daemon) -> None:
             loop.remove_signal_handler(signum)
 
 
+def admitted_network(
+    federation: FederationConfig, writer: asyncio.StreamWriter
+) -> bool:
+    """Whether a connection to the TLS listener comes from ``allowed_networks``,
+    judged by its address before it counts under the cap and before its handshake,
+    so a refused one costs neither a slot nor a handshake. A connection whose address
+    cannot be read is refused while the list is set."""
+    if not federation.allowed_networks:
+        return True
+    peer: object = writer.get_extra_info("peername")
+    host: object = (
+        cast(tuple[object, ...], peer)[0] if isinstance(peer, tuple) and peer else None
+    )
+    if isinstance(host, str) and federation.admits(host):
+        return True
+    print(
+        f"dromond: refused a tls connection from {host}, outside allowed_networks",
+        file=sys.stderr,
+    )
+    return False
+
+
 async def _listen_tls(
     daemon: Daemon, cap: ConnectionCap, writers: set[asyncio.StreamWriter]
 ) -> asyncio.Server | None:
@@ -2559,9 +2771,7 @@ async def _listen_tls(
         return None
     where = format_host_port(federation.tls_listen)
     try:
-        context = server_context_for(
-            daemon.paths.state_dir, daemon.paths.state_dir / PEERS_DIR_NAME, federation
-        )
+        serving = tls_serving(daemon)
     except (FederationError, OSError) as error:
         print(f"dromond: nothing listens over tls on {where}: {error}", file=sys.stderr)
         return None
@@ -2569,13 +2779,12 @@ async def _listen_tls(
     async def accept(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        if not admitted_network(federation, writer):
+            writer.close()
+            return
         writers.add(writer)
         try:
-            await cap.admit(
-                writer,
-                lambda: tls_peer_connection(daemon, reader, writer, context),
-                answer=False,
-            )
+            await cap.admit(writer, lambda: serving(reader, writer), answer=False)
         finally:
             writers.discard(writer)
 
@@ -2590,6 +2799,45 @@ async def _listen_tls(
         return None
     print(f"dromond: peers may connect over tls on {where}", file=sys.stderr)
     return server
+
+
+type TlsServing = Callable[
+    [asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]
+]
+"""Serves one connection the TLS listener has admitted, from its handshake on."""
+
+
+def tls_serving(daemon: Daemon) -> TlsServing:
+    """How the TLS listener serves each connection. With ``remote = "open"`` it is
+    ``open_tls_peer_connection`` over pyOpenSSL, for declared and undeclared keys
+    alike, since one port cannot hold two TLS stacks. Otherwise it is the standard
+    library's allowlist listener, unchanged. Raises ``FederationError`` or ``OSError``
+    when the context cannot be built, such as for a missing identity."""
+    federation = daemon.project.federation
+    store = daemon.paths.state_dir / PEERS_DIR_NAME
+    if federation.remote_open:
+        identity = read_identity(store)
+        if identity is None:
+            raise FederationError(
+                "this daemon has no identity to present over tls, which dromon peer"
+                " key makes"
+            )
+        opened = open_server_context(identity)
+
+        def open_serving(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> Awaitable[None]:
+            return open_tls_peer_connection(daemon, reader, writer, opened)
+
+        return open_serving
+    context = server_context_for(daemon.paths.state_dir, store, federation)
+
+    def pinned_serving(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> Awaitable[None]:
+        return tls_peer_connection(daemon, reader, writer, context)
+
+    return pinned_serving
 
 
 def successor_args(overrides: Overrides, hold_wakes: bool) -> list[str]:
@@ -2633,12 +2881,30 @@ def start_successor(paths: ProjectPaths, args: Sequence[str]) -> int:
     return exits.OK
 
 
+def _peer_pid(writer: asyncio.StreamWriter) -> int | None:
+    """The pid of the process that connected to the peer socket, or ``None``."""
+    try:
+        return peercred.peer_pid(
+            cast(peercred.CredentialSocket, writer.get_extra_info("socket"))
+        )
+    except peercred.PeerCredentialError:
+        return None
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    """Whether two paths name one file, compared by their resolved spelling, since a
+    socket that is not yet made or is gone cannot be compared by its inode."""
+    return os.path.realpath(left) == os.path.realpath(right)
+
+
 class ProjectMismatch(Exception):
     """The project file and the event log disagree on something that cannot change."""
 
 
 def protected_dirs(
-    paths: ProjectPaths, federation: FederationConfig = NO_FEDERATION
+    paths: ProjectPaths,
+    federation: FederationConfig = NO_FEDERATION,
+    registry_dir: Path | None = None,
 ) -> tuple[Path, ...]:
     """The directories every enabled sandbox denies, which hold the event log, the
     project file and the daemon's socket, followed by each declared peer's, which hold
@@ -2646,9 +2912,126 @@ def protected_dirs(
     project's own directories, or two peers share one."""
     own = (paths.state_dir.resolve(), paths.runtime_dir.resolve())
     try:
-        return own + peer_directories(federation, own)
+        found = own + peer_directories(federation, own)
     except FederationError as error:
         raise ConfigError(str(error)) from error
+    # The registry of open local federation, which a line that could write it could
+    # use to pass for a daemon. Each registered project's own directories are read
+    # at each engine build, by ``registry_protected``.
+    if federation.local_open:
+        directory = registry_dir or registry.default_directory()
+        found = (*found, Path(os.path.realpath(directory)))
+    return found
+
+
+def open_federation(
+    scheduler: Scheduler,
+    log: EventLog,
+    federation: FederationConfig,
+    directory: Path | None = None,
+) -> None:
+    """Give the scheduler what open federation needs at each use, the open peers'
+    turns per hour from ``[federation.open]`` and, while ``local`` is open, whether a
+    name is registered."""
+
+    def turns(peer_id: str) -> int:
+        definition = federation.definition(log.state, peer_id)
+        return 0 if definition is None else definition.turns_per_hour
+
+    scheduler.peer_turns.open_allowance = turns
+    if not federation.local_open:
+        return
+    where = directory or registry.default_directory()
+
+    def registered(name: str) -> bool:
+        try:
+            registry.check_directory(where)
+        except registry.RegistryError:
+            return False
+        return registry.read_entry(where, name) is not None
+
+    scheduler.registered = registered
+
+
+def registry_protected(
+    paths: ProjectPaths, federation: FederationConfig, directory: Path
+) -> Callable[[], tuple[Path, ...]] | None:
+    """While ``local`` is open, what reads every registered project's runtime and
+    state directories, live or stale, other than this project's own, for each engine
+    build. **Decided by core, for the operator's review.** They are read at each
+    build rather than at start, so a project registered after this daemon started is
+    denied from each line's next turn. A turn already running keeps the sandbox it
+    started with. A registry that cannot be read, or holds more entries than it may,
+    raises ``ConfigError``, which ends the turn before anything runs."""
+    if not federation.local_open:
+        return None
+    own = {
+        os.path.realpath(paths.state_dir),
+        os.path.realpath(paths.runtime_dir),
+    }
+
+    def read() -> tuple[Path, ...]:
+        try:
+            found = registry.entries(directory)
+        except registry.RegistryError as error:
+            raise ConfigError(f"the open-federation registry: {error}") from error
+        dirs: dict[str, Path] = {}
+        for entry in found:
+            for each in entry.directories():
+                real = os.path.realpath(each)
+                if real not in own:
+                    dirs[real] = Path(real)
+        return tuple(dirs[key] for key in sorted(dirs))
+
+    return read
+
+
+def open_registration(
+    paths: ProjectPaths,
+    federation: FederationConfig,
+    directory: Path,
+    discloses: Callable[[str], bool],
+    start_of: registry.StartOf,
+) -> registry.Entry | None:
+    """Register this daemon in the open-federation registry while ``local`` is open,
+    with the pid and start time the process table gives it, and say the entry, or
+    ``None`` when the project is not open. Raises ``FederationError`` when the
+    registry is refused, the name is held by a live daemon, the name is on the
+    disclosure list, which it would leave the project through, or the registry lies
+    in the project, where a line could reach it."""
+    if not federation.local_open or federation.name is None:
+        return None
+    name = federation.name
+    if discloses(name):
+        raise FederationError(
+            "federation.name is on the disclosure list, and an open daemon gives it"
+            " to every registered project"
+        )
+    root = paths.root.resolve()
+    real = Path(os.path.realpath(directory))
+    if real == root or root in real.parents:
+        raise FederationError(
+            f"the open-federation registry {real} lies inside the project {root}"
+        )
+    pid = os.getpid()
+    try:
+        started = start_of(pid)
+    except Exception as error:
+        raise FederationError(
+            f"the process table cannot give this daemon's start time: {error}"
+        ) from error
+    if started is None:
+        raise FederationError("the process table does not list this daemon")
+    try:
+        entry = registry.Entry(name, paths.peer_socket, root, pid, started)
+        registry.register(directory, entry, start_of)
+    except registry.RegistryError as error:
+        raise FederationError(str(error)) from error
+    print(
+        f"dromond: registered for open local federation as {name} in {directory}",
+        file=sys.stderr,
+    )
+    return entry
 
 
 def check_plugins(config: LineConfig) -> None:
@@ -2998,6 +3381,9 @@ def run(
                     line_secrets=line_secrets,
                     line_git_ssh=line_git_ssh,
                     read_only_paths=config.read_only_paths,
+                    extra_protected=registry_protected(
+                        paths, config.federation, registry.default_directory()
+                    ),
                 ),
                 limits=limits,
                 default_operator=operator,
@@ -3031,6 +3417,7 @@ def run(
                     for peer_id, peer in config.federation.peers.items()
                 }
             )
+            open_federation(scheduler, log, config.federation)
             teacher = start_teacher(config, paths)
             try:
                 daemon = Daemon(
@@ -3052,7 +3439,18 @@ def run(
                 # Checked here as well as in ``serve``, so a refused relay stops the
                 # start before any socket is made.
                 daemon.relay_routes(config)
-                asyncio.run(serve(daemon))
+                entry = open_registration(
+                    paths,
+                    config.federation,
+                    daemon.registry_dir,
+                    scheduler.discloses,
+                    daemon.start_of,
+                )
+                try:
+                    asyncio.run(serve(daemon))
+                finally:
+                    if entry is not None:
+                        registry.unregister(daemon.registry_dir, entry)
                 successor = daemon.successor
             finally:
                 if teacher is not None:
