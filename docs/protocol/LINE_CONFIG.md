@@ -163,7 +163,7 @@ argument outside a tool's schema is refused.
 | `propose_change` | Records a proposed patch, file list and message for operator review; it does not change project files |
 | `read_instructions` | Shows the instructions the line's next turn receives, as below |
 | `write_scratch` | Writes a file under the line's scratch in its working directory, `tmp/` or `tmp/lines/LINE`, as below |
-| `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term or the file that matched. Files are checked independently, so a match cannot span files. The combined content is at most 1 MiB. One call, including a list, spends one recorded check, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. Added on 2026-10-28 |
+| `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term, a file name or a line location. Files are checked independently, so a match cannot span files. The combined content is at most 1 MiB. One call, including a list, spends one recorded check, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. Added on 2026-10-28 |
 | `list_processes`, `stop_process` | List and stop the processes the line started, as below |
 
 **Issues.** **Round 11, item 3, decided by core for review on 2026-10-31.** A line
@@ -739,9 +739,9 @@ to read the result.
   identifier its note will carry, as [`CLIENT.md`](CLIENT.md) specifies.
 
 **Disclosure guard.** When the project names a disclosure list, a refused tool call
-names the field that contains a listed term, such as `body` or `note`, without naming
-the term or its position. If several fields contain a listed term, all such field names
-are reported. The refusal records nothing and counts against the same hourly limit as
+names a field such as `body` or `note` only when the call offers text in that one
+field. Calls offering several text fields receive a generic refusal, even if only
+one matches. Neither answer names the term or its position. The refusal records a disclosure check and counts against the same hourly limit as
 `check_disclosure`, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. A wake note
 is checked again when it fires.
 
@@ -1898,3 +1898,16 @@ so it never enters the event log and no client or line can set it. Added on
 ## Not yet specified
 
 - References to secrets held in files or a keychain rather than the environment.
+
+## Runtime lifecycle options
+
+`dromon create` and `dromon configure` accept `--workdir-access read` or `write`,
+`--keep-session` and `--no-keep-session`, `--allow-compact` and `--no-allow-compact`,
+`--keep-session-idle-seconds`, `--keep-session-max-seconds`,
+`--keep-session-hard-seconds`, `--keep-session-at-max` and `--auto-compact-tokens`.
+Values use the same validation and engine restrictions as the corresponding project
+line keys. The at maximum policy is `close`, `ask` or `keep`.
+
+Accepted disclosure occurrences apply to files checked through `check_disclosure`.
+They do not exempt messages or text checks. The operator sets them as described in
+[`PROJECT_CONFIG.md`](PROJECT_CONFIG.md).

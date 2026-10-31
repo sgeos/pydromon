@@ -2008,6 +2008,7 @@ class Scheduler:
         """Each undelivered message to a line that repeats an earlier one, and that
         earlier message, until the repeat is delivered."""
         self._disclosure: tuple[str, ...] = ()
+        self._disclosure_accepted: dict[str, tuple[str, ...]] = {}
         """The project's disclosure terms, case folded. Never logged or returned."""
         self._lease_names: frozenset[str] = frozenset()
         self._lease_ttl = DEFAULT_LEASE_TTL_SECONDS
@@ -2362,6 +2363,22 @@ class Scheduler:
                 " operator's own. Restore the file, or restart the daemon so that"
                 " it checks the file again, before resuming the line"
             )
+
+    def set_disclosure_accepted(self, entries: Mapping[str, tuple[str, ...]]) -> None:
+        """Replace operator accepted occurrences on startup and reload."""
+        self._disclosure_accepted = dict(entries)
+
+    def _checked_matches(self, line_id: str, path: str | None, text: str) -> int:
+        accepted: tuple[str, ...] = ()
+        if path is not None and self._root is not None:
+            workdir = self.effective_config(line_id).workdir or "."
+            file = (self._root / workdir / path).resolve()
+            try:
+                relative = file.relative_to(self._root.resolve()).as_posix()
+            except ValueError:
+                relative = ""
+            accepted = self._disclosure_accepted.get(relative, ())
+        return disclosure.matching_lines(self._disclosure, text, accepted)
 
     def set_disclosure_terms(self, terms: Sequence[str]) -> None:
         """Replace the disclosure terms the tools check, already case folded."""
@@ -5068,14 +5085,14 @@ class Scheduler:
                     line_id, file_path, MAX_CHECKED_BYTES - total_bytes
                 )
                 total_bytes += len(file_bytes)
-                matched_lines += disclosure.matching_lines(
-                    self._disclosure, file_bytes.decode("utf-8", "replace")
+                matched_lines += self._checked_matches(
+                    line_id, file_path, file_bytes.decode("utf-8", "replace")
                 )
         else:
             if path is not None:
                 text = self._read_checked(line_id, path).decode("utf-8", "replace")
             checked_text = cast(str, text)
-            matched_lines = disclosure.matching_lines(self._disclosure, checked_text)
+            matched_lines = self._checked_matches(line_id, path, checked_text)
         matched = min(matched_lines, MAX_DISCLOSURE_MATCHES)
         self._log.append(DisclosureChecked(line_id, format_due(now), matched))
         recent = self._log.state.disclosure_checks[line_id]
@@ -5160,12 +5177,17 @@ class Scheduler:
         parts = Path(path).parts
         if ".." in parts or not parts:
             raise LineToolRefused("path may not contain ..")
-        root = Path(os.path.realpath(self._workdir_of(line_id)))
+        try:
+            root = Path(os.path.realpath(self._workdir_of(line_id)))
+        except LineToolRefused as error:
+            raise LineToolRefused("cannot resolve the working directory") from error
         candidate = root.joinpath(*parts)
         for directory in self._protected:
             guarded = Path(os.path.realpath(directory))
             if candidate == guarded or guarded in candidate.parents:
-                raise LineToolRefused(f"{path} is in a directory Dromon protects")
+                raise LineToolRefused(
+                    "the supplied file is in a directory Dromon protects"
+                )
         try:
             parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
         except OSError as error:
@@ -5184,7 +5206,8 @@ class Scheduler:
             )
         except OSError as error:
             raise LineToolRefused(
-                f"cannot read {path}: {error.strerror or type(error).__name__}"
+                "cannot read the supplied file: "
+                f"{error.strerror or type(error).__name__}"
             ) from error
         finally:
             os.close(parent)
@@ -5193,17 +5216,19 @@ class Scheduler:
         facts = os.fstat(descriptor)
         if not stat.S_ISREG(facts.st_mode):
             os.close(descriptor)
-            raise LineToolRefused(f"{path} is not a regular file")
+            raise LineToolRefused("the supplied file is not a regular file")
         if facts.st_nlink != 1 or facts.st_uid != os.getuid():
             os.close(descriptor)
-            raise LineToolRefused(f"{path} has more than one name or another owner")
+            raise LineToolRefused(
+                "the supplied file has more than one name or another owner"
+            )
         with os.fdopen(descriptor, "rb") as handle:
             raw = handle.read(max_bytes + 1)
         if len(raw) > max_bytes:
             raise LineToolRefused(
                 f"the checked files are over {MAX_CHECKED_BYTES} bytes combined"
                 if max_bytes < MAX_CHECKED_BYTES
-                else f"{path} is over {MAX_CHECKED_BYTES} bytes"
+                else f"the supplied file is over {MAX_CHECKED_BYTES} bytes"
             )
         return raw
 

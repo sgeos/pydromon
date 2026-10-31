@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import time
+import tomllib
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from pathlib import Path
 from typing import Final, cast
@@ -726,7 +727,21 @@ def _config_document(arguments: argparse.Namespace) -> dict[str, object] | None:
         instructions,
         prompt,
     )
-    if not any(given) and effort is None and workdir is None:
+    lifecycle = {
+        name: getattr(arguments, name, None)
+        for name in (
+            "workdir_access",
+            "keep_session",
+            "keep_session_idle_seconds",
+            "keep_session_max_seconds",
+            "keep_session_at_max",
+            "keep_session_hard_seconds",
+            "allow_compact",
+            "auto_compact_tokens",
+        )
+        if getattr(arguments, name, None) is not None
+    }
+    if not any(given) and effort is None and workdir is None and not lifecycle:
         return None
     document: dict[str, object] = {
         "builtin_tools": tools,
@@ -734,6 +749,7 @@ def _config_document(arguments: argparse.Namespace) -> dict[str, object] | None:
         "tool_policy": "allow_all" if allow_all else "allowlist",
         "inherit_account_mcp": inherit,
     }
+    document.update(lifecycle)
     if mcp_file is not None:
         document["mcp_servers"] = json.loads(mcp_file.read_text(encoding="utf-8"))
     if sandbox_file is not None:
@@ -779,6 +795,13 @@ def _create(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         args["config"] = config
     if arguments.session is not None:
         args["engine_session"] = arguments.session
+    limits = {
+        name: getattr(arguments, name)
+        for name in ("max_autonomous_turns", "max_cost_usd", "cooldown_seconds")
+        if getattr(arguments, name) is not None
+    }
+    if limits:
+        args["limits"] = limits
     return _request(paths, "create", Operation.CREATE_LINE, args)
 
 
@@ -1189,6 +1212,40 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             f" keep alive {teacher.keep_alive},"
             + (" autostart" if teacher.autostart else " started with dromon teacher up")
         )
+    print(
+        f"daemon: operator {config.operator}, tick_seconds {config.tick_seconds},"
+        f" require_sandbox {config.require_sandbox}"
+    )
+    print(
+        f"federation: local {config.federation.local},"
+        f" remote {config.federation.remote},"
+        f" listen {config.federation.listen}, tls_listen {config.federation.tls_listen}"
+    )
+    print(f"federation policy: {config.federation}")
+    raw_document = tomllib.loads(file.read_text(encoding="utf-8"))
+    for name in sorted(cast(dict[str, object], raw_document.get("profiles", {}))):
+        print(f"profile {name}: validated")
+    for name, hashes in sorted(config.disclosure_accepted.items()):
+        print(f"disclosure accepted {name}: {len(hashes)} exact line hashes")
+    print(f"agents: {config.agents}")
+    print(f"read_only_paths: {', '.join(config.read_only_paths) or 'none'}")
+    print(
+        f"leases: {', '.join(config.lease_names) or 'none'},"
+        f" ttl_seconds {config.lease_ttl_seconds}"
+    )
+    for name, command in sorted(config.run_commands.items()):
+        print(f"run {name}: {command}")
+    for name, relay in sorted(config.relays.relays.items()):
+        print(
+            f"relay {name}: {relay.kind}, path {relay.path}, command {relay.command},"
+            f" timeout_seconds {relay.timeout_seconds}"
+        )
+    for operator, relay in sorted(config.relays.routes.items()):
+        print(f"operator {operator}: relay {relay}")
+    for name, role in sorted(config.roles.items()):
+        print(f"role {name}: {role}")
+    for name, peer in sorted(config.federation.peers.items()):
+        print(f"peer {name}: {peer}")
     for line_id, line in sorted(config.lines.items()):
         line_settings = engine_settings.merge([config.settings, line.config.settings])
         line_sandbox = merge([config.sandbox, line.config.sandbox])
@@ -2529,6 +2586,21 @@ def _add_tool_options(command: argparse.ArgumentParser) -> None:
         help="the directory the line's engine runs in, relative to the project root,"
         " default the project root",
     )
+    command.add_argument("--workdir-access", choices=("read", "write"))
+    command.add_argument(
+        "--keep-session", action=argparse.BooleanOptionalAction, default=None
+    )
+    command.add_argument(
+        "--allow-compact", action=argparse.BooleanOptionalAction, default=None
+    )
+    for option in (
+        "keep-session-idle-seconds",
+        "keep-session-max-seconds",
+        "keep-session-hard-seconds",
+        "auto-compact-tokens",
+    ):
+        command.add_argument("--" + option, type=int)
+    command.add_argument("--keep-session-at-max", choices=("close", "keep", "ask"))
     command.add_argument(
         "--effort",
         choices=EFFORTS,
@@ -2750,6 +2822,9 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("line_id", help="the line's identifier")
             _add_tool_options(command)
         if name == "create":
+            command.add_argument("--max-autonomous-turns", type=int)
+            command.add_argument("--max-cost-usd")
+            command.add_argument("--cooldown-seconds")
             command.add_argument(
                 "--session",
                 default=None,
