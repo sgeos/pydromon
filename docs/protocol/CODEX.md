@@ -111,7 +111,14 @@ the observed `usageLimitExceeded` shape above may fail a role over.
 ## Tools across threads
 
 For `workdir_access: read`, the `dromon-line` permission profile marks the working
-directory read-only and grants writes only to its `tmp` subdirectory. This setting is
+directory read-only and grants writes only to the line's own scratch, `tmp/lines/LINE`,
+by its real path, which the daemon creates before the engine starts, walking each
+component without following a link. **Changed on 2026-10-31, round 10 re-review, N2.**
+The profile granted the whole of `tmp` before, which is the owner's scratch in a
+role's worktree, so a read-only seat could write the owner's files there.
+**Assumption, not probed.** Codex grants a directory inside a read workspace root by
+its absolute path, as it does for `writable_paths`. An operator probe should confirm
+that a read line can write its own scratch and not `tmp/` beside it. This setting is
 part of the stored thread fingerprint, so a resumed thread with different access is
 replaced before a turn starts.
 

@@ -7,6 +7,25 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- A line that does not write its working directory, a seat that does not own its
+  role among them, has a scratch of its own, `tmp/lines/LINE`, for `write_scratch`
+  and for the Codex read profile, which granted the whole of `tmp/` before. Either
+  let a read-only seat, or a line with no writing tool, write a file of the owner's
+  scratch, which stays `tmp/`. The tool's description says where each scratch is.
+  Round 10 re-review, N1 and N2. **Behaviour change.** A line that is no role's seat
+  and has no writing tool now writes under `tmp/lines/LINE` too, so its reports move
+  there.
+- A seat on an engine that cannot confine it, such as Grok, whose turn began while
+  its role was vacant, no longer runs on beside a seat that then takes the role or is
+  given it. The new owner's first turn waits for that turn, and for the seat's kept
+  connection to close. Round 10 re-review, N3.
+- A role's worktree inside another role's, or holding it, is refused as a shared one
+  is, by `dromon role create` and `update` and in the project file, and a line that
+  could write a directory inside an owned worktree, or one holding it, is refused or
+  held as one in the worktree is. Round 10 re-review, N4. **Rollout hazard.** A
+  project file with a role on the project root and another below it, or with a
+  writing line on the root beside an owned role below it, is now refused whole at a
+  start or a reload.
 - A seat that does not own its role is built with its role's worktree read only on
   Claude Code and Codex, the engines that can confine it. The confining engines were
   derived from the capability table, but the step that applies a seat's read access

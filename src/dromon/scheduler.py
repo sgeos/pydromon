@@ -225,6 +225,7 @@ from dromon.roles import (
     RolePlace,
     RoleWanted,
     file_differences,
+    overlapping,
     placement_refusal,
     shared_worktree,
     shared_worktree_refusal,
@@ -495,6 +496,12 @@ MIN_RATE_SECONDS: Final = 60
 
 MAX_SCRATCH_BYTES: Final = 256 * 1024
 SCRATCH_DIRECTORY: Final = "tmp"
+LINES_SCRATCH_DIRECTORY: Final = "lines"
+"""**Round 10 re-review, N1 and N2.** The directory under ``tmp/`` that holds a scratch
+of its own, ``tmp/lines/LINE``, for each line that does not write its working
+directory, so such a line never writes a file of the line that does, such as a role's
+owner, whose scratch is ``tmp/`` itself. A line's identifier matches ``ID_PATTERN``, so
+it is one path component."""
 
 MAX_DIGEST_BYTES: Final = 16 * 1024 * 1024
 """The largest task output ``task_recorded`` digests. A larger one is recorded with no
@@ -819,7 +826,7 @@ WRITE_SCRATCH_SCHEMA: Final[dict[str, object]] = {
     "properties": {
         "path": {
             "type": "string",
-            "description": "A path relative to tmp/ in your working directory",
+            "description": "A path relative to your scratch directory",
         },
         "text": {"type": "string", "description": "The file's whole new content"},
     },
@@ -1355,6 +1362,11 @@ def engine_factory(
                     "Codex lines take no sandbox or settings, and the project file"
                     " sets one for every line"
                 )
+            scratch = (
+                own_scratch(workdir, spec.line_id)
+                if spec.config.workdir_access is WorkdirAccess.READ
+                else None
+            )
             return CodexLine(
                 driver,
                 workdir,
@@ -1371,6 +1383,7 @@ def engine_factory(
                 ceiling_reached=spec.ceiling_reached,
                 ceiling_settled=spec.ceiling_settled,
                 credits_spent=spec.credits_spent,
+                scratch=scratch,
             )
         if driver.settings.engine == grok.ENGINE_NAME:
             if spec.config.writable_paths:
@@ -1852,10 +1865,10 @@ class Scheduler:
         """What each role's operator was last told of a failover that found no seat,
         so the same is not told at every turn's end. Lost at a restart, after which
         it is told once again."""
-        self._turn_owned: set[str] = set()
-        """Lines whose turn in flight started while they owned their role, so their
-        engine was built as the role's writer. No other seat's turn as owner starts
-        while one runs, so a role never has two writers."""
+        self._writer_turns: set[str] = set()
+        """Seats whose turn in flight started as a writer of their role's worktree,
+        as ``_turn_writes`` judges it. No other seat's turn as owner starts while one
+        runs, so a role never has two writers."""
         self._closing_writer: dict[str, asyncio.Task[None]] = {}
         """The closing of a former owner's kept engine connection, which the new
         owner's first turn waits for, since a kept connection's background tasks
@@ -4325,12 +4338,37 @@ class Scheduler:
             " operator restarts the daemon."
         )
 
+    def scratch_parts(self, line_id: str) -> tuple[str, ...]:
+        """The components, relative to ``line_id``'s working directory, of the
+        scratch ``write_scratch`` writes for it. **Round 10 re-review, N1.** That is
+        ``tmp/`` for a role's owner and for a line that is not a seat and could write
+        its working directory, as ``line_place`` judges it, and ``tmp/lines/LINE``
+        for every other line, a seat that does not own its role among them, whatever
+        its engine. **Decided by core on 2026-10-31, for review.** An owner keeps
+        ``tmp/`` even with no writing tool, since it holds the role's write ownership
+        and its reports stay where they were. A line's scratch moves when it gains or
+        loses its role or a writing tool. **Default deny.** A line whose directory
+        does not resolve has a scratch of its own."""
+        state = self._log.state
+        seat = state.seats.get(line_id)
+        if seat is not None:
+            writes = state.roles[seat.role_id].owner == line_id
+        else:
+            place = self.line_place(
+                self.effective_config(line_id), self.model_of(line_id), None
+            )
+            writes = place is not None and place.writes
+        if writes:
+            return (SCRATCH_DIRECTORY,)
+        return (SCRATCH_DIRECTORY, LINES_SCRATCH_DIRECTORY, line_id)
+
     def write_scratch(self, line_id: str, path: str, text: str) -> str:
-        """Write ``text`` to ``path`` under ``tmp/`` in the line's working directory,
-        creating directories, and return the path written, relative to the working
-        directory. Refused for an absolute path, ``..``, a path that resolves outside
-        ``tmp/``, a target that is a symbolic link or a directory, text over
-        ``MAX_SCRATCH_BYTES``, and text the disclosure list covers."""
+        """Write ``text`` to ``path`` under the line's scratch in its working
+        directory, as ``scratch_parts`` gives it, creating directories, and return the
+        path written, relative to the working directory. Refused for an absolute path,
+        ``..``, a path that resolves outside the scratch, a target that is a symbolic
+        link or a directory, text over ``MAX_SCRATCH_BYTES``, and text the disclosure
+        list covers."""
         if not path or "\x00" in path or path.startswith(("/", "~")):
             raise LineToolRefused("path must be a relative path under tmp/")
         parts = Path(path).parts
@@ -4343,6 +4381,7 @@ class Scheduler:
         if refusal is not None:
             raise LineToolRefused(refusal)
         workdir = self._workdir_of(line_id)
+        scratch = self.scratch_parts(line_id)
         # Every component is opened relative to its parent's descriptor without
         # following links, so no link swapped in at any level can redirect the
         # write, however the race falls.
@@ -4353,7 +4392,7 @@ class Scheduler:
                 f"cannot open the working directory: {error.strerror}"
             ) from error
         try:
-            names = [SCRATCH_DIRECTORY, *parts[:-1]]
+            names = [*scratch, *parts[:-1]]
             for index, name in enumerate(names):
                 entered = _enter(parent, name, path, scratch_root=index == 0)
                 os.close(parent)
@@ -4375,7 +4414,7 @@ class Scheduler:
             os.close(parent)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
-        return f"{SCRATCH_DIRECTORY}/{Path(*parts)}"
+        return str(Path(*scratch, *parts))
 
     def check_disclosure(
         self,
@@ -4990,12 +5029,28 @@ class Scheduler:
         one's next turn is built with its new access. The former owner's kept
         connection closes before the new owner's first turn starts. A successor by a
         handoff is awakened and sent a note from the former owner, which wakes it once
-        the former owner's turn has ended."""
-        for line_id in (plan.previous, plan.owner):
+        the former owner's turn has ended.
+
+        **Round 10 re-review, N3.** A role that gains an owner also drops the engine
+        of each other seat whose engine cannot confine it, since such a seat may
+        have been built with its own access while the role was vacant, and its kept
+        connection closes before the new owner's first turn too. Its next turn waits,
+        as ``waits_unconfined`` says."""
+        unconfined = (
+            ()
+            if plan.owner is None
+            else tuple(
+                line_id
+                for line_id in seat_order(self._log.state, plan.role_id)
+                if line_id not in (plan.previous, plan.owner)
+                and self._unconfined(line_id)
+            )
+        )
+        for line_id in (plan.previous, plan.owner, *unconfined):
             if line_id is None:
                 continue
             closing = self._drop_engine(line_id)
-            if line_id == plan.previous and closing is not None:
+            if line_id != plan.owner and closing is not None:
                 self._closing_writer[line_id] = closing
                 closing.add_done_callback(lambda _: self._work.set())
             self.activity.record(
@@ -5666,7 +5721,9 @@ class Scheduler:
 
     def beside_owner(self, line_id: str) -> str | None:
         """The role whose worktree ``line_id`` could write while another seat owns
-        it and it is not a seat of the role, or ``None``. Such a line does not start
+        it and it is not a seat of the role, or ``None``. A line in a directory inside
+        the worktree, or one holding it, counts, as ``roles.overlapping`` judges,
+        **round 10 re-review, N4**. Such a line does not start
         a turn, and a new owner's first turn waits for one in flight. **Default
         deny.** It arises only from a log made before the rule, or from a role that
         gained an owner while such a line ran in its worktree, since every command
@@ -5684,7 +5741,7 @@ class Scheduler:
         if place is None or not place.writes:
             return None
         for role_id, role in self.role_places().items():
-            if role.owner is not None and role.worktree == place.directory:
+            if role.owner is not None and overlapping(role.worktree, place.directory):
                 return role_id
         return None
 
@@ -5714,7 +5771,12 @@ class Scheduler:
         places = self.role_places(trial)
         pair = shared_worktree({role_id: p.worktree for role_id, p in places.items()})
         if pair is not None:
-            raise EventRejected(shared_worktree_refusal(*pair, places[pair[1]].workdir))
+            first, second = places[pair[0]], places[pair[1]]
+            raise EventRejected(
+                shared_worktree_refusal(
+                    *pair, second.workdir, first.worktree != second.worktree
+                )
+            )
         for line_id in sorted(trial.lines):
             definition = config.lines.get(line_id)
             if line_id in state.lines:
@@ -5808,12 +5870,15 @@ class Scheduler:
         an engine session's life. Raises ``EventRejected``, recording nothing.
 
         **Round 10 review, F3.** A worktree that is another role's, by real path, is
-        refused, so two owners never write one directory."""
+        refused, so two owners never write one directory. **Re-review, N4.** So is
+        one inside another role's worktree, or one that holds it."""
         worktree = self._role_worktree(wanted.workdir)
         for other, place in self.role_places().items():
-            if other != role_id and place.worktree == worktree:
+            if other != role_id and overlapping(place.worktree, worktree):
                 raise EventRejected(
-                    shared_worktree_refusal(other, role_id, wanted.workdir)
+                    shared_worktree_refusal(
+                        other, role_id, wanted.workdir, place.worktree != worktree
+                    )
                 )
         outside = {
             line_id: self._line_workdir(line_id)
@@ -5931,11 +5996,33 @@ class Scheduler:
             ],
         }
 
+    def _unconfined(self, line_id: str) -> bool:
+        """Whether ``line_id``'s engine cannot confine it to reading its role's
+        worktree. An unknown model counts as one that cannot."""
+        return ENGINE_OF.get(self.model_of(line_id), "") not in self._confining
+
+    def _turn_writes(self, line_id: str) -> bool:
+        """Whether a turn ``line_id`` starts now runs as a writer of its role's
+        worktree, which is a turn of the role's owner, or of a seat of a vacant role
+        whose engine cannot confine it, since such a seat runs with its own access.
+        **Round 10 re-review, N3.** Only the owner's turns were counted before, so a
+        seat on Pi, Cursor or Antigravity whose turn began while the role was vacant
+        went on writing after another seat took the role, and the new owner's first
+        turn did not wait for it. **Default deny.** A seat of a vacant role on such an
+        engine is counted whether or not its own configuration can write."""
+        state = self._log.state
+        seat = state.seats.get(line_id)
+        if seat is None:
+            return False
+        owner = state.roles[seat.role_id].owner
+        return owner == line_id or (owner is None and self._unconfined(line_id))
+
     def _waits_for_writer(self, line_id: str) -> bool:
         """Whether ``line_id`` owns its role while a former writer of it has not
-        finished, which is another seat whose turn in flight started as the owner,
-        or whose kept connection is still closing. **Never two writers**, as
-        ``ROLES.md`` requires, so the new owner's first turn waits for both.
+        finished, which is another seat whose turn in flight started as a writer,
+        as ``_turn_writes`` judges it, or whose kept connection is still closing.
+        **Never two writers**, as ``ROLES.md`` requires, so the new owner's first
+        turn waits for both.
 
         **Round 10 review, F4.** It waits as well for a turn in flight of a line that
         is not a seat and could write the role's worktree, which ``beside_owner``
@@ -5947,7 +6034,7 @@ class Scheduler:
         for other, its in state.seats.items():
             if other == line_id or its.role_id != seat.role_id:
                 continue
-            if other in self._turn_owned:
+            if other in self._writer_turns:
                 return True
             closing = self._closing_writer.get(other)
             if closing is not None and not closing.done():
@@ -6407,7 +6494,9 @@ class Scheduler:
 
     def write_scratch_tool(self, line_id: str) -> SdkMcpTool[Any]:
         """The ``write_scratch`` tool for ``line_id``, which writes only under its own
-        working directory's ``tmp/``."""
+        scratch, as ``scratch_parts`` gives it. The description is fixed for the
+        engine session's life, and the scratch can move with ownership, so it states
+        the rule and each result names the path written."""
 
         async def handler(args: dict[str, Any]) -> dict[str, Any]:
             unexpected = _unexpected(args, WRITE_SCRATCH_SCHEMA)
@@ -6426,9 +6515,14 @@ class Scheduler:
         return SdkMcpTool(
             name=WRITE_SCRATCH_TOOL_NAME,
             description=(
-                "Write a scratch or report file under tmp/ in your working directory,"
+                "Write a scratch or report file under your scratch directory,"
                 " replacing it whole, without needing a file-writing tool. The path is"
-                " relative to tmp/, and the text is at most 256 KiB."
+                " relative to it, and the text is at most 256 KiB. Your scratch is"
+                " tmp/ in your working directory while you own your role, or are no"
+                " role's seat and can write the directory, and tmp/lines/<your line"
+                " id>/ otherwise, so that you never write the owner's files. The"
+                " owner's scratch is tmp/, which you may read. The result names the"
+                " path written."
             ),
             input_schema=WRITE_SCRATCH_SCHEMA,
             handler=handler,
@@ -7478,9 +7572,8 @@ class Scheduler:
         except Exception as error:  # noqa: BLE001
             compaction, owed, refused = None, None, error
             prompt = f"the prompt could not be composed: {error}"
-        seat = self._log.state.seats.get(line_id)
-        if seat is not None and self._log.state.roles[seat.role_id].owner == line_id:
-            self._turn_owned.add(line_id)
+        if self._turn_writes(line_id):
+            self._writer_turns.add(line_id)
         keys = sorted({m.correlation for _, m in messages if m.correlation is not None})
         task = asyncio.get_running_loop().create_task(
             self._turn(
@@ -7607,7 +7700,7 @@ class Scheduler:
             self._correlate(line_id, keys, report)
             self._note_quiet(line_id, sent)
             self._running.pop(line_id, None)
-            self._turn_owned.discard(line_id)
+            self._writer_turns.discard(line_id)
             self._last_turn_end[line_id] = self._clock()
             if line is not None:
                 # Round 8 review, ON1. With no report the prompt may never have
@@ -8629,9 +8722,8 @@ class Scheduler:
         self._log.append(LineStateChanged(line_id, LineState.RUNNING))
         self._turns[line_id] = self._turns.get(line_id, 0) + 1
         self._counting[line_id] = True
-        seat = self._log.state.seats.get(line_id)
-        if seat is not None and self._log.state.roles[seat.role_id].owner == line_id:
-            self._turn_owned.add(line_id)
+        if self._turn_writes(line_id):
+            self._writer_turns.add(line_id)
         self.activity.record(
             line_id,
             ActivityKind.TURN_STARTED,
@@ -8740,7 +8832,7 @@ class Scheduler:
             if line is not None and line.state is LineState.RUNNING:
                 self._log.append(LineStateChanged(line_id, LineState.IDLE))
             self._running.pop(line_id, None)
-            self._turn_owned.discard(line_id)
+            self._writer_turns.discard(line_id)
             self._last_turn_end[line_id] = self._clock()
             if line is not None:
                 # Round 8 review, ON1, as in ``_turn``. An engine turn that failed or
@@ -9181,6 +9273,33 @@ def _unexpected(args: dict[str, Any], schema: dict[str, object]) -> str | None:
     if extra:
         return "unexpected argument " + ", ".join(extra)
     return None
+
+
+def own_scratch(workdir: Path, line_id: str) -> Path:
+    """Create ``tmp/lines/LINE`` under ``workdir`` for ``line_id`` if it is missing,
+    walking each component without following a link, as ``write_scratch`` does, and
+    return its path. **Round 10 re-review, N2.** The directory exists before the
+    engine starts, so its sandbox can grant it by real path. Raises
+    ``EngineRefused`` for a link or a file in the way, or any other failure."""
+    names = (SCRATCH_DIRECTORY, LINES_SCRATCH_DIRECTORY, line_id)
+    try:
+        parent = os.open(workdir, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as error:
+        raise EngineRefused(
+            f"cannot open the working directory {workdir}: {error.strerror}"
+        ) from error
+    try:
+        for index, name in enumerate(names):
+            entered = _enter(parent, name, "/".join(names), scratch_root=index == 0)
+            os.close(parent)
+            parent = entered
+    except LineToolRefused as error:
+        raise EngineRefused(
+            f"the line's own scratch cannot be made: {error}"
+        ) from error
+    finally:
+        os.close(parent)
+    return workdir.joinpath(*names)
 
 
 def _enter(parent: int, name: str, path: str, *, scratch_root: bool) -> int:

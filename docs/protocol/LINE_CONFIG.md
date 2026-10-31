@@ -118,7 +118,7 @@ argument outside a tool's schema is refused.
 | `set_brief` | Records the line's standing brief, its `task`, its open `decisions`, the `artifacts` its task concerns and its `next_action`, as one `brief_set` event that replaces its previous brief and that the daemon stamps with the time, the worktree's commit and its own. Only `task` is required. Each text field is at most 4,096 bytes, at most 32 paths are named, each on one line and at most 1,024 bytes, and the whole is at most 16,384 bytes. An unknown key is refused, and the text is checked against the disclosure list as `record_role_note` is. The brief leads the line's first turn after its engine session is new, is shown by `line_status`, and fills the role transition package where a journal entry is silent, as below. Added on 2026-10-29 |
 | `propose_change` | Records a proposed patch, file list and message for operator review; it does not change project files |
 | `read_instructions` | Shows the instructions the line's next turn receives, as below |
-| `write_scratch` | Writes a file under `tmp/` in the line's working directory, as below |
+| `write_scratch` | Writes a file under the line's scratch in its working directory, `tmp/` or `tmp/lines/LINE`, as below |
 | `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term or the file that matched. Files are checked independently, so a match cannot span files. The combined content is at most 1 MiB. One call, including a list, spends one recorded check, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. Added on 2026-10-28 |
 | `list_processes`, `stop_process` | List and stop the processes the line started, as below |
 
@@ -347,7 +347,7 @@ unreadable instruction file is reported as the turn would refuse it.
 - **Whole text.** With `full` set to `true` the tool returns the composed text itself. A
   `full` that is not a boolean is refused.
 
-**`write_scratch`.** Arguments `path`, relative to `tmp/` in the line's working
+**`write_scratch`.** Arguments `path`, relative to the line's scratch in its working
 directory, and `text`, at most 262,144 bytes of UTF-8, which replaces the file whole.
 The daemon writes the file, so a line without `Write` can keep its own notes and
 reports. It creates `tmp/` and the directories under it. It refuses an absolute path,
@@ -359,6 +359,17 @@ file the same way. So a `tmp/` or a directory under it that is a link, or that a
 process swaps for a link at any moment, refuses the write instead of redirecting it,
 as does a file in a directory's place. Text or a path that the project's disclosure
 list covers is refused, and nothing is written.
+
+- **Whose scratch.** **Decided by the operator on 2026-10-31, round 10 re-review, N1.**
+  A line's scratch is `tmp/` while it owns its role, or is no role's seat and could
+  write its working directory, as `lineconfig.can_write_workdir` judges. Every other
+  line, a seat that does not own its role among them, has a scratch of its own,
+  `tmp/lines/LINE`, so it never writes a file of the owner, whose scratch is `tmp/`
+  and which it may read. The tool's description states the rule, and each result names
+  the path written. **Decided by core, for review.** An owner keeps `tmp/` even with no
+  writing tool, so a role's reports stay where they were. A line's scratch moves when
+  it gains or loses its role or a writing tool, and what it wrote before stays where
+  it was written.
 
 **Processes.** **Decided by the operator on 2026-10-26.** Claude Code, Codex and Grok
 Build each scope their own process controls to the agent's own session, and these
@@ -1619,7 +1630,9 @@ line and asks an operator, unless the line mailed an operator during the turn.
 
 `workdir_access` defaults to `write`. With `read`, Claude Code and Codex apply their
 engine sandbox or permission profile to prevent writes under the working directory.
-Dromon's `write_scratch` tool is the supported write path under `tmp`. Pi, Cursor Agent
+Dromon's `write_scratch` tool is the supported write path, into the line's scratch as
+above, which for a line that does not own a role is its own `tmp/lines/LINE`. That
+directory is also the one a Codex line in this mode may write. Pi, Cursor Agent
 and Antigravity refuse to start in this mode because their adapters cannot enforce it.
 Grok refuses it too until a live probe shows its reader profile deny a write to the
 worktree, as [`GROK.md`](GROK.md) records. Claude Code also refuses configurations with mechanisms that can

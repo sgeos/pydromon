@@ -366,12 +366,22 @@ def permission_profile(
     config: LineConfig,
     protected: Sequence[Path],
     write_protected: Sequence[Path] = (),
+    scratch: Path | None = None,
 ) -> str:
     """The ``dromon-line`` profile for ``config``, as an inline TOML table.
 
     The workspace is writable only with a write tool, ``.git`` is readable but not
     writable, each existing protected path is denied by its real path, and each
     validated operator-granted directory is writable.
+
+    **Round 10 re-review, N2.** A line with ``workdir_access`` read may write only
+    ``scratch``, its own directory under ``tmp/lines/``, given by its real path, and
+    nothing else of the workdir. It was given the whole of ``tmp/`` before, which is
+    the owner's scratch when the workdir is a role's worktree, so a read-only seat
+    could write the owner's files there. A read line given no ``scratch`` has none.
+    **Assumption.** Codex grants a directory below a read workspace root by its
+    absolute path, as it does for ``writable_paths``. No operator probe has confirmed
+    it for a directory inside the workspace.
     """
     workspace = (
         "write"
@@ -379,7 +389,11 @@ def permission_profile(
         and WRITE_TOOLS & set(config.builtin_tools)
         else "read"
     )
-    scratch = ', "tmp"="write"' if config.workdir_access is WorkdirAccess.READ else ""
+    own = (
+        (_toml_string(os.path.realpath(scratch)),)
+        if scratch is not None and config.workdir_access is WorkdirAccess.READ
+        else ()
+    )
     granted = validate_writable_paths(
         config.writable_paths,
         (*protected, *write_protected),
@@ -392,9 +406,10 @@ def permission_profile(
         ]
     )
     entries = [
-        f'":workspace_roots"={{"."="{workspace}", ".git"="read"{scratch}}}',
+        f'":workspace_roots"={{"."="{workspace}", ".git"="read"}}',
         *(f'{_toml_string(str(directory))}="deny"' for directory in denied),
         *(f'{_toml_string(str(directory))}="write"' for directory in granted),
+        *(f'{directory}="write"' for directory in own),
     ]
     return f'{{extends=":workspace", filesystem={{{", ".join(entries)}}}}}'
 
@@ -473,12 +488,14 @@ def server_arguments(
     mark: str | None = None,
     variables: Mapping[str, str] | None = None,
     write_protected: Sequence[Path] = (),
+    scratch: Path | None = None,
 ) -> list[str]:
     """The ``codex app-server`` arguments that isolate a line configured as ``config``
     from the operator's ``servers``, from every tool it was not given, and from the
     ``protected`` directories, and that give the line's shell commands its process
     ``mark`` and the further ``variables``, such as ``dromon.gitssh.environment``
-    gives.
+    gives. A read line may write its own ``scratch``, as ``permission_profile``
+    says.
 
     The mark goes through Codex's ``shell_environment_policy.set``, which applies to
     the commands Codex runs and not to Codex's own processes, so the app-server and its
@@ -516,7 +533,7 @@ def server_arguments(
     arguments += [
         "-c",
         f"permissions.{PROFILE_NAME}="
-        f"{permission_profile(config, protected, write_protected)}",
+        f"{permission_profile(config, protected, write_protected, scratch)}",
     ]
     return arguments
 
@@ -1071,6 +1088,7 @@ class CodexLine:
         ceiling_reached: Ask = no_operator,
         ceiling_settled: Settle = nothing_to_settle,
         credits_spent: Callable[[str], object] = ignore_credits,
+        scratch: Path | None = None,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -1092,6 +1110,8 @@ class CodexLine:
         """The agent and pinned hosts of the project's ``[git_ssh]`` table, if the
         line was given them."""
         """The process mark every process of this line inherits, if issued."""
+        self.scratch = scratch
+        """The line's own scratch directory, which a read line may write, if given."""
         self._next_id = 0
         self._thread_id = ""
         self._connection: Connection | None = None
@@ -1216,6 +1236,7 @@ class CodexLine:
                 self.mark,
                 variables,
                 git_directories(self.cwd) or (),
+                self.scratch,
             )
             instructions = read_instructions(self.config.instructions, self.cwd)
         except Exception:

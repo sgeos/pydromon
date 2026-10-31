@@ -1220,19 +1220,31 @@ def test_the_profile_writes_only_with_a_write_tool_and_never_git(
         }
 
 
-def test_a_read_only_workdir_profile_keeps_tmp_writable() -> None:
+def test_a_read_only_workdir_profile_writes_only_the_lines_own_scratch(
+    tmp_path: Path,
+) -> None:
+    """Round 10 re-review, N2. The read profile granted the whole of ``tmp/``, the
+    owner's scratch, so a read-only seat could write the owner's files there."""
+    import os
     import tomllib
 
     config = config_from_document(
         {"builtin_tools": ["Bash", "Edit", "Write"], "workdir_access": "read"}
     )
-    text = profile_of(server_arguments([], config, ()))
-    profile = tomllib.loads(f"profile = {text}")["profile"]
-    assert profile["filesystem"][":workspace_roots"] == {
-        ".": "read",
-        ".git": "read",
-        "tmp": "write",
-    }
+    scratch = tmp_path / "tmp" / "lines" / "beta"
+    scratch.mkdir(parents=True)
+    text = profile_of(server_arguments([], config, (), scratch=scratch))
+    filesystem = tomllib.loads(f"profile = {text}")["profile"]["filesystem"]
+    assert filesystem[":workspace_roots"] == {".": "read", ".git": "read"}
+    assert filesystem[os.path.realpath(scratch)] == "write"
+    assert "tmp" not in str(filesystem[":workspace_roots"])
+    # A read line given no scratch writes nothing, and a writer is granted none.
+    bare = tomllib.loads(f"profile = {profile_of(server_arguments([], config, ()))}")
+    assert all(v != "write" for v in bare["profile"]["filesystem"].values())
+    writer = config_from_document({"builtin_tools": ["Edit"]})
+    text = profile_of(server_arguments([], writer, (), scratch=scratch))
+    filesystem = tomllib.loads(f"profile = {text}")["profile"]["filesystem"]
+    assert os.path.realpath(scratch) not in filesystem
 
 
 def test_the_profile_denies_each_protected_directory_that_exists(
