@@ -56,6 +56,7 @@ import asyncio
 import json
 import os
 import shutil
+import stat
 import tomllib
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -79,6 +80,7 @@ from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 from dromon import gitssh
 from dromon.gitssh import GitSshAccess
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, WorkdirAccess
+from dromon.workdir import git_directories
 
 ENGINE_NAME: Final = "grok-build"
 """The engine this adapter runs, as drivers name it."""
@@ -108,6 +110,11 @@ PROFILE_BASES: Final[dict[str, frozenset[str]]] = {
     WRITER_PROFILE: frozenset({"workspace", "strict"}),
 }
 """The built-in profiles each of Dromon's profiles may extend."""
+
+PROFILE_EXTENDS: Final[dict[str, str]] = {
+    READER_PROFILE: "read-only",
+    WRITER_PROFILE: "workspace",
+}
 
 API_ENVIRONMENT: Final = (
     "XAI_API_KEY",
@@ -275,10 +282,12 @@ REFUSED_HOME_ENTRIES: Final = (
     "skills",
     "workflows",
 )
-"""Entries of a Grok home that would give a line agents, hooks, plugins, language
-servers, rules, skills or workflows it was not given, as Grok's guide lists them. A
-file is refused when present, a directory when it holds anything, since Grok may
-create an empty one."""
+"""Entries of a Grok home that could load agents, hooks, plugins, language servers,
+rules, skills or workflows. **Observed in Dromon's Grok home on 2026-10-30.** Grok
+creates an empty ``hooks-paths`` file and an ``installed-plugins`` directory holding
+empty ``*.lock`` files. **Inference, not verified live.** Those empty records load no
+hook paths or plugins. Empty regular files and these lock files are allowed; symlinks,
+non-empty files and all other directory contents remain refused."""
 
 USER_HOME_HARNESS_ENTRIES: Final = (
     ".agents",
@@ -376,7 +385,12 @@ def _own_directory(directory: Path, label: str) -> None:
         )
 
 
-def prepare_home(grok_home: Path, workspace: Path, protected: Sequence[Path]) -> None:
+def prepare_home(
+    grok_home: Path,
+    workspace: Path,
+    protected: Sequence[Path],
+    daemon_home: Path | None = None,
+) -> None:
     """Create Dromon's Grok home and the line's ``HOME`` inside it, owner-only, and
     write the Grok home's ``config.toml`` and ``sandbox.toml`` when either is missing.
     An existing file is never replaced, so drift is refused by ``check_home``,
@@ -389,9 +403,9 @@ def prepare_home(grok_home: Path, workspace: Path, protected: Sequence[Path]) ->
     _write_new(grok_home / "config.toml", HOME_CONFIG)
     _write_new(
         grok_home / "sandbox.toml",
-        profile_snippet(READER_PROFILE, workspace, protected)
+        profile_snippet(READER_PROFILE, workspace, protected, daemon_home)
         + "\n\n"
-        + profile_snippet(WRITER_PROFILE, workspace, protected)
+        + profile_snippet(WRITER_PROFILE, workspace, protected, daemon_home)
         + "\n",
     )
 
@@ -422,7 +436,7 @@ def check_home(grok_home: Path, system: Path = SYSTEM_POLICY_DIR) -> None:
             f"{grok_home / TRUST_FILE} trusts a folder, which would let a project's"
             " hooks, MCP servers and permission rules load for a Grok line"
         )
-    found = _loading_entries(grok_home, REFUSED_HOME_ENTRIES)
+    found = _loading_entries(grok_home, REFUSED_HOME_ENTRIES, allow_empty_records=True)
     if found:
         raise EngineRefused(
             f"Dromon's Grok home {grok_home} holds " + ", ".join(found) + ", which"
@@ -443,16 +457,74 @@ def check_user_home(user_home: Path) -> None:
         )
 
 
-def _loading_entries(directory: Path, names: Sequence[str]) -> list[str]:
-    """Which of ``names`` in ``directory`` are a file or link, or a directory that
-    holds anything. An empty directory is allowed, since Grok may create one."""
+def _loading_entries(
+    directory: Path, names: Sequence[str], *, allow_empty_records: bool = False
+) -> list[str]:
+    """Entries that may load configuration, allowing only known empty Grok records.
+
+    ``hooks-paths`` may be an empty regular file. ``installed-plugins`` may hold only
+    empty regular ``*.lock`` files. Never follow symbolic links. Empty directories are
+    allowed because Grok may create them."""
     found: list[str] = []
     for name in names:
         entry = directory / name
-        if entry.is_dir() and not entry.is_symlink():
-            if any(True for _ in entry.iterdir()):
+        try:
+            info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise EngineRefused(
+                f"cannot inspect Grok home entry {entry}: {error}"
+            ) from error
+        if stat.S_ISLNK(info.st_mode):
+            found.append(name)
+            continue
+        if not allow_empty_records:
+            if stat.S_ISDIR(info.st_mode):
+                try:
+                    if any(True for _ in entry.iterdir()):
+                        found.append(name)
+                except OSError as error:
+                    raise EngineRefused(
+                        f"cannot inspect Grok home entry {entry}: {error}"
+                    ) from error
+            else:
                 found.append(name)
-        elif os.path.lexists(entry):
+            continue
+        if stat.S_ISREG(info.st_mode):
+            if name != "hooks-paths" or info.st_size != 0:
+                found.append(name)
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            found.append(name)
+            continue
+        try:
+            children = list(entry.iterdir())
+        except OSError as error:
+            raise EngineRefused(
+                f"cannot inspect Grok home entry {entry}: {error}"
+            ) from error
+        if not children:
+            continue
+        if name != "installed-plugins":
+            found.append(name)
+            continue
+        allowed_locks = True
+        for child in children:
+            try:
+                child_info = child.lstat()
+            except OSError as error:
+                raise EngineRefused(
+                    f"cannot inspect Grok home entry {child}: {error}"
+                ) from error
+            if not (
+                child.name.endswith(".lock")
+                and stat.S_ISREG(child_info.st_mode)
+                and child_info.st_size == 0
+            ):
+                allowed_locks = False
+                break
+        if not allowed_locks:
             found.append(name)
     return found
 
@@ -682,18 +754,47 @@ def _covers(paths: Sequence[Path], target: Path) -> bool:
     return False
 
 
-def profile_snippet(name: str, workspace: Path, protected: Sequence[Path]) -> str:
-    """The ``sandbox.toml`` table that defines ``name`` for this project."""
+GROK_CREDENTIAL_PATHS: Final = (
+    Path(".ssh"),
+    Path(".aws"),
+    Path(".codex/auth.json"),
+    Path(".cargo/credentials.toml"),
+    Path(".pi/agent/auth.json"),
+)
+"""Operator-home credentials Grok profiles must deny, when each path exists."""
+
+
+def _credential_paths(daemon_home: Path) -> tuple[Path, ...]:
+    """The configured credential paths under the daemon's real home directory."""
+    real_home = Path(os.path.realpath(daemon_home))
+    return tuple(real_home / relative for relative in GROK_CREDENTIAL_PATHS)
+
+
+def profile_snippet(
+    name: str,
+    workspace: Path,
+    protected: Sequence[Path],
+    daemon_home: Path | None = None,
+) -> str:
+    """The full ``sandbox.toml`` table for a new Dromon profile."""
+    daemon_home = Path.home() if daemon_home is None else daemon_home
     deny = [".dromon"] + [
         os.path.realpath(p)
         for p in protected
         if not _covers([workspace / ".dromon"], p)
     ]
+    deny.extend(
+        str(path) for path in _credential_paths(daemon_home) if os.path.lexists(path)
+    )
     lines = [f"[profiles.{name}]"]
     if name == WRITER_PROFILE:
         lines.append('extends = "workspace"')
+        git = git_directories(workspace)
+        directories = () if git is None else tuple(sorted(set(git)))
         lines.append(
-            f"read_only = [{json.dumps(os.path.realpath(workspace / '.git'))}]"
+            "read_only = ["
+            + ", ".join(json.dumps(str(path)) for path in directories)
+            + "]"
         )
     else:
         lines.append('extends = "read-only"')
@@ -712,6 +813,7 @@ def check_profile(
     protected: Sequence[Path],
     home: Path,
     grok_home: Path,
+    daemon_home: Path | None = None,
 ) -> str:
     """The name of the Grok profile the line runs under, after checking that it denies
     every ``protected`` directory and, for a writer, keeps ``.git`` read-only. Raises
@@ -726,31 +828,75 @@ def check_profile(
     guide anchors ``~``. **Inference, not verified.**
     That Grok reads ``sandbox.toml`` from ``GROK_HOME``, as it does ``config.toml``.
     """
+    daemon_home = Path.home() if daemon_home is None else daemon_home
     name = profile_name(config)
     file = grok_home / "sandbox.toml"
-    profile = _load_profiles(file).get(name)
-    advice = f" Add this to {file}:\n\n{profile_snippet(name, workspace, protected)}"
+    profiles = _load_profiles(file)
+    profile = profiles.get(name)
+    full_snippet = profile_snippet(name, workspace, protected, daemon_home)
+    if profile is None:
+        advice = f" Add this new table to {file}:\n\n{full_snippet}"
+    else:
+        deny_values = [".dromon"] + [
+            str(Path(os.path.realpath(path)))
+            for path in protected
+            if not _covers([workspace / ".dromon"], path)
+        ]
+        deny_values.extend(
+            str(path)
+            for path in _credential_paths(daemon_home)
+            if os.path.lexists(path)
+        )
+        git = git_directories(workspace)
+        read_only_values = (
+            []
+            if name != WRITER_PROFILE or git is None
+            else [str(path) for path in sorted(set(git))]
+        )
+        advice = "".join(
+            (
+                " Update only the ",
+                repr(name),
+                " profile in ",
+                str(file),
+                ". Add missing entries to its deny and read_only arrays, creating"
+                " either array if the profile has none, and leave every other profile"
+                " table and entry as it is. Required "
+                "deny entries are ",
+                json.dumps(deny_values),
+                "; required read_only entries are ",
+                json.dumps(read_only_values),
+            )
+        )
     if profile is None:
         raise EngineRefused(f"no Grok sandbox profile {name} is defined.{advice}")
     unknown = sorted(set(profile) - PROFILE_KEYS)
     if unknown:
         raise EngineRefused(
             f"the Grok sandbox profile {name} sets " + ", ".join(unknown) + ", which"
-            f" Dromon does not accept for it.{advice}"
+            f" Dromon does not accept for it.{advice} Remove unsupported keys from"
+            " this profile."
         )
     base = profile.get("extends", "workspace")
     if base not in PROFILE_BASES[name]:
         raise EngineRefused(
             f"the Grok sandbox profile {name} extends {base!r}, which Dromon does not"
-            f" accept for it.{advice}"
+            f" accept for it.{advice} Set extends to {PROFILE_EXTENDS[name]!r} in this"
+            " profile."
         )
     denied = [
         path
         for entry in _entries(profile, "deny")
         if (path := _resolve(entry, workspace, home)) is not None
     ]
+    required_deny = [
+        *protected,
+        *(path for path in _credential_paths(daemon_home) if os.path.lexists(path)),
+    ]
     exposed = [
-        str(p) for p in protected if os.path.exists(p) and not _covers(denied, p)
+        str(path)
+        for path in required_deny
+        if os.path.lexists(path) and not _covers(denied, path)
     ]
     if exposed:
         raise EngineRefused(
@@ -759,12 +905,15 @@ def check_profile(
             + "."
             + advice
         )
-    git = workspace / ".git"
-    if name == WRITER_PROFILE and git.exists():
+    git = git_directories(workspace)
+    if name == WRITER_PROFILE and git is not None:
         held = [Path(entry) for entry in _entries(profile, "read_only")]
-        if not _covers(held, git) and not _covers(denied, git):
+        required_git_dirs = tuple(set(git))
+        unheld = [path for path in required_git_dirs if not _covers(held, path)]
+        if unheld:
             raise EngineRefused(
-                f"the Grok sandbox profile {name} leaves {git} writable.{advice}"
+                f"the Grok sandbox profile {name} does not hold git directories"
+                " read-only: " + ", ".join(map(str, unheld)) + "." + advice
             )
     return name
 
@@ -938,7 +1087,7 @@ class GrokLine:
             raise EngineRefused(reason)
         grok_home = self._home / HOME_DIR
         user_home = grok_home / USER_HOME
-        prepare_home(grok_home, self.cwd, self.protected)
+        prepare_home(grok_home, self.cwd, self.protected, self._home)
         check_home(grok_home)
         check_project(self.cwd)
         claude_mode = claude_mode_refusal(user_home, self.cwd)
@@ -948,7 +1097,7 @@ class GrokLine:
         environment["GROK_HOME"] = str(grok_home)
         environment["HOME"] = str(user_home)
         environment["GROK_SANDBOX"] = check_profile(
-            self.config, self.cwd, self.protected, user_home, grok_home
+            self.config, self.cwd, self.protected, user_home, grok_home, self._home
         )
         effort = self.config.effort or self.driver.settings.effort
         if effort not in EFFORTS:
