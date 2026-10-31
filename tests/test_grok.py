@@ -2651,3 +2651,256 @@ def test_a_grok_line_given_git_ssh_carries_its_command_and_no_other(
     plain = FakeGrok([chunk("hello")])
     run(line(plain, project, environment={"PATH": "/bin", COMMAND_VARIABLE: "x"}))
     assert COMMAND_VARIABLE not in plain.environment
+
+
+# The tool call shape Grok sends, as its session log of 2026-10-31 recorded it. The
+# first tool_call has no kind and no toolName, a title equal to the tool's name and
+# the tool in _meta["x.ai/tool"], and a later tool_call_update adds the kind,
+# rewrites the title and adds a variant to rawInput.
+
+
+def grok_meta(name: str, namespace: str = "grok_build") -> dict[str, object]:
+    return {"x.ai/tool": {"version": 1, "name": name, "namespace": namespace}}
+
+
+def grok_call(
+    name: str, ident: str = "t", raw_input: object | None = None
+) -> dict[str, Any]:
+    update: dict[str, Any] = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": ident,
+        "title": name,
+        "_meta": grok_meta(name),
+    }
+    if raw_input is not None:
+        update["rawInput"] = raw_input
+    return note(update)
+
+
+def grok_permission(ident: str = "t", **fields: object) -> dict[str, Any]:
+    request = permission("other", ident=ident)
+    tool_call = cast(dict[str, Any], request["params"]["toolCall"])
+    del tool_call["kind"], tool_call["toolName"]
+    tool_call.update(fields)
+    return request
+
+
+def test_the_observed_search_tool_sequence_is_counted_as_discovery(
+    project: tuple[Path, Path, Path],
+) -> None:
+    query = {"query": "dromon list_mail read_mail send_message", "limit": 10}
+    server = FakeGrok(
+        [
+            grok_call("search_tool", ident="c0", raw_input=query),
+            call_update(
+                "c0",
+                kind="other",
+                title='Search tools: "dromon list_mail read_mail send_message"',
+                rawInput={"variant": "SearchTool", **query},
+                _meta=grok_meta("search_tool"),
+            ),
+        ]
+    )
+    assert run(line(server, project)).tool_uses == ("search_tool",)
+
+
+def test_a_grok_built_in_is_counted_as_the_line_tool_that_permits_it(
+    project: tuple[Path, Path, Path],
+) -> None:
+    given = LineConfig(builtin_tools=("Read",))
+    server = FakeGrok([grok_call("read_file"), call_update("t", kind="read")])
+    assert run(line(server, project, config=given)).tool_uses == ("Read",)
+
+
+@pytest.mark.parametrize("name", ["read_file", "spawn_subagent", "ask_user_question"])
+def test_a_grok_tool_the_line_was_not_given_is_refused(
+    project: tuple[Path, Path, Path], name: str
+) -> None:
+    given = LineConfig(builtin_tools=("Bash",))
+    with pytest.raises(EngineRefused, match=f"not given: {name}"):
+        run(line(FakeGrok([grok_call(name)]), project, config=given))
+
+
+def test_another_namespace_is_not_taken_as_a_grok_tool(
+    project: tuple[Path, Path, Path],
+) -> None:
+    event = grok_call("search_tool")
+    event["params"]["update"]["_meta"] = grok_meta("search_tool", "other")
+    with pytest.raises(EngineRefused, match="not given: search_tool"):
+        run(line(FakeGrok([event]), project))
+
+
+def test_a_grok_use_tool_runs_only_the_line_tool_it_names(
+    project: tuple[Path, Path, Path],
+) -> None:
+    raw = use_tool_input("dromon__send_message")
+    server = FakeGrok(
+        [
+            grok_call("use_tool", ident="u", raw_input=raw),
+            call_update("u", kind="other", rawInput={"variant": "UseTool", **raw}),
+            grok_permission(ident="u"),
+        ]
+    )
+    report = run(line(server, project))
+    assert report.tool_uses == ("dromon__send_message",)
+    assert server.answers()[-1]["result"]["outcome"]["optionId"] == "yes"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        {"tool_name": "other__send_message", "tool_input": {}},
+        {"tool_name": "dromon__send_message", "tool_input_file": "/outside.json"},
+        {"file": "/outside.json"},
+        {"tool_name": "dromon__send_message", "tool_input": {}, "variant": 1},
+        {
+            "tool_name": "dromon__send_message",
+            "tool_input": {},
+            "variant": "FileBacked",
+        },
+        {"tool_name": "dromon__send_message", "tool_input": {}, "server": "x"},
+    ),
+)
+def test_a_grok_use_tool_refuses_any_other_target_or_form(
+    project: tuple[Path, Path, Path], raw: object
+) -> None:
+    with pytest.raises(EngineRefused, match="not given: use_tool"):
+        run(line(FakeGrok([grok_call("use_tool", raw_input=raw)]), project))
+
+
+def test_a_grok_use_tool_target_cannot_change_in_an_update(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok(
+        [
+            grok_call("use_tool", raw_input=use_tool_input("dromon__send_message")),
+            call_update("t", rawInput=use_tool_input("other__send_message")),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="changed the structured input"):
+        run(line(server, project))
+
+
+@pytest.mark.parametrize(
+    "fields",
+    ({"_meta": grok_meta("run_terminal_command")}, {"toolName": "search_tool"}),
+)
+def test_a_grok_call_cannot_change_its_name_in_an_update(
+    project: tuple[Path, Path, Path], fields: dict[str, object]
+) -> None:
+    server = FakeGrok([grok_call("search_tool"), call_update("t", **fields)])
+    with pytest.raises(EngineRefused, match="changed the name"):
+        run(line(server, project))
+
+
+def test_a_permission_request_is_judged_by_the_recorded_grok_name(
+    project: tuple[Path, Path, Path],
+) -> None:
+    given = LineConfig(builtin_tools=("Read",))
+    granted = FakeGrok([grok_call("read_file"), grok_permission()])
+    run(line(granted, project, config=given))
+    assert granted.answers()[-1]["result"]["outcome"]["optionId"] == "yes"
+
+
+def test_a_grok_kind_that_disagrees_with_its_name_is_refused_at_first_sight(
+    project: tuple[Path, Path, Path],
+) -> None:
+    # Review G1. A read-only line must not run a call whose kind says execute, even
+    # when its _meta says read_file.
+    event = grok_call("read_file")
+    event["params"]["update"]["kind"] = "execute"
+    given = LineConfig(builtin_tools=("Read",))
+    with pytest.raises(EngineRefused, match="not given: read_file"):
+        run(line(FakeGrok([event]), project, config=given))
+
+
+@pytest.mark.parametrize(
+    ("name", "kind"), [("read_file", "execute"), ("search_tool", "read")]
+)
+def test_a_grok_kind_added_later_must_agree_with_its_name(
+    project: tuple[Path, Path, Path], name: str, kind: str
+) -> None:
+    given = LineConfig(builtin_tools=("Read",))
+    server = FakeGrok([grok_call(name), call_update("t", kind=kind)])
+    with pytest.raises(EngineRefused, match="does not agree"):
+        run(line(server, project, config=given))
+
+
+def test_a_grok_name_added_in_a_later_update_is_refused(
+    project: tuple[Path, Path, Path],
+) -> None:
+    # Review G2. A call first judged by its kind cannot be renamed by a later _meta.
+    given = LineConfig(builtin_tools=("Read",))
+    server = FakeGrok(
+        [
+            tool_call("read", ident="t"),
+            call_update("t", _meta=grok_meta("run_terminal_command")),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="in a later update"):
+        run(line(server, project, config=given))
+
+
+@pytest.mark.parametrize(
+    ("name", "kind", "given"),
+    [
+        # Review of d29174d, PA. A kind naming another of the line's tools still
+        # disagrees with the call's own name.
+        ("read_file", "execute", ("Read", "Bash")),
+        # PB to PD. A built-in with a kind not in its row of GROK_TOOL_KINDS is
+        # refused, which fails closed until Grok's real kinds are recorded.
+        ("run_terminal_command", "other", ("Bash",)),
+        ("web_search", "read", ("WebSearch",)),
+    ],
+)
+def test_a_grok_kind_must_be_one_its_own_name_allows(
+    project: tuple[Path, Path, Path], name: str, kind: str, given: tuple[str, ...]
+) -> None:
+    event = grok_call(name)
+    event["params"]["update"]["kind"] = kind
+    config = LineConfig(builtin_tools=given)
+    with pytest.raises(EngineRefused, match=f"not given: {name}"):
+        run(line(FakeGrok([event]), project, config=config))
+
+
+@pytest.mark.parametrize(
+    ("name", "kind", "given", "counted"),
+    [
+        ("list_dir", "search", ("Glob",), "Glob"),
+        ("web_search", "search", ("WebSearch",), "WebSearch"),
+        ("run_terminal_command", "execute", ("Bash",), "Bash"),
+    ],
+)
+def test_a_grok_kind_its_name_allows_is_accepted(
+    project: tuple[Path, Path, Path],
+    name: str,
+    kind: str,
+    given: tuple[str, ...],
+    counted: str,
+) -> None:
+    event = grok_call(name)
+    event["params"]["update"]["kind"] = kind
+    config = LineConfig(builtin_tools=given)
+    assert run(line(FakeGrok([event]), project, config=config)).tool_uses == (counted,)
+
+
+@pytest.mark.parametrize("kind", [["read"], {"kind": "read"}, 3])
+def test_a_grok_kind_that_is_not_text_is_refused(
+    project: tuple[Path, Path, Path], kind: object
+) -> None:
+    # Review G-A. A non-string kind once raised TypeError before Dromon answered.
+    event = grok_call("read_file")
+    event["params"]["update"]["kind"] = kind
+    config = LineConfig(builtin_tools=("Read",))
+    with pytest.raises(EngineRefused, match="not given: read_file"):
+        run(line(FakeGrok([event]), project, config=config))
+
+
+def test_a_permission_request_whose_kind_disagrees_is_refused(
+    project: tuple[Path, Path, Path],
+) -> None:
+    # Review G-B. The permission path judges the kind against the recorded name too.
+    config = LineConfig(builtin_tools=("Read", "Bash"))
+    server = FakeGrok([grok_call("read_file"), grok_permission(kind="execute")])
+    with pytest.raises(EngineRefused, match="does not agree"):
+        run(line(server, project, config=config))
