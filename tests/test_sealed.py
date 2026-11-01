@@ -22,7 +22,13 @@ from dromon.daemon import apply_project, report_unsealed
 from dromon.driver import Strategy
 from dromon.engine import EngineRefused
 from dromon.eventlog import EventLog, read_entries
-from dromon.lineconfig import ConfigError, LineConfig, McpServer, encode_config
+from dromon.lineconfig import (
+    ConfigError,
+    LineConfig,
+    McpServer,
+    encode_config,
+    parse_servers,
+)
 from dromon.model import (
     InvalidField,
     LineConfigured,
@@ -162,6 +168,32 @@ def test_a_configuration_copied_from_a_view_is_refused(world: World) -> None:
     assert world.log.last_seq == before
 
 
+@pytest.mark.parametrize(
+    ("value", "kind"),
+    [
+        ("tok3n${NOPE_VALUE-IN-ERR}", "malformed variable reference at character 6"),
+        ("${DROMON_TAILTEXT}", "reserved variable, at character 1"),
+    ],
+)
+@pytest.mark.parametrize("table", ["env", "headers"])
+def test_a_refused_reference_names_its_place_and_no_part_of_the_value(
+    value: str, kind: str, table: str
+) -> None:
+    """Audit's finding V1. A credential that holds a stray ``${`` is refused before
+    sealing, so its error must keep the value out as sealing does."""
+    server = (
+        {"command": "s", "env": {"TOKEN": value}}
+        if table == "env"
+        else {"type": "http", "url": "https://x", "headers": {"TOKEN": value}}
+    )
+    with pytest.raises(ConfigError) as raised:
+        parse_servers({"s": server})
+    message = str(raised.value)
+    assert f"server s {table} TOKEN" in message and kind in message
+    pieces = {value[i : i + 3] for i in range(len(value) - 2)}
+    assert [piece for piece in pieces if piece in message] == []
+
+
 def test_equal_values_have_unrelated_digests() -> None:
     config = LineConfig(
         mcp_servers=(
@@ -237,6 +269,35 @@ def test_a_store_others_may_read_is_refused(tmp_path: Path) -> None:
     os.chmod(store.path, 0o640)
     with pytest.raises(SealedError, match="owner only"):
         store.read()
+
+
+def test_a_link_in_the_store_s_place_is_not_followed(tmp_path: Path) -> None:
+    """The link leads to a well-formed owner-only store, so only the refusal to
+    follow it refuses it, which is the guard under test."""
+    target = SealedStore(tmp_path / "elsewhere")
+    target.add(seal(literal_config()).values)
+    link = tmp_path / "store"
+    link.symlink_to(target.path)
+    with pytest.raises(SealedError, match="cannot open the sealed store"):
+        SealedStore(link).read()
+
+
+def test_a_directory_in_the_store_s_place_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "store"
+    path.mkdir(mode=0o700)
+    with pytest.raises(SealedError, match="not a regular file"):
+        SealedStore(path).read()
+
+
+def test_a_named_pipe_in_the_store_s_place_is_refused_without_blocking(
+    tmp_path: Path,
+) -> None:
+    """A pipe with no writer would block an open that waits for one, so this test
+    would hang rather than fail if the store opened it without ``O_NONBLOCK``."""
+    path = tmp_path / "store"
+    os.mkfifo(path, 0o600)
+    with pytest.raises(SealedError, match="not a regular file"):
+        SealedStore(path).read()
 
 
 @pytest.mark.parametrize(

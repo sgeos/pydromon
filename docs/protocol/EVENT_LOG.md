@@ -419,6 +419,20 @@ written. The daemon now seals each such value before it appends the event, as
   an operator already keeps a token in the daemon's environment, and its literal text,
   such as `Bearer`, is not the secret. The project file's `secrets` list, which grants
   each line the variables its references may name, is unchanged.
+- **What is not sealed.** A credential written into an MCP server's `command`, `args`
+  or `url` is not sealed and reaches the log as written, as does any value elsewhere in
+  the configuration. Those fields name a program or an address, and sealing them would
+  hide from every view what a line runs and where it connects. A credential belongs in
+  `env` or `headers`, or in the daemon's environment behind a `${NAME}` reference.
+  Audit's review of 2026-11-01 confirmed this residual, and it stays recorded rather
+  than closed.
+- **Errors.** A configuration refused before sealing names the location of the refused
+  value, such as `server search env TOKEN`, and a character position within it, and
+  never any part of the value, since the error reaches the client and, for a project
+  file, the daemon's output. Audit's finding V1 found a malformed reference echoing
+  the 16 characters after its `${`, which is no longer so. A reserved variable that a
+  reference names is not echoed either, since a reserved prefix matches names with
+  arbitrary text after it.
 - **The event.** The configuration text holds `<sealed>` at each sealed location, and
   `sealed` names the location and the HMAC-SHA256 of the value under a random 32 byte
   key drawn for that value. A configuration with no literal value is written exactly
@@ -442,16 +456,25 @@ written. The daemon now seals each such value before it appends the event, as
   each missing value, never a value, until an operator configures the line again. At
   start, a line whose project file holds the values is sealed afresh, since its stored
   configuration then differs from the file's. A line configured through a client
-  needs the operator. `dromond --check` reads the live store and writes none, so what
-  its copy of the log seals is kept nowhere.
+  needs the operator. A store that is a symbolic link is not followed, and a named
+  pipe in its place is refused without waiting for a writer.
+- **The check.** `dromond --check` reads the live store and writes none, so what its
+  copy of the log seals is kept nowhere. This is load-bearing and not only tidy. The
+  copy may reconfigure a line, and a writing store would then keep the new value and
+  remove, as no configuration in the copy names it, the value the live log still
+  names, so the running daemon would fail that line's next turn. A test holds the
+  live store byte for byte across a check that reseals a line, after Audit's finding
+  G1c that nothing held it.
 - **No silent migration.** A `line_configured` appended before this change keeps its
   literal values, since the log is append-only and no event is rewritten. A line whose
   current configuration still holds literal values is named at every start, on the
   daemon's standard error, and in the daemon status as `event_log.unsealed_lines`,
   with how many values each holds. Nothing reseals it on its own. Configuring the line
   again, through the project file or `dromon configure`, appends a sealed event, and
-  the earlier events still hold the old values. Removing them needs a new log, which is
-  not built here.
+  the earlier events still hold the old values. A line the log holds sealed is
+  therefore not a line whose history is clean. Removing the old values needs a new
+  log, which is not built here, so the remedy for a credential an older event holds is
+  to rotate it, after which the value the log keeps is no longer valid.
 - **Rollback.** A daemon older than `sealed` refuses as corrupt a log holding any
   `line_configured` that gives it, and so cannot start on it, as the rollback floor
   above records. A log whose every configuration has no literal value stays readable,
@@ -464,7 +487,11 @@ holds. `dromond --check` copies it, a backup copies it, and the operator's clien
 and exports what it holds, so a credential in it is disclosed to every reader of any
 copy and of any view. The store narrows that set. Fact, from the code. It holds only the
 sealed values and their keys, it is created owner only and refused when its mode admits
-anyone else, no snapshot or check copies it, and no view or tool reads it. Inference.
+anyone else, no snapshot or check copies it, and no view or tool reads it. That holds
+for a copy of the log file and for the check's copy. A copy of the whole state
+directory, such as a backup of it, carries the store with the log, and gains nothing
+from sealing. The keyed digest gives integrity and not secrecy once the store is read,
+since each key and its value sit together in it, protected only by its mode. Inference.
 A line can never read it, since it lies beside the log in the daemon's state
 directory, which every line's sandbox denies as it denies the log. A line whose sandbox
 is disabled runs as the operator's user and could read both files, as it could read
@@ -472,9 +499,12 @@ the log before this change, so the store does not protect against such a line. T
 keyed digest lets the event bind the store's value without revealing it, so a reader
 of the log alone cannot test a guess, which a plain hash of a short secret would
 allow. A reader of both files learns the values, as a reader of the log did before.
-The values still reach the engine's process at each turn, as before, and a credential
-written into a server's `command`, `args` or `url` is not sealed and still reaches the
-log, which remains a residual.
+The values still reach the engine's process at each turn, as before, so a line sees the
+values configured for it, as a settings `env` value is given to every command the line
+runs. Sealing keeps the values out of the log, its copies and the views, and not out of
+the line they are configured for. A credential written into a server's `command`,
+`args` or `url` is not sealed and still reaches the log, and older events keep their
+literals, both of which remain residuals as stated above.
 
 ## Bounded start
 

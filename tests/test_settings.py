@@ -366,12 +366,12 @@ def test_references_are_found_and_expanded_with_defaults() -> None:
 @pytest.mark.parametrize(
     ("text", "message"),
     [
-        ("${", "malformed variable reference"),
-        ("${1X}", "malformed variable reference"),
-        ("${A B}", "malformed variable reference"),
-        ("ok ${A} then ${", "malformed variable reference"),
-        ("${ANTHROPIC_API_KEY}", "may not refer to the variable ANTHROPIC_API_KEY"),
-        ("${CLAUDE_CODE_OAUTH_TOKEN:-x}", "may not refer to the variable"),
+        ("${", "malformed variable reference at character 1"),
+        ("${1X}", "malformed variable reference at character 1"),
+        ("${A B}", "malformed variable reference at character 1"),
+        ("ok ${A} then ${", "malformed variable reference at character 14"),
+        ("${ANTHROPIC_API_KEY}", "reserved variable, at character 1"),
+        ("${CLAUDE_CODE_OAUTH_TOKEN:-x}", "reserved variable, at character 1"),
     ],
 )
 def test_a_bad_reference_is_refused_when_the_server_is_configured(

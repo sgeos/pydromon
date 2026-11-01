@@ -210,16 +210,22 @@ class SealedStore:
         """Every value kept, by digest, as its key in hexadecimal and the value. A
         store that does not exist holds none. Raises ``SealedError`` for a store that
         others may read, is too large, or is malformed."""
+        # O_NOFOLLOW refuses a symbolic link put in the store's place, and O_NONBLOCK
+        # keeps a named pipe there from blocking the open until a writer appears.
+        # Either needs write access to the state directory, which a line has not.
         try:
-            descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
+            descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except FileNotFoundError:
             return {}
         except OSError as error:
             raise SealedError(f"cannot open the sealed store {self.path}") from error
+        # The type is checked on the descriptor before a file object is made of it,
+        # since Python refuses a directory there with its own error, not this one.
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            _fail(f"the sealed store {self.path} is not a regular file")
         with os.fdopen(descriptor, "rb") as file:
             status = os.fstat(file.fileno())
-            if not stat.S_ISREG(status.st_mode):
-                _fail(f"the sealed store {self.path} is not a regular file")
             if status.st_mode & 0o077:
                 _fail(
                     f"the sealed store {self.path} may be read by others than its"
