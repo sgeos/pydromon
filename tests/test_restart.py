@@ -1095,6 +1095,50 @@ def test_a_snapshot_copies_a_table_a_later_version_adds_whole(
 def test_a_snapshot_copies_at_least_one_row_at_a_time(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="at least one row"):
         eventlog.snapshot(tmp_path / "a", tmp_path / "b", rows=0)
+    with pytest.raises(ValueError, match="at least one row"):
+        eventlog.snapshot(tmp_path / "a", tmp_path / "b", max_bytes=0)
+
+
+def test_a_snapshot_attaches_the_live_log_read_only(tmp_path: Path) -> None:
+    """Another connection holds the live log's write lock, as a daemon in the
+    middle of a commit does. Attached read-only, the source takes no part in the
+    copy's own ``BEGIN IMMEDIATE``, so the copy goes on. Attached without
+    ``mode=ro``, that transaction would wait for the source's write lock, and here
+    fail as locked, as was observed on 2026-10-31."""
+    source = tmp_path / "events.sqlite"
+    world = World(source, ["alpha"])
+    world.log.close()
+    holder = sqlite3.connect(source, isolation_level=None)
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        eventlog.snapshot(source, tmp_path / "copy.sqlite")
+        assert time.monotonic() - started < 4.0
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert read_entries(tmp_path / "copy.sqlite") == read_entries(source)
+
+
+def test_a_snapshot_range_is_bounded_by_bytes_as_well_as_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A body may be up to 1 MiB, so a count of rows alone would not bound how long
+    a range holds the lock. A range stops at the event that reaches the byte bound,
+    and always takes one."""
+    source = tmp_path / "events.sqlite"
+    world = World(source, [f"line{n}" for n in range(5)])
+    world.log.close()
+    events = len(read_entries(source))
+    pauses: list[float] = []
+    monkeypatch.setattr(eventlog.time, "sleep", pauses.append)
+    eventlog.snapshot(source, tmp_path / "one.sqlite", max_bytes=1)
+    assert len(pauses) == events
+    pauses.clear()
+    eventlog.snapshot(source, tmp_path / "all.sqlite")
+    assert len(pauses) == 1
+    assert read_entries(tmp_path / "one.sqlite") == read_entries(source)
+    assert read_entries(tmp_path / "all.sqlite") == read_entries(source)
 
 
 def test_a_sweep_removes_old_check_directories_and_nothing_else(

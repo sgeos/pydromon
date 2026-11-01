@@ -19,9 +19,10 @@ All notable changes are recorded here. The format follows
   the import check by `--version`. Prompted by the restart of 2026-10-31 that left no
   daemon for about eight minutes. After audit's reviews, the copy is not a SQLite
   backup, which starts again at every write to the source, but the exact schema and
-  the events up to the sequence number read when it begins, copied 2,000 at a time
-  with a short pause and no lock between ranges, so it finishes on a busy log and
-  delays the daemon's commits by at most one range. Preflight
+  the events up to the sequence number read when it begins, copied in ranges of at
+  most 2,000 events and about 1 MiB with a short pause and no lock between them, so
+  it finishes on a busy log and delays the daemon's commits by at most the reading
+  of one range. The live log is attached read-only, which a test pins. Preflight
   directories that a killed check left are swept after a client's timeout, by each
   check when older than its bound, and by each start.
 - `dromon land WORKTREE`, round 13, one operator command that takes a line's finished

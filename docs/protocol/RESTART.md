@@ -112,12 +112,17 @@ message and leaving the old daemon running.
   found. The copy is therefore made from the schema and the rows, decided by the
   operator on 2026-10-31. The schema's statements and its version are copied
   exactly. The newest sequence number is read once, and the events up to it are
-  copied 2,000 at a time by sequence number, each range one statement with a pause
-  of 1 millisecond and no lock after it. The events table is append only, so a
-  range once read never changes, and an event the daemon appends during the copy
-  lies above the bound and is left out, as anything recorded during the drain is.
-  The copy finishes in a number of statements fixed when it begins, and a commit of
-  the running daemon waits at most for one range.
+  copied by sequence number in ranges of at most 2,000 events and about 1 MiB, each
+  read through one cursor closed before the range is written, with a pause of 1
+  millisecond and no lock after it. A body may be up to 1 MiB, so the byte bound is
+  what keeps a range short. A range stops at the event that reaches it, so it reads
+  at most a little over 2 MiB, and always one event. The events table is append
+  only, so a range once read never changes, and an event the daemon appends during
+  the copy lies above the bound and is left out, as anything recorded during the
+  drain is. The copy finishes in at most as many ranges as there are events, and a
+  commit of the running daemon waits at most for one range to be read. The live log
+  is attached read-only, since a copy's own write transaction would otherwise take
+  the live log's write lock too, and a test pins this.
 - **Leftover copies are swept.** A check removes its own directory as it ends. A check
   the client kills at its bound cannot, so the client sweeps the preflight directories
   after a timeout, each check sweeps those older than the bound, and each start, which
