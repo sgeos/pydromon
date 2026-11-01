@@ -3,7 +3,7 @@
 > **Navigation**: [Protocol](./README.md) | [Documentation Root](../README.md)
 
 **Status.** Draft, written on 2026-10-25. Normative for Dromon's side. The Python module
-`dromon.codex` implements it against Codex 0.164.0. The app-server protocol is OpenAI's,
+`dromon.codex` implements it against Codex 0.164.0. **Fact, observed on 2026-11-01 with Codex 0.166.0.** That version refuses a configuration that defines a permissions profile without `default_permissions`, with "config defines `[permissions]` profiles but does not set `default_permissions`", so Dromon also passes `-c default_permissions="dromon-line"`. The app-server protocol is OpenAI's,
 documented as experimental, and Dromon also relies on its experimental dynamic tools.
 
 ## Purpose

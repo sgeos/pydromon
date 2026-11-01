@@ -620,6 +620,11 @@ def server_arguments(
         f"permissions.{PROFILE_NAME}="
         f"{permission_profile(config, protected, write_protected, scratch)}",
     ]
+    # Fact, 2026-11-01, Codex 0.166.0: a configuration that defines a permissions
+    # profile without default_permissions is refused at start with "config defines
+    # `[permissions]` profiles but does not set `default_permissions`", so every
+    # Codex line failed. Naming Dromon's profile keeps thread/start's choice the same.
+    arguments += ["-c", f'default_permissions="{PROFILE_NAME}"']
     return arguments
 
 
