@@ -72,6 +72,8 @@ class Operation(StrEnum):
     """Operator only. Not offered to external agents or lines. Added in round 10."""
     ROLE_DELETE = "role_delete"
     """Operator only. Not offered to external agents or lines. Added in round 10."""
+    RETIRE_LINE = "retire_line"
+    """Operator only. Not offered to external agents or lines. Added in round 14."""
     RUN_CLEAR = "run_clear"
     """Operator only. Not offered to external agents or lines. Task of 2026-10-31."""
     BUDGETS = "budgets"

@@ -21,7 +21,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import cast
 
@@ -240,6 +240,137 @@ class Launched:
             self.process.stdout.close()
         if self.process.stdin is not None:
             self.process.stdin.close()
+
+
+UNVERIFIED = 1
+"""The status a launcher exits with when one of its own bounds passed, read from
+``launcher.main`` and ``launcher.reap``. It is returned only when a walk of the
+process table did not finish within ``WALK_DEADLINE_SECONDS``, when what it killed
+was not confirmed gone within ``KILL_CONFIRM_SECONDS``, or when the harness was not
+reaped within ``REAP_SECONDS``."""
+
+ATTEMPTS = 3
+"""How many times a stop test runs its scenario when the launcher reports that one
+of its own bounds passed on a loaded machine."""
+
+
+def loaded() -> str | None:
+    """The machine's load, described, when it runs more work than it has processors,
+    and otherwise ``None``. A load average that cannot be read counts as not loaded,
+    so the stop tests then fail rather than skip.
+
+    **Assumption.** A one minute load average above the processor count is a loaded
+    machine. The gates that failed these tests in round 13 ran at load averages of 150
+    to 220, far above any processor count here."""
+    try:
+        one, _, _ = os.getloadavg()
+    except OSError:
+        return None
+    processors = os.cpu_count() or 1
+    if one <= processors:
+        return None
+    return f"a load average of {one:.0f} on {processors} processors"
+
+
+def until_conclusive(attempt: Callable[[int], str | None], what: str) -> None:
+    """Run ``attempt`` until one run is conclusive, at most ``ATTEMPTS`` times.
+
+    **Round 14, item 9.** The launcher's stop is bounded by its own constants, which
+    the Agent SDK's window fixes, so a test cannot wait longer for it without changing
+    what it checks. ``attempt`` asserts every outcome the bounds do not explain, and
+    returns ``None`` when its run was conclusive, or the bound the launcher reported
+    passing. Such a run counts as inconclusive only on a loaded machine, so the same
+    outcome on an idle one fails the test. When no run is conclusive, the test is
+    skipped with the load and the bounds named, so the skip is counted and seen, as
+    a test that needs ``ps`` is."""
+    passed: list[str] = []
+    for number in range(ATTEMPTS):
+        bound = attempt(number)
+        if bound is None:
+            return
+        load = loaded()
+        assert load is not None, f"{what}: {bound}, on a machine that is not loaded"
+        passed.append(f"{bound}, at {load}")
+    pytest.skip(
+        f"{what} was inconclusive in {ATTEMPTS} runs, since the launcher's own"
+        f" bounds passed under load: {'; '.join(passed)}"
+    )
+
+
+def test_load_is_read_against_the_processor_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processors = 4
+    monkeypatch.setattr(os, "cpu_count", lambda: processors)
+    monkeypatch.setattr(os, "getloadavg", lambda: (float(processors), 0.0, 0.0))
+    assert loaded() is None
+    monkeypatch.setattr(os, "getloadavg", lambda: (processors * 50.0, 0.0, 0.0))
+    assert loaded() == f"a load average of {processors * 50} on {processors} processors"
+
+    def unreadable() -> tuple[float, float, float]:
+        raise OSError("no load average")
+
+    monkeypatch.setattr(os, "getloadavg", unreadable)
+    assert loaded() is None
+
+
+def test_a_conclusive_run_ends_the_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "loaded", lambda: "heavy")
+    runs: list[int] = []
+
+    def attempt(number: int) -> str | None:
+        runs.append(number)
+        return "a bound passed" if number == 0 else None
+
+    until_conclusive(attempt, "a stop")
+    assert runs == [0, 1]
+
+
+def test_a_passed_bound_on_an_idle_machine_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "loaded", lambda: None)
+    runs: list[int] = []
+
+    def attempt(number: int) -> str | None:
+        runs.append(number)
+        return "a bound passed"
+
+    with pytest.raises(AssertionError, match="a stop: a bound passed, on a machine"):
+        until_conclusive(attempt, "a stop")
+    assert runs == [0]
+
+
+def test_runs_inconclusive_under_load_skip_naming_each(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "loaded", lambda: "heavy")
+    runs: list[int] = []
+
+    def attempt(number: int) -> str | None:
+        runs.append(number)
+        return f"bound {number}"
+
+    with pytest.raises(pytest.skip.Exception) as skipped:
+        until_conclusive(attempt, "a stop")
+    assert runs == list(range(ATTEMPTS))
+    for number in range(ATTEMPTS):
+        assert f"bound {number}, at heavy" in str(skipped.value)
+
+
+def test_a_failed_assertion_in_a_run_is_never_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "loaded", lambda: "heavy")
+    runs: list[int] = []
+
+    def attempt(number: int) -> str | None:
+        runs.append(number)
+        raise AssertionError("the child survived")
+
+    with pytest.raises(AssertionError, match="the child survived"):
+        until_conclusive(attempt, "a stop")
+    assert runs == [0]
 
 
 @pytest.fixture
@@ -471,13 +602,23 @@ def test_the_filter_passes_the_lines_git_command_and_never_the_daemons(
 def test_a_stop_under_kill_all_ends_the_harness_and_its_group(
     tmp_path: Path, started: list[Launched]
 ) -> None:
-    launched = Launched(tmp_path, HARNESS + "time.sleep(60)\n", StopPolicy.KILL_ALL)
-    started.append(launched)
-    stay = launched.pid("stay")
-    assert alive(stay)
-    launched.process.send_signal(signal.SIGTERM)
-    assert launched.wait() == 128 + signal.SIGTERM
-    assert gone(stay)
+    def attempt(number: int) -> str | None:
+        del number
+        launched = Launched(tmp_path, HARNESS + "time.sleep(60)\n", StopPolicy.KILL_ALL)
+        started.append(launched)
+        stay = launched.pid("stay")
+        assert alive(stay)
+        launched.process.send_signal(signal.SIGTERM)
+        status = launched.wait()
+        # The group is signalled whether or not the walk finished, so the child in
+        # it is gone either way.
+        assert gone(stay)
+        if status == UNVERIFIED:
+            return "the launcher could not confirm its stop within its bounds"
+        assert status == 128 + signal.SIGTERM
+        return None
+
+    until_conclusive(attempt, "the stop under kill_all")
 
 
 @NEEDS_PS
@@ -838,17 +979,31 @@ STUBBORN = (
 def test_a_harness_that_ignores_sigterm_is_killed_within_the_sdk_window(
     tmp_path: Path, started: list[Launched]
 ) -> None:
-    """F5. The launcher's own stop, under the SDK's timing."""
-    launched = Launched(tmp_path, STUBBORN, StopPolicy.KILL_ALL)
-    started.append(launched)
-    stay = launched.pid("stay")
-    began = time.monotonic()
-    launched.process.send_signal(signal.SIGTERM)
-    status = launched.wait()
-    took = time.monotonic() - began
-    assert took < launcher.SDK_CLOSE_SECONDS
-    assert status == 128 + signal.SIGKILL
-    assert gone(stay)
+    """F5. The launcher's own stop, under the SDK's timing. The time is the meaning
+    of the test, so a stop past the window counts as inconclusive only on a loaded
+    machine, where the launcher's waits, each a count of short sleeps, take longer."""
+
+    def attempt(number: int) -> str | None:
+        del number
+        launched = Launched(tmp_path, STUBBORN, StopPolicy.KILL_ALL)
+        started.append(launched)
+        stay = launched.pid("stay")
+        began = time.monotonic()
+        launched.process.send_signal(signal.SIGTERM)
+        status = launched.wait()
+        took = time.monotonic() - began
+        assert gone(stay)
+        if status == UNVERIFIED:
+            return "the launcher could not confirm its stop within its bounds"
+        assert status == 128 + signal.SIGKILL
+        if took >= launcher.SDK_CLOSE_SECONDS:
+            return (
+                f"the stop took {took:.1f} seconds, past the Agent SDK's"
+                f" {launcher.SDK_CLOSE_SECONDS:g}"
+            )
+        return None
+
+    until_conclusive(attempt, "the stop of a harness that ignores SIGTERM")
 
 
 VERSION_HARNESS = "import sys\nsys.stdout.write('1.0.0 (Claude Code)\\n')\n"
@@ -929,30 +1084,39 @@ session of its own, when its input closes, and echoes what it reads until then."
 def test_under_leave_background_a_closed_input_does_not_reach_the_harness(
     tmp_path: Path, started: list[Launched]
 ) -> None:
-    reports = tmp_path / "left"
-    reports.mkdir()
-    launched = Launched(
-        tmp_path,
-        CLOSING,
-        StopPolicy.LEAVE_BACKGROUND,
-        report=reports,
-        stdin=subprocess.PIPE,
-    )
-    started.append(launched)
-    assert launched.process.stdin is not None and launched.process.stdout is not None
-    # The relay carries the input across.
-    launched.process.stdin.write(b"ping\n")
-    launched.process.stdin.flush()
-    assert launched.process.stdout.readline() == b"echo ping\n"
-    # The daemon's close, as the Agent SDK's first step, stops the harness instead.
-    launched.process.stdin.close()
-    assert launched.wait() == 128 + signal.SIGKILL
-    away = launched.pid("away")
-    assert alive(away)
-    found = collect_reports(reports)
-    (report,) = found
-    assert report.cause == "stopped"
-    assert away in {pid for pid, _ in report.processes}
+    def attempt(number: int) -> str | None:
+        reports = tmp_path / f"left-{number}"
+        reports.mkdir()
+        launched = Launched(
+            tmp_path,
+            CLOSING,
+            StopPolicy.LEAVE_BACKGROUND,
+            report=reports,
+            stdin=subprocess.PIPE,
+        )
+        started.append(launched)
+        stdin, stdout = launched.process.stdin, launched.process.stdout
+        assert stdin is not None and stdout is not None
+        # The relay carries the input across.
+        stdin.write(b"ping\n")
+        stdin.flush()
+        assert stdout.readline() == b"echo ping\n"
+        # The daemon's close, as the Agent SDK's first step, stops the harness
+        # instead.
+        stdin.close()
+        status = launched.wait()
+        away = launched.pid("away")
+        # The harness never saw its input close, whatever the walk found.
+        assert alive(away)
+        (report,) = collect_reports(reports)
+        assert report.cause == "stopped"
+        if status == UNVERIFIED or not report.listed:
+            return "the launcher could not list or reap within its bounds"
+        assert status == 128 + signal.SIGKILL
+        assert away in {pid for pid, _ in report.processes}
+        return None
+
+    until_conclusive(attempt, "the stop under leave_background")
 
 
 @NEEDS_PS

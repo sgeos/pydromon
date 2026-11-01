@@ -70,6 +70,7 @@ from dromon.model import (
     SeatBound,
     SeatUnbound,
     RoleRetired,
+    LineRetired,
     RoleHeld,
     RoleHolder,
     OwnershipChanged,
@@ -200,6 +201,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "seat_bound": ("line_id", "role_id", "may_own"),
     "seat_unbound": ("line_id", "role_id"),
     "role_retired": ("role_id", "by", "retired_at"),
+    "line_retired": ("line_id", "by", "retired_at"),
     "role_held": ("role_id", "holder", "by", "held_at"),
     "ownership_changed": (
         "role_id",
@@ -635,6 +637,12 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "by": str(event.by),
                 "retired_at": event.retired_at,
             }
+        case LineRetired():
+            return "line_retired", {
+                "line_id": event.line_id,
+                "by": str(event.by),
+                "retired_at": event.retired_at,
+            }
         case RoleHeld():
             return "role_held", {
                 "role_id": event.role_id,
@@ -960,6 +968,12 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
         case "role_retired":
             return RoleRetired(
                 _str(data, "role_id"),
+                _operator(data, "by"),
+                _str(data, "retired_at"),
+            )
+        case "line_retired":
+            return LineRetired(
+                _str(data, "line_id"),
                 _operator(data, "by"),
                 _str(data, "retired_at"),
             )

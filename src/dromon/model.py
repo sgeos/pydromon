@@ -1619,6 +1619,26 @@ class RoleRetired:
 
 
 @dataclass(frozen=True, slots=True)
+class LineRetired:
+    """An operator retires a line, which is hibernated, idle and a seat of no role.
+    **Round 14, item 4.** The line stays in the log with its mail, which can still be
+    read, and starts no turn again. Mail to it is refused, the one-writer rule no
+    longer reads it, and its identifier is never used again, as every identifier of
+    the log is never reused. A line that only the log knew, such as one a client
+    created and the project file never declared, can so be taken out of the rules
+    that read every line."""
+
+    line_id: str
+    by: OperatorAddress
+    retired_at: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_operator_address("by", self.by)
+        check_instant("retired_at", self.retired_at)
+
+
+@dataclass(frozen=True, slots=True)
 class RoleHeld:
     """Whether the project file or an operator's commands decide a role's terms and
     seats from now. A command that changes a role records ``operator``, and a start or
@@ -2101,6 +2121,7 @@ type Event = (
     | SeatBound
     | SeatUnbound
     | RoleRetired
+    | LineRetired
     | RoleHeld
     | OwnershipChanged
     | RoleNoted
@@ -2484,6 +2505,11 @@ class State:
     """Each line's questions to an operator still open, in the order asked, kept by
     ``_put_message`` as ``unread_mail`` is. A line with none has no entry. The inner
     maps are ordered sets. **Task of 2026-11-01.**"""
+    retired_lines: dict[str, LineRetired] = field(
+        default_factory=dict[str, LineRetired]
+    )
+    """Every retired line, keyed by line, each of which also stays in ``lines``.
+    Bounded by the lines ever created. **Round 14, item 4.**"""
 
     def holder_of(self, role_id: str) -> RoleHolder:
         """What decides ``role_id``'s terms and seats now."""
@@ -2564,6 +2590,7 @@ class State:
             dict(self.latest_runs),
             {line_id: dict(mail) for line_id, mail in self.unread_mail.items()},
             {line_id: dict(asked) for line_id, asked in self.open_asked.items()},
+            dict(self.retired_lines),
         )
 
     def line_mail(self, line_id: str) -> LineMail:
@@ -2629,6 +2656,9 @@ class State:
             case LineAwakened():
                 if not self._line(event.line_id).hibernated:
                     raise EventRejected(f"line {event.line_id} is not hibernated")
+                self._check_not_retired(event.line_id)
+            case LineRetired():
+                self._check_line_retired(event)
             case OperatorRegistered():
                 if event.operator_id in self.operators:
                     raise EventRejected(f"operator {event.operator_id} exists")
@@ -2860,6 +2890,8 @@ class State:
             case LineAwakened():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, hibernated=False)
+            case LineRetired():
+                self.retired_lines[event.line_id] = event
             case LineSession():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(
@@ -3279,6 +3311,35 @@ class State:
             raise EventRejected(
                 f"line {event.line_id} cannot go from {line.state} to {event.state}"
             )
+        if event.state is LineState.RUNNING:
+            self._check_not_retired(event.line_id)
+
+    def _check_not_retired(self, line_id: str) -> None:
+        retired = self.retired_lines.get(line_id)
+        if retired is not None:
+            raise EventRejected(
+                f"line {line_id} was retired by {retired.by} at {retired.retired_at}"
+            )
+
+    def _check_line_retired(self, event: LineRetired) -> None:
+        line = self._line(event.line_id)
+        self._require_party(event.by)
+        self._check_not_retired(event.line_id)
+        if line.state is LineState.RUNNING:
+            raise EventRejected(
+                f"line {event.line_id} is in a turn, so it is retired once the turn"
+                " ends"
+            )
+        if not line.hibernated:
+            raise EventRejected(
+                f"line {event.line_id} is hibernated before it is retired"
+            )
+        seat = self.seats.get(event.line_id)
+        if seat is not None:
+            raise EventRejected(
+                f"line {event.line_id} is a seat of role {seat.role_id}, which is"
+                " unbound before it is retired"
+            )
 
     def _reserver(self, message_id: str) -> str | None:
         """The line whose pending scheduled wake reserves ``message_id``, if any."""
@@ -3322,6 +3383,10 @@ class State:
         if not isinstance(event.sender, HarnessAddress):
             self._require_party(event.sender)
         self._require_party(event.recipient)
+        if isinstance(event.recipient, LineAddress):
+            # Round 14, item 4. A retired line starts no turn, so no turn of it would
+            # receive the mail.
+            self._check_not_retired(event.recipient.line_id)
         firing = self._is_firing(event)
         # Decided by the operator on 2026-10-27. A line may send itself a note, for a
         # note to a later turn or to test a tool. No operator or agent may, since no
@@ -3633,6 +3698,7 @@ class State:
 
     def _check_seat_bound(self, event: SeatBound) -> None:
         self._line(event.line_id)
+        self._check_not_retired(event.line_id)
         role = self._role(event.role_id)
         seat = self.seats.get(event.line_id)
         if seat is not None and seat.role_id != event.role_id:

@@ -285,6 +285,7 @@ from dromon.model import (
     RoleNoteKind,
     OwnershipChanged,
     OwnershipCause,
+    Event,
     EventRejected,
     HARNESS,
     HarnessAddress,
@@ -296,6 +297,7 @@ from dromon.model import (
     LineCreated,
     LineHeld,
     LineHibernated,
+    LineRetired,
     LineOverridden,
     LineReleased,
     LeaseAcquired,
@@ -2858,6 +2860,49 @@ class Scheduler:
         self._work.set()
         return True
 
+    def retire_line(self, operator: OperatorAddress, line_id: str) -> LineRetired:
+        """``operator`` retires ``line_id``, hibernating it first where it is not, so
+        that every gate hibernation closes stays closed, and return the record.
+        **Round 14, item 4.** Both events are checked on a copy of the state before
+        either is appended, so a refusal records nothing. The daemon refuses a line
+        the project file declares before it calls this. Raises ``EventRejected``.
+
+        **Residual.** A lease the line holds ends at its time to live, and a
+        supervised run it started runs to its end, since neither needs a turn."""
+        if line_id in self._running:
+            raise EventRejected(
+                f"line {line_id} is in a turn, so it is retired once the turn ends"
+            )
+        state = self._log.state
+        line = state.lines.get(line_id)
+        if line is None:
+            raise EventRejected(f"no line {line_id}")
+        retired = LineRetired(line_id, operator, format_due(self._wall_clock()))
+        events: list[Event] = []
+        if operator.operator_id not in state.operators:
+            events.append(OperatorRegistered(operator.operator_id))
+        if not line.hibernated:
+            events.append(LineHibernated(line_id))
+        events.append(retired)
+        trial = state.copy()
+        for event in events:
+            trial.check(event)
+            trial.apply(event)
+        for event in events:
+            self._log.append(event)
+        self._drop_engine(line_id)
+        self.activity.record(
+            line_id, ActivityKind.NOTICE, f"operator {operator} retired the line"
+        )
+        return retired
+
+    def retired_lines_view(self) -> list[dict[str, object]]:
+        """Every retired line, by identifier, with who retired it and when."""
+        return [
+            {"line_id": line_id, "by": str(event.by), "retired_at": event.retired_at}
+            for line_id, event in sorted(self._log.state.retired_lines.items())
+        ]
+
     # Restart to upgrade, decided by the operator on 2026-10-27.
 
     def begin_restart(
@@ -3738,12 +3783,27 @@ class Scheduler:
 
     def run_status(self, line_id: str) -> str:
         """The latest runs of ``line_id``'s scope, newest first, with their
-        receipts, and the commands the project declares."""
-        found = self._scope_runs(line_id)[-MAX_RUNS_SHOWN:]
+        receipts, and the commands the project declares. **Round 14, item 2.** A
+        failed run names the run that corrected it, and that run names each it
+        corrected, as ``runs.corrections`` links them, read from every run of the
+        scope, so a link to a run older than those shown is still named."""
+        scope = self._scope_runs(line_id)
+        found = scope[-MAX_RUNS_SHOWN:]
         declared = ", ".join(sorted(self._run_commands)) or "none"
         if not found:
             return f"no runs yet, so previous is none. Declared commands: {declared}"
-        lines = [_run_line(run) for run in reversed(found)]
+        corrected = runs.corrections(scope)
+        corrected_by = {
+            failed: passed for passed, ids in corrected.items() for failed in ids
+        }
+        lines = [
+            _run_line(run)
+            + _correction_text(
+                corrected.get(run.started.run_id, ()),
+                corrected_by.get(run.started.run_id),
+            )
+            for run in reversed(found)
+        ]
         return (
             f"previous is {found[-1].started.run_id}. Declared commands: {declared}.\n"
             + "\n".join(lines)
@@ -3846,7 +3906,7 @@ class Scheduler:
                 finding.exit_code,
                 finding.output_digest,
                 finding.output_bytes,
-                finding.note,
+                runs.note_with_summary(finding.note, finding.summary),
                 format_due(self._wall_clock()),
             )
         )
@@ -4841,6 +4901,8 @@ class Scheduler:
         line = self._log.line(line_id)
         if line_id in self._running or line.state is LineState.RUNNING:
             return "running"
+        if line_id in self._log.state.retired_lines:
+            return "retired"
         if line.hibernated:
             return "hibernated"
         if line.held_by is not None:
@@ -6604,6 +6666,10 @@ class Scheduler:
                 )
             )
         for line_id in sorted(trial.lines):
+            if line_id in trial.retired_lines:
+                # Round 14, item 4. A retired line never runs again, so it writes
+                # nothing, and the daemon refuses a file that declares one.
+                continue
             definition = config.lines.get(line_id)
             if line_id in state.lines:
                 baseline = (
@@ -11029,6 +11095,16 @@ def _tool_text(text: str) -> dict[str, Any]:
 
 def _tool_error(text: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}], "is_error": True}
+
+
+def _correction_text(corrects: tuple[str, ...], corrected_by: str | None) -> str:
+    """What a run's line in ``run_status`` adds of the runs it corrected or the run
+    that corrected it. Round 14, item 2."""
+    if corrects:
+        return f". It corrects the failed runs {', '.join(corrects)}"
+    if corrected_by is not None:
+        return f". Corrected by run {corrected_by}"
+    return ""
 
 
 def _run_line(run: Run) -> str:

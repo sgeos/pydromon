@@ -250,7 +250,10 @@ relay = "tail"          # the route of operator ana's mail
   is refused and the daemon does not start. After `rebind_line`, the file is updated to
   the new binding, which it then matches.
   A client may still switch a line's model within its engine, as an override. Lines
-  created through the client and absent from the file are left as they are.
+  created through the client and absent from the file are left as they are, and
+  `dromon status` names each as not in the project file. From round 14 an operator
+  may retire such a line with `dromon retire`, and a file that declares a retired line
+  is refused, since a line identifier is never used again.
 - **Reload.** `reload_project` applies the file again without a restart, with the same
   rules, after checking all of it, so a refused reload applies nothing. It refuses a
   change to the sandbox, the engine settings, the teacher, the external agent policy,

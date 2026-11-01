@@ -75,6 +75,7 @@ from dromon.model import (
     RoleHeld,
     RoleHolder,
     RoleRetired,
+    LineRetired,
     OwnershipChanged,
     OwnershipCause,
     RoleNoted,
@@ -260,6 +261,9 @@ SCENARIO: tuple[Event, ...] = (
     RoleHeld("core", RoleHolder.FILE, ANA, AT),
     SeatUnbound("alpha", "docs"),
     RoleRetired("docs", BEN, AT),
+    LineCreated("delta", ENGINE, "subscription"),
+    LineHibernated("delta"),
+    LineRetired("delta", BEN, AT),
     BudgetStated(
         "claude-code", 40, "2026-10-28T00:00:00Z", BudgetSource.OPERATOR, "", AT
     ),

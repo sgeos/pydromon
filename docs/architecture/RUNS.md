@@ -141,6 +141,18 @@ Each end records `run_ended` with the digest and size of the output file, read w
 end is recorded, then removes the receipt, and sends a note from the harness to the
 scope's present holder, the role's owner or else the line that started it.
 
+**The test summary, round 14, item 2.** The same reconciliation reads the last 64 KiB
+of the output, opened as the digest is, and finds pytest's final line, such as `5162
+passed, 10 skipped, 48 deselected in 231.52s`, with the skip reasons of the short
+summary before it, which `-rfEs` in `pyproject.toml` makes pytest print. `run_ended`'s
+note then ends with `The output's test summary says` and that summary, at most eight
+reasons and the rest counted, each line cut to 200 printable characters and the whole
+note to 1,024 bytes. pytest names no deselected test, so only their count is given,
+and the run's command in the log says which marker expression deselected them.
+**Trust.** The output is under the line's working directory, which a writing line can
+edit, so the summary is what the output says, never what the daemon saw run, and the
+note says so in its wording. An output without a final line adds nothing.
+
 ## A lost run
 
 A lost run's supervisor is gone without a receipt, so its command may still run, in a
@@ -176,6 +188,17 @@ latest is open, and one while the latest is lost and not cleared. A seat that ga
 having read its predecessor's, and cannot start a second one while the first may still
 run. A refusal names the latest run with its record, so the refusal itself is the
 reading.
+
+**A failed run and its correction, round 14, item 2.** A run fails when it ends other
+than by exiting with code 0, so `stopped` and `lost` fail too. Each failed run is
+corrected by the next run of the same command in its scope that exits with code 0.
+`run_status` names, for a failed run, the run that corrected it, and for that run each
+failed run it corrected, read from every run of the scope, so a link reaches a run
+older than the ten shown. **Decided.** The link is derived from the log, not recorded,
+so no event changes and an older log is linked as well. Both runs stay in the log, and
+each output file stays under `tmp/runs` with its own name, since Dromon removes none.
+**Inference.** A pass of the same command is taken as the correction even where the
+tree changed for another reason, since the daemon cannot tell why a run passed.
 
 ## Tools
 
@@ -295,6 +318,89 @@ shows that the tree passes the gate it carries, not that the gate was untouched.
 operator who wants more declares a script outside every worktree, by an absolute path,
 that fetches the gate from the reviewed commit. The same trust section says why.
 
+## Design, a gate run that a reading line may start
+
+**Status.** Round 14, item 1. Designed, not implemented, for the operator's review. No
+code reads any of this yet, and nothing in this section changes what a run does now.
+
+**The problem.** A review seat has `read` access to its working directory, so it may
+not start a run, as the trust section requires, since a run writes outside the line's
+sandbox. A review therefore reports a sandbox gate with the socket and process-table
+tests left out, and the operator runs the full gate by hand. The run proposed here lets
+a reading line start a gate on a commit it names, without letting it write any
+worktree, by running the gate in a checkout that no line can write and that Dromon
+removes afterwards.
+
+**The declaration.** The operator declares such commands apart from the others, so
+that no existing command becomes startable by a reading line.
+
+```toml
+[runs.commit_commands]
+review-gate = ["./scripts/check.sh"]
+
+[runs.commit_refs]
+patterns = ["refs/heads/*"]
+```
+
+**How a line starts it.** `start_run` gains an optional argument `commit`, required for
+a commit command and refused for any other. It must be a full commit identifier of 40
+hexadecimal characters, never a name such as a branch, so it cannot move between the
+check and the checkout.
+
+1. The daemon checks the commit with `git cat-file -e COMMIT^{commit}` and checks that
+   a ref matching one of `patterns` contains it, with `git for-each-ref --contains`,
+   in the project's repository, with arguments as an array and never a shell string.
+2. It makes `tmp/commit-runs/RUN`, mode 0700, under the project root, never under a
+   line's working directory, and fills it with `git clone --no-checkout --shared` of
+   the project's repository followed by `git checkout --detach COMMIT`. A clone writes
+   nothing into the project's own repository, as `git worktree add` would.
+3. The run then starts as any run does, with that directory as its working directory,
+   and its output file under `tmp/runs` in the reading line's working directory, which
+   the daemon writes, not the line, as it writes the output of any run.
+4. `run_started` gains an optional field `commit`, so the record names what ran.
+5. Once `run_ended` is recorded, the daemon removes the checkout with a removal that
+   does not follow links, `shutil.rmtree` where `avoids_symlink_attacks` is true, and
+   refuses commit runs where it is not. A lost run's checkout is kept until the run is
+   cleared, since its command may still run there.
+
+**The trust argument.** It is written for the operator to accept or refuse.
+
+- **What runs.** The code at a commit that a ref matching `patterns` contains, which is
+  code a writer committed and the operator's repository holds. **Fact.** A reading line
+  can neither write that code nor change it after the check, since the identifier is a
+  digest of the tree and the checkout is made by the daemon in a directory no line can
+  write.
+- **What a reading line gains.** It can make the daemon run any such commit's gate
+  outside every sandbox, with the daemon's authority. **Inference.** This is no more
+  than the exposure the trust section already accepts for a writing line that starts
+  its own gate, since the code was committed by a line that could have started it
+  itself. It is more where a commit's author could not start runs, such as a seat that
+  does not own its role, since a reviewer can then run that author's code.
+  `patterns` is how the operator bounds it, such as to `refs/heads/main` alone.
+- **What the run can write.** A run is not sandboxed, so the commit's code may write
+  anywhere the daemon may, other worktrees included. The checkout keeps the run's own
+  writes out of every worktree, but a hostile commit is not contained. **Assumption.**
+  The operator declares commit commands only where the committed gate is trusted as
+  much as the gate a writing line runs.
+- **What is not shared.** The checkout has no virtual environment, so the command makes
+  its own, with `uv sync --locked` in its first step, which needs uv's cache and the
+  network. Nothing of a line's uncommitted work reaches it.
+- **Scope and successor.** A commit run belongs to the reading line's scope as any run
+  does, with the same `previous` rule, so a successor reads its record first.
+
+**Failure modes.** A commit that is not found or not contained is refused before
+anything is made. A clone or checkout that fails removes its directory and records
+nothing. A daemon that dies during a run leaves the checkout, which the next start's
+reconciliation removes once the run has ended or been cleared. A checkout left by a
+crash before the run was recorded has no run, and a start removes every directory
+under `tmp/commit-runs` that no open or lost run names, never following a link.
+
+**Tests to write with it.** A refused short identifier, an unreachable commit, a
+commit outside `patterns`, a reading line refused an ordinary command and allowed a
+commit command, a checkout that holds the commit's tree and none of the worktree's
+uncommitted files, removal after the end, a lost run's checkout kept, a link placed in
+`tmp/commit-runs` not followed, and the start's sweep.
+
 ## Not implemented
 
 **Deferred.** These are left out of the smallest feature, and named so they are not
@@ -331,4 +437,6 @@ ignores `SIGTERM`. **Coverage gap.** `ps` cannot run inside an agent sandbox, so
 real-process tests stand in for the start time with whether the process answers a
 signal, and for the process list with the processes the test started, while `getsid`
 is real. The one test that reads the real table is skipped there, and `ps -A` is not
-run by any test that runs in the sandbox.
+run by any test that runs in the sandbox. Round 14 added the test summary, its bounds,
+its reading of a link or a named pipe, and the links between failed runs and their
+corrections in `run_status`.

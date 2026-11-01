@@ -108,6 +108,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "sync-worktrees": "run uv sync --locked in every role's worktree",
     "renew": "start a line's next turn in a fresh engine session, keeping its mail,"
     " brief and files",
+    "retire": "retire a line the project file does not declare, for good",
 }
 """Planned subcommands and their one-line help, in display order."""
 
@@ -261,14 +262,20 @@ def _peer_row(peer: Mapping[str, object]) -> str:
 
 def _line_row(line: Mapping[str, object]) -> str:
     """One line of ``dromon status`` for a session line, naming a hibernation and a
-    hold, which each keep the line from waking."""
+    hold, which each keep the line from waking, and a line the project file no
+    longer declares. **Round 14, item 4.** A daemon from before round 14 gives no
+    ``declared``, which is then not shown. A retired line is hibernated as well,
+    which is not named twice."""
+    condition = line.get("condition")
     parts = [
         f"line {line.get('line_id')}",
         str(line.get("condition", line.get("state"))),
         f"{line.get('pending')} pending",
     ]
-    if line.get("hibernated") is True and line.get("condition") != "hibernated":
+    if line.get("hibernated") is True and condition not in ("hibernated", "retired"):
         parts.append("hibernated")
+    if line.get("declared") is False and condition != "retired":
+        parts.append("not in the project file")
     if line.get("held_by") is not None and line.get("condition") != "held":
         parts.append(f"held by {line.get('held_by')}")
     return ", ".join(parts)
@@ -2251,6 +2258,22 @@ def _renew(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
+def _retire(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Retire a line, which then starts no turn again, keeps its mail readable, takes
+    no new mail and leaves the one-writer rule. Round 14, item 4. The daemon refuses a
+    line the project file declares, one in a turn and a seat of a role."""
+    line_id: str = arguments.line_id
+    args: dict[str, object] = {"line_id": line_id, "operator": arguments.operator}
+    result = _call(paths, "retire", Operation.RETIRE_LINE, args)
+    if isinstance(result, int):
+        return result
+    warning = result.get("warning")
+    if isinstance(warning, str):
+        print(f"dromon retire: {warning}")
+    print(f"dromon retire: line {line_id} retired at {result.get('retired_at')}")
+    return exits.OK
+
+
 def _land_arguments(command: argparse.ArgumentParser) -> None:
     """The options of ``dromon land``, which ``dromon.land`` describes."""
     command.add_argument("worktree", type=Path, help="the top of the line's worktree")
@@ -2676,6 +2699,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "fleet": lambda _paths, arguments: _fleet(arguments),
     "sync-worktrees": _sync_worktrees,
     "renew": _renew,
+    "retire": _retire,
 }
 
 
@@ -3009,6 +3033,13 @@ def build_parser() -> argparse.ArgumentParser:
             _land_arguments(command)
         if name == "renew":
             command.add_argument("line_id", help="the line to renew")
+        if name == "retire":
+            command.add_argument("line_id", help="the line to retire")
+            command.add_argument(
+                "--operator",
+                default=default_operator(),
+                help="who retires the line, default %(default)s",
+            )
         if name == "awaken":
             command.add_argument("line_id", help="the hibernated line")
         if name == "start":

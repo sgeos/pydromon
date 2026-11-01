@@ -851,6 +851,7 @@ class Daemon:
                 | Operation.ROLE_CREATE
                 | Operation.ROLE_UPDATE
                 | Operation.ROLE_DELETE
+                | Operation.RETIRE_LINE
                 | Operation.RUN_CLEAR
                 | Operation.BUDGETS
                 | Operation.BUDGET_SET
@@ -949,6 +950,11 @@ class Daemon:
                         request.args, ("role_id", "operator")
                     )
                     result = self._role_delete(role_id, operator)
+                case Operation.RETIRE_LINE:
+                    line_id, operator = _text_args(
+                        request.args, ("line_id", "operator")
+                    )
+                    result = self._retire_line(line_id, operator)
                 case Operation.ROLE_TAKE:
                     role_id, seat, operator = _text_args(
                         request.args, ("role_id", "seat", "operator")
@@ -1195,6 +1201,32 @@ class Daemon:
             "retired_at": retired.retired_at,
             **lost,
         }
+
+    def line_summaries(self) -> list[dict[str, object]]:
+        """The scheduler's summary of each line, with ``declared``, whether the project
+        file the daemon applied last declares it. **Round 14, item 4.** A line removed
+        from the file stays in the log and runs as before, so ``declared`` false is how
+        a client shows it as such, and ``condition`` says ``retired`` once an operator
+        retires it."""
+        declared = self.project.lines
+        return [
+            {**entry, "declared": str(entry["line_id"]) in declared}
+            for entry in self.scheduler.line_summaries()
+        ]
+
+    def _retire_line(self, line_id: str, operator: str) -> dict[str, object]:
+        """An operator's ``retire_line``. **Round 14, item 4.** A line the project file
+        declares is refused, since a start or a reload would declare it again, and
+        the response warns of the background tasks its kept engine connection closes
+        with, read before the change."""
+        if line_id in self.project.lines:
+            raise EventRejected(
+                f"line {line_id} is declared in the project file, so remove it from"
+                " the file and reload before it is retired"
+            )
+        lost = self.tasks_lost([line_id])
+        retired = self.scheduler.retire_line(OperatorAddress(operator), line_id)
+        return {"line_id": line_id, "retired_at": retired.retired_at, **lost}
 
     def _budget_set(self, args: dict[str, object]) -> dict[str, object]:
         """An operator's statement of a provider's budget, with ``provider`` and
@@ -1948,7 +1980,8 @@ class Daemon:
             "tick": self.scheduler.tick,
             "daemon": self.scheduler.daemon_status(),
             "restart": self.scheduler.restart_status(),
-            "lines": self.scheduler.line_summaries(),
+            "lines": self.line_summaries(),
+            "retired_lines": self.scheduler.retired_lines_view(),
             "scheduler": self.scheduler.fault_status(),
             "peers": [
                 report.wire(detail=True) for report in self.scheduler.peer_reports()
@@ -3392,6 +3425,14 @@ def check_project(log: EventLog, config: ProjectConfig) -> None:
     within its engine, as an override."""
     for line_id, definition in sorted(config.lines.items()):
         existing = log.state.lines.get(line_id)
+        retired = log.state.retired_lines.get(line_id)
+        if retired is not None:
+            # Round 14, item 4. A line identifier is never used again.
+            raise ProjectMismatch(
+                f"line {line_id} was retired by {retired.by} at {retired.retired_at},"
+                " so the project file may not declare it. Remove it from the file,"
+                " or declare a line with a new identifier."
+            )
         if existing is not None and (existing.engine, existing.strategy) != (
             definition.model,
             definition.strategy.value,

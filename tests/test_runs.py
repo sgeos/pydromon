@@ -28,6 +28,7 @@ from dromon.driver import Strategy
 from dromon.eventlog import EventLog
 from dromon.model import (
     HARNESS,
+    MAX_RUN_NOTE_BYTES,
     EventRejected,
     InvalidField,
     LineAddress,
@@ -41,6 +42,7 @@ from dromon.model import (
     RoleNoteKind,
     RunCleared,
     RunClearance,
+    Run,
     RunEnded,
     RunStarted,
     RunStatus,
@@ -1301,3 +1303,145 @@ def test_a_command_that_ends_unstopped_is_never_signalled(tmp_path: Path) -> Non
         [sys.executable, "-c", "pass"], process_group=0
     )
     assert runs.Supervision().wait(child) == 0
+
+
+# Round 14, item 2. Receipts that name what the gate skipped, and failed runs linked
+# to the run that corrected them.
+
+
+QUIET_GATE = b"""\
+........s....
+=========================== short test summary info ============================
+SKIPPED [8] tests/test_launcher.py:470: ps cannot run here, as inside an agent sandbox
+SKIPPED [2] tests/test_launcher.py:120: only Linux has a child subreaper
+5162 passed, 10 skipped, 48 deselected in 231.52s (0:03:51)
+"""
+
+
+def test_the_summary_names_the_counts_and_each_skip_reason() -> None:
+    assert runs.gate_summary(QUIET_GATE) == (
+        "5162 passed, 10 skipped, 48 deselected, skipped [8]"
+        " tests/test_launcher.py:470: ps cannot run here, as inside an agent"
+        " sandbox; [2] tests/test_launcher.py:120: only Linux has a child subreaper"
+    )
+
+
+def test_the_summary_reads_the_last_final_line_with_or_without_its_rule() -> None:
+    ruled = b"===== 3 failed, 1 passed in 0.5s =====\n"
+    assert runs.gate_summary(ruled) == "3 failed, 1 passed"
+    # An earlier run's summary in the same output, as from a gate run twice, is
+    # replaced by the last, with only the last section's reasons.
+    twice = QUIET_GATE + b"short test summary info\n7 passed in 1.0s\n"
+    assert runs.gate_summary(twice) == "7 passed"
+    assert runs.gate_summary(b"ruff: All checks passed!\n") is None
+    assert runs.gate_summary(b"") is None
+
+
+def test_the_summary_is_bounded_and_printable() -> None:
+    count = runs.MAX_SKIP_REASONS + 3
+    reasons = b"".join(
+        b"SKIPPED [1] tests/t.py:%d: reason\x1b\x07 " % n + b"x" * 400 + b"\n"
+        for n in range(count)
+    )
+    summary = runs.gate_summary(reasons + b"1 passed, %d skipped in 2s\n" % count)
+    assert summary is not None
+    assert summary.endswith("; and 3 more")
+    assert summary.count("[1] tests/t.py:") == runs.MAX_SKIP_REASONS
+    assert "\x1b" not in summary and "\x07" not in summary
+    longest = max(len(part) for part in summary.split("; "))
+    assert longest <= runs.MAX_SUMMARY_LINE + len("1 passed, 11 skipped, skipped ")
+
+
+def test_a_note_with_a_summary_fits_the_event() -> None:
+    assert runs.note_with_summary("as it was", None) == "as it was"
+    assert runs.note_with_summary("", "1 passed") == (
+        "The output's test summary says 1 passed"
+    )
+    long = runs.note_with_summary("é" * MAX_RUN_NOTE_BYTES, "1 passed")
+    assert len(long.encode()) <= MAX_RUN_NOTE_BYTES
+    RunEnded("r-1", RunStatus.EXITED, 0, None, None, long, LATER)
+
+
+def test_the_tail_is_read_as_the_digest_is_and_only_from_a_regular_file(
+    tmp_path: Path,
+) -> None:
+    run = run_in(tmp_path)
+    write_output(tmp_path, run, b"a" * runs.TAIL_BYTES + QUIET_GATE)
+    tail = runs.output_tail(tmp_path, run.output_file)
+    assert tail is not None and len(tail) == runs.TAIL_BYTES
+    assert tail.endswith(QUIET_GATE)
+    assert runs.output_tail(tmp_path, "tmp/runs/missing.out") is None
+    pipe = tmp_path / "tmp" / "runs" / "pipe.out"
+    os.mkfifo(pipe)
+    assert runs.output_tail(tmp_path, "tmp/runs/pipe.out") is None
+    (tmp_path / "tmp" / "runs" / "link.out").symlink_to(tmp_path / run.output_file)
+    assert runs.output_tail(tmp_path, "tmp/runs/link.out") is None
+
+
+def test_a_receipt_carries_the_outputs_summary_into_the_finding(
+    tmp_path: Path,
+) -> None:
+    run = run_in(tmp_path)
+    digest = write_output(tmp_path, run, QUIET_GATE)
+    runs.write_receipt(
+        runs.receipt_path(tmp_path, run.run_id), runs.Receipt(RunStatus.EXITED, 0, "")
+    )
+    (finding,) = runs.reconcile([run], tmp_path, lambda pid: None)
+    assert finding.output_digest == digest
+    assert finding.summary == runs.gate_summary(QUIET_GATE)
+
+
+def a_run(
+    run_id: str,
+    status: RunStatus | None,
+    code: int | None = None,
+    command: str = "gate",
+) -> Run:
+    begun = replace(started(run_id), command=command)
+    end = (
+        None
+        if status is None
+        else RunEnded(run_id, status, code, None, None, "", LATER)
+    )
+    return Run(begun, end)
+
+
+def test_failed_runs_are_linked_to_the_next_pass_of_their_command() -> None:
+    scope = [
+        a_run("r-1", RunStatus.EXITED, 0),
+        a_run("r-2", RunStatus.EXITED, 1),
+        a_run("r-3", RunStatus.STOPPED),
+        a_run("r-4", RunStatus.EXITED, 0, command="device"),
+        a_run("r-5", RunStatus.LOST),
+        a_run("r-6", RunStatus.EXITED, 0),
+        a_run("r-7", RunStatus.EXITED, 2),
+        a_run("r-8", None),
+    ]
+    assert runs.corrections(scope) == {"r-6": ("r-2", "r-3", "r-5")}
+    assert [runs.failed(run) for run in scope] == [
+        False,
+        True,
+        True,
+        False,
+        True,
+        False,
+        True,
+        False,
+    ]
+
+
+def test_run_status_names_the_correction_both_ways(project: Path) -> None:
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+        previous = None
+        for number, code in enumerate((1, 0, 0), start=1):
+            run_id = f"r-{number}"
+            log.append(started(run_id, previous=previous))
+            log.append(RunEnded(run_id, RunStatus.EXITED, code, None, None, "", LATER))
+            previous = run_id
+        shown = scheduler.run_status("alpha").splitlines()
+    assert shown[0].startswith("previous is r-3")
+    assert shown[1].startswith("run r-3 ") and "orrect" not in shown[1]
+    assert shown[2].endswith("It corrects the failed runs r-1")
+    assert shown[3].endswith("Corrected by run r-2")
