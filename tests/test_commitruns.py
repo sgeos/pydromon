@@ -105,6 +105,23 @@ def repo(tmp_path: Path) -> tuple[Path, str, str]:
     return repository_with_side_branch(tmp_path)
 
 
+def checked(
+    repository: Path,
+    commit: str,
+    patterns: Sequence[str] = MAIN,
+    anchor: commitruns.RefAnchor | None = None,
+) -> None:
+    """``check_commit`` with the anchor a daemon starting now would read, unless one
+    read earlier is given."""
+    commitruns.check_commit(
+        repository,
+        commit,
+        patterns,
+        git_env(repository.parent),
+        anchor=commitruns.ref_anchor(repository) if anchor is None else anchor,
+    )
+
+
 # The project file.
 
 
@@ -192,27 +209,24 @@ def test_a_name_or_a_short_commit_is_refused(
     repo: tuple[Path, str, str], commit: str
 ) -> None:
     repository, _, _ = repo
-    environment = git_env(repository.parent)
     with pytest.raises(commitruns.CommitRefused, match="is not a full commit"):
-        commitruns.check_commit(repository, commit, MAIN, environment)
+        checked(repository, commit)
 
 
 def test_a_commit_not_in_the_repository_is_refused(repo: tuple[Path, str, str]) -> None:
     repository, _, _ = repo
-    environment = git_env(repository.parent)
     with pytest.raises(commitruns.CommitRefused, match="is not a commit"):
-        commitruns.check_commit(repository, "b" * 40, MAIN, environment)
+        checked(repository, "b" * 40)
 
 
 def test_a_commit_no_allowed_ref_points_at_is_refused(
     repo: tuple[Path, str, str],
 ) -> None:
     repository, main, side = repo
-    environment = git_env(repository.parent)
-    commitruns.check_commit(repository, main, MAIN, environment)
+    checked(repository, main)
     with pytest.raises(commitruns.CommitRefused, match="no ref matching"):
-        commitruns.check_commit(repository, side, MAIN, environment)
-    commitruns.check_commit(repository, side, ("refs/remotes/origin/*",), environment)
+        checked(repository, side)
+    checked(repository, side, ("refs/remotes/origin/*",))
 
 
 def test_only_a_tip_runs_not_a_commit_a_ref_contains(
@@ -221,13 +235,12 @@ def test_only_a_tip_runs_not_a_commit_a_ref_contains(
     """Review of 1449c5c, C1. ``side`` contains ``main``, and a local branch points
     at ``main`` still, but no allowed ref points at it, so it is refused."""
     repository, main, side = repo
-    environment = git_env(repository.parent)
     git(repository, "update-ref", "refs/remotes/origin/main", side)
     assert git(repository, "merge-base", "--is-ancestor", main, side) == ""
     assert git(repository, "rev-parse", "refs/heads/main") == main
     with pytest.raises(commitruns.CommitRefused, match="Only the tip"):
-        commitruns.check_commit(repository, main, MAIN, environment)
-    commitruns.check_commit(repository, side, MAIN, environment)
+        checked(repository, main)
+    checked(repository, side)
 
 
 @pytest.mark.parametrize(
@@ -270,7 +283,7 @@ def test_a_repository_without_the_files_backend_is_refused(
 
     monkeypatch.setattr(commitruns, "_git", fake_git)
     with pytest.raises(commitruns.CommitRefused, match="files backend"):
-        commitruns.check_commit(tmp_path, "a" * 40, MAIN, {})
+        commitruns.check_commit(tmp_path, "a" * 40, MAIN, {}, anchor=((1, 1), (1, 2)))
     assert asked == ["cat-file", "config"]
 
 
@@ -293,7 +306,7 @@ def test_a_ref_directory_that_is_a_link_is_refused(
     reads the line's ``origin/main``, which points at a commit the line chose. The
     control shows git accepts it, and the check refuses it."""
     repository, _, side = repo
-    environment = git_env(repository.parent)
+    anchor = commitruns.ref_anchor(repository)
     made = line_made_refs(repository, side)
     common = repository / ".git"
     target = common / where
@@ -302,7 +315,46 @@ def test_a_ref_directory_that_is_a_link_is_refused(
     os.symlink(source, target)
     assert git(repository, "rev-parse", "refs/remotes/origin/main") == side
     with pytest.raises(commitruns.CommitRefused, match="not a real directory"):
-        commitruns.check_commit(repository, side, MAIN, environment)
+        checked(repository, side, anchor=anchor)
+
+
+@pytest.mark.parametrize("where", ["refs", "refs/remotes"])
+def test_a_real_directory_moved_into_the_place_of_refs_is_refused(
+    repo: tuple[Path, str, str], where: str
+) -> None:
+    """Final check of 951b9e7, item 2. A real directory of this user's, holding
+    a line's ``origin/main``, passes every ``lstat`` check, as the control shows
+    when the anchor is read after the swap. The anchor the daemon read at its start
+    names the directory that was there, so the commit is refused."""
+    repository, _, side = repo
+    anchor = commitruns.ref_anchor(repository)
+    made = line_made_refs(repository, side)
+    common = repository / ".git"
+    target = common / where
+    os.rename(target, repository.parent / "moved")
+    source = made / Path(where).relative_to("refs") if where != "refs" else made
+    os.rename(source, target)
+    (common / "packed-refs").unlink(missing_ok=True)
+    assert git(repository, "rev-parse", "refs/remotes/origin/main") == side
+    checked(repository, side)
+    with pytest.raises(commitruns.CommitRefused, match="found when it started"):
+        checked(repository, side, anchor=anchor)
+
+
+def test_fetching_packing_and_collecting_keep_the_anchor(
+    repo: tuple[Path, str, str],
+) -> None:
+    """Final check of 951b9e7, item 2. What an operator's fetch, ``git pack-refs``
+    and ``git gc`` do to the refs leaves both anchored directories in place, so a
+    commit run still starts. Observed with the git these tests run."""
+    repository, main, side = repo
+    anchor = commitruns.ref_anchor(repository)
+    git(repository, "update-ref", "refs/remotes/origin/main", side)
+    git(repository, "pack-refs", "--all")
+    git(repository, "gc", "--quiet", "--prune=now")
+    git(repository, "update-ref", "refs/remotes/origin/main", main)
+    assert commitruns.ref_anchor(repository) == anchor
+    checked(repository, main, anchor=anchor)
 
 
 @pytest.mark.parametrize("which", ["packed", "loose"])
@@ -310,7 +362,6 @@ def test_a_ref_file_that_is_a_link_is_refused(
     repo: tuple[Path, str, str], which: str
 ) -> None:
     repository, main, _ = repo
-    environment = git_env(repository.parent)
     common = repository / ".git"
     if which == "packed":
         git(repository, "pack-refs", "--all")
@@ -321,29 +372,29 @@ def test_a_ref_file_that_is_a_link_is_refused(
     os.symlink(repository.parent / "moved", path)
     assert git(repository, "rev-parse", "refs/remotes/origin/main") == main
     with pytest.raises(commitruns.CommitRefused, match="not a real file"):
-        commitruns.check_commit(repository, main, MAIN, environment)
+        checked(repository, main)
 
 
 def test_a_dot_git_that_is_a_link_is_refused(repo: tuple[Path, str, str]) -> None:
     repository, main, _ = repo
-    environment = git_env(repository.parent)
+    anchor = commitruns.ref_anchor(repository)
     os.rename(repository / ".git", repository.parent / "elsewhere.git")
     os.symlink(repository.parent / "elsewhere.git", repository / ".git")
     assert git(repository, "rev-parse", "refs/remotes/origin/main") == main
     with pytest.raises(commitruns.CommitRefused, match="is a link"):
-        commitruns.check_commit(repository, main, MAIN, environment)
+        checked(repository, main, anchor=anchor)
 
 
 def test_a_ref_store_of_another_user_is_refused(
     repo: tuple[Path, str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repository, main, _ = repo
-    environment = git_env(repository.parent)
-    commitruns.check_commit(repository, main, MAIN, environment)
+    anchor = commitruns.ref_anchor(repository)
+    checked(repository, main, anchor=anchor)
     owner = os.getuid()
     monkeypatch.setattr(commitruns.os, "getuid", lambda: owner + 1)
     with pytest.raises(commitruns.CommitRefused, match="not this user's"):
-        commitruns.check_commit(repository, main, MAIN, environment)
+        checked(repository, main, anchor=anchor)
 
 
 def test_a_ref_store_swapped_during_the_match_is_refused(
@@ -353,8 +404,8 @@ def test_a_ref_store_swapped_during_the_match_is_refused(
     one replaced while git read it refuses the commit, here a ``packed-refs``
     rewritten under a new inode as a fetch or a swap would leave it."""
     repository, main, _ = repo
-    environment = git_env(repository.parent)
     git(repository, "pack-refs", "--all")
+    anchor = commitruns.ref_anchor(repository)
     real_git = commitruns._git  # pyright: ignore[reportPrivateUsage]
 
     def swapping_git(
@@ -370,7 +421,7 @@ def test_a_ref_store_swapped_during_the_match_is_refused(
 
     monkeypatch.setattr(commitruns, "_git", swapping_git)
     with pytest.raises(commitruns.CommitRefused, match="changed while"):
-        commitruns.check_commit(repository, main, MAIN, environment)
+        checked(repository, main, anchor=anchor)
 
 
 @pytest.mark.parametrize(
@@ -884,6 +935,49 @@ def test_a_refused_start_is_recorded_and_its_cooldown_outlives_a_restart(
         run = asyncio.run(scheduler.start_run("alpha", "review", "none", main))
         wait_for_supervisor(scheduler, run.run_id)
         check(scheduler)
+
+
+def test_the_scheduler_anchors_the_refs_when_it_is_made(
+    repo: tuple[Path, str, str], tmp_path: Path
+) -> None:
+    """Final check of 951b9e7, item 2. The scheduler, made as the daemon starts,
+    reads the anchor once. A real ``refs/remotes`` moved into place afterwards
+    refuses the start and is recorded, while a scheduler made after the swap would
+    accept it, as the control shows."""
+    repository, _, side = repo
+    with EventLog(tmp_path / "events.sqlite") as log:
+        scheduler = commit_scheduler(log, repository, tmp_path)
+        made = line_made_refs(repository, side)
+        remotes = repository / ".git" / "refs" / "remotes"
+        os.rename(remotes, repository.parent / "moved")
+        os.rename(made / "remotes", remotes)
+        with pytest.raises(runs.RunRefused, match="found when it started"):
+            asyncio.run(scheduler.start_run("alpha", "review", "none", side))
+        (refused,) = log.state.commit_refusals.values()
+        assert "found when it started" in refused.reason
+    checked(repository, side)
+
+
+def test_refs_unreadable_when_the_scheduler_is_made_refuse_every_commit_run(
+    repo: tuple[Path, str, str], tmp_path: Path
+) -> None:
+    """Final check of 951b9e7, item 2. A ``.git`` that is a link when the daemon
+    starts leaves no anchor, so a commit run is refused and recorded even once the
+    link is gone, until a restart reads the anchor again."""
+    repository, main, _ = repo
+    moved = repository.parent / "elsewhere.git"
+    os.rename(repository / ".git", moved)
+    os.symlink(moved, repository / ".git")
+    with EventLog(tmp_path / "events.sqlite") as log:
+        scheduler = commit_scheduler(log, repository, tmp_path)
+        (repository / ".git").unlink()
+        os.rename(moved, repository / ".git")
+        with pytest.raises(runs.RunRefused, match="when the daemon started"):
+            asyncio.run(scheduler.start_run("alpha", "review", "none", main))
+        (refused,) = log.state.commit_refusals.values()
+        assert "is a link" in refused.reason
+        restarted = commit_scheduler(log, repository, tmp_path, clock=Clock())
+        assert restarted._ref_anchor == commitruns.ref_anchor(repository)  # pyright: ignore[reportPrivateUsage]
 
 
 def test_a_second_start_of_a_scope_is_refused_while_one_is_in_progress(

@@ -173,13 +173,16 @@ def run_command(
     *,
     stream: bool = False,
     timeout: float = GIT_SECONDS,
+    env: Mapping[str, str] | None = None,
 ) -> Completed:
     """The real runner. A timeout or a command that cannot start is reported as a
-    failed command, so every step judges one ``Completed``."""
+    failed command, so every step judges one ``Completed``. ``env``, when given,
+    is the command's whole environment, which ``dromon sync-worktrees`` sets."""
     try:
         done = subprocess.run(  # noqa: S603
             list(argv),
             cwd=cwd,
+            env=None if env is None else dict(env),
             input=stdin,
             capture_output=not stream,
             text=True,

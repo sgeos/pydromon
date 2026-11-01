@@ -79,6 +79,14 @@ class ProjectPaths:
         return self.state_dir / "commit-runs"
 
     @property
+    def sync_environments(self) -> Path:
+        """Where ``dromon sync-worktrees`` builds each worktree's environment before
+        moving it into place. **Round 14, final check of 951b9e7, item 1.** In the
+        state directory, which every line's sandbox denies, so uv never runs an
+        interpreter a line could write, as ``dromon.syncenv`` says."""
+        return self.state_dir / "sync-envs"
+
+    @property
     def lock(self) -> Path:
         return self.runtime_dir / "dromond.lock"
 

@@ -74,10 +74,28 @@ the point of it, since it must outlive the engine, and it is also its risk.
   reader cannot parse. A local source outside the worktree leaves it unsynced.
   **Residual.** A file git ignores inside a compared directory is not shown, a build
   backend fetched from an index is shown only as the `pyproject.toml` line that names
-  it, configuration uv reads outside the worktree is not compared, and the worktree's
-  virtual environment, which git ignores and whose interpreter uv runs, is not
-  compared. **Hypothesis, not tested.** A line that writes its `.venv` could have a
-  sync run code of its own that way.
+  it, and configuration uv reads outside the worktree is not compared. **Round 14,
+  final check of 951b9e7, item 1.** The worktree's `.venv`, which git ignores, was not
+  compared either, and the audit line confirmed that `uv sync` ran an executable
+  `.venv/bin/python` a line had written, with no difference shown. Each sync now
+  builds the environment in a fresh private directory in the state directory's
+  `sync-envs`, which no line's sandbox can write. It runs `uv venv --relocatable`
+  there, then `uv sync --locked --link-mode copy` with `UV_PROJECT_ENVIRONMENT`
+  naming it and `VIRTUAL_ENV` removed, and checks that `pyvenv.cfg` says
+  `relocatable = true`. Only then does it move the worktree's `.venv` into the
+  private directory, move the new environment into its place, and remove the private
+  directory without following links, so nothing in the old environment is read or
+  run. **Fact, observed with uv 0.13.5 on 2026-11-01.** Neither step ran a planted
+  interpreter, while a plain `uv sync` in the same worktree did, and a moved
+  environment ran `pytest` with nothing reinstalled by a later `uv sync --locked`.
+  **The gate's own uv run.** It is unchanged. A line's `uv sync --locked` and `uv run`
+  use the worktree's `.venv` as before and find it current. Whatever a line then
+  writes there, the next sync moves aside unread. Packages are copied, since on Linux
+  uv hard links from the operator's cache by default, and a line writing such a file
+  would change that cache. **Residual.** A line that makes a new `.venv` between the
+  two moves leaves the worktree with no environment until the next sync. A gate
+  running during the swap may fail on a module it had not loaded, so sync while no
+  line runs one. A line whose sandbox is disabled can write the state directory too.
 - **Who may start or stop.** A seat may start or stop its role's runs only while it
   owns the role, so the one-writer rule holds for what a run writes. Every line, a
   seat that owns its role included, also needs `write` access to its working
@@ -432,10 +450,19 @@ commit run is stopped with the same access it was started with.
    match, and a change of any refuses the start, so a swap while git reads them is
    caught too, and so is a fetch that ends meanwhile, which a retry after the cooldown
    passes. Before, with `refs` replaced by a link to a line's directory, a line's
-   commit was accepted as the tip of `origin/main`. A real directory a line put in
-   place of `refs` would pass this check, and only the sandbox's rule against renaming
-   a parent of a denied path keeps it out, as [`SANDBOX.md`](../protocol/SANDBOX.md)
-   gives.
+   commit was accepted as the tip of `origin/main`. **Round 14, final check of
+   951b9e7, item 2.** A real directory a line moved into the place of `refs` passed
+   these checks, as the audit line confirmed. The daemon therefore reads the device
+   and inode of `refs` and `refs/remotes` once as it starts, and refuses every commit
+   run while either differs, with a restart as the remedy once the operator has
+   checked them. Refs that cannot be read at the start refuse every commit run until a
+   restart. **Fact, observed with git 2.56.** `git update-ref` of a remote-tracking
+   ref, `git pack-refs --all`, `git gc --prune=now` and `git remote remove` keep both
+   directories. **Inference.** A fetch, which updates remote-tracking refs the same
+   way, keeps them too. It was not run, since lines have no network. **Residual.** A
+   swap made before the daemon starts is anchored as found, and the sandbox's rule
+   against renaming a parent of a denied path remains the first barrier, as
+   [`SANDBOX.md`](../protocol/SANDBOX.md) gives.
 2. It makes `commit-runs/RUN`, mode 0700, in the daemon's state directory, holding
    `home`, empty and mode 0700, and `tree`, filled with `git clone --no-checkout
    --shared` of the project's repository, then an `info/attributes` of `* -filter` in
@@ -574,7 +601,17 @@ checkout made on the commit worker, and the fresh home. From the re-review of 52
 it covers a link at `refs`, `refs/remotes`, a remote's directory, `packed-refs`, a
 loose ref and `.git`, each with git shown reading through it first, a store of
 another user, a store replaced during the match, and a matched ref outside
-`refs/remotes`. **Coverage gap.** No test runs Claude Code's sandbox, so the rule
+`refs/remotes`. From the final check of 951b9e7 it covers a real directory moved into
+the place of `refs` and of `refs/remotes`, each accepted without the anchor first as a
+control, the anchor kept through ref updates, packing and collection, a scheduler that
+refuses and records a swap made after it was made, and refs unreadable when it was
+made refusing every commit run until a new scheduler reads them. `tests/test_syncenv.py`
+covers a planted `.venv/bin/python` never run and replaced, the environment every
+step of uv receives, a worktree with no environment, a linked `.venv` moved without
+following it, a failed step, an environment that is not relocatable, a `.venv` made
+between the two moves, a wide or linked staging directory, and leftovers reported.
+**Coverage gap.** No test runs uv itself, since uv needs the network, so its
+behaviour is the experiment of 2026-11-01. No test runs Claude Code's sandbox, so the rule
 against renaming `refs` is read from its code and not observed. The
 real-process tests stand in for `ps` as the other run tests do. No test reaches the
 network, so the large file filter's own behaviour is shown only by the review's

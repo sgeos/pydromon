@@ -117,6 +117,12 @@ class CommitRefused(ValueError):
     """A commit run cannot start, or its checkout cannot be made or removed."""
 
 
+RefAnchor = tuple[tuple[int, int], tuple[int, int]]
+"""The device and inode of the common git directory's ``refs`` and ``refs/remotes``,
+read when the daemon starts. ``(0, 0)`` stands for a ``refs/remotes`` that did not
+exist then."""
+
+
 @dataclass(frozen=True, slots=True)
 class Checkout:
     """A commit run's checkout, ``tree``, and the empty private home its command is
@@ -245,6 +251,8 @@ def check_commit(
     commit: str,
     patterns: Sequence[str],
     environment: Mapping[str, str],
+    *,
+    anchor: RefAnchor,
 ) -> None:
     """Refuse ``commit`` unless it is a full object name of a commit in
     ``repository`` that a ref matching one of ``patterns`` points at now, in a
@@ -257,9 +265,16 @@ def check_commit(
     and loose file of a matched ref must be real and this user's, not links, checked
     with ``lstat``. With ``refs`` replaced by a link to a line's directory, git read a
     line's ref as ``origin/main``. The store is read again after the match, and a
-    change refuses the commit, so a swap during the match is caught too. A real
-    directory a line put in place of ``refs`` passes this check. Only the sandbox
-    keeps a line from renaming ``refs``, as ``SANDBOX.md`` gives."""
+    change refuses the commit, so a swap during the match is caught too.
+
+    **Round 14, final check of 951b9e7, item 2.** A real directory a line moved into
+    the place of ``refs`` or ``refs/remotes`` passes the ``lstat`` checks, since it
+    is neither a link nor another user's. ``anchor`` holds the identities of both as
+    ``ref_anchor`` read them when the daemon started, and a commit is refused when
+    either differs. An operator's fetch and ``git gc`` rewrite files inside them and
+    replace neither directory, so they do not trip it. **Residual.** A swap made
+    before the daemon started is anchored as found, and only the sandbox keeps a
+    line from renaming ``refs``, as ``SANDBOX.md`` gives."""
     if COMMIT_PATTERN.fullmatch(commit) is None:
         raise CommitRefused(
             f"{commit!r} is not a full commit, 40 or 64 lowercase hexadecimal"
@@ -279,6 +294,12 @@ def check_commit(
         )
     common = _common_directory(repository)
     before = _ref_store(common)
+    if before[:2] != anchor:
+        raise CommitRefused(
+            f"the refs or refs/remotes directory of {common} is not the one the"
+            " daemon found when it started, so no commit run is trusted. Check them,"
+            " then restart the daemon"
+        )
     tips = _git(
         ["for-each-ref", "--format=%(refname)", f"--points-at={commit}", *patterns],
         repository,
@@ -299,6 +320,15 @@ def check_commit(
             f"the refs of {common} changed while {commit} was checked, so it is"
             " refused. Start it again once no fetch is running"
         )
+
+
+def ref_anchor(repository: Path) -> RefAnchor:
+    """The identities of ``refs`` and ``refs/remotes`` in the common git directory
+    of ``repository``, each checked as ``check_commit`` checks it, for the daemon to
+    read once at its start and give to every ``check_commit``. Round 14, final check
+    of 951b9e7, item 2. Raises ``CommitRefused``."""
+    store = _ref_store(_common_directory(repository))
+    return (store[0], store[1])
 
 
 def _common_directory(repository: Path) -> Path:

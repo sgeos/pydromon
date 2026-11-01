@@ -23,6 +23,7 @@ from typing import Final, cast
 
 import dromon
 from dromon import __version__, buildinputs, exits, fleet, land, registry, restart, runs
+from dromon import syncenv
 from dromon import proposals as proposal_store
 from dromon.client import (
     REQUEST_TIMEOUT_SECONDS,
@@ -2351,12 +2352,6 @@ def _proposal(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
-SYNC_SECONDS: Final = 600.0
-"""How long ``uv sync --locked`` may take in one worktree."""
-
-SYNC_ARGV: Final = ("uv", "sync", "--locked")
-
-
 def _role_worktrees(result: Mapping[str, object]) -> list[tuple[str, str]]:
     """Each role and its worktree from a ``roles`` answer, in role order. Entries
     in another form are skipped, since they name no worktree to sync."""
@@ -2401,12 +2396,15 @@ def _sync_accepted(label: str, target: Path, accept_changes: bool) -> bool:
 
 
 def _sync_worktrees(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
-    """Run ``uv sync --locked`` in every role's worktree and report each. Round 14,
+    """Run ``uv sync --locked`` for every role's worktree and report each. Round 14,
     item 3. A worktree's environment goes stale when ``uv.lock`` changes, and a
     line cannot sync it, since its sandbox has no network and cannot write uv's
     cache. ``--locked`` never changes the lock file, but the branch it installs
     from is written by a line, so a worktree whose build inputs differ from the
     base is shown and synced only on the operator's yes or ``--accept-changes``.
+    **Final check of 951b9e7, item 1.** The environment is built outside the
+    worktree and moved into place, so uv never runs the interpreter in a ``.venv``
+    a line could write, as ``dromon.syncenv`` says.
     A worktree outside the project, or with no ``uv.lock`` or no
     ``pyproject.toml``, is reported and skipped. Exits 1 when any worktree failed,
     lay outside the project or was left unsynced."""
@@ -2438,17 +2436,15 @@ def _sync_worktrees(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         if not _sync_accepted(label, target, accept_changes):
             failed += 1
             continue
-        done = land.run_command(SYNC_ARGV, target, timeout=SYNC_SECONDS)
-        if done.code == 0:
-            print(f"{label}: synced")
+        try:
+            synced = syncenv.sync(target, paths.sync_environments, land.run_command)
+        except syncenv.SyncFailed as error:
+            failed += 1
+            print(f"{label}: not synced, {error}", file=sys.stderr)
             continue
-        failed += 1
-        reason = (done.stderr or done.stdout).strip().splitlines()
-        print(
-            f"{label}: uv sync --locked failed with status {done.code}:"
-            f" {reason[-1] if reason else 'no output'}",
-            file=sys.stderr,
-        )
+        print(f"{label}: synced, its {syncenv.ENVIRONMENT} built anew and moved in")
+        if synced.left is not None:
+            print(f"{label}: {synced.left}", file=sys.stderr)
     return exits.FAILURE if failed else exits.OK
 
 

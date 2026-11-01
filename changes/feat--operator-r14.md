@@ -77,6 +77,16 @@ Type: Added
   file or the lock names, and compares the whole worktree, saying why, where a backend
   path, a workspace, a backend other than `uv_build`, a local index, link, cache or
   mirror, or a local git source leaves the build's inputs unbounded.
+- Round 14, final check of the commit runs and the sync. `dromon sync-worktrees` no
+  longer lets uv read a worktree's `.venv`, whose interpreter a line could write and
+  `uv sync` ran. It builds each environment with `uv venv --relocatable` and `uv sync
+  --locked --link-mode copy` in a fresh private directory in the state directory's
+  `sync-envs`, moves the old `.venv` there and the new environment into its place,
+  and removes the old one unread. The daemon reads the device and inode of the
+  project's `refs` and `refs/remotes` as it starts, and refuses every commit run
+  while either differs, since a real directory a line moved into their place passed
+  the `lstat` checks. The build-input tests pin each compared configuration file,
+  `uv.toml` included.
 - Round 14, restart preflight. The read-only `start_context` request, on the client
   socket only, gives the daemon's interpreter and its `DROMON_REGISTRY_DIR` and
   `SSH_AUTH_SOCK`, and `dromon restart` runs its preflight on that interpreter with

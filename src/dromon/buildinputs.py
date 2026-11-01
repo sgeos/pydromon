@@ -33,9 +33,10 @@ installed from an index through ``build-system.requires`` is shown only as the c
 to ``pyproject.toml`` that names it. Configuration uv reads from outside the worktree,
 such as the operator's own ``uv.toml``, the environment, and a parent directory's
 project, which for a worktree under ``tmp/worktrees`` is the operator's checkout, is
-not compared. The worktree's virtual environment is ignored by git and not compared,
-though uv runs its interpreter. **Hypothesis, not tested.** A line that writes
-``.venv`` could have a sync run code of its own that way. Porting note: ``tomllib`` is
+not compared. The worktree's virtual environment is ignored by git and not compared.
+The audit line confirmed that ``uv sync`` runs the interpreter a line writes there,
+so ``dromon.syncenv`` builds each environment outside the worktree and never lets
+uv read the worktree's own. Porting note: ``tomllib`` is
 Python's own reader, and a port needs a TOML reader that also rejects duplicate
 keys."""
 

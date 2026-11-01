@@ -3557,6 +3557,7 @@ def private_dirs(paths: ProjectPaths) -> tuple[Path, ...]:
         paths.commit_checkouts,
         paths.state_dir / proposal_store.PROPOSALS_DIRECTORY,
         paths.state_dir / evidence.PROBES_DIRECTORY,
+        paths.sync_environments,
     )
 
 

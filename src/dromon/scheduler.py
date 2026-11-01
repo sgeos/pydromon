@@ -2092,6 +2092,15 @@ class Scheduler:
         self._checkouts_starting: set[str] = set()
         """Runs whose checkout is made but whose start is not yet recorded, which a
         tidy keeps."""
+        self._ref_anchor: commitruns.RefAnchor | str = "no project root was given"
+        """The identities of the project's ``refs`` and ``refs/remotes``, read once
+        here, as the daemon starts, or why they could not be read, which refuses
+        every commit run. Round 14, final check of 951b9e7, item 2."""
+        if root is not None and checkout_dir is not None:
+            try:
+                self._ref_anchor = commitruns.ref_anchor(root)
+            except commitruns.CommitRefused as error:
+                self._ref_anchor = str(error)
         self._tidy_pending = checkout_dir is not None
         """Whether a checkout may be left that no blocking run names, which is so at
         start, after a crash, and after each end or clearance of a commit run."""
@@ -3992,11 +4001,16 @@ class Scheduler:
                 "this platform cannot remove a checkout without following links, so"
                 " commit runs are refused"
             )
-        refs = self._commit_refs
+        refs, anchor = self._commit_refs, self._ref_anchor
         git_environment = commitruns.git_environment(os.environ)
 
         def make() -> commitruns.Checkout:
-            commitruns.check_commit(root, commit, refs, git_environment)
+            if isinstance(anchor, str):
+                raise commitruns.CommitRefused(
+                    f"the project's refs could not be read when the daemon started,"
+                    f" {anchor}, so no commit run is trusted until it restarts"
+                )
+            commitruns.check_commit(root, commit, refs, git_environment, anchor=anchor)
             return commitruns.make_checkout(base, run_id, root, commit, git_environment)
 
         self._checkouts_starting.add(run_id)

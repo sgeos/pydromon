@@ -269,12 +269,51 @@ def test_an_edited_backend_of_a_local_source_differs(repository: Path) -> None:
     assert buildinputs.differences(repository).untracked == ("libs/bar/hook.py",)
 
 
-@pytest.mark.parametrize("name", ["uv.toml", ".python-version", ".python-versions"])
-def test_a_new_configuration_file_differs(repository: Path, name: str) -> None:
-    (repository / name).write_text("3.12\n")
+PINNED_CONFIG = (
+    "pyproject.toml",
+    "uv.lock",
+    "uv.toml",
+    ".python-version",
+    ".python-versions",
+)
+
+
+def test_the_compared_configuration_is_pinned() -> None:
+    """Final check of 951b9e7, item 3. The other tests take the compared files from
+    the module, so a file dropped from it passed them all."""
+    assert buildinputs.CONFIG_FILES == PINNED_CONFIG
+
+
+@pytest.mark.parametrize(
+    ("name", "text"),
+    [
+        ("uv.toml", "native-tls = true\n"),
+        (".python-version", "3.12\n"),
+        (".python-versions", "3.12\n"),
+    ],
+)
+def test_a_new_configuration_file_differs(
+    repository: Path, name: str, text: str
+) -> None:
+    """Final check of 951b9e7, item 3. Each file is valid, so the inputs stay
+    bounded and the file is found because it is compared, not because an unreadable
+    ``uv.toml`` made the whole tree compared."""
+    (repository / name).write_text(text)
     found = buildinputs.differences(repository)
+    assert found.unbounded is None
     assert found.untracked == (name,)
     assert found.differ
+
+
+def test_a_changed_uv_toml_differs(repository: Path) -> None:
+    (repository / "uv.toml").write_text("native-tls = true\n")
+    git(repository, "add", "uv.toml")
+    git(repository, "commit", "--quiet", "-m", "configure uv")
+    git(repository, "update-ref", "refs/remotes/origin/main", "HEAD")
+    (repository / "uv.toml").write_text("native-tls = false\n")
+    found = buildinputs.differences(repository)
+    assert found.unbounded is None
+    assert "+native-tls = false" in found.diff
 
 
 def test_an_unbounded_worktree_differs_in_any_file_and_says_why(

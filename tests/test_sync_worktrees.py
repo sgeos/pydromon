@@ -2,12 +2,12 @@
 ``uv`` are both replaced, so no test reaches the network or a daemon."""
 
 import argparse
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
 
-from dromon import buildinputs, cli, exits, land
+from dromon import buildinputs, cli, exits, land, syncenv
 from dromon.land import Completed
 from dromon.paths import ProjectPaths, project_paths
 from dromon.protocol import ErrorCode, Operation, Response
@@ -48,7 +48,8 @@ class Uv:
     """Stands in for both ``uv`` and the git calls that compare build inputs. Each
     worktree named in ``diffs`` differs from the base by that diff text, one named
     in ``untracked`` holds those untracked files, and one in ``git_failing`` has no
-    base to compare with."""
+    base to compare with. ``uv venv`` makes a relocatable environment at the path it
+    is given, and ``uv sync`` fails in a worktree named in ``failing``."""
 
     def __init__(
         self,
@@ -62,6 +63,8 @@ class Uv:
         self.untracked = untracked or {}
         self.git_failing = git_failing or set()
         self.ran: list[tuple[tuple[str, ...], Path]] = []
+        self.made: list[Path] = []
+        self.environments: list[Mapping[str, str] | None] = []
         self.compared: list[tuple[tuple[str, ...], Path]] = []
 
     def __call__(
@@ -72,6 +75,7 @@ class Uv:
         *,
         stream: bool = False,
         timeout: float = land.GIT_SECONDS,
+        env: Mapping[str, str] | None = None,
     ) -> Completed:
         del stdin, stream, timeout
         if argv[0] == "git":
@@ -81,6 +85,13 @@ class Uv:
             if "diff" in argv:
                 return Completed(0, self.diffs.get(cwd.name, ""))
             return Completed(0, self.untracked.get(cwd.name, ""))
+        self.environments.append(env)
+        if argv[1] == "venv":
+            stage = Path(argv[-1])
+            stage.mkdir()
+            (stage / "pyvenv.cfg").write_text(f"{syncenv.RELOCATABLE}\n")
+            self.made.append(stage)
+            return Completed(0, "")
         self.ran.append((tuple(argv), cwd))
         if cwd.name in self.failing:
             return Completed(1, "", "error: the lock file needs updating\n")
@@ -115,7 +126,12 @@ def test_every_role_s_worktree_is_synced_and_reported(
     code = cli._sync_worktrees(paths, argparse.Namespace())  # pyright: ignore[reportPrivateUsage]
     assert code == exits.FAILURE
     assert [cwd.name for _, cwd in uv.ran] == ["core", "review"]
-    assert all(argv == ("uv", "sync", "--locked") for argv, _ in uv.ran)
+    assert all(argv == syncenv.SYNC_ARGV for argv, _ in uv.ran)
+    # Each environment was made in the state directory, never in a worktree.
+    assert all(paths.sync_environments in stage.parents for stage in uv.made)
+    assert (paths.root / core / ".venv" / "pyvenv.cfg").is_file()
+    assert not (paths.root / review / ".venv").exists()
+    assert list(paths.sync_environments.iterdir()) == []
     captured = capsys.readouterr()
     assert f"core {core}: build inputs match origin/main" in captured.out
     assert f"core {core}: synced" in captured.out
