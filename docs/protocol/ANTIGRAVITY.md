@@ -38,9 +38,9 @@ Identity changes, reused permission identifiers, execution without approval or a
 rejection, missing permission options, runtime questions, model or mode changes,
 unknown protocol messages, deadlines and driver budgets still stop the turn. Driver
 budgets are checked before granting a permission request. An engine refusal or driver
-interruption leaves a bounded harness note for the next prompt, filtered against the
-disclosure list when recorded and shown. Its wording comes only from Dromon's
-closed vocabulary, with no engine labels, titles, identifiers or error text.
+interruption leaves a bounded harness note for the next prompt. Its wording comes
+only from Dromon's closed vocabulary, with no engine labels, titles, identifiers or
+error text.
 Unrecognized causes receive a generic safety or protocol explanation. Older
 persisted notes are classified again before display. It survives a restart, does
 not wake or release the line, and remains owed until a later turn returns an engine
@@ -49,10 +49,10 @@ A connection failure or protocol error during cancellation keeps the original
 refusal or driver cause. Priority mail and restart interruptions retain their
 existing notices.
 
-Harness screening of these fixed notices does not consume the line's hourly
-disclosure allowance or hold the line. Line-originated disclosure checks retain
-their existing allowance. The finite notice vocabulary prevents engine text from
-becoming an unmetered disclosure query.
+Fixed stop notices contain only public Dromon wording and are not screened against
+the disclosure list. Their wording never depends on that list, so observing a notice
+reveals no list membership. They consume no line disclosure allowance.
+Line-originated disclosure checks retain their existing allowance.
 
 ## Evidence
 
@@ -207,9 +207,11 @@ with `DROMON_ANTIGRAVITY_RUNTIME`.
     waits for its permission request. Every update after rejection requires
     `_meta.toolNotRun` equal to the Boolean `true`. Without it, `pending`, `failed`,
     completed, unknown and missing status all cancel the turn. Execution or unknown
-    status contradicting the marker also cancels. The marker is an engine assertion,
-    not proof of no side effects. No live observation establishes that this runtime
-    supplies it. Rejection before execution depends on the runtime honoring its
+    status contradicting the marker also cancels. Dromon trusts the engine's own
+    `_meta.toolNotRun` assertion that the rejected call did not run. It is not
+    independent proof of no side effects. A runtime that falsely asserts
+    non-execution can therefore leave the turn running. No live observation
+    establishes that this runtime supplies it. Rejection before execution depends on the runtime honoring its
     permission answer. An unauthorized call with another status, including no
     status, cancels and refuses the turn. **F1.** No
     kind, `think` included, exempts a call. **F2 and F3.** Every `tool_call_update` is

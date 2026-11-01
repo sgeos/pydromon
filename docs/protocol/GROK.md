@@ -50,10 +50,8 @@ rejection, missing permission options, model or permission mode drift, undeclare
 servers, unsafe protocol messages, deadlines and driver budgets keep their turn stop.
 When a refusal raises an engine error, or a driver interruption reports its cause,
 Dromon records a bounded harness note for the next prompt. This note survives a
-restart and is checked against the disclosure list both when recorded and when
-shown. A protected cause is replaced by a generic disclosure explanation. The note
-does not wake the line or release a hold. A later reported turn retires it, while an
-unreported turn leaves it owed. The note uses only a closed vocabulary owned by
+restart and does not wake the line or release a hold. A later reported turn retires
+it, while an unreported turn leaves it owed. The note uses only a closed vocabulary owned by
 Dromon. Engine labels, titles, identifiers and error text are never interpolated.
 Unrecognized causes receive a generic safety or protocol explanation. Persisted
 notes from older versions are classified again before display. The original refusal
@@ -61,10 +59,10 @@ or driver cause survives a connection failure or protocol error
 during cancellation. Priority mail and restart interruptions retain their existing
 notices.
 
-Harness screening of these fixed notices does not consume the line's hourly
-disclosure allowance or hold the line. Line-originated disclosure checks retain
-their existing allowance. The finite notice vocabulary prevents engine text from
-becoming an unmetered disclosure query.
+Fixed stop notices contain only public Dromon wording and are not screened against
+the disclosure list. Their wording never depends on that list, so observing a notice
+reveals no list membership. They consume no line disclosure allowance.
+Line-originated disclosure checks retain their existing allowance.
 
 ## Evidence
 
@@ -339,7 +337,9 @@ and workflows live in `$GROK_HOME`.
    call reported as `pending`, `failed`, completed or unknown without that marker
    stops the turn, as does missing status without the marker. An execution status
    or unknown status contradicting the marker also stops the turn. The marker is
-   an engine assertion rather than proof that no side effect occurred. Rejection
+   an engine assertion that Dromon trusts to mean the rejected call did not run.
+   It is not independent proof that no side effect occurred. A runtime that falsely
+   asserts non-execution can therefore leave the turn running. Rejection
    before execution depends on the runtime honoring its permission answer.
    An unauthorized call with no explicit
    pending status, an identity change, a reused identifier, a permission request for

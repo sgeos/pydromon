@@ -1794,12 +1794,11 @@ STOP_CAUSES: Final = (
     ("the engine asked", "The engine made an unsupported protocol request."),
 )
 STOP_CAUSE_UNKNOWN: Final = "An engine safety or protocol check stopped the turn."
-STOP_CAUSE_WITHHELD: Final = "The cause was withheld by the disclosure guard."
 
 
 def _stop_cause(cause: str) -> str:
     """Map arbitrary evidence to a bounded vocabulary owned by Dromon."""
-    if cause in (STOP_CAUSE_UNKNOWN, STOP_CAUSE_WITHHELD):
+    if cause == STOP_CAUSE_UNKNOWN:
         return cause
     # Canonical notes must survive replay without being reclassified by a prefix.
     for _, notice in STOP_CAUSES:
@@ -8601,16 +8600,12 @@ class Scheduler:
         )
 
     def _safe_stop_notice(self, cause: str) -> str:
-        """Render only closed Dromon wording and screen without a line check.
-        Engine labels and errors never enter the note. Legacy persisted notes are
-        classified again rather than trusted after replay. Only fixed harness
-        wording reaches the guard, so arbitrary engine text cannot become an
-        unmetered disclosure query. Screening does not consume the line allowance.
+        """Render fixed public wording without consulting the disclosure list.
+        No engine text enters the note, as _stop_cause guarantees, including on
+        replay. Screening public wording would reveal disclosure-list membership
+        through whether a known sentence was withheld.
         """
-        notice = ENGINE_STOP_NOTE + _stop_cause(cause)
-        if self.discloses(notice):
-            return ENGINE_STOP_NOTE + STOP_CAUSE_WITHHELD
-        return notice
+        return ENGINE_STOP_NOTE + _stop_cause(cause)
 
     def _note_engine_stop(self, line_id: str, cause: str) -> None:
         """Persist a cause without waking the line or clearing its failure state.

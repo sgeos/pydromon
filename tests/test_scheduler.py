@@ -1915,21 +1915,26 @@ def test_stop_notice_survives_replay_without_engine_text(
         notices.stop_workers()
 
 
-def test_stop_notice_is_rechecked_after_disclosure_reload(
+def test_stop_notice_is_unchanged_after_disclosure_reload(
     make_world: MakeWorld,
 ) -> None:
     target = make_world({"alpha": []})
     target.scheduler._note_engine_stop(  # pyright: ignore[reportPrivateUsage]
         "alpha", "the engine reused a tool call identifier"
     )
-    target.scheduler.set_disclosure_terms(["identifier"])
+    before = target.scheduler._engine_stop_notice("alpha")  # pyright: ignore[reportPrivateUsage]
+    target.scheduler.set_disclosure_terms(["identifier", "engine", "dromon"])
     notice = target.scheduler._engine_stop_notice("alpha")  # pyright: ignore[reportPrivateUsage]
-    assert notice is not None and "disclosure guard" in notice
-    assert "identifier" not in notice
+    assert notice == before
+    assert (
+        notice
+        == scheduler_module.ENGINE_STOP_NOTE
+        + "the engine reused a tool call identifier"
+    )
     assert not target.log.state.disclosure_checks.get("alpha")
 
 
-def test_stop_notice_screening_leaves_the_line_disclosure_allowance_untouched(
+def test_stop_notices_leave_the_line_disclosure_allowance_untouched(
     make_world: MakeWorld,
 ) -> None:
     target = make_world({"alpha": []})
@@ -1942,7 +1947,11 @@ def test_stop_notice_screening_leaves_the_line_disclosure_allowance_untouched(
             "alpha", "the engine reused a tool call identifier"
         )
         notice = target.scheduler._engine_stop_notice("alpha")  # pyright: ignore[reportPrivateUsage]
-        assert notice is not None and "disclosure guard" in notice
+        assert (
+            notice
+            == scheduler_module.ENGINE_STOP_NOTE
+            + "the engine reused a tool call identifier"
+        )
     assert target.log.state.disclosure_checks["alpha"] == before
     assert target.log.state.lines["alpha"].held_by is None
     assert "alpha" not in target.scheduler._disclosure_spent  # pyright: ignore[reportPrivateUsage]

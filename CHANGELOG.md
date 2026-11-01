@@ -134,6 +134,12 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- Review of 60fcdd3. Fixed public stop notices no longer consult the disclosure list,
+  so their display cannot reveal whether the list matches a known sentence. They
+  still contain no engine text and consume no line disclosure allowance. The engine
+  documents now state that Dromon trusts the runtime's own `_meta.toolNotRun`
+  assertion that a rejected call did not run.
+
 - Review of 7eda348. Grok and Antigravity continue after a rejected call is reported
   only when the update explicitly asserts non-execution through `_meta.toolNotRun`
   equal to Boolean `true`, without contradictory execution status. Pending and
