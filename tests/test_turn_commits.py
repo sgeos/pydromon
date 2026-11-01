@@ -6,7 +6,7 @@ with a plain warning when a pair differs."""
 
 from collections.abc import Callable, Generator, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
@@ -21,6 +21,7 @@ BRIEFED = "a" * 40
 MOVED = "b" * 40
 LOADED = "c" * 40
 CHECKED_OUT = "d" * 40
+OLDER = "e" * 40
 AT = "2026-11-01T09:00:00Z"
 
 
@@ -57,9 +58,9 @@ class Turns:
         self.scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
         self.head: str | None = BRIEFED
 
-    def brief(self, commit: str) -> None:
+    def brief(self, commit: str, daemon: str = LOADED) -> None:
         self.log.append(
-            BriefSet("alpha", "the task", "", (), "the next step", commit, LOADED, AT)
+            BriefSet("alpha", "the task", "", (), "the next step", commit, daemon, AT)
         )
 
     def notice(self) -> str | None:
@@ -138,3 +139,37 @@ def test_nothing_known_gives_no_notice(
         assert turns.notice() is None
     finally:
         turns.log.close()
+
+
+def paths_holding(value: object, wanted: str, path: str = "") -> list[str]:
+    """Every key path in a ``line_status`` answer whose value is ``wanted``."""
+    found: list[str] = []
+    pending: list[tuple[str, object]] = [(path, value)]
+    # Bounded by the size of the answer, since each pass consumes one node.
+    while pending:
+        where, node = pending.pop()
+        if node == wanted:
+            found.append(where)
+        elif isinstance(node, dict):
+            items = cast(dict[str, object], node).items()
+            pending.extend((f"{where}.{key}", child) for key, child in items)
+        elif isinstance(node, list):
+            children = cast(list[object], node)
+            pending.extend((f"{where}[{index}]", c) for index, c in enumerate(children))
+    return sorted(found)
+
+
+@pytest.mark.parametrize("detail", [True, False])
+def test_a_brief_set_under_an_older_daemon_names_it_only_as_its_stamp(
+    turns: Turns, detail: bool
+) -> None:
+    """**Follow-up of 2026-11-01.** A line reported an older daemon commit from
+    ``line_status``. The brief's stamp was named ``daemon_commit``, as the running
+    commit is, so it could be taken for it. Every field that names the older commit
+    now says it was taken when the brief was set."""
+    turns.brief(BRIEFED, daemon=OLDER)
+    status = turns.scheduler.line_status("alpha", detail=detail, lists=False)
+    assert paths_holding(status, OLDER) == [".brief.daemon_commit_when_set"]
+    commits = cast(dict[str, object], status["commits"])
+    assert commits["daemon"] == LOADED
+    assert f"under the daemon at commit {LOADED}" in str(commits["cite"])

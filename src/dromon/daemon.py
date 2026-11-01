@@ -1839,11 +1839,24 @@ class Daemon:
     def _send(self, args: dict[str, object]) -> dict[str, object]:
         """Record an operator's note. ``priority``, optional and default false, makes
         it priority mail, which only a line may receive, and which for an operator
-        is unlimited."""
+        is unlimited.
+
+        ``asks_reply``, optional, says whether the note asks its recipient for a
+        reply, as a line's ``send_message`` does. **Follow-up of 2026-11-01.** Omitted,
+        the daemon's rule decides, so a note asks a reply unless it is itself a reply,
+        and an operator's note that asks nothing no longer has to stay in a line's
+        unanswered count until the line acknowledges it."""
         urgent = args.get("priority", False)
         if not isinstance(urgent, bool):
             raise ProtocolError(ErrorCode.BAD_REQUEST, "priority is not a boolean")
-        texts = {key: value for key, value in args.items() if key != "priority"}
+        asks = args.get("asks_reply")
+        if asks is not None and not isinstance(asks, bool):
+            raise ProtocolError(ErrorCode.BAD_REQUEST, "asks_reply is not a boolean")
+        texts = {
+            key: value
+            for key, value in args.items()
+            if key not in ("priority", "asks_reply")
+        }
         optional = ("reply_to",) if "reply_to" in texts else ()
         values = _text_args(texts, ("recipient", "body", "operator", *optional))
         recipient, body, operator = values[:3]
@@ -1855,7 +1868,7 @@ class Daemon:
             self.scheduler.check_priority(sender, address)
         self.scheduler.ensure_operator(sender.operator_id)
         message_id = self.scheduler.send(
-            sender, address, body, reply_to, priority=urgent
+            sender, address, body, reply_to, priority=urgent, asks_reply=asks
         )
         return {"message_id": message_id, "priority": urgent}
 

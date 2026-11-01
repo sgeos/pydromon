@@ -11,3 +11,9 @@ Type: Fixed
 - One `line_status` call copies the event log's state once, not 27 or 49 times. At
   100,000 messages the default call fell from 83 to 58 ms and the detailed one from
   129 to 51 ms on the line's machine.
+- A failure the engine reports without raising marks the line failed in an ordinary
+  turn, as it did in a turn the engine started by itself, so a line that mailed an
+  operator before it failed stands `failed` and waits for new mail.
+- `line_status` names the brief's stamp `workdir_commit_when_set` and
+  `daemon_commit_when_set`, so a commit the brief was set under is not read as the
+  running daemon's.

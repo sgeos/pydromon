@@ -9082,6 +9082,13 @@ class Scheduler:
                 ending += f", interrupted by its driver: {report.interrupted_for}"
             elif turn_outcome(report) == FAILED:
                 ending = f"failed: the engine ended the turn as {report.subtype}"
+                # Follow-up of 2026-11-01. A failure the engine reports without
+                # raising marks the line failed, as one it raises does here and as
+                # either does in a self-started turn. Unmarked, a line that mailed an
+                # operator in the turn escaped the hold, showed as idle rather than
+                # failed, kept no failed flag across a restart, and stayed eligible
+                # to wake before any new mail came.
+                self._failed.add(line_id)
                 failed = True
         except asyncio.CancelledError:
             if line_id in self._interrupted:
@@ -9479,10 +9486,14 @@ class Scheduler:
         if brief is None:
             return None
         newest = self._mail_after_brief(line_id)
+        # Follow-up of 2026-11-01. A line reported an older daemon commit than the one
+        # running. The brief's stamp, taken when it was set, was named daemon_commit
+        # as the running commit is, so it is now named for when it was taken, and
+        # commits gives the commits now. That this caused the report is a hypothesis.
         view: dict[str, object] = {
             "set_at": brief.set_at,
-            "workdir_commit": brief.workdir_commit or None,
-            "daemon_commit": brief.daemon_commit or None,
+            "workdir_commit_when_set": brief.workdir_commit or None,
+            "daemon_commit_when_set": brief.daemon_commit or None,
             "trust": BRIEF_UNTRUSTED,
             # Review r6, finding 8. The lead's sentence, for a turn without the lead.
             "operator_mail_since": (

@@ -292,7 +292,10 @@ given exactly when the line is held.
   its record from the state, and the record follows the memory. **Fact.** In an
   ordinary turn, a failure the engine reported without raising never entered the
   memory, so it is not recorded either, while a turn the engine started by itself
-  enters both. This difference predates round 14 and is not changed. **Residual.** A note the daemon records for the line without
+  entered both. **Required by the operator on 2026-11-01.** Both kinds of turn now
+  mark the line failed for such a report, so a line that mailed an operator in the
+  turn escapes the hold as before but stands `failed`, is not woken again until new
+  mail reaches it, and stays failed across a restart. **Residual.** A note the daemon records for the line without
   waking it clears the state's flag, while the daemon's memory keeps the line failed
   until a restart.
 - **The cost.** **Decided by the operator on review r13, C1.** The state keeps each
@@ -1080,6 +1083,18 @@ the intent itself, in the line's own words, set with `set_brief` and recorded as
   silent it fills Task from the former owner's latest operator mail and Gate and
   coverage from its latest task record, each marked observed by the daemon, as
   [`ROLES.md`](../architecture/ROLES.md) describes.
+- **The stamp's commits, from 2026-11-01.** `line_status` names the commits the brief
+  was stamped with `workdir_commit_when_set` and `daemon_commit_when_set`, which were
+  `workdir_commit` and `daemon_commit` before. **Fact, from the operator.** A line
+  reported a daemon commit older than the one the daemon had run for an hour.
+  **Inference, from the code.** The daemon's commit in `commits` and in `daemon` is
+  read once when the daemon starts, and each call answers from it afresh, so it cannot
+  name an earlier daemon. A kept session holds only the answers of its earlier calls,
+  which a line may quote after a restart. **Hypothesis.** The line took
+  the brief's stamp, set under an earlier daemon, for the daemon's commit, since both
+  bore the same name. Renamed so that no field naming an older daemon reads as the
+  running one. A role's journal entries keep `daemon_commit`, since `role_entry` in
+  [`CLIENT.md`](CLIENT.md) names it and each entry stands beside its `noted_at`.
 - **Trust.** The brief is untrusted data, since a line may relay in it what other lines
   and agents wrote. The daemon stamps it and checks its bounds and the disclosure list,
   and checks nothing else. A brief that holds a term the disclosure list in force

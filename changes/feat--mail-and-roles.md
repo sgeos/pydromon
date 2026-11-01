@@ -22,3 +22,7 @@ Type: Added
 - `report_role_ready`, by which a seat reports its role ready. It is refused until
   ownership has passed to the caller and no former writer is in flight, and it reports
   the worktree's `HEAD` and dirty paths together to an operator.
+- `dromon send` and `dromon fleet send` take `--no-reply` and `--ask-reply`, and the
+  daemon's `send` takes `asks_reply`. Given neither, a new note asks a reply and a
+  `--reply-to` note asks none, so an operator's note can leave a line's unanswered
+  count without being acknowledged.

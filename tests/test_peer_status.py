@@ -98,7 +98,8 @@ class Recorder:
         action = self.world.actions.pop(self.spec.line_id, None)
         if action is not None:
             action()
-        return TurnReport("success", 1, "ok", (), None, None, "session-1", None, 0.0)
+        subtype = self.world.subtypes.pop(self.spec.line_id, "success")
+        return TurnReport(subtype, 1, "ok", (), None, None, "session-1", None, 0.0)
 
 
 class World:
@@ -107,6 +108,8 @@ class World:
         self.root = root
         self.clock = Clock()
         self.actions: dict[str, Callable[[], None]] = {}
+        self.subtypes: dict[str, str] = {}
+        """The subtype the next turn of a line reports, ``success`` when unset."""
         self.log = EventLog(path, self.clock.text)
         self.scheduler = self.start()
         self.scheduler.ensure_operator("ana")
@@ -1048,3 +1051,70 @@ def test_a_bad_offset_is_refused(
     result = asyncio.run(invoke())
     assert result.get("is_error") is True
     assert refusal in result["content"][0]["text"]
+
+
+# A failure the engine reports without raising. Follow-up of 2026-11-01.
+
+REPORTED_FAILURE = "error_during_execution"
+
+
+def report_failure(world: World, line_id: str, kind: str, *, mail: bool) -> None:
+    """End one turn of ``line_id`` with a failure its engine reports in a turn
+    report, in an ordinary turn or in one its engine started by itself, having
+    mailed an operator first when ``mail`` is true."""
+    if kind == "ordinary":
+
+        def act() -> None:
+            if mail:
+                world.scheduler.send(LineAddress(line_id), ANA, "this turn ends badly")
+
+        world.subtypes[line_id] = REPORTED_FAILURE
+        world.turn(line_id, act)
+        return
+    report = TurnReport(REPORTED_FAILURE, 1, "ok", (), None, None, "s-1", None, 0.0)
+
+    async def go() -> None:
+        completion: asyncio.Future[tuple[TurnReport | None, Exception | None]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        completion.set_result((report, None))
+        world.log.append(LineStateChanged(line_id, LineState.RUNNING))
+        mailed = world.scheduler._operator_mail(line_id)  # pyright: ignore[reportPrivateUsage]
+        if mail:
+            world.scheduler.send(LineAddress(line_id), ANA, "this turn ends badly")
+        await world.scheduler._self_started_turn(line_id, completion, mailed)  # pyright: ignore[reportPrivateUsage]
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "self-started"])
+def test_a_reported_failure_after_operator_mail_marks_the_line_failed(
+    world: World, kind: str
+) -> None:
+    """The ordinary turn did not mark the line failed for a failure its engine
+    reported without raising, while a self-started turn did. Both now do, in memory
+    and in the log, so the condition survives a restart."""
+    report_failure(world, "beta", kind, mail=True)
+    assert world.log.state.lines["beta"].held_by is None
+    assert world.beta()["condition"] == "failed"
+    assert world.log.state.lines["beta"].failed
+    assert not world.scheduler._eligible("beta")  # pyright: ignore[reportPrivateUsage]
+    world.restart()
+    assert world.beta()["condition"] == "failed"
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "self-started"])
+def test_a_reported_failure_without_operator_mail_holds_the_line(
+    world: World, kind: str
+) -> None:
+    report_failure(world, "beta", kind, mail=False)
+    assert world.log.state.lines["beta"].hold_cause is HoldCause.TURN_FAILED
+    assert world.beta()["condition"] == "held"
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "self-started"])
+def test_a_reported_failure_is_cleared_by_new_mail(world: World, kind: str) -> None:
+    report_failure(world, "beta", kind, mail=True)
+    world.scheduler.send(ANA, BETA, "try again")
+    assert world.beta()["condition"] == "idle"
+    assert not world.log.state.lines["beta"].failed
