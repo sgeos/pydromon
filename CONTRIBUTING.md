@@ -43,7 +43,9 @@ alone. The hygiene checks need `python3` and `shellcheck`, and fail without them
    `<scope>/<short-description>`, such as `fix/parser-error-recovery`.
 3. Write commit messages as conventional commits, such as `feat:`, `fix:`, `docs:`,
    `test:` or `chore:`.
-4. Add an entry under `[Unreleased]` in `CHANGELOG.md` for any change a user would notice.
+4. Add a changelog fragment for any change a user would notice. Write
+   `changes/BRANCH.md`, with BRANCH the branch name with each `/` written `--`, and do
+   not edit `CHANGELOG.md`. [`changes/README.md`](changes/README.md) gives the form.
 5. Update the specification under [`docs/protocol/`](docs/protocol/README.md) when a
    behaviour it describes changes. It is normative, and the Rust port will be written
    from it.

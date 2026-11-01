@@ -18,7 +18,7 @@
 - [ ] Any figure quoted in the change was measured on this tree, or the same sentence says it was not
 - [ ] No check was weakened to make this pass. If a check is wrong, the change says so and fixes it deliberately
 - [ ] Nothing from `secret/`, `tmp/` or `.dromon/` is included
-- [ ] `CHANGELOG.md` has an entry under `[Unreleased]` if a user would notice the change
+- [ ] A fragment under `changes/` records the change if a user would notice it, and `CHANGELOG.md` is not edited
 
 ## Notes for the reviewer
 

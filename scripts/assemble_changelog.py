@@ -19,15 +19,36 @@ library.
   and every fragment, and writes nothing.
 * ``release VERSION DATE`` writes that section into CHANGELOG.md as ``## [VERSION] -
   DATE`` below an empty ``## [Unreleased]``, deletes the fragments it used, and
-  prints their names. ``--dry-run`` prints the new CHANGELOG.md and changes nothing.
-  The release commit then holds the changelog edit and the fragment deletions.
+  prints their names. It refuses a version already in the changelog and a date that is
+  not a real calendar date. ``--dry-run`` prints the new CHANGELOG.md and changes
+  nothing. The release commit then holds the changelog edit and the fragment deletions.
 * ``collapse`` rewrites the Unreleased section with one heading of each type, keeping
   every entry in order. It is how the repeated headings were removed.
 * ``check`` is the gate's rule. It validates every fragment, and refuses a branch that
-  changes CHANGELOG.md's Unreleased section and neither adds nor deletes a fragment.
-  Its base is the merge base of HEAD and ``--base``, which defaults to ``origin/main``
-  and then ``main``. With no base available, as in a clone that fetched one branch, it
-  says so and passes. A release deletes fragments, so it is allowed to edit Unreleased.
+  changes CHANGELOG.md's Unreleased section unless the change is a release or a
+  lossless regrouping. Its base is the merge base of HEAD and ``--base``, which defaults
+  to ``origin/main`` and then ``main``. With no base available, as in a clone that
+  fetched one branch, it prints that it skipped and exits 3, which the gate shows as a
+  skip and not as a pass. Any other failure exits 1.
+
+**The branch rule.** A branch does not edit CHANGELOG.md's Unreleased section. Its
+entry goes in a fragment. Two edits are allowed, because neither adds, removes or
+changes an entry. A *release* adds a version heading, leaves Unreleased empty, and
+keeps every entry that was in Unreleased and every released line, and either deletes a
+fragment or had entries in Unreleased. A *lossless regrouping* leaves Unreleased exactly
+as ``collapse`` would write the base's, so a section with repeated headings can be
+tidied once, and a section already tidy has nothing left to regroup. The regrouping is
+the cleanest exception for the branch that introduced this rule, since it needs no
+mark in the history and cannot be used to slip an entry in.
+
+**Atomic release.** The new changelog is written to a temporary file first. The
+fragments are then moved into ``changes/.released-VERSION``, and the temporary file
+replaces CHANGELOG.md, which is one atomic step. Only then is the staging directory
+removed. A failure before the replacement moves the fragments back and removes the
+temporary file, so nothing has changed. A failure removing the staging directory leaves
+a finished release and a directory to remove by hand, which no command reads as
+fragments, so nothing is released twice. If moving back also fails, the message names
+the staging directory that holds the fragments.
 
 **Failure modes.** A fragment that does not parse stops every command, naming the file.
 Unreleased entries are kept as written, apart from the order of the headings. The
@@ -41,9 +62,14 @@ date is an argument.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import datetime
+import os
 import re
+import shutil
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Final, NamedTuple
 
@@ -56,6 +82,8 @@ NOT_FRAGMENTS: Final = frozenset({"README.md"})
 FRAGMENT_NAME: Final = re.compile(r"[a-z0-9][a-z0-9._-]*\.md")
 VERSION: Final = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?")
 DATE: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+SKIPPED: Final = 3
+"""The exit status of ``check`` when it had no base branch to compare with."""
 
 
 class ChangelogError(Exception):
@@ -189,6 +217,12 @@ def release_text(text: str, fragments: list[Fragment], version: str, date: str) 
         raise ChangelogError(f"{version!r} is not a version such as 0.1.0")
     if DATE.fullmatch(date) is None:
         raise ChangelogError(f"{date!r} is not a date such as 2026-10-31")
+    try:
+        datetime.date.fromisoformat(date)
+    except ValueError as error:
+        raise ChangelogError(f"{date!r} is not a calendar date") from error
+    if any(heading.startswith(f"## [{version}]") for heading in version_headings(text)):
+        raise ChangelogError(f"version {version} is already in the changelog")
     parts = split_changelog(text)
     merged = join_entries(parts.unreleased, fragments)
     if not merged:
@@ -215,20 +249,69 @@ def unreleased_text(text: str) -> str:
     return "\n".join(lines[start:end])
 
 
-def branch_violation(
-    base: str, head: str, added: list[str], removed: list[str]
-) -> str | None:
+def version_headings(text: str) -> set[str]:
+    """The headings of the released sections, such as ``## [0.1.0] - 2026-11-15``."""
+    return {
+        line
+        for line in text.split("\n")
+        if line.startswith("## [") and line != UNRELEASED
+    }
+
+
+def entry_lines(text: str) -> Counter[str]:
+    """Every line that is neither blank nor a type heading."""
+    return Counter(
+        line
+        for line in text.split("\n")
+        if line.strip() and not line.startswith("### ")
+    )
+
+
+def outside_unreleased(text: str) -> str:
+    """``text`` without the Unreleased section."""
+    section = unreleased_text(text)
+    return text.replace(section, "", 1) if section else text
+
+
+def is_regrouping(base: str, head: str) -> bool:
+    """Whether ``head``'s Unreleased is exactly what ``collapse`` makes of ``base``'s,
+    which moves entries under fewer headings and changes none."""
+    try:
+        return unreleased_text(collapse_text(base)) == unreleased_text(head)
+    except ChangelogError:
+        return False
+
+
+def is_release(base: str, head: str, removed: list[str]) -> bool:
+    """Whether ``head`` is ``base`` released. A version heading is new, Unreleased is
+    empty, every released line of ``base`` and every entry of its Unreleased is still
+    there, and something was released, a deleted fragment or Unreleased entries."""
+    try:
+        before = split_changelog(base)
+        after = split_changelog(head)
+    except ChangelogError:
+        return False
+    if not version_headings(head) - version_headings(base) or after.unreleased:
+        return False
+    kept = entry_lines(unreleased_text(base))
+    kept.pop(UNRELEASED, None)
+    wanted = entry_lines(outside_unreleased(base)) + kept
+    if wanted - entry_lines(outside_unreleased(head)):
+        return False
+    return bool(removed) or bool(before.unreleased)
+
+
+def branch_violation(base: str, head: str, removed: list[str]) -> str | None:
     """Why a branch breaks the rule, or ``None``. ``base`` and ``head`` are the
-    changelog before and after the branch, ``added`` and ``removed`` the fragment
-    files it adds and deletes."""
+    changelog before and after the branch, ``removed`` the fragment files it deletes."""
     if unreleased_text(base) == unreleased_text(head):
         return None
-    if added or removed:
+    if is_regrouping(base, head) or is_release(base, head, removed):
         return None
     return (
-        "this branch edits CHANGELOG.md's Unreleased section and adds no fragment."
-        " Put the entry in changes/BRANCH.md instead, as changes/README.md says, and"
-        " leave the changelog to the release"
+        "this branch edits CHANGELOG.md's Unreleased section, which only a release or"
+        " a lossless regrouping may do. Put the entry in changes/BRANCH.md instead,"
+        " as changes/README.md says, and leave the changelog to the release"
     )
 
 
@@ -254,48 +337,105 @@ def find_base(root: Path, requested: str | None) -> str | None:
     return None
 
 
-def fragment_changes(root: Path, base: str) -> tuple[list[str], list[str]]:
-    """The fragment files a working tree adds and deletes against ``base``,
-    untracked files included."""
+def removed_fragments(root: Path, base: str) -> list[str]:
+    """The fragment files a working tree deletes against ``base``."""
     status = run_git(root, "diff", "--name-status", base, "--", FRAGMENTS_DIRECTORY)
-    added: list[str] = []
     removed: list[str] = []
     for line in (status or "").splitlines():
         kind, _, name = line.partition("\t")
-        leaf = Path(name).name
-        if leaf in NOT_FRAGMENTS:
-            continue
-        if kind.startswith("A"):
-            added.append(leaf)
-        elif kind.startswith("D"):
-            removed.append(leaf)
-    untracked = run_git(
-        root, "ls-files", "--others", "--exclude-standard", "--", FRAGMENTS_DIRECTORY
-    )
-    for name in (untracked or "").splitlines():
-        if Path(name).name not in NOT_FRAGMENTS:
-            added.append(Path(name).name)
-    return added, removed
+        if kind.startswith("D") and Path(name).name not in NOT_FRAGMENTS:
+            removed.append(Path(name).name)
+    return removed
 
 
 def check(root: Path, requested: str | None) -> int:
     read_fragments(root)
     base = find_base(root, requested)
-    if base is None:
+    old = None if base is None else run_git(root, "show", f"{base}:CHANGELOG.md")
+    if base is None or old is None:
         print(
-            "assemble_changelog: note: no base branch is available, so the rule on"
-            " editing Unreleased was not checked"
+            "assemble_changelog: SKIPPED: no base branch with a changelog is"
+            " available, so the rule on editing Unreleased was not checked"
         )
-        return 0
-    old = run_git(root, "show", f"{base}:CHANGELOG.md")
-    if old is None:
-        return 0
+        return SKIPPED
     new = (root / "CHANGELOG.md").read_text(encoding="utf-8")
-    added, removed = fragment_changes(root, base)
-    why = branch_violation(old, new, added, removed)
+    why = branch_violation(old, new, removed_fragments(root, base))
     if why is not None:
         print(f"assemble_changelog: FAIL: {why}", file=sys.stderr)
         return 1
+    return 0
+
+
+def apply_release(
+    root: Path, new_text: str, fragments: list[Fragment], version: str
+) -> list[str]:
+    """Write a release so that a failure leaves nothing changed, or a finished release.
+    Returns warnings. Raises ``ChangelogError`` when it undid the release."""
+    directory = root / FRAGMENTS_DIRECTORY
+    changelog = root / "CHANGELOG.md"
+    temporary = root / "CHANGELOG.md.release"
+    staging = directory / f".released-{version}"
+    for leftover in (temporary, staging):
+        # Only what this call made is ever removed, so a path already there is refused
+        # before anything is touched, and is never taken for this call's own.
+        if os.path.lexists(leftover):
+            raise ChangelogError(
+                f"{leftover} is left over from an earlier release, so nothing changed."
+                " Remove it by hand and run the release again"
+            )
+    moved: list[str] = []
+    made_staging = False
+    try:
+        temporary.write_text(new_text, encoding="utf-8")
+        if fragments:
+            staging.mkdir()
+            made_staging = True
+        for fragment in fragments:
+            os.replace(directory / fragment.name, staging / fragment.name)
+            moved.append(fragment.name)
+        os.replace(temporary, changelog)
+    except OSError as error:
+        stuck: list[str] = []
+        for name in reversed(moved):
+            try:
+                os.replace(staging / name, directory / name)
+            except OSError:
+                stuck.append(name)
+        with contextlib.suppress(OSError):
+            temporary.unlink(missing_ok=True)
+        if not stuck:
+            if made_staging:
+                staging.rmdir()
+            raise ChangelogError(
+                f"the release failed and was undone, nothing changed: {error}"
+            ) from error
+        raise ChangelogError(
+            f"the release failed: {error}. Fragments {', '.join(stuck)} could not be"
+            f" moved back and are in {staging}"
+        ) from error
+    try:
+        if staging.exists():
+            shutil.rmtree(staging)
+    except OSError as error:
+        return [
+            f"the release is complete, but {staging} could not be removed: {error}."
+            " Remove it by hand. No command reads it as fragments"
+        ]
+    return []
+
+
+def perform_release(root: Path, version: str, date: str, dry_run: bool) -> int:
+    text = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    fragments = read_fragments(root)
+    new = release_text(text, fragments, version, date)
+    if dry_run:
+        print(new, end="")
+        return 0
+    warnings = apply_release(root, new, fragments, version)
+    for fragment in fragments:
+        print(f"removed {FRAGMENTS_DIRECTORY}/{fragment.name}")
+    for warning in warnings:
+        print(f"assemble_changelog: warning: {warning}", file=sys.stderr)
     return 0
 
 
@@ -329,14 +469,9 @@ def main(argv: list[str]) -> int:
             merged = join_entries(split_changelog(text).unreleased, fragments)
             print(render_sections(merged), end="")
             return 0
-        new = release_text(text, fragments, arguments.version, arguments.date)
-        if arguments.dry_run:
-            print(new, end="")
-            return 0
-        changelog.write_text(new, encoding="utf-8")
-        for fragment in fragments:
-            (root / FRAGMENTS_DIRECTORY / fragment.name).unlink()
-            print(f"removed {FRAGMENTS_DIRECTORY}/{fragment.name}")
+        return perform_release(
+            root, arguments.version, arguments.date, arguments.dry_run
+        )
     except ChangelogError as error:
         print(f"assemble_changelog: FAIL: {error}", file=sys.stderr)
         return 1

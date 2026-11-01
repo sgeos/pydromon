@@ -71,8 +71,8 @@ operator's instruction of 2026-10-25, which applies to every repository.
 adding under the same headings made almost every merge conflict. It adds one file,
 `changes/BRANCH.md`, with BRANCH the branch name with each `/` written `--`, a first
 line `Type: Added`, `Type: Changed` or `Type: Fixed`, a blank line, and its bullets.
-`scripts/check.sh` validates the fragments and refuses a branch that edits the
-Unreleased section and adds or deletes no fragment. A release runs
+`scripts/check.sh` validates the fragments and refuses any branch edit of the
+Unreleased section other than a release or a lossless regrouping of its headings. A release runs
 `python3 -I scripts/assemble_changelog.py release VERSION DATE`, in the operator's
 session and in one commit with the deleted fragments, after `preview` shows the
 entries. [`changes/README.md`](changes/README.md) is the convention in full.

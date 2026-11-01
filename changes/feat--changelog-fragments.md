@@ -6,5 +6,8 @@ Type: Added
   `scripts/assemble_changelog.py` assembles the fragments at a release, previews them
   and collapses the Unreleased section's repeated headings, which it did once for the
   existing entries without losing any. `scripts/check.sh` validates every fragment and
-  refuses a branch that edits the Unreleased section and adds or deletes no fragment.
+  refuses any branch edit of the Unreleased section other than a release or a lossless
+  regrouping, and prints a skip, not a pass, when it has no base branch to compare
+  with. Continuous integration fetches the full history for that base. A release
+  refuses a version already released and an impossible date, and is atomic.
   `changes/README.md` and the Git Workflow section of `CLAUDE.md` state the convention.
