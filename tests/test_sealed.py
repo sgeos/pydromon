@@ -9,7 +9,7 @@ never a value, and a log written before sealing is reported and never migrated."
 import json
 import os
 import stat
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -118,8 +118,13 @@ class World:
 
 
 @pytest.fixture
-def world(tmp_path: Path) -> World:
-    return World(tmp_path / "events.sqlite")
+def world(tmp_path: Path) -> Iterator[World]:
+    """A world whose log is closed at the end of the test, so that its connection is
+    never left to the garbage collector, which reports it as a ``ResourceWarning``
+    in whichever later test collection happens to run."""
+    target = World(tmp_path / "events.sqlite")
+    yield target
+    target.log.close()
 
 
 def log_text(path: Path) -> str:
