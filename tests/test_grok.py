@@ -640,6 +640,7 @@ def test_any_drift_in_the_home_config_is_refused(tmp_path: Path, document: str) 
 def test_the_home_config_is_compared_by_its_contents(tmp_path: Path) -> None:
     _, _, grok_home = prepared(tmp_path)
     (grok_home / "config.toml").write_text(
+        "disable_web_search = true\n"
         "[compat.cursor]\nhooks = false\nmcps = false\n"
         '[ui]\npermission_mode = "default"\n'
         "[compat.claude]\nhooks = false\nmcps = false\n"
@@ -663,6 +664,16 @@ def test_a_policy_file_may_exist_only_empty(
     etc = tmp_path / "etc"
     etc.mkdir()
     file = (etc if system else grok_home) / name
+    if not system and name == "requirements.toml":
+        for content in (
+            "",
+            "[features]\nimage_edit = true\n",
+            grok_module.HOME_REQUIREMENTS + "extra = false\n",
+        ):
+            file.write_text(content)
+            with pytest.raises(EngineRefused, match="image-edit denial only"):
+                check_home(grok_home, etc)
+        return
     file.write_text("")
     check_home(grok_home, etc)
     file.write_text("[permission]\n")
@@ -3928,3 +3939,31 @@ def test_a_missing_hook_executable_refuses_before_launch(
     with pytest.raises(EngineRefused, match="denial hook program is not executable"):
         run(line(server, project))
     assert server.methods() == []
+
+
+@pytest.mark.parametrize("search", [False, True])
+def test_server_tool_controls_replace_inherited_values(
+    project: tuple[Path, Path, Path], search: bool
+) -> None:
+    server = FakeGrok()
+    disabled = {
+        "GROK_BACKEND_SEARCH",
+        "GROK_WORKFLOWS",
+        "GROK_WORKFLOW_CONVERSION",
+        "GROK_ASK_USER_QUESTION",
+        "GROK_FEEDBACK_ENABLED",
+    }
+    inherited = dict.fromkeys(disabled, "1")
+    inherited["GROK_CONFIG"] = '{"features":{"image_gen":true,"video_gen":true}}'
+    config = LineConfig(builtin_tools=("WebSearch",) if search else ())
+    run(line(server, project, config=config, environment=inherited))
+    assert {key: server.environment[key] for key in disabled} == dict.fromkeys(
+        disabled, "0"
+    )
+    assert json.loads(server.environment["GROK_CONFIG"]) == {
+        "features": {"backend_tools": False, "image_gen": False, "video_gen": False}
+    }
+    assert tomllib.loads(grok_module.HOME_CONFIG)["disable_web_search"] is True
+    assert tomllib.loads(grok_module.HOME_REQUIREMENTS) == {
+        "features": {"image_edit": False}
+    }
