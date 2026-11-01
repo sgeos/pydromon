@@ -480,8 +480,6 @@ def test_the_arguments_name_the_model_and_map_effort() -> None:
         GROK,
         "--reasoning-effort",
         "high",
-        "--deny",
-        "WebFetch",
         "stdio",
     ]
     assert grok_arguments(GROK, "max")[5] == "xhigh"
@@ -3848,15 +3846,17 @@ def test_generated_hook_runs_a_fixed_system_program_without_shell_input(
 
 
 @pytest.mark.parametrize("fetch", [False, True])
-def test_web_fetch_deny_rule_is_selected_for_each_process(
+def test_no_deny_rule_is_passed_to_grok_agent(
     project: tuple[Path, Path, Path], fetch: bool
 ) -> None:
+    # Fact, 2026-11-01: Grok Build 1.0.70's agent command refuses --deny with
+    # "unexpected argument" and exits 2, which closed every Grok turn. WebFetch is
+    # withheld by GROK_WEB_FETCH and refused per call instead.
     server = FakeGrok()
     config = LineConfig(builtin_tools=("WebFetch",) if fetch else ())
     run(line(server, project, config=config))
-    assert ("--deny" in server.arguments) is not fetch
-    if not fetch:
-        assert server.arguments[-3:] == ["--deny", "WebFetch", "stdio"]
+    assert "--deny" not in server.arguments
+    assert server.arguments[-1] == "stdio"
     assert "permission" not in tomllib.loads(HOME_CONFIG)
 
 
