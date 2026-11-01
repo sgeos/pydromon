@@ -45,6 +45,7 @@ from dromon.protocol import (
 )
 from dromon.scheduler import LineEngine, LineSpec, Scheduler
 from dromon.launcher import StopPolicy, TreeRow
+from dromon.mailbox import counts_unanswered
 
 HAIKU = "claude-haiku-5-5"
 
@@ -1118,6 +1119,66 @@ def test_send_with_priority_refuses_and_records_nothing(
     with EventLog(paths.event_log) as log:
         assert log.state.messages == {}
         assert "ana" not in log.state.operators
+
+
+@pytest.mark.parametrize(
+    ("given", "reply_to", "recorded", "counted"),
+    [
+        ({}, False, None, True),
+        ({}, True, None, False),
+        ({"asks_reply": False}, False, False, False),
+        ({"asks_reply": True}, True, True, True),
+    ],
+)
+def test_send_records_whether_the_note_asks_a_reply(
+    paths: ProjectPaths,
+    given: dict[str, object],
+    reply_to: bool,
+    recorded: bool | None,
+    counted: bool,
+) -> None:
+    """**Follow-up of 2026-11-01.** An operator's note says whether it asks a reply,
+    and omitted the daemon's rule decides, so a reply asks none."""
+    request(
+        paths, "create_line", {"line_id": "alpha", "model": HAIKU, "strategy": "api"}
+    )
+    args: dict[str, object] = {"recipient": "alpha", "body": "x", "operator": "ana"}
+    if reply_to:
+        with EventLog(paths.event_log) as log:
+            log.append(OperatorRegistered("ana"))
+            log.append(
+                MessageSent(
+                    "m-report",
+                    LineAddress("alpha"),
+                    OperatorAddress("ana"),
+                    MessageKind.NOTE,
+                    "a report",
+                )
+            )
+        args["reply_to"] = "m-report"
+    response = request(paths, "send", {**args, **given})
+    assert response.ok and response.result is not None, response.error_message
+    with EventLog(paths.event_log) as log:
+        message = log.state.messages[str(response.result["message_id"])]
+        assert message.asks_reply is recorded
+        assert counts_unanswered(log.state, message) is counted
+
+
+def test_send_refuses_an_asks_reply_that_is_not_a_boolean(paths: ProjectPaths) -> None:
+    request(
+        paths, "create_line", {"line_id": "alpha", "model": HAIKU, "strategy": "api"}
+    )
+    args: dict[str, object] = {
+        "recipient": "alpha",
+        "body": "x",
+        "operator": "ana",
+        "asks_reply": "no",
+    }
+    response = request(paths, "send", args)
+    assert (response.ok, response.error_code) == (False, ErrorCode.BAD_REQUEST)
+    assert "asks_reply is not a boolean" in (response.error_message or "")
+    with EventLog(paths.event_log) as log:
+        assert log.state.messages == {}
 
 
 def test_create_limits_are_durable(paths: ProjectPaths) -> None:

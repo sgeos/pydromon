@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from typing import cast
 
-from dromon import priority
+from dromon import linetemp, priority
 from dromon import scheduler as scheduler_module
 from dromon.processes import ProcessInfo
 from dromon.fleet import HOSTS_FILE_ENV
@@ -162,6 +162,9 @@ SCENARIO: tuple[Event, ...] = (
     MessageSent("m6", ALPHA, ALPHA, NOTE, "a note to my next turn"),
     MessageSent("m3", ALPHA, BEN, NOTE, "thank you", reply_to="m2"),
     MessageSent("m7", ALPHA, BEN, NOTE, "keyed", request=RequestStamp("k1", "b" * 64)),
+    MessageSent("m8", ALPHA, BEN, NOTE, "corrects m7", reply_to="m7", asks_reply=False),
+    MessageDelivered("m8"),
+    MessageAcknowledged("m8", "the correction needs no reply"),
     MessageSent("h1", HARNESS, BEN, NOTE, "a note the harness wrote"),
     MessageSent("i1", ALPHA, BEN, MessageKind.ISSUE, "a tool's refusal misleads"),
     AgentRegistered("probe", AgentAccess.MESSAGE, "0" * 64),
@@ -171,6 +174,7 @@ SCENARIO: tuple[Event, ...] = (
     TurnCorrelated("beta", ("game-7.round-2", "game-8"), 2, None),
     LineTurnEnded("beta", "a" * 40),
     LineTurnEnded("beta", None, True),
+    LineTurnEnded("beta", None, None, True),
     DisclosureChecked("beta", "2026-10-28T19:00:00Z", 2),
     MessageSent("m5", BETA, PROBE, NOTE, "to an agent", reply_to="m4"),
     AgentRegistered("guest", AgentAccess.OBSERVE, ""),
@@ -274,7 +278,7 @@ SCENARIO: tuple[Event, ...] = (
         "five_hour",
     ),
     BudgetHandoffRequested("claude-code", "core", 8, 10, AT),
-    LeaseAcquired("gate", "beta", AT, "2026-10-27T08:00:00Z"),
+    LeaseAcquired("gate", "beta", AT, "2026-10-27T08:00:00Z", "the sandbox gate"),
     LeaseReleased("gate", "beta", LeaseEnd.RELEASED),
     LeaseAcquired("device", "beta", AT, "2026-10-27T08:00:00Z"),
     LeaseReleased("device", "beta", LeaseEnd.UNDECLARED),
@@ -396,6 +400,18 @@ def _no_real_process_table(
     node = cast(pytest.Item, request.node)  # pyright: ignore[reportUnknownMemberType]
     if node.get_closest_marker("real_processes") is None:
         monkeypatch.setattr(scheduler_module, "SystemProcesses", NoProcesses)
+
+
+@pytest.fixture(autouse=True)
+def _private_line_temp(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Give every test's lines temporary directories of its own, under the test's
+    own directory, since a line the factory builds with an enabled sandbox makes
+    them, and no test may write the machine's shared temporary directory. **Round 14,
+    item 6.**"""
+    base = tmp_path_factory.mktemp("linetemp")
+    monkeypatch.setattr(linetemp, "base_directory", lambda: base)
 
 
 @pytest.fixture(autouse=True)

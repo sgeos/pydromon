@@ -35,6 +35,7 @@ from types import TracebackType
 from typing import Final, Self, cast
 
 from dromon.codec import DecodeError, decode, encode
+from dromon.mailbox import counts_unanswered
 from dromon.model import (
     Event,
     EventRejected,
@@ -47,6 +48,7 @@ from dromon.model import (
     LineAddress,
     LineMail,
     LineStateChanged,
+    MessageAcknowledged,
     MessageRead,
     MessageReceived,
     MessageSent,
@@ -234,7 +236,15 @@ class RecordedTimes:
     the map is bounded by the unread mail rather than by every message the log has
     held. Mail enters that index only when it is sent or received, and leaves it
     only when it is read, so these two events keep the map.
-    **Porting note.** A port keeps the same two maps beside its state."""
+
+    **Round 14 task of 2026-11-01.** The time of each message counted as unanswered
+    is kept too, so a line listing its unanswered mail sees how long each has
+    waited. A message enters when it is sent or received counted, and leaves when a
+    reply, a correction or an acknowledgement takes it out of the count, so the map
+    is bounded by the unanswered mail. A reply to a hold question is never counted,
+    and the hold questions are only added to, so no later event puts a message back
+    in the count. **Porting note.** A port keeps the same three maps beside its
+    state."""
 
     def __init__(self) -> None:
         self.line_changed: dict[str, str] = {}
@@ -243,6 +253,14 @@ class RecordedTimes:
         self.message_recorded: dict[str, str] = {}
         """When each unread message to a line was sent or received, by its
         identifier."""
+        self.unanswered_recorded: dict[str, str] = {}
+        """When each message counted as unanswered was sent or received, by its
+        identifier."""
+
+    def unanswered_since(self, message_id: str) -> str | None:
+        """When ``message_id`` was sent or received, while it is counted as
+        unanswered, or ``None``."""
+        return self.unanswered_recorded.get(message_id)
 
     def note(self, entry: Entry, state: State) -> None:
         """Note ``entry``'s time, with ``state`` as it stands once the entry is
@@ -256,8 +274,20 @@ class RecordedTimes:
                 state.unread_mail.get(recipient.line_id, {})
             ):
                 self.message_recorded.setdefault(event.message_id, entry.recorded_at)
+            if counts_unanswered(state, state.messages[event.message_id]):
+                self.unanswered_recorded.setdefault(event.message_id, entry.recorded_at)
+            if event.reply_to is not None:
+                self._drop_answered(state, event.reply_to)
         elif isinstance(event, MessageRead):
             self.message_recorded.pop(event.message_id, None)
+        elif isinstance(event, MessageAcknowledged):
+            self._drop_answered(state, event.message_id)
+
+    def _drop_answered(self, state: State, message_id: str) -> None:
+        """Forget ``message_id``'s time once it is no longer counted."""
+        message = state.messages.get(message_id)
+        if message is None or not counts_unanswered(state, message):
+            self.unanswered_recorded.pop(message_id, None)
 
 
 def replay(path: Path) -> State:

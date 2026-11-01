@@ -136,6 +136,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "choices",
         "reply_to",
         "request",
+        "asks_reply",
     ),
     "message_received": (
         "message_id",
@@ -151,7 +152,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "message_returned": ("message_id", "code", "note_id"),
     "message_unconfirmed": ("message_id", "note_id"),
     "message_read": ("message_id",),
-    "message_acknowledged": ("message_id",),
+    "message_acknowledged": ("message_id", "reason"),
     "message_prioritized": ("message_id",),
     "message_correlated": ("message_id", "key"),
     "turn_correlated": ("line_id", "keys", "key_count", "cost_micro_usd"),
@@ -160,7 +161,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "wake_issued": ("wake_id",),
     "wake_scheduled": ("line_id", "message_id", "due", "note", "task_id", "request"),
     "wake_withdrawn": ("line_id", "message_id"),
-    "line_turn_ended": ("line_id", "workdir_commit", "unreported"),
+    "line_turn_ended": ("line_id", "workdir_commit", "unreported", "failed"),
     "task_noted": ("line_id", "message_id", "task_id", "status", "body"),
     "task_recorded": (
         "line_id",
@@ -247,7 +248,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "threshold",
         "requested_at",
     ),
-    "lease_acquired": ("name", "line_id", "acquired_at", "expires"),
+    "lease_acquired": ("name", "line_id", "acquired_at", "expires", "note"),
     "lease_released": ("name", "line_id", "cause"),
     "run_started": (
         "run_id",
@@ -379,9 +380,11 @@ def _upgraded(kind: str, data: object) -> object:
 
 
 OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
-    "message_sent": ("request",),
+    "message_sent": ("request", "asks_reply"),
+    "message_acknowledged": ("reason",),
     "wake_scheduled": ("request",),
-    "line_turn_ended": ("unreported",),
+    "line_turn_ended": ("unreported", "failed"),
+    "lease_acquired": ("note",),
     "budget_stated": ("window",),
     "line_held": ("cause",),
 }
@@ -390,10 +393,11 @@ them never held, so decoding reads an absent one as null. **Task of 2026-10-29,
 round 5.** The request key of a keyed call is recorded in the event of its act, and
 an event of a call without a key is written as before it. The ``window`` field was
 added to ``budget_stated`` on 2026-10-31, and ``cause`` to ``line_held`` the same
-day. **Porting hazard.** A port must omit these
-fields when null, not write them as null, so that its log stays readable by a daemon
-that predates them, and must read an absent one as null. A daemon predating ``window``
-does not read an event that names one."""
+day. ``asks_reply`` was added to ``message_sent`` and ``reason`` to
+``message_acknowledged`` in the round 14 task of 2026-11-01. **Porting hazard.** A
+port must omit these fields when null, not write them as null, so that its log stays
+readable by a daemon that predates them, and must read an absent one as null. A daemon
+predating ``window`` does not read an event that names one."""
 
 
 def _without_nulls(kind: str, data: dict[str, object]) -> dict[str, object]:
@@ -474,6 +478,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "choices": list(event.choices),
                 "reply_to": event.reply_to,
                 "request": _request_wire(event.request),
+                "asks_reply": event.asks_reply,
             }
         case MessageReceived():
             return "message_received", {
@@ -502,7 +507,10 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
         case MessageRead():
             return "message_read", {"message_id": event.message_id}
         case MessageAcknowledged():
-            return "message_acknowledged", {"message_id": event.message_id}
+            return "message_acknowledged", {
+                "message_id": event.message_id,
+                "reason": event.reason,
+            }
         case MessagePrioritized():
             return "message_prioritized", {"message_id": event.message_id}
         case MessageCorrelated():
@@ -522,6 +530,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "line_id": event.line_id,
                 "workdir_commit": event.workdir_commit,
                 "unreported": event.unreported,
+                "failed": event.failed,
             }
         case TaskRecorded():
             return "task_recorded", {
@@ -699,6 +708,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "line_id": event.line_id,
                 "acquired_at": event.acquired_at,
                 "expires": event.expires,
+                "note": event.note,
             }
         case LeaseReleased():
             return "lease_released", {
@@ -816,6 +826,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _choices(data),
                 _optional_str(data, "reply_to"),
                 _request(data),
+                _optional_bool(data, "asks_reply"),
             )
         case "message_received":
             return MessageReceived(
@@ -843,7 +854,9 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
         case "message_read":
             return MessageRead(_str(data, "message_id"))
         case "message_acknowledged":
-            return MessageAcknowledged(_str(data, "message_id"))
+            return MessageAcknowledged(
+                _str(data, "message_id"), _optional_str(data, "reason")
+            )
         case "message_prioritized":
             return MessagePrioritized(_str(data, "message_id"))
         case "message_correlated":
@@ -860,6 +873,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "line_id"),
                 _optional_str(data, "workdir_commit"),
                 _optional_bool(data, "unreported"),
+                _optional_bool(data, "failed"),
             )
         case "task_recorded":
             return TaskRecorded(
@@ -1027,6 +1041,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "line_id"),
                 _str(data, "acquired_at"),
                 _str(data, "expires"),
+                _optional_str(data, "note"),
             )
         case "lease_released":
             return LeaseReleased(

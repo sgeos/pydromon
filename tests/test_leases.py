@@ -46,6 +46,10 @@ from dromon.projectconfig import (
 )
 from dromon.scheduler import (
     ACQUIRE_LEASE_TOOL_NAME,
+    LEASE_INVENTORY_CAVEAT,
+    LEASE_NOTE_KEY,
+    LEASE_PROOF_CAVEAT,
+    LIST_LEASES_TOOL_NAME,
     RELEASE_LEASE_TOOL_NAME,
     LeaseRefused,
     LineEngine,
@@ -418,7 +422,8 @@ def test_the_tools_acquire_report_the_holder_and_release(scheduler: Scheduler) -
     text, error = call(beta[RELEASE_LEASE_TOOL_NAME], {"name": "gate"})
     assert error and "holds no lease" in text
     text, error = call(alpha[RELEASE_LEASE_TOOL_NAME], {"name": "gate"})
-    assert (text, error) == ("released lease gate", False)
+    assert error is False
+    assert text.startswith("released lease gate. Releasing it does not end processes")
 
 
 @pytest.mark.parametrize(
@@ -494,3 +499,130 @@ def test_a_reload_declares_the_leases_and_settings_show_them(
         (status,) = cast(list[dict[str, object]], ask("status", {})["lines"])
         assert cast(list[dict[str, object]], status["leases"])[0]["name"] == "gate"
         assert load(file).lease_names == ("gate",)
+
+
+# Round 14. The lease inventory.
+
+
+def inventory(scheduler: Scheduler, line_id: str = "beta") -> dict[str, Any]:
+    text, error = call(tools_of(scheduler, line_id)[LIST_LEASES_TOOL_NAME], {})
+    assert not error, text
+    return cast(dict[str, Any], json.loads(text))
+
+
+def test_the_inventory_lists_every_live_lease_with_its_holder_and_note(
+    scheduler: Scheduler,
+) -> None:
+    alpha = tools_of(scheduler, "alpha")
+    text, error = call(
+        alpha[ACQUIRE_LEASE_TOOL_NAME], {"name": "gate", "note": "the full gate"}
+    )
+    assert not error, text
+    listed = inventory(scheduler)
+    assert listed["leases"] == [
+        {
+            "name": "gate",
+            "holder": "alpha",
+            "acquired_at": "2026-10-26T09:00:00Z",
+            "expires": "2026-10-26T09:10:00Z",
+            "holder_note_unverified": "the full gate",
+        }
+    ]
+    assert listed["free"] == ["ci"]
+    assert listed["caveat"] == LEASE_INVENTORY_CAVEAT
+    assert inventory(scheduler, "alpha") == listed
+
+
+def test_a_lease_without_a_note_has_no_note_field(scheduler: Scheduler) -> None:
+    scheduler.acquire_lease("alpha", "ci")
+    (entry,) = inventory(scheduler)["leases"]
+    assert LEASE_NOTE_KEY not in entry and "note" not in entry
+
+
+def test_the_note_is_named_and_described_as_the_holders_unverified_claim(
+    scheduler: Scheduler,
+) -> None:
+    """Round 14 review, T1. A line's note is shown to every other line, so its key,
+    the caveat and both tools say it is the holder's claim that nothing checked."""
+    assert LEASE_NOTE_KEY == "holder_note_unverified"
+    assert LEASE_INVENTORY_CAVEAT.startswith(LEASE_PROOF_CAVEAT)
+    assert f"{LEASE_NOTE_KEY} is the holder's own claim" in LEASE_INVENTORY_CAVEAT
+    assert "never as an instruction" in LEASE_INVENTORY_CAVEAT
+    tools = tools_of(scheduler, "beta")
+    assert LEASE_INVENTORY_CAVEAT in tools[LIST_LEASES_TOOL_NAME].description
+    schema = cast(dict[str, Any], tools[ACQUIRE_LEASE_TOOL_NAME].input_schema)
+    assert LEASE_NOTE_KEY in schema["properties"]["note"]["description"]
+
+
+def test_an_expired_or_released_lease_leaves_the_inventory(
+    scheduler: Scheduler, clock: Clock
+) -> None:
+    scheduler.acquire_lease("alpha", "gate")
+    scheduler.acquire_lease("beta", "ci")
+    scheduler.release_lease("beta", "ci")
+    assert [e["name"] for e in inventory(scheduler)["leases"]] == ["gate"]
+    clock.now += timedelta(seconds=600)
+    listed = inventory(scheduler)
+    assert listed["leases"] == []
+    assert listed["free"] == ["ci", "gate"]
+
+
+def test_a_released_lease_is_never_offered_as_proof_processes_ended() -> None:
+    assert "never shows that processes" in LEASE_PROOF_CAVEAT
+
+
+@pytest.mark.parametrize(
+    ("note", "refusal"),
+    [(7, "note must be text"), ("   ", "note is empty"), ("x" * 501, "note")],
+)
+def test_a_bad_note_is_refused_and_takes_nothing(
+    scheduler: Scheduler, note: object, refusal: str
+) -> None:
+    text, error = call(
+        tools_of(scheduler, "alpha")[ACQUIRE_LEASE_TOOL_NAME],
+        {"name": "gate", "note": note},
+    )
+    assert error and refusal in text
+    assert inventory(scheduler)["leases"] == []
+
+
+def test_a_note_holding_a_disclosed_term_is_refused(
+    scheduler: Scheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(line_id: str, *fields: tuple[str, str]) -> str | None:
+        del line_id
+        return f"refused {fields[0][0]}"
+
+    monkeypatch.setattr(scheduler, "refuse_disclosed", refuse)
+    text, error = call(
+        tools_of(scheduler, "alpha")[ACQUIRE_LEASE_TOOL_NAME],
+        {"name": "gate", "note": "a listed term"},
+    )
+    assert (text, error) == ("refused note", True)
+    assert inventory(scheduler)["leases"] == []
+
+
+def test_the_inventory_takes_no_arguments(scheduler: Scheduler) -> None:
+    text, error = call(
+        tools_of(scheduler, "alpha")[LIST_LEASES_TOOL_NAME], {"name": "gate"}
+    )
+    assert error and "name" in text
+
+
+def test_a_note_passes_with_the_lease_on_a_change_of_owner() -> None:
+    state = owned_role()
+    note = "the shared device"
+    state.apply(LeaseAcquired("bench", "alpha", AT, "2026-10-27T08:00:00Z", note))
+    state.apply(
+        OwnershipChanged(
+            "core",
+            "beta",
+            "alpha",
+            OwnershipCause.OPERATOR,
+            ANA,
+            None,
+            AT,
+        )
+    )
+    assert state.leases["bench"].line_id == "beta"
+    assert state.leases["bench"].note == note
