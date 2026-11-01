@@ -512,20 +512,78 @@ class LineStateChanged:
         check_member("state", self.state, LineState)
 
 
+MAX_SEALED_VALUES: Final = 4096
+"""The most sealed values one ``line_configured`` names."""
+
+MAX_SEALED_STEP_BYTES: Final = 4096
+"""The longest step of a sealed value's location, the longest text a line
+configuration admits."""
+
+SEALED_PLACES: Final = (
+    ("mcp_servers", 4, ("env", "headers")),
+    ("settings", 3, ("env",)),
+)
+"""Where a sealed value may stand. The first step, how many steps, and the table the
+step before the last names, so a location reads ``mcp_servers``, a server, ``env`` or
+``headers``, and a key, or ``settings``, ``env`` and a key."""
+
+
+@dataclass(frozen=True, slots=True)
+class SealedValue:
+    """Where a value of a line's configuration was taken out of the log, and the
+    digest that ties the event to the value kept in the sealed store beside the log.
+
+    **Task of 2026-11-01.** ``at`` is the location as the steps of its path in the
+    configuration's canonical JSON, where the text holds ``dromon.sealed.SEALED_TEXT``
+    in its place. ``digest`` is an HMAC-SHA256 of the value under a random key kept
+    only in the store, in lowercase hexadecimal, so the log alone tells nothing of the
+    value, not even whether two lines share one. The model checks the form only, as
+    for the configuration text itself."""
+
+    at: tuple[str, ...]
+    digest: str
+
+    def __post_init__(self) -> None:
+        if not self.at:
+            raise InvalidField("a sealed value has no location")
+        place = next((p for p in SEALED_PLACES if p[0] == self.at[0]), None)
+        if place is None or len(self.at) != place[1] or self.at[-2] not in place[2]:
+            raise InvalidField(f"a sealed value cannot stand at {list(self.at)!r}")
+        for step in self.at:
+            check_text("a sealed value's step", step, MAX_SEALED_STEP_BYTES)
+            if not step:
+                raise InvalidField("a sealed value's location has an empty step")
+        check_text("a sealed value's digest", self.digest)
+        if TOKEN_HASH.fullmatch(self.digest) is None:
+            raise InvalidField("a sealed value's digest is not a SHA-256 hex digest")
+
+
 @dataclass(frozen=True, slots=True)
 class LineConfigured:
     """A line's tool configuration, as the canonical JSON of ``dromon.lineconfig``.
 
     The model checks only that it is bounded text. The daemon validates its meaning
     before appending, and decodes it again when it builds the line's engine.
+
+    **Task of 2026-11-01.** ``sealed`` names each value the daemon took out of the
+    text into the sealed store, as ``dromon.sealed`` describes, in the order of
+    their locations, each location once. It is left out of the wire when empty, so a
+    configuration with no literal value is written as before. **Rollback hazard.** A
+    daemon older than the field refuses an event that gives it.
     """
 
     line_id: str
     config: str
+    sealed: tuple[SealedValue, ...] = ()
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
         check_text("config", self.config, MAX_CONFIG_BYTES)
+        if len(self.sealed) > MAX_SEALED_VALUES:
+            raise InvalidField(f"sealed names more than {MAX_SEALED_VALUES} values")
+        places = [value.at for value in self.sealed]
+        if places != sorted(set(places)):
+            raise InvalidField("sealed must name each location once, in order")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2178,6 +2236,9 @@ class Line:
     state: LineState
     config: str | None = None
     """The latest ``line_configured`` text, or ``None`` for the default."""
+    sealed: tuple[SealedValue, ...] = ()
+    """The values the latest ``line_configured`` sealed, which its text holds as
+    ``dromon.sealed.SEALED_TEXT``."""
     engine_session: str | None = None
     """The engine session the line's next turn resumes, if one was recorded."""
     held_by: str | None = None
@@ -2933,7 +2994,9 @@ class State:
                     )
             case LineConfigured():
                 line = self.lines[event.line_id]
-                self.lines[event.line_id] = replace(line, config=event.config)
+                self.lines[event.line_id] = replace(
+                    line, config=event.config, sealed=event.sealed
+                )
             case LineHeld():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(

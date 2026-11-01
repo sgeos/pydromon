@@ -46,10 +46,12 @@ The configuration is stored in the event log as canonical JSON, so it survives a
 restart and every change is on record. ``docs/protocol/LINE_CONFIG.md`` is normative.
 
 Security. The configuration is operator authority and arrives only through the client.
-An MCP server's ``env`` and ``headers`` may hold credentials, and they are stored in the
-event log, whose file is readable by its owner only. ``allow_all`` and
-``inherit_account_mcp`` hand a line every tool they bring, such as a claude.ai
-account's mail and file connectors, and are meant for lines the operator trusts.
+An MCP server's ``env`` and ``headers`` may hold credentials. From 2026-11-01 the
+scheduler seals each literal value into the store beside the event log before it
+stores a configuration, as ``dromon.sealed`` describes, so the log holds a
+placeholder. ``allow_all`` and ``inherit_account_mcp`` hand a line every tool they
+bring, such as a claude.ai account's mail and file connectors, and are meant for lines
+the operator trusts.
 """
 
 import json

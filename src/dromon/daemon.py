@@ -95,6 +95,7 @@ from dromon.driver import (
     Strategy,
 )
 from dromon.eventlog import EventLog, LogError, read_entries, snapshot, utc_now
+from dromon.sealed import SealedStore, store_path
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.mailbox import MAX_PAGE, listing, outcome, replied_ids, sent, summary
 from dromon.lineconfig import (
@@ -103,7 +104,6 @@ from dromon.lineconfig import (
     LineConfig,
     check_instructions,
     config_from_document,
-    decode_config,
 )
 from dromon.projectconfig import (
     ConfigFileError,
@@ -3527,10 +3527,14 @@ def apply_project(scheduler: Scheduler, log: EventLog, config: ProjectConfig) ->
                 placement_checked=True,
             )
         else:
+            # The stored configuration is compared with its sealed values put back,
+            # so a sealed line is not configured again at every start. A store that
+            # cannot give them makes it differ, and the project file's values are
+            # sealed afresh.
             stored = (
                 DEFAULT_CONFIG
                 if existing.config is None
-                else decode_config(existing.config)
+                else scheduler.unsealed_baseline(line_id)
             )
             if stored != definition.config:
                 scheduler.configure_line(
@@ -3538,6 +3542,19 @@ def apply_project(scheduler: Scheduler, log: EventLog, config: ProjectConfig) ->
                 )
         scheduler.set_line_policy(
             line_id, definition.limits, definition.wake_every_ticks
+        )
+
+
+def report_unsealed(scheduler: Scheduler) -> None:
+    """Tell the operator, at start, of each line whose configuration the log still
+    stores with literal values, from before sealing. **Task of 2026-11-01.** Nothing
+    is migrated on its own, so the operator chooses when to configure each again."""
+    for line_id, count in scheduler.unsealed_lines().items():
+        print(
+            f"dromond: line {line_id}'s configuration holds {count} literal"
+            " value(s) the event log stores as written; configure the line again"
+            " to seal them, and see EVENT_LOG.md for the events that keep them",
+            file=sys.stderr,
         )
 
 
@@ -3674,6 +3691,9 @@ def run(
                 line_tokens=line_tokens,
                 report_dir=paths.left_reports,
                 walk_check=launcher.walk_unavailable,
+                sealed_store=SealedStore(
+                    store_path(paths.event_log), writable=not check_only
+                ),
             )
             scheduler.record_walk_gap(launcher.walk_gap())
             scheduler.set_disclosure_terms(terms)
@@ -3684,6 +3704,7 @@ def run(
             check_lines_sandboxed(config, log, scheduler)
             check_roles(scheduler, log, config)
             apply_project(scheduler, log, config)
+            report_unsealed(scheduler)
             check_grok_profiles(config, paths, scheduler, registry_dir)
             for event in plan_peers(log.state, config.federation):
                 log.append(event)

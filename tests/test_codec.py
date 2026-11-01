@@ -52,7 +52,8 @@ def test_the_field_table_matches_each_event(scenario: tuple[Event, ...]) -> None
         omitted = {
             name
             for name in OMITTED_WHEN_NULL.get(document["kind"], ())
-            if getattr(event, name) is None
+            # A tuple field such as ``sealed`` is left out when empty.
+            if getattr(event, name) in (None, ())
         }
         assert set(document["data"]) == set(declared) - omitted
 
