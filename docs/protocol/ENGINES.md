@@ -158,8 +158,8 @@ the real path Dromon checked, so a link or file swapped in after the check is re
 **Review of 1045994, I4.** On Codex, and on Grok when it sends no permission request, the
 check runs after the engine has begun the call and can only stop the turn.
 
-**Claude Code.** **Inference from Claude Code's documentation, not verified through
-Dromon.** `Read` returns an image to the model, so `ViewImage` needs nothing beyond
+**Claude Code.** **Inference from Claude Code's documentation, then shown live through
+Dromon on 2026-11-01 as below.** `Read` returns an image to the model, so `ViewImage` needs nothing beyond
 offering `Read` and gating it. `claude_tools` maps the name, and the init check accepts
 `Read` for a line with `ViewImage`. The verify-first steps are below.
 
@@ -176,9 +176,13 @@ verify. The Codex check stays after the fact, as the table above says. **Review 
 a9995d8, item 1.** The hook fails closed, an ask rule for `Read` sends every `Read` to
 the gate, a `Read` that completed with no hook call ends the turn and holds the line, and
 a managed policy that sets `disableAllHooks` or `allowManagedHooksOnly` refuses a
-view-only line where Dromon can read it. Whether the engine runs the hook for an
-in-directory `Read`, and whether an ask rule outranks its allowance, are still to be
-shown live, and the missing-hook check is what notices if they are not.
+view-only line where Dromon can read it. **Fact, observed live on 2026-11-01** by the operator, on claude-haiku-5-5 under the
+daemon code at commit fb11f22. The engine runs the hook for an in-directory `Read` and
+honours its deny. A renamed text file, a 6,000,287 byte png, a path outside the working
+directory and a path under `.dromon` were each refused with Dromon's message, and a
+small png was viewed. [`LINE_CONFIG.md`](LINE_CONFIG.md) records the details. **Not
+shown.** Whether an ask rule outranks the engine's allowance on its own, since the hook
+denied first. The missing-hook check is what notices if the hook is ever skipped.
 
 **Verify first.** The operator runs these once per engine before relying on the
 capability, and the Codex and Grok steps are in [`CODEX.md`](CODEX.md) and

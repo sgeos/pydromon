@@ -399,6 +399,13 @@ CREATE TABLE events (
 a payload that does not decode, or an event that does not apply makes the log corrupt,
 reported with the offending `seq`. A reader never skips a row.
 
+**Cost of a start, measured.** **Fact, observed on 2026-11-01** by the operator, reading
+this project's own log without writing it. The log was 4,390,912 bytes and held 1,882
+messages. Importing the daemon's modules took 0.048 seconds, replaying the log took
+0.139 seconds, and the peak memory was 32.4 MiB. The measuring script was the core
+line's. The daemon commit was not recorded. One log is no curve, so the figures give no
+growth rate, and snapshots stay under "Not yet specified".
+
 **Writers.** One process writes a log. Before each append, the writer checks inside an
 immediate transaction that the newest `seq` is the one it last read, and refuses to
 append otherwise.
