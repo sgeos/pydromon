@@ -19,11 +19,15 @@ index and the working files, which ``status`` must. The environment is cleared o
 ``GIT_`` variables, the system and user configuration are not read, the optional locks
 are off so that no index is rewritten, and the file system monitor, which would run a
 program, is turned off on the command line. **Assumption and residual.** The
-repository's own configuration is still read. A line that can write it could steer git
-with a clean or smudge filter that ``.gitattributes`` names, which a sandboxed line
-cannot do, since every enabled sandbox denies it that file, as ``dromon.workdir``
-describes. A line with no sandbox and write access to its checkout could already run
-anything as the daemon's user, so the residual adds no authority to it.
+repository's own configuration is still read, and that file, the ``config`` of the
+common git directory, is where a filter is defined. A line that could write it could
+steer git with a clean or smudge filter that ``.gitattributes`` names. A sandboxed
+line cannot, since every enabled sandbox denies it writes to that ``config``, to
+``config.worktree`` and to the hooks, as ``dromon.workdir`` describes.
+``.gitattributes`` itself is not guarded, and a line can write it, but a name that no
+configuration defines runs nothing. A line with no sandbox and write access to its
+checkout could already run anything as the daemon's user, so the residual adds no
+authority to it.
 
 Failure modes. A git that cannot be started, one that runs past its bound, one that
 fails, and a directory that is not a checkout all give no status, with the reason, so a

@@ -1490,3 +1490,126 @@ def test_a_harness_that_does_not_read_its_input_does_not_hide_the_close(
     assert launched.wait() == 128 + signal.SIGKILL
     assert time.monotonic() - began < launcher.LAUNCHER_EXIT_SECONDS + 5
     assert launcher.RELAY_BACKLOG > 4 * 64 * 1024
+
+
+def _reaps_nothing(_pids: set[int]) -> set[int]:
+    return set()
+
+
+def _always_alive(_pid: int) -> bool:
+    return True
+
+
+class _Exited:
+    """An ``ExitWatch`` that has already seen the harness exit."""
+
+    def exited(self) -> bool:
+        return True
+
+
+class _Time:
+    """A monotonic clock that advances only when a pause is taken, by a multiple of
+    the pause asked for, which is a loaded machine."""
+
+    def __init__(self, stretch: float) -> None:
+        self.now = 100.0
+        self.stretch = stretch
+        self.pauses: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def pause(self, seconds: float) -> None:
+        self.pauses.append(seconds)
+        self.now += seconds * self.stretch
+
+
+def test_a_wait_for_exits_ends_at_its_deadline_when_sleeps_stretch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Counting polls lets a wait run for the polls times the stretch. A deadline ends
+    it after the first sleep that carries the clock past it."""
+    monkeypatch.setattr(launcher, "_alive", _always_alive)
+    monkeypatch.setattr(launcher, "_reap_adopted", _reaps_nothing)
+    world = _Time(stretch=50.0)
+    left = launcher._wait_gone(  # pyright: ignore[reportPrivateUsage]
+        cast(ExitWatch, _Exited()),
+        {7},
+        launcher.EXIT_SECONDS,
+        pause=world.pause,
+        clock=world.clock,
+    )
+    assert left == {7}
+    assert len(world.pauses) == 1
+    assert world.now - 100.0 >= launcher.EXIT_SECONDS
+    # A count of polls would have slept this many times, each one stretched.
+    assert len(world.pauses) < int(launcher.EXIT_SECONDS / launcher.CHECK_SECONDS)
+
+
+def test_a_wait_for_exits_is_not_cut_short_on_an_unloaded_machine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(launcher, "_alive", _always_alive)
+    monkeypatch.setattr(launcher, "_reap_adopted", _reaps_nothing)
+    world = _Time(stretch=1.0)
+    launcher._wait_gone(  # pyright: ignore[reportPrivateUsage]
+        cast(ExitWatch, _Exited()),
+        {7},
+        launcher.EXIT_SECONDS,
+        pause=world.pause,
+        clock=world.clock,
+    )
+    assert sum(world.pauses) == pytest.approx(launcher.EXIT_SECONDS)
+    assert max(world.pauses) <= launcher.CHECK_SECONDS
+
+
+def test_a_wait_for_exits_notices_an_exit_during_its_last_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _Time(stretch=50.0)
+    monkeypatch.setattr(launcher, "_reap_adopted", _reaps_nothing)
+
+    def alive_until_first_sleep_ends(_pid: int) -> bool:
+        return world.now < 101.0
+
+    monkeypatch.setattr(launcher, "_alive", alive_until_first_sleep_ends)
+    left = launcher._wait_gone(  # pyright: ignore[reportPrivateUsage]
+        cast(ExitWatch, _Exited()),
+        {7},
+        launcher.EXIT_SECONDS,
+        pause=world.pause,
+        clock=world.clock,
+    )
+    assert left == {7}
+    assert world.pauses == [launcher.CHECK_SECONDS]
+
+
+def test_a_wait_for_exits_ends_when_the_clock_does_not_advance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(launcher, "_alive", _always_alive)
+    monkeypatch.setattr(launcher, "_reap_adopted", _reaps_nothing)
+    world = _Time(stretch=0.0)
+    left = launcher._wait_gone(  # pyright: ignore[reportPrivateUsage]
+        cast(ExitWatch, _Exited()),
+        {7},
+        launcher.EXIT_SECONDS,
+        pause=world.pause,
+        clock=world.clock,
+    )
+    assert left == {7}
+    assert len(world.pauses) <= int(launcher.EXIT_SECONDS / launcher.CHECK_SECONDS) + 2
+
+
+def test_a_wait_for_no_pids_returns_at_once() -> None:
+    world = _Time(stretch=1.0)
+    assert (
+        launcher._wait_gone(  # pyright: ignore[reportPrivateUsage]
+            cast(ExitWatch, _Exited()),
+            set(),
+            pause=world.pause,
+            clock=world.clock,
+        )
+        == set()
+    )
+    assert world.pauses == []

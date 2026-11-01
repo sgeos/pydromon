@@ -96,7 +96,10 @@ its working directory, and sets `TMPDIR` and `UV_CACHE_DIR` to them. They are ou
 because the deny-write rule above covers the whole working directory of a read line, and
 no layer lifts it. [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies them, with the checks that
 refuse a planted link or another user's directory, and the hypothesis, not verified live,
-that Claude Code may override `TMPDIR` with its own.
+that Claude Code may override `TMPDIR` with its own. The sandbox also denies the line
+reads of the directory that holds every line's directory, and lifts the denial for its
+own, so one line cannot read what another's commands wrote. That `allowRead` lifts a
+`denyRead` above it is a hypothesis, not verified live.
 
 When a line's turn starts, Dromon merges the layers and derives the settings it hands to
 Claude Code. Nothing is passed when no layer sets anything, and the line then has no

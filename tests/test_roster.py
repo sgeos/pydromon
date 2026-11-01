@@ -2,7 +2,6 @@
 Dromon holds as running, since a compaction can drop what the line knew of them."""
 
 import asyncio
-import json
 from collections.abc import Generator, Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -82,9 +81,9 @@ def test_a_compaction_names_the_tasks_dromon_holds_as_running(
     text = lead(found, True)
     assert text is not None
     assert "Dromon still holds 2 as running in your kept session" in text
-    assert '"b1", command "make gate"' in text
-    assert json.dumps('sleep 9 "x"') in text
-    assert "quoted as data" in text and "Their ends are noted as they happen." in text
+    assert "by identifier b1, b2." in text
+    assert "make gate" not in text and "sleep" not in text
+    assert "Their ends are noted as they happen." in text
 
 
 def test_nothing_is_said_without_a_compaction_or_without_tasks(
@@ -106,17 +105,48 @@ def test_a_compaction_the_engine_made_by_itself_owes_the_roster_next_turn(
     assert lead(found, False) is not None
 
 
-def test_a_command_the_disclosure_list_covers_is_withheld(
+def test_no_command_text_reaches_the_roster_so_it_is_no_disclosure_oracle(
     scheduler: tuple[Scheduler, Kept],
 ) -> None:
+    """Review of 2026-11-01, finding 1. A roster that screened commands let a line
+    learn from the withheld words whether a candidate held a listed term. Two tasks
+    whose commands differ in that way must give the same roster."""
     found, engine = scheduler
     found._disclosure = ("secretword",)  # pyright: ignore[reportPrivateUsage]
     engine.tasks = [task("b1", "run SECRETWORD now"), task("b2", "make gate")]
+    covered = lead(found, True)
+    engine.tasks = [task("b1", "run harmless now"), task("b2", "make gate")]
+    plain = lead(found, True)
+    assert covered is not None and covered == plain
+    assert "SECRETWORD" not in covered and WITHHELD_COMMAND not in covered
+
+
+def test_the_roster_makes_no_disclosure_check(
+    scheduler: tuple[Scheduler, Kept], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    found, engine = scheduler
+    calls: list[tuple[str, ...]] = []
+
+    def record(*texts: str) -> bool:
+        calls.append(texts)
+        return False
+
+    monkeypatch.setattr(found, "discloses", record)
+    engine.tasks = [task("b1", "make gate")]
+    assert lead(found, True) is not None
+    assert calls == []
+
+
+def test_an_identifier_that_is_not_plain_is_counted_and_not_shown(
+    scheduler: tuple[Scheduler, Kept],
+) -> None:
+    found, engine = scheduler
+    engine.tasks = [task("b1", "x"), task("run SECRETWORD now", "y")]
     text = lead(found, True)
     assert text is not None
+    assert "holds 2 as running" in text and "by identifier b1." in text
+    assert "1 more are not named here." in text
     assert "SECRETWORD" not in text
-    assert f'"b1", command {WITHHELD_COMMAND}' in text
-    assert '"b2", command "make gate"' in text
 
 
 def test_a_long_roster_is_cut_with_the_count_of_the_rest(
@@ -128,7 +158,7 @@ def test_a_long_roster_is_cut_with_the_count_of_the_rest(
     assert text is not None
     assert f"holds {MAX_ROSTER_TASKS + 3} as running" in text
     assert "3 more are not named here." in text
-    assert f'"b{MAX_ROSTER_TASKS}"' not in text
+    assert f"b{MAX_ROSTER_TASKS}" not in text
 
 
 def test_a_pending_wake_for_a_task_is_named(

@@ -1144,18 +1144,34 @@ def _reap_adopted(pids: set[int]) -> set[int]:
 
 
 def _wait_gone(
-    exits: ExitWatch, pids: set[int], seconds: float = EXIT_SECONDS
+    exits: ExitWatch,
+    pids: set[int],
+    seconds: float = EXIT_SECONDS,
+    *,
+    pause: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
 ) -> set[int]:
     """Wait up to ``seconds`` for the harness and ``pids`` to end, and return
-    those of ``pids`` not reaped here."""
+    those of ``pids`` not reaped here.
+
+    The limit is a monotonic deadline and not a count of polls. A count lets one stop
+    stretch to the number of polls times the time each took, and under load a sleep
+    and a process-table read each take far longer than they are asked to, which ops
+    observed. The final check is made at the deadline, so a process that ended during
+    the last sleep is not reported as running. The iteration count is also capped, so
+    that a clock that does not advance still ends the loop."""
     if not pids:
         return set()
     tracked = set(pids)
-    for _ in range(int(seconds / CHECK_SECONDS)):
+    deadline = clock() + seconds
+    for _ in range(int(seconds / CHECK_SECONDS) + 2):
         tracked -= _reap_adopted(tracked)
         if exits.exited() and not any(_alive(pid) for pid in tracked):
             break
-        time.sleep(CHECK_SECONDS)
+        remaining = deadline - clock()
+        if remaining <= 0:
+            break
+        pause(min(CHECK_SECONDS, remaining))
     return tracked
 
 

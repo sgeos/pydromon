@@ -588,6 +588,9 @@ DIGEST_CHUNK_BYTES: Final = 1024 * 1024
 WITHHELD_COMMAND: Final = "withheld, since the disclosure list covers it"
 
 MAX_ROSTER_TASKS: Final = 10
+ROSTER_TASK_ID: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
+"""What a task identifier must look like to be named in the roster. The engines make
+identifiers, and one that is not plain is counted without being shown."""
 """The most background tasks a turn after a compaction names. **Round 14, item 4.**"""
 
 CHECK_DISCLOSURE_TOOL_NAME: Final = "check_disclosure"
@@ -1684,7 +1687,13 @@ def engine_factory(
                     [
                         merged,
                         parse_sandbox(
-                            {"filesystem": {"allowWrite": line_temp.writable()}},
+                            {
+                                "filesystem": {
+                                    "allowWrite": line_temp.writable(),
+                                    "denyRead": line_temp.others_unreadable(),
+                                    "allowRead": line_temp.readable(),
+                                }
+                            },
                             operator=True,
                         ),
                     ]
@@ -2071,6 +2080,10 @@ class Scheduler:
         self._process_worker = ProcessWorker()
         self._sweep_worker = ProcessWorker()
         self._git_worker = ProcessWorker()
+        self._walk_worker = ProcessWorker()
+        """The kill-all pre-turn check has its own thread. It can run for most of a
+        minute on a loaded machine, and a stop, a listing or a pid watch must not wait
+        behind it. Review of 2026-11-01, finding 4."""
         self._worktree_runner: WorktreeRunner = run_git
         """Separate queue so a sweep waiting on signalled children cannot occupy
         the worker that serves process inspections and stops."""
@@ -2275,9 +2288,28 @@ class Scheduler:
         # What launchers left running while the daemon was down, such as after a
         # crash, is recorded now.
         self.collect_left()
+        self._sweep_line_temps()
         self._schedule_survivor_scan()
         self._withdraw_stale_ceilings()
         self._work.set()
+
+    def _sweep_line_temps(self) -> None:
+        """Remove the temporary directories that no line owns, and stale entries in
+        those that do, as ``linetemp.sweep`` says, before any engine of this run
+        starts. A failure is written to standard error and does not stop the start,
+        since a directory that stays is a cost in disk and not a fault."""
+        try:
+            swept = linetemp.sweep(set(self._log.state.lines))
+        except OSError as error:
+            print(f"dromond: line temporary sweep failed: {error}", file=sys.stderr)
+            return
+        if swept.removed:
+            print(
+                f"dromond: removed {len(swept.removed)} stale temporary entries",
+                file=sys.stderr,
+            )
+        for note in swept.failed[:5]:
+            print(f"dromond: line temporary sweep left {note}", file=sys.stderr)
 
     def record_walk_gap(self, note: str | None) -> None:
         """Record what this platform keeps the launcher's walk from reaching, once,
@@ -8640,6 +8672,7 @@ class Scheduler:
             ("process inspection", self._process_worker),
             ("launch-record sweep", self._sweep_worker),
             ("worktree status", self._git_worker),
+            ("kill-all walk check", self._walk_worker),
         ):
             if not worker.close():
                 joined = False
@@ -9207,9 +9240,15 @@ class Scheduler:
         cases that owe the brief too, and is read before ``_brief_lead`` clears that
         mark.
 
-        Each command is the line's own text, so it is quoted as a JSON string, said
-        to be data, and withheld when the disclosure list covers it, as a task's end
-        note does. At most ``MAX_ROSTER_TASKS`` are named, with the count of the rest.
+        **No command text is given.** A command is the line's own text, and screening
+        it against the disclosure list here, outside the counted checks, made a free
+        oracle. A line could start a task whose command held a candidate string and
+        learn at the next compaction, from the fixed withheld words, whether the
+        candidate held a listed term. Review of 2026-11-01, finding 1. The roster
+        gives each task's identifier only, which the engine makes, and the line can
+        ask the engine's own task tools for the command. An identifier that is not
+        plain, so could carry text, is counted and not shown. At most
+        ``MAX_ROSTER_TASKS`` are named, with the count of the rest.
         **Limit.** A task that the engine ended with the compaction, if it does, has
         no entry here, and its end, if the engine reports one, still arrives as a task
         note. The roster says nothing of a process the engine does not report as a
@@ -9233,20 +9272,12 @@ class Scheduler:
             if not isinstance(value, Mapping):
                 continue
             task = cast(Mapping[str, object], value)
-            task_id, command = task.get("task_id"), task.get("command")
+            task_id = task.get("task_id")
             if not isinstance(task_id, str) or not task_id:
                 continue
             total += 1
-            if len(named) < MAX_ROSTER_TASKS:
-                text = command if isinstance(command, str) else ""
-                shown = (
-                    WITHHELD_COMMAND
-                    if self.discloses(task_id, text)
-                    else json.dumps(text, ensure_ascii=True)
-                )
-                named.append(
-                    f"{json.dumps(task_id, ensure_ascii=True)}, command {shown}"
-                )
+            if len(named) < MAX_ROSTER_TASKS and ROSTER_TASK_ID.fullmatch(task_id):
+                named.append(task_id)
         if total == 0:
             return None
         rest = total - len(named)
@@ -9259,9 +9290,9 @@ class Scheduler:
         return (
             "Dromon note: your session was compacted, which can drop what you knew of"
             f" your background tasks. Dromon still holds {total} as running in your"
-            f" kept session: {'; '.join(named)}."
+            f" kept session, by identifier {', '.join(named) or 'none shown'}."
             + (f" {rest} more are not named here." if rest else "")
-            + " The commands are your own earlier text, quoted as data."
+            + " Your engine's own task tools give each one's command and output."
             + waiting
             + " Their ends are noted as they happen."
         )
@@ -9514,7 +9545,7 @@ class Scheduler:
         ):
             return
         try:
-            reason = await self._process_worker.run(self._walk_check)
+            reason = await self._walk_worker.run(self._walk_check)
         except ProcessRefused as error:
             reason = str(error)
         if reason is not None:

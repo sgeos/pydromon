@@ -2,11 +2,14 @@
 that it may write, outside its working directory, and its shell is pointed at them."""
 
 import os
+import shutil
 import stat
+from collections.abc import Sequence
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
+from claude_agent_sdk import SdkMcpTool
 
 from dromon import launcher, linetemp
 from dromon.driver import Strategy
@@ -14,7 +17,7 @@ from dromon.engine import ClaudeCodeLine, launch_environment
 from dromon.lineconfig import LineConfig, WorkdirAccess
 from dromon.linetemp import LineTemp, LineTempRefused, prepare
 from dromon.sandbox import parse_sandbox
-from dromon.scheduler import LineSpec, engine_factory
+from dromon.scheduler import LineEngine, LineSpec, engine_factory
 
 HAIKU = "claude-haiku-5-5"
 
@@ -214,3 +217,171 @@ def test_a_line_still_starts_when_its_directories_cannot_be_made(
 def test_a_line_temp_is_plain_data() -> None:
     found = LineTemp(Path("/a"), Path("/a/tmp"), Path("/a/uv-cache"))
     assert found.writable() == ["/a/tmp", "/a/uv-cache"]
+
+
+# Review of 2026-11-01, finding 2. Removal and the age rule.
+
+WEEK = linetemp.MAX_TEMP_AGE_SECONDS
+
+
+def fill(root: Path, name: str) -> tuple[Path, Path]:
+    found = prepare(name, root)
+    return found.temp, found.cache
+
+
+def test_the_sweep_removes_stale_entries_of_a_known_line_and_keeps_fresh_ones(
+    tmp_path: Path,
+) -> None:
+    temp, cache = fill(tmp_path, "alpha")
+    (temp / "old").write_text("x")
+    (temp / "fresh").write_text("y")
+    (cache / "old-cache").write_text("z")
+    nested = temp / "tree"
+    nested.mkdir()
+    (nested / "inner").write_text("w")
+    now = 2_000_000_000.0
+    for path in (temp / "old", cache / "old-cache", nested):
+        os.utime(path, (now - WEEK - 10, now - WEEK - 10))
+    os.utime(temp / "fresh", (now - 5, now - 5))
+    swept = linetemp.sweep({"alpha"}, tmp_path, now=now)
+    assert sorted(Path(p).name for p in swept.removed) == ["old", "tree"]
+    assert swept.failed == ()
+    assert not (temp / "old").exists() and not nested.exists()
+    assert (temp / "fresh").exists()
+    assert (cache / "old-cache").exists(), "a known line's cache is left"
+
+
+def test_the_sweep_removes_an_unknown_lines_directory_only_when_it_is_stale(
+    tmp_path: Path,
+) -> None:
+    """The base is shared by every daemon of the user, so a line this daemon does not
+    know may be another project's, and its fresh files stay."""
+    gone_temp, gone_cache = fill(tmp_path, "gone")
+    other_temp, other_cache = fill(tmp_path, "other")
+    (gone_temp / "a").write_text("x")
+    (gone_cache / "b").write_text("y")
+    (other_temp / "live").write_text("z")
+    now = 2_000_000_000.0
+    for path in (gone_temp / "a", gone_cache / "b"):
+        os.utime(path, (now - WEEK - 10, now - WEEK - 10))
+    os.utime(other_temp / "live", (now - 5, now - 5))
+    swept = linetemp.sweep({"alpha"}, tmp_path, now=now)
+    assert not gone_temp.parent.exists()
+    assert str(gone_temp.parent) in swept.removed
+    assert (other_temp / "live").exists() and other_cache.exists()
+
+
+def test_the_sweep_does_not_follow_a_link(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "precious").write_text("keep")
+    temp, _ = fill(tmp_path, "alpha")
+    link = temp / "link"
+    link.symlink_to(outside)
+    now = 2_000_000_000.0
+    os.utime(link, (now - WEEK - 10, now - WEEK - 10), follow_symlinks=False)
+    swept = linetemp.sweep({"alpha"}, tmp_path, now=now)
+    assert str(link) in swept.removed
+    assert not link.is_symlink() and not link.exists()
+    assert (outside / "precious").read_text() == "keep"
+
+
+def test_the_sweep_leaves_a_parent_that_is_not_the_users_private_directory(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / f"dromon-{os.getuid()}"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+    (parent / "gone").mkdir()
+    swept = linetemp.sweep(set(), tmp_path, now=2_000_000_000.0)
+    assert swept.removed == () and len(swept.failed) == 1
+    assert (parent / "gone").exists()
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    parent.rmdir() if not any(parent.iterdir()) else shutil.rmtree(parent)
+    parent.symlink_to(outside)
+    swept = linetemp.sweep(set(), tmp_path, now=2_000_000_000.0)
+    assert swept.removed == () and len(swept.failed) == 1
+
+
+def test_the_sweep_has_nothing_to_do_without_a_directory(tmp_path: Path) -> None:
+    assert linetemp.sweep({"alpha"}, tmp_path) == linetemp.Swept((), ())
+
+
+def test_one_failure_does_not_stop_the_other_removals(tmp_path: Path) -> None:
+    temp, _ = fill(tmp_path, "alpha")
+    locked = temp / "locked"
+    locked.mkdir()
+    (locked / "inner").write_text("x")
+    (temp / "plain").write_text("y")
+    now = 2_000_000_000.0
+    os.utime(temp / "plain", (now - WEEK - 10, now - WEEK - 10))
+    os.utime(locked, (now - WEEK - 10, now - WEEK - 10))
+    locked.chmod(0o500)
+    try:
+        swept = linetemp.sweep({"alpha"}, tmp_path, now=now)
+    finally:
+        locked.chmod(0o700)
+    assert str(temp / "plain") in swept.removed
+    assert not (temp / "plain").exists()
+    assert any("locked" in note for note in swept.failed)
+
+
+def test_a_line_that_may_not_read_others_is_denied_the_directory_that_holds_them(
+    tmp_path: Path,
+) -> None:
+    found = prepare("alpha", tmp_path)
+    assert found.others_unreadable() == [str(found.root.parent)]
+    assert found.readable() == [str(found.root)]
+    engine = build(LineConfig(builtin_tools=("Bash",)))
+    assert engine.temp is not None
+    filesystem = cast(dict[str, list[str]], (engine.sandbox or {})["filesystem"])
+    parent = os.path.realpath(engine.temp.root.parent)
+    root = os.path.realpath(engine.temp.root)
+    assert parent in filesystem["denyRead"]
+    assert root in filesystem["allowRead"]
+    assert root.startswith(parent + os.sep)
+
+
+def no_engine(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> LineEngine:
+    raise AssertionError(f"no engine may start, but {spec.line_id} did")
+
+
+def test_the_daemon_sweeps_at_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dromon.eventlog import EventLog
+    from dromon.scheduler import Scheduler
+
+    asked: list[set[str]] = []
+
+    def record(known: set[str], *_: object, **__: object) -> linetemp.Swept:
+        asked.append(set(known))
+        return linetemp.Swept(("x",), ("y: nope",))
+
+    monkeypatch.setattr(linetemp, "sweep", record)
+    with EventLog(tmp_path / "events.sqlite") as log:
+        found = Scheduler(log, no_engine)
+        found.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+        found.recover()
+        found.stop_workers()
+    assert asked == [{"alpha"}]
+
+
+def test_a_failed_sweep_does_not_stop_the_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from dromon.eventlog import EventLog
+    from dromon.scheduler import Scheduler
+
+    def broken(*_: object, **__: object) -> linetemp.Swept:
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(linetemp, "sweep", broken)
+    with EventLog(tmp_path / "events.sqlite") as log:
+        found = Scheduler(log, no_engine)
+        found.recover()
+        found.stop_workers()
+    assert "line temporary sweep failed: disk gone" in capsys.readouterr().err

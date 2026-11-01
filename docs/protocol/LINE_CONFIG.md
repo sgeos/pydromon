@@ -553,13 +553,25 @@ tools do the same for a line.
   neither the daemon nor an engine it started and whose environment holds the line's
   mark, read again at the moment of stopping. Every other pid is refused, as are a pid
   of 1 or less, a process that has already ended and one that cannot be signalled.
-- **Process workers.** Process inspections and launch-record sweeps use separate worker
-  threads, each with at most eight queued calls behind its active call. Sweeps wait for
+  **Reuse of a pid, review of 2026-11-01.** The listing is read again after the mark,
+  and the signal is sent only if the process is still the one first seen, by parent,
+  command and an elapsed time that has not gone back. Otherwise the stop is refused as
+  `changed while it was checked`. **Residual.** No process handle exists on this
+  platform, so a pid reused within the same second by a process with the same parent
+  and command is not told apart, and the window between the second listing and the
+  signal remains, which is microseconds and not the listing's seconds.
+- **Process workers.** Process inspections, launch-record sweeps, worktree status and
+  the kill-all pre-turn walk use separate worker threads, each with at most eight queued calls behind its active call. Sweeps wait for
   signalled processes, so isolating them keeps a long sweep from occupying the inspection
   queue. When an inspection queue is full, the request is refused. A queued call whose
   caller is cancelled is skipped if it has not started. A call already running cannot be
   stopped, so a cancelled stop request may still take effect. Both queues are bounded,
   and sweeps report a repeated queue refusal once until a sweep succeeds.
+  **The pre-turn walk has its own worker, review of 2026-11-01.** The walk can run for
+  up to 63 seconds on a loaded machine, and on the shared worker a stop, a listing and a
+  pid watch queued behind it. A stop of a running turn never used the worker. A stop
+  with `stop_process` is now answered while a walk is held, which a test shows by
+  holding the walk and stopping a process.
 - **Detached-process inspection.** At the end of a turn, the scan runs on the process
   worker because its process-table reads can block. The worker receives only the process
   table and scan inputs, then returns process identifiers and command strings. Its result
@@ -613,11 +625,28 @@ rests on. A **fact** was observed, an **inference** follows from facts, and a
   2026-10-26 and unchanged here.** The mark cannot be read there, so the self-test
   fails and `list_processes` and `stop_process` answer unavailable on that platform. A
   line cannot there list the commands it started, and the scoping to its own, which the
-  mark gives, holds only where the mark is readable. **Left undone.** An attribution
-  by ancestry from the line's harness would cover a command the engine started and
-  that has not been reparented, and needs the launch record's harness pid and a stop
-  that checks descent again. It was not built, since it cannot be verified without a
-  live daemon, and a wrong attribution would let a line stop another line's process.
+  mark gives, holds only where the mark is readable. **Not built, and why.** An
+  attribution by ancestry was examined in the follow-up to round 14 and left out for
+  three reasons. **First, the daemon cannot name a line's launcher where the mark is
+  unreadable.** Every launcher is a child of the daemon, and nothing else tells them
+  apart, since the engines do not expose the launcher's pid and the mark in its
+  environment is the unreadable thing. A launcher's command line is readable, but it
+  carries no mark, and adding one touches the launch path of all six engines and the
+  script that Claude Code runs as its executable. **Second, ancestry loses what matters
+  most.** A command that detaches, or whose parent has ended, is given to the system's
+  first process and leaves the tree, so a listing by ancestry would omit the very
+  background jobs that outlive a shell, while looking complete. **Third, a stop would
+  need its own proof.** The safe form, which this note records for a later round, is a
+  single parent-only walk, without the group rule that `descendants` applies, from a
+  launcher that the daemon itself started and has not reaped, since its pid cannot then
+  be reused, with the walk repeated immediately before the signal and the launcher, the
+  harness and every other line's launcher excluded. A descendant of one launcher is
+  never a descendant of another, so the form cannot cross lines, and it shares with the
+  mark's check the unavoidable window between the last look and the signal. It cannot be
+  verified without a live daemon on a platform with an unreadable mark, which no test
+  here has. **Inference.** Until then a line on such a platform can use the commands of
+  its own shell and its engine's own task tools, and `stop_process` refuses rather than
+  guesses, which is the safe direction.
 - **`wake_after` waits for a process of the line's own.** A `task_id` of the form
   `pid:NUMBER` is accepted only after the daemon has read, as `stop_process` does,
   that the process carries the line's mark. The daemon then looks every five seconds, on
@@ -643,9 +672,13 @@ rests on. A **fact** was observed, an **inference** follows from facts, and a
   it started, while the engine keeps running it. **Fact.** Dromon follows each task
   from the engine's own events in the kept connection, which a compaction does not
   touch. The turn after a requested compaction, or after the engine compacted by
-  itself, therefore leads with a note naming the tasks Dromon holds as running, each
-  with its command quoted as data and withheld where the disclosure list covers it,
-  at most ten with the count of the rest, and the task a pending wake waits for. The
+  itself, therefore leads with a note naming the tasks Dromon holds as running by
+  identifier only, at most ten with the count of the rest, and the task a pending wake
+  waits for. **No command text is given, review of 2026-11-01.** Screening a command
+  against the disclosure list outside the counted checks let a line learn from the
+  withheld words, at its next compaction, whether a candidate string held a listed
+  term. The line can ask its engine's own task tools for a command. An identifier that
+  is not plain is counted and not shown. The
   note is composed beside the standing brief, which is owed in the same cases. **Limit.**
   If the engine itself ends a task at a compaction, Dromon can only record the end it
   reports, and cannot keep the task. A restart ends the kept connection, and then the
@@ -667,7 +700,23 @@ rests on. A **fact** was observed, an **inference** follows from facts, and a
   overridden where Claude Code sets its own, in which case the here-document case
   depends on Claude Code, and the cache and the write grant still stand. A line whose
   directories cannot be made still starts, and its facts say it keeps the engine's own.
-  The directories are not removed, since a line's command may still use them.
+  **Removal, reading and size, review of 2026-11-01.** No event retires or deletes a
+  line, so nothing is removed at one. At each daemon start, before any engine starts,
+  a sweep removes entries of a line's `tmp` directory unchanged for a week, treats the
+  cache and `tmp` of a line this daemon does not know alike, and removes such a
+  directory when both are empty. It is age and not absence that decides, since the
+  parent directory is shared by every daemon of the user, and removing a directory for
+  being unknown would end another project's commands. Nothing is followed through a
+  link. **There is no byte bound, and none is possible.** The sandbox has no quota, and
+  the system gives an unprivileged process none for a directory on a shared file
+  system, so a line can fill the disk between two starts. The sweep and its age rule
+  bound the growth over time and not within it, and the daemon does not measure the
+  size. A cache that a line only reads is removed after a week, which costs speed only.
+  The sandbox denies the line reads of the directory that holds every line's directory
+  and lifts the denial for its own, so a line cannot read what another line's commands
+  wrote. **Hypothesis, not verified live.** An `allowRead` entry lifts a `denyRead` of
+  a directory above it, as the sandbox's own `allowWithinDeny` suggests. If it did not,
+  the line could not read its own temporary files, which a here-document does.
 - **`worktree_status`.** No arguments. The daemon runs `git`, outside the line's
   sandbox, in the line's own working directory, and gives `head`, `branch`, `origin_main`
   with `ahead` and `behind` of the last fetched `origin/main` or the reason it has none,
@@ -1714,6 +1763,14 @@ daemon stops it, when the daemon stops or dies, and when the line's engine is st
   ends the harness's group, writes an unverified-stop report and exits unsuccessfully.
   After `SIGKILL`, it waits another 0.25 seconds and reports an unverified stop if a
   process still answers. The daemon records that report as `stop_unverified`.
+  **Follow-up to round 14.** The waits for the harness and the descendants to end, the
+  2 seconds and the 0.25 seconds above, are monotonic deadlines and not counts of
+  polls. **Fact, observed by ops.** Under load a sleep and a liveness check each ran far
+  longer than asked, so a count of 20 polls stretched a stop well past its bound. The
+  deadline ends the wait at the first look after it passes, the last look still checks
+  for an exit during the last sleep, and an iteration cap ends the loop where the clock
+  does not advance. **Residual.** One sleep or one check can still overrun the deadline
+  by its own stretch, so the bound is the deadline plus one such step and not exact.
   **Review F2 of the re-review, 2026-10-27.**
 - **The harness's own teardown.** **Item 7 of the live check of 2026-10-26.** Under
   `leave_background` a graceful stop of the daemon still ended a background `sleep`,

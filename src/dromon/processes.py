@@ -657,11 +657,54 @@ def line_process_ended(
     return all(entry["pid"] != pid for entry in found)
 
 
+def elapsed_seconds(text: str) -> int | None:
+    """``ps``'s ``[[days-]hours:]minutes:seconds`` as whole seconds, or ``None`` when
+    the text is not in that form."""
+    days = 0
+    rest = text
+    if "-" in text:
+        head, _, rest = text.partition("-")
+        if not head.isdecimal():
+            return None
+        days = int(head)
+    parts = rest.split(":")
+    if not 2 <= len(parts) <= 3 or not all(part.isdecimal() for part in parts):
+        return None
+    total = 0
+    for part in parts:
+        total = total * 60 + int(part)
+    return days * 86400 + total
+
+
+def _same_process(before: ProcessInfo, after: ProcessInfo | None) -> bool:
+    """Whether ``after`` is still the process ``before`` described. A pid that the
+    system gave to another process since has a different parent or command, or an
+    elapsed time that is shorter, since a process's own elapsed time only grows."""
+    if after is None or after.pid != before.pid or after.ppid != before.ppid:
+        return False
+    if after.command != before.command:
+        return False
+    first, second = elapsed_seconds(before.elapsed), elapsed_seconds(after.elapsed)
+    return first is not None and second is not None and second >= first
+
+
 def stop_line_process(
     table: ProcessTable, mark: str, daemon_pid: int, pid: int, force: bool
 ) -> str:
     """Send ``SIGTERM``, or ``SIGKILL`` with ``force``, to ``pid`` if it is the line's,
-    checking its mark again now. Returns what was done, or raises ``ProcessRefused``."""
+    checking its mark again now. Returns what was done, or raises ``ProcessRefused``.
+
+    **Reuse of a pid, review of 2026-11-01, finding 6.** The mark is read, and the
+    signal follows, so a process that ended between the two could have its pid given
+    to another, which the signal would then reach. The listing is therefore read
+    again after the mark, and the signal is sent only if the process is still the one
+    first seen, by parent, command and an elapsed time that has not gone back.
+    **Residual.** The two reads and the signal are not one step, and no process
+    handle exists on this platform, so a pid reused within the same second by a
+    process with the same parent and command is not told apart, and one reused after
+    the second listing and before the signal is not seen at all. The window that
+    remains is the time between the second listing and the signal, which is
+    microseconds and not the listing's seconds."""
     if type(pid) is not int or pid <= 1:
         raise ProcessRefused("pid must be a whole number above 1")
     processes = table.own_processes()
@@ -672,6 +715,11 @@ def stop_line_process(
         raise ProcessRefused(f"process {pid} is the daemon or a line's engine")
     if not table.has_variable(pid, f"{MARK_VARIABLE}={mark}"):
         raise ProcessRefused(f"process {pid} is not one of yours")
+    again = table.own_processes()
+    if not _same_process(process, next((p for p in again if p.pid == pid), None)):
+        raise ProcessRefused(
+            f"process {pid} changed while it was checked, so it was not signalled"
+        )
     chosen = signal.SIGKILL if force else signal.SIGTERM
     try:
         table.send(pid, chosen)

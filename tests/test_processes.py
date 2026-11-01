@@ -29,6 +29,7 @@ from dromon.processes import (
     marked_processes,
     parse_ps,
     read_environment,
+    elapsed_seconds,
     stop_line_process,
 )
 from dromon.scheduler import LineEngine, LineSpec, Scheduler, engine_factory
@@ -258,6 +259,75 @@ def test_the_mark_is_read_again_at_the_moment_of_stopping(table: FakeTable) -> N
     with pytest.raises(ProcessRefused, match="is not one of yours"):
         stop_line_process(table, MARK, DAEMON, 2001, False)
     assert table.sent == []
+
+
+class _Reusing(FakeTable):
+    """A table whose pid 2001 is given to another process once its mark was read."""
+
+    def __init__(self, base: FakeTable, replacement: ProcessInfo | None) -> None:
+        super().__init__(base.rows, base.envs)
+        self.replacement = replacement
+        self.checked = False
+
+    def has_variable(self, pid: int, assignment: str) -> bool:
+        answer = super().has_variable(pid, assignment)
+        self.checked = True
+        return answer
+
+    def own_processes(self) -> Sequence[ProcessInfo]:
+        if not self.checked:
+            return self.rows
+        rest = [p for p in self.rows if p.pid != 2001]
+        return rest if self.replacement is None else [*rest, self.replacement]
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        None,
+        ProcessInfo(2001, 1, "00:00", "uv run pytest " + "x" * 300),
+        ProcessInfo(2001, 1001, "00:00", "someone else's job"),
+        ProcessInfo(2001, 1001, "00:01", "uv run pytest " + "x" * 300),
+        ProcessInfo(2001, 1001, "later", "uv run pytest " + "x" * 300),
+    ],
+    ids=["gone", "other parent", "other command", "younger", "unreadable time"],
+)
+def test_a_pid_given_to_another_process_after_the_mark_was_read_is_not_signalled(
+    table: FakeTable, replacement: ProcessInfo | None
+) -> None:
+    reusing = _Reusing(table, replacement)
+    with pytest.raises(ProcessRefused, match="changed while it was checked"):
+        stop_line_process(reusing, MARK, DAEMON, 2001, False)
+    assert reusing.sent == []
+
+
+def test_a_process_that_only_grew_older_is_still_signalled(table: FakeTable) -> None:
+    older = ProcessInfo(2001, 1001, "02:03", "uv run pytest " + "x" * 300)
+    reusing = _Reusing(table, older)
+    assert stop_line_process(reusing, MARK, DAEMON, 2001, False) == (
+        "sent SIGTERM to process 2001"
+    )
+    assert reusing.sent == [(2001, signal.SIGTERM)]
+
+
+@pytest.mark.parametrize(
+    ("text", "seconds"),
+    [
+        ("00:05", 5),
+        ("59:00", 3540),
+        ("01:00:00", 3600),
+        ("1-02:03:04", 86400 + 2 * 3600 + 3 * 60 + 4),
+        ("7", None),
+        ("a:b", None),
+        ("x-01:00", None),
+        ("1:2:3:4", None),
+        ("", None),
+    ],
+)
+def test_ps_elapsed_time_is_read_as_seconds_or_refused(
+    text: str, seconds: int | None
+) -> None:
+    assert elapsed_seconds(text) == seconds
 
 
 def test_a_process_that_ended_or_cannot_be_signalled_is_reported(
@@ -782,3 +852,54 @@ def test_where_processes_can_be_identified_line_status_says_so(
         "stop_unverified": None,
         "walk_limit": None,
     }
+
+
+def test_a_stop_does_not_wait_behind_a_kill_all_walk_check(
+    tmp_path: Path, table: FakeTable, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of 2026-11-01, finding 4. The pre-turn walk can run for most of a
+    minute under load, and it shared the one worker that serves stops, listings and
+    pid watches, so a stop queued behind it. It has its own worker now, so the stop
+    is answered while the walk is still held."""
+    import os
+
+    monkeypatch.setattr(os, "getpid", lambda: DAEMON)
+    release = threading.Event()
+    walking = threading.Event()
+
+    def slow_walk() -> str | None:
+        walking.set()
+        release.wait(timeout=30)
+        return None
+
+    async def scenario(found: Scheduler) -> tuple[str, bool, bool]:
+        mark_value = found.line_mark("alpha")
+        table.envs[2001] = mark(mark_value)
+        check = asyncio.create_task(found._check_walk("alpha"))  # pyright: ignore[reportPrivateUsage]
+        while not walking.is_set():
+            await asyncio.sleep(0.01)
+        tool = next(t for t in found.own_tools("alpha") if t.name == "stop_process")
+        try:
+            result = await asyncio.wait_for(tool.handler({"pid": 2001}), timeout=5)
+            still_walking = not check.done()
+        finally:
+            release.set()
+            await check
+        return (
+            cast(str, result["content"][0]["text"]),
+            result.get("is_error") is True,
+            still_walking,
+        )
+
+    with EventLog(tmp_path / "events.sqlite") as log:
+        found = Scheduler(
+            log, no_engine, hold_wakes=True, processes=table, walk_check=slow_walk
+        )
+        found.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+        try:
+            text, error, still_walking = asyncio.run(scenario(found))
+        finally:
+            release.set()
+            found.stop_workers()
+    assert (text, error) == ("sent SIGTERM to process 2001", False)
+    assert still_walking
