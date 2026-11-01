@@ -341,16 +341,10 @@ stops the start, or refuses the reload and keeps the previous list.
   operator and is exempt. Agent names hold only lowercase letters, digits, `.`, `_` and
   `-`, so a term with a space or a capital letter matches only its folded form, and a
   term with a space matches no name.
-- **What a refusal says.** A tool refusal names the field of the call that contains a
-  listed term, such as `body` or `note`, when the call offered text in that one field
-  only, and never names the term or its position. A call that offered text in several
-  fields is refused with the generic text, which names no field. **Review r4, finding
-  F1.** Naming each matching field of such a call would answer one bit per field in
-  one counted refusal, so a line could test several candidate words for the price of
-  one. A line that wants the field named sends it alone, at the cost of one check. No
-  message is recorded, and the refusal is recorded as `disclosure_checked`, which
-  holds no text. A refusal of an outbound federated message follows the same rule for
-  its `body` and `sender`.
+- **What a refusal says.** A tool refusal names at most one field, such as `body`
+  or `note`, only when the call offered text in that one field. A call offering
+  several fields receives a generic refusal even when only one matches. The round 4
+  review F1 rule prevents learning more than one bit from each counted refusal.
 - **Not checked.** Messages from operators, who hold authority, and the questions the
   daemon asks on a held line's behalf.
 - **Secrecy.** Terms are never logged, returned or stored. Errors about the file name
@@ -361,7 +355,9 @@ stops the start, or refuses the reload and keeps the previous list.
 - **Checking before sending.** **Item B2 of 2026-10-28.** A line's `check_disclosure`
   tool checks exactly one of `text`, a `path`, or a `paths` list of one to eight files
   relative to its working directory, and answers `pass` or `fail` with how many lines
-  hold a listed term, compared as above, and never which term or which file matched.
+  hold a listed term, compared as above, and never which term matched. The answer
+  never names a matching file or line location, including when several
+  files were supplied. File read failures also omit file names.
   Each file is checked independently and the counts are summed, so a match cannot span
   a file boundary. Their combined size may not exceed 1 MiB. A file that cannot be
   read refuses the whole call without recording a check. Each successful call,
@@ -549,3 +545,32 @@ Reviewed on 2026-10-25 from public documentation.
 
 Dromon follows the TOML and profile convention of Codex and Grok Build. It replaces
 rather than merges lists, unlike Claude Code, so that a line's grant is explicit.
+
+## Accepted disclosure occurrences
+
+The operator may set `[daemon.disclosure_accepted]` to a mapping from project relative
+file paths to lists of lowercase Secure Hash Algorithm 256 digests. Each digest covers
+the exact UTF-8 line content without its line ending. A trailing carriage return
+is removed before hashing in both the gate and tool. There are at most 256 paths and at most
+256 digests per path. Absolute paths and parent traversal are refused.
+
+An acceptance applies only to that file during `check_disclosure` and the local gate
+scan. Identical content anywhere in that file is exempt, including repeated lines.
+Moving the line within that file preserves acceptance. Editing the line or
+copying it to another file checks it again. Text checks and message fields receive no
+exemption. Existing private gate exceptions continue to apply for compatibility.
+
+The project file is an operator trust boundary. Lines are denied `.dromon`, so they
+cannot read the accepted hashes or test guesses against them offline. Someone who can
+read that configuration can test candidate short lines against a hash, so the hashes
+must not be treated as secret resistant to offline guessing. Entries contain paths
+and hashes, never listed terms or exact line text.
+
+A line able to edit an accepted file can try candidate content and observe whether
+the aggregate count drops. Each such check spends the existing hourly allowance.
+Acceptance remains scoped to content within the configured file under that limit.
+Refusals name a field only for calls offering one text field. No file names, line
+numbers or line ranges are returned to a line. File and line locations were declined because
+they would let a line narrow its own text to a listed term. Aggregate counts and
+the hourly limit remain diagnostic safeguards, not protection against a malicious
+agent. The gate reads the same project acceptance table.

@@ -119,6 +119,11 @@ operator authority. The design keeps that without exception.
   from `keleusma:@ana` is data, as mail from a line is, even when `ana` is a local
   operator too. It does not reset a line's autonomous-turn count, release a held line,
   answer a question or reach any operator request.
+- **The operator's fleet is not federation.** **Asked by the operator on 2026-10-31,
+  round 13.** The operator manages every daemon at once through the fleet index and
+  each daemon's own operator socket, as [`FLEET.md`](FLEET.md) specifies, and never
+  through a peer, a peer socket or a peer token. A machine elsewhere would be reached
+  through the operator's own SSH, which is designed there and not implemented.
 - **Default deny, per peer and per direction.** A daemon accepts no peer that its
   operator has not declared, and a declared peer has both directions off until the
   operator turns each on. **Amended on 2026-10-31.** An operator may open the project

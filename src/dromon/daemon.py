@@ -37,9 +37,11 @@ import json
 import contextlib
 import fcntl
 import os
+import shutil
 import signal
 import ssl
 import sys
+import tempfile
 import time
 import traceback
 from datetime import UTC, datetime
@@ -51,7 +53,7 @@ from typing import Any, Final, Protocol, cast
 from claude_agent_sdk import SdkMcpTool
 from OpenSSL.SSL import Context as OpenSSLContext
 
-from dromon import __version__, exits, peercred, registry, restart, runs
+from dromon import __version__, exits, fleet, peercred, registry, restart, runs
 from dromon.federation import (
     MAX_OPEN_REMOTE_PEERS,
     NO_FEDERATION,
@@ -92,7 +94,7 @@ from dromon.driver import (
     DriverError,
     Strategy,
 )
-from dromon.eventlog import EventLog, LogError, read_entries, utc_now
+from dromon.eventlog import EventLog, LogError, read_entries, snapshot, utc_now
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.mailbox import MAX_PAGE, listing, outcome, replied_ids, sent, summary
 from dromon.lineconfig import (
@@ -128,6 +130,7 @@ from dromon.configview import (
 )
 from dromon.overrides import (
     Layer,
+    apply_limits,
     OverrideError,
     Scope,
     Value,
@@ -154,6 +157,7 @@ from dromon.model import (
     EventRejected,
     InvalidField,
     LineAddress,
+    LineOverridden,
     Message,
     OperatorAddress,
     QuestionStatus,
@@ -1037,7 +1041,9 @@ class Daemon:
         return Response(request.request_id, True, result=result)
 
     def _create_line(self, args: dict[str, object]) -> dict[str, object]:
-        texts = {key: value for key, value in args.items() if key != "config"}
+        texts = {
+            key: value for key, value in args.items() if key not in ("config", "limits")
+        }
         names = ("line_id", "model", "strategy")
         if "engine_session" in texts:
             names += ("engine_session",)
@@ -1051,7 +1057,30 @@ class Daemon:
         config = _config_arg(args) if "config" in args else DEFAULT_CONFIG
         self._check_workdir(config)
         check_sandbox_required(self.project, line_id, model, config)
+        raw_limits = args.get("limits", {})
+        if not isinstance(raw_limits, dict):
+            raise OverrideError("limits must be an object")
+        limits_document: dict[str, Value] = {}
+        for key, value in cast(dict[str, object], raw_limits).items():
+            if key not in ("max_autonomous_turns", "max_cost_usd", "cooldown_seconds"):
+                raise OverrideError("unknown line limit key")
+            full_key = "limits." + key
+            limits_document[full_key] = check(spec_of(Scope.LINE, full_key), value)
+        try:
+            apply_limits(self.scheduler.limits, limits_document)
+        except ValueError as error:
+            raise OverrideError(str(error)) from error
+        # Limits cannot change the engine or placement. Validate and encode the
+        # entire override before creation, so no later override validation can
+        # refuse a request whose line has already been recorded.
+        initial_override = (
+            LineOverridden(line_id, encode_override(limits_document))
+            if limits_document
+            else None
+        )
         self.scheduler.create_line(line_id, model, chosen, config, session)
+        if initial_override is not None:
+            self.log.append(initial_override)
         return {"line_id": line_id}
 
     def _configure_line(self, args: dict[str, object]) -> dict[str, object]:
@@ -1625,6 +1654,7 @@ class Daemon:
             }
         )
         self.scheduler.set_disclosure_terms(terms)
+        self.scheduler.set_disclosure_accepted(config.disclosure_accepted)
         self.scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
         self.scheduler.set_runs(config.run_commands)
         self.project = config
@@ -1904,6 +1934,7 @@ class Daemon:
             "pid": os.getpid(),
             "project": str(self.paths.root),
             "started_at": self.started_at,
+            "options": successor_args(self.command_line, self.hold_wakes),
             "event_log": {
                 "last_seq": self.log.last_seq,
                 "lines": len(state.lines),
@@ -2952,25 +2983,37 @@ def protected_dirs(
 ) -> tuple[Path, ...]:
     """The directories every enabled sandbox denies, which hold the event log, the
     project file and the daemon's socket, followed by each declared peer's, which hold
-    the same for another project. Raises ``ConfigError`` when a peer names this
-    project's own directories, or two peers share one."""
+    the same for another project, and then the fleet index. Raises ``ConfigError``
+    when a peer names this project's own directories, or two peers share one."""
     own = (paths.state_dir.resolve(), paths.runtime_dir.resolve())
     try:
         found = own + peer_directories(federation, own)
     except FederationError as error:
         raise ConfigError(str(error)) from error
+    try:
+        registry_in_use = registry_dir or registry.configured_directory(os.environ)
+    except registry.RegistryError as error:
+        raise ConfigError(str(error)) from error
+    # The fleet index, whatever the federation mode, so that no line can write an
+    # entry that sends the operator's commands to a socket of its choosing. Round 13,
+    # item 1. A directory that does not exist yet is denied as well, by its path.
+    found = (
+        *found,
+        *(
+            index
+            for index in fleet.denied_indexes(registry_in_use)
+            if index not in found
+        ),
+    )
     # The registry of open local federation, which a line that could write it could
     # use to pass for a daemon. Each registered project's own directories are read
     # at each engine build, by ``registry_protected``. The default registry is denied
     # too when ``DROMON_REGISTRY_DIR`` moves this daemon's, so that its lines cannot
     # write the one other daemons read.
     if federation.local_open:
-        try:
-            directory = registry_dir or registry.configured_directory(os.environ)
-        except registry.RegistryError as error:
-            raise ConfigError(str(error)) from error
         reals = dict.fromkeys(
-            os.path.realpath(each) for each in (directory, registry.default_directory())
+            os.path.realpath(each)
+            for each in (registry_in_use, registry.default_directory())
         )
         found = (*found, *(Path(real) for real in reals))
     return found
@@ -3089,6 +3132,56 @@ def open_registration(
         f"dromond: registered for open local federation as {name} in {directory}",
         file=sys.stderr,
     )
+    return entry
+
+
+def make_index(registry_dir: Path) -> bool:
+    """Make the fleet index before any engine is built, so that every line's sandbox
+    denies a directory that exists, and say whether it is there. Review of 7ff033f,
+    G5. **Decided by core, for the operator's review.** A failure is written to
+    standard error and the daemon starts, as one that cannot be listed does. A
+    directory refused for a wider mode exists, so it is denied. **Inference, not
+    verified.** A directory the daemon cannot make, its lines, which run as the same
+    user with less access, cannot make either, unless the cause passes."""
+    try:
+        fleet.ensure_index(registry_dir)
+    except fleet.FleetError as error:
+        print(f"dromond: {error}", file=sys.stderr)
+        return False
+    return True
+
+
+def fleet_registration(
+    paths: ProjectPaths,
+    registry_dir: Path,
+    start_of: registry.StartOf,
+    commit: str | None,
+) -> fleet.IndexEntry | None:
+    """Write this daemon's entry in the fleet index, whatever its federation mode, and
+    say it, or ``None`` when it cannot be written. Round 13, item 1.
+
+    **Decided by core, for the operator's review.** A failure is written to standard
+    error and the daemon starts unlisted, rather than refusing to start. The index
+    grants nothing, since a client reaches a daemon only through its socket, so a
+    daemon missing from it loses only the fleet commands' sight of it, while a refusal
+    would stop a project's daemon for a convenience. A project root whose last step is
+    not a valid name, such as one with a control character, is also left out."""
+    root = paths.root.resolve()
+    directory = fleet.index_directory(registry_dir)
+    try:
+        started = start_of(os.getpid())
+        if started is None:
+            raise fleet.FleetError("the process table does not list this daemon")
+        entry = fleet.IndexEntry(
+            root.name, root, paths.socket, os.getpid(), started, commit
+        )
+        fleet.write_index_entry(directory, entry)
+    except Exception as error:  # noqa: BLE001, any failure leaves the daemon unlisted
+        print(
+            f"dromond: not listed in the fleet index {directory}: {error}",
+            file=sys.stderr,
+        )
+        return None
     return entry
 
 
@@ -3379,16 +3472,49 @@ def apply_project(scheduler: Scheduler, log: EventLog, config: ProjectConfig) ->
         )
 
 
+CHECK_PASSED: Final = "dromond: the start checks pass, and nothing was started"
+"""What ``dromond --check`` says when a start would get past its checks."""
+
+
+def check_scratch(paths: ProjectPaths) -> Path:
+    """A new private directory under the runtime directory for a check's copy of
+    the event log, on the same file system and as private as the log, after
+    sweeping the directories killed checks left, as ``restart.sweep_checks``
+    describes. Raises ``LogError``."""
+    restart.sweep_checks(paths.runtime_dir, restart.CHECK_SECONDS)
+    try:
+        return Path(
+            tempfile.mkdtemp(prefix=restart.CHECK_PREFIX, dir=paths.runtime_dir)
+        )
+    except OSError as error:
+        raise LogError(
+            f"cannot make a directory for a copy of the log in {paths.runtime_dir}"
+        ) from error
+
+
 def run(
     paths: ProjectPaths,
     *,
     overrides: Overrides | None = None,
     hold_wakes: bool = False,
+    check_only: bool = False,
 ) -> int:
     """Run the daemon for ``paths`` in the foreground and return its exit status.
 
     The project file ``.dromon/dromon.toml``, when present, supplies lines, limits and
     the wake policy. ``overrides`` from the command line take precedence over it.
+
+    With ``check_only``, the start checks run and nothing starts, which is what
+    ``dromon restart`` asks of the installed code before it stops the running
+    daemon. The checks are this function's own, in its own order, so a check added
+    to a start is a check of the preflight too. They read the project file and a
+    copy of the event log made by ``eventlog.snapshot`` in a private directory under
+    the runtime directory, which is removed afterwards, so whatever a start would
+    append is appended to the copy. The lock, which the running daemon holds, is not
+    taken, the teacher is not brought up, the registry is not written, no socket is
+    made and none is removed, the process table is not probed, and recovery, which
+    runs in ``serve``, does not run. ``docs/protocol/RESTART.md`` says what the
+    check therefore cannot find.
     """
     os.umask(0o077)
     given = overrides or Overrides()
@@ -3408,7 +3534,7 @@ def run(
         check_engines(config)
         terms = project_terms(config, paths)
         limits, operator, tick = resolve(config, given)
-        lock = acquire_lock(paths.lock)
+        lock = None if check_only else acquire_lock(paths.lock)
     except AlreadyRunning as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.ALREADY_RUNNING
@@ -3427,10 +3553,26 @@ def run(
         line_id: definition.secret_names for line_id, definition in config.lines.items()
     }
     launcher.configure(paths.left_reports)
+    if lock is not None:
+        # A start holds the lock, so no check of its own runs, and any preflight
+        # directory left is a killed check's copy of the log.
+        restart.sweep_checks(paths.runtime_dir, None)
+    if not check_only:
+        # A check writes nothing of the operator's, the fleet index included. It
+        # builds no engine, so no sandbox needs the index to exist, and it returns
+        # before ``fleet_registration``, so it writes no entry either.
+        make_index(registry_dir)
     successor: list[str] | None = None
     scheduler: Scheduler | None = None
+    scratch: Path | None = None
+    daemon_commit = read_head_commit(Path(__file__).parent)
     try:
-        with EventLog(paths.event_log) as log:
+        log_path = paths.event_log
+        if check_only:
+            scratch = check_scratch(paths)
+            log_path = scratch / paths.event_log.name
+            snapshot(paths.event_log, log_path)
+        with EventLog(log_path) as log:
             scheduler = Scheduler(
                 log,
                 engine_factory(
@@ -3455,15 +3597,18 @@ def run(
                 root=paths.root,
                 protected=protected_dirs(paths, config.federation, registry_dir),
                 read_only_paths=config.read_only_paths,
-                daemon_commit=read_head_commit(Path(__file__).parent),
+                daemon_commit=daemon_commit,
                 daemon_checkout=Path(__file__).parent,
-                processes_identifiable=environment_reading_works(),
+                processes_identifiable=(
+                    False if check_only else environment_reading_works()
+                ),
                 line_tokens=line_tokens,
                 report_dir=paths.left_reports,
                 walk_check=launcher.walk_unavailable,
             )
             scheduler.record_walk_gap(launcher.walk_gap())
             scheduler.set_disclosure_terms(terms)
+            scheduler.set_disclosure_accepted(config.disclosure_accepted)
             scheduler.set_git_ssh(line_git_ssh)
             scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
             scheduler.set_runs(config.run_commands)
@@ -3480,7 +3625,7 @@ def run(
                 }
             )
             open_federation(scheduler, log, config.federation, registry_dir)
-            teacher = start_teacher(config, paths)
+            teacher = None if check_only else start_teacher(config, paths)
             try:
                 daemon = Daemon(
                     paths,
@@ -3502,6 +3647,9 @@ def run(
                 # Checked here as well as in ``serve``, so a refused relay stops the
                 # start before any socket is made.
                 daemon.relay_routes(config)
+                if check_only:
+                    print(CHECK_PASSED, file=sys.stderr)
+                    return exits.OK
                 entry = open_registration(
                     paths,
                     config.federation,
@@ -3509,9 +3657,19 @@ def run(
                     scheduler.discloses,
                     daemon.start_of,
                 )
+                indexed = fleet_registration(
+                    paths,
+                    daemon.registry_dir,
+                    daemon.start_of,
+                    daemon_commit,
+                )
                 try:
                     asyncio.run(serve(daemon))
                 finally:
+                    if indexed is not None:
+                        fleet.remove_index_entry(
+                            fleet.index_directory(daemon.registry_dir), indexed
+                        )
                     if entry is not None:
                         registry.unregister(daemon.registry_dir, entry)
                 successor = daemon.successor
@@ -3532,15 +3690,19 @@ def run(
     finally:
         if scheduler is not None:
             scheduler.stop_workers()
-        for stale in (
-            paths.socket,
-            paths.agent_socket,
-            paths.line_socket,
-            paths.peer_socket,
-        ):
-            with contextlib.suppress(FileNotFoundError):
-                stale.unlink()
-        os.close(lock)
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
+        # A check holds no lock, and the sockets are the running daemon's.
+        if lock is not None:
+            for stale in (
+                paths.socket,
+                paths.agent_socket,
+                paths.line_socket,
+                paths.peer_socket,
+            ):
+                with contextlib.suppress(FileNotFoundError):
+                    stale.unlink()
+            os.close(lock)
     if successor is not None:
         return start_successor(paths, successor)
     print("dromond: stopped", file=sys.stderr)
@@ -3596,6 +3758,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="record messages but wake no line, for maintenance and tests",
     )
     parser.add_argument(
+        "--check",
+        action="store_true",
+        help="run the start checks against the project file and a copy of the event"
+        " log, start nothing and exit, as dromon restart does before it stops the"
+        " running daemon",
+    )
+    parser.add_argument(
         "--tick-seconds",
         type=float,
         default=None,
@@ -3635,7 +3804,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.USAGE
     hold: bool = arguments.hold_wakes
-    return run(paths, overrides=overrides, hold_wakes=hold)
+    check: bool = arguments.check
+    return run(paths, overrides=overrides, hold_wakes=hold, check_only=check)
 
 
 if __name__ == "__main__":

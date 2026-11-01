@@ -4,12 +4,15 @@ share. Their behaviour within a turn is tested through each adapter."""
 import asyncio
 from collections import deque
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from dromon import acp
 from dromon.engine import EngineRefused
+from dromon.mcp import Bridge
+from dromon.protocol import Operation
 
 OPTIONS = [
     {"optionId": "always", "kind": "allow_always"},
@@ -241,3 +244,63 @@ def test_a_request_dromon_does_not_serve_is_answered_with_an_error() -> None:
             },
         }
     ]
+
+
+@pytest.mark.parametrize("runtime_error", [False, True])
+def test_mcp_refusal_carries_a_reason_and_allows_the_next_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_error: bool,
+) -> None:
+    reason = "the text contains a term from the project's disclosure list"
+    requests = 0
+
+    def daemon(
+        self: Bridge, operation: Operation, extra: Mapping[str, object]
+    ) -> object:
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            if runtime_error:
+                raise RuntimeError(reason)
+            return {"content": [{"type": "text", "text": reason}], "is_error": True}
+        return {"content": [{"type": "text", "text": "corrected"}]}
+
+    monkeypatch.setattr(Bridge, "_daemon", daemon)
+    bridge = Bridge(tmp_path / "unused.sock", "alpha", None, party="line")
+    first = bridge.handle(
+        {"id": 1, "method": "tools/call", "params": {"name": "send_message"}}
+    )
+    second = bridge.handle(
+        {"id": 2, "method": "tools/call", "params": {"name": "list_mail"}}
+    )
+    assert first is not None and second is not None
+    assert first["result"] == {
+        "content": [{"type": "text", "text": reason}],
+        "isError": True,
+    }
+    assert second["result"] == {
+        "content": [{"type": "text", "text": "corrected"}],
+        "isError": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "status", ["pending", "failed", "in_progress", "completed", "unknown", None]
+)
+@pytest.mark.parametrize("marker", [True, False, "true", 1, None])
+def test_rejected_call_requires_explicit_non_execution_evidence(
+    status: str | None,
+    marker: object,
+) -> None:
+    fields: dict[str, object] = {"_meta": {"toolNotRun": marker}}
+    if status is not None:
+        fields["status"] = status
+    assert acp.rejected_call_not_run(fields) is (
+        marker is True and status in (None, "pending", "failed")
+    )
+
+
+@pytest.mark.parametrize("meta", [None, True, [], "toolNotRun", {}])
+def test_missing_or_malformed_non_execution_evidence_fails_closed(meta: object) -> None:
+    assert not acp.rejected_call_not_run({"status": "failed", "_meta": meta})

@@ -18,7 +18,7 @@ from typing import Final
 
 from dromon.ui.keys import Key, Named, from_text
 from dromon.ui.render import Frame, Style
-from dromon.ui.runtime import Daemon, Runtime, detached_status
+from dromon.ui.runtime import Daemon, Projects, Runtime, detached_status
 
 PUMP_MILLISECONDS: Final = 50
 COLUMNS: Final = 110
@@ -182,10 +182,19 @@ class Window:
         text.configure(state="disabled")
 
 
-def run(daemon: Daemon, line_id: str, operator: str, poll_seconds: float) -> int:
+def run(
+    daemon: Daemon,
+    line_id: str,
+    operator: str,
+    poll_seconds: float,
+    projects: Projects | None = None,
+    project: str | None = None,
+) -> int:
     """Open the window and run it until the operator detaches or closes it."""
     root = tk.Tk()
-    runtime = Runtime(daemon, line_id, operator, poll_seconds, root.bell)
+    runtime = Runtime(
+        daemon, line_id, operator, poll_seconds, root.bell, projects, project
+    )
     window = Window(root, runtime)
     root.after(0, window.pump)
     root.mainloop()

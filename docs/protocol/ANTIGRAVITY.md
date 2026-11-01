@@ -23,6 +23,37 @@ line whose driver names the `antigravity` engine runs each turn through the runt
 over the Agent Client Protocol, ACP, through the client it shares with
 [`GROK.md`](GROK.md) in `dromon.acp`.
 
+## Refusal explanations
+
+The Agent Client Protocol version 1 permission answer selects an option or reports
+cancellation. Its schema defines no standard reason field, and metadata does not
+establish a model-visible explanation. The evidence and limits are described in
+[GROK.md](GROK.md#refusal-explanations). Dromon rejects an ordinary request for a tool
+the line was not given without cancelling the turn. Whether Antigravity presents a
+useful denial message and continues has not been verified live. Dromon's own tools
+return explanatory Model Context Protocol errors, including safe disclosure refusals,
+within the turn.
+
+Identity changes, reused permission identifiers, execution without approval or after
+rejection, missing permission options, runtime questions, model or mode changes,
+unknown protocol messages, deadlines and driver budgets still stop the turn. Driver
+budgets are checked before granting a permission request. An engine refusal or driver
+interruption leaves a bounded harness note for the next prompt. Its wording comes
+only from Dromon's closed vocabulary, with no engine labels, titles, identifiers or
+error text.
+Unrecognized causes receive a generic safety or protocol explanation. Older
+persisted notes are classified again before display. It survives a restart, does
+not wake or release the line, and remains owed until a later turn returns an engine
+report.
+A connection failure or protocol error during cancellation keeps the original
+refusal or driver cause. Priority mail and restart interruptions retain their
+existing notices.
+
+Fixed stop notices contain only public Dromon wording and are not screened against
+the disclosure list. Their wording never depends on that list, so observing a notice
+reveals no list membership. They consume no line disclosure allowance.
+Line-originated disclosure checks retain their existing allowance.
+
 ## Evidence
 
 Each claim below is labelled. **Second implementation** means that T3 Code, an
@@ -172,12 +203,22 @@ with `DROMON_ANTIGRAVITY_RUNTIME`.
     `toolName` is `dromon__TOOL`. **Antigravity review, F4.** A title never names a
     tool, since a file name or the model can make it equal to one. A permission
     request for one of Dromon's own tools is allowed once. Any other is refused with a
-    single rejection, and a tool call that is not Dromon's cancels and refuses the
-    turn, saying whether it came before the tool ran or after it started. **F1.** No
+    single rejection that leaves the turn running. An explicitly `pending` call
+    waits for its permission request. Every update after rejection requires
+    `_meta.toolNotRun` equal to the Boolean `true`. Without it, `pending`, `failed`,
+    completed, unknown and missing status all cancel the turn. Execution or unknown
+    status contradicting the marker also cancels. Dromon trusts the engine's own
+    `_meta.toolNotRun` assertion that the rejected call did not run. It is not
+    independent proof of no side effects. A runtime that falsely asserts
+    non-execution can therefore leave the turn running. No live observation
+    establishes that this runtime supplies it. Rejection before execution depends on the runtime honoring its
+    permission answer. An unauthorized call with another status, including no
+    status, cancels and refuses the turn. **F1.** No
     kind, `think` included, exempts a call. **F2 and F3.** Every `tool_call_update` is
     checked as well, and a recorded call whose `toolName`, `title` or `kind` changes,
     or gains one it lacked, refuses the turn, in an update or in a permission request,
-    which is then rejected. A call without an identifier refuses the turn. A question
+    which is then rejected. A repeated permission identifier, a permission request
+    for a call no longer pending or a call without an identifier refuses the turn. A question
     from the runtime is answered as cancelled and refuses the turn. Once a turn is
     cancelled, every permission request is answered as cancelled, as ACP requires.
 15. **Strictness.** An update kind outside ACP version 1, a request other than a

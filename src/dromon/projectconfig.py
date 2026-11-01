@@ -31,6 +31,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Final, cast
 
+from dromon.disclosure import DisclosureError, accepted_entries
 from dromon.driver import MODELS, Strategy
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.lineconfig import (
@@ -98,7 +99,13 @@ TOP_KEYS: Final = frozenset(
     }
 )
 DAEMON_KEYS: Final = frozenset(
-    {"operator", "tick_seconds", "require_sandbox", "disclosure_terms"}
+    {
+        "operator",
+        "tick_seconds",
+        "require_sandbox",
+        "disclosure_terms",
+        "disclosure_accepted",
+    }
 )
 LIMIT_KEYS: Final = frozenset(
     {"max_autonomous_turns", "max_cost_usd", "cooldown_seconds"}
@@ -271,6 +278,9 @@ class ProjectConfig:
     disclosure_terms: str | None = None
     """The project's disclosure list, a path relative to the project root, or
     ``None``. Only the path is held here. The daemon reads the terms."""
+    disclosure_accepted: dict[str, tuple[str, ...]] = field(
+        default_factory=dict[str, tuple[str, ...]]
+    )
     lease_names: tuple[str, ...] = ()
     """The leases the project's lines may acquire, by name."""
     lease_ttl_seconds: int = DEFAULT_LEASE_TTL
@@ -411,6 +421,10 @@ class _Reader:
             not isinstance(terms, str) or not terms or "\x00" in terms
         ):
             raise self.fail("daemon.disclosure_terms", "must be a path to a file")
+        try:
+            accepted = accepted_entries(daemon.get("disclosure_accepted", {}))
+        except DisclosureError as error:
+            raise self.fail("daemon.disclosure_accepted", str(error)) from error
         limits = self.limits(top.get("limits", {}), "limits", DEFAULT_LIMITS)
         wake = self.wake(top.get("wake", {}), "wake", 1)
         sandbox = self.sandbox(top.get("sandbox"), "sandbox")
@@ -471,6 +485,7 @@ class _Reader:
             git_ssh=git_ssh,
             require_sandbox=require_sandbox,
             disclosure_terms=terms,
+            disclosure_accepted=accepted,
             lease_names=lease_names,
             lease_ttl_seconds=lease_ttl,
             run_commands=run_commands,

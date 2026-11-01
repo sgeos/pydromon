@@ -28,6 +28,75 @@ All notable changes are recorded here. The format follows
   held line's mail waits undelivered. **Rollback hazard.** A daemon before this change
   refuses a log holding a `line_held` with a cause. See
   [`LINE_CONFIG.md`](docs/protocol/LINE_CONFIG.md).
+- A restart preflight, round 13. `dromon restart` now reads `status`, then runs the
+  installed daemon's own start checks in a process of their own, `dromond --check`
+  with the running daemon's command-line options, against the project file and a copy
+  of the event log in a private directory under the
+  runtime directory, and refuses the restart with the new code's own message while
+  the old daemon keeps serving. The check never writes the live log, takes no lock,
+  makes and removes no socket, and starts nothing. `status` gives the new field
+  `options`. `docs/protocol/RESTART.md` tables what the check covers and what only a
+  real start reveals, which includes anything recorded during the drain. It replaces
+  the import check by `--version`. Prompted by the restart of 2026-10-31 that left no
+  daemon for about eight minutes. After audit's reviews, the copy is not a SQLite
+  backup, which starts again at every write to the source, but the exact schema and
+  the events up to the sequence number read when it begins, copied in ranges of at
+  most 2,000 events and about 1 MiB with a short pause and no lock between them, so
+  it finishes on a busy log and delays the daemon's commits by at most the reading
+  of one range. The live log is attached read-only, which a test pins. Preflight
+  directories that a killed check left are swept after a client's timeout, by each
+  check when older than its bound, and by each start.
+- `dromon land WORKTREE`, round 13, one operator command that takes a line's finished
+  worktree to a pull request. It shows the plan with every path to stage, refuses
+  protected paths under `docs/process`, `docs/roadmap`, `secret` and `.dromon`
+  except those a resolved merge carries unchanged from the incoming commit, screens
+  the diff, message, title and body against the disclosure list by file and line
+  only, then asks, stages, commits with the operator's message, runs the full gate,
+  asks, pushes without force, asks, and opens the pull request with `gh`. `--dry-run`
+  changes nothing, and `--yes` answers every question. It never merges and never adds
+  a `Co-Authored-By` trailer, and refuses a commit that a hook gave one. After
+  audit's review, it also screens every commit the push carries since the branch
+  left the remote base, their messages and the branch name, refuses an empty list or
+  a missing `--terms` file, lets only a merge of the published base carry a protected
+  path, re-screens the stored message after hooks, and asks before running a branch
+  that changes `scripts/`, even with `--yes`. A preflight writes nothing of the
+  operator's, so it neither makes the fleet index nor writes an entry in it.
+- The operator's fleet, round 13, as `docs/architecture/FLEET.md` specifies. Every
+  daemon, whatever its federation mode, writes an entry in a per-user fleet index at
+  start and removes it at stop. The entry holds the project root, its operator socket,
+  the pid, the start time and the daemon's commit. The index is the directory `index`
+  inside the open-federation registry, so `DROMON_REGISTRY_DIR` moves it as well, with
+  mode 0700 and entries of mode 0600. An entry's name must be the last step of its
+  root. The daemon makes the index at start, before any engine is built, and every line
+  of every project is denied it. A daemon whose entry cannot be written starts unlisted
+  and says so. `dromon fleet list`,
+  `questions`, `mail`, `issues`, `answer`, `send`, `read`, `status` and `restart` read
+  the index and send the existing operations to each daemon's own operator socket,
+  after `status` has shown that the daemon answering is the one the entry names, and
+  take `PROJECT:ID` or `PROJECT:LINE`. `fleet restart` takes as the successor only the
+  daemon the index then lists for the same root, live and saying that pid and root. A
+  stale or unknown entry is shown and never asked, and a daemon that does not answer is
+  reported while the rest go on. The attached client's `/projects` lists the index,
+  with the root beside a name two projects share, and `/project PROJECT[:LINE]` moves
+  to another project without restarting. A per-user hosts file,
+  `.config/dromon/hosts.toml` or `DROMON_HOSTS_FILE`, names other machines, which
+  `dromon fleet hosts` lists. It holds no credential. Reaching those machines through
+  the operator's own SSH is designed and not implemented. **Rollback hazard.** An
+  older daemon writes no entry, so `dromon fleet` does not see it, and an older client
+  has no `fleet` command. The index directory an older release leaves is harmless and
+  may be removed. **Operational note.** The daemon now makes the index at start, so a
+  Grok line's turns are refused, naming the entry to add, until its profile denies the
+  index, as for every protected directory.
+- Runtime line creation accepts limits, kept session and compaction options.
+  Configuration accepts workdir access and the project summary shows operator routing,
+  relays, supervised runs, read only paths and federation policy.
+- Disclosure refusals name message fields. Checks return only aggregate counts,
+  without file names or line locations.
+  Older daemons refuse the new `disclosure_accepted` key, so remove that table
+  before rolling back. Operator accepted occurrences use file paths and exact line
+  content hashes shared by the daemon and gate. Text and messages retain disclosure checks and the hourly limit.
+- The gate reports bounded groups of skipped and deselected tests with their reasons.
+
 - Open federation, round 12. `[federation] local` and `remote` take `allowlist`, the
   default, which keeps the behaviour of declared peers exactly, or `open`. With
   `local = "open"`, `listen` and a unique `name`, a daemon registers in a per-user
@@ -155,6 +224,34 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- Review of 60fcdd3. Fixed public stop notices no longer consult the disclosure list,
+  so their display cannot reveal whether the list matches a known sentence. They
+  still contain no engine text and consume no line disclosure allowance. The engine
+  documents now state that Dromon trusts the runtime's own `_meta.toolNotRun`
+  assertion that a rejected call did not run.
+
+- Review of 7eda348. Grok and Antigravity continue after a rejected call is reported
+  only when the update explicitly asserts non-execution through `_meta.toolNotRun`
+  equal to Boolean `true`, without contradictory execution status. Pending and
+  failed status alone now stop the turn. Stop notes use a closed Dromon vocabulary
+  and discard engine labels and error text, including when reading older notes.
+  Harness screening of those fixed notes leaves the line's hourly disclosure
+  allowance untouched. Line-originated checks retain their existing allowance.
+
+- Grok and Antigravity reject ordinary tool permission requests without cancelling
+  the turn when a rejection option is available. Identity changes, reused permission
+  identifiers, execution without approval, missing options and driver budgets still
+  stop it. Budgets are checked before granting a new call. Engine refusals and driver
+  interruptions leave a bounded, disclosure-filtered cause in the next prompt through
+  a durable harness note that does not wake the line. Agent Client Protocol version 1
+  defines no custom reason field, so a model-visible explanation for a selected
+  rejection remains runtime-dependent and unverified live.
+
+- `dromon restart` waits for its successor until a deadline, and each status request
+  waits no longer than what remains of it. Each poll waited out a whole request
+  timeout before, so a daemon that accepted and never answered could hold the client
+  for hours, as the review of 7ff033f found. A hang now costs at most the drain wait,
+  plus 70 seconds for the shutdown and startup bounds, plus one poll.
 - ACP adapters now cancel and refuse a turn when the runtime omits the permission
   option needed for Dromon's intended decision. The refusal names the tool, whether
   Dromon intended to allow or refuse it, and bounded evidence of the offered option

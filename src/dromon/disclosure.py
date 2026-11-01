@@ -9,8 +9,8 @@ and lines whose first non-blank character is ``#`` are ignored, as in
 external agent sends through Dromon's tools is refused when its text holds a term.
 ``docs/protocol/PROJECT_CONFIG.md`` is normative.
 
-Secrecy. A term is never logged, returned or stored. A refusal says only that the text
-holds a term from the list, and errors about the file name the file, never its content.
+Secrecy. A term is never logged, returned or stored. A refusal names the matching
+field without its value. File errors name the file, never its content.
 
 Limits. Matching is by substring after Unicode case folding, so a term written another
 way, split across messages, or encoded, passes. The check is a guard against accidents,
@@ -22,8 +22,9 @@ full case folding. A port must use the same folding to match the same texts.
 """
 
 from collections.abc import Iterable
+from hashlib import sha256
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
 
 MAX_TERMS_FILE_BYTES: Final = 1024 * 1024
 """The largest disclosure list read, so a mistaken path cannot exhaust memory."""
@@ -45,13 +46,11 @@ def field_refusal(fields: Iterable[str]) -> str:
 
 
 def refusal(matched: Iterable[str], offered: int) -> str:
-    """The refusal for a call that offered ``offered`` fields with text, of which
-    ``matched`` hold a listed term. **Review r4, finding F1.** Naming the matched
-    fields of a call with several would answer one bit per field in one counted
-    refusal, so a line could test several candidate words for the price of one.
-    The field is therefore named only when the call offered text in one field, which
-    answers one bit as every refusal did before, and a line that wants a field named
-    sends it alone."""
+    """Name a field only when the call offered text in that one field.
+
+    Round 4 review F1 bounds each counted refusal to one bit. Calls offering
+    several fields receive the generic refusal even if only one field matches.
+    """
     names = tuple(dict.fromkeys(matched))
     if not names:
         raise ValueError("a disclosure refusal must name at least one field")
@@ -97,14 +96,56 @@ def discloses(terms: Iterable[str], texts: Iterable[str]) -> bool:
     return any(term in text for term in terms for text in folded)
 
 
-def matching_lines(terms: Iterable[str], text: str) -> int:
-    """How many lines of ``text`` hold any of ``terms``, which are case folded. The
-    count says how much of a text to look at and never which term matched. Since
-    ``load_terms`` reads each term from one line, no term holds a line break, so the
-    count is 0 exactly when ``discloses`` finds nothing."""
+def accepted_entries(raw: object) -> dict[str, tuple[str, ...]]:
+    """Validate operator supplied paths and digests without reading their contents."""
+    if not isinstance(raw, dict) or len(cast(dict[object, object], raw)) > 256:
+        raise DisclosureError(
+            "disclosure_accepted must be a table of at most 256 paths"
+        )
+    result: dict[str, tuple[str, ...]] = {}
+    for path, hashes in cast(dict[object, object], raw).items():
+        if (
+            not isinstance(path, str)
+            or not path
+            or Path(path).is_absolute()
+            or ".." in Path(path).parts
+            or "\\" in path
+            or "\x00" in path
+        ):
+            raise DisclosureError(
+                "disclosure_accepted needs project relative file paths"
+            )
+        if (
+            not isinstance(hashes, list)
+            or not hashes
+            or len(cast(list[object], hashes)) > 256
+            or any(
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)
+                for digest in cast(list[object], hashes)
+            )
+        ):
+            raise DisclosureError(
+                "disclosure_accepted needs lists of lowercase SHA-256 digests"
+            )
+        result[path] = tuple(cast(list[str], hashes))
+    return result
+
+
+def matching_lines(
+    terms: Iterable[str], text: str, accepted: Iterable[str] = ()
+) -> int:
+    """Count matching lines, exempting exact operator accepted line digests.
+
+    No file or line locations are returned. An exemption applies only when the
+    caller supplied the digests for the checked file, never for arbitrary text.
+    """
     listed = tuple(terms)
+    exemptions = frozenset(accepted)
     return sum(
         1
-        for line in text.casefold().splitlines()
-        if any(term in line for term in listed)
+        for line in text.splitlines()
+        if sha256(line.removesuffix("\r").encode("utf-8")).hexdigest() not in exemptions
+        and any(term in line.casefold() for term in listed)
     )
