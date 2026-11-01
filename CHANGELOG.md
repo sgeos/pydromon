@@ -7,6 +7,27 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- A read-only view of every other line in `line_status`. Each entry of `other_lines`
+  now also gives the line's `condition`, the short `hold_cause` of a hold, `since`, when
+  its state, hold or hibernation last changed, and its `unread` count with
+  `oldest_unread_age_seconds`, and never a message's body, sender or identifier, nor
+  the hold question. An entry gives `line_id`, `state` and `condition` always and
+  every other field only when it says something, and no longer gives `held`, since
+  `hold_cause` is given exactly when the line is held. A view too large for the
+  response bound keeps as many lines as fit, with `other_lines_omitted` counting the
+  rest, where before it vanished at about seventeen other lines. The lines it keeps
+  are first those held, failed or with unread mail, then the rest, so a held line
+  whose name sorts last is not the one dropped. The state keeps
+  each line's unread mail and open questions as indexes, so `condition` and the view
+  scan no messages, and the view is built only when the lists are asked for. A line had held back work it planned for a peer because its
+  status gave no reliable view of the peer. `line_held` takes an optional `cause`,
+  left out of the wire when absent, so an older log still decodes and an older hold
+  shows `unrecorded`. The times are the event log's `recorded_at`, kept beside the
+  state as the log is replayed and appended, so they survive a restart. **Decided by
+  core, for review.** `unread` here counts mail still waiting for delivery, since a
+  held line's mail waits undelivered. **Rollback hazard.** A daemon before this change
+  refuses a log holding a `line_held` with a cause. See
+  [`LINE_CONFIG.md`](docs/protocol/LINE_CONFIG.md).
 - A restart preflight, round 13. `dromon restart` now reads `status`, then runs the
   installed daemon's own start checks in a process of their own, `dromond --check`
   with the running daemon's command-line options, against the project file and a copy

@@ -20,6 +20,7 @@ from dromon.driver import Strategy
 from dromon.engine import EnginePlanLimit, TurnReport
 from dromon.eventlog import Entry, EventLog, read_entries, replay
 from dromon.model import (
+    HoldCause,
     HARNESS,
     MAX_BRIEF_ARTIFACTS,
     MAX_BRIEF_BYTES,
@@ -647,7 +648,9 @@ def test_an_owner_held_at_a_plan_limit_can_be_taken_from(world: World) -> None:
 
 
 def test_an_owner_held_otherwise_cannot_be_taken_from(world: World) -> None:
-    world.scheduler.hold("alpha", "took too many turns")
+    world.scheduler.hold(
+        "alpha", "took too many turns", cause=HoldCause.AUTONOMOUS_TURNS
+    )
     with pytest.raises(LineToolRefused, match="does not show unable to act"):
         world.scheduler.take_ownership("beta", "alpha is held")
 

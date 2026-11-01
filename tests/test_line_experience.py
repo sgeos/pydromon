@@ -33,6 +33,7 @@ from dromon.limits import Limits
 from dromon import scheduler as scheduler_module
 from dromon.mailbox import MailSummary, listing, summary
 from dromon.model import (
+    HoldCause,
     HARNESS,
     DISCLOSURE_CHECK_WINDOW_SECONDS,
     MAX_DISCLOSURE_CHECKS,
@@ -180,7 +181,9 @@ def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
     scheduler.set_leases(["gate"], 600)
     scheduler.acquire_lease("beta", "gate")
     message_id, due = scheduler.schedule_wake("alpha", 120, "later")
-    question = scheduler.hold("alpha", "was held for this test")
+    question = scheduler.hold(
+        "alpha", "was held for this test", cause=HoldCause.AUTONOMOUS_TURNS
+    )
     text, error = world.call("line_status")
     assert not error
     status = json.loads(text)
@@ -230,16 +233,17 @@ def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
         "tasks": [],
     }
     assert full["leases"] == []
-    assert full["other_lines"] == [
-        {
-            "line_id": "beta",
-            "state": "idle",
-            "held": False,
-            "hibernated": False,
-            "workdir_commit": None,
-            "leases": ["gate"],
-        }
-    ]
+    (beta,) = full["other_lines"]
+    assert full["other_lines_omitted"] == 0
+    assert isinstance(beta.pop("since"), str)
+    # An entry gives only the fields that say something, so beta's idle state,
+    # empty mailbox and unread working directory give none.
+    assert beta == {
+        "line_id": "beta",
+        "state": "idle",
+        "condition": "idle",
+        "leases": ["gate"],
+    }
     assert full["commits"]["workdir"] is None
     assert full["commits"]["daemon"] == COMMIT
     for secret in ("a private body", "jotter", "s3", "was held for this test"):
@@ -346,10 +350,12 @@ def test_default_line_status_has_a_hard_size_bound(
 def test_line_status_lists_have_a_hard_size_bound(
     world: World, monkeypatch: pytest.MonkeyPatch, detail: bool
 ) -> None:
+    """**Task of 2026-11-01, review r13, T1.** Other lines past the bound are cut
+    to those that fit, with a count of the rest, rather than dropped whole."""
     original = world.scheduler._detailed_line_status  # pyright: ignore[reportPrivateUsage]
 
-    def oversized(line_id: str) -> dict[str, object]:
-        status = original(line_id)
+    def oversized(line_id: str, *, others: bool = True) -> dict[str, object]:
+        status = original(line_id, others=others)
         status["other_lines"] = [
             {"line_id": f"beta-{index}-" + "x" * 1_000, "state": "idle"}
             for index in range(20)
@@ -361,9 +367,36 @@ def test_line_status_lists_have_a_hard_size_bound(
     assert not error
     assert len(text.encode("utf-8")) <= MAX_LINE_STATUS_DEFAULT_BYTES
     result = json.loads(text)
+    lists = result if detail else result["lists"]
+    shown = lists["other_lines"]
+    assert 0 < len(shown) < 20
+    assert [entry["line_id"][:7] for entry in shown] == [
+        f"beta-{index}-"[:7] for index in range(len(shown))
+    ]
+    assert lists["other_lines_omitted"] == 20 - len(shown)
+    assert "status_truncated" not in result
+
+
+@pytest.mark.parametrize("detail", [False, True])
+def test_line_status_truncates_when_the_other_lists_pass_the_bound(
+    world: World, monkeypatch: pytest.MonkeyPatch, detail: bool
+) -> None:
+    original = world.scheduler._detailed_line_status  # pyright: ignore[reportPrivateUsage]
+
+    def oversized(line_id: str, *, others: bool = True) -> dict[str, object]:
+        status = original(line_id, others=others)
+        status["recent_turns"] = [{"subtype": "x" * 1_000} for _ in range(20)]
+        return status
+
+    monkeypatch.setattr(world.scheduler, "_detailed_line_status", oversized)
+    text, error = world.call("line_status", {"detail": detail, "lists": True})
+    assert not error
+    assert len(text.encode("utf-8")) <= MAX_LINE_STATUS_DEFAULT_BYTES
+    result = json.loads(text)
     assert result["status_truncated"] is True
     assert result["lists_truncated"] is True
     assert result["suggested_arguments"] == {"detail": True, "lists": False}
+    assert [entry["line_id"] for entry in result["other_lines"]] == ["beta"]
 
 
 # R2, the budget line.
@@ -1273,6 +1306,7 @@ def test_a_spent_limit_holds_the_line_and_answers_nothing_more(
     question = world.log.state.messages[question_id]
     assert question.kind is MessageKind.QUESTION
     assert "disclosure checks" in question.body
+    assert world.log.state.lines["alpha"].hold_cause is HoldCause.DISCLOSURE_CHECKS
     # Every checked tool now answers alike, so a clean text and a listed one cannot
     # be told apart, and the held turn learns nothing further of the list.
     sent = len(world.log.state.messages)
@@ -1300,7 +1334,9 @@ def test_a_spent_limit_holds_the_line_and_answers_nothing_more(
 
 def test_a_line_held_already_is_not_held_twice(world: World, tmp_path: Path) -> None:
     listed(world, tmp_path)
-    world.scheduler.hold("alpha", "passed a test limit")
+    world.scheduler.hold(
+        "alpha", "passed a test limit", cause=HoldCause.AUTONOMOUS_TURNS
+    )
     for _ in range(MAX_DISCLOSURE_CHECKS):
         world.call("wake_after", {"seconds": 60, "note": "codename"})
     text, error = world.call("wake_after", {"seconds": 60, "note": "clean"})
@@ -1592,7 +1628,9 @@ def test_read_instructions_refuses_bad_arguments_and_missing_files(
 
 
 def test_a_reply_to_a_hold_question_is_not_counted_unanswered(world: World) -> None:
-    question = world.scheduler.hold("alpha", "was held for this test")
+    question = world.scheduler.hold(
+        "alpha", "was held for this test", cause=HoldCause.AUTONOMOUS_TURNS
+    )
     operator = cast(OperatorAddress, world.log.state.messages[question].recipient)
     reply = world.scheduler.answer(operator, question, "resume")
     request = world.scheduler.send(ANA, LineAddress("alpha"), "a real request")

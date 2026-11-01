@@ -29,6 +29,7 @@ from dromon.launcher import StopPolicy
 from dromon.lineconfig import LineConfig
 from dromon.eventlog import EventLog
 from dromon.model import (
+    HoldCause,
     EventRejected,
     InvalidField,
     LineAddress,
@@ -277,7 +278,9 @@ def test_a_stop_of_a_line_already_held_keeps_its_hold(
         world.scheduler.send(ANA, LineAddress("alpha"), "long work")
         while not engine.prompts:
             await asyncio.sleep(0)
-        held = world.scheduler.hold("alpha", "was held for another reason")
+        held = world.scheduler.hold(
+            "alpha", "was held for another reason", cause=HoldCause.AUTONOMOUS_TURNS
+        )
         assert world.scheduler.interrupt("alpha") is True
         assert world.log.state.lines["alpha"].held_by == held
 
@@ -811,7 +814,7 @@ def test_a_lines_condition_keeps_its_states_apart(
     run(world, act)
     assert world.scheduler.condition("alpha") == "failed"
     assert world.log.state.lines["alpha"].held_by is None
-    world.scheduler.hold("alpha", "was held")
+    world.scheduler.hold("alpha", "was held", cause=HoldCause.AUTONOMOUS_TURNS)
     assert world.scheduler.condition("alpha") == "held"
 
 
@@ -1313,7 +1316,7 @@ def test_an_unknown_cost_is_kept_apart_from_zero(
     bound = scheduler.cost_status("alpha")
     assert (bound["estimate"], bound["basis"]) == ("0.2500", "lower_bound")
     assert "1 turns of unknown cost" in engine.prompts[-1]
-    scheduler.hold("alpha", "was held for this test")
+    scheduler.hold("alpha", "was held for this test", cause=HoldCause.AUTONOMOUS_TURNS)
     scheduler.release("alpha")
     assert scheduler.cost_status("alpha")["basis"] == "exact"
     assert scheduler.cost_status("alpha")["unknown_turns"] == 0
