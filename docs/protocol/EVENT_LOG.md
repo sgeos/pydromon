@@ -182,27 +182,78 @@ Each event has a kind and fields, all required. An optional value is written as 
    reply would go to the harness, which is never a recipient.
 
 
-**The rollback floor of round 14.** **Required by the operator on 2026-11-01, from the
-round 14 review, R1.** Each change below is one way. Once the log holds one such
-event, no daemon older than the floor can open it, since a daemon refuses as corrupt
-a field or a rule it does not know. The floor of each is commit `4330502` on the
-branch `feat/mail-and-roles`, the first to write and read it, and every later commit
-of that branch and of `main` after its merge. **Fact, from the commit.** Commit
-`1361146` on the same branch added `asks_reply` to the client's `send`, and this
-review's corrections add no field and no rule a log holds, so neither moves a floor.
+**The rollback floor.** **Required by the operator on 2026-11-01, from the round 14
+review, R1, and made the one place for every one-way change on the same day.** Each
+change below is one way. Once the log holds one such event, field or value, no daemon
+older than the change's floor can open it, since a daemon refuses as corrupt a kind, a
+field, a value or a rule it does not know. A commit can open a log only if it descends
+from the floor of every change the log holds, so the floor of a log is the newest floor
+among the changes it holds. Each other document that names a rollback hazard refers
+here. A row names the first commit to write and read the change, or the first of each where it names several changes, and the merge that
+brought it into `main`, which is the oldest commit of `main` that opens it.
+A pending row is on a branch not yet merged, and its floor on `main` will be that
+branch's merge.
 
-| Change | Written when | Floor |
-|---|---|---|
-| `message_sent.asks_reply` | A line's `send_message` or an operator's `send` says whether a note asks a reply | `4330502` |
-| A correction, a note naming a note of the same sender to the same recipient | A line or an operator corrects its own note | `4330502` |
-| `message_acknowledged.reason` | A recipient closes a message with a reason | `4330502` |
-| `line_turn_ended.failed` | Any turn fails, which is routine | `4330502` |
-| `lease_acquired.note` | A line acquires a lease with a note | `4330502` |
+| Change | First commit | Floor on `main` | Branch |
+|---|---|---|---|
+| `operator_registered`, operator addresses, `note` and `question` kinds | `4d9b3ff` | `621d6db` | `feat/operator-addresses`, #5 |
+| `line_configured` | `7040c16` | `2d04603` | `feat/ticks-and-line-tools`, #11 |
+| `line_session` | `885540c` | `2e413c8` | `feat/operator-questions`, #12 |
+| `message_read`, `message_acknowledged` | `3435363` | `4db8750` | `feat/acknowledgements`, #15 |
+| `line_held`, `line_released` | `5443902` | `c494576` | `feat/conversation-control`, #16 |
+| `agent_registered`, `agent_revoked`, agent addresses | `2354eca` | `c711727` | `feat/external-agents`, #26 |
+| `line_session_cleared`, `line_overridden`, `project_overridden` | `3565e10` | `b04276e` | `feat/settings-layers`, #32 |
+| `wake_scheduled` | `be9138d` | `cca21c4` | `feat/wake-and-guards`, #37 |
+| `line_rebound` | `b04b07a` | `521090e` | `feat/rebind-settings-leases`, #38 |
+| `task_noted` | `551538c` | `ea0bee1` | `feat/round3`, #45 |
+| `line_cost_marked` | `970af75` | `d31c7cd` | `feat/round4`, #46 |
+| `wake_withdrawn` | `6b22d69` | `39d7d10` | `feat/round7`, #49 |
+| `processes_left`, `stop_unverified`, `walk_limited` | `8d5b34a` | `7bb46de` | `feat/stop-policy`, #54 |
+| `context_handed_off` | `b5e5beb` | `c22843a` | `feat/remaining-mining`, #56 |
+| `message_prioritized`, `restart_noted` | `b2431bb` | `05c16de` | `feat/restart-and-seats`, #58 |
+| `role_declared`, `seat_bound`, `ownership_changed`, `role_noted`, `budget_stated`, and the kinds `line_hibernated` and `line_awakened` that replaced `line_muted` and `line_unmuted` | `4d65469`, `dc768e1` | `d8673c7` | `feat/roles`, #60 |
+| `role_declared` seats, failover and `handoff_below_percent`, and `ownership_changed.back_to` | `dc768e1`, `7041905` | `d8673c7` | `feat/roles`, #60 |
+| `message_received`, `message_returned`, `message_unconfirmed`, `message_correlated`, `turn_correlated`, `disclosure_checked`, `task_recorded`, `peer_declared`, `peer_removed`, `peer_keyed`, remote addresses and the `!dromon` sender | `d767e49` to `26bd06f` | `1f98cab` | `feat/federation`, #67 |
+| `line_turn_ended`, `wake_scheduled.task_id` | `eba7e37` | `e11064d` | `feat/continuity-fixes`, #71 |
+| `brief_set` | `b467231` | `2b0ac5c` | `feat/standing-brief`, #72 |
+| `request` on `message_sent` and `wake_scheduled` | `7543a57` | `6d1e098` | `feat/durable-request-keys`, #76 |
+| `line_turn_ended.unreported` | `14993cb` | `2caeb4f` | `fix/own-notes-shown`, #92 |
+| `seat_unbound`, `role_retired`, `role_held` | `99184f7` | `81f9153` | `feat/role-crud`, #104 |
+| The `issue` message kind | `1ede2db` | `2acce91` | `feat/operator-push`, #105 |
+| An engine-qualified model name with `:` in `line_created` or `line_rebound`, such as a Pi line's | `cd245c3` | `70abab2` | `fix/role-scratch`, #106 |
+| `lease_acquired`, `lease_released`, `run_started`, `run_ended`, `run_cleared` | `09003fa`, `14d605e` | `047fb45` | `feat/durable-ownership`, #108 |
+| `budget_handoff_requested`, `budget_stated.window` | `1a1532d` | `33ac280` | `fix/grok-quota`, #109 |
+| `peer_opened` | `499bd55` | `f5f8da1` | `feat/federation-modes`, #114 |
+| `line_held.cause` and its hold causes | `f893e9a` | `f34a620` | `feat/peer-status`, #119 |
+| `message_sent.asks_reply`, written when a line's `send_message` or an operator's `send` says whether a note asks a reply | `4330502` | Pending | `feat/mail-and-roles` |
+| A correction, a note naming a note of the same sender to the same recipient | `4330502` | Pending | `feat/mail-and-roles` |
+| `message_acknowledged.reason` | `4330502` | Pending | `feat/mail-and-roles` |
+| `line_turn_ended.failed`, written with every failed turn | `4330502` | Pending | `feat/mail-and-roles` |
+| `lease_acquired.note` | `4330502` | Pending | `feat/mail-and-roles` |
+| `line_retired` | `625f3de` | Pending | `feat/operator-r14` |
+| A commit run, a `run_started` with `commit` and `checkout` | `1449c5c` | Pending | `feat/operator-r14` |
 
-**Inference.** `failed` is written with every failed turn, so a log a round 14 daemon
-has run for any while has most likely passed the floor. The other changes appear only
-when a party chooses them. `dromond` checks a log only forward, so a rollback past the
-floor is found when the older daemon refuses the log at its start, not before.
+**Fact, from the history.** The table was built from the history of `HEAD` on
+`feat/mail-and-roles` at `5a1603f`. A kind's first commit is the oldest whose
+`dromon.codec` names it, a field's is the oldest that adds it to its kind's fields or
+to the fields omitted when null, and a value's is the oldest that adds it to its
+enumeration in `dromon.model`. The floor on `main` is the oldest merge on the first
+parent line of `HEAD` that contains the first commit. The rows of `feat/operator-r14`
+come from that branch at `1449c5c`. Every enumeration of `dromon.model` gained no
+value after it was added except `MessageKind`, which gained `issue`. Commit `1361146`
+and `5a1603f` on `feat/mail-and-roles` add no kind, field or value, and `main` at
+`af316a0` changes neither `dromon.codec` nor `dromon.model` since `47c58d5`, so none of
+them moves a floor. The kinds of the first event log, merged in `4f0ee19`, are the
+format itself and are not listed.
+
+**Inference.** The search reads the codec and the model, not every rule of the
+applying code. A rule that a newer daemon applies and an older one refuses, such as a
+correction, is listed only where its commit or a document names it, so a rule changed
+without either may be missing. `failed` is written with every failed turn, so a log a
+daemon built from `feat/mail-and-roles` has run for any while has most likely passed
+that floor. Most other changes appear only when a party uses the feature.
+`dromond` checks a log only forward, so a rollback past a floor is found when the
+older daemon refuses the log at its start, not before.
 
 **Scheduled wakes.** **Decided by the operator on 2026-10-26.** A line schedules a wake
 for itself with the `wake_after` tool, as [`LINE_CONFIG.md`](LINE_CONFIG.md)

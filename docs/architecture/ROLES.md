@@ -266,7 +266,9 @@ resolve real paths on the file system, which a port must do the same way.
 **Rollback hazard.** A daemon older than round 10 does not know `seat_unbound`,
 `role_retired` or `role_held`, so once any of them is in the log, the older daemon
 cannot read the log at all, as for the `unreported` field of `line_turn_ended`. A
-rollback past round 10 needs a log without them.
+rollback past round 10 needs a log without them. The rollback floor in
+[`EVENT_LOG.md`](../protocol/EVENT_LOG.md) names the commits of these and every other
+one-way change.
 
 ## What write ownership means
 

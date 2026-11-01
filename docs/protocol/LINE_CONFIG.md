@@ -202,7 +202,8 @@ reply, and receives each through the operator's relay like any other mail, as
   was not added.
 - **Rollback hazard.** A daemon older than this kind cannot read an event log that
   holds an issue, since its codec refuses an unknown message kind, so a rollback past
-  it needs the log from before the first issue.
+  it needs the log from before the first issue. The rollback floor in
+  [`EVENT_LOG.md`](EVENT_LOG.md) names its commits.
 
 **Decided by the operator on 2026-10-26**, from the lines' own reports, for what follows
 in this section.
@@ -724,6 +725,13 @@ during that turn.
     correction asks what the note it corrects asked, or more when it says true, and
     never less. `dromon.model.asks_reply_of` holds the rule, which the views and a
     correction's application share.
+  - **Known limit, M1b, decided by the operator on 2026-11-01.** A reply asks nothing
+    by default, and the rule cannot tell a reply that answers from a reply that asks
+    again. So a line that writes a new ask as a reply to an operator's mail is not
+    counted as unanswered. The note still counts in the operator's unread count until
+    it is read, and the line may still set `asks_reply` true. Accepted over counting
+    every reply to an operator, which would make the count grow with each answer, as
+    before round 14.
   - `list_mail` with `unanswered_only` lists exactly what the count counts, each
     entry ending with how long it has waited, such as `unanswered for 1h 3m`. It is
     refused beside `own_notes_only`, which selects other messages.

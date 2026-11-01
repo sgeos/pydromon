@@ -26,3 +26,8 @@ Type: Fixed
   `message_acknowledged.reason`, `line_turn_ended.failed`, which every failed turn
   writes, or `lease_acquired.note`, no daemon older than commit `4330502` can open it.
   `EVENT_LOG.md` gives the floor of each.
+- A line's new ask written as a reply to operator mail is not counted as unanswered,
+  and stays in the operator's unread count. `LINE_CONFIG.md` records it as a known
+  limit, which the operator accepted.
+- `EVENT_LOG.md` gives in one table the oldest commit able to open a log for every
+  one-way change so far, with its branch, and marks the ones not yet merged as pending.
