@@ -305,6 +305,14 @@ fi
 
 # --- Project checks -----------------------------------------------------------------
 
+# Changelog fragments. A branch records its entry in changes/ and does not edit the
+# Unreleased section of CHANGELOG.md, which conflicted on almost every merge. This
+# validates every fragment, and refuses a branch that edits that section and neither
+# adds nor deletes a fragment. Without origin/main or main to compare with, as in a
+# shallow clone, it says so and passes. changes/README.md states the convention.
+python3 -I scripts/assemble_changelog.py check || fail "the changelog fragment rule, explained above"
+pass "changelog fragments are valid and Unreleased is edited only through them"
+
 # A stale environment tests old code, so the installed environment must match the lock.
 uv sync --locked
 pass "the environment matches uv.lock"

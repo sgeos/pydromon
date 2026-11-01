@@ -59,6 +59,9 @@ markers = [
 # Collection skips the state directory, which a line's sandbox denies outright, so a
 # line running the gate in its own project would otherwise fail to collect.
 addopts = "-m 'not live' --ignore=.dromon"
+# scripts/assemble_changelog.py is imported by its tests, as a module of the scripts
+# directory, which holds no package.
+pythonpath = ["scripts"]
 # A test that runs for five minutes is taken as hung. pytest then prints the traceback
 # of every thread and exits, so a hang names its test rather than running out the job's
 # timeout in silence, as one macOS job did on 2026-10-28. The slowest test took 89
@@ -79,5 +82,6 @@ select = ["E", "F", "B", "S", "ANN", "RET", "SIM"]
 "tests/*" = ["S101"]
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", "scripts/assemble_changelog.py"]
+extraPaths = ["scripts"]
 typeCheckingMode = "strict"
