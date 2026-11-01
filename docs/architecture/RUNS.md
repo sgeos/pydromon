@@ -227,7 +227,23 @@ processes. What was decided and why.
   supervisor walks from its own process at `SIGTERM` and again at `SIGKILL`, and
   signals only what that walk found. A process identifier remembered from the first
   walk is never signalled at the second, so one that ended and was reused is not
-  reached unless it descends from the supervisor. A process is found only by its
+  reached unless it descends from the supervisor. **Re-review of 4da3e0e.** Within one
+  stop, between the walk and a signal, a descendant can also end and its identifier go
+  to a process that is not one. The walk therefore reads each process's start time
+  with `lstart`, and just before each signal `signal_if_same` reads the process's
+  parent and start time again and turns the signal away if either differs, if the
+  process is gone, or if `ps` cannot say. These checks come before the group signal,
+  since the group signal ends the command and every orphan then has another parent.
+  For the same reason a child is signalled before its parent, deepest first, because a
+  parent that ends orphans its child and the parent check would turn the child away.
+  The second full-gate run of 2026-11-01 showed this with a descendant in a session of
+  its own, whose parent was the command.
+  **Limit.** The check is itself a reading, so a window of a few milliseconds remains,
+  smaller and not zero. It runs the `ps` command once per descendant. The `ps` runs in
+  the C locale so that `lstart` is five words on every host and is read the same way
+  twice. **Hypothesis.** `lstart` has one-second resolution, so a reuse within the
+  same second by a process with the same parent is not told apart, and such a process
+  is a child of the same parent and so a descendant anyway. A process is found only by its
   ancestry from the supervisor, and a process in another session cannot join a group a
   descendant leads, so a line's other processes and the operator's are out of reach.
 - **A command that ends first** is not followed by a return until the descendants

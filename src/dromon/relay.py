@@ -40,7 +40,7 @@ from typing import Final, Protocol, cast
 
 from dromon.eventlog import EventLog
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
-from dromon.processes import attached
+from dromon.processes import TreeRow, attached, deepest_first, signal_if_same
 from dromon.model import (
     ID_PATTERN,
     MessageDelivered,
@@ -248,14 +248,20 @@ class CommandRelay:
             await asyncio.wait_for(_feed(process, payload), self._timeout)
             detail = tail.finish()
         except TimeoutError as error:
-            await _end_group(process)
-            tail.close()
+            try:
+                await _end_group(process)
+            finally:
+                # A cancellation during the end wait must not leave the descriptor and
+                # the loop's reader behind. **Re-review of 4da3e0e.**
+                tail.close()
             raise RelayError(
                 f"the relay command timed out after {self._timeout}s"
             ) from error
         except BaseException:
-            await _end_group(process)
-            tail.close()
+            try:
+                await _end_group(process)
+            finally:
+                tail.close()
             raise
         if process.returncode != 0:
             text = detail.decode("utf-8", errors="replace").strip()[:200]
@@ -292,10 +298,18 @@ class _StderrTail:
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
         self._read, self.write = os.pipe()
-        os.set_blocking(self._read, False)
         self._kept = bytearray()
         self._reading = True
-        loop.add_reader(self._read, self._pull)
+        try:
+            os.set_blocking(self._read, False)
+            loop.add_reader(self._read, self._pull)
+        except BaseException:
+            # A loop that cannot watch the pipe must not leave both ends open.
+            self._reading = False
+            os.close(self._read)
+            os.close(self.write)
+            self.write = -1
+            raise
 
     def release_write(self) -> None:
         """Close the daemon's copy of the write end, once the command has its own."""
@@ -358,11 +372,6 @@ ATTACHED_WAIT_SECONDS: Final = 3.0
 """How long ending a command waits for the walk that finds its descendants."""
 
 
-def _signal_pid(pid: int, number: int) -> None:
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.kill(pid, number)
-
-
 async def _end_group(process: "asyncio.subprocess.Process") -> None:
     """Kill the command's process group and its descendants, and reap the command.
 
@@ -382,22 +391,26 @@ async def _end_group(process: "asyncio.subprocess.Process") -> None:
     Process groups are POSIX, and a port to another platform needs its own way to end
     the group and its descendants."""
     if process.returncode is None:
-        found: list[int] = []
+        rows: list[TreeRow] = []
         try:
             try:
-                rows = await asyncio.wait_for(
+                walked = await asyncio.wait_for(
                     asyncio.to_thread(attached, process.pid), ATTACHED_WAIT_SECONDS
                 )
             except TimeoutError:
-                rows = None
-            found = [row.pid for row in rows or ()]
+                walked = None
+            rows = walked or []
         finally:
-            for pid in found:
-                _signal_pid(pid, signal.SIGKILL)
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(process.pid, signal.SIGKILL)
-            with contextlib.suppress(ProcessLookupError):
-                process.kill()
+            try:
+                # Before the group, which orphans what it ends. Each is checked against
+                # the walk just before its signal, as ``signal_if_same`` says.
+                for row in deepest_first(rows):
+                    signal_if_same(row, signal.SIGKILL)
+            finally:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
     await asyncio.shield(process.wait())
 
 

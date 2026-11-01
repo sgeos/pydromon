@@ -80,6 +80,17 @@ error and does not wait for a descendant that inherited the pipe. **Round 15, it
 The pipe is made by Dromon and passed to the command as its standard error, and Dromon
 closes it with public interfaces only, `os.pipe`, a descriptor given as `stderr` and the
 loop's `add_reader`. It no longer reaches asyncio's private subprocess transport.
+**Re-review of 4da3e0e.** The read end is closed in a `finally` on the paths that end
+the command, so a second cancellation that arrives while the group is being ended does
+not leave the descriptor and the loop's reader behind. A loop that cannot watch the
+pipe leaves neither end open. Before a descendant that a timeout or stop found is
+killed, its parent and start time are read again and compared with the walk's, so a
+process that took the identifier of one that ended is not killed, as
+[`RUNS.md`](../architecture/RUNS.md) describes. The check runs before the group is
+killed, deepest descendant first so that a parent does not orphan its child ahead of the
+child's check, and it blocks the event loop for the length of one `ps` per descendant, at most
+one second each. **Technical debt.** A command with many descendants could hold the
+loop for that many seconds on a timeout.
 
 ## File relay
 

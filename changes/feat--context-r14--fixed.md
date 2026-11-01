@@ -23,3 +23,10 @@ Type: Fixed
   passes a 65th policy file unread, and refuses a directory with more files than it
   reads. It also refuses any value of `disableAllHooks` or `allowManagedHooksOnly`
   that is not the boolean `false`, where it refused only `true`.
+- Round 15, re-review. A relay task cancelled while its command's group was being ended
+  no longer leaves the stderr pipe's read descriptor and loop reader open. A descendant
+  found by the walk is now signalled only if its start time and parent are still those
+  the walk read, so a process that took the identifier of one that ended is not
+  signalled, by a relay stop or a supervised run's stop.
+  Descendants are signalled deepest first, so a parent that ends does not orphan a
+  child before the child's own check.

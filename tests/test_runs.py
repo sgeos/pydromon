@@ -1324,8 +1324,17 @@ def sleeper(
     )
 
 
+STARTED = "Sat Nov  1 07:23:05 2026"
+"""A start time as a walk reads it, for the rows a test stands in for the walk with."""
+
+
 def row_of(process: subprocess.Popen[bytes], parent: int = 1) -> TreeRow:
-    return TreeRow(process.pid, parent, process.pid, "sleep")
+    return TreeRow(process.pid, parent, process.pid, "sleep", STARTED)
+
+
+def unchanged(pid: int) -> tuple[int, str]:
+    """The identity every ``row_of`` row still has, parent 1 and ``STARTED``."""
+    return 1, STARTED
 
 
 def finish(*processes: subprocess.Popen[bytes]) -> None:
@@ -1340,7 +1349,7 @@ def test_a_stop_ends_a_descendant_in_a_session_of_its_own() -> None:
     stray = sleeper()
     try:
         supervision = runs.Supervision(
-            lambda: [] if stray.poll() is not None else [row_of(stray)]
+            lambda: [] if stray.poll() is not None else [row_of(stray)], unchanged
         )
         supervision.stopping.set()
         assert supervision.wait(command, grace=5.0) == -signal.SIGTERM
@@ -1367,7 +1376,7 @@ def test_the_walk_is_made_before_the_group_is_signalled() -> None:
         return [row_of(stray)] if command.poll() is None else []
 
     try:
-        supervision = runs.Supervision(walk)
+        supervision = runs.Supervision(walk, unchanged)
         supervision.stopping.set()
         assert supervision.wait(command, grace=5.0) == -signal.SIGTERM
         assert seen[0] is None
@@ -1383,7 +1392,7 @@ def test_a_descendant_that_ignores_sigterm_is_killed_after_the_grace() -> None:
     time.sleep(0.3)
     try:
         supervision = runs.Supervision(
-            lambda: [] if stray.poll() is not None else [row_of(stray)]
+            lambda: [] if stray.poll() is not None else [row_of(stray)], unchanged
         )
         supervision.stopping.set()
         started = time.monotonic()
@@ -1402,7 +1411,7 @@ def test_a_command_that_ends_first_is_not_returned_while_a_descendant_runs() -> 
     time.sleep(0.3)
     try:
         supervision = runs.Supervision(
-            lambda: [] if stray.poll() is not None else [row_of(stray)]
+            lambda: [] if stray.poll() is not None else [row_of(stray)], unchanged
         )
         supervision.stopping.set()
         started = time.monotonic()
@@ -1411,6 +1420,92 @@ def test_a_command_that_ends_first_is_not_returned_while_a_descendant_runs() -> 
         assert stray.wait(timeout=WAIT_SECONDS) == -signal.SIGKILL
     finally:
         finish(command, stray)
+
+
+@pytest.mark.parametrize("changed", ["start", "parent", "gone"])
+def test_a_process_whose_identity_changed_since_the_walk_is_not_signalled(
+    changed: str,
+) -> None:
+    """Re-review of 4da3e0e. Between the walk and the signal the descendant can end
+    and its identifier go to a process that is not one. The stray here stands for that
+    process. Its start time or parent differs from the row, or ``ps`` cannot say, so it
+    is left running and is not counted among the descendants ended."""
+    command = sleeper(own_session=False)
+    stray = sleeper()
+    time.sleep(0.3)
+
+    def identity(pid: int) -> tuple[int, str] | None:
+        if changed == "gone":
+            return None
+        if changed == "start":
+            return 1, "Sun Nov  2 00:00:00 2026"
+        return 2, STARTED
+
+    try:
+        supervision = runs.Supervision(lambda: [row_of(stray)], identity)
+        supervision.stopping.set()
+        assert supervision.wait(command, grace=0.3) == -signal.SIGTERM
+        assert stray.poll() is None, "a process with another identity was signalled"
+        assert supervision.outside == set()
+        assert supervision.note() == ""
+    finally:
+        finish(command, stray)
+
+
+def test_the_identity_is_checked_before_the_group_is_signalled() -> None:
+    """The group signal ends the command, and a descendant it leaves has another parent
+    from then on, so a check made after it would find every orphan changed. The first
+    check of a stop must see the command still running."""
+    command = sleeper(own_session=False)
+    stray = sleeper()
+    time.sleep(0.3)
+    seen: list[int | None] = []
+
+    def identity(pid: int) -> tuple[int, str]:
+        seen.append(command.poll())
+        return 1, STARTED
+
+    try:
+        supervision = runs.Supervision(
+            lambda: [] if command.poll() is not None else [row_of(stray)], identity
+        )
+        supervision.stopping.set()
+        supervision.wait(command, grace=5.0)
+        assert seen and seen[0] is None
+        assert stray.wait(timeout=WAIT_SECONDS) == -signal.SIGTERM
+    finally:
+        finish(command, stray)
+
+
+def test_a_child_is_signalled_before_its_parent_so_it_is_not_orphaned_first() -> None:
+    """Round 15, re-review. With the real process table the parent of a descendant in a
+    session of its own is the command. A signal to the command first ended it, the
+    descendant's parent became the system's first process, and the check turned the
+    descendant away. The identity here changes once the parent has ended."""
+    parent = sleeper(own_session=False)
+    child = sleeper(ignore_term=True)
+    time.sleep(0.3)
+    parent_row = TreeRow(parent.pid, 1, parent.pid, "sleep", STARTED)
+    child_row = TreeRow(child.pid, parent.pid, child.pid, "sleep", STARTED)
+
+    checked: list[int] = []
+
+    def identity(pid: int) -> tuple[int, str] | None:
+        """The parent's check comes just before its signal, so a child checked after
+        it has been orphaned by that signal."""
+        checked.append(pid)
+        if pid == child.pid:
+            return (1 if parent.pid in checked else parent.pid), STARTED
+        return 1, STARTED
+
+    try:
+        supervision = runs.Supervision(lambda: [parent_row, child_row], identity)
+        supervision.stopping.set()
+        supervision._end(parent, parent.poll(), signal.SIGTERM)  # pyright: ignore[reportPrivateUsage]
+        assert parent.wait(timeout=WAIT_SECONDS) == -signal.SIGTERM
+        assert child_row.pid in supervision.outside
+    finally:
+        finish(parent, child)
 
 
 def test_a_signal_goes_only_to_what_the_latest_walk_found() -> None:
@@ -1425,7 +1520,7 @@ def test_a_signal_goes_only_to_what_the_latest_walk_found() -> None:
         return answers.pop(0) if answers else []
 
     try:
-        supervision = runs.Supervision(walk)
+        supervision = runs.Supervision(walk, unchanged)
         supervision.stopping.set()
         assert supervision.wait(command, grace=0.3) == -signal.SIGTERM
         assert stray.poll() is None, "a process the latest walk did not name was killed"
@@ -1464,7 +1559,7 @@ def test_a_stop_that_never_comes_never_walks_the_table() -> None:
         raise AssertionError("no stop was noted, so nothing may be walked")
 
     child = subprocess.Popen([sys.executable, "-c", "pass"], process_group=0)  # noqa: S603
-    assert runs.Supervision(walk).wait(child) == 0
+    assert runs.Supervision(walk, unchanged).wait(child) == 0
 
 
 def test_the_receipt_of_a_stopped_run_names_the_descendants_it_ended(
@@ -1473,7 +1568,7 @@ def test_the_receipt_of_a_stopped_run_names_the_descendants_it_ended(
     stray = sleeper()
     try:
         supervision = runs.Supervision(
-            lambda: [] if stray.poll() is not None else [row_of(stray)]
+            lambda: [] if stray.poll() is not None else [row_of(stray)], unchanged
         )
         stopper = threading.Timer(0.5, supervision.stopping.set)
         stopper.start()

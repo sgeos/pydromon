@@ -56,7 +56,17 @@ PROC: Final = Path("/proc")
 """Linux's process file system, a module constant so tests can stand in for it."""
 
 PS_FIELDS: Final = "pid=,ppid=,pgid=,args="
-"""The field list ``tree_or_reason`` gives ``ps``, which identifies its own listing."""
+"""The field list ``tree_or_reason`` gives ``ps``."""
+
+PS_START_FIELDS: Final = "pid=,ppid=,pgid=,lstart=,args="
+"""The field list of a listing that also gives each process's start time, which a
+caller that signals what it finds needs to know the process is still the one found."""
+
+PS_LISTING_MARK: Final = "pid=,ppid=,pgid="
+"""What both field lists begin with, which identifies the ``ps`` of a listing."""
+
+START_TOKENS: Final = 5
+"""The words of ``lstart``, as in ``Sat Nov  1 07:23:05 2026``, in the C locale."""
 
 UNIDENTIFIABLE: Final = (
     "This platform does not let the daemon read another process's environment, so it"
@@ -429,35 +439,50 @@ class TreeRow:
     ppid: int
     pgid: int
     command: str
+    started: str = ""
+    """The process's start time as ``ps`` prints it, or empty when the listing did not
+    ask. **Round 15, re-review.** A pid is reused, and a process is the same one only
+    if its start time is also unchanged, so a caller that signals a row checks this."""
 
 
-def parse_tree(output: str) -> list[TreeRow]:
-    """Rows of ``ps -o pid=,ppid=,pgid=,args=``. A malformed row is skipped."""
+def parse_tree(output: str, with_start: bool = False) -> list[TreeRow]:
+    """Rows of ``ps -o pid=,ppid=,pgid=,args=``, or with ``with_start`` of ``ps -o
+    pid=,ppid=,pgid=,lstart=,args=``. A malformed row is skipped."""
     rows: list[TreeRow] = []
+    first = 3 + (START_TOKENS if with_start else 0)
     for line in output.splitlines():
-        fields = line.split(None, 3)
-        if len(fields) < 3:
+        fields = line.split(None, first)
+        if len(fields) < first:
             continue
         try:
             pid, ppid, pgid = int(fields[0]), int(fields[1]), int(fields[2])
         except ValueError:
             continue
-        command = fields[3] if len(fields) == 4 else ""
-        rows.append(TreeRow(pid, ppid, pgid, command[:MAX_COMMAND_CHARACTERS]))
+        started = " ".join(fields[3:first])
+        command = fields[first] if len(fields) == first + 1 else ""
+        rows.append(TreeRow(pid, ppid, pgid, command[:MAX_COMMAND_CHARACTERS], started))
     return rows
 
 
-def read_tree(uid: int, timeout: float = PS_TIMEOUT_SECONDS) -> list[TreeRow] | None:
+def _ps_environment() -> dict[str, str]:
+    """The environment ``ps`` runs in. The C locale gives ``lstart`` the same five
+    words on every host, and gives a start time read twice the same text."""
+    return {**os.environ, "LC_ALL": "C"}
+
+
+def read_tree(
+    uid: int, timeout: float = PS_TIMEOUT_SECONDS, with_start: bool = False
+) -> list[TreeRow] | None:
     """Every process of ``uid`` with its parent and group, or ``None`` when ``ps``
     cannot be run, fails or takes longer than ``timeout``. ``None`` is never an empty
     tree, since a caller that ends what it finds must know that it found nothing
     because it could not look."""
-    found = tree_or_reason(uid, timeout)
+    found = tree_or_reason(uid, timeout, with_start)
     return None if isinstance(found, TreeReadFailure) else found
 
 
 def tree_or_reason(
-    uid: int, timeout: float = PS_TIMEOUT_SECONDS
+    uid: int, timeout: float = PS_TIMEOUT_SECONDS, with_start: bool = False
 ) -> list[TreeRow] | TreeReadFailure:
     """Every process of ``uid`` with its parent and group, or why ``ps`` could not
     list them. ``ps`` takes these fields alike on macOS and Linux."""
@@ -469,12 +494,13 @@ def tree_or_reason(
                 "-U",
                 str(uid),
                 "-o",
-                PS_FIELDS,
+                PS_START_FIELDS if with_start else PS_FIELDS,
             ],
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
+            env=_ps_environment(),
         )
     except OSError as error:
         return TreeReadFailure(f"ps cannot be run: {error}")
@@ -488,7 +514,7 @@ def tree_or_reason(
         return TreeReadFailure(
             f"ps failed with status {found.returncode} and said {detail}"
         )
-    return parse_tree(found.stdout)
+    return parse_tree(found.stdout, with_start)
 
 
 def descendants(rows: Sequence[TreeRow], root: int) -> list[TreeRow]:
@@ -539,7 +565,7 @@ def attached(root: int, timeout: float = ATTACHED_SECONDS) -> list[TreeRow] | No
     exited is no longer below ``root``, except on Linux where the caller is a child
     subreaper, as the launcher is and a run's supervisor is not, so it is not found.
     The caller's own process and ``root`` are never in the result."""
-    rows = read_tree(os.getuid(), timeout)
+    rows = read_tree(os.getuid(), timeout, with_start=True)
     if rows is None:
         return None
     me = os.getpid()
@@ -555,7 +581,7 @@ def _is_own_listing(row: TreeRow, me: int) -> bool:
     of the caller and lists itself, so a walk from the caller would find it among its
     descendants, count it as one outside the command's group and signal a process that
     is gone. **Round 15.** Found when a receipt named a descendant that was this."""
-    return row.ppid == me and PS_FIELDS in row.command
+    return row.ppid == me and PS_LISTING_MARK in row.command
 
 
 def line_processes(
@@ -634,3 +660,85 @@ def stop_line_process(
     except PermissionError as error:
         raise ProcessRefused(f"process {pid} cannot be signalled") from error
     return f"sent {chosen.name} to process {pid}"
+
+
+IDENTITY_SECONDS: Final = 1.0
+"""How long the check of one process's identity may take."""
+
+
+def identity_of(pid: int, timeout: float = IDENTITY_SECONDS) -> tuple[int, str] | None:
+    """The parent and the start time of ``pid`` now, in the form a row from
+    ``attached`` has them, or ``None`` when the process is gone or ``ps`` cannot say.
+    Not knowing is never the same as knowing, so a caller that signals only a process
+    it can show to be unchanged treats ``None`` as changed."""
+    try:
+        found = subprocess.run(  # noqa: S603
+            [  # noqa: S607
+                "ps",
+                "-ww",
+                "-p",
+                str(pid),
+                "-o",
+                "ppid=,lstart=",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=_ps_environment(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    fields = found.stdout.split()
+    if found.returncode != 0 or len(fields) != 1 + START_TOKENS:
+        return None
+    try:
+        return int(fields[0]), " ".join(fields[1:])
+    except ValueError:
+        return None
+
+
+def deepest_first(rows: Sequence[TreeRow]) -> list[TreeRow]:
+    """``rows`` ordered so that no row comes before one of its descendants in
+    ``rows``, deepest first and by pid within a depth. **Round 15, re-review.** A
+    signal to a parent can end it, and a child that outlives it is given to the
+    system's first process, so the parent check of ``signal_if_same`` would turn the
+    child away. Children are therefore signalled before their parents. The depth is
+    found by following parents within ``rows``, at most ``len(rows)`` steps each."""
+    by_pid = {row.pid: row for row in rows}
+
+    def depth(row: TreeRow) -> int:
+        steps = 0
+        current = row
+        while steps < len(rows) and current.ppid in by_pid:
+            current = by_pid[current.ppid]
+            steps += 1
+        return steps
+
+    return sorted(rows, key=lambda row: (-depth(row), row.pid))
+
+
+def signal_if_same(
+    row: TreeRow,
+    number: int,
+    identity: Callable[[int], tuple[int, str] | None] | None = None,
+) -> bool:
+    """Signal ``row``'s process only if its parent and start time are still the ones
+    the walk found, and say whether it was signalled. **Round 15, re-review.** A
+    process that ended and was reaped between the walk and the signal can have its pid
+    given to one that is not a descendant. A new process has another start time, so
+    the check turns the signal away, and a row without a start time, which the
+    listing did not ask for, is never signalled. The check is itself a reading and
+    leaves a window of a few milliseconds, which is smaller and not zero. A process
+    whose parent exited in the meantime has another parent and is turned away too,
+    which is the platform limit stated for ``attached``."""
+    if row.started == "":
+        return False
+    now = (identity if identity is not None else identity_of)(row.pid)
+    if now != (row.ppid, row.started):
+        return False
+    try:
+        os.kill(row.pid, number)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True

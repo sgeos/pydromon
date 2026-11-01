@@ -38,6 +38,7 @@ from dromon.model import (
     State,
 )
 from dromon.paths import ProjectPaths, project_paths
+from dromon import processes as processes_module
 from dromon.processes import TreeRow
 from dromon.projectconfig import ConfigFileError, ProjectConfig, config_path, parse
 import dromon.relay as relay_module
@@ -536,9 +537,15 @@ def test_the_processes_a_walk_finds_are_killed_and_no_others(
         while not child.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         pid = int(child.read_text())
-        return [TreeRow(pid, root, pid, "sleep")]
+        command_pid[0] = root
+        return [TreeRow(pid, root, pid, "sleep", STARTED)]
 
+    def identity(pid: int) -> tuple[int, str] | None:
+        return (command_pid[0], STARTED) if pid == int(child.read_text()) else None
+
+    command_pid: list[int] = [0]
     monkeypatch.setattr(relay_module, "attached", walk)
+    monkeypatch.setattr(processes_module, "identity_of", identity)
     relay = CommandRelay([sys.executable, "-c", script], 1.0)
     try:
         with pytest.raises(RelayError, match="timed out"):
@@ -550,6 +557,122 @@ def test_the_processes_a_walk_finds_are_killed_and_no_others(
         neighbour.wait()
         with contextlib.suppress(ProcessLookupError, ValueError, OSError):
             os.kill(int(child.read_text()), 9)
+
+
+STARTED = "Sat Nov  1 07:23:05 2026"
+"""A start time as a walk reads it, for the rows a test stands in for the walk with."""
+
+
+@pytest.mark.parametrize("changed", ["start", "parent", "gone"])
+def test_a_process_whose_identity_changed_since_the_walk_is_not_signalled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    """Re-review of 4da3e0e. Between the walk and the signal a descendant can end and
+    its pid go to a process that is not a descendant. The neighbour here stands for
+    that process, and the walk names it. Its start time, its parent or its absence
+    differs from the row, so it is left running, and the group is still ended."""
+    neighbour = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
+    )
+    command_child = tmp_path / "child.pid"
+    script = (
+        "import subprocess,sys,time;"
+        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']);"
+        f"open({str(command_child)!r},'w').write(str(p.pid)); time.sleep(60)"
+    )
+    root: list[int] = [0]
+
+    def walk(pid: int) -> list[TreeRow]:
+        root[0] = pid
+        return [TreeRow(neighbour.pid, pid, neighbour.pid, "sleep", STARTED)]
+
+    def identity(pid: int) -> tuple[int, str] | None:
+        if changed == "gone":
+            return None
+        if changed == "start":
+            return root[0], "Sun Nov  2 00:00:00 2026"
+        return root[0] + 1, STARTED
+
+    monkeypatch.setattr(relay_module, "attached", walk)
+    monkeypatch.setattr(processes_module, "identity_of", identity)
+    relay = CommandRelay([sys.executable, "-c", script], 0.6)
+    try:
+        with pytest.raises(RelayError, match="timed out"):
+            asyncio.run(relay.deliver(notice()))
+        assert neighbour.poll() is None, "a process with another identity was killed"
+        assert _gone(int(command_child.read_text())), "the group was not ended"
+    finally:
+        neighbour.kill()
+        neighbour.wait()
+
+
+def test_a_row_with_no_start_time_is_never_signalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeping = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+
+        def identity(pid: int) -> tuple[int, str]:
+            return os.getpid(), ""
+
+        monkeypatch.setattr(processes_module, "identity_of", identity)
+        row = TreeRow(sleeping.pid, os.getpid(), sleeping.pid, "sleep")
+        assert processes_module.signal_if_same(row, 9) is False
+        assert sleeping.poll() is None
+    finally:
+        sleeping.kill()
+        sleeping.wait()
+
+
+def test_a_cancellation_while_ending_the_group_closes_the_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-review of 4da3e0e. A second cancellation that arrives while the group is
+    being ended must not skip the close of the read descriptor, which left its loop
+    reader behind. The walk is slow, so the cancellation lands inside it, and the
+    command must still end."""
+
+    def slow(root: int) -> list[TreeRow] | None:
+        time.sleep(1.0)
+        return []
+
+    monkeypatch.setattr(relay_module, "attached", slow)
+    relay = CommandRelay([sys.executable, "-c", "import time; time.sleep(30)"], 0.3)
+    pids: list[int] = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def recording(*arguments: object, **options: object) -> object:
+        process = await real_exec(*arguments, **options)  # pyright: ignore[reportArgumentType, reportUnknownVariableType]
+        pids.append(process.pid)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+        return process  # pyright: ignore[reportUnknownVariableType]
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", recording)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(relay.deliver(notice()))
+        # The timeout is 0.3 seconds, so the group is being ended soon after.
+        await asyncio.sleep(0.6)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    asyncio.run(scenario())
+    before = _open_descriptors()
+    asyncio.run(scenario())
+    assert _open_descriptors() == before
+    assert pids and all(_gone(pid) for pid in pids)
+
+
+def test_a_loop_that_cannot_watch_the_pipe_leaves_no_descriptor() -> None:
+    class Refusing:
+        def add_reader(self, *arguments: object) -> None:
+            raise RuntimeError("no reader")
+
+    before = _open_descriptors()
+    with pytest.raises(RuntimeError, match="no reader"):
+        relay_module._StderrTail(Refusing())  # pyright: ignore[reportPrivateUsage, reportArgumentType]
+    assert _open_descriptors() == before
 
 
 def test_a_walk_that_fails_still_kills_the_group(

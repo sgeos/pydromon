@@ -62,7 +62,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final, cast
 
-from dromon.processes import TreeRow, attached
+from dromon.processes import TreeRow, attached, deepest_first, signal_if_same
 from dromon.model import (
     MAX_EXIT_CODE,
     MAX_RUN_NOTE_BYTES,
@@ -631,7 +631,8 @@ class Supervision:
     command's group misses a descendant that called ``setsid``. A stop therefore also
     walks the process table for what descends from the supervisor, by parent, and
     signals those, at ``SIGTERM`` and again at ``SIGKILL``. The walk comes before the
-    group signal, because the signal orphans what the command left. Each signal goes
+    group signal, because the signal orphans what the command left. Each is signalled
+    only if its start time and parent are still those the walk read. Each signal goes
     to the result of a walk made just before it and never to a process identifier
     remembered from an earlier walk, so a process that ended and whose identifier was
     reused is not signalled unless it descends from the supervisor. **Limits.** A
@@ -643,10 +644,13 @@ class Supervision:
     says."""
 
     def __init__(
-        self, walk: Callable[[], list[TreeRow] | None] = _below_this_process
+        self,
+        walk: Callable[[], list[TreeRow] | None] = _below_this_process,
+        identity: Callable[[int], tuple[int, str] | None] | None = None,
     ) -> None:
         self.stopping = threading.Event()
         self._walk = walk
+        self._identity = identity
         self.outside: set[int] = set()
         """The descendants a stop signalled that were outside the command's group."""
         self.unreadable = False
@@ -691,24 +695,30 @@ class Supervision:
     def _end(
         self, child: subprocess.Popen[bytes], code: int | None, number: int
     ) -> None:
-        """Walk the process table, then signal the command's group while the command
-        is unreaped, then whatever the walk found. **The order matters.** The group
+        """Walk the process table, signal what it found, then signal the command's
+        group while the command is unreaped. **The order matters twice.** The group
         signal ends the command, and a descendant that outlives it is given to the
         system's first process at that moment and is no longer below this one, so a
-        walk made after the signal misses exactly the descendant it is for. The
-        full-gate run of 2026-11-01 showed it. The walk is made at most a moment
-        before the signals, so none goes to a process identifier from an earlier
-        walk."""
+        walk made after the signal misses exactly the descendant it is for, as the
+        full-gate run of 2026-11-01 showed. Children are signalled before their
+        parents, because a parent that ends gives its child to the system's first
+        process, and the parent check would then turn the child away, as the second
+        run of that day showed. For the same reason the check of each
+        descendant's parent, made just before its signal, must come before the group
+        signal, or it would find every orphan changed. **Re-review of 4da3e0e.** A
+        pid that was reused since the walk is not signalled, because its start time or
+        parent differs, as ``signal_if_same`` says."""
         found = self._walk()
-        if code is None:
-            _signal_group(child.pid, number)
         if found is None:
             self.unreadable = True
-            return
-        for row in found:
-            if row.pgid != child.pid:
-                self.outside.add(row.pid)
-            _signal_pid(row.pid, number)
+        else:
+            for row in deepest_first(found):
+                if signal_if_same(row, number, self._identity) and (
+                    row.pgid != child.pid
+                ):
+                    self.outside.add(row.pid)
+        if code is None:
+            _signal_group(child.pid, number)
 
     def note(self) -> str:
         """What a stop did beyond the command's group, for the receipt."""
@@ -726,11 +736,6 @@ class Supervision:
 def _signal_group(group: int, number: int) -> None:
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(group, number)
-
-
-def _signal_pid(pid: int, number: int) -> None:
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.kill(pid, number)
 
 
 def supervise(
