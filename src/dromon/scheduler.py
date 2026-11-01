@@ -267,6 +267,7 @@ from dromon.mailbox import (
 )
 from dromon.lineconfig import (
     DEFAULT_CONFIG,
+    REPORT_RESERVED,
     ConfigError,
     LineConfig,
     WorkdirAccess,
@@ -577,6 +578,22 @@ UNKNOWN_COST_RULE: Final = (
     " unknown_turns and adds nothing to the estimate, so it counts as 0 toward the"
     " limit. The limit holds the line only on the costs reported, so a line whose"
     " turns report none is not held by it."
+)
+COST_UNREPORTED_ENGINES: Final = frozenset(
+    {codex.ENGINE_NAME, grok.ENGINE_NAME, cursor.ENGINE_NAME}
+)
+"""The engines whose adapters never report a cost, so ``max_cost_usd`` can never hold
+a line on them. **Fact, read on 2026-11-01.** Each adapter's turn report sets
+``cost_estimate_usd=None`` in its code. Claude Code, Pi and Antigravity report one when
+the engine gives it. **Review of a9995d8, item 4.** On a subscription the cost is quota,
+which the limit never measured, so such a line is bounded by its autonomous-turn limit
+alone and ``cost_usd.limit_enforced`` says so. On the ``api`` strategy the cost is money
+and nothing would bound it, so Dromon **refuses** that pairing and does not substitute
+a guessed per-turn charge."""
+UNREPORTED_ENGINE_NOTE: Final = (
+    "This line's engine reports no cost, so max_cost_usd never holds it. Its turns"
+    " are bounded by the autonomous-turn limit, and by the hold after a failed turn,"
+    " alone."
 )
 SCRATCH_AREA: Final = "scratch"
 REPORTS_AREA: Final = "reports"
@@ -1490,6 +1507,9 @@ def engine_factory(
         # Every adapter ends a turn gracefully when its driver answers interrupt, so
         # priority mail steers the driver rather than each engine.
         driver: Driver = priority.steered(spec.model, spec.strategy, spec.redirect)
+        unbounded = cost_bound_refusal(driver.settings.engine, spec.strategy)
+        if unbounded is not None:
+            raise EngineRefused(unbounded)
         # Read at each build, so a project registered for open federation after the
         # daemon started is denied from each line's next turn.
         protected_now = (
@@ -1746,8 +1766,27 @@ def _party(owner: str | Address) -> Address:
     return LineAddress(owner) if isinstance(owner, str) else owner
 
 
+def cost_bound_refusal(engine: str, strategy: Strategy) -> str | None:
+    """Why a line on ``engine`` with ``strategy`` is refused because no limit could
+    bound its spending, or ``None``. **Review of a9995d8, item 4.** The ``api``
+    strategy spends money, and on an engine in ``COST_UNREPORTED_ENGINES`` the cost
+    limit never sees any of it. The refusal is the choice made over a configured
+    per-turn charge, which would be a number Dromon invented for a spend it cannot
+    see."""
+    if strategy is Strategy.API and engine in COST_UNREPORTED_ENGINES:
+        return (
+            f"the api strategy is refused on the {engine} engine, which reports no"
+            " cost, so max_cost_usd could not bound what the line spends. Use the"
+            " subscription strategy"
+        )
+    return None
+
+
 def _check_engine_supports(driver: Driver, config: LineConfig) -> None:
     """Raise ``ConfigError`` if the driver's engine cannot run ``config``."""
+    unbounded = cost_bound_refusal(driver.settings.engine, driver.settings.strategy)
+    if unbounded is not None:
+        raise ConfigError(unbounded)
     if config.fresh_session_each_turn and driver.settings.engine not in {
         ENGINE_NAME_CLAUDE,
         codex.ENGINE_NAME,
@@ -2065,6 +2104,13 @@ class Scheduler:
         """Lines whose last compaction left the context at or past their
         ``auto_compact_tokens``, or left it unknown, so no automatic compaction
         follows until a context below the threshold is reported. In memory."""
+        self._manual_held: set[str] = set()
+        """Lines whose last compaction left the context at or past their warning, or
+        left it unknown, so ``compact_session`` is refused until a context below the
+        warning is reported. **Review of a9995d8, item 2.** The automatic path has
+        ``_auto_held`` for the same reason, and a manual request had no such guard, so
+        a line whose compaction did not help could chain them, nine in two seconds
+        once the 60 second default wake was gone. In memory."""
         self._wake_delivered: dict[str, str] = {}
         """When each fired wake's note was delivered, for ``list_mail``. In memory,
         so a note delivered before a restart shows its due time only."""
@@ -2464,6 +2510,7 @@ class Scheduler:
         self._context.pop(line_id, None)
         self._context_source.pop(line_id, None)
         self._auto_held.discard(line_id)
+        self._manual_held.discard(line_id)
         self._context_compaction_wakes.discard(line_id)
         self._compaction_free_turn_used.discard(line_id)
         self._withdraw_context_compaction_wake(line_id)
@@ -4066,12 +4113,20 @@ class Scheduler:
             if not unknown
             else f"${cost:.2f} and {unknown} turns of unknown cost, counted as $0.00"
         )
-        line = (
-            f"Autonomous turns in a row without operator mail: {used} of"
-            f" {limits.max_autonomous_turns}."
-            f" Estimated cost since your last release: {spent} of"
-            f" ${limits.max_cost_usd:.2f}. A line past either is held. {counting}"
-        )
+        if self._cost_reported(line_id):
+            line = (
+                f"Autonomous turns in a row without operator mail: {used} of"
+                f" {limits.max_autonomous_turns}."
+                f" Estimated cost since your last release: {spent} of"
+                f" ${limits.max_cost_usd:.2f}. A line past either is held. {counting}"
+            )
+        else:
+            line = (
+                f"Autonomous turns in a row without operator mail: {used} of"
+                f" {limits.max_autonomous_turns}. A line past that is held."
+                f" Your engine reports no cost, so the cost limit of"
+                f" ${limits.max_cost_usd:.2f} does not apply to you. {counting}"
+            )
         warning = self._context_warning(line_id) if warn else None
         return f"{line} {warning}" if warning else line
 
@@ -4081,11 +4136,15 @@ class Scheduler:
         config = self.effective_config(line_id)
         if context is None or context < config.context_warn_tokens:
             return None
-        remedy = (
-            "compact_session compacts it at the start of your next turn."
-            if self._may_compact(line_id)
-            else "An operator can enable compact_session for this line."
-        )
+        if not self._may_compact(line_id):
+            remedy = "An operator can enable compact_session for this line."
+        elif line_id in self._manual_held:
+            remedy = (
+                "Your last compaction did not bring it below the warning, so"
+                " compact_session is refused until a context below it is reported."
+            )
+        else:
+            remedy = "compact_session compacts it at the start of your next turn."
         return (
             f"Your context is about {context} tokens, past this line's warning at"
             f" {config.context_warn_tokens}, and every engine call re-reads it."
@@ -4117,6 +4176,7 @@ class Scheduler:
             ),
             "last_compaction": self._last_compaction.get(line_id),
             "auto_compact_held": line_id in self._auto_held,
+            "compact_session_held": line_id in self._manual_held,
         }
 
     def session_compacted(
@@ -4161,9 +4221,12 @@ class Scheduler:
         after = compaction.get("after_tokens")
         estimate = compaction.get("after_estimate_tokens")
         threshold = self._auto_compact_threshold(line_id)
+        warning = self.effective_config(line_id).context_warn_tokens
         if isinstance(after, int):
             if threshold is not None and after >= threshold:
                 self._auto_held.add(line_id)
+            if after >= warning:
+                self._manual_held.add(line_id)
             self._context_reported(line_id, after, CONTEXT_FROM_COMPACTION)
         elif type(estimate) is int and estimate > 0:
             # An engine that estimates the size itself, as Pi does, gives it here.
@@ -4174,12 +4237,15 @@ class Scheduler:
             )
             if threshold is not None and estimate >= threshold:
                 self._auto_held.add(line_id)
+            if estimate >= warning:
+                self._manual_held.add(line_id)
             self._context_reported(line_id, estimate, CONTEXT_FROM_ENGINE_ESTIMATE)
         else:
             self._context.pop(line_id, None)
             self._context_source.pop(line_id, None)
             # Whether it got below the threshold is unknown, so it is held.
             self._auto_held.add(line_id)
+            self._manual_held.add(line_id)
         # The round 4 report of core. The daemon's context-warning wake was withdrawn
         # only when a reported size fell below the warning, so it fired as a reminder
         # after the fact. **Task of 2026-10-30.** A sized compaction that left the
@@ -4228,6 +4294,8 @@ class Scheduler:
         threshold = self._auto_compact_threshold(line_id)
         if threshold is not None and tokens >= threshold:
             self._auto_held.add(line_id)
+        if tokens >= self.effective_config(line_id).context_warn_tokens:
+            self._manual_held.add(line_id)
         self._context_reported(line_id, tokens, CONTEXT_FROM_ESTIMATE)
 
     def _record_session(self, line_id: str, report: TurnReport) -> None:
@@ -4261,6 +4329,8 @@ class Scheduler:
             self._compaction_free_turn_used.discard(line_id)
         self._context[line_id] = tokens
         self._context_source[line_id] = source
+        if tokens < warning:
+            self._manual_held.discard(line_id)
         threshold = self._auto_compact_threshold(line_id)
         if threshold is None or tokens < threshold:
             self._auto_held.discard(line_id)
@@ -4897,6 +4967,7 @@ class Scheduler:
         known = line_id in self._cost
         unknown = self._cost_unknown.get(line_id, 0)
         basis = "exact" if not unknown else "lower_bound" if known else "unknown"
+        enforced = self._cost_reported(line_id)
         return {
             "estimate": (
                 UNKNOWN if basis == "unknown" else f"{self._cost.get(line_id, 0.0):.4f}"
@@ -4906,13 +4977,21 @@ class Scheduler:
             "unknown_counts_as_usd": f"{UNKNOWN_TURN_COST_USD:.4f}",
             "counting": UNKNOWN_COST_RULE,
             "limit": f"{limits.max_cost_usd:.2f}",
+            "limit_enforced": enforced,
             "note": (
                 None
-                if not unknown
+                if enforced and not unknown
+                else UNREPORTED_ENGINE_NOTE
+                if not enforced
                 else f"{unknown} turns since the last release reported no cost, so"
                 " the budget holds the line only on what the others reported"
             ),
         }
+
+    def _cost_reported(self, line_id: str) -> bool:
+        """Whether the line's engine reports costs at all, so that ``max_cost_usd``
+        can hold it. ``False`` for an engine in ``COST_UNREPORTED_ENGINES``."""
+        return ENGINE_OF.get(self.model_of(line_id)) not in COST_UNREPORTED_ENGINES
 
     def _summary_cost(self, line_id: str) -> object:
         """The estimate for the client protocol, which keeps ``null`` for an unknown
@@ -5289,6 +5368,17 @@ class Scheduler:
             names = [*scratch, *parts[:-1]]
             for index, name in enumerate(names):
                 entered = _enter(parent, name, path, scratch_root=index == 0)
+                if (
+                    area == REPORTS_AREA
+                    and index == 1
+                    and _is_reserved(parent, entered)
+                ):
+                    os.close(entered)
+                    raise LineToolRefused(
+                        f"the report directory {'/'.join(scratch)} is, on this"
+                        f" volume, one of tmp/{', tmp/'.join(REPORT_RESERVED)}, which"
+                        " hold other lines' and roles' files"
+                    )
                 os.close(parent)
                 parent = entered
             flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
@@ -7744,6 +7834,15 @@ class Scheduler:
                 return _tool_error(
                     "your context must be at or past this line's warning at"
                     f" {warning} tokens before it can be compacted"
+                )
+            if line_id in self._manual_held:
+                return _tool_error(
+                    "your last compaction did not bring your context below this"
+                    f" line's warning at {warning} tokens, or its size is unknown,"
+                    " so another would cost a turn and not help. compact_session"
+                    " is available again once a context below the warning is"
+                    " reported. Consider handing off your work and asking an"
+                    " operator for a fresh session."
                 )
             pending = self._log.state.scheduled.get(line_id)
             if pending is not None:
@@ -10443,6 +10542,25 @@ def own_scratch(workdir: Path, line_id: str) -> Path:
     return workdir.joinpath(*names)
 
 
+def _is_reserved(tmp: int, directory: int) -> bool:
+    """Whether the open ``directory`` is the same directory as one of the names
+    ``REPORT_RESERVED`` under the open ``tmp``, compared by device and inode. **Review
+    of a9995d8, item 3.** On a volume that ignores case or Unicode form, ``tmp/Lines``
+    is ``tmp/lines``, and the configuration's name check cannot know every spelling a
+    volume treats alike, so the directory a write is about to use is compared with the
+    reserved ones as the volume resolves them. A reserved name that does not exist
+    cannot be the same directory."""
+    found = os.fstat(directory)
+    for reserved in REPORT_RESERVED:
+        try:
+            other = os.stat(reserved, dir_fd=tmp, follow_symlinks=False)
+        except OSError:
+            continue
+        if (other.st_dev, other.st_ino) == (found.st_dev, found.st_ino):
+            return True
+    return False
+
+
 def _enter(parent: int, name: str, path: str, *, scratch_root: bool) -> int:
     """Create the directory ``name`` under the open directory ``parent`` if it is
     missing, and return a new descriptor for it, opened without following a link. The
@@ -10778,6 +10896,7 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
             "unknown_counts_as_usd": cost["unknown_counts_as_usd"],
             "counting": cost["counting"],
             "limit": cost["limit"],
+            "limit_enforced": cost["limit_enforced"],
         },
         "provider_budget": full["provider_budget"],
         "disclosure": full["disclosure"],

@@ -8,3 +8,10 @@ Type: Changed
   while the client protocol's `cost_estimate_usd` stays `null`. The budget line at the
   head of each turn's prompt says that turns of unknown cost are counted as $0.00. A
   file for `check_disclosure` may now exceed 1 MiB, up to 16 MiB combined.
+- Round 14 review. The `api` strategy is refused on the Codex, Grok and Cursor Agent
+  engines, which report no cost, so `max_cost_usd` could not bound what such a line
+  spends. `compact_session` is refused after a compaction that left the context at
+  or past the warning, or of unknown size, until a context below the warning is
+  reported. `report_directory` refuses `tmp/worktrees`, `tmp/runs` and `tmp/probes`
+  as well as `tmp/lines`, in any letter case or Unicode form, and any component that
+  starts with a dot. The write compares the directory with them by inode.

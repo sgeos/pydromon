@@ -47,7 +47,7 @@ keys, duplicate keys and numbers are refused.
 | `workdir` | The directory the line's engine runs in, as the working directory section below specifies. Omitted when unset | the project root |
 | `workdir_access` | `write` or `read`; read confines the working directory to reads, with the scratch exception below | `write` |
 | `writable_paths` | Existing absolute directories a Codex line may write when given `Edit` or `Write`. Refused on other engines | none |
-| `report_directory` | A relative directory under `tmp/` in the working directory, such as `tmp/reports`, that `write_scratch` writes to when a call asks for its `reports` area, as the `write_scratch` section below specifies. Never `tmp` itself, never under `tmp/lines`, written with `/`, with at most eight components. Omitted when unset | none |
+| `report_directory` | A relative directory under `tmp/` in the working directory, such as `tmp/reports`, that `write_scratch` writes to when a call asks for its `reports` area, as the `write_scratch` section below specifies. Never `tmp` itself, never directly under `tmp/lines`, `tmp/worktrees`, `tmp/runs` or `tmp/probes`, compared without regard to letter case or Unicode form, so `tmp/Lines` is refused, with no component that starts with `.` or ends with `.` or a space, written with `/`, with at most eight components. The write also compares the directory it opens with those four by device and inode, so a volume that treats other spellings alike cannot reach another line's scratch or another role's worktree. Omitted when unset | none |
 | `keep_session` | Keep a Claude Code or Codex line's engine connected between turns, as the kept sessions section below specifies. Refused on Grok lines. Omitted when false | `false` |
 | `fresh_session_each_turn` | Start each turn in a new Claude Code or Codex engine session, without a context handoff or standing brief. Refused with `keep_session`, with explicit `context_handoff = true`, and on adapters that cannot start a new session each turn. Omitted when false | `false` |
 | `keep_session_idle_seconds` | Seconds a kept connection waits for the next turn before it closes, a whole number from 60 to 86,400. Omitted at its default | `1800` |
@@ -154,6 +154,37 @@ hook, registered through the Agent SDK for every view-only line, runs before eve
 `Read`, before the permission rules and the callback, and applies `image_refusal` to
 its `file_path`. A refusal there is a deny, which no allow overrides, and a missing or
 malformed `file_path` is refused. The callback keeps the same check as a second guard.
+**Review of a9995d8, item 1. Fail closed, three more guards.**
+1. *A hook that fails denies.* Its body is wrapped, and an exception, or a failure to
+   record the call, answers with the deny, naming the exception's type and nothing of
+   its text. **Inference.** Claude Code treats a hook that errors as one that failed,
+   which does not block the tool, so the wrapper keeps the failure from reading as an
+   allowance.
+2. *An ask rule for `Read`.* A view-only line's flag settings carry
+   `permissions.ask: ["Read"]`, joined with the operator's own ask rules once. An ask
+   rule makes the engine consult the permission callback, so the gate runs for every
+   `Read` whatever the hook does. **Hypothesis, to be shown live.** An ask rule
+   outranks the engine's allowance for a read inside its working directory. If it does
+   not, the hook and the missing-hook check below are what hold.
+3. *A `Read` without a hook call ends the turn.* The hook records each tool call it is
+   given. The adapter records each `Read` a view-only line makes and, when its result
+   arrives, finds the call among the hook's. The hook runs before the tool, so a result
+   with no hook call means the engine skipped the hook for it. The adapter interrupts
+   the turn and refuses it, and the scheduler holds a line whose turn failed, as for
+   any refused turn. This detects and does not prevent, since the `Read` has completed,
+   and what it returned has reached the model.
+4. *A policy that switches hooks off refuses the line.* **Fact, found in the bundled
+   Claude Code 2.1.310 by the audit line.** The settings `disableAllHooks` and
+   `allowManagedHooksOnly` stop hooks from running, and the engine's message says
+   "set in settings or by policy". **Hypothesis.** Either stops an SDK hook callback.
+   `dromon.hookpolicy` reads the line's `[settings]` document and the managed policy
+   files, `managed-settings.json` and the fragments in `managed-settings.d`, under
+   `/Library/Application Support/ClaudeCode` and `/etc/claude-code`, and refuses to
+   start a view-only line when one is `true`. A policy file that exists and cannot be
+   read as a JSON object also refuses, because a policy that cannot be seen cannot be
+   shown to leave hooks on. **Limit.** A policy delivered by a mobile device management
+   profile or a registry key cannot be seen from here, and the third guard is what
+   catches it, after the fact.
 **Other engines.** Codex has no permission callback to bypass. Its `view_image` is
 checked by Dromon against the `imageView` item as the engine emits it, which detects
 and does not prevent, as stated above, so an over-limit or non-image file on Codex is
@@ -261,7 +292,19 @@ the limit holds the line only on the costs reported. A line whose turns report n
 is therefore never held by the cost limit, only by its limit on autonomous turns. This
 is a decision to count them apart and not to guess, because a guess would hold or free
 a line on a number nobody measured. The budget line at the head of each turn's prompt
-says `counted as $0.00` beside the turns. The client protocol's
+says `counted as $0.00` beside the turns. **Review of a9995d8, item 4. The limit may not
+be enforced.** `cost_usd` also gives `limit_enforced`, `false` for a line whose engine
+never reports a cost, which are Codex, Grok and Cursor Agent, whose adapters set the
+turn's cost to `null` in code. The `limit` beside an unknown estimate read as
+protection, and for these lines it holds nothing, so the entry says so with a `note`
+and the prompt's budget line says that the cost limit does not apply. They are bounded
+by the autonomous-turn limit and the hold after a failed turn alone. On a subscription
+that is quota and not money. **The `api` strategy is refused on those engines**, when a
+line is created and when its engine is built, because nothing would bound what it
+spends. This is the choice made over a per-turn charge, which would be a number Dromon
+made up for a spend it cannot see. The `flexible` strategy is allowed and shows
+`limit_enforced` false. Claude Code, Pi and Antigravity report a cost when the engine
+gives one. The client protocol's
 `cost_estimate_usd` stays `null` for an unknown cost, as [`CLIENT.md`](CLIENT.md)
 specifies.
 
@@ -1157,6 +1200,18 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
     request is held in memory, so a daemon restart loses it while the wake survives.
     The wake's note says so, since the wake's turn cannot tell a lost request from a
     consumed one, and a line without a compaction note may ask again.
+  - **Review of a9995d8, item 2. A manual request is bounded as the automatic ones
+    are.** Without the sixty second default, a line whose compaction left its context
+    at the warning could ask after every turn, and one chained nine compactions in two
+    seconds before the cost limit held it. `compact_session` is now refused after a
+    compaction that left the context at or past the line's warning, or left its size
+    unknown, until a context below the warning is reported, which is the rule
+    `auto_compact_held` applies to the automatic path. The refusal says so and advises
+    handing off and asking an operator for a fresh session. `line_status` gives
+    `compact_session_held`, and the context warning in the prompt says that the tool is
+    refused while it holds. Clearing the session releases it. **Limit.** A compaction
+    that reports a size below the warning and is followed by turns that report a size at
+    or past it again is not held by this, and only the autonomous-turn limit bounds it.
   - **The warning after the compaction.** A turn that begins with a compaction leaves
     the context warning out of its first line. The compaction's note ends with the
     warning as it stands once the compaction is recorded, so a compacted line is not

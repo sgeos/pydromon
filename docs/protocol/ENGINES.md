@@ -172,7 +172,13 @@ text file and a 6,000,287 byte png, which the rule refuses when called directly.
 the permission callback, so the rule did not run. Round 14, item 5, applies the rule in
 a `PreToolUse` hook, which the engine runs before every tool, and
 [`LINE_CONFIG.md`](LINE_CONFIG.md) records the defect, the fix and what is left to
-verify. The Codex check stays after the fact, as the table above says.
+verify. The Codex check stays after the fact, as the table above says. **Review of
+a9995d8, item 1.** The hook fails closed, an ask rule for `Read` sends every `Read` to
+the gate, a `Read` that completed with no hook call ends the turn and holds the line, and
+a managed policy that sets `disableAllHooks` or `allowManagedHooksOnly` refuses a
+view-only line where Dromon can read it. Whether the engine runs the hook for an
+in-directory `Read`, and whether an ask rule outranks its allowance, are still to be
+shown live, and the missing-hook check is what notices if they are not.
 
 **Verify first.** The operator runs these once per engine before relying on the
 capability, and the Codex and Grok steps are in [`CODEX.md`](CODEX.md) and

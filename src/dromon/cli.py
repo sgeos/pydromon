@@ -1991,12 +1991,7 @@ def _print_role(role: Mapping[str, object]) -> None:
             marks.append("not usable for failover")
         if seat["waits_unconfined"] is True:
             marks.append("waits, its engine cannot confine it")
-        budget = cast(Mapping[str, object], seat["budget"])
-        # Round 14, item 4. An unknown budget is a named entry, never ``None``.
-        if budget.get("status") == "unknown":
-            marks.append("budget unknown")
-        else:
-            marks.append(f"budget {_budget_text(budget)}")
+        marks.append(_seat_budget_mark(seat.get("budget")))
         print(
             f"  seat {seat['line_id']} on {seat['model']}, {', '.join(marks)},"
             f" at {seat['workdir_commit'] or 'no commit'}"
@@ -2016,12 +2011,27 @@ def _print_role(role: Mapping[str, object]) -> None:
         )
 
 
+def _seat_budget_mark(budget: object) -> str:
+    """How ``dromon role`` shows a seat's budget. **Round 14, item 4 and its review.**
+    The daemon now sends an unknown budget as a named entry with ``status`` unknown,
+    and an older daemon sends ``null`` for it. A new client talks to an older daemon
+    after every pull until the daemon restarts, so both read as unknown, and so does
+    an entry that lacks the fields of a stated budget, since the client must not
+    fail on what it cannot read."""
+    if not isinstance(budget, Mapping):
+        return "budget unknown"
+    entry = cast(Mapping[str, object], budget)
+    if entry.get("status") == "unknown" or not {"source", "stated_at"} <= set(entry):
+        return "budget unknown"
+    return f"budget {_budget_text(entry)}"
+
+
 def _budget_text(budget: Mapping[str, object]) -> str:
     """A stated budget, with its source and time, since it is a snapshot."""
     parts: list[str] = []
-    if budget["remaining_percent"] not in (None, "unknown"):
+    if budget.get("remaining_percent") not in (None, "unknown"):
         parts.append(f"{budget['remaining_percent']} percent")
-    if budget["resets_at"] not in (None, "unknown"):
+    if budget.get("resets_at") not in (None, "unknown"):
         parts.append(f"resets {budget['resets_at']}")
     parts.append(f"stated by {budget['source']} at {budget['stated_at']}")
     return ", ".join(parts)

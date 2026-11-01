@@ -16,3 +16,6 @@ Type: Added
   `compact_session` wakes the line as soon as the turn that asked ends, and not after
   a minute. `dromon settings` shows `allow_compact`, `context_warn_tokens` and
   `auto_compact_tokens` with their sources.
+- Round 14 review. `cost_usd` gives `limit_enforced`, false for a line whose engine
+  never reports a cost, and `line_status` has `compact_session_held`. A new module
+  `dromon.hookpolicy` reads the line's settings and the managed Claude Code policy.

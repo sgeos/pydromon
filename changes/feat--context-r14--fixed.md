@@ -8,3 +8,10 @@ Type: Fixed
   working directory. It now also runs in a `PreToolUse` hook that the engine runs
   before every `Read`, and a refusal there is final. `LINE_CONFIG.md` and `ENGINES.md`
   record the defect, the inference about its cause and what is left to verify live.
+- Round 14 review. The ViewImage hook fails closed, since a hook that raises denies.
+  A view-only line also asks before every `Read`, so the permission gate runs whatever
+  the hook does. A `Read` that completes without a hook call ends the turn and holds
+  the line. A view-only line is refused where the line's settings or a managed policy
+  set `disableAllHooks` or `allowManagedHooksOnly`. `report_directory` accepted
+  `tmp/Lines`, which overwrote another line's scratch on a volume that ignores case.
+  `dromon role` no longer fails when an older daemon sends a seat's budget as `null`.

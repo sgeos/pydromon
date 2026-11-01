@@ -65,11 +65,14 @@ from dromon.scheduler import (
     DISCLOSURE_HELD,
     MAX_LINE_STATUS_DEFAULT_BYTES,
     MAX_SCRATCH_BYTES,
+    COST_UNREPORTED_ENGINES,
     UNKNOWN_COST_RULE,
+    UNREPORTED_ENGINE_NOTE,
     UNRELEASED_NOTE,
     LineSpec,
     LineToolRefused,
     Scheduler,
+    cost_bound_refusal,
 )
 from dromon.workdir import read_head_commit
 
@@ -204,6 +207,7 @@ def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
         "unknown_counts_as_usd": "0.0000",
         "counting": UNKNOWN_COST_RULE,
         "limit": "3.00",
+        "limit_enforced": True,
     }
     assert status["scheduled_wake"] == {"due": due, "message_id": message_id}
     assert status["unread"] == 1 and status["pending"] == 0
@@ -228,6 +232,7 @@ def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
         "unknown_counts_as_usd": "0.0000",
         "counting": UNKNOWN_COST_RULE,
         "limit": "3.00",
+        "limit_enforced": True,
         "note": None,
     }
     assert (full["workdir"], full["workdir_path"]) == (None, str(world.root))
@@ -2150,6 +2155,50 @@ def test_the_reports_area_writes_under_the_declared_directory(world: World) -> N
     assert not (world.root / "tmp" / "reports" / "review" / "n.md").exists()
 
 
+def volume_ignores_case(directory: Path) -> bool:
+    probe = directory / "CaseProbe"
+    probe.mkdir(exist_ok=True)
+    return (directory / "caseprobe").exists()
+
+
+def test_the_reports_area_is_refused_where_the_volume_aliases_a_reserved_name(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review of a9995d8, item 3. The configuration refuses tmp/Lines by name, so a
+    # value that skips that check is built directly, and the write must still refuse
+    # where the volume makes it the same directory as tmp/lines.
+    (world.root / "tmp" / "lines" / "beta").mkdir(parents=True)
+    if not volume_ignores_case(world.root / "tmp" / "lines" / "beta"):
+        pytest.skip("this volume is case sensitive, so there is no alias to find")
+    other = world.root / "tmp" / "lines" / "beta" / "notes.md"
+    other.write_text("beta's notes\n")
+    config = LineConfig(builtin_tools=("Read", "Edit"), report_directory="tmp/reports")
+    object.__setattr__(config, "report_directory", "tmp/Lines")
+    world.scheduler.configure_line("alpha", REPORTING)
+
+    def fixed(line_id: str) -> LineConfig:
+        del line_id
+        return config
+
+    monkeypatch.setattr(world.scheduler, "effective_config", fixed)
+    text, error = world.call(
+        "write_scratch",
+        {"path": "beta/notes.md", "text": "overwritten", "area": "reports"},
+    )
+    assert error and "one of tmp/lines" in text
+    assert other.read_text() == "beta's notes\n"
+
+
+def test_a_report_directory_beside_the_reserved_ones_still_writes(world: World) -> None:
+    for name in ("lines", "worktrees", "runs", "probes"):
+        (world.root / "tmp" / name).mkdir(parents=True, exist_ok=True)
+    world.scheduler.configure_line("alpha", REPORTING)
+    text, error = world.call(
+        "write_scratch", {"path": "r.md", "text": "x", "area": "reports"}
+    )
+    assert not error, text
+
+
 def test_the_reports_area_is_refused_without_a_declared_directory(
     world: World,
 ) -> None:
@@ -2341,3 +2390,50 @@ def test_line_status_shows_how_unknown_cost_counts(world: World) -> None:
         "alpha", TurnCause.AUTONOMOUS
     )
     assert "51 turns of unknown cost, counted as $0.00" in line
+
+
+def test_a_line_on_an_engine_that_reports_no_cost_says_its_limit_is_not_enforced(
+    world: World,
+) -> None:
+    # Review of a9995d8, item 4. The limit beside an unknown estimate read as
+    # protection, so the entry says outright that it holds nothing here.
+    world.scheduler.create_line("delta", "gpt-6-luna", Strategy.SUBSCRIPTION)
+    cost = world.scheduler.cost_status("delta")
+    assert cost["limit_enforced"] is False
+    assert cost["note"] == UNREPORTED_ENGINE_NOTE
+    for _ in range(30):
+        world.scheduler.spent_between("delta", INTERRUPTED_KIND, None, None)
+    assert world.log.state.lines["delta"].held_by is None
+    assert world.scheduler.cost_status("delta")["note"] == UNREPORTED_ENGINE_NOTE
+    line = world.scheduler._budget_line(  # pyright: ignore[reportPrivateUsage]
+        "delta", TurnCause.AUTONOMOUS
+    )
+    assert "does not apply to you" in line and "Estimated cost" not in line
+    claude = world.scheduler._budget_line(  # pyright: ignore[reportPrivateUsage]
+        "alpha", TurnCause.AUTONOMOUS
+    )
+    assert "Estimated cost since your last release" in claude
+
+
+@pytest.mark.parametrize("model", ["gpt-6-luna", "grok-4.7"])
+def test_the_api_strategy_is_refused_on_an_engine_that_reports_no_cost(
+    world: World, model: str
+) -> None:
+    with pytest.raises(ConfigError, match="api strategy is refused"):
+        world.scheduler.create_line("delta", model, Strategy.API)
+    assert "delta" not in world.log.state.lines
+    # The same engines on a subscription, and Claude Code on the api strategy, stay.
+    world.scheduler.create_line("delta", model, Strategy.SUBSCRIPTION)
+    world.scheduler.create_line("epsilon", HAIKU, Strategy.API)
+    assert world.scheduler.cost_status("epsilon")["limit_enforced"] is True
+
+
+def test_the_cost_refusal_names_each_engine_that_reports_no_cost() -> None:
+    from dromon.driver import ENGINE_OF, MODELS
+
+    for model in MODELS:
+        refused = cost_bound_refusal(ENGINE_OF[model], Strategy.API)
+        assert (refused is not None) == (ENGINE_OF[model] in COST_UNREPORTED_ENGINES)
+        assert cost_bound_refusal(ENGINE_OF[model], Strategy.SUBSCRIPTION) is None
+        assert cost_bound_refusal(ENGINE_OF[model], Strategy.FLEXIBLE) is None
+    assert {"codex", "grok-build", "cursor-agent"} == COST_UNREPORTED_ENGINES

@@ -54,6 +54,7 @@ account's mail and file connectors, and are meant for lines the operator trusts.
 
 import json
 import re
+import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -547,7 +548,18 @@ def _workdir(value: object) -> str:
 
 MAX_REPORT_DEPTH: Final = 8
 REPORT_ROOT: Final = "tmp"
-REPORT_RESERVED: Final = "lines"
+REPORT_RESERVED: Final = ("lines", "worktrees", "runs", "probes")
+"""The directories of ``tmp/`` that Dromon or another role keeps. ``lines`` holds each
+line's own scratch, ``worktrees`` the roles' worktrees, ``runs`` the supervised runs'
+output and ``probes`` the recorded engine fixtures. **Review of a9995d8, item 3.** A
+report directory in or under any of them would write what another line or role owns,
+and on a volume that ignores case, ``tmp/Lines`` is ``tmp/lines``, so names are compared
+after normalization and case folding."""
+
+
+def _folded(part: str) -> str:
+    """A path component as a volume that ignores case, or Unicode form, would see it."""
+    return unicodedata.normalize("NFKC", part).casefold()
 
 
 def _report_directory(value: object) -> str:
@@ -568,10 +580,16 @@ def _report_directory(value: object) -> str:
         _fail(f"report_directory has more than {MAX_REPORT_DEPTH} components")
     if parts[0] != REPORT_ROOT or len(parts) < 2:
         _fail(f"report_directory must be a directory under {REPORT_ROOT}/")
-    if parts[1] == REPORT_RESERVED:
+    if _folded(parts[1]) in REPORT_RESERVED:
         _fail(
-            f"report_directory may not be under {REPORT_ROOT}/{REPORT_RESERVED}/, which"
-            " holds lines' own scratch"
+            f"report_directory may not be under {REPORT_ROOT}/ at any of"
+            f" {', '.join(REPORT_RESERVED)}, in any letter case, which hold lines'"
+            " scratch, roles' worktrees and recorded runs and probes"
+        )
+    if any(part.startswith(".") or part.endswith((".", " ")) for part in parts[1:]):
+        _fail(
+            "report_directory may not have a component that starts with . or ends"
+            " with . or a space"
         )
     return text
 

@@ -31,7 +31,7 @@ from dromon.model import (
     LineRebound,
     State,
 )
-from dromon.scheduler import LineSpec, Scheduler
+from dromon.scheduler import LineSpec, Scheduler, cost_bound_refusal
 
 HAIKU = "claude-haiku-5-5"
 QUALIFIED = tuple(model for model in MODELS if ":" in model)
@@ -97,6 +97,14 @@ def test_the_qualified_models_are_the_ones_the_identifier_pattern_refuses() -> N
 def test_a_line_can_be_created_on_every_packaged_model_a_daemon_may_hold(
     scheduler: Scheduler, model: str, strategy: Strategy
 ) -> None:
+    refusal = cost_bound_refusal(ENGINE_OF[model], strategy)
+    if refusal is not None:
+        # Review of a9995d8, item 4. The api strategy is refused where no cost is
+        # reported, since nothing would bound what the line spends.
+        with pytest.raises(ConfigError, match="reports no cost"):
+            scheduler.create_line("alpha", model, strategy)
+        assert "alpha" not in scheduler.state.lines
+        return
     scheduler.create_line("alpha", model, strategy)
     line = scheduler.state.lines["alpha"]
     assert (line.engine, line.strategy) == (model, strategy.value)

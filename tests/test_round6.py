@@ -581,17 +581,18 @@ def test_automatic_compaction_resumes_once_a_compaction_gets_below(
     world.after = 250_000
     world.run("grow")
     world.run("work")
-    world.after = 5_000
-    world.call("compact_session", {"seconds": 60})
-    world.run("asked")
+    # Round 14 review, item 2. compact_session is refused while the last compaction
+    # has not got below the warning, so the engine's own compaction does it here.
+    world.scheduler.session_compacted(
+        "alpha", {"trigger": "auto", "before_tokens": 250_000, "after_tokens": 5_000}
+    )
     world.context = 200_000
     world.run("grown again")
     world.run("work again")
     engine = world.engine
     assert isinstance(engine, Compacting)
-    assert len(engine.reasons) == 3
-    assert engine.reasons[1] == "at your request"
-    assert engine.reasons[2].startswith("automatically")
+    assert len(engine.reasons) == 2
+    assert engine.reasons[1].startswith("automatically")
 
 
 def test_a_request_takes_precedence_over_the_automatic_reason(world: World) -> None:
@@ -1402,3 +1403,87 @@ def test_an_unreported_codex_compaction_is_still_said_plainly() -> None:
     target.request_compaction("at your request", lambda: None)
     asyncio.run(target.run_turn("second"))
     assert "reported no compaction" in server.prompt()
+
+
+# Review of a9995d8, item 2. A manual request has the guard the automatic path has.
+
+
+def test_a_compaction_that_left_the_warning_refuses_another_request(
+    world: World,
+) -> None:
+    compactable(world, context_warn_tokens=250_000)
+    world.context = 100_000
+    world.after = 250_000
+    world.run("start")
+    context_at_warning(world)
+    assert "is_error" not in world.call("compact_session", {})
+    world.run()
+    engine = world.engine
+    assert isinstance(engine, Compacting)
+    assert len(engine.reasons) == 1
+    assert world.status()["context"]["compact_session_held"] is True
+    # The chain the review found: a request after every turn, nine in two seconds.
+    for number in range(9):
+        refused = world.call("compact_session", {})
+        assert refused.get("is_error") is True, number
+        assert "did not bring your context below" in text_of(refused)
+        assert "alpha" not in world.log.state.scheduled
+        world.run(f"turn {number}")
+    assert len(engine.reasons) == 1
+    warning_text = world.scheduler._context_warning("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert warning_text is not None and "compact_session is refused" in warning_text
+
+
+def test_the_request_is_allowed_again_once_a_context_below_the_warning_is_reported(
+    world: World,
+) -> None:
+    compactable(world, context_warn_tokens=250_000)
+    world.context = 100_000
+    world.after = 250_000
+    world.run("start")
+    context_at_warning(world)
+    world.call("compact_session", {})
+    world.run()
+    assert world.status()["context"]["compact_session_held"] is True
+    world.context = 100_000
+    world.run("shrunk")
+    assert world.status()["context"]["compact_session_held"] is False
+    context_at_warning(world)
+    assert "is_error" not in world.call("compact_session", {})
+
+
+def test_a_compaction_of_unknown_size_refuses_another_request(world: World) -> None:
+    compactable(world, context_warn_tokens=250_000)
+    world.context = 100_000
+    world.after = None
+    world.run("start")
+    context_at_warning(world)
+    world.call("compact_session", {})
+    world.run()
+    assert world.status()["context"]["compact_session_held"] is True
+    context_at_warning(world)
+    assert world.call("compact_session", {}).get("is_error") is True
+
+
+def test_a_compaction_below_the_warning_holds_nothing(world: World) -> None:
+    compactable(world, context_warn_tokens=250_000)
+    world.context = 100_000
+    world.after = 5_000
+    world.run("start")
+    context_at_warning(world)
+    world.call("compact_session", {})
+    world.run()
+    assert world.status()["context"]["compact_session_held"] is False
+    context_at_warning(world)
+    assert "is_error" not in world.call("compact_session", {})
+
+
+def test_clearing_the_session_releases_the_hold(world: World) -> None:
+    compactable(world, context_warn_tokens=250_000)
+    world.scheduler.session_compacted(
+        "alpha",
+        {"trigger": "manual", "before_tokens": 300_000, "after_tokens": 260_000},
+    )
+    assert world.status()["context"]["compact_session_held"] is True
+    world.scheduler._forget_context("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert world.status()["context"]["compact_session_held"] is False

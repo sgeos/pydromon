@@ -323,6 +323,10 @@ def test_only_one_compaction_wake_is_uncounted_per_warning_interval(
     assert len(world.engine.prompts) == 1
     assert world.status()["autonomous_turns"]["used"] == 0
 
+    # Round 14 review, item 2. compact_session now refuses a second request after a
+    # compaction that left the context at the warning, so this test lifts that guard
+    # to keep counting turns independently of it. The guard has tests of its own.
+    world.scheduler._manual_held.discard("alpha")  # pyright: ignore[reportPrivateUsage]
     world.compact_wake()
     world.past_due()
     world.run()
