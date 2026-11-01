@@ -134,8 +134,42 @@ project settings.
    are the common git directory's `hooks` and `config`, and the git directory's
    `config.worktree`. For a linked worktree, whose `.git` is a file, they also include
    that file and its `commondir`, since rewriting either would hand git a directory of
-   the line's own making. Only writes are denied, so the line can still read them and
-   commit. A `.git` or `commondir` that cannot be read, or that is malformed, ends the
+   the line's own making. **Round 14, review of 1449c5c, C1.** They also include the
+   common directory's `refs/remotes` and `packed-refs`, where git's files backend
+   keeps the remote-tracking refs, so that only the operator's fetch moves the refs a
+   commit run may name, as [`RUNS.md`](../architecture/RUNS.md) gives. Only writes
+   are denied, so the line can still read them and commit.
+   **Round 14, re-review of 522c146, item 3. What the `packed-refs` deny costs.**
+   Git rewrites `packed-refs` whole, under a new inode, whenever a packed ref is
+   removed or the refs are packed. So for a line with an enabled sandbox, deleting or
+   renaming a branch that is in `packed-refs`, `git tag -d` of a packed tag, `git
+   update-ref -d` of a packed ref, `git pack-refs` and `git gc` fail. A commit on a
+   packed branch, deleting a branch that is only a loose ref and creating a tag leave
+   `packed-refs` unchanged and keep working. **Fact, observed by the audit line in a
+   scratch repository on 2026-11-01, watching the inode.** `git gc --auto`, which a
+   commit or a merge may start, is expected to fail at its packing step and print an
+   error without failing the commit. **Hypothesis, not observed.** These tasks are
+   left to the operator's own sessions. Fetching, which writes `refs/remotes`, was
+   already out of reach, since a sandboxed line has no network and cannot add a
+   remote with `config` guarded.
+   **Round 14, re-review of 522c146, C1a. Renaming a parent.** A deny on a path
+   would not hold if a line could rename its parent, such as `refs`, aside and put a
+   directory or a link of its own in its place. Claude Code also denies
+   `file-write-unlink`, which a rename of its source needs, on each parent of a
+   denied path that lies inside a writable root, so `refs` and the common directory
+   itself cannot be renamed or removed while `refs/heads` stays writable. **Fact,
+   read on 2026-11-01 in the sandbox profile generator bundled with Claude Code
+   2.1.316, and by the audit line in 2.1.310, which denies `file-write-unlink` and
+   `file-write-create` on each ancestor. Inference, not tested live, that Seatbelt
+   then refuses the rename.** Linux, whose sandbox mounts each denied path, a line
+   whose sandbox is disabled, and the other engines were not read. Claude Code's
+   settings have no separate rule for renames, so Dromon adds none. The daemon also
+   checks the refs it trusts with `lstat` before a commit run, which refuses a link
+   but not a real directory a line made. **Round 14, final check of 951b9e7, item 2.**
+   It therefore also refuses a commit run when `refs` or `refs/remotes` is not the
+   directory it found as it started, as [`RUNS.md`](../architecture/RUNS.md) gives,
+   so a swap after the start is refused even where the sandbox's rule does not hold.
+   A `.git` or `commondir` that cannot be read, or that is malformed, ends the
    turn before any command runs, and `dromond` refuses a project file with such a line.
    Git itself refuses such a checkout. **Fact, observed on 2026-10-26 with Claude
    Code 2.1.310 on macOS.** A deny entry wins over an allow entry. A Haiku line in a
@@ -176,7 +210,8 @@ succeeded and the one that wrote in the home directory was refused.
   process of another user, and a line runs as the operator's user. A project can require an enabled sandbox for every Claude Code line
   with `daemon.require_sandbox`, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies.
 - The git guard protects only the files of its set, the hooks directory, `config`,
-  `config.worktree` and a linked worktree's two pointers. Every other file under the
+  `config.worktree`, `refs/remotes`, `packed-refs` and a linked worktree's two
+  pointers. Every other file under the
   git directory stays as writable as the line's grants make it. Git runs no other file
   there as code unless configuration tells it to. A filter or merge driver, for
   example, is named in `.gitattributes` but defined in configuration, which is guarded.

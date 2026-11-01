@@ -72,8 +72,17 @@ class Operation(StrEnum):
     """Operator only. Not offered to external agents or lines. Added in round 10."""
     ROLE_DELETE = "role_delete"
     """Operator only. Not offered to external agents or lines. Added in round 10."""
+    RETIRE_LINE = "retire_line"
+    """Operator only. Not offered to external agents or lines. Added in round 14."""
     RUN_CLEAR = "run_clear"
     """Operator only. Not offered to external agents or lines. Task of 2026-10-31."""
+    RUNS = "runs"
+    """Read only. Not offered to external agents or lines. Added in round 14."""
+    START_CONTEXT = "start_context"
+    """Read only. The interpreter and the environment variables a restart's
+    successor starts with, for ``dromon restart``'s preflight. Not offered to
+    external agents or lines, since it names a path and the operator's
+    ``SSH_AUTH_SOCK``. Added in round 14, item 6."""
     BUDGETS = "budgets"
     BUDGET_SET = "budget_set"
     """Operator only. Not offered to external agents."""

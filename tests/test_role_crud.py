@@ -27,12 +27,17 @@ from dromon.eventlog import EventLog
 from dromon.lineconfig import LineConfig, WorkdirAccess, encode_config
 from dromon.model import (
     EventRejected,
+    HoldCause,
+    LineAddress,
     LineConfigured,
     LineCreated,
+    LineState,
+    LineStateChanged,
     OperatorAddress,
     OperatorRegistered,
     OwnershipCause,
     OwnershipChanged,
+    QuestionStatus,
     RoleDeclared,
     RoleHeld,
     RoleHolder,
@@ -1163,3 +1168,165 @@ def test_a_file_writer_beside_the_files_owner_is_refused_at_reload_and_start(
     assert scheduler.beside_owner("other") is None
     scheduler.give_ownership(ANA, "core", "core")
     assert scheduler.beside_owner("other") == "core"
+    # Audit of round 14, R4. A retired line waits for nothing, so the role's text
+    # no longer names it.
+    assert "other" in scheduler._beside_owner_of("core")  # pyright: ignore[reportPrivateUsage]
+    scheduler.retire_line(ANA, "other")
+    assert scheduler.beside_owner("other") is None
+    assert "other" not in scheduler._beside_owner_of("core")  # pyright: ignore[reportPrivateUsage]
+
+
+# Round 14, item 4. Retiring a line.
+
+
+def test_a_retired_line_is_hibernated_and_takes_no_turn_mail_or_seat(
+    desk: Desk, dromon: Run
+) -> None:
+    status, out, _ = dromon("retire", "echo", "--operator", "ana")
+    assert status == exits.OK, out
+    assert f"dromon retire: line echo retired at {AT}" in out
+    state = desk.log.state
+    assert state.retired_lines["echo"].by == ANA
+    assert state.lines["echo"].hibernated
+    assert desk.scheduler.condition("echo") == "retired"
+    refused = "line echo was retired by @ana at"
+    sent = desk.ask("send", {"recipient": "echo", "body": "hi", "operator": "ana"})
+    assert not sent.ok and refused in str(sent.error_message)
+    with pytest.raises(EventRejected, match=refused):
+        desk.scheduler.awaken("echo")
+    for event in (
+        LineStateChanged("echo", LineState.RUNNING),
+        SeatBound("echo", "core", True),
+        LineCreated("echo", HAIKU, "subscription"),
+    ):
+        with pytest.raises(EventRejected):
+            state.check(event)
+    # The line and the mail it had stay in the log.
+    assert "echo" in state.lines
+
+
+def test_a_retirement_withdraws_the_lines_questions_and_wake_and_says_so(
+    desk: Desk, dromon: Run
+) -> None:
+    """Audit of round 14, R1, R2 and R3. An answer is mail to the line, which a
+    retired line refuses, so its open questions are withdrawn in the same batch, and
+    its pending wake too, since it could never fire. Mail it received stays readable
+    by an operator, and reading it marks nothing."""
+    scheduler = desk.scheduler
+    asked = scheduler.ask("echo", ANA, "May I go on?", ("yes", "no"))
+    answered = scheduler.ask("echo", ANA, "Already answered?")
+    assert desk.ask(
+        "answer", {"question_id": answered, "body": "yes", "operator": "ana"}
+    ).ok
+    held = scheduler.hold("echo", "passed a limit", cause=HoldCause.AUTONOMOUS_TURNS)
+    other = scheduler.ask("fox", ANA, "Not echo's question")
+    wake, _ = scheduler.schedule_wake("echo", 3600, "later")
+    received = scheduler.send(LineAddress("fox"), LineAddress("echo"), "for echo")
+    before = desk.ask("read", {"operator": "ana", "message_id": received})
+    assert not before.ok and "no message" in str(before.error_message)
+    status, out, err = dromon("retire", "echo", "--operator", "ana")
+    assert status == exits.OK, err
+    withdrawn = sorted([asked, held])
+    assert f"withdrew its open questions {', '.join(withdrawn)}" in out
+    assert f"withdrew its scheduled wake {wake}" in out
+    state = desk.log.state
+    assert all(state.messages[q].status is QuestionStatus.WITHDRAWN for q in withdrawn)
+    assert state.messages[answered].status is QuestionStatus.ANSWERED
+    assert state.messages[other].status is QuestionStatus.OPEN
+    assert "echo" not in state.scheduled
+    assert wake in state.withdrawn_wakes
+    opened = desk.ask("read", {"operator": "ana", "message_id": received})
+    assert opened.ok and opened.result is not None
+    assert opened.result["body"] == "for echo"
+    assert opened.result["recipient"] == "echo"
+    assert not state.messages[received].read
+    # Another line's mail is still closed to an operator who neither sent nor got it.
+    to_fox = scheduler.send(LineAddress("echo"), LineAddress("fox"), "for fox")
+    assert not desk.ask("read", {"operator": "ben", "message_id": to_fox}).ok
+
+
+def test_a_retirement_with_nothing_to_withdraw_says_nothing_of_it(
+    desk: Desk, dromon: Run
+) -> None:
+    status, out, _ = dromon("retire", "echo", "--operator", "ana")
+    assert status == exits.OK
+    assert "withdrew" not in out
+
+
+def test_a_retirement_refused_records_nothing(desk: Desk, dromon: Run) -> None:
+    def refused(line_id: str) -> str:
+        before = desk.log.last_seq
+        response = desk.ask("retire_line", {"line_id": line_id, "operator": "ana"})
+        assert not response.ok
+        assert desk.log.last_seq == before
+        return str(response.error_message)
+
+    # A seat is not hibernated by a refused retirement, since both events are
+    # checked before either is appended.
+    assert "is a seat of role core, which is unbound" in refused("alpha")
+    assert not desk.log.state.lines["alpha"].hibernated
+    assert "no line nobody" in refused("nobody")
+    desk.log.append(LineStateChanged("fox", LineState.RUNNING))
+    assert "line fox is in a turn" in refused("fox")
+    desk.daemon.project = parse(project("", '[lines.echo]\nmodel = "claude-haiku-5-5"'))
+    assert "is declared in the project file" in refused("echo")
+    desk.daemon.project = ProjectConfig()
+    status, _, _ = dromon("retire", "echo", "--operator", "ana")
+    assert status == exits.OK
+    assert "line echo was retired by @ana" in refused("echo")
+    status, _, err = dromon("retire", "echo", "--operator", "ana")
+    assert status != exits.OK and "was retired" in err
+
+
+def test_a_retired_writer_leaves_the_one_writer_rule_and_its_name_is_not_reused(
+    reloads: Reloads,
+) -> None:
+    """A line only the log knows, which could write an owned role's worktree,
+    refuses every file until it is retired, as on 2026-10-31, and a file may then
+    not declare it again."""
+    lines = LINES.replace("[lines.other]", "[lines.unused]")
+    owned = project(CORE + 'owner = "core"\n', lines)
+    reloads.file.write_text(project(CORE, lines))
+    assert reloads.ask("reload_project").ok
+    scheduler = reloads.daemon.scheduler
+    scheduler.create_line(
+        "stray", HAIKU, Strategy.SUBSCRIPTION, replace(WRITER, workdir=WORKTREE)
+    )
+    assert "line stray could write" in refused_reload(reloads, owned)
+    scheduler.retire_line(ANA, "stray")
+    reloads.file.write_text(owned)
+    response = reloads.ask("reload_project")
+    assert response.ok, response.error_message
+    declared = project(CORE, lines + '[lines.stray]\nmodel = "claude-haiku-5-5"\n')
+    error = refused_reload(reloads, declared)
+    assert "line stray was retired by @ana" in error
+    assert "may not declare it" in error
+
+
+def test_status_names_a_line_the_file_dropped_and_a_retired_one(
+    reloads: Reloads,
+) -> None:
+    reloads.file.write_text(project(CORE))
+    assert reloads.ask("reload_project").ok
+    scheduler = reloads.daemon.scheduler
+    for line_id in ("dropped", "gone"):
+        scheduler.create_line(line_id, HAIKU, Strategy.SUBSCRIPTION, LineConfig())
+    scheduler.retire_line(ANA, "gone")
+    summaries = {
+        str(entry["line_id"]): entry for entry in reloads.daemon.line_summaries()
+    }
+    assert summaries["core"]["declared"] is True
+    assert summaries["dropped"]["declared"] is False
+    rows = {line_id: cli._line_row(entry) for line_id, entry in summaries.items()}  # pyright: ignore[reportPrivateUsage]
+    assert "not in the project file" in rows["dropped"]
+    assert "not in the project file" not in rows["core"]
+    assert rows["gone"].startswith("line gone, retired,")
+    assert "hibernated" not in rows["gone"]
+    assert "not in the project file" not in rows["gone"]
+    # A daemon from before round 14 gives no declared, which is then not shown.
+    older = {k: v for k, v in summaries["dropped"].items() if k != "declared"}
+    assert "project file" not in cli._line_row(older)  # pyright: ignore[reportPrivateUsage]
+    status = reloads.ask("status")
+    assert status.ok and status.result is not None
+    retired = cast(list[dict[str, object]], status.result["retired_lines"])
+    assert [entry["line_id"] for entry in retired] == ["gone"]

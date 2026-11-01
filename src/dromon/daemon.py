@@ -54,6 +54,8 @@ from claude_agent_sdk import SdkMcpTool
 from OpenSSL.SSL import Context as OpenSSLContext
 
 from dromon import __version__, exits, fleet, grok, peercred, registry, restart, runs
+from dromon import evidence
+from dromon import proposals as proposal_store
 from dromon.federation import (
     MAX_OPEN_REMOTE_PEERS,
     NO_FEDERATION,
@@ -855,7 +857,10 @@ class Daemon:
                 | Operation.ROLE_CREATE
                 | Operation.ROLE_UPDATE
                 | Operation.ROLE_DELETE
+                | Operation.RETIRE_LINE
                 | Operation.RUN_CLEAR
+                | Operation.RUNS
+                | Operation.START_CONTEXT
                 | Operation.BUDGETS
                 | Operation.BUDGET_SET
                 | Operation.AGENT_ADD
@@ -953,6 +958,11 @@ class Daemon:
                         request.args, ("role_id", "operator")
                     )
                     result = self._role_delete(role_id, operator)
+                case Operation.RETIRE_LINE:
+                    line_id, operator = _text_args(
+                        request.args, ("line_id", "operator")
+                    )
+                    result = self._retire_line(line_id, operator)
                 case Operation.ROLE_TAKE:
                     role_id, seat, operator = _text_args(
                         request.args, ("role_id", "seat", "operator")
@@ -987,6 +997,14 @@ class Daemon:
                         "operator": operator,
                         "cleared_at": cleared.cleared_at,
                     }
+                case Operation.RUNS:
+                    names = ("run_id",) if "run_id" in request.args else ()
+                    values = _text_args(request.args, names)
+                    found = self.scheduler.runs_view(values[0] if values else None)
+                    result = {"runs": cast(object, found)}
+                case Operation.START_CONTEXT:
+                    _text_args(request.args, ())
+                    result = start_context(os.environ)
                 case Operation.BUDGETS:
                     _text_args(request.args, ())
                     result = self.scheduler.budgets_view()
@@ -1197,6 +1215,38 @@ class Daemon:
             "role_id": role_id,
             "unbound": list(change.unbound),
             "retired_at": retired.retired_at,
+            **lost,
+        }
+
+    def line_summaries(self) -> list[dict[str, object]]:
+        """The scheduler's summary of each line, with ``declared``, whether the project
+        file the daemon applied last declares it. **Round 14, item 4.** A line removed
+        from the file stays in the log and runs as before, so ``declared`` false is how
+        a client shows it as such, and ``condition`` says ``retired`` once an operator
+        retires it."""
+        declared = self.project.lines
+        return [
+            {**entry, "declared": str(entry["line_id"]) in declared}
+            for entry in self.scheduler.line_summaries()
+        ]
+
+    def _retire_line(self, line_id: str, operator: str) -> dict[str, object]:
+        """An operator's ``retire_line``. **Round 14, item 4.** A line the project file
+        declares is refused, since a start or a reload would declare it again, and
+        the response warns of the background tasks its kept engine connection closes
+        with, read before the change."""
+        if line_id in self.project.lines:
+            raise EventRejected(
+                f"line {line_id} is declared in the project file, so remove it from"
+                " the file and reload before it is retired"
+            )
+        lost = self.tasks_lost([line_id])
+        retired = self.scheduler.retire_line(OperatorAddress(operator), line_id)
+        return {
+            "line_id": line_id,
+            "retired_at": retired.record.retired_at,
+            "withdrawn_questions": list(retired.withdrawn_questions),
+            "withdrawn_wake": retired.withdrawn_wake,
             **lost,
         }
 
@@ -1663,7 +1713,9 @@ class Daemon:
         self.scheduler.set_disclosure_terms(terms)
         self.scheduler.set_disclosure_accepted(config.disclosure_accepted)
         self.scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
-        self.scheduler.set_runs(config.run_commands)
+        self.scheduler.set_runs(
+            config.run_commands, config.run_commit_commands, config.run_commit_refs
+        )
         self.project = config
         self.project_file_present = present
         self.apply_project_values()
@@ -1837,6 +1889,7 @@ class Daemon:
         return {
             "message_id": message_id,
             "sender": str(message.sender),
+            "recipient": str(message.recipient),
             "kind": message.kind.value,
             "reply_to": message.reply_to,
             "choices": list(message.choices),
@@ -1965,7 +2018,8 @@ class Daemon:
             "tick": self.scheduler.tick,
             "daemon": self.scheduler.daemon_status(),
             "restart": self.scheduler.restart_status(),
-            "lines": self.scheduler.line_summaries(),
+            "lines": self.line_summaries(),
+            "retired_lines": self.scheduler.retired_lines_view(),
             "scheduler": self.scheduler.fault_status(),
             "peers": [
                 report.wire(detail=True) for report in self.scheduler.peer_reports()
@@ -2936,6 +2990,18 @@ def tls_serving(daemon: Daemon) -> TlsServing:
     return pinned_serving
 
 
+def start_context(environment: Mapping[str, str]) -> dict[str, object]:
+    """What a restart's successor starts with that a client cannot see, its
+    interpreter, which ``client.start`` runs, and ``restart.START_ENVIRONMENT`` as
+    ``environment`` holds it, each value ``None`` when unset. **Round 14, item 6.**"""
+    return {
+        "interpreter": sys.executable,
+        "environment": {
+            name: environment.get(name) for name in restart.START_ENVIRONMENT
+        },
+    }
+
+
 def successor_args(overrides: Overrides, hold_wakes: bool) -> list[str]:
     """The ``dromond`` options a restart's successor starts with, so that it keeps
     what the command line gave. ``dromon.client.start`` adds the project and the
@@ -3459,6 +3525,14 @@ def check_project(log: EventLog, config: ProjectConfig) -> None:
     within its engine, as an override."""
     for line_id, definition in sorted(config.lines.items()):
         existing = log.state.lines.get(line_id)
+        retired = log.state.retired_lines.get(line_id)
+        if retired is not None:
+            # Round 14, item 4. A line identifier is never used again.
+            raise ProjectMismatch(
+                f"line {line_id} was retired by {retired.by} at {retired.retired_at},"
+                " so the project file may not declare it. Remove it from the file,"
+                " or declare a line with a new identifier."
+            )
         if existing is not None and (existing.engine, existing.strategy) != (
             definition.model,
             definition.strategy.value,
@@ -3542,6 +3616,45 @@ def apply_project(scheduler: Scheduler, log: EventLog, config: ProjectConfig) ->
         )
 
 
+def private_dirs(paths: ProjectPaths) -> tuple[Path, ...]:
+    """Every private directory Dromon owns under the project, which a start creates
+    or checks. The peers' token store is checked by ``check_token_store``, and a
+    teacher's runtime directory when the teacher starts."""
+    return (
+        paths.state_dir,
+        paths.runtime_dir,
+        paths.left_reports,
+        paths.commit_checkouts,
+        paths.state_dir / proposal_store.PROPOSALS_DIRECTORY,
+        paths.state_dir / evidence.PROBES_DIRECTORY,
+        paths.sync_environments,
+    )
+
+
+def check_private_dirs(paths: ProjectPaths) -> None:
+    """Create every private directory with mode 0700, or check the one there, and
+    refuse naming every one that is not private, not only the first. Raises
+    ``PathError``.
+
+    **Round 14, item 8.** A supervised run in another project failed late, on a
+    private directory made before with a wide mode. The start now makes or checks
+    them all before any line's turn, a role's first turn included, so such a
+    project refuses at once with every path to fix. An existing directory is never
+    tightened silently, as ``ensure_private_dir`` decides. **Residual.** A mode
+    widened after the start is found at the next start, or where the directory is
+    next used."""
+    refused: list[str] = []
+    for directory in private_dirs(paths):
+        try:
+            ensure_private_dir(directory)
+        except PathError as error:
+            refused.append(str(error))
+    if refused:
+        raise PathError(
+            "private directories Dromon owns are not private: " + " ".join(refused)
+        )
+
+
 CHECK_PASSED: Final = "dromond: the start checks pass, and nothing was started"
 """What ``dromond --check`` says when a start would get past its checks."""
 
@@ -3593,9 +3706,7 @@ def run(
         # check reads the registry, and every later use reads this one.
         registry_dir = registry.configured_directory(os.environ)
         peercred.check_supported()
-        ensure_private_dir(paths.state_dir)
-        ensure_private_dir(paths.runtime_dir)
-        ensure_private_dir(paths.left_reports)
+        check_private_dirs(paths)
         check_token_store(paths.state_dir / PEERS_DIR_NAME)
         file = config_path(paths.state_dir)
         config = load(file, paths.root) if file.exists() else ProjectConfig()
@@ -3674,6 +3785,7 @@ def run(
                 ),
                 line_tokens=line_tokens,
                 report_dir=paths.left_reports,
+                checkout_dir=paths.commit_checkouts,
                 walk_check=launcher.walk_unavailable,
             )
             scheduler.record_walk_gap(launcher.walk_gap())
@@ -3681,7 +3793,9 @@ def run(
             scheduler.set_disclosure_accepted(config.disclosure_accepted)
             scheduler.set_git_ssh(line_git_ssh)
             scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
-            scheduler.set_runs(config.run_commands)
+            scheduler.set_runs(
+                config.run_commands, config.run_commit_commands, config.run_commit_refs
+            )
             check_lines_sandboxed(config, log, scheduler)
             check_roles(scheduler, log, config)
             apply_project(scheduler, log, config)

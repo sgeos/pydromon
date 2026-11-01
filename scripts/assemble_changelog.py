@@ -35,7 +35,9 @@ library.
 entry goes in a fragment. Two edits are allowed, because neither adds, removes or
 changes an entry. A *release* adds a version heading, leaves Unreleased empty, and
 keeps every entry that was in Unreleased and every released line, and either deletes a
-fragment or had entries in Unreleased. A *lossless regrouping* leaves Unreleased exactly
+fragment or had entries in Unreleased. Its new section holds exactly the Unreleased
+entries and the deleted fragments' lines, each under its own type, so no entry is
+dropped or moved to another type. A *lossless regrouping* leaves Unreleased exactly
 as ``collapse`` would write the base's, so a section with repeated headings can be
 tidied once, and a section already tidy has nothing left to regroup. The regrouping is
 the cleanest exception for the branch that introduced this rule, since it needs no
@@ -282,26 +284,86 @@ def is_regrouping(base: str, head: str) -> bool:
         return False
 
 
-def is_release(base: str, head: str, removed: list[str]) -> bool:
+def typed_entries(text: str, headings: set[str]) -> Counter[tuple[str, str]] | None:
+    """Each entry line of the sections ``headings`` name, with the type heading it
+    sits under, or ``None`` when such a section has text above its first type
+    heading or a heading that is not a type."""
+    found: Counter[tuple[str, str]] = Counter()
+    inside = False
+    kind: str | None = None
+    for line in text.split("\n"):
+        if line.startswith("## "):
+            inside, kind = line in headings, None
+            continue
+        if not inside:
+            continue
+        if line.startswith("### "):
+            kind = line[4:].strip()
+            if kind not in TYPES:
+                return None
+            continue
+        if line.strip():
+            if kind is None:
+                return None
+            found[(kind, line)] += 1
+    return found
+
+
+def released_entries(
+    unreleased: dict[str, str], removed: list[Fragment]
+) -> Counter[tuple[str, str]]:
+    """What a release of ``unreleased`` and ``removed`` must hold, each line with its
+    type."""
+    owed: Counter[tuple[str, str]] = Counter()
+    sources = [*unreleased.items(), *((f.type, f.body) for f in removed)]
+    for kind, body in sources:
+        for line in body.split("\n"):
+            if line.strip():
+                owed[(kind, line)] += 1
+    return owed
+
+
+def is_release(base: str, head: str, removed: list[Fragment]) -> bool:
     """Whether ``head`` is ``base`` released. A version heading is new, Unreleased is
     empty, every released line of ``base`` and every entry of its Unreleased is still
-    there, and something was released, a deleted fragment or Unreleased entries."""
+    there, and something was released, a deleted fragment or Unreleased entries.
+
+    Round 14, item 10. Every line the release adds outside Unreleased must also come
+    from somewhere, the entries Unreleased held, the bodies of the fragments the
+    branch deletes, or the new version headings, so that a release cannot slip in
+    an entry no fragment held. Lines are compared as a multiset, ignoring blank
+    lines and type headings, which the release writes itself.
+
+    Audit of round 14, T1 and T2. The new sections must also hold exactly what was
+    released, each line under its own type, the type of the Unreleased heading it
+    sat under or of the fragment that held it. A release can therefore neither drop
+    a deleted fragment's entry nor move an entry to another type heading."""
     try:
         before = split_changelog(base)
         after = split_changelog(head)
     except ChangelogError:
         return False
-    if not version_headings(head) - version_headings(base) or after.unreleased:
+    new_headings = version_headings(head) - version_headings(base)
+    if not new_headings or after.unreleased:
         return False
     kept = entry_lines(unreleased_text(base))
     kept.pop(UNRELEASED, None)
-    wanted = entry_lines(outside_unreleased(base)) + kept
-    if wanted - entry_lines(outside_unreleased(head)):
+    old = entry_lines(outside_unreleased(base))
+    found = entry_lines(outside_unreleased(head))
+    if (old + kept) - found:
+        return False
+    sources = kept + Counter(new_headings)
+    for fragment in removed:
+        sources += entry_lines(fragment.body)
+    if (found - old) - sources:
+        return False
+    owed = released_entries(before.unreleased, removed)
+    if typed_entries(head, new_headings) != owed:
         return False
     return bool(removed) or bool(before.unreleased)
 
 
-def branch_violation(base: str, head: str, removed: list[str]) -> str | None:
+def branch_violation(base: str, head: str, removed: list[Fragment]) -> str | None:
     """Why a branch breaks the rule, or ``None``. ``base`` and ``head`` are the
     changelog before and after the branch, ``removed`` the fragment files it deletes."""
     if unreleased_text(base) == unreleased_text(head):
@@ -337,14 +399,20 @@ def find_base(root: Path, requested: str | None) -> str | None:
     return None
 
 
-def removed_fragments(root: Path, base: str) -> list[str]:
-    """The fragment files a working tree deletes against ``base``."""
+def removed_fragments(root: Path, base: str) -> list[Fragment]:
+    """The fragments a working tree deletes against ``base``, as ``base`` holds
+    them, so a release can be checked against what they said. Raises
+    ``ChangelogError`` for one that cannot be read there or does not parse."""
     status = run_git(root, "diff", "--name-status", base, "--", FRAGMENTS_DIRECTORY)
-    removed: list[str] = []
+    removed: list[Fragment] = []
     for line in (status or "").splitlines():
         kind, _, name = line.partition("\t")
-        if kind.startswith("D") and Path(name).name not in NOT_FRAGMENTS:
-            removed.append(Path(name).name)
+        if not kind.startswith("D") or Path(name).name in NOT_FRAGMENTS:
+            continue
+        text = run_git(root, "show", f"{base}:{name}")
+        if text is None:
+            raise ChangelogError(f"{name}: the deleted fragment cannot be read at base")
+        removed.append(parse_fragment(Path(name).name, text))
     return removed
 
 

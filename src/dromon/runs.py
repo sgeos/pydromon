@@ -49,6 +49,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import select
 import signal
 import stat
@@ -67,6 +68,7 @@ from dromon.model import (
     MAX_EXIT_CODE,
     MAX_RUN_NOTE_BYTES,
     ID_PATTERN,
+    Run,
     RunStarted,
     RunStatus,
     format_due,
@@ -137,6 +139,9 @@ class Finding:
     note: str
     output_digest: str | None
     output_bytes: int | None
+    summary: str | None = None
+    """The test summary the output ends with, as ``gate_summary`` reads it, or
+    ``None`` when it holds none. Round 14, item 2."""
 
 
 @dataclass(slots=True)
@@ -197,6 +202,180 @@ def open_output(workdir: Path, run_id: str) -> tuple[int, str]:
     return output, "/".join((*OUTPUT_DIRECTORY, name))
 
 
+def _open_output_read(workdir: Path, output_file: str) -> int | None:
+    """A descriptor of a run's output open for reading, as ``open_output`` opens it,
+    or ``None`` when it cannot be opened. The caller checks that it is a regular
+    file before reading, as ``output_digest`` says why."""
+    *parts, name = output_file.split("/")
+    try:
+        directory = _open_beneath(workdir, parts, create=False)
+        try:
+            return os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                dir_fd=directory,
+            )
+        finally:
+            os.close(directory)
+    except OSError:
+        return None
+
+
+TAIL_BYTES: Final = 64 * 1024
+"""How much of the end of a run's output is read for its test summary. pytest's
+short summary and its final line come last, and 64 KiB holds them for any gate this
+project runs. **Assumption.** A summary of more than that many bytes is cut at its
+start, so its first skip reasons may be missed."""
+
+MAX_SKIP_REASONS: Final = 8
+"""The most skip reasons a summary names, the rest counted."""
+
+MAX_SUMMARY_LINE: Final = 200
+"""The most characters of one line of output a summary keeps."""
+
+MAX_REASON_CHARS: Final = 80
+"""The most characters of one skip reason a summary keeps, after its place."""
+
+SUMMARY_PATTERN: Final = re.compile(
+    r"=*\s*((?:\d+ (?:passed|failed|skipped|deselected|xfailed|xpassed|errors?"
+    r"|warnings?)(?:, )?)+) in \d"
+)
+"""pytest's final line, such as ``5162 passed, 10 skipped, 48 deselected in 231.5s``,
+with or without the rule of equals signs it has without ``-q``."""
+
+SKIP_PATTERN: Final = re.compile(r"SKIPPED \[\d+\] \S")
+"""A line of pytest's short summary naming skipped tests, which ``-rs`` prints as
+``SKIPPED [COUNT] FILE:LINE: REASON``."""
+
+SECTION_MARK: Final = "short test summary info"
+
+
+def output_tail(workdir: Path, output_file: str) -> bytes | None:
+    """The last ``TAIL_BYTES`` of a run's output, opened as ``output_digest`` opens
+    it, or ``None`` when it cannot be read as a regular file. Blocking, so it runs
+    on the process worker."""
+    descriptor = _open_output_read(workdir, output_file)
+    if descriptor is None:
+        return None
+    with os.fdopen(descriptor, "rb", buffering=0) as handle:
+        status = os.fstat(handle.fileno())
+        if not stat.S_ISREG(status.st_mode):
+            return None
+        handle.seek(max(0, status.st_size - TAIL_BYTES))
+        tail = b""
+        # Bounded, since each read but the last returns at least one byte.
+        for _ in range(TAIL_BYTES):
+            chunk = handle.read(TAIL_BYTES - len(tail))
+            if not chunk:
+                break
+            tail += chunk
+            if len(tail) >= TAIL_BYTES:
+                break
+        return tail
+
+
+def _printable(raw: str) -> str:
+    """``raw`` without characters that are not printable, cut to
+    ``MAX_SUMMARY_LINE``, since the output is the line's to write."""
+    return "".join(c for c in raw if c.isprintable()).strip()[:MAX_SUMMARY_LINE]
+
+
+def _skip_reason(line: str) -> str:
+    """One skip line as its count and place and at most ``MAX_REASON_CHARS`` of its
+    reason, so a forged reason carries little text. **Audit of round 14.**"""
+    entry = line.removeprefix("SKIPPED ")
+    place, sep, reason = entry.partition(": ")
+    if not sep:
+        return entry[:MAX_REASON_CHARS]
+    cut = reason[:MAX_REASON_CHARS]
+    return f"{place}: {cut}{'...' if len(reason) > MAX_REASON_CHARS else ''}"
+
+
+def gate_summary(tail: bytes) -> str | None:
+    """pytest's final line in ``tail`` and the skip reasons of the short summary
+    before it, or ``None`` when ``tail`` holds no final line. **Round 14, item 2.**
+    The daemon reads this from the output, which a writing line can edit, so it is
+    what the output says, never what the daemon saw run. pytest does not name
+    deselected tests, so only their count is given, in the final line.
+
+    **Audit of round 14.** Only the last short summary block is read. Where the
+    tail holds pytest's ``short test summary info`` mark, the summary is the first
+    final line after the last mark, with the skip lines between, and is ``None``
+    when no final line follows it. Without a mark, the last final line is taken,
+    with no reasons, as pytest prints the mark whenever it has a reason to name. A
+    command can still print a forged block last, which is why the note labels the
+    summary unverified."""
+    lines = [_printable(raw) for raw in tail.decode("utf-8", "replace").splitlines()]
+    marks = [index for index, line in enumerate(lines) if SECTION_MARK in line]
+    if not marks:
+        finals = [found for line in lines if (found := SUMMARY_PATTERN.match(line))]
+        return finals[-1].group(1).rstrip(", ") if finals else None
+    summary: str | None = None
+    reasons: list[str] = []
+    for line in lines[marks[-1] + 1 :]:
+        if SKIP_PATTERN.match(line):
+            reasons.append(_skip_reason(line))
+            continue
+        found = SUMMARY_PATTERN.match(line)
+        if found is not None:
+            summary = found.group(1).rstrip(", ")
+            break
+    if summary is None:
+        return None
+    if not reasons:
+        return summary
+    shown = "; ".join(reasons[:MAX_SKIP_REASONS])
+    more = len(reasons) - MAX_SKIP_REASONS
+    rest = f"; and {more} more" if more > 0 else ""
+    return f"{summary}, skipped {shown}{rest}"
+
+
+SUMMARY_LABEL: Final = "Unverified, the run's own output ends with the test summary"
+"""How a note introduces the summary. **Audit of round 14.** The output is the
+line's to write, so the summary is labelled as its claim wherever the note is shown,
+in ``run_status``, the holder's ``Run ended`` note and ``dromon run status``."""
+
+
+def note_with_summary(note: str, summary: str | None) -> str:
+    """The run's note with its output's test summary after it, labelled unverified
+    and quoted, cut to ``MAX_RUN_NOTE_BYTES`` at a character boundary, so
+    ``run_ended`` holds it."""
+    if summary is None:
+        return note
+    lead = f"{note}. " if note else ""
+    text = f'{lead}{SUMMARY_LABEL} "{summary}"'
+    return text.encode()[:MAX_RUN_NOTE_BYTES].decode("utf-8", "ignore")
+
+
+def failed(run: Run) -> bool:
+    """Whether ``run`` ended other than by exiting with code 0."""
+    ended = run.ended
+    if ended is None:
+        return False
+    return ended.status is not RunStatus.EXITED or ended.exit_code != 0
+
+
+def corrections(scope: Sequence[Run]) -> dict[str, tuple[str, ...]]:
+    """Each run of ``scope``, oldest first, that exited with code 0 after failed
+    runs of the same command, mapped to those runs, the oldest first. **Round 14,
+    item 2.** A failed run is corrected by the next run of its command that passed,
+    so a receipt that failed is linked to the one that corrected it, and both stay
+    in the log with their output files. Bounded by the runs of ``scope``."""
+    waiting: dict[str, list[str]] = {}
+    found: dict[str, tuple[str, ...]] = {}
+    for run in scope:
+        if run.ended is None:
+            continue
+        command = run.started.command
+        if failed(run):
+            waiting.setdefault(command, []).append(run.started.run_id)
+            continue
+        corrected = waiting.pop(command, [])
+        if corrected:
+            found[run.started.run_id] = tuple(corrected)
+    return found
+
+
 def output_digest(workdir: Path, output_file: str) -> tuple[str | None, int | None]:
     """The SHA-256 digest and size of a run's output, read as ``open_output``
     opens it, or both ``None`` when it cannot be read as a regular file. The digest
@@ -206,18 +385,8 @@ def output_digest(workdir: Path, output_file: str) -> tuple[str | None, int | No
     ``O_NONBLOCK``, which makes opening a pipe with no writer return at once, and is
     read only once ``fstat`` shows a regular file. Without it the open waits for a
     writer, and with it the process worker, for as long as the line likes."""
-    *parts, name = output_file.split("/")
-    try:
-        directory = _open_beneath(workdir, parts, create=False)
-        try:
-            descriptor = os.open(
-                name,
-                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-                dir_fd=directory,
-            )
-        finally:
-            os.close(directory)
-    except OSError:
+    descriptor = _open_output_read(workdir, output_file)
+    if descriptor is None:
         return None, None
     with os.fdopen(descriptor, "rb", buffering=0) as handle:
         status = os.fstat(handle.fileno())
@@ -416,13 +585,16 @@ def launch(
     argv: Sequence[str],
     environment: Mapping[str, str],
     start_of: Callable[[int], str | None] = process_start,
+    command_dir: Path | None = None,
 ) -> Launched:
     """Open the run's output, start its supervisor, wait until it says it is ready,
     so that a stop can no longer find it without its handlers, and read the
     supervisor's start time. It then waits for ``GO``. Raises ``RunRefused`` and
     leaves nothing running when any step fails. Blocking, so it runs on the process
-    worker."""
+    worker. The output is always under ``workdir``, and the command runs in
+    ``command_dir`` where one is given, a commit run's checkout, round 14, item 1."""
     output, output_file = open_output(workdir, run_id)
+    runs_in = workdir if command_dir is None else command_dir
     ready_read, ready_write = os.pipe()
     try:
         child = subprocess.Popen(  # noqa: S603
@@ -433,7 +605,7 @@ def launch(
                 "dromon.runs",
                 str(receipt_path(directory, run_id)),
                 run_id,
-                str(workdir),
+                str(runs_in),
                 str(ready_write),
                 "--",
                 *argv,
@@ -545,8 +717,10 @@ def reconcile(
                     f" process, started {started}, so its supervisor is gone without"
                     " a receipt"
                 )
+                # Audit of round 14. A lost run has no result, so no summary its
+                # output gives is shown as one, however green it reads.
                 found.append(
-                    Finding(run.run_id, RunStatus.LOST, None, note, *_digest(run))
+                    Finding(run.run_id, RunStatus.LOST, None, note, *_digest(run), None)
                 )
                 continue
         found.append(
@@ -556,6 +730,7 @@ def reconcile(
                 receipt.exit_code,
                 receipt.note,
                 *_digest(run),
+                _summary(run),
             )
         )
     return found
@@ -563,6 +738,11 @@ def reconcile(
 
 def _digest(run: RunStarted) -> tuple[str | None, int | None]:
     return output_digest(Path(run.workdir), run.output_file)
+
+
+def _summary(run: RunStarted) -> str | None:
+    tail = output_tail(Path(run.workdir), run.output_file)
+    return None if tail is None else gate_summary(tail)
 
 
 def signal_run(

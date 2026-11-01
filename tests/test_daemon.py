@@ -224,6 +224,24 @@ def test_daemon_run_finally_joins_a_process_worker_with_a_running_call(
     assert "dromond: stopped" in capsys.readouterr().err
 
 
+def test_a_start_makes_every_private_directory_and_refuses_naming_each_wide_one(
+    paths: ProjectPaths, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round 14, item 8. Every private directory is made with mode 0700 before any
+    turn, and a start with wide ones refuses, naming each, not only the first."""
+    daemon_module.check_private_dirs(paths)
+    for directory in daemon_module.private_dirs(paths):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    wide = [daemon_module.private_dirs(paths)[2], daemon_module.private_dirs(paths)[3]]
+    for directory in wide:
+        directory.chmod(0o755)
+    assert daemon_module.run(paths) == exits.FAILURE
+    err = capsys.readouterr().err
+    assert "private directories Dromon owns are not private" in err
+    assert all(str(directory) in err for directory in wide)
+    assert all(stat.S_IMODE(d.stat().st_mode) == 0o755 for d in wide)
+
+
 def test_stop_answers_then_requests_the_stop(paths: ProjectPaths) -> None:
     response, stopping = handle(paths, b'{"id":"x","op":"stop","v":1}\n')
     assert response.result == {"stopping": True}
