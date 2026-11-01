@@ -126,9 +126,34 @@ project settings.
    the line's own making. **Round 14, review of 1449c5c, C1.** They also include the
    common directory's `refs/remotes` and `packed-refs`, where git's files backend
    keeps the remote-tracking refs, so that only the operator's fetch moves the refs a
-   commit run may name, as [`RUNS.md`](../architecture/RUNS.md) gives. A line can then
-   neither pack refs nor delete a packed one, which only the operator's sessions do.
-   Only writes are denied, so the line can still read them and commit. A `.git` or `commondir` that cannot be read, or that is malformed, ends the
+   commit run may name, as [`RUNS.md`](../architecture/RUNS.md) gives. Only writes
+   are denied, so the line can still read them and commit.
+   **Round 14, re-review of 522c146, item 3. What the `packed-refs` deny costs.**
+   Git rewrites `packed-refs` whole, under a new inode, whenever a packed ref is
+   removed or the refs are packed. So for a line with an enabled sandbox, deleting or
+   renaming a branch that is in `packed-refs`, `git tag -d` of a packed tag, `git
+   update-ref -d` of a packed ref, `git pack-refs` and `git gc` fail. A commit on a
+   packed branch, deleting a branch that is only a loose ref and creating a tag leave
+   `packed-refs` unchanged and keep working. **Fact, observed by the audit line in a
+   scratch repository on 2026-11-01, watching the inode.** `git gc --auto`, which a
+   commit or a merge may start, is expected to fail at its packing step and print an
+   error without failing the commit. **Hypothesis, not observed.** These tasks are
+   left to the operator's own sessions. Fetching, which writes `refs/remotes`, was
+   already out of reach, since a sandboxed line has no network and cannot add a
+   remote with `config` guarded.
+   **Round 14, re-review of 522c146, C1a. Renaming a parent.** A deny on a path
+   would not hold if a line could rename its parent, such as `refs`, aside and put a
+   directory or a link of its own in its place. Claude Code also denies
+   `file-write-unlink`, which a rename of its source needs, on each parent of a
+   denied path that lies inside a writable root, so `refs` and the common directory
+   itself cannot be renamed or removed while `refs/heads` stays writable. **Fact,
+   read on 2026-11-01 in the sandbox profile generator bundled with Claude Code
+   2.1.316. Inference, not tested live, that Seatbelt then refuses the rename.**
+   Claude Code's settings have no separate rule for renames, so Dromon adds none. The
+   daemon also checks the refs it trusts with `lstat` before a commit run, as
+   [`RUNS.md`](../architecture/RUNS.md) gives, which refuses a link but not a real
+   directory a line made, so the sandbox's rule is what keeps that out.
+   A `.git` or `commondir` that cannot be read, or that is malformed, ends the
    turn before any command runs, and `dromond` refuses a project file with such a line.
    Git itself refuses such a checkout. **Fact, observed on 2026-10-26 with Claude
    Code 2.1.310 on macOS.** A deny entry wins over an allow entry. A Haiku line in a

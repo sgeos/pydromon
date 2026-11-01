@@ -274,6 +274,115 @@ def test_a_repository_without_the_files_backend_is_refused(
     assert asked == ["cat-file", "config"]
 
 
+def line_made_refs(repository: Path, side: str) -> Path:
+    """A directory a line could make, holding refs in which ``origin/main`` points
+    at ``side``, and ``packed-refs`` removed so that git reads only the loose refs."""
+    made = repository.parent / "line-refs"
+    (made / "remotes" / "origin").mkdir(parents=True)
+    (made / "heads").mkdir()
+    (made / "remotes" / "origin" / "main").write_text(f"{side}\n")
+    (made / "heads" / "main").write_text(f"{side}\n")
+    return made
+
+
+@pytest.mark.parametrize("where", ["refs", "refs/remotes", "refs/remotes/origin"])
+def test_a_ref_directory_that_is_a_link_is_refused(
+    repo: tuple[Path, str, str], where: str
+) -> None:
+    """Re-review of 522c146, C1a. With ``where`` a link into a line's directory, git
+    reads the line's ``origin/main``, which points at a commit the line chose. The
+    control shows git accepts it, and the check refuses it."""
+    repository, _, side = repo
+    environment = git_env(repository.parent)
+    made = line_made_refs(repository, side)
+    common = repository / ".git"
+    target = common / where
+    os.rename(target, repository.parent / "moved")
+    source = made / Path(where).relative_to("refs") if where != "refs" else made
+    os.symlink(source, target)
+    assert git(repository, "rev-parse", "refs/remotes/origin/main") == side
+    with pytest.raises(commitruns.CommitRefused, match="not a real directory"):
+        commitruns.check_commit(repository, side, MAIN, environment)
+
+
+@pytest.mark.parametrize("which", ["packed", "loose"])
+def test_a_ref_file_that_is_a_link_is_refused(
+    repo: tuple[Path, str, str], which: str
+) -> None:
+    repository, main, _ = repo
+    environment = git_env(repository.parent)
+    common = repository / ".git"
+    if which == "packed":
+        git(repository, "pack-refs", "--all")
+        path = common / "packed-refs"
+    else:
+        path = common / "refs" / "remotes" / "origin" / "main"
+    os.rename(path, repository.parent / "moved")
+    os.symlink(repository.parent / "moved", path)
+    assert git(repository, "rev-parse", "refs/remotes/origin/main") == main
+    with pytest.raises(commitruns.CommitRefused, match="not a real file"):
+        commitruns.check_commit(repository, main, MAIN, environment)
+
+
+def test_a_dot_git_that_is_a_link_is_refused(repo: tuple[Path, str, str]) -> None:
+    repository, main, _ = repo
+    environment = git_env(repository.parent)
+    os.rename(repository / ".git", repository.parent / "elsewhere.git")
+    os.symlink(repository.parent / "elsewhere.git", repository / ".git")
+    assert git(repository, "rev-parse", "refs/remotes/origin/main") == main
+    with pytest.raises(commitruns.CommitRefused, match="is a link"):
+        commitruns.check_commit(repository, main, MAIN, environment)
+
+
+def test_a_ref_store_of_another_user_is_refused(
+    repo: tuple[Path, str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, main, _ = repo
+    environment = git_env(repository.parent)
+    commitruns.check_commit(repository, main, MAIN, environment)
+    owner = os.getuid()
+    monkeypatch.setattr(commitruns.os, "getuid", lambda: owner + 1)
+    with pytest.raises(commitruns.CommitRefused, match="not this user's"):
+        commitruns.check_commit(repository, main, MAIN, environment)
+
+
+def test_a_ref_store_swapped_during_the_match_is_refused(
+    repo: tuple[Path, str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-review of 522c146, C1a. The store is read before and after the match, so
+    one replaced while git read it refuses the commit, here a ``packed-refs``
+    rewritten under a new inode as a fetch or a swap would leave it."""
+    repository, main, _ = repo
+    environment = git_env(repository.parent)
+    git(repository, "pack-refs", "--all")
+    real_git = commitruns._git  # pyright: ignore[reportPrivateUsage]
+
+    def swapping_git(
+        arguments: Sequence[str], cwd: Path, environment: Mapping[str, str]
+    ) -> subprocess.CompletedProcess[bytes]:
+        result = real_git(arguments, cwd, environment)
+        if arguments[0] == "for-each-ref":
+            packed = repository / ".git" / "packed-refs"
+            copy = packed.with_name("packed-refs.new")
+            copy.write_bytes(packed.read_bytes())
+            os.replace(copy, packed)
+        return result
+
+    monkeypatch.setattr(commitruns, "_git", swapping_git)
+    with pytest.raises(commitruns.CommitRefused, match="changed while"):
+        commitruns.check_commit(repository, main, MAIN, environment)
+
+
+@pytest.mark.parametrize(
+    "name", ["refs/heads/main", "refs/remotes/origin/../x", "refs/remotes//main"]
+)
+def test_a_matched_ref_outside_the_remotes_cannot_be_checked(
+    tmp_path: Path, name: str
+) -> None:
+    with pytest.raises(commitruns.CommitRefused, match="cannot be checked"):
+        commitruns._check_ref_path(tmp_path, name)  # pyright: ignore[reportPrivateUsage]
+
+
 # The checkout.
 
 

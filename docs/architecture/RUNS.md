@@ -62,9 +62,22 @@ the point of it, since it must outlive the engine, and it is also its risk.
   `origin/main`, in the working tree and with untracked files, prints the difference,
   and syncs a worktree that differs only on the operator's yes or with
   `--accept-changes`. A worktree that matches is synced without a question, and one
-  whose difference cannot be read is not synced. **Residual.** A file git ignores
-  inside a backend path is not shown, and a build backend fetched from an index is
-  shown only as the `pyproject.toml` line that names it.
+  whose difference cannot be read is not synced. **Round 14, re-review of 522c146,
+  S1b.** Those three missed inputs, so a vendored dependency's edited backend ran in a
+  sync with no difference shown. The command now compares `pyproject.toml`, `uv.lock`,
+  `uv.toml`, `.python-version`, `.python-versions` and every local source directory
+  that `[tool.uv.sources]` or `uv.lock` names. Where the files a build reads cannot be
+  bounded it compares the whole worktree and says why. That is so for a backend path,
+  a workspace, a build backend other than uv's own `uv_build`, which may run any file
+  of the project, an index, link, cache or interpreter mirror in a local place, a
+  source from a local git repository or address, and a configuration file Python's
+  reader cannot parse. A local source outside the worktree leaves it unsynced.
+  **Residual.** A file git ignores inside a compared directory is not shown, a build
+  backend fetched from an index is shown only as the `pyproject.toml` line that names
+  it, configuration uv reads outside the worktree is not compared, and the worktree's
+  virtual environment, which git ignores and whose interpreter uv runs, is not
+  compared. **Hypothesis, not tested.** A line that writes its `.venv` could have a
+  sync run code of its own that way.
 - **Who may start or stop.** A seat may start or stop its role's runs only while it
   owns the role, so the one-writer rule holds for what a run writes. Every line, a
   seat that owns its role included, also needs `write` access to its working
@@ -411,7 +424,18 @@ commit run is stopped with the same access it was started with.
    for-each-ref --points-at`, in the project's repository, with arguments as an array
    and never a shell string. **Round 14, review of 1449c5c, C1.** Only a tip
    qualifies. Before, any commit a matching ref contained did, so a commit merged and
-   reverted since, or fixed since, could run.
+   reverted since, or fixed since, could run. **Round 14, re-review of 522c146, C1a.**
+   The checkout's `.git`, the common git directory, its `refs`, `refs/remotes` and
+   `packed-refs`, and each directory and loose file of a matched ref below
+   `refs/remotes` must be real and owned by the daemon's user, not links, checked with
+   `lstat`. `refs`, `refs/remotes` and `packed-refs` are read before and after the
+   match, and a change of any refuses the start, so a swap while git reads them is
+   caught too, and so is a fetch that ends meanwhile, which a retry after the cooldown
+   passes. Before, with `refs` replaced by a link to a line's directory, a line's
+   commit was accepted as the tip of `origin/main`. A real directory a line put in
+   place of `refs` would pass this check, and only the sandbox's rule against renaming
+   a parent of a denied path keeps it out, as [`SANDBOX.md`](../protocol/SANDBOX.md)
+   gives.
 2. It makes `commit-runs/RUN`, mode 0700, in the daemon's state directory, holding
    `home`, empty and mode 0700, and `tree`, filled with `git clone --no-checkout
    --shared` of the project's repository, then an `info/attributes` of `* -filter` in
@@ -546,7 +570,12 @@ the operator's global configuration defines and one a configuration still read
 defines, each run without the protections first as a control, a hook likewise, a git
 call killed with its child at its bound, a refused start recorded with a cooldown
 that outlives a restart, a second start refused while one is in progress, the
-checkout made on the commit worker, and the fresh home. **Coverage gap.** The
+checkout made on the commit worker, and the fresh home. From the re-review of 522c146
+it covers a link at `refs`, `refs/remotes`, a remote's directory, `packed-refs`, a
+loose ref and `.git`, each with git shown reading through it first, a store of
+another user, a store replaced during the match, and a matched ref outside
+`refs/remotes`. **Coverage gap.** No test runs Claude Code's sandbox, so the rule
+against renaming `refs` is read from its code and not observed. The
 real-process tests stand in for `ps` as the other run tests do. No test reaches the
 network, so the large file filter's own behaviour is shown only by the review's
 experiment, and the filter test stands in for it with a filter that records its run.

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from dromon import cli, exits, land
+from dromon import buildinputs, cli, exits, land
 from dromon.land import Completed
 from dromon.paths import ProjectPaths, project_paths
 from dromon.protocol import ErrorCode, Operation, Response
@@ -185,7 +185,8 @@ def test_a_worktree_whose_build_inputs_differ_is_shown_and_asked_about(
         {"--no-ext-diff", "--no-textconv", "core.fsmonitor=false"} <= set(argv)
         for argv in diffs
     )
-    assert all(argv[-2:] == ("pyproject.toml", "uv.lock") for argv in diffs)
+    compared = buildinputs.CONFIG_FILES
+    assert all(tuple(argv[-len(compared) :]) == compared for argv in diffs)
 
 
 def test_accept_changes_syncs_after_showing_without_asking(

@@ -43,7 +43,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from dromon import workdir
 from dromon.model import COMMIT_PATTERN, ID_PATTERN
+from dromon.sandbox import SandboxError
 
 GIT_SECONDS: Final = 60.0
 """The bound on one git call. A commit run's start makes at most six, so it holds
@@ -73,6 +75,9 @@ command is given."""
 
 MAX_REF_PATTERNS: Final = 16
 MAX_REF_PATTERN_BYTES: Final = 256
+MAX_MATCHED_REFS: Final = 64
+"""The most matched refs whose paths are checked. One that points at the commit is
+enough, and the first are checked, so the check is bounded."""
 MAX_SWEPT: Final = 4096
 """The most entries one sweep reads, so a directory filled by a fault is still
 bounded. What is left is removed by the next sweep."""
@@ -245,7 +250,16 @@ def check_commit(
     ``repository`` that a ref matching one of ``patterns`` points at now, in a
     repository whose refs are kept by the files backend. Raises ``CommitRefused``.
     **Round 14, review of 1449c5c, C1.** Only a tip qualifies, not every commit a
-    ref contains, so a commit since reverted or fixed does not run."""
+    ref contains, so a commit since reverted or fixed does not run.
+
+    **Round 14, re-review of 522c146, C1a.** The checkout's ``.git``, the common git
+    directory, its ``refs``, ``refs/remotes`` and ``packed-refs``, and each directory
+    and loose file of a matched ref must be real and this user's, not links, checked
+    with ``lstat``. With ``refs`` replaced by a link to a line's directory, git read a
+    line's ref as ``origin/main``. The store is read again after the match, and a
+    change refuses the commit, so a swap during the match is caught too. A real
+    directory a line put in place of ``refs`` passes this check. Only the sandbox
+    keeps a line from renaming ``refs``, as ``SANDBOX.md`` gives."""
     if COMMIT_PATTERN.fullmatch(commit) is None:
         raise CommitRefused(
             f"{commit!r} is not a full commit, 40 or 64 lowercase hexadecimal"
@@ -263,6 +277,8 @@ def check_commit(
             "the project's repository does not keep its refs in the files backend,"
             " so a line's sandbox cannot be kept from moving refs/remotes"
         )
+    common = _common_directory(repository)
+    before = _ref_store(common)
     tips = _git(
         ["for-each-ref", "--format=%(refname)", f"--points-at={commit}", *patterns],
         repository,
@@ -270,11 +286,97 @@ def check_commit(
     )
     if tips.returncode != 0:
         raise CommitRefused(f"the refs at {commit} cannot be read: {_said(tips)}")
-    if not tips.stdout.strip():
+    matched = tips.stdout.decode(errors="replace").split()
+    if not matched:
         raise CommitRefused(
             f"no ref matching {', '.join(patterns)} points at {commit}. Only the tip"
             " of an allowed ref runs, so name the commit such a ref holds now"
         )
+    for name in matched[:MAX_MATCHED_REFS]:
+        _check_ref_path(common, name)
+    if _ref_store(common) != before:
+        raise CommitRefused(
+            f"the refs of {common} changed while {commit} was checked, so it is"
+            " refused. Start it again once no fetch is running"
+        )
+
+
+def _common_directory(repository: Path) -> Path:
+    """The common git directory of ``repository``, found as the sandbox guards find
+    it, after checking that the checkout's ``.git`` is not a link. Raises
+    ``CommitRefused``."""
+    dot = repository / ".git"
+    try:
+        found = os.lstat(dot)
+    except OSError as error:
+        raise CommitRefused(f"{dot} cannot be read: {error}") from error
+    if stat.S_ISLNK(found.st_mode) or found.st_uid != os.getuid():
+        raise CommitRefused(f"{dot} is a link or not this user's, so its refs are not")
+    try:
+        common = workdir.git_common_directory(repository)
+    except SandboxError as error:
+        raise CommitRefused(str(error)) from error
+    if common is None:
+        raise CommitRefused(f"{repository} is not a git checkout")
+    _real_entry(common, directory=True, required=True)
+    return common
+
+
+def _real_entry(path: Path, *, directory: bool, required: bool) -> tuple[int, int]:
+    """The device and inode of ``path``, read with ``lstat``, after checking that it
+    is a directory or a regular file as ``directory`` says, owned by this user, and
+    not a link. ``(0, 0)`` stands for a path that does not exist, which is refused
+    when ``required``. Raises ``CommitRefused``. **Round 14, re-review of 522c146,
+    C1a.** A link would let git read refs from a directory a line made."""
+    try:
+        found = os.lstat(path)
+    except FileNotFoundError:
+        if required:
+            raise CommitRefused(f"{path} does not exist") from None
+        return (0, 0)
+    except OSError as error:
+        raise CommitRefused(f"{path} cannot be read: {error}") from error
+    kind = stat.S_ISDIR if directory else stat.S_ISREG
+    if (
+        stat.S_ISLNK(found.st_mode)
+        or not kind(found.st_mode)
+        or found.st_uid != os.getuid()
+    ):
+        raise CommitRefused(
+            f"{path} is not a real {'directory' if directory else 'file'} of this"
+            " user, so the refs a commit run names cannot be trusted"
+        )
+    return (found.st_dev, found.st_ino)
+
+
+def _ref_store(common: Path) -> tuple[tuple[int, int], ...]:
+    """The identities of ``refs``, ``refs/remotes`` and ``packed-refs`` in the common
+    git directory, each checked by ``_real_entry``. ``refs`` must exist, the other two
+    may not. Raises ``CommitRefused``."""
+    refs = common / "refs"
+    return (
+        _real_entry(refs, directory=True, required=True),
+        _real_entry(refs / "remotes", directory=True, required=False),
+        _real_entry(common / "packed-refs", directory=False, required=False),
+    )
+
+
+def _check_ref_path(common: Path, name: str) -> None:
+    """Check each directory of the matched ref ``name`` below ``refs/remotes``, and
+    its loose file where there is one, with ``_real_entry``. A ref only in
+    ``packed-refs`` has no file. Raises ``CommitRefused``."""
+    parts = name.split("/")
+    if (
+        not name.startswith(REMOTE_REFS)
+        or len(name.encode()) > MAX_REF_PATTERN_BYTES
+        or any(part in ("", ".", "..") for part in parts)
+    ):
+        raise CommitRefused(f"the matched ref {name!r} cannot be checked")
+    path = common / "refs" / "remotes"
+    for part in parts[2:-1]:
+        path = path / part
+        _real_entry(path, directory=True, required=False)
+    _real_entry(path / parts[-1], directory=False, required=False)
 
 
 def _private_base(base: Path) -> None:

@@ -65,6 +65,18 @@ Type: Added
   move each allowed ref, and that a reading seat can read output a command wrote
   unsandboxed. **Rollback hazard.** A daemon from before this change cannot decode
   `commit_run_refused` and refuses the log once one is recorded.
+- Round 14, commit run re-review. A commit run is refused unless the checkout's
+  `.git`, the common git directory, its `refs`, `refs/remotes` and `packed-refs`, and
+  each directory and loose file of the matched ref are real and the daemon user's, not
+  links, read with `lstat` before and after the match, since a link at `refs` let a
+  line's commit pass as `origin/main`'s tip. `SANDBOX.md` records that Claude Code
+  already denies renaming a parent of a denied path, and that the `packed-refs` deny
+  makes deleting or renaming a packed branch or tag, `git pack-refs` and `git gc`
+  fail for a sandboxed line. `dromon sync-worktrees` also compares `uv.toml`,
+  `.python-version`, `.python-versions` and every local source directory the project
+  file or the lock names, and compares the whole worktree, saying why, where a backend
+  path, a workspace, a backend other than `uv_build`, a local index, link, cache or
+  mirror, or a local git source leaves the build's inputs unbounded.
 - Round 14, restart preflight. The read-only `start_context` request, on the client
   socket only, gives the daemon's interpreter and its `DROMON_REGISTRY_DIR` and
   `SSH_AUTH_SOCK`, and `dromon restart` runs its preflight on that interpreter with
