@@ -198,10 +198,11 @@ def ensure_index(registry_dir: Path) -> Path:
     return it. Raises ``FleetError`` when it cannot be made or is wider.
 
     **Review of 7ff033f, G5.** Codex's profile denies a protected path only when it
-    exists, and Grok's check requires only those that exist, so the daemon makes the
-    index before any engine is built, and every line's sandbox then denies it. Only
-    the index in use is made. **Limit.** A daemon given ``DROMON_REGISTRY_DIR`` leaves
-    the default index unmade, so a Codex or Grok line of such a daemon could make the
+    exists. Grok requires protected path denials even before they exist. The daemon
+    makes the index before any engine is built, and every line's sandbox then denies
+    it. Only the index in use is made. **Limit.** A daemon given
+    ``DROMON_REGISTRY_DIR`` leaves
+    the default index unmade, so a Codex line of such a daemon could make the
     default one, which a client without the override reads. Making it would reach
     outside the override, which no test may do."""
     directory = index_directory(registry_dir)

@@ -63,12 +63,38 @@ through its own explicit mechanism.
 
 The daemon runs the command without blocking its event loop. The command is the
 leader of its own process group. On a timeout, or when the daemon stops while it runs,
-that group is killed. A descendant that starts a new session escapes this signal and
-may outlive the command or daemon. Standard output is discarded. Standard error is
+that group is killed, and so is every descendant that a walk of the process table
+finds below the command, including one that started a session of its own.
+**Round 15, item 2.** The walk finds a process by its ancestry from the command alone,
+so another line's or the operator's processes are out of reach. It does not find a
+descendant whose parent had already exited, or one forked after the walk, and the
+group is not frozen first because a stopped child blocks Python 3.15's event loop
+watcher. A relay command carries no line's mark, which is why the mark is not used,
+and a command that double forks or daemonizes may outlive its notice. An operator
+should write a relay command that does neither. An unreadable process table, or a walk
+that takes more than 3 seconds, leaves the group kill alone. Standard output is discarded. Standard error is
 drained while the command runs, retaining at most 4,096 bytes, of which 200 reach a
 failure reason. Acceptance is judged by the command's exit status. Once it exits, the
-daemon closes its read end of standard error and does not wait for a descendant that
-inherited the pipe.
+daemon reads what the pipe holds, in at most 16 reads, closes its read end of standard
+error and does not wait for a descendant that inherited the pipe. **Round 15, item 1.**
+The pipe is made by Dromon and passed to the command as its standard error, and Dromon
+closes it with public interfaces only, `os.pipe`, a descriptor given as `stderr` and the
+loop's `add_reader`. It no longer reaches asyncio's private subprocess transport.
+**Re-review of 4da3e0e.** The read end is closed in a `finally` on the paths that end
+the command, so a second cancellation that arrives while the group is being ended does
+not leave the descriptor and the loop's reader behind. A loop that cannot watch the
+pipe leaves neither end open. Before a descendant that a timeout or stop found is
+killed, its parent and start time are read again and compared with the walk's, so a
+process that took the identifier of one that ended is not killed, as
+[`RUNS.md`](../architecture/RUNS.md) describes. The check runs before the group is
+killed, deepest descendant first so that a parent does not orphan its child ahead of
+the child's check. The checks, the group kill and the command's kill run in one worker
+thread, shielded from cancellation, because each check runs `ps` for up to a second and
+the event loop serves every line. A test holds a ticker on the loop while three slow
+checks run. **Limits.** A cancellation that arrives while the thread works does not
+stop it, which is intended, but the cancelled task returns before the kill is done, so
+the command is reaped by the loop's watcher and not awaited. A command with many
+descendants keeps one worker thread busy for up to a second each.
 
 ## File relay
 

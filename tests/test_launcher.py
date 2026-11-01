@@ -914,6 +914,107 @@ def test_a_walk_that_cannot_read_the_table_is_never_an_empty_tree(
     assert launcher._harness_tree(1, 2) == []  # pyright: ignore[reportPrivateUsage]
 
 
+class _WalkClock:
+    """A clock that only the pauses and the fake process table advance."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.pauses: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def pause(self, seconds: float) -> None:
+        self.pauses.append(seconds)
+        self.now += seconds
+
+
+def test_a_slow_process_table_is_retried_with_backoff_before_the_turn_is_refused() -> (
+    None
+):
+    """Round 14, item 1. A table that answers on the second attempt does not refuse
+    the turn, and each attempt is allowed longer than the one before."""
+    world = _WalkClock()
+    allowed: list[float] = []
+
+    def read(_uid: int, timeout: float) -> list[TreeRow] | TreeReadFailure:
+        allowed.append(timeout)
+        if len(allowed) == 1:
+            world.now += timeout
+            return TreeReadFailure("ps did not answer", timed_out=True)
+        world.now += 12.0
+        return []
+
+    assert walk_unavailable(read, world.pause, world.clock) is None
+    assert allowed == [
+        launcher.CHECK_ATTEMPT_SECONDS[0],
+        launcher.CHECK_ATTEMPT_SECONDS[1],
+    ]
+    assert world.pauses == [launcher.CHECK_PAUSE_SECONDS]
+    assert allowed[1] > allowed[0]
+
+
+def test_a_process_table_that_never_answers_is_refused_within_the_bound() -> None:
+    """Round 14, item 1. The reason carries each measured time and the total, and the
+    total stays within the deadline, pauses included."""
+    world = _WalkClock()
+
+    def read(_uid: int, timeout: float) -> list[TreeRow] | TreeReadFailure:
+        world.now += timeout
+        return TreeReadFailure("ps did not answer", timed_out=True)
+
+    reason = walk_unavailable(read, world.pause, world.clock)
+    assert reason is not None
+    assert world.now <= launcher.CHECK_DEADLINE_SECONDS
+    assert world.pauses == [1.0, 2.0]
+    assert reason == launcher.walk_timeout_reason([10.0, 20.0, 30.0], world.now)
+    assert "3 attempts" in reason
+    assert "10.0, 20.0, 30.0 seconds each" in reason
+    assert f"{world.now:.1f} seconds in all" in reason
+
+
+def test_a_deadline_shorter_than_the_attempts_cuts_the_last_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The total is a bound, so the last attempt gets only what remains of it."""
+    monkeypatch.setattr(launcher, "CHECK_DEADLINE_SECONDS", 25.0)
+    world = _WalkClock()
+    allowed: list[float] = []
+
+    def read(_uid: int, timeout: float) -> list[TreeRow] | TreeReadFailure:
+        allowed.append(timeout)
+        world.now += timeout
+        return TreeReadFailure("ps did not answer", timed_out=True)
+
+    reason = walk_unavailable(read, world.pause, world.clock)
+    assert reason is not None
+    assert allowed == [10.0, 14.0]
+    assert world.now <= 25.0
+
+
+def test_a_process_table_failure_that_is_not_a_timeout_is_returned_at_once() -> None:
+    world = _WalkClock()
+    calls = 0
+
+    def read(_uid: int, _timeout: float) -> list[TreeRow] | TreeReadFailure:
+        nonlocal calls
+        calls += 1
+        return TreeReadFailure("ps cannot be run: denied")
+
+    assert (
+        walk_unavailable(read, world.pause, world.clock) == "ps cannot be run: denied"
+    )
+    assert calls == 1
+    assert world.pauses == []
+
+
+def test_the_timeout_reason_names_one_attempt_in_the_singular() -> None:
+    reason = launcher.walk_timeout_reason([9.5], 9.5)
+    assert "1 attempt," in reason
+    assert "9.5 seconds each" in reason
+    assert "none seconds" in launcher.walk_timeout_reason([], 0.0)
+
+
 def test_a_process_table_error_is_not_retried_as_a_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1678,3 +1779,126 @@ def test_a_harness_that_does_not_read_its_input_does_not_hide_the_close(
     assert launched.wait() == 128 + signal.SIGKILL
     assert time.monotonic() - began < launcher.LAUNCHER_EXIT_SECONDS + 5
     assert launcher.RELAY_BACKLOG > 4 * 64 * 1024
+
+
+def _reaps_nothing(_pids: set[int]) -> set[int]:
+    return set()
+
+
+def _always_alive(_pid: int) -> bool:
+    return True
+
+
+class _Exited:
+    """An ``ExitWatch`` that has already seen the harness exit."""
+
+    def exited(self) -> bool:
+        return True
+
+
+class _Time:
+    """A monotonic clock that advances only when a pause is taken, by a multiple of
+    the pause asked for, which is a loaded machine."""
+
+    def __init__(self, stretch: float) -> None:
+        self.now = 100.0
+        self.stretch = stretch
+        self.pauses: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def pause(self, seconds: float) -> None:
+        self.pauses.append(seconds)
+        self.now += seconds * self.stretch
+
+
+def test_a_wait_for_exits_ends_at_its_deadline_when_sleeps_stretch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Counting polls lets a wait run for the polls times the stretch. A deadline ends
+    it after the first sleep that carries the clock past it."""
+    monkeypatch.setattr(launcher, "_alive", _always_alive)
+    monkeypatch.setattr(launcher, "_reap_adopted", _reaps_nothing)
+    world = _Time(stretch=50.0)
+    left = launcher._wait_gone(  # pyright: ignore[reportPrivateUsage]
+        cast(ExitWatch, _Exited()),
+        {7},
+        launcher.EXIT_SECONDS,
+        pause=world.pause,
+        clock=world.clock,
+    )
+    assert left == {7}
+    assert len(world.pauses) == 1
+    assert world.now - 100.0 >= launcher.EXIT_SECONDS
+    # A count of polls would have slept this many times, each one stretched.
+    assert len(world.pauses) < int(launcher.EXIT_SECONDS / launcher.CHECK_SECONDS)
+
+
+def test_a_wait_for_exits_is_not_cut_short_on_an_unloaded_machine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(launcher, "_alive", _always_alive)
+    monkeypatch.setattr(launcher, "_reap_adopted", _reaps_nothing)
+    world = _Time(stretch=1.0)
+    launcher._wait_gone(  # pyright: ignore[reportPrivateUsage]
+        cast(ExitWatch, _Exited()),
+        {7},
+        launcher.EXIT_SECONDS,
+        pause=world.pause,
+        clock=world.clock,
+    )
+    assert sum(world.pauses) == pytest.approx(launcher.EXIT_SECONDS)
+    assert max(world.pauses) <= launcher.CHECK_SECONDS
+
+
+def test_a_wait_for_exits_notices_an_exit_during_its_last_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _Time(stretch=50.0)
+    monkeypatch.setattr(launcher, "_reap_adopted", _reaps_nothing)
+
+    def alive_until_first_sleep_ends(_pid: int) -> bool:
+        return world.now < 101.0
+
+    monkeypatch.setattr(launcher, "_alive", alive_until_first_sleep_ends)
+    left = launcher._wait_gone(  # pyright: ignore[reportPrivateUsage]
+        cast(ExitWatch, _Exited()),
+        {7},
+        launcher.EXIT_SECONDS,
+        pause=world.pause,
+        clock=world.clock,
+    )
+    assert left == {7}
+    assert world.pauses == [launcher.CHECK_SECONDS]
+
+
+def test_a_wait_for_exits_ends_when_the_clock_does_not_advance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(launcher, "_alive", _always_alive)
+    monkeypatch.setattr(launcher, "_reap_adopted", _reaps_nothing)
+    world = _Time(stretch=0.0)
+    left = launcher._wait_gone(  # pyright: ignore[reportPrivateUsage]
+        cast(ExitWatch, _Exited()),
+        {7},
+        launcher.EXIT_SECONDS,
+        pause=world.pause,
+        clock=world.clock,
+    )
+    assert left == {7}
+    assert len(world.pauses) <= int(launcher.EXIT_SECONDS / launcher.CHECK_SECONDS) + 2
+
+
+def test_a_wait_for_no_pids_returns_at_once() -> None:
+    world = _Time(stretch=1.0)
+    assert (
+        launcher._wait_gone(  # pyright: ignore[reportPrivateUsage]
+            cast(ExitWatch, _Exited()),
+            set(),
+            pause=world.pause,
+            clock=world.clock,
+        )
+        == set()
+    )
+    assert world.pauses == []

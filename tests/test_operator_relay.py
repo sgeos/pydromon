@@ -10,7 +10,9 @@ import asyncio
 import contextlib
 import json
 import os
+import inspect
 import stat
+import subprocess
 import sys
 import time
 from collections.abc import Generator, Sequence
@@ -36,7 +38,10 @@ from dromon.model import (
     State,
 )
 from dromon.paths import ProjectPaths, project_paths
+from dromon import processes as processes_module
+from dromon.processes import TreeRow
 from dromon.projectconfig import ConfigFileError, ProjectConfig, config_path, parse
+import dromon.relay as relay_module
 from dromon.relay import (
     FIRST_BACKOFF_SECONDS,
     SWEEP_SECONDS,
@@ -431,31 +436,316 @@ def test_a_hung_command_times_out_and_its_group_is_killed(tmp_path: Path) -> Non
         pytest.fail("the command's child outlived the timeout")
 
 
-def test_a_command_child_that_starts_a_session_escapes_group_kill(
+def _ps_runs() -> bool:
+    try:
+        found = subprocess.run(  # noqa: S603
+            ["/bin/ps", "-o", "pid=", "-p", str(os.getpid())],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except OSError:
+        return False
+    return found.returncode == 0
+
+
+NEEDS_PS = pytest.mark.skipif(
+    not _ps_runs(), reason="ps cannot run here, as inside an agent sandbox"
+)
+
+
+def _gone(pid: int, seconds: float = 5.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+@NEEDS_PS
+def test_a_command_child_that_starts_a_session_is_ended_with_the_command(
     tmp_path: Path,
 ) -> None:
+    """Round 15, item 2. A descendant that called ``setsid`` is in a group of its
+    own, which a signal to the command's group misses. The walk of the process table
+    finds it by ancestry, so the timeout ends it too."""
     child = tmp_path / "escaped.pid"
     marker = tmp_path / "escaped.marker"
     child_code = (
-        f"import time; time.sleep(0.5); open({str(marker)!r},'w').write('alive')"
+        f"import time; time.sleep(1.5); open({str(marker)!r},'w').write('alive')"
     )
     script = (
         "import subprocess,sys,time;"
         f"p=subprocess.Popen([sys.executable,'-c',{child_code!r}],start_new_session=True);"
         f"open({str(child)!r},'w').write(str(p.pid)); time.sleep(30)"
     )
-    relay = CommandRelay([sys.executable, "-c", script], 0.2)
+    relay = CommandRelay([sys.executable, "-c", script], 0.5)
     with pytest.raises(RelayError, match="timed out"):
         asyncio.run(relay.deliver(notice()))
     pid = int(child.read_text())
     try:
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline and not marker.exists():
-            time.sleep(0.02)
-        assert marker.read_text() == "alive"
+        assert _gone(pid), "the session leader outlived the command"
+        time.sleep(1.5)
+        assert not marker.exists(), "the child ran on after the timeout"
     finally:
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, 9)
+
+
+@NEEDS_PS
+def test_ending_a_command_does_not_reach_a_process_it_did_not_start(
+    tmp_path: Path,
+) -> None:
+    """The walk finds descendants by ancestry alone, so a neighbour in a session of
+    its own, which the test starts and the command does not, is left running."""
+    neighbour = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+    )
+    try:
+        relay = CommandRelay([sys.executable, "-c", "import time; time.sleep(30)"], 0.3)
+        with pytest.raises(RelayError, match="timed out"):
+            asyncio.run(relay.deliver(notice()))
+        assert neighbour.poll() is None
+    finally:
+        neighbour.kill()
+        neighbour.wait()
+
+
+def test_the_processes_a_walk_finds_are_killed_and_no_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without ``ps``: the walk is stood in for, finding the command's session
+    leader and nothing else. The leader is killed, and a neighbour that the walk does
+    not name is left running."""
+    child = tmp_path / "escaped.pid"
+    script = (
+        "import subprocess,sys,time;"
+        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+        "start_new_session=True);"
+        f"open({str(child)!r},'w').write(str(p.pid)); time.sleep(60)"
+    )
+    neighbour = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
+    )
+
+    def walk(root: int) -> list[TreeRow]:
+        deadline = time.monotonic() + 3
+        while not child.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        pid = int(child.read_text())
+        command_pid[0] = root
+        return [TreeRow(pid, root, pid, "sleep", STARTED)]
+
+    def identity(pid: int) -> tuple[int, str] | None:
+        return (command_pid[0], STARTED) if pid == int(child.read_text()) else None
+
+    command_pid: list[int] = [0]
+    monkeypatch.setattr(relay_module, "attached", walk)
+    monkeypatch.setattr(processes_module, "identity_of", identity)
+    relay = CommandRelay([sys.executable, "-c", script], 1.0)
+    try:
+        with pytest.raises(RelayError, match="timed out"):
+            asyncio.run(relay.deliver(notice()))
+        assert _gone(int(child.read_text())), "the process the walk named survived"
+        assert neighbour.poll() is None, "a process the walk did not name was killed"
+    finally:
+        neighbour.kill()
+        neighbour.wait()
+        with contextlib.suppress(ProcessLookupError, ValueError, OSError):
+            os.kill(int(child.read_text()), 9)
+
+
+STARTED = "Sat Nov  1 07:23:05 2026"
+"""A start time as a walk reads it, for the rows a test stands in for the walk with."""
+
+
+@pytest.mark.parametrize("changed", ["start", "parent", "gone"])
+def test_a_process_whose_identity_changed_since_the_walk_is_not_signalled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    """Re-review of 4da3e0e. Between the walk and the signal a descendant can end and
+    its pid go to a process that is not a descendant. The neighbour here stands for
+    that process, and the walk names it. Its start time, its parent or its absence
+    differs from the row, so it is left running, and the group is still ended."""
+    neighbour = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
+    )
+    command_child = tmp_path / "child.pid"
+    script = (
+        "import subprocess,sys,time;"
+        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']);"
+        f"open({str(command_child)!r},'w').write(str(p.pid)); time.sleep(60)"
+    )
+    root: list[int] = [0]
+
+    def walk(pid: int) -> list[TreeRow]:
+        root[0] = pid
+        return [TreeRow(neighbour.pid, pid, neighbour.pid, "sleep", STARTED)]
+
+    def identity(pid: int) -> tuple[int, str] | None:
+        if changed == "gone":
+            return None
+        if changed == "start":
+            return root[0], "Sun Nov  2 00:00:00 2026"
+        return root[0] + 1, STARTED
+
+    monkeypatch.setattr(relay_module, "attached", walk)
+    monkeypatch.setattr(processes_module, "identity_of", identity)
+    relay = CommandRelay([sys.executable, "-c", script], 0.6)
+    try:
+        with pytest.raises(RelayError, match="timed out"):
+            asyncio.run(relay.deliver(notice()))
+        assert neighbour.poll() is None, "a process with another identity was killed"
+        assert _gone(int(command_child.read_text())), "the group was not ended"
+    finally:
+        neighbour.kill()
+        neighbour.wait()
+
+
+def test_a_row_with_no_start_time_is_never_signalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeping = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+
+        def identity(pid: int) -> tuple[int, str]:
+            return os.getpid(), ""
+
+        monkeypatch.setattr(processes_module, "identity_of", identity)
+        row = TreeRow(sleeping.pid, os.getpid(), sleeping.pid, "sleep")
+        assert processes_module.signal_if_same(row, 9) is False
+        assert sleeping.poll() is None
+    finally:
+        sleeping.kill()
+        sleeping.wait()
+
+
+def test_a_cancellation_while_ending_the_group_closes_the_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-review of 4da3e0e. A second cancellation that arrives while the group is
+    being ended must not skip the close of the read descriptor, which left its loop
+    reader behind. The walk is slow, so the cancellation lands inside it, and the
+    command must still end."""
+
+    def slow(root: int) -> list[TreeRow] | None:
+        time.sleep(1.0)
+        return []
+
+    monkeypatch.setattr(relay_module, "attached", slow)
+    relay = CommandRelay([sys.executable, "-c", "import time; time.sleep(30)"], 0.3)
+    pids: list[int] = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def recording(*arguments: object, **options: object) -> object:
+        process = await real_exec(*arguments, **options)  # pyright: ignore[reportArgumentType, reportUnknownVariableType]
+        pids.append(process.pid)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+        return process  # pyright: ignore[reportUnknownVariableType]
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", recording)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(relay.deliver(notice()))
+        # The timeout is 0.3 seconds, so the group is being ended soon after.
+        await asyncio.sleep(0.6)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    asyncio.run(scenario())
+    before = _open_descriptors()
+    asyncio.run(scenario())
+    assert _open_descriptors() == before
+    assert pids and all(_gone(pid) for pid in pids)
+
+
+def test_the_loop_stays_responsive_while_each_descendant_is_checked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-review of 6ce43e8. Each check runs ``ps`` for up to a second, and the event
+    loop serves every line, so the checks run in a thread. Each stands in here with a
+    sleep of 0.4 seconds, three in all, and a ticker on the loop must never wait
+    anything like that long. The command must still end."""
+    rows = [
+        TreeRow(50_000 + number, 1, 50_000 + number, "x", "t") for number in range(3)
+    ]
+    signalled: list[int] = []
+
+    def walk(root: int) -> list[TreeRow] | None:
+        return rows
+
+    def slow_signal(row: TreeRow, number: int) -> bool:
+        time.sleep(0.4)
+        signalled.append(row.pid)
+        return False
+
+    monkeypatch.setattr(relay_module, "attached", walk)
+    monkeypatch.setattr(relay_module, "signal_if_same", slow_signal)
+    relay = CommandRelay([sys.executable, "-c", "import time; time.sleep(30)"], 0.3)
+    gaps: list[float] = []
+
+    async def scenario() -> None:
+        stop = asyncio.Event()
+
+        async def ticker() -> None:
+            last = time.monotonic()
+            while not stop.is_set():
+                await asyncio.sleep(0.02)
+                now = time.monotonic()
+                gaps.append(now - last)
+                last = now
+
+        watching = asyncio.create_task(ticker())
+        try:
+            with pytest.raises(RelayError, match="timed out"):
+                await relay.deliver(notice())
+        finally:
+            stop.set()
+            await watching
+
+    started = time.monotonic()
+    asyncio.run(scenario())
+    assert time.monotonic() - started >= 1.2, "the checks did not all run"
+    assert sorted(signalled) == sorted(row.pid for row in rows)
+    assert gaps and max(gaps) < 0.3, f"the loop stalled for {max(gaps):.2f} seconds"
+
+
+def test_a_loop_that_cannot_watch_the_pipe_leaves_no_descriptor() -> None:
+    class Refusing:
+        def add_reader(self, *arguments: object) -> None:
+            raise RuntimeError("no reader")
+
+    before = _open_descriptors()
+    with pytest.raises(RuntimeError, match="no reader"):
+        relay_module._StderrTail(Refusing())  # pyright: ignore[reportPrivateUsage, reportArgumentType]
+    assert _open_descriptors() == before
+
+
+def test_a_walk_that_fails_still_kills_the_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A process table that cannot be read leaves the group kill alone, which still
+    ends the command and its group."""
+    child = tmp_path / "child.pid"
+    script = (
+        "import subprocess,sys,time;"
+        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']);"
+        f"open({str(child)!r},'w').write(str(p.pid)); time.sleep(60)"
+    )
+
+    def unreadable(root: int) -> list[TreeRow] | None:
+        return None
+
+    monkeypatch.setattr(relay_module, "attached", unreadable)
+    relay = CommandRelay([sys.executable, "-c", script], 0.5)
+    with pytest.raises(RelayError, match="timed out"):
+        asyncio.run(relay.deliver(notice()))
+    assert _gone(int(child.read_text()))
 
 
 def test_success_does_not_wait_for_a_child_holding_stderr(tmp_path: Path) -> None:
@@ -481,6 +771,88 @@ def test_a_failing_command_reports_its_status_and_bounded_detail() -> None:
     with pytest.raises(RelayError, match="exited with status 3") as caught:
         asyncio.run(relay.deliver(notice()))
     assert len(str(caught.value)) < 300
+
+
+def _open_descriptors() -> int:
+    return len(os.listdir("/dev/fd"))
+
+
+def test_the_relay_reaches_no_private_attribute_of_asyncio() -> None:
+    """Round 15, item 1. The stderr pipe is Dromon's own, closed with public
+    interfaces, so nothing reads a transport's private attribute."""
+    assert "._transport" not in inspect.getsource(relay_module)
+
+
+def test_the_kept_stderr_is_what_the_command_wrote_before_it_exited() -> None:
+    script = "import sys; sys.stderr.write('refused: ' + 'y' * 50); sys.exit(4)"
+    relay = CommandRelay([sys.executable, "-c", script], 5)
+    with pytest.raises(RelayError, match="exited with status 4: refused: y") as caught:
+        asyncio.run(relay.deliver(notice()))
+    assert "y" * 50 in str(caught.value)
+
+
+def test_a_descendant_that_keeps_writing_stderr_neither_delays_nor_grows_the_result(
+    tmp_path: Path,
+) -> None:
+    child = tmp_path / "writer.pid"
+    child_code = (
+        "import sys,time\n"
+        "while True:\n"
+        "    try: sys.stderr.write('z' * 4096); sys.stderr.flush()\n"
+        "    except Exception: break\n"
+        "    time.sleep(0.001)\n"
+    )
+    script = (
+        "import subprocess,sys;"
+        f"p=subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
+        f"open({str(child)!r},'w').write(str(p.pid));"
+        "sys.stderr.write('last words'); sys.exit(5)"
+    )
+    relay = CommandRelay([sys.executable, "-c", script], 5.0)
+    started = time.monotonic()
+    with pytest.raises(RelayError, match="exited with status 5") as caught:
+        asyncio.run(relay.deliver(notice()))
+    assert time.monotonic() - started < 2.0
+    assert len(str(caught.value)) < 300
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(int(child.read_text()), 9)
+
+
+def test_delivering_leaves_no_descriptor_open_on_any_path(tmp_path: Path) -> None:
+    ok = CommandRelay([sys.executable, "-c", "import sys; sys.stdin.read()"], 5)
+    failing = CommandRelay([sys.executable, "-c", "import sys; sys.exit(2)"], 5)
+    hung = CommandRelay([sys.executable, "-c", "import time; time.sleep(30)"], 0.3)
+    missing = CommandRelay([str(tmp_path / "absent")], 5)
+
+    async def attempt(relay: CommandRelay) -> None:
+        with contextlib.suppress(RelayError):
+            await relay.deliver(notice())
+
+    async def rounds() -> None:
+        for relay in (ok, failing, hung, missing):
+            await attempt(relay)
+
+    asyncio.run(rounds())
+    before = _open_descriptors()
+    for _ in range(3):
+        asyncio.run(rounds())
+    assert _open_descriptors() == before
+
+
+def test_a_cancelled_delivery_ends_the_command_and_closes_the_pipe() -> None:
+    relay = CommandRelay([sys.executable, "-c", "import time; time.sleep(30)"], 30)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(relay.deliver(notice()))
+        await asyncio.sleep(0.3)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    before = _open_descriptors()
+    asyncio.run(scenario())
+    assert _open_descriptors() == before
 
 
 def test_a_missing_command_cannot_start(tmp_path: Path) -> None:

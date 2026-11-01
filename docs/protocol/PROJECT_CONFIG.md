@@ -364,7 +364,15 @@ stops the start, or refuses the reload and keeps the previous list.
   never names a matching file or line location, including when several
   files were supplied. File read failures also omit file names.
   Each file is checked independently and the counts are summed, so a match cannot span
-  a file boundary. Their combined size may not exceed 1 MiB. A file that cannot be
+  a file boundary. **Round 14, item 3.** A file is checked in parts of at most 1 MiB,
+  each cut after a newline so that no line is split and no term straddles a cut, and
+  the counts are summed, so the file costs one check and the sum equals the count for
+  the whole. The combined size of the files may not exceed 16 MiB, and a line longer
+  than 1 MiB is refused, since a cut there could split a term. A text is still at most
+  1 MiB. A `path` may be absolute when it lies under the line's working directory, as
+  `write_scratch` reports the file it wrote, so a line checks the file it wrote and
+  not a draft. It is normalized lexically and then walked without following a link. A
+  file that cannot be
   read refuses the whole call without recording a check. Each successful call,
   including a list, is recorded as one
   `disclosure_checked` event, without the text or its name, as [`EVENT_LOG.md`](EVENT_LOG.md)
@@ -374,7 +382,7 @@ stops the start, or refuses the reload and keeps the previous list.
   a term, so an unlimited check would let a line test candidate words one by one. A
   file is read as `write_scratch` writes, walked without following a link, and only
   when it is a regular file of the daemon's user with one name, outside every
-  directory Dromon protects, and at most 1 MiB. A refusal, of a missing list, a limit
+  directory Dromon protects, and at most 16 MiB combined. A refusal, of a missing list, a limit
   reached, or a text or file not read, records nothing and reveals nothing of the
   list. **Decided by the operator on 2026-10-28.** A refusal for disclosure by
   `send_message`, `ask_operator`, `wake_after` or `write_scratch` identifies the

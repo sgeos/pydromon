@@ -150,9 +150,10 @@ whose own experimental fields are `history`, `path`, `runtimeWorkspaceRoots`,
 thread keeps the tools it was started with.
 
 Dromon therefore stores a Codex line's engine session as the thread identifier, a
-colon, and the first 16 hexadecimal digits of the SHA-256 of the sorted names of the
-line's Dromon tools. At each turn, a stored session whose fingerprint differs from
-today's tools, or that has none, as one stored before fingerprints existed or adopted
+colon, and the first 16 hexadecimal digits of a Secure Hash Algorithm 256 digest.
+**Fact.** The digest covers the effective permission profile, built-in tool names and
+Dromon tool names. It includes protected and read-only paths and scratch grants. At each turn, a stored session whose fingerprint differs from
+today's configuration, or that has none, as one stored before fingerprints existed or adopted
 from elsewhere, is not resumed. A new thread is started with today's tools, and the
 turn's text opens with a note telling the line that its earlier thread's context is
 not available and that its mailbox, files and reports are unchanged.
@@ -172,7 +173,8 @@ observed live.
 Codex loads the operator's user configuration, which cannot be skipped by the
 app-server. Dromon starts it with these arguments.
 
-- `-c mcp_servers.NAME.enabled=false` for every server `codex mcp list --json` names.
+- `-c mcp_servers.NAME={enabled=false,command="/usr/bin/false",args=[]}` for every
+  server `codex mcp list --json` names.
   A name that is not a bare key is refused, because Codex rejects a quoted one.
 - `--disable` for `apps`, `browser_use`, `browser_use_external`, `computer_use`,
   `goals`, `hooks`, `image_generation`, `in_app_browser`, `memories`, `multi_agent`,
@@ -507,3 +509,66 @@ turn. `dromon probe --model gpt-6-luna` reported the subscription credential.
     wakes the line with the same task-end note, with the status `ended`, since the
     listing gives no exit code. An end found by the listing after a turn is noted too,
     since the engine does not tell the model that a terminal ended.
+
+## Active writer recovery
+
+**Fact.** Round 14 operator mail records two `thread/resume` refusals reporting that
+the thread already has an active writer. Dromon retries that specific error once after
+0.25 seconds. A second refusal starts a new thread without resuming the contested
+thread again. The first prompt explains the replacement and the loss of earlier
+thread context. Mail, standing brief and worktree files belong to the line and remain.
+Other remote procedure call errors and plan limits retain their existing handling.
+If starting the replacement fails, the refusal explains what another resume retries.
+
+**Fact.** Dromon calls `thread/resume` before each kept turn even when the same
+app-server loaded that thread on the preceding turn.
+
+**Implementing agent observation, not verified by review.** Read-only inspection
+of the installed executable found the active writer
+refusal beside diagnostics for acquiring, inspecting and removing stale thread writer
+locks. The executable also names `rollout/src/writer_lock.rs` and contains a
+coordination-lock diagnostic saying another Codex process may be suspended on this
+or another host. No capture accompanies this observation.
+
+**Inference.** The refusal concerns ownership of a thread writer lock rather than
+account authentication. Dromon does not remove those locks or terminate an unknown
+owner as part of recovery.
+
+**Hypothesis.** The retained app-server itself, another surviving app-server or
+incomplete writer cleanup may hold the thread. The recorded error does not identify the writer process. Official
+OpenAI documentation could not be fetched from the implementation sandbox because
+its host could not be resolved. No credential file or live engine was used to diagnose
+this condition. The retry and replacement are covered by scripted exchanges.
+
+**Fact.** A kept app-server configuration change closes its connection. The persisted
+thread digest also includes its permission profile, so the new connection starts a
+new thread when that profile changes rather than resuming a thread with old grants.
+The digest records the exact launch profile even if a protected path appears during
+the turn. It is not recomputed from changed paths when recording the result.
+Existing sessions with the older digest format are replaced once on their next turn.
+
+**Fact.** A `codex mcp list` entry without a text `name` is ignored only when it has
+Boolean `enabled=false`. Named entries still receive disabling overrides regardless
+of their initial state. Every other nameless entry is refused with its array entry
+and field identified.
+This does not repair a failure inside Codex before its listing returns.
+
+
+**Fact.** Dromon supplies a complete disabled standard input and output transport
+for each named account server. An inert command and empty arguments provide the
+transport metadata even when the server has no local configuration. The enabled
+flag remains false and the post-start checks still require zero server tools.
+
+**Fact.** The original reported account initialization failure was not reproduced
+here. The operator identified Codex but supplied no error text or missing field.
+Tests verify the generated configuration as parsed TOML. Official configuration
+documentation could not be fetched because developers.openai.com did not resolve.
+Actual Codex configuration merging and account initialization remain unverified.
+
+
+**Fact.** A failed writer replacement retains the original stored session identifier
+in the cached adapter, so a later turn retries resume recovery. A replacement that
+returns the contested identifier is refused before prompting. Tests cover both
+paths. A disallowed dynamic tool completion without a matching denied request
+interrupts the turn, including when only the turn completion arrives. Notifications
+alone do not establish that execution required Dromon's response.

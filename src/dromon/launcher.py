@@ -177,6 +177,7 @@ RELAYED_VARIABLES: Final = (
     "GIT_SSH_COMMAND",
     "SHELL",
     "CLAUDE_CODE_SHELL",
+    "UV_CACHE_DIR",
 )
 """Variables a Claude Code line's adapter gives its shell commands, which the
 launcher's filter would drop as daemon variables. The adapter sets each under the
@@ -228,6 +229,17 @@ WALK_SECONDS: Final = 0.5
 
 WALK_DEADLINE_SECONDS: Final = 0.75
 """The total bound for retries of one process-table walk at launcher stop."""
+
+CHECK_ATTEMPT_SECONDS: Final = (10.0, 20.0, 30.0)
+"""The time each attempt of the daemon's pre-turn check may take. **Fact, three round
+13 lines.** ``ps`` took 9.5 to 15.4 seconds under load and 0.04 seconds at rest, so the
+first bound is the old one and the later ones clear the slowest value measured."""
+
+CHECK_PAUSE_SECONDS: Final = 1.0
+"""The pause before the second attempt of the check, doubled before each later one."""
+
+CHECK_DEADLINE_SECONDS: Final = 65.0
+"""The total bound for the check, attempts and pauses together."""
 
 EXIT_SECONDS: Final = 2.0
 """How long what the launcher terminated may take to exit before it is killed."""
@@ -335,14 +347,62 @@ def walk_gap(platform: str = sys.platform) -> str | None:
     return None if platform.startswith("linux") else WALK_GAP
 
 
-def walk_unavailable() -> str | None:
+def walk_unavailable(
+    read: Callable[[int, float], list[TreeRow] | TreeReadFailure] | None = None,
+    pause: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> str | None:
     """Why the process table cannot be walked here, or ``None`` when it can. The
     daemon asks before each turn under ``KILL_ALL``, which refuses the turn rather
     than end only what it can reach without the walk. **Review F2.** It allows ``ps``
     the ordinary bound, not ``WALK_SECONDS``, since it asks whether ``ps`` can run at
-    all, and a slow answer on a loaded machine must not refuse a turn."""
-    found = tree_or_reason(os.getuid())
-    return str(found) if isinstance(found, TreeReadFailure) else None
+    all, and a slow answer on a loaded machine must not refuse a turn.
+
+    **Round 14, item 1.** One call with one bound held a line whenever the machine
+    was loaded, since ``ps`` took 9.5 to 15.4 seconds under load and 0.04 seconds at
+    rest, as three round 13 lines measured. A timeout is therefore retried, with each
+    attempt allowed longer than the one before, ``CHECK_ATTEMPT_SECONDS``, after a
+    pause that doubles, within ``CHECK_DEADLINE_SECONDS`` in all. Only a timeout is
+    retried. A ``ps`` that cannot run or that fails answers the same way again, so
+    its reason is returned at once. The reason after a timeout names each attempt's
+    measured time, so that the hold message says how slow the table was and not only
+    that it was too slow. **Residual.** The check runs on the process worker, so a
+    worst case of about ``CHECK_DEADLINE_SECONDS`` delays other process tools, and a
+    machine that never answers still holds the line."""
+    reader = tree_or_reason if read is None else read
+    started = clock()
+    measured: list[float] = []
+    pause_seconds = CHECK_PAUSE_SECONDS
+    for bound in CHECK_ATTEMPT_SECONDS:
+        remaining = CHECK_DEADLINE_SECONDS - (clock() - started)
+        if remaining <= 0:
+            break
+        allowed = min(bound, remaining)
+        began = clock()
+        found = reader(os.getuid(), allowed)
+        if not isinstance(found, TreeReadFailure):
+            return None
+        if not found.timed_out:
+            return str(found)
+        measured.append(clock() - began)
+        if len(measured) < len(CHECK_ATTEMPT_SECONDS):
+            left = CHECK_DEADLINE_SECONDS - (clock() - started)
+            if left <= pause_seconds:
+                break
+            pause(pause_seconds)
+            pause_seconds *= 2
+    return walk_timeout_reason(measured, clock() - started)
+
+
+def walk_timeout_reason(measured: Sequence[float], total: float) -> str:
+    """The reason for a walk whose every attempt timed out, with the time each
+    attempt took and the total, so a hold names how slow the process table was."""
+    times = ", ".join(f"{seconds:.1f}" for seconds in measured) or "none"
+    attempts = "attempt" if len(measured) == 1 else "attempts"
+    return (
+        f"ps did not answer in {len(measured)} {attempts}, which took {times} seconds"
+        f" each and {total:.1f} seconds in all, and a loaded machine can be this slow"
+    )
 
 
 def policy_of(environment: Mapping[str, str]) -> StopPolicy:
@@ -1084,18 +1144,34 @@ def _reap_adopted(pids: set[int]) -> set[int]:
 
 
 def _wait_gone(
-    exits: ExitWatch, pids: set[int], seconds: float = EXIT_SECONDS
+    exits: ExitWatch,
+    pids: set[int],
+    seconds: float = EXIT_SECONDS,
+    *,
+    pause: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
 ) -> set[int]:
     """Wait up to ``seconds`` for the harness and ``pids`` to end, and return
-    those of ``pids`` not reaped here."""
+    those of ``pids`` not reaped here.
+
+    The limit is a monotonic deadline and not a count of polls. A count lets one stop
+    stretch to the number of polls times the time each took, and under load a sleep
+    and a process-table read each take far longer than they are asked to, which ops
+    observed. The final check is made at the deadline, so a process that ended during
+    the last sleep is not reported as running. The iteration count is also capped, so
+    that a clock that does not advance still ends the loop."""
     if not pids:
         return set()
     tracked = set(pids)
-    for _ in range(int(seconds / CHECK_SECONDS)):
+    deadline = clock() + seconds
+    for _ in range(int(seconds / CHECK_SECONDS) + 2):
         tracked -= _reap_adopted(tracked)
         if exits.exited() and not any(_alive(pid) for pid in tracked):
             break
-        time.sleep(CHECK_SECONDS)
+        remaining = deadline - clock()
+        if remaining <= 0:
+            break
+        pause(min(CHECK_SECONDS, remaining))
     return tracked
 
 

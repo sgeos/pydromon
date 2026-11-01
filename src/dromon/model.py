@@ -60,6 +60,13 @@ TOKEN_HASH: Final = re.compile(r"[0-9a-f]{64}")
 MAX_TEXT_BYTES: Final = 1024 * 1024
 """Upper bound on the UTF-8 size of a message body."""
 
+MAX_LEASE_NOTE_BYTES: Final = 500
+"""Upper bound on the UTF-8 size of the note a lease is acquired with."""
+
+MAX_CLOSE_REASON_BYTES: Final = 500
+"""Upper bound on the UTF-8 size of the reason an acknowledgement records, which is a
+short account and never a reply."""
+
 MAX_OPEN_ISSUES_PER_LINE: Final = 5
 """At most five unclosed issues from one line may burden an operator."""
 
@@ -761,6 +768,12 @@ class LineTurnEnded:
     of 2026-10-30.** Such a turn retires no own note, as
     ``State.reported_turn_ends`` says. ``False`` is refused, so the fact has one
     encoding and the wire omits it when null."""
+    failed: bool | None = None
+    """``True`` when the turn failed, so the line stands as failed until something
+    reaches it, as ``Line.failed`` says, and ``None`` otherwise and in a log written
+    before the field. **Round 14 task of 2026-11-01.** ``False`` is refused, as for
+    ``unreported``. **Rollback hazard.** A daemon older than the field refuses an
+    event that gives it."""
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
@@ -768,6 +781,8 @@ class LineTurnEnded:
             check_commit("workdir_commit", self.workdir_commit)
         if self.unreported is not None and self.unreported is not True:
             raise InvalidField("unreported must be true or null")
+        if self.failed is not None and self.failed is not True:
+            raise InvalidField("failed must be true or null")
 
 
 MAX_DISCLOSURE_CHECKS: Final = 10
@@ -972,6 +987,13 @@ class MessageSent:
     request: RequestStamp | None = None
     """The request key of the ``send_message`` or ``ask_operator`` call that sent
     it, or ``None``, absent from the wire, when the call gave none."""
+    asks_reply: bool | None = None
+    """Whether a note asks its recipient for a reply, as its sender said, or
+    ``None``, absent from the wire, when the sender said nothing. **Round 14 task of
+    2026-11-01.** A note that asks nothing is not counted as unanswered, and a note
+    whose sender said nothing asks a reply unless it is itself a reply, as
+    ``dromon.mailbox.asks_reply`` decides. Only a note carries it. **Rollback
+    hazard.** A daemon older than this field refuses an event that gives it."""
 
     def __post_init__(self) -> None:
         check_id("message_id", self.message_id)
@@ -983,6 +1005,11 @@ class MessageSent:
         check_optional_id("reply_to", self.reply_to)
         if self.kind is MessageKind.NOTE and self.choices:
             raise InvalidField("only a question has choices")
+        if self.asks_reply is not None:
+            if type(self.asks_reply) is not bool:
+                raise InvalidField("asks_reply is not a boolean")
+            if self.kind is not MessageKind.NOTE:
+                raise InvalidField("only a note says whether it asks a reply")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1070,12 +1097,23 @@ class MessageAcknowledged:
     The sender sees the difference between an acknowledgement and a reply, because a
     sender may still be expecting a reply. A question stays open until it is answered
     or withdrawn, whether or not it is acknowledged.
+
+    **Round 14 task of 2026-11-01.** ``reason`` is the recipient's short account of
+    why it closed the message without a reply, such as the report that answered it,
+    or ``None``, absent from the wire, when it gave none. It is shown only in the
+    recipient's own mailbox. **Rollback hazard.** A daemon older than the field
+    refuses an event that gives it.
     """
 
     message_id: str
+    reason: str | None = None
 
     def __post_init__(self) -> None:
         check_id("message_id", self.message_id)
+        if self.reason is not None:
+            check_text("reason", self.reason, MAX_CLOSE_REASON_BYTES)
+            if not self.reason.strip():
+                raise InvalidField("reason is empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1900,12 +1938,18 @@ class LeaseAcquired:
     as the daemon ended them in memory before. ``ownership_changed`` from one seat to
     another passes the previous owner's leases to the new owner, keeping both
     times, so the role's resource stays guarded across a change of seat and the
-    successor can release it. **Decided on 2026-10-31,** as ``ROLES.md`` records."""
+    successor can release it. **Decided on 2026-10-31,** as ``ROLES.md`` records.
+
+    **Round 14 task of 2026-11-01.** ``note`` is the holder's short account of what
+    it holds the lease for, shown in the lease inventory, or ``None``, absent from
+    the wire, when it gave none. **Rollback hazard.** A daemon older than the field
+    refuses an event that gives it."""
 
     name: str
     line_id: str
     acquired_at: str
     expires: str
+    note: str | None = None
 
     def __post_init__(self) -> None:
         check_id("name", self.name)
@@ -1914,6 +1958,10 @@ class LeaseAcquired:
         check_instant("expires", self.expires)
         if parse_due(self.expires) <= parse_due(self.acquired_at):
             raise InvalidField("a lease expires after it is acquired")
+        if self.note is not None:
+            check_text("note", self.note, MAX_LEASE_NOTE_BYTES)
+            if not self.note.strip():
+                raise InvalidField("note is empty")
 
 
 class LeaseEnd(StrEnum):
@@ -2219,6 +2267,12 @@ class Line:
     hibernated: bool = False
     """Whether an operator hibernated the line, from ``line_hibernated`` until
     ``line_awakened``."""
+    failed: bool = False
+    """Whether the line's last turn failed and nothing has reached it since.
+    **Round 14 task of 2026-11-01.** Set by a ``line_turn_ended`` that gives
+    ``failed``, and cleared by one that does not, by a new message to the line, by
+    ``line_released`` and by a restart note, the events at which the scheduler
+    clears its own record, so a restarted daemon shows a failed line as failed."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -2268,6 +2322,41 @@ class Message:
     the line whose engine reported it ended after the message reached the line, which
     retires an own note from ``own_notes``, as ``dromon.mailbox.counts_own_note``
     says."""
+    asks_reply: bool | None = None
+    """What the note's ``message_sent`` said of asking a reply, or ``None``. For a
+    correction it is whether it asks, true when the note it corrects asked or when
+    its sender said true, so a correction never lowers an ask."""
+    replied: bool = False
+    """Whether the recipient has sent a reply naming this message. **Round 14 task
+    of 2026-11-01.** Kept as the reply applies, so the unanswered count reads it
+    without a scan of every message the log holds. It agrees with
+    ``dromon.mailbox.replied_ids`` of the recipient by construction."""
+    corrected_by: str | None = None
+    """The first later note from the same sender to the same recipient that names
+    this one with ``reply_to``, a correction, which closes this one for the
+    recipient's unanswered count, or ``None``."""
+    closed_reason: str | None = None
+    """The reason the recipient gave when it acknowledged the message, or ``None``."""
+
+
+def asks_reply_of(message: Message) -> bool:
+    """Whether ``message`` asks its recipient for a reply, the rule
+    ``dromon.mailbox.asks_reply`` gives the views. Kept here so that a correction can
+    apply it to the note it corrects as the correction applies.
+
+    **Round 14 review, M1, required by the operator on 2026-11-01.** A question and an
+    issue always ask. A note asks when its sender said so. A sender's ``False`` is
+    honoured only for a note to a line, since a line could otherwise send an operator
+    a note whose body asks a decision and leave it out of the operator's unanswered
+    count. Any other note asks unless it is itself a reply, as for a note whose
+    sender said nothing."""
+    if message.kind is not MessageKind.NOTE:
+        return True
+    if message.asks_reply is True:
+        return True
+    if message.asks_reply is False and isinstance(message.recipient, LineAddress):
+        return False
+    return message.reply_to is None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2940,7 +3029,9 @@ class State:
                 self.hold_questions.add(event.question_id)
             case LineReleased():
                 line = self.lines[event.line_id]
-                self.lines[event.line_id] = replace(line, held_by=None, hold_cause=None)
+                self.lines[event.line_id] = replace(
+                    line, held_by=None, hold_cause=None, failed=False
+                )
             case LineHibernated():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(line, hibernated=True)
@@ -3037,7 +3128,10 @@ class State:
                 self._put_message(event.message_id, replace(message, read=True))
             case MessageAcknowledged():
                 message = self.messages[event.message_id]
-                self._put_message(event.message_id, replace(message, acknowledged=True))
+                self._put_message(
+                    event.message_id,
+                    replace(message, acknowledged=True, closed_reason=event.reason),
+                )
             case MessagePrioritized():
                 message = self.messages[event.message_id]
                 self._put_message(event.message_id, replace(message, priority=True))
@@ -3050,6 +3144,11 @@ class State:
                 self._total_correlated(event)
             case LineTurnEnded():
                 self.last_turn_commits[event.line_id] = event.workdir_commit
+                line = self.lines[event.line_id]
+                if line.failed != (event.failed is True):
+                    self.lines[event.line_id] = replace(
+                        line, failed=event.failed is True
+                    )
                 if event.unreported is None:
                     self.reported_turn_ends[event.line_id] = (
                         self.reported_turn_ends.get(event.line_id, 0) + 1
@@ -3621,12 +3720,28 @@ class State:
             del self.correlations[next(iter(self.correlations))]
 
     def _check_reply(self, event: MessageSent, reply_to: str) -> None:
+        """A reply goes back from the parent's recipient to its sender. **Round 14
+        task of 2026-11-01.** A note may also name a note its own sender sent to the
+        same recipient, as a correction of it, which closes the earlier one for the
+        recipient's unanswered count."""
         parent = self._message(reply_to)
-        if (parent.sender, parent.recipient) != (event.recipient, event.sender):
+        reply = (parent.sender, parent.recipient) == (event.recipient, event.sender)
+        correction = (parent.sender, parent.recipient) == (
+            event.sender,
+            event.recipient,
+        )
+        if not reply and not correction:
             raise EventRejected(
                 f"a reply to {reply_to} must go from {parent.recipient}"
-                f" to {parent.sender}"
+                f" to {parent.sender}, or correct it from {parent.sender}"
+                f" to {parent.recipient}"
             )
+        if not reply:
+            if parent.kind is not MessageKind.NOTE or event.kind is not (
+                MessageKind.NOTE
+            ):
+                raise EventRejected(f"only a note corrects a note, and {reply_to}")
+            return
         if parent.kind is MessageKind.QUESTION:
             if parent.status is not QuestionStatus.OPEN:
                 raise EventRejected(f"question {reply_to} is {parent.status}")
@@ -3878,12 +3993,28 @@ class State:
             _asking_line(message),
         )
         self.messages[message_id] = message
+        if previous is None and isinstance(message.recipient, LineAddress):
+            # Round 14. New mail to a line clears its failure, as the scheduler's
+            # send clears it, so a restart reads the same condition.
+            line = self.lines.get(message.recipient.line_id)
+            if line is not None and line.failed:
+                self.lines[message.recipient.line_id] = replace(line, failed=False)
 
     def _apply_message_sent(self, event: MessageSent) -> None:
         if self._is_firing(event) and isinstance(event.sender, LineAddress):
             fired = self.scheduled.pop(event.sender.line_id)
             self.fired_dues[event.message_id] = fired.due
         status = QuestionStatus.OPEN if event.kind is MessageKind.QUESTION else None
+        asks = event.asks_reply
+        if event.reply_to is not None:
+            parent = self.messages[event.reply_to]
+            if event.sender != parent.recipient:
+                # A correction stands in for the note it corrects, so it asks what
+                # that note asked. Otherwise a correction, which is a reply by its
+                # form, would ask nothing, and correcting a task would drop it from
+                # the recipient's count. Round 14 review, M1. It may raise the ask
+                # but never lower it, so a sender cannot correct an ask away.
+                asks = asks_reply_of(parent) or asks is True
         self._put_message(
             event.message_id,
             Message(
@@ -3894,19 +4025,22 @@ class State:
                 event.choices,
                 event.reply_to,
                 status=status,
+                asks_reply=asks,
             ),
         )
         if event.reply_to is not None:
             parent = self.messages[event.reply_to]
-            if parent.status is QuestionStatus.OPEN:
-                self._put_message(
-                    event.reply_to,
-                    replace(
+            if event.sender == parent.recipient:
+                parent = replace(parent, replied=True)
+                if parent.status is QuestionStatus.OPEN:
+                    parent = replace(
                         parent,
                         status=QuestionStatus.ANSWERED,
                         answered_by=event.message_id,
-                    ),
-                )
+                    )
+            elif parent.corrected_by is None:
+                parent = replace(parent, corrected_by=event.message_id)
+            self._put_message(event.reply_to, parent)
         if isinstance(event.recipient, RemoteAddress):
             self.outbox.setdefault(event.recipient.peer_id, {})[event.message_id] = None
 
@@ -3962,6 +4096,9 @@ class State:
                 priority_asked=event.priority_asked,
             ),
         )
+        if event.reply_to is not None:
+            parent = self.messages[event.reply_to]
+            self._put_message(event.reply_to, replace(parent, replied=True))
         self.received[(peer_id, event.origin_id)] = event.message_id
         self.received_times[(peer_id, event.origin_id)] = received_at
         self.waiting_from[peer_id] = self.waiting_from.get(peer_id, 0) + 1

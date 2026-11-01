@@ -6,6 +6,7 @@ daemon and scheduler over a real event log. The new events, ``seat_unbound``,
 restart, and a reload of the project file against a role an operator changed reports
 what it leaves, as ``docs/architecture/ROLES.md`` states."""
 
+import os
 import asyncio
 import json
 from collections.abc import Callable, Iterator, Sequence
@@ -51,7 +52,7 @@ from dromon.model import (
 from dromon.paths import ProjectPaths, project_paths
 from dromon.projectconfig import ProjectConfig, config_path, parse
 from dromon.protocol import Operation, Response
-from dromon.roles import plan_file_roles
+from dromon.roles import plan_file_roles, shared_worktree
 from dromon.scheduler import LineEngine, LineSpec, Scheduler
 
 HAIKU = "claude-haiku-5-5"
@@ -878,6 +879,43 @@ def test_a_role_worktree_may_not_lie_inside_another_or_hold_it(
     assert status == exits.FAILURE
     assert "roles core and docs would have worktrees one inside the other" in err
     assert desk.log.state.roles["docs"].workdir == DOCS
+
+
+def test_a_role_whose_worktree_is_missing_still_claims_it(
+    desk: Desk, dromon: Run
+) -> None:
+    """Round 14. A role whose worktree did not resolve was left out of the check, so
+    a second role could take the directory holding it, and own the missing worktree
+    once it was made again. The claim now resolves what exists and keeps the rest,
+    and the check compares it as it compares a resolved worktree."""
+    assert create_docs(dromon)[0] == exits.OK
+    (desk.paths.root / DOCS).rmdir()
+    assert "docs" not in desk.scheduler.role_places()
+    claimed = desk.scheduler.claimed_worktrees()
+    root = Path(os.path.realpath(desk.paths.root))
+    assert claimed["docs"] == root / DOCS
+    assert claimed["core"] == root / TREE
+    outer = root / "tmp/worktrees"
+    assert shared_worktree({"docs": claimed["docs"], "outer": outer}) == (
+        "docs",
+        "outer",
+    )
+
+
+def test_a_disjoint_layout_passes_even_through_a_link(desk: Desk, dromon: Run) -> None:
+    """Round 14. Disjoint worktrees pass, one of them reached through a symbolic
+    link, so the check refuses overlap and nothing else."""
+    (desk.paths.root / "tmp/other").mkdir()
+    (desk.paths.root / "tmp/alias").symlink_to(desk.paths.root / "tmp/other")
+    claimed = desk.scheduler.claimed_worktrees()
+    root = Path(os.path.realpath(desk.paths.root))
+    linked = Path(os.path.realpath(desk.paths.root / "tmp/alias"))
+    assert linked == root / "tmp/other"
+    assert shared_worktree({**claimed, "dup": linked}) is None
+    assert create_docs(dromon)[0] == exits.OK
+    assert (
+        shared_worktree({**desk.scheduler.claimed_worktrees(), "dup": linked}) is None
+    )
 
 
 def test_a_writer_inside_an_owned_worktree_is_refused_and_waits(

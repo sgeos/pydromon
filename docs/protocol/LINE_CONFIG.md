@@ -47,6 +47,7 @@ keys, duplicate keys and numbers are refused.
 | `workdir` | The directory the line's engine runs in, as the working directory section below specifies. Omitted when unset | the project root |
 | `workdir_access` | `write` or `read`; read confines the working directory to reads, with the scratch exception below | `write` |
 | `writable_paths` | Existing absolute directories a Codex line may write when given `Edit` or `Write`. Refused on other engines | none |
+| `report_directory` | A relative directory under `tmp/` in the working directory, such as `tmp/reports`, that `write_scratch` writes to when a call asks for its `reports` area, as the `write_scratch` section below specifies. Never `tmp` itself, never directly under `tmp/lines`, `tmp/worktrees`, `tmp/runs` or `tmp/probes`, compared without regard to letter case or Unicode form, so `tmp/Lines` is refused, with no component that starts with `.` or ends with `.` or a space, written with `/`, with at most eight components. The write also compares the directory it opens with those four by device and inode, so a volume that treats other spellings alike cannot reach another line's scratch or another role's worktree. Omitted when unset | none |
 | `keep_session` | Keep a Claude Code or Codex line's engine connected between turns, as the kept sessions section below specifies. Refused on Grok lines. Omitted when false | `false` |
 | `fresh_session_each_turn` | Start each turn in a new Claude Code or Codex engine session, without a context handoff or standing brief. Refused with `keep_session`, with explicit `context_handoff = true`, and on adapters that cannot start a new session each turn. Omitted when false | `false` |
 | `keep_session_idle_seconds` | Seconds a kept connection waits for the next turn before it closes, a whole number from 60 to 86,400. Omitted at its default | `1800` |
@@ -135,8 +136,70 @@ pins this, so a later change that refuses such files is deliberate. **Review of 
 I1.**
 
 [`ENGINES.md`](ENGINES.md) gives the rationale, the limits that only an engine holds,
-and the steps the operator runs before relying on it. Nothing was run live when this
-was written.
+and the steps the operator runs before relying on it.
+
+**Round 14, item 5. A defect in the Claude Code rule, and its fix.** **Fact, from the
+operator's live run of 2026-11-01.** A Claude Code line on claude-haiku-5-5 with
+`builtin_tools` of `["ViewImage"]` and `workdir_access` `read` viewed a word in
+`word.png` and reported it. It then read `word.txt`, a text file renamed to a png, and
+got the engine's binary-file notice and not Dromon's refusal, and it viewed `big.png`,
+a valid png of 6,000,287 bytes, over the 5 MiB limit, and reported the word. A path
+outside the working directory and a path under `.dromon` were refused with Dromon's
+message. `imageaccess.image_refusal` refused both files when called directly. So the
+rule was right and was not called for them. **Inference, not verified.** Claude Code
+allows a `Read` inside its working directory without calling the permission callback,
+so the rule in the callback ran only for paths the engine would ask about, and a
+view-only line could read any file in its working directory. **Fix.** A `PreToolUse`
+hook, registered through the Agent SDK for every view-only line, runs before every
+`Read`, before the permission rules and the callback, and applies `image_refusal` to
+its `file_path`. A refusal there is a deny, which no allow overrides, and a missing or
+malformed `file_path` is refused. The callback keeps the same check as a second guard.
+**Review of a9995d8, item 1. Fail closed, three more guards.**
+1. *A hook that fails denies.* Its body is wrapped, and an exception, or a failure to
+   record the call, answers with the deny, naming the exception's type and nothing of
+   its text. **Inference.** Claude Code treats a hook that errors as one that failed,
+   which does not block the tool, so the wrapper keeps the failure from reading as an
+   allowance.
+2. *An ask rule for `Read`.* A view-only line's flag settings carry
+   `permissions.ask: ["Read"]`, joined with the operator's own ask rules once. An ask
+   rule makes the engine consult the permission callback, so the gate runs for every
+   `Read` whatever the hook does. **Hypothesis, to be shown live.** An ask rule
+   outranks the engine's allowance for a read inside its working directory. If it does
+   not, the hook and the missing-hook check below are what hold.
+3. *A `Read` without a hook call ends the turn.* The hook records each tool call it is
+   given. The adapter records each `Read` a view-only line makes and, when its result
+   arrives, finds the call among the hook's. The hook runs before the tool, so a result
+   with no hook call means the engine skipped the hook for it. The adapter interrupts
+   the turn and refuses it with a `ConfinementBreach`. **Round 15, review of
+   e9adf91.** The scheduler holds a line whose turn ended in a breach unconditionally.
+   The exemption for a line that mailed an operator during a failed turn does not
+   apply, because the mail may explain a failure and does not undo a call that escaped
+   its confinement. The hold text names the breach. This detects and does not prevent,
+   since the `Read` has completed, and what it returned has reached the model.
+4. *A policy that switches hooks off refuses the line.* **Fact, found in the bundled
+   Claude Code 2.1.310 by the audit line.** The settings `disableAllHooks` and
+   `allowManagedHooksOnly` stop hooks from running, and the engine's message says
+   "set in settings or by policy". **Hypothesis.** Either stops an SDK hook callback.
+   `dromon.hookpolicy` reads the line's `[settings]` document and the managed policy
+   files, `managed-settings.json` and the fragments in `managed-settings.d`, under
+   `/Library/Application Support/ClaudeCode` and `/etc/claude-code`, and refuses to
+   start a view-only line when one is present with any value but the boolean `false`.
+   **Round 15, review of e9adf91.** A string, a number, `null` and a container refuse
+   as `true` does, because only `false` is shown to leave hooks on. A directory that
+   holds more than 64 policy files, the main file included, refuses too, since a file
+   past the bound would go unread and could carry a switch. A policy file that exists
+   and cannot be read as a JSON object also refuses, because a policy that cannot be
+   seen cannot be shown to leave hooks on. **Limit.** A policy delivered by a mobile device management
+   profile or a registry key cannot be seen from here, and the third guard is what
+   catches it, after the fact.
+**Other engines.** Codex has no permission callback to bypass. Its `view_image` is
+checked by Dromon against the `imageView` item as the engine emits it, which detects
+and does not prevent, as stated above, so an over-limit or non-image file on Codex is
+caught only after the engine began the call. Grok is not enabled, and it shares the
+class of risk, since whether Grok asks before `read_file` is unknown, so it stays
+disabled until its verify-first item 6 shows how it behaves. **Verification still to
+run.** The operator repeats the live run on Claude Code and expects Dromon's refusal
+for `word.txt`, the renamed png and `big.png`, and the image still viewed.
 
 ## Dromon's own tools
 
@@ -147,12 +210,13 @@ argument outside a tool's schema is refused.
 
 | Tool | Effect |
 |---|---|
-| `send_message` | Sends a note to a line, an operator or the line itself, delivered in a later tick. With `priority` true, a note to another line is priority mail, rate limited, as [`PRIORITY.md`](PRIORITY.md) specifies. With `issue` true, from 2026-10-31, it raises an issue with an operator, as below |
+| `send_message` | Sends a note to a line, an operator or the line itself, delivered in a later tick. With `priority` true, a note to another line is priority mail, rate limited, as [`PRIORITY.md`](PRIORITY.md) specifies. With `issue` true, from 2026-10-31, it raises an issue with an operator, as below. From round 14, `asks_reply` says whether a note asks a reply, and `reply_to` may also name a note the line sent the same recipient, to correct it, as the unanswered rule below says. `@operator` names the project's default operator, as below |
 | `ask_operator` | Asks an operator a question, which never pauses the line |
-| `wake_after` | Schedules one wake for the line, optionally tied to a running background task, as below |
+| `wake_after` | Schedules one wake for the line, optionally tied to a running background task or to a process of its own that `list_processes` shows, as below |
 | `list_mail`, `read_mail`, `acknowledge_mail` | Page through, open and acknowledge the line's mailbox |
 | `list_sent` | Lists what became of the line's sent mail |
 | `acquire_lease`, `release_lease` | Take and give up a lease the project declares, as below |
+| `list_leases` | From round 14. Lists every live lease, with its holder, both times and the holder's unverified note, and the declared leases no line holds. Read only, the same for every line, as below |
 | `start_run`, `run_status`, `stop_run` | Offered while the project declares a run command, or while the line's scope has a run to read. Start a declared command as a supervised run that outlives the turn, the seat and the daemon, show the scope's latest runs with their receipts, and stop its open run, as [`RUNS.md`](../architecture/RUNS.md) specifies. A seat must own its role, and every line needs write access to its working directory. A lost run blocks its scope until no process is left in its supervisor's group or session, or an operator clears it. Added on 2026-10-31, and the last two sentences in the review of that day. From round 14 they are also offered while the project declares a commit command, and `start_run` takes `commit`, the full commit a commit command runs on in a checkout the daemon makes, which a line that only reads its working directory may start and stop |
 | `line_status` | Shows a compact read-only status by default, with diagnostic detail and long lists available by argument, as below |
 | `role_status` | Offered only to a seat of a role. Shows the role's worktree, whether the project file or an operator holds it, its declared failover order, failover policy, handoff threshold, owner, the seat a failover would pass it to now and the latest change of owner, its seats in the failover order with whether each is usable for a failover, their condition, worktree access, whether each waits because its engine cannot confine it, model, provider and stated budget, each seat's latest three background task ends with the digest of their output, and its latest five journal entries, the newest with its body, read only, as [`ROLES.md`](../architecture/ROLES.md) describes. Added on 2026-10-27, the task ends on 2026-10-28, the holder and the order on 2026-10-31 in round 10, and whether the project file declares the role, how a role an operator holds differs from it, and the lines that wait beside the owner, in the round 10 review |
@@ -162,9 +226,10 @@ argument outside a tool's schema is refused.
 | `set_brief` | Records the line's standing brief, its `task`, its open `decisions`, the `artifacts` its task concerns and its `next_action`, as one `brief_set` event that replaces its previous brief and that the daemon stamps with the time, the worktree's commit and its own. Only `task` is required. Each text field is at most 4,096 bytes, at most 32 paths are named, each on one line and at most 1,024 bytes, and the whole is at most 16,384 bytes. An unknown key is refused, and the text is checked against the disclosure list as `record_role_note` is. The brief leads the line's first turn after its engine session is new, is shown by `line_status`, and fills the role transition package where a journal entry is silent, as below. Added on 2026-10-29 |
 | `propose_change` | Records a proposed patch, file list and message for operator review; it does not change project files |
 | `read_instructions` | Shows the instructions the line's next turn receives, as below |
-| `write_scratch` | Writes a file under the line's scratch in its working directory, `tmp/` or `tmp/lines/LINE`, as below |
-| `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term, a file name or a line location. Files are checked independently, so a match cannot span files. The combined content is at most 1 MiB. One call, including a list, spends one recorded check, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. Added on 2026-10-28 |
-| `list_processes`, `stop_process` | List and stop the processes the line started, as below |
+| `write_scratch` | Writes a file under the line's scratch in its working directory, `tmp/` or `tmp/lines/LINE`, as below. Its result gives the absolute path written and the bytes written |
+| `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term, a file name or a line location. Files are checked independently, so a match cannot span files. A file is read in parts of at most 1 MiB cut after a newline and the counts are summed, a line may not exceed 1 MiB, and the combined content is at most 16 MiB. A path may be the absolute path `write_scratch` reported. One call, including a list, spends one recorded check, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. Added on 2026-10-28 |
+| `list_processes`, `stop_process` | List and stop the processes the line started, as below. Where the daemon cannot attribute processes to the line, `list_processes` says it is unavailable and why, and never returns an empty list. Changed in round 14 |
+| `worktree_status` | Gives the state of the line's own working directory, computed by the daemon outside the line's sandbox, as the processes section below specifies. Added in round 14, item 7 |
 
 **Issues.** **Round 11, item 3, decided by core for review on 2026-10-31.** A line
 raises a harness or operator-experience issue unasked with `send_message` and `issue`
@@ -201,7 +266,8 @@ reply, and receives each through the operator's relay like any other mail, as
   was not added.
 - **Rollback hazard.** A daemon older than this kind cannot read an event log that
   holds an issue, since its codec refuses an unknown message kind, so a rollback past
-  it needs the log from before the first issue.
+  it needs the log from before the first issue. The rollback floor in
+  [`EVENT_LOG.md`](EVENT_LOG.md) names its commits.
 
 **Decided by the operator on 2026-10-26**, from the lines' own reports, for what follows
 in this section.
@@ -212,14 +278,52 @@ default. The compact JSON answer includes the line's `line_id`, `state`, `condit
 `unread`, `unanswered` and, from 2026-10-30, `own_notes`, the pending message count, `model`, `strategy`, a short context summary and daemon version and
 commit. It also includes a `commits` object with the worktree commit, the daemon commit
 and a sentence citing both. It includes counts of leases, background tasks, recent turns and other lines,
-not their contents. The default answer and every response that includes lists are
+not their contents. From round 14 it also gives `background_jobs`, the count of
+background jobs of a line that is not running, and `background_ends`, which says how the
+end of a job reaches the line, as the processes section below specifies. The default answer and every response that includes lists are
 bounded to 8,192 UTF-8 bytes. If a response exceeds that bound, it returns a small
 object with `status_truncated`. A truncated list response also sets `lists_truncated`
 and suggests `detail: true, lists: false` to omit the lists.
 
+**Round 14, items 3 and 4. Unknown is a named entry, never null.** The compact answer
+and the detailed one also give three entries, each of which says `unknown` where a
+fact is unknown, so no reader mistakes a missing value for a fact. `provider_budget` is
+the stated budget of the line's provider, with `status` `stated` or `unknown`, `provider`,
+`remaining_percent`, `resets_at`, `source`, `note` and `stated_at`, each `unknown`
+where the statement left it out or none exists. `role_status` gives each seat's
+`budget` in the same form. Dromon moves no role and holds no line on a budget it does
+not know. `disclosure` says whether the project has a disclosure list, `list` being
+`configured` or `none`, with a `note`, so a line learns early that `check_disclosure`
+can neither pass nor fail without one. It names no path, term, count of terms or line
+number, which the operator has declined to give. `cost_usd` keeps its `estimate`,
+`unknown` when no turn since the release reported a cost and some reported none, and
+gains `unknown_turns`, `unknown_counts_as_usd` and `counting`. **How unknown cost
+counts against `max_cost_usd`.** A turn that reported no cost, or ended without a
+report, adds nothing to the estimate, so it counts as `0.0000` toward the limit, and
+the limit holds the line only on the costs reported. A line whose turns report none
+is therefore never held by the cost limit, only by its limit on autonomous turns. This
+is a decision to count them apart and not to guess, because a guess would hold or free
+a line on a number nobody measured. The budget line at the head of each turn's prompt
+says `counted as $0.00` beside the turns. **Review of a9995d8, item 4. The limit may not
+be enforced.** `cost_usd` also gives `limit_enforced`, `false` for a line whose engine
+never reports a cost, which are Codex, Grok and Cursor Agent, whose adapters set the
+turn's cost to `null` in code. The `limit` beside an unknown estimate read as
+protection, and for these lines it holds nothing, so the entry says so with a `note`
+and the prompt's budget line says that the cost limit does not apply. They are bounded
+by the autonomous-turn limit and the hold after a failed turn alone. On a subscription
+that is quota and not money. **The `api` strategy is refused on those engines**, when a
+line is created and when its engine is built, because nothing would bound what it
+spends. This is the choice made over a per-turn charge, which would be a number Dromon
+made up for a spend it cannot see. The `flexible` strategy is allowed and shows
+`limit_enforced` false. Claude Code, Pi and Antigravity report a cost when the engine
+gives one. The client protocol's
+`cost_estimate_usd` stays `null` for an unknown cost, as [`CLIENT.md`](CLIENT.md)
+specifies.
+
 Set `detail` to true for diagnostic fields, including the resolved `workdir`,
 `engine_session`, kept-session state, process status, event-log status and full context
-details. It also gives `sandbox`, the built engine's full effective Claude Code sandbox
+details. From round 14 it also gives `sandbox_facts`, the facts a turn's prompt states
+about the sandbox, as the processes section below specifies. It also gives `sandbox`, the built engine's full effective Claude Code sandbox
 document, including resolved write paths and Dromon's added write denials. Its
 `shared_git_directory_write_allowed` says whether the shared Git directory itself is
 writable through that sandbox, and `shared_git_denied_paths` lists denied paths inside
@@ -252,6 +356,7 @@ out reads as the value in the last column.
 | `oldest_unread_age_seconds` | Whole seconds since the oldest of those was sent | No unread mail, or its time does not parse |
 | `workdir_commit` | The commit at `HEAD` of the line's working directory | Not allowed or not in a checkout |
 | `leases` | The names of the leases the line holds | None held |
+| `background_jobs` | How many background jobs the line has while it is not running, so that `idle` with a job is told from `idle` with nothing going on. Added in round 14, item 3 | None |
 
 The entry gave `held` until 2026-11-01. It is no longer given, since `hold_cause` is
 given exactly when the line is held.
@@ -268,14 +373,53 @@ given exactly when the line is held.
   the other lists alone pass the bound, the response is truncated as before, and
   still carries `other_lines` and `other_lines_omitted` at its top. An entry whose
   lease names alone would pass the bound gives `lease_count` in place of `leases`, so
-  at least one entry is given whenever another line exists. No argument pages past
-  the lines left out.
+  at least one entry is given whenever another line exists.
+- **Paging, from round 14.** **Required by the operator on 2026-11-01.** Until then no
+  argument reached the lines a bounded response left out. `line_status` takes
+  `other_lines_offset`, an integer from 0 to 100,000 given with `lists`, which skips
+  that many lines of the order kept past the bound, those that say something first
+  and then the rest. A response that leaves lines out past those it shows gives
+  `other_lines_next_offset`, the offset of the next page, and a page that began past 0
+  gives `other_lines_offset`. `other_lines_omitted` counts every other line the
+  response does not show, those before the offset included. An offset past the end
+  shows none. The paging fields are measured with the entries, so a page stays within
+  the bound. An offset without `lists`, or one that is not such an integer, is
+  refused. **Residual.** The order is computed afresh for each call, so a line whose
+  condition changes between two pages may be shown twice or not at all. Each page is
+  exact for the moment it was built.
+- **`failed` across a restart, from round 14.** **Required by the operator on
+  2026-11-01.** The condition was held in the daemon's memory only, so after a
+  restart a failed line read `idle`. A turn that fails now records `failed` in its
+  `line_turn_ended`, and the state keeps the line failed until a turn ends without
+  it, new mail reaches the line, the line is released, or a restart note reaches it,
+  the events at which the scheduler clears its own record. A restarted daemon seeds
+  its record from the state, and the record follows the memory. **Fact.** In an
+  ordinary turn, a failure the engine reported without raising never entered the
+  memory, so it is not recorded either, while a turn the engine started by itself
+  entered both. **Required by the operator on 2026-11-01.** Both kinds of turn now
+  mark the line failed for such a report, so a line that mailed an operator in the
+  turn escapes the hold as before but stands `failed`, is not woken again until new
+  mail reaches it, and stays failed across a restart. **Residual.** A note the daemon records for the line without
+  waking it clears the state's flag, while the daemon's memory keeps the line failed
+  until a restart.
 - **The cost.** **Decided by the operator on review r13, C1.** The state keeps each
   line's unread mail and its open questions to an operator as indexes, updated as
   events apply and rebuilt by replay, so a line's `condition`, its `unread` and its
   oldest unread mail are read without a scan of the messages. The view is built only
   when `lists` is true. The caller's own counts are still found by a scan of its
   mailbox, as before, and reading each other line's `workdir_commit` reads a file.
+- **One copy per call, from round 14.** **Required by the operator on 2026-11-01.**
+  Each `line_status` call read the event log's state 27 times, and 49 with `lists`,
+  and each read copied every message, which was the whole of its linear cost. The
+  reads of one call now share one copy, taken when the call starts, and a read after
+  the log moved takes a new one, so every answer is what a fresh copy gives. Outside
+  `line_status` every read is still a fresh copy. Measured with 12 lines and 100,000
+  messages on the line's machine, the mean of five calls through the tool, the base
+  commit 47c58d5 took 83 ms for the default call and 129 ms with `detail` and
+  `lists`, and this change takes 58 ms and 51 ms. What remains is the one copy and
+  the scan of the caller's mailbox. **Inference.** The figures vary between runs by
+  tens of milliseconds, so only their size is meant. Building a line's tools still
+  reads the state about 11 times, outside this change.
 
 - **Never the mail.** The view gives a count and an age, and never a message's body,
   sender, identifier or subject. A hold gives its closed cause and never the hold
@@ -437,6 +581,19 @@ is read.
   worktree. It was `false` there before, which said the daemon was not behind a
   worktree whose code it may not contain. It is cached by both commits, as `stale` is.
   The compact view carries it too.
+- **The turn's commits, from round 14.** **Required by the operator on 2026-11-01,
+  every turn decided by core for review.** A line acted on a standing brief written
+  at an earlier commit, and on a daemon whose checkout had left its loaded code,
+  without noticing either. Every turn's prompt now leads, after the worktree-moved
+  notice, with one paragraph naming the commit the line's standing brief names beside
+  its worktree's `HEAD`, and the commit the daemon loaded beside its checkout's `HEAD`.
+  A pair that differs carries a plain `WARNING`, and the brief's warning gives the
+  `git log` range to read. A pair is left out where a commit is not known, as for a
+  line with no brief or a brief stamped with no commit. **Inference.** The commits are
+  read from small files, never by git, so the daemon's pair is compared as commits
+  and not as code, unlike `stale`, and a move that touched only documents is warned of
+  too. **Coverage gap.** The tests call the notice directly and do not compose a whole
+  prompt.
 - **`cite`.** One sentence naming both full commits, such as `line core read its
   worktree at commit C, under the daemon at commit D.`, with the commit the daemon's
   own checkout has moved to when it is stale, and a clause saying that the daemon's code
@@ -494,7 +651,20 @@ unreadable instruction file is reported as the turn would refuse it.
   `full` that is not a boolean is refused.
 
 **`write_scratch`.** Arguments `path`, relative to the line's scratch in its working
-directory, and `text`, at most 262,144 bytes of UTF-8, which replaces the file whole.
+directory, `text`, at most 262,144 bytes of UTF-8, which replaces the file whole, and
+`area`, `scratch` by default or `reports`. **Round 14, item 2.** The result is `wrote N
+bytes to PATH`, with the bytes written, not characters, and the absolute path of the
+file, built from the working directory's real path and the components the call opened
+without following a link, so it names the file written and `check_disclosure` accepts
+it. Directories below the area are created. With `area` set to `reports` the path is
+relative to the line's `report_directory`, and the call is refused when the
+configuration declares none, so a review line that declares `tmp/reports` writes its
+reports without a shell. The reports area is refused while the line does not own its
+role's worktree, since a seat that is not the owner never writes the owner's files, so
+its report directory would be the owner's. **Residual.** The line then writes under
+its own scratch, and the operator moves the report. Every path outside the area stays
+refused, as the next sentences say, and `read_only_paths` bind the reports area as they
+bind the scratch.
 The daemon writes the file, so a line without `Write` can keep its own notes and
 reports. It creates `tmp/` and the directories under it. It refuses an absolute path,
 a path starting with `~`, any `..`, a target that is a symbolic link, which is never
@@ -548,13 +718,27 @@ tools do the same for a line.
   neither the daemon nor an engine it started and whose environment holds the line's
   mark, read again at the moment of stopping. Every other pid is refused, as are a pid
   of 1 or less, a process that has already ended and one that cannot be signalled.
-- **Process workers.** Process inspections and launch-record sweeps use separate worker
-  threads, each with at most eight queued calls behind its active call. Sweeps wait for
+  **Reuse of a pid, review of 2026-11-01.** The listing is read again after the mark,
+  and the signal is sent only if the process is still the one first seen, by parent,
+  command and an elapsed time that has not gone back. Otherwise the stop is refused as
+  `changed while it was checked`. The line's mark is then read a second time, so a
+  pid reused within the same second by a process with the same parent and command is
+  still refused unless it carries the mark, which only the line's own processes have.
+  **Residual.** No process handle exists on this platform, so the window between that
+  second read and the signal remains, which is microseconds and not the listing's
+  seconds.
+- **Process workers.** Process inspections, launch-record sweeps, worktree status and
+  the kill-all pre-turn walk use separate worker threads, each with at most eight queued calls behind its active call. Sweeps wait for
   signalled processes, so isolating them keeps a long sweep from occupying the inspection
   queue. When an inspection queue is full, the request is refused. A queued call whose
   caller is cancelled is skipped if it has not started. A call already running cannot be
   stopped, so a cancelled stop request may still take effect. Both queues are bounded,
   and sweeps report a repeated queue refusal once until a sweep succeeds.
+  **The pre-turn walk has its own worker, review of 2026-11-01.** The walk can run for
+  up to 63 seconds on a loaded machine, and on the shared worker a stop, a listing and a
+  pid watch queued behind it. A stop of a running turn never used the worker. A stop
+  with `stop_process` is now answered while a walk is held, which a test shows by
+  holding the walk and stopping a process.
 - **Detached-process inspection.** At the end of a turn, the scan runs on the process
   worker because its process-table reads can block. The worker receives only the process
   table and scan inputs, then returns process identifiers and command strings. Its result
@@ -588,6 +772,147 @@ tools do the same for a line.
 - **Limits.** A pid reused by another process between the check and the signal is the
   race every signal by pid has, narrowed by checking immediately before. External
   agents have neither tool.
+
+**Round 14, processes and the sandbox.** Decided by the operator on 2026-11-01, from
+the round 13 reports and two other projects' trials. Each item below says what it
+rests on. A **fact** was observed, an **inference** follows from facts, and a
+**hypothesis** was not tested live, since a line may not start a daemon or an engine.
+
+- **`list_processes` never answers silence for failure.** **Fact.** The environments
+  were read with one `ps`, and a `ps` that timed out under load gave an empty mapping,
+  which listed nothing, so a line read "no process of mine" from a table it had not
+  read. The line tools now read strictly. A `ps` that cannot run, times out or fails
+  with no output, and a reading where processes exist and none has a readable
+  environment, raise a refusal that names the cause. `list_processes` and the `pid:`
+  form of `wake_after` answer `list_processes is unavailable: REASON`, with
+  `unavailable` first, and `stop_process` does the same where processes cannot be
+  identified. An empty list now means that the environments were read and none carried
+  the line's mark. Each listed process also gives `task_id`, `pid:NUMBER`.
+- **What stays unavailable, and what is left.** **Fact, observed on macOS 27 on
+  2026-10-26 and unchanged here.** The mark cannot be read there, so the self-test
+  fails and `list_processes` and `stop_process` answer unavailable on that platform. A
+  line cannot there list the commands it started, and the scoping to its own, which the
+  mark gives, holds only where the mark is readable. **Not built, and why.** An
+  attribution by ancestry was examined in the follow-up to round 14 and left out for
+  three reasons. **First, the daemon cannot name a line's launcher where the mark is
+  unreadable.** Every launcher is a child of the daemon, and nothing else tells them
+  apart, since the engines do not expose the launcher's pid and the mark in its
+  environment is the unreadable thing. A launcher's command line is readable, but it
+  carries no mark, and adding one touches the launch path of all six engines and the
+  script that Claude Code runs as its executable. **Second, ancestry loses what matters
+  most.** A command that detaches, or whose parent has ended, is given to the system's
+  first process and leaves the tree, so a listing by ancestry would omit the very
+  background jobs that outlive a shell, while looking complete. **Third, a stop would
+  need its own proof.** The safe form, which this note records for a later round, is a
+  single parent-only walk, without the group rule that `descendants` applies, from a
+  launcher that the daemon itself started and has not reaped, since its pid cannot then
+  be reused, with the walk repeated immediately before the signal and the launcher, the
+  harness and every other line's launcher excluded. A descendant of one launcher is
+  never a descendant of another, so the form cannot cross lines, and it shares with the
+  mark's check the unavoidable window between the last look and the signal. It cannot be
+  verified without a live daemon on a platform with an unreadable mark, which no test
+  here has. **Inference.** Until then a line on such a platform can use the commands of
+  its own shell and its engine's own task tools, and `stop_process` refuses rather than
+  guesses, which is the safe direction.
+- **`wake_after` waits for a process of the line's own.** A `task_id` of the form
+  `pid:NUMBER` is accepted only after the daemon has read, as `stop_process` does,
+  that the process carries the line's mark. The daemon then looks every five seconds, on
+  the process worker, for the process to leave the line's listing, and records its end
+  as a background task's, which withdraws the wake and wakes the line with a note. A
+  table that cannot be read is not an end, so the look is repeated. The exit code is
+  not available, since the process is not the daemon's child. **Residuals.** The watch
+  lives in the daemon, so a restart ends it, and the new run's tokens no longer find
+  the process, so the wake fires at its timeout. One watch is kept for each line, since
+  a line has one wake.
+- **Idle with a background job.** `condition` stays one word, so every client that
+  reads it is unaffected. `background_jobs` beside it counts the jobs of a line that is
+  not running, the larger of what its kept engine reports and the processes the daemon
+  found left by an earlier turn, and `dromon status` writes `idle with 2 background
+  jobs`. The entries of `other_lines` give it when it is above zero. A line's own
+  `line_status` gives `background_ends`, which says how the end reaches the line, and,
+  where the line waits for a task, which task and which wake. **Inference.** The daemon
+  cannot say when a job will end, only that its end is recorded and wakes the line, so
+  no time is given. An engine that cannot say counts as no job, which
+  `background_tasks_unknown` keeps apart.
+- **Background tasks across a compaction.** **Hypothesis, not verified live.** A
+  compaction replaces the conversation with a summary, so the line may forget a build
+  it started, while the engine keeps running it. **Fact.** Dromon follows each task
+  from the engine's own events in the kept connection, which a compaction does not
+  touch. The turn after a requested compaction, or after the engine compacted by
+  itself, therefore leads with a note naming the tasks Dromon holds as running by
+  identifier only, at most ten with the count of the rest, and the task a pending wake
+  waits for. **No command text is given, review of 2026-11-01.** Screening a command
+  against the disclosure list outside the counted checks let a line learn from the
+  withheld words, at its next compaction, whether a candidate string held a listed
+  term. The line can ask its engine's own task tools for a command. An identifier that
+  is not plain is counted and not shown. The
+  note is composed beside the standing brief, which is owed in the same cases. **Limit.**
+  If the engine itself ends a task at a compaction, Dromon can only record the end it
+  reports, and cannot keep the task. A restart ends the kept connection, and then the
+  roster is empty. A process the engine does not report as a task is for
+  `list_processes`.
+- **A temporary directory and a cache the sandbox lets the shell write.** A Claude Code
+  line with an enabled sandbox is given, outside its working directory, the directories
+  `dromon-UID/LINE/tmp` and `dromon-UID/LINE/uv-cache` under the system temporary
+  directory. They are created with mode 0700, opened without following a link, and
+  refused unless the daemon's user owns them alone, as `dromon.linetemp` records. The
+  sandbox is granted write access to both, `TMPDIR` is set to the first and
+  `UV_CACHE_DIR` to the second, so the project's gate needs no workaround for the
+  uv cache, and a here-document has a writable place for its temporary file. They lie
+  outside the working directory because a line with read access has that directory
+  denied to writes and no layer can lift the denial. `UV_CACHE_DIR` travels as a
+  relayed variable, so only the adapter's value reaches the engine. **Fact.** In a round
+  14 session Claude Code set the shell's `TMPDIR` to a directory of its own under
+  `/tmp`, and its sandbox granted it. **Hypothesis.** A `TMPDIR` that Dromon sets may be
+  overridden where Claude Code sets its own, in which case the here-document case
+  depends on Claude Code, and the cache and the write grant still stand. A line whose
+  directories cannot be made still starts, and its facts say it keeps the engine's own.
+  **Removal, reading and size, review of 2026-11-01.** No event retires or deletes a
+  line, so nothing is removed at one. At each daemon start, before any engine starts,
+  a sweep removes entries of a line's `tmp` directory unchanged for a week, treats the
+  cache and `tmp` of a line this daemon does not know alike, and removes such a
+  directory when both are empty. It is age and not absence that decides, since the
+  parent directory is shared by every daemon of the user, and removing a directory for
+  being unknown would end another project's commands. Nothing is followed through a
+  link. **There is no byte bound, and none is possible.** The sandbox has no quota, and
+  the system gives an unprivileged process none for a directory on a shared file
+  system, so a line can fill the disk between two starts. The sweep and its age rule
+  bound the growth over time and not within it, and the daemon does not measure the
+  size. A cache that a line only reads is removed after a week, which costs speed only.
+  The sandbox denies the line reads of the directory that holds every line's directory
+  and lifts the denial for its own, so a line cannot read what another line's commands
+  wrote. **Hypothesis, not verified live.** An `allowRead` entry lifts a `denyRead` of
+  a directory above it, as the sandbox's own `allowWithinDeny` suggests. If it did not,
+  the line could not read its own temporary files, which a here-document does.
+- **`worktree_status`.** No arguments. The daemon runs `git`, outside the line's
+  sandbox, in the line's own working directory, and gives `head`, `branch`, `origin_main`
+  with `ahead` and `behind` of the last fetched `origin/main` or the reason it has none,
+  `dirty` as status letters and paths, `dirty_count`, `dirty_truncated`, `complete`,
+  `incomplete` and `clean`. `clean` is true only when git finished with nothing on its
+  error stream and listed no path. It is false when a path is dirty. It is null when git
+  said something and listed no dirty path, which is the case a sandboxed `git status`
+  could not tell from clean, and every line git said is named, with the path it quotes.
+  Where the commit or the status cannot be read, the answer is `worktree_status is
+  unavailable: REASON`. The list is cut at 200 entries and each path at 300
+  characters. **Trust.** Git runs with the daemon's authority in a directory the line
+  may write, with `GIT_` variables cleared, the system and user configuration unread,
+  optional locks off and the file system monitor off on the command line. **Residual.**
+  The repository's own configuration is read, and a filter it names that
+  `.gitattributes` selects would run, which a sandboxed line cannot arrange, since its
+  sandbox denies it that file. The daemon never fetches, so `ahead` and `behind` are as
+  the last fetch left them, and the answer says so.
+- **Sandbox facts at turn start.** A Claude Code turn's prompt leads with one short
+  paragraph, given the first time in a daemon run, again when it changes, with a
+  compaction, and every turn of a line that starts a fresh session each turn, and
+  always in `line_status` detail as `sandbox_facts`. It says whether the shell is
+  confined, whether `ps` is allowed, the scratch directory and whether the shell may
+  write it, the directories above, and the domains the network is configured to reach.
+  **Fact.** `ps` was refused with `Operation not permitted` under an enabled sandbox on
+  macOS, so it is reported denied there, unknown on another platform and allowed with no
+  enabled sandbox. **Hypothesis.** The network answer is the configured allowlist and
+  not a probe, so a listed domain may still be down. An engine whose sandbox Dromon
+  does not hold, Codex, Grok and the others, is told nothing. An engine's automatic
+  compaction can drop the paragraph until the next change, which `line_status` repairs.
 
 ## The wake prompt
 
@@ -639,6 +964,60 @@ during that turn.
   none asks a reply of the line. The state the event log builds keeps
   every such question's identifier from its `line_held` event, so the rule survives a
   restart. **Decided by the operator on 2026-10-26** in round 2.
+- **`@operator`, from round 14.** **Required by the operator on 2026-11-01.** A line
+  addressing `@operator` in `send_message` or in `ask_operator`'s `to` was refused
+  with `no operator operator` in a project whose operator has another name. It now
+  names the project's default operator, the `operator` of the project file, unless an
+  operator named `operator` is registered, who is then meant. When the default
+  operator is not registered either, the call is refused with the operators that
+  exist, such as `no operator is configured for @operator to name; the operators are
+  @ana, @ben`, or with `there are none`. Any other operator address that names no
+  registered operator is refused the same way, so the refusal says what to write. The
+  resolved address is what the log records, so a reader of the log never meets the
+  alias.
+- **Unanswered, from round 14.** **Required by the operator on 2026-11-01, the
+  defaults decided by core for review.** The count only grew, since every report and
+  every reply counted until its recipient answered it. `dromon.mailbox.counts_unanswered`
+  is now the one rule.
+  - A message leaves the count once its recipient replies to it or acknowledges it,
+    as before, and also once its own sender corrects it with a later note naming it
+    by `reply_to`, since the correction is then the one to answer. `list_sent` shows
+    such a message as `corrected`.
+  - A note that asks nothing is not counted. `send_message` takes `asks_reply`. A
+    note that leaves it out asks a reply unless it is itself a reply, and a
+    correction that leaves it out asks what the note it corrects asked. A question
+    and an issue always ask. Decided over counting every note, which made the count
+    grow with every reply, and over a default of asking nothing, which would hide an
+    operator's task note sent from a client without the flag.
+  - **Round 14 review, M1, required by the operator on 2026-11-01.** A line could
+    hide its own ask from an operator, by sending a note with `asks_reply` false or
+    by correcting an asking note with it. `asks_reply` false is now honoured only for
+    a note to a line, so a note to an operator counts unless it is a reply, and a
+    correction asks what the note it corrects asked, or more when it says true, and
+    never less. `dromon.model.asks_reply_of` holds the rule, which the views and a
+    correction's application share.
+  - **Known limit, M1b, decided by the operator on 2026-11-01.** A reply asks nothing
+    by default, and the rule cannot tell a reply that answers from a reply that asks
+    again. So a line that writes a new ask as a reply to an operator's mail is not
+    counted as unanswered. The note still counts in the operator's unread count until
+    it is read, and the line may still set `asks_reply` true. Accepted over counting
+    every reply to an operator, which would make the count grow with each answer, as
+    before round 14.
+  - `list_mail` with `unanswered_only` lists exactly what the count counts, each
+    entry ending with how long it has waited, such as `unanswered for 1h 3m`. It is
+    refused beside `own_notes_only`, which selects other messages.
+  - `acknowledge_mail` takes an optional `reason` of at most 500 bytes, checked
+    against the disclosure list like a body. It is recorded in `message_acknowledged`
+    and shown only in the recipient's own listing as `closed because` the reason. The
+    sender sees `acknowledged` and never the reason, since the reason is the
+    recipient's note to itself. A reason for a message already acknowledged is
+    refused, since it would not be recorded.
+  - **Failure modes.** The ages are the event log's `recorded_at`, kept as events
+    apply, and follow the clock, as the peer view's ages do. From 2026-11-01
+    `dromon send --no-reply` lets an operator's note ask nothing, while the curses
+    client still sends no `asks_reply`, so its notes take the default. Messages already in a log keep their old fields, so an old reply
+    that asked nothing leaves the count at once, which shrinks it and hides nothing
+    that asked a reply.
 - **Own notes.** **Required by the operator on 2026-10-30, the rule decided by core
   for review.** A note from the line to itself, such as a fired wake, a task-end note
   or a compaction request, is never counted in `unread`, and is counted in
@@ -745,9 +1124,34 @@ a time.
   one acquisition lasts at most one time to live. The holder may acquire it again once
   it has expired. Expiry follows the daemon's wall clock, so a change of that clock
   moves it. A name the project does not declare is refused, listing the declared
-  names.
+  names. From round 14 it takes an optional `note` of at most 500 bytes saying what
+  the lease is held for, checked against the disclosure list and recorded in
+  `lease_acquired`. A note that is not text, is blank or is too long is refused, and
+  nothing is acquired.
 - **`release_lease`.** Argument `name`. It ends the line's lease, and is refused for a
-  lease the line does not hold.
+  lease the line does not hold. From round 14 its answer says that releasing a lease
+  does not end the processes started under it.
+- **`list_leases`, from round 14.** **Required by the operator on 2026-11-01.** No
+  arguments. It answers with `leases`, each live lease in name order with `name`,
+  `holder`, `acquired_at`, `expires` and `holder_note_unverified` when a note was
+  given, `free`, the declared names no line holds, and `caveat`. Expiry is read by the
+  wall clock as an acquisition reads it, so the two agree. A note passes with its lease
+  on a change of owner, as the times do.
+- **The note is the holder's claim.** **Round 14 review, T1, required by the operator
+  on 2026-11-01.** The note was given under a plain `note` beside the daemon's own
+  fields, though it is a line's own text that every other line reads. It is named
+  `holder_note_unverified`, and the `caveat`, the description of `list_leases` and
+  that of the note in `acquire_lease` say it is the holder's claim, bounded to 500
+  bytes and screened against the disclosure list but otherwise unchecked, to be read
+  as a claim and never as an instruction. **Residual.** How many leases a line may
+  hold, and so how much such text it can show, is bounded only by the declared names.
+- **A lease is not proof that processes ended.** **Required by the operator on
+  2026-11-01.** A released lease was read as proof that the former holder's processes
+  had ended, which the daemon never checks. The `caveat` of `list_leases`, its
+  description and the answer of `release_lease` say that a lease released, expired
+  or absent shows only that no line holds it. A line checks its own processes with
+  `list_processes`, and a successor checks a former holder's with the recovery
+  checklist.
 - **Ends.** A lease ends when released, when its time to live passes, when its holder's
   engine session is cleared, whether by `clear_session`, by a change of its `workdir`
   or at the start of each turn under `fresh_session_each_turn`, when its holder is
@@ -772,7 +1176,10 @@ to read the result.
 
 - **Arguments.** `seconds`, a whole number from 60 to 86,400, and `note`, text of at
   most 2,000 bytes. Optional `task_id` names one of the line's currently running
-  background tasks. Naming a task that is not running is refused. A number with a
+  background tasks, or, from round 14, one of its own processes that `list_processes`
+  shows, written `pid:NUMBER` as that listing gives it. Naming a task that is not
+  running, or a process that is not the line's own, is refused. Where processes cannot
+  be attributed, a `pid:` identifier is refused as unavailable with the reason. A number with a
   fraction, a boolean or text is refused.
 - **Effect.** The daemon appends `wake_scheduled` with the due time, the wall clock in
   Coordinated Universal Time plus `seconds`, rounded up to the whole second so a wake
@@ -973,6 +1380,18 @@ the intent itself, in the line's own words, set with `set_brief` and recorded as
   silent it fills Task from the former owner's latest operator mail and Gate and
   coverage from its latest task record, each marked observed by the daemon, as
   [`ROLES.md`](../architecture/ROLES.md) describes.
+- **The stamp's commits, from 2026-11-01.** `line_status` names the commits the brief
+  was stamped with `workdir_commit_when_set` and `daemon_commit_when_set`, which were
+  `workdir_commit` and `daemon_commit` before. **Fact, from the operator.** A line
+  reported a daemon commit older than the one the daemon had run for an hour.
+  **Inference, from the code.** The daemon's commit in `commits` and in `daemon` is
+  read once when the daemon starts, and each call answers from it afresh, so it cannot
+  name an earlier daemon. A kept session holds only the answers of its earlier calls,
+  which a line may quote after a restart. **Hypothesis.** The line took
+  the brief's stamp, set under an earlier daemon, for the daemon's commit, since both
+  bore the same name. Renamed so that no field naming an older daemon reads as the
+  running one. A role's journal entries keep `daemon_commit`, since `role_entry` in
+  [`CLIENT.md`](CLIENT.md) names it and each entry stands beside its `noted_at`.
 - **Trust.** The brief is untrusted data, since a line may relay in it what other lines
   and agents wrote. The daemon stamps it and checks its bounds and the disclosure list,
   and checks nothing else. A brief that holds a term the disclosure list in force
@@ -1083,14 +1502,31 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
   it would an ordinary prompt, which is no weaker than a turn without a compaction.
 - **Round 6, decided by the operator on 2026-10-26** from the round 5 reports.
   - **Its own wake.** `compact_session` takes an optional `seconds`, from 60 to
-    86,400, by default 60, and schedules a wake through the `wake_after` machinery,
-    so the compaction does not wait for unrelated mail. A wake already pending stays,
+    86,400, and schedules a wake through the `wake_after` machinery, so the compaction
+    does not wait for unrelated mail. **Round 14, item 1, decided by the operator.**
+    Without `seconds` the wake is due at once, so the compacted turn follows as soon
+    as the turn that asked ends, where it once waited a minute by default. A named
+    delay still waits for the clock. The line's turn is not interrupted, since a due
+    wake is delivered to a line that is not running, and the compaction runs at the
+    start of the next turn as before. A wake already pending stays,
     and none is added. A bad `seconds` is refused with nothing asked or scheduled. In
     round 6 a compaction an earlier turn consumed left the wake to fire, which cost one
     short turn. Round 7 withdraws it, as below. **Review, F4.** The
     request is held in memory, so a daemon restart loses it while the wake survives.
     The wake's note says so, since the wake's turn cannot tell a lost request from a
     consumed one, and a line without a compaction note may ask again.
+  - **Review of a9995d8, item 2. A manual request is bounded as the automatic ones
+    are.** Without the sixty second default, a line whose compaction left its context
+    at the warning could ask after every turn, and one chained nine compactions in two
+    seconds before the cost limit held it. `compact_session` is now refused after a
+    compaction that left the context at or past the line's warning, or left its size
+    unknown, until a context below the warning is reported, which is the rule
+    `auto_compact_held` applies to the automatic path. The refusal says so and advises
+    handing off and asking an operator for a fresh session. `line_status` gives
+    `compact_session_held`, and the context warning in the prompt says that the tool is
+    refused while it holds. Clearing the session releases it. **Limit.** A compaction
+    that reports a size below the warning and is followed by turns that report a size at
+    or past it again is not held by this, and only the autonomous-turn limit bounds it.
   - **The warning after the compaction.** A turn that begins with a compaction leaves
     the context warning out of its first line. The compaction's note ends with the
     warning as it stands once the compaction is recorded, so a compacted line is not
@@ -1108,6 +1544,40 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
     to the turn it was made for, which takes it as it starts, so a turn refused before
     its compaction point leaves nothing for a later turn. A Codex compaction in which
     no call was seen reports its usage as unknown, not as zeros.
+  - **Round 14, item 1. The settings view.** `dromon settings LINE` shows
+    `allow_compact`, `context_warn_tokens` and `auto_compact_tokens`, each with its
+    source, `line configuration` for a value the line's configuration sets and
+    `default` for one it leaves unset, and says in words what `allow_compact` gives or
+    withholds, so an operator can tell why a line has no `compact_session`. They are
+    read only there, changed by configuration. **Fact, from the operator.** Round 13's
+    line lacked `allow_compact` because it was created before `dromon create` took
+    that option.
+  - **Round 14, item 1. Which engines compact, and what each loses.** **Fact, from the
+    adapters.** Only a Claude Code line and a Codex line can compact, and only when
+    the operator sets `allow_compact`. Grok, Pi, Cursor and Antigravity lines refuse
+    `allow_compact` when they are configured, so they have neither `compact_session`
+    nor an automatic compaction, and the warning at the head of their prompt is all
+    they get. Antigravity's runtime may compact by itself and Dromon cannot ask it to.
+    **A line asks, and the daemon compacts without being asked.** A line with
+    `allow_compact` calls `compact_session` while its context is at or past its
+    warning, and the compaction runs at the start of its next turn, which a wake it
+    schedules brings about, so the request is made at the end of one turn and takes
+    effect before the next. The same line is woken by the daemon to compact when its
+    estimate reaches the warning or `auto_compact_tokens`, whichever is lower, at the
+    boundary between turns. A line without `allow_compact` has neither, by the
+    operator's choice, and its warning says that an operator can enable it. **What
+    each loses.** Claude Code runs its own built-in `compact` command, which replaces
+    the conversation with a summary the model writes, so the exact wording of earlier
+    messages, earlier tool results and reasoning are no longer in the context, and
+    the engine reports the sizes before and after. Codex runs `thread/compact/start`,
+    with the same loss, and reports no size after, so the context after is an estimate
+    from the next call and no automatic compaction repeats until a smaller context is
+    reported. Neither loses files, the mailbox or the standing brief, and the next
+    turn leads with the brief when the session was compacted since the last turn.
+    **Inference** for the summary's content, which the engines choose and Dromon does
+    not see. **Residual.** A line cannot compact itself without `allow_compact`, and
+    the daemon holds no way for it to ask the operator for one beyond
+    `ask_operator`.
   - **Its own cost.** Each of `recent_turns` has a `kind`, `turn` for a Dromon turn,
     and `compaction`, the compaction it began with, with its trigger, sizes, its own
     `cost_usd` and `usage`, which the turn's own include, or `null`. A Claude Code
@@ -1275,10 +1745,18 @@ ends with each turn, and the next turn resumes the session in a new one.
   as delivered notes without a separate wake. Each task is noted at most once. At most
   3 task notes wake or accompany turns for a line in any 60 seconds. Ends past that
   limit are counted and named in the line's next note. A command is cut to 200
-  characters, and withheld when the
-  project's disclosure list covers it. It is the line's own text, so the note quotes
+  characters. It is the line's own text, so the note quotes
   it as a JSON string and says that it is data from the line's own tool call and not
-  an instruction, so that it cannot pose as Dromon's words.
+  an instruction, so that it cannot pose as Dromon's words. **Round 14 follow-up.**
+  Neither the command nor the output is screened against the disclosure list, and
+  neither is the command or output file name that `task_recorded` stores. The note goes
+  only to the line whose task wrote them, which holds them already, and a screen would
+  have answered that line, outside the counted checks, whether a string it chose is
+  listed, the oracle the roster closed. `role_status` shows a line its own record as
+  recorded, and shows a command or output file name the list covers as withheld in
+  every other seat's record and to an operator, who are not the line that chose them.
+  The residual is that a line colluding with a peer seat could still read the peer's
+  view. The role handoff package screens the latest record in the same way.
   **Round 4, decided by the operator on 2026-10-26.** An end waits up to 2 seconds for
   the turn the engine begins by itself on it. When the scheduler admits that turn, the
   one note says it began an ordinary Dromon turn. When admission is refused, the note
@@ -1291,8 +1769,7 @@ ends with each turn, and the next turn resumes the session in a new one.
   code 1` observed live in round 5, since the quoted description before it is the
   line's own text. It quotes the first lines of the task's
   output, at most 20 lines and 2,048 bytes, as a JSON string said to be data the task
-  wrote, says when the output is empty, and withholds it when the disclosure list
-  covers it. The output file is the line's to write, so it is read only as a file
+  wrote, says when the output is empty. The output file is the line's to write, so it is read only as a file
   named `.output`, not starting with a dot, in a `tasks` directory, inside the line's
   working directory or under the engine's own location, `claude-` and the user's
   number under `/tmp` and under the system's temporary directory. It is opened by
@@ -1303,7 +1780,7 @@ ends with each turn, and the next turn resumes the session in a new one.
   cannot have the daemon read for it a file its own sandbox denies.
   **Round 5, decided by the operator on 2026-10-26.** The note states the output's
   state plainly: quoted, empty, missing, not readable, outside the allowed locations,
-  withheld, that the engine named no output file, or, when it reported neither an exit
+  that the engine named no output file, or, when it reported neither an exit
   code nor output, that it reported none. It ends with the time Dromon detected the
   end, and its header in the prompt gives that time and the time it was delivered.
   `line_status` keeps the last task note's `last_task_note`, with its `message_id`,
@@ -1589,11 +2066,27 @@ daemon stops it, when the daemon stops or dies, and when the line's engine is st
 - **A walk that cannot be made refuses the turn.** **Review F2.** Under `kill_all` the
   daemon asks before each turn whether `ps` can list the process table, and refuses to
   start the turn, saying why, when it cannot. A failed walk is never taken for an
-  empty tree. A typed timeout result is retried within a 0.75-second deadline. Other
-  process-table errors are not retried. If a walk still fails at stop time, the launcher
+  empty tree. **Round 14, item 1.** The daemon's check retries a timeout, allowing the
+  attempts 10, 20 and 30 seconds after pauses of 1 and 2 seconds, within 65 seconds in
+  all, because `ps` took 9.5 to 15.4 seconds under load and 0.04 seconds at rest, as
+  three round 13 lines measured, and one 10-second call held a line each time. The hold
+  message names the attempts and the measured time of each. A `ps` that cannot run or
+  that fails is not retried. The check runs on the process worker, so its worst case
+  delays other process tools for about a minute, and a machine that never answers still
+  holds the line. The stop-time walk keeps its own 0.75-second deadline, since it runs
+  while the engine is ending. A typed timeout result of that walk is retried within
+  it. Other process-table errors are not retried. If a walk still fails at stop time, the launcher
   ends the harness's group, writes an unverified-stop report and exits unsuccessfully.
   After `SIGKILL`, it waits another 0.25 seconds and reports an unverified stop if a
   process still answers. The daemon records that report as `stop_unverified`.
+  **Follow-up to round 14.** The waits for the harness and the descendants to end, the
+  2 seconds and the 0.25 seconds above, are monotonic deadlines and not counts of
+  polls. **Fact, observed by ops.** Under load a sleep and a liveness check each ran far
+  longer than asked, so a count of 20 polls stretched a stop well past its bound. The
+  deadline ends the wait at the first look after it passes, the last look still checks
+  for an exit during the last sleep, and an iteration cap ends the loop where the clock
+  does not advance. **Residual.** One sleep or one check can still overrun the deadline
+  by its own stretch, so the bound is the deadline plus one such step and not exact.
   **Review F2 of the re-review, 2026-10-27.**
 - **The harness's own teardown.** **Item 7 of the live check of 2026-10-26.** Under
   `leave_background` a graceful stop of the daemon still ended a background `sleep`,

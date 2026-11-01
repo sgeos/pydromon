@@ -7,6 +7,7 @@ deselection, and the variable keeps such a run from calling the engine by accide
 """
 
 import asyncio
+import json
 import re
 import os
 from collections.abc import (
@@ -19,7 +20,7 @@ from collections.abc import (
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from claude_agent_sdk import (
@@ -44,6 +45,7 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import RateLimitStatus
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon import engine as engine_module
+from dromon import hookpolicy
 from dromon.driver import Action, Credential, Driver, Event, Strategy, driver_resource
 from dromon.launcher import StopPolicy
 from dromon.priority import SteeredDriver
@@ -51,6 +53,7 @@ from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, McpServer, ToolPolicy
 from dromon.engine import (
     API_ENVIRONMENT,
     BILLING_LIMIT,
+    ConfinementBreach,
     EnginePlanLimit,
     KEY_SOURCES,
     MCP_SERVER_NAME,
@@ -64,6 +67,7 @@ from dromon.engine import (
     credential_of,
     permission_gate,
     launch_environment,
+    view_image_hooks,
 )
 
 MODEL = "claude-haiku-5-5"
@@ -173,7 +177,10 @@ def run(target: ClaudeCodeLine, prompt: str = "hello") -> TurnReport:
     return asyncio.run(target.run_turn(prompt))
 
 
-def test_claude_bash_refuses_missing_shell_before_starting() -> None:
+def test_claude_bash_refuses_missing_shell_before_starting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("dromon.engine_environment.CLAUDE_FALLBACK_SHELLS", ())
     session = Scripted([])
     target = ClaudeCodeLine(
         Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
@@ -183,7 +190,7 @@ def test_claude_bash_refuses_missing_shell_before_starting() -> None:
         session_factory=session.factory,
     )
     with pytest.raises(
-        EngineRefused, match="Claude Code shell unavailable: SHELL is not set"
+        EngineRefused, match="Claude Code shell unavailable: no executable bash or zsh"
     ):
         run(target)
     assert session.options == []
@@ -879,3 +886,290 @@ def test_a_line_without_view_image_or_read_is_refused_an_engine_that_offers_read
     ):
         run(configured(LineConfig(builtin_tools=("Edit",)), session))
     assert session.interrupts == 1
+
+
+# Round 14, item 5. Every Read on a view-only line meets the rule before the engine's
+# own permission handling, because the engine allows a Read in its working directory
+# without calling the permission callback.
+
+
+def hook_decision(
+    config: LineConfig, workdir: Path, tool_input: dict[str, Any]
+) -> dict[str, Any]:
+    hooks = view_image_hooks(config, workdir)
+    assert hooks is not None
+    (matcher,) = hooks["PreToolUse"]
+    assert matcher.matcher == "Read"
+    (hook,) = matcher.hooks
+    event: dict[str, Any] = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Read",
+        "tool_input": tool_input,
+        "tool_use_id": "u1",
+    }
+    return dict(asyncio.run(hook(event, "u1", {"signal": None})))  # type: ignore[arg-type]
+
+
+def denied(decision: dict[str, Any]) -> str | None:
+    output = decision.get("hookSpecificOutput")
+    if not output:
+        return None
+    assert output["hookEventName"] == "PreToolUse"
+    assert output["permissionDecision"] == "deny"
+    return str(output["permissionDecisionReason"])
+
+
+def test_a_view_only_line_has_a_hook_before_every_read(tmp_path: Path) -> None:
+    session = Scripted([init(tools=["Read"]), result()])
+    run(configured(LineConfig(builtin_tools=("ViewImage",)), session))
+    hooks = session.options[0].hooks
+    assert hooks is not None and list(hooks) == ["PreToolUse"]
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [(), ("Read",), ("Read", "ViewImage"), ("Bash",), ("Edit", "Write")],
+)
+def test_no_other_line_has_the_view_image_hook(tools: tuple[str, ...]) -> None:
+    assert view_image_hooks(LineConfig(builtin_tools=tools), Path("/work")) is None
+
+
+def test_the_hook_refuses_what_the_engine_would_read_without_asking(
+    tmp_path: Path,
+) -> None:
+    from imagesamples import png
+
+    config = LineConfig(builtin_tools=("ViewImage",))
+    (tmp_path / "word.png").write_bytes(png())
+    (tmp_path / "word.txt").write_text("a text file")
+    (tmp_path / "renamed.png").write_text("a text file renamed to a png")
+    (tmp_path / "big.png").write_bytes(png(5 * 1024 * 1024 + 1))
+    (tmp_path / ".dromon").mkdir()
+    (tmp_path / ".dromon" / "x.png").write_bytes(png())
+    outside = tmp_path.parent / "outside.png"
+    outside.write_bytes(png())
+    assert denied(hook_decision(config, tmp_path, {"file_path": "word.png"})) is None
+    assert (
+        denied(
+            hook_decision(config, tmp_path, {"file_path": str(tmp_path / "word.png")})
+        )
+        is None
+    )
+    for path, why in (
+        ("word.txt", "by its name"),
+        ("renamed.png", "does not begin"),
+        ("big.png", "over the limit"),
+        (".dromon/x.png", "never reads"),
+        (str(outside), "outside"),
+        ("missing.png", "does not exist"),
+    ):
+        reason = denied(hook_decision(config, tmp_path, {"file_path": path}))
+        assert reason is not None and "ViewImage" in reason and why in reason, path
+    for given in ({}, {"file_path": None}, {"file_path": 3}, {"path": "word.png"}):
+        assert denied(hook_decision(config, tmp_path, given)) is not None
+
+
+def test_a_hook_that_gets_no_tool_input_refuses(tmp_path: Path) -> None:
+    hooks = view_image_hooks(LineConfig(builtin_tools=("ViewImage",)), tmp_path)
+    assert hooks is not None
+    hook = hooks["PreToolUse"][0].hooks[0]
+    event: Any = {"hook_event_name": "PreToolUse", "tool_name": "Read"}
+    decision = cast(dict[str, Any], asyncio.run(hook(event, None, {"signal": None})))  # type: ignore[arg-type]
+    assert denied(decision) is not None
+
+
+# Review of a9995d8, item 1. The hook fails closed, a Read that completed without a
+# hook call ends the turn, an ask rule sends every Read to the gate, and a policy that
+# switches hooks off refuses a view-only line.
+
+
+def hook_of(
+    config: LineConfig, workdir: Path, record: Callable[[str], None] | None = None
+) -> Callable[..., Any]:
+    hooks = view_image_hooks(config, workdir, record)
+    assert hooks is not None
+    return hooks["PreToolUse"][0].hooks[0]
+
+
+def test_a_hook_that_raises_denies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*arguments: object) -> str:
+        raise RuntimeError("secret detail")
+
+    monkeypatch.setattr(engine_module, "image_refusal", broken)
+    hook = hook_of(LineConfig(builtin_tools=("ViewImage",)), tmp_path)
+    event: Any = {"tool_name": "Read", "tool_input": {"file_path": "a.png"}}
+    decision = cast(dict[str, Any], asyncio.run(hook(event, "u1", {"signal": None})))
+    reason = denied(decision)
+    assert reason is not None and "RuntimeError" in reason
+    assert "secret detail" not in reason
+
+
+def test_a_hook_whose_record_raises_denies(tmp_path: Path) -> None:
+    def broken(identifier: str) -> None:
+        raise RuntimeError(identifier)
+
+    hook = hook_of(LineConfig(builtin_tools=("ViewImage",)), tmp_path, broken)
+    event: Any = {"tool_name": "Read", "tool_input": {"file_path": "a.png"}}
+    decision = cast(dict[str, Any], asyncio.run(hook(event, "u1", {"signal": None})))
+    assert denied(decision) is not None
+
+
+def test_a_hook_records_the_call_even_when_it_denies(tmp_path: Path) -> None:
+    seen: list[str] = []
+    hook = hook_of(LineConfig(builtin_tools=("ViewImage",)), tmp_path, seen.append)
+    event: Any = {"tool_name": "Read", "tool_input": {"file_path": "missing.png"}}
+    decision = cast(dict[str, Any], asyncio.run(hook(event, "u7", {"signal": None})))
+    assert denied(decision) is not None
+    # The identifier may also come from the input when the callback is given none.
+    event2: Any = {"tool_input": {}, "tool_use_id": "u8"}
+    asyncio.run(hook(event2, None, {"signal": None}))
+    assert seen == ["u7", "u8"]
+
+
+def read_result(identifier: str) -> UserMessage:
+    return UserMessage(
+        content=[ToolResultBlock(tool_use_id=identifier, content="x", is_error=False)]
+    )
+
+
+def read_call(identifier: str, name: str = "Read") -> AssistantMessage:
+    return say(ToolUseBlock(id=identifier, name=name, input={"file_path": "a.png"}))
+
+
+VIEW_ONLY = LineConfig(builtin_tools=("ViewImage",))
+
+
+def test_a_read_that_completed_without_the_hook_ends_the_turn() -> None:
+    session = Scripted(
+        [init(tools=["Read"]), read_call("r1"), read_result("r1"), result()]
+    )
+    target = configured(VIEW_ONLY, session)
+    with pytest.raises(
+        ConfinementBreach, match="without the ViewImage hook having run"
+    ):
+        run(target)
+    assert session.interrupts == 1
+
+
+class Hooking(Scripted):
+    """A session that, as the engine does, calls the registered hook for a call
+    before it delivers that call's result."""
+
+    def __init__(self, messages: Sequence[Message], hooked: Sequence[str]) -> None:
+        super().__init__(messages)
+        self.hooked = list(hooked)
+
+    async def receive_response(self) -> AsyncIterator[Message]:
+        hooks = self.options[-1].hooks
+        assert hooks is not None
+        hook = hooks["PreToolUse"][0].hooks[0]
+        for message in self.messages:
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, ToolUseBlock) and block.id in self.hooked:
+                        event: Any = {"tool_name": "Read", "tool_input": block.input}
+                        await hook(event, block.id, {"signal": None})
+            yield message
+
+
+def test_a_read_with_a_hook_call_is_not_refused() -> None:
+    session = Hooking(
+        [
+            init(tools=["Read"]),
+            read_call("r1"),
+            read_result("r1"),
+            read_call("r2"),
+            read_result("r2"),
+            result(),
+        ],
+        hooked=["r1", "r2"],
+    )
+    report = run(configured(VIEW_ONLY, session))
+    assert report.interrupted_for is None
+    assert session.interrupts == 0
+
+
+def test_only_the_read_that_skipped_the_hook_is_refused() -> None:
+    session = Hooking(
+        [
+            init(tools=["Read"]),
+            read_call("r1"),
+            read_result("r1"),
+            read_call("r2"),
+            read_result("r2"),
+            result(),
+        ],
+        hooked=["r1"],
+    )
+    with pytest.raises(ConfinementBreach, match="without the ViewImage hook"):
+        run(configured(VIEW_ONLY, session))
+
+
+def test_other_tools_and_other_lines_need_no_hook_call() -> None:
+    session = Scripted(
+        [init(tools=["Read"]), read_call("e1", "Echo"), read_result("e1"), result()]
+    )
+    assert run(configured(VIEW_ONLY, session)).interrupted_for is None
+    plain = Scripted(
+        [init(tools=["Read"]), read_call("r1"), read_result("r1"), result()]
+    )
+    run(configured(LineConfig(builtin_tools=("Read",)), plain))
+    assert plain.interrupts == 0
+
+
+def test_a_view_only_line_asks_before_every_read() -> None:
+    session = Scripted([init(tools=["Read"]), result()])
+    run(configured(VIEW_ONLY, session))
+    settings = json.loads(str(session.options[0].settings))
+    assert settings["permissions"]["ask"] == ["Read"]
+
+
+def test_the_ask_rule_joins_the_operator_rules_once() -> None:
+    merged = engine_module.flag_settings(
+        {"permissions": {"ask": ["Bash", "Read", 3], "deny": ["Edit"]}}, ("Read",)
+    )
+    assert merged["permissions"] == {"ask": ["Bash", "Read"], "deny": ["Edit"]}
+    replaced = engine_module.flag_settings({"permissions": "nonsense"}, ("Read",))
+    assert replaced["permissions"] == {"ask": ["Read"]}
+
+
+@pytest.mark.parametrize("tools", [(), ("Read",), ("Read", "ViewImage")])
+def test_no_other_line_asks_before_a_read(tools: tuple[str, ...]) -> None:
+    offered = ["Read"] if tools else []
+    session = Scripted([init(tools=offered), result()])
+    run(configured(LineConfig(builtin_tools=tools), session))
+    assert "permissions" not in json.loads(str(session.options[0].settings))
+
+
+@pytest.mark.parametrize("key", ["disableAllHooks", "allowManagedHooksOnly"])
+def test_a_managed_policy_that_switches_hooks_off_refuses_a_view_only_line(
+    key: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "managed-settings.json").write_text(json.dumps({key: True}))
+    monkeypatch.setattr(hookpolicy, "MANAGED_DIRECTORIES", (tmp_path,))
+    session = Scripted([init(tools=["Read"]), result()])
+    with pytest.raises(EngineRefused, match=f"sets {key}") as refused:
+        run(configured(VIEW_ONLY, session))
+    # A refusal before the turn is not a breach, which the scheduler holds for
+    # unconditionally. The line did nothing outside its confinement.
+    assert not isinstance(refused.value, ConfinementBreach)
+    assert session.options == []
+    # A line that is not view-only is not affected by it.
+    other = Scripted([init(tools=["Read"]), result()])
+    run(configured(LineConfig(builtin_tools=("Read",)), other))
+
+
+def test_the_operators_settings_document_cannot_switch_hooks_off() -> None:
+    session = Scripted([init(tools=["Read"]), result()])
+    target = ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        Path("/work"),
+        config=VIEW_ONLY,
+        environment={},
+        session_factory=session.factory,
+        settings={"disableAllHooks": True},
+    )
+    with pytest.raises(EngineRefused, match="settings document sets disableAllHooks"):
+        run(target)

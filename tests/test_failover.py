@@ -670,7 +670,7 @@ def test_status_omits_a_window_after_its_reset_time(world: World) -> None:
         list[dict[str, object]], world.scheduler.role_view("core")["seats"]
     )
     alpha = next(seat for seat in role_seats if seat["line_id"] == "alpha")
-    assert alpha["budget"] is None
+    assert cast(dict[str, object], alpha["budget"])["status"] == "unknown"
 
 
 def test_handoff_notice_is_once_per_crossing_below_threshold(world: World) -> None:

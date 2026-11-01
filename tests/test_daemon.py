@@ -45,6 +45,7 @@ from dromon.protocol import (
 )
 from dromon.scheduler import LineEngine, LineSpec, Scheduler
 from dromon.launcher import StopPolicy, TreeRow
+from dromon.mailbox import counts_unanswered
 
 HAIKU = "claude-haiku-5-5"
 
@@ -1138,6 +1139,66 @@ def test_send_with_priority_refuses_and_records_nothing(
         assert "ana" not in log.state.operators
 
 
+@pytest.mark.parametrize(
+    ("given", "reply_to", "recorded", "counted"),
+    [
+        ({}, False, None, True),
+        ({}, True, None, False),
+        ({"asks_reply": False}, False, False, False),
+        ({"asks_reply": True}, True, True, True),
+    ],
+)
+def test_send_records_whether_the_note_asks_a_reply(
+    paths: ProjectPaths,
+    given: dict[str, object],
+    reply_to: bool,
+    recorded: bool | None,
+    counted: bool,
+) -> None:
+    """**Follow-up of 2026-11-01.** An operator's note says whether it asks a reply,
+    and omitted the daemon's rule decides, so a reply asks none."""
+    request(
+        paths, "create_line", {"line_id": "alpha", "model": HAIKU, "strategy": "api"}
+    )
+    args: dict[str, object] = {"recipient": "alpha", "body": "x", "operator": "ana"}
+    if reply_to:
+        with EventLog(paths.event_log) as log:
+            log.append(OperatorRegistered("ana"))
+            log.append(
+                MessageSent(
+                    "m-report",
+                    LineAddress("alpha"),
+                    OperatorAddress("ana"),
+                    MessageKind.NOTE,
+                    "a report",
+                )
+            )
+        args["reply_to"] = "m-report"
+    response = request(paths, "send", {**args, **given})
+    assert response.ok and response.result is not None, response.error_message
+    with EventLog(paths.event_log) as log:
+        message = log.state.messages[str(response.result["message_id"])]
+        assert message.asks_reply is recorded
+        assert counts_unanswered(log.state, message) is counted
+
+
+def test_send_refuses_an_asks_reply_that_is_not_a_boolean(paths: ProjectPaths) -> None:
+    request(
+        paths, "create_line", {"line_id": "alpha", "model": HAIKU, "strategy": "api"}
+    )
+    args: dict[str, object] = {
+        "recipient": "alpha",
+        "body": "x",
+        "operator": "ana",
+        "asks_reply": "no",
+    }
+    response = request(paths, "send", args)
+    assert (response.ok, response.error_code) == (False, ErrorCode.BAD_REQUEST)
+    assert "asks_reply is not a boolean" in (response.error_message or "")
+    with EventLog(paths.event_log) as log:
+        assert log.state.messages == {}
+
+
 def test_create_limits_are_durable(paths: ProjectPaths) -> None:
     args: dict[str, object] = {
         "line_id": "beta",
@@ -1204,3 +1265,45 @@ def test_create_override_encoding_failure_leaves_no_line(
     assert "cannot encode" in (response.error_message or "")
     with EventLog(paths.event_log) as log:
         assert "beta" not in log.state.lines
+
+
+@pytest.mark.parametrize("omit", ["read_only", "fleet", "none"])
+def test_start_checks_every_logged_grok_profile(
+    paths: ProjectPaths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, omit: str
+) -> None:
+    from dromon import grok
+    from dromon.projectconfig import ProjectConfig
+    from dromon.sandbox import SandboxError
+    from dromon.security_paths import project_secret_paths
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    grok_home = home / grok.HOME_DIR
+    grok_home.mkdir(parents=True)
+    readonly = paths.root / "docs"
+    readonly.mkdir()
+    config = ProjectConfig(read_only_paths=("docs",))
+    registry_dir = tmp_path / "registry"
+    protected = daemon_module.protected_dirs(paths, config.federation, registry_dir)
+    declared = tuple(p for p in protected if omit != "fleet" or "index" not in p.parts)
+    snippet = grok.profile_snippet(
+        grok.READER_PROFILE,
+        paths.root,
+        (*declared, *project_secret_paths(paths.root, paths.root)),
+        home,
+        () if omit == "read_only" else (readonly,),
+    )
+    (grok_home / "sandbox.toml").write_text(snippet)
+    paths.state_dir.mkdir(exist_ok=True)
+    with EventLog(paths.event_log) as log:
+        log.append(LineCreated("alpha", HAIKU, "subscription"))
+        log.append(LineCreated("beta", "grok-4.7", "subscription"))
+        scheduler = held_scheduler(log)
+        if omit == "none":
+            daemon_module.check_grok_profiles(config, paths, scheduler, registry_dir)
+        else:
+            with pytest.raises(SandboxError, match="Grok line beta.*dromon-reader"):
+                daemon_module.check_grok_profiles(
+                    config, paths, scheduler, registry_dir
+                )

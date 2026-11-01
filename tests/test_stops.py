@@ -24,7 +24,12 @@ from dromon.activity import ActivityKind
 from dromon.agents import AgentError, LineTokens
 from dromon.ceiling import CHOICES, Choice, parse_choice
 from dromon.driver import Credential, Strategy
-from dromon.engine import HALT_REASON, INTERRUPTED_KIND, TurnReport
+from dromon.engine import (
+    HALT_REASON,
+    INTERRUPTED_KIND,
+    ConfinementBreach,
+    TurnReport,
+)
 from dromon.launcher import StopPolicy
 from dromon.lineconfig import LineConfig
 from dromon.eventlog import EventLog
@@ -69,6 +74,7 @@ class Engine:
         self.gate: asyncio.Event | None = None
         self.subtype = "success"
         self.fail = False
+        self.breach = False
         self.error = "the engine broke"
         self.during: Callable[[], object] | None = None
 
@@ -78,6 +84,8 @@ class Engine:
             await self.gate.wait()
         if self.during is not None:
             self.during()
+        if self.breach:
+            raise ConfinementBreach(self.error)
         if self.fail:
             raise RuntimeError(self.error)
         self.session_id = "session-1"
@@ -576,7 +584,8 @@ def marked(world: World, *pids: int) -> None:
     world.table.rows = [ProcessInfo(DAEMON, 1, "1:00", "dromond")] + [
         ProcessInfo(pid, 1, "0:10", f"nohup work {pid}") for pid in pids
     ]
-    world.table.envs = {pid: [mark] for pid in pids}
+    # The daemon's own environment is readable wherever the platform works at all.
+    world.table.envs = {DAEMON: ["PATH=/bin"], **{pid: [mark] for pid in pids}}
 
 
 def test_detached_processes_found_by_the_mark_are_recorded_once(
@@ -839,6 +848,66 @@ def test_a_failed_turn_without_operator_mail_is_held_with_its_cause(
     body = world.log.state.messages[line.held_by].body
     assert "failed: the engine broke" in body
     assert "sent no operator mail during it" in body
+
+
+def test_a_confinement_breach_holds_the_line_even_after_operator_mail(
+    worlds: Callable[..., World],
+) -> None:
+    """Round 15, review of e9adf91. A ``Read`` with no hook call escaped the line's
+    confinement. The mail exemption of an ordinary failed turn does not apply, so the
+    line is held although it mailed an operator during the turn, and the hold says it
+    was a breach."""
+    engine = Engine()
+    world = worlds(engine)
+    engine.breach = True
+    engine.error = "a Read completed without the ViewImage hook"
+    engine.during = lambda: world.scheduler.ask("alpha", ANA, "the tests broke")
+
+    async def act() -> None:
+        world.scheduler.send(ANA, LineAddress("alpha"), "x")
+
+    run(world, act)
+    line = world.log.state.lines["alpha"]
+    assert world.scheduler.condition("alpha") == "held"
+    assert line.held_by is not None
+    body = world.log.state.messages[line.held_by].body
+    assert "confinement breach" in body
+    assert "a Read completed without the ViewImage hook" in body
+    assert "sent no operator mail" not in body
+
+
+def test_an_ordinary_failure_after_operator_mail_is_still_not_held(
+    worlds: Callable[..., World],
+) -> None:
+    """The counterpart of the breach test. The exemption stands for a failure that
+    the line's mail may explain."""
+    engine = Engine()
+    world = worlds(engine)
+    engine.fail = True
+    engine.during = lambda: world.scheduler.ask("alpha", ANA, "the tests broke")
+
+    async def act() -> None:
+        world.scheduler.send(ANA, LineAddress("alpha"), "x")
+
+    run(world, act)
+    assert world.log.state.lines["alpha"].held_by is None
+
+
+def test_a_breach_without_operator_mail_names_the_breach_not_the_missing_mail(
+    worlds: Callable[..., World],
+) -> None:
+    engine = Engine()
+    world = worlds(engine)
+    engine.breach = True
+
+    async def act() -> None:
+        world.scheduler.send(ANA, LineAddress("alpha"), "x")
+
+    run(world, act)
+    held = world.log.state.lines["alpha"].held_by
+    assert held is not None
+    body = world.log.state.messages[held].body
+    assert "confinement breach" in body and "sent no operator mail" not in body
 
 
 def test_a_failure_s_quoted_cause_is_cut(worlds: Callable[..., World]) -> None:
@@ -1303,7 +1372,7 @@ def test_an_unknown_cost_is_kept_apart_from_zero(
     run(world, act)
     unknown = scheduler.cost_status("alpha")
     assert (unknown["estimate"], unknown["basis"], unknown["unknown_turns"]) == (
-        None,
+        "unknown",
         "unknown",
         1,
     )

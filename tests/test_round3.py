@@ -329,14 +329,27 @@ def test_a_task_triggered_turn_waits_for_already_sent_mail(world: World) -> None
     asyncio.run(go())
 
 
-def test_a_task_note_withholds_a_disclosed_command(world: World) -> None:
+def test_a_task_note_does_not_screen_a_command_against_the_list(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Screening a line's own text would tell it, through its notes, whether a string
+    it chose is listed, outside the counted checks. The note gives the same words
+    whether or not the command holds a listed term, and nothing is checked."""
     world.scheduler.set_disclosure_terms(["secret name"])
+    calls: list[tuple[str, ...]] = []
+
+    def refuse(*texts: str) -> bool:
+        calls.append(texts)
+        return True
+
+    monkeypatch.setattr(world.scheduler, "discloses", refuse)
     world.scheduler.background_ended(
-        "alpha", BackgroundEnd("t1", "grep secret name", "failed")
+        "alpha", BackgroundEnd("t2", "grep secret name", "failed")
     )
     (note,) = world.notes()
-    assert "secret" not in note.lower().replace("withheld", "")
-    assert "Its command is withheld" in note
+    assert calls == []
+    assert "withheld" not in note
+    assert json.dumps("grep secret name") in note
 
 
 def test_a_task_note_for_an_unknown_line_is_dropped(world: World) -> None:
@@ -1051,12 +1064,22 @@ def test_a_directory_swapped_for_a_link_between_check_and_read_is_refused(
     assert refused(rooted, root / "tasks" / "d.output", UNREADABLE)
 
 
-def test_an_output_on_the_disclosure_list_is_withheld(rooted: World) -> None:
+def test_an_output_file_is_not_screened_against_the_list(
+    rooted: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = cast(Path, rooted.scheduler._root)  # pyright: ignore[reportPrivateUsage]
     rooted.scheduler.set_disclosure_terms(["secret name"])
+    calls: list[tuple[str, ...]] = []
+
+    def refuse(*texts: str) -> bool:
+        calls.append(texts)
+        return True
+
+    monkeypatch.setattr(rooted.scheduler, "discloses", refuse)
     output = task_output(root, "s.output", "the Secret Name is here")
     note = output_note(rooted, output)
-    assert "Its output is withheld" in note and "Secret" not in note
+    assert calls == []
+    assert "withheld" not in note and json.dumps("the Secret Name is here") in note
 
 
 # C, notes to oneself are not unanswered.
@@ -1345,7 +1368,7 @@ def test_compact_session_asks_for_a_compaction_and_refuses_otherwise(
     extra = asyncio.run(call({"now": True}))
     assert extra.get("is_error") and "unexpected argument now" in str(extra)
     done = asyncio.run(call({}))
-    assert not done.get("is_error") and "next turn" in str(done)
+    assert not done.get("is_error") and "turn ends" in str(done)
     assert world.status()["context"]["compaction_pending"] is True
     # Withdrawn permission refuses a tool the line still holds.
     world.scheduler.configure_line("alpha", LineConfig())
@@ -1377,13 +1400,23 @@ def test_inline_output_is_quoted_or_said_empty_or_absent(world: World) -> None:
     assert "The engine named no output file for it." in unnamed
 
 
-def test_inline_output_on_the_disclosure_list_is_withheld(world: World) -> None:
+def test_inline_output_is_not_screened_against_the_list(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
     world.scheduler.set_disclosure_terms(["secret name"])
+    calls: list[tuple[str, ...]] = []
+
+    def refuse(*texts: str) -> bool:
+        calls.append(texts)
+        return True
+
+    monkeypatch.setattr(world.scheduler, "discloses", refuse)
     world.scheduler.background_ended(
         "alpha", BackgroundEnd("p1", "make", "completed", 0, output="Secret Name")
     )
     (note,) = world.notes()
-    assert "Its output is withheld" in note and "Secret" not in note
+    assert calls == []
+    assert "withheld" not in note and json.dumps("Secret Name") in note
 
 
 # F, when an end was detected and its note delivered.
@@ -1689,7 +1722,7 @@ def test_every_task_end_is_recorded_with_its_output_digest(rooted: World) -> Non
     assert (third.output_digest, third.output_bytes, third.exit_code) == (None, None, 2)
 
 
-def test_a_task_record_withholds_disclosed_names_and_skips_a_large_output(
+def test_a_task_record_keeps_names_as_reported_and_skips_a_large_output(
     rooted: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = cast(Path, rooted.scheduler._root)  # pyright: ignore[reportPrivateUsage]
@@ -1708,8 +1741,7 @@ def test_a_task_record_withholds_disclosed_names_and_skips_a_large_output(
         "alpha", BackgroundEnd("t3", "make", "completed", 0, str(outside))
     )
     first, second, third = records(rooted)
-    withheld = scheduler_module.WITHHELD_COMMAND
-    assert (first.command, first.output_file) == (withheld, withheld)
+    assert (first.command, first.output_file) == ("grep codename", str(named))
     assert first.output_digest == hashlib.sha256(b"x").hexdigest()
     assert (second.output_digest, second.output_bytes) == (None, None)
     assert (third.output_digest, third.output_file) == (None, str(outside))
@@ -1767,3 +1799,31 @@ def test_a_bad_task_record_is_refused(change: dict[str, object], match: str) -> 
     }
     with pytest.raises(InvalidField, match=match):
         TaskRecorded(**cast(dict[str, Any], fields))
+
+
+def test_a_seat_sees_its_own_task_unscreened_and_a_peers_screened(
+    rooted: World,
+) -> None:
+    """The line's own view must not answer whether a string it chose is listed. A
+    peer seat, and an operator, are shown the withheld text instead."""
+    rooted.log.append(RoleDeclared("core", "."))
+    rooted.log.append(SeatBound("alpha", "core", True))
+    rooted.scheduler.create_line("beta", HAIKU, Strategy.SUBSCRIPTION)
+    rooted.log.append(SeatBound("beta", "core", False))
+    rooted.scheduler.set_disclosure_terms(["codename"])
+    rooted.scheduler.background_ended(
+        "alpha", BackgroundEnd("t1", "grep codename", "completed", 0)
+    )
+
+    def shown(view: dict[str, object], seat: str) -> object:
+        seats = cast(list[dict[str, Any]], view["seats"])
+        (found,) = [entry for entry in seats if entry["line_id"] == seat]
+        (task,) = cast(list[dict[str, object]], found["recent_tasks"])
+        return task["command"]
+
+    own = rooted.scheduler.role_status("alpha")
+    peer = rooted.scheduler.role_status("beta")
+    operator = rooted.scheduler.role_view("core")
+    assert shown(own, "alpha") == "grep codename"
+    assert shown(peer, "alpha") == scheduler_module.WITHHELD_COMMAND
+    assert shown(operator, "alpha") == scheduler_module.WITHHELD_COMMAND

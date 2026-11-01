@@ -163,6 +163,23 @@ Dromon.** `Read` returns an image to the model, so `ViewImage` needs nothing bey
 offering `Read` and gating it. `claude_tools` maps the name, and the init check accepts
 `Read` for a line with `ViewImage`. The verify-first steps are below.
 
+**Verified live, 2026-11-01, with a defect found.** **Fact, the operator's run.** On
+Claude Code `Read` delivers a png through the Agent SDK, a view-only line viewed a word
+in a small png, and a Codex line on gpt-6.1-terra did the same, while a Codex line
+without `ViewImage` had no image tool. The same Claude Code line also read a renamed
+text file and a 6,000,287 byte png, which the rule refuses when called directly.
+**Inference.** The engine allows a `Read` inside its working directory without calling
+the permission callback, so the rule did not run. Round 14, item 5, applies the rule in
+a `PreToolUse` hook, which the engine runs before every tool, and
+[`LINE_CONFIG.md`](LINE_CONFIG.md) records the defect, the fix and what is left to
+verify. The Codex check stays after the fact, as the table above says. **Review of
+a9995d8, item 1.** The hook fails closed, an ask rule for `Read` sends every `Read` to
+the gate, a `Read` that completed with no hook call ends the turn and holds the line, and
+a managed policy that sets `disableAllHooks` or `allowManagedHooksOnly` refuses a
+view-only line where Dromon can read it. Whether the engine runs the hook for an
+in-directory `Read`, and whether an ask rule outranks its allowance, are still to be
+shown live, and the missing-hook check is what notices if they are not.
+
 **Verify first.** The operator runs these once per engine before relying on the
 capability, and the Codex and Grok steps are in [`CODEX.md`](CODEX.md) and
 [`GROK.md`](GROK.md). For Claude Code, create a line in a scratch project with
@@ -216,11 +233,12 @@ custom MCP server configuration.
 
 ## Shell selection
 
-When a line is given a shell tool, Dromon requires the daemon's `SHELL` value to be an
-absolute path to an executable file. A missing value, relative path or non-executable
-file refuses the turn before the engine starts. Claude Code additionally accepts only
-paths named `bash` or `zsh`, as required by its override. `line_status` reports whether
-the line requires a shell, the path its adapter will use, or the validation reason.
+**Fact.** Codex requires the daemon's `SHELL` to be an absolute executable path.
+Claude Code prefers that value when it names an executable `bash` or `zsh`. Otherwise
+it checks `/bin/bash`, `/bin/zsh`, `/usr/bin/bash` and `/usr/bin/zsh` in that order.
+It refuses the turn when none is executable. The fixed list avoids relying on the
+inherited executable search path. `line_status` reports the selected path through the
+same selector that supplies the adapter environment. No live turn verifies this change.
 
 The pinned Agent SDK source merges `ClaudeAgentOptions.env` into the CLI subprocess
 environment. **Fact.** The bundled Claude Code executable contains the strings
@@ -558,3 +576,22 @@ describe the probe's own thread and are kept, and the plan's use across turns is
 that recording scrubbed. A test replays it through the real adapter and Agent SDK
 client, and checks that the turn succeeds on the subscription with every recorded
 frame exchanged in order.
+
+## Continuing after unavailable tools
+
+**Fact.** Claude Code's permission gate returns a named denial and allows the turn to
+continue. Codex returns a named error for an unknown dynamic tool without invoking a
+handler. A disallowed dynamic call that completes without a matching request also
+interrupts because its notification alone does not establish non-execution. Other
+unexpected Codex items still interrupt for the same reason.
+
+**Fact.** Grok and Antigravity reject ACP permission requests for unavailable calls.
+They continue only when each subsequent report explicitly asserts `toolNotRun` as a
+Boolean true value. Other reports cancel the turn because non-execution is uncertain.
+Pi and Cursor report tool activity without a supported response that refuses that
+individual execution. Unexpected tools therefore still abort those turns.
+
+**Inference.** Grok's documented `--tools` and `--disallowed-tools` flags for terminal
+and headless modes do not establish their applicability to `agent stdio`. Advertisement
+filtering on that transport remains unverified. Dromon continues to reject unavailable
+`todo_write`, `spawn_subagent` and `web_fetch` calls through its permission policy.

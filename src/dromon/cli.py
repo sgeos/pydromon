@@ -269,10 +269,13 @@ def _line_row(line: Mapping[str, object]) -> str:
     longer declares. **Round 14, item 4.** A daemon from before round 14 gives no
     ``declared``, which is then not shown. A retired line is hibernated as well,
     which is not named twice."""
-    condition = line.get("condition")
+    condition = str(line.get("condition", line.get("state")))
+    jobs = line.get("background_jobs")
+    if condition == "idle" and type(jobs) is int and jobs > 0:
+        condition = f"idle with {jobs} background {'job' if jobs == 1 else 'jobs'}"
     parts = [
         f"line {line.get('line_id')}",
-        str(line.get("condition", line.get("state"))),
+        condition,
         f"{line.get('pending')} pending",
     ]
     if line.get("hibernated") is True and condition not in ("hibernated", "retired"):
@@ -977,6 +980,8 @@ def _send(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         args["reply_to"] = arguments.reply_to
     if arguments.priority:
         args["priority"] = True
+    if arguments.asks_reply is not None:
+        args["asks_reply"] = arguments.asks_reply
     answer = _call(
         paths, "send", Operation.SEND, args, check_after_timeout="dromon sent"
     )
@@ -2189,9 +2194,7 @@ def _print_role(role: Mapping[str, object]) -> None:
             marks.append("not usable for failover")
         if seat["waits_unconfined"] is True:
             marks.append("waits, its engine cannot confine it")
-        budget = cast(Mapping[str, object] | None, seat["budget"])
-        if budget is not None:
-            marks.append(f"budget {_budget_text(budget)}")
+        marks.append(_seat_budget_mark(seat.get("budget")))
         print(
             f"  seat {seat['line_id']} on {seat['model']}, {', '.join(marks)},"
             f" at {seat['workdir_commit'] or 'no commit'}"
@@ -2211,12 +2214,27 @@ def _print_role(role: Mapping[str, object]) -> None:
         )
 
 
+def _seat_budget_mark(budget: object) -> str:
+    """How ``dromon role`` shows a seat's budget. **Round 14, item 4 and its review.**
+    The daemon now sends an unknown budget as a named entry with ``status`` unknown,
+    and an older daemon sends ``null`` for it. A new client talks to an older daemon
+    after every pull until the daemon restarts, so both read as unknown, and so does
+    an entry that lacks the fields of a stated budget, since the client must not
+    fail on what it cannot read."""
+    if not isinstance(budget, Mapping):
+        return "budget unknown"
+    entry = cast(Mapping[str, object], budget)
+    if entry.get("status") == "unknown" or not {"source", "stated_at"} <= set(entry):
+        return "budget unknown"
+    return f"budget {_budget_text(entry)}"
+
+
 def _budget_text(budget: Mapping[str, object]) -> str:
     """A stated budget, with its source and time, since it is a snapshot."""
     parts: list[str] = []
-    if budget["remaining_percent"] is not None:
+    if budget.get("remaining_percent") not in (None, "unknown"):
         parts.append(f"{budget['remaining_percent']} percent")
-    if budget["resets_at"] is not None:
+    if budget.get("resets_at") not in (None, "unknown"):
         parts.append(f"resets {budget['resets_at']}")
     parts.append(f"stated by {budget['source']} at {budget['stated_at']}")
     return ", ".join(parts)
@@ -3159,6 +3177,7 @@ def _add_fleet_commands(command: argparse.ArgumentParser) -> None:
                 action="store_true",
                 help="end the line's running turn at a safe point and lead its next",
             )
+            _add_reply_flags(sub)
         if action == "status":
             sub.add_argument(
                 "--correlation",
@@ -3665,7 +3684,35 @@ def build_parser() -> argparse.ArgumentParser:
                 action="store_true",
                 help="end the line's running turn at a safe point and lead its next",
             )
+            _add_reply_flags(command)
     return parser
+
+
+def _add_reply_flags(command: argparse.ArgumentParser) -> None:
+    """``--no-reply`` and ``--ask-reply`` for a ``send``, which set ``asks_reply``.
+
+    **Follow-up of 2026-11-01, decided by core for review.** Given neither, the client
+    sends no ``asks_reply`` and the daemon's rule decides, so a new note asks a reply
+    and a ``--reply-to`` note asks none. That suits an operator's task note, which
+    wants a report, and an operator's answer to a report, which wants nothing. Decided
+    over a default of asking nothing, which would leave a task note out of the line's
+    unanswered count, where the line looks for work still owed."""
+    replies = command.add_mutually_exclusive_group()
+    replies.add_argument(
+        "--no-reply",
+        dest="asks_reply",
+        action="store_false",
+        default=None,
+        help="the note asks no reply, so it never counts as unanswered",
+    )
+    replies.add_argument(
+        "--ask-reply",
+        dest="asks_reply",
+        action="store_true",
+        default=None,
+        help="the note asks a reply even with --reply-to. By default a new note"
+        " asks one and a reply does not",
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

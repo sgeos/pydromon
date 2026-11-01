@@ -89,7 +89,7 @@ class Server:
             return {"account": {"type": world.account}}
         if method in ("thread/start", "thread/resume"):
             return {
-                "thread": {"id": "th"},
+                "thread": {"id": getattr(world, "thread_id", "th")},
                 "model": LUNA,
                 "modelProvider": "openai",
                 "activePermissionProfile": {"id": world.profile},
@@ -143,6 +143,7 @@ def done() -> dict[str, Any]:
 
 class World:
     def __init__(self, script: list[list[dict[str, Any]]]) -> None:
+        self.thread_id = "th"
         self.script = script
         self.servers: list[Server] = []
         self.account = "chatgpt"
@@ -1155,3 +1156,53 @@ def test_an_operators_stop_keeps_a_codex_line_without_terminals(
         return reason
 
     assert asyncio.run(go()) is None
+
+
+def test_changed_permission_profile_opens_new_thread_on_new_server(
+    tmp_path: Path,
+) -> None:
+    world = World([[done()], [done()]])
+    engine = world.line(tmp_path)
+    guard = tmp_path / "restricted"
+    guard.mkdir()
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        engine.write_protected = (guard,)
+        await engine.run_turn("second")
+        await engine.close()
+
+    asyncio.run(go())
+    assert len(world.servers) == 2
+    assert world.servers[0].closed
+    assert "thread/resume" not in world.servers[1].methods()
+    assert "thread/start" in world.servers[1].methods()
+
+
+def test_kept_writer_conflict_replaces_thread_and_runs_the_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("dromon.codex.WRITER_RETRY_SECONDS", 0)
+    world = World([[done()], [said("recovered"), done()]])
+    engine = world.line(tmp_path)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        world.failing.add("thread/resume")
+        world.errors["thread/resume"] = {
+            "code": -32600,
+            "message": "thread th already has an active writer",
+        }
+        world.thread_id = "replacement"
+        report = await engine.run_turn("second")
+        assert report.text == "recovered"
+        await engine.close()
+
+    asyncio.run(go())
+    assert len(world.servers) == 1
+    methods = world.servers[0].methods()
+    assert methods.count("thread/resume") == 2
+    assert methods.count("thread/start") == 2
+    assert methods.count("turn/start") == 2
+    prompt = [m for m in world.servers[0].sent if m.get("method") == "turn/start"][-1]
+    assert "Dromon replaced your Codex session" in str(prompt)
