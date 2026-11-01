@@ -366,6 +366,16 @@ capability. Nothing here is run by a line.
 6. Note whether the item arrives before or after the image is read. If after, the
    limit above stands as written, and if before, record it here.
 
+**Fact, observed live on 2026-11-01** by the operator, on gpt-6.1-terra with
+`builtin_tools` of `["ViewImage"]` and `workdir_access` `read`. The daemon commit was
+not recorded. The line viewed a synthetic png and reported its made up word. A Codex
+line without `ViewImage` answered that no image viewing tool was available. A file
+named `word.txt` was refused by name, as not a png, jpg, jpeg, gif or webp image, and
+the refusal held the whole turn, as the check can only stop a turn. **Not shown.** That
+the turn report counts one `ViewImage` use, since no operator command shows tool counts.
+The oversize file, the path outside the working directory, the path under `.dromon`,
+step 6 and the `--disable view_image` argument were not run on Codex.
+
 ## Verification
 
 **Fact, verified on 2026-10-25 with Codex 0.164.0 and GPT-6-Luna on the operator's

@@ -6,7 +6,12 @@
 `dromon.grok` implements it against Grok Build 1.0.70. **Not verified against a live
 turn.** An operator probe on 2026-10-27 created a session, which Dromon refused before
 any prompt was sent, as the probe section below records. Dromon's own Grok home, which
-that probe called for, was built the same day and has not yet run.
+that probe called for, was built the same day and has not yet run. **Fact, observed on
+2026-11-01** by the operator, under the daemon at commit fb11f22, on grok-4.7. After the
+`--deny` hotfix and a regenerated Grok home configuration with the `PreToolUse` hook, a
+line named grok-review ran turns again, resumed a session and called `read_file`,
+`use_tool`, `search_tool` and `run_terminal_command`. The sections below record which
+points that run settled and which it did not.
 
 ## Purpose
 
@@ -779,9 +784,25 @@ Boolean `toolNotRun=true`. Each rejected identifier must receive its own confirm
 at turn end cancels the turn and raises a refusal naming the tool, which holds the
 line because non-execution is uncertain. Permission denial alone does not prove that a tool had no effects.
 
-**Unverified.** No live tool-definition snapshot verifies removal of `spawn_subagent`
-or `web_fetch` on Grok 1.0.70 here. That is the next operator verification. No
-supported advertisement control was established for `todo_write`. A transport-specific
+**Fact, observed live on 2026-11-01** by the operator, on grok-4.7 under the daemon at
+commit fb11f22, for a line named grok-review with `builtin_tools` of Bash, Glob, Grep and
+Read. The tool list the engine offered holds `web_search`, `open_page`,
+`open_page_with_find`, `x_user_search`, `x_semantic_search`, `x_keyword_search`,
+`x_thread_fetch`, `run_terminal_command`, `read_file`, `search_replace`, `list_dir`,
+`grep`, `kill_command_or_subagent`, `todo_write`, `get_command_or_subagent_output`,
+`scheduler_create`, `scheduler_delete`, `scheduler_list`, `monitor`, `search_tool`,
+`use_tool`, `workflow`, `enter_plan_mode`, `exit_plan_mode`, `ask_user_question`,
+`send_feedback`, `image_gen`, `image_edit`, `image_to_video`, `reference_to_video` and
+`write`. It holds neither `spawn_subagent` nor `web_fetch`, so `GROK_SUBAGENTS=0` and
+`GROK_WEB_FETCH=0` take effect live. `todo_write` is still advertised. Asked to call it,
+the model's inference ended at 09:21:00.881Z and Dromon's cancel reached Grok at
+09:21:00.883Z, and Grok's log has no `exec_done` for `todo_write`. Dromon held the line
+with "the engine used a tool the line was not given: todo_write". **Inference.** The call
+did not run. Whether the hook alone would have denied it is not shown, since Dromon's
+notice check acted first. The line status at that point read daemon and daemon checkout
+fb11f22, workdir 47c58d5 and stale false.
+
+**Unverified, remaining.** No supported advertisement control was established for `todo_write`. A transport-specific
 filter or an independently verified custom main-agent configuration is still needed
 to remove that tool from the advertised set. The current individual denial remains. The permissions guide lists `todo_write`
 among operations that never prompt by default unless a deny rule or hook blocks
@@ -823,7 +844,9 @@ headless runs count the folder as trusted for their own hooks. Whether the parti
 `agent stdio` launch activates this hook without a saved trust record requires the
 operator's live check after restart. Dromon does not disable folder trust or introduce
 a saved grant to make the hook run. A live check must establish that the hook loads,
-matches both tool names and blocks their calls. Its effect remains unverified.
+matches both tool names and blocks their calls. Its effect remains unverified. The live
+run of 2026-11-01 above shows the line ran turns with the regenerated configuration,
+and does not show the hook acting.
 Existing home config and profiles are not rewritten. An older config must be removed
 for Dromon to regenerate it, and the reported program-directory entry must be added
 to both existing profiles before turns can run.
@@ -857,8 +880,9 @@ for this follow-up.
 in the reported model options, including grouped options. Otherwise it refuses
 before selection or prompting and reports the current model and listed values.
 Tests cover the exact request shape, a resumed session with a matching rules digest,
-missing requested values and version 2 refusal. Live acceptance remains unverified
-and the operator will verify it after merge.
+missing requested values and version 2 refusal. **Fact, observed on 2026-11-01** by the operator, on grok-4.7 under the daemon at
+commit fb11f22. The model pin on a resumed session did not fail, so the bare string was
+accepted or was not needed, which the run does not distinguish.
 
 **Fact.** The persisted session identifier includes a 71 byte rules suffix. Dromon
 refuses an identifier whose encoded form would exceed 256 bytes before sending a
