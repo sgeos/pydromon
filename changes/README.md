@@ -29,7 +29,9 @@ whether or not the branch also adds a fragment. Two edits are allowed, because n
 adds, removes or changes an entry.
 
 - A release adds a version heading, leaves Unreleased empty and keeps every entry, as
-  the next section describes.
+  the next section describes. From round 14 every line it adds must also come from
+  the entries Unreleased held or from the fragments the branch deletes, read as the
+  base holds them, so a release cannot add an entry that no fragment held.
 - A lossless regrouping leaves Unreleased exactly as the `collapse` command would write
   it, which tidies repeated headings once. A section already tidy has nothing to regroup.
 

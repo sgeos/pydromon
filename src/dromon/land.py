@@ -89,6 +89,9 @@ after case folding."""
 DEFAULT_BASE: Final = "main"
 DEFAULT_REMOTE: Final = "origin"
 
+LOCK_FILE: Final = "uv.lock"
+"""The lock file whose change makes every other worktree's environment stale."""
+
 GATE: Final = ("./scripts/check.sh",)
 """The full gate, as continuous integration and the pre-push hook run it."""
 
@@ -237,6 +240,9 @@ class Plan:
     """Where the branch left the remote base, from which every commit the push
     carries is screened, or ``None`` when the remote base is not known."""
     gate_changed: tuple[str, ...] = ()
+    lock_changed: bool = False
+    """Whether the branch changes ``uv.lock``, so that every other worktree's
+    environment goes stale once it merges. Round 14, item 3."""
     """Paths under ``scripts/`` the branch changes against ``fork``, which hold the
     gate and the hooks that land runs as the operator."""
 
@@ -393,6 +399,7 @@ class Lander:
             frozenset(carried),
             fork,
             () if fork is None else self._gate_changes(fork, changes),
+            fork is not None and LOCK_FILE in self._changed(fork, changes),
         )
 
     def _fork(self, remote_base: str) -> str | None:
@@ -410,12 +417,18 @@ class Lander:
         )
         return done.code == 0
 
-    def _gate_changes(self, fork: str, changes: Sequence[Change]) -> tuple[str, ...]:
-        """The paths under ``scripts/`` that differ from ``fork`` in the commits or
-        the working tree, or that are new. Audit's finding L5."""
+    def _changed(self, fork: str, changes: Sequence[Change]) -> frozenset[str]:
+        """The paths that differ from ``fork`` in the commits or the working tree,
+        or that are new."""
         listed = self.git("diff", "--name-only", "-z", "--no-renames", fork)
         names = {name for name in listed.split("\0") if name}
         names |= {change.path for change in changes}
+        return frozenset(names)
+
+    def _gate_changes(self, fork: str, changes: Sequence[Change]) -> tuple[str, ...]:
+        """The paths under ``scripts/`` that differ from ``fork``. Audit's finding
+        L5."""
+        names = self._changed(fork, changes)
         return tuple(sorted(n for n in names if n.casefold().startswith("scripts/")))
 
     def load_lists(self) -> None:
@@ -768,6 +781,12 @@ def describe(plan: Plan, request: Request) -> str:
         " sandbox, which is all of the branch's code they reach: scripts/check.sh,"
         " the tests, conftest.py, pyproject.toml and uv.lock"
     )
+    if plan.lock_changed:
+        lines.append(
+            "  warning: the branch changes uv.lock, so once it merges every role's"
+            " worktree needs dromon sync-worktrees, since lines cannot sync without"
+            " the network"
+        )
     if plan.gate_changed:
         lines.append(
             f"  the branch changes {len(plan.gate_changed)} paths under scripts/,"

@@ -173,7 +173,10 @@ limits, operator, tick and held wakes, all of which the check validates the same
 
 The command reads the daemon's `pid` and commit, runs the preflight, sends `restart`,
 and polls `status` four times a second until a daemon with another `pid` answers. It then prints the successor's commit and the commit before, and says when
-they are the same. It fails when the daemon refuses the request, when the restart is
+they are the same. From round 14 it also prints the commit the successor's checkout
+holds, and warns when that differs from the commit it loaded, which narrows the gap
+of a checkout that moves after the check, since the operator then sees that the
+daemon does not run the code checked out now. It fails when the daemon refuses the request, when the restart is
 abandoned, and when no successor answers within the wait and 70 seconds more, which
 covers the shutdown and the successor's start.
 

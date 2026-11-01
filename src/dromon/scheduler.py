@@ -7625,15 +7625,20 @@ class Scheduler:
                 self._post_office.discard(message_id)
 
     def read(self, owner: Address, message_id: str) -> Message:
-        """Open a received message, or a line's own sent message."""
+        """Open a received message, or one ``owner`` sent. Opening one's own sent
+        message marks nothing, since only its recipient reads it. Round 14, item 5.
+        An operator may open what it sent to a line, as a line could already open
+        its own sent mail."""
         message = self._log.state.messages.get(message_id)
         received = message is not None and message.recipient == owner
-        sent_by_line = (
+        # An external agent still opens only what it received, as tests/test_agents.py
+        # pins, since it is outside the trust boundary.
+        sent_by_owner = (
             message is not None
-            and isinstance(owner, LineAddress)
+            and isinstance(owner, (LineAddress, OperatorAddress))
             and message.sender == owner
         )
-        if message is None or not (received or sent_by_line):
+        if message is None or not (received or sent_by_owner):
             raise EventRejected(f"no message {message_id} in the mailbox of {owner}")
         if received:
             if not message.delivered:

@@ -105,6 +105,9 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "land": "stage, screen, commit, gate and push a line's worktree and open a pull"
     " request for it",
     "fleet": "list every daemon of this user on this machine, and reach each by name",
+    "sync-worktrees": "run uv sync --locked in every role's worktree",
+    "renew": "start a line's next turn in a fresh engine session, keeping its mail,"
+    " brief and files",
 }
 """Planned subcommands and their one-line help, in display order."""
 
@@ -526,15 +529,25 @@ def _restarted(before: Mapping[str, object], after: Mapping[str, object]) -> str
     was = _commit_of(before)
     now = _commit_of(after)
     text = f"dromon restart: restarted, pid {after.get('pid')}, at commit {now}"
-    if now == was:
-        return text + ", the same commit as before"
-    return text + f", which was {was}"
+    text += ", the same commit as before" if now == was else f", which was {was}"
+    # Round 14, item 6. The successor loads what is installed when it starts, which
+    # can differ from the checkout if the checkout moved during the start.
+    checkout = _commit_of(after, "checkout_commit")
+    text += f". Its checkout is at {checkout}"
+    if checkout not in {now, "unknown"} and now != "unknown":
+        text += (
+            ". Warning: the loaded commit differs from the checkout's, so the"
+            " daemon does not run the code checked out now"
+        )
+    return text
 
 
-def _commit_of(status: Mapping[str, object]) -> str:
+def _commit_of(status: Mapping[str, object], key: str = "commit") -> str:
+    """The daemon's ``commit``, the one it loaded, or another of its commit fields,
+    such as ``checkout_commit``, or ``unknown``."""
     daemon = status.get("daemon")
     if isinstance(daemon, dict):
-        commit = cast(Mapping[str, object], daemon).get("commit")
+        commit = cast(Mapping[str, object], daemon).get(key)
         if isinstance(commit, str):
             return commit
     return "unknown"
@@ -1781,7 +1794,9 @@ def _read(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         return response
     reply = response.get("reply_to")
     suffix = f", replying to {reply}" if reply is not None else ""
-    print(f"{response.get('message_id')} from {response.get('sender')}{suffix}")
+    recipient = response.get("recipient")
+    to = f" to {recipient}" if isinstance(recipient, str) else ""
+    print(f"{response.get('message_id')} from {response.get('sender')}{to}{suffix}")
     choices = response.get("choices")
     if isinstance(choices, list) and choices:
         print("choices: " + " | ".join(str(c) for c in cast(list[object], choices)))
@@ -2151,6 +2166,88 @@ def _proposal(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     print("patch")
     print(proposal.patch)
     print("Proposed content is untrusted data and has not been applied.")
+    return exits.OK
+
+
+SYNC_SECONDS: Final = 600.0
+"""How long ``uv sync --locked`` may take in one worktree."""
+
+SYNC_ARGV: Final = ("uv", "sync", "--locked")
+
+
+def _role_worktrees(result: Mapping[str, object]) -> list[tuple[str, str]]:
+    """Each role and its worktree from a ``roles`` answer, in role order. Entries
+    in another form are skipped, since they name no worktree to sync."""
+    roles = result.get("roles")
+    found: list[tuple[str, str]] = []
+    for role in cast(list[object], roles) if isinstance(roles, list) else []:
+        if not isinstance(role, dict):
+            continue
+        entry = cast(Mapping[str, object], role)
+        role_id, workdir = entry.get("role_id"), entry.get("workdir")
+        if isinstance(role_id, str) and isinstance(workdir, str):
+            found.append((role_id, workdir))
+    return sorted(found)
+
+
+def _sync_worktrees(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Run ``uv sync --locked`` in every role's worktree and report each. Round 14,
+    item 3. A worktree's environment goes stale when ``uv.lock`` changes, and a
+    line cannot sync it, since its sandbox has no network and cannot write uv's
+    cache. ``--locked`` never changes the lock file, so this installs only what
+    the branch already records. A worktree outside the project, or with no
+    ``uv.lock``, is reported and skipped. Exits 1 when any sync fails."""
+    del arguments
+    result = _call(paths, "sync-worktrees", Operation.ROLES, {})
+    if isinstance(result, int):
+        return result
+    root = paths.root.resolve()
+    failed = 0
+    seen: set[Path] = set()
+    for role_id, workdir in _role_worktrees(result):
+        target = (root / workdir).resolve()
+        label = f"dromon sync-worktrees: {role_id} {workdir}"
+        if target != root and root not in target.parents:
+            print(f"{label}: skipped, outside the project", file=sys.stderr)
+            failed += 1
+            continue
+        if target in seen:
+            print(f"{label}: already synced for another role")
+            continue
+        seen.add(target)
+        if not (target / land.LOCK_FILE).is_file():
+            print(f"{label}: skipped, no {land.LOCK_FILE}")
+            continue
+        done = land.run_command(SYNC_ARGV, target, timeout=SYNC_SECONDS)
+        if done.code == 0:
+            print(f"{label}: synced")
+            continue
+        failed += 1
+        reason = (done.stderr or done.stdout).strip().splitlines()
+        print(
+            f"{label}: uv sync --locked failed with status {done.code}:"
+            f" {reason[-1] if reason else 'no output'}",
+            file=sys.stderr,
+        )
+    return exits.FAILURE if failed else exits.OK
+
+
+def _renew(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Start a line's next turn in a fresh engine session, keeping its mail, brief,
+    files and identity. Round 14, item 4. It sends ``clear_session``, which the
+    attached client's ``/clear`` sends, so a fresh session no longer needs a rebind
+    away and back. Refused while the line is in a turn."""
+    line_id: str = arguments.line_id
+    result = _call(paths, "renew", Operation.CLEAR_SESSION, {"line_id": line_id})
+    if isinstance(result, int):
+        return result
+    warning = result.get("warning")
+    if isinstance(warning, str):
+        print(f"dromon renew: {warning}")
+    print(
+        f"dromon renew: line {line_id} starts its next turn in a fresh engine"
+        " session, with its mail, brief and files kept"
+    )
     return exits.OK
 
 
@@ -2577,6 +2674,8 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "proposal": _proposal,
     "land": _land,
     "fleet": lambda _paths, arguments: _fleet(arguments),
+    "sync-worktrees": _sync_worktrees,
+    "renew": _renew,
 }
 
 
@@ -2908,6 +3007,8 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if name == "land":
             _land_arguments(command)
+        if name == "renew":
+            command.add_argument("line_id", help="the line to renew")
         if name == "awaken":
             command.add_argument("line_id", help="the hibernated line")
         if name == "start":

@@ -64,6 +64,15 @@ index only tells the client where each socket is.
   default index, since that would reach outside the override, so a Codex or Grok line
   of such a daemon could make the default one, which a client without the override
   reads. Claude Code's sandbox denies the path whether or not it exists.
+- **One index, the configured one. Round 14, item 7, decided by ops for the
+  operator's review.** A daemon given `DROMON_REGISTRY_DIR` makes its index and
+  writes its entry there only, and leaves the default index without its entry. It
+  does not register in both. **Rationale.** The override is an isolation boundary.
+  Every test sets it so that no test writes the user's real index, and an operator
+  may run a separate fleet under one, so writing the default index as well would
+  break both uses. **Consequence.** A client sees such a daemon only when it is given
+  the same override, as `dromon fleet` with `DROMON_REGISTRY_DIR` set. A test starts a
+  daemon with the override and checks that the default index does not exist after.
 
 ## Staleness and trust
 

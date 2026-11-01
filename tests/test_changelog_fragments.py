@@ -271,9 +271,9 @@ def test_the_rule_allows_an_untouched_changelog() -> None:
     assert branch_violation(REPEATED, REPEATED, []) is None
 
 
-@pytest.mark.parametrize("removed", [[], ["feat--x.md"]])
+@pytest.mark.parametrize("removed", [[], [Fragment("feat--x.md", "Added", "- X.")]])
 def test_the_rule_refuses_an_edit_to_unreleased_whatever_the_fragments(
-    removed: list[str],
+    removed: list[Fragment],
 ) -> None:
     # Review of 4da95bf, item 6. Adding a fragment no longer excuses an edit.
     changed = REPEATED.replace("- First added.", "- Edited.")
@@ -311,9 +311,24 @@ def test_a_tidy_section_has_nothing_left_to_regroup() -> None:
 def test_the_rule_allows_a_release_with_or_without_fragments() -> None:
     fragment = Fragment("a.md", "Fixed", "- From a.")
     with_fragment = release_text(REPEATED, [fragment], "0.1.0", "2026-11-15")
-    assert branch_violation(REPEATED, with_fragment, ["a.md"]) is None
+    assert branch_violation(REPEATED, with_fragment, [fragment]) is None
     # Review of 4da95bf, F3c. Entries in Unreleased and no fragment still release.
     assert branch_violation(REPEATED, RELEASED, []) is None
+
+
+def test_a_release_may_add_only_lines_its_fragments_and_unreleased_held() -> None:
+    """Round 14, item 10. A release once kept every entry but could add one that no
+    deleted fragment held."""
+    fragment = Fragment("a.md", "Fixed", "- From a.\n  Continued.")
+    honest = release_text(REPEATED, [fragment], "0.1.0", "2026-11-15")
+    assert branch_violation(REPEATED, honest, [fragment]) is None
+    sneaked = honest.replace("- From a.\n", "- From a.\n- Sneaked in.\n")
+    assert branch_violation(REPEATED, sneaked, [fragment]) is not None
+    # A fragment's line claimed by a release that did not delete that fragment.
+    assert branch_violation(REPEATED, honest, []) is not None
+    # Two copies of a line that one fragment held once.
+    doubled = honest.replace("- From a.\n", "- From a.\n- From a.\n")
+    assert branch_violation(REPEATED, doubled, [fragment]) is not None
 
 
 def test_a_release_must_keep_every_entry_and_empty_unreleased() -> None:
@@ -329,7 +344,10 @@ def test_a_release_must_keep_every_entry_and_empty_unreleased() -> None:
 
 def test_an_edit_that_adds_no_version_heading_is_not_a_release() -> None:
     emptied = REPEATED.replace(unreleased_text(REPEATED), "## [Unreleased]\n")
-    assert branch_violation(REPEATED, emptied, ["a.md"]) is not None
+    assert (
+        branch_violation(REPEATED, emptied, [Fragment("a.md", "Added", "- A.")])
+        is not None
+    )
 
 
 def test_a_release_with_nothing_released_is_not_one() -> None:

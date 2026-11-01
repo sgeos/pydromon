@@ -282,26 +282,39 @@ def is_regrouping(base: str, head: str) -> bool:
         return False
 
 
-def is_release(base: str, head: str, removed: list[str]) -> bool:
+def is_release(base: str, head: str, removed: list[Fragment]) -> bool:
     """Whether ``head`` is ``base`` released. A version heading is new, Unreleased is
     empty, every released line of ``base`` and every entry of its Unreleased is still
-    there, and something was released, a deleted fragment or Unreleased entries."""
+    there, and something was released, a deleted fragment or Unreleased entries.
+
+    Round 14, item 10. Every line the release adds outside Unreleased must also come
+    from somewhere, the entries Unreleased held, the bodies of the fragments the
+    branch deletes, or the new version headings, so that a release cannot slip in
+    an entry no fragment held. Lines are compared as a multiset, ignoring blank
+    lines and type headings, which the release writes itself."""
     try:
         before = split_changelog(base)
         after = split_changelog(head)
     except ChangelogError:
         return False
-    if not version_headings(head) - version_headings(base) or after.unreleased:
+    new_headings = version_headings(head) - version_headings(base)
+    if not new_headings or after.unreleased:
         return False
     kept = entry_lines(unreleased_text(base))
     kept.pop(UNRELEASED, None)
-    wanted = entry_lines(outside_unreleased(base)) + kept
-    if wanted - entry_lines(outside_unreleased(head)):
+    old = entry_lines(outside_unreleased(base))
+    found = entry_lines(outside_unreleased(head))
+    if (old + kept) - found:
+        return False
+    sources = kept + Counter(new_headings)
+    for fragment in removed:
+        sources += entry_lines(fragment.body)
+    if (found - old) - sources:
         return False
     return bool(removed) or bool(before.unreleased)
 
 
-def branch_violation(base: str, head: str, removed: list[str]) -> str | None:
+def branch_violation(base: str, head: str, removed: list[Fragment]) -> str | None:
     """Why a branch breaks the rule, or ``None``. ``base`` and ``head`` are the
     changelog before and after the branch, ``removed`` the fragment files it deletes."""
     if unreleased_text(base) == unreleased_text(head):
@@ -337,14 +350,20 @@ def find_base(root: Path, requested: str | None) -> str | None:
     return None
 
 
-def removed_fragments(root: Path, base: str) -> list[str]:
-    """The fragment files a working tree deletes against ``base``."""
+def removed_fragments(root: Path, base: str) -> list[Fragment]:
+    """The fragments a working tree deletes against ``base``, as ``base`` holds
+    them, so a release can be checked against what they said. Raises
+    ``ChangelogError`` for one that cannot be read there or does not parse."""
     status = run_git(root, "diff", "--name-status", base, "--", FRAGMENTS_DIRECTORY)
-    removed: list[str] = []
+    removed: list[Fragment] = []
     for line in (status or "").splitlines():
         kind, _, name = line.partition("\t")
-        if kind.startswith("D") and Path(name).name not in NOT_FRAGMENTS:
-            removed.append(Path(name).name)
+        if not kind.startswith("D") or Path(name).name in NOT_FRAGMENTS:
+            continue
+        text = run_git(root, "show", f"{base}:{name}")
+        if text is None:
+            raise ChangelogError(f"{name}: the deleted fragment cannot be read at base")
+        removed.append(parse_fragment(Path(name).name, text))
     return removed
 
 

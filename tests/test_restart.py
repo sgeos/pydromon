@@ -25,7 +25,7 @@ from typing import Any, Final, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import cli, client, daemon, eventlog, exits, fleet, restart
+from dromon import cli, client, daemon, eventlog, exits, fleet, registry, restart
 from dromon.registry import REGISTRY_DIR_ENV
 from dromon.activity import ActivityKind
 from dromon.configview import Overrides
@@ -701,6 +701,22 @@ def status(
     return {"pid": pid, "daemon": {"commit": commit}, "restart": state}
 
 
+def test_the_restart_report_names_the_checkout_and_warns_when_it_differs() -> None:
+    """Round 14, item 6. The loaded commit and the checkout's, and a warning when
+    they differ, as when the checkout moved while the successor started."""
+    before = status(1, "a" * 40)
+    same = {"pid": 2, "daemon": {"commit": "b" * 40, "checkout_commit": "b" * 40}}
+    moved = {"pid": 2, "daemon": {"commit": "b" * 40, "checkout_commit": "c" * 40}}
+    said = cli._restarted(before, same)  # pyright: ignore[reportPrivateUsage]
+    assert f"Its checkout is at {'b' * 40}" in said
+    assert "Warning" not in said
+    said = cli._restarted(before, moved)  # pyright: ignore[reportPrivateUsage]
+    assert f"Its checkout is at {'c' * 40}" in said
+    assert "Warning: the loaded commit differs from the checkout's" in said
+    said = cli._restarted(before, status(2, "b" * 40))  # pyright: ignore[reportPrivateUsage]
+    assert "Its checkout is at unknown" in said and "Warning" not in said
+
+
 def no_sleep(seconds: float) -> None:
     del seconds
 
@@ -1215,6 +1231,28 @@ def test_a_check_writes_nothing_in_the_operator_s_fleet_index(
     assert daemon.run(paths) == exits.OK
     assert fleet.index_directory(registry_dir).is_dir()
     live.log = EventLog(paths.event_log)
+
+
+def test_a_daemon_given_a_registry_directory_registers_there_only(
+    paths: ProjectPaths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 14, item 7, decided by ops for the operator's review. A daemon given
+    ``DROMON_REGISTRY_DIR`` makes the index there and leaves the default one
+    untouched, since the override is an isolation boundary that every test relies
+    on. A client given the same override finds it."""
+    default = tmp_path / "home" / ".local" / "state" / "dromon" / "registry"
+    monkeypatch.setattr(registry, "default_directory", lambda: default)
+    given = tmp_path / "given"
+    monkeypatch.setenv(REGISTRY_DIR_ENV, str(given))
+
+    async def no_serve(target: Daemon) -> None:
+        assert target.registry_dir == given
+
+    monkeypatch.setattr(daemon, "serve", no_serve)
+    monkeypatch.setattr(daemon, "environment_reading_works", lambda: False)
+    assert daemon.run(paths) == exits.OK
+    assert fleet.index_directory(given).is_dir()
+    assert not default.exists()
 
 
 def test_a_start_sweeps_every_check_directory(

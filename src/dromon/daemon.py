@@ -54,6 +54,8 @@ from claude_agent_sdk import SdkMcpTool
 from OpenSSL.SSL import Context as OpenSSLContext
 
 from dromon import __version__, exits, fleet, peercred, registry, restart, runs
+from dromon import evidence
+from dromon import proposals as proposal_store
 from dromon.federation import (
     MAX_OPEN_REMOTE_PEERS,
     NO_FEDERATION,
@@ -1830,6 +1832,7 @@ class Daemon:
         return {
             "message_id": message_id,
             "sender": str(message.sender),
+            "recipient": str(message.recipient),
             "kind": message.kind.value,
             "reply_to": message.reply_to,
             "choices": list(message.choices),
@@ -3472,6 +3475,43 @@ def apply_project(scheduler: Scheduler, log: EventLog, config: ProjectConfig) ->
         )
 
 
+def private_dirs(paths: ProjectPaths) -> tuple[Path, ...]:
+    """Every private directory Dromon owns under the project, which a start creates
+    or checks. The peers' token store is checked by ``check_token_store``, and a
+    teacher's runtime directory when the teacher starts."""
+    return (
+        paths.state_dir,
+        paths.runtime_dir,
+        paths.left_reports,
+        paths.state_dir / proposal_store.PROPOSALS_DIRECTORY,
+        paths.state_dir / evidence.PROBES_DIRECTORY,
+    )
+
+
+def check_private_dirs(paths: ProjectPaths) -> None:
+    """Create every private directory with mode 0700, or check the one there, and
+    refuse naming every one that is not private, not only the first. Raises
+    ``PathError``.
+
+    **Round 14, item 8.** A supervised run in another project failed late, on a
+    private directory made before with a wide mode. The start now makes or checks
+    them all before any line's turn, a role's first turn included, so such a
+    project refuses at once with every path to fix. An existing directory is never
+    tightened silently, as ``ensure_private_dir`` decides. **Residual.** A mode
+    widened after the start is found at the next start, or where the directory is
+    next used."""
+    refused: list[str] = []
+    for directory in private_dirs(paths):
+        try:
+            ensure_private_dir(directory)
+        except PathError as error:
+            refused.append(str(error))
+    if refused:
+        raise PathError(
+            "private directories Dromon owns are not private: " + " ".join(refused)
+        )
+
+
 CHECK_PASSED: Final = "dromond: the start checks pass, and nothing was started"
 """What ``dromond --check`` says when a start would get past its checks."""
 
@@ -3523,9 +3563,7 @@ def run(
         # check reads the registry, and every later use reads this one.
         registry_dir = registry.configured_directory(os.environ)
         peercred.check_supported()
-        ensure_private_dir(paths.state_dir)
-        ensure_private_dir(paths.runtime_dir)
-        ensure_private_dir(paths.left_reports)
+        check_private_dirs(paths)
         check_token_store(paths.state_dir / PEERS_DIR_NAME)
         file = config_path(paths.state_dir)
         config = load(file, paths.root) if file.exists() else ProjectConfig()
