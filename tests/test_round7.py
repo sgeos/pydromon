@@ -193,7 +193,7 @@ class World:
         if seeded_context:
             warning = self.scheduler.effective_config("alpha").context_warn_tokens
             self.scheduler._context["alpha"] = warning  # pyright: ignore[reportPrivateUsage]
-        self.call("compact_session", {})
+        self.call("compact_session", {"seconds": 60})
         if seeded_context:
             self.scheduler._context.pop("alpha", None)  # pyright: ignore[reportPrivateUsage]
         return self.log.state.scheduled["alpha"].message_id
@@ -301,7 +301,7 @@ def test_compact_session_refuses_while_context_is_below_its_warning(
     world: World,
 ) -> None:
     world.scheduler._context["alpha"] = 4_999  # pyright: ignore[reportPrivateUsage]
-    result = world.call("compact_session", {})
+    result = world.call("compact_session", {"seconds": 60})
     assert result.get("is_error") is True
     assert "at or past this line's warning" in str(result["content"][0]["text"])
     assert "alpha" not in world.log.state.scheduled
@@ -373,7 +373,7 @@ def test_a_wake_the_line_scheduled_itself_is_never_withdrawn(world: World) -> No
     world.scheduler._context["alpha"] = (  # pyright: ignore[reportPrivateUsage]
         world.scheduler.effective_config("alpha").context_warn_tokens
     )
-    world.call("compact_session", {})
+    world.call("compact_session", {"seconds": 60})
     world.run("work")
     assert world.engine.reasons == ["at your request"]
     assert world.log.state.scheduled["alpha"] == own
@@ -583,7 +583,7 @@ def test_the_tool_says_the_wake_is_withdrawn_if_an_earlier_turn_compacts(
     world.scheduler._context["alpha"] = (  # pyright: ignore[reportPrivateUsage]
         world.scheduler.effective_config("alpha").context_warn_tokens
     )
-    result = world.call("compact_session", {})
+    result = world.call("compact_session", {"seconds": 60})
     assert "withdrawn" in str(result["content"][0]["text"])
 
 

@@ -107,6 +107,10 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     CLIJSONDecodeError,
+    HookContext,
+    HookInput,
+    HookJSONOutput,
+    HookMatcher,
     McpSdkServerConfig,
     McpServerConfig,
     Message,
@@ -1766,6 +1770,54 @@ def permission_gate(
     return gate
 
 
+VIEW_IMAGE_HOOK_MATCHER: Final = "Read"
+"""The tool the ``ViewImage`` hook runs before."""
+
+
+def view_image_hooks(
+    config: LineConfig, workdir: Path
+) -> dict[str, list[HookMatcher]] | None:
+    """The hooks that hold a view-only line's ``Read`` to images, or ``None`` for any
+    other line.
+
+    **Round 14, item 5. The defect this closes.** A line with ``ViewImage`` and
+    without ``Read`` is offered ``Read``, and the permission callback allowed it only
+    for a path ``imageaccess.image_refusal`` accepts. The operator's live run of
+    2026-11-01 showed Claude Code viewing a 6,000,287 byte png over the limit, and
+    answering a renamed text file with the engine's own binary-file notice rather than
+    Dromon's refusal. **Inference, the cause.** Claude Code allows a ``Read`` inside
+    its working directory without calling the permission callback, so the rule ran
+    only for paths the engine would ask about. **Fix.** A ``PreToolUse`` hook runs
+    before every tool call, before the permission rules and the callback, whatever
+    they would decide, so the rule is applied there to every ``Read``, and a
+    refusal there is final, since a deny from a hook cannot be overridden by an allow.
+    The callback's check stays as a second guard. **Residual.** The check and the
+    engine's read are two steps, as ``imageaccess`` says."""
+    if not view_only(config.builtin_tools):
+        return None
+
+    async def hook(
+        input_data: HookInput, tool_use_id: str | None, context: HookContext
+    ) -> HookJSONOutput:
+        del tool_use_id, context
+        given = cast(dict[str, Any], input_data).get("tool_input")
+        arguments = cast(dict[str, Any], given) if isinstance(given, dict) else {}
+        why = image_refusal(arguments.get("file_path"), workdir)
+        if why is None:
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"Dromon's ViewImage rule refuses this Read: {why}"
+                ),
+            }
+        }
+
+    return {"PreToolUse": [HookMatcher(matcher=VIEW_IMAGE_HOOK_MATCHER, hooks=[hook])]}
+
+
 def _read_bounded(file: Path, what: str) -> bytes:
     try:
         with file.open("rb") as handle:
@@ -2193,6 +2245,7 @@ class ClaudeCodeLine:
             tools=claude_tools(self.config.builtin_tools),
             mcp_servers=cast(dict[str, McpServerConfig], servers),
             strict_mcp_config=not self.config.inherit_account_mcp,
+            hooks=cast(Any, view_image_hooks(self.config, self.cwd)),
             can_use_tool=permission_gate(
                 self.config,
                 self.own_tools,

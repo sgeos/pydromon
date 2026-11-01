@@ -1303,7 +1303,7 @@ def test_an_unknown_cost_is_kept_apart_from_zero(
     run(world, act)
     unknown = scheduler.cost_status("alpha")
     assert (unknown["estimate"], unknown["basis"], unknown["unknown_turns"]) == (
-        None,
+        "unknown",
         "unknown",
         1,
     )

@@ -303,6 +303,12 @@ class LineConfig:
     """Whether the engine may write its workdir, as enforced by its confinement."""
     writable_paths: tuple[str, ...] = ()
     """Absolute directories an operator grants a Codex line permission to write."""
+    report_directory: str | None = None
+    """A directory inside the line's working directory, under ``tmp/``, that
+    ``write_scratch`` may also write to when the call asks for the reports area, so a
+    review line writes its report without a shell. **Round 14, item 2.** Relative,
+    written with ``/``, never ``tmp`` itself and never under ``tmp/lines``, which
+    hold lines' scratch."""
     project_settings: bool = False
     """Whether a Claude Code line also loads Claude Code's project setting source, the
     working directory's ``.claude/settings.json`` and what it brings."""
@@ -459,6 +465,8 @@ def encode_config(config: LineConfig) -> str:
         document["workdir_access"] = config.workdir_access.value
     if config.writable_paths:
         document["writable_paths"] = list(config.writable_paths)
+    if config.report_directory is not None:
+        document["report_directory"] = config.report_directory
     if config.project_settings:
         document["project_settings"] = True
     if config.plugins:
@@ -534,6 +542,37 @@ def _workdir(value: object) -> str:
         _fail("workdir must not contain a NUL character")
     if text.startswith("~") and text != "~" and not text.startswith("~/"):
         _fail("workdir may start with ~ only as ~ or ~/, not as another user's home")
+    return text
+
+
+MAX_REPORT_DEPTH: Final = 8
+REPORT_ROOT: Final = "tmp"
+REPORT_RESERVED: Final = "lines"
+
+
+def _report_directory(value: object) -> str:
+    """A report directory as written, relative to the working directory and inside
+    its ``tmp/``. Refused when absolute, when any component is empty, ``.`` or ``..``,
+    when it is ``tmp`` itself, outside ``tmp``, under ``tmp/lines``, or deeper than
+    ``MAX_REPORT_DEPTH`` components. A bare ``\\`` is refused, since a path here is
+    written with ``/``."""
+    text = _text(value, "report_directory")
+    if "\x00" in text or "\\" in text:
+        _fail("report_directory must not contain a NUL character or a backslash")
+    parts = text.split("/")
+    if text.startswith("/") or any(part in ("", ".", "..") for part in parts):
+        _fail(
+            "report_directory must be a relative path with no empty, . or .. component"
+        )
+    if len(parts) > MAX_REPORT_DEPTH:
+        _fail(f"report_directory has more than {MAX_REPORT_DEPTH} components")
+    if parts[0] != REPORT_ROOT or len(parts) < 2:
+        _fail(f"report_directory must be a directory under {REPORT_ROOT}/")
+    if parts[1] == REPORT_RESERVED:
+        _fail(
+            f"report_directory may not be under {REPORT_ROOT}/{REPORT_RESERVED}/, which"
+            " holds lines' own scratch"
+        )
     return text
 
 
@@ -651,6 +690,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         "workdir",
         "workdir_access",
         "writable_paths",
+        "report_directory",
         "project_settings",
         "plugins",
         "keep_session",
@@ -721,6 +761,11 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
     for path in writable_paths:
         if not Path(path).is_absolute():
             _fail(f"writable path {path!r} must be absolute")
+    report_directory = (
+        _report_directory(document["report_directory"])
+        if "report_directory" in document
+        else None
+    )
     project_settings = document.get("project_settings", False)
     if type(project_settings) is not bool:
         _fail("project_settings must be a boolean")
@@ -803,6 +848,7 @@ def config_from_document(document: Mapping[str, object]) -> LineConfig:
         workdir=workdir,
         workdir_access=workdir_access,
         writable_paths=tuple(sorted(writable_paths)),
+        report_directory=report_directory,
         project_settings=project_settings,
         plugins=plugins,
         keep_session=keep,

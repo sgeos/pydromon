@@ -19,7 +19,7 @@ from collections.abc import (
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from claude_agent_sdk import (
@@ -64,6 +64,7 @@ from dromon.engine import (
     credential_of,
     permission_gate,
     launch_environment,
+    view_image_hooks,
 )
 
 MODEL = "claude-haiku-5-5"
@@ -879,3 +880,93 @@ def test_a_line_without_view_image_or_read_is_refused_an_engine_that_offers_read
     ):
         run(configured(LineConfig(builtin_tools=("Edit",)), session))
     assert session.interrupts == 1
+
+
+# Round 14, item 5. Every Read on a view-only line meets the rule before the engine's
+# own permission handling, because the engine allows a Read in its working directory
+# without calling the permission callback.
+
+
+def hook_decision(
+    config: LineConfig, workdir: Path, tool_input: dict[str, Any]
+) -> dict[str, Any]:
+    hooks = view_image_hooks(config, workdir)
+    assert hooks is not None
+    (matcher,) = hooks["PreToolUse"]
+    assert matcher.matcher == "Read"
+    (hook,) = matcher.hooks
+    event: dict[str, Any] = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Read",
+        "tool_input": tool_input,
+        "tool_use_id": "u1",
+    }
+    return dict(asyncio.run(hook(event, "u1", {"signal": None})))  # type: ignore[arg-type]
+
+
+def denied(decision: dict[str, Any]) -> str | None:
+    output = decision.get("hookSpecificOutput")
+    if not output:
+        return None
+    assert output["hookEventName"] == "PreToolUse"
+    assert output["permissionDecision"] == "deny"
+    return str(output["permissionDecisionReason"])
+
+
+def test_a_view_only_line_has_a_hook_before_every_read(tmp_path: Path) -> None:
+    session = Scripted([init(tools=["Read"]), result()])
+    run(configured(LineConfig(builtin_tools=("ViewImage",)), session))
+    hooks = session.options[0].hooks
+    assert hooks is not None and list(hooks) == ["PreToolUse"]
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [(), ("Read",), ("Read", "ViewImage"), ("Bash",), ("Edit", "Write")],
+)
+def test_no_other_line_has_the_view_image_hook(tools: tuple[str, ...]) -> None:
+    assert view_image_hooks(LineConfig(builtin_tools=tools), Path("/work")) is None
+
+
+def test_the_hook_refuses_what_the_engine_would_read_without_asking(
+    tmp_path: Path,
+) -> None:
+    from imagesamples import png
+
+    config = LineConfig(builtin_tools=("ViewImage",))
+    (tmp_path / "word.png").write_bytes(png())
+    (tmp_path / "word.txt").write_text("a text file")
+    (tmp_path / "renamed.png").write_text("a text file renamed to a png")
+    (tmp_path / "big.png").write_bytes(png(5 * 1024 * 1024 + 1))
+    (tmp_path / ".dromon").mkdir()
+    (tmp_path / ".dromon" / "x.png").write_bytes(png())
+    outside = tmp_path.parent / "outside.png"
+    outside.write_bytes(png())
+    assert denied(hook_decision(config, tmp_path, {"file_path": "word.png"})) is None
+    assert (
+        denied(
+            hook_decision(config, tmp_path, {"file_path": str(tmp_path / "word.png")})
+        )
+        is None
+    )
+    for path, why in (
+        ("word.txt", "by its name"),
+        ("renamed.png", "does not begin"),
+        ("big.png", "over the limit"),
+        (".dromon/x.png", "never reads"),
+        (str(outside), "outside"),
+        ("missing.png", "does not exist"),
+    ):
+        reason = denied(hook_decision(config, tmp_path, {"file_path": path}))
+        assert reason is not None and "ViewImage" in reason and why in reason, path
+    for given in ({}, {"file_path": None}, {"file_path": 3}, {"path": "word.png"}):
+        assert denied(hook_decision(config, tmp_path, given)) is not None
+
+
+def test_a_hook_that_gets_no_tool_input_refuses(tmp_path: Path) -> None:
+    hooks = view_image_hooks(LineConfig(builtin_tools=("ViewImage",)), tmp_path)
+    assert hooks is not None
+    hook = hooks["PreToolUse"][0].hooks[0]
+    event: Any = {"hook_event_name": "PreToolUse", "tool_name": "Read"}
+    decision = cast(dict[str, Any], asyncio.run(hook(event, None, {"signal": None})))  # type: ignore[arg-type]
+    assert denied(decision) is not None

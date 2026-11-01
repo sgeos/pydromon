@@ -47,6 +47,7 @@ keys, duplicate keys and numbers are refused.
 | `workdir` | The directory the line's engine runs in, as the working directory section below specifies. Omitted when unset | the project root |
 | `workdir_access` | `write` or `read`; read confines the working directory to reads, with the scratch exception below | `write` |
 | `writable_paths` | Existing absolute directories a Codex line may write when given `Edit` or `Write`. Refused on other engines | none |
+| `report_directory` | A relative directory under `tmp/` in the working directory, such as `tmp/reports`, that `write_scratch` writes to when a call asks for its `reports` area, as the `write_scratch` section below specifies. Never `tmp` itself, never under `tmp/lines`, written with `/`, with at most eight components. Omitted when unset | none |
 | `keep_session` | Keep a Claude Code or Codex line's engine connected between turns, as the kept sessions section below specifies. Refused on Grok lines. Omitted when false | `false` |
 | `fresh_session_each_turn` | Start each turn in a new Claude Code or Codex engine session, without a context handoff or standing brief. Refused with `keep_session`, with explicit `context_handoff = true`, and on adapters that cannot start a new session each turn. Omitted when false | `false` |
 | `keep_session_idle_seconds` | Seconds a kept connection waits for the next turn before it closes, a whole number from 60 to 86,400. Omitted at its default | `1800` |
@@ -135,8 +136,32 @@ pins this, so a later change that refuses such files is deliberate. **Review of 
 I1.**
 
 [`ENGINES.md`](ENGINES.md) gives the rationale, the limits that only an engine holds,
-and the steps the operator runs before relying on it. Nothing was run live when this
-was written.
+and the steps the operator runs before relying on it.
+
+**Round 14, item 5. A defect in the Claude Code rule, and its fix.** **Fact, from the
+operator's live run of 2026-11-01.** A Claude Code line on claude-haiku-5-5 with
+`builtin_tools` of `["ViewImage"]` and `workdir_access` `read` viewed a word in
+`word.png` and reported it. It then read `word.txt`, a text file renamed to a png, and
+got the engine's binary-file notice and not Dromon's refusal, and it viewed `big.png`,
+a valid png of 6,000,287 bytes, over the 5 MiB limit, and reported the word. A path
+outside the working directory and a path under `.dromon` were refused with Dromon's
+message. `imageaccess.image_refusal` refused both files when called directly. So the
+rule was right and was not called for them. **Inference, not verified.** Claude Code
+allows a `Read` inside its working directory without calling the permission callback,
+so the rule in the callback ran only for paths the engine would ask about, and a
+view-only line could read any file in its working directory. **Fix.** A `PreToolUse`
+hook, registered through the Agent SDK for every view-only line, runs before every
+`Read`, before the permission rules and the callback, and applies `image_refusal` to
+its `file_path`. A refusal there is a deny, which no allow overrides, and a missing or
+malformed `file_path` is refused. The callback keeps the same check as a second guard.
+**Other engines.** Codex has no permission callback to bypass. Its `view_image` is
+checked by Dromon against the `imageView` item as the engine emits it, which detects
+and does not prevent, as stated above, so an over-limit or non-image file on Codex is
+caught only after the engine began the call. Grok is not enabled, and it shares the
+class of risk, since whether Grok asks before `read_file` is unknown, so it stays
+disabled until its verify-first item 6 shows how it behaves. **Verification still to
+run.** The operator repeats the live run on Claude Code and expects Dromon's refusal
+for `word.txt`, the renamed png and `big.png`, and the image still viewed.
 
 ## Dromon's own tools
 
@@ -162,8 +187,8 @@ argument outside a tool's schema is refused.
 | `set_brief` | Records the line's standing brief, its `task`, its open `decisions`, the `artifacts` its task concerns and its `next_action`, as one `brief_set` event that replaces its previous brief and that the daemon stamps with the time, the worktree's commit and its own. Only `task` is required. Each text field is at most 4,096 bytes, at most 32 paths are named, each on one line and at most 1,024 bytes, and the whole is at most 16,384 bytes. An unknown key is refused, and the text is checked against the disclosure list as `record_role_note` is. The brief leads the line's first turn after its engine session is new, is shown by `line_status`, and fills the role transition package where a journal entry is silent, as below. Added on 2026-10-29 |
 | `propose_change` | Records a proposed patch, file list and message for operator review; it does not change project files |
 | `read_instructions` | Shows the instructions the line's next turn receives, as below |
-| `write_scratch` | Writes a file under the line's scratch in its working directory, `tmp/` or `tmp/lines/LINE`, as below |
-| `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term, a file name or a line location. Files are checked independently, so a match cannot span files. The combined content is at most 1 MiB. One call, including a list, spends one recorded check, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. Added on 2026-10-28 |
+| `write_scratch` | Writes a file under the line's scratch in its working directory, `tmp/` or `tmp/lines/LINE`, as below. Its result gives the absolute path written and the bytes written |
+| `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term, a file name or a line location. Files are checked independently, so a match cannot span files. A file is read in parts of at most 1 MiB cut after a newline and the counts are summed, a line may not exceed 1 MiB, and the combined content is at most 16 MiB. A path may be the absolute path `write_scratch` reported. One call, including a list, spends one recorded check, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. Added on 2026-10-28 |
 | `list_processes`, `stop_process` | List and stop the processes the line started, as below |
 
 **Issues.** **Round 11, item 3, decided by core for review on 2026-10-31.** A line
@@ -216,6 +241,29 @@ not their contents. The default answer and every response that includes lists ar
 bounded to 8,192 UTF-8 bytes. If a response exceeds that bound, it returns a small
 object with `status_truncated`. A truncated list response also sets `lists_truncated`
 and suggests `detail: true, lists: false` to omit the lists.
+
+**Round 14, items 3 and 4. Unknown is a named entry, never null.** The compact answer
+and the detailed one also give three entries, each of which says `unknown` where a
+fact is unknown, so no reader mistakes a missing value for a fact. `provider_budget` is
+the stated budget of the line's provider, with `status` `stated` or `unknown`, `provider`,
+`remaining_percent`, `resets_at`, `source`, `note` and `stated_at`, each `unknown`
+where the statement left it out or none exists. `role_status` gives each seat's
+`budget` in the same form. Dromon moves no role and holds no line on a budget it does
+not know. `disclosure` says whether the project has a disclosure list, `list` being
+`configured` or `none`, with a `note`, so a line learns early that `check_disclosure`
+can neither pass nor fail without one. It names no path, term, count of terms or line
+number, which the operator has declined to give. `cost_usd` keeps its `estimate`,
+`unknown` when no turn since the release reported a cost and some reported none, and
+gains `unknown_turns`, `unknown_counts_as_usd` and `counting`. **How unknown cost
+counts against `max_cost_usd`.** A turn that reported no cost, or ended without a
+report, adds nothing to the estimate, so it counts as `0.0000` toward the limit, and
+the limit holds the line only on the costs reported. A line whose turns report none
+is therefore never held by the cost limit, only by its limit on autonomous turns. This
+is a decision to count them apart and not to guess, because a guess would hold or free
+a line on a number nobody measured. The budget line at the head of each turn's prompt
+says `counted as $0.00` beside the turns. The client protocol's
+`cost_estimate_usd` stays `null` for an unknown cost, as [`CLIENT.md`](CLIENT.md)
+specifies.
 
 Set `detail` to true for diagnostic fields, including the resolved `workdir`,
 `engine_session`, kept-session state, process status, event-log status and full context
@@ -494,7 +542,20 @@ unreadable instruction file is reported as the turn would refuse it.
   `full` that is not a boolean is refused.
 
 **`write_scratch`.** Arguments `path`, relative to the line's scratch in its working
-directory, and `text`, at most 262,144 bytes of UTF-8, which replaces the file whole.
+directory, `text`, at most 262,144 bytes of UTF-8, which replaces the file whole, and
+`area`, `scratch` by default or `reports`. **Round 14, item 2.** The result is `wrote N
+bytes to PATH`, with the bytes written, not characters, and the absolute path of the
+file, built from the working directory's real path and the components the call opened
+without following a link, so it names the file written and `check_disclosure` accepts
+it. Directories below the area are created. With `area` set to `reports` the path is
+relative to the line's `report_directory`, and the call is refused when the
+configuration declares none, so a review line that declares `tmp/reports` writes its
+reports without a shell. The reports area is refused while the line does not own its
+role's worktree, since a seat that is not the owner never writes the owner's files, so
+its report directory would be the owner's. **Residual.** The line then writes under
+its own scratch, and the operator moves the report. Every path outside the area stays
+refused, as the next sentences say, and `read_only_paths` bind the reports area as they
+bind the scratch.
 The daemon writes the file, so a line without `Write` can keep its own notes and
 reports. It creates `tmp/` and the directories under it. It refuses an absolute path,
 a path starting with `~`, any `..`, a target that is a symbolic link, which is never
@@ -1083,8 +1144,13 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
   it would an ordinary prompt, which is no weaker than a turn without a compaction.
 - **Round 6, decided by the operator on 2026-10-26** from the round 5 reports.
   - **Its own wake.** `compact_session` takes an optional `seconds`, from 60 to
-    86,400, by default 60, and schedules a wake through the `wake_after` machinery,
-    so the compaction does not wait for unrelated mail. A wake already pending stays,
+    86,400, and schedules a wake through the `wake_after` machinery, so the compaction
+    does not wait for unrelated mail. **Round 14, item 1, decided by the operator.**
+    Without `seconds` the wake is due at once, so the compacted turn follows as soon
+    as the turn that asked ends, where it once waited a minute by default. A named
+    delay still waits for the clock. The line's turn is not interrupted, since a due
+    wake is delivered to a line that is not running, and the compaction runs at the
+    start of the next turn as before. A wake already pending stays,
     and none is added. A bad `seconds` is refused with nothing asked or scheduled. In
     round 6 a compaction an earlier turn consumed left the wake to fire, which cost one
     short turn. Round 7 withdraws it, as below. **Review, F4.** The
@@ -1108,6 +1174,40 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
     to the turn it was made for, which takes it as it starts, so a turn refused before
     its compaction point leaves nothing for a later turn. A Codex compaction in which
     no call was seen reports its usage as unknown, not as zeros.
+  - **Round 14, item 1. The settings view.** `dromon settings LINE` shows
+    `allow_compact`, `context_warn_tokens` and `auto_compact_tokens`, each with its
+    source, `line configuration` for a value the line's configuration sets and
+    `default` for one it leaves unset, and says in words what `allow_compact` gives or
+    withholds, so an operator can tell why a line has no `compact_session`. They are
+    read only there, changed by configuration. **Fact, from the operator.** Round 13's
+    line lacked `allow_compact` because it was created before `dromon create` took
+    that option.
+  - **Round 14, item 1. Which engines compact, and what each loses.** **Fact, from the
+    adapters.** Only a Claude Code line and a Codex line can compact, and only when
+    the operator sets `allow_compact`. Grok, Pi, Cursor and Antigravity lines refuse
+    `allow_compact` when they are configured, so they have neither `compact_session`
+    nor an automatic compaction, and the warning at the head of their prompt is all
+    they get. Antigravity's runtime may compact by itself and Dromon cannot ask it to.
+    **A line asks, and the daemon compacts without being asked.** A line with
+    `allow_compact` calls `compact_session` while its context is at or past its
+    warning, and the compaction runs at the start of its next turn, which a wake it
+    schedules brings about, so the request is made at the end of one turn and takes
+    effect before the next. The same line is woken by the daemon to compact when its
+    estimate reaches the warning or `auto_compact_tokens`, whichever is lower, at the
+    boundary between turns. A line without `allow_compact` has neither, by the
+    operator's choice, and its warning says that an operator can enable it. **What
+    each loses.** Claude Code runs its own built-in `compact` command, which replaces
+    the conversation with a summary the model writes, so the exact wording of earlier
+    messages, earlier tool results and reasoning are no longer in the context, and
+    the engine reports the sizes before and after. Codex runs `thread/compact/start`,
+    with the same loss, and reports no size after, so the context after is an estimate
+    from the next call and no automatic compaction repeats until a smaller context is
+    reported. Neither loses files, the mailbox or the standing brief, and the next
+    turn leads with the brief when the session was compacted since the last turn.
+    **Inference** for the summary's content, which the engines choose and Dromon does
+    not see. **Residual.** A line cannot compact itself without `allow_compact`, and
+    the daemon holds no way for it to ask the operator for one beyond
+    `ask_operator`.
   - **Its own cost.** Each of `recent_turns` has a `kind`, `turn` for a Dromon turn,
     and `compaction`, the compaction it began with, with its trigger, sizes, its own
     `cost_usd` and `usage`, which the turn's own include, or `null`. A Claude Code

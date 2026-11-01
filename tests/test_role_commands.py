@@ -482,3 +482,13 @@ def test_roles_lists_every_role_by_identifier(desk: Desk) -> None:
     assert response.ok and response.result is not None
     roles = cast(list[dict[str, object]], response.result["roles"])
     assert [role["role_id"] for role in roles] == ["archive", "core"]
+
+
+def test_a_seat_with_no_stated_budget_says_unknown(desk: Desk, dromon: Run) -> None:
+    # Round 14, item 4. The status gives a named unknown entry, never null, and the
+    # command says so in words and not as a budget of "unknown percent".
+    status, out, _ = dromon("role")
+    assert status == exits.OK
+    (alpha,) = [line for line in out.splitlines() if line.startswith("  seat alpha")]
+    assert "budget unknown" in alpha
+    assert "unknown percent" not in alpha and "stated by unknown" not in alpha

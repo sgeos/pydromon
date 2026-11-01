@@ -253,19 +253,47 @@ def world(worlds: Callable[..., World]) -> World:
 # A. compact_session schedules its own wake.
 
 
-def test_compact_session_schedules_a_wake_a_minute_ahead_by_default(
+def test_compact_session_schedules_a_wake_due_at_once_by_default(
     world: World,
 ) -> None:
+    # Round 14, item 1. No wait: the compacted turn follows the turn that asked.
     compactable(world)
     context_at_warning(world)
     result = world.call("compact_session", {})
     assert "is_error" not in result
     pending = world.log.state.scheduled["alpha"]
-    due = START + timedelta(seconds=DEFAULT_COMPACT_WAKE_SECONDS)
-    assert pending.due == due.strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert pending.due == START.strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert DEFAULT_COMPACT_WAKE_SECONDS == 0
     assert pending.message_id in text_of(result)
+    assert "as soon as this turn ends" in text_of(result)
     assert pending.note == COMPACT_WAKE_NOTE
     assert world.status()["context"]["compaction_pending"] is True
+
+
+def test_the_default_request_compacts_in_the_next_turn_with_no_clock_advance(
+    world: World,
+) -> None:
+    compactable(world)
+    world.run("start")
+    context_at_warning(world)
+    world.call("compact_session", {})
+    # The clock is not moved: the wake is due already, where a delayed one is not.
+    world.run()
+    engine = world.engine
+    assert isinstance(engine, Compacting)
+    assert len(engine.prompts) == 2 and len(engine.reasons) == 1
+    assert "from alpha, note" in engine.prompts[-1]
+
+
+def test_a_named_delay_still_waits_for_the_clock(world: World) -> None:
+    compactable(world)
+    world.run("start")
+    context_at_warning(world)
+    world.call("compact_session", {"seconds": 60})
+    world.run()
+    engine = world.engine
+    assert isinstance(engine, Compacting)
+    assert len(engine.prompts) == 1 and engine.reasons == []
 
 
 def test_compact_session_takes_the_seconds_to_wait(world: World) -> None:
@@ -321,7 +349,7 @@ def test_the_wake_starts_the_compacted_turn_without_other_mail(world: World) -> 
     compactable(world)
     world.run("start")
     context_at_warning(world)
-    world.call("compact_session", {})
+    world.call("compact_session", {"seconds": 60})
     world.clock.now = START + timedelta(seconds=61)
     world.run()
     engine = world.engine
@@ -339,7 +367,7 @@ def test_a_compacted_turn_is_not_told_to_compact_again(world: World) -> None:
     world.context = 1_000_000
     context_at_warning(world)
     world.run("grow", "and grow")
-    world.call("compact_session", {})
+    world.call("compact_session", {"seconds": 60})
     world.run("work")
     engine = world.engine
     assert isinstance(engine, Compacting)
@@ -368,7 +396,7 @@ def test_an_engine_that_cannot_compact_gets_the_warning_in_its_prompt(
     compactable(world, context_warn_tokens=150_000)
     world.context = 400_000
     world.run("grow")
-    world.call("compact_session", {})
+    world.call("compact_session", {"seconds": 60})
     world.run("work")
     prompt = world.engine.prompts[-1]
     assert prompt.startswith(WARNING)
@@ -554,7 +582,7 @@ def test_automatic_compaction_resumes_once_a_compaction_gets_below(
     world.run("grow")
     world.run("work")
     world.after = 5_000
-    world.call("compact_session", {})
+    world.call("compact_session", {"seconds": 60})
     world.run("asked")
     world.context = 200_000
     world.run("grown again")
@@ -570,7 +598,7 @@ def test_a_request_takes_precedence_over_the_automatic_reason(world: World) -> N
     compactable(world, auto_compact_tokens=180_000, context_warn_tokens=180_000)
     world.context = 200_000
     world.scheduler._context["alpha"] = 200_000  # pyright: ignore[reportPrivateUsage]
-    world.call("compact_session", {})
+    world.call("compact_session", {"seconds": 60})
     world.run("work")
     engine = world.engine
     assert isinstance(engine, Compacting)
@@ -601,7 +629,7 @@ def test_an_unreported_compaction_leaves_no_cause_for_a_later_one(
     world.scheduler._engine_factory = world.build  # pyright: ignore[reportPrivateUsage]
     compactable(world)
     context_at_warning(world)
-    world.call("compact_session", {})
+    world.call("compact_session", {"seconds": 60})
     world.run("work")
     engine = world.engine
     assert isinstance(engine, Silent) and engine.reasons == ["at your request"]
@@ -655,7 +683,7 @@ def test_an_unreported_cost_between_turns_is_said_plainly(world: World) -> None:
     # Row 8. The cost is unknown, which is not zero.
     cost = world.status()["cost_usd"]
     assert (cost["estimate"], cost["basis"], cost["unknown_turns"]) == (
-        None,
+        "unknown",
         "unknown",
         1,
     )

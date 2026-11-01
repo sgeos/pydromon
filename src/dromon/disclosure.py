@@ -149,3 +149,48 @@ def matching_lines(
         if sha256(line.removesuffix("\r").encode("utf-8")).hexdigest() not in exemptions
         and any(term in line.casefold() for term in listed)
     )
+
+
+class LineTooLong(ValueError):
+    """A line is longer than a part, so it cannot be checked without splitting it, and
+    a term could straddle the split."""
+
+
+def split_parts(data: bytes, size: int) -> list[bytes]:
+    """``data`` cut into parts of at most ``size`` bytes, each ending after a newline.
+
+    **Round 14, item 3.** A file over one check's limit is checked in parts, and the
+    counts are summed, so the file costs one check. A cut falls only after a newline,
+    so no line is split and no term straddles a cut, and the sum equals the count for
+    the whole file. ``LineTooLong`` if a line, with its newline, is over ``size``,
+    which fails closed, since splitting it would let a term straddle the cut.
+    Each loop step advances by at least one byte and the number of steps is at most
+    ``len(data)``, so it ends."""
+    if size < 1:
+        raise ValueError("a part must hold at least one byte")
+    parts: list[bytes] = []
+    start = 0
+    while start < len(data):
+        end = min(start + size, len(data))
+        if end < len(data):
+            cut = data.rfind(b"\n", start, end)
+            if cut < 0:
+                raise LineTooLong(f"a line is longer than {size} bytes")
+            end = cut + 1
+        parts.append(data[start:end])
+        start = end
+    return parts
+
+
+def matching_lines_in_parts(
+    terms: Iterable[str], data: bytes, size: int, accepted: Iterable[str] = ()
+) -> int:
+    """The count ``matching_lines`` gives for all of ``data`` decoded as UTF-8 with
+    replacement, summed over parts of at most ``size`` bytes. Equal to the whole by
+    construction of ``split_parts``, which a test checks."""
+    listed = tuple(terms)
+    exemptions = tuple(accepted)
+    return sum(
+        matching_lines(listed, part.decode("utf-8", "replace"), exemptions)
+        for part in split_parts(data, size)
+    )

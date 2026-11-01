@@ -1991,8 +1991,11 @@ def _print_role(role: Mapping[str, object]) -> None:
             marks.append("not usable for failover")
         if seat["waits_unconfined"] is True:
             marks.append("waits, its engine cannot confine it")
-        budget = cast(Mapping[str, object] | None, seat["budget"])
-        if budget is not None:
+        budget = cast(Mapping[str, object], seat["budget"])
+        # Round 14, item 4. An unknown budget is a named entry, never ``None``.
+        if budget.get("status") == "unknown":
+            marks.append("budget unknown")
+        else:
             marks.append(f"budget {_budget_text(budget)}")
         print(
             f"  seat {seat['line_id']} on {seat['model']}, {', '.join(marks)},"
@@ -2016,9 +2019,9 @@ def _print_role(role: Mapping[str, object]) -> None:
 def _budget_text(budget: Mapping[str, object]) -> str:
     """A stated budget, with its source and time, since it is a snapshot."""
     parts: list[str] = []
-    if budget["remaining_percent"] is not None:
+    if budget["remaining_percent"] not in (None, "unknown"):
         parts.append(f"{budget['remaining_percent']} percent")
-    if budget["resets_at"] is not None:
+    if budget["resets_at"] not in (None, "unknown"):
         parts.append(f"resets {budget['resets_at']}")
     parts.append(f"stated by {budget['source']} at {budget['stated_at']}")
     return ", ".join(parts)
