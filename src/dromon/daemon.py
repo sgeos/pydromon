@@ -53,7 +53,7 @@ from typing import Any, Final, Protocol, cast
 from claude_agent_sdk import SdkMcpTool
 from OpenSSL.SSL import Context as OpenSSLContext
 
-from dromon import __version__, exits, peercred, registry, restart, runs
+from dromon import __version__, exits, fleet, peercred, registry, restart, runs
 from dromon.federation import (
     MAX_OPEN_REMOTE_PEERS,
     NO_FEDERATION,
@@ -2983,25 +2983,37 @@ def protected_dirs(
 ) -> tuple[Path, ...]:
     """The directories every enabled sandbox denies, which hold the event log, the
     project file and the daemon's socket, followed by each declared peer's, which hold
-    the same for another project. Raises ``ConfigError`` when a peer names this
-    project's own directories, or two peers share one."""
+    the same for another project, and then the fleet index. Raises ``ConfigError``
+    when a peer names this project's own directories, or two peers share one."""
     own = (paths.state_dir.resolve(), paths.runtime_dir.resolve())
     try:
         found = own + peer_directories(federation, own)
     except FederationError as error:
         raise ConfigError(str(error)) from error
+    try:
+        registry_in_use = registry_dir or registry.configured_directory(os.environ)
+    except registry.RegistryError as error:
+        raise ConfigError(str(error)) from error
+    # The fleet index, whatever the federation mode, so that no line can write an
+    # entry that sends the operator's commands to a socket of its choosing. Round 13,
+    # item 1. A directory that does not exist yet is denied as well, by its path.
+    found = (
+        *found,
+        *(
+            index
+            for index in fleet.denied_indexes(registry_in_use)
+            if index not in found
+        ),
+    )
     # The registry of open local federation, which a line that could write it could
     # use to pass for a daemon. Each registered project's own directories are read
     # at each engine build, by ``registry_protected``. The default registry is denied
     # too when ``DROMON_REGISTRY_DIR`` moves this daemon's, so that its lines cannot
     # write the one other daemons read.
     if federation.local_open:
-        try:
-            directory = registry_dir or registry.configured_directory(os.environ)
-        except registry.RegistryError as error:
-            raise ConfigError(str(error)) from error
         reals = dict.fromkeys(
-            os.path.realpath(each) for each in (directory, registry.default_directory())
+            os.path.realpath(each)
+            for each in (registry_in_use, registry.default_directory())
         )
         found = (*found, *(Path(real) for real in reals))
     return found
@@ -3120,6 +3132,56 @@ def open_registration(
         f"dromond: registered for open local federation as {name} in {directory}",
         file=sys.stderr,
     )
+    return entry
+
+
+def make_index(registry_dir: Path) -> bool:
+    """Make the fleet index before any engine is built, so that every line's sandbox
+    denies a directory that exists, and say whether it is there. Review of 7ff033f,
+    G5. **Decided by core, for the operator's review.** A failure is written to
+    standard error and the daemon starts, as one that cannot be listed does. A
+    directory refused for a wider mode exists, so it is denied. **Inference, not
+    verified.** A directory the daemon cannot make, its lines, which run as the same
+    user with less access, cannot make either, unless the cause passes."""
+    try:
+        fleet.ensure_index(registry_dir)
+    except fleet.FleetError as error:
+        print(f"dromond: {error}", file=sys.stderr)
+        return False
+    return True
+
+
+def fleet_registration(
+    paths: ProjectPaths,
+    registry_dir: Path,
+    start_of: registry.StartOf,
+    commit: str | None,
+) -> fleet.IndexEntry | None:
+    """Write this daemon's entry in the fleet index, whatever its federation mode, and
+    say it, or ``None`` when it cannot be written. Round 13, item 1.
+
+    **Decided by core, for the operator's review.** A failure is written to standard
+    error and the daemon starts unlisted, rather than refusing to start. The index
+    grants nothing, since a client reaches a daemon only through its socket, so a
+    daemon missing from it loses only the fleet commands' sight of it, while a refusal
+    would stop a project's daemon for a convenience. A project root whose last step is
+    not a valid name, such as one with a control character, is also left out."""
+    root = paths.root.resolve()
+    directory = fleet.index_directory(registry_dir)
+    try:
+        started = start_of(os.getpid())
+        if started is None:
+            raise fleet.FleetError("the process table does not list this daemon")
+        entry = fleet.IndexEntry(
+            root.name, root, paths.socket, os.getpid(), started, commit
+        )
+        fleet.write_index_entry(directory, entry)
+    except Exception as error:  # noqa: BLE001, any failure leaves the daemon unlisted
+        print(
+            f"dromond: not listed in the fleet index {directory}: {error}",
+            file=sys.stderr,
+        )
+        return None
     return entry
 
 
@@ -3495,9 +3557,15 @@ def run(
         # A start holds the lock, so no check of its own runs, and any preflight
         # directory left is a killed check's copy of the log.
         restart.sweep_checks(paths.runtime_dir, None)
+    if not check_only:
+        # A check writes nothing of the operator's, the fleet index included. It
+        # builds no engine, so no sandbox needs the index to exist, and it returns
+        # before ``fleet_registration``, so it writes no entry either.
+        make_index(registry_dir)
     successor: list[str] | None = None
     scheduler: Scheduler | None = None
     scratch: Path | None = None
+    daemon_commit = read_head_commit(Path(__file__).parent)
     try:
         log_path = paths.event_log
         if check_only:
@@ -3529,7 +3597,7 @@ def run(
                 root=paths.root,
                 protected=protected_dirs(paths, config.federation, registry_dir),
                 read_only_paths=config.read_only_paths,
-                daemon_commit=read_head_commit(Path(__file__).parent),
+                daemon_commit=daemon_commit,
                 daemon_checkout=Path(__file__).parent,
                 processes_identifiable=(
                     False if check_only else environment_reading_works()
@@ -3589,9 +3657,19 @@ def run(
                     scheduler.discloses,
                     daemon.start_of,
                 )
+                indexed = fleet_registration(
+                    paths,
+                    daemon.registry_dir,
+                    daemon.start_of,
+                    daemon_commit,
+                )
                 try:
                     asyncio.run(serve(daemon))
                 finally:
+                    if indexed is not None:
+                        fleet.remove_index_entry(
+                            fleet.index_directory(daemon.registry_dir), indexed
+                        )
                     if entry is not None:
                         registry.unregister(daemon.registry_dir, entry)
                 successor = daemon.successor

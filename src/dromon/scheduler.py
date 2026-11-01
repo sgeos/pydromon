@@ -1731,6 +1731,85 @@ def new_id(prefix: str) -> str:
     return f"{prefix}-{secrets.token_hex(6)}"
 
 
+ENGINE_STOP_NOTE: Final = "Dromon stopped the previous engine turn. "
+"""A harness note retained for the next reported turn without waking the line."""
+
+
+# Prefixes select fixed wording only. No suffix or other engine-controlled text is
+# interpolated. Unknown failures deliberately lose detail at this trust boundary.
+STOP_CAUSES: Final = (
+    (
+        "the engine reused a tool call identifier",
+        "the engine reused a tool call identifier",
+    ),
+    ("the engine changed", "the engine changed the identity of a tool call"),
+    (
+        "the engine ran a rejected tool call",
+        "the engine did not confirm that a rejected tool call did not run",
+    ),
+    (
+        "the engine used a tool the line was not given",
+        "the engine used a tool the line was not given",
+    ),
+    (
+        "the engine started a tool the line was not given",
+        "the engine started a tool the line was not given",
+    ),
+    (
+        "the engine requested permission for a tool no longer pending",
+        "the engine requested permission for a tool no longer pending",
+    ),
+    ("the engine switched to the model", "the engine changed the configured model"),
+    (
+        "the engine switched to the permission mode",
+        "the engine changed the configured permission mode",
+    ),
+    (
+        "the engine closed its connection",
+        "the engine connection closed during the turn",
+    ),
+    (
+        "the engine did not finish cancelling",
+        "the engine did not finish cancelling its turn",
+    ),
+    (
+        "The driver interrupted it for tool_budget.",
+        "The driver interrupted it for tool_budget.",
+    ),
+    ("The driver interrupted it for ", "The driver interrupted the turn."),
+    (
+        "ACP offered no option for Dromon",
+        "The engine offered no usable permission option.",
+    ),
+    ("Grok turn reached its absolute cap", "The turn reached its absolute time limit."),
+    ("the turn reached its absolute cap", "The turn reached its absolute time limit."),
+    ("Grok turn had no activity", "The turn reached its inactivity time limit."),
+    ("Antigravity timed out", "The engine did not respond before its deadline."),
+    ("Grok start timed out", "The engine did not respond before its deadline."),
+    (
+        "the engine reported a tool call without an identifier",
+        "The engine reported a tool call without an identifier.",
+    ),
+    ("the engine sent", "The engine sent an unsupported protocol message."),
+    ("the engine asked", "The engine made an unsupported protocol request."),
+)
+STOP_CAUSE_UNKNOWN: Final = "An engine safety or protocol check stopped the turn."
+
+
+def _stop_cause(cause: str) -> str:
+    """Map arbitrary evidence to a bounded vocabulary owned by Dromon."""
+    if cause == STOP_CAUSE_UNKNOWN:
+        return cause
+    # Canonical notes must survive replay without being reclassified by a prefix.
+    for _, notice in STOP_CAUSES:
+        if cause == notice:
+            return notice
+    for prefix, notice in STOP_CAUSES:
+        if cause.startswith(prefix):
+            return notice
+    return STOP_CAUSE_UNKNOWN
+
+
 def compose_prompt(
     line_id: str,
     new: list[tuple[str, Message]],
@@ -8292,6 +8371,9 @@ class Scheduler:
                 notes=self._notes(messages),
                 operator=self.last_operator(line_id),
             )
+            stopped = self._engine_stop_notice(line_id)
+            if stopped is not None:
+                prompt = f"{stopped}\n\n{prompt}"
             quiet = self._quiet_notice(line_id)
             if quiet is not None:
                 prompt = f"{quiet}\n\n{prompt}"
@@ -8354,6 +8436,7 @@ class Scheduler:
         report: TurnReport | None = None
         ending = "cancelled"
         failed = False
+        stop_cause: str | None = None
         engine: LineEngine | None = None
         mailed = self._operator_mail(line_id)
         sent = self._line_mail(line_id)
@@ -8393,6 +8476,7 @@ class Scheduler:
                 if redirected == restart.REASON:
                     self._note_restart(line_id)
             elif report.interrupted_for is not None:
+                stop_cause = f"The driver interrupted it for {report.interrupted_for}."
                 ending += f", interrupted by its driver: {report.interrupted_for}"
             elif turn_outcome(report) == FAILED:
                 ending = f"failed: the engine ended the turn as {report.subtype}"
@@ -8419,6 +8503,8 @@ class Scheduler:
             # The boundary between the scheduler and an engine. Any engine failure
             # ends only this turn, and is reported rather than crashing the daemon.
             self._failed.add(line_id)
+            if isinstance(error, EngineRefused):
+                stop_cause = str(error)
             ending = f"failed: {error}"
             failed = True
             print(f"dromond: line {line_id} turn failed: {error}", file=sys.stderr)
@@ -8458,6 +8544,8 @@ class Scheduler:
                         True if report is None else None,
                     )
                 )
+            if stop_cause is not None and line is not None:
+                self._note_engine_stop(line_id, stop_cause)
             # A handoff asked for in the turn takes effect now that it has ended,
             # however it ended.
             self._settle_relinquish(line_id)
@@ -8535,6 +8623,44 @@ class Scheduler:
             for message in self._log.state.messages.values()
             if message.sender == address and message.recipient != address
         )
+
+    def _safe_stop_notice(self, cause: str) -> str:
+        """Render fixed public wording without consulting the disclosure list.
+        No engine text enters the note, as _stop_cause guarantees, including on
+        replay. Screening public wording would reveal disclosure-list membership
+        through whether a known sentence was withheld.
+        """
+        return ENGINE_STOP_NOTE + _stop_cause(cause)
+
+    def _note_engine_stop(self, line_id: str, cause: str) -> None:
+        """Persist a cause without waking the line or clearing its failure state.
+        Delivery after the turn end keeps it owed until a later engine report,
+        including across a restart or a failure before the next prompt arrives."""
+        message_id = new_id("m")
+        self._log.append(
+            MessageSent(
+                message_id,
+                HARNESS,
+                LineAddress(line_id),
+                MessageKind.NOTE,
+                self._safe_stop_notice(cause),
+            )
+        )
+        self._log.append(MessageDelivered(message_id))
+
+    def _engine_stop_notice(self, line_id: str) -> str | None:
+        current = self._log.state.reported_turn_ends.get(line_id, 0)
+        notice: str | None = None
+        for message in self._log.state.messages.values():
+            if (
+                message.sender == HARNESS
+                and message.recipient == LineAddress(line_id)
+                and message.body.startswith(ENGINE_STOP_NOTE)
+                and message.reported_ends_at_delivery is not None
+                and message.reported_ends_at_delivery >= current
+            ):
+                notice = message.body[len(ENGINE_STOP_NOTE) :]
+        return None if notice is None else self._safe_stop_notice(notice)
 
     def _note_quiet(self, line_id: str, sent: int) -> None:
         """**Item B1 of 2026-10-28.** Remember for ``line_id``'s next prompt that its

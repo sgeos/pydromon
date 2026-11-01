@@ -25,7 +25,8 @@ from typing import Any, Final, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import cli, client, daemon, eventlog, exits, restart
+from dromon import cli, client, daemon, eventlog, exits, fleet, restart
+from dromon.registry import REGISTRY_DIR_ENV
 from dromon.activity import ActivityKind
 from dromon.configview import Overrides
 from dromon.daemon import Daemon, build_parser, start_successor, successor_args
@@ -674,9 +675,14 @@ class Daemons:
         self.status_calls = 0
 
     def __call__(
-        self, socket: Path, operation: Operation, args: dict[str, object] | None = None
+        self,
+        socket: Path,
+        operation: Operation,
+        args: dict[str, object] | None = None,
+        *,
+        timeout_seconds: float = client.REQUEST_TIMEOUT_SECONDS,
     ) -> Response:
-        del socket
+        del socket, timeout_seconds
         self.sent.append((operation, dict(args or {})))
         if operation is Operation.RESTART:
             return Response("r", ok=True, result=self.restarted)
@@ -897,9 +903,13 @@ def test_dromon_restart_crosses_the_wire_to_a_daemon_whose_rates_are_known(
     sent: list[Operation] = []
 
     def wire(
-        socket: Path, operation: Operation, args: dict[str, object] | None = None
+        socket: Path,
+        operation: Operation,
+        args: dict[str, object] | None = None,
+        *,
+        timeout_seconds: float = client.REQUEST_TIMEOUT_SECONDS,
     ) -> Response:
-        del socket
+        del socket, timeout_seconds
         sent.append(operation)
         request = encode_request(Request(f"w{len(sent)}", operation, dict(args or {})))
         response = decode_response(encode_response(target.respond(request)))
@@ -1179,6 +1189,34 @@ def test_a_check_sweeps_what_a_killed_check_left(
     assert running.exists()
 
 
+def test_a_check_writes_nothing_in_the_operator_s_fleet_index(
+    live: World,
+    paths: ProjectPaths,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A start makes the fleet index, and a check does not, as it registers nothing
+    in the open-federation registry. The entry is written by
+    ``fleet_registration``, which a check returns before, and which needs the
+    process table, which an agent sandbox denies, so the entry is not asserted
+    here."""
+    registry_dir = tmp_path / "registry"
+    monkeypatch.setenv(REGISTRY_DIR_ENV, str(registry_dir))
+    config_path(paths.state_dir).write_text(AGREEING)
+    assert daemon.run(paths, check_only=True) == exits.OK
+    assert not fleet.index_directory(registry_dir).exists()
+
+    async def no_serve(target: Daemon) -> None:
+        del target
+
+    live.log.close()
+    monkeypatch.setattr(daemon, "serve", no_serve)
+    monkeypatch.setattr(daemon, "environment_reading_works", lambda: False)
+    assert daemon.run(paths) == exits.OK
+    assert fleet.index_directory(registry_dir).is_dir()
+    live.log = EventLog(paths.event_log)
+
+
 def test_a_start_sweeps_every_check_directory(
     paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1308,9 +1346,13 @@ def over_the_wire(
     successor answer under another process id once ``restart`` is sent."""
 
     def wire(
-        socket: Path, operation: Operation, args: dict[str, object] | None = None
+        socket: Path,
+        operation: Operation,
+        args: dict[str, object] | None = None,
+        *,
+        timeout_seconds: float = client.REQUEST_TIMEOUT_SECONDS,
     ) -> Response:
-        del socket
+        del socket, timeout_seconds
         sent.append(operation)
         request = encode_request(Request(f"w{len(sent)}", operation, dict(args or {})))
         response = decode_response(encode_response(target.respond(request)))

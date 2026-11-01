@@ -188,6 +188,11 @@ than the version, `NaN` and `Infinity`, and missing or extra keys are refused.
 | `dromon mcp --agent NAME` or `--line LINE` | Serves one external agent over MCP on standard input and output, reading its token from `DROMON_AGENT_TOKEN`, as [`AGENTS.md`](AGENTS.md) specifies, or one line's own tools to its engine through `lines.sock`, reading the line's token from `DROMON_LINE_TOKEN` | 0, or 1 on an oversized message |
 | `dromon teacher [up\|status\|down]` | Brings the project's teacher up, reports it, or releases it, without the daemon, as [`TEACHER.md`](TEACHER.md) specifies. The default is `status`. `--force` loads the model when too little memory is available | 0, or 1 on failure or when the project declares no teacher |
 | `dromon config` | Validates `.dromon/dromon.toml` without a daemon, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, and prints its limits, wake policy and lines | 0, or 1 on an invalid file |
+| `dromon fleet list` | **Round 13.** Reads the fleet index, which every daemon of this user on this machine writes at start, and prints each daemon with its state, its commit, its lines, its open questions, the unread mail and open issues of `--operator`, and whether it runs behind its checkout, and then its root. A stale or unknown entry is shown and never asked. A daemon that does not answer is reported, and the rest are still listed. Sends `status` and then `mail` with `issues_only` to each daemon's own operator socket, so listing delivers waiting operator mail, as `dromon mail` does | 0, or 1 when the index cannot be read or any live daemon did not answer |
+| `dromon fleet questions`, `dromon fleet mail [--unread]`, `dromon fleet issues` | **Round 13.** Send `questions`, or `mail`, with `--operator`, `--all` for questions and `--limit N`, default 20 from each daemon, to every live daemon, and print each item as `PROJECT:ID`, which the routed commands take. A daemon that does not answer is reported on standard error and the rest go on | 0, or 1 as for `fleet list` |
+| `dromon fleet answer PROJECT:QUESTION BODY`, `dromon fleet send PROJECT:RECIPIENT BODY`, `dromon fleet read PROJECT:MESSAGE` | **Round 13.** Run `dromon answer`, `send` or `read` against the daemon `PROJECT` names, with their options. `PROJECT` is a project's name, the last step of its root, or its root, and the target is split at its last colon, since no identifier holds one. A name two live daemons share is refused, and the root then tells them apart | 0, 4, or 1 |
+| `dromon fleet status PROJECT`, `dromon fleet restart PROJECT` | **Round 13.** Run `dromon status` or `dromon restart` against the daemon `PROJECT` names, with their options. `restart` checks that this client's installed daemon imports, which is the successor's code only when both run from the same installation. It checks the daemon's status against the entry again before asking for the restart, and takes as the successor only the daemon the index then lists for the same root and socket under another pid, live by its start time, whose status gives that pid and root, so another process on the socket is never taken for it | 0, 4, or 1 |
+| `dromon fleet hosts` | **Round 13.** Lists the hosts of the per-user hosts file. Reaching them is designed and not implemented, as [`FLEET.md`](../architecture/FLEET.md) says | 0, or 1 on a refused file |
 | `dromond` | Runs the daemon in the foreground, after applying `.dromon/dromon.toml`. Each flag overrides the file. `--max-autonomous-turns N`, default 12, `--max-cost-usd X`, default 2, and `--cooldown-seconds S`, default 0, set the conversation limits, `--operator NAME`, default `operator`, names who hears about a held line no operator has messaged, `--hold-wakes` records messages without waking any line, and `--tick-seconds S` sets the time between ticks while work is in flight, default 1, at most 60 | 0, 1 on failure, 2 on a bad cap or cadence, or 5 when another daemon holds the lock |
 
 The tool options are `--tool NAME`, repeatable, `--mcp-config FILE`, a JSON file of MCP
@@ -202,6 +207,21 @@ directory the daemon resolves against the project root, as
 [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies.
 
 Status 2 is a usage error and status 3 marks a subcommand not yet implemented.
+
+**The fleet commands, round 13.** Every `dromon fleet` command needs no project of its
+own and ignores `--project`. Each reaches a daemon only by connecting to the operator
+socket its entry in the fleet index names, and first sends `status`, refusing a daemon
+that does not give the pid and project root its entry names. It then sends the very
+operation its single-project command sends, so no new authority and no new operation
+exist. A peer token is never used, and nothing passes through a peer. Each request
+waits at most 2 seconds, `FLEET_TIMEOUT_SECONDS`, so a daemon that hangs delays the
+rest by at most that for each of its requests. **Review of 7ff033f, G2.** That bound
+holds for the requests the fleet commands make themselves. A routed command's own
+operation, such as the body of `fleet send`, waits as its single-project command
+does, at most 5 seconds. `fleet restart` waits for its successor at most the drain
+wait plus 70 seconds plus one poll, each status waiting at most 2 seconds, as
+`dromon restart` waits with 5. The index, its staleness rule and the
+hosts of other machines are in [`FLEET.md`](../architecture/FLEET.md).
 
 ## Line activity
 
@@ -270,6 +290,7 @@ for the line's open questions, a status bar, the input, and suggestions or a hin
 | `/create LINE MODEL [STRATEGY]` | Sends `create_line`, with the subscription strategy by default |
 | `/reload` | Sends `reload_project` |
 | `/line LINE`, `/lines` | Attaches to another line, or lists the daemon's lines to pick one |
+| `/project PROJECT[:LINE]`, `/projects` | **Round 13.** Attaches to a line of another project in the fleet index without restarting, or lists the index's projects with their states, and with the root beside a name two projects share, which `/project` then completes, to the root for a shared name. The target is the rest of the input whole, so a root that holds a space stays one root, and the line follows its last colon. A root that holds a colon is given with its line or with a final colon. The client moves only once the other daemon answers through its own socket, says the pid and root its entry names, and has the line, so a project that cannot be reached leaves it where it was. Without `LINE` it keeps the line's name when the other project has it, and takes that project's first line otherwise. The status bar and the window's title name the line as `PROJECT:LINE` |
 | `/activity`, `/mail` | Chooses the pane |
 | `/help`, `/?` | Lists commands and keys |
 | `/quit`, `/exit` | Detaches |

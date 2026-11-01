@@ -156,6 +156,7 @@ message and leaving the old daemon running.
 | The lock | The running daemon holds it, so the check does not take it |
 | Sockets, the TLS listener and peer connections | The check makes none, and never removes the running daemon's |
 | The open-federation registry | Registering would meet the running daemon's own entry, so the check does not write it, and the refusals of a name on the disclosure list or a registry inside the project are found only at the start |
+| The fleet index | A check writes nothing of the operator's, so it neither makes the index nor writes an entry in it, and a failure to make or write it is found only at the start, which starts unlisted then, as [`FLEET.md`](../architecture/FLEET.md) gives |
 | The teacher | Bringing it up loads a model, so the check does not |
 | Recovery, the survivor scan and the process-table probe | They run in `serve`, or touch the process table, which the check does not |
 | Engines | No engine is built until a line's first turn, at a start as at a check |

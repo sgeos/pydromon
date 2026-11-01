@@ -2,6 +2,7 @@
 protected set, and the refusal of unconfined engines in a project with peers. The
 design is ``docs/architecture/FEDERATION.md``."""
 
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -25,6 +26,8 @@ from dromon.federation_tls import MAX_PEER_CERTIFICATES
 from dromon.lineconfig import DEFAULT_CONFIG, ConfigError
 from dromon.model import AgentAddress, LineAddress, OperatorAddress
 from dromon.paths import ProjectPaths, project_paths
+from dromon.fleet import denied_indexes
+from dromon.registry import configured_directory
 from dromon.projectconfig import ConfigFileError, ProjectConfig, parse
 from dromon.sandbox import SandboxError, parse_sandbox
 
@@ -314,13 +317,15 @@ def test_a_bad_peer_names_its_line_in_the_project_file() -> None:
 
 def test_protected_directories_add_each_peer(paths: ProjectPaths) -> None:
     config = project_with_peers(paths)
-    own = protected_dirs(paths)
-    assert own == (paths.state_dir.resolve(), paths.runtime_dir.resolve())
+    indexes = denied_indexes(configured_directory(os.environ))
+    own = (paths.state_dir.resolve(), paths.runtime_dir.resolve())
+    assert protected_dirs(paths) == (*own, *indexes)
     keleusma = (paths.root.parent / "keleusma").resolve()
     assert protected_dirs(paths, config.federation) == (
         *own,
         keleusma / "run",
         keleusma / ".dromon",
+        *indexes,
     )
 
 

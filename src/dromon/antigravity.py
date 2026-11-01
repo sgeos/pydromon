@@ -29,7 +29,8 @@ variable and reads the sign-in from the profile.
 Isolation. Dromon serves no file system and no terminal, gives the line no built-in
 tool, and puts the session in the ``default`` permission mode. Every permission request
 is refused unless it is for one of Dromon's own tools, and a tool call that is not one
-of them cancels and refuses the turn. Every tool call and every update to it is
+of them is rejected without ending the turn when it asks before running. An
+unauthorized call reported as running cancels and refuses the turn. Every update is
 checked, whatever its kind, and a call whose name, title or kind changes refuses the
 turn. A tool is one of Dromon's own only by its structured ``toolName``, never by its
 title. **Inference.** A tool that asks first is denied before it runs. One the runtime
@@ -531,6 +532,8 @@ class _Turn:
         default_factory=dict[str, dict[str, object]]
     )
     """Each tool call's identity as first recorded, by its identifier."""
+    permission_calls: set[str] = field(default_factory=set[str])
+    rejected_calls: set[str] = field(default_factory=set[str])
     finished: set[str] = field(default_factory=set[str])
     """Tool calls whose update reported them finished, so each result is fed to the
     driver once."""
@@ -738,10 +741,17 @@ class AntigravityLine:
             if error.head.startswith(SIGN_IN_NOTICE):
                 raise EngineRefused(SIGN_IN_REFUSAL) from error
             raise
-        except acp.RpcError as error:
-            if error.code == SIGN_IN_REQUIRED:
-                raise EngineRefused(SIGN_IN_REFUSAL) from error
-            raise EngineRefused(f"the engine refused a request: {error}") from error
+        except (acp.RpcError, EngineRefused) as error:
+            # A transport failure while cancelling does not replace the stop cause.
+            if turn.refusal is not None:
+                raise EngineRefused(turn.refusal) from error
+            if turn.interrupted_for is not None:
+                return
+            if isinstance(error, acp.RpcError):
+                if error.code == SIGN_IN_REQUIRED:
+                    raise EngineRefused(SIGN_IN_REFUSAL) from error
+                raise EngineRefused(f"the engine refused a request: {error}") from error
+            raise
         finally:
             self._client = None
             self._session = None
@@ -928,6 +938,18 @@ class AntigravityLine:
                 )
             return
         refusal = acp.identity_refusal(identifier, tool_call, turn.calls)
+        if (
+            refusal is None
+            and isinstance(identifier, str)
+            and identifier in turn.permission_calls
+        ):
+            refusal = "the engine reused a tool call identifier after permission"
+        if (
+            refusal is None
+            and "status" in tool_call
+            and tool_call["status"] != "pending"
+        ):
+            refusal = "the engine requested permission for a tool no longer pending"
         # With no field changed, the call is what was recorded plus what the request
         # adds, so a request that omits the recorded name still names the call.
         known = turn.calls.get(str(identifier), {})
@@ -937,19 +959,20 @@ class AntigravityLine:
         response, missing_option = acp.permission_result(
             options, permitted, acp.tool_label(tool_call)
         )
+        if refusal is None and missing_option is None:
+            if isinstance(identifier, str):
+                turn.permission_calls.add(identifier)
+                if not permitted:
+                    turn.rejected_calls.add(identifier)
+            await self._record(str(identifier), tool_call, turn)
+            if turn.cancelled:
+                response = {"outcome": {"outcome": "cancelled"}}
         await self._rpc().respond(request_id, response)
         if missing_option is not None:
             refusal = refusal or missing_option
         if refusal is not None:
             await self._cancel(turn, refusal)
             return
-        await self._record(str(identifier), tool_call, turn)
-        if not permitted:
-            await self._cancel(
-                turn,
-                "the engine asked to use a tool the line was not given, which Dromon"
-                f" refused before it ran: {acp.tool_label(tool_call)}",
-            )
 
     async def _update(self, update: dict[str, Any], turn: _Turn) -> None:
         kind = update.get("sessionUpdate")
@@ -1016,6 +1039,12 @@ class AntigravityLine:
                 # The safe point before the next model call that priority mail
                 # takes, as ``dromon.priority`` describes.
                 await self._act(Event(TOOL_RESULT), turn)
+            return
+        if str(identifier) in turn.rejected_calls:
+            if not acp.rejected_call_not_run(update):
+                await self._cancel(turn, acp.REJECTION_UNCONFIRMED)
+            return
+        if acp.waiting_for_permission(update):
             return
         started = update.get("status") in STARTED_STATUSES or "status" not in update
         when = "after it started" if started else "before it ran"

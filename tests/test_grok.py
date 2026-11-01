@@ -1663,8 +1663,7 @@ def test_permission_requests_follow_the_lines_tools(
     assert picked == {"p1": "yes", "p2": "yes"}
     assert answers["x"]["error"]["code"] == -32601
     assert report.tool_uses == ("Read", "dromon__send_message")
-    # A refused request cancels the turn, and ACP requires every request after a
-    # cancel to be answered as cancelled, which grants nothing.
+    # An ordinary rejection leaves later independent calls available.
     refused = FakeGrok(
         [
             permission("execute", request_id="p1", ident="a"),
@@ -1672,11 +1671,12 @@ def test_permission_requests_follow_the_lines_tools(
             permission("other", "gmail__send", request_id="p3", ident="c"),
         ]
     )
-    with pytest.raises(EngineRefused, match="not given: execute"):
-        run(line(refused, project, config=reader))
+    assert run(line(refused, project, config=reader)).tool_uses == ("Read",)
+    assert "session/cancel" not in refused.methods()
     answers = {a["id"]: a["result"]["outcome"] for a in refused.answers()}
     assert answers["p1"]["optionId"] == "no"
-    assert answers["p2"] == answers["p3"] == {"outcome": "cancelled"}
+    assert answers["p2"]["optionId"] == "yes"
+    assert answers["p3"]["optionId"] == "no"
 
 
 @pytest.mark.parametrize(
@@ -1962,8 +1962,8 @@ def test_a_title_never_names_one_of_dromons_tools(
     asked = permission("other")
     asked["params"]["toolCall"] = titled
     server = FakeGrok([asked, chunk("done")])
-    with pytest.raises(EngineRefused, match="not given: dromon__send_message"):
-        run(line(server, project))
+    assert run(line(server, project)).text == "done"
+    assert "session/cancel" not in server.methods()
     answers = {a["id"]: a for a in server.answers()}
     assert answers["p1"]["result"]["outcome"]["optionId"] == "no"
     used = FakeGrok([note({"sessionUpdate": "tool_call", **titled})])
@@ -1980,8 +1980,8 @@ def test_no_kind_is_exempt_from_the_tool_check(
     with pytest.raises(EngineRefused, match="not given: think"):
         run(line(server, project))
     asked = FakeGrok([permission("think")])
-    with pytest.raises(EngineRefused, match="not given: think"):
-        run(line(asked, project))
+    assert run(line(asked, project)).tool_uses == ()
+    assert "session/cancel" not in asked.methods()
     assert asked.answers()[0]["result"]["outcome"]["optionId"] == "no"
 
 
@@ -3314,3 +3314,153 @@ def test_a_task_tool_of_kind_other_still_needs_bash(
     config = LineConfig(builtin_tools=("Read",))
     with pytest.raises(EngineRefused, match="not given: kill_command_or_subagent"):
         run(line(FakeGrok([event]), project, config=config))
+
+
+@pytest.mark.parametrize(
+    "status", ["pending", "failed", "in_progress", "completed", "unknown", None]
+)
+def test_rejected_call_cannot_run_after_permission(
+    project: tuple[Path, Path, Path],
+    status: str | None,
+) -> None:
+    denied = permission("execute")
+    fields = {} if status is None else {"status": status}
+    server = FakeGrok([denied, call_update("t", **fields)])
+    with pytest.raises(
+        EngineRefused, match="did not confirm that a rejected tool call did not run"
+    ):
+        run(line(server, project))
+    assert server.methods().count("session/cancel") == 1
+
+
+@pytest.mark.parametrize("status", ["pending", "failed", None])
+def test_pending_call_can_be_rejected_and_another_call_can_succeed(
+    project: tuple[Path, Path, Path],
+    status: str | None,
+) -> None:
+    announcement = tool_call("execute", ident="blocked")
+    announcement["params"]["update"]["status"] = "pending"
+    server = FakeGrok(
+        [
+            announcement,
+            permission("execute", ident="blocked", request_id="deny"),
+            call_update("blocked", status=status, _meta={"toolNotRun": True}),
+            permission(
+                "other", "dromon__send_message", ident="good", request_id="allow"
+            ),
+            chunk("corrected"),
+        ]
+    )
+    report = run(line(server, project))
+    assert report.text == "corrected"
+    assert report.tool_uses == ("dromon__send_message",)
+    assert "session/cancel" not in server.methods()
+
+
+def test_a_rejected_permission_identifier_cannot_be_reused(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok(
+        [permission("execute"), permission("execute", request_id="again")]
+    )
+    with pytest.raises(EngineRefused, match="reused a tool call identifier"):
+        run(line(server, project))
+
+
+def test_unapproved_pending_call_starting_without_permission_stops(
+    project: tuple[Path, Path, Path],
+) -> None:
+    first = tool_call("execute")
+    first["params"]["update"]["status"] = "pending"
+    server = FakeGrok([first, call_update("t", status="in_progress")])
+    with pytest.raises(EngineRefused, match="started a tool the line was not given"):
+        run(line(server, project))
+
+
+@pytest.mark.parametrize("status", ["in_progress", "completed", "failed"])
+def test_permission_for_an_already_started_call_stops(
+    project: tuple[Path, Path, Path], status: str
+) -> None:
+    request = permission("execute")
+    request["params"]["toolCall"]["status"] = status
+    server = FakeGrok([request])
+    with pytest.raises(EngineRefused, match="no longer pending"):
+        run(line(server, project))
+    assert "session/cancel" in server.methods()
+
+
+def test_driver_budget_does_not_grant_the_request_that_stops_it(
+    project: tuple[Path, Path, Path],
+) -> None:
+    budget = grok().settings.tool_budget
+    server = FakeGrok(
+        [
+            permission("read", ident=f"t{i}", request_id=f"p{i}")
+            for i in range(budget + 1)
+        ]
+    )
+    report = run(line(server, project, config=LineConfig(builtin_tools=("Read",))))
+    assert report.interrupted_for == "tool_budget"
+    assert report.tool_uses
+    at_stop = server.answers()[len(report.tool_uses) - 1]
+    assert at_stop["result"]["outcome"] == {"outcome": "cancelled"}
+
+
+@pytest.mark.parametrize("rpc_error", [False, True])
+@pytest.mark.parametrize("budget_stop", [False, True])
+def test_cancel_transport_failure_keeps_the_original_stop_cause(
+    project: tuple[Path, Path, Path], rpc_error: bool, budget_stop: bool
+) -> None:
+    class BreaksOnCancel(FakeGrok):
+        async def send(self, message: Mapping[str, object]) -> None:
+            if message.get("method") == "session/cancel":
+                self.sent.append(dict(message))
+                self.queue.clear()
+                if rpc_error:
+                    self.queue.append(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": self.prompt_id,
+                            "error": {
+                                "code": -32000,
+                                "message": "cancel transport failed",
+                            },
+                        }
+                    )
+                return
+            await super().send(message)
+
+    budget = grok().settings.tool_budget
+    events = (
+        [
+            permission("read", ident=f"t{i}", request_id=f"p{i}")
+            for i in range(budget + 1)
+        ]
+        if budget_stop
+        else [tool_call("read"), call_update("t", kind="execute")]
+    )
+    server = BreaksOnCancel(events)
+    target = line(server, project, config=LineConfig(builtin_tools=("Read",)))
+    if budget_stop:
+        report = run(target)
+        assert report.interrupted_for == "tool_budget"
+    else:
+        with pytest.raises(EngineRefused, match="changed the kind"):
+            run(target)
+
+
+def test_non_execution_evidence_is_required_again_on_each_update(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok(
+        [
+            permission("execute"),
+            call_update("t", status="failed", _meta={"toolNotRun": True}),
+            call_update("t", status="failed"),
+        ]
+    )
+    with pytest.raises(
+        EngineRefused, match="did not confirm that a rejected tool call did not run"
+    ):
+        run(line(server, project))
+    assert server.methods().count("session/cancel") == 1

@@ -150,13 +150,39 @@ class Client:
         )
 
 
+def waiting_for_permission(fields: Mapping[str, Any]) -> bool:
+    """A pending announcement may wait for its first permission request."""
+    return fields.get("status") == "pending"
+
+
+REJECTION_UNCONFIRMED: Final = (
+    "the engine did not confirm that a rejected tool call did not run"
+)
+
+
+def rejected_call_not_run(fields: Mapping[str, Any]) -> bool:
+    """Require explicit non-execution evidence on every post-rejection update.
+    The toolNotRun metadata assertion is trusted as an engine protocol report,
+    not proof of no side effects. Conflicting execution status fails closed.
+    Status alone, including pending or failed, establishes no such evidence.
+    """
+    meta = fields.get("_meta")
+    return (
+        isinstance(meta, Mapping)
+        and cast(Mapping[str, object], meta).get("toolNotRun") is True
+        and fields.get("status") in (None, "pending", "failed")
+    )
+
+
 def permission_result(
     options: object, permitted: bool, tool_name: str
 ) -> tuple[dict[str, object], str | None]:
     """The answer to ``session/request_permission``. Only a single use is ever granted,
-    so no grant outlives the call. A refusal prefers a single rejection. If no option
-    of the intended kind is offered, answer as cancelled and return bounded evidence
-    so the adapter can cancel and refuse the turn rather than leave it running."""
+    so no grant outlives the call. A refusal prefers a single rejection. ACP version
+    1 carries only an option identifier, with no standard model-visible reason.
+    Metadata and RPC errors do not establish that a model receives an explanation.
+    If no option of the intended kind is offered, answer as cancelled and return
+    bounded evidence so the adapter can cancel rather than leave the turn running."""
     wanted = ("allow_once",) if permitted else ("reject_once", "reject_always")
     if isinstance(options, Sequence) and not isinstance(options, (str, bytes)):
         offered = cast(Sequence[Any], options)
