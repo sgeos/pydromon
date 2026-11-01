@@ -401,17 +401,29 @@ async def _end_group(process: "asyncio.subprocess.Process") -> None:
                 walked = None
             rows = walked or []
         finally:
-            try:
-                # Before the group, which orphans what it ends. Each is checked against
-                # the walk just before its signal, as ``signal_if_same`` says.
-                for row in deepest_first(rows):
-                    signal_if_same(row, signal.SIGKILL)
-            finally:
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.killpg(process.pid, signal.SIGKILL)
-                with contextlib.suppress(ProcessLookupError):
-                    process.kill()
+            # In a thread, because each check runs ``ps`` for up to a second and the
+            # loop serves every line. Shielded, so a cancellation here does not stop
+            # the signals half way, which a thread that has started cannot be made to
+            # do in any case. Re-review, round 15.
+            await asyncio.shield(asyncio.to_thread(_kill_below, process.pid, rows))
     await asyncio.shield(process.wait())
+
+
+def _kill_below(pid: int, rows: Sequence[TreeRow]) -> None:
+    """Kill the descendants a walk found, deepest first and each only if it is still
+    the process the walk read, and then the command's group and the command. The
+    order is the one ``signal_if_same`` and ``deepest_first`` explain, and it is why
+    all of it runs in one place. Blocking, so a caller on the event loop runs it in a
+    thread. ``os.kill`` is used for the command because asyncio's process object
+    belongs to the loop's thread."""
+    try:
+        for row in deepest_first(rows):
+            signal_if_same(row, signal.SIGKILL)
+    finally:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pid, signal.SIGKILL)
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGKILL)
 
 
 class FileRelay:

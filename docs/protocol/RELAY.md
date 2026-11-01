@@ -87,10 +87,14 @@ pipe leaves neither end open. Before a descendant that a timeout or stop found i
 killed, its parent and start time are read again and compared with the walk's, so a
 process that took the identifier of one that ended is not killed, as
 [`RUNS.md`](../architecture/RUNS.md) describes. The check runs before the group is
-killed, deepest descendant first so that a parent does not orphan its child ahead of the
-child's check, and it blocks the event loop for the length of one `ps` per descendant, at most
-one second each. **Technical debt.** A command with many descendants could hold the
-loop for that many seconds on a timeout.
+killed, deepest descendant first so that a parent does not orphan its child ahead of
+the child's check. The checks, the group kill and the command's kill run in one worker
+thread, shielded from cancellation, because each check runs `ps` for up to a second and
+the event loop serves every line. A test holds a ticker on the loop while three slow
+checks run. **Limits.** A cancellation that arrives while the thread works does not
+stop it, which is intended, but the cancelled task returns before the kill is done, so
+the command is reaped by the loop's watcher and not awaited. A command with many
+descendants keeps one worker thread busy for up to a second each.
 
 ## File relay
 

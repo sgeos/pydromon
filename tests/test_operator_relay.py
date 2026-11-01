@@ -664,6 +664,57 @@ def test_a_cancellation_while_ending_the_group_closes_the_pipe(
     assert pids and all(_gone(pid) for pid in pids)
 
 
+def test_the_loop_stays_responsive_while_each_descendant_is_checked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-review of 6ce43e8. Each check runs ``ps`` for up to a second, and the event
+    loop serves every line, so the checks run in a thread. Each stands in here with a
+    sleep of 0.4 seconds, three in all, and a ticker on the loop must never wait
+    anything like that long. The command must still end."""
+    rows = [
+        TreeRow(50_000 + number, 1, 50_000 + number, "x", "t") for number in range(3)
+    ]
+    signalled: list[int] = []
+
+    def walk(root: int) -> list[TreeRow] | None:
+        return rows
+
+    def slow_signal(row: TreeRow, number: int) -> bool:
+        time.sleep(0.4)
+        signalled.append(row.pid)
+        return False
+
+    monkeypatch.setattr(relay_module, "attached", walk)
+    monkeypatch.setattr(relay_module, "signal_if_same", slow_signal)
+    relay = CommandRelay([sys.executable, "-c", "import time; time.sleep(30)"], 0.3)
+    gaps: list[float] = []
+
+    async def scenario() -> None:
+        stop = asyncio.Event()
+
+        async def ticker() -> None:
+            last = time.monotonic()
+            while not stop.is_set():
+                await asyncio.sleep(0.02)
+                now = time.monotonic()
+                gaps.append(now - last)
+                last = now
+
+        watching = asyncio.create_task(ticker())
+        try:
+            with pytest.raises(RelayError, match="timed out"):
+                await relay.deliver(notice())
+        finally:
+            stop.set()
+            await watching
+
+    started = time.monotonic()
+    asyncio.run(scenario())
+    assert time.monotonic() - started >= 1.2, "the checks did not all run"
+    assert sorted(signalled) == sorted(row.pid for row in rows)
+    assert gaps and max(gaps) < 0.3, f"the loop stalled for {max(gaps):.2f} seconds"
+
+
 def test_a_loop_that_cannot_watch_the_pipe_leaves_no_descriptor() -> None:
     class Refusing:
         def add_reader(self, *arguments: object) -> None:

@@ -30,3 +30,6 @@ Type: Fixed
   signalled, by a relay stop or a supervised run's stop.
   Descendants are signalled deepest first, so a parent that ends does not orphan a
   child before the child's own check.
+- Round 15, second re-review. The relay's per-descendant start time and parent check
+  and its group kill run in a worker thread, so the event loop that serves every line
+  no longer waits for up to a second of `ps` per descendant.
