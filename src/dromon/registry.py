@@ -131,10 +131,10 @@ class Entry:
 
 
 def _check_path(path: Path, name: str) -> None:
-    _check_text(str(path), name)
+    check_absolute(str(path), name)
 
 
-def _check_text(text: str, name: str) -> None:
+def check_absolute(text: str, name: str) -> None:
     if not text.startswith("/") or "\x00" in text:
         raise RegistryError(f"{name} must be an absolute path")
     if len(text.encode("utf-8")) > MAX_PATH_BYTES:
@@ -189,7 +189,7 @@ def configured_directory(environ: Mapping[str, str]) -> Path:
     given = environ.get(REGISTRY_DIR_ENV)
     if given is None:
         return default_directory()
-    _check_text(given, REGISTRY_DIR_ENV)
+    check_absolute(given, REGISTRY_DIR_ENV)
     return Path(given)
 
 
@@ -224,9 +224,10 @@ def ensure_directory(directory: Path) -> None:
 
 
 @contextmanager
-def _locked(directory: Path) -> Generator[None]:
-    """Hold the registry's advisory lock, so two daemons registering one name at once
-    cannot both take it, and a stale entry is replaced once."""
+def locked(directory: Path) -> Generator[None]:
+    """Hold the advisory lock of ``directory``, a registry or the fleet index, so two
+    daemons registering one name at once cannot both take it, and a stale entry is
+    replaced once."""
     try:
         descriptor = os.open(
             directory / LOCK_NAME,
@@ -246,17 +247,14 @@ def entry_path(directory: Path, name: str) -> Path:
     return directory / f"{name}{ENTRY_SUFFIX}"
 
 
-def read_entry(directory: Path, name: str) -> Entry | None:
-    """The entry for ``name``, or ``None`` when there is none or it is not a regular
-    file of this user with mode 0600 holding a valid entry for that name. It is
-    opened without following a link and without blocking, so a named pipe put there
-    returns at once."""
-    if ID_PATTERN.fullmatch(name) is None:
-        return None
+def read_private(path: Path) -> bytes | None:
+    """The bytes of ``path``, or ``None`` when it is missing or is not a regular file
+    of this user with mode 0600 and at most ``MAX_ENTRY_BYTES``. It is opened without
+    following a link and without blocking, so a named pipe put there returns at once.
+    The registry and the fleet index both read their entries through it."""
     try:
         descriptor = os.open(
-            entry_path(directory, name),
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
         )
     except OSError:
         return None
@@ -269,11 +267,45 @@ def read_entry(directory: Path, name: str) -> Entry | None:
             or found.st_size > MAX_ENTRY_BYTES
         ):
             return None
-        data = os.read(descriptor, MAX_ENTRY_BYTES + 1)
+        return os.read(descriptor, MAX_ENTRY_BYTES + 1)
     except OSError:
         return None
     finally:
         os.close(descriptor)
+
+
+def write_private(path: Path, data: bytes) -> None:
+    """Create ``path`` with mode 0600 holding ``data``, refusing one that exists or
+    is a link. Raises ``RegistryError``, and leaves no partial file behind."""
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            ENTRY_MODE,
+        )
+    except OSError as error:
+        raise RegistryError(f"the entry {path} cannot be written") from error
+    try:
+        os.fchmod(descriptor, ENTRY_MODE)
+        os.write(descriptor, data)
+        os.fsync(descriptor)
+    except OSError as error:
+        os.close(descriptor)
+        with suppress(OSError):
+            path.unlink()
+        raise RegistryError(f"the entry {path} cannot be written") from error
+    os.close(descriptor)
+
+
+def read_entry(directory: Path, name: str) -> Entry | None:
+    """The entry for ``name``, or ``None`` when there is none or it is not a regular
+    file of this user with mode 0600 holding a valid entry for that name, as
+    ``read_private`` reads it."""
+    if ID_PATTERN.fullmatch(name) is None:
+        return None
+    data = read_private(entry_path(directory, name))
+    if data is None:
+        return None
     try:
         entry = parse_entry(data.decode("utf-8"))
     except (UnicodeDecodeError, RegistryError):
@@ -358,7 +390,7 @@ def register(directory: Path, entry: Entry, start_of: StartOf) -> None:
     holder lives, so a name is never taken from a daemon that may still run."""
     ensure_directory(directory)
     path = entry_path(directory, entry.name)
-    with _locked(directory):
+    with locked(directory):
         if path.is_symlink() or path.exists():
             held = read_entry(directory, entry.name)
             if held is not None:
@@ -380,25 +412,7 @@ def register(directory: Path, entry: Entry, start_of: StartOf) -> None:
                 raise RegistryError(
                     f"the stale entry {path} cannot be removed"
                 ) from error
-        data = entry.text().encode("utf-8")
-        try:
-            descriptor = os.open(
-                path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                ENTRY_MODE,
-            )
-        except OSError as error:
-            raise RegistryError(f"the entry {path} cannot be written") from error
-        try:
-            os.fchmod(descriptor, ENTRY_MODE)
-            os.write(descriptor, data)
-            os.fsync(descriptor)
-        except OSError as error:
-            os.close(descriptor)
-            with suppress(OSError):
-                path.unlink()
-            raise RegistryError(f"the entry {path} cannot be written") from error
-        os.close(descriptor)
+        write_private(path, entry.text().encode("utf-8"))
 
 
 def unregister(directory: Path, entry: Entry) -> bool:
@@ -406,7 +420,7 @@ def unregister(directory: Path, entry: Entry) -> bool:
     removes a successor's entry. Says whether it removed one, and never raises."""
     try:
         check_directory(directory)
-        with _locked(directory):
+        with locked(directory):
             if read_entry(directory, entry.name) != entry:
                 return False
             entry_path(directory, entry.name).unlink()

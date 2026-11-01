@@ -1,5 +1,6 @@
 """Sandbox documents: validation, trust, merging, unattended defaults and protection."""
 
+import os
 import asyncio
 import json
 from pathlib import Path
@@ -25,6 +26,8 @@ from dromon.lineconfig import (
     encode_config,
 )
 from dromon.paths import project_paths
+from dromon.fleet import denied_indexes
+from dromon.registry import configured_directory
 from dromon.projectconfig import ConfigFileError, parse
 from dromon.sandbox import (
     SandboxConfig,
@@ -478,6 +481,7 @@ def test_the_daemon_refuses_a_file_that_reopens_a_protected_directory(
     assert protected_dirs(paths) == (
         paths.state_dir.resolve(),
         paths.runtime_dir.resolve(),
+        *denied_indexes(configured_directory(os.environ)),
     )
 
 

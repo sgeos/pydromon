@@ -7,6 +7,42 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- The operator's fleet, round 13, as `docs/architecture/FLEET.md` specifies. Every
+  daemon, whatever its federation mode, writes an entry in a per-user fleet index at
+  start and removes it at stop. The entry holds the project root, its operator socket,
+  the pid, the start time and the daemon's commit. The index is the directory `index`
+  inside the open-federation registry, so `DROMON_REGISTRY_DIR` moves it as well, with
+  mode 0700 and entries of mode 0600. An entry's name must be the last step of its
+  root. The daemon makes the index at start, before any engine is built, and every line
+  of every project is denied it. A daemon whose entry cannot be written starts unlisted
+  and says so. `dromon fleet list`,
+  `questions`, `mail`, `issues`, `answer`, `send`, `read`, `status` and `restart` read
+  the index and send the existing operations to each daemon's own operator socket,
+  after `status` has shown that the daemon answering is the one the entry names, and
+  take `PROJECT:ID` or `PROJECT:LINE`. `fleet restart` takes as the successor only the
+  daemon the index then lists for the same root, live and saying that pid and root. A
+  stale or unknown entry is shown and never asked, and a daemon that does not answer is
+  reported while the rest go on. The attached client's `/projects` lists the index,
+  with the root beside a name two projects share, and `/project PROJECT[:LINE]` moves
+  to another project without restarting. A per-user hosts file,
+  `.config/dromon/hosts.toml` or `DROMON_HOSTS_FILE`, names other machines, which
+  `dromon fleet hosts` lists. It holds no credential. Reaching those machines through
+  the operator's own SSH is designed and not implemented. **Rollback hazard.** An
+  older daemon writes no entry, so `dromon fleet` does not see it, and an older client
+  has no `fleet` command. The index directory an older release leaves is harmless and
+  may be removed. **Operational note.** The daemon now makes the index at start, so a
+  Grok line's turns are refused, naming the entry to add, until its profile denies the
+  index, as for every protected directory.
+- Runtime line creation accepts limits, kept session and compaction options.
+  Configuration accepts workdir access and the project summary shows operator routing,
+  relays, supervised runs, read only paths and federation policy.
+- Disclosure refusals name message fields. Checks return only aggregate counts,
+  without file names or line locations.
+  Older daemons refuse the new `disclosure_accepted` key, so remove that table
+  before rolling back. Operator accepted occurrences use file paths and exact line
+  content hashes shared by the daemon and gate. Text and messages retain disclosure checks and the hourly limit.
+- The gate reports bounded groups of skipped and deselected tests with their reasons.
+
 - Open federation, round 12. `[federation] local` and `remote` take `allowlist`, the
   default, which keeps the behaviour of declared peers exactly, or `open`. With
   `local = "open"`, `listen` and a unique `name`, a daemon registers in a per-user
@@ -157,6 +193,11 @@ All notable changes are recorded here. The format follows
   defines no custom reason field, so a model-visible explanation for a selected
   rejection remains runtime-dependent and unverified live.
 
+- `dromon restart` waits for its successor until a deadline, and each status request
+  waits no longer than what remains of it. Each poll waited out a whole request
+  timeout before, so a daemon that accepted and never answered could hold the client
+  for hours, as the review of 7ff033f found. A hang now costs at most the drain wait,
+  plus 70 seconds for the shutdown and startup bounds, plus one poll.
 - ACP adapters now cancel and refuse a turn when the runtime omits the permission
   option needed for Dromon's intended decision. The refusal names the tool, whether
   Dromon intended to allow or refuse it, and bounded evidence of the offered option

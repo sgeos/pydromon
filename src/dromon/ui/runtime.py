@@ -45,12 +45,17 @@ from dromon.ui.model import (
     Failed,
     FetchActivity,
     FetchLines,
+    FetchProjects,
     FetchSettings,
     FetchView,
     LinesLoaded,
     Lost,
     Model,
+    OpenProject,
     Pressed,
+    ProjectOpened,
+    ProjectRow,
+    ProjectsLoaded,
     Request,
     Resized,
     SettingsLoaded,
@@ -83,6 +88,21 @@ class Daemon(Protocol):
     """The port to the daemon. ``call`` raises ``Unreachable`` and nothing else."""
 
     def call(self, operation: Operation, args: dict[str, object]) -> Response: ...
+
+
+class Projects(Protocol):
+    """The port to the fleet index, through which a client moves between projects.
+    Round 13, item 4. It reaches each daemon only through that daemon's own socket."""
+
+    def names(self) -> tuple[ProjectRow, ...]:
+        """Each project of the index with its state and root, which raises
+        ``Unreachable`` when the index cannot be read."""
+        ...
+
+    def open(self, project: str) -> Daemon:
+        """The port to ``project``'s daemon once it has said it is the daemon the
+        index names. Raises ``Unreachable`` with the reason otherwise."""
+        ...
 
 
 def request_of(
@@ -162,10 +182,13 @@ class Runtime:
         operator: str,
         poll_seconds: float,
         bell: Callable[[], None] = lambda: None,
+        projects: Projects | None = None,
+        project: str | None = None,
     ) -> None:
         self._daemon = daemon
         self._bell = bell
-        self._model = initial(line_id, operator, poll_seconds)
+        self._projects = projects
+        self._model = initial(line_id, operator, poll_seconds, project)
         self._frame: tuple[Model, Frame] | None = None
 
     @property
@@ -242,11 +265,42 @@ class Runtime:
                 if isinstance(response, Failed | Lost):
                     return response
                 return SettingsLoaded(line_id, settings_of(response))
+            case OpenProject(project, line_id, current):
+                return self._open(project, line_id, current)
+            case FetchProjects():
+                if self._projects is None:
+                    return Failed("this client was given no fleet index")
+                try:
+                    return ProjectsLoaded(self._projects.names())
+                except Unreachable as error:
+                    return Failed(str(error))
             case Bell():
                 self._bell()
                 return None
             case Exit():
                 return None
+
+    def _open(self, project: str, line_id: str | None, current: str) -> Event:
+        """Move to ``project``'s daemon, once it answers and has the line, so that a
+        project that cannot be reached leaves the client where it was."""
+        if self._projects is None:
+            return Failed("this client was given no fleet index")
+        try:
+            daemon = self._projects.open(project)
+            response = daemon.call(Operation.STATUS, {})
+        except Unreachable as error:
+            return Failed(f"{project}: {error}")
+        if not response.ok:
+            return Failed(f"{project}: {response.error_message or 'refused'}")
+        lines = lines_of(response.result or {})
+        names = [line.line_id for line in lines]
+        if line_id is not None and line_id not in names:
+            return Failed(f"{project} has no line {line_id}")
+        if not names:
+            return Failed(f"{project} has no lines")
+        chosen = line_id or (current if current in names else names[0])
+        self._daemon = daemon
+        return ProjectOpened(project, chosen, lines)
 
     def _ask(
         self, operation: Operation, args: dict[str, object]
