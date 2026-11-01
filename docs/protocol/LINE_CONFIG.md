@@ -163,8 +163,9 @@ malformed `file_path` is refused. The callback keeps the same check as a second 
 2. *An ask rule for `Read`.* A view-only line's flag settings carry
    `permissions.ask: ["Read"]`, joined with the operator's own ask rules once. An ask
    rule makes the engine consult the permission callback, so the gate runs for every
-   `Read` whatever the hook does. **Hypothesis, to be shown live.** An ask rule
-   outranks the engine's allowance for a read inside its working directory. If it does
+   `Read` whatever the hook does. **Hypothesis, still not shown live.** An ask rule
+   outranks the engine's allowance for a read inside its working directory. The live
+   run of 2026-11-01 below does not show it, because the hook denied first. If it does
    not, the hook and the missing-hook check below are what hold.
 3. *A `Read` without a hook call ends the turn.* The hook records each tool call it is
    given. The adapter records each `Read` a view-only line makes and, when its result
@@ -197,9 +198,16 @@ checked by Dromon against the `imageView` item as the engine emits it, which det
 and does not prevent, as stated above, so an over-limit or non-image file on Codex is
 caught only after the engine began the call. Grok is not enabled, and it shares the
 class of risk, since whether Grok asks before `read_file` is unknown, so it stays
-disabled until its verify-first item 6 shows how it behaves. **Verification still to
-run.** The operator repeats the live run on Claude Code and expects Dromon's refusal
-for `word.txt`, the renamed png and `big.png`, and the image still viewed.
+disabled until its verify-first item 6 shows how it behaves. **Fact, the fix observed
+live on 2026-11-01** by the operator, on claude-haiku-5-5 under the daemon code at
+commit fb11f22. `word.png` was viewed and the word reported. `word.txt` was refused
+with "PreToolUse:Read hook error: Dromon's ViewImage rule refuses this Read" and the
+rule's reason, a name that is not a png, jpg, jpeg, gif or webp name. `big.png`,
+6,000,287 bytes, was refused for being over the limit of 5,242,880. A png outside the
+working directory and a file under `.dromon` were refused as outside it. Claude Code
+therefore runs the `PreToolUse` hook for a `Read` inside its working directory and
+honours its deny, and the defect above is closed. **Not shown.** Whether the ask rule
+outranks the engine's allowance on its own, since the hook denied first.
 
 ## Dromon's own tools
 
@@ -861,11 +869,15 @@ rests on. A **fact** was observed, an **inference** follows from facts, and a
   uv cache, and a here-document has a writable place for its temporary file. They lie
   outside the working directory because a line with read access has that directory
   denied to writes and no layer can lift the denial. `UV_CACHE_DIR` travels as a
-  relayed variable, so only the adapter's value reaches the engine. **Fact.** In a round
-  14 session Claude Code set the shell's `TMPDIR` to a directory of its own under
-  `/tmp`, and its sandbox granted it. **Hypothesis.** A `TMPDIR` that Dromon sets may be
-  overridden where Claude Code sets its own, in which case the here-document case
-  depends on Claude Code, and the cache and the write grant still stand. A line whose
+  relayed variable, so only the adapter's value reaches the engine. **Fact, observed
+  live on 2026-11-01** by the operator, on a Claude Code line on Sonnet 5.5 under the
+  daemon at commit c47d51a. Claude Code replaces `TMPDIR` in the shell with its own
+  directory, `/tmp/claude-UID` for the user's number, which its sandbox grants, while
+  `UV_CACHE_DIR` stays Dromon's. A here-document to `$TMPDIR` worked, so on Claude Code
+  the here-document case depends on Claude Code's directory, and the cache and the
+  write grant still stand. **Inference.** That directory is shared by every Claude Code
+  line of the user, so such lines may read one another's temporary files there, outside
+  Dromon's control. A line whose
   directories cannot be made still starts, and its facts say it keeps the engine's own.
   **Removal, reading and size, review of 2026-11-01.** No event retires or deletes a
   line, so nothing is removed at one. At each daemon start, before any engine starts,
@@ -881,9 +893,12 @@ rests on. A **fact** was observed, an **inference** follows from facts, and a
   size. A cache that a line only reads is removed after a week, which costs speed only.
   The sandbox denies the line reads of the directory that holds every line's directory
   and lifts the denial for its own, so a line cannot read what another line's commands
-  wrote. **Hypothesis, not verified live.** An `allowRead` entry lifts a `denyRead` of
-  a directory above it, as the sandbox's own `allowWithinDeny` suggests. If it did not,
-  the line could not read its own temporary files, which a here-document does.
+  wrote. **Fact, observed live on 2026-11-01** on the same line and daemon. Listing the
+  directory that holds every line's directory, and listing another line's `tmp`, were
+  refused with "Operation not permitted", and a file written to the line's own `tmp`
+  was listed and read back by its full path. An `allowRead` entry therefore lifts a
+  `denyRead` of a directory above it on Claude Code, as the sandbox's own
+  `allowWithinDeny` suggested.
 - **`worktree_status`.** No arguments. The daemon runs `git`, outside the line's
   sandbox, in the line's own working directory, and gives `head`, `branch`, `origin_main`
   with `ahead` and `behind` of the last fetched `origin/main` or the reason it has none,
@@ -2296,15 +2311,24 @@ an engine, and refuses a missing path or a symbolic link whose target leaves the
 workdir. Dromon's `write_scratch` tool also refuses a target at or below a configured
 read-only path, including paths under `tmp/`. Codex profiles add explicit read entries
 under the `tmp/` write grant and retain read-only parents around protected descendants.
-The test suite checks the generated profile, not Codex's runtime precedence for these
-overlapping entries.
+The test suite checks the generated profile. **Fact, observed live on 2026-11-01** by
+the operator in a scratch project with read-only paths `a/ro`, `b/ro` and `tmp/keep`,
+on a Codex line on gpt-6.1-terra with Bash and Edit and a Claude Code line on
+claude-haiku-5-5 with Bash, Write, Read and its sandbox. The daemon commit was not
+recorded. On both engines a direct write into a read-only directory, a write to
+`tmp/keep`, which is a read-only path inside Codex's `tmp` write grant, a rename of the
+parent of a read-only path, and a write through a newly created symbolic link to
+`tmp/keep` were each refused with "Operation not permitted". The links themselves were
+created. **Inference.** Codex's runtime precedence gives the deny inside the `tmp`
+grant, and the engines deny the rename of a parent of a protected path, so the rename
+bypass this section once warned of did not occur. Only the shell was exercised, and
+the `Edit` and `Write` tools were not.
 
-These engine rules are based on resolved paths when the engine is built. Dromon has not
-verified how Claude Code or Codex applies them after a writable parent is renamed, or
-when a line creates a new symbolic link that points into a read-only path. Until those
-cases are checked against the live engines, do not rely on `read_only_paths` to prevent
-those operations. The setting does not freeze directory names or re-resolve links on
-every engine file operation.
+These engine rules are based on resolved paths when the engine is built. The setting
+does not freeze directory names or re-resolve links on every engine file operation,
+and the live check above covers the shell and not the file tools, so do not rely on
+`read_only_paths` for an `Edit` or `Write` after a writable parent is renamed or a new
+link is made until those are checked.
 
 **Codex writable paths.** An operator may name additional absolute directories with
 `writable_paths` for a Codex line given `Edit` or `Write`. For example, a line may use
