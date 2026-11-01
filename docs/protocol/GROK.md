@@ -114,8 +114,8 @@ and its `README.md`.
 - `grok agent stdio` runs the agent over ACP. Agent options such as `--model` and
   `--reasoning-effort` precede the transport, and `--no-leader` starts a local agent.
 - `session/new` and `session/load` take `cwd`, `mcpServers` and `_meta`, whose
-  `yoloMode` and `autoMode` choose always-approve and auto mode, and whose `rules` are
-  appended to the system prompt. `session/prompt` streams `session/update`
+  `yoloMode` and `autoMode` choose always-approve and auto mode. Rules are documented
+  for session creation, with retention on load discussed below. `session/prompt` streams `session/update`
   notifications, including `agent_message_chunk`, `agent_thought_chunk` and
   `tool_call`, and the agent may send `session/request_permission`.
 - Custom sandbox profiles are defined only in `~/.grok/sandbox.toml` or a project's
@@ -698,3 +698,91 @@ user's MCP servers and reports no permission mode.
   `project_settings`, which loads Claude Code's settings.
 - No network blocking for a Grok line's commands on macOS.
 - Grok reports no cost, and the driver's `max_turns` is not enforced.
+
+## Rules retained by sessions
+
+**Fact.** The bundled guide `15-agent-mode.md` documents `_meta.rules` under optional
+fields on `session/new`. `17-sessions.md` documents loading a persisted session but
+does not promise replacing its rules. Round 14 operator mail reports resumed rules
+remaining unchanged. No live exchange independently verifies that report here.
+
+**Inference.** Passing current rules to `session/load` is insufficient evidence that
+they apply. Dromon stores the session identifier followed by `:rules-` and the full
+Secure Hash Algorithm 256 digest of the rendered instructions supplied at creation.
+It loads only when the current digest matches. A changed or absent digest creates a
+new session and explains the replacement in the first prompt. The mailbox, standing
+brief and files remain. Legacy sessions are replaced once because their rules cannot
+be established. The digest records the creation snapshot even if an instruction file
+changes during the turn. Restoring earlier rules does not restore earlier context.
+
+## Profile checks before startup
+
+**Fact.** Every effective Grok line is checked after project declarations are applied
+to the event log during the shared daemon start and restart preflight. This includes
+lines created through clients. The check reads profiles without creating homes or
+starting engines. A refusal names the line and the profile table or missing array
+entries. The required paths include project read-only paths and both fleet indexes.
+Protected paths require denial even before they exist. Turn-time checking remains
+necessary because paths and registered peers can change after preflight.
+
+## Tool advertisement filtering
+
+**Fact.** The bundled guide `14-headless-mode.md` documents `--tools` and
+`--disallowed-tools` for terminal and headless invocations. It describes differences
+between shell and daemon routes, including entries that remove nothing and issue a
+warning. The agent options table in `15-agent-mode.md` does not document either flag
+for `agent stdio`, which is the transport Dromon uses.
+
+**Inference.** These guides do not establish a supported way to filter the built-in
+tools advertised on Dromon's transport. Dromon does not pass an unverified filtering
+flag. This finding does not establish that Grok has no filtering capability.
+
+**Fact.** Dromon rejects unavailable calls through its permission policy. It continues
+after a rejected call only when the subsequent report explicitly asserts Boolean
+`toolNotRun=true`. Otherwise it cancels the turn because non-execution is uncertain.
+This policy does not remove a tool from the model's advertised tools.
+
+**Unverified.** Filtering on `agent stdio` still requires transport-specific vendor
+documentation or an independent exchange showing that unavailable tools disappear
+from the advertised set. No live Grok turn was run for this investigation.
+
+
+## Model selection after loading a session
+
+**Fact.** Round 14 operator mail reports that Grok 1.0.70 returned a model other
+than `grok-4.7` after loading the grok-review session. The operator did not identify
+the returned model. Dromon can read it from the session response and checks that all
+reported model fields agree. A failed model selection now includes that reported
+model in its refusal message.
+
+**Fact.** Dromon now sends `session/set_config_option` with `configId` equal to
+`model` and a string `value` equal to the driver model. Previously it sent a nested
+object. The operator observed error code `-32602` naming `SessionConfigOptionValue`
+for that object. The bundled guides `15-agent-mode.md` and `17-sessions.md` show the
+nested form, which conflicts with this runtime report.
+
+**Fact.** The operator supplied schema examples fetched from
+[ACP version 1](https://agentclientprotocol.com/protocol/v1/session-config-options)
+and [ACP version 2](https://agentclientprotocol.com/protocol/v2/session-config-options).
+Both use bare select strings. Version 2 also requires `type` equal to `id` for a
+select. Version 1 permits the bare string without that field. Dromon requests
+version 1 at initialization, records the reported version on the adapter and
+refuses any other version before opening a session. No version 2 compatibility is
+claimed. Scripted replies report version 1. No new live initialization was captured
+for this follow-up.
+
+**Fact.** Before changing a mismatching model, Dromon requires the requested value
+in the reported model options, including grouped options. Otherwise it refuses
+before selection or prompting and reports the current model and listed values.
+Tests cover the exact request shape, a resumed session with a matching rules digest,
+missing requested values and version 2 refusal. Live acceptance remains unverified
+and the operator will verify it after merge.
+
+**Fact.** The persisted session identifier includes a 71 byte rules suffix. Dromon
+refuses an identifier whose encoded form would exceed 256 bytes before sending a
+prompt. Tests cover the boundary and a multibyte identifier.
+
+**Fact.** Project reload can introduce Grok lines or change their working directory,
+read-only paths or profile requirements. It checks prospective declared configurations
+with operator overrides and existing client-created lines before mutating daemon
+state. Invalid profiles refuse the reload. Turn-time checks remain necessary.

@@ -392,3 +392,33 @@ def test_an_unconfined_line_is_not_created_beside_peers(paths: ProjectPaths) -> 
         )
         assert not refused.ok and "cannot confine" in (refused.error_message or "")
         assert client.daemon.log.last_seq == before
+
+
+@pytest.mark.parametrize("declaration", [True, False])
+def test_reload_checks_grok_profiles_before_mutating(
+    paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch, declaration: bool
+) -> None:
+    from dromon import daemon as daemon_module
+    from dromon.sandbox import SandboxError
+
+    checked: list[ProjectConfig] = []
+
+    def reject(config: ProjectConfig, *args: object) -> None:
+        checked.append(config)
+        raise SandboxError("Grok profile missing protected path")
+
+    monkeypatch.setattr(daemon_module, "check_grok_profiles", reject)
+    with attached(paths) as client:
+        write_file(
+            paths,
+            '[lines.beta]\nmodel = "grok-4.7"\n'
+            if declaration
+            else 'read_only_paths = ["docs"]\n',
+        )
+        before = client.daemon.log.last_seq
+        response = client.ask("reload_project")
+        assert not response.ok
+        assert "Grok profile" in (response.error_message or "")
+        assert checked
+        assert client.daemon.log.last_seq == before
+        assert "beta" not in client.daemon.log.state.lines

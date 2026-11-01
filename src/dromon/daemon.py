@@ -53,7 +53,7 @@ from typing import Any, Final, Protocol, cast
 from claude_agent_sdk import SdkMcpTool
 from OpenSSL.SSL import Context as OpenSSLContext
 
-from dromon import __version__, exits, fleet, peercred, registry, restart, runs
+from dromon import __version__, exits, fleet, grok, peercred, registry, restart, runs
 from dromon.federation import (
     MAX_OPEN_REMOTE_PEERS,
     NO_FEDERATION,
@@ -118,7 +118,13 @@ from dromon.gitssh import GitSshAccess, GitSshError, sandbox_layer, unreadable
 from dromon.processes import environment_reading_works
 from dromon.roles import RoleConflict, RoleWanted, plan_file_roles, seat_order
 from dromon.relay import AsyncRelay, OperatorRelayer, RelayConfigError, build_routes
-from dromon.workdir import git_write_guards, read_head_commit, resolve_workdir
+from dromon.workdir import (
+    git_write_guards,
+    read_head_commit,
+    resolve_read_only_paths,
+    resolve_workdir,
+)
+from dromon.security_paths import project_secret_paths
 from dromon.configview import (
     OVERRIDE,
     LineFacts,
@@ -1642,6 +1648,7 @@ class Daemon:
         routes = self.relay_routes(config)
         terms = project_terms(config, self.paths)
         check_lines_sandboxed(config, self.log, self.scheduler)
+        check_grok_profiles(config, self.paths, self.scheduler, self.registry_dir)
         for line_id in sorted(set(self.project.lines) - set(config.lines)):
             if line_id in self.log.state.lines:
                 self.scheduler.set_line_policy(line_id, None, None)
@@ -3315,6 +3322,55 @@ def project_terms(config: ProjectConfig, paths: ProjectPaths) -> tuple[str, ...]
     return load_terms(paths.root / config.disclosure_terms)
 
 
+def check_grok_profiles(
+    config: ProjectConfig,
+    paths: ProjectPaths,
+    scheduler: Scheduler,
+    registry_dir: Path,
+) -> None:
+    """Check every effective Grok line without creating homes or starting engines.
+
+    Start and restart preflight share this check. A missing profile is an operator
+    action and the adapter's error supplies the table or missing entries to add.
+    """
+    dynamic = registry_protected(paths, config.federation, registry_dir)
+    protected = (
+        *protected_dirs(paths, config.federation, registry_dir),
+        *(() if dynamic is None else dynamic()),
+    )
+    home = Path.home()
+    grok_home = home / grok.HOME_DIR
+    from dromon.overrides import apply_config
+
+    for line_id in sorted(set(scheduler.state.lines) | set(config.lines)):
+        definition = config.lines.get(line_id)
+        existing = line_id in scheduler.state.lines
+        overrides = scheduler.line_overrides(line_id) if existing else {}
+        model = overrides.get("model") or (
+            definition.model if definition is not None else scheduler.model_of(line_id)
+        )
+        if ENGINE_OF[str(model)] != grok.ENGINE_NAME:
+            continue
+        line = (
+            apply_config(definition.config, overrides)
+            if definition is not None
+            else scheduler.effective_config(line_id)
+        )
+        try:
+            workspace = resolve_workdir(line.workdir, paths.root, protected)
+            grok.check_profile(
+                line,
+                workspace,
+                (*protected, *project_secret_paths(paths.root, workspace)),
+                grok_home / grok.USER_HOME,
+                grok_home,
+                home,
+                resolve_read_only_paths(config.read_only_paths, workspace),
+            )
+        except (EngineRefused, ConfigError) as error:
+            raise SandboxError(f"Grok line {line_id}: {error}") from error
+
+
 def check_engines(config: ProjectConfig) -> None:
     """Refuse a project file that gives a Codex line a sandbox or settings through the
     project's own tables, which the line's engine cannot honour. Raises ``ValueError``.
@@ -3615,6 +3671,7 @@ def run(
             check_lines_sandboxed(config, log, scheduler)
             check_roles(scheduler, log, config)
             apply_project(scheduler, log, config)
+            check_grok_profiles(config, paths, scheduler, registry_dir)
             for event in plan_peers(log.state, config.federation):
                 log.append(event)
             scheduler.federation = config.federation
