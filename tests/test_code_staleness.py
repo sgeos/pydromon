@@ -30,9 +30,20 @@ HAIKU = "claude-haiku-5-5"
 ANA = OperatorAddress("ana")
 ALPHA = LineAddress("alpha")
 START = datetime(2026, 10, 31, 9, 0, 0, tzinfo=UTC)
-SETTLE_SECONDS = 30.0
-"""How long a test waits for the worker, far past what real git takes, so only a
-worker that never answers fails it."""
+SETTLE_SECONDS = codetree.MAX_PENDING * codetree.GIT_SECONDS
+"""How long a test waits for the worker, derived from the worker's own bounds. The
+worker takes at most ``MAX_PENDING`` questions at a time and a git that is running
+answers within ``GIT_SECONDS``, so a worker that has answered nothing in their product
+has not merely been slow. The wait ends at once when the questions are answered, so the
+bound costs time only when the test would fail.
+
+**Round 14 follow-up.** A fixed 30 seconds failed once on a macOS runner with Python
+3.15 and passed on a re-run. **Hypothesis.** A git process that was slow to start, which
+``GIT_SECONDS`` does not bound because ``subprocess.run`` starts its timer after the
+process exists, held the worker past 30 seconds. The same runner stalled a process start
+past five minutes in another test, which is the evidence for it, and the failed log was
+not read here. The check is unchanged, since the worker must still answer, and only how
+long the test waits to see it is derived."""
 STATUS_BOUND_SECONDS = 0.5
 """How long a status may take while git hangs, a tenth of ``GIT_SECONDS``."""
 
@@ -327,18 +338,26 @@ def test_code_trees_stay_bounded(
 
 
 class Hung:
-    """A git that sleeps until it is released, or for ``GIT_SECONDS`` at most, as a
-    git on a stalled volume does before its timeout."""
+    """A git that sleeps until it is released, or for ``hold`` seconds at most, which is
+    ``GIT_SECONDS`` unless a test asks for longer, as a git on a stalled volume does
+    before its timeout. It records that it was asked and whether it has answered."""
 
-    def __init__(self) -> None:
+    def __init__(self, hold: float = codetree.GIT_SECONDS) -> None:
         self.release = threading.Event()
+        self.entered = threading.Event()
+        self.answered = False
+        self._hold = hold
         # Taken before the test replaces it with this fake.
         self.real = codetree._git  # pyright: ignore[reportPrivateUsage]
 
     def __call__(self, directory: Path, *arguments: str) -> Any:  # noqa: ANN401
-        if not self.release.wait(codetree.GIT_SECONDS):
-            raise codetree._Timeout  # pyright: ignore[reportPrivateUsage]
-        return self.real(directory, *arguments)
+        self.entered.set()
+        try:
+            if not self.release.wait(self._hold):
+                raise codetree._Timeout  # pyright: ignore[reportPrivateUsage]
+            return self.real(directory, *arguments)
+        finally:
+            self.answered = True
 
 
 def test_the_queue_of_questions_is_bounded(
@@ -543,15 +562,21 @@ def test_a_prompt_does_not_wait_for_git_and_tells_the_turn_after(
 ) -> None:
     """Round 9 review, F4. While git hangs, the turn starts without the notice, and
     the turn after git answers leads with it."""
-    hung = Hung()
+    # Held well past the turn, so a slow runner does not end the hang by itself. A turn
+    # that waited for git would wait out the hold, and git would have ended by then.
+    hung = Hung(hold=4 * codetree.GIT_SECONDS)
     monkeypatch.setattr(codetree, "_git", hung)
     repository.checkout(repository.code)
-    began = time.monotonic()
     try:
         stale_world.run("one")
+        answered_in_the_turn = hung.answered
     finally:
         hung.release.set()
-    assert time.monotonic() - began < codetree.GIT_SECONDS
+    # The turn began and ended while git was outstanding, however long that took. The
+    # earlier check, that the turn took less than ``GIT_SECONDS``, measured the
+    # runner as much as the code, and git must also have been asked at all.
+    assert not answered_in_the_turn
+    assert hung.entered.wait(SETTLE_SECONDS)
     told = "The daemon runs code from"
     assert told not in stale_world.last_prompt()
     asked(stale_world.trees, lambda: stale_world.scheduler.daemon_behind("alpha"))
