@@ -1445,3 +1445,151 @@ def test_run_status_names_the_correction_both_ways(project: Path) -> None:
     assert shown[1].startswith("run r-3 ") and "orrect" not in shown[1]
     assert shown[2].endswith("It corrects the failed runs r-1")
     assert shown[3].endswith("Corrected by run r-2")
+
+
+# Round 14, item 11. The runs an operator reads without the log.
+
+
+def runs_in_two_scopes(log: EventLog, scheduler: Scheduler) -> int:
+    """Line ``alpha`` with ``MAX_RUNS_SHOWN + 2`` ended runs, the first failing,
+    and line ``beta`` with one open run. Returns how many runs ``alpha`` has."""
+    from dromon.scheduler import MAX_RUNS_SHOWN
+
+    scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+    scheduler.create_line("beta", HAIKU, Strategy.SUBSCRIPTION)
+    count = MAX_RUNS_SHOWN + 2
+    previous = None
+    for number in range(1, count + 1):
+        run_id = f"r-{number}"
+        log.append(started(run_id, previous=previous))
+        code = 1 if number == 1 else 0
+        log.append(RunEnded(run_id, RunStatus.EXITED, code, None, None, "", LATER))
+        previous = run_id
+    log.append(started("r-b", line_id="beta"))
+    return count
+
+
+def test_runs_view_gives_each_scope_newest_first_and_bounded(project: Path) -> None:
+    from dromon.scheduler import MAX_RUNS_SHOWN
+
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        count = runs_in_two_scopes(log, scheduler)
+        views = scheduler.runs_view(None)
+    alpha = [view for view in views if view["scope"] == "line alpha"]
+    beta = [view for view in views if view["scope"] == "line beta"]
+    assert [view["scope"] for view in views] == ["line alpha"] * len(alpha) + [
+        "line beta"
+    ]
+    expected = [f"r-{number}" for number in range(count, count - MAX_RUNS_SHOWN, -1)]
+    assert [view["run_id"] for view in alpha] == expected
+    newest = alpha[0]
+    assert (newest["command"], newest["line_id"], newest["state"]) == (
+        "gate",
+        "alpha",
+        "exited",
+    )
+    assert (newest["exit_code"], newest["ended_at"]) == (0, LATER)
+    assert newest["output_file"] == f"tmp/runs/r-{count}.out"
+    assert newest["previous"] == f"r-{count - 1}"
+    # r-2 corrected r-1, which is no longer shown, and the link is still given.
+    assert alpha[-1]["run_id"] == "r-3" and alpha[-1]["corrects"] == []
+    assert beta[0]["state"] == "running" and beta[0]["blocks"] is True
+    assert (beta[0]["ended_at"], beta[0]["exit_code"]) == (None, None)
+
+
+def test_runs_view_of_one_run_names_its_correction_and_refuses_an_unknown(
+    project: Path,
+) -> None:
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        runs_in_two_scopes(log, scheduler)
+        (first,) = scheduler.runs_view("r-1")
+        (second,) = scheduler.runs_view("r-2")
+        with pytest.raises(EventRejected, match="no run r-0"):
+            scheduler.runs_view("r-0")
+    assert (first["exit_code"], first["corrected_by"]) == (1, "r-2")
+    assert second["corrects"] == ["r-1"] and second["corrected_by"] is None
+
+
+def test_runs_view_of_a_cleared_lost_run_names_who_cleared_it(project: Path) -> None:
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project, lambda session: True)
+        run_id = lost_on(log, scheduler)
+        (blocking,) = scheduler.runs_view(run_id)
+        scheduler.clear_run(ANA, run_id)
+        (cleared,) = scheduler.runs_view(run_id)
+    assert (blocking["state"], blocking["blocks"], blocking["exit_code"]) == (
+        "lost",
+        True,
+        None,
+    )
+    assert (cleared["blocks"], cleared["cleared_by"]) == (False, "ana")
+    assert cleared["cleared_at"] is not None
+
+
+def test_dromon_run_status_prints_runs_and_one_receipt(
+    project: Path,
+    short_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The ``runs`` request through the client, with its refusals."""
+    import json
+
+    from dromon import cli
+    from dromon.configview import Overrides
+    from dromon.daemon import Daemon
+    from dromon.model import format_due
+    from dromon.paths import project_paths
+    from dromon.projectconfig import ProjectConfig
+    from dromon.protocol import Operation, Response
+
+    paths = project_paths(project, short_runtime)
+    paths.state_dir.mkdir(mode=0o700)
+    base = ("--project", str(project), "--runtime-dir", str(short_runtime))
+    with EventLog(paths.event_log) as log:
+        scheduler = scheduler_on(log, project)
+        daemon = Daemon(
+            paths,
+            log,
+            format_due(datetime(2026, 10, 31, 9, tzinfo=UTC)),
+            scheduler,
+            project=ProjectConfig(),
+            command_line=Overrides(),
+            project_file_present=False,
+        )
+
+        def call(
+            socket: Path, operation: Operation, args: dict[str, object] | None = None
+        ) -> Response:
+            del socket
+            line = {"id": "r", "op": operation.value, "v": 1, "args": args or {}}
+            return daemon.respond((json.dumps(line) + "\n").encode())
+
+        monkeypatch.setattr(cli, "call", call)
+        assert cli.main([*base, "run", "status"]) == 0
+        assert capsys.readouterr().out == "no runs yet\n"
+        count = runs_in_two_scopes(log, scheduler)
+        refused = call(paths.socket, Operation.RUNS, {"run_id": 7})
+        assert refused.error_code == "bad_request"
+        assert cli.main([*base, "run", "status"]) == 0
+        listed = capsys.readouterr().out.splitlines()
+        assert cli.main([*base, "run", "status", "r-1"]) == 0
+        one = capsys.readouterr().out.splitlines()
+        assert cli.main([*base, "run", "status", "r-0"]) != 0
+        assert "no run r-0" in capsys.readouterr().err
+        assert cli.main([*base, "run", "clear"]) == 2
+        assert "name the run to clear" in capsys.readouterr().err
+    assert listed[0] == "line alpha"
+    assert listed[1] == (
+        f"  r-{count} gate by alpha, started {AT}, exited with exit code 0 at"
+        f" {LATER}, output /work/tmp/runs/r-{count}.out"
+    )
+    assert "line beta" in listed
+    assert listed[-1].endswith(
+        "still running as process 4321, output /work/tmp/runs/r-b.out"
+    )
+    assert one[0].startswith("r-1 gate by alpha,")
+    assert one[0].endswith(", corrected by r-2")
+    assert one[1:] == ["  scope: line alpha", "  previous: none"]

@@ -148,7 +148,7 @@ from dromon.security_paths import project_secret_paths
 from dromon.handoff import Handoff
 from dromon.handoff import select as select_handoff
 from dromon import requestkeys
-from dromon import runs
+from dromon import commitruns, runs
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 from dromon.requestkeys import (
     REQUEST_KEY,
@@ -506,6 +506,13 @@ START_RUN_SCHEMA: Final[dict[str, object]] = {
         "previous": {
             "type": "string",
             "description": "The latest run run_status names, or none if it names none",
+        },
+        "commit": {
+            "type": "string",
+            "description": (
+                "For a commit command only, the full hexadecimal commit to run it on,"
+                " in a checkout Dromon makes"
+            ),
         },
     },
     "required": ["command", "previous"],
@@ -1898,6 +1905,7 @@ class Scheduler:
         confining_engines: frozenset[str] = CONFINING_ENGINES,
         run_start_of: Callable[[int], str | None] = runs.process_start,
         run_occupied: Callable[[int], bool] = runs.session_occupied,
+        checkout_dir: Path | None = None,
     ) -> None:
         if not 1 <= wake_every_ticks <= MAX_WAKE_EVERY_TICKS:
             raise ValueError(f"wake_every_ticks must be in [1, {MAX_WAKE_EVERY_TICKS}]")
@@ -2036,6 +2044,19 @@ class Scheduler:
         """Background process scans started during recovery, kept until they finish."""
         self._run_commands: dict[str, tuple[str, ...]] = {}
         """The commands the project declares for runs, by name."""
+        self._commit_commands: dict[str, tuple[str, ...]] = {}
+        """Round 14, item 1. The commands a line may start on a commit it names."""
+        self._commit_refs: tuple[str, ...] = ()
+        """The ref patterns one of which must contain a commit run's commit."""
+        self._checkout_dir = checkout_dir
+        """Where commit runs' checkouts are made, or ``None``, which refuses them."""
+        self._checkouts_starting: set[str] = set()
+        """Runs whose checkout is made but whose start is not yet recorded, which a
+        tidy keeps."""
+        self._tidy_pending = checkout_dir is not None
+        """Whether a checkout may be left that no blocking run names, which is so at
+        start, after a crash, and after each end or clearance of a commit run."""
+        self._tidy_failure: str | None = None
         self._run_children: dict[str, subprocess.Popen[bytes]] = {}
         """The supervisors this daemon started, by run, so each is reaped. A
         restarted daemon has none, since an orphaned supervisor is reaped by the
@@ -3638,10 +3659,20 @@ class Scheduler:
 
     # Supervised runs. Task of 2026-10-31, as ``docs/architecture/RUNS.md`` says.
 
-    def set_runs(self, commands: Mapping[str, Sequence[str]]) -> None:
-        """Declare the commands lines may start as runs, as the project file does at
-        start and reload. A run already started is unaffected."""
+    def set_runs(
+        self,
+        commands: Mapping[str, Sequence[str]],
+        commit_commands: Mapping[str, Sequence[str]] | None = None,
+        commit_refs: Sequence[str] = (),
+    ) -> None:
+        """Declare the commands lines may start as runs, and the commit commands
+        with the refs their commits must be in, as the project file does at start
+        and reload. A run already started is unaffected."""
         self._run_commands = {name: tuple(argv) for name, argv in commands.items()}
+        self._commit_commands = {
+            name: tuple(argv) for name, argv in (commit_commands or {}).items()
+        }
+        self._commit_refs = tuple(commit_refs)
 
     def _run_role(self, line_id: str) -> str | None:
         seat = self._log.state.seats.get(line_id)
@@ -3662,11 +3693,13 @@ class Scheduler:
         )
         return None if latest is None else self._log.state.runs[latest]
 
-    def _run_refusal(self, line_id: str) -> str | None:
+    def _run_refusal(self, line_id: str, writes: bool = True) -> str | None:
         """Why ``line_id`` may not start or stop its scope's runs. A seat must own
         its role, and every line, a seat included, must have write access to its
         working directory, since a run may write there outside the line's sandbox.
-        So a read-only seat that owns its role cannot write its worktree by a run."""
+        So a read-only seat that owns its role cannot write its worktree by a run.
+        **Round 14, item 1.** A commit run, ``writes`` false, runs in the daemon's
+        checkout, not the working directory, so reading access is enough for it."""
         role_id = self._run_role(line_id)
         if role_id is not None:
             owner = self._log.state.roles[role_id].owner
@@ -3675,22 +3708,59 @@ class Scheduler:
                     f"only role {role_id}'s owner starts or stops its runs, and its"
                     f" owner is {owner or 'nobody'}"
                 )
-        if self.effective_config(line_id).workdir_access is not WorkdirAccess.WRITE:
-            return "a run may write your working directory, which you may only read"
+        if (
+            writes
+            and self.effective_config(line_id).workdir_access is not WorkdirAccess.WRITE
+        ):
+            hint = (
+                ". A commit command, which runs on a commit you name, needs only"
+                f" reading: {', '.join(sorted(self._commit_commands))}"
+                if self._commit_commands
+                else ""
+            )
+            return (
+                "a run may write your working directory, which you may only read" + hint
+            )
         return None
 
-    async def start_run(self, line_id: str, command: str, previous: str) -> RunStarted:
+    def _run_argv(self, command: str, commit: str | None) -> tuple[str, ...]:
+        """The program and arguments of the declared ``command``, which must be a
+        commit command exactly when ``commit`` is given. Raises
+        ``runs.RunRefused``."""
+        if commit is None:
+            argv = self._run_commands.get(command)
+            if argv is not None:
+                return argv
+            if command in self._commit_commands:
+                raise runs.RunRefused(
+                    f"{command} is a commit command, so name the full commit it runs on"
+                )
+        else:
+            argv = self._commit_commands.get(command)
+            if argv is not None:
+                return argv
+            if command in self._run_commands:
+                raise runs.RunRefused(
+                    f"{command} runs in your working directory and takes no commit"
+                )
+        declared = ", ".join(sorted(self._run_commands)) or "none"
+        commits = ", ".join(sorted(self._commit_commands)) or "none"
+        raise runs.RunRefused(
+            f"the project declares no run command {command!r}. Declared: {declared}."
+            f" Commit commands: {commits}"
+        )
+
+    async def start_run(
+        self, line_id: str, command: str, previous: str, commit: str | None = None
+    ) -> RunStarted:
         """Start the declared ``command`` for ``line_id`` as a supervised run.
         ``previous`` must name its scope's latest run, or be ``none`` when it has
         none, so that a successor seat has read its predecessor's record first.
-        Raises ``runs.RunRefused``."""
-        argv = self._run_commands.get(command)
-        if argv is None:
-            declared = ", ".join(sorted(self._run_commands)) or "none"
-            raise runs.RunRefused(
-                f"the project declares no run command {command!r}. Declared: {declared}"
-            )
-        refusal = self._run_refusal(line_id)
+        **Round 14, item 1.** With ``commit``, a commit command runs in a checkout of
+        that commit the daemon makes, as ``commitruns`` says. Raises
+        ``runs.RunRefused``."""
+        argv = self._run_argv(command, commit)
+        refusal = self._run_refusal(line_id, writes=commit is None)
         if refusal is not None:
             raise runs.RunRefused(refusal)
         latest = self._latest_run(line_id)
@@ -3724,29 +3794,49 @@ class Scheduler:
             **allowlisted(os.environ, BASE_ENVIRONMENT),
             RUN_ID_VARIABLE: run_id,
         }
-        launched = await self._process_worker.run(
-            lambda: runs.launch(
-                directory, run_id, workdir, argv, environment, self._run_start_of
-            )
-        )
-        started = RunStarted(
-            run_id,
-            line_id,
-            self._run_role(line_id),
-            latest_id,
-            command,
-            argv,
-            str(workdir),
-            launched.output_file,
-            launched.child.pid,
-            launched.process_started,
-            format_due(self._wall_clock()),
+        checkout = (
+            None
+            if commit is None
+            else await self._make_checkout(run_id, commit, environment)
         )
         try:
-            self._log.append(started)
+            launched = await self._process_worker.run(
+                lambda: runs.launch(
+                    directory,
+                    run_id,
+                    workdir,
+                    argv,
+                    environment,
+                    self._run_start_of,
+                    command_dir=checkout,
+                )
+            )
+            started = RunStarted(
+                run_id,
+                line_id,
+                self._run_role(line_id),
+                latest_id,
+                command,
+                argv,
+                str(workdir),
+                launched.output_file,
+                launched.child.pid,
+                launched.process_started,
+                format_due(self._wall_clock()),
+                commit,
+                None if checkout is None else str(checkout),
+            )
+            try:
+                self._log.append(started)
+            except BaseException:
+                await self._process_worker.run(lambda: runs.abandon(launched.child))
+                raise
         except BaseException:
-            await self._process_worker.run(lambda: runs.abandon(launched.child))
+            if checkout is not None:
+                self._tidy_pending = True
             raise
+        finally:
+            self._checkouts_starting.discard(run_id)
         self._run_children[run_id] = launched.child
         if not runs.release(launched):
             await self._process_worker.run(lambda: runs.abandon(launched.child))
@@ -3768,13 +3858,71 @@ class Scheduler:
             )
         return started
 
+    async def _make_checkout(
+        self, run_id: str, commit: str, environment: Mapping[str, str]
+    ) -> Path:
+        """Check ``commit`` and make its checkout for ``run_id`` on the process
+        worker, as ``commitruns`` says. Round 14, item 1. A checkout left by a
+        failure or a cancellation is removed by the next tidy. Raises
+        ``runs.RunRefused``."""
+        base, root = self._checkout_dir, self._root
+        if base is None or root is None:
+            raise runs.RunRefused("this daemon makes no checkouts for commit runs")
+        if not commitruns.supported():
+            raise runs.RunRefused(
+                "this platform cannot remove a checkout without following links, so"
+                " commit runs are refused"
+            )
+        refs = self._commit_refs
+        git_environment = commitruns.git_environment(environment)
+
+        def make() -> Path:
+            commitruns.check_commit(root, commit, refs, git_environment)
+            return commitruns.make_checkout(base, run_id, root, commit, git_environment)
+
+        self._checkouts_starting.add(run_id)
+        try:
+            return await self._process_worker.run(make)
+        except commitruns.CommitRefused as error:
+            self._checkouts_starting.discard(run_id)
+            raise runs.RunRefused(str(error)) from error
+        except BaseException:
+            self._checkouts_starting.discard(run_id)
+            self._tidy_pending = True
+            raise
+
+    async def tidy_checkouts(self) -> None:
+        """Remove every commit run's checkout that no blocking run names and no
+        start is making, on the process worker. Round 14, item 1. A run that has
+        ended keeps its checkout only while it is lost and uncleared, since its
+        command may still run there. A failure is said once on the daemon's standard
+        error and tried again at the next check."""
+        base = self._checkout_dir
+        if base is None or not self._tidy_pending:
+            return
+        keep = {
+            run_id for run_id, run in self._log.state.runs.items() if run.blocks
+        } | set(self._checkouts_starting)
+        self._tidy_pending = False
+        try:
+            await self._process_worker.run(lambda: commitruns.sweep(base, keep))
+        except (commitruns.CommitRefused, ProcessRefused) as error:
+            self._tidy_pending = True
+            if self._tidy_failure != str(error):
+                self._tidy_failure = str(error)
+                print(f"dromond: checkouts are left, as {error}", file=sys.stderr)
+            return
+        self._tidy_failure = None
+
     async def stop_run(self, line_id: str, run_id: str) -> None:
         """Ask the supervisor of ``line_id``'s open run ``run_id`` to stop its
-        command. Raises ``runs.RunRefused`` or ``runs.TableUnreadable``."""
-        refusal = self._run_refusal(line_id)
+        command. Raises ``runs.RunRefused`` or ``runs.TableUnreadable``. A commit
+        run is stopped with reading access, as it was started."""
+        latest = self._latest_run(line_id)
+        writes = latest is None or latest.started.commit is None
+        refusal = self._run_refusal(line_id, writes=writes)
         if refusal is not None:
             raise runs.RunRefused(refusal)
-        latest = self._latest_run(line_id)
         if latest is None or latest.started.run_id != run_id or latest.ended:
             raise runs.RunRefused(f"run {run_id} is not your scope's open run")
         await self._process_worker.run(
@@ -3790,6 +3938,10 @@ class Scheduler:
         scope = self._scope_runs(line_id)
         found = scope[-MAX_RUNS_SHOWN:]
         declared = ", ".join(sorted(self._run_commands)) or "none"
+        if self._commit_commands:
+            declared += ". Commit commands, which take a commit: " + ", ".join(
+                sorted(self._commit_commands)
+            )
         if not found:
             return f"no runs yet, so previous is none. Declared commands: {declared}"
         corrected = runs.corrections(scope)
@@ -3809,6 +3961,47 @@ class Scheduler:
             + "\n".join(lines)
         )
 
+    def runs_view(self, run_id: str | None) -> list[dict[str, object]]:
+        """Supervised runs for an operator, as plain data. **Round 14, item 11.**
+        With ``run_id``, that run alone. Without, the latest ``MAX_RUNS_SHOWN`` of
+        every scope, scopes in sorted order and each scope's runs newest first, so
+        the list is bounded by the number of scopes. Each run carries the links
+        ``runs.corrections`` derives within its scope. Raises ``EventRejected`` for
+        an unknown run. It reads the log only and records nothing."""
+        state = self._log.state
+        by_scope: dict[tuple[str, str], list[Run]] = {}
+        for run in state.runs.values():
+            scope = run_scope(run.started.line_id, run.started.role_id)
+            by_scope.setdefault(scope, []).append(run)
+        if run_id is not None:
+            found = state.runs.get(run_id)
+            if found is None:
+                raise EventRejected(f"no run {run_id}")
+            scope = run_scope(found.started.line_id, found.started.role_id)
+            chosen = {scope: [found]}
+        else:
+            chosen = {
+                scope: list(reversed(scope_runs[-MAX_RUNS_SHOWN:]))
+                for scope, scope_runs in sorted(by_scope.items())
+            }
+        views: list[dict[str, object]] = []
+        for scope, shown in chosen.items():
+            corrected = runs.corrections(by_scope[scope])
+            corrected_by = {
+                failed: passed for passed, ids in corrected.items() for failed in ids
+            }
+            for run in shown:
+                key = run.started.run_id
+                views.append(
+                    _run_view(
+                        run,
+                        scope,
+                        corrected.get(key, ()),
+                        corrected_by.get(key),
+                    )
+                )
+        return views
+
     def check_runs(self) -> None:
         """Start a reconciliation of the runs that have not ended, unless one is
         under way, there are none, or there is no event loop."""
@@ -3816,13 +4009,15 @@ class Scheduler:
             return
         if self._run_check is not None and not self._run_check.done():
             return
-        if not any(run.blocks for run in self._log.state.runs.values()):
+        if not self._tidy_pending and not any(
+            run.blocks for run in self._log.state.runs.values()
+        ):
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        self._run_check = loop.create_task(self.reconcile_runs())
+        self._run_check = loop.create_task(self._check_runs())
 
     async def reconcile_runs(self) -> None:
         """Reconcile the open runs against their receipts and the process table, on
@@ -3869,6 +4064,13 @@ class Scheduler:
                 self._clear_run(run_id, None)
         self._run_failure = None
 
+    async def _check_runs(self) -> None:
+        """Reconcile the runs, then remove the checkouts no blocking run names,
+        which needs only the log, so a process table that cannot be read leaves no
+        checkout of a run already ended."""
+        await self.reconcile_runs()
+        await self.tidy_checkouts()
+
     def clear_run(self, operator: OperatorAddress, run_id: str) -> RunCleared:
         """``operator`` clears the lost run ``run_id`` after inspecting what may be
         left of its command, so its scope may start another. Raises
@@ -3892,6 +4094,8 @@ class Scheduler:
         event = RunCleared(run_id, cause, operator_id, format_due(self._wall_clock()))
         self._log.append(event)
         cleared = self._log.state.runs[run_id]
+        if cleared.started.checkout is not None:
+            self._tidy_pending = True
         self._note_run_holder(cleared, f"Run cleared: {_run_line(cleared)}")
         return event
 
@@ -3912,6 +4116,8 @@ class Scheduler:
         )
         self._run_children.pop(finding.run_id, None)
         ended = self._log.state.runs[finding.run_id]
+        if ended.started.checkout is not None:
+            self._tidy_pending = True
         self._note_run_holder(ended, f"Run ended: {_run_line(ended)}")
 
     def _note_run_holder(self, run: Run, text: str) -> None:
@@ -3928,7 +4134,11 @@ class Scheduler:
     def _run_tools(self, line_id: str) -> list[SdkMcpTool[Any]]:
         """The run tools, offered while the project declares a run command or the
         line's scope has a run to read."""
-        if not self._run_commands and not self._scope_runs(line_id):
+        if (
+            not self._run_commands
+            and not self._commit_commands
+            and not self._scope_runs(line_id)
+        ):
             return []
 
         async def start(args: dict[str, Any]) -> dict[str, Any]:
@@ -3936,14 +4146,18 @@ class Scheduler:
             if unexpected:
                 return _tool_error(unexpected)
             command, previous = args.get("command"), args.get("previous")
+            commit = args.get("commit")
             if not isinstance(command, str) or not isinstance(previous, str):
                 return _tool_error("command and previous must be text")
+            if commit is not None and not isinstance(commit, str):
+                return _tool_error("commit must be text")
             try:
-                started = await self.start_run(line_id, command, previous)
+                started = await self.start_run(line_id, command, previous, commit)
             except (runs.RunRefused, EventRejected, ProcessRefused) as error:
                 return _tool_error(str(error))
+            on = "" if started.commit is None else f" on commit {started.commit}"
             return _tool_text(
-                f"started run {started.run_id} of {command}, writing"
+                f"started run {started.run_id} of {command}{on}, writing"
                 f" {started.output_file}. Its end is sent to its scope's holder."
             )
 
@@ -3975,7 +4189,9 @@ class Scheduler:
                 description=(
                     "Start a command the project declares as a supervised run, which"
                     " outlives your turn, your seat and a daemon restart. Read"
-                    " run_status first and name its latest run as previous."
+                    " run_status first and name its latest run as previous. A commit"
+                    " command also takes commit, and runs on that commit in a"
+                    " checkout Dromon makes, so a line that only reads may start it."
                 ),
                 input_schema=START_RUN_SCHEMA,
                 handler=start,
@@ -11107,11 +11323,49 @@ def _correction_text(corrects: tuple[str, ...], corrected_by: str | None) -> str
     return ""
 
 
+def _run_view(
+    run: Run,
+    scope: tuple[str, str],
+    corrects: tuple[str, ...],
+    corrected_by: str | None,
+) -> dict[str, object]:
+    """One run as the ``runs`` request gives it. Round 14, item 11. ``state`` is
+    ``running`` until ``run_ended``, then the end's status. Every field is plain
+    data the log holds, so a port gives the same view."""
+    started, ended, cleared = run.started, run.ended, run.cleared
+    return {
+        "run_id": started.run_id,
+        "scope": f"{scope[0]} {scope[1]}",
+        "command": started.command,
+        "line_id": started.line_id,
+        "role_id": started.role_id,
+        "previous": started.previous,
+        "commit": started.commit,
+        "checkout": started.checkout,
+        "workdir": started.workdir,
+        "output_file": started.output_file,
+        "pid": started.pid,
+        "started_at": started.started_at,
+        "state": "running" if ended is None else ended.status.value,
+        "ended_at": None if ended is None else ended.ended_at,
+        "exit_code": None if ended is None else ended.exit_code,
+        "output_bytes": None if ended is None else ended.output_bytes,
+        "output_digest": None if ended is None else ended.output_digest,
+        "note": None if ended is None else ended.note,
+        "blocks": run.blocks,
+        "cleared_at": None if cleared is None else cleared.cleared_at,
+        "cleared_by": None if cleared is None else cleared.operator_id,
+        "corrects": list(corrects),
+        "corrected_by": corrected_by,
+    }
+
+
 def _run_line(run: Run) -> str:
     """One run as a line reads it, with its receipt once it has ended."""
     started = run.started
+    on = "" if started.commit is None else f" on commit {started.commit}"
     head = (
-        f"run {started.run_id} of {started.command} by line {started.line_id},"
+        f"run {started.run_id} of {started.command}{on} by line {started.line_id},"
         f" started {started.started_at}, output {started.output_file} in"
         f" {started.workdir}"
     )

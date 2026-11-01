@@ -76,6 +76,8 @@ class Operation(StrEnum):
     """Operator only. Not offered to external agents or lines. Added in round 14."""
     RUN_CLEAR = "run_clear"
     """Operator only. Not offered to external agents or lines. Task of 2026-10-31."""
+    RUNS = "runs"
+    """Read only. Not offered to external agents or lines. Added in round 14."""
     BUDGETS = "budgets"
     BUDGET_SET = "budget_set"
     """Operator only. Not offered to external agents."""

@@ -853,6 +853,7 @@ class Daemon:
                 | Operation.ROLE_DELETE
                 | Operation.RETIRE_LINE
                 | Operation.RUN_CLEAR
+                | Operation.RUNS
                 | Operation.BUDGETS
                 | Operation.BUDGET_SET
                 | Operation.AGENT_ADD
@@ -989,6 +990,11 @@ class Daemon:
                         "operator": operator,
                         "cleared_at": cleared.cleared_at,
                     }
+                case Operation.RUNS:
+                    names = ("run_id",) if "run_id" in request.args else ()
+                    values = _text_args(request.args, names)
+                    found = self.scheduler.runs_view(values[0] if values else None)
+                    result = {"runs": cast(object, found)}
                 case Operation.BUDGETS:
                     _text_args(request.args, ())
                     result = self.scheduler.budgets_view()
@@ -1690,7 +1696,9 @@ class Daemon:
         self.scheduler.set_disclosure_terms(terms)
         self.scheduler.set_disclosure_accepted(config.disclosure_accepted)
         self.scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
-        self.scheduler.set_runs(config.run_commands)
+        self.scheduler.set_runs(
+            config.run_commands, config.run_commit_commands, config.run_commit_refs
+        )
         self.project = config
         self.project_file_present = present
         self.apply_project_values()
@@ -3524,6 +3532,7 @@ def private_dirs(paths: ProjectPaths) -> tuple[Path, ...]:
         paths.state_dir,
         paths.runtime_dir,
         paths.left_reports,
+        paths.commit_checkouts,
         paths.state_dir / proposal_store.PROPOSALS_DIRECTORY,
         paths.state_dir / evidence.PROBES_DIRECTORY,
     )
@@ -3683,6 +3692,7 @@ def run(
                 ),
                 line_tokens=line_tokens,
                 report_dir=paths.left_reports,
+                checkout_dir=paths.commit_checkouts,
                 walk_check=launcher.walk_unavailable,
             )
             scheduler.record_walk_gap(launcher.walk_gap())
@@ -3690,7 +3700,9 @@ def run(
             scheduler.set_disclosure_accepted(config.disclosure_accepted)
             scheduler.set_git_ssh(line_git_ssh)
             scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
-            scheduler.set_runs(config.run_commands)
+            scheduler.set_runs(
+                config.run_commands, config.run_commit_commands, config.run_commit_refs
+            )
             check_lines_sandboxed(config, log, scheduler)
             check_roles(scheduler, log, config)
             apply_project(scheduler, log, config)

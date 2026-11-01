@@ -550,13 +550,16 @@ def launch(
     argv: Sequence[str],
     environment: Mapping[str, str],
     start_of: Callable[[int], str | None] = process_start,
+    command_dir: Path | None = None,
 ) -> Launched:
     """Open the run's output, start its supervisor, wait until it says it is ready,
     so that a stop can no longer find it without its handlers, and read the
     supervisor's start time. It then waits for ``GO``. Raises ``RunRefused`` and
     leaves nothing running when any step fails. Blocking, so it runs on the process
-    worker."""
+    worker. The output is always under ``workdir``, and the command runs in
+    ``command_dir`` where one is given, a commit run's checkout, round 14, item 1."""
     output, output_file = open_output(workdir, run_id)
+    runs_in = workdir if command_dir is None else command_dir
     ready_read, ready_write = os.pipe()
     try:
         child = subprocess.Popen(  # noqa: S603
@@ -567,7 +570,7 @@ def launch(
                 "dromon.runs",
                 str(receipt_path(directory, run_id)),
                 run_id,
-                str(workdir),
+                str(runs_in),
                 str(ready_write),
                 "--",
                 *argv,

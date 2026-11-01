@@ -71,6 +71,14 @@ class ProjectPaths:
         return self.state_dir / "left"
 
     @property
+    def commit_checkouts(self) -> Path:
+        """Where the daemon checks out a commit run's commit, one directory per run.
+        **Round 14, item 1.** In the state directory, which every line's sandbox
+        denies, so no line can write a checkout, not even one whose working directory
+        is the project root, as one under ``tmp`` would let it."""
+        return self.state_dir / "commit-runs"
+
+    @property
     def lock(self) -> Path:
         return self.runtime_dir / "dromond.lock"
 

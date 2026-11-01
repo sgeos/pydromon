@@ -308,6 +308,8 @@ SCENARIO: tuple[Event, ...] = (
         4400,
         AT,
         AT,
+        "a" * 40,
+        "/work/.dromon/commit-runs/r-2",
     ),
     RunEnded("r-2", RunStatus.LOST, None, None, None, "no receipt", AT),
     RunCleared("r-2", RunClearance.OPERATOR, "ana", AT),

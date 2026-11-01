@@ -263,6 +263,8 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "pid",
         "process_started",
         "started_at",
+        "commit",
+        "checkout",
     ),
     "run_ended": (
         "run_id",
@@ -386,16 +388,18 @@ OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
     "line_turn_ended": ("unreported",),
     "budget_stated": ("window",),
     "line_held": ("cause",),
+    "run_started": ("commit", "checkout"),
 }
 """The fields left out of the wire when they are null, which a log written before
 them never held, so decoding reads an absent one as null. **Task of 2026-10-29,
 round 5.** The request key of a keyed call is recorded in the event of its act, and
 an event of a call without a key is written as before it. The ``window`` field was
 added to ``budget_stated`` on 2026-10-31, and ``cause`` to ``line_held`` the same
-day. **Porting hazard.** A port must omit these
-fields when null, not write them as null, so that its log stays readable by a daemon
-that predates them, and must read an absent one as null. A daemon predating ``window``
-does not read an event that names one."""
+day. ``commit`` and ``checkout`` were added to ``run_started`` in round 14, so a
+daemon that predates them still reads every run but a commit run. **Porting
+hazard.** A port must omit these fields when null, not write them as null, so that
+its log stays readable by a daemon that predates them, and must read an absent one
+as null. A daemon predating ``window`` does not read an event that names one."""
 
 
 def _without_nulls(kind: str, data: dict[str, object]) -> dict[str, object]:
@@ -727,6 +731,8 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "pid": event.pid,
                 "process_started": event.process_started,
                 "started_at": event.started_at,
+                "commit": event.commit,
+                "checkout": event.checkout,
             }
         case RunEnded():
             return "run_ended", {
@@ -1061,6 +1067,8 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _int(data, "pid"),
                 _str(data, "process_started"),
                 _str(data, "started_at"),
+                _optional_str(data, "commit"),
+                _optional_str(data, "checkout"),
             )
         case "run_ended":
             return RunEnded(

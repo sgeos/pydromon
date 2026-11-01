@@ -55,6 +55,7 @@ from dromon.model import (
     LineSession,
     check_workdir,
 )
+from dromon import commitruns
 from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, SandboxError, merge, parse_sandbox
 from dromon.settings import SettingsConfig, SettingsError, parse_settings
@@ -112,7 +113,19 @@ LIMIT_KEYS: Final = frozenset(
 )
 WAKE_KEYS: Final = frozenset({"every_ticks"})
 LEASE_KEYS: Final = frozenset({"names", "ttl_seconds"})
-RUN_KEYS: Final = frozenset({"commands"})
+RUN_KEYS: Final = frozenset({"commands", "commit_commands", "commit_refs"})
+REF_KEYS: Final = frozenset({"patterns"})
+
+
+@dataclass(frozen=True, slots=True)
+class RunTables:
+    """What the ``[runs]`` table declares. Round 14, item 1."""
+
+    commands: dict[str, tuple[str, ...]]
+    commit_commands: dict[str, tuple[str, ...]]
+    commit_refs: tuple[str, ...]
+
+
 MAX_RUN_COMMANDS: Final = 64
 ROLE_KEYS: Final = frozenset(
     {
@@ -290,6 +303,13 @@ class ProjectConfig:
     )
     """The commands lines may start as supervised runs, by name, each as its
     program and arguments. ``docs/architecture/RUNS.md`` is normative."""
+    run_commit_commands: dict[str, tuple[str, ...]] = field(
+        default_factory=dict[str, tuple[str, ...]]
+    )
+    """**Round 14, item 1.** The commands a line, a reading one included, may start
+    on a commit it names, in a checkout the daemon makes."""
+    run_commit_refs: tuple[str, ...] = ()
+    """The ref patterns one of which must contain a commit run's commit."""
     read_only_paths: tuple[str, ...] = ()
     """Project-relative-path entries denied write access under every line's workdir."""
     lines: dict[str, LineDefinition] = field(default_factory=dict[str, LineDefinition])
@@ -453,7 +473,7 @@ class _Reader:
             except GitSshError as error:
                 raise self.fail(error.key, str(error)) from error
         lease_names, lease_ttl = self.leases(top.get("leases", {}))
-        run_commands = self.runs(top.get("runs", {}))
+        run_tables = self.runs(top.get("runs", {}))
         read_only_paths = self.read_only_paths(top.get("read_only_paths", []))
         profiles = self.profiles(top.get("profiles", {}))
         lines_table = top.get("lines", {})
@@ -488,7 +508,9 @@ class _Reader:
             disclosure_accepted=accepted,
             lease_names=lease_names,
             lease_ttl_seconds=lease_ttl,
-            run_commands=run_commands,
+            run_commands=run_tables.commands,
+            run_commit_commands=run_tables.commit_commands,
+            run_commit_refs=run_tables.commit_refs,
             read_only_paths=read_only_paths,
             lines=lines,
             roles=roles,
@@ -561,20 +583,54 @@ class _Reader:
             )
         return tuple(sorted(found)), ttl
 
-    def runs(self, value: object) -> dict[str, tuple[str, ...]]:
-        """The ``[runs]`` table, as each declared command's program and arguments.
+    def runs(self, value: object) -> RunTables:
+        """The ``[runs]`` table, as each declared command's program and arguments,
+        the commit commands and the ref patterns a commit run's commit must be in.
         A command is an array, never a shell string, so a name runs exactly what
-        the operator wrote."""
+        the operator wrote. **Round 14, item 1.** A commit command is declared apart,
+        so no ordinary command becomes one a reading line may start, and a name may
+        not be in both tables, so a name always says which it is."""
         document = self.table(value, "runs", RUN_KEYS)
-        commands = document.get("commands", {})
-        if not isinstance(commands, dict):
-            raise self.fail("runs.commands", "must be a table")
-        table = cast(dict[str, object], commands)
+        commands = self.run_commands(document.get("commands", {}), "runs.commands")
+        commit_commands = self.run_commands(
+            document.get("commit_commands", {}), "runs.commit_commands"
+        )
+        both = sorted(set(commands) & set(commit_commands))
+        if both:
+            raise self.fail(
+                "runs.commit_commands",
+                f"declares {', '.join(both)}, which runs.commands declares too",
+            )
+        refs = self.table(document.get("commit_refs", {}), "runs.commit_refs", REF_KEYS)
+        patterns = refs.get("patterns", [])
+        if not isinstance(patterns, list) or not all(
+            isinstance(item, str) for item in cast(list[object], patterns)
+        ):
+            raise self.fail("runs.commit_refs.patterns", "must be an array of strings")
+        found = tuple(cast(list[str], patterns))
+        if commit_commands and not found:
+            raise self.fail(
+                "runs.commit_refs.patterns",
+                "must name the refs a commit run's commit must be in, since"
+                " runs.commit_commands declares commands",
+            )
+        if found:
+            try:
+                commitruns.check_patterns(found)
+            except commitruns.CommitRefused as error:
+                raise self.fail("runs.commit_refs.patterns", str(error)) from error
+        return RunTables(commands, commit_commands, found)
+
+    def run_commands(self, value: object, where: str) -> dict[str, tuple[str, ...]]:
+        """One table of run commands, each a program and its arguments."""
+        if not isinstance(value, dict):
+            raise self.fail(where, "must be a table")
+        table = cast(dict[str, object], value)
         if len(table) > MAX_RUN_COMMANDS:
-            raise self.fail("runs.commands", f"declares more than {MAX_RUN_COMMANDS}")
+            raise self.fail(where, f"declares more than {MAX_RUN_COMMANDS}")
         found: dict[str, tuple[str, ...]] = {}
         for name, argv in sorted(table.items()):
-            key = f"runs.commands.{name}"
+            key = f"{where}.{name}"
             if ID_PATTERN.fullmatch(name) is None:
                 raise self.fail(key, f"{name!r} is not an identifier")
             if not isinstance(argv, list) or not argv:

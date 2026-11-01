@@ -91,7 +91,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "set": "change a project or line setting, or return it to the layers below",
     "role": "show, create, update or delete roles, read their journals, or give,"
     " vacate or ask to hand over one",
-    "run": "clear a lost supervised run after inspecting what is left of it",
+    "run": "show supervised runs, or clear a lost one after inspecting what is left",
     "budget": "list the providers' stated budgets, or state one",
     "reload": "read the project file again and apply its lines, limits and wake policy",
     "config": "check the project file and show what it declares",
@@ -1299,6 +1299,10 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     )
     for name, command in sorted(config.run_commands.items()):
         print(f"run {name}: {command}")
+    for name, command in sorted(config.run_commit_commands.items()):
+        print(f"commit run {name}: {command}")
+    if config.run_commit_refs:
+        print(f"commit run refs: {', '.join(config.run_commit_refs)}")
     for name, relay in sorted(config.relays.relays.items()):
         print(
             f"relay {name}: {relay.kind}, path {relay.path}, command {relay.command},"
@@ -1813,9 +1817,15 @@ def _read(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 
 
 def _run(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
-    """Clear a lost run, so its scope may start another. Its command may still run,
-    so the operator inspects what is left of it first."""
-    run_id: str = arguments.run_id
+    """Show supervised runs, or clear a lost run, so its scope may start another.
+    A lost run's command may still run, so the operator inspects what is left of it
+    first."""
+    run_id: str | None = arguments.run_id
+    if arguments.action == "status":
+        return _run_status(paths, run_id)
+    if run_id is None:
+        print("dromon run clear: name the run to clear", file=sys.stderr)
+        return exits.USAGE
     args: dict[str, object] = {"run_id": run_id, "operator": arguments.operator}
     result = _call(paths, "run clear", Operation.RUN_CLEAR, args)
     if isinstance(result, int):
@@ -1825,6 +1835,87 @@ def _run(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         f" {result['cleared_at']}"
     )
     return exits.OK
+
+
+def _run_status(paths: ProjectPaths, run_id: str | None) -> int:
+    """Print every scope's recent runs, or one run with its whole receipt. Round
+    14, item 11, since an operator otherwise read ``run_ended`` from the log."""
+    args: dict[str, object] = {} if run_id is None else {"run_id": run_id}
+    result = _call(paths, "run status", Operation.RUNS, args)
+    if isinstance(result, int):
+        return result
+    found = result.get("runs")
+    views = [
+        cast(dict[str, object], view)
+        for view in (cast(list[object], found) if isinstance(found, list) else [])
+        if isinstance(view, dict)
+    ]
+    if run_id is not None:
+        for view in views:
+            print(_run_row(view))
+            for detail in _run_details(view):
+                print(f"  {detail}")
+        return exits.OK
+    if not views:
+        print("no runs yet")
+        return exits.OK
+    scope: object = None
+    for view in views:
+        if view.get("scope") != scope:
+            scope = view.get("scope")
+            print(scope)
+        print(f"  {_run_row(view)}")
+    return exits.OK
+
+
+def _run_row(view: dict[str, object]) -> str:
+    """One run on one line, with its command, line, start, end, exit code and the
+    output file's path, joined to the run's working directory."""
+    state = view.get("state")
+    if state == "running":
+        end = f"still running as process {view.get('pid')}"
+    else:
+        code = view.get("exit_code")
+        with_code = "" if code is None else f" with exit code {code}"
+        end = f"{state}{with_code} at {view.get('ended_at')}"
+        if view.get("blocks") is True:
+            end += ", blocking its scope until it is cleared"
+    output = f"{view.get('workdir')}/{view.get('output_file')}"
+    row = (
+        f"{view.get('run_id')} {view.get('command')} by {view.get('line_id')},"
+        f" started {view.get('started_at')}, {end}, output {output}"
+    )
+    corrects = view.get("corrects")
+    if isinstance(corrects, list) and corrects:
+        row += ", corrects " + ", ".join(str(c) for c in cast(list[object], corrects))
+    corrected_by = view.get("corrected_by")
+    if corrected_by is not None:
+        row += f", corrected by {corrected_by}"
+    return row
+
+
+def _run_details(view: dict[str, object]) -> list[str]:
+    """What ``dromon run status RUN`` adds to a run's row, each field the log
+    holds that the row leaves out."""
+    previous = view.get("previous")
+    details = [
+        f"scope: {view.get('scope')}",
+        f"previous: {'none' if previous is None else previous}",
+    ]
+    size = view.get("output_bytes")
+    if size is not None:
+        digest = view.get("output_digest")
+        of = "" if digest is None else f" of SHA-256 {digest}"
+        details.append(f"output: {size} bytes{of}")
+    note = view.get("note")
+    if note:
+        details.append(f"note: {note}")
+    cleared_at = view.get("cleared_at")
+    if cleared_at is not None:
+        by = view.get("cleared_by")
+        who = "no process was left" if by is None else f"operator {by}"
+        details.append(f"cleared: at {cleared_at}, as {who}")
+    return details
 
 
 def _role(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
@@ -3287,8 +3378,12 @@ def build_parser() -> argparse.ArgumentParser:
                 help="who makes the change or the request, default %(default)s",
             )
         if name == "run":
-            command.add_argument("action", choices=["clear"])
-            command.add_argument("run_id", help="the lost run to clear")
+            command.add_argument("action", choices=["status", "clear"])
+            command.add_argument(
+                "run_id",
+                nargs="?",
+                help="for status, one run to show, and for clear, the lost run",
+            )
             command.add_argument(
                 "--operator",
                 default=default_operator(),

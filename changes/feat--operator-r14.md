@@ -22,4 +22,12 @@ Type: Added
   `-rfEs` in `pyproject.toml` now makes pytest print, and `run_status` links each
   failed run to the run of its command that corrected it. The launcher's stop tests
   count a run whose own bounds passed as inconclusive on a loaded machine, retry it,
-  and skip with the load named when no run is conclusive.
+  and skip with the load named when no run is conclusive. `dromon run status` and the
+  `runs` request list each scope's latest runs with command, line, start, end, exit
+  code and output file, and `dromon run status RUN` shows one run's whole receipt.
+- Round 14, commit runs. `[runs.commit_commands]` and `[runs.commit_refs] patterns`
+  declare gates a line that only reads its working directory may start with
+  `start_run` and a full `commit`, which the daemon checks is contained by an allowed
+  ref, checks out detached in a private `commit-runs` directory in its state
+  directory, records as `commit` and `checkout` on `run_started`, and removes once the
+  run no longer blocks its scope, without following links.

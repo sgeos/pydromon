@@ -1979,18 +1979,34 @@ class RunStarted:
     """The name the project file declares the command under."""
     argv: tuple[str, ...]
     workdir: str
-    """The absolute working directory the command runs in."""
+    """The absolute working directory of the line, which holds the output file, and
+    where the command runs unless ``checkout`` is given."""
     output_file: str
     """Where its output goes, relative to ``workdir``."""
     pid: int
     process_started: str
     started_at: str
+    commit: str | None = None
+    """**Round 14, item 1.** The full commit a commit command ran, which the daemon
+    checked out for it, or ``None`` for a run in the line's working directory."""
+    checkout: str | None = None
+    """The absolute directory the command of a commit run ran in, the daemon's
+    detached checkout of ``commit``, given exactly when ``commit`` is. ``workdir``
+    then holds only the output file."""
 
     def __post_init__(self) -> None:
         check_id("run_id", self.run_id)
         check_id("line_id", self.line_id)
         check_optional_id("role_id", self.role_id)
         check_optional_id("previous", self.previous)
+        if self.commit is not None and COMMIT_PATTERN.fullmatch(self.commit) is None:
+            raise InvalidField("commit must be null or a full hexadecimal commit")
+        if (self.commit is None) != (self.checkout is None):
+            raise InvalidField("checkout is given exactly when commit is")
+        if self.checkout is not None:
+            check_text("checkout", self.checkout, MAX_TASK_PATH_BYTES)
+            if not self.checkout.startswith("/"):
+                raise InvalidField(f"checkout is not absolute: {self.checkout!r}")
         check_id("command", self.command)
         if not 0 < len(self.argv) <= MAX_RUN_ARGUMENTS:
             raise InvalidField(f"argv must hold 1 to {MAX_RUN_ARGUMENTS} arguments")

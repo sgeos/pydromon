@@ -58,7 +58,10 @@ the point of it, since it must outlive the engine, and it is also its risk.
   directory, since a run writes there outside the line's sandbox. A line with `read`
   access may read a run's record but not start or stop one. **Review of 2026-10-31,
   R3.** A seat that owned its role was once let through without this check, so a
-  read-only seat could write its worktree by a run.
+  read-only seat could write its worktree by a run. **Round 14.** A commit command is
+  the one exception, since it runs in the daemon's checkout of a committed tree and
+  not in the working directory, as the section on a gate run that a reading line may
+  start argues.
 - **The output path.** The output file is under the working directory, which a line can
   write, while the daemon writes it outside any sandbox. The daemon therefore opens
   `tmp`, `tmp/runs` and the file one step at a time, each relative to the one before,
@@ -204,13 +207,20 @@ tree changed for another reason, since the daemon cannot tell why a run passed.
 
 | Tool | Effect |
 |---|---|
-| `start_run` | Arguments `command` and `previous`. Starts the declared command, and answers with the run's identifier and output file |
+| `start_run` | Arguments `command` and `previous`, and `commit` for a commit command only. Starts the declared command, and answers with the run's identifier and output file |
 | `run_status` | No arguments. The scope's latest ten runs, newest first, with what `previous` must be and the declared commands |
 | `stop_run` | Argument `run_id`, the scope's open run. Signals its supervisor after checking its start time again |
 
 They are offered while the project declares a run command, or while the line's scope
 has a run to read. The operator's `dromon run clear RUN` is the only way to clear a
 lost run by hand, and is offered to no line or external agent.
+
+**Round 14, item 11.** The operator reads runs with `dromon run status`, the request
+`runs`, which lists the latest ten runs of every scope with each run's command, line,
+start, end, exit code and output file, and with `dromon run status RUN` for one run
+with the rest of its receipt. Before this the operator read `run_ended` from the event
+log by hand. The request reads the log and records nothing. It is bounded by the
+number of scopes, since each scope gives at most ten runs.
 
 ## Events and rollback hazards
 
@@ -318,10 +328,13 @@ shows that the tree passes the gate it carries, not that the gate was untouched.
 operator who wants more declares a script outside every worktree, by an absolute path,
 that fetches the gate from the reviewed commit. The same trust section says why.
 
-## Design, a gate run that a reading line may start
+## A gate run that a reading line may start
 
-**Status.** Round 14, item 1. Designed, not implemented, for the operator's review. No
-code reads any of this yet, and nothing in this section changes what a run does now.
+**Status.** Round 14, item 1. Designed, then implemented in `dromon.commitruns` and
+the scheduler at the operator's direction, since four lines asked for such a gate.
+Two decisions changed from the design, each said where it applies. The checkout is
+in the daemon's state directory rather than under `tmp`, and `run_started` gains
+`checkout` beside `commit`.
 
 **The problem.** A review seat has `read` access to its working directory, so it may
 not start a run, as the trust section requires, since a run writes outside the line's
@@ -342,26 +355,41 @@ review-gate = ["./scripts/check.sh"]
 patterns = ["refs/heads/*"]
 ```
 
-**How a line starts it.** `start_run` gains an optional argument `commit`, required for
+A name may not be in both tables, and declaring a commit command requires at least one
+pattern, each beginning `refs/`, at most 16.
+
+**How a line starts it.** `start_run` takes an optional argument `commit`, required for
 a commit command and refused for any other. It must be a full commit identifier of 40
-hexadecimal characters, never a name such as a branch, so it cannot move between the
-check and the checkout.
+or 64 lowercase hexadecimal characters, never a name such as a branch, so it cannot
+move between the check and the checkout. The line needs only `read` access to its
+working directory, and a seat must still own its role, so the scope rule holds. A
+commit run is stopped with the same access it was started with.
 
 1. The daemon checks the commit with `git cat-file -e COMMIT^{commit}` and checks that
    a ref matching one of `patterns` contains it, with `git for-each-ref --contains`,
    in the project's repository, with arguments as an array and never a shell string.
-2. It makes `tmp/commit-runs/RUN`, mode 0700, under the project root, never under a
-   line's working directory, and fills it with `git clone --no-checkout --shared` of
-   the project's repository followed by `git checkout --detach COMMIT`. A clone writes
-   nothing into the project's own repository, as `git worktree add` would.
-3. The run then starts as any run does, with that directory as its working directory,
-   and its output file under `tmp/runs` in the reading line's working directory, which
-   the daemon writes, not the line, as it writes the output of any run.
-4. `run_started` gains an optional field `commit`, so the record names what ran.
-5. Once `run_ended` is recorded, the daemon removes the checkout with a removal that
-   does not follow links, `shutil.rmtree` where `avoids_symlink_attacks` is true, and
-   refuses commit runs where it is not. A lost run's checkout is kept until the run is
-   cleared, since its command may still run there.
+   Every git call turns hooks off, turns the credential prompt off, and is bounded to
+   60 seconds.
+2. It makes `commit-runs/RUN`, mode 0700, in the daemon's state directory, and fills
+   it with `git clone --no-checkout --shared` of the project's repository followed by
+   `git checkout --detach COMMIT`, then checks that `HEAD` is the commit. A clone
+   writes nothing into the project's own repository, as `git worktree add` would.
+   **Changed from the design.** The design put the checkout under `tmp` in the project
+   root. A line whose working directory is the project root could write there, so it
+   is in the state directory instead, which every line's sandbox denies. The start
+   makes or checks `commit-runs` with the other private directories.
+3. The run then starts as any run does, with the checkout as its command's working
+   directory, and its output file under `tmp/runs` in the reading line's working
+   directory, which the daemon writes, not the line, as it writes the output of any
+   run.
+4. `run_started` gains the optional fields `commit` and `checkout`, the directory the
+   command ran in, so the record names what ran and where without reading the
+   project's configuration. `workdir` then holds only the output.
+5. The daemon removes every checkout that no blocking run names, after each
+   reconciliation, with a removal that does not follow links, `shutil.rmtree` with a
+   directory descriptor where `avoids_symlink_attacks` is true. It refuses commit runs
+   where it is not. A lost run's checkout is kept until the run is cleared, since its
+   command may still run there.
 
 **The trust argument.** It is written for the operator to accept or refuse.
 
@@ -390,16 +418,30 @@ check and the checkout.
 
 **Failure modes.** A commit that is not found or not contained is refused before
 anything is made. A clone or checkout that fails removes its directory and records
-nothing. A daemon that dies during a run leaves the checkout, which the next start's
+nothing. A daemon that dies during a run leaves the checkout, which a later
 reconciliation removes once the run has ended or been cleared. A checkout left by a
-crash before the run was recorded has no run, and a start removes every directory
-under `tmp/commit-runs` that no open or lost run names, never following a link.
+crash before the run was recorded has no run, and the first check after a start
+removes every entry of `commit-runs` that no open or lost run names, never following
+a link, reading at most 4,096 entries at a time. A removal that fails is said once on
+the daemon's standard error and tried again at the next check.
 
-**Tests to write with it.** A refused short identifier, an unreachable commit, a
-commit outside `patterns`, a reading line refused an ordinary command and allowed a
-commit command, a checkout that holds the commit's tree and none of the worktree's
-uncommitted files, removal after the end, a lost run's checkout kept, a link placed in
-`tmp/commit-runs` not followed, and the start's sweep.
+**Residual.** The checks and the clone run on the process worker, which also serves
+stops and reconciliation, so a slow clone delays them, by at most the 60-second bound
+of each of its four git calls. **Inference.** A shared clone that checks out one tree
+is fast for a repository of this size, so the delay is short in practice. The
+checkout is also a full working tree for the duration of the run, so disk use grows
+with each open commit run, bounded by one open run per scope.
+
+**Tests.** `tests/test_commitruns.py` covers the declaration and its refusals, the
+event's fields together and its wire form without them, a refused name, short
+identifier and uppercase identifier, an unknown commit, a commit outside `patterns`, a
+checkout that holds the commit's tree and none of the uncommitted files and adds no
+worktree to the repository, a failed checkout that leaves nothing, a wide or linked
+base refused, a link in or at a checkout not followed, the sweep, a reading line
+refused an ordinary command and allowed a commit command whose checkout is removed
+after the end, the refusals before anything is made, a lost run's checkout kept until
+it is cleared, a start's sweep, and the tool's `commit` argument. **Coverage gap.**
+The real-process tests stand in for `ps` as the other run tests do.
 
 ## Not implemented
 
