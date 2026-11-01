@@ -198,7 +198,8 @@ lost run by hand, and is offered to no line or external agent.
 A supervisor started by a newer daemon also keeps running under an older one, which
 does not know of it, and its receipt waits unread in the report directory. A daemon
 of 09003fa, before the review, reads no `run_cleared` and lets a lost run's scope
-start another run.
+start another run. The rollback floor in [`EVENT_LOG.md`](../protocol/EVENT_LOG.md)
+names the commits of these and every other one-way change.
 
 ## Failure modes
 

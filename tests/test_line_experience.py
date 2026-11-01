@@ -1640,10 +1640,20 @@ def test_a_reply_to_a_hold_question_is_not_counted_unanswered(world: World) -> N
     assert (counts.unread, counts.unanswered) == (2, 1)
 
 
-def test_an_ordinary_reply_to_a_lines_question_still_counts(world: World) -> None:
+def test_an_ordinary_reply_to_a_lines_question_asks_nothing_by_default(
+    world: World,
+) -> None:
+    """Round 14. A reply whose sender said nothing of asking asks nothing, so it is
+    not counted, and one whose sender said it asks a reply is."""
     question = world.scheduler.ask("alpha", ANA, "which branch?")
     reply = world.scheduler.answer(ANA, question, "main")
     world.log.append(MessageDelivered(reply))
+    assert summary(world.log.state, LineAddress("alpha"), 0).unanswered == 0
+    second = world.scheduler.ask("alpha", ANA, "and which commit?")
+    asking = world.scheduler.send(
+        ANA, LineAddress("alpha"), "which do you think?", second, asks_reply=True
+    )
+    world.log.append(MessageDelivered(asking))
     assert summary(world.log.state, LineAddress("alpha"), 0).unanswered == 1
 
 

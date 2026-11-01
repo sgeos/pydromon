@@ -876,6 +876,8 @@ def _send(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         args["reply_to"] = arguments.reply_to
     if arguments.priority:
         args["priority"] = True
+    if arguments.asks_reply is not None:
+        args["asks_reply"] = arguments.asks_reply
     answer = _call(
         paths, "send", Operation.SEND, args, check_after_timeout="dromon sent"
     )
@@ -2823,6 +2825,7 @@ def _add_fleet_commands(command: argparse.ArgumentParser) -> None:
                 action="store_true",
                 help="end the line's running turn at a safe point and lead its next",
             )
+            _add_reply_flags(sub)
         if action == "status":
             sub.add_argument(
                 "--correlation",
@@ -3309,7 +3312,35 @@ def build_parser() -> argparse.ArgumentParser:
                 action="store_true",
                 help="end the line's running turn at a safe point and lead its next",
             )
+            _add_reply_flags(command)
     return parser
+
+
+def _add_reply_flags(command: argparse.ArgumentParser) -> None:
+    """``--no-reply`` and ``--ask-reply`` for a ``send``, which set ``asks_reply``.
+
+    **Follow-up of 2026-11-01, decided by core for review.** Given neither, the client
+    sends no ``asks_reply`` and the daemon's rule decides, so a new note asks a reply
+    and a ``--reply-to`` note asks none. That suits an operator's task note, which
+    wants a report, and an operator's answer to a report, which wants nothing. Decided
+    over a default of asking nothing, which would leave a task note out of the line's
+    unanswered count, where the line looks for work still owed."""
+    replies = command.add_mutually_exclusive_group()
+    replies.add_argument(
+        "--no-reply",
+        dest="asks_reply",
+        action="store_false",
+        default=None,
+        help="the note asks no reply, so it never counts as unanswered",
+    )
+    replies.add_argument(
+        "--ask-reply",
+        dest="asks_reply",
+        action="store_true",
+        default=None,
+        help="the note asks a reply even with --reply-to. By default a new note"
+        " asks one and a reply does not",
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

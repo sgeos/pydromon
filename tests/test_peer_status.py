@@ -29,18 +29,23 @@ from dromon.limits import Limits
 from dromon.model import (
     Event,
     HoldCause,
+    InvalidField,
     LeaseAcquired,
     LineAddress,
+    LineCreated as LineCreatedEvent,
     LineHeld,
     LineMail,
+    LineReleased,
     LineState,
     LineStateChanged,
+    LineTurnEnded,
     Message,
     MessageDelivered,
     MessageKind,
     MessageRead,
     MessageSent,
     OperatorAddress,
+    OperatorRegistered as OperatorRegisteredEvent,
     QuestionStatus,
     State,
 )
@@ -93,7 +98,8 @@ class Recorder:
         action = self.world.actions.pop(self.spec.line_id, None)
         if action is not None:
             action()
-        return TurnReport("success", 1, "ok", (), None, None, "session-1", None, 0.0)
+        subtype = self.world.subtypes.pop(self.spec.line_id, "success")
+        return TurnReport(subtype, 1, "ok", (), None, None, "session-1", None, 0.0)
 
 
 class World:
@@ -102,6 +108,8 @@ class World:
         self.root = root
         self.clock = Clock()
         self.actions: dict[str, Callable[[], None]] = {}
+        self.subtypes: dict[str, str] = {}
+        """The subtype the next turn of a line reports, ``success`` when unset."""
         self.log = EventLog(path, self.clock.text)
         self.scheduler = self.start()
         self.scheduler.ensure_operator("ana")
@@ -907,3 +915,206 @@ def test_the_times_follow_the_events_the_log_holds(world: World) -> None:
     world.restart()
     assert world.log.times.line_changed["beta"] == changed
     assert world.log.times.message_recorded["m-x"] == changed
+
+
+# Round 14. The failed condition survives a restart, and the omitted lines page.
+
+
+def fail_beta(world: World) -> None:
+    def act() -> None:
+        world.scheduler.send(BETA, ANA, "this turn is about to fail")
+        raise RuntimeError("the engine broke")
+
+    world.turn("beta", act)
+
+
+def test_a_failed_line_is_still_failed_after_a_restart(world: World) -> None:
+    fail_beta(world)
+    assert world.beta()["condition"] == "failed"
+    assert world.log.state.lines["beta"].failed
+    world.restart()
+    assert world.beta()["condition"] == "failed"
+
+
+def test_mail_to_a_failed_line_clears_it_in_the_log_too(world: World) -> None:
+    fail_beta(world)
+    world.scheduler.send(ANA, BETA, "try again")
+    assert not world.log.state.lines["beta"].failed
+    world.restart()
+    assert world.beta()["condition"] == "idle"
+
+
+def test_a_turn_that_ends_well_clears_the_recorded_failure(world: World) -> None:
+    fail_beta(world)
+    world.turn("beta", lambda: None)
+    assert not world.log.state.lines["beta"].failed
+    world.restart()
+    assert world.beta()["condition"] == "idle"
+
+
+def test_a_release_clears_the_recorded_failure() -> None:
+    state = State()
+    for event in (
+        OperatorRegisteredEvent("ana"),
+        LineCreatedEvent("beta", HAIKU, "subscription"),
+        LineTurnEnded("beta", None, None, True),
+        MessageSent("q-1", BETA, ANA, MessageKind.QUESTION, "held", ("resume",)),
+    ):
+        state.apply(event)
+    assert state.lines["beta"].failed
+    state.apply(LineHeld("beta", "q-1", HoldCause.TURN_FAILED))
+    state.apply(LineReleased("beta"))
+    assert not state.lines["beta"].failed
+
+
+def test_the_failed_field_is_true_or_absent() -> None:
+    with pytest.raises(InvalidField, match="failed must be true or null"):
+        LineTurnEnded("beta", None, None, False)
+    event = LineTurnEnded("beta", None, None, True)
+    assert decode(encode(event)) == event
+    assert "failed" not in encode(LineTurnEnded("beta", None))
+
+
+def pages(world: World, args: dict[str, object]) -> list[list[str]]:
+    """Every page of the other lines, following ``other_lines_next_offset``."""
+    shown: list[list[str]] = []
+    offset = 0
+    for _ in range(100):
+        status = json.loads(world.call({**args, "other_lines_offset": offset}))
+        lists = status.get("lists", status)
+        shown.append([entry["line_id"] for entry in lists["other_lines"]])
+        assert len(world.call({**args, "other_lines_offset": offset})) <= (
+            MAX_LINE_STATUS_DEFAULT_BYTES
+        )
+        if offset:
+            assert lists["other_lines_offset"] == offset
+        assert lists["other_lines_omitted"] == status["other_line_count"] - len(
+            shown[-1]
+        )
+        following = lists.get("other_lines_next_offset")
+        if following is None:
+            return shown
+        assert following == offset + len(shown[-1])
+        offset = following
+    raise AssertionError("the pages never ended")
+
+
+@pytest.mark.parametrize("args", [{"lists": True}, {"detail": True, "lists": True}])
+def test_paging_reaches_every_other_line_once(
+    world: World, args: dict[str, object]
+) -> None:
+    expected = many(world, 99)
+    world.scheduler.create_line("zeta", HAIKU, Strategy.SUBSCRIPTION)
+    make_held(world, "zeta")
+    shown = pages(world, args)
+    assert len(shown) > 1
+    assert shown[0][-1] == "zeta"
+    flat = [line_id for page in shown for line_id in page]
+    assert sorted(flat) == sorted([*expected, "zeta"])
+    assert len(flat) == len(set(flat))
+
+
+def test_a_view_that_fits_gives_no_next_offset(world: World) -> None:
+    status = json.loads(world.call({"lists": True}))
+    assert "other_lines_next_offset" not in status["lists"]
+    assert "other_lines_offset" not in status["lists"]
+
+
+def test_an_offset_past_the_end_shows_none_and_counts_all(world: World) -> None:
+    many(world, 3)
+    status = json.loads(world.call({"lists": True, "other_lines_offset": 50}))
+    lists = status["lists"]
+    assert lists["other_lines"] == []
+    assert lists["other_lines_omitted"] == 4
+    assert "other_lines_next_offset" not in lists
+
+
+@pytest.mark.parametrize(
+    ("args", "refusal"),
+    [
+        ({"other_lines_offset": 1}, "other_lines_offset pages the lists"),
+        ({"lists": True, "other_lines_offset": -1}, "must be an integer from 0"),
+        ({"lists": True, "other_lines_offset": "2"}, "must be an integer from 0"),
+        ({"lists": True, "other_lines_offset": True}, "must be an integer from 0"),
+    ],
+)
+def test_a_bad_offset_is_refused(
+    world: World, args: dict[str, object], refusal: str
+) -> None:
+    tool = next(
+        t for t in world.scheduler.own_tools("alpha") if t.name == "line_status"
+    )
+
+    async def invoke() -> dict[str, Any]:
+        return await tool.handler(args)
+
+    result = asyncio.run(invoke())
+    assert result.get("is_error") is True
+    assert refusal in result["content"][0]["text"]
+
+
+# A failure the engine reports without raising. Follow-up of 2026-11-01.
+
+REPORTED_FAILURE = "error_during_execution"
+
+
+def report_failure(world: World, line_id: str, kind: str, *, mail: bool) -> None:
+    """End one turn of ``line_id`` with a failure its engine reports in a turn
+    report, in an ordinary turn or in one its engine started by itself, having
+    mailed an operator first when ``mail`` is true."""
+    if kind == "ordinary":
+
+        def act() -> None:
+            if mail:
+                world.scheduler.send(LineAddress(line_id), ANA, "this turn ends badly")
+
+        world.subtypes[line_id] = REPORTED_FAILURE
+        world.turn(line_id, act)
+        return
+    report = TurnReport(REPORTED_FAILURE, 1, "ok", (), None, None, "s-1", None, 0.0)
+
+    async def go() -> None:
+        completion: asyncio.Future[tuple[TurnReport | None, Exception | None]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        completion.set_result((report, None))
+        world.log.append(LineStateChanged(line_id, LineState.RUNNING))
+        mailed = world.scheduler._operator_mail(line_id)  # pyright: ignore[reportPrivateUsage]
+        if mail:
+            world.scheduler.send(LineAddress(line_id), ANA, "this turn ends badly")
+        await world.scheduler._self_started_turn(line_id, completion, mailed)  # pyright: ignore[reportPrivateUsage]
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "self-started"])
+def test_a_reported_failure_after_operator_mail_marks_the_line_failed(
+    world: World, kind: str
+) -> None:
+    """The ordinary turn did not mark the line failed for a failure its engine
+    reported without raising, while a self-started turn did. Both now do, in memory
+    and in the log, so the condition survives a restart."""
+    report_failure(world, "beta", kind, mail=True)
+    assert world.log.state.lines["beta"].held_by is None
+    assert world.beta()["condition"] == "failed"
+    assert world.log.state.lines["beta"].failed
+    assert not world.scheduler._eligible("beta")  # pyright: ignore[reportPrivateUsage]
+    world.restart()
+    assert world.beta()["condition"] == "failed"
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "self-started"])
+def test_a_reported_failure_without_operator_mail_holds_the_line(
+    world: World, kind: str
+) -> None:
+    report_failure(world, "beta", kind, mail=False)
+    assert world.log.state.lines["beta"].hold_cause is HoldCause.TURN_FAILED
+    assert world.beta()["condition"] == "held"
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "self-started"])
+def test_a_reported_failure_is_cleared_by_new_mail(world: World, kind: str) -> None:
+    report_failure(world, "beta", kind, mail=True)
+    world.scheduler.send(ANA, BETA, "try again")
+    assert world.beta()["condition"] == "idle"
+    assert not world.log.state.lines["beta"].failed

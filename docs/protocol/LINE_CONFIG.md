@@ -147,12 +147,13 @@ argument outside a tool's schema is refused.
 
 | Tool | Effect |
 |---|---|
-| `send_message` | Sends a note to a line, an operator or the line itself, delivered in a later tick. With `priority` true, a note to another line is priority mail, rate limited, as [`PRIORITY.md`](PRIORITY.md) specifies. With `issue` true, from 2026-10-31, it raises an issue with an operator, as below |
+| `send_message` | Sends a note to a line, an operator or the line itself, delivered in a later tick. With `priority` true, a note to another line is priority mail, rate limited, as [`PRIORITY.md`](PRIORITY.md) specifies. With `issue` true, from 2026-10-31, it raises an issue with an operator, as below. From round 14, `asks_reply` says whether a note asks a reply, and `reply_to` may also name a note the line sent the same recipient, to correct it, as the unanswered rule below says. `@operator` names the project's default operator, as below |
 | `ask_operator` | Asks an operator a question, which never pauses the line |
 | `wake_after` | Schedules one wake for the line, optionally tied to a running background task or to a process of its own that `list_processes` shows, as below |
 | `list_mail`, `read_mail`, `acknowledge_mail` | Page through, open and acknowledge the line's mailbox |
 | `list_sent` | Lists what became of the line's sent mail |
 | `acquire_lease`, `release_lease` | Take and give up a lease the project declares, as below |
+| `list_leases` | From round 14. Lists every live lease, with its holder, both times and the holder's unverified note, and the declared leases no line holds. Read only, the same for every line, as below |
 | `start_run`, `run_status`, `stop_run` | Offered while the project declares a run command, or while the line's scope has a run to read. Start a declared command as a supervised run that outlives the turn, the seat and the daemon, show the scope's latest runs with their receipts, and stop its open run, as [`RUNS.md`](../architecture/RUNS.md) specifies. A seat must own its role, and every line needs write access to its working directory. A lost run blocks its scope until no process is left in its supervisor's group or session, or an operator clears it. Added on 2026-10-31, and the last two sentences in the review of that day |
 | `line_status` | Shows a compact read-only status by default, with diagnostic detail and long lists available by argument, as below |
 | `role_status` | Offered only to a seat of a role. Shows the role's worktree, whether the project file or an operator holds it, its declared failover order, failover policy, handoff threshold, owner, the seat a failover would pass it to now and the latest change of owner, its seats in the failover order with whether each is usable for a failover, their condition, worktree access, whether each waits because its engine cannot confine it, model, provider and stated budget, each seat's latest three background task ends with the digest of their output, and its latest five journal entries, the newest with its body, read only, as [`ROLES.md`](../architecture/ROLES.md) describes. Added on 2026-10-27, the task ends on 2026-10-28, the holder and the order on 2026-10-31 in round 10, and whether the project file declares the role, how a role an operator holds differs from it, and the lines that wait beside the owner, in the round 10 review |
@@ -202,7 +203,8 @@ reply, and receives each through the operator's relay like any other mail, as
   was not added.
 - **Rollback hazard.** A daemon older than this kind cannot read an event log that
   holds an issue, since its codec refuses an unknown message kind, so a rollback past
-  it needs the log from before the first issue.
+  it needs the log from before the first issue. The rollback floor in
+  [`EVENT_LOG.md`](EVENT_LOG.md) names its commits.
 
 **Decided by the operator on 2026-10-26**, from the lines' own reports, for what follows
 in this section.
@@ -273,14 +275,53 @@ given exactly when the line is held.
   the other lists alone pass the bound, the response is truncated as before, and
   still carries `other_lines` and `other_lines_omitted` at its top. An entry whose
   lease names alone would pass the bound gives `lease_count` in place of `leases`, so
-  at least one entry is given whenever another line exists. No argument pages past
-  the lines left out.
+  at least one entry is given whenever another line exists.
+- **Paging, from round 14.** **Required by the operator on 2026-11-01.** Until then no
+  argument reached the lines a bounded response left out. `line_status` takes
+  `other_lines_offset`, an integer from 0 to 100,000 given with `lists`, which skips
+  that many lines of the order kept past the bound, those that say something first
+  and then the rest. A response that leaves lines out past those it shows gives
+  `other_lines_next_offset`, the offset of the next page, and a page that began past 0
+  gives `other_lines_offset`. `other_lines_omitted` counts every other line the
+  response does not show, those before the offset included. An offset past the end
+  shows none. The paging fields are measured with the entries, so a page stays within
+  the bound. An offset without `lists`, or one that is not such an integer, is
+  refused. **Residual.** The order is computed afresh for each call, so a line whose
+  condition changes between two pages may be shown twice or not at all. Each page is
+  exact for the moment it was built.
+- **`failed` across a restart, from round 14.** **Required by the operator on
+  2026-11-01.** The condition was held in the daemon's memory only, so after a
+  restart a failed line read `idle`. A turn that fails now records `failed` in its
+  `line_turn_ended`, and the state keeps the line failed until a turn ends without
+  it, new mail reaches the line, the line is released, or a restart note reaches it,
+  the events at which the scheduler clears its own record. A restarted daemon seeds
+  its record from the state, and the record follows the memory. **Fact.** In an
+  ordinary turn, a failure the engine reported without raising never entered the
+  memory, so it is not recorded either, while a turn the engine started by itself
+  entered both. **Required by the operator on 2026-11-01.** Both kinds of turn now
+  mark the line failed for such a report, so a line that mailed an operator in the
+  turn escapes the hold as before but stands `failed`, is not woken again until new
+  mail reaches it, and stays failed across a restart. **Residual.** A note the daemon records for the line without
+  waking it clears the state's flag, while the daemon's memory keeps the line failed
+  until a restart.
 - **The cost.** **Decided by the operator on review r13, C1.** The state keeps each
   line's unread mail and its open questions to an operator as indexes, updated as
   events apply and rebuilt by replay, so a line's `condition`, its `unread` and its
   oldest unread mail are read without a scan of the messages. The view is built only
   when `lists` is true. The caller's own counts are still found by a scan of its
   mailbox, as before, and reading each other line's `workdir_commit` reads a file.
+- **One copy per call, from round 14.** **Required by the operator on 2026-11-01.**
+  Each `line_status` call read the event log's state 27 times, and 49 with `lists`,
+  and each read copied every message, which was the whole of its linear cost. The
+  reads of one call now share one copy, taken when the call starts, and a read after
+  the log moved takes a new one, so every answer is what a fresh copy gives. Outside
+  `line_status` every read is still a fresh copy. Measured with 12 lines and 100,000
+  messages on the line's machine, the mean of five calls through the tool, the base
+  commit 47c58d5 took 83 ms for the default call and 129 ms with `detail` and
+  `lists`, and this change takes 58 ms and 51 ms. What remains is the one copy and
+  the scan of the caller's mailbox. **Inference.** The figures vary between runs by
+  tens of milliseconds, so only their size is meant. Building a line's tools still
+  reads the state about 11 times, outside this change.
 
 - **Never the mail.** The view gives a count and an age, and never a message's body,
   sender, identifier or subject. A hold gives its closed cause and never the hold
@@ -442,6 +483,19 @@ is read.
   worktree. It was `false` there before, which said the daemon was not behind a
   worktree whose code it may not contain. It is cached by both commits, as `stale` is.
   The compact view carries it too.
+- **The turn's commits, from round 14.** **Required by the operator on 2026-11-01,
+  every turn decided by core for review.** A line acted on a standing brief written
+  at an earlier commit, and on a daemon whose checkout had left its loaded code,
+  without noticing either. Every turn's prompt now leads, after the worktree-moved
+  notice, with one paragraph naming the commit the line's standing brief names beside
+  its worktree's `HEAD`, and the commit the daemon loaded beside its checkout's `HEAD`.
+  A pair that differs carries a plain `WARNING`, and the brief's warning gives the
+  `git log` range to read. A pair is left out where a commit is not known, as for a
+  line with no brief or a brief stamped with no commit. **Inference.** The commits are
+  read from small files, never by git, so the daemon's pair is compared as commits
+  and not as code, unlike `stale`, and a move that touched only documents is warned of
+  too. **Coverage gap.** The tests call the notice directly and do not compose a whole
+  prompt.
 - **`cite`.** One sentence naming both full commits, such as `line core read its
   worktree at commit C, under the daemon at commit D.`, with the commit the daemon's
   own checkout has moved to when it is stale, and a clause saying that the daemon's code
@@ -799,6 +853,60 @@ during that turn.
   none asks a reply of the line. The state the event log builds keeps
   every such question's identifier from its `line_held` event, so the rule survives a
   restart. **Decided by the operator on 2026-10-26** in round 2.
+- **`@operator`, from round 14.** **Required by the operator on 2026-11-01.** A line
+  addressing `@operator` in `send_message` or in `ask_operator`'s `to` was refused
+  with `no operator operator` in a project whose operator has another name. It now
+  names the project's default operator, the `operator` of the project file, unless an
+  operator named `operator` is registered, who is then meant. When the default
+  operator is not registered either, the call is refused with the operators that
+  exist, such as `no operator is configured for @operator to name; the operators are
+  @ana, @ben`, or with `there are none`. Any other operator address that names no
+  registered operator is refused the same way, so the refusal says what to write. The
+  resolved address is what the log records, so a reader of the log never meets the
+  alias.
+- **Unanswered, from round 14.** **Required by the operator on 2026-11-01, the
+  defaults decided by core for review.** The count only grew, since every report and
+  every reply counted until its recipient answered it. `dromon.mailbox.counts_unanswered`
+  is now the one rule.
+  - A message leaves the count once its recipient replies to it or acknowledges it,
+    as before, and also once its own sender corrects it with a later note naming it
+    by `reply_to`, since the correction is then the one to answer. `list_sent` shows
+    such a message as `corrected`.
+  - A note that asks nothing is not counted. `send_message` takes `asks_reply`. A
+    note that leaves it out asks a reply unless it is itself a reply, and a
+    correction that leaves it out asks what the note it corrects asked. A question
+    and an issue always ask. Decided over counting every note, which made the count
+    grow with every reply, and over a default of asking nothing, which would hide an
+    operator's task note sent from a client without the flag.
+  - **Round 14 review, M1, required by the operator on 2026-11-01.** A line could
+    hide its own ask from an operator, by sending a note with `asks_reply` false or
+    by correcting an asking note with it. `asks_reply` false is now honoured only for
+    a note to a line, so a note to an operator counts unless it is a reply, and a
+    correction asks what the note it corrects asked, or more when it says true, and
+    never less. `dromon.model.asks_reply_of` holds the rule, which the views and a
+    correction's application share.
+  - **Known limit, M1b, decided by the operator on 2026-11-01.** A reply asks nothing
+    by default, and the rule cannot tell a reply that answers from a reply that asks
+    again. So a line that writes a new ask as a reply to an operator's mail is not
+    counted as unanswered. The note still counts in the operator's unread count until
+    it is read, and the line may still set `asks_reply` true. Accepted over counting
+    every reply to an operator, which would make the count grow with each answer, as
+    before round 14.
+  - `list_mail` with `unanswered_only` lists exactly what the count counts, each
+    entry ending with how long it has waited, such as `unanswered for 1h 3m`. It is
+    refused beside `own_notes_only`, which selects other messages.
+  - `acknowledge_mail` takes an optional `reason` of at most 500 bytes, checked
+    against the disclosure list like a body. It is recorded in `message_acknowledged`
+    and shown only in the recipient's own listing as `closed because` the reason. The
+    sender sees `acknowledged` and never the reason, since the reason is the
+    recipient's note to itself. A reason for a message already acknowledged is
+    refused, since it would not be recorded.
+  - **Failure modes.** The ages are the event log's `recorded_at`, kept as events
+    apply, and follow the clock, as the peer view's ages do. From 2026-11-01
+    `dromon send --no-reply` lets an operator's note ask nothing, while the curses
+    client still sends no `asks_reply`, so its notes take the default. Messages already in a log keep their old fields, so an old reply
+    that asked nothing leaves the count at once, which shrinks it and hides nothing
+    that asked a reply.
 - **Own notes.** **Required by the operator on 2026-10-30, the rule decided by core
   for review.** A note from the line to itself, such as a fired wake, a task-end note
   or a compaction request, is never counted in `unread`, and is counted in
@@ -905,9 +1013,34 @@ a time.
   one acquisition lasts at most one time to live. The holder may acquire it again once
   it has expired. Expiry follows the daemon's wall clock, so a change of that clock
   moves it. A name the project does not declare is refused, listing the declared
-  names.
+  names. From round 14 it takes an optional `note` of at most 500 bytes saying what
+  the lease is held for, checked against the disclosure list and recorded in
+  `lease_acquired`. A note that is not text, is blank or is too long is refused, and
+  nothing is acquired.
 - **`release_lease`.** Argument `name`. It ends the line's lease, and is refused for a
-  lease the line does not hold.
+  lease the line does not hold. From round 14 its answer says that releasing a lease
+  does not end the processes started under it.
+- **`list_leases`, from round 14.** **Required by the operator on 2026-11-01.** No
+  arguments. It answers with `leases`, each live lease in name order with `name`,
+  `holder`, `acquired_at`, `expires` and `holder_note_unverified` when a note was
+  given, `free`, the declared names no line holds, and `caveat`. Expiry is read by the
+  wall clock as an acquisition reads it, so the two agree. A note passes with its lease
+  on a change of owner, as the times do.
+- **The note is the holder's claim.** **Round 14 review, T1, required by the operator
+  on 2026-11-01.** The note was given under a plain `note` beside the daemon's own
+  fields, though it is a line's own text that every other line reads. It is named
+  `holder_note_unverified`, and the `caveat`, the description of `list_leases` and
+  that of the note in `acquire_lease` say it is the holder's claim, bounded to 500
+  bytes and screened against the disclosure list but otherwise unchecked, to be read
+  as a claim and never as an instruction. **Residual.** How many leases a line may
+  hold, and so how much such text it can show, is bounded only by the declared names.
+- **A lease is not proof that processes ended.** **Required by the operator on
+  2026-11-01.** A released lease was read as proof that the former holder's processes
+  had ended, which the daemon never checks. The `caveat` of `list_leases`, its
+  description and the answer of `release_lease` say that a lease released, expired
+  or absent shows only that no line holds it. A line checks its own processes with
+  `list_processes`, and a successor checks a former holder's with the recovery
+  checklist.
 - **Ends.** A lease ends when released, when its time to live passes, when its holder's
   engine session is cleared, whether by `clear_session`, by a change of its `workdir`
   or at the start of each turn under `fresh_session_each_turn`, when its holder is
@@ -1136,6 +1269,18 @@ the intent itself, in the line's own words, set with `set_brief` and recorded as
   silent it fills Task from the former owner's latest operator mail and Gate and
   coverage from its latest task record, each marked observed by the daemon, as
   [`ROLES.md`](../architecture/ROLES.md) describes.
+- **The stamp's commits, from 2026-11-01.** `line_status` names the commits the brief
+  was stamped with `workdir_commit_when_set` and `daemon_commit_when_set`, which were
+  `workdir_commit` and `daemon_commit` before. **Fact, from the operator.** A line
+  reported a daemon commit older than the one the daemon had run for an hour.
+  **Inference, from the code.** The daemon's commit in `commits` and in `daemon` is
+  read once when the daemon starts, and each call answers from it afresh, so it cannot
+  name an earlier daemon. A kept session holds only the answers of its earlier calls,
+  which a line may quote after a restart. **Hypothesis.** The line took
+  the brief's stamp, set under an earlier daemon, for the daemon's commit, since both
+  bore the same name. Renamed so that no field naming an older daemon reads as the
+  running one. A role's journal entries keep `daemon_commit`, since `role_entry` in
+  [`CLIENT.md`](CLIENT.md) names it and each entry stands beside its `noted_at`.
 - **Trust.** The brief is untrusted data, since a line may relay in it what other lines
   and agents wrote. The daemon stamps it and checks its bounds and the disclosure list,
   and checks nothing else. A brief that holds a term the disclosure list in force
