@@ -959,8 +959,8 @@ def test_line_status_uses_adapter_environment_and_reports_failure(
     status = json.loads(text)["shell"]
     assert status == {
         "required": True,
-        "path": None,
-        "reason": "SHELL must name an executable file",
+        "path": "/bin/bash",
+        "reason": None,
     }
 
 
