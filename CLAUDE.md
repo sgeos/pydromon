@@ -67,6 +67,16 @@ at merge must be green. Use scoped conventional commits such as `feat:`, `fix:`,
 `test:` and `chore:`. Commit messages carry no `Co-Authored-By` trailer, at the
 operator's instruction of 2026-10-25, which applies to every repository.
 
+**Changelog fragments.** A branch does not edit `CHANGELOG.md`, because every branch
+adding under the same headings made almost every merge conflict. It adds one file,
+`changes/BRANCH.md`, with BRANCH the branch name with each `/` written `--`, a first
+line `Type: Added`, `Type: Changed` or `Type: Fixed`, a blank line, and its bullets.
+`scripts/check.sh` validates the fragments and refuses any branch edit of the
+Unreleased section other than a release or a lossless regrouping of its headings. A release runs
+`python3 -I scripts/assemble_changelog.py release VERSION DATE`, in the operator's
+session and in one commit with the deleted fragments, after `preview` shows the
+entries. [`changes/README.md`](changes/README.md) is the convention in full.
+
 The remote is `https://github.com/sgeos/pydromon`, a public repository. Its git
 configuration uses the GitHub command-line tool as the credential helper, because SSH
 keys are unreachable from inside agent sandboxes.

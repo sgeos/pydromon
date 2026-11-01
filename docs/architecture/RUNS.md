@@ -237,6 +237,64 @@ start another run.
   identify a supervisor, so every `start_run` is refused and nothing starts.
 - **An output larger than 1 GiB** is recorded with its size and without a digest.
 
+## Example, a run of the full gate
+
+**Status.** An example of a declaration and of how a line uses it. This document does
+not declare it. **Declaring a command is the operator's decision**, made in the project
+file, and nothing here changes what the project declares.
+
+**The problem.** A line's engine sandbox denies binding a Unix domain socket and running
+`ps`, so a line runs `./scripts/check.sh -m "not socket and not live"` and reports that
+the socket tests were deselected and that seven launcher tests that read the process
+table were skipped. A run executes outside every engine sandbox, as the trust section
+says, so it can run the whole gate.
+
+**The declaration.**
+
+```toml
+[runs.commands]
+full-gate = ["./scripts/check.sh"]
+```
+
+With no arguments the gate runs the socket tests and the process-table tests, and
+`pyproject.toml` still deselects the live tests, which spend subscriptions and are
+never part of it. A run takes no arguments from a line, so a line cannot add `-m` to
+this one or ask for the live tests. The command is not given a time limit, as the
+deferred list says, and the gate takes a few minutes. Two cases stay refused. A daemon
+that itself runs in a sandbox that denies `ps` refuses every `start_run`, and a line
+with `read` access to its working directory may read a run but not start one, so a
+review seat cannot.
+
+**How a line starts it.** The line must own its role, or be a line of its own, and have
+`write` access to its working directory.
+
+1. Call `run_status`. It names the scope's latest runs and gives the `previous` value
+   the next start must carry, or `none`. A scope with an open run, or a lost run that
+   no one has cleared, cannot start another.
+2. Call `start_run` with `command` set to `full-gate` and that `previous`. It answers
+   with the run's identifier and its output file under `tmp/runs` in the working
+   directory.
+3. End the turn or do other work. When the run ends, a note from the harness reaches
+   the scope's present holder, which is the role's owner or else the line that started
+   it, and a daemon restart or a handoff does not lose the run.
+
+**How a line reads the result.** The receipt is `RUN.run` in the daemon's report
+directory, which no line can read, so a line reads what the daemon recorded from it.
+
+- `run_status` shows the run's end, `exited` with an exit code, `stopped` or `lost`.
+  Exit code 0 means every check of the gate passed. Any other code means a check failed,
+  and 127 means the program could not start. A `lost` run says its supervisor ended
+  without a receipt, and it blocks its scope until it clears or the operator clears it.
+- The output file holds the gate's output, and `run_ended` records its size and digest.
+  The line reads the file for the counts in pytest's summary line and reports them
+  with the run's identifier and the commit it read, as a sandbox gate is reported.
+
+**What the result proves.** The gate ran in the worktree as the line left it, with the
+line's own `scripts/check.sh` and tests, which a writing line can edit. A green run
+shows that the tree passes the gate it carries, not that the gate was untouched. An
+operator who wants more declares a script outside every worktree, by an absolute path,
+that fetches the gate from the reviewed commit. The same trust section says why.
+
 ## Not implemented
 
 **Deferred.** These are left out of the smallest feature, and named so they are not

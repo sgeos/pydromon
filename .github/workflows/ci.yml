@@ -55,8 +55,13 @@ jobs:
         # 3.12 is requires-python in pyproject.toml, and 3.15 the newest release.
         python: ["3.12", "3.15"]
     steps:
+      # The full history, so that origin/main exists. The gate's changelog rule compares
+      # a branch with its merge base with origin/main, and at the default depth of one
+      # there is no such reference, so the rule would be skipped on every job. On a push
+      # to main the merge base is the commit itself and the rule finds nothing to refuse.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - id: python

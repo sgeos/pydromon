@@ -334,6 +334,21 @@ fi
 
 # --- Project checks -----------------------------------------------------------------
 
+# Changelog fragments. A branch records its entry in changes/ and does not edit the
+# Unreleased section of CHANGELOG.md, which conflicted on almost every merge. This
+# validates every fragment, and refuses a branch that edits that section unless it is a
+# release or a lossless regrouping. The rule compares with the merge base of HEAD and
+# origin/main, then main. Without either, as in a shallow clone, the script exits 3 and
+# this says it SKIPPED the rule, and does not report a pass. changes/README.md states
+# the convention.
+changelog_status=0
+python3 -I scripts/assemble_changelog.py check || changelog_status=$?
+case "$changelog_status" in
+0) pass "changelog fragments are valid and Unreleased is edited only through them" ;;
+3) printf 'check.sh: SKIPPED: the changelog rule had no base branch, so only the fragments were validated\n' ;;
+*) fail "the changelog fragment rule, explained above" ;;
+esac
+
 # A stale environment tests old code, so the installed environment must match the lock.
 uv sync --locked
 pass "the environment matches uv.lock"

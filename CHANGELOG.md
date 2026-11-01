@@ -182,377 +182,6 @@ All notable changes are recorded here. The format follows
   replies query in the client, with each request bounded by the remaining timeout. It
   returns the reply without marking it read, and reports timeout, invalid source and
   daemon loss as failures.
-
-### Changed
-
-- Remote and local open federation are bounded further, from findings F1 to F3 of
-  the round 12 review, decided by the operator on 2026-10-31. At most 64 undeclared
-  remote keys are recorded, and a new key past that is refused at `hello` before any
-  event. All undeclared keys share `[federation.open] remote_total_turns_per_hour`
-  and `remote_total_waiting`, 6 and 500 by default, besides each key's own. A `hello`
-  without a token must match the entry's start time as read when its connection was
-  accepted, in a worker thread, and is refused when it cannot be read. With
-  `remote = "open"`, `allowed_networks` is required, and a world-open listener lists
-  `"0.0.0.0/0"` and `"::/0"`. A file that opens `remote` without it is now refused.
-  From finding R1 of the round 12 re-review, all undeclared keys also share
-  `remote_total_deliveries`, the `deliver` requests they may make together in ten
-  minutes, 60 by default, which is one declared peer's rate, and at most 3,840, so 64
-  keys together cannot exceed it. `FEDERATION.md` now states that an empty
-  `allowed_networks` admits every address to a TLS listener that serves declared
-  peers with `remote` closed, under the pin checks, and that undeclared projects on
-  this machine are not capped, since each is a process of the same user that a live
-  registry entry names. **Rollback hazard.** A daemon before round 12 refuses a
-  project file that holds any of the new `[federation]` keys, `local`, `remote`,
-  `name`, `allowed_networks` or the `[federation.open]` table, as an unknown key, and
-  so refuses the whole file. **Fact,** read from `_known` at 7aaec56. Removing those keys before a rollback lets the older daemon read the file,
-  though it still cannot read a log that holds `peer_opened`.
-- A peer reaches only declared operators, decision 25 of `FEDERATION.md`, decided by
-  the operator on 2026-10-31. An operator the project file declares, by `[daemon]
-  operator` or an `[operators.ID]` table, may receive peer mail before sending
-  anything, and the first note records the operator. An operator known only from the
-  log, which a peer could reach before this change, is refused with `refused`, so a
-  project that names an undeclared operator in `reach` must now declare it.
-- Leases are durable, task of 2026-10-31. `lease_acquired` records the holder, the
-  acquisition and the expiry, and `lease_released` a release or a name the project
-  file no longer declares, so a restart keeps a held lease until it expires, and
-  expiry stays its bound. A cleared session or a rebind ends a line's leases as the
-  event log applies it. A change of a role's owner from one seat to another passes the
-  previous owner's leases to the new owner with the same times, as `ROLES.md` records
-  as decided. A start whose project file no longer declares a held lease's name now
-  ends it. **Rollback hazard.** A daemon older than this cannot read a log holding
-  `lease_acquired` or `lease_released`.
-
-### Fixed
-
-- Review of 60fcdd3. Fixed public stop notices no longer consult the disclosure list,
-  so their display cannot reveal whether the list matches a known sentence. They
-  still contain no engine text and consume no line disclosure allowance. The engine
-  documents now state that Dromon trusts the runtime's own `_meta.toolNotRun`
-  assertion that a rejected call did not run.
-
-- Review of 7eda348. Grok and Antigravity continue after a rejected call is reported
-  only when the update explicitly asserts non-execution through `_meta.toolNotRun`
-  equal to Boolean `true`, without contradictory execution status. Pending and
-  failed status alone now stop the turn. Stop notes use a closed Dromon vocabulary
-  and discard engine labels and error text, including when reading older notes.
-  Harness screening of those fixed notes leaves the line's hourly disclosure
-  allowance untouched. Line-originated checks retain their existing allowance.
-
-- Grok and Antigravity reject ordinary tool permission requests without cancelling
-  the turn when a rejection option is available. Identity changes, reused permission
-  identifiers, execution without approval, missing options and driver budgets still
-  stop it. Budgets are checked before granting a new call. Engine refusals and driver
-  interruptions leave a bounded, disclosure-filtered cause in the next prompt through
-  a durable harness note that does not wake the line. Agent Client Protocol version 1
-  defines no custom reason field, so a model-visible explanation for a selected
-  rejection remains runtime-dependent and unverified live.
-
-- `dromon restart` waits for its successor until a deadline, and each status request
-  waits no longer than what remains of it. Each poll waited out a whole request
-  timeout before, so a daemon that accepted and never answered could hold the client
-  for hours, as the review of 7ff033f found. A hang now costs at most the drain wait,
-  plus 70 seconds for the shutdown and startup bounds, plus one poll.
-- ACP adapters now cancel and refuse a turn when the runtime omits the permission
-  option needed for Dromon's intended decision. The refusal names the tool, whether
-  Dromon intended to allow or refuse it, and bounded evidence of the offered option
-  kinds and identifiers. An `allow_always` option never substitutes for `allow_once`.
-- Grok's `get_command_or_subagent_output` may carry the kind `other`, which a live turn
-  on 2026-10-31 showed, and so may `kill_command_or_subagent`, which shares its Grok
-  category. Both still need `Bash`.
-- Claude Code now records the positive percentage remaining in a documented,
-  non-rejected rate-limit window, with its reset time when supplied. It retains each
-  named window and shows the lowest remaining percentage among unexpired windows. A
-  positive snapshot cannot replace a recorded zero before its reset. Handoff requests
-  are recorded once per crossing below the role threshold and re-armed only above it.
-  A daemon predating round 11 cannot read the log after a `budget_handoff_requested`
-  event is recorded.
-  Percentage conversion is exact and rounds toward less remaining. Grok Build's
-  documented rate-limit classes are emitted to its `StopFailure` hook, but Dromon's
-  Agent Client Protocol adapter cannot read that hook event or a documented reset
-  field, so it classifies no new Grok quota errors. `GROK.md` records the available
-  budget evidence for every engine and the evidence limits. `ROLES.md` and `ENGINES.md`
-  describe the per-window snapshot and the fields retained in scrubbed recordings.
-- Supervised runs, review of 2026-10-31. Reading a run's output opens it without
-  blocking and reads only a regular file, so a named pipe a line puts there cannot
-  stall reconciliation on the process worker, R1. A seat that owns its role needs
-  write access to its working directory to start or stop a run, as any other line
-  does, R3. A run whose supervisor cannot be told to start is recorded as `stopped`
-  with no exit code and the caller is told nothing started, R6. The supervisor signals
-  its command's group only from the thread that waits for it, between polls that
-  found the command unreaped, so a late `SIGKILL` can no longer reach a reused group
-  identifier, R7. A `ps` that exits with status 1 and a complaint is a failure to
-  read the table, not an absent process. `ROLES.md` states that a change of owner
-  passes every lease of the former owner, including one not taken for the role, R4,
-  and `RUNS.md` states the window between checking and signalling a supervisor, R5.
-- `write_scratch` refuses targets covered by project `read_only_paths` in the
-  scratch directory it actually uses, including a seat's `tmp/lines/LINE`. Codex keeps
-  read-only parent entries while denying protected descendants and makes read-only
-  entries under `tmp/` explicit. `dromon wait` reports replies left out by the response
-  size bound. Documentation states that worker joins are bounded and that engine
-  enforcement after parent renames or newly created symbolic links is unverified.
-- The process-inspection and launch-record-sweep workers now stop when their scheduler
-  or daemon stops. Shutdown rejects new inspections, drops queued calls, and joins each
-  worker for at most one second. A process-table read already in progress cannot be
-  interrupted and may outlive that bound, after which its worker exits. This also
-  closes workers when startup validation refuses a daemon before its service loop.
-- A line can be created on, or rebound to, the packaged Pi model. The log checked a
-  line's model as an identifier, which refuses the colon and slash of the
-  engine-qualified names of Pi, Cursor Agent and Antigravity, so no Pi line could be
-  created. The `engine` field of `line_created` and `line_rebound` is now a model
-  name, an identifier or one with a colon and the harness's own identifier, as
-  [`EVENT_LOG.md`](docs/protocol/EVENT_LOG.md) gives it. Every other field stays an
-  identifier. Cursor Agent and Antigravity lines are still refused by their adapters,
-  which allow them only in `dromon probe`, and their names no longer stand in the way
-  once that refusal is lifted. **Rollback hazard.** A daemon before this change
-  refuses a log holding such a line as corrupt.
-- A Codex line's turn is refused when any directory of its own scratch, `tmp`,
-  `tmp/lines` or `tmp/lines/LINE`, is a symbolic link or not a directory, checked
-  by `lstat` each turn before its permission profile is built, so the owner of a
-  role's worktree cannot redirect a read seat's grant into its own scratch. Review
-  of ebedeed, R1.
-- A Codex line with write access, no `Edit` or `Write` and a shell is granted its
-  own scratch, where `write_scratch` writes for it, as a read line is. Review of
-  ebedeed, G3.
-- A line that does not write its working directory, a seat that does not own its
-  role among them, has a scratch of its own, `tmp/lines/LINE`, for `write_scratch`
-  and for the Codex read profile, which granted the whole of `tmp/` before. Either
-  let a read-only seat, or a line with no writing tool, write a file of the owner's
-  scratch, which stays `tmp/`. The tool's description says where each scratch is.
-  Round 10 re-review, N1 and N2. **Behaviour change.** A line that is no role's seat
-  and has no writing tool now writes under `tmp/lines/LINE` too, so its reports move
-  there.
-- A seat on an engine that cannot confine it, such as Grok, whose turn began while
-  its role was vacant, no longer runs on beside a seat that then takes the role or is
-  given it. The new owner's first turn waits for that turn, and for the seat's kept
-  connection to close. Round 10 re-review, N3.
-- A role's worktree inside another role's, or holding it, is refused as a shared one
-  is, by `dromon role create` and `update` and in the project file, and a line that
-  could write a directory inside an owned worktree, or one holding it, is refused or
-  held as one in the worktree is. Round 10 re-review, N4. **Rollout hazard.** A
-  project file with a role on the project root and another below it, or with a
-  writing line on the root beside an owned role below it, is now refused whole at a
-  start or a reload.
-- Bound issue volume per line, ran different operators' relays concurrently while
-  preserving each operator's notice order, and restricted file relays to protected
-  state/runtime directories. File relay FIFO opens are nonblocking. Command relay
-  success now follows the command's exit status even when a child holds standard error
-  open. A child that starts a new session can still escape timeout process-group kills.
-
-- A seat that does not own its role is built with its role's worktree read only on
-  Claude Code and Codex, the engines that can confine it. The confining engines were
-  derived from the capability table, but the step that applies a seat's read access
-  to its engine was never added, so such a seat ran with its own access, write by
-  default, beside the owner. A seat whose configuration Claude Code cannot make read
-  only now fails its turn as the engine is built and is held. Round 10 review, F7.
-- The one-writer rule holds on every path, at the operator's decision of 2026-10-31.
-  A seat with a turn in flight is never unbound, hibernated or not, by `dromon role
-  update` or `delete`, for an owned or a vacant role. A writer seat of an owned role is
-  not unbound while it could write the worktree, hibernated or not. An owning seat is
-  never configured out of its role's worktree, and a seat that runs elsewhere does not
-  gain its role by a give, a take, a handoff or a failover. A line that is not a seat
-  of a role is refused, by `dromon create`, `configure`, `set`, `rebind` and the
-  project file, where it could write the worktree of a role another seat owns, and one
-  a log left there before the rule waits, and is named by `dromon role status`. Two
-  roles never share a worktree, compared by real path, at `dromon role create` and
-  `update` and in the project file, which is refused whole at a start or a reload
-  naming both roles. Round 10 review, F1 to F4.
-- A role that returns to the project file is given the file's first owner in the same
-  pass, rather than at the next start or reload. Round 10 review, F5.
-- `dromon role status`, `roles` and a seat's `role_status` show whether the project
-  file declares a role, each way its table differs from a role an operator holds, and
-  the lines that wait beside the owner. Round 10 review, F6.
-- Refused Codex items count toward the driver's tool budget whether first announced by
-  `item/started` or `item/completed`. Matching item identifiers are counted once
-  regardless of notice order. A refusal announced by neither notice remains invisible.
-- A launcher retries a timed-out process-table walk until its 0.75-second deadline.
-  If the table still cannot be read while stopping under `kill_all`, it reports the
-  stop as unverified and exits unsuccessfully after ending the harness's group. It
-  waits 0.25 seconds after `SIGKILL` and reports unverified if a process remains.
-  Process-table inspections and detached-process scans share a worker with a bounded
-  queue of eight calls. Launch-record sweeps use a separate worker with its own bounded
-  queue. Detached-process scan results contain only process identifiers and command
-  strings. Retiring an engine calls `Driver.close` on the owning thread, though a virtual
-  machine not closed before it becomes cyclic garbage may still be finalized on any
-  thread.
-- Process-table failures use a typed error, and only an explicit timeout triggers the
-  launcher's retry. A queued process call cancelled by its caller is skipped, though
-  a call already running cannot be cancelled.
-- Launcher tests start the source module from this checkout explicitly. Tests that need
-  a real `ps` table are marked to skip when `ps` cannot run instead of branching their
-  expected exit status on a probe result.
-
-- Grok's `list_dir` may carry the kind `other`, which Grok gives it, as a live turn of
-  58 tool calls on 2026-10-31 showed. That turn also confirmed the observed kinds of
-  `read_file`, `grep`, `run_terminal_command`, `search_tool` and `use_tool`.
-- A refused Grok `use_tool` call says why, and a file-backed one says to pass its arguments
-  inline, so the line can correct itself.
-- Grok tool calls are judged by the name Grok gives them in `_meta["x.ai/tool"]`.
-  Grok's first announcement of a call has no `kind` and no `toolName`, so every Grok
-  tool call was refused, including `search_tool`, and a later update that rewrites the
-  title would have refused the turn. A call so named is identified by that name, and
-  Grok's built-ins map to the line's tools by a table in `GROK.md`.
-- Grok sessions now set the model to the exact identifier in the driver's settings
-  when `session/new` or `session/load` reports another model. Dromon requires a model
-  config option, requires the `models` field and model option to agree when both are
-  reported, and checks the complete updated option list with the driver before
-  prompting. Conflicting or unreadable model reports refuse the turn. A successful
-  pin supersedes a mismatching notice held before its response, while a later mismatch
-  refuses the turn. Tests cover new and resumed sessions, successful selection,
-  refusal, conflicting model reports and a post-pin model notice.
-- A Claude Code line reads engine messages of up to `MAX_MESSAGE_CHARACTERS`, 32 MiB of
-  characters, which Dromon now passes to the Agent SDK as its buffer size in place of
-  its default of 1 MiB. A turn whose engine still sends a longer message ends with a
-  refusal that names the limit and a tool result carrying a large file, such as an
-  Edit, a Write or a Read, as the likely cause, where it said only that the engine's
-  process ended. Claude Code 2.1.310 was read to put an Edit's whole original file in
-  its stream message, however small the edit. The bound, its memory cost and that
-  reading are in `docs/protocol/ENGINES.md`. Reported by another project, whose line
-  ended its turn on an Edit of a 2.5 MB file.
-- A line given `fresh_session_each_turn` by a reload or `dromon configure` has its
-  recorded session cleared at once, so `dromon settings` stops showing the old
-  session as soon as the change applies. A turn in flight at that change, or at a
-  change of `workdir`, records neither its session, its context estimate, a compaction
-  nor a compaction wake when it ends, since they belong to the session the line no
-  longer resumes. Required by the operator in the round 9 review, F1. Every cleared or
-  rebound session also forgets the daemon's context estimate of the old session, with
-  the compaction and the context-warning wake it would start. The first turn after
-  such a reload had warned of the old session's context, which the line took to mean
-  the old session had resumed, though its engine was built with none to resume.
-  Reported by another project in round 9.
-- `dromon config` warns about a shared working directory only for lines that can
-  write it, as each engine confines them. A line needs `workdir_access` `write`, and
-  on Claude Code a shell or file-write built-in or a policy allowing every tool, on
-  Codex and Grok Build `Edit` or `Write`, whatever its policy, while a Pi, Cursor
-  Agent or Antigravity line with write access always counts. Read-only lines and lines
-  whose only tools come from MCP servers had been named as writers. Reported by
-  another project in round 9, and the engines' rules required by the operator in its
-  review, F16 and F17.
-- The daemon is stale in `line_status` only when its own checkout holds code under
-  its package directory other than the code it loaded, so a commit of documents no
-  longer warns, and the warning clears once the checkout returns to that code. Git
-  compares the trees only for commits not compared before, and caches the answer by
-  commit. The stale note names the daemon's own checkout, not the line's worktree.
-  Where the code cannot be compared, any move of `HEAD` is stale, as before.
-  Reported by another project in round 9. Git runs on a worker thread, never on the
-  daemon's event loop, so a status or a prompt never waits on it, and an answer git
-  could not give, a timeout, a git that could not start or an error status, is kept
-  for 60 seconds and then asked again. Required by the operator in the round 9
-  review, F4 and F6.
-- An attached client whose daemon is gone detaches by itself once 5 polls in a row
-  have found nothing listening, over at least 10 seconds with the socket file missing
-  or 60 seconds of refused connections, prints why, and exits with 4. A refusal waits
-  the longer bound because a live daemon with a full backlog may refuse connections
-  on Darwin, as the operator required in the round 9 review, F14. A slow daemon, or
-  one that refuses a request, never counts. The terminal loop waits out its input
-  timeout when curses returns at once, as it does once the terminal is gone. One
-  client had polled a deleted project for days at full processor use. Reported by
-  another project in round 9.
-- `test_a_stop_under_kill_all_also_ends_a_child_that_left_the_group` and every other
-  launcher test that waits for a process to go poll to a monotonic deadline derived
-  from the launcher's own bounds, and a `ps` that times out under load counts as not
-  yet gone rather than failing the test. One run failed at a load average of 189.
-- Grok refuses a reused tool call identifier, including a repeated permission request,
-  so the same identifier cannot obtain multiple grants while counting once. Tests also
-  cover raw input changes in updates, non-`other` discovery calls, and a non-marker
-  `.claude` directory. The Codex dangling-credential overlap test now isolates the
-  `.cargo` guard it is intended to cover. The normal ACP order of announcement,
-  permission request and updates is accepted and counted once, as is a permission
-  request that arrives before the announcement.
-- Grok lines may use `search_tool` for discovery and `use_tool` for a qualified tool
-  served by that line's Dromon MCP server. Dromon checks the documented inline input
-  shape, refuses file-backed or ambiguous targets, keeps the target fixed through the
-  permission request, and counts the underlying Dromon tool against its budget. The
-  ACP call shape remains unverified pending a first live line turn. Grok project checks
-  allow only a real, empty `.claude/.cc-writes` marker and refuse other contents. The
-  local guides do not establish whether Grok creates `.grok` in its isolated home, so
-  no allowance was added for that path.
-- Grok refusal advice for an existing sandbox profile now lists only missing deny and
-  read-only entries. Tests check that an existing credential is omitted while a
-  missing one is named. Codex writable-path validation also has a test that refuses a
-  home-directory grant when `.netrc` is a dangling symbolic link. The Grok `.grok`
-  marker remains unresolved pending a live Dromon turn, and the Codex probe conclusion
-  is labeled as an inference.
-- Codex and Grok profiles now share the operator credential path list and require
-  existing project and workdir `secret` directories to be denied by real absolute
-  path. Codex adds validated operator-granted `writable_paths` for existing absolute
-  directories, only when the line has `Edit` or `Write`, and refuses grants that
-  overlap credentials or other protected paths. A Codex probe signed in with
-  `~/.codex/auth.json` denied, and that path is now denied by the profile. The operator
-  will verify that a live line command cannot read it.
-  Claude Code's existing `network.allowLocalBinding` setting is documented with a
-  line configuration example. Grok symlink writes outside the workdir remain
-  unverified, and no external writable path grant was added.
-- The shared credential list now includes additional common stores. It is explicitly
-  incomplete, and each engine exempts only its own sign-in path. A dangling link at a
-  listed home path is denied by its absolute path. Protocol documents describe the
-  probe result and the remaining unverified Codex path behavior, and correct when and
-  where `writable_paths` are validated. Negative tests cover unsupported engines,
-  missing write tools, Git overlap, links to protected paths, dangling credentials and
-  a credential created between Codex turns.
-- Grok home checks now allow an empty regular `hooks-paths` file and an
-  `installed-plugins` directory containing only empty regular `*.lock` files, while
-  refusing symbolic links and any other contents. Grok writer profiles hold the
-  actual Git directories read-only and deny credential paths that exist under the
-  daemon's real home when each check runs. A new profile includes only paths present
-  when it is written, and the next turn refuses a credential created later. Refusal
-  advice for an existing profile names values to add while preserving every other
-  table and entry. `docs/protocol/GROK.md` records the observed and inferred behavior,
-  including the pointer files that remain unguarded between turns.
-- A line's own notes, such as fired wakes and task-end notes, leave the `own_notes`
-  count once a turn of the line has ended after their delivery, whatever the turn's
-  outcome, as well as once they are read, acknowledged or replied to. The count had
-  grown with every note a line left alone after its work was done, and a worker line
-  in another project counted 62. The rule is read from the event log alone, so it
-  holds across a restart, and the wake prompt, `line_status`, `list_mail` and the
-  client's views share it. A task note recorded during a running turn counts until
-  that turn ends, and a note delivered between turns without a wake counts until the
-  next turn ends. A prompt still marks nothing read, and mail from any other sender
-  is unchanged. Required by the operator on 2026-10-30 in round 8. A turn whose
-  engine returned no report, as when its prompt could not be composed, retires no
-  note, since its prompt may never have reached the engine, and records
-  `line_turn_ended` with the new optional field `unreported`, which a daemon that
-  predates it cannot read, so a rollback after such a turn cannot load the log. The
-  prompt and the counts line of `list_mail` now say that a note past the count is
-  still listed by `list_mail` without a filter. Required by the operator in the round
-  8 review.
-- Wake prompts now state the operator at turn start that `ask_operator` will use when
-  `to` is omitted, and explain that a new operator message during the turn changes
-  that default.
-- Role ownership notices are now suppressed across daemon restarts after the notified
-  seat ends a turn that started after the change. Replay reconstructs each seat's
-  turn starts and ends since the latest ownership change. A turn already running at
-  the change no longer suppresses the notice, and a later ownership change starts a
-  new notice for both affected seats.
-- One context warning now gives one compaction wake. No context-warning wake is
-  queued while the line's turn runs or a compaction decided for it is under way, any
-  reported compaction withdraws a pending one whatever its size, and one that falls
-  due under the automatic hold is withdrawn. The engines line received a second wake,
-  queued one second into the first wake's turn, which fired after it. The wake's note
-  now says why it was scheduled, with the estimated tokens, the warning and the
-  source of the estimate. Required by the operator on 2026-10-30. After review, no
-  context-warning wake is queued while another wake is pending or mail waits for the
-  line, and the line is no longer marked as woken for one it did not get, so a wait
-  for a background task that ends without a turn no longer suppresses the wake, nor
-  does a wake of the line's own that replaced it and then ended without a turn. A
-  compaction reported after the wake fired delivers its note without a turn of its
-  own, as the engines line's log showed one. A restarted daemon takes a pending wake
-  with the context note as the warning's, so a later compaction withdraws it.
-- A `wake_after` bound to a running background task now acts as a wait. The line can
-  end its turn and be woken by that task even after reaching the ordinary task-note
-  limit, and the task note names the cancelled wake. If the task outlives the timeout, the
-  scheduled wake fires. The tool descriptions explain how to use the wait.
-- Claude Code and Codex lines granted a shell tool now require the daemon's `SHELL` to
-  name an absolute executable. Claude Code additionally requires Bash or Zsh and
-  receives the validated path as both `SHELL` and `CLAUDE_CODE_SHELL`, and the launcher
-  drops inherited shell values from lines without shell tools. Codex supports Bash as
-  its only shell tool and receives `SHELL` in its app-server and shell command
-  environments. `line_status` reports the line adapter's selected path or validation
-  reason. **Reported on 2026-10-29** by a worker line in another project whose shell
-  changed from bash to zsh between turns. `check_disclosure` now explains where the
-  project configures a list and that a check cannot resolve without one.
-
-### Added
-
 - The daemon relays operators' mail. The project file's `[relays.NAME]` tables declare
   command and file relays, and `[operators.ID] relay = NAME` routes an operator's mail
   to one. A relayer task forwards every undelivered message to a routed operator, off
@@ -707,109 +336,6 @@ All notable changes are recorded here. The format follows
   shows it, always delimited as untrusted data. A turn that ends without a report,
   as one that fails before its engine receives the prompt, leaves the lead owed to
   the next turn. Asked for by three of the round 3 reports.
-
-### Fixed
-
-- A silent-turn reminder no longer says that the line sent no mail when it mailed
-  another party in a turn its engine started by itself after a task ended. The saved
-  state keeps the count of mail the line had sent to anyone but itself, and the
-  reminder is dropped once that count has grown. It now opens "A turn of yours ended
-  with" rather than speaking of the last turn. It is still given when every task it
-  names has ended, with a closing sentence on how the work ended, which is decided
-  for review. Reported by the core line on 2026-10-30.
-- A silent-turn reminder no longer repeats a saved background-task count as if it
-  were current. Dromon checks the same task identifiers against the live kept-session
-  listing and later task records, and reports unknown when it cannot verify an end.
-  `line_status` exposes the engine's `background_tasks_unknown` flag.
-- A client request that times out now says that the daemon may still have carried it
-  out, and `dromon send` points to `dromon sent` before a retry. **Found on
-  2026-10-29,** when a send timed out at the client while the daemon was busy and the
-  message had in fact been recorded, so a retry would have sent it twice.
-- The role transition package now marks where each item came from, observed by the
-  daemon, reported by a line, unknown, or unreadable by the daemon, each with its time.
-  A field the journal entry lacks is taken from the former owner's standing brief, so
-  a failover, which writes no handoff note, no longer leaves every field missing. A
-  path git could not read is named as unreadable, never as absent or untracked, and
-  the former owner's process state is said to be unknown where the platform cannot
-  identify a line's processes. Found in the live failover of 2026-10-28.
-- A hung test now ends the run after 300 seconds with the traceback of every thread,
-  through pytest's `faulthandler_timeout`, instead of running out the job's 30 minute
-  timeout in silence, as one macOS job did on 2026-10-28.
-- A Pi test failed in two gates of one session with a Keleusma virtual machine
-  dropped on another thread, and passed alone. **Inference.** A driver another test
-  left open was finalized by the cycle collector on asyncio's child-watcher thread.
-  The tests now turn automatic collection off and collect on the main thread every 25
-  tests, so a leak is finalized on the thread that made it. The original failure was
-  not reproduced, so the fix is not yet confirmed.
-- Two engine deadline tests gave their fakes ten milliseconds to reach a stage, so a
-  loaded host could fail them naming an earlier stage. The Antigravity first-output
-  test and the Grok start test now allow half a second.
-- The Grok sliding deadline test kept its limits a few tens of milliseconds apart, so a
-  loaded host could fire the inactivity deadline where the absolute cap was meant to.
-  Each limit is now far from the other and from the chunk delay, and the active turn
-  still outlasts the sliding deadline, so the test still proves that activity resets
-  it. Found by the core role's gate on 2026-10-28.
-- `dromon config` now names the disclosure list the project file gives, or says that
-  it gives none, in which case no line's mail or report is checked. It refuses a list
-  it cannot read, as the daemon does. The terms are never shown. Found by the round 3
-  reports, when `check_disclosure` refused in the team's own project for want of a
-  list.
-
-- `dromon config` no longer warns that the seats of one role share a workdir, which
-  they do by design, since only the role's owner writes there. A writing line outside
-  the role in the same workdir is still warned about. Found by the operator on
-  2026-10-28.
-- A read-only Claude Code line could leave its sandbox. A sandbox layer that set
-  `allowUnsandboxedCommands` true or `failIfUnavailable` false let a shell command run
-  outside the Seatbelt sandbox that denies writes to the working directory. The read
-  sandbox now sets both keys itself, after every other layer, and a line whose project
-  or own sandbox sets either the other way, or sets `excludedCommands` or
-  `filesystem.disabled`, is refused. Each refusal of a read-only Claude line now has a
-  test. Found by the review of read-only seats, findings 1 and 2.
-- Grok's `read_only_workdir` capability is unknown rather than yes, since no live run
-  has shown its reader profile deny a write. Review of read-only seats, finding 3. A
-  Grok line with `workdir_access: read` is now refused until that capability is
-  known, since the reader profile rests on Grok's built-in `read-only` base, which
-  Dromon cannot inspect. Second round, findings 1 and 2.
-- A Grok turn is refused when Grok loads any MCP server but Dromon's, which the
-  operator's first live probe of 2026-10-27 showed it does from the user's own
-  configuration, and when Grok does not list its servers. Grok's own notices for its
-  servers, models and settings are read, and one that shows another server, another
-  model or a mode that does not ask refuses the turn. A permission mode reported as a
-  `configOptions` entry of the category `mode` is accepted. Grok's scans of Claude
-  Code's and Cursor's MCP and hook files are turned off.
-- `dromon probe --scrub` also replaces MCP server names, addresses, commands and
-  arguments, slash command and skill names with their descriptions, host names,
-  agent ids and a subscription tier, so a scrubbed Grok recording holds none of the
-  operator's configuration.
-- A malformed time in a role or budget event named the field `due`, and now names
-  its own field, such as `resets_at`.
-- `dromon send` prints the message identifier alone again. Since priority mail it had
-  printed every key of the result, so a plain note ended with `priority False`. It now
-  adds `priority mail` on a second line only when the note is priority mail. Found by
-  the operator on 2026-10-27.
-- The client protocol carries no floats, and the daemon sent two. `dromon status`
-  failed once the daemon had run for a minute, because `events_per_hour` was a
-  fraction, and `dromon restart` failed at once, because its `--wait-seconds` went out
-  as a float. Both are whole numbers now, and `--wait-seconds` takes whole seconds. The
-  encoder refuses a float wherever it appears and names its path, the daemon answers a
-  response it cannot encode with an internal error under the request's identifier, and
-  a request refused for holding a float is answered under its own identifier. Found by
-  the operator's live check of 2026-10-27.
-- The safe point of priority mail, and so of `dromon restart --interrupt`, moved to
-  the moment after a tool result is delivered and before the next model call, once
-  every tool use of the turn has its result, or the end of an assistant message that
-  holds no tool use, by the operator's decision of 2026-10-27 after a review. It was a
-  text or thinking event, which can share a message with a tool use after it. Each
-  adapter feeds the new driver events `tool_result` and Pi also `message_end`, which
-  the packaged drivers answer with `continue`.
-- `recent_turns` gives `interrupted_for`, so a turn ended for priority mail or a
-  restart says so beside an engine subtype such as `error_during_execution`.
-- Claude Code's `thinking_tokens` system message, a progress estimate while the model
-  thinks, is handled and no longer reported as unknown.
-
-### Added
-
 - `wake_after` may name one of the line's running background tasks. Dromon records a
   task binding on the scheduled wake, and the matching `task_noted` event withdraws it
   atomically while it is still scheduled. A wake that has fired already cannot be
@@ -1403,96 +929,6 @@ All notable changes are recorded here. The format follows
   `toolName`.
 - Models on harnesses that run other vendors' models are named `ENGINE:ID`, as
   `docs/protocol/DRIVER.md` records.
-
-### Changed
-
-- Mute is renamed hibernate, at the operator's direction of 2026-10-27. The commands
-  are `dromon hibernate LINE` and `dromon awaken LINE`, the client operations
-  `hibernate` and `awaken`, the field and condition `hibernated`, the `role status`
-  mark `hibernated`, the `request_handoff` result `owner_hibernated`, and the events
-  `line_hibernated` and `line_awakened`. Event logs that already hold `line_muted` and
-  `line_unmuted` still replay, since the codec decodes those as the new kinds, and new
-  events are written only under the new names. `dromon mute` and `dromon unmute`, and
-  the operations `mute` and `unmute`, are removed without aliases, since no release
-  carried them.
-- A line's relative `instructions` paths resolve against the project root, not the
-  line's `workdir`, so a line moved to a worktree still reads the project's files. The
-  engine receives the absolute path, which the composed instructions now name.
-- `pykeleusma` is pinned to its first PyPI release, `0.2.2.0`, in place of commit
-  `19d4558` of its repository. Every call Dromon makes is unchanged, and the packaged
-  drivers run as before. The release has wheels for Python 3.12 or later on Linux,
-  macOS and Windows, so CI no longer installs a Rust toolchain, and the README no
-  longer asks for one. CI sets `UV_NO_BUILD_PACKAGE=pykeleusma`, so a wheel that
-  stopped matching fails the run instead of building from source unnoticed.
-- A compaction's `trigger` is only what the engine reported, with a `trigger_note`,
-  so a Codex compaction, which reports none, no longer shows a `manual` that Dromon
-  made up. A Codex compaction is reported as such even when Dromon had no earlier
-  estimate of its size. The context note for a call no longer uses Claude Code's
-  wording on Codex lines.
-
-- The gate runs pyright for Linux and for macOS, since pyright skips another
-  platform's branch, which let a Linux-only type error reach `main` in pull request 42.
-
-- The subscription drivers allow a development turn: 200 engine turns and 400 tool
-  calls for Opus, GPT-6-Luna and Grok, and 100 and 200 for Haiku. The API and flexible
-  drivers keep their small budgets.
-
-- pydromon is set up to develop itself with Dromon, as `docs/process/DOGFOOD.md`
-  records. pytest's collection now ignores `.dromon`, which a Codex line's profile
-  denies outright, so a line can run the gate in the project it works on.
-
-- Synced with `sgeos/project-template` a second time. The repository gains
-  `CODE_OF_CONDUCT.md`, linked from the README, `CONTRIBUTING.md` and `llms.txt`,
-  `.github/CODEOWNERS`, `.github/release.yml`, an issue template `config.yml` that
-  routes security reports to private advisories, `docs/decisions/TEMPLATE.md`,
-  `scripts/worktree.sh` and an opt-in `scripts/hooks/pre-push`. `scripts/check.sh` takes
-  the template's hygiene checks, which add Markdown link, text, size and executable
-  checks, require shellcheck, and scan for the terms in an untracked
-  `secret/disclosure-terms.txt`, and it takes `--hygiene-only`. CI grants no permissions
-  by default, installs shellcheck on macOS where missing, and lints its workflows with
-  actionlint and zizmor. Dependabot groups action updates weekly. Commit messages no
-  longer carry a `Co-Authored-By` trailer, on the operator's instruction.
-
-- CI groups concurrent runs by the pull request's ref and otherwise by run, as the
-  Keleusma repository does, so a second merge to `main` no longer cancels the first
-  merge's run. The test matrix runs at most two jobs at once, and Linux jobs require
-  shellcheck on `scripts/`.
-- Questions no longer block. The `blocking` field leaves `message_sent`, notices and the
-  `ask_operator` tool. After asking, a line ends its turn or keeps working, as it
-  decides, and the answer arrives as mail.
-  Dromon's tools now reject arguments outside their schema.
-- The scheduler is a game loop. Each tick updates every line once and skips a busy one,
-  turns run without the tick waiting for them, and mail sent during a tick moves from
-  the sent queue to the post office at its end. `dromond` gains `--tick-seconds`.
-- The scheduler is tick based. A message sent in one turn is received no sooner than
-  the next tick, even by an idle line, and messages never interrupt a turn. `status`
-  reports the tick.
-- Driver documentation no longer claims that Keleusma resets private data. It persists
-  once assigned, as the `pykeleusma` line pointed out and this line confirmed.
-- `line_created` gains a `strategy` field naming the line's driver strategy.
-- The build backend requirement moves to `uv_build` 0.13, matching the installed uv.
-- `docs/protocol/RELAY.md` requires every relay adapter to support a response path and
-  states the properties its deferred design must have.
-- Operators are no longer a singleton. Each operator is a party with an address such as
-  `@ana`, registered by a new `operator_registered` event. An operator question is a
-  `message_sent` of kind question from a line to one operator, and the answer is that
-  operator's reply, which must reverse the question's route. `question_asked`,
-  `question_answered` and the wake cause field are removed, and messages gain `kind`,
-  `choices`, `blocking` and `reply_to`. The draft format version stays 1.
-- `docs/architecture/KELEUSMA_INTEGRATION.md` records the `pykeleusma` line's answers to
-  the four questions, the binding's current task status, and the tagged-tuple
-  constraints it reported. One-element tuples in the examples became two-element ones.
-- `CLAUDE.md` states that dates in tracked files are in Coordinated Universal Time.
-- The design records two operator decisions. The protocol specification is drafted in
-  this repository, and the first adapter targets Claude Opus 5.5.
-- The design records what Anthropic's terms allow for subscription sign-in, the open
-  choice of the first adapter that follows from it, and that standard harness features
-  such as compaction land with the task that first needs them.
-- `docs/process/HANDOFF.md` names the interline line `pydromon` as this line's mailbox.
-- Roadmap task 1 is done. The seed was checked against Appendix B and nothing conflicts.
-
-### Added
-
 - Round 2 of the session-line experience. A Claude Code line with `keep_session`
   keeps its engine connected between turns, so commands started in the background
   outlive the turn and the engine's `TaskStop` works across turns. Every per-turn check
@@ -1891,3 +1327,552 @@ All notable changes are recorded here. The format follows
   command tests, the design, the naming and port decision, the 0.1.0 milestone and the
   process files. Ignored project-local `tmp/` and `secret/` directories, following the
   Keleusma repository.
+
+### Changed
+
+- Remote and local open federation are bounded further, from findings F1 to F3 of
+  the round 12 review, decided by the operator on 2026-10-31. At most 64 undeclared
+  remote keys are recorded, and a new key past that is refused at `hello` before any
+  event. All undeclared keys share `[federation.open] remote_total_turns_per_hour`
+  and `remote_total_waiting`, 6 and 500 by default, besides each key's own. A `hello`
+  without a token must match the entry's start time as read when its connection was
+  accepted, in a worker thread, and is refused when it cannot be read. With
+  `remote = "open"`, `allowed_networks` is required, and a world-open listener lists
+  `"0.0.0.0/0"` and `"::/0"`. A file that opens `remote` without it is now refused.
+  From finding R1 of the round 12 re-review, all undeclared keys also share
+  `remote_total_deliveries`, the `deliver` requests they may make together in ten
+  minutes, 60 by default, which is one declared peer's rate, and at most 3,840, so 64
+  keys together cannot exceed it. `FEDERATION.md` now states that an empty
+  `allowed_networks` admits every address to a TLS listener that serves declared
+  peers with `remote` closed, under the pin checks, and that undeclared projects on
+  this machine are not capped, since each is a process of the same user that a live
+  registry entry names. **Rollback hazard.** A daemon before round 12 refuses a
+  project file that holds any of the new `[federation]` keys, `local`, `remote`,
+  `name`, `allowed_networks` or the `[federation.open]` table, as an unknown key, and
+  so refuses the whole file. **Fact,** read from `_known` at 7aaec56. Removing those keys before a rollback lets the older daemon read the file,
+  though it still cannot read a log that holds `peer_opened`.
+- A peer reaches only declared operators, decision 25 of `FEDERATION.md`, decided by
+  the operator on 2026-10-31. An operator the project file declares, by `[daemon]
+  operator` or an `[operators.ID]` table, may receive peer mail before sending
+  anything, and the first note records the operator. An operator known only from the
+  log, which a peer could reach before this change, is refused with `refused`, so a
+  project that names an undeclared operator in `reach` must now declare it.
+- Leases are durable, task of 2026-10-31. `lease_acquired` records the holder, the
+  acquisition and the expiry, and `lease_released` a release or a name the project
+  file no longer declares, so a restart keeps a held lease until it expires, and
+  expiry stays its bound. A cleared session or a rebind ends a line's leases as the
+  event log applies it. A change of a role's owner from one seat to another passes the
+  previous owner's leases to the new owner with the same times, as `ROLES.md` records
+  as decided. A start whose project file no longer declares a held lease's name now
+  ends it. **Rollback hazard.** A daemon older than this cannot read a log holding
+  `lease_acquired` or `lease_released`.
+- Mute is renamed hibernate, at the operator's direction of 2026-10-27. The commands
+  are `dromon hibernate LINE` and `dromon awaken LINE`, the client operations
+  `hibernate` and `awaken`, the field and condition `hibernated`, the `role status`
+  mark `hibernated`, the `request_handoff` result `owner_hibernated`, and the events
+  `line_hibernated` and `line_awakened`. Event logs that already hold `line_muted` and
+  `line_unmuted` still replay, since the codec decodes those as the new kinds, and new
+  events are written only under the new names. `dromon mute` and `dromon unmute`, and
+  the operations `mute` and `unmute`, are removed without aliases, since no release
+  carried them.
+- A line's relative `instructions` paths resolve against the project root, not the
+  line's `workdir`, so a line moved to a worktree still reads the project's files. The
+  engine receives the absolute path, which the composed instructions now name.
+- `pykeleusma` is pinned to its first PyPI release, `0.2.2.0`, in place of commit
+  `19d4558` of its repository. Every call Dromon makes is unchanged, and the packaged
+  drivers run as before. The release has wheels for Python 3.12 or later on Linux,
+  macOS and Windows, so CI no longer installs a Rust toolchain, and the README no
+  longer asks for one. CI sets `UV_NO_BUILD_PACKAGE=pykeleusma`, so a wheel that
+  stopped matching fails the run instead of building from source unnoticed.
+- A compaction's `trigger` is only what the engine reported, with a `trigger_note`,
+  so a Codex compaction, which reports none, no longer shows a `manual` that Dromon
+  made up. A Codex compaction is reported as such even when Dromon had no earlier
+  estimate of its size. The context note for a call no longer uses Claude Code's
+  wording on Codex lines.
+
+- The gate runs pyright for Linux and for macOS, since pyright skips another
+  platform's branch, which let a Linux-only type error reach `main` in pull request 42.
+
+- The subscription drivers allow a development turn: 200 engine turns and 400 tool
+  calls for Opus, GPT-6-Luna and Grok, and 100 and 200 for Haiku. The API and flexible
+  drivers keep their small budgets.
+
+- pydromon is set up to develop itself with Dromon, as `docs/process/DOGFOOD.md`
+  records. pytest's collection now ignores `.dromon`, which a Codex line's profile
+  denies outright, so a line can run the gate in the project it works on.
+
+- Synced with `sgeos/project-template` a second time. The repository gains
+  `CODE_OF_CONDUCT.md`, linked from the README, `CONTRIBUTING.md` and `llms.txt`,
+  `.github/CODEOWNERS`, `.github/release.yml`, an issue template `config.yml` that
+  routes security reports to private advisories, `docs/decisions/TEMPLATE.md`,
+  `scripts/worktree.sh` and an opt-in `scripts/hooks/pre-push`. `scripts/check.sh` takes
+  the template's hygiene checks, which add Markdown link, text, size and executable
+  checks, require shellcheck, and scan for the terms in an untracked
+  `secret/disclosure-terms.txt`, and it takes `--hygiene-only`. CI grants no permissions
+  by default, installs shellcheck on macOS where missing, and lints its workflows with
+  actionlint and zizmor. Dependabot groups action updates weekly. Commit messages no
+  longer carry a `Co-Authored-By` trailer, on the operator's instruction.
+
+- CI groups concurrent runs by the pull request's ref and otherwise by run, as the
+  Keleusma repository does, so a second merge to `main` no longer cancels the first
+  merge's run. The test matrix runs at most two jobs at once, and Linux jobs require
+  shellcheck on `scripts/`.
+- Questions no longer block. The `blocking` field leaves `message_sent`, notices and the
+  `ask_operator` tool. After asking, a line ends its turn or keeps working, as it
+  decides, and the answer arrives as mail.
+  Dromon's tools now reject arguments outside their schema.
+- The scheduler is a game loop. Each tick updates every line once and skips a busy one,
+  turns run without the tick waiting for them, and mail sent during a tick moves from
+  the sent queue to the post office at its end. `dromond` gains `--tick-seconds`.
+- The scheduler is tick based. A message sent in one turn is received no sooner than
+  the next tick, even by an idle line, and messages never interrupt a turn. `status`
+  reports the tick.
+- Driver documentation no longer claims that Keleusma resets private data. It persists
+  once assigned, as the `pykeleusma` line pointed out and this line confirmed.
+- `line_created` gains a `strategy` field naming the line's driver strategy.
+- The build backend requirement moves to `uv_build` 0.13, matching the installed uv.
+- `docs/protocol/RELAY.md` requires every relay adapter to support a response path and
+  states the properties its deferred design must have.
+- Operators are no longer a singleton. Each operator is a party with an address such as
+  `@ana`, registered by a new `operator_registered` event. An operator question is a
+  `message_sent` of kind question from a line to one operator, and the answer is that
+  operator's reply, which must reverse the question's route. `question_asked`,
+  `question_answered` and the wake cause field are removed, and messages gain `kind`,
+  `choices`, `blocking` and `reply_to`. The draft format version stays 1.
+- `docs/architecture/KELEUSMA_INTEGRATION.md` records the `pykeleusma` line's answers to
+  the four questions, the binding's current task status, and the tagged-tuple
+  constraints it reported. One-element tuples in the examples became two-element ones.
+- `CLAUDE.md` states that dates in tracked files are in Coordinated Universal Time.
+- The design records two operator decisions. The protocol specification is drafted in
+  this repository, and the first adapter targets Claude Opus 5.5.
+- The design records what Anthropic's terms allow for subscription sign-in, the open
+  choice of the first adapter that follows from it, and that standard harness features
+  such as compaction land with the task that first needs them.
+- `docs/process/HANDOFF.md` names the interline line `pydromon` as this line's mailbox.
+- Roadmap task 1 is done. The seed was checked against Appendix B and nothing conflicts.
+
+### Fixed
+
+- Review of 60fcdd3. Fixed public stop notices no longer consult the disclosure list,
+  so their display cannot reveal whether the list matches a known sentence. They
+  still contain no engine text and consume no line disclosure allowance. The engine
+  documents now state that Dromon trusts the runtime's own `_meta.toolNotRun`
+  assertion that a rejected call did not run.
+
+- Review of 7eda348. Grok and Antigravity continue after a rejected call is reported
+  only when the update explicitly asserts non-execution through `_meta.toolNotRun`
+  equal to Boolean `true`, without contradictory execution status. Pending and
+  failed status alone now stop the turn. Stop notes use a closed Dromon vocabulary
+  and discard engine labels and error text, including when reading older notes.
+  Harness screening of those fixed notes leaves the line's hourly disclosure
+  allowance untouched. Line-originated checks retain their existing allowance.
+
+- Grok and Antigravity reject ordinary tool permission requests without cancelling
+  the turn when a rejection option is available. Identity changes, reused permission
+  identifiers, execution without approval, missing options and driver budgets still
+  stop it. Budgets are checked before granting a new call. Engine refusals and driver
+  interruptions leave a bounded, disclosure-filtered cause in the next prompt through
+  a durable harness note that does not wake the line. Agent Client Protocol version 1
+  defines no custom reason field, so a model-visible explanation for a selected
+  rejection remains runtime-dependent and unverified live.
+
+- `dromon restart` waits for its successor until a deadline, and each status request
+  waits no longer than what remains of it. Each poll waited out a whole request
+  timeout before, so a daemon that accepted and never answered could hold the client
+  for hours, as the review of 7ff033f found. A hang now costs at most the drain wait,
+  plus 70 seconds for the shutdown and startup bounds, plus one poll.
+- ACP adapters now cancel and refuse a turn when the runtime omits the permission
+  option needed for Dromon's intended decision. The refusal names the tool, whether
+  Dromon intended to allow or refuse it, and bounded evidence of the offered option
+  kinds and identifiers. An `allow_always` option never substitutes for `allow_once`.
+- Grok's `get_command_or_subagent_output` may carry the kind `other`, which a live turn
+  on 2026-10-31 showed, and so may `kill_command_or_subagent`, which shares its Grok
+  category. Both still need `Bash`.
+- Claude Code now records the positive percentage remaining in a documented,
+  non-rejected rate-limit window, with its reset time when supplied. It retains each
+  named window and shows the lowest remaining percentage among unexpired windows. A
+  positive snapshot cannot replace a recorded zero before its reset. Handoff requests
+  are recorded once per crossing below the role threshold and re-armed only above it.
+  A daemon predating round 11 cannot read the log after a `budget_handoff_requested`
+  event is recorded.
+  Percentage conversion is exact and rounds toward less remaining. Grok Build's
+  documented rate-limit classes are emitted to its `StopFailure` hook, but Dromon's
+  Agent Client Protocol adapter cannot read that hook event or a documented reset
+  field, so it classifies no new Grok quota errors. `GROK.md` records the available
+  budget evidence for every engine and the evidence limits. `ROLES.md` and `ENGINES.md`
+  describe the per-window snapshot and the fields retained in scrubbed recordings.
+- Supervised runs, review of 2026-10-31. Reading a run's output opens it without
+  blocking and reads only a regular file, so a named pipe a line puts there cannot
+  stall reconciliation on the process worker, R1. A seat that owns its role needs
+  write access to its working directory to start or stop a run, as any other line
+  does, R3. A run whose supervisor cannot be told to start is recorded as `stopped`
+  with no exit code and the caller is told nothing started, R6. The supervisor signals
+  its command's group only from the thread that waits for it, between polls that
+  found the command unreaped, so a late `SIGKILL` can no longer reach a reused group
+  identifier, R7. A `ps` that exits with status 1 and a complaint is a failure to
+  read the table, not an absent process. `ROLES.md` states that a change of owner
+  passes every lease of the former owner, including one not taken for the role, R4,
+  and `RUNS.md` states the window between checking and signalling a supervisor, R5.
+- `write_scratch` refuses targets covered by project `read_only_paths` in the
+  scratch directory it actually uses, including a seat's `tmp/lines/LINE`. Codex keeps
+  read-only parent entries while denying protected descendants and makes read-only
+  entries under `tmp/` explicit. `dromon wait` reports replies left out by the response
+  size bound. Documentation states that worker joins are bounded and that engine
+  enforcement after parent renames or newly created symbolic links is unverified.
+- The process-inspection and launch-record-sweep workers now stop when their scheduler
+  or daemon stops. Shutdown rejects new inspections, drops queued calls, and joins each
+  worker for at most one second. A process-table read already in progress cannot be
+  interrupted and may outlive that bound, after which its worker exits. This also
+  closes workers when startup validation refuses a daemon before its service loop.
+- A line can be created on, or rebound to, the packaged Pi model. The log checked a
+  line's model as an identifier, which refuses the colon and slash of the
+  engine-qualified names of Pi, Cursor Agent and Antigravity, so no Pi line could be
+  created. The `engine` field of `line_created` and `line_rebound` is now a model
+  name, an identifier or one with a colon and the harness's own identifier, as
+  [`EVENT_LOG.md`](docs/protocol/EVENT_LOG.md) gives it. Every other field stays an
+  identifier. Cursor Agent and Antigravity lines are still refused by their adapters,
+  which allow them only in `dromon probe`, and their names no longer stand in the way
+  once that refusal is lifted. **Rollback hazard.** A daemon before this change
+  refuses a log holding such a line as corrupt.
+- A Codex line's turn is refused when any directory of its own scratch, `tmp`,
+  `tmp/lines` or `tmp/lines/LINE`, is a symbolic link or not a directory, checked
+  by `lstat` each turn before its permission profile is built, so the owner of a
+  role's worktree cannot redirect a read seat's grant into its own scratch. Review
+  of ebedeed, R1.
+- A Codex line with write access, no `Edit` or `Write` and a shell is granted its
+  own scratch, where `write_scratch` writes for it, as a read line is. Review of
+  ebedeed, G3.
+- A line that does not write its working directory, a seat that does not own its
+  role among them, has a scratch of its own, `tmp/lines/LINE`, for `write_scratch`
+  and for the Codex read profile, which granted the whole of `tmp/` before. Either
+  let a read-only seat, or a line with no writing tool, write a file of the owner's
+  scratch, which stays `tmp/`. The tool's description says where each scratch is.
+  Round 10 re-review, N1 and N2. **Behaviour change.** A line that is no role's seat
+  and has no writing tool now writes under `tmp/lines/LINE` too, so its reports move
+  there.
+- A seat on an engine that cannot confine it, such as Grok, whose turn began while
+  its role was vacant, no longer runs on beside a seat that then takes the role or is
+  given it. The new owner's first turn waits for that turn, and for the seat's kept
+  connection to close. Round 10 re-review, N3.
+- A role's worktree inside another role's, or holding it, is refused as a shared one
+  is, by `dromon role create` and `update` and in the project file, and a line that
+  could write a directory inside an owned worktree, or one holding it, is refused or
+  held as one in the worktree is. Round 10 re-review, N4. **Rollout hazard.** A
+  project file with a role on the project root and another below it, or with a
+  writing line on the root beside an owned role below it, is now refused whole at a
+  start or a reload.
+- Bound issue volume per line, ran different operators' relays concurrently while
+  preserving each operator's notice order, and restricted file relays to protected
+  state/runtime directories. File relay FIFO opens are nonblocking. Command relay
+  success now follows the command's exit status even when a child holds standard error
+  open. A child that starts a new session can still escape timeout process-group kills.
+
+- A seat that does not own its role is built with its role's worktree read only on
+  Claude Code and Codex, the engines that can confine it. The confining engines were
+  derived from the capability table, but the step that applies a seat's read access
+  to its engine was never added, so such a seat ran with its own access, write by
+  default, beside the owner. A seat whose configuration Claude Code cannot make read
+  only now fails its turn as the engine is built and is held. Round 10 review, F7.
+- The one-writer rule holds on every path, at the operator's decision of 2026-10-31.
+  A seat with a turn in flight is never unbound, hibernated or not, by `dromon role
+  update` or `delete`, for an owned or a vacant role. A writer seat of an owned role is
+  not unbound while it could write the worktree, hibernated or not. An owning seat is
+  never configured out of its role's worktree, and a seat that runs elsewhere does not
+  gain its role by a give, a take, a handoff or a failover. A line that is not a seat
+  of a role is refused, by `dromon create`, `configure`, `set`, `rebind` and the
+  project file, where it could write the worktree of a role another seat owns, and one
+  a log left there before the rule waits, and is named by `dromon role status`. Two
+  roles never share a worktree, compared by real path, at `dromon role create` and
+  `update` and in the project file, which is refused whole at a start or a reload
+  naming both roles. Round 10 review, F1 to F4.
+- A role that returns to the project file is given the file's first owner in the same
+  pass, rather than at the next start or reload. Round 10 review, F5.
+- `dromon role status`, `roles` and a seat's `role_status` show whether the project
+  file declares a role, each way its table differs from a role an operator holds, and
+  the lines that wait beside the owner. Round 10 review, F6.
+- Refused Codex items count toward the driver's tool budget whether first announced by
+  `item/started` or `item/completed`. Matching item identifiers are counted once
+  regardless of notice order. A refusal announced by neither notice remains invisible.
+- A launcher retries a timed-out process-table walk until its 0.75-second deadline.
+  If the table still cannot be read while stopping under `kill_all`, it reports the
+  stop as unverified and exits unsuccessfully after ending the harness's group. It
+  waits 0.25 seconds after `SIGKILL` and reports unverified if a process remains.
+  Process-table inspections and detached-process scans share a worker with a bounded
+  queue of eight calls. Launch-record sweeps use a separate worker with its own bounded
+  queue. Detached-process scan results contain only process identifiers and command
+  strings. Retiring an engine calls `Driver.close` on the owning thread, though a virtual
+  machine not closed before it becomes cyclic garbage may still be finalized on any
+  thread.
+- Process-table failures use a typed error, and only an explicit timeout triggers the
+  launcher's retry. A queued process call cancelled by its caller is skipped, though
+  a call already running cannot be cancelled.
+- Launcher tests start the source module from this checkout explicitly. Tests that need
+  a real `ps` table are marked to skip when `ps` cannot run instead of branching their
+  expected exit status on a probe result.
+
+- Grok's `list_dir` may carry the kind `other`, which Grok gives it, as a live turn of
+  58 tool calls on 2026-10-31 showed. That turn also confirmed the observed kinds of
+  `read_file`, `grep`, `run_terminal_command`, `search_tool` and `use_tool`.
+- A refused Grok `use_tool` call says why, and a file-backed one says to pass its arguments
+  inline, so the line can correct itself.
+- Grok tool calls are judged by the name Grok gives them in `_meta["x.ai/tool"]`.
+  Grok's first announcement of a call has no `kind` and no `toolName`, so every Grok
+  tool call was refused, including `search_tool`, and a later update that rewrites the
+  title would have refused the turn. A call so named is identified by that name, and
+  Grok's built-ins map to the line's tools by a table in `GROK.md`.
+- Grok sessions now set the model to the exact identifier in the driver's settings
+  when `session/new` or `session/load` reports another model. Dromon requires a model
+  config option, requires the `models` field and model option to agree when both are
+  reported, and checks the complete updated option list with the driver before
+  prompting. Conflicting or unreadable model reports refuse the turn. A successful
+  pin supersedes a mismatching notice held before its response, while a later mismatch
+  refuses the turn. Tests cover new and resumed sessions, successful selection,
+  refusal, conflicting model reports and a post-pin model notice.
+- A Claude Code line reads engine messages of up to `MAX_MESSAGE_CHARACTERS`, 32 MiB of
+  characters, which Dromon now passes to the Agent SDK as its buffer size in place of
+  its default of 1 MiB. A turn whose engine still sends a longer message ends with a
+  refusal that names the limit and a tool result carrying a large file, such as an
+  Edit, a Write or a Read, as the likely cause, where it said only that the engine's
+  process ended. Claude Code 2.1.310 was read to put an Edit's whole original file in
+  its stream message, however small the edit. The bound, its memory cost and that
+  reading are in `docs/protocol/ENGINES.md`. Reported by another project, whose line
+  ended its turn on an Edit of a 2.5 MB file.
+- A line given `fresh_session_each_turn` by a reload or `dromon configure` has its
+  recorded session cleared at once, so `dromon settings` stops showing the old
+  session as soon as the change applies. A turn in flight at that change, or at a
+  change of `workdir`, records neither its session, its context estimate, a compaction
+  nor a compaction wake when it ends, since they belong to the session the line no
+  longer resumes. Required by the operator in the round 9 review, F1. Every cleared or
+  rebound session also forgets the daemon's context estimate of the old session, with
+  the compaction and the context-warning wake it would start. The first turn after
+  such a reload had warned of the old session's context, which the line took to mean
+  the old session had resumed, though its engine was built with none to resume.
+  Reported by another project in round 9.
+- `dromon config` warns about a shared working directory only for lines that can
+  write it, as each engine confines them. A line needs `workdir_access` `write`, and
+  on Claude Code a shell or file-write built-in or a policy allowing every tool, on
+  Codex and Grok Build `Edit` or `Write`, whatever its policy, while a Pi, Cursor
+  Agent or Antigravity line with write access always counts. Read-only lines and lines
+  whose only tools come from MCP servers had been named as writers. Reported by
+  another project in round 9, and the engines' rules required by the operator in its
+  review, F16 and F17.
+- The daemon is stale in `line_status` only when its own checkout holds code under
+  its package directory other than the code it loaded, so a commit of documents no
+  longer warns, and the warning clears once the checkout returns to that code. Git
+  compares the trees only for commits not compared before, and caches the answer by
+  commit. The stale note names the daemon's own checkout, not the line's worktree.
+  Where the code cannot be compared, any move of `HEAD` is stale, as before.
+  Reported by another project in round 9. Git runs on a worker thread, never on the
+  daemon's event loop, so a status or a prompt never waits on it, and an answer git
+  could not give, a timeout, a git that could not start or an error status, is kept
+  for 60 seconds and then asked again. Required by the operator in the round 9
+  review, F4 and F6.
+- An attached client whose daemon is gone detaches by itself once 5 polls in a row
+  have found nothing listening, over at least 10 seconds with the socket file missing
+  or 60 seconds of refused connections, prints why, and exits with 4. A refusal waits
+  the longer bound because a live daemon with a full backlog may refuse connections
+  on Darwin, as the operator required in the round 9 review, F14. A slow daemon, or
+  one that refuses a request, never counts. The terminal loop waits out its input
+  timeout when curses returns at once, as it does once the terminal is gone. One
+  client had polled a deleted project for days at full processor use. Reported by
+  another project in round 9.
+- `test_a_stop_under_kill_all_also_ends_a_child_that_left_the_group` and every other
+  launcher test that waits for a process to go poll to a monotonic deadline derived
+  from the launcher's own bounds, and a `ps` that times out under load counts as not
+  yet gone rather than failing the test. One run failed at a load average of 189.
+- Grok refuses a reused tool call identifier, including a repeated permission request,
+  so the same identifier cannot obtain multiple grants while counting once. Tests also
+  cover raw input changes in updates, non-`other` discovery calls, and a non-marker
+  `.claude` directory. The Codex dangling-credential overlap test now isolates the
+  `.cargo` guard it is intended to cover. The normal ACP order of announcement,
+  permission request and updates is accepted and counted once, as is a permission
+  request that arrives before the announcement.
+- Grok lines may use `search_tool` for discovery and `use_tool` for a qualified tool
+  served by that line's Dromon MCP server. Dromon checks the documented inline input
+  shape, refuses file-backed or ambiguous targets, keeps the target fixed through the
+  permission request, and counts the underlying Dromon tool against its budget. The
+  ACP call shape remains unverified pending a first live line turn. Grok project checks
+  allow only a real, empty `.claude/.cc-writes` marker and refuse other contents. The
+  local guides do not establish whether Grok creates `.grok` in its isolated home, so
+  no allowance was added for that path.
+- Grok refusal advice for an existing sandbox profile now lists only missing deny and
+  read-only entries. Tests check that an existing credential is omitted while a
+  missing one is named. Codex writable-path validation also has a test that refuses a
+  home-directory grant when `.netrc` is a dangling symbolic link. The Grok `.grok`
+  marker remains unresolved pending a live Dromon turn, and the Codex probe conclusion
+  is labeled as an inference.
+- Codex and Grok profiles now share the operator credential path list and require
+  existing project and workdir `secret` directories to be denied by real absolute
+  path. Codex adds validated operator-granted `writable_paths` for existing absolute
+  directories, only when the line has `Edit` or `Write`, and refuses grants that
+  overlap credentials or other protected paths. A Codex probe signed in with
+  `~/.codex/auth.json` denied, and that path is now denied by the profile. The operator
+  will verify that a live line command cannot read it.
+  Claude Code's existing `network.allowLocalBinding` setting is documented with a
+  line configuration example. Grok symlink writes outside the workdir remain
+  unverified, and no external writable path grant was added.
+- The shared credential list now includes additional common stores. It is explicitly
+  incomplete, and each engine exempts only its own sign-in path. A dangling link at a
+  listed home path is denied by its absolute path. Protocol documents describe the
+  probe result and the remaining unverified Codex path behavior, and correct when and
+  where `writable_paths` are validated. Negative tests cover unsupported engines,
+  missing write tools, Git overlap, links to protected paths, dangling credentials and
+  a credential created between Codex turns.
+- Grok home checks now allow an empty regular `hooks-paths` file and an
+  `installed-plugins` directory containing only empty regular `*.lock` files, while
+  refusing symbolic links and any other contents. Grok writer profiles hold the
+  actual Git directories read-only and deny credential paths that exist under the
+  daemon's real home when each check runs. A new profile includes only paths present
+  when it is written, and the next turn refuses a credential created later. Refusal
+  advice for an existing profile names values to add while preserving every other
+  table and entry. `docs/protocol/GROK.md` records the observed and inferred behavior,
+  including the pointer files that remain unguarded between turns.
+- A line's own notes, such as fired wakes and task-end notes, leave the `own_notes`
+  count once a turn of the line has ended after their delivery, whatever the turn's
+  outcome, as well as once they are read, acknowledged or replied to. The count had
+  grown with every note a line left alone after its work was done, and a worker line
+  in another project counted 62. The rule is read from the event log alone, so it
+  holds across a restart, and the wake prompt, `line_status`, `list_mail` and the
+  client's views share it. A task note recorded during a running turn counts until
+  that turn ends, and a note delivered between turns without a wake counts until the
+  next turn ends. A prompt still marks nothing read, and mail from any other sender
+  is unchanged. Required by the operator on 2026-10-30 in round 8. A turn whose
+  engine returned no report, as when its prompt could not be composed, retires no
+  note, since its prompt may never have reached the engine, and records
+  `line_turn_ended` with the new optional field `unreported`, which a daemon that
+  predates it cannot read, so a rollback after such a turn cannot load the log. The
+  prompt and the counts line of `list_mail` now say that a note past the count is
+  still listed by `list_mail` without a filter. Required by the operator in the round
+  8 review.
+- Wake prompts now state the operator at turn start that `ask_operator` will use when
+  `to` is omitted, and explain that a new operator message during the turn changes
+  that default.
+- Role ownership notices are now suppressed across daemon restarts after the notified
+  seat ends a turn that started after the change. Replay reconstructs each seat's
+  turn starts and ends since the latest ownership change. A turn already running at
+  the change no longer suppresses the notice, and a later ownership change starts a
+  new notice for both affected seats.
+- One context warning now gives one compaction wake. No context-warning wake is
+  queued while the line's turn runs or a compaction decided for it is under way, any
+  reported compaction withdraws a pending one whatever its size, and one that falls
+  due under the automatic hold is withdrawn. The engines line received a second wake,
+  queued one second into the first wake's turn, which fired after it. The wake's note
+  now says why it was scheduled, with the estimated tokens, the warning and the
+  source of the estimate. Required by the operator on 2026-10-30. After review, no
+  context-warning wake is queued while another wake is pending or mail waits for the
+  line, and the line is no longer marked as woken for one it did not get, so a wait
+  for a background task that ends without a turn no longer suppresses the wake, nor
+  does a wake of the line's own that replaced it and then ended without a turn. A
+  compaction reported after the wake fired delivers its note without a turn of its
+  own, as the engines line's log showed one. A restarted daemon takes a pending wake
+  with the context note as the warning's, so a later compaction withdraws it.
+- A `wake_after` bound to a running background task now acts as a wait. The line can
+  end its turn and be woken by that task even after reaching the ordinary task-note
+  limit, and the task note names the cancelled wake. If the task outlives the timeout, the
+  scheduled wake fires. The tool descriptions explain how to use the wait.
+- Claude Code and Codex lines granted a shell tool now require the daemon's `SHELL` to
+  name an absolute executable. Claude Code additionally requires Bash or Zsh and
+  receives the validated path as both `SHELL` and `CLAUDE_CODE_SHELL`, and the launcher
+  drops inherited shell values from lines without shell tools. Codex supports Bash as
+  its only shell tool and receives `SHELL` in its app-server and shell command
+  environments. `line_status` reports the line adapter's selected path or validation
+  reason. **Reported on 2026-10-29** by a worker line in another project whose shell
+  changed from bash to zsh between turns. `check_disclosure` now explains where the
+  project configures a list and that a check cannot resolve without one.
+- A silent-turn reminder no longer says that the line sent no mail when it mailed
+  another party in a turn its engine started by itself after a task ended. The saved
+  state keeps the count of mail the line had sent to anyone but itself, and the
+  reminder is dropped once that count has grown. It now opens "A turn of yours ended
+  with" rather than speaking of the last turn. It is still given when every task it
+  names has ended, with a closing sentence on how the work ended, which is decided
+  for review. Reported by the core line on 2026-10-30.
+- A silent-turn reminder no longer repeats a saved background-task count as if it
+  were current. Dromon checks the same task identifiers against the live kept-session
+  listing and later task records, and reports unknown when it cannot verify an end.
+  `line_status` exposes the engine's `background_tasks_unknown` flag.
+- A client request that times out now says that the daemon may still have carried it
+  out, and `dromon send` points to `dromon sent` before a retry. **Found on
+  2026-10-29,** when a send timed out at the client while the daemon was busy and the
+  message had in fact been recorded, so a retry would have sent it twice.
+- The role transition package now marks where each item came from, observed by the
+  daemon, reported by a line, unknown, or unreadable by the daemon, each with its time.
+  A field the journal entry lacks is taken from the former owner's standing brief, so
+  a failover, which writes no handoff note, no longer leaves every field missing. A
+  path git could not read is named as unreadable, never as absent or untracked, and
+  the former owner's process state is said to be unknown where the platform cannot
+  identify a line's processes. Found in the live failover of 2026-10-28.
+- A hung test now ends the run after 300 seconds with the traceback of every thread,
+  through pytest's `faulthandler_timeout`, instead of running out the job's 30 minute
+  timeout in silence, as one macOS job did on 2026-10-28.
+- A Pi test failed in two gates of one session with a Keleusma virtual machine
+  dropped on another thread, and passed alone. **Inference.** A driver another test
+  left open was finalized by the cycle collector on asyncio's child-watcher thread.
+  The tests now turn automatic collection off and collect on the main thread every 25
+  tests, so a leak is finalized on the thread that made it. The original failure was
+  not reproduced, so the fix is not yet confirmed.
+- Two engine deadline tests gave their fakes ten milliseconds to reach a stage, so a
+  loaded host could fail them naming an earlier stage. The Antigravity first-output
+  test and the Grok start test now allow half a second.
+- The Grok sliding deadline test kept its limits a few tens of milliseconds apart, so a
+  loaded host could fire the inactivity deadline where the absolute cap was meant to.
+  Each limit is now far from the other and from the chunk delay, and the active turn
+  still outlasts the sliding deadline, so the test still proves that activity resets
+  it. Found by the core role's gate on 2026-10-28.
+- `dromon config` now names the disclosure list the project file gives, or says that
+  it gives none, in which case no line's mail or report is checked. It refuses a list
+  it cannot read, as the daemon does. The terms are never shown. Found by the round 3
+  reports, when `check_disclosure` refused in the team's own project for want of a
+  list.
+
+- `dromon config` no longer warns that the seats of one role share a workdir, which
+  they do by design, since only the role's owner writes there. A writing line outside
+  the role in the same workdir is still warned about. Found by the operator on
+  2026-10-28.
+- A read-only Claude Code line could leave its sandbox. A sandbox layer that set
+  `allowUnsandboxedCommands` true or `failIfUnavailable` false let a shell command run
+  outside the Seatbelt sandbox that denies writes to the working directory. The read
+  sandbox now sets both keys itself, after every other layer, and a line whose project
+  or own sandbox sets either the other way, or sets `excludedCommands` or
+  `filesystem.disabled`, is refused. Each refusal of a read-only Claude line now has a
+  test. Found by the review of read-only seats, findings 1 and 2.
+- Grok's `read_only_workdir` capability is unknown rather than yes, since no live run
+  has shown its reader profile deny a write. Review of read-only seats, finding 3. A
+  Grok line with `workdir_access: read` is now refused until that capability is
+  known, since the reader profile rests on Grok's built-in `read-only` base, which
+  Dromon cannot inspect. Second round, findings 1 and 2.
+- A Grok turn is refused when Grok loads any MCP server but Dromon's, which the
+  operator's first live probe of 2026-10-27 showed it does from the user's own
+  configuration, and when Grok does not list its servers. Grok's own notices for its
+  servers, models and settings are read, and one that shows another server, another
+  model or a mode that does not ask refuses the turn. A permission mode reported as a
+  `configOptions` entry of the category `mode` is accepted. Grok's scans of Claude
+  Code's and Cursor's MCP and hook files are turned off.
+- `dromon probe --scrub` also replaces MCP server names, addresses, commands and
+  arguments, slash command and skill names with their descriptions, host names,
+  agent ids and a subscription tier, so a scrubbed Grok recording holds none of the
+  operator's configuration.
+- A malformed time in a role or budget event named the field `due`, and now names
+  its own field, such as `resets_at`.
+- `dromon send` prints the message identifier alone again. Since priority mail it had
+  printed every key of the result, so a plain note ended with `priority False`. It now
+  adds `priority mail` on a second line only when the note is priority mail. Found by
+  the operator on 2026-10-27.
+- The client protocol carries no floats, and the daemon sent two. `dromon status`
+  failed once the daemon had run for a minute, because `events_per_hour` was a
+  fraction, and `dromon restart` failed at once, because its `--wait-seconds` went out
+  as a float. Both are whole numbers now, and `--wait-seconds` takes whole seconds. The
+  encoder refuses a float wherever it appears and names its path, the daemon answers a
+  response it cannot encode with an internal error under the request's identifier, and
+  a request refused for holding a float is answered under its own identifier. Found by
+  the operator's live check of 2026-10-27.
+- The safe point of priority mail, and so of `dromon restart --interrupt`, moved to
+  the moment after a tool result is delivered and before the next model call, once
+  every tool use of the turn has its result, or the end of an assistant message that
+  holds no tool use, by the operator's decision of 2026-10-27 after a review. It was a
+  text or thinking event, which can share a message with a tool use after it. Each
+  adapter feeds the new driver events `tool_result` and Pi also `message_end`, which
+  the packaged drivers answer with `continue`.
+- `recent_turns` gives `interrupted_for`, so a turn ended for priority mail or a
+  restart says so beside an engine subtype such as `error_during_execution`.
+- Claude Code's `thinking_tokens` system message, a progress estimate while the model
+  thinks, is handled and no longer reported as unknown.
