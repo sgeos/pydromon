@@ -163,6 +163,23 @@ Dromon.** `Read` returns an image to the model, so `ViewImage` needs nothing bey
 offering `Read` and gating it. `claude_tools` maps the name, and the init check accepts
 `Read` for a line with `ViewImage`. The verify-first steps are below.
 
+**Verified live, 2026-11-01, with a defect found.** **Fact, the operator's run.** On
+Claude Code `Read` delivers a png through the Agent SDK, a view-only line viewed a word
+in a small png, and a Codex line on gpt-6.1-terra did the same, while a Codex line
+without `ViewImage` had no image tool. The same Claude Code line also read a renamed
+text file and a 6,000,287 byte png, which the rule refuses when called directly.
+**Inference.** The engine allows a `Read` inside its working directory without calling
+the permission callback, so the rule did not run. Round 14, item 5, applies the rule in
+a `PreToolUse` hook, which the engine runs before every tool, and
+[`LINE_CONFIG.md`](LINE_CONFIG.md) records the defect, the fix and what is left to
+verify. The Codex check stays after the fact, as the table above says. **Review of
+a9995d8, item 1.** The hook fails closed, an ask rule for `Read` sends every `Read` to
+the gate, a `Read` that completed with no hook call ends the turn and holds the line, and
+a managed policy that sets `disableAllHooks` or `allowManagedHooksOnly` refuses a
+view-only line where Dromon can read it. Whether the engine runs the hook for an
+in-directory `Read`, and whether an ask rule outranks its allowance, are still to be
+shown live, and the missing-hook check is what notices if they are not.
+
 **Verify first.** The operator runs these once per engine before relying on the
 capability, and the Codex and Grok steps are in [`CODEX.md`](CODEX.md) and
 [`GROK.md`](GROK.md). For Claude Code, create a line in a scratch project with

@@ -3,8 +3,10 @@
 
 import asyncio
 import json
+import os
 import signal
 import subprocess
+import sys
 import threading
 from collections.abc import Generator, Sequence
 from pathlib import Path
@@ -19,6 +21,14 @@ from dromon.engine import ClaudeCodeLine
 from dromon.eventlog import EventLog
 from dromon.processes import (
     MARK_VARIABLE,
+    PS_FIELDS,
+    PS_START_FIELDS,
+    deepest_first,
+    identity_of,
+    parse_tree,
+    signal_if_same,
+    TreeRow,
+    attached,
     MAX_COMMAND_CHARACTERS,
     ProcessInfo,
     ProcessRefused,
@@ -879,6 +889,183 @@ def test_where_processes_can_be_identified_line_status_says_so(
         "stop_unverified": None,
         "walk_limit": None,
     }
+
+
+def test_attached_leaves_out_the_ps_that_listed_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 15. The ``ps`` that reads the table is a child of the caller and lists
+    itself, so a walk from the caller would count it as a descendant outside any
+    group and signal a process that is gone. Its own listing is left out, and only
+    that one, so a ``ps`` of some other command stays."""
+    me = os.getpid()
+    rows = [
+        TreeRow(me, 1, me, "daemon"),
+        TreeRow(900, me, me, f"ps -ww -U 501 -o {PS_FIELDS}"),
+        TreeRow(901, me, 901, "sleep 60"),
+        TreeRow(902, 901, 902, "ps aux"),
+        TreeRow(903, 901, 903, f"ps -ww -U 501 -o {PS_FIELDS}"),
+        TreeRow(904, me, me, f"ps -ww -U 501 -o {PS_START_FIELDS}"),
+    ]
+
+    def table(
+        uid: int, timeout: float = 1.0, with_start: bool = False
+    ) -> list[TreeRow] | None:
+        return rows
+
+    monkeypatch.setattr(processes, "read_tree", table)
+    from_me = attached(me)
+    from_child = attached(901)
+    assert from_me is not None and from_child is not None
+    assert [row.pid for row in from_me] == [901, 902, 903]
+    assert [row.pid for row in from_child] == [902, 903]
+
+
+STARTED = "Sat Nov 1 07:23:05 2026"
+
+
+def test_a_listing_with_start_times_is_parsed_with_its_five_words() -> None:
+    output = (
+        "  101     1   101 Sat Nov  1 07:23:05 2026 /usr/bin/python3 -c  x  y\n"
+        "  102   101   101 Sun Nov  2 00:00:01 2026 sleep 60\n"
+        "  103   102   103 Mon Nov  3 00:00:01 2026\n"
+        "short\n"
+        "  abc     1   101 Sat Nov  1 07:23:05 2026 bad\n"
+    )
+    assert parse_tree(output, with_start=True) == [
+        TreeRow(101, 1, 101, "/usr/bin/python3 -c  x  y", STARTED),
+        TreeRow(102, 101, 101, "sleep 60", "Sun Nov 2 00:00:01 2026"),
+        TreeRow(103, 102, 103, "", "Mon Nov 3 00:00:01 2026"),
+    ]
+    # Without the start time the same text is not read as a listing with it.
+    assert parse_tree("  101     1   101 /bin/sh -c x\n") == [
+        TreeRow(101, 1, 101, "/bin/sh -c x")
+    ]
+
+
+def test_a_signal_goes_only_to_a_process_with_the_identity_the_walk_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent: list[tuple[int, int]] = []
+
+    def kill(pid: int, number: int) -> None:
+        sent.append((pid, number))
+
+    monkeypatch.setattr(os, "kill", kill)
+    row = TreeRow(4321, 77, 4321, "sleep", STARTED)
+    assert signal_if_same(row, 15, lambda pid: (77, STARTED)) is True
+    assert sent == [(4321, 15)]
+    for now in (None, (78, STARTED), (77, "Sun Nov  2 00:00:00 2026")):
+        assert signal_if_same(row, 15, lambda pid, now=now: now) is False
+    # A row from a listing that did not ask for start times is never signalled, and
+    # the identity is not even read for it.
+    bare = TreeRow(4321, 77, 4321, "sleep")
+    assert signal_if_same(bare, 15, lambda pid: (77, "")) is False
+    assert sent == [(4321, 15)]
+
+
+def test_a_process_that_ended_before_the_signal_is_not_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def gone(pid: int, number: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(os, "kill", gone)
+    row = TreeRow(4321, 77, 4321, "sleep", STARTED)
+    assert signal_if_same(row, 9, lambda pid: (77, STARTED)) is False
+
+
+def test_the_default_identity_is_read_from_ps(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Done:
+        def __init__(self, stdout: str, returncode: int = 0) -> None:
+            self.stdout = stdout
+            self.returncode = returncode
+
+    answers = iter(
+        [
+            Done("   77 Sat Nov  1 07:23:05 2026\n"),
+            Done("", 1),
+            Done("   77 Sat Nov  1\n"),
+            Done("  xx Sat Nov  1 07:23:05 2026\n"),
+        ]
+    )
+    calls: list[list[str]] = []
+
+    def run(command: list[str], **options: object) -> Done:
+        calls.append(command)
+        env = options["env"]
+        assert isinstance(env, dict) and env["LC_ALL"] == "C"
+        return next(answers)
+
+    monkeypatch.setattr(processes.subprocess, "run", run)
+    assert identity_of(5) == (77, STARTED)
+    assert identity_of(5) is None
+    assert identity_of(5) is None
+    assert identity_of(5) is None
+    assert "ppid=,lstart=" in calls[0] and "5" in calls[0]
+
+
+def test_an_unreadable_identity_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(*arguments: object, **options: object) -> None:
+        raise OSError("no ps")
+
+    monkeypatch.setattr(processes.subprocess, "run", broken)
+    assert identity_of(5) is None
+
+
+def _ps_runs() -> bool:
+    try:
+        found = subprocess.run(  # noqa: S603
+            ["/bin/ps", "-o", "pid=", "-p", str(os.getpid())],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except OSError:
+        return False
+    return found.returncode == 0
+
+
+@pytest.mark.skipif(
+    not _ps_runs(), reason="ps cannot run here, as inside an agent sandbox"
+)
+def test_the_start_time_of_a_walk_is_the_one_the_identity_check_reads() -> None:
+    """With the real ``ps``. The two readings are of one process and must agree to the
+    character, or a real stop would turn every descendant away as changed. Only the
+    full gate, outside a sandbox, runs this."""
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        rows = attached(os.getpid())
+        assert rows is not None
+        row = next(found for found in rows if found.pid == child.pid)
+        assert row.started != "" and row.ppid == os.getpid()
+        assert identity_of(child.pid) == (os.getpid(), row.started)
+        assert signal_if_same(row, 0) is True
+    finally:
+        child.kill()
+        child.wait()
+    assert identity_of(child.pid) is None
+
+
+def test_deepest_first_puts_a_child_before_its_parent() -> None:
+    """Round 15, re-review. A parent that is signalled first can end and orphan its
+    child, whose parent check would then turn the signal away."""
+    grandchild = TreeRow(30, 20, 30, "c", STARTED)
+    child = TreeRow(20, 10, 10, "b", STARTED)
+    top = TreeRow(10, 1, 10, "a", STARTED)
+    other = TreeRow(15, 1, 15, "d", STARTED)
+    ordered = deepest_first([top, other, child, grandchild])
+    assert ordered.index(grandchild) < ordered.index(child) < ordered.index(top)
+    assert sorted(row.pid for row in ordered) == [10, 15, 20, 30]
+    assert deepest_first([]) == []
+
+
+def test_deepest_first_ends_on_a_cycle() -> None:
+    """Parents that form a loop cannot occur in a real table, and the depth is
+    bounded by the number of rows all the same."""
+    a = TreeRow(1000, 2000, 1000, "a", STARTED)
+    b = TreeRow(2000, 1000, 2000, "b", STARTED)
+    assert sorted(row.pid for row in deepest_first([a, b])) == [1000, 2000]
 
 
 def test_a_stop_does_not_wait_behind_a_kill_all_walk_check(

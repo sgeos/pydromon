@@ -2813,8 +2813,9 @@ async def serve(daemon: Daemon) -> None:
         # sockets open.
         with contextlib.suppress(Exception):
             await forwarding
-        # A relay command still running is killed with its process group, and its
-        # notice stays undelivered for the next start.
+        # A relay command still running is killed with its process group and the
+        # descendants a walk finds below it, and its notice stays undelivered for the
+        # next start.
         relaying.cancel()
         with contextlib.suppress(Exception, asyncio.CancelledError):
             await relaying

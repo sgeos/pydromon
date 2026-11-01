@@ -559,3 +559,57 @@ def test_a_writer_holding_or_inside_an_owned_worktree_is_refused() -> None:
     assert placement_refusal("gamma", writer, vacant) is None
     beside = LinePlace(OTHER, root / OTHER, True, None)
     assert placement_refusal("gamma", beside, places) is None
+
+
+# Round 14, item 2. The reports area.
+
+
+def test_the_owner_writes_the_reports_area_and_a_read_seat_is_refused(
+    world: World,
+) -> None:
+    declared = LineConfig(workdir=TREE, report_directory="tmp/reports")
+    world.scheduler.configure_line("alpha", declared)
+    world.scheduler.configure_line("beta", declared)
+    written = world.scheduler.write_scratch_file(
+        "alpha", "r14.md", "owner", area="reports"
+    )
+    assert written.relative == "tmp/reports/r14.md" and written.size == 5
+    target = world.root.resolve() / TREE / "tmp/reports/r14.md"
+    assert written.absolute == str(target) and target.read_text() == "owner"
+    # Default deny. A seat that does not own its role never writes the owner's files,
+    # so it has no reports area in the owner's worktree, though it declares one.
+    with pytest.raises(LineToolRefused, match="do not own your role's worktree"):
+        world.scheduler.write_scratch("beta", "r14.md", "seat", area="reports")
+    assert target.read_text() == "owner"
+    assert not world.scratch("beta").exists()
+    # It still has its own scratch.
+    assert world.scheduler.write_scratch("beta", "r14.md", "seat") == (
+        "tmp/lines/beta/r14.md"
+    )
+
+
+def test_the_reports_area_follows_ownership(world: World) -> None:
+    declared = LineConfig(workdir=TREE, report_directory="tmp/reports")
+    world.scheduler.configure_line("beta", declared)
+    world.scheduler.give_ownership(ANA, "core", "beta")
+    assert world.scheduler.write_scratch("beta", "x.md", "y", area="reports") == (
+        "tmp/reports/x.md"
+    )
+    world.scheduler.give_ownership(ANA, "core", "alpha")
+    with pytest.raises(LineToolRefused, match="do not own your role's worktree"):
+        world.scheduler.write_scratch("beta", "x.md", "z", area="reports")
+
+
+def test_read_only_paths_hold_in_the_reports_area(tmp_path: Path) -> None:
+    world = World(tmp_path / "project", read_only_paths=("tmp/reports/sealed",))
+    try:
+        world.scheduler.configure_line(
+            "alpha", LineConfig(workdir=TREE, report_directory="tmp/reports")
+        )
+        with pytest.raises(LineToolRefused, match="read_only_paths"):
+            world.scheduler.write_scratch(
+                "alpha", "sealed/r.md", "blocked", area="reports"
+            )
+        world.scheduler.write_scratch("alpha", "open/r.md", "ok", area="reports")
+    finally:
+        world.log.close()

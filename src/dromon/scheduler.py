@@ -116,7 +116,15 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, BinaryIO, Final, Protocol, cast, runtime_checkable
+from typing import (
+    Any,
+    BinaryIO,
+    Final,
+    NamedTuple,
+    Protocol,
+    cast,
+    runtime_checkable,
+)
 
 from claude_agent_sdk import SdkMcpTool
 
@@ -177,6 +185,7 @@ from dromon.engine import (
     BackgroundEnd,
     SelfStartedFinish,
     ClaudeCodeLine,
+    ConfinementBreach,
     EnginePlanLimit,
     EngineRefused,
     TurnReport,
@@ -271,6 +280,7 @@ from dromon.mailbox import (
 )
 from dromon.lineconfig import (
     DEFAULT_CONFIG,
+    REPORT_RESERVED,
     ConfigError,
     LineConfig,
     WorkdirAccess,
@@ -651,6 +661,43 @@ MIN_RATE_SECONDS: Final = 60
 """How recent an identical message must be for a new one to be marked a repeat."""
 
 MAX_SCRATCH_BYTES: Final = 256 * 1024
+UNKNOWN: Final = "unknown"
+"""What a status entry says where a fact is not known, in place of ``None``."""
+UNKNOWN_TURN_COST_USD: Final = 0.0
+UNKNOWN_COST_RULE: Final = (
+    "A turn that reported no cost, or ended without a report, is counted apart in"
+    " unknown_turns and adds nothing to the estimate, so it counts as 0 toward the"
+    " limit. The limit holds the line only on the costs reported, so a line whose"
+    " turns report none is not held by it."
+)
+COST_UNREPORTED_ENGINES: Final = frozenset(
+    {codex.ENGINE_NAME, grok.ENGINE_NAME, cursor.ENGINE_NAME}
+)
+"""The engines whose adapters never report a cost, so ``max_cost_usd`` can never hold
+a line on them. **Fact, read on 2026-11-01.** Each adapter's turn report sets
+``cost_estimate_usd=None`` in its code. Claude Code, Pi and Antigravity report one when
+the engine gives it. **Review of a9995d8, item 4.** On a subscription the cost is quota,
+which the limit never measured, so such a line is bounded by its autonomous-turn limit
+alone and ``cost_usd.limit_enforced`` says so. On the ``api`` strategy the cost is money
+and nothing would bound it, so Dromon **refuses** that pairing and does not substitute
+a guessed per-turn charge."""
+UNREPORTED_ENGINE_NOTE: Final = (
+    "This line's engine reports no cost, so max_cost_usd never holds it. Its turns"
+    " are bounded by the autonomous-turn limit, and by the hold after a failed turn,"
+    " alone."
+)
+SCRATCH_AREA: Final = "scratch"
+REPORTS_AREA: Final = "reports"
+
+
+class ScratchWrite(NamedTuple):
+    """What ``write_scratch_file`` wrote."""
+
+    relative: str
+    absolute: str
+    size: int
+
+
 SCRATCH_DIRECTORY: Final = "tmp"
 LINES_SCRATCH_DIRECTORY: Final = "lines"
 """**Round 10 re-review, N1 and N2.** The directory under ``tmp/`` that holds a scratch
@@ -676,7 +723,12 @@ identifiers, and one that is not plain is counted without being shown."""
 
 CHECK_DISCLOSURE_TOOL_NAME: Final = "check_disclosure"
 MAX_CHECKED_BYTES: Final = 1024 * 1024
-"""The largest combined text or files ``check_disclosure`` reads in one check."""
+"""The largest text ``check_disclosure`` takes, and the size of one part of a file.
+**Round 14, item 3.** A file is checked in parts of at most this size, split after a
+newline, and the counts are summed, so a longer file costs one check and not several."""
+MAX_CHECKED_TOTAL_BYTES: Final = 16 * 1024 * 1024
+"""The largest combined files ``check_disclosure`` reads in one check. A bound on
+memory and time, since the parts are held together before they are split."""
 MAX_CHECKED_PATHS: Final = 8
 """The largest file list ``check_disclosure`` accepts, bounding path validation."""
 DISCLOSURE_HELD: Final = (
@@ -693,7 +745,10 @@ CHECK_DISCLOSURE_SCHEMA: Final[dict[str, object]] = {
         "text": {"type": "string", "description": "A text to check, at most 1 MiB"},
         "path": {
             "type": "string",
-            "description": "A file to check, relative to your working directory",
+            "description": (
+                "A file to check, relative to your working directory, or the absolute"
+                " path write_scratch reported for a file under it"
+            ),
         },
         "paths": {
             "type": "array",
@@ -701,8 +756,8 @@ CHECK_DISCLOSURE_SCHEMA: Final[dict[str, object]] = {
             "minItems": 1,
             "maxItems": MAX_CHECKED_PATHS,
             "description": (
-                "Files to check together, relative to your working directory,"
-                f" at most {MAX_CHECKED_PATHS}"
+                "Files to check together, relative to your working directory or"
+                f" absolute paths under it, at most {MAX_CHECKED_PATHS}"
             ),
         },
     },
@@ -1015,6 +1070,15 @@ WRITE_SCRATCH_SCHEMA: Final[dict[str, object]] = {
             "description": "A path relative to your scratch directory",
         },
         "text": {"type": "string", "description": "The file's whole new content"},
+        "area": {
+            "type": "string",
+            "enum": ["scratch", "reports"],
+            "description": (
+                "Where the path is relative to. scratch, the default, is your scratch"
+                " directory. reports is the report directory your configuration"
+                " declares, which is refused if it declares none"
+            ),
+        },
     },
     "required": ["path", "text"],
     "additionalProperties": False,
@@ -1042,7 +1106,11 @@ CONTEXT_COMPACTION_NOTE: Final = (
 )
 STOP_BACKGROUND_TOOL_NAME: Final = "stop_background"
 
-DEFAULT_COMPACT_WAKE_SECONDS: Final = 60
+DEFAULT_COMPACT_WAKE_SECONDS: Final = 0
+"""How long after the request ``compact_session`` wakes the line for the compacted turn
+when the line names no delay. **Round 14, item 1.** Zero: the wake is due at once, so
+the compacted turn follows as soon as the turn that asked ends, and not a minute
+later. A line may still name a delay of ``MIN_WAKE_SECONDS`` or more."""
 
 CONTEXT_FROM_CALL: Final = "call"
 CONTEXT_FROM_COMPACTION: Final = "compaction"
@@ -1112,8 +1180,8 @@ COMPACT_SESSION_SCHEMA: Final[dict[str, object]] = {
             "minimum": MIN_WAKE_SECONDS,
             "maximum": MAX_WAKE_SECONDS,
             "description": (
-                "When to wake you for the compacted turn, in whole seconds. Default"
-                f" {DEFAULT_COMPACT_WAKE_SECONDS}. No wake is scheduled if one is"
+                "A delay before the compacted turn, in whole seconds. Omit it to"
+                " compact as soon as this turn ends. No wake is scheduled if one is"
                 " already pending"
             ),
         },
@@ -1592,6 +1660,9 @@ def engine_factory(
         # Every adapter ends a turn gracefully when its driver answers interrupt, so
         # priority mail steers the driver rather than each engine.
         driver: Driver = priority.steered(spec.model, spec.strategy, spec.redirect)
+        unbounded = cost_bound_refusal(driver.settings.engine, spec.strategy)
+        if unbounded is not None:
+            raise EngineRefused(unbounded)
         # Read at each build, so a project registered for open federation after the
         # daemon started is denied from each line's next turn.
         protected_now = (
@@ -1876,8 +1947,27 @@ def _party(owner: str | Address) -> Address:
     return LineAddress(owner) if isinstance(owner, str) else owner
 
 
+def cost_bound_refusal(engine: str, strategy: Strategy) -> str | None:
+    """Why a line on ``engine`` with ``strategy`` is refused because no limit could
+    bound its spending, or ``None``. **Review of a9995d8, item 4.** The ``api``
+    strategy spends money, and on an engine in ``COST_UNREPORTED_ENGINES`` the cost
+    limit never sees any of it. The refusal is the choice made over a configured
+    per-turn charge, which would be a number Dromon invented for a spend it cannot
+    see."""
+    if strategy is Strategy.API and engine in COST_UNREPORTED_ENGINES:
+        return (
+            f"the api strategy is refused on the {engine} engine, which reports no"
+            " cost, so max_cost_usd could not bound what the line spends. Use the"
+            " subscription strategy"
+        )
+    return None
+
+
 def _check_engine_supports(driver: Driver, config: LineConfig) -> None:
     """Raise ``ConfigError`` if the driver's engine cannot run ``config``."""
+    unbounded = cost_bound_refusal(driver.settings.engine, driver.settings.strategy)
+    if unbounded is not None:
+        raise ConfigError(unbounded)
     if config.fresh_session_each_turn and driver.settings.engine not in {
         ENGINE_NAME_CLAUDE,
         codex.ENGINE_NAME,
@@ -2195,6 +2285,13 @@ class Scheduler:
         """Lines whose last compaction left the context at or past their
         ``auto_compact_tokens``, or left it unknown, so no automatic compaction
         follows until a context below the threshold is reported. In memory."""
+        self._manual_held: set[str] = set()
+        """Lines whose last compaction left the context at or past their warning, or
+        left it unknown, so ``compact_session`` is refused until a context below the
+        warning is reported. **Review of a9995d8, item 2.** The automatic path has
+        ``_auto_held`` for the same reason, and a manual request had no such guard, so
+        a line whose compaction did not help could chain them, nine in two seconds
+        once the 60 second default wake was gone. In memory."""
         self._wake_delivered: dict[str, str] = {}
         """When each fired wake's note was delivered, for ``list_mail``. In memory,
         so a note delivered before a restart shows its due time only."""
@@ -2634,6 +2731,7 @@ class Scheduler:
         self._context.pop(line_id, None)
         self._context_source.pop(line_id, None)
         self._auto_held.discard(line_id)
+        self._manual_held.discard(line_id)
         self._context_compaction_wakes.discard(line_id)
         self._compaction_free_turn_used.discard(line_id)
         self._withdraw_context_compaction_wake(line_id)
@@ -2669,17 +2767,63 @@ class Scheduler:
         """Replace operator accepted occurrences on startup and reload."""
         self._disclosure_accepted = dict(entries)
 
+    def _accepted_lines(self, line_id: str, path: str | None) -> tuple[str, ...]:
+        """The operator's accepted line digests for the project file at ``path``,
+        relative to the line's working directory, or none."""
+        if path is None or self._root is None:
+            return ()
+        workdir = self.effective_config(line_id).workdir or "."
+        file = (self._root / workdir / path).resolve()
+        try:
+            relative = file.relative_to(self._root.resolve()).as_posix()
+        except ValueError:
+            relative = ""
+        return self._disclosure_accepted.get(relative, ())
+
     def _checked_matches(self, line_id: str, path: str | None, text: str) -> int:
-        accepted: tuple[str, ...] = ()
-        if path is not None and self._root is not None:
-            workdir = self.effective_config(line_id).workdir or "."
-            file = (self._root / workdir / path).resolve()
-            try:
-                relative = file.relative_to(self._root.resolve()).as_posix()
-            except ValueError:
-                relative = ""
-            accepted = self._disclosure_accepted.get(relative, ())
-        return disclosure.matching_lines(self._disclosure, text, accepted)
+        return disclosure.matching_lines(
+            self._disclosure, text, self._accepted_lines(line_id, path)
+        )
+
+    def _checked_file_matches(self, line_id: str, path: str, data: bytes) -> int:
+        """The lines of a file's bytes that hold a listed term, counted in parts of
+        at most ``MAX_CHECKED_BYTES`` and summed. Refused when a line is longer than
+        a part, since a term could straddle a cut there. **Round 14, item 3.**"""
+        try:
+            return disclosure.matching_lines_in_parts(
+                self._disclosure,
+                data,
+                MAX_CHECKED_BYTES,
+                self._accepted_lines(line_id, path),
+            )
+        except disclosure.LineTooLong as error:
+            raise LineToolRefused(
+                f"the supplied file has a line longer than {MAX_CHECKED_BYTES} bytes,"
+                " which cannot be checked in parts without risking a term across a cut"
+            ) from error
+
+    def _workdir_relative(self, line_id: str, path: str) -> str:
+        """``path`` as a path relative to the line's working directory. A relative
+        path is returned as it is. An absolute one, as ``write_scratch`` reports it,
+        is accepted only when it lies under the working directory's real path, and is
+        returned relative to it. It is normalized lexically and never resolved
+        through a link, and ``_read_checked`` then walks it without following any
+        link, so what is checked is what is read. **Round 14, item 3.**"""
+        if not path.startswith("/"):
+            return path
+        if "\x00" in path:
+            raise LineToolRefused("path may not contain a null character")
+        try:
+            root = Path(os.path.realpath(self._workdir_of(line_id)))
+        except LineToolRefused as error:
+            raise LineToolRefused("cannot resolve the working directory") from error
+        try:
+            return str(Path(os.path.normpath(path)).relative_to(root))
+        except ValueError as error:
+            raise LineToolRefused(
+                "path must be a relative path in your working directory, or an"
+                " absolute path under it"
+            ) from error
 
     def set_disclosure_terms(self, terms: Sequence[str]) -> None:
         """Replace the disclosure terms the tools check, already case folded."""
@@ -3472,9 +3616,13 @@ class Scheduler:
         note: str,
         task_id: str | None = None,
         request: RequestStamp | None = None,
+        *,
+        minimum: int = MIN_WAKE_SECONDS,
     ) -> tuple[str, str]:
         """Schedule ``line_id``'s one wake ``seconds`` from now, replacing any pending
-        one, and return the identifier its note will carry and its due time.
+        one, and return the identifier its note will carry and its due time. A wake
+        is at least ``minimum`` seconds ahead, ``MIN_WAKE_SECONDS`` unless the caller
+        is the daemon's own tool that needs a wake as soon as its turn ends.
 
         When ``task_id`` names a running task, its end cancels the pending wake and
         wakes the line with a task note. The caller ends its turn to wait. If the task
@@ -3482,13 +3630,9 @@ class Scheduler:
         The due time is rounded up to the whole second, so a wake never fires early.
         Raises ``InvalidField`` or ``EventRejected``.
         """
-        if (
-            type(seconds) is not int
-            or not MIN_WAKE_SECONDS <= seconds <= MAX_WAKE_SECONDS
-        ):
+        if type(seconds) is not int or not minimum <= seconds <= MAX_WAKE_SECONDS:
             raise InvalidField(
-                f"seconds must be a whole number from {MIN_WAKE_SECONDS}"
-                f" to {MAX_WAKE_SECONDS}"
+                f"seconds must be a whole number from {minimum} to {MAX_WAKE_SECONDS}"
             )
         now = self._wall_clock().astimezone(UTC)
         start = now.replace(microsecond=0)
@@ -4374,14 +4518,22 @@ class Scheduler:
         spent = (
             f"${cost:.2f}"
             if not unknown
-            else f"${cost:.2f} and {unknown} turns of unknown cost"
+            else f"${cost:.2f} and {unknown} turns of unknown cost, counted as $0.00"
         )
-        line = (
-            f"Autonomous turns in a row without operator mail: {used} of"
-            f" {limits.max_autonomous_turns}."
-            f" Estimated cost since your last release: {spent} of"
-            f" ${limits.max_cost_usd:.2f}. A line past either is held. {counting}"
-        )
+        if self._cost_reported(line_id):
+            line = (
+                f"Autonomous turns in a row without operator mail: {used} of"
+                f" {limits.max_autonomous_turns}."
+                f" Estimated cost since your last release: {spent} of"
+                f" ${limits.max_cost_usd:.2f}. A line past either is held. {counting}"
+            )
+        else:
+            line = (
+                f"Autonomous turns in a row without operator mail: {used} of"
+                f" {limits.max_autonomous_turns}. A line past that is held."
+                f" Your engine reports no cost, so the cost limit of"
+                f" ${limits.max_cost_usd:.2f} does not apply to you. {counting}"
+            )
         warning = self._context_warning(line_id) if warn else None
         return f"{line} {warning}" if warning else line
 
@@ -4391,11 +4543,15 @@ class Scheduler:
         config = self.effective_config(line_id)
         if context is None or context < config.context_warn_tokens:
             return None
-        remedy = (
-            "compact_session compacts it at the start of your next turn."
-            if self._may_compact(line_id)
-            else "An operator can enable compact_session for this line."
-        )
+        if not self._may_compact(line_id):
+            remedy = "An operator can enable compact_session for this line."
+        elif line_id in self._manual_held:
+            remedy = (
+                "Your last compaction did not bring it below the warning, so"
+                " compact_session is refused until a context below it is reported."
+            )
+        else:
+            remedy = "compact_session compacts it at the start of your next turn."
         return (
             f"Your context is about {context} tokens, past this line's warning at"
             f" {config.context_warn_tokens}, and every engine call re-reads it."
@@ -4427,6 +4583,7 @@ class Scheduler:
             ),
             "last_compaction": self._last_compaction.get(line_id),
             "auto_compact_held": line_id in self._auto_held,
+            "compact_session_held": line_id in self._manual_held,
         }
 
     def session_compacted(
@@ -4471,9 +4628,12 @@ class Scheduler:
         after = compaction.get("after_tokens")
         estimate = compaction.get("after_estimate_tokens")
         threshold = self._auto_compact_threshold(line_id)
+        warning = self.effective_config(line_id).context_warn_tokens
         if isinstance(after, int):
             if threshold is not None and after >= threshold:
                 self._auto_held.add(line_id)
+            if after >= warning:
+                self._manual_held.add(line_id)
             self._context_reported(line_id, after, CONTEXT_FROM_COMPACTION)
         elif type(estimate) is int and estimate > 0:
             # An engine that estimates the size itself, as Pi does, gives it here.
@@ -4484,12 +4644,15 @@ class Scheduler:
             )
             if threshold is not None and estimate >= threshold:
                 self._auto_held.add(line_id)
+            if estimate >= warning:
+                self._manual_held.add(line_id)
             self._context_reported(line_id, estimate, CONTEXT_FROM_ENGINE_ESTIMATE)
         else:
             self._context.pop(line_id, None)
             self._context_source.pop(line_id, None)
             # Whether it got below the threshold is unknown, so it is held.
             self._auto_held.add(line_id)
+            self._manual_held.add(line_id)
         # The round 4 report of core. The daemon's context-warning wake was withdrawn
         # only when a reported size fell below the warning, so it fired as a reminder
         # after the fact. **Task of 2026-10-30.** A sized compaction that left the
@@ -4538,6 +4701,8 @@ class Scheduler:
         threshold = self._auto_compact_threshold(line_id)
         if threshold is not None and tokens >= threshold:
             self._auto_held.add(line_id)
+        if tokens >= self.effective_config(line_id).context_warn_tokens:
+            self._manual_held.add(line_id)
         self._context_reported(line_id, tokens, CONTEXT_FROM_ESTIMATE)
 
     def _record_session(self, line_id: str, report: TurnReport) -> None:
@@ -4571,6 +4736,8 @@ class Scheduler:
             self._compaction_free_turn_used.discard(line_id)
         self._context[line_id] = tokens
         self._context_source[line_id] = source
+        if tokens < warning:
+            self._manual_held.discard(line_id)
         threshold = self._auto_compact_threshold(line_id)
         if threshold is None or tokens < threshold:
             self._auto_held.discard(line_id)
@@ -5056,6 +5223,8 @@ class Scheduler:
                 ),
             },
             "cost_usd": self.cost_status(line_id),
+            "provider_budget": self.provider_budget_status(line_id),
+            "disclosure": self.disclosure_status(),
             "leases": self.leases_of(line_id),
             "scheduled_wake": _scheduled_summary(pending),
             **summary(state, LineAddress(line_id), 0).counts(),
@@ -5394,25 +5563,70 @@ class Scheduler:
     def cost_status(self, line_id: str) -> dict[str, object]:
         """**Row 8 of the T3 Code review.** The line's cost since its release, with
         unknown kept apart from zero. ``estimate`` is the sum of the costs turns
-        reported, or ``None`` when none reported one and some reported none.
+        reported, or ``unknown`` when none reported one and some reported none.
         ``basis`` is ``exact`` when every turn reported a cost, ``lower_bound`` when
-        some did not, and ``unknown`` when none did."""
+        some did not, and ``unknown`` when none did. **Round 14, item 4.** A turn of
+        unknown cost counts as ``unknown_counts_as_usd`` toward ``limit``, which is
+        zero, and ``counting`` says so, so the limit holds the line only on the costs
+        reported and a run of turns that report none is never held by it."""
         limits = self.limits_for(line_id)
         known = line_id in self._cost
         unknown = self._cost_unknown.get(line_id, 0)
         basis = "exact" if not unknown else "lower_bound" if known else "unknown"
+        enforced = self._cost_reported(line_id)
         return {
             "estimate": (
-                None if basis == "unknown" else f"{self._cost.get(line_id, 0.0):.4f}"
+                UNKNOWN if basis == "unknown" else f"{self._cost.get(line_id, 0.0):.4f}"
             ),
             "basis": basis,
             "unknown_turns": unknown,
+            "unknown_counts_as_usd": f"{UNKNOWN_TURN_COST_USD:.4f}",
+            "counting": UNKNOWN_COST_RULE,
             "limit": f"{limits.max_cost_usd:.2f}",
+            "limit_enforced": enforced,
             "note": (
                 None
-                if not unknown
+                if enforced and not unknown
+                else UNREPORTED_ENGINE_NOTE
+                if not enforced
                 else f"{unknown} turns since the last release reported no cost, so"
                 " the budget holds the line only on what the others reported"
+            ),
+        }
+
+    def _cost_reported(self, line_id: str) -> bool:
+        """Whether the line's engine reports costs at all, so that ``max_cost_usd``
+        can hold it. ``False`` for an engine in ``COST_UNREPORTED_ENGINES``."""
+        return ENGINE_OF.get(self.model_of(line_id)) not in COST_UNREPORTED_ENGINES
+
+    def _summary_cost(self, line_id: str) -> object:
+        """The estimate for the client protocol, which keeps ``null`` for an unknown
+        cost, as it always did, while the status tools say ``unknown``."""
+        estimate = self.cost_status(line_id)["estimate"]
+        return None if estimate == UNKNOWN else estimate
+
+    def provider_budget_status(self, line_id: str) -> dict[str, object]:
+        """The stated budget of the line's provider, or an entry that says it is
+        unknown. **Round 14, item 4.** Never ``None``."""
+        engine = ENGINE_OF.get(self.model_of(line_id))
+        return _budget_entry(engine, self._budget_of(line_id))
+
+    def disclosure_status(self) -> dict[str, object]:
+        """Whether the project has a disclosure list, so a line learns early that
+        ``check_disclosure`` can neither pass nor fail without one, and that the
+        daemon refuses no message for it. **Round 14, item 3.** Never a path, a term,
+        a count of terms or a line number."""
+        if self._disclosure:
+            return {
+                "list": "configured",
+                "note": "check_disclosure can pass or fail against the project's list",
+            }
+        return {
+            "list": "none",
+            "note": (
+                "no disclosure list is configured for this project, so check_disclosure"
+                " can neither pass nor fail and the daemon withholds nothing for it."
+                " An operator sets daemon.disclosure_terms in the project file"
             ),
         }
 
@@ -5787,15 +6001,36 @@ class Scheduler:
             return (SCRATCH_DIRECTORY,)
         return (SCRATCH_DIRECTORY, LINES_SCRATCH_DIRECTORY, line_id)
 
-    def write_scratch(self, line_id: str, path: str, text: str) -> str:
+    def write_scratch(
+        self, line_id: str, path: str, text: str, area: str = SCRATCH_AREA
+    ) -> str:
+        """Write ``text`` as ``write_scratch_file`` does, and return only the path
+        written, relative to the working directory."""
+        return self.write_scratch_file(line_id, path, text, area).relative
+
+    def write_scratch_file(
+        self, line_id: str, path: str, text: str, area: str = SCRATCH_AREA
+    ) -> ScratchWrite:
         """Write ``text`` to ``path`` under the line's scratch in its working
-        directory, as ``scratch_parts`` gives it, creating directories, and return the
-        path written, relative to the working directory. Refused for an absolute path,
-        ``..``, a path that resolves outside the scratch, a target that is a symbolic
-        link or a directory, text over ``MAX_SCRATCH_BYTES``, and text the disclosure
-        list covers."""
+        directory, as ``scratch_parts`` gives it, or with ``area`` set to
+        ``reports`` under the report directory its configuration declares, creating
+        directories, and return the path written relative to the working directory,
+        the same path resolved to an absolute one, and the bytes written.
+        **Round 14, item 2.** The absolute path is built from the working
+        directory's real path and the components this call opened without following a
+        link, so it names the file written and can be handed to ``check_disclosure``.
+        Refused for an absolute path,
+        ``..``, a path that resolves outside the area, a target that is a symbolic
+        link or a directory, text over ``MAX_SCRATCH_BYTES``, text the disclosure
+        list covers, and ``reports`` when no report directory is declared. Every
+        other directory stays refused."""
+        if area not in (SCRATCH_AREA, REPORTS_AREA):
+            raise LineToolRefused(f"area must be {SCRATCH_AREA} or {REPORTS_AREA}")
         if not path or "\x00" in path or path.startswith(("/", "~")):
-            raise LineToolRefused("path must be a relative path under tmp/")
+            raise LineToolRefused(
+                "path must be a relative path under tmp/ or the report directory,"
+                " not an absolute one"
+            )
         parts = Path(path).parts
         if ".." in parts or not parts:
             raise LineToolRefused("path may not contain ..")
@@ -5806,7 +6041,7 @@ class Scheduler:
         if refusal is not None:
             raise LineToolRefused(refusal)
         workdir = self._workdir_of(line_id)
-        scratch = self.scratch_parts(line_id)
+        scratch = self._area_parts(line_id, area)
         read_only = resolve_read_only_paths(self._read_only_paths, workdir)
         target = Path(os.path.normpath(workdir.joinpath(*scratch, *parts)))
         if any(
@@ -5829,6 +6064,17 @@ class Scheduler:
             names = [*scratch, *parts[:-1]]
             for index, name in enumerate(names):
                 entered = _enter(parent, name, path, scratch_root=index == 0)
+                if (
+                    area == REPORTS_AREA
+                    and index == 1
+                    and _is_reserved(parent, entered)
+                ):
+                    os.close(entered)
+                    raise LineToolRefused(
+                        f"the report directory {'/'.join(scratch)} is, on this"
+                        f" volume, one of tmp/{', tmp/'.join(REPORT_RESERVED)}, which"
+                        " hold other lines' and roles' files"
+                    )
                 os.close(parent)
                 parent = entered
             flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
@@ -5848,7 +6094,33 @@ class Scheduler:
             os.close(parent)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
-        return str(Path(*scratch, *parts))
+        relative = Path(*scratch, *parts)
+        return ScratchWrite(
+            str(relative), str(Path(os.path.realpath(workdir)) / relative), len(data)
+        )
+
+    def _area_parts(self, line_id: str, area: str) -> tuple[str, ...]:
+        """The components of the directory ``write_scratch`` writes under for
+        ``area``: the line's scratch, or the report directory its configuration
+        declares. ``LineToolRefused`` when the area is reports and none is declared."""
+        if area == SCRATCH_AREA:
+            return self.scratch_parts(line_id)
+        declared = self.effective_config(line_id).report_directory
+        if declared is not None and self.scratch_parts(line_id) != (SCRATCH_DIRECTORY,):
+            # Default deny. A line whose scratch is its own subdirectory does not
+            # write its working directory, as a seat that does not own its role, so
+            # a report directory there would be the owner's files.
+            raise LineToolRefused(
+                "the reports area is refused while you do not own your role's"
+                " worktree, since you never write the owner's files. Write under"
+                " your scratch instead"
+            )
+        if declared is None:
+            raise LineToolRefused(
+                "this line's configuration declares no report_directory, so the"
+                " reports area is refused. Write under your scratch instead"
+            )
+        return tuple(declared.split("/"))
 
     def check_disclosure(
         self,
@@ -5899,18 +6171,21 @@ class Scheduler:
         if paths is not None:
             total_bytes = 0
             for file_path in paths:
+                relative = self._workdir_relative(line_id, file_path)
                 file_bytes = self._read_checked(
-                    line_id, file_path, MAX_CHECKED_BYTES - total_bytes
+                    line_id, relative, MAX_CHECKED_TOTAL_BYTES - total_bytes
                 )
                 total_bytes += len(file_bytes)
-                matched_lines += self._checked_matches(
-                    line_id, file_path, file_bytes.decode("utf-8", "replace")
+                matched_lines += self._checked_file_matches(
+                    line_id, relative, file_bytes
                 )
+        elif path is not None:
+            relative = self._workdir_relative(line_id, path)
+            matched_lines = self._checked_file_matches(
+                line_id, relative, self._read_checked(line_id, relative)
+            )
         else:
-            if path is not None:
-                text = self._read_checked(line_id, path).decode("utf-8", "replace")
-            checked_text = cast(str, text)
-            matched_lines = self._checked_matches(line_id, path, checked_text)
+            matched_lines = self._checked_matches(line_id, None, cast(str, text))
         matched = min(matched_lines, MAX_DISCLOSURE_MATCHES)
         self._log.append(DisclosureChecked(line_id, format_due(now), matched))
         recent = self._state().disclosure_checks[line_id]
@@ -5979,7 +6254,7 @@ class Scheduler:
         return DISCLOSURE_HELD
 
     def _read_checked(
-        self, line_id: str, path: str, max_bytes: int = MAX_CHECKED_BYTES
+        self, line_id: str, path: str, max_bytes: int = MAX_CHECKED_TOTAL_BYTES
     ) -> bytes:
         """The contents of the file at ``path``, relative to the line's working
         directory, for ``check_disclosure``. It is walked from the working
@@ -6045,9 +6320,9 @@ class Scheduler:
             raw = handle.read(max_bytes + 1)
         if len(raw) > max_bytes:
             raise LineToolRefused(
-                f"the checked files are over {MAX_CHECKED_BYTES} bytes combined"
-                if max_bytes < MAX_CHECKED_BYTES
-                else f"the supplied file is over {MAX_CHECKED_BYTES} bytes"
+                f"the checked files are over {MAX_CHECKED_TOTAL_BYTES} bytes combined"
+                if max_bytes < MAX_CHECKED_TOTAL_BYTES
+                else f"the supplied file is over {MAX_CHECKED_TOTAL_BYTES} bytes"
             )
         return raw
 
@@ -6419,7 +6694,7 @@ class Scheduler:
                     "waits_unconfined": self.waits_unconfined(seat_id),
                     "model": self.model_of(seat_id),
                     "provider": engine,
-                    "budget": None if budget is None else _budget_view(budget),
+                    "budget": _budget_entry(engine, budget),
                     "workdir_commit": self._workdir_commit(seat_id),
                     "recent_tasks": [
                         self._seat_task_view(record, viewer == seat_id)
@@ -8242,13 +8517,18 @@ class Scheduler:
                 return _tool_error(unexpected)
             path: object = args.get("path")
             text: object = args.get("text")
-            if not isinstance(path, str) or not isinstance(text, str):
-                return _tool_error("path and text must be text")
+            area: object = args.get("area", SCRATCH_AREA)
+            if (
+                not isinstance(path, str)
+                or not isinstance(text, str)
+                or not isinstance(area, str)
+            ):
+                return _tool_error("path, text and area must be text")
             try:
-                written = self.write_scratch(line_id, path, text)
+                written = self.write_scratch_file(line_id, path, text, area)
             except LineToolRefused as error:
                 return _tool_error(str(error))
-            return _tool_text(f"wrote {written} in your working directory")
+            return _tool_text(f"wrote {written.size} bytes to {written.absolute}")
 
         return SdkMcpTool(
             name=WRITE_SCRATCH_TOOL_NAME,
@@ -8259,8 +8539,11 @@ class Scheduler:
                 " tmp/ in your working directory while you own your role, or are no"
                 " role's seat and can write the directory, and tmp/lines/<your line"
                 " id>/ otherwise, so that you never write the owner's files. The"
-                " owner's scratch is tmp/, which you may read. The result names the"
-                " path written."
+                " owner's scratch is tmp/, which you may read. With area reports the"
+                " path is relative to the report directory your configuration declares,"
+                " if it declares one. Directories below the area are created. The"
+                " result gives the absolute path written and the bytes written, and"
+                " check_disclosure accepts that path."
             ),
             input_schema=WRITE_SCRATCH_SCHEMA,
             handler=handler,
@@ -8309,7 +8592,11 @@ class Scheduler:
                 " that this project covers it. The answer is pass or fail with how"
                 " many lines hold a listed term, never the term. The listed files are"
                 " checked independently and their counts are summed, so a match does"
-                " not span files. Their combined content is at most 1 MiB."
+                " not span files. A file is read in parts of at most 1 MiB split after"
+                " a newline and the counts summed, for one check, so check the file"
+                " you wrote and not a draft. Their combined content is at most 16 MiB,"
+                " a line may not exceed 1 MiB, and text is at most 1 MiB. A path may"
+                " be the absolute path write_scratch reported."
                 " Checks are limited per hour and recorded."
             ),
             input_schema=CHECK_DISCLOSURE_SCHEMA,
@@ -8438,14 +8725,17 @@ class Scheduler:
             unexpected = _unexpected(args, COMPACT_SESSION_SCHEMA)
             if unexpected:
                 return _tool_error(unexpected)
-            seconds: object = args.get("seconds", DEFAULT_COMPACT_WAKE_SECONDS)
-            if type(seconds) is not int or not (
-                MIN_WAKE_SECONDS <= seconds <= MAX_WAKE_SECONDS
-            ):
-                return _tool_error(
-                    f"seconds must be a whole number from {MIN_WAKE_SECONDS}"
-                    f" to {MAX_WAKE_SECONDS}"
-                )
+            seconds = DEFAULT_COMPACT_WAKE_SECONDS
+            if "seconds" in args:
+                given: object = args["seconds"]
+                if type(given) is not int or not (
+                    MIN_WAKE_SECONDS <= given <= MAX_WAKE_SECONDS
+                ):
+                    return _tool_error(
+                        f"seconds must be a whole number from {MIN_WAKE_SECONDS}"
+                        f" to {MAX_WAKE_SECONDS}"
+                    )
+                seconds = given
             if not self._may_compact(line_id):
                 return _tool_error("this line may not compact its session")
             context = self._context.get(line_id)
@@ -8454,6 +8744,15 @@ class Scheduler:
                 return _tool_error(
                     "your context must be at or past this line's warning at"
                     f" {warning} tokens before it can be compacted"
+                )
+            if line_id in self._manual_held:
+                return _tool_error(
+                    "your last compaction did not bring your context below this"
+                    f" line's warning at {warning} tokens, or its size is unknown,"
+                    " so another would cost a turn and not help. compact_session"
+                    " is available again once a context below the warning is"
+                    " reported. Consider handing off your work and asking an"
+                    " operator for a fresh session."
                 )
             pending = self._state().scheduled.get(line_id)
             if pending is not None:
@@ -8466,27 +8765,32 @@ class Scheduler:
                 )
             try:
                 message_id, due = self.schedule_wake(
-                    line_id, seconds, COMPACT_WAKE_NOTE
+                    line_id, seconds, COMPACT_WAKE_NOTE, minimum=0
                 )
             except (InvalidField, EventRejected) as error:
                 return _tool_error(str(error))
             self._compact_requests.add(line_id)
             self._compact_wake[line_id] = message_id
             self._compact_wake_free.add(line_id)
+            when = (
+                "as soon as this turn ends"
+                if seconds == DEFAULT_COMPACT_WAKE_SECONDS
+                else "in your next turn, after the delay you named"
+            )
             return _tool_text(
-                "Your session will be compacted at the start of your next turn. A wake"
-                f" is scheduled for {due}, whose note arrives as {message_id}, so the"
-                " compaction does not wait for other mail. Once the engine reports"
-                " any compaction, the pending wake is withdrawn. The prompt gives the"
-                " context before and after where the engine reports them."
+                f"Your session will be compacted {when}. A wake is scheduled for"
+                f" {due}, whose note arrives as {message_id}, so the compaction does"
+                " not wait for other mail. Once the engine reports any compaction,"
+                " the pending wake is withdrawn. The prompt gives the context before"
+                " and after where the engine reports them."
             )
 
         return SdkMcpTool(
             name=COMPACT_SESSION_TOOL_NAME,
             description=(
-                "Compact your own engine session at the start of your next turn, which"
+                "Compact your own engine session as soon as this turn ends, which"
                 " summarizes the conversation so far so that each engine call re-reads"
-                " less. It schedules a wake for that turn, after 60 seconds or the"
+                " less. It schedules a wake due at once for that turn, or after the"
                 " seconds given, unless a wake is already pending, and withdraws that"
                 " wake once any compaction is reported. Use it only when"
                 " context is at or past this line's warning. Your next prompt says"
@@ -9481,6 +9785,7 @@ class Scheduler:
         report: TurnReport | None = None
         ending = "cancelled"
         failed = False
+        breached = False
         stop_cause: str | None = None
         engine: LineEngine | None = None
         mailed = self._operator_mail(line_id)
@@ -9570,6 +9875,7 @@ class Scheduler:
                 stop_cause = str(error)
             ending = f"failed: {error}"
             failed = True
+            breached = isinstance(error, ConfinementBreach)
             print(f"dromond: line {line_id} turn failed: {error}", file=sys.stderr)
         finally:
             self._end_token(line_id, engine)
@@ -9622,8 +9928,8 @@ class Scheduler:
             report,
         )
         self._compaction_free_turn_inflight.discard(line_id)
-        if failed and self._operator_mail(line_id) == mailed:
-            self._hold_failed(line_id, ending)
+        if failed and (breached or self._operator_mail(line_id) == mailed):
+            self._hold_failed(line_id, ending, breached)
         self.fail_over_if_unable(line_id)
 
     def _handoff(
@@ -10116,14 +10422,18 @@ class Scheduler:
             " since. " + " ".join(parts)
         )
 
-    def _hold_failed(self, line_id: str, ending: str) -> None:
+    def _hold_failed(self, line_id: str, ending: str, breach: bool = False) -> None:
         """Hold a line whose turn failed and ask an operator, unless a limit already
         held it. **Luna's turn of 2026-10-27.** A turn that failed before it began
         was recorded only in the line's activity, and no operator learned of it for
         hours. A line cannot report a failure that kept its turn from running, so the
         daemon does, unless the line mailed an operator during the turn, whose mail
         may explain it. The hold also keeps the next wake from failing the same way
-        unseen. Answering the question releases the line."""
+        unseen. Answering the question releases the line.
+
+        **Round 15, review of e9adf91.** A ``breach`` is a call that escaped its
+        confinement, and the caller holds for it whether or not the line mailed an
+        operator, so the hold text says so and not that no mail was sent."""
         line = self._state().lines.get(line_id)
         if line is None or line.held_by is not None:
             return
@@ -10132,11 +10442,12 @@ class Scheduler:
             if len(ending) <= MAX_FAILURE_TEXT
             else ending[:MAX_FAILURE_TEXT] + "..."
         )
-        self.hold(
-            line_id,
-            f"had a turn fail and sent no operator mail during it. {cut}",
-            cause=HoldCause.TURN_FAILED,
+        what = (
+            "had a turn end in a confinement breach"
+            if breach
+            else "had a turn fail and sent no operator mail during it"
         )
+        self.hold(line_id, f"{what}. {cut}", cause=HoldCause.TURN_FAILED)
 
     async def _check_walk(self, line_id: str) -> None:
         """Refuse the turn when the line's stop policy is ``kill_all`` and the
@@ -10867,8 +11178,11 @@ class Scheduler:
             self._settle_relinquish(line_id)
             self._work.set()
         self._apply_limits(line_id, TurnCause.AUTONOMOUS, True, report)
-        if failed and self._operator_mail(line_id) == mailed:
-            self._hold_failed(line_id, ending)
+        if failed and (
+            isinstance(error, ConfinementBreach)
+            or self._operator_mail(line_id) == mailed
+        ):
+            self._hold_failed(line_id, ending, isinstance(error, ConfinementBreach))
         self.fail_over_if_unable(line_id)
 
     def _record_task(self, line_id: str, end: BackgroundEnd) -> None:
@@ -11271,7 +11585,7 @@ class Scheduler:
                 # A decimal string, because the client protocol carries no floats,
                 # or null when no turn since the release reported a cost and some
                 # reported none, since that cost is unknown, not zero.
-                "cost_estimate_usd": self.cost_status(line_id)["estimate"],
+                "cost_estimate_usd": self._summary_cost(line_id),
                 "cost_unknown_turns": self._cost_unknown.get(line_id, 0),
                 "held_by": line.held_by,
                 "tool_policy": self.effective_config(line_id).tool_policy.value,
@@ -11317,6 +11631,25 @@ def own_scratch(workdir: Path, line_id: str) -> Path:
     finally:
         os.close(parent)
     return workdir.joinpath(*names)
+
+
+def _is_reserved(tmp: int, directory: int) -> bool:
+    """Whether the open ``directory`` is the same directory as one of the names
+    ``REPORT_RESERVED`` under the open ``tmp``, compared by device and inode. **Review
+    of a9995d8, item 3.** On a volume that ignores case or Unicode form, ``tmp/Lines``
+    is ``tmp/lines``, and the configuration's name check cannot know every spelling a
+    volume treats alike, so the directory a write is about to use is compared with the
+    reserved ones as the volume resolves them. A reserved name that does not exist
+    cannot be the same directory."""
+    found = os.fstat(directory)
+    for reserved in REPORT_RESERVED:
+        try:
+            other = os.stat(reserved, dir_fd=tmp, follow_symlinks=False)
+        except OSError:
+            continue
+        if (other.st_dev, other.st_ino) == (found.st_dev, found.st_ino):
+            return True
+    return False
 
 
 def _enter(parent: int, name: str, path: str, *, scratch_root: bool) -> int:
@@ -11667,8 +12000,14 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         "cost_usd": {
             "estimate": cost["estimate"],
             "basis": cost["basis"],
+            "unknown_turns": cost["unknown_turns"],
+            "unknown_counts_as_usd": cost["unknown_counts_as_usd"],
+            "counting": cost["counting"],
             "limit": cost["limit"],
+            "limit_enforced": cost["limit_enforced"],
         },
+        "provider_budget": full["provider_budget"],
+        "disclosure": full["disclosure"],
         "leases": len(cast(list[dict[str, object]], full["leases"])),
         "scheduled_wake": full["scheduled_wake"],
         "unread": full["unread"],
@@ -11969,13 +12308,39 @@ def _scheduled_summary(pending: ScheduledWake | None) -> dict[str, object] | Non
 
 def _budget_view(budget: BudgetStated) -> dict[str, object]:
     """A provider's stated budget as ``role_status`` gives it, with its source and
-    time, since it is a snapshot."""
+    time, since it is a snapshot. A field the statement left out says ``unknown`` and
+    is never ``None``. **Round 14, item 4.**"""
+    percent = budget.remaining_percent
     return {
-        "remaining_percent": budget.remaining_percent,
-        "resets_at": budget.resets_at,
+        "status": "stated",
+        "provider": budget.provider,
+        "remaining_percent": UNKNOWN if percent is None else percent,
+        "resets_at": UNKNOWN if budget.resets_at is None else budget.resets_at,
         "source": budget.source.value,
         "note": budget.note,
         "stated_at": budget.stated_at,
+    }
+
+
+def _budget_entry(
+    provider: str | None, budget: BudgetStated | None
+) -> dict[str, object]:
+    """The budget entry for a provider: the statement, or a named entry that says no
+    budget is known. Dromon takes no action on a budget it does not know, so a role
+    never moves on it. **Round 14, item 4.**"""
+    if budget is not None:
+        return _budget_view(budget)
+    return {
+        "status": UNKNOWN,
+        "provider": UNKNOWN if provider is None else provider,
+        "remaining_percent": UNKNOWN,
+        "resets_at": UNKNOWN,
+        "source": UNKNOWN,
+        "note": (
+            "no budget is stated for this provider, so Dromon does not know what is"
+            " left and moves no role on it. dromon budget set states one"
+        ),
+        "stated_at": UNKNOWN,
     }
 
 

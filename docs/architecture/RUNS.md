@@ -100,6 +100,12 @@ is right for an engine and wrong for a build that must outlive the daemon.
    while the command is unreaped, so no signal reaches a later group of the same
    identifier. **Review of 2026-10-31, R7.** A timer once sent `SIGKILL` on its own
    and could do so after the command was reaped.
+   **Round 15, item 2.** The same two signals also go to the descendants below the
+   supervisor, found by a walk of the process table made just before each signal and
+   before the group signal, because that signal ends the command and orphans what it
+   left. The first full-gate run of the change failed for walking after it. A
+   descendant that called `setsid` is ended with the command. See the section on
+   descendants in a session of their own.
 
 A program that cannot be started gives an `exited` receipt with exit code 127 and the
 reason.
@@ -201,6 +207,72 @@ of 09003fa, before the review, reads no `run_cleared` and lets a lost run's scop
 start another run. The rollback floor in [`EVENT_LOG.md`](../protocol/EVENT_LOG.md)
 names the commits of these and every other one-way change.
 
+## Descendants in a session of their own
+
+**Round 15, item 2, requested by the operator on 2026-11-01.** A signal to the
+command's group misses a descendant that called `setsid`, which leaves the group. The
+question was whether Dromon can find such a descendant by the mark it puts in a line's
+environment, or by another means that cannot reach another line's or the operator's
+processes. What was decided and why.
+
+- **The mark is not used.** **Fact, observed on macOS, Darwin 27.** The daemon cannot
+  read another process's environment there, as `environment_reading_works` finds, so a
+  walk by mark finds nothing. **Fact, by design.** A run's command carries no line's
+  mark, only `DROMON_RUN_ID`, so that it is not a line's process and no line can stop
+  it with `stop_process`. **Inference.** Adding a mark of the run's own would work on
+  Linux, which reads `/proc/PID/environ`, but a descendant can clear its environment
+  with `env -i`, and the mark would have to survive a daemon restart, which means
+  recording a secret in the event log. Ancestry has neither weakness.
+- **What is used.** `dromon.processes.attached` lists what descends from a root by
+  parent, and the members of the groups those lead, whatever session each is in. The
+  supervisor walks from its own process at `SIGTERM` and again at `SIGKILL`, and
+  signals only what that walk found. A process identifier remembered from the first
+  walk is never signalled at the second, so one that ended and was reused is not
+  reached unless it descends from the supervisor. **Re-review of 4da3e0e.** Within one
+  stop, between the walk and a signal, a descendant can also end and its identifier go
+  to a process that is not one. The walk therefore reads each process's start time
+  with `lstart`, and just before each signal `signal_if_same` reads the process's
+  parent and start time again and turns the signal away if either differs, if the
+  process is gone, or if `ps` cannot say. These checks come before the group signal,
+  since the group signal ends the command and every orphan then has another parent.
+  For the same reason a child is signalled before its parent, deepest first, because a
+  parent that ends orphans its child and the parent check would turn the child away.
+  The second full-gate run of 2026-11-01 showed this with a descendant in a session of
+  its own, whose parent was the command.
+  **Limit.** The check is itself a reading, so a window of a few milliseconds remains,
+  smaller and not zero. It runs the `ps` command once per descendant. The `ps` runs in
+  the C locale so that `lstart` is five words on every host and is read the same way
+  twice. **Hypothesis.** `lstart` has one-second resolution, so a reuse within the
+  same second by a process with the same parent is not told apart, and such a process
+  is a child of the same parent and so a descendant anyway. A process is found only by its
+  ancestry from the supervisor, and a process in another session cannot join a group a
+  descendant leads, so a line's other processes and the operator's are out of reach.
+- **A command that ends first** is not followed by a return until the descendants
+  outside its group are gone or the 10 seconds have passed, and the survivors are
+  then sent `SIGKILL`. The receipt note of a stopped run says how many descendants
+  outside the group were signalled, or that the process table could not be read.
+
+**What is not found, and what an operator must avoid.**
+
+- **A descendant whose parent has exited** is no longer below the supervisor and is
+  not found, because it was given to the system's first process. The launcher is a
+  child subreaper on Linux and so finds such orphans, but it also reaps them. A run's
+  supervisor is not a subreaper, since every orphan would stay unreaped until the run
+  ends, and that behaviour could not be tested on this platform. **Hypothesis.** A
+  subreaper supervisor that reaps adopted children with `waitid` and `WNOWAIT` is
+  feasible on Linux and is the next step. macOS has no subreaper, so there a
+  daemonizing command escapes whatever is built.
+- **A command must not double fork or daemonize,** as the section on the command
+  already says. The walk improves a stop for a descendant that is still attached to a
+  living parent, such as a build tool's worker, and not for one that detached itself.
+- **A supervisor that is killed,** or a command that ends and leaves background
+  processes without any stop, is the lost-run check's, which finds only the
+  supervisor's group and session.
+- **The walk is not frozen.** The launcher stops the harness's group first so that
+  nothing forks during its walk. That cannot be done here, because a stopped child
+  makes Python 3.15's asyncio child watcher block on it, as the relay found. A
+  descendant forked between the walk and the signal is not found.
+
 ## Failure modes
 
 - **A supervisor killed with `SIGKILL`,** or a machine restart, leaves no receipt. The
@@ -229,7 +301,7 @@ names the commits of these and every other one-way change.
   within the time `ps` takes to answer. A port on Linux may close it with a process
   descriptor.
 - **A command that leaves background processes** after it exits leaves them running.
-  The supervisor ends its group only on a stop.
+  The supervisor ends its group, and the descendants below it, only on a stop.
 - **A receipt that is malformed** counts as none, so its run ends as `lost` once the
   supervisor is gone.
 - **The report directory** is the daemon's state, which no line can write. A daemon
@@ -332,4 +404,6 @@ ignores `SIGTERM`. **Coverage gap.** `ps` cannot run inside an agent sandbox, so
 real-process tests stand in for the start time with whether the process answers a
 signal, and for the process list with the processes the test started, while `getsid`
 is real. The one test that reads the real table is skipped there, and `ps -A` is not
-run by any test that runs in the sandbox.
+run by any test that runs in the sandbox. **Round 15.** The descendant walk is stood in
+for by a function in the sandbox, and a real-supervisor test that starts a child with
+`setsid` runs only where `ps` runs, which is the supervised full gate.

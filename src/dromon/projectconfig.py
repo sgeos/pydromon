@@ -143,6 +143,7 @@ TOOL_KEYS: Final = frozenset(
         "instructions",
         "workdir",
         "workdir_access",
+        "report_directory",
         "project_settings",
         "plugins",
         "keep_session",

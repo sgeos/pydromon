@@ -1368,7 +1368,7 @@ def test_compact_session_asks_for_a_compaction_and_refuses_otherwise(
     extra = asyncio.run(call({"now": True}))
     assert extra.get("is_error") and "unexpected argument now" in str(extra)
     done = asyncio.run(call({}))
-    assert not done.get("is_error") and "next turn" in str(done)
+    assert not done.get("is_error") and "turn ends" in str(done)
     assert world.status()["context"]["compaction_pending"] is True
     # Withdrawn permission refuses a tool the line still holds.
     world.scheduler.configure_line("alpha", LineConfig())

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from typing import cast
 
-from dromon import linetemp, priority
+from dromon import hookpolicy, linetemp, priority
 from dromon import scheduler as scheduler_module
 from dromon.processes import ProcessInfo
 from dromon.fleet import HOSTS_FILE_ENV
@@ -400,6 +400,14 @@ def _no_real_process_table(
     node = cast(pytest.Item, request.node)  # pyright: ignore[reportUnknownMemberType]
     if node.get_closest_marker("real_processes") is None:
         monkeypatch.setattr(scheduler_module, "SystemProcesses", NoProcesses)
+
+
+@pytest.fixture(autouse=True)
+def _no_machine_hook_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the machine's own managed Claude Code policy out of every test, since a
+    view-only line is refused where that policy switches hooks off. A test of the
+    reader names its directories. Round 14."""
+    monkeypatch.setattr(hookpolicy, "MANAGED_DIRECTORIES", ())
 
 
 @pytest.fixture(autouse=True)

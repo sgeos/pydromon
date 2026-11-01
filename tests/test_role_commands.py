@@ -482,3 +482,86 @@ def test_roles_lists_every_role_by_identifier(desk: Desk) -> None:
     assert response.ok and response.result is not None
     roles = cast(list[dict[str, object]], response.result["roles"])
     assert [role["role_id"] for role in roles] == ["archive", "core"]
+
+
+def test_a_seat_with_no_stated_budget_says_unknown(desk: Desk, dromon: Run) -> None:
+    # Round 14, item 4. The status gives a named unknown entry, never null, and the
+    # command says so in words and not as a budget of "unknown percent".
+    status, out, _ = dromon("role")
+    assert status == exits.OK
+    (alpha,) = [line for line in out.splitlines() if line.startswith("  seat alpha")]
+    assert "budget unknown" in alpha
+    assert "unknown percent" not in alpha and "stated by unknown" not in alpha
+
+
+def role_with(budget: object) -> dict[str, object]:
+    return {
+        "role_id": "core",
+        "workdir": ".",
+        "owner": "alpha",
+        "handoff_seconds": 3600,
+        "failover": "automatic",
+        "next_seat": None,
+        "handoff_below_percent": 10,
+        "held_by": "owner",
+        "held": None,
+        "last_change": None,
+        "order": [],
+        "seats": [
+            {
+                "line_id": "alpha",
+                "model": HAIKU,
+                "condition": "idle",
+                "owner": True,
+                "may_own": True,
+                "hibernated": False,
+                "usable": True,
+                "waits_unconfined": False,
+                "workdir_commit": None,
+                "budget": budget,
+            }
+        ],
+        "journal": [],
+        "file_differences": [],
+        "beside_owner": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "budget",
+    [
+        None,
+        {},
+        {"status": "unknown", "provider": PROVIDER},
+        {"remaining_percent": 40},
+        "nonsense",
+        3,
+        [],
+    ],
+)
+def test_the_client_reads_an_older_daemons_missing_budget_as_unknown(
+    budget: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Review of a9995d8, item 5. A daemon that has not restarted sends null, and a new
+    # client must not fail on it.
+    cli._print_role(role_with(budget))  # pyright: ignore[reportPrivateUsage]
+    (seat,) = [
+        line for line in capsys.readouterr().out.splitlines() if "seat alpha" in line
+    ]
+    assert "budget unknown" in seat
+
+
+def test_the_client_still_shows_a_stated_budget(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stated = {
+        "status": "stated",
+        "provider": PROVIDER,
+        "remaining_percent": 40,
+        "resets_at": "2026-10-27T12:00:00Z",
+        "source": "operator",
+        "stated_at": AT,
+    }
+    cli._print_role(role_with(stated))  # pyright: ignore[reportPrivateUsage]
+    out = capsys.readouterr().out
+    assert "budget 40 percent, resets 2026-10-27T12:00:00Z, stated by operator" in out
