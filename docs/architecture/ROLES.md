@@ -266,7 +266,9 @@ resolve real paths on the file system, which a port must do the same way.
 **Rollback hazard.** A daemon older than round 10 does not know `seat_unbound`,
 `role_retired` or `role_held`, so once any of them is in the log, the older daemon
 cannot read the log at all, as for the `unreported` field of `line_turn_ended`. A
-rollback past round 10 needs a log without them.
+rollback past round 10 needs a log without them. The rollback floor in
+[`EVENT_LOG.md`](../protocol/EVENT_LOG.md) names the commits of these and every other
+one-way change.
 
 ## What write ownership means
 
@@ -287,6 +289,74 @@ the owner's change may be inconsistent, which the recovery checklist accounts fo
 change drops the engine of every seat whose access changed, so the next turn builds a
 new session with the new profile, since a sandbox is fixed for an engine session's
 life.
+
+**Worktrees that overlap, from round 14.** **Required by the operator on
+2026-11-01.** A role's worktree equal to another's, inside it, or holding it, by real
+path and so through a symbolic link, was already refused by `dromon role create`,
+`update` and a project file. The check left out a role whose worktree did not resolve,
+as for one removed or not yet made, so a second role could take the directory holding
+it and own the missing worktree once it was made again. Each role now claims its
+worktree by real path as far as the path exists, with the rest kept as written, and
+the check compares those claims. A disjoint layout passes, one reached through a link
+included. **Coverage gap.** The tests check the claims and the comparison directly,
+since no line in the test desk runs where a second disjoint role would need its seats.
+
+**Readiness, from round 14.** **Required by the operator on 2026-11-01. The tool
+decided by core for review.** A successor seat reported a role ready before ownership
+had passed to it, and named a commit without the uncommitted work beside it. A seat
+now reports with `report_role_ready`, which takes no arguments.
+
+- It is refused unless the caller owns its role, naming the owner or saying the role
+  has none. It is refused while the caller has asked to give the role up when its turn
+  ends, and while a former writer's turn or kept connection is still in flight, which
+  is when the new owner's own turns wait too.
+- The daemon then reads the role worktree's `HEAD` and runs `git status
+  --porcelain=v1 -z` there with optional locks off, and reports both together, at
+  most 100 dirty paths named and the rest counted, each path cut at 300 characters.
+  A worktree whose commit or status cannot be read is refused, since a report must
+  not claim a clean tree it did not read.
+- The report is sent to the operator who last mailed the line, or to the default
+  operator, as a note from the harness, and the line is answered with the same text.
+- **Residual.** Nothing stops a line from saying it is ready in an ordinary message.
+  The tool makes the checked claim available, and a reader can tell the two apart by
+  the sender, since only the harness sends the checked one.
+
+**A turn in flight when ownership changes.** **Required by the operator on
+2026-11-01, round 14. The choice decided by core for review.** A brief that arrived
+before a role was given made the new owner's first turn read-only, because that turn
+was built before the change. Dropping the engine changed only the next turn. Each
+running turn whose line's access the change altered, the former owner's, the new
+owner's and each unconfined seat's, is now ended at its next safe point, as priority
+mail ends one, with a reason naming the change. Its next turn is built with the new
+access. The new owner's fresh turn is woken by the note a handoff or an operator's give
+already sends, and a seat that took the role inside its own turn is sent a note from
+the harness for the same purpose. The change of access is asked before priority mail,
+since a turn running with access it no longer has is the more urgent to end.
+
+- **Why end the turn rather than rebuild before the next tool call.** An engine's
+  sandbox and permissions are fixed when its session is built. A rebuild inside a
+  turn would start a new session and lose the turn's state anyway, and no engine
+  offers a point between tool calls where Dromon could swap its sandbox. The safe
+  point is a mechanism every adapter already honours.
+- **Residual.** The turn ends at its next safe point, not at once, so a tool call
+  already running when the change applies finishes with the access its turn was built
+  with. A safe point needs every tool the turn started to have finished. The former
+  owner's turn cannot be in this position for a change the harness makes, since a
+  handoff takes effect when the owner's turn ends and a take or a give is refused
+  while the owner's turn is in flight.
+- **Residual, longer than one call. Round 14 review, O1, recorded at the operator's
+  request.** **Inference, from `dromon.priority`.** A safe point is reached only once
+  every tool use of the turn has its result. Parallel tool calls, and the calls of a
+  subagent inside a task, therefore keep the access the turn was built with until the
+  last of them returns, which may be far longer than one call. A long command run in
+  such a turn keeps that access for its whole length. A background task started in
+  the turn keeps the sandbox it was started with after the turn ends, as before round
+  14. Two writers are still not at work together, since the new owner's first turn
+  waits for the former writer's turn to end. Not shown by a run, since it needs a
+  live engine.
+- **Tested, from the round 14 review, G1.** A turn that ends before it reaches a safe
+  point clears its reason at its end, in both the ordinary and the self-started path,
+  so the next turn, already built with the new access, is not ended for it.
 
 **An engine that cannot confine a seat.** **Inference.** Not every adapter can make one
 directory read only. A seat on such an engine is not woken while another seat owns the

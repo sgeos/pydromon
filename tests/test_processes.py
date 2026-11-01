@@ -36,8 +36,10 @@ from dromon.processes import (
     MAX_PENDING_PROCESS_CALLS,
     SystemProcesses,
     line_processes,
+    marked_processes,
     parse_ps,
     read_environment,
+    elapsed_seconds,
     stop_line_process,
 )
 from dromon.scheduler import LineEngine, LineSpec, Scheduler, engine_factory
@@ -221,6 +223,7 @@ def test_a_line_lists_only_its_own_marked_processes(table: FakeTable) -> None:
     assert [p["pid"] for p in found] == [2001, 2002]
     assert found[1] == {
         "pid": 2002,
+        "task_id": "pid:2002",
         "elapsed": "1-02:03:04",
         "command": "nohup ./gate.sh",
     }
@@ -268,6 +271,102 @@ def test_the_mark_is_read_again_at_the_moment_of_stopping(table: FakeTable) -> N
     assert table.sent == []
 
 
+class _Reusing(FakeTable):
+    """A table whose pid 2001 is given to another process once its mark was read."""
+
+    def __init__(self, base: FakeTable, replacement: ProcessInfo | None) -> None:
+        super().__init__(base.rows, base.envs)
+        self.replacement = replacement
+        self.checked = False
+
+    def has_variable(self, pid: int, assignment: str) -> bool:
+        answer = super().has_variable(pid, assignment)
+        self.checked = True
+        return answer
+
+    def own_processes(self) -> Sequence[ProcessInfo]:
+        if not self.checked:
+            return self.rows
+        rest = [p for p in self.rows if p.pid != 2001]
+        return rest if self.replacement is None else [*rest, self.replacement]
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        None,
+        ProcessInfo(2001, 1, "00:00", "uv run pytest " + "x" * 300),
+        ProcessInfo(2001, 1001, "00:00", "someone else's job"),
+        ProcessInfo(2001, 1001, "00:01", "uv run pytest " + "x" * 300),
+        ProcessInfo(2001, 1001, "later", "uv run pytest " + "x" * 300),
+    ],
+    ids=["gone", "other parent", "other command", "younger", "unreadable time"],
+)
+def test_a_pid_given_to_another_process_after_the_mark_was_read_is_not_signalled(
+    table: FakeTable, replacement: ProcessInfo | None
+) -> None:
+    reusing = _Reusing(table, replacement)
+    with pytest.raises(ProcessRefused, match="changed while it was checked"):
+        stop_line_process(reusing, MARK, DAEMON, 2001, False)
+    assert reusing.sent == []
+
+
+class _Unmarked(FakeTable):
+    """A table whose pid 2001 is given, with the same parent and command and a later
+    elapsed time, to a process that carries no mark, once the second listing is read."""
+
+    def __init__(self, base: FakeTable) -> None:
+        super().__init__(base.rows, base.envs)
+        self.listings = 0
+
+    def own_processes(self) -> Sequence[ProcessInfo]:
+        self.listings += 1
+        return self.rows
+
+    def has_variable(self, pid: int, assignment: str) -> bool:
+        if self.listings >= 2:
+            return False
+        return super().has_variable(pid, assignment)
+
+
+def test_a_process_without_the_mark_at_the_second_check_is_not_signalled(
+    table: FakeTable,
+) -> None:
+    unmarked = _Unmarked(table)
+    with pytest.raises(ProcessRefused, match="no longer carries the line's mark"):
+        stop_line_process(unmarked, MARK, DAEMON, 2001, False)
+    assert unmarked.listings == 2 and unmarked.sent == []
+
+
+def test_a_process_that_only_grew_older_is_still_signalled(table: FakeTable) -> None:
+    older = ProcessInfo(2001, 1001, "02:03", "uv run pytest " + "x" * 300)
+    reusing = _Reusing(table, older)
+    assert stop_line_process(reusing, MARK, DAEMON, 2001, False) == (
+        "sent SIGTERM to process 2001"
+    )
+    assert reusing.sent == [(2001, signal.SIGTERM)]
+
+
+@pytest.mark.parametrize(
+    ("text", "seconds"),
+    [
+        ("00:05", 5),
+        ("59:00", 3540),
+        ("01:00:00", 3600),
+        ("1-02:03:04", 86400 + 2 * 3600 + 3 * 60 + 4),
+        ("7", None),
+        ("a:b", None),
+        ("x-01:00", None),
+        ("1:2:3:4", None),
+        ("", None),
+    ],
+)
+def test_ps_elapsed_time_is_read_as_seconds_or_refused(
+    text: str, seconds: int | None
+) -> None:
+    assert elapsed_seconds(text) == seconds
+
+
 def test_a_process_that_ended_or_cannot_be_signalled_is_reported(
     table: FakeTable,
 ) -> None:
@@ -298,9 +397,10 @@ def test_ps_rows_are_parsed_and_malformed_ones_skipped() -> None:
 
 
 class Completed:
-    def __init__(self, stdout: str, returncode: int = 0) -> None:
+    def __init__(self, stdout: str, returncode: int = 0, stderr: str = "") -> None:
         self.stdout = stdout
         self.returncode = returncode
+        self.stderr = stderr
 
 
 def test_the_system_table_lists_through_ps_and_fails_closed(
@@ -476,6 +576,104 @@ def test_list_processes_takes_no_arguments_and_reports_a_listing_failure(
     table.own_processes = broken  # type: ignore[method-assign]
     text, error = call(scheduler, "alpha", "list_processes", {})
     assert error and "cannot list processes" in text
+    assert text.startswith("list_processes is unavailable: ")
+
+
+def test_a_table_whose_environments_failed_is_unavailable_and_never_an_empty_list(
+    scheduler: Scheduler, table: FakeTable, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 14, item 2. A ps that timed out gave an empty mapping of environments,
+    and an empty mapping listed nothing, which a line reads as no process running."""
+    import os
+
+    monkeypatch.setattr(os, "getpid", lambda: DAEMON)
+
+    def timed_out() -> dict[int, list[str]]:
+        raise ProcessRefused("ps did not answer within 10 seconds")
+
+    table.environments = timed_out  # type: ignore[method-assign]
+    text, error = call(scheduler, "alpha", "list_processes", {})
+    assert error
+    assert text == (
+        "list_processes is unavailable: ps did not answer within 10 seconds"
+    )
+    assert text != "[]"
+
+
+def test_no_readable_environment_at_all_is_unavailable_and_not_an_empty_list(
+    table: FakeTable,
+) -> None:
+    """Round 14, item 2. Processes exist and none can be attributed, so the reading
+    failed, which is not the same as a line with nothing running."""
+    for pid in table.envs:
+        table.envs[pid] = None
+    with pytest.raises(ProcessRefused, match="none of the 8 processes"):
+        line_processes(table, MARK, DAEMON)
+    with pytest.raises(ProcessRefused, match="none of the 8 processes"):
+        marked_processes(table, DAEMON)
+
+
+def test_a_working_table_with_nothing_of_the_lines_lists_an_empty_list(
+    table: FakeTable,
+) -> None:
+    """The counterpart of the above. An empty list is still the answer for a line
+    with nothing running, when the environments could be read."""
+    assert line_processes(table, "alpha.nothing", DAEMON) == []
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_strict_environment_reading_names_why_it_failed(
+    monkeypatch: pytest.MonkeyPatch, platform: str, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(processes.sys, "platform", platform)
+    monkeypatch.setattr(processes, "PROC", tmp_path / "missing")
+
+    def timed_out(command: list[str], **_: object) -> Completed:
+        raise subprocess.TimeoutExpired(command, 10)
+
+    monkeypatch.setattr(subprocess, "run", timed_out)
+    with pytest.raises(ProcessRefused):
+        processes.read_environments(1, strict=True)
+    assert processes.read_environments(1) == {}
+    if platform == "darwin":
+        with pytest.raises(ProcessRefused, match="did not answer within 10 seconds"):
+            processes.read_environments(1, strict=True)
+
+        def cannot_run(command: list[str], **_: object) -> Completed:
+            raise OSError("not permitted")
+
+        monkeypatch.setattr(subprocess, "run", cannot_run)
+        with pytest.raises(ProcessRefused, match="ps cannot be run: not permitted"):
+            processes.read_environments(1, strict=True)
+
+        def denied(command: list[str], **_: object) -> Completed:
+            return Completed("", 2, "denied\n")
+
+        monkeypatch.setattr(subprocess, "run", denied)
+        with pytest.raises(ProcessRefused, match="status 2 and said denied"):
+            processes.read_environments(1, strict=True)
+
+
+def test_strict_environment_reading_is_refused_on_an_unknown_platform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(processes.sys, "platform", "plan9")
+    with pytest.raises(ProcessRefused, match="does not let the daemon read"):
+        processes.read_environments(1, strict=True)
+    assert processes.read_environments(1) == {}
+
+
+def test_the_system_table_environments_are_strict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(processes.sys, "platform", "darwin")
+
+    def timed_out(command: list[str], **_: object) -> Completed:
+        raise subprocess.TimeoutExpired(command, 10)
+
+    monkeypatch.setattr(subprocess, "run", timed_out)
+    with pytest.raises(ProcessRefused):
+        SystemProcesses().environments()
 
 
 def test_all_environments_are_read_in_one_call_on_macos(
@@ -664,7 +862,10 @@ def test_where_processes_cannot_be_identified_the_tools_explain(
         ]
         for name, args in cases:
             text, error = call(blind, "alpha", name, args)
-            assert (text, error) == (processes.UNIDENTIFIABLE, True)
+            assert (text, error) == (
+                processes.unavailable(name, processes.UNIDENTIFIABLE),
+                True,
+            )
         status = blind.line_status("alpha")["processes"]
         assert status == {
             "identifiable": False,
@@ -865,3 +1066,54 @@ def test_deepest_first_ends_on_a_cycle() -> None:
     a = TreeRow(1000, 2000, 1000, "a", STARTED)
     b = TreeRow(2000, 1000, 2000, "b", STARTED)
     assert sorted(row.pid for row in deepest_first([a, b])) == [1000, 2000]
+
+
+def test_a_stop_does_not_wait_behind_a_kill_all_walk_check(
+    tmp_path: Path, table: FakeTable, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of 2026-11-01, finding 4. The pre-turn walk can run for most of a
+    minute under load, and it shared the one worker that serves stops, listings and
+    pid watches, so a stop queued behind it. It has its own worker now, so the stop
+    is answered while the walk is still held."""
+    import os
+
+    monkeypatch.setattr(os, "getpid", lambda: DAEMON)
+    release = threading.Event()
+    walking = threading.Event()
+
+    def slow_walk() -> str | None:
+        walking.set()
+        release.wait(timeout=30)
+        return None
+
+    async def scenario(found: Scheduler) -> tuple[str, bool, bool]:
+        mark_value = found.line_mark("alpha")
+        table.envs[2001] = mark(mark_value)
+        check = asyncio.create_task(found._check_walk("alpha"))  # pyright: ignore[reportPrivateUsage]
+        while not walking.is_set():
+            await asyncio.sleep(0.01)
+        tool = next(t for t in found.own_tools("alpha") if t.name == "stop_process")
+        try:
+            result = await asyncio.wait_for(tool.handler({"pid": 2001}), timeout=5)
+            still_walking = not check.done()
+        finally:
+            release.set()
+            await check
+        return (
+            cast(str, result["content"][0]["text"]),
+            result.get("is_error") is True,
+            still_walking,
+        )
+
+    with EventLog(tmp_path / "events.sqlite") as log:
+        found = Scheduler(
+            log, no_engine, hold_wakes=True, processes=table, walk_check=slow_walk
+        )
+        found.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+        try:
+            text, error, still_walking = asyncio.run(scenario(found))
+        finally:
+            release.set()
+            found.stop_workers()
+    assert (text, error) == ("sent SIGTERM to process 2001", False)
+    assert still_walking

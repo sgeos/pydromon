@@ -7,6 +7,7 @@ import pytest
 from pathlib import Path
 
 from dromon import __version__, cli, daemon, exits
+from dromon.paths import ProjectPaths, project_paths
 from dromon.protocol import Operation, Response
 
 
@@ -372,6 +373,51 @@ def test_send_passes_priority_only_when_asked(
     ((operation, args),) = sent
     assert operation is Operation.SEND and args is not None
     assert args.get("priority") is expected
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [([], None), (["--no-reply"], False), (["--ask-reply"], True)],
+)
+@pytest.mark.parametrize("fleet", [False, True])
+def test_send_passes_asks_reply_only_when_asked(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    short_runtime: Path,
+    flag: list[str],
+    expected: bool | None,
+    fleet: bool,
+) -> None:
+    """**Follow-up of 2026-11-01.** Given neither flag, the client sends nothing,
+    so the daemon's rule decides."""
+    sent: list[tuple[Operation, dict[str, object] | None]] = []
+    monkeypatch.setattr(cli, "call", answering(sent, {"message_id": "m-1"}))
+    if fleet:
+
+        def routed(*given: object) -> tuple[ProjectPaths, str]:
+            del given
+            return project_paths(tmp_path, short_runtime), "alpha"
+
+        monkeypatch.setattr(cli, "_fleet_routed", routed)
+        argv = ["fleet", "send", "here:alpha", "stop", *flag]
+    else:
+        runtime = ["--runtime-dir", str(short_runtime)]
+        argv = ["--project", str(tmp_path), *runtime, "send", "alpha", "stop", *flag]
+    assert cli.main([*argv, "--operator", "ana"]) == exits.OK
+    ((operation, args),) = sent
+    assert operation is Operation.SEND and args is not None
+    assert args.get("asks_reply") is expected
+    assert ("asks_reply" in args) is (expected is not None)
+
+
+def test_send_refuses_both_reply_flags(
+    tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    runtime = ["--runtime-dir", str(short_runtime)]
+    argv = ["--project", str(tmp_path), *runtime, "send", "alpha", "stop"]
+    with pytest.raises(SystemExit):
+        cli.main([*argv, "--no-reply", "--ask-reply"])
+    assert "not allowed with argument" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

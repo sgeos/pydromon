@@ -1483,7 +1483,7 @@ def test_line_status_shows_the_brief_as_untrusted_data(world: World) -> None:
     full = cast(dict[str, Any], world.scheduler.line_status("alpha")["brief"])
     assert "untrusted" in full["trust"]
     assert full["untrusted_data"]["task"] == long_task
-    assert full["workdir_commit"] == WORKTREE_COMMIT
+    assert full["workdir_commit_when_set"] == WORKTREE_COMMIT
     compact = cast(
         dict[str, Any],
         world.scheduler.line_status("alpha", detail=False, lists=False)["brief"],

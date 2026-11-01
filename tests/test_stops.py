@@ -584,7 +584,8 @@ def marked(world: World, *pids: int) -> None:
     world.table.rows = [ProcessInfo(DAEMON, 1, "1:00", "dromond")] + [
         ProcessInfo(pid, 1, "0:10", f"nohup work {pid}") for pid in pids
     ]
-    world.table.envs = {pid: [mark] for pid in pids}
+    # The daemon's own environment is readable wherever the platform works at all.
+    world.table.envs = {DAEMON: ["PATH=/bin"], **{pid: [mark] for pid in pids}}
 
 
 def test_detached_processes_found_by_the_mark_are_recorded_once(
