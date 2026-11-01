@@ -15,7 +15,9 @@ All notable changes are recorded here. The format follows
   every other field only when it says something, and no longer gives `held`, since
   `hold_cause` is given exactly when the line is held. A view too large for the
   response bound keeps as many lines as fit, with `other_lines_omitted` counting the
-  rest, where before it vanished at about seventeen other lines. The state keeps
+  rest, where before it vanished at about seventeen other lines. The lines it keeps
+  are first those held, failed or with unread mail, then the rest, so a held line
+  whose name sorts last is not the one dropped. The state keeps
   each line's unread mail and open questions as indexes, so `condition` and the view
   scan no messages, and the view is built only when the lists are asked for. A line had held back work it planned for a peer because its
   status gave no reliable view of the peer. `line_held` takes an optional `cause`,

@@ -29,6 +29,7 @@ from dromon.limits import Limits
 from dromon.model import (
     Event,
     HoldCause,
+    LeaseAcquired,
     LineAddress,
     LineHeld,
     LineMail,
@@ -550,6 +551,32 @@ def test_the_view_is_rebuilt_from_the_log_after_a_restart(world: World) -> None:
     assert after["oldest_unread_age_seconds"] == 60
 
 
+# Leases.
+
+
+def test_an_expired_lease_leaves_the_view_as_the_lease_becomes_free(
+    world: World,
+) -> None:
+    """Re-review of r13. A lease past its expiry needs no event to end, so the view
+    must judge it by the clock, as ``_live_lease`` does, and the two must agree. At
+    its expiry exactly a lease is free."""
+    now = world.clock.now
+    world.log.append(
+        LeaseAcquired("gate", "beta", due(now), due(now + timedelta(seconds=60)))
+    )
+    world.log.append(
+        LeaseAcquired("device", "beta", due(now), due(now + timedelta(seconds=600)))
+    )
+    live = world.scheduler._live_lease  # pyright: ignore[reportPrivateUsage]
+    assert world.beta()["leases"] == ["device", "gate"]
+    world.clock.advance(60)
+    assert world.beta()["leases"] == ["device"]
+    assert live("gate") is None and live("device") is not None
+    world.clock.advance(540)
+    assert "leases" not in world.beta()
+    assert live("device") is None
+
+
 # The response bound.
 
 
@@ -588,6 +615,86 @@ def test_a_view_past_the_bound_keeps_the_first_lines_and_counts_the_rest(
     assert len(shown) + lists["other_lines_omitted"] == len(expected)
     assert lists["other_lines_omitted"] > 0
     assert status["other_line_count"] == len(expected)
+
+
+def make_held(world: World, line_id: str) -> None:
+    world.scheduler.hold(line_id, HOLD_REASON, cause=HoldCause.COST)
+
+
+def make_failed(world: World, line_id: str) -> None:
+    def act() -> None:
+        world.scheduler.send(LineAddress(line_id), ANA, "this turn is about to fail")
+        raise RuntimeError("the engine broke")
+
+    world.turn(line_id, act)
+    # The failed turn leaves its note unread. Reading it here leaves the failure as
+    # the only thing the line's entry says.
+    for message_id in list(world.log.state.unread_mail.get(line_id, {})):
+        if not world.log.state.messages[message_id].delivered:
+            world.log.append(MessageDelivered(message_id))
+        world.log.append(MessageRead(message_id))
+
+
+def make_unread(world: World, line_id: str) -> None:
+    world.scheduler.send(ANA, LineAddress(line_id), "a note left unread")
+
+
+@pytest.mark.parametrize(
+    ("make", "says"),
+    [
+        (make_held, ("hold_cause", "cost")),
+        (make_failed, ("condition", "failed")),
+        (make_unread, ("unread", 1)),
+    ],
+)
+@pytest.mark.parametrize("args", [{"lists": True}, {"detail": True, "lists": True}])
+def test_a_line_that_says_something_survives_the_bound_though_it_sorts_last(
+    world: World,
+    make: Callable[[World, str], None],
+    says: tuple[str, object],
+    args: dict[str, object],
+) -> None:
+    """Re-review of r13. Past the bound, a held line, a failed one, or one with
+    unread mail is kept before the idle lines, and the lines kept are still given in
+    the order of their identifiers."""
+    idle = many(world, 99)
+    world.scheduler.create_line("zeta", HAIKU, Strategy.SUBSCRIPTION)
+    make(world, "zeta")
+    text = world.call(args)
+    assert len(text.encode("utf-8")) <= MAX_LINE_STATUS_DEFAULT_BYTES
+    status = json.loads(text)
+    lists = status.get("lists", status)
+    entries = cast(list[dict[str, object]], lists["other_lines"])
+    shown = [cast(str, entry["line_id"]) for entry in entries]
+    assert shown[-1] == "zeta"
+    key, value = says
+    zeta = entries[-1]
+    assert zeta[key] == value
+    reasons = {name for name in ("hold_cause", "unread") if name in zeta}
+    if zeta["condition"] == "failed":
+        reasons.add("condition")
+    assert reasons == {key}, "each case must be kept for its own reason alone"
+    assert shown[:-1] == idle[: len(shown) - 1]
+    assert shown == sorted(shown)
+    assert lists["other_lines_omitted"] > 0
+    assert len(shown) + lists["other_lines_omitted"] == len(idle) + 1
+
+
+def test_a_hibernated_or_waiting_line_is_not_kept_before_the_rest(
+    world: World,
+) -> None:
+    """Only a hold, a failed turn and unread mail move a line forward, so a line
+    that is merely hibernated or waiting on an operator keeps its place."""
+    idle = many(world, 99)
+    world.scheduler.create_line("zeta", HAIKU, Strategy.SUBSCRIPTION)
+    world.scheduler.hibernate("zeta")
+    world.scheduler.ask("zeta", ANA, "a question waiting on the operator")
+    status = json.loads(world.call({"lists": True}))
+    lists = status.get("lists", status)
+    shown = [entry["line_id"] for entry in lists["other_lines"]]
+    assert lists["other_lines_omitted"] > 0
+    assert shown == idle[: len(shown)]
+    assert "zeta" not in shown
 
 
 def test_the_most_lines_that_fit_are_kept(world: World) -> None:

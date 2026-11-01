@@ -258,8 +258,13 @@ given exactly when the line is held.
 
 - **The response bound.** **Decided by the operator on review r13, T1.** When the
   whole response would pass the bound of 8,192 bytes, it keeps as many other lines as
-  fit, the first in order, and `other_lines_omitted` beside `other_lines` counts the
-  rest. It is 0 when every line is shown, and `other_line_count` gives them all. When
+  fit, and `other_lines_omitted` beside `other_lines` counts the rest. It is 0 when
+  every line is shown, and `other_line_count` gives them all. **Decided by the
+  operator on the re-review of r13.** The lines kept are first those that are held,
+  whose turn failed or that hold unread mail, and then the rest, each part in the
+  order of their identifiers. A line that is only hibernated or waiting keeps its
+  place. The lines kept are given in the order of their identifiers, as the whole
+  view is, so a held line whose name sorts last is shown, and is shown last. When
   the other lists alone pass the bound, the response is truncated as before, and
   still carries `other_lines` and `other_lines_omitted` at its top. An entry whose
   lease names alone would pass the bound gives `lease_count` in place of `leases`, so

@@ -10510,15 +10510,16 @@ def _status_size(status: dict[str, object]) -> int:
 def _with_other_lines(
     status: dict[str, object], entries: list[dict[str, object]], kept: int
 ) -> dict[str, object]:
-    """``status`` with the first ``kept`` of ``entries`` as its other lines and the
-    count of the rest as ``other_lines_omitted``, under ``lists`` when ``status`` has
-    that object and at its top otherwise. ``status`` itself is not changed."""
+    """``status`` with the first ``kept`` of ``entries`` as its other lines, in the
+    order of their identifiers, and the count of the rest as
+    ``other_lines_omitted``, under ``lists`` when ``status`` has that object and at
+    its top otherwise. ``status`` itself is not changed."""
     fitted = dict(status)
     holder = fitted
     if isinstance(fitted.get("lists"), dict):
         holder = dict(cast(dict[str, object], fitted["lists"]))
         fitted["lists"] = holder
-    holder["other_lines"] = entries[:kept]
+    holder["other_lines"] = sorted(entries[:kept], key=_entry_line_id)
     holder["other_lines_omitted"] = len(entries) - kept
     return fitted
 
@@ -10549,6 +10550,26 @@ def _fit_other_lines(
     return _with_other_lines(status, entries, low)
 
 
+def _entry_line_id(entry: dict[str, object]) -> str:
+    """The identifier of the line ``entry`` describes."""
+    return cast(str, entry["line_id"])
+
+
+def _says_something(entry: dict[str, object]) -> bool:
+    """Whether ``entry`` describes a line that is held, whose turn failed, or that
+    holds unread mail, which are what a line most needs to see of a peer."""
+    return (
+        "hold_cause" in entry or entry.get("condition") == "failed" or "unread" in entry
+    )
+
+
+def _ranked_other_lines(entries: list[dict[str, object]]) -> list[dict[str, object]]:
+    """``entries``, which are in the order of their identifiers, with those that say
+    something first and the rest after, each part keeping that order. The sort is
+    stable, so only the two parts move."""
+    return sorted(entries, key=lambda entry: not _says_something(entry))
+
+
 def _bare_other_line(entry: dict[str, object]) -> dict[str, object]:
     """``entry`` with its lease names replaced by their count, whose size is bounded
     by the identifier pattern and the fixed fields alone."""
@@ -10567,14 +10588,21 @@ def _bounded_with_lists(
 
     **Task of 2026-11-01, decided by the operator on review r13, T1.** The view of
     the other lines never vanishes as the lines grow. When the whole response would
-    pass the bound, it keeps as many other lines as fit, in the order of their
-    identifiers, with ``other_lines_omitted`` counting the rest. When not one fits
+    pass the bound, it keeps as many other lines as fit, with
+    ``other_lines_omitted`` counting the rest. When not one fits
     beside the other lists, the response is truncated as before, and still carries
     as many other lines as fit beside the shortest status, then, should not one fit
     with its lease names, entries with a lease count instead. Such an entry is at
     most a few hundred bytes, since identifiers match ``ID_PATTERN``, so at least one
-    is always given while any other line exists."""
-    entries = cast(list[dict[str, object]], full["other_lines"])
+    is always given while any other line exists.
+
+    **Follow-up of 2026-11-01, decided by the operator on the re-review of
+    r13.** Past the bound, the lines kept are first those that are held, whose turn
+    failed, or that hold unread mail, and then the rest, each in the order of their
+    identifiers. A held line whose name sorts last is then not the one dropped. The
+    lines kept are given in the order of their identifiers, as the whole view is, so
+    the order of a response never depends on whether it was bounded."""
+    entries = _ranked_other_lines(cast(list[dict[str, object]], full["other_lines"]))
     fitted = _fit_other_lines(status, entries)
     if fitted is not None:
         return fitted
