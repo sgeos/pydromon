@@ -532,11 +532,18 @@ SESSION_SEPARATOR: Final = ":"
 in the engine session Dromon stores. A thread identifier holds no colon."""
 
 TOOLS_CHANGED_NOTE: Final = (
-    "Dromon's tools for this line changed since your Codex thread started, and a"
-    " resumed thread keeps the tools it started with, so this turn starts a new thread."
+    "Dromon's tools or permission profile for this line changed since your Codex"
+    " thread started, so this turn starts a new thread."
     " The earlier thread's context is not available in it. Your mailbox, files and"
     " reports are unchanged."
 )
+
+WRITER_REPLACED_NOTE: Final = (
+    "Dromon replaced your Codex session because thread/resume twice reported an"
+    " active writer after a short wait. This turn starts a new thread. Your mailbox,"
+    " standing brief and files are retained. The earlier thread context is unavailable."
+)
+WRITER_RETRY_SECONDS: Final = 0.25
 
 
 def split_session(session: str | None) -> tuple[str | None, str | None]:
@@ -591,7 +598,13 @@ def server_arguments(
                 f"the MCP server name {name!r} cannot be disabled by a Codex override,"
                 " so the line cannot be isolated"
             )
-        arguments += ["-c", f"mcp_servers.{name}.enabled=false"]
+        # Account listings can name servers absent from local configuration. A
+        # sparse enabled override then creates an entry without a transport.
+        # Supply a complete inert stdio transport even though it is disabled.
+        arguments += [
+            "-c",
+            f'mcp_servers.{name}={{enabled=false,command="/usr/bin/false",args=[]}}',
+        ]
     for feature in DISABLED_FEATURES:
         arguments += ["--disable", feature]
     image = "enable" if VIEW_IMAGE in config.builtin_tools else "disable"
@@ -729,14 +742,19 @@ def list_servers(environment: Mapping[str, str]) -> Sequence[str]:
     if not isinstance(decoded, list):
         raise EngineRefused("codex mcp list returned something other than a list")
     names: list[str] = []
-    for entry in cast(list[object], decoded):
+    for index, entry in enumerate(cast(list[object], decoded)):
+        fields = cast(dict[str, object], entry) if isinstance(entry, dict) else {}
         name = (
             cast(dict[str, object], entry).get("name")
             if isinstance(entry, dict)
             else None
         )
         if not isinstance(name, str):
-            raise EngineRefused("codex mcp list returned a server without a name")
+            if fields.get("enabled") is False:
+                # No disabling override can be formed without a name. Named
+                # entries still get an explicit override even when disabled.
+                continue
+            raise EngineRefused(f"codex mcp list field [{index}].name must be text")
         names.append(name)
     return names
 
@@ -755,7 +773,18 @@ def identifier(value: object) -> str | None:
 
 
 class _RpcError(Exception):
-    pass
+    def __init__(self, method: str, error: object) -> None:
+        super().__init__(f"{method}: {error}")
+        fields = cast(dict[str, Any], error) if isinstance(error, dict) else {}
+        self.writer_conflict = (
+            method == "thread/resume"
+            and fields.get("code") == -32600
+            and isinstance(fields.get("message"), str)
+            and re.fullmatch(
+                r"thread \S+ already has an active writer", fields["message"]
+            )
+            is not None
+        )
 
 
 PLAN_LIMIT_CODES: Final = frozenset(
@@ -992,6 +1021,7 @@ class _Turn:
     """Identifiers of refused items already counted, regardless of notice order."""
     tools_changed: bool = False
     """Whether this turn started a new thread because Dromon's tools changed."""
+    writer_replaced: bool = False
     calls: list[dict[str, int]] = field(default_factory=list[dict[str, int]])
     """Each engine call's tokens, the latest ``MAX_CALLS``."""
     first_total: dict[str, int] | None = None
@@ -1173,6 +1203,7 @@ class CodexLine:
         self.config = config
         self.mcp_tools = {tool.name: tool for tool in mcp_tools}
         self.session_id = session_id
+        self._session_fingerprint = ""
         self.protected = tuple(protected)
         self.write_protected = tuple(write_protected)
         self._environment = os.environ if environment is None else environment
@@ -1320,6 +1351,13 @@ class CodexLine:
                 (*self.write_protected, *(git_directories(self.cwd) or ())),
                 scratch,
             )
+            prefix = f"permissions.{PROFILE_NAME}="
+            profile = next(
+                arg[len(prefix) :] for arg in arguments if arg.startswith(prefix)
+            )
+            # Persist the exact profile supplied at launch, even if a protected
+            # path appears while initialize or the turn is in progress.
+            self._session_fingerprint = self.tools_fingerprint(profile)
             instructions = read_instructions(self.config.instructions, self.cwd)
         except Exception:
             await self.close()
@@ -1361,7 +1399,7 @@ class CodexLine:
         thread_id: str,
         compaction: tuple[dict[str, int | str | None], _Turn] | None = None,
     ) -> TurnReport:
-        session = f"{thread_id}{SESSION_SEPARATOR}{self.tools_fingerprint()}"
+        session = f"{thread_id}{SESSION_SEPARATOR}{self._session_fingerprint}"
         self.session_id = session
         subtype = "success" if turn.status == "completed" else turn.status
         self.driver.step(Event("result", subtype, 1))
@@ -1416,7 +1454,7 @@ class CodexLine:
                     limit = _plan_limit(error)
                     if limit is not None:
                         raise EnginePlanLimit(limit)
-                    raise _RpcError(f"{method}: {error}")
+                    raise _RpcError(method, error)
                 result: object = message.get("result")
                 return cast(dict[str, Any], result) if isinstance(result, dict) else {}
             await self._dispatch(message, turn)
@@ -1441,7 +1479,15 @@ class CodexLine:
             if tool is None:
                 result = tool_output(
                     {
-                        "content": [{"type": "text", "text": "no such tool"}],
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "the line was not given tool "
+                                    f"{params.get('tool')!r}"
+                                ),
+                            }
+                        ],
                         "is_error": True,
                     }
                 )
@@ -1619,6 +1665,10 @@ class CodexLine:
         # The driver's budget counts refused calls even when Codex reports only
         # item/completed. Identifiers deduplicate either notice order.
         await self._act(Event("tool_use", kind), turn)
+        if kind == "dynamicToolCall":
+            # Execution requires our item/tool/call response. An unknown handler
+            # returns an error there without running code, so continuation is safe.
+            return
         reason = f"the engine used a tool the line was not given: {kind}"
         if kind == IMAGE_ITEM and VIEW_IMAGE in self.config.builtin_tools:
             reason = f"the line may not view that image: {self._image_refusal(item)}"
@@ -1711,20 +1761,43 @@ class CodexLine:
         if instructions:
             settings["developerInstructions"] = instructions
         resumable, fingerprint = split_session(self.session_id)
-        if resumable is not None and fingerprint != self.tools_fingerprint():
+        if resumable is not None and fingerprint != self._session_fingerprint:
             # thread/resume takes no dynamicTools in this Codex, so a thread keeps the
             # tools it was started with, and changed tools need a new thread.
             turn.tools_changed = True
             resumable = None
+        result: dict[str, Any] = {}
+        if resumable is not None:
+            for attempt in range(2):
+                try:
+                    result = await self._call(
+                        "thread/resume", {**settings, "threadId": resumable}, turn
+                    )
+                    break
+                except _RpcError as error:
+                    if not error.writer_conflict:
+                        raise
+                    if attempt == 0:
+                        await asyncio.sleep(WRITER_RETRY_SECONDS)
+                    else:
+                        turn.writer_replaced = True
+                        resumable = None
         if resumable is None:
             settings["dynamicTools"] = [
                 dynamic_tool(t) for t in self.mcp_tools.values()
             ]
-            result = await self._call("thread/start", settings, turn)
-        else:
-            result = await self._call(
-                "thread/resume", {**settings, "threadId": resumable}, turn
-            )
+            try:
+                result = await self._call("thread/start", settings, turn)
+            except _RpcError as error:
+                if turn.writer_replaced:
+                    self.session_id = None
+                    raise EngineRefused(
+                        "the active writer persisted and a replacement thread could"
+                        " not start. A resume will retry thread recovery and"
+                        " replacement, retaining"
+                        " the line's mailbox, brief and files"
+                    ) from error
+                raise
         thread = cast(dict[str, Any], result.get("thread") or {})
         thread_id = str(thread.get("id") or "")
         if not thread_id:
@@ -1771,15 +1844,25 @@ class CodexLine:
         if apps.get("data"):
             turn.refusal = "the engine offers apps the line was not given"
 
-    def tools_fingerprint(self) -> str:
-        """A short digest of the names of Dromon's tools for this line, stored with
-        the thread so a resumed thread can be checked against today's tools."""
-        names = "\n".join([self.config.workdir_access.value, *sorted(self.mcp_tools)])
+    def tools_fingerprint(self, profile: str | None = None) -> str:
+        """Digest tools and the profile snapshot used to open the thread."""
+        if profile is None:
+            profile = permission_profile(
+                self.config,
+                self.protected,
+                (*self.write_protected, *(git_directories(self.cwd) or ())),
+                self.scratch,
+            )
+        names = "\n".join(
+            [profile, *sorted(self.config.builtin_tools), *sorted(self.mcp_tools)]
+        )
         return hashlib.sha256(names.encode("utf-8")).hexdigest()[:16]
 
     async def _run(self, thread_id: str, prompt: str, turn: _Turn) -> None:
         if turn.tools_changed:
             prompt = f"{TOOLS_CHANGED_NOTE}\n\n{prompt}"
+        if turn.writer_replaced:
+            prompt = f"{WRITER_REPLACED_NOTE}\n\n{prompt}"
         self.driver.step(Event("turn_start"))
         started = await self._call(
             "turn/start",

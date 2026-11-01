@@ -114,8 +114,8 @@ and its `README.md`.
 - `grok agent stdio` runs the agent over ACP. Agent options such as `--model` and
   `--reasoning-effort` precede the transport, and `--no-leader` starts a local agent.
 - `session/new` and `session/load` take `cwd`, `mcpServers` and `_meta`, whose
-  `yoloMode` and `autoMode` choose always-approve and auto mode, and whose `rules` are
-  appended to the system prompt. `session/prompt` streams `session/update`
+  `yoloMode` and `autoMode` choose always-approve and auto mode. Rules are documented
+  for session creation, with retention on load discussed below. `session/prompt` streams `session/update`
   notifications, including `agent_message_chunk`, `agent_thought_chunk` and
   `tool_call`, and the agent may send `session/request_permission`.
 - Custom sandbox profiles are defined only in `~/.grok/sandbox.toml` or a project's
@@ -698,3 +698,50 @@ user's MCP servers and reports no permission mode.
   `project_settings`, which loads Claude Code's settings.
 - No network blocking for a Grok line's commands on macOS.
 - Grok reports no cost, and the driver's `max_turns` is not enforced.
+
+## Rules retained by sessions
+
+**Fact.** The bundled guide `15-agent-mode.md` documents `_meta.rules` under optional
+fields on `session/new`. `17-sessions.md` documents loading a persisted session but
+does not promise replacing its rules. Round 14 operator mail reports resumed rules
+remaining unchanged. No live exchange independently verifies that report here.
+
+**Inference.** Passing current rules to `session/load` is insufficient evidence that
+they apply. Dromon stores the session identifier followed by `:rules-` and the full
+Secure Hash Algorithm 256 digest of the rendered instructions supplied at creation.
+It loads only when the current digest matches. A changed or absent digest creates a
+new session and explains the replacement in the first prompt. The mailbox, standing
+brief and files remain. Legacy sessions are replaced once because their rules cannot
+be established. The digest records the creation snapshot even if an instruction file
+changes during the turn. Restoring earlier rules does not restore earlier context.
+
+## Profile checks before startup
+
+**Fact.** Every effective Grok line is checked after project declarations are applied
+to the event log during the shared daemon start and restart preflight. This includes
+lines created through clients. The check reads profiles without creating homes or
+starting engines. A refusal names the line and the profile table or missing array
+entries. The required paths include project read-only paths and both fleet indexes.
+Protected paths require denial even before they exist. Turn-time checking remains
+necessary because paths and registered peers can change after preflight.
+
+## Tool advertisement filtering
+
+**Fact.** The bundled guide `14-headless-mode.md` documents `--tools` and
+`--disallowed-tools` for terminal and headless invocations. It describes differences
+between shell and daemon routes, including entries that remove nothing and issue a
+warning. The agent options table in `15-agent-mode.md` does not document either flag
+for `agent stdio`, which is the transport Dromon uses.
+
+**Inference.** These guides do not establish a supported way to filter the built-in
+tools advertised on Dromon's transport. Dromon does not pass an unverified filtering
+flag. This finding does not establish that Grok has no filtering capability.
+
+**Fact.** Dromon rejects unavailable calls through its permission policy. It continues
+after a rejected call only when the subsequent report explicitly asserts Boolean
+`toolNotRun=true`. Otherwise it cancels the turn because non-execution is uncertain.
+This policy does not remove a tool from the model's advertised tools.
+
+**Unverified.** Filtering on `agent stdio` still requires transport-specific vendor
+documentation or an independent exchange showing that unavailable tools disappear
+from the advertised set. No live Grok turn was run for this investigation.

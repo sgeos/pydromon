@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import sys
+import tomllib
 from collections import deque
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -525,8 +526,17 @@ def test_the_thread_is_isolated_and_offers_only_dromons_tools() -> None:
 def test_the_arguments_disable_every_server_feature_and_the_shell() -> None:
     arguments = server_arguments(["slack", "gmail", "gmail"], LineConfig())
     assert arguments[0] == "app-server"
-    assert arguments.count("mcp_servers.gmail.enabled=false") == 1
-    assert "mcp_servers.slack.enabled=false" in arguments
+    entries = [value for value in arguments if value.startswith("mcp_servers.")]
+    assert len(entries) == 2
+    for entry in entries:
+        servers = tomllib.loads(entry)["mcp_servers"]
+        assert set(servers) <= {"gmail", "slack"}
+        for server in servers.values():
+            assert server == {
+                "enabled": False,
+                "command": "/usr/bin/false",
+                "args": [],
+            }
     with pytest.raises(EngineRefused, match="cannot be disabled"):
         server_arguments(["mail.example"], LineConfig())
     for feature in (*DISABLED_FEATURES, "shell_tool", "unified_exec"):
@@ -1850,3 +1860,177 @@ def test_a_budget_stop_before_the_turn_is_named_is_sent_once_it_is() -> None:
     report = run(line(server))
     assert report.interrupted_for == "tool_budget"
     assert interrupted_turns(server) == ["t1"]
+
+
+@pytest.mark.parametrize("failures", [1, 2])
+def test_active_writer_retries_once_then_replaces(
+    failures: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(codex_module, "WRITER_RETRY_SECONDS", 0)
+
+    class WriterServer(FakeServer):
+        remaining = failures
+
+        async def send(self, message: Mapping[str, object]) -> None:
+            if message.get("method") == "thread/resume" and self.remaining:
+                self.remaining -= 1
+                self.sent.append(dict(message))
+                self.queue.append(
+                    {
+                        "id": message["id"],
+                        "error": {
+                            "code": -32600,
+                            "message": "thread th already has an active writer",
+                        },
+                    }
+                )
+                return
+            await super().send(message)
+
+    server = WriterServer()
+    target = line(server)
+    target.session_id = f"th:{target.tools_fingerprint()}"
+    report = run(target)
+    assert server.methods().count("thread/resume") == 2
+    assert server.methods().count("thread/start") == (1 if failures == 2 else 0)
+    assert (
+        codex_module.WRITER_REPLACED_NOTE in str(server.params("turn/start")["input"])
+    ) == (failures == 2)
+    assert report.subtype == "success"
+
+
+def test_other_resume_errors_are_not_retried() -> None:
+    server = FakeServer(failing="thread/resume")
+    target = line(server)
+    target.session_id = f"th:{target.tools_fingerprint()}"
+    with pytest.raises(EngineRefused, match="refused a request"):
+        run(target)
+    assert server.methods().count("thread/resume") == 1
+    assert "thread/start" not in server.methods()
+
+
+def test_profile_change_replaces_the_thread(tmp_path: Path) -> None:
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    server = FakeServer()
+    target = line(server)
+    target.session_id = f"th:{target.tools_fingerprint()}"
+    target.protected = (protected,)
+    run(target)
+    assert "thread/resume" not in server.methods()
+    assert "thread/start" in server.methods()
+    assert TOOLS_CHANGED_NOTE in str(server.params("turn/start")["input"])
+
+
+def test_unknown_dynamic_call_returns_named_error_and_continues() -> None:
+    calls.clear()
+    server = FakeServer(
+        [
+            item("dynamicToolCall", tool="missing"),
+            {
+                "id": "bad",
+                "method": "item/tool/call",
+                "params": {"tool": "missing", "arguments": {}},
+            },
+            message("recovered"),
+            completed(),
+        ]
+    )
+    report = run(line(server))
+    assert report.text == "recovered"
+    assert not calls
+    assert "turn/interrupt" not in server.methods()
+    assert "missing" in str(server.answers()[0])
+    assert server.answers()[0]["result"]["success"] is False
+
+
+@pytest.mark.parametrize("enabled", [True, False, None, "false"])
+def test_disabled_connector_does_not_need_a_name(
+    enabled: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(codex_module, "codex_path", lambda: "/unused/codex")
+
+    def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(returncode=0, stdout=json.dumps([{"enabled": enabled}]))
+
+    monkeypatch.setattr(codex_module.subprocess, "run", fake_run)
+    if enabled is False:
+        assert codex_module.list_servers({}) == []
+    else:
+        with pytest.raises(EngineRefused, match=r"\[0\].name"):
+            codex_module.list_servers({})
+
+
+def test_replacement_failure_explains_resume(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(codex_module, "WRITER_RETRY_SECONDS", 0)
+
+    class FailedReplacement(FakeServer):
+        async def send(self, message: Mapping[str, object]) -> None:
+            if message.get("method") == "thread/resume":
+                self.sent.append(dict(message))
+                self.queue.append(
+                    {
+                        "id": message["id"],
+                        "error": {
+                            "code": -32600,
+                            "message": "thread th already has an active writer",
+                        },
+                    }
+                )
+                return
+            await super().send(message)
+
+    server = FailedReplacement(failing="thread/start")
+    target = line(server)
+    target.session_id = f"th:{target.tools_fingerprint()}"
+    with pytest.raises(EngineRefused, match="A resume will retry thread recovery"):
+        run(target)
+    assert server.methods().count("thread/resume") == 2
+    assert server.methods().count("thread/start") == 1
+    assert "turn/start" not in server.methods()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"code": -1, "message": "thread th already has an active writer"},
+        {
+            "code": -32600,
+            "message": "unrelated",
+            "data": "already has an active writer",
+        },
+    ],
+)
+def test_writer_recovery_requires_the_specific_error(error: dict[str, object]) -> None:
+    server = FakeServer(failing="thread/resume", failing_error=error)
+    target = line(server)
+    target.session_id = f"th:{target.tools_fingerprint()}"
+    with pytest.raises(EngineRefused):
+        run(target)
+    assert server.methods().count("thread/resume") == 1
+    assert "thread/start" not in server.methods()
+
+
+def test_profile_digest_keeps_the_launch_snapshot_when_a_path_appears(
+    tmp_path: Path,
+) -> None:
+    guard = tmp_path / "later"
+
+    class AppearingPath(FakeServer):
+        async def send(self, message: Mapping[str, object]) -> None:
+            if message.get("method") == "initialize":
+                guard.mkdir(exist_ok=True)
+            await super().send(message)
+
+    server = AppearingPath()
+    target = line(server)
+    target.protected = (guard,)
+    before = target.tools_fingerprint()
+    first = run(target)
+    assert split_session(first.session_id)[1] == before
+    assert target.tools_fingerprint() != before
+    run(target)
+    assert server.methods().count("thread/start") == 2
+    assert "thread/resume" not in server.methods()

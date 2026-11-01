@@ -5,6 +5,7 @@ script follows Grok Build 1.0.70's documentation and its ``initialize`` answer.
 """
 
 import asyncio
+import hashlib
 import dataclasses
 import json
 import os
@@ -1320,10 +1321,10 @@ def test_a_plain_turn_reports_text_credential_and_session(
     assert (report.subtype, report.text, report.session_id) == (
         "success",
         "hello there",
-        "s1",
+        "s1:rules-" + hashlib.sha256(b"").hexdigest(),
     )
     assert report.credential is Credential.SUBSCRIPTION
-    assert target.session_id == "s1"
+    assert target.session_id == "s1:rules-" + hashlib.sha256(b"").hexdigest()
     assert "DAEMON_ONLY_SENTINEL" not in server.environment
     assert server.environment["GROK_SANDBOX"] == READER_PROFILE
     init = server.params("initialize")
@@ -1504,7 +1505,7 @@ def test_the_session_carries_dromons_tools_instructions_and_ask_mode(
 
 def test_the_next_turn_loads_the_session(project: tuple[Path, Path, Path]) -> None:
     server = FakeGrok()
-    run(line(server, project, session_id="s1"))
+    run(line(server, project, session_id="s1:rules-" + hashlib.sha256(b"").hexdigest()))
     assert server.params("session/load")["sessionId"] == "s1"
     assert "session/new" not in server.methods()
 
@@ -3464,3 +3465,32 @@ def test_non_execution_evidence_is_required_again_on_each_update(
     ):
         run(line(server, project))
     assert server.methods().count("session/cancel") == 1
+
+
+@pytest.mark.parametrize("stored", ["s1", "s1:rules-incorrect"])
+def test_unknown_or_changed_rules_replace_a_grok_session(
+    project: tuple[Path, Path, Path], stored: str
+) -> None:
+    server = FakeGrok()
+    target = line(server, project, session_id=stored)
+    report = run(target)
+    assert "session/load" not in server.methods()
+    assert "session/new" in server.methods()
+    assert "Dromon replaced your Grok session" in str(server.params("session/prompt"))
+    assert report.session_id == "s1:rules-" + hashlib.sha256(b"").hexdigest()
+
+
+def test_grok_changed_rules_file_starts_a_new_session(
+    project: tuple[Path, Path, Path],
+) -> None:
+    workspace, _, _ = project
+    rules = workspace / "RULES.md"
+    rules.write_text("Old rules")
+    config = LineConfig(instructions=("RULES.md",))
+    initial = line(FakeGrok(), project, config=config)
+    stored = run(initial).session_id
+    rules.write_text("New rules")
+    server = FakeGrok()
+    run(line(server, project, config=config, session_id=stored))
+    assert "session/load" not in server.methods()
+    assert "New rules" in str(server.params("session/new"))

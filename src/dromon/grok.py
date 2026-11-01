@@ -54,6 +54,7 @@ the Codex adapter is.
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -1114,11 +1115,7 @@ def check_profile(
         *protected,
         *(path for path in _credential_paths(daemon_home) if os.path.lexists(path)),
     ]
-    exposed = [
-        str(path)
-        for path in required_deny
-        if os.path.lexists(path) and not _covers(denied, path)
-    ]
+    exposed = [str(path) for path in required_deny if not _covers(denied, path)]
     if exposed:
         raise EngineRefused(
             f"the Grok sandbox profile {name} does not deny "
@@ -1294,6 +1291,8 @@ class GrokLine:
         self.config = config
         self.own_tools = acp.own_tool_names([tool.name for tool in mcp_tools])
         self.session_id = session_id
+        self._rules_digest = ""
+        self._rules_replaced = False
         self.protected = tuple(protected)
         self.read_only_paths = tuple(read_only_paths)
         self.bridge = tuple(bridge)
@@ -1400,7 +1399,7 @@ class GrokLine:
             raise EngineRefused(turn.refusal)
         if credential is None or session_id is None:
             raise EngineRefused("the engine did not finish cancelling its turn")
-        self.session_id = session_id
+        self.session_id = f"{session_id}:rules-{self._rules_digest}"
         subtype = "success" if stop == "end_turn" else stop
         self.driver.step(Event("result", subtype, 1))
         return TurnReport(
@@ -1410,7 +1409,7 @@ class GrokLine:
             tool_uses=tuple(turn.tool_uses),
             interrupted_for=turn.interrupted_for,
             credential=credential,
-            session_id=session_id,
+            session_id=self.session_id,
             capabilities=None,
             cost_estimate_usd=None,
         )
@@ -1958,6 +1957,14 @@ class GrokLine:
     async def _open_session(self, turn: _Turn) -> str:
         meta: dict[str, object] = {"yoloMode": False, "autoMode": False}
         instructions = read_instructions(self.config.instructions, self.cwd)
+        self._rules_digest = hashlib.sha256(instructions.encode("utf-8")).hexdigest()
+        resumable: str | None = None
+        if self.session_id is not None:
+            candidate, separator, digest = self.session_id.rpartition(":rules-")
+            if separator and digest == self._rules_digest:
+                resumable = candidate
+            else:
+                self._rules_replaced = True
         if instructions:
             meta["rules"] = instructions
         params: dict[str, object] = {
@@ -1965,14 +1972,14 @@ class GrokLine:
             "mcpServers": acp.mcp_servers(self.bridge, self.line_token),
             "_meta": meta,
         }
-        if self.session_id is None:
+        if resumable is None:
             result = await self._rpc().call("session/new", params)
             session_id = str(result.get("sessionId") or "")
         else:
             result = await self._rpc().call(
-                "session/load", {**params, "sessionId": self.session_id}
+                "session/load", {**params, "sessionId": resumable}
             )
-            session_id = self.session_id
+            session_id = resumable
         if not session_id:
             raise EngineRefused("the engine started a session without an identifier")
         self.session_id_in_use = session_id
@@ -2039,6 +2046,14 @@ class GrokLine:
         return session_id
 
     async def _prompt(self, session_id: str, prompt: str, turn: _Turn) -> str:
+        if self._rules_replaced:
+            prompt = (
+                "Dromon replaced your Grok session because its stored rules differ"
+                " from the current instructions, or their digest was unavailable."
+                " Your mailbox, brief and files are retained. Earlier session"
+                " context is unavailable.\n\n" + prompt
+            )
+            self._rules_replaced = False
         self.driver.step(Event("turn_start"))
         now = asyncio.get_running_loop().time()
         turn.absolute_deadline = now + ABSOLUTE_TURN_SECONDS
