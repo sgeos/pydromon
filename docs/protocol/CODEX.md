@@ -523,11 +523,12 @@ If starting the replacement fails, the refusal explains what another resume retr
 **Fact.** Dromon calls `thread/resume` before each kept turn even when the same
 app-server loaded that thread on the preceding turn.
 
-**Fact.** Read-only inspection of the installed executable found the active writer
+**Implementing agent observation, not verified by review.** Read-only inspection
+of the installed executable found the active writer
 refusal beside diagnostics for acquiring, inspecting and removing stale thread writer
 locks. The executable also names `rollout/src/writer_lock.rs` and contains a
 coordination-lock diagnostic saying another Codex process may be suspended on this
-or another host.
+or another host. No capture accompanies this observation.
 
 **Inference.** The refusal concerns ownership of a thread writer lock rather than
 account authentication. Dromon does not remove those locks or terminate an unknown
