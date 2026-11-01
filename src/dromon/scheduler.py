@@ -1735,6 +1735,82 @@ ENGINE_STOP_NOTE: Final = "Dromon stopped the previous engine turn. "
 """A harness note retained for the next reported turn without waking the line."""
 
 
+# Prefixes select fixed wording only. No suffix or other engine-controlled text is
+# interpolated. Unknown failures deliberately lose detail at this trust boundary.
+STOP_CAUSES: Final = (
+    (
+        "the engine reused a tool call identifier",
+        "the engine reused a tool call identifier",
+    ),
+    ("the engine changed", "the engine changed the identity of a tool call"),
+    (
+        "the engine ran a rejected tool call",
+        "the engine did not confirm that a rejected tool call did not run",
+    ),
+    (
+        "the engine used a tool the line was not given",
+        "the engine used a tool the line was not given",
+    ),
+    (
+        "the engine started a tool the line was not given",
+        "the engine started a tool the line was not given",
+    ),
+    (
+        "the engine requested permission for a tool no longer pending",
+        "the engine requested permission for a tool no longer pending",
+    ),
+    ("the engine switched to the model", "the engine changed the configured model"),
+    (
+        "the engine switched to the permission mode",
+        "the engine changed the configured permission mode",
+    ),
+    (
+        "the engine closed its connection",
+        "the engine connection closed during the turn",
+    ),
+    (
+        "the engine did not finish cancelling",
+        "the engine did not finish cancelling its turn",
+    ),
+    (
+        "The driver interrupted it for tool_budget.",
+        "The driver interrupted it for tool_budget.",
+    ),
+    ("The driver interrupted it for ", "The driver interrupted the turn."),
+    (
+        "ACP offered no option for Dromon",
+        "The engine offered no usable permission option.",
+    ),
+    ("Grok turn reached its absolute cap", "The turn reached its absolute time limit."),
+    ("the turn reached its absolute cap", "The turn reached its absolute time limit."),
+    ("Grok turn had no activity", "The turn reached its inactivity time limit."),
+    ("Antigravity timed out", "The engine did not respond before its deadline."),
+    ("Grok start timed out", "The engine did not respond before its deadline."),
+    (
+        "the engine reported a tool call without an identifier",
+        "The engine reported a tool call without an identifier.",
+    ),
+    ("the engine sent", "The engine sent an unsupported protocol message."),
+    ("the engine asked", "The engine made an unsupported protocol request."),
+)
+STOP_CAUSE_UNKNOWN: Final = "An engine safety or protocol check stopped the turn."
+STOP_CAUSE_WITHHELD: Final = "The cause was withheld by the disclosure guard."
+
+
+def _stop_cause(cause: str) -> str:
+    """Map arbitrary evidence to a bounded vocabulary owned by Dromon."""
+    if cause in (STOP_CAUSE_UNKNOWN, STOP_CAUSE_WITHHELD):
+        return cause
+    # Canonical notes must survive replay without being reclassified by a prefix.
+    for _, notice in STOP_CAUSES:
+        if cause == notice:
+            return notice
+    for prefix, notice in STOP_CAUSES:
+        if cause.startswith(prefix):
+            return notice
+    return STOP_CAUSE_UNKNOWN
+
+
 def compose_prompt(
     line_id: str,
     new: list[tuple[str, Message]],
@@ -8524,13 +8600,17 @@ class Scheduler:
             if message.sender == address and message.recipient != address
         )
 
-    def _safe_stop_notice(self, line_id: str, cause: str) -> str:
-        """Filter the entire notice before bounding it, including engine evidence.
-        Recheck stored notices when the disclosure list changes between turns."""
-        notice = (ENGINE_STOP_NOTE + cause).encode("utf-8", "replace").decode("utf-8")
-        if self.refuse_disclosed(line_id, ("cause", notice)) is not None:
-            return ENGINE_STOP_NOTE + "The cause was withheld by the disclosure guard."
-        return _cut(notice, MAX_FAILURE_TEXT)
+    def _safe_stop_notice(self, cause: str) -> str:
+        """Render only closed Dromon wording and screen without a line check.
+        Engine labels and errors never enter the note. Legacy persisted notes are
+        classified again rather than trusted after replay. Only fixed harness
+        wording reaches the guard, so arbitrary engine text cannot become an
+        unmetered disclosure query. Screening does not consume the line allowance.
+        """
+        notice = ENGINE_STOP_NOTE + _stop_cause(cause)
+        if self.discloses(notice):
+            return ENGINE_STOP_NOTE + STOP_CAUSE_WITHHELD
+        return notice
 
     def _note_engine_stop(self, line_id: str, cause: str) -> None:
         """Persist a cause without waking the line or clearing its failure state.
@@ -8543,7 +8623,7 @@ class Scheduler:
                 HARNESS,
                 LineAddress(line_id),
                 MessageKind.NOTE,
-                self._safe_stop_notice(line_id, cause),
+                self._safe_stop_notice(cause),
             )
         )
         self._log.append(MessageDelivered(message_id))
@@ -8560,7 +8640,7 @@ class Scheduler:
                 and message.reported_ends_at_delivery >= current
             ):
                 notice = message.body[len(ENGINE_STOP_NOTE) :]
-        return None if notice is None else self._safe_stop_notice(line_id, notice)
+        return None if notice is None else self._safe_stop_notice(notice)
 
     def _note_quiet(self, line_id: str, sent: int) -> None:
         """**Item B1 of 2026-10-28.** Remember for ``line_id``'s next prompt that its

@@ -53,14 +53,18 @@ Dromon records a bounded harness note for the next prompt. This note survives a
 restart and is checked against the disclosure list both when recorded and when
 shown. A protected cause is replaced by a generic disclosure explanation. The note
 does not wake the line or release a hold. A later reported turn retires it, while an
-unreported turn leaves it owed. Engine evidence in the cause remains untrusted data.
-The original refusal or driver cause survives a connection failure or protocol error
+unreported turn leaves it owed. The note uses only a closed vocabulary owned by
+Dromon. Engine labels, titles, identifiers and error text are never interpolated.
+Unrecognized causes receive a generic safety or protocol explanation. Persisted
+notes from older versions are classified again before display. The original refusal
+or driver cause survives a connection failure or protocol error
 during cancellation. Priority mail and restart interruptions retain their existing
 notices.
 
-A disclosure refusal while recording or rechecking a cause spends the existing
-hourly disclosure budget. Once that budget is held, subsequent causes use the same
-generic notice without revealing whether each candidate matched.
+Harness screening of these fixed notices does not consume the line's hourly
+disclosure allowance or hold the line. Line-originated disclosure checks retain
+their existing allowance. The finite notice vocabulary prevents engine text from
+becoming an unmetered disclosure query.
 
 ## Evidence
 
@@ -330,8 +334,14 @@ and workflows live in `$GROK_HOME`.
 9. **Permission requests** are answered with an `allow_once` option for a permitted call
    and a rejection option otherwise. An ordinary policy denial leaves the turn
    running. An explicitly `pending` unauthorized call waits for its permission
-   request. A rejected call may report `pending` or `failed`. A report that it started,
-   completed or has no status stops the turn. An unauthorized call with no explicit
+   request. Every update after rejection must carry `_meta.toolNotRun` equal to
+   the Boolean `true`. Status alone does not establish non-execution. A rejected
+   call reported as `pending`, `failed`, completed or unknown without that marker
+   stops the turn, as does missing status without the marker. An execution status
+   or unknown status contradicting the marker also stops the turn. The marker is
+   an engine assertion rather than proof that no side effect occurred. Rejection
+   before execution depends on the runtime honoring its permission answer.
+   An unauthorized call with no explicit
    pending status, an identity change, a reused identifier, a permission request for
    a call no longer pending, a missing permission option or the driver's tool budget
    sends `session/cancel`, and every

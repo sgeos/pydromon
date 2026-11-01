@@ -1599,7 +1599,9 @@ def test_an_antigravity_line_given_git_ssh_carries_its_command_and_no_other(
     assert COMMAND_VARIABLE not in plain.environment
 
 
-@pytest.mark.parametrize("status", ["in_progress", "completed", None])
+@pytest.mark.parametrize(
+    "status", ["pending", "failed", "in_progress", "completed", "unknown", None]
+)
 def test_a_rejected_call_must_not_execute(
     home: Path,
     runtime: Path,
@@ -1607,19 +1609,22 @@ def test_a_rejected_call_must_not_execute(
 ) -> None:
     fields = {} if status is None else {"status": status}
     server = FakeRuntime([permission("blocked"), changed(**fields)])
-    with pytest.raises(EngineRefused, match="not given, stopped"):
+    with pytest.raises(
+        EngineRefused, match="did not confirm that a rejected tool call did not run"
+    ):
         run(line(server, home, runtime, tools=True))
     assert server.methods().count("session/cancel") == 1
 
 
+@pytest.mark.parametrize("status", ["pending", "failed", None])
 def test_pending_denial_leaves_a_corrected_call_available(
-    home: Path, runtime: Path
+    home: Path, runtime: Path, status: str | None
 ) -> None:
     server = FakeRuntime(
         [
             tool("blocked"),
             permission("blocked"),
-            changed(status="failed"),
+            changed(status=status, _meta={"toolNotRun": True}),
             own("good"),
             permission(RUNNING, ident="good", tool_name=OWN, request="p2"),
             said("corrected"),
@@ -1724,3 +1729,21 @@ def test_cancel_transport_failure_keeps_the_original_stop_cause(
     else:
         with pytest.raises(EngineRefused, match="changed the kind"):
             run(target)
+
+
+def test_non_execution_evidence_is_required_again_on_each_update(
+    home: Path,
+    runtime: Path,
+) -> None:
+    server = FakeRuntime(
+        [
+            permission("blocked"),
+            changed(status="failed", _meta={"toolNotRun": True}),
+            changed(status="failed"),
+        ]
+    )
+    with pytest.raises(
+        EngineRefused, match="did not confirm that a rejected tool call did not run"
+    ):
+        run(line(server, home, runtime, tools=True))
+    assert server.methods().count("session/cancel") == 1

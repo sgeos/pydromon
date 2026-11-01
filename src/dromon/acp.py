@@ -150,13 +150,27 @@ class Client:
         )
 
 
-def waiting_for_permission(
-    fields: Mapping[str, Any], *, rejected: bool = False
-) -> bool:
-    """Only explicit pending calls, or failed rejected calls, are safe to leave.
-    Missing status is not evidence that execution has not started."""
-    return fields.get("status") == "pending" or (
-        rejected and fields.get("status") == "failed"
+def waiting_for_permission(fields: Mapping[str, Any]) -> bool:
+    """A pending announcement may wait for its first permission request."""
+    return fields.get("status") == "pending"
+
+
+REJECTION_UNCONFIRMED: Final = (
+    "the engine did not confirm that a rejected tool call did not run"
+)
+
+
+def rejected_call_not_run(fields: Mapping[str, Any]) -> bool:
+    """Require explicit non-execution evidence on every post-rejection update.
+    The toolNotRun metadata assertion is trusted as an engine protocol report,
+    not proof of no side effects. Conflicting execution status fails closed.
+    Status alone, including pending or failed, establishes no such evidence.
+    """
+    meta = fields.get("_meta")
+    return (
+        isinstance(meta, Mapping)
+        and cast(Mapping[str, object], meta).get("toolNotRun") is True
+        and fields.get("status") in (None, "pending", "failed")
     )
 
 

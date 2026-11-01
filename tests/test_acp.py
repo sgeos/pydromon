@@ -283,3 +283,24 @@ def test_mcp_refusal_carries_a_reason_and_allows_the_next_call(
         "content": [{"type": "text", "text": "corrected"}],
         "isError": False,
     }
+
+
+@pytest.mark.parametrize(
+    "status", ["pending", "failed", "in_progress", "completed", "unknown", None]
+)
+@pytest.mark.parametrize("marker", [True, False, "true", 1, None])
+def test_rejected_call_requires_explicit_non_execution_evidence(
+    status: str | None,
+    marker: object,
+) -> None:
+    fields: dict[str, object] = {"_meta": {"toolNotRun": marker}}
+    if status is not None:
+        fields["status"] = status
+    assert acp.rejected_call_not_run(fields) is (
+        marker is True and status in (None, "pending", "failed")
+    )
+
+
+@pytest.mark.parametrize("meta", [None, True, [], "toolNotRun", {}])
+def test_missing_or_malformed_non_execution_evidence_fails_closed(meta: object) -> None:
+    assert not acp.rejected_call_not_run({"status": "failed", "_meta": meta})

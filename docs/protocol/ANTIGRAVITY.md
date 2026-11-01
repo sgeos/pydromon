@@ -39,15 +39,20 @@ rejection, missing permission options, runtime questions, model or mode changes,
 unknown protocol messages, deadlines and driver budgets still stop the turn. Driver
 budgets are checked before granting a permission request. An engine refusal or driver
 interruption leaves a bounded harness note for the next prompt, filtered against the
-disclosure list when recorded and shown. It survives a restart, does not wake or
-release the line, and remains owed until a later turn returns an engine report.
+disclosure list when recorded and shown. Its wording comes only from Dromon's
+closed vocabulary, with no engine labels, titles, identifiers or error text.
+Unrecognized causes receive a generic safety or protocol explanation. Older
+persisted notes are classified again before display. It survives a restart, does
+not wake or release the line, and remains owed until a later turn returns an engine
+report.
 A connection failure or protocol error during cancellation keeps the original
 refusal or driver cause. Priority mail and restart interruptions retain their
 existing notices.
 
-A disclosure refusal while recording or rechecking a cause spends the existing
-hourly disclosure budget. Once that budget is held, subsequent causes use the same
-generic notice without revealing whether each candidate matched.
+Harness screening of these fixed notices does not consume the line's hourly
+disclosure allowance or hold the line. Line-originated disclosure checks retain
+their existing allowance. The finite notice vocabulary prevents engine text from
+becoming an unmetered disclosure query.
 
 ## Evidence
 
@@ -199,9 +204,14 @@ with `DROMON_ANTIGRAVITY_RUNTIME`.
     tool, since a file name or the model can make it equal to one. A permission
     request for one of Dromon's own tools is allowed once. Any other is refused with a
     single rejection that leaves the turn running. An explicitly `pending` call
-    waits for its permission request. A rejected call may report `pending` or `failed`.
-    An unauthorized call with another status, including no status, cancels and refuses
-    the turn. **F1.** No
+    waits for its permission request. Every update after rejection requires
+    `_meta.toolNotRun` equal to the Boolean `true`. Without it, `pending`, `failed`,
+    completed, unknown and missing status all cancel the turn. Execution or unknown
+    status contradicting the marker also cancels. The marker is an engine assertion,
+    not proof of no side effects. No live observation establishes that this runtime
+    supplies it. Rejection before execution depends on the runtime honoring its
+    permission answer. An unauthorized call with another status, including no
+    status, cancels and refuses the turn. **F1.** No
     kind, `think` included, exempts a call. **F2 and F3.** Every `tool_call_update` is
     checked as well, and a recorded call whose `toolName`, `title` or `kind` changes,
     or gains one it lacked, refuses the turn, in an update or in a permission request,

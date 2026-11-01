@@ -3316,7 +3316,9 @@ def test_a_task_tool_of_kind_other_still_needs_bash(
         run(line(FakeGrok([event]), project, config=config))
 
 
-@pytest.mark.parametrize("status", ["in_progress", "completed", None])
+@pytest.mark.parametrize(
+    "status", ["pending", "failed", "in_progress", "completed", "unknown", None]
+)
 def test_rejected_call_cannot_run_after_permission(
     project: tuple[Path, Path, Path],
     status: str | None,
@@ -3324,13 +3326,17 @@ def test_rejected_call_cannot_run_after_permission(
     denied = permission("execute")
     fields = {} if status is None else {"status": status}
     server = FakeGrok([denied, call_update("t", **fields)])
-    with pytest.raises(EngineRefused, match="ran a rejected tool call"):
+    with pytest.raises(
+        EngineRefused, match="did not confirm that a rejected tool call did not run"
+    ):
         run(line(server, project))
     assert server.methods().count("session/cancel") == 1
 
 
+@pytest.mark.parametrize("status", ["pending", "failed", None])
 def test_pending_call_can_be_rejected_and_another_call_can_succeed(
     project: tuple[Path, Path, Path],
+    status: str | None,
 ) -> None:
     announcement = tool_call("execute", ident="blocked")
     announcement["params"]["update"]["status"] = "pending"
@@ -3338,7 +3344,7 @@ def test_pending_call_can_be_rejected_and_another_call_can_succeed(
         [
             announcement,
             permission("execute", ident="blocked", request_id="deny"),
-            call_update("blocked", status="failed"),
+            call_update("blocked", status=status, _meta={"toolNotRun": True}),
             permission(
                 "other", "dromon__send_message", ident="good", request_id="allow"
             ),
@@ -3441,3 +3447,20 @@ def test_cancel_transport_failure_keeps_the_original_stop_cause(
     else:
         with pytest.raises(EngineRefused, match="changed the kind"):
             run(target)
+
+
+def test_non_execution_evidence_is_required_again_on_each_update(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok(
+        [
+            permission("execute"),
+            call_update("t", status="failed", _meta={"toolNotRun": True}),
+            call_update("t", status="failed"),
+        ]
+    )
+    with pytest.raises(
+        EngineRefused, match="did not confirm that a rejected tool call did not run"
+    ):
+        run(line(server, project))
+    assert server.methods().count("session/cancel") == 1

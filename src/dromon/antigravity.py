@@ -1040,9 +1040,11 @@ class AntigravityLine:
                 # takes, as ``dromon.priority`` describes.
                 await self._act(Event(TOOL_RESULT), turn)
             return
-        if acp.waiting_for_permission(
-            update, rejected=str(identifier) in turn.rejected_calls
-        ):
+        if str(identifier) in turn.rejected_calls:
+            if not acp.rejected_call_not_run(update):
+                await self._cancel(turn, acp.REJECTION_UNCONFIRMED)
+            return
+        if acp.waiting_for_permission(update):
             return
         started = update.get("status") in STARTED_STATUSES or "status" not in update
         when = "after it started" if started else "before it ran"

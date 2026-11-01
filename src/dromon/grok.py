@@ -1789,8 +1789,8 @@ class GrokLine:
                 return
             await self._record(str(identifier), update, turn)
             if str(identifier) in turn.rejected_calls:
-                if not acp.waiting_for_permission(update, rejected=True):
-                    await self._cancel(turn, "the engine ran a rejected tool call")
+                if not acp.rejected_call_not_run(update):
+                    await self._cancel(turn, acp.REJECTION_UNCONFIRMED)
                 return
             if acp.newly_finished(str(identifier), update, turn.finished):
                 # The safe point before the next model call that priority mail

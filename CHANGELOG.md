@@ -134,6 +134,14 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- Review of 7eda348. Grok and Antigravity continue after a rejected call is reported
+  only when the update explicitly asserts non-execution through `_meta.toolNotRun`
+  equal to Boolean `true`, without contradictory execution status. Pending and
+  failed status alone now stop the turn. Stop notes use a closed Dromon vocabulary
+  and discard engine labels and error text, including when reading older notes.
+  Harness screening of those fixed notes leaves the line's hourly disclosure
+  allowance untouched. Line-originated checks retain their existing allowance.
+
 - Grok and Antigravity reject ordinary tool permission requests without cancelling
   the turn when a rejection option is available. Identity changes, reused permission
   identifiers, execution without approval, missing options and driver budgets still
