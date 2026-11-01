@@ -1345,7 +1345,6 @@ def grok_arguments(
         model,
         "--reasoning-effort",
         EFFORTS[effort],
-        *([] if "WebFetch" in config.builtin_tools else ["--deny", "WebFetch"]),
         "stdio",
     ]
 

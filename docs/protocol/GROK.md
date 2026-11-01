@@ -804,10 +804,12 @@ They do not establish live Grok enforcement.
 
 **Fact.** The home is shared by concurrent lines. A `WebFetch` deny in that file
 would also block a line granted `WebFetch`, because deny rules win over allow rules.
-Dromon instead supplies the documented command-line rule `--deny WebFetch` only to
-processes whose lines lack the grant. The switches remain in place. The permissions
-guide says command-line rules are enforced and deny rules win. Acceptance of that
-flag together with `agent stdio` remains unverified against the live binary.
+Dromon therefore writes no `WebFetch` deny rule. It sets `GROK_WEB_FETCH=0` for a
+line without the grant and refuses a `web_fetch` call one at a time. **Fact, observed
+by the operator on 2026-11-01.** The permissions guide documents a command-line rule
+`--deny`, but Grok Build 1.0.70's `grok agent` refuses it with "unexpected argument
+'--deny' found" and exits with status 2. Passing it closed every Grok turn of a line
+without `WebFetch`, so Dromon no longer passes it.
 
 **Fact.** The hook guide says a command with an `args` array starts no shell, a
 matching explicit denial blocks, and startup errors, crashes, timeouts and malformed
