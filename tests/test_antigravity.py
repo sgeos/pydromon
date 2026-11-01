@@ -968,18 +968,16 @@ def test_another_tools_permission_is_refused_before_it_runs(
     home: Path, runtime: Path
 ) -> None:
     server = FakeRuntime([permission("Read /etc/hosts"), said("x")])
-    with pytest.raises(EngineRefused, match="refused before it ran: Read /etc/hosts"):
-        run(line(server, home, runtime, tools=True))
+    assert run(line(server, home, runtime, tools=True)).text == "x"
     assert server.answer("p1")["result"] == {
         "outcome": {"outcome": "selected", "optionId": "no"}
     }
-    assert server.request("session/cancel")["params"] == {"sessionId": "s1"}
+    assert "session/cancel" not in server.methods()
 
 
 @pytest.mark.parametrize(
     ("status", "when"),
     [
-        ("pending", "before it ran"),
         ("in_progress", "after it started"),
         (None, "after"),
     ],
@@ -993,17 +991,16 @@ def test_another_tool_call_cancels_the_turn(
     assert "session/cancel" in server.methods()
 
 
-@pytest.mark.parametrize("status", ["pending", "in_progress"])
-def test_no_kind_exempts_a_tool_call_from_the_check(
-    home: Path, runtime: Path, status: str
-) -> None:
+def test_no_kind_exempts_a_tool_call_from_the_check(home: Path, runtime: Path) -> None:
     """Antigravity review, F1. The kind is the runtime's own report, so a call of the
     kind ``think`` titled as a shell command is refused like any other."""
-    server = FakeRuntime([tool("rm -rf ~", kind="think", status=status), said("x")])
+    server = FakeRuntime(
+        [tool("rm -rf ~", kind="think", status="in_progress"), said("x")]
+    )
     with pytest.raises(EngineRefused, match=r"not given, stopped .*: rm -rf ~"):
         run(line(server, home, runtime, tools=True))
     assert "session/cancel" in server.methods()
-    plain = FakeRuntime([tool("plan", kind="think"), said("x")])
+    plain = FakeRuntime([tool("plan", kind="think", status="in_progress"), said("x")])
     with pytest.raises(EngineRefused, match="not given"):
         run(line(plain, home, runtime))
 
@@ -1018,7 +1015,7 @@ def test_a_quiet_looking_call_that_turns_into_a_command_is_refused(
         changed("k1", title="rm -rf ~", kind="execute", status="in_progress"),
     ]
     server = FakeRuntime(events, stop=None)
-    with pytest.raises(EngineRefused, match="stopped before it ran: plan"):
+    with pytest.raises(EngineRefused, match="changed the title"):
         run(line(server, home, runtime, tools=True))
     assert server.methods().count("session/cancel") == 1
 
@@ -1075,11 +1072,13 @@ def test_a_title_never_names_dromons_tool(home: Path, runtime: Path) -> None:
     tools, so a call whose title equals its name is refused, both as a permission
     request and as a call."""
     asked = FakeRuntime([permission(OWN), said("x")])
-    with pytest.raises(EngineRefused, match=f"refused before it ran: {OWN}"):
-        run(line(asked, home, runtime, tools=True))
+    assert run(line(asked, home, runtime, tools=True)).tool_uses == ()
+    assert "session/cancel" not in asked.methods()
     assert asked.answer("p1")["result"]["outcome"]["optionId"] == "no"
-    used = FakeRuntime([tool(OWN, kind="other"), said("x")])
-    with pytest.raises(EngineRefused, match=f"not given, stopped before it ran: {OWN}"):
+    used = FakeRuntime([tool(OWN, kind="other", status="in_progress"), said("x")])
+    with pytest.raises(
+        EngineRefused, match=f"not given, stopped after it started: {OWN}"
+    ):
         run(line(used, home, runtime, tools=True))
 
 
@@ -1107,7 +1106,7 @@ def test_a_request_after_a_cancel_is_answered_as_cancelled(
     """ACP requires it, and a cancelled outcome grants nothing, even for Dromon's own
     tool. The first refusal stands."""
     asked = permission(RUNNING, ident="t2", tool_name=OWN)
-    server = FakeRuntime([tool("view_file"), asked])
+    server = FakeRuntime([tool("view_file", status="in_progress"), asked])
     with pytest.raises(EngineRefused, match="view_file"):
         run(line(server, home, runtime, tools=True))
     assert server.answer("p1")["result"] == {"outcome": {"outcome": "cancelled"}}
@@ -1598,3 +1597,153 @@ def test_an_antigravity_line_given_git_ssh_carries_its_command_and_no_other(
     plain = FakeRuntime()
     run(line(plain, home, runtime, environment={COMMAND_VARIABLE: "x"}))
     assert COMMAND_VARIABLE not in plain.environment
+
+
+@pytest.mark.parametrize(
+    "status", ["pending", "failed", "in_progress", "completed", "unknown", None]
+)
+def test_a_rejected_call_must_not_execute(
+    home: Path,
+    runtime: Path,
+    status: str | None,
+) -> None:
+    fields = {} if status is None else {"status": status}
+    server = FakeRuntime([permission("blocked"), changed(**fields)])
+    with pytest.raises(
+        EngineRefused, match="did not confirm that a rejected tool call did not run"
+    ):
+        run(line(server, home, runtime, tools=True))
+    assert server.methods().count("session/cancel") == 1
+
+
+@pytest.mark.parametrize("status", ["pending", "failed", None])
+def test_pending_denial_leaves_a_corrected_call_available(
+    home: Path, runtime: Path, status: str | None
+) -> None:
+    server = FakeRuntime(
+        [
+            tool("blocked"),
+            permission("blocked"),
+            changed(status=status, _meta={"toolNotRun": True}),
+            own("good"),
+            permission(RUNNING, ident="good", tool_name=OWN, request="p2"),
+            said("corrected"),
+        ]
+    )
+    report = run(line(server, home, runtime, tools=True))
+    assert report.text == "corrected" and report.tool_uses == (OWN,)
+    assert server.answer("p1")["result"]["outcome"]["optionId"] == "no"
+    assert server.answer("p2")["result"]["outcome"]["optionId"] == "once"
+    assert "session/cancel" not in server.methods()
+
+
+@pytest.mark.parametrize("tool_name", [None, OWN])
+def test_permission_identifiers_are_single_use(
+    home: Path, runtime: Path, tool_name: str | None
+) -> None:
+    server = FakeRuntime(
+        [
+            permission(RUNNING, tool_name=tool_name),
+            permission(RUNNING, tool_name=tool_name, request="again"),
+        ]
+    )
+    with pytest.raises(EngineRefused, match="reused a tool call identifier"):
+        run(line(server, home, runtime, tools=True))
+    assert server.methods().count("session/cancel") == 1
+
+
+def test_pending_call_cannot_start_without_approval(home: Path, runtime: Path) -> None:
+    server = FakeRuntime([tool("blocked"), changed(status="in_progress")])
+    with pytest.raises(EngineRefused, match="not given, stopped after it started"):
+        run(line(server, home, runtime, tools=True))
+
+
+@pytest.mark.parametrize("status", ["in_progress", "completed", "failed"])
+def test_permission_for_a_non_pending_call_stops(
+    home: Path, runtime: Path, status: str
+) -> None:
+    request = permission("blocked")
+    request["params"]["toolCall"]["status"] = status
+    server = FakeRuntime([request])
+    with pytest.raises(EngineRefused, match="no longer pending"):
+        run(line(server, home, runtime, tools=True))
+    assert "session/cancel" in server.methods()
+
+
+def test_driver_budget_is_checked_before_permission_is_granted(
+    home: Path, runtime: Path
+) -> None:
+    budget = driver(Strategy.SUBSCRIPTION).settings.tool_budget
+    server = FakeRuntime(
+        [
+            permission(RUNNING, ident=f"t{i}", request=f"p{i}", tool_name=OWN)
+            for i in range(budget + 1)
+        ]
+    )
+    report = run(line(server, home, runtime, tools=True))
+    assert report.interrupted_for == "tool_budget"
+    assert report.tool_uses
+    at_stop = server.answer(f"p{len(report.tool_uses) - 1}")
+    assert at_stop["result"]["outcome"] == {"outcome": "cancelled"}
+
+
+@pytest.mark.parametrize("rpc_error", [False, True])
+@pytest.mark.parametrize("budget_stop", [False, True])
+def test_cancel_transport_failure_keeps_the_original_stop_cause(
+    home: Path, runtime: Path, rpc_error: bool, budget_stop: bool
+) -> None:
+    class BreaksOnCancel(FakeRuntime):
+        async def send(self, message: Mapping[str, object]) -> None:
+            if message.get("method") == "session/cancel":
+                self.sent.append(dict(message))
+                self.outbox.clear()
+                self.stopped.set()
+                if rpc_error:
+                    self.outbox.append(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": self.prompt_id,
+                            "error": {
+                                "code": -32000,
+                                "message": "cancel transport failed",
+                            },
+                        }
+                    )
+                return
+            await super().send(message)
+
+    budget = driver().settings.tool_budget
+    events = (
+        [
+            permission(RUNNING, ident=f"t{i}", request=f"p{i}", tool_name=OWN)
+            for i in range(budget + 1)
+        ]
+        if budget_stop
+        else [own(), changed(kind="execute")]
+    )
+    server = BreaksOnCancel(events)
+    target = line(server, home, runtime, tools=True)
+    if budget_stop:
+        report = run(target)
+        assert report.interrupted_for == "tool_budget"
+    else:
+        with pytest.raises(EngineRefused, match="changed the kind"):
+            run(target)
+
+
+def test_non_execution_evidence_is_required_again_on_each_update(
+    home: Path,
+    runtime: Path,
+) -> None:
+    server = FakeRuntime(
+        [
+            permission("blocked"),
+            changed(status="failed", _meta={"toolNotRun": True}),
+            changed(status="failed"),
+        ]
+    )
+    with pytest.raises(
+        EngineRefused, match="did not confirm that a rejected tool call did not run"
+    ):
+        run(line(server, home, runtime, tools=True))
+    assert server.methods().count("session/cancel") == 1

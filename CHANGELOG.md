@@ -170,6 +170,29 @@ All notable changes are recorded here. The format follows
 
 ### Fixed
 
+- Review of 60fcdd3. Fixed public stop notices no longer consult the disclosure list,
+  so their display cannot reveal whether the list matches a known sentence. They
+  still contain no engine text and consume no line disclosure allowance. The engine
+  documents now state that Dromon trusts the runtime's own `_meta.toolNotRun`
+  assertion that a rejected call did not run.
+
+- Review of 7eda348. Grok and Antigravity continue after a rejected call is reported
+  only when the update explicitly asserts non-execution through `_meta.toolNotRun`
+  equal to Boolean `true`, without contradictory execution status. Pending and
+  failed status alone now stop the turn. Stop notes use a closed Dromon vocabulary
+  and discard engine labels and error text, including when reading older notes.
+  Harness screening of those fixed notes leaves the line's hourly disclosure
+  allowance untouched. Line-originated checks retain their existing allowance.
+
+- Grok and Antigravity reject ordinary tool permission requests without cancelling
+  the turn when a rejection option is available. Identity changes, reused permission
+  identifiers, execution without approval, missing options and driver budgets still
+  stop it. Budgets are checked before granting a new call. Engine refusals and driver
+  interruptions leave a bounded, disclosure-filtered cause in the next prompt through
+  a durable harness note that does not wake the line. Agent Client Protocol version 1
+  defines no custom reason field, so a model-visible explanation for a selected
+  rejection remains runtime-dependent and unverified live.
+
 - `dromon restart` waits for its successor until a deadline, and each status request
   waits no longer than what remains of it. Each poll waited out a whole request
   timeout before, so a daemon that accepted and never answered could hold the client
