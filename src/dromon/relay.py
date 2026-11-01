@@ -36,10 +36,11 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Final, Protocol, cast
+from typing import Final, Protocol, cast
 
 from dromon.eventlog import EventLog
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
+from dromon.processes import attached
 from dromon.model import (
     ID_PATTERN,
     MessageDelivered,
@@ -165,9 +166,9 @@ class CommandRelay:
     channel.
 
     Porting note. A port needs only process spawning with an argument vector, standard
-    input and a timeout, which every target platform has. Python's asyncio API does
-    not expose closing one subprocess pipe independently, so the stderr drain closes
-    that pipe through the subprocess transport after the command exits.
+    input, a pipe for standard error that it can close itself, and a timeout, which
+    every target platform has. The standard error pipe is made by Dromon and closed
+    after the command exits, with public interfaces only.
     """
 
     def __init__(
@@ -214,12 +215,15 @@ class CommandRelay:
         """Hand ``notice`` to the command without blocking the event loop.
 
         The command runs in its own process group. A timeout or daemon stop kills that
-        group, but does not reach a child that starts a new session. Standard output is
+        group and every descendant a walk of the process table finds below the command,
+        including one that started a session of its own. It does not reach a
+        descendant whose parent had exited, as ``_end_group`` says. Standard output is
         discarded and at most ``STDERR_KEPT`` bytes of standard error are kept. The
         command's exit status determines acceptance; a descendant holding standard error
         open does not extend the wait after the command exits. Raises ``RelayError`` as
         ``forward`` does."""
         payload = (encode_notice(notice) + "\n").encode("utf-8")
+        tail = _StderrTail(asyncio.get_running_loop())
         try:
             # As in ``forward``, the argument vector is operator configuration and no
             # shell is involved.
@@ -227,21 +231,31 @@ class CommandRelay:
                 *self._argv,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=tail.write,
                 env=allowlisted(self._environment, BASE_ENVIRONMENT),
                 start_new_session=True,
             )
         except OSError as error:
+            tail.close()
             raise RelayError(f"the relay command could not start: {error}") from error
+        except BaseException:
+            tail.close()
+            raise
+        finally:
+            # The command holds its own copy now, or never started.
+            tail.release_write()
         try:
-            detail = await asyncio.wait_for(_feed(process, payload), self._timeout)
+            await asyncio.wait_for(_feed(process, payload), self._timeout)
+            detail = tail.finish()
         except TimeoutError as error:
             await _end_group(process)
+            tail.close()
             raise RelayError(
                 f"the relay command timed out after {self._timeout}s"
             ) from error
         except BaseException:
             await _end_group(process)
+            tail.close()
             raise
         if process.returncode != 0:
             text = detail.decode("utf-8", errors="replace").strip()[:200]
@@ -253,71 +267,137 @@ class CommandRelay:
 STDERR_KEPT: Final = 4096
 """The bytes of a relay command's standard error kept for its failure's reason."""
 
+STDERR_CHUNK: Final = 65536
+STDERR_DRAIN_READS: Final = 16
+"""The most reads that empty the pipe once the command has exited. Each takes at most
+``STDERR_CHUNK`` bytes, so a descendant that keeps writing cannot extend the drain."""
 
-async def _feed(process: "asyncio.subprocess.Process", payload: bytes) -> bytes:
-    """Feed input and drain bounded stderr while the command runs.
 
-    Once the command exits, close its stderr pipe and return the status without
-    waiting for descendants that inherited the descriptor."""
-    stdin, stderr = process.stdin, process.stderr
-    if stdin is None or stderr is None:
-        raise RelayError("the relay command has no pipes")
-    reader = asyncio.create_task(_read_stderr(stderr))
-    try:
+class _StderrTail:
+    """The read end of a pipe Dromon makes for a command's standard error, and its
+    first ``STDERR_KEPT`` bytes.
+
+    **Round 15, item 1.** The command once wrote to a pipe that asyncio's subprocess
+    transport owned, and the end of the wait closed it through the transport's
+    private attribute, so a descendant holding the write end could not hold the
+    result. Dromon owns this pipe, so it closes it itself, with public interfaces
+    only: ``os.pipe``, a descriptor passed as ``stderr``, and the loop's
+    ``add_reader``. **Porting note.** A port needs a pipe it can close on its own
+    schedule, which every platform has.
+
+    **Behaviour kept.** Bytes the command wrote before it exited are read before the
+    pipe is closed, up to ``STDERR_DRAIN_READS`` reads, and a descendant that still
+    holds the write end is not waited for."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self._read, self.write = os.pipe()
+        os.set_blocking(self._read, False)
+        self._kept = bytearray()
+        self._reading = True
+        loop.add_reader(self._read, self._pull)
+
+    def release_write(self) -> None:
+        """Close the daemon's copy of the write end, once the command has its own."""
+        if self.write >= 0:
+            os.close(self.write)
+            self.write = -1
+
+    def _pull(self) -> bool:
+        """Read once. ``True`` when nothing more can be read now, at the end of the
+        stream or with the pipe empty."""
+        if not self._reading:
+            return True
         try:
-            stdin.write(payload)
-            await stdin.drain()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        finally:
-            stdin.close()
-        while process.returncode is None:
-            await asyncio.sleep(0.01)
-        # asyncio's subprocess transport owns pipe 2. Closing it after the leader
-        # exits gives the reader buffered bytes and EOF, even if a child inherited
-        # the write end. The result cannot wait for that child.
-        _close_stderr_pipe(process)
-        await process.wait()
-        return await reader
+            chunk = os.read(self._read, STDERR_CHUNK)
+        except BlockingIOError:
+            return True
+        except OSError:
+            chunk = b""
+        if not chunk:
+            self._loop.remove_reader(self._read)
+            return True
+        if len(self._kept) < STDERR_KEPT:
+            self._kept += chunk[: STDERR_KEPT - len(self._kept)]
+        return False
+
+    def finish(self) -> bytes:
+        """Take what the pipe holds, close it, and return the kept bytes."""
+        for _ in range(STDERR_DRAIN_READS):
+            if self._pull():
+                break
+        self.close()
+        return bytes(self._kept)
+
+    def close(self) -> None:
+        """Close both ends. Safe to call again."""
+        self.release_write()
+        if self._reading:
+            self._reading = False
+            self._loop.remove_reader(self._read)
+            os.close(self._read)
+
+
+async def _feed(process: "asyncio.subprocess.Process", payload: bytes) -> None:
+    """Feed the command its input and wait for it to exit. Standard error is read by
+    the ``_StderrTail`` the caller made, and not waited for."""
+    stdin = process.stdin
+    if stdin is None:
+        raise RelayError("the relay command has no input pipe")
+    try:
+        stdin.write(payload)
+        await stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
     finally:
-        _close_stderr_pipe(process)
-        if not reader.done():
-            reader.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await reader
+        stdin.close()
+    await process.wait()
 
 
-async def _read_stderr(stderr: asyncio.StreamReader) -> bytes:
-    """Drain standard error while retaining only its first ``STDERR_KEPT`` bytes."""
-    kept = bytearray()
-    while chunk := await stderr.read(65536):
-        if len(kept) < STDERR_KEPT:
-            kept += chunk[: STDERR_KEPT - len(kept)]
-    return bytes(kept)
+ATTACHED_WAIT_SECONDS: Final = 3.0
+"""How long ending a command waits for the walk that finds its descendants."""
 
 
-def _close_stderr_pipe(process: "asyncio.subprocess.Process") -> None:
-    """Close the subprocess transport's stderr read end.
-
-    asyncio exposes the process wait but not a public way to close one inherited
-    pipe independently. This narrow access is necessary so a grandchild retaining
-    stderr cannot hold completion after the command exits."""
-    transport = cast(Any, process)._transport
-    pipe = cast(asyncio.BaseTransport | None, transport.get_pipe_transport(2))
-    if pipe is not None:
-        pipe.close()
+def _signal_pid(pid: int, number: int) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, number)
 
 
 async def _end_group(process: "asyncio.subprocess.Process") -> None:
-    """Kill the command's process group and reap the command.
+    """Kill the command's process group and its descendants, and reap the command.
 
-    A descendant that starts a new session escapes this kill. Process groups are
-    POSIX, and a port to another platform needs its own way to end group members."""
+    **Round 15, item 2.** The walk finds the descendants by ancestry, which includes
+    one that called ``setsid`` and so is in a group of its own, and each is killed
+    with the group. A descendant whose parent had already exited, or that is started
+    after the walk, is not found. An unreadable table or a walk that takes longer than
+    ``ATTACHED_WAIT_SECONDS`` leaves the group kill alone.
+
+    **Why the group is not frozen first, as the launcher freezes the harness's.**
+    Observed on Python 3.15 on macOS. Stopping the group with ``SIGSTOP`` makes the
+    event loop's child watcher call a blocking ``os.waitpid`` for the stopped
+    command, which blocks the loop until the command exits, which only the kill ends.
+    The loop therefore deadlocks. The cost of not freezing is that a descendant can
+    fork between the walk and the kill, and that child is not found.
+
+    Process groups are POSIX, and a port to another platform needs its own way to end
+    the group and its descendants."""
     if process.returncode is None:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(process.pid, signal.SIGKILL)
-        with contextlib.suppress(ProcessLookupError):
-            process.kill()
+        found: list[int] = []
+        try:
+            try:
+                rows = await asyncio.wait_for(
+                    asyncio.to_thread(attached, process.pid), ATTACHED_WAIT_SECONDS
+                )
+            except TimeoutError:
+                rows = None
+            found = [row.pid for row in rows or ()]
+        finally:
+            for pid in found:
+                _signal_pid(pid, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(process.pid, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
     await asyncio.shield(process.wait())
 
 

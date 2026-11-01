@@ -300,6 +300,14 @@ class EngineRefused(Exception):
     """The credential policy or the driver refused to run the turn."""
 
 
+class ConfinementBreach(EngineRefused):
+    """A call escaped the confinement Dromon gave the line, as a ``Read`` that
+    completed on a view-only line with no ViewImage hook call. **Round 15, review
+    of e9adf91.** The scheduler holds a line whose turn ends this way whether or not
+    the line mailed an operator, because the mail exemption covers a failed turn an
+    operator may have been told about and not a call that escaped its confinement."""
+
+
 class EnginePlanLimit(EngineRefused):
     """The subscription reached a plan limit and needs operator release.
     ``resets_at`` is the reset time the engine reported, in the model's
@@ -1707,6 +1715,9 @@ class _Turn:
     tool_uses: list[str] = field(default_factory=list[str])
     interrupted_for: str | None = None
     refusal: str | None = None
+    breach: bool = False
+    """Whether the refusal is a confinement breach, which the scheduler holds a line
+    for unconditionally."""
     capabilities: Capabilities | None = None
     credential: Credential | None = None
     require_init: bool = True
@@ -1729,6 +1740,12 @@ class _Turn:
     reads: set[str] = field(default_factory=set[str])
     """The identifiers of the ``Read`` calls a view-only line made and whose results
     have not arrived, which each must have had a call of the ViewImage hook."""
+
+
+def _refusal_error(turn: _Turn) -> EngineRefused:
+    """The error that ends a refused turn, a ``ConfinementBreach`` for a breach."""
+    text = turn.refusal if turn.refusal is not None else ""
+    return ConfinementBreach(text) if turn.breach else EngineRefused(text)
 
 
 type PermissionGate = Callable[
@@ -2412,7 +2429,7 @@ class ClaudeCodeLine:
                     )
                     prompt = f"{note}\n\n{prompt}"
                 if turn.refusal is not None:
-                    raise EngineRefused(turn.refusal)
+                    raise _refusal_error(turn)
                 answered = False
                 # Bounded by HANDOFF_RESENDS, past which _handed_off refuses.
                 for resends in range(HANDOFF_RESENDS + 1):
@@ -2441,7 +2458,7 @@ class ClaudeCodeLine:
             self._turn = None
         cost = None if result is None else self._measure(result)
         if turn.refusal is not None:
-            raise EngineRefused(turn.refusal)
+            raise _refusal_error(turn)
         self._check_limit(result, turn)
         return self._report(result, turn, cost)
 
@@ -2695,6 +2712,7 @@ class ClaudeCodeLine:
         if tool_use_id in self._hooked:
             self._hooked.discard(tool_use_id)
             return
+        turn.breach = True
         if turn.refusal is None:
             turn.refusal = (
                 "a Read completed on a view-only line without the ViewImage hook"
@@ -3184,7 +3202,7 @@ class ClaudeCodeLine:
                     )
                 self._refuse_missing_sign_in(result.result, turn)
                 if turn.refusal is not None:
-                    raise EngineRefused(turn.refusal)
+                    raise _refusal_error(turn)
                 if turn.capabilities is None:
                     raise EngineRefused(
                         "the engine did not report its tools and credential before"
@@ -3481,7 +3499,7 @@ class ClaudeCodeLine:
                 inbox = asyncio.Queue()
                 connection.inbox = inbox
             if turn.refusal is not None:
-                raise EngineRefused(turn.refusal)
+                raise _refusal_error(turn)
             await connection.session.query(prompt)
             answered = False
             resends = 0
@@ -3537,14 +3555,14 @@ class ClaudeCodeLine:
             await self.close()
             self._notes.append(DIED_NOTE)
             if turn.refusal is not None:
-                raise EngineRefused(turn.refusal)
+                raise _refusal_error(turn)
             raise EngineRefused(
                 connection.ended_by or "the engine's process ended during the turn"
             )
         cost = self._measure(result)
         if turn.refusal is not None:
             await self.close()
-            raise EngineRefused(turn.refusal)
+            raise _refusal_error(turn)
         self._check_limit(result, turn)
         if turn.capabilities is not None:
             connection.capabilities = turn.capabilities

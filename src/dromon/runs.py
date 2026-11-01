@@ -62,6 +62,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final, cast
 
+from dromon.processes import TreeRow, attached
 from dromon.model import (
     MAX_EXIT_CODE,
     MAX_RUN_NOTE_BYTES,
@@ -91,6 +92,9 @@ STOP_GRACE_SECONDS: Final = 10.0
 POLL_SECONDS: Final = 0.1
 """How often a supervisor looks whether its command has ended, unless a stop wakes
 it sooner."""
+STRAY_POLL_SECONDS: Final = 0.2
+"""How often a stopped supervisor, whose command has ended, looks whether the
+descendants outside the command's group have gone as well."""
 
 MAX_DIGEST_BYTES: Final = 2**30
 """The largest output whose digest is read. A larger one is recorded with its size
@@ -607,6 +611,11 @@ def write_receipt(path: Path, receipt: Receipt) -> None:
     partial.replace(path)
 
 
+def _below_this_process() -> list[TreeRow] | None:
+    """What descends from the supervisor, by ``dromon.processes.attached``."""
+    return attached(os.getpid())
+
+
 class Supervision:
     """The supervisor's stop, which its signal handlers share. Installed before the
     supervisor says it is ready, so no stop can find it without them.
@@ -616,10 +625,32 @@ class Supervision:
     identifier is the command's process identifier, which cannot be reused while the
     command is unreaped, so no signal reaches a later group of the same identifier.
     **Review of 2026-10-31, R7.** A timer thread once sent ``SIGKILL`` on its own, and
-    could do so after the command was reaped."""
+    could do so after the command was reaped.
 
-    def __init__(self) -> None:
+    **Round 15, item 2. Descendants in a session of their own.** A signal to the
+    command's group misses a descendant that called ``setsid``. A stop therefore also
+    walks the process table for what descends from the supervisor, by parent, and
+    signals those, at ``SIGTERM`` and again at ``SIGKILL``. The walk comes before the
+    group signal, because the signal orphans what the command left. Each signal goes
+    to the result of a walk made just before it and never to a process identifier
+    remembered from an earlier walk, so a process that ended and whose identifier was
+    reused is not signalled unless it descends from the supervisor. **Limits.** A
+    descendant whose parent has exited is no longer found, because this supervisor is
+    not a child subreaper, which would leave every orphan unreaped until the run ends.
+    The launcher is one because it reaps. A stop does not run when the supervisor
+    itself is killed. A command that ends on its own is not followed by a walk, so a
+    descendant it leaves is the lost-run check's to find, as ``session_occupied``
+    says."""
+
+    def __init__(
+        self, walk: Callable[[], list[TreeRow] | None] = _below_this_process
+    ) -> None:
         self.stopping = threading.Event()
+        self._walk = walk
+        self.outside: set[int] = set()
+        """The descendants a stop signalled that were outside the command's group."""
+        self.unreadable = False
+        """Whether a walk could not read the process table."""
 
     def install(self) -> None:
         for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -635,26 +666,71 @@ class Supervision:
         clock: Callable[[], float] = time.monotonic,
     ) -> int:
         """Wait for ``child`` and return its status. Once a stop is noted, its group
-        is sent ``SIGTERM`` and, ``grace`` seconds later, ``SIGKILL``."""
+        and the descendants below the supervisor are sent ``SIGTERM`` and, ``grace``
+        seconds later, ``SIGKILL``. A command that ends first is not returned until
+        the descendants outside its group are gone or ``grace`` has passed."""
         terminated_at: float | None = None
         killed = False
         while True:
             code = child.poll()
-            if code is not None:
-                return code
             if self.stopping.is_set():
                 if terminated_at is None:
                     terminated_at = clock()
-                    _signal_group(child.pid, signal.SIGTERM)
+                    self._end(child, code, signal.SIGTERM)
                 elif not killed and clock() - terminated_at >= grace:
                     killed = True
-                    _signal_group(child.pid, signal.SIGKILL)
-            self.stopping.wait(POLL_SECONDS)
+                    self._end(child, code, signal.SIGKILL)
+            if code is not None:
+                if not self.stopping.is_set() or killed:
+                    return code
+                left = self._walk()
+                if not left:
+                    return code
+            self.stopping.wait(POLL_SECONDS if code is None else STRAY_POLL_SECONDS)
+
+    def _end(
+        self, child: subprocess.Popen[bytes], code: int | None, number: int
+    ) -> None:
+        """Walk the process table, then signal the command's group while the command
+        is unreaped, then whatever the walk found. **The order matters.** The group
+        signal ends the command, and a descendant that outlives it is given to the
+        system's first process at that moment and is no longer below this one, so a
+        walk made after the signal misses exactly the descendant it is for. The
+        full-gate run of 2026-11-01 showed it. The walk is made at most a moment
+        before the signals, so none goes to a process identifier from an earlier
+        walk."""
+        found = self._walk()
+        if code is None:
+            _signal_group(child.pid, number)
+        if found is None:
+            self.unreadable = True
+            return
+        for row in found:
+            if row.pgid != child.pid:
+                self.outside.add(row.pid)
+            _signal_pid(row.pid, number)
+
+    def note(self) -> str:
+        """What a stop did beyond the command's group, for the receipt."""
+        parts: list[str] = []
+        if self.outside:
+            parts.append(f"{len(self.outside)} descendants outside its group")
+        if self.unreadable:
+            parts.append(
+                "the process table could not be read, so descendants outside its"
+                " group may remain"
+            )
+        return "" if not parts else ", with " + " and ".join(parts)
 
 
 def _signal_group(group: int, number: int) -> None:
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(group, number)
+
+
+def _signal_pid(pid: int, number: int) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, number)
 
 
 def supervise(
@@ -675,7 +751,9 @@ def supervise(
     code = supervision.wait(child)
     if supervision.stopping.is_set():
         return Receipt(
-            RunStatus.STOPPED, code, "stop_run asked its supervisor to end it"
+            RunStatus.STOPPED,
+            code,
+            "stop_run asked its supervisor to end it" + supervision.note(),
         )
     return Receipt(RunStatus.EXITED, code, "")
 

@@ -170,9 +170,12 @@ malformed `file_path` is refused. The callback keeps the same check as a second 
    given. The adapter records each `Read` a view-only line makes and, when its result
    arrives, finds the call among the hook's. The hook runs before the tool, so a result
    with no hook call means the engine skipped the hook for it. The adapter interrupts
-   the turn and refuses it, and the scheduler holds a line whose turn failed, as for
-   any refused turn. This detects and does not prevent, since the `Read` has completed,
-   and what it returned has reached the model.
+   the turn and refuses it with a `ConfinementBreach`. **Round 15, review of
+   e9adf91.** The scheduler holds a line whose turn ended in a breach unconditionally.
+   The exemption for a line that mailed an operator during a failed turn does not
+   apply, because the mail may explain a failure and does not undo a call that escaped
+   its confinement. The hold text names the breach. This detects and does not prevent,
+   since the `Read` has completed, and what it returned has reached the model.
 4. *A policy that switches hooks off refuses the line.* **Fact, found in the bundled
    Claude Code 2.1.310 by the audit line.** The settings `disableAllHooks` and
    `allowManagedHooksOnly` stop hooks from running, and the engine's message says
@@ -180,9 +183,13 @@ malformed `file_path` is refused. The callback keeps the same check as a second 
    `dromon.hookpolicy` reads the line's `[settings]` document and the managed policy
    files, `managed-settings.json` and the fragments in `managed-settings.d`, under
    `/Library/Application Support/ClaudeCode` and `/etc/claude-code`, and refuses to
-   start a view-only line when one is `true`. A policy file that exists and cannot be
-   read as a JSON object also refuses, because a policy that cannot be seen cannot be
-   shown to leave hooks on. **Limit.** A policy delivered by a mobile device management
+   start a view-only line when one is present with any value but the boolean `false`.
+   **Round 15, review of e9adf91.** A string, a number, `null` and a container refuse
+   as `true` does, because only `false` is shown to leave hooks on. A directory that
+   holds more than 64 policy files, the main file included, refuses too, since a file
+   past the bound would go unread and could carry a switch. A policy file that exists
+   and cannot be read as a JSON object also refuses, because a policy that cannot be
+   seen cannot be shown to leave hooks on. **Limit.** A policy delivered by a mobile device management
    profile or a registry key cannot be seen from here, and the third guard is what
    catches it, after the fact.
 **Other engines.** Codex has no permission callback to bypass. Its `view_image` is

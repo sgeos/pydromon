@@ -63,12 +63,23 @@ through its own explicit mechanism.
 
 The daemon runs the command without blocking its event loop. The command is the
 leader of its own process group. On a timeout, or when the daemon stops while it runs,
-that group is killed. A descendant that starts a new session escapes this signal and
-may outlive the command or daemon. Standard output is discarded. Standard error is
+that group is killed, and so is every descendant that a walk of the process table
+finds below the command, including one that started a session of its own.
+**Round 15, item 2.** The walk finds a process by its ancestry from the command alone,
+so another line's or the operator's processes are out of reach. It does not find a
+descendant whose parent had already exited, or one forked after the walk, and the
+group is not frozen first because a stopped child blocks Python 3.15's event loop
+watcher. A relay command carries no line's mark, which is why the mark is not used,
+and a command that double forks or daemonizes may outlive its notice. An operator
+should write a relay command that does neither. An unreadable process table, or a walk
+that takes more than 3 seconds, leaves the group kill alone. Standard output is discarded. Standard error is
 drained while the command runs, retaining at most 4,096 bytes, of which 200 reach a
 failure reason. Acceptance is judged by the command's exit status. Once it exits, the
-daemon closes its read end of standard error and does not wait for a descendant that
-inherited the pipe.
+daemon reads what the pipe holds, in at most 16 reads, closes its read end of standard
+error and does not wait for a descendant that inherited the pipe. **Round 15, item 1.**
+The pipe is made by Dromon and passed to the command as its standard error, and Dromon
+closes it with public interfaces only, `os.pipe`, a descriptor given as `stderr` and the
+loop's `add_reader`. It no longer reaches asyncio's private subprocess transport.
 
 ## File relay
 

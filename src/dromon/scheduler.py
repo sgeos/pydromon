@@ -184,6 +184,7 @@ from dromon.engine import (
     BackgroundEnd,
     SelfStartedFinish,
     ClaudeCodeLine,
+    ConfinementBreach,
     EnginePlanLimit,
     EngineRefused,
     TurnReport,
@@ -8787,6 +8788,7 @@ class Scheduler:
         report: TurnReport | None = None
         ending = "cancelled"
         failed = False
+        breached = False
         stop_cause: str | None = None
         engine: LineEngine | None = None
         mailed = self._operator_mail(line_id)
@@ -8864,6 +8866,7 @@ class Scheduler:
                 stop_cause = str(error)
             ending = f"failed: {error}"
             failed = True
+            breached = isinstance(error, ConfinementBreach)
             print(f"dromond: line {line_id} turn failed: {error}", file=sys.stderr)
         finally:
             self._end_token(line_id, engine)
@@ -8914,8 +8917,8 @@ class Scheduler:
             report,
         )
         self._compaction_free_turn_inflight.discard(line_id)
-        if failed and self._operator_mail(line_id) == mailed:
-            self._hold_failed(line_id, ending)
+        if failed and (breached or self._operator_mail(line_id) == mailed):
+            self._hold_failed(line_id, ending, breached)
         self.fail_over_if_unable(line_id)
 
     def _handoff(
@@ -9335,14 +9338,18 @@ class Scheduler:
             " since. " + " ".join(parts)
         )
 
-    def _hold_failed(self, line_id: str, ending: str) -> None:
+    def _hold_failed(self, line_id: str, ending: str, breach: bool = False) -> None:
         """Hold a line whose turn failed and ask an operator, unless a limit already
         held it. **Luna's turn of 2026-10-27.** A turn that failed before it began
         was recorded only in the line's activity, and no operator learned of it for
         hours. A line cannot report a failure that kept its turn from running, so the
         daemon does, unless the line mailed an operator during the turn, whose mail
         may explain it. The hold also keeps the next wake from failing the same way
-        unseen. Answering the question releases the line."""
+        unseen. Answering the question releases the line.
+
+        **Round 15, review of e9adf91.** A ``breach`` is a call that escaped its
+        confinement, and the caller holds for it whether or not the line mailed an
+        operator, so the hold text says so and not that no mail was sent."""
         line = self._log.state.lines.get(line_id)
         if line is None or line.held_by is not None:
             return
@@ -9351,11 +9358,12 @@ class Scheduler:
             if len(ending) <= MAX_FAILURE_TEXT
             else ending[:MAX_FAILURE_TEXT] + "..."
         )
-        self.hold(
-            line_id,
-            f"had a turn fail and sent no operator mail during it. {cut}",
-            cause=HoldCause.TURN_FAILED,
+        what = (
+            "had a turn end in a confinement breach"
+            if breach
+            else "had a turn fail and sent no operator mail during it"
         )
+        self.hold(line_id, f"{what}. {cut}", cause=HoldCause.TURN_FAILED)
 
     async def _check_walk(self, line_id: str) -> None:
         """Refuse the turn when the line's stop policy is ``kill_all`` and the
@@ -10084,8 +10092,11 @@ class Scheduler:
             self._settle_relinquish(line_id)
             self._work.set()
         self._apply_limits(line_id, TurnCause.AUTONOMOUS, True, report)
-        if failed and self._operator_mail(line_id) == mailed:
-            self._hold_failed(line_id, ending)
+        if failed and (
+            isinstance(error, ConfinementBreach)
+            or self._operator_mail(line_id) == mailed
+        ):
+            self._hold_failed(line_id, ending, isinstance(error, ConfinementBreach))
         self.fail_over_if_unable(line_id)
 
     def _record_task(self, line_id: str, end: BackgroundEnd) -> None:

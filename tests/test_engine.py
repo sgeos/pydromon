@@ -53,6 +53,7 @@ from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, McpServer, ToolPolicy
 from dromon.engine import (
     API_ENVIRONMENT,
     BILLING_LIMIT,
+    ConfinementBreach,
     EnginePlanLimit,
     KEY_SOURCES,
     MCP_SERVER_NAME,
@@ -1042,7 +1043,9 @@ def test_a_read_that_completed_without_the_hook_ends_the_turn() -> None:
         [init(tools=["Read"]), read_call("r1"), read_result("r1"), result()]
     )
     target = configured(VIEW_ONLY, session)
-    with pytest.raises(EngineRefused, match="without the ViewImage hook having run"):
+    with pytest.raises(
+        ConfinementBreach, match="without the ViewImage hook having run"
+    ):
         run(target)
     assert session.interrupts == 1
 
@@ -1097,7 +1100,7 @@ def test_only_the_read_that_skipped_the_hook_is_refused() -> None:
         ],
         hooked=["r1"],
     )
-    with pytest.raises(EngineRefused, match="without the ViewImage hook"):
+    with pytest.raises(ConfinementBreach, match="without the ViewImage hook"):
         run(configured(VIEW_ONLY, session))
 
 
@@ -1144,8 +1147,11 @@ def test_a_managed_policy_that_switches_hooks_off_refuses_a_view_only_line(
     (tmp_path / "managed-settings.json").write_text(json.dumps({key: True}))
     monkeypatch.setattr(hookpolicy, "MANAGED_DIRECTORIES", (tmp_path,))
     session = Scripted([init(tools=["Read"]), result()])
-    with pytest.raises(EngineRefused, match=f"sets {key}"):
+    with pytest.raises(EngineRefused, match=f"sets {key}") as refused:
         run(configured(VIEW_ONLY, session))
+    # A refusal before the turn is not a breach, which the scheduler holds for
+    # unconditionally. The line did nothing outside its confinement.
+    assert not isinstance(refused.value, ConfinementBreach)
     assert session.options == []
     # A line that is not view-only is not affected by it.
     other = Scripted([init(tools=["Read"]), result()])

@@ -15,3 +15,11 @@ Type: Fixed
   set `disableAllHooks` or `allowManagedHooksOnly`. `report_directory` accepted
   `tmp/Lines`, which overwrote another line's scratch on a volume that ignores case.
   `dromon role` no longer fails when an older daemon sends a seat's budget as `null`.
+- Round 15. A supervised run stopped with a `setsid` child, or a relay command that
+  timed out with one, left that child running. Both now end it while its parent lives.
+- Round 15. A view-only line whose `Read` completed without the ViewImage hook is now
+  held whether or not it mailed an operator during the turn, because the mail exemption
+  does not fit a call that escaped its confinement. The hook policy check no longer
+  passes a 65th policy file unread, and refuses a directory with more files than it
+  reads. It also refuses any value of `disableAllHooks` or `allowManagedHooksOnly`
+  that is not the boolean `false`, where it refused only `true`.

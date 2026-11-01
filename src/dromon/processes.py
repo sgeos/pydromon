@@ -55,6 +55,9 @@ MARK_VARIABLE: Final = "DROMON_LINE_MARK"
 PROC: Final = Path("/proc")
 """Linux's process file system, a module constant so tests can stand in for it."""
 
+PS_FIELDS: Final = "pid=,ppid=,pgid=,args="
+"""The field list ``tree_or_reason`` gives ``ps``, which identifies its own listing."""
+
 UNIDENTIFIABLE: Final = (
     "This platform does not let the daemon read another process's environment, so it"
     " cannot tell which processes are yours, and it neither lists nor stops any. Use"
@@ -466,7 +469,7 @@ def tree_or_reason(
                 "-U",
                 str(uid),
                 "-o",
-                "pid=,ppid=,pgid=,args=",
+                PS_FIELDS,
             ],
             capture_output=True,
             text=True,
@@ -512,6 +515,47 @@ def descendants(rows: Sequence[TreeRow], root: int) -> list[TreeRow]:
         if row.pgid in groups and row.pid != root and row.pid not in found:
             found[row.pid] = row
     return sorted(found.values(), key=lambda row: row.pid)
+
+
+ATTACHED_SECONDS: Final = 2.0
+"""How long one walk for ``attached`` may take. A walk that takes longer finds
+nothing, and the caller ends what it can reach without it."""
+
+
+def attached(root: int, timeout: float = ATTACHED_SECONDS) -> list[TreeRow] | None:
+    """The processes of the daemon's user that descend from ``root`` by parent, with
+    the members of the groups those lead, whatever session each is in. ``None`` when
+    the process table cannot be read, which is never an empty list. Blocking, so a
+    caller on the event loop runs it in a thread.
+
+    **Round 15, item 2.** This is how a relay command and a supervised run find a
+    descendant that called ``setsid``, which a signal to the command's group misses.
+    It cannot reach another line's or the operator's processes, because a process is
+    found only by its ancestry from ``root`` and a process in another session cannot
+    join a group a descendant leads. **Not the line mark.** The mark is read from the
+    environment, which this platform may not let the daemon read, as
+    ``environment_reading_works`` finds, and which a descendant can clear with ``env
+    -i``. The ancestry cannot be cleared. **Limit.** A descendant whose parent has
+    exited is no longer below ``root``, except on Linux where the caller is a child
+    subreaper, as the launcher is and a run's supervisor is not, so it is not found.
+    The caller's own process and ``root`` are never in the result."""
+    rows = read_tree(os.getuid(), timeout)
+    if rows is None:
+        return None
+    me = os.getpid()
+    return [
+        row
+        for row in descendants(rows, root)
+        if row.pid not in (me, root) and not _is_own_listing(row, me)
+    ]
+
+
+def _is_own_listing(row: TreeRow, me: int) -> bool:
+    """Whether ``row`` is the ``ps`` that ``read_tree`` ran for ``me``. It is a child
+    of the caller and lists itself, so a walk from the caller would find it among its
+    descendants, count it as one outside the command's group and signal a process that
+    is gone. **Round 15.** Found when a receipt named a descendant that was this."""
+    return row.ppid == me and PS_FIELDS in row.command
 
 
 def line_processes(

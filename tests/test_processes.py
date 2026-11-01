@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import os
 import signal
 import subprocess
 import threading
@@ -19,6 +20,9 @@ from dromon.engine import ClaudeCodeLine
 from dromon.eventlog import EventLog
 from dromon.processes import (
     MARK_VARIABLE,
+    PS_FIELDS,
+    TreeRow,
+    attached,
     MAX_COMMAND_CHARACTERS,
     ProcessInfo,
     ProcessRefused,
@@ -678,3 +682,30 @@ def test_where_processes_can_be_identified_line_status_says_so(
         "stop_unverified": None,
         "walk_limit": None,
     }
+
+
+def test_attached_leaves_out_the_ps_that_listed_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 15. The ``ps`` that reads the table is a child of the caller and lists
+    itself, so a walk from the caller would count it as a descendant outside any
+    group and signal a process that is gone. Its own listing is left out, and only
+    that one, so a ``ps`` of some other command stays."""
+    me = os.getpid()
+    rows = [
+        TreeRow(me, 1, me, "daemon"),
+        TreeRow(900, me, me, f"ps -ww -U 501 -o {PS_FIELDS}"),
+        TreeRow(901, me, 901, "sleep 60"),
+        TreeRow(902, 901, 902, "ps aux"),
+        TreeRow(903, 901, 903, f"ps -ww -U 501 -o {PS_FIELDS}"),
+    ]
+
+    def table(uid: int, timeout: float = 1.0) -> list[TreeRow] | None:
+        return rows
+
+    monkeypatch.setattr(processes, "read_tree", table)
+    from_me = attached(me)
+    from_child = attached(901)
+    assert from_me is not None and from_child is not None
+    assert [row.pid for row in from_me] == [901, 902, 903]
+    assert [row.pid for row in from_child] == [902, 903]

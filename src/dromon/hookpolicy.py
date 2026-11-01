@@ -18,12 +18,20 @@ policy that arrives some other way, such as a mobile device management profile o
 registry key, cannot be seen from here. The adapter's check that every ``Read`` had a
 hook call is the second line of defence for that case.
 
+**Round 15, review of e9adf91.** Two gaps in the first reading are closed. A
+directory that holds more than ``MAX_POLICY_FILES`` policy files refuses, because a
+file past the bound would otherwise be unread and could carry a switch. A switch
+whose value is anything but the boolean ``false`` refuses, because Dromon cannot show
+that Claude Code reads a string, a number or ``null`` as unset. **Hypothesis.** Only
+``false`` leaves hooks on, so the check treats every other value as set.
+
 **Porting note.** The directories are plain data. The reader is bounded by the number
 of entries in them and by ``MAX_POLICY_FILES`` and ``MAX_POLICY_BYTES``.
 """
 
 import json
 from collections.abc import Mapping, Sequence
+from itertools import islice
 from pathlib import Path
 from typing import Final, cast
 
@@ -45,7 +53,10 @@ MAX_POLICY_BYTES: Final = 1024 * 1024
 
 def _policy_files(directory: Path) -> list[Path]:
     """The policy files in ``directory``, the main file then the fragments in name
-    order, at most ``MAX_POLICY_FILES``. A name that is absent is skipped."""
+    order. A name that is absent is skipped. The list holds at most
+    ``MAX_POLICY_FILES + 1`` names, so a caller that sees more than
+    ``MAX_POLICY_FILES`` knows the directory holds more than it reads, whatever its
+    size. The reading of the directory is bounded for that reason."""
     files: list[Path] = []
     main = directory / MANAGED_FILE
     if main.exists():
@@ -53,7 +64,10 @@ def _policy_files(directory: Path) -> list[Path]:
     fragments = directory / MANAGED_FRAGMENTS
     try:
         names = sorted(
-            entry for entry in fragments.iterdir() if entry.suffix == ".json"
+            islice(
+                (entry for entry in fragments.iterdir() if entry.suffix == ".json"),
+                MAX_POLICY_FILES + 1,
+            )
         )
     except FileNotFoundError:
         names = []
@@ -62,12 +76,13 @@ def _policy_files(directory: Path) -> list[Path]:
         files.append(fragments)
         names = []
     files.extend(names)
-    return files[:MAX_POLICY_FILES]
+    return files[: MAX_POLICY_FILES + 1]
 
 
 def _switch(document: Mapping[str, object]) -> str | None:
+    """The first hook switch ``document`` sets to anything but the boolean ``false``."""
     for key in HOOK_SWITCHES:
-        if document.get(key) is True:
+        if key in document and document[key] is not False:
             return key
     return None
 
@@ -89,7 +104,10 @@ def _file_refusal(file: Path) -> str | None:
     found = _switch(cast(dict[str, object], document))
     if found is None:
         return None
-    return f"the managed policy {file} sets {found}, which stops hooks from running"
+    return (
+        f"the managed policy {file} sets {found} to a value other than false, which"
+        " may stop hooks from running"
+    )
 
 
 def hook_policy_refusal(
@@ -99,16 +117,24 @@ def hook_policy_refusal(
     """Why a view-only line must not start, or ``None``. The operator's settings
     document is read first, then each managed policy file in ``directories``. A file
     that exists and cannot be read as a JSON object also refuses, because a policy
-    that cannot be seen cannot be shown to leave hooks on, which fails closed."""
+    that cannot be seen cannot be shown to leave hooks on, which fails closed. So does
+    a directory with more files than ``MAX_POLICY_FILES``."""
     if settings is not None:
         found = _switch(settings)
         if found is not None:
             return (
-                f"the line's settings document sets {found}, which stops hooks from"
-                " running"
+                f"the line's settings document sets {found} to a value other than"
+                " false, which may stop hooks from running"
             )
     for directory in MANAGED_DIRECTORIES if directories is None else directories:
-        for file in _policy_files(directory):
+        files = _policy_files(directory)
+        if len(files) > MAX_POLICY_FILES:
+            return (
+                f"the managed policy in {directory} holds more than"
+                f" {MAX_POLICY_FILES} files, which is more than Dromon reads, so it"
+                " cannot show that none of them stops hooks from running"
+            )
+        for file in files:
             why = _file_refusal(file)
             if why is not None:
                 return why

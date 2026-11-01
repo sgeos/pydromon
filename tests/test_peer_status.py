@@ -22,7 +22,7 @@ from dromon import gitssh
 from dromon import scheduler as scheduler_module
 from dromon.codec import DecodeError, decode, encode
 from dromon.driver import Strategy
-from dromon.engine import EnginePlanLimit, TurnReport
+from dromon.engine import ConfinementBreach, EnginePlanLimit, TurnReport
 from dromon.eventlog import EventLog
 from dromon.gitssh import GitSshAccess
 from dromon.limits import Limits
@@ -847,6 +847,37 @@ def test_a_plan_limit_in_a_self_started_turn_records_its_cause(
 
     asyncio.run(go())
     assert world.log.state.lines["beta"].hold_cause is cause
+
+
+@pytest.mark.parametrize(
+    ("error", "held"),
+    [
+        (ConfinementBreach("a Read escaped its confinement"), True),
+        (RuntimeError("the engine broke"), False),
+    ],
+)
+def test_a_self_started_turn_is_held_for_a_breach_even_after_operator_mail(
+    world: World, error: Exception, held: bool
+) -> None:
+    """Round 15, review of e9adf91. A count of earlier operator mail that differs
+    from the current one stands for mail sent during the turn. It exempts an ordinary
+    failure from the hold and does not exempt a confinement breach."""
+
+    async def go() -> None:
+        completion: asyncio.Future[tuple[TurnReport | None, Exception | None]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        completion.set_result((None, error))
+        world.log.append(LineStateChanged("beta", LineState.RUNNING))
+        await world.scheduler._self_started_turn("beta", completion, -1)  # pyright: ignore[reportPrivateUsage]
+
+    asyncio.run(go())
+    line = world.log.state.lines["beta"]
+    assert (line.held_by is not None) is held
+    if held:
+        assert line.hold_cause is HoldCause.TURN_FAILED
+        body = world.log.state.messages[line.held_by or ""].body
+        assert "confinement breach" in body
 
 
 def test_a_failed_turn_without_operator_mail_records_its_cause(world: World) -> None:

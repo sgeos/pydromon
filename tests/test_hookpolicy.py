@@ -35,14 +35,32 @@ def test_the_main_file_and_each_fragment_are_read(key: str, tmp_path: Path) -> N
     assert why is not None and "20-y.json" in why and key in why
 
 
-@pytest.mark.parametrize("value", [False, None, "true", 1, []])
-def test_a_switch_that_is_not_true_is_no_refusal(value: object, tmp_path: Path) -> None:
+def test_a_switch_that_is_false_or_absent_is_no_refusal(tmp_path: Path) -> None:
     managed(
         tmp_path,
         "managed-settings.json",
-        json.dumps({"disableAllHooks": value, "allowManagedHooksOnly": value}),
+        json.dumps({"disableAllHooks": False, "allowManagedHooksOnly": False}),
     )
     assert hook_policy_refusal(None, (tmp_path,)) is None
+    assert hook_policy_refusal({"disableAllHooks": False}, (tmp_path,)) is None
+
+
+@pytest.mark.parametrize("key", hookpolicy.HOOK_SWITCHES)
+@pytest.mark.parametrize("value", [True, None, "true", "false", 0, 1, [], {}])
+def test_a_switch_that_is_not_the_boolean_false_refuses(
+    key: str, value: object, tmp_path: Path
+) -> None:
+    """Round 15, review of e9adf91. Only ``false`` is shown to leave hooks on, so a
+    string, a number, ``null`` and a container refuse as ``true`` does, in a managed
+    file, in a fragment and in the operator's settings document."""
+    managed(tmp_path / "a", "managed-settings.json", json.dumps({key: value}))
+    why = hook_policy_refusal(None, (tmp_path / "a",))
+    assert why is not None and f"sets {key}" in why
+    managed(tmp_path / "b" / "managed-settings.d", "10.json", json.dumps({key: value}))
+    why = hook_policy_refusal(None, (tmp_path / "b",))
+    assert why is not None and f"sets {key}" in why and "10.json" in why
+    why = hook_policy_refusal({key: value}, (tmp_path / "absent",))
+    assert why is not None and "settings document" in why
 
 
 @pytest.mark.parametrize(
@@ -87,13 +105,39 @@ def test_the_settings_document_is_read_first(tmp_path: Path) -> None:
     assert hook_policy_refusal({"allowManagedHooksOnly": False}, (tmp_path,)) is None
 
 
-def test_fragments_are_bounded_by_the_file_limit(tmp_path: Path) -> None:
-    for number in range(hookpolicy.MAX_POLICY_FILES + 5):
-        managed(tmp_path / "managed-settings.d", f"{number:03}.json", json.dumps({}))
-    # The one past the limit is not read, so it cannot refuse. This pins the bound.
-    managed(
-        tmp_path / "managed-settings.d",
-        "999.json",
-        json.dumps({"disableAllHooks": True}),
-    )
+def test_more_files_than_the_limit_refuses_even_when_the_extra_is_harmless(
+    tmp_path: Path,
+) -> None:
+    """Round 15, review of e9adf91. A 65th fragment that disables hooks passed,
+    because only the first 64 were read. The directory now refuses when it holds more
+    than it reads, whatever the file past the bound holds, and the main file counts."""
+    fragments = tmp_path / "managed-settings.d"
+    for number in range(hookpolicy.MAX_POLICY_FILES + 1):
+        managed(fragments, f"{number:03}.json", json.dumps({}))
+    why = hook_policy_refusal(None, (tmp_path,))
+    assert why is not None and "more than" in why and str(tmp_path) in why
+    # The one past the bound is the one that carries the switch.
+    managed(fragments, "999.json", json.dumps({"disableAllHooks": True}))
+    assert hook_policy_refusal(None, (tmp_path,)) is not None
+
+
+def test_exactly_the_limit_is_read_in_full(tmp_path: Path) -> None:
+    fragments = tmp_path / "managed-settings.d"
+    for number in range(hookpolicy.MAX_POLICY_FILES):
+        managed(fragments, f"{number:03}.json", json.dumps({}))
     assert hook_policy_refusal(None, (tmp_path,)) is None
+    # With the main file the directory holds one more than the limit.
+    managed(tmp_path, "managed-settings.json", json.dumps({}))
+    assert hook_policy_refusal(None, (tmp_path,)) is not None
+    # The last of the files at the limit is read, so a switch in it is found.
+    (tmp_path / "managed-settings.json").unlink()
+    managed(fragments, "063.json", json.dumps({"allowManagedHooksOnly": True}))
+    why = hook_policy_refusal(None, (tmp_path,))
+    assert why is not None and "063.json" in why
+
+
+def test_the_reading_of_a_large_directory_is_bounded(tmp_path: Path) -> None:
+    fragments = tmp_path / "managed-settings.d"
+    for number in range(hookpolicy.MAX_POLICY_FILES * 3):
+        managed(fragments, f"{number:04}.json", json.dumps({}))
+    assert len(hookpolicy._policy_files(tmp_path)) == hookpolicy.MAX_POLICY_FILES + 1  # pyright: ignore[reportPrivateUsage]
