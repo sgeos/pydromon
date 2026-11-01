@@ -4,36 +4,37 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-10-31, rounds 9 to 11
+## 2026-11-01, rounds 12 and 13
 
-**Done, merged in pull requests 97 to 110.**
+**Done, merged in pull requests 111 to 120.**
 
-- **Confinement.** Codex and Grok lines are denied a shared list of credential paths
-  and the project's secret directories by real path. A live Codex line turn was refused
-  `secret/`, `~/.ssh` and `~/.codex/auth.json`. `read_only_paths` makes paths in every
-  line's workdir unwritable on each engine, and this project now protects
-  `docs/process` and `docs/roadmap` with it.
-- **Grok.** Tool calls are judged by Grok's own `_meta` name and kind, Dromon's tools
-  are reached through `use_tool`, and the driver's model is requested per session. A
-  Grok line in another project ran turns of 58 and more tool calls on the result.
-- **Team.** Roles can be created, updated and deleted at run time, under one writer
-  per worktree. The `capabilities` role was created that way on a new Claude Sonnet 5.5
-  driver. Read lines get their own scratch.
-- **Operator.** Mail is pushed through a file relay that the operator follows, lines
-  raise issues, and `dromon wait` waits for a reply without polling.
-- **Durability.** Leases survive a restart and pass with a role, and declared commands
-  run under a supervisor that a successor and a restart reconcile.
-- **Gaps from another project's planned team.** `ViewImage` on Claude Code, Codex and
-  Grok, budget windows for Claude Code, and no Grok quota classification without a
-  documented shape.
+- **Federation.** Local and remote federation can be open or limited to an allowlist,
+  with TLS through a pinned `pyopenssl`.
+- **Operator commands.** `dromon create` takes limits, kept session and compaction,
+  `dromon configure` takes `workdir_access`, and `dromon config` shows every table it
+  validates. The gate prints each skipped test's reason.
+- **Disclosure.** A refusal names at most one field and never a term or a line. The
+  operator can accept an occurrence by file and line hash.
+- **Fleet.** A per-user index of daemons and `dromon fleet` commands.
+- **Refusals.** An ACP call that is rejected and reports that it did not run continues
+  the turn, and stop notes use fixed words.
+- **Restart and landing.** `dromon restart` runs the installed code's start checks
+  against a snapshot of the live log before the old daemon stops, and `dromon land`
+  takes a line's tree to a pull request.
+- **Peer state.** A line sees each other line's state, hold cause, unread age and live
+  leases, bounded, with nothing from notes or questions crossing.
+- **Changelog fragments.** One file per branch under `changes/`, assembled at release,
+  with a gate rule that continuous integration now enforces.
+- **Team.** Three new roles, `ops` on Opus 5.5, `audit` on Sonnet 5.5 and `grok-review`
+  on Grok 4.7. `engines` moved to GPT-6.1-Sol.
 
 **Verified.** Full gates outside the sandbox and continuous integration on every pull
-request, with reviews and re-reviews by the review line. Probe turns on Sol, Terra and
-Sonnet 5.5, and a live Codex confinement check.
+request, with reviews and re-reviews by the audit and review lines. The restart onto
+`65d4ffa` passed its preflight, and a Grok turn ran after the fleet index was denied in
+its profile. The changelog rule ran with a base in continuous integration.
 
 **Not verified.** The items under Unverified live in `HANDOFF.md`.
 
-**Also this session.** A restart onto the one-writer rule left no daemon for about
-eight minutes, since two log-only legacy lines could write the project root. They are
-declared read-only in the project file now. Every line and the operator wrote an
-experience report, and two of four lines are satisfied.
+**Also this session.** Every line and the operator wrote a round 13 report. Five of
+seven lines are satisfied, up from two of five in round 11. The operator is not, and
+names a declared full-gate run as the change that would most move it.
