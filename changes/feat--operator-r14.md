@@ -87,6 +87,11 @@ Type: Added
   while either differs, since a real directory a line moved into their place passed
   the `lstat` checks. The build-input tests pin each compared configuration file,
   `uv.toml` included.
+- Round 14, a stalled start. The runner of `dromon land` and `dromon sync-worktrees`
+  bounds each command's start at 30 seconds apart from its run, and gives status 125
+  naming the stall, since a land test hung for five minutes on macOS in `subprocess`
+  before its command ran. A command that starts after its caller gave up is killed
+  and reaped.
 - Round 14, restart preflight. The read-only `start_context` request, on the client
   socket only, gives the daemon's interpreter and its `DROMON_REGISTRY_DIR` and
   `SSH_AUTH_SOCK`, and `dromon restart` runs its preflight on that interpreter with

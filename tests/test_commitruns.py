@@ -882,7 +882,14 @@ def test_the_start_run_tool_takes_a_commit(
     with EventLog(tmp_path / "events.sqlite") as log:
         scheduler = commit_scheduler(log, repository, tmp_path)
         tools = {tool.name: tool for tool in scheduler.own_tools("alpha")}
-        start = tools["start_run"].handler
+        handler = tools["start_run"].handler
+
+        async def start(args: dict[str, Any]) -> dict[str, Any]:
+            """The handler awaited in a coroutine, since ``asyncio.run`` on Python
+            3.12 is typed to take a ``Coroutine`` and the handler gives an
+            ``Awaitable``."""
+            return await handler(args)
+
         refused = asyncio.run(
             start({"command": "review", "previous": "none", "commit": 7})
         )
