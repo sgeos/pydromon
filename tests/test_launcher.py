@@ -657,6 +657,107 @@ def test_a_walk_that_cannot_read_the_table_is_never_an_empty_tree(
     assert launcher._harness_tree(1, 2) == []  # pyright: ignore[reportPrivateUsage]
 
 
+class _WalkClock:
+    """A clock that only the pauses and the fake process table advance."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.pauses: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def pause(self, seconds: float) -> None:
+        self.pauses.append(seconds)
+        self.now += seconds
+
+
+def test_a_slow_process_table_is_retried_with_backoff_before_the_turn_is_refused() -> (
+    None
+):
+    """Round 14, item 1. A table that answers on the second attempt does not refuse
+    the turn, and each attempt is allowed longer than the one before."""
+    world = _WalkClock()
+    allowed: list[float] = []
+
+    def read(_uid: int, timeout: float) -> list[TreeRow] | TreeReadFailure:
+        allowed.append(timeout)
+        if len(allowed) == 1:
+            world.now += timeout
+            return TreeReadFailure("ps did not answer", timed_out=True)
+        world.now += 12.0
+        return []
+
+    assert walk_unavailable(read, world.pause, world.clock) is None
+    assert allowed == [
+        launcher.CHECK_ATTEMPT_SECONDS[0],
+        launcher.CHECK_ATTEMPT_SECONDS[1],
+    ]
+    assert world.pauses == [launcher.CHECK_PAUSE_SECONDS]
+    assert allowed[1] > allowed[0]
+
+
+def test_a_process_table_that_never_answers_is_refused_within_the_bound() -> None:
+    """Round 14, item 1. The reason carries each measured time and the total, and the
+    total stays within the deadline, pauses included."""
+    world = _WalkClock()
+
+    def read(_uid: int, timeout: float) -> list[TreeRow] | TreeReadFailure:
+        world.now += timeout
+        return TreeReadFailure("ps did not answer", timed_out=True)
+
+    reason = walk_unavailable(read, world.pause, world.clock)
+    assert reason is not None
+    assert world.now <= launcher.CHECK_DEADLINE_SECONDS
+    assert world.pauses == [1.0, 2.0]
+    assert reason == launcher.walk_timeout_reason([10.0, 20.0, 30.0], world.now)
+    assert "3 attempts" in reason
+    assert "10.0, 20.0, 30.0 seconds each" in reason
+    assert f"{world.now:.1f} seconds in all" in reason
+
+
+def test_a_deadline_shorter_than_the_attempts_cuts_the_last_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The total is a bound, so the last attempt gets only what remains of it."""
+    monkeypatch.setattr(launcher, "CHECK_DEADLINE_SECONDS", 25.0)
+    world = _WalkClock()
+    allowed: list[float] = []
+
+    def read(_uid: int, timeout: float) -> list[TreeRow] | TreeReadFailure:
+        allowed.append(timeout)
+        world.now += timeout
+        return TreeReadFailure("ps did not answer", timed_out=True)
+
+    reason = walk_unavailable(read, world.pause, world.clock)
+    assert reason is not None
+    assert allowed == [10.0, 14.0]
+    assert world.now <= 25.0
+
+
+def test_a_process_table_failure_that_is_not_a_timeout_is_returned_at_once() -> None:
+    world = _WalkClock()
+    calls = 0
+
+    def read(_uid: int, _timeout: float) -> list[TreeRow] | TreeReadFailure:
+        nonlocal calls
+        calls += 1
+        return TreeReadFailure("ps cannot be run: denied")
+
+    assert (
+        walk_unavailable(read, world.pause, world.clock) == "ps cannot be run: denied"
+    )
+    assert calls == 1
+    assert world.pauses == []
+
+
+def test_the_timeout_reason_names_one_attempt_in_the_singular() -> None:
+    reason = launcher.walk_timeout_reason([9.5], 9.5)
+    assert "1 attempt," in reason
+    assert "9.5 seconds each" in reason
+    assert "none seconds" in launcher.walk_timeout_reason([], 0.0)
+
+
 def test_a_process_table_error_is_not_retried_as_a_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

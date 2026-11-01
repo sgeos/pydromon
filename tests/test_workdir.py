@@ -373,7 +373,10 @@ def test_a_claude_line_runs_in_its_workdir_with_its_paths_resolved_there(
         == "Contents of CLAUDE.md:\n\nThe worktree's rules."
     )
     sandbox = cast(dict[str, dict[str, list[str]]], engine.sandbox)
-    assert sandbox["filesystem"]["allowWrite"] == [str(tree / "out")]
+    assert engine.temp is not None
+    assert sandbox["filesystem"]["allowWrite"] == sorted(
+        {str(tree / "out"), *(os.path.realpath(p) for p in engine.temp.writable())}
+    )
     assert str(common / "hooks") in sandbox["filesystem"]["denyWrite"]
     assert str(root / ".dromon") in sandbox["filesystem"]["denyRead"]
     default = build(haiku_spec(DEFAULT_CONFIG), [])

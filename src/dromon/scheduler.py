@@ -143,7 +143,8 @@ from dromon.forwarder import PeerReport, check_outbound, outage_text
 from dromon.peering import PeerPriority, PeerTurns, Received, TurnCause, turn_cause
 from dromon import acp, antigravity, codex, cursor, grok, pi
 from dromon.agents import LineTokens
-from dromon import capabilities, launcher, redact
+from dromon import capabilities, launcher, linetemp, redact
+from dromon.linetemp import LineTemp
 from dromon.security_paths import project_secret_paths
 from dromon.handoff import Handoff
 from dromon.handoff import select as select_handoff
@@ -203,13 +204,23 @@ from dromon.processes import (
     ProcessWorker,
     TreeReadFailure,
     UNIDENTIFIABLE,
+    unavailable,
     SystemProcesses,
     TreeRow,
+    line_process_ended,
     line_processes,
     marked_processes,
+    pid_of_task,
+    pid_task_id,
     stop_line_process,
 )
 from dromon.projectconfig import ProjectConfig
+from dromon.worktree import (
+    Runner as WorktreeRunner,
+    WorktreeUnavailable,
+    run_git,
+    worktree_status,
+)
 from dromon.workdir import (
     git_common_directory,
     git_write_guards,
@@ -543,9 +554,10 @@ WAKE_TOOL_SCHEMA: Final[dict[str, object]] = {
         "task_id": {
             "type": "string",
             "description": (
-                "A running background task to wait for. End your turn after naming"
-                " it. Its end cancels this wake and wakes you; otherwise this wake"
-                " fires after the timeout."
+                "A running background task to wait for, or a process of yours that"
+                " list_processes shows, written as its task_id, pid:NUMBER. End your"
+                " turn after naming it. Its end cancels this wake and wakes you;"
+                " otherwise this wake fires after the timeout."
             ),
         },
         REQUEST_KEY: REQUEST_KEY_PROPERTY,
@@ -574,6 +586,9 @@ MAX_DIGEST_BYTES: Final = 16 * 1024 * 1024
 digest, so one end cannot hold the event loop for long."""
 DIGEST_CHUNK_BYTES: Final = 1024 * 1024
 WITHHELD_COMMAND: Final = "withheld, since the disclosure list covers it"
+
+MAX_ROSTER_TASKS: Final = 10
+"""The most background tasks a turn after a compaction names. **Round 14, item 4.**"""
 
 CHECK_DISCLOSURE_TOOL_NAME: Final = "check_disclosure"
 MAX_CHECKED_BYTES: Final = 1024 * 1024
@@ -900,6 +915,13 @@ WRITE_SCRATCH_SCHEMA: Final[dict[str, object]] = {
     "additionalProperties": False,
 }
 
+
+PID_WATCH_SECONDS: Final = 5.0
+"""How often the daemon looks for the end of a process a line waits for by its
+``pid:`` task identifier. Each look reads the environments of the daemon's user, which
+is one ``ps`` call on macOS, so it is not made oftener. **Round 14, item 5.**"""
+
+WORKTREE_STATUS_TOOL_NAME: Final = "worktree_status"
 
 LIST_PROCESSES_TOOL_NAME: Final = "list_processes"
 STOP_PROCESS_TOOL_NAME: Final = "stop_process"
@@ -1646,6 +1668,27 @@ def engine_factory(
         plugin_dirs = tuple(resolve_plugin(path) for path in spec.config.plugins)
         write_protected = (*claude_dir, *plugin_dirs)
         guarded = (*guarded, *write_protected)
+        line_temp: LineTemp | None = None
+        if enabled:
+            try:
+                line_temp = linetemp.prepare(spec.line_id)
+            except OSError as error:
+                # The line still starts, with the shell's own temporary directory, and
+                # its status says why it has none of its own.
+                print(
+                    f"dromond: no temporary directory for line {spec.line_id}: {error}",
+                    file=sys.stderr,
+                )
+            if line_temp is not None:
+                merged = merge(
+                    [
+                        merged,
+                        parse_sandbox(
+                            {"filesystem": {"allowWrite": line_temp.writable()}},
+                            operator=True,
+                        ),
+                    ]
+                )
         sandbox = effective(merged, workdir, protected_now, guarded)
         if enabled and git_ssh is not None and sandbox is not None:
             denied = unreadable(git_ssh, sandbox)
@@ -1686,6 +1729,7 @@ def engine_factory(
             consent_asked=spec.consent_asked,
             budget_reported=spec.budget_reported,
             secret_names=lambda: tuple((line_secrets or {}).get(spec.line_id, ())),
+            temp=line_temp,
         )
 
     return build
@@ -2026,11 +2070,15 @@ class Scheduler:
         self._processes: ProcessTable = processes or SystemProcesses()
         self._process_worker = ProcessWorker()
         self._sweep_worker = ProcessWorker()
+        self._git_worker = ProcessWorker()
+        self._worktree_runner: WorktreeRunner = run_git
         """Separate queue so a sweep waiting on signalled children cannot occupy
         the worker that serves process inspections and stops."""
         self._workers_stopped = False
         self._workers_joined = True
         self._process_tasks: set[asyncio.Task[None]] = set()
+        self._pid_watchers: dict[str, asyncio.Task[None]] = {}
+        self._facts_told: dict[str, str] = {}
         """Background process scans started during recovery, kept until they finish."""
         self._run_commands: dict[str, tuple[str, ...]] = {}
         """The commands the project declares for runs, by name."""
@@ -3405,9 +3453,16 @@ class Scheduler:
                 return _tool_error("note must be text")
             if task_id is not None and not isinstance(task_id, str):
                 return _tool_error("task_id must be text")
-            if task_id is not None and task_id not in self.running_task_ids(line_id):
+            watched: int | None = None
+            if isinstance(task_id, str) and pid_of_task(task_id) is not None:
+                refusal = await self._own_pid_refusal(line_id, task_id)
+                if refusal is not None:
+                    return _tool_error(refusal)
+                watched = pid_of_task(task_id)
+            elif task_id is not None and task_id not in self.running_task_ids(line_id):
                 return _tool_error(
-                    "task_id must name one of your running background tasks"
+                    "task_id must name one of your running background tasks, or a"
+                    " process of yours that list_processes shows, as pid:NUMBER"
                 )
             refusal = self.refuse_disclosed(line_id, ("note", note))
             if refusal is not None:
@@ -3419,6 +3474,7 @@ class Scheduler:
                 )
             except (InvalidField, EventRejected) as error:
                 return _tool_error(str(error))
+            self._watch_pid(line_id, watched, message_id)
             return _tool_text(
                 _wake_text(
                     due,
@@ -3435,8 +3491,10 @@ class Scheduler:
                 " command you started in the background. After the given seconds,"
                 " from 60 to 86400, your note arrives as a message from you, which"
                 " wakes you. You have at most one scheduled wake, and a new call"
-                " replaces it. Optionally name one of your running background tasks"
-                " as task_id to wait for it: end your turn after this call. The task"
+                " replaces it. Optionally name one of your running background tasks,"
+                " or one of your own processes by the pid:NUMBER task_id that"
+                " list_processes gives, as task_id to wait for it: end your turn"
+                " after this call. The task"
                 " end cancels this wake and wakes you with a task note. If the task"
                 " outlives the timeout, this wake fires instead. A wake that has"
                 " fired already cannot be cancelled."
@@ -3444,6 +3502,79 @@ class Scheduler:
             input_schema=WAKE_TOOL_SCHEMA,
             handler=handler,
         )
+
+    async def _own_pid_refusal(self, line_id: str, task_id: str) -> str | None:
+        """Why ``task_id``, written as ``pid:NUMBER``, is not a process of the line's
+        that runs now, or ``None`` when it is. The check is the one ``stop_process``
+        makes, so a line can wait only for what it could list and stop, and not for
+        another line's process or the daemon's. **Round 14, item 5.**"""
+        pid = pid_of_task(task_id)
+        if pid is None:
+            return "task_id is not written as pid:NUMBER"
+        if not self._processes_identifiable:
+            return unavailable(WAKE_TOOL_NAME, UNIDENTIFIABLE)
+        mark = self.line_mark(line_id)
+        try:
+            ended = await self._process_worker.run(
+                lambda: line_process_ended(self._processes, mark, os.getpid(), pid)
+            )
+        except ProcessRefused as error:
+            return unavailable(WAKE_TOOL_NAME, str(error))
+        if ended:
+            return f"process {pid} is not one of your running processes"
+        return None
+
+    def _watch_pid(self, line_id: str, pid: int | None, wake_id: str) -> None:
+        """Start a task that ends the wake ``wake_id`` when the line's process
+        ``pid`` ends, replacing the line's earlier watch. ``None`` only replaces."""
+        earlier = self._pid_watchers.pop(line_id, None)
+        if earlier is not None:
+            earlier.cancel()
+        if pid is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._watch_pid_end(line_id, pid, wake_id))
+        self._pid_watchers[line_id] = task
+        self._process_tasks.add(task)
+        task.add_done_callback(self._process_tasks.discard)
+
+    async def _watch_pid_end(self, line_id: str, pid: int, wake_id: str) -> None:
+        """Poll for the end of the line's process ``pid`` while the wake ``wake_id`` is
+        still pending, and record the end as a background task's. A table that cannot
+        be read is not an end, so the watch tries again, and the scheduled wake still
+        fires at its timeout. **Round 14, item 5.** The exit code is unknown, since the
+        process is not the daemon's child. After a restart no watch remains, and the
+        line's marks change, so the wake fires at its timeout, as the item records."""
+        task_id = pid_task_id(pid)
+        mark = self.line_mark(line_id)
+        while True:
+            pending = self._log.state.scheduled.get(line_id)
+            if (
+                line_id not in self._log.state.lines
+                or pending is None
+                or pending.message_id != wake_id
+            ):
+                return
+            try:
+                ended = await self._process_worker.run(
+                    lambda: line_process_ended(self._processes, mark, os.getpid(), pid)
+                )
+            except ProcessRefused:
+                ended = False
+            if ended:
+                self.background_ended(
+                    line_id,
+                    BackgroundEnd(
+                        task_id,
+                        f"process {pid}",
+                        "ended, and its exit code is not available",
+                    ),
+                )
+                return
+            await asyncio.sleep(PID_WATCH_SECONDS)
 
     def running_task_ids(self, line_id: str) -> set[str]:
         """The task identifiers the line's kept engine currently reports running."""
@@ -4580,6 +4711,8 @@ class Scheduler:
             "line_id": line_id,
             "state": line.state.value,
             "condition": self.condition(line_id),
+            "background_jobs": self.background_jobs(line_id),
+            "background_ends": self.background_ends(line_id),
             "held_by": line.held_by,
             "hibernated": line.hibernated,
             "autonomous_turns": {
@@ -4605,6 +4738,7 @@ class Scheduler:
             "workdir": config.workdir,
             "workdir_path": workdir,
             "sandbox": self._sandbox_status(line_id, workdir),
+            "sandbox_facts": self.sandbox_facts(line_id),
             "engine_session": line.engine_session,
             "shell": self._shell_status(line_id, config),
             "kept_session": self.kept_session(line_id),
@@ -4659,6 +4793,9 @@ class Scheduler:
             cause = _hold_cause(other)
             if cause is not None:
                 entry["hold_cause"] = cause
+            jobs = self.background_jobs(other_id)
+            if jobs:
+                entry["background_jobs"] = jobs
             if other.hibernated:
                 entry["hibernated"] = True
             since = _recorded_time_of(recorded.line_changed.get(other_id))
@@ -4786,6 +4923,147 @@ class Scheduler:
             ),
         }
 
+    def sandbox_facts(self, line_id: str) -> dict[str, object] | None:
+        """What a line keeps rediscovering about its sandbox, or ``None`` for an engine
+        whose sandbox document Dromon does not hold. **Round 14, item 8.** The facts
+        are read from the engine the line runs on, not guessed, and each says whether
+        it is configuration or an observation.
+
+        - ``ps``. Under an enabled sandbox on macOS, ``/bin/ps`` was refused with
+          ``Operation not permitted``, which three lines observed, so the answer there
+          is ``denied`` and the line is pointed to ``list_processes``. On another
+          platform it is ``unknown``, and with no enabled sandbox ``allowed``.
+        - ``scratch`` and ``temporary``. The paths, and whether the shell may write
+          them, from the sandbox document's write grants and denials.
+        - ``network``. The allowed domains of the document, which is configuration
+          and not a probe, so a listed domain may still be down."""
+        engine = self._engines.get(line_id)
+        if not isinstance(engine, ClaudeCodeLine):
+            return None
+        document = engine.sandbox
+        enabled = document is not None and document.get("enabled") is True
+        filesystem_value = None if document is None else document.get("filesystem")
+        filesystem = (
+            cast(dict[str, object], filesystem_value)
+            if isinstance(filesystem_value, dict)
+            else {}
+        )
+        confined = enabled and filesystem.get("disabled") is not True
+        allow_write = _sandbox_paths(filesystem.get("allowWrite"))
+        deny_write = _sandbox_paths(filesystem.get("denyWrite"))
+
+        def writable(path: Path) -> bool:
+            if not confined:
+                return True
+            return _sandbox_path_covered(
+                path, [str(engine.cwd), *allow_write]
+            ) and not _sandbox_path_covered(path, deny_write)
+
+        parts = self.scratch_parts(line_id)
+        scratch = engine.cwd.joinpath(*parts)
+        temp = engine.temp
+        network_value = None if document is None else document.get("network")
+        network = (
+            cast(dict[str, object], network_value)
+            if isinstance(network_value, dict)
+            else {}
+        )
+        domains = sorted(_sandbox_paths(network.get("allowedDomains")))
+        if not enabled:
+            ps = "allowed"
+        elif sys.platform == "darwin":
+            ps = "denied"
+        else:
+            ps = "unknown"
+        return {
+            "shell_sandboxed": confined,
+            "ps": ps,
+            "scratch": {"path": str(scratch), "shell_may_write": writable(scratch)},
+            "temporary": (
+                None
+                if temp is None
+                else {
+                    "tmpdir": str(temp.temp),
+                    "uv_cache_dir": str(temp.cache),
+                    "shell_may_write": all(
+                        writable(Path(path)) for path in temp.writable()
+                    ),
+                }
+            ),
+            "network": (
+                {"restricted": False, "allowed_domains": None}
+                if not confined
+                else {"restricted": True, "allowed_domains": domains}
+            ),
+            "note": (
+                "ps and the network answers describe configuration and what lines"
+                " observed on this platform. They are not probes of this turn."
+            ),
+        }
+
+    def _facts_due(self, line_id: str, facts: str, *, fresh: bool) -> bool:
+        """Whether this turn's prompt carries the sandbox facts. They lead the first
+        turn of a daemon run, a turn after the facts changed, a compaction, and every
+        turn of a line that starts a fresh session each turn, since the session then
+        holds nothing of an earlier turn. Otherwise the session already holds them,
+        and repeating them would cost tokens each turn. **Hypothesis.** An engine's own
+        automatic compaction can drop them, which the next change or restart repairs,
+        and ``line_status`` gives them whole at any time."""
+        told = self._facts_told.get(line_id)
+        self._facts_told[line_id] = facts
+        return (
+            fresh
+            or told != facts
+            or self.effective_config(line_id).fresh_session_each_turn
+        )
+
+    def _sandbox_facts_text(self, line_id: str) -> str | None:
+        """``sandbox_facts`` as the lines of a turn's prompt, or ``None``."""
+        facts = self.sandbox_facts(line_id)
+        if facts is None:
+            return None
+        scratch = cast(dict[str, object], facts["scratch"])
+        temporary = cast("dict[str, object] | None", facts["temporary"])
+        network = cast(dict[str, object], facts["network"])
+        lines = ["Your sandbox, as the daemon configured it for this turn."]
+        if facts["shell_sandboxed"] is not True:
+            lines.append(
+                "Your shell is not confined by a Dromon sandbox, so ps runs and the"
+                " network is not limited by Dromon."
+            )
+        else:
+            lines.append(
+                "ps is "
+                + (
+                    "refused in your shell on this platform, so use list_processes"
+                    " and worktree_status."
+                    if facts["ps"] == "denied"
+                    else "of unknown use in your shell here, so prefer list_processes"
+                    " and worktree_status."
+                )
+            )
+            domains = cast("list[str] | None", network["allowed_domains"])
+            lines.append(
+                "Network, as configured and not probed, reaches only "
+                + (", ".join(domains) if domains else "no domain")
+                + "."
+            )
+        lines.append(
+            f"Scratch is {scratch['path']}, which your shell "
+            + ("may" if scratch["shell_may_write"] else "may not")
+            + " write."
+        )
+        if temporary is None:
+            lines.append("Your shell keeps the temporary directory the engine gave it.")
+        else:
+            lines.append(
+                f"TMPDIR is {temporary['tmpdir']} and UV_CACHE_DIR is"
+                f" {temporary['uv_cache_dir']}, which your shell may"
+                + ("" if temporary["shell_may_write"] else " not")
+                + " write."
+            )
+        return " ".join(lines)
+
     def cost_status(self, line_id: str) -> dict[str, object]:
         """**Row 8 of the T3 Code review.** The line's cost since its release, with
         unknown kept apart from zero. ``estimate`` is the sum of the costs turns
@@ -4826,6 +5104,48 @@ class Scheduler:
             "sandbox": report.sandbox_mode,
             "isolation": capabilities.isolation_of(capabilities.table_of(engine)),
         }
+
+    def background_jobs(self, line_id: str) -> int:
+        """How many background jobs a line that is not running has, so that an idle
+        line with work still going on is not read as one with nothing to do. **Round
+        14, item 3.** The count is the larger of what the line's kept engine reports
+        and the processes of an earlier turn that the daemon found still running
+        under the line's mark. A line that is running has none counted, since its
+        turn is the work shown. An engine that cannot say counts as no job here,
+        which ``background_tasks_unknown`` in the full status keeps apart."""
+        if line_id in self._running:
+            return 0
+        reported = 0
+        engine = self._engines.get(line_id)
+        if isinstance(engine, KeptEngine):
+            try:
+                status = engine.kept_status()
+            except Exception:  # noqa: BLE001
+                status = {}
+            count = status.get("background_tasks")
+            if status.get("kept") is True and type(count) is int and count > 0:
+                reported = count
+        return max(reported, len(self._detached.get(line_id, ())))
+
+    def background_ends(self, line_id: str) -> str | None:
+        """What ends a line's background job and what the line is told, or ``None``
+        when it has no job. **Round 14, item 3.** The daemon cannot say when a job
+        will end, only how the end reaches the line, so the text says that and not a
+        time."""
+        if self.background_jobs(line_id) == 0:
+            return None
+        pending = self._log.state.scheduled.get(line_id)
+        if pending is not None and pending.task_id is not None:
+            return (
+                f"The line waits for {pending.task_id}. Its end cancels wake"
+                f" {pending.message_id} and wakes the line with a task note, and"
+                f" otherwise the wake fires at {pending.due}."
+            )
+        return (
+            "The daemon records the end of a job its engine reports or its own"
+            " check of the line's processes finds, and wakes the line with a task"
+            " note, within the limit on such notes. It cannot say when a job will end."
+        )
 
     def condition(self, line_id: str) -> str:
         """**Row 5 of the T3 Code review.** One word for where a line stands, which
@@ -5440,6 +5760,43 @@ class Scheduler:
             token = self._mark_tokens.setdefault(line_id, secrets.token_hex(16))
         return f"{line_id}.{token}"
 
+    def worktree_status_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``worktree_status`` tool for ``line_id``, which reads only the line's
+        own working directory. **Round 14, item 7.** The daemon runs git outside the
+        line's sandbox, so a path the sandbox denies is read, and a path git could not
+        read is named as incomplete and never counted as clean."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, NO_ARGUMENTS_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            try:
+                workdir = self._workdir_of(line_id)
+            except LineToolRefused as error:
+                return _tool_error(unavailable(WORKTREE_STATUS_TOOL_NAME, str(error)))
+            try:
+                found = await self._git_worker.run(
+                    lambda: worktree_status(workdir, self._worktree_runner)
+                )
+            except (WorktreeUnavailable, ProcessRefused) as error:
+                return _tool_error(unavailable(WORKTREE_STATUS_TOOL_NAME, str(error)))
+            return _tool_text(json.dumps(found, indent=2))
+
+        return SdkMcpTool(
+            name=WORKTREE_STATUS_TOOL_NAME,
+            description=(
+                "Give the state of your own working directory, computed by the daemon"
+                " outside your sandbox: the commit checked out, the branch, how far"
+                " the commit is ahead of and behind origin/main as last fetched, and"
+                " the dirty paths. A path that could not be read is listed as"
+                " incomplete, and clean is then null, never true. Where the state"
+                " cannot be read, the answer begins with unavailable and gives the"
+                " reason."
+            ),
+            input_schema=NO_ARGUMENTS_SCHEMA,
+            handler=handler,
+        )
+
     def list_processes_tool(self, line_id: str) -> SdkMcpTool[Any]:
         """The ``list_processes`` tool for ``line_id``, which sees only its own."""
 
@@ -5448,14 +5805,18 @@ class Scheduler:
             if unexpected:
                 return _tool_error(unexpected)
             if not self._processes_identifiable:
-                return _tool_error(UNIDENTIFIABLE)
+                return _tool_error(
+                    unavailable(LIST_PROCESSES_TOOL_NAME, UNIDENTIFIABLE)
+                )
             mark = self.line_mark(line_id)
             try:
                 found = await self._process_worker.run(
                     lambda: line_processes(self._processes, mark, os.getpid())
                 )
             except ProcessRefused as error:
-                return _tool_error(str(error))
+                # A failed inspection is never an empty list, which would say that
+                # the line has no process.
+                return _tool_error(unavailable(LIST_PROCESSES_TOOL_NAME, str(error)))
             return _tool_text(json.dumps(found, indent=2))
 
         return SdkMcpTool(
@@ -5463,7 +5824,10 @@ class Scheduler:
             description=(
                 "List the processes you started that still run, including those"
                 " started in the background or with nohup in an earlier turn, with"
-                " pid, elapsed time and command. Only your own are shown."
+                " pid, elapsed time and command. Only your own are shown. Where the"
+                " daemon cannot attribute processes, or could not read the process"
+                " table, the answer begins with unavailable and gives the reason,"
+                " and is never an empty list."
             ),
             input_schema=NO_ARGUMENTS_SCHEMA,
             handler=handler,
@@ -5483,7 +5847,7 @@ class Scheduler:
             if type(force) is not bool:
                 return _tool_error("force must be true or false")
             if not self._processes_identifiable:
-                return _tool_error(UNIDENTIFIABLE)
+                return _tool_error(unavailable(STOP_PROCESS_TOOL_NAME, UNIDENTIFIABLE))
             mark = self.line_mark(line_id)
             try:
                 done = await self._process_worker.run(
@@ -7498,6 +7862,7 @@ class Scheduler:
             self.propose_change_tool(line_id),
             self.list_processes_tool(line_id),
             self.stop_process_tool(line_id),
+            self.worktree_status_tool(line_id),
             self.list_mail_tool(line_id),
             self.read_mail_tool(line_id),
             self.acknowledge_mail_tool(line_id),
@@ -8253,6 +8618,9 @@ class Scheduler:
                 worker.cancel()
                 stopping.cancel()
         finally:
+            for watcher in list(self._pid_watchers.values()):
+                watcher.cancel()
+            self._pid_watchers.clear()
             for turn in list(self._running.values()):
                 turn.cancel()
             if self._running:
@@ -8271,6 +8639,7 @@ class Scheduler:
         for worker_name, worker in (
             ("process inspection", self._process_worker),
             ("launch-record sweep", self._sweep_worker),
+            ("worktree status", self._git_worker),
         ):
             if not worker.close():
                 joined = False
@@ -8437,6 +8806,9 @@ class Scheduler:
             notice = self._role_notice(line_id)
             if notice is not None:
                 prompt = f"{notice}\n\n{prompt}"
+            roster = self._roster_lead(line_id, compaction is not None)
+            if roster is not None:
+                prompt = f"{roster}\n\n{prompt}"
             brief = (
                 None
                 if self.effective_config(line_id).fresh_session_each_turn
@@ -8495,6 +8867,11 @@ class Scheduler:
             await self._check_walk(line_id)
             self._check_git_ssh(line_id)
             engine = self.engine_for(line_id)
+            facts = self._sandbox_facts_text(line_id)
+            if facts is not None and self._facts_due(
+                line_id, facts, fresh=compaction is not None
+            ):
+                prompt = f"{facts}\n\n{prompt}"
             self._start_token(line_id, engine)
             if compaction is not None:
                 if isinstance(engine, CompactingEngine):
@@ -8816,6 +9193,77 @@ class Scheduler:
             f" {after[:12]} since your last turn ended. git log --oneline"
             f" {before[:12]}..{after[:12]} lists the commits between, and git status"
             " shows what is left uncommitted."
+        )
+
+    def _roster_lead(self, line_id: str, compacting: bool) -> str | None:
+        """What ``line_id``'s turn leads with after its session was compacted, naming
+        the background tasks Dromon holds as running, or ``None``. **Round 14, item
+        4.** A compaction replaces the conversation with a summary, so the line may no
+        longer know that a build it started is still running, and then neither waits
+        for it nor stops it. Dromon follows each task from the engine's own events, in
+        the kept connection, which a compaction does not touch, so the roster is
+        read from there and given back. It is given when this turn asks for a
+        compaction or the engine compacted by itself since the last turn, the two
+        cases that owe the brief too, and is read before ``_brief_lead`` clears that
+        mark.
+
+        Each command is the line's own text, so it is quoted as a JSON string, said
+        to be data, and withheld when the disclosure list covers it, as a task's end
+        note does. At most ``MAX_ROSTER_TASKS`` are named, with the count of the rest.
+        **Limit.** A task that the engine ended with the compaction, if it does, has
+        no entry here, and its end, if the engine reports one, still arrives as a task
+        note. The roster says nothing of a process the engine does not report as a
+        task, which ``list_processes`` shows, and a daemon restart ends the kept
+        connection, so none is named after one."""
+        if not (compacting or line_id in self._brief_owed):
+            return None
+        engine = self._engines.get(line_id)
+        if not isinstance(engine, KeptEngine):
+            return None
+        try:
+            status = engine.kept_status()
+        except Exception:  # noqa: BLE001
+            return None
+        listed = status.get("tasks")
+        if status.get("kept") is not True or not isinstance(listed, list):
+            return None
+        named: list[str] = []
+        total = 0
+        for value in cast(list[object], listed):
+            if not isinstance(value, Mapping):
+                continue
+            task = cast(Mapping[str, object], value)
+            task_id, command = task.get("task_id"), task.get("command")
+            if not isinstance(task_id, str) or not task_id:
+                continue
+            total += 1
+            if len(named) < MAX_ROSTER_TASKS:
+                text = command if isinstance(command, str) else ""
+                shown = (
+                    WITHHELD_COMMAND
+                    if self.discloses(task_id, text)
+                    else json.dumps(text, ensure_ascii=True)
+                )
+                named.append(
+                    f"{json.dumps(task_id, ensure_ascii=True)}, command {shown}"
+                )
+        if total == 0:
+            return None
+        rest = total - len(named)
+        wake = self._log.state.scheduled.get(line_id)
+        waiting = (
+            f" Your pending wake {wake.message_id} waits for task {wake.task_id}."
+            if wake is not None and wake.task_id
+            else ""
+        )
+        return (
+            "Dromon note: your session was compacted, which can drop what you knew of"
+            f" your background tasks. Dromon still holds {total} as running in your"
+            f" kept session: {'; '.join(named)}."
+            + (f" {rest} more are not named here." if rest else "")
+            + " The commands are your own earlier text, quoted as data."
+            + waiting
+            + " Their ends are noted as they happen."
         )
 
     def _brief_lead(self, line_id: str, compacting: bool) -> str | None:
@@ -10184,6 +10632,7 @@ class Scheduler:
                 "strategy": line.strategy,
                 "state": line.state.value,
                 "condition": self.condition(line_id),
+                "background_jobs": self.background_jobs(line_id),
                 "hibernated": line.hibernated,
                 "pending": len(self.pending(line_id)),
                 "turns": self._turns.get(line_id, 0),
@@ -10606,6 +11055,8 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
             "note": commits.get("note"),
         },
         "brief": _compact_brief(full["brief"]),
+        "background_jobs": full["background_jobs"],
+        "background_ends": full["background_ends"],
         "background_task_count": len(cast(list[dict[str, object]], kept["tasks"])),
         "background_tasks_unknown": kept.get("background_tasks_unknown") is True,
         "recent_turn_count": len(cast(list[dict[str, object]], full["recent_turns"])),

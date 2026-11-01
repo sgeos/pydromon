@@ -90,6 +90,14 @@ read-only seats, findings 1 and 2. Dromon's `write_scratch` tool remains
 available for scratch files, under the line's own `tmp/lines/LINE`, as
 [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies.
 
+**A temporary directory and package cache, round 14, item 6.** Where a line's sandbox is
+enabled, Dromon also grants write access to two directories of the line's own outside
+its working directory, and sets `TMPDIR` and `UV_CACHE_DIR` to them. They are outside
+because the deny-write rule above covers the whole working directory of a read line, and
+no layer lifts it. [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies them, with the checks that
+refuse a planted link or another user's directory, and the hypothesis, not verified live,
+that Claude Code may override `TMPDIR` with its own.
+
 When a line's turn starts, Dromon merges the layers and derives the settings it hands to
 Claude Code. Nothing is passed when no layer sets anything, and the line then has no
 sandbox but any managed policy, because Dromon starts Claude Code without user or
