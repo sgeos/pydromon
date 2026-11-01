@@ -625,10 +625,12 @@ def no_sleep(seconds: float) -> None:
     del seconds
 
 
-def preflight_passes(argv: object, runtime_dir: Path | None = None) -> None:
+def preflight_passes(
+    argv: object, runtime_dir: Path | None = None, environment: object = None
+) -> None:
     """A restart preflight that passes, since these tests start no installed
     daemon. ``tests/test_restart.py`` covers the preflight itself."""
-    del argv, runtime_dir
+    del argv, runtime_dir, environment
 
 
 @pytest.fixture

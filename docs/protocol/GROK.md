@@ -77,7 +77,7 @@ distinguish a spent plan from a transient rate limit. The hook input may also ca
 or a mapping from those details to a reset time.
 
 **Fact.** Those hook fields are not a documented ACP `session/update` or
-`session/prompt` response. Dromon's Grok home registers no hooks, and the ACP adapter
+`session/prompt` response. Dromon's Grok home registers a tool denial hook, and the ACP adapter
 reads no hook event. A generic JSON-RPC error therefore does not establish that a plan
 is exhausted, even if its text contains `quota` or `rate_limit`. Dromon classifies no
 new Grok plan limit and extracts no reset time. The turn still fails as an ordinary
@@ -197,7 +197,7 @@ and workflows live in `$GROK_HOME`.
 - **What Dromon writes.** Before each turn Dromon creates the home, owner-only, and
   writes its `config.toml` and its `sandbox.toml` when either is missing. An existing
   file is never replaced. The `config.toml` sets `[ui] permission_mode = "default"`,
-  Grok's asking mode, declares no MCP server and no hook, and sets the `mcps` and
+  Grok's asking mode, declares no MCP server, installs a fixed denial hook and sets the `mcps` and
   `hooks` cells of `[compat.claude]` and `[compat.cursor]` to false. The
   `sandbox.toml` holds the two profiles below, written for the line that first needs
   them.
@@ -206,7 +206,7 @@ and workflows live in `$GROK_HOME`.
   parsed contents differ from Dromon's in any key, a `managed_config.toml` or
   `requirements.toml`, in the home or in `/etc/grok`, that sets anything, a
   `trusted_folders.toml` that trusts any folder, and any of `agents`, `hooks`,
-  `hooks-paths`, `installed-plugins`, `lsp.json`, `plugins`, `rules`, `skills` or
+  `hooks-paths`, `disabled-hooks`, `installed-plugins`, `lsp.json`, `plugins`, `rules`, `skills` or
   `workflows`. Empty regular files are allowed because they load no entries, and the
   `installed-plugins` directory may hold only empty regular files named `*.lock`.
   **Observed on 2026-10-30.** Grok created an empty `hooks-paths` file and an
@@ -466,6 +466,7 @@ directories. This example assumes every listed credential path exists.
 ```toml
 [profiles.dromon-reader]
 extends = "read-only"
+read_only = ["/usr/bin"]
 deny = [".dromon", "/placeholder/project/secret", "/placeholder/worktree/secret",
         "/placeholder/operator-home/.ssh", "/placeholder/operator-home/.aws",
         "/placeholder/operator-home/.codex/auth.json",
@@ -474,7 +475,7 @@ deny = [".dromon", "/placeholder/project/secret", "/placeholder/worktree/secret"
 
 [profiles.dromon-writer]
 extends = "workspace"
-read_only = ["/placeholder/worktree/gitdir", "/placeholder/repository/gitdir"]
+read_only = ["/usr/bin", "/placeholder/worktree/gitdir", "/placeholder/repository/gitdir"]
 deny = [".dromon", "/placeholder/project/secret", "/placeholder/worktree/secret",
         "/placeholder/operator-home/.ssh", "/placeholder/operator-home/.aws",
         "/placeholder/operator-home/.codex/auth.json",
@@ -708,12 +709,20 @@ remaining unchanged. No live exchange independently verifies that report here.
 
 **Inference.** Passing current rules to `session/load` is insufficient evidence that
 they apply. Dromon stores the session identifier followed by `:rules-` and the full
-Secure Hash Algorithm 256 digest of the rendered instructions supplied at creation.
+Secure Hash Algorithm 256 digest of the rendered instructions, tool switches, built-in grants, allowed tool
+patterns, tool policy and Dromon tool names supplied at creation.
 It loads only when the current digest matches. A changed or absent digest creates a
 new session and explains the replacement in the first prompt. The mailbox, standing
 brief and files remain. Legacy sessions are replaced once because their rules cannot
 be established. The digest records the creation snapshot even if an instruction file
 changes during the turn. Restoring earlier rules does not restore earlier context.
+A valid replacement identifier is cached on the adapter before model, permission
+and prompt checks can refuse the turn. A retry loads that replacement rather than
+creating another session. If replacement fails before yielding a valid identifier,
+the adapter permits only one attempt for that digest and requires operator recovery.
+The digest also covers the generated home configuration. This bound is local to the adapter. The scheduler persists a session identifier only
+from a successful turn report, so adapter reconstruction or a daemon restart can
+allow a new replacement attempt after a failed turn.
 
 ## Profile checks before startup
 
@@ -727,24 +736,97 @@ necessary because paths and registered peers can change after preflight.
 
 ## Tool advertisement filtering
 
-**Fact.** The bundled guide `14-headless-mode.md` documents `--tools` and
-`--disallowed-tools` for terminal and headless invocations. It describes differences
-between shell and daemon routes, including entries that remove nothing and issue a
-warning. The agent options table in `15-agent-mode.md` does not document either flag
-for `agent stdio`, which is the transport Dromon uses.
+**Fact.** The following bundled Grok Build 1.0.70 guides were checked on 2026-11-01.
 
-**Inference.** These guides do not establish a supported way to filter the built-in
-tools advertised on Dromon's transport. Dromon does not pass an unverified filtering
-flag. This finding does not establish that Grok has no filtering capability.
+- `05-configuration.md` documents `GROK_CONFIG` for `agent stdio`, with a limited
+  overlay allowlist, and the direct `GROK_SUBAGENTS` and `GROK_WEB_FETCH` switches.
+- `16-subagents.md` explicitly says the subagent disable controls apply to
+  interactive, headless and `grok agent stdio` invocations. It documents
+  `GROK_SUBAGENTS=0` and `[subagents] enabled=false`.
+- `26-config-reference.md` documents `subagents.enabled` as the task tool master
+  switch and `features.web_fetch` with its `GROK_WEB_FETCH` equivalent.
+- `14-headless-mode.md` documents `--tools` and `--disallowed-tools` for terminal
+  and headless use, including the model name `spawn_subagent` for the task tool.
+- `15-agent-mode.md` does not list general tool filtering flags. Its agent profile
+  option does not load the file on the daemon route. The `tools` frontmatter example
+  in `16-subagents.md` describes custom agents and does not establish that this
+  option can filter the default main agent on Dromon's transport.
+- `18-sandbox.md` describes file and process restrictions rather than an advertised
+  tool allowlist. The reference and the guides contain no established `todo_write`
+  disable switch for `agent stdio`.
 
-**Fact.** Dromon rejects unavailable calls through its permission policy. It continues
-after a rejected call only when the subsequent report explicitly asserts Boolean
-`toolNotRun=true`. Otherwise it cancels the turn because non-execution is uncertain.
-This policy does not remove a tool from the model's advertised tools.
+**Fact, before the generated hook change.** Read-only inspection of Dromon's Grok home found only asking mode and
+compatibility settings in `config.toml`. The `dromon-reader` and `dromon-writer`
+sandbox profiles contain `extends`, `deny` and `read_only`. Policy and folder-trust
+files are present. Dromon's existing validation requires them to be empty and refuses
+custom agents, hooks and discovery entries. No credential file was read.
 
-**Unverified.** Filtering on `agent stdio` still requires transport-specific vendor
-documentation or an independent exchange showing that unavailable tools disappear
-from the advertised set. No live Grok turn was run for this investigation.
+**Fact.** Dromon now sets `GROK_SUBAGENTS=0` in every Grok process because it does
+not support granting `Agent` on this engine. It sets `GROK_WEB_FETCH=0` when the
+line lacks `WebFetch`, and `1` when granted. These documented process switches are
+selected from the line configuration and replace inherited values. They require no
+shared home edits and cannot change another line's process environment.
+
+**Fact.** The persisted rules digest includes every tool grant as well as these
+switches. A change in `Read`, `WebFetch`, allowed tool patterns, tool policy or the
+Dromon tool set starts a fresh session. Tests cover inherited value replacement,
+per-line web fetch grants, changed grants, matching-digest reuse and refusal retries.
+
+**Fact.** Dromon individually rejects permission requests for unavailable
+`todo_write`, `spawn_subagent` and `web_fetch`. Parameterized exchanges verify that
+the turn can continue to an allowed call when each later update explicitly reports
+Boolean `toolNotRun=true`. Each rejected identifier must receive its own confirming update. A missing report
+at turn end cancels the turn and raises a refusal naming the tool, which holds the
+line because non-execution is uncertain. Permission denial alone does not prove that a tool had no effects.
+
+**Unverified.** No live tool-definition snapshot verifies removal of `spawn_subagent`
+or `web_fetch` on Grok 1.0.70 here. That is the next operator verification. No
+supported advertisement control was established for `todo_write`. A transport-specific
+filter or an independently verified custom main-agent configuration is still needed
+to remove that tool from the advertised set. The current individual denial remains. The permissions guide lists `todo_write`
+among operations that never prompt by default unless a deny rule or hook blocks
+them. Its Tool Names section recognizes only `Bash`, `Read`, `Edit`, `Write`,
+`Grep`, `Glob`, `MCPTool`, `WebFetch`, `WebSearch` and `*`, and says unrecognized
+rule names are skipped. A bare `todo_write` or `spawn_subagent` deny entry therefore
+has no established enforcement under this guide. The operator authorized a documented `PreToolUse` hook instead.
+
+**Fact.** The generated `config.toml` now contains one `hooks.PreToolUse` matcher
+for `todo_write|spawn_subagent`. It invokes `/usr/bin/printf` with a separate `args`
+array to emit a fixed JSON denial. The hook reads no input, selects no program from
+`PATH`, starts no shell and loads no script from a line. The adapter checks that the
+program and its parents are owned by the system and cannot be written by other users.
+It refuses a workspace that contains the program, and both sandbox profiles must
+hold the program directory read-only. Saved hook-disable entries are refused. Tests
+execute the generated command with hostile input and `PATH`, refuse a program under
+the workspace, refuse a missing executable, reject config drift and require sandbox
+protection of the program directory. These are adapter and local command tests.
+They do not establish live Grok enforcement.
+
+**Fact.** The home is shared by concurrent lines. A `WebFetch` deny in that file
+would also block a line granted `WebFetch`, because deny rules win over allow rules.
+Dromon therefore writes no `WebFetch` deny rule. It sets `GROK_WEB_FETCH=0` for a
+line without the grant and refuses a `web_fetch` call one at a time. **Fact, observed
+by the operator on 2026-11-01.** The permissions guide documents a command-line rule
+`--deny`, but Grok Build 1.0.70's `grok agent` refuses it with "unexpected argument
+'--deny' found" and exits with status 2. Passing it closed every Grok turn of a line
+without `WebFetch`, so Dromon no longer passes it.
+
+**Fact.** The hook guide says a command with an `args` array starts no shell, a
+matching explicit denial blocks, and startup errors, crashes, timeouts and malformed
+output fail open. There is no documented fail-closed handler option. Dromon refuses
+before launch when its program or protection checks fail. It cannot force Grok to
+block a call after a hook failure inside Grok. The permission-response and update
+checks remain necessary, and cannot undo a call that already ran.
+
+**Unverified.** The guide gates user configuration hooks on folder trust and says
+headless runs count the folder as trusted for their own hooks. Whether the particular
+`agent stdio` launch activates this hook without a saved trust record requires the
+operator's live check after restart. Dromon does not disable folder trust or introduce
+a saved grant to make the hook run. A live check must establish that the hook loads,
+matches both tool names and blocks their calls. Its effect remains unverified.
+Existing home config and profiles are not rewritten. An older config must be removed
+for Dromon to regenerate it, and the reported program-directory entry must be added
+to both existing profiles before turns can run.
 
 
 ## Model selection after loading a session

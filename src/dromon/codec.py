@@ -70,6 +70,7 @@ from dromon.model import (
     SeatBound,
     SeatUnbound,
     RoleRetired,
+    LineRetired,
     RoleHeld,
     RoleHolder,
     OwnershipChanged,
@@ -91,6 +92,7 @@ from dromon.model import (
     RunEnded,
     RunStarted,
     RunStatus,
+    CommitRunRefused,
     PeerDeclared,
     PeerKeyed,
     PeerOpened,
@@ -202,6 +204,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "seat_bound": ("line_id", "role_id", "may_own"),
     "seat_unbound": ("line_id", "role_id"),
     "role_retired": ("role_id", "by", "retired_at"),
+    "line_retired": ("line_id", "by", "retired_at"),
     "role_held": ("role_id", "holder", "by", "held_at"),
     "ownership_changed": (
         "role_id",
@@ -263,6 +266,8 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "pid",
         "process_started",
         "started_at",
+        "commit",
+        "checkout",
     ),
     "run_ended": (
         "run_id",
@@ -274,6 +279,14 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "ended_at",
     ),
     "run_cleared": ("run_id", "cause", "operator_id", "cleared_at"),
+    "commit_run_refused": (
+        "line_id",
+        "role_id",
+        "command",
+        "commit",
+        "reason",
+        "refused_at",
+    ),
     "peer_declared": ("peer_id", "transport", "policy"),
     "peer_removed": ("peer_id",),
     "peer_keyed": ("peer_id", "token_sha256"),
@@ -388,6 +401,7 @@ OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
     "lease_acquired": ("note",),
     "budget_stated": ("window",),
     "line_held": ("cause",),
+    "run_started": ("commit", "checkout"),
     "line_configured": ("sealed",),
 }
 """The fields left out of the wire when they are null, which a log written before
@@ -395,12 +409,15 @@ them never held, so decoding reads an absent one as null. **Task of 2026-10-29,
 round 5.** The request key of a keyed call is recorded in the event of its act, and
 an event of a call without a key is written as before it. The ``window`` field was
 added to ``budget_stated`` on 2026-10-31, and ``cause`` to ``line_held`` the same
-day. ``asks_reply`` was added to ``message_sent`` and ``reason`` to
-``message_acknowledged`` in the round 14 task of 2026-11-01, and ``sealed`` to
-``line_configured`` in a task of the same day. **Porting hazard.** A
-port must omit these fields when null, not write them as null, so that its log stays
-readable by a daemon that predates them, and must read an absent one as null. A daemon
-predating ``window`` does not read an event that names one."""
+day. ``commit`` and ``checkout`` were added to ``run_started`` in round 14, so a
+daemon that predates them still reads every run but a commit run. ``asks_reply`` was
+added to ``message_sent`` and ``reason`` to ``message_acknowledged`` in the round 14
+task of 2026-11-01, and ``sealed`` to ``line_configured`` in a task of the same day,
+so a daemon that predates it still reads every configuration without a literal
+value. **Porting hazard.** A port must omit these fields when null, not write them
+as null, so that its log stays readable by a daemon that predates them, and must
+read an absent one as null. A daemon predating ``window`` does not read an event
+that names one."""
 
 
 def _without_nulls(kind: str, data: dict[str, object]) -> dict[str, object]:
@@ -655,6 +672,12 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "by": str(event.by),
                 "retired_at": event.retired_at,
             }
+        case LineRetired():
+            return "line_retired", {
+                "line_id": event.line_id,
+                "by": str(event.by),
+                "retired_at": event.retired_at,
+            }
         case RoleHeld():
             return "role_held", {
                 "role_id": event.role_id,
@@ -740,6 +763,8 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "pid": event.pid,
                 "process_started": event.process_started,
                 "started_at": event.started_at,
+                "commit": event.commit,
+                "checkout": event.checkout,
             }
         case RunEnded():
             return "run_ended", {
@@ -757,6 +782,15 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "cause": event.cause.value,
                 "operator_id": event.operator_id,
                 "cleared_at": event.cleared_at,
+            }
+        case CommitRunRefused():
+            return "commit_run_refused", {
+                "line_id": event.line_id,
+                "role_id": event.role_id,
+                "command": event.command,
+                "commit": event.commit,
+                "reason": event.reason,
+                "refused_at": event.refused_at,
             }
         case PeerDeclared():
             return "peer_declared", {
@@ -990,6 +1024,12 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _operator(data, "by"),
                 _str(data, "retired_at"),
             )
+        case "line_retired":
+            return LineRetired(
+                _str(data, "line_id"),
+                _operator(data, "by"),
+                _str(data, "retired_at"),
+            )
         case "role_held":
             return RoleHeld(
                 _str(data, "role_id"),
@@ -1075,6 +1115,8 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _int(data, "pid"),
                 _str(data, "process_started"),
                 _str(data, "started_at"),
+                _optional_str(data, "commit"),
+                _optional_str(data, "checkout"),
             )
         case "run_ended":
             return RunEnded(
@@ -1092,6 +1134,15 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _member(data, "cause", RunClearance),
                 _optional_str(data, "operator_id"),
                 _str(data, "cleared_at"),
+            )
+        case "commit_run_refused":
+            return CommitRunRefused(
+                _str(data, "line_id"),
+                _optional_str(data, "role_id"),
+                _str(data, "command"),
+                _str(data, "commit"),
+                _str(data, "reason"),
+                _str(data, "refused_at"),
             )
         case "peer_declared":
             return PeerDeclared(

@@ -57,8 +57,10 @@ markers = [
     "real_processes: gives a test's scheduler the operating system's process table",
 ]
 # Collection skips the state directory, which a line's sandbox denies outright, so a
-# line running the gate in its own project would otherwise fail to collect.
-addopts = "-m 'not live' --ignore=.dromon"
+# line running the gate in its own project would otherwise fail to collect. -rfEs adds
+# each skip reason to pytest's short summary, beside failures and errors, so a run's
+# receipt can name what the gate skipped. Round 14, item 2.
+addopts = "-m 'not live' --ignore=.dromon -rfEs"
 # scripts/assemble_changelog.py is imported by its tests, as a module of the scripts
 # directory, which holds no package.
 pythonpath = ["scripts"]

@@ -18,9 +18,10 @@ prefer a key over a cached sign-in.
 
 Grok's home. A Grok line runs with ``GROK_HOME`` set to Dromon's own Grok home,
 ``~/.grok/dromon-home``, never the operator's. Dromon writes its ``config.toml``, which
-sets the asking mode and declares no MCP server or hook, and its ``sandbox.toml`` when
-either is missing, and before every turn refuses any drift, any policy or trust file
-that sets something, and any agents, hooks, plugins, rules, skills or workflows there.
+sets the asking mode and one fixed denial hook without MCP servers, and its
+``sandbox.toml`` when either is missing, and before every turn refuses any drift,
+any policy or trust file that sets something, and any agents, hooks, plugins, rules,
+skills or workflows there.
 Grok runs with ``HOME`` set to ``USER_HOME`` inside that home, so it cannot read the
 operator's Claude Code, Cursor or other harness files, and Dromon refuses a turn when
 that directory holds any or a Claude Code settings file there names another mode.
@@ -299,6 +300,8 @@ DROMON_CONTROLLED: Final = (
     "GROK_SANDBOX",
     "GROK_CONFIG",
     "GROK_CONFIG_PATH",
+    "GROK_SUBAGENTS",
+    "GROK_WEB_FETCH",
     *HOME_VARIABLES,
 )
 """Variables Dromon sets or clears itself. An inherited ``GROK_HOME`` or ``HOME`` is
@@ -397,6 +400,12 @@ keeps anything it may write under ``HOME`` where a turn finds it. ``GROK_HOME`` 
 first, so both expand the operator's ``HOME`` in any POSIX shell. Dromon never writes,
 reads or copies the credential this stores."""
 
+HOOK_PROGRAM: Final = Path("/usr/bin/printf")
+"""A system-owned program, never a script loaded from a line's worktree."""
+HOOK_REPLY: Final = json.dumps(
+    {"decision": "deny", "reason": "Dromon does not grant this tool"}
+)
+
 HOME_CONFIG: Final = (
     "# Dromon's Grok home. Dromon wrote this file and refuses a Grok turn when it\n"
     "# changes. Delete it to have Dromon write it again.\n"
@@ -411,9 +420,17 @@ HOME_CONFIG: Final = (
     "[compat.cursor]\n"
     "mcps = false\n"
     "hooks = false\n"
+    "\n"
+    "[[hooks.PreToolUse]]\n"
+    'matcher = "todo_write|spawn_subagent"\n'
+    'hooks = [{ type = "command", command = '
+    + json.dumps(str(HOOK_PROGRAM))
+    + ', args = ["%s\\n", '
+    + json.dumps(HOOK_REPLY)
+    + "], timeout = 5 }]\n"
 )
 """The whole of the home's ``config.toml``. It sets Grok's asking mode, declares no
-MCP server and no hook, and turns off the scans of Claude Code's and Cursor's MCP
+MCP server, installs one fixed denial hook and turns off Claude Code's and Cursor's MCP
 servers and hooks. Compared by its parsed contents before every turn, so any key Grok
 or anyone else adds is drift."""
 
@@ -434,6 +451,7 @@ REFUSED_HOME_ENTRIES: Final = (
     "agents",
     "hooks",
     "hooks-paths",
+    "disabled-hooks",
     "installed-plugins",
     "lsp.json",
     "plugins",
@@ -899,6 +917,36 @@ def engine_environment(
 # The sandbox profile.
 
 
+def tool_environment(config: LineConfig) -> dict[str, str]:
+    """Documented launch switches, selected by this line rather than inherited.
+
+    The bundled subagent guide explicitly includes agent stdio. The configuration
+    reference documents web_fetch as a feature switch. Agent is unsupported here.
+    """
+    return {
+        "GROK_SUBAGENTS": "0",
+        "GROK_WEB_FETCH": "1" if "WebFetch" in config.builtin_tools else "0",
+    }
+
+
+def session_digest(
+    config: LineConfig, instructions: str, own_tools: frozenset[str] = frozenset()
+) -> str:
+    """Bind a resumed session to its rules, switches and complete tool grants."""
+    settings = {
+        "instructions": instructions,
+        "tool_environment": tool_environment(config),
+        "builtin_tools": sorted(config.builtin_tools),
+        "allowed_tools": sorted(config.allowed_tools),
+        "tool_policy": config.tool_policy.value,
+        "own_tools": sorted(own_tools),
+        "home_config": HOME_CONFIG,
+    }
+    return hashlib.sha256(
+        json.dumps(settings, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 def profile_name(config: LineConfig) -> str:
     return (
         WRITER_PROFILE
@@ -987,7 +1035,7 @@ def profile_snippet(
     if name == WRITER_PROFILE:
         lines.append('extends = "workspace"')
         git = git_directories(workspace)
-        directories = set(read_only_paths)
+        directories = {*read_only_paths, HOOK_PROGRAM.parent.resolve()}
         if git is not None:
             directories.update(git)
         lines.append(
@@ -997,14 +1045,14 @@ def profile_snippet(
         )
     else:
         lines.append('extends = "read-only"')
-        if read_only_paths:
-            lines.append(
-                "read_only = ["
-                + ", ".join(
-                    json.dumps(str(path)) for path in sorted(set(read_only_paths))
-                )
-                + "]"
+        lines.append(
+            "read_only = ["
+            + ", ".join(
+                json.dumps(str(path))
+                for path in sorted({*read_only_paths, HOOK_PROGRAM.parent.resolve()})
             )
+            + "]"
+        )
     lines.append(f"deny = [{', '.join(json.dumps(entry) for entry in deny)}]")
     return "\n".join(lines)
 
@@ -1037,6 +1085,7 @@ def check_profile(
     That Grok reads ``sandbox.toml`` from ``GROK_HOME``, as it does ``config.toml``.
     """
     daemon_home = Path.home() if daemon_home is None else daemon_home
+    check_hook_program(workspace, home, grok_home)
     name = profile_name(config)
     file = grok_home / "sandbox.toml"
     profiles = _load_profiles(file)
@@ -1069,7 +1118,7 @@ def check_profile(
             or not _covers(denied, path)
         ]
         git = git_directories(workspace)
-        required_read_only = set(read_only_paths)
+        required_read_only = {*read_only_paths, HOOK_PROGRAM.parent.resolve()}
         if name == WRITER_PROFILE and git is not None:
             required_read_only.update(git)
         held = [Path(entry) for entry in _entries(profile, "read_only")]
@@ -1125,7 +1174,7 @@ def check_profile(
             + advice
         )
     git = git_directories(workspace)
-    required_read_only = set(read_only_paths)
+    required_read_only = {*read_only_paths, HOOK_PROGRAM.parent.resolve()}
     if name == WRITER_PROFILE and git is not None:
         required_read_only.update(git)
     if required_read_only:
@@ -1229,6 +1278,9 @@ class _Turn:
     """Identifiers first announced by a ``tool_call`` update."""
     blocked_calls: set[str] = field(default_factory=set[str])
     rejected_calls: set[str] = field(default_factory=set[str])
+    confirmed_rejections: set[str] = field(default_factory=set[str])
+    """Rejected identifiers with a later non-execution confirmation."""
+    rejected_labels: dict[str, str] = field(default_factory=dict[str, str])
     permission_calls: set[str] = field(default_factory=set[str])
     """Identifiers whose permission request has already been answered."""
     finished: set[str] = field(default_factory=set[str])
@@ -1245,8 +1297,45 @@ class _Turn:
     model_pinned: bool = False
     """Whether the opened session was confirmed to use the driver's model."""
 
+    def unconfirmed_refusal(self) -> str | None:
+        unconfirmed = self.rejected_calls - self.confirmed_rejections
+        if not unconfirmed:
+            return None
+        names = sorted(self.rejected_labels[item] for item in unconfirmed)
+        return acp.REJECTION_UNCONFIRMED + ": " + ", ".join(names)
 
-def grok_arguments(model: str, effort: str) -> list[str]:
+
+def check_hook_program(workspace: Path, home: Path, grok_home: Path) -> None:
+    """Refuse a replaceable denial program before any Grok process starts.
+
+    The fixed executable and every parent must be system-owned and not writable
+    by another user. The sandbox must also hold its directory read-only, including
+    for a line running with the same user as Dromon. There is no script to edit.
+    """
+    program = HOOK_PROGRAM.resolve()
+    # These paths describe Grok's documented temporary write grants, not files
+    # Dromon creates in shared temporary directories.
+    temporary = (Path("/tmp"), Path("/var/tmp"))  # noqa: S108
+    if _covers((workspace, home, grok_home, *temporary), program):
+        raise EngineRefused(
+            "Grok denial hook program is within a line's writable paths"
+        )
+    try:
+        for path in (program, *program.parents):
+            info = path.stat()
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                raise EngineRefused("Grok denial hook program is not system-protected")
+        if not program.is_file() or not os.access(program, os.X_OK):
+            raise EngineRefused("Grok denial hook program is not executable")
+    except OSError as error:
+        raise EngineRefused(
+            f"cannot inspect Grok denial hook program: {error}"
+        ) from error
+
+
+def grok_arguments(
+    model: str, effort: str, config: LineConfig = DEFAULT_CONFIG
+) -> list[str]:
     """The ``grok`` arguments for one turn. The model and effort are agent options,
     placed before the transport, as Grok documents."""
     return [
@@ -1294,6 +1383,7 @@ class GrokLine:
         self.session_id = session_id
         self._rules_digest = ""
         self._rules_replaced = False
+        self._replacement_attempted: str | None = None
         self.protected = tuple(protected)
         self.read_only_paths = tuple(read_only_paths)
         self.bridge = tuple(bridge)
@@ -1331,6 +1421,7 @@ class GrokLine:
         if claude_mode is not None:
             raise EngineRefused(claude_mode)
         check_user_home(user_home)
+        environment.update(tool_environment(self.config))
         environment["GROK_HOME"] = str(grok_home)
         environment["HOME"] = str(user_home)
         environment["GROK_SANDBOX"] = check_profile(
@@ -1345,7 +1436,7 @@ class GrokLine:
         effort = self.config.effort or self.driver.settings.effort
         if effort not in EFFORTS:
             raise EngineRefused(f"the driver names an unknown effort {effort!r}")
-        arguments = grok_arguments(self.driver.settings.model, effort)
+        arguments = grok_arguments(self.driver.settings.model, effort, self.config)
         turn = _Turn()
         credential: Credential | None = None
         session_id: str | None = None
@@ -1371,8 +1462,12 @@ class GrokLine:
                     ) from error
                 if turn.refusal is None:
                     stop = await self._prompt(session_id, prompt, turn)
+                    unconfirmed = turn.unconfirmed_refusal()
+                    if unconfirmed is not None:
+                        await self._cancel(turn, unconfirmed)
             except (acp.RpcError, EngineRefused) as error:
                 # A transport failure while cancelling does not replace the stop cause.
+                turn.refusal = turn.refusal or turn.unconfirmed_refusal()
                 if turn.refusal is not None:
                     raise EngineRefused(turn.refusal) from error
                 if turn.interrupted_for is not None:
@@ -1385,6 +1480,7 @@ class GrokLine:
                     raise
             except TimeoutError:
                 # Closing the connection stops Grok if its turn exceeds the bound.
+                turn.refusal = turn.refusal or turn.unconfirmed_refusal()
                 if turn.refusal is None and turn.interrupted_for is None:
                     now = asyncio.get_running_loop().time()
                     turn.refusal = (
@@ -1396,6 +1492,7 @@ class GrokLine:
                     )
                 stop = "cancelled"
             finally:
+                turn.refusal = turn.refusal or turn.unconfirmed_refusal()
                 self._client = None
         if turn.refusal is not None:
             raise EngineRefused(turn.refusal)
@@ -1732,6 +1829,7 @@ class GrokLine:
                     turn.permission_calls.add(identifier)
                     if not permitted:
                         turn.rejected_calls.add(identifier)
+                        turn.rejected_labels[identifier] = label
                 # Count an allowed call before granting it, so the driver can stop
                 # at its budget without authorizing another execution.
                 await self._record(
@@ -1791,7 +1889,14 @@ class GrokLine:
             await self._record(str(identifier), update, turn)
             if str(identifier) in turn.rejected_calls:
                 if not acp.rejected_call_not_run(update):
-                    await self._cancel(turn, acp.REJECTION_UNCONFIRMED)
+                    await self._cancel(
+                        turn,
+                        acp.REJECTION_UNCONFIRMED
+                        + ": "
+                        + turn.rejected_labels[str(identifier)],
+                    )
+                else:
+                    turn.confirmed_rejections.add(str(identifier))
                 return
             if acp.newly_finished(str(identifier), update, turn.finished):
                 # The safe point before the next model call that priority mail
@@ -1961,7 +2066,7 @@ class GrokLine:
     async def _open_session(self, turn: _Turn) -> str:
         meta: dict[str, object] = {"yoloMode": False, "autoMode": False}
         instructions = read_instructions(self.config.instructions, self.cwd)
-        self._rules_digest = hashlib.sha256(instructions.encode("utf-8")).hexdigest()
+        self._rules_digest = session_digest(self.config, instructions, self.own_tools)
         resumable: str | None = None
         if self.session_id is not None:
             candidate, separator, digest = self.session_id.rpartition(":rules-")
@@ -1977,6 +2082,14 @@ class GrokLine:
             "_meta": meta,
         }
         if resumable is None:
+            if self._rules_replaced:
+                if self._replacement_attempted == self._rules_digest:
+                    raise EngineRefused(
+                        "Grok session replacement already failed for these rules and"
+                        " tool grants. Clear the session or reconfigure the line"
+                        " before another replacement attempt."
+                    )
+                self._replacement_attempted = self._rules_digest
             result = await self._rpc().call("session/new", params)
             session_id = str(result.get("sessionId") or "")
         else:
@@ -1995,6 +2108,9 @@ class GrokLine:
                 "Grok session identifier plus rules digest exceeds 256 bytes"
             )
         self.session_id_in_use = session_id
+        # Cache a valid replacement before any subsequent refusal. Failed turns
+        # have no TurnReport, so the scheduler cannot persist this identifier yet.
+        self.session_id = f"{session_id}:rules-{self._rules_digest}"
         if turn.refusal is not None:
             return session_id
         if not turn.servers_reported:
@@ -2100,8 +2216,9 @@ class GrokLine:
     async def _prompt(self, session_id: str, prompt: str, turn: _Turn) -> str:
         if self._rules_replaced:
             prompt = (
-                "Dromon replaced your Grok session because its stored rules differ"
-                " from the current instructions, or their digest was unavailable."
+                "Dromon replaced your Grok session because its stored rules or tool"
+                " grants differ from the current configuration, or their digest"
+                " was unavailable."
                 " Your mailbox, brief and files are retained. Earlier session"
                 " context is unavailable.\n\n" + prompt
             )

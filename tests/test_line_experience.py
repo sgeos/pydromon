@@ -19,7 +19,13 @@ from dromon import __version__, disclosure
 from dromon.codex import default_cache_home, engine_environment
 from dromon.disclosure import load_terms
 from dromon.driver import Driver, Strategy
-from dromon.engine import CLAUDE_CODE_PROMPT_MARK, ClaudeCodeLine, TurnReport
+from dromon.engine import (
+    CLAUDE_CODE_PROMPT_MARK,
+    INTERRUPTED_KIND,
+    ClaudeCodeLine,
+    TurnReport,
+)
+from dromon.peering import TurnCause
 from dromon.eventlog import EventLog, read_entries
 from dromon.lineconfig import (
     ConfigError,
@@ -59,10 +65,14 @@ from dromon.scheduler import (
     DISCLOSURE_HELD,
     MAX_LINE_STATUS_DEFAULT_BYTES,
     MAX_SCRATCH_BYTES,
+    COST_UNREPORTED_ENGINES,
+    UNKNOWN_COST_RULE,
+    UNREPORTED_ENGINE_NOTE,
     UNRELEASED_NOTE,
     LineSpec,
     LineToolRefused,
     Scheduler,
+    cost_bound_refusal,
 )
 from dromon.workdir import read_head_commit
 
@@ -193,7 +203,11 @@ def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
     assert status["cost_usd"] == {
         "estimate": "0.2500",
         "basis": "exact",
+        "unknown_turns": 0,
+        "unknown_counts_as_usd": "0.0000",
+        "counting": UNKNOWN_COST_RULE,
         "limit": "3.00",
+        "limit_enforced": True,
     }
     assert status["scheduled_wake"] == {"due": due, "message_id": message_id}
     assert status["unread"] == 1 and status["pending"] == 0
@@ -215,7 +229,10 @@ def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
         "estimate": "0.2500",
         "basis": "exact",
         "unknown_turns": 0,
+        "unknown_counts_as_usd": "0.0000",
+        "counting": UNKNOWN_COST_RULE,
         "limit": "3.00",
+        "limit_enforced": True,
         "note": None,
     }
     assert (full["workdir"], full["workdir_path"]) == (None, str(world.root))
@@ -722,10 +739,8 @@ def test_write_scratch_writes_under_tmp_creating_directories(world: World) -> No
     text, error = world.call(
         "write_scratch", {"path": "reports/round1.md", "text": "Report.\n"}
     )
-    assert (text, error) == (
-        "wrote tmp/reports/round1.md in your working directory",
-        False,
-    )
+    written = world.root.resolve() / "tmp" / "reports" / "round1.md"
+    assert (text, error) == (f"wrote 8 bytes to {written}", False)
     assert (world.root / "tmp" / "reports" / "round1.md").read_text() == "Report.\n"
     world.call("write_scratch", {"path": "reports/round1.md", "text": "Again.\n"})
     assert (world.root / "tmp" / "reports" / "round1.md").read_text() == "Again.\n"
@@ -1162,22 +1177,34 @@ def test_check_disclosure_refuses_without_a_list_or_one_input(
     text, error = world.call("check_disclosure", {"text": big})
     assert error and "is over" in text
     assert checks(world) == []
-    (world.root / "first.md").write_text("x" * scheduler_module.MAX_CHECKED_BYTES)
-    (world.root / "second.md").write_text("y")
-    text, error = world.call("check_disclosure", {"paths": ["first.md", "second.md"]})
-    assert error and "over 1048576 bytes combined" in text
-    assert checks(world) == []
+    # Round 14, item 3. A file over one part is checked in parts, so two files over a
+    # part together are no longer refused. Only the combined total is bounded.
+    third = scheduler_module.MAX_CHECKED_TOTAL_BYTES // 3 + 1
+    for name in ("first.md", "second.md", "third.md"):
+        (world.root / name).write_text(("x" * 99 + "\n") * (third // 100))
+    text, error = world.call(
+        "check_disclosure", {"paths": ["first.md", "second.md", "third.md"]}
+    )
+    assert not error, text
+    # The three files, each over a part together, cost one check.
+    assert len(checks(world)) == 1
+    (world.root / "fourth.md").write_text("x" * 100 + "\n")
+    (world.root / "huge.md").write_text(
+        ("x" * 99 + "\n") * (scheduler_module.MAX_CHECKED_TOTAL_BYTES // 100)
+    )
+    text, error = world.call("check_disclosure", {"paths": ["huge.md", "fourth.md"]})
+    assert error and "bytes combined" in text
     too_many = [
         f"file-{number}.md" for number in range(scheduler_module.MAX_CHECKED_PATHS + 1)
     ]
     text, error = world.call("check_disclosure", {"paths": too_many})
     assert error and f"between 1 and {scheduler_module.MAX_CHECKED_PATHS}" in text
-    assert checks(world) == []
+    assert len(checks(world)) == 1
     text, error = world.call("check_disclosure", {"paths": []})
     assert error and "between 1 and" in text
     text, error = world.call("check_disclosure", {"paths": "one.md"})
     assert error and "paths must be a list of text" in text
-    assert checks(world) == []
+    assert len(checks(world)) == 1
 
 
 @pytest.mark.parametrize(
@@ -2103,3 +2130,320 @@ def test_a_refused_listing_gives_no_counts(world: World) -> None:
     assert error and LIST_MAIL_COUNTS.search(text) is None
     text, error = world.call("list_mail", {"unread_only": "yes"})
     assert error and LIST_MAIL_COUNTS.search(text) is None
+
+
+# Round 14. Items 2 to 4.
+
+REPORTING = LineConfig(
+    builtin_tools=("Read", "Edit"), report_directory="tmp/reports/review"
+)
+"""A writing line that declares a report directory inside its own tmp/."""
+
+
+def test_write_scratch_reports_the_absolute_path_and_the_bytes(world: World) -> None:
+    as_writer(world)
+    text, error = world.call("write_scratch", {"path": "a/b/c.md", "text": "héllo\n"})
+    target = world.root.resolve() / "tmp" / "a" / "b" / "c.md"
+    # The count is bytes, not characters: é is two bytes in UTF-8.
+    assert (text, error) == (f"wrote 7 bytes to {target}", False)
+    assert target.read_text(encoding="utf-8") == "héllo\n"
+    assert target.is_absolute() and os.path.realpath(target) == str(target)
+
+
+def test_the_reports_area_writes_under_the_declared_directory(world: World) -> None:
+    world.scheduler.configure_line("alpha", REPORTING)
+    text, error = world.call(
+        "write_scratch",
+        {"path": "r14/report.md", "text": "Report.\n", "area": "reports"},
+    )
+    target = world.root.resolve() / "tmp" / "reports" / "review" / "r14" / "report.md"
+    assert (text, error) == (f"wrote 8 bytes to {target}", False)
+    assert target.read_text() == "Report.\n"
+    # The default area is still the scratch, and the reports directory is unaffected.
+    text, error = world.call("write_scratch", {"path": "n.md", "text": "x"})
+    assert not error and (world.root / "tmp" / "n.md").exists()
+    assert not (world.root / "tmp" / "reports" / "review" / "n.md").exists()
+
+
+def volume_ignores_case(directory: Path) -> bool:
+    probe = directory / "CaseProbe"
+    probe.mkdir(exist_ok=True)
+    return (directory / "caseprobe").exists()
+
+
+def test_the_reports_area_is_refused_where_the_volume_aliases_a_reserved_name(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review of a9995d8, item 3. The configuration refuses tmp/Lines by name, so a
+    # value that skips that check is built directly, and the write must still refuse
+    # where the volume makes it the same directory as tmp/lines.
+    (world.root / "tmp" / "lines" / "beta").mkdir(parents=True)
+    if not volume_ignores_case(world.root / "tmp" / "lines" / "beta"):
+        pytest.skip("this volume is case sensitive, so there is no alias to find")
+    other = world.root / "tmp" / "lines" / "beta" / "notes.md"
+    other.write_text("beta's notes\n")
+    config = LineConfig(builtin_tools=("Read", "Edit"), report_directory="tmp/reports")
+    object.__setattr__(config, "report_directory", "tmp/Lines")
+    world.scheduler.configure_line("alpha", REPORTING)
+
+    def fixed(line_id: str) -> LineConfig:
+        del line_id
+        return config
+
+    monkeypatch.setattr(world.scheduler, "effective_config", fixed)
+    text, error = world.call(
+        "write_scratch",
+        {"path": "beta/notes.md", "text": "overwritten", "area": "reports"},
+    )
+    assert error and "one of tmp/lines" in text
+    assert other.read_text() == "beta's notes\n"
+
+
+def test_a_report_directory_beside_the_reserved_ones_still_writes(world: World) -> None:
+    for name in ("lines", "worktrees", "runs", "probes"):
+        (world.root / "tmp" / name).mkdir(parents=True, exist_ok=True)
+    world.scheduler.configure_line("alpha", REPORTING)
+    text, error = world.call(
+        "write_scratch", {"path": "r.md", "text": "x", "area": "reports"}
+    )
+    assert not error, text
+
+
+def test_the_reports_area_is_refused_without_a_declared_directory(
+    world: World,
+) -> None:
+    as_writer(world)
+    text, error = world.call(
+        "write_scratch", {"path": "r.md", "text": "x", "area": "reports"}
+    )
+    assert error and "declares no report_directory" in text
+    assert not (world.root / "tmp" / "reports").exists()
+
+
+def test_every_other_path_stays_refused_in_the_reports_area(world: World) -> None:
+    world.scheduler.configure_line("alpha", REPORTING)
+    for path in ("../escape.md", "a/../../escape.md", "/etc/x", "~/x", "", "a\x00b"):
+        text, error = world.call(
+            "write_scratch", {"path": path, "text": "x", "area": "reports"}
+        )
+        assert error, path
+    text, error = world.call(
+        "write_scratch", {"path": "r.md", "text": "x", "area": "elsewhere"}
+    )
+    assert error and "area must be scratch or reports" in text
+    text, error = world.call("write_scratch", {"path": "r.md", "text": "x", "area": 3})
+    assert error and "path, text and area must be text" in text
+    assert not (world.root / "escape.md").exists()
+    assert not (world.root.parent / "escape.md").exists()
+
+
+def test_a_link_in_the_report_directory_is_refused(
+    world: World, tmp_path: Path
+) -> None:
+    world.scheduler.configure_line("alpha", REPORTING)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (world.root / "tmp").mkdir(exist_ok=True)
+    (world.root / "tmp" / "reports").symlink_to(outside)
+    text, error = world.call(
+        "write_scratch", {"path": "r.md", "text": "x", "area": "reports"}
+    )
+    assert error and "link" in text
+    assert list(outside.iterdir()) == []
+    target = outside / "r.md"
+    assert not target.exists()
+
+
+def test_the_reports_area_still_refuses_disclosed_text(
+    world: World, tmp_path: Path
+) -> None:
+    world.scheduler.configure_line("alpha", REPORTING)
+    listed(world, tmp_path)
+    text, error = world.call(
+        "write_scratch",
+        {"path": "r.md", "text": "the codename", "area": "reports"},
+    )
+    assert error and "disclosure" in text
+    assert not (world.root / "tmp" / "reports" / "review" / "r.md").exists()
+
+
+def test_check_disclosure_takes_the_path_write_scratch_reported(
+    world: World, tmp_path: Path
+) -> None:
+    as_writer(world)
+    listed(world, tmp_path)
+    text, error = world.call("write_scratch", {"path": "draft.md", "text": "clean\n"})
+    assert not error
+    absolute = text.removeprefix("wrote 6 bytes to ")
+    # The file is rewritten after the draft passed. The check reads what is there.
+    (world.root / "tmp" / "draft.md").write_text("one codename line\n")
+    text, error = world.call("check_disclosure", {"path": absolute})
+    assert not error and text.startswith("fail, 1 line holds a term")
+    text, error = world.call("check_disclosure", {"paths": [absolute, "tmp/draft.md"]})
+    assert not error and text.startswith("fail, 2 lines hold a term")
+
+
+def test_check_disclosure_refuses_an_absolute_path_outside_the_directory(
+    world: World, tmp_path: Path
+) -> None:
+    as_writer(world)
+    listed(world, tmp_path)
+    outside = tmp_path / "outside.md"
+    outside.write_text("codename\n")
+    inside = world.root.resolve() / "tmp" / "x.md"
+    inside.parent.mkdir(exist_ok=True)
+    inside.write_text("clean\n")
+    escapes = (
+        str(outside),
+        str(world.root.resolve()) + "/../outside.md",
+        str(world.root.resolve().parent / "other" / "x.md"),
+        "/etc/passwd",
+    )
+    for path in escapes:
+        text, error = world.call("check_disclosure", {"path": path})
+        assert error and "working directory" in text, path
+    assert checks(world) == []
+    # A link inside the directory is not followed, even by an absolute path.
+    link = world.root.resolve() / "tmp" / "link.md"
+    link.symlink_to(outside)
+    text, error = world.call("check_disclosure", {"path": str(link)})
+    assert error and "cannot read the supplied file" in text
+    assert checks(world) == []
+
+
+def test_a_file_over_a_part_is_checked_in_parts_for_one_check(
+    world: World, tmp_path: Path
+) -> None:
+    listed(world, tmp_path)
+    part = scheduler_module.MAX_CHECKED_BYTES
+    filler = "x" * 99 + "\n"
+    lines = [filler] * (part * 3 // 100)
+    for index in (5, part // 100 - 1, part // 100, part * 2 // 100 + 7):
+        lines[index] = "a codename line\n"
+    body = "".join(lines)
+    (world.root / "big.md").write_text(body)
+    assert len(body.encode()) > 2 * part
+    expected = disclosure.matching_lines(("codename",), body)
+    assert expected == 4
+    text, error = world.call("check_disclosure", {"path": "big.md"})
+    assert not error and text.startswith("fail, 4 lines hold a term")
+    assert [event.matched_lines for event in checks(world)] == [4]
+
+
+def test_a_line_over_a_part_is_refused_and_records_nothing(
+    world: World, tmp_path: Path
+) -> None:
+    listed(world, tmp_path)
+    (world.root / "long.md").write_text("x" * (scheduler_module.MAX_CHECKED_BYTES + 1))
+    text, error = world.call("check_disclosure", {"path": "long.md"})
+    assert error and "line longer than 1048576 bytes" in text
+    assert checks(world) == []
+
+
+def test_a_file_over_the_total_bound_is_refused(world: World, tmp_path: Path) -> None:
+    listed(world, tmp_path)
+    with (world.root / "huge.md").open("w") as handle:
+        for _ in range(scheduler_module.MAX_CHECKED_TOTAL_BYTES // 100 + 1):
+            handle.write("x" * 99 + "\n")
+    text, error = world.call("check_disclosure", {"path": "huge.md"})
+    assert error and "is over 16777216 bytes" in text
+    assert checks(world) == []
+
+
+def test_line_status_warns_early_when_no_disclosure_list_is_configured(
+    world: World, tmp_path: Path
+) -> None:
+    text, error = world.call("line_status")
+    assert not error
+    status = json.loads(text)
+    assert status["disclosure"]["list"] == "none"
+    assert "can neither pass nor fail" in status["disclosure"]["note"]
+    full_text, _ = world.call("line_status", {"detail": True})
+    assert json.loads(full_text)["disclosure"] == status["disclosure"]
+    listed(world, tmp_path)
+    text, _ = world.call("line_status")
+    configured = json.loads(text)["disclosure"]
+    assert configured["list"] == "configured"
+    # The answer reveals nothing of the list: no term, count, path or line number.
+    assert set(configured) == {"list", "note"}
+    assert "codename" not in text.casefold() and "second term" not in text.casefold()
+
+
+def test_line_status_gives_the_provider_budget_as_unknown_not_null(
+    world: World,
+) -> None:
+    text, _ = world.call("line_status")
+    status = json.loads(text)
+    budget = status["provider_budget"]
+    assert budget["status"] == "unknown" and budget["provider"] == "claude-code"
+    assert None not in budget.values()
+    full_text, _ = world.call("line_status", {"detail": True})
+    assert json.loads(full_text)["provider_budget"] == budget
+    assert len(text.encode("utf-8")) <= MAX_LINE_STATUS_DEFAULT_BYTES
+
+
+def test_line_status_shows_how_unknown_cost_counts(world: World) -> None:
+    scheduler = world.scheduler
+    scheduler.spent_between("alpha", INTERRUPTED_KIND, None, None)
+    text, _ = world.call("line_status")
+    cost = json.loads(text)["cost_usd"]
+    assert cost["estimate"] == "unknown" and cost["basis"] == "unknown"
+    assert cost["unknown_turns"] == 1
+    assert cost["unknown_counts_as_usd"] == "0.0000"
+    assert cost["counting"] == UNKNOWN_COST_RULE
+    # Counted as zero, so any number of them leaves the line unheld by the limit.
+    for _ in range(50):
+        scheduler.spent_between("alpha", INTERRUPTED_KIND, None, None)
+    assert scheduler.cost_status("alpha")["unknown_turns"] == 51
+    assert world.log.state.lines["alpha"].held_by is None
+    line = scheduler._budget_line(  # pyright: ignore[reportPrivateUsage]
+        "alpha", TurnCause.AUTONOMOUS
+    )
+    assert "51 turns of unknown cost, counted as $0.00" in line
+
+
+def test_a_line_on_an_engine_that_reports_no_cost_says_its_limit_is_not_enforced(
+    world: World,
+) -> None:
+    # Review of a9995d8, item 4. The limit beside an unknown estimate read as
+    # protection, so the entry says outright that it holds nothing here.
+    world.scheduler.create_line("delta", "gpt-6-luna", Strategy.SUBSCRIPTION)
+    cost = world.scheduler.cost_status("delta")
+    assert cost["limit_enforced"] is False
+    assert cost["note"] == UNREPORTED_ENGINE_NOTE
+    for _ in range(30):
+        world.scheduler.spent_between("delta", INTERRUPTED_KIND, None, None)
+    assert world.log.state.lines["delta"].held_by is None
+    assert world.scheduler.cost_status("delta")["note"] == UNREPORTED_ENGINE_NOTE
+    line = world.scheduler._budget_line(  # pyright: ignore[reportPrivateUsage]
+        "delta", TurnCause.AUTONOMOUS
+    )
+    assert "does not apply to you" in line and "Estimated cost" not in line
+    claude = world.scheduler._budget_line(  # pyright: ignore[reportPrivateUsage]
+        "alpha", TurnCause.AUTONOMOUS
+    )
+    assert "Estimated cost since your last release" in claude
+
+
+@pytest.mark.parametrize("model", ["gpt-6-luna", "grok-4.7"])
+def test_the_api_strategy_is_refused_on_an_engine_that_reports_no_cost(
+    world: World, model: str
+) -> None:
+    with pytest.raises(ConfigError, match="api strategy is refused"):
+        world.scheduler.create_line("delta", model, Strategy.API)
+    assert "delta" not in world.log.state.lines
+    # The same engines on a subscription, and Claude Code on the api strategy, stay.
+    world.scheduler.create_line("delta", model, Strategy.SUBSCRIPTION)
+    world.scheduler.create_line("epsilon", HAIKU, Strategy.API)
+    assert world.scheduler.cost_status("epsilon")["limit_enforced"] is True
+
+
+def test_the_cost_refusal_names_each_engine_that_reports_no_cost() -> None:
+    from dromon.driver import ENGINE_OF, MODELS
+
+    for model in MODELS:
+        refused = cost_bound_refusal(ENGINE_OF[model], Strategy.API)
+        assert (refused is not None) == (ENGINE_OF[model] in COST_UNREPORTED_ENGINES)
+        assert cost_bound_refusal(ENGINE_OF[model], Strategy.SUBSCRIPTION) is None
+        assert cost_bound_refusal(ENGINE_OF[model], Strategy.FLEXIBLE) is None
+    assert {"codex", "grok-build", "cursor-agent"} == COST_UNREPORTED_ENGINES

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from typing import cast
 
-from dromon import linetemp, priority
+from dromon import hookpolicy, linetemp, priority
 from dromon import scheduler as scheduler_module
 from dromon.processes import ProcessInfo
 from dromon.fleet import HOSTS_FILE_ENV
@@ -76,6 +76,7 @@ from dromon.model import (
     RoleHeld,
     RoleHolder,
     RoleRetired,
+    LineRetired,
     OwnershipChanged,
     OwnershipCause,
     RoleNoted,
@@ -93,6 +94,7 @@ from dromon.model import (
     RunEnded,
     RunStarted,
     RunStatus,
+    CommitRunRefused,
     PeerDeclared,
     PeerKeyed,
     PeerOpened,
@@ -270,6 +272,9 @@ SCENARIO: tuple[Event, ...] = (
     RoleHeld("core", RoleHolder.FILE, ANA, AT),
     SeatUnbound("alpha", "docs"),
     RoleRetired("docs", BEN, AT),
+    LineCreated("delta", ENGINE, "subscription"),
+    LineHibernated("delta"),
+    LineRetired("delta", BEN, AT),
     BudgetStated(
         "claude-code", 40, "2026-10-28T00:00:00Z", BudgetSource.OPERATOR, "", AT
     ),
@@ -314,9 +319,12 @@ SCENARIO: tuple[Event, ...] = (
         4400,
         AT,
         AT,
+        "a" * 40,
+        "/work/.dromon/commit-runs/r-2",
     ),
     RunEnded("r-2", RunStatus.LOST, None, None, None, "no receipt", AT),
     RunCleared("r-2", RunClearance.OPERATOR, "ana", AT),
+    CommitRunRefused("alpha", None, "build", "a" * 40, "no ref points at it", AT),
     PeerDeclared("keleusma", "unix", '{"inbound":true}'),
     PeerKeyed("keleusma", "c" * 64),
     MessageReceived("r1", KAIZEN, BETA, "from a peer", None, "m-origin-1", AT, True),
@@ -406,6 +414,14 @@ def _no_real_process_table(
     node = cast(pytest.Item, request.node)  # pyright: ignore[reportUnknownMemberType]
     if node.get_closest_marker("real_processes") is None:
         monkeypatch.setattr(scheduler_module, "SystemProcesses", NoProcesses)
+
+
+@pytest.fixture(autouse=True)
+def _no_machine_hook_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the machine's own managed Claude Code policy out of every test, since a
+    view-only line is refused where that policy switches hooks off. A test of the
+    reader names its directories. Round 14."""
+    monkeypatch.setattr(hookpolicy, "MANAGED_DIRECTORIES", ())
 
 
 @pytest.fixture(autouse=True)

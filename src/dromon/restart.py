@@ -36,6 +36,18 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Final
 
+from dromon.gitssh import AGENT_VARIABLE
+from dromon.registry import REGISTRY_DIR_ENV
+
+START_ENVIRONMENT: Final = (REGISTRY_DIR_ENV, AGENT_VARIABLE)
+"""The environment variables a start's checks read, which a restart's successor
+inherits from the running daemon. **Round 14, item 6.** ``dromon restart``'s
+preflight runs with the daemon's values of them rather than the client's, so a
+refusal that depends on either is found before the stop. **Assumption.** No other
+variable changes what a start's checks decide. ``HOME`` moves the default registry,
+but a client and its daemon run as one user, and ``DROMON_RUNTIME_DIR`` is replaced
+by the ``--runtime-dir`` the preflight passes."""
+
 CHECK_PREFIX: Final = "preflight-"
 """The prefix of the private directory a preflight copies the event log into, under
 the runtime directory."""

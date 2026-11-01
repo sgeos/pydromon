@@ -28,6 +28,7 @@ from dromon.driver import Strategy
 from dromon.eventlog import EventLog
 from dromon.model import (
     HARNESS,
+    MAX_RUN_NOTE_BYTES,
     EventRejected,
     InvalidField,
     LineAddress,
@@ -41,12 +42,14 @@ from dromon.model import (
     RoleNoteKind,
     RunCleared,
     RunClearance,
+    Run,
     RunEnded,
     RunStarted,
     RunStatus,
     SeatBound,
     State,
 )
+from dromon.processes import TreeRow
 from dromon.projectconfig import ConfigFileError, parse
 from dromon.scheduler import (
     RUN_STATUS_TOOL_NAME,
@@ -1301,3 +1304,651 @@ def test_a_command_that_ends_unstopped_is_never_signalled(tmp_path: Path) -> Non
         [sys.executable, "-c", "pass"], process_group=0
     )
     assert runs.Supervision().wait(child) == 0
+
+
+# Round 14, item 2. Receipts that name what the gate skipped, and failed runs linked
+# to the run that corrected them.
+
+
+QUIET_GATE = b"""\
+........s....
+=========================== short test summary info ============================
+SKIPPED [8] tests/test_launcher.py:470: ps cannot run here, as inside an agent sandbox
+SKIPPED [2] tests/test_launcher.py:120: only Linux has a child subreaper
+5162 passed, 10 skipped, 48 deselected in 231.52s (0:03:51)
+"""
+
+
+def test_the_summary_names_the_counts_and_each_skip_reason() -> None:
+    assert runs.gate_summary(QUIET_GATE) == (
+        "5162 passed, 10 skipped, 48 deselected, skipped [8]"
+        " tests/test_launcher.py:470: ps cannot run here, as inside an agent"
+        " sandbox; [2] tests/test_launcher.py:120: only Linux has a child subreaper"
+    )
+
+
+def test_only_the_last_summary_block_is_read() -> None:
+    """Audit of round 14. A green final line printed after pytest's own block is
+    not taken, and a mark with no final line after it gives no summary."""
+    failing = (
+        b"short test summary info\nFAILED tests/t.py::x - boom\n"
+        b"1 failed, 9 passed in 2.0s\n"
+    )
+    assert (
+        runs.gate_summary(failing + b"5000 passed in 1.00s\n") == "1 failed, 9 passed"
+    )
+    assert runs.gate_summary(failing + b"short test summary info\n") is None
+    # Without a mark the last final line is taken, with no reasons.
+    assert runs.gate_summary(b"SKIPPED [1] a.py:1: why\n3 passed in 1s\n") == (
+        "3 passed"
+    )
+
+
+def test_a_skip_reason_is_cut_after_its_place() -> None:
+    reason = "r" * (runs.MAX_REASON_CHARS + 20)
+    tail = (
+        f"short test summary info\nSKIPPED [1] a.py:7: {reason}\n"
+        "1 passed, 1 skipped in 1s\n"
+    )
+    summary = runs.gate_summary(tail.encode())
+    assert summary == (
+        f"1 passed, 1 skipped, skipped [1] a.py:7: {'r' * runs.MAX_REASON_CHARS}..."
+    )
+
+
+def test_the_summary_reads_the_last_final_line_with_or_without_its_rule() -> None:
+    ruled = b"===== 3 failed, 1 passed in 0.5s =====\n"
+    assert runs.gate_summary(ruled) == "3 failed, 1 passed"
+    # An earlier run's summary in the same output, as from a gate run twice, is
+    # replaced by the last, with only the last section's reasons.
+    twice = QUIET_GATE + b"short test summary info\n7 passed in 1.0s\n"
+    assert runs.gate_summary(twice) == "7 passed"
+    assert runs.gate_summary(b"ruff: All checks passed!\n") is None
+    assert runs.gate_summary(b"") is None
+
+
+def test_the_summary_is_bounded_and_printable() -> None:
+    count = runs.MAX_SKIP_REASONS + 3
+    reasons = b"short test summary info\n" + b"".join(
+        b"SKIPPED [1] tests/t.py:%d: reason\x1b\x07 " % n + b"x" * 400 + b"\n"
+        for n in range(count)
+    )
+    summary = runs.gate_summary(reasons + b"1 passed, %d skipped in 2s\n" % count)
+    assert summary is not None
+    assert summary.endswith("; and 3 more")
+    assert summary.count("[1] tests/t.py:") == runs.MAX_SKIP_REASONS
+    assert "\x1b" not in summary and "\x07" not in summary
+    longest = max(len(part) for part in summary.split("; "))
+    assert longest <= runs.MAX_REASON_CHARS + len("1 passed, 11 skipped, skipped ") + 30
+
+
+def test_a_note_with_a_summary_fits_the_event_and_is_labelled_unverified() -> None:
+    assert runs.note_with_summary("as it was", None) == "as it was"
+    assert runs.note_with_summary("", "1 passed") == (
+        f'{runs.SUMMARY_LABEL} "1 passed"'
+    )
+    assert runs.SUMMARY_LABEL.startswith("Unverified")
+    long = runs.note_with_summary("é" * MAX_RUN_NOTE_BYTES, "1 passed")
+    assert len(long.encode()) <= MAX_RUN_NOTE_BYTES
+    RunEnded("r-1", RunStatus.EXITED, 0, None, None, long, LATER)
+
+
+def test_the_tail_is_read_as_the_digest_is_and_only_from_a_regular_file(
+    tmp_path: Path,
+) -> None:
+    run = run_in(tmp_path)
+    write_output(tmp_path, run, b"a" * runs.TAIL_BYTES + QUIET_GATE)
+    tail = runs.output_tail(tmp_path, run.output_file)
+    assert tail is not None and len(tail) == runs.TAIL_BYTES
+    assert tail.endswith(QUIET_GATE)
+    assert runs.output_tail(tmp_path, "tmp/runs/missing.out") is None
+    pipe = tmp_path / "tmp" / "runs" / "pipe.out"
+    os.mkfifo(pipe)
+    assert runs.output_tail(tmp_path, "tmp/runs/pipe.out") is None
+    (tmp_path / "tmp" / "runs" / "link.out").symlink_to(tmp_path / run.output_file)
+    assert runs.output_tail(tmp_path, "tmp/runs/link.out") is None
+
+
+def test_a_receipt_carries_the_outputs_summary_into_the_finding(
+    tmp_path: Path,
+) -> None:
+    run = run_in(tmp_path)
+    digest = write_output(tmp_path, run, QUIET_GATE)
+    runs.write_receipt(
+        runs.receipt_path(tmp_path, run.run_id), runs.Receipt(RunStatus.EXITED, 0, "")
+    )
+    (finding,) = runs.reconcile([run], tmp_path, lambda pid: None)
+    assert finding.output_digest == digest
+    assert finding.summary == runs.gate_summary(QUIET_GATE)
+
+
+def test_a_lost_run_shows_no_summary_however_green_its_output(
+    tmp_path: Path,
+) -> None:
+    """Audit of round 14. A lost run has no exit code, so a green summary in its
+    output, which the line could have printed, is never shown as its result."""
+    run = run_in(tmp_path)
+    digest = write_output(tmp_path, run, QUIET_GATE)
+    (finding,) = runs.reconcile([run], tmp_path, lambda pid: None)
+    assert finding.status is RunStatus.LOST
+    assert finding.output_digest == digest
+    assert finding.summary is None
+
+
+def a_run(
+    run_id: str,
+    status: RunStatus | None,
+    code: int | None = None,
+    command: str = "gate",
+) -> Run:
+    begun = replace(started(run_id), command=command)
+    end = (
+        None
+        if status is None
+        else RunEnded(run_id, status, code, None, None, "", LATER)
+    )
+    return Run(begun, end)
+
+
+def test_failed_runs_are_linked_to_the_next_pass_of_their_command() -> None:
+    scope = [
+        a_run("r-1", RunStatus.EXITED, 0),
+        a_run("r-2", RunStatus.EXITED, 1),
+        a_run("r-3", RunStatus.STOPPED),
+        a_run("r-4", RunStatus.EXITED, 0, command="device"),
+        a_run("r-5", RunStatus.LOST),
+        a_run("r-6", RunStatus.EXITED, 0),
+        a_run("r-7", RunStatus.EXITED, 2),
+        a_run("r-8", None),
+    ]
+    assert runs.corrections(scope) == {"r-6": ("r-2", "r-3", "r-5")}
+    assert [runs.failed(run) for run in scope] == [
+        False,
+        True,
+        True,
+        False,
+        True,
+        False,
+        True,
+        False,
+    ]
+
+
+def test_run_status_names_the_correction_both_ways(project: Path) -> None:
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+        previous = None
+        for number, code in enumerate((1, 0, 0), start=1):
+            run_id = f"r-{number}"
+            log.append(started(run_id, previous=previous))
+            log.append(RunEnded(run_id, RunStatus.EXITED, code, None, None, "", LATER))
+            previous = run_id
+        shown = scheduler.run_status("alpha").splitlines()
+    assert shown[0].startswith("previous is r-3")
+    assert shown[1].startswith("run r-3 ") and "orrect" not in shown[1]
+    assert shown[2].endswith("It corrects the failed runs r-1")
+    assert shown[3].endswith("Corrected by run r-2")
+
+
+# Round 14, item 11. The runs an operator reads without the log.
+
+
+def runs_in_two_scopes(log: EventLog, scheduler: Scheduler) -> int:
+    """Line ``alpha`` with ``MAX_RUNS_SHOWN + 2`` ended runs, the first failing,
+    and line ``beta`` with one open run. Returns how many runs ``alpha`` has."""
+    from dromon.scheduler import MAX_RUNS_SHOWN
+
+    scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+    scheduler.create_line("beta", HAIKU, Strategy.SUBSCRIPTION)
+    count = MAX_RUNS_SHOWN + 2
+    previous = None
+    for number in range(1, count + 1):
+        run_id = f"r-{number}"
+        log.append(started(run_id, previous=previous))
+        code = 1 if number == 1 else 0
+        log.append(RunEnded(run_id, RunStatus.EXITED, code, None, None, "", LATER))
+        previous = run_id
+    log.append(started("r-b", line_id="beta"))
+    return count
+
+
+def test_runs_view_gives_each_scope_newest_first_and_bounded(project: Path) -> None:
+    from dromon.scheduler import MAX_RUNS_SHOWN
+
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        count = runs_in_two_scopes(log, scheduler)
+        views = scheduler.runs_view(None)
+    alpha = [view for view in views if view["scope"] == "line alpha"]
+    beta = [view for view in views if view["scope"] == "line beta"]
+    assert [view["scope"] for view in views] == ["line alpha"] * len(alpha) + [
+        "line beta"
+    ]
+    expected = [f"r-{number}" for number in range(count, count - MAX_RUNS_SHOWN, -1)]
+    assert [view["run_id"] for view in alpha] == expected
+    newest = alpha[0]
+    assert (newest["command"], newest["line_id"], newest["state"]) == (
+        "gate",
+        "alpha",
+        "exited",
+    )
+    assert (newest["exit_code"], newest["ended_at"]) == (0, LATER)
+    assert newest["output_file"] == f"tmp/runs/r-{count}.out"
+    assert newest["previous"] == f"r-{count - 1}"
+    # r-2 corrected r-1, which is no longer shown, and the link is still given.
+    assert alpha[-1]["run_id"] == "r-3" and alpha[-1]["corrects"] == []
+    assert beta[0]["state"] == "running" and beta[0]["blocks"] is True
+    assert (beta[0]["ended_at"], beta[0]["exit_code"]) == (None, None)
+
+
+def test_runs_view_of_one_run_names_its_correction_and_refuses_an_unknown(
+    project: Path,
+) -> None:
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        runs_in_two_scopes(log, scheduler)
+        (first,) = scheduler.runs_view("r-1")
+        (second,) = scheduler.runs_view("r-2")
+        with pytest.raises(EventRejected, match="no run r-0"):
+            scheduler.runs_view("r-0")
+    assert (first["exit_code"], first["corrected_by"]) == (1, "r-2")
+    assert second["corrects"] == ["r-1"] and second["corrected_by"] is None
+
+
+def test_runs_view_of_a_cleared_lost_run_names_who_cleared_it(project: Path) -> None:
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project, lambda session: True)
+        run_id = lost_on(log, scheduler)
+        (blocking,) = scheduler.runs_view(run_id)
+        scheduler.clear_run(ANA, run_id)
+        (cleared,) = scheduler.runs_view(run_id)
+    assert (blocking["state"], blocking["blocks"], blocking["exit_code"]) == (
+        "lost",
+        True,
+        None,
+    )
+    assert (cleared["blocks"], cleared["cleared_by"]) == (False, "ana")
+    assert cleared["cleared_at"] is not None
+
+
+def test_dromon_run_status_prints_runs_and_one_receipt(
+    project: Path,
+    short_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The ``runs`` request through the client, with its refusals."""
+    import json
+
+    from dromon import cli
+    from dromon.configview import Overrides
+    from dromon.daemon import Daemon
+    from dromon.model import format_due
+    from dromon.paths import project_paths
+    from dromon.projectconfig import ProjectConfig
+    from dromon.protocol import Operation, Response
+
+    paths = project_paths(project, short_runtime)
+    paths.state_dir.mkdir(mode=0o700)
+    base = ("--project", str(project), "--runtime-dir", str(short_runtime))
+    with EventLog(paths.event_log) as log:
+        scheduler = scheduler_on(log, project)
+        daemon = Daemon(
+            paths,
+            log,
+            format_due(datetime(2026, 10, 31, 9, tzinfo=UTC)),
+            scheduler,
+            project=ProjectConfig(),
+            command_line=Overrides(),
+            project_file_present=False,
+        )
+
+        def call(
+            socket: Path, operation: Operation, args: dict[str, object] | None = None
+        ) -> Response:
+            del socket
+            line = {"id": "r", "op": operation.value, "v": 1, "args": args or {}}
+            return daemon.respond((json.dumps(line) + "\n").encode())
+
+        monkeypatch.setattr(cli, "call", call)
+        assert cli.main([*base, "run", "status"]) == 0
+        assert capsys.readouterr().out == "no runs yet\n"
+        count = runs_in_two_scopes(log, scheduler)
+        refused = call(paths.socket, Operation.RUNS, {"run_id": 7})
+        assert refused.error_code == "bad_request"
+        assert cli.main([*base, "run", "status"]) == 0
+        listed = capsys.readouterr().out.splitlines()
+        assert cli.main([*base, "run", "status", "r-1"]) == 0
+        one = capsys.readouterr().out.splitlines()
+        assert cli.main([*base, "run", "status", "r-0"]) != 0
+        assert "no run r-0" in capsys.readouterr().err
+        assert cli.main([*base, "run", "clear"]) == 2
+        assert "name the run to clear" in capsys.readouterr().err
+    assert listed[0] == "line alpha"
+    assert listed[1] == (
+        f"  r-{count} gate by alpha, started {AT}, exited with exit code 0 at"
+        f" {LATER}, output /work/tmp/runs/r-{count}.out"
+    )
+    assert "line beta" in listed
+    assert listed[-1].endswith(
+        "still running as process 4321, output /work/tmp/runs/r-b.out"
+    )
+    assert one[0].startswith("r-1 gate by alpha,")
+    assert one[0].endswith(", corrected by r-2")
+    assert one[1:] == ["  scope: line alpha", "  previous: none"]
+
+
+# Round 15, item 2. A stop also ends the descendants below the supervisor that called
+# ``setsid``. These stand in for the walk, since ``ps`` cannot run inside an agent
+# sandbox, and one test at the end reads the real table where ``ps`` runs.
+
+
+def sleeper(
+    *, ignore_term: bool = False, own_session: bool = True
+) -> subprocess.Popen[bytes]:
+    code = "import signal, time;"
+    if ignore_term:
+        code += " signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+    code += " time.sleep(60)"
+    return subprocess.Popen(  # noqa: S603
+        [sys.executable, "-c", code],
+        start_new_session=own_session,
+        process_group=None if own_session else 0,
+    )
+
+
+STARTED = "Sat Nov  1 07:23:05 2026"
+"""A start time as a walk reads it, for the rows a test stands in for the walk with."""
+
+
+def row_of(process: subprocess.Popen[bytes], parent: int = 1) -> TreeRow:
+    return TreeRow(process.pid, parent, process.pid, "sleep", STARTED)
+
+
+def unchanged(pid: int) -> tuple[int, str]:
+    """The identity every ``row_of`` row still has, parent 1 and ``STARTED``."""
+    return 1, STARTED
+
+
+def finish(*processes: subprocess.Popen[bytes]) -> None:
+    for process in processes:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+
+
+def test_a_stop_ends_a_descendant_in_a_session_of_its_own() -> None:
+    command = sleeper(own_session=False)
+    stray = sleeper()
+    try:
+        supervision = runs.Supervision(
+            lambda: [] if stray.poll() is not None else [row_of(stray)], unchanged
+        )
+        supervision.stopping.set()
+        assert supervision.wait(command, grace=5.0) == -signal.SIGTERM
+        assert stray.wait(timeout=WAIT_SECONDS) == -signal.SIGTERM
+        assert supervision.outside == {stray.pid}
+        assert supervision.note() == ", with 1 descendants outside its group"
+    finally:
+        finish(command, stray)
+
+
+def test_the_walk_is_made_before_the_group_is_signalled() -> None:
+    """The group signal ends the command and orphans what it left, so a walk made
+    after it misses the descendant it is for. The full-gate run of 2026-11-01 failed
+    for this. Here the first walk of a stop must see the command still running, and
+    the stray found by it is ended although the command died of the group signal."""
+    command = sleeper(own_session=False)
+    stray = sleeper()
+    seen: list[int | None] = []
+
+    def walk() -> list[TreeRow] | None:
+        seen.append(command.poll())
+        # After the command is gone the stray is no longer below the supervisor, as
+        # it is not once the system's first process has been given it.
+        return [row_of(stray)] if command.poll() is None else []
+
+    try:
+        supervision = runs.Supervision(walk, unchanged)
+        supervision.stopping.set()
+        assert supervision.wait(command, grace=5.0) == -signal.SIGTERM
+        assert seen[0] is None
+        assert stray.wait(timeout=WAIT_SECONDS) == -signal.SIGTERM
+        assert supervision.outside == {stray.pid}
+    finally:
+        finish(command, stray)
+
+
+def test_a_descendant_that_ignores_sigterm_is_killed_after_the_grace() -> None:
+    command = sleeper(own_session=False)
+    stray = sleeper(ignore_term=True)
+    time.sleep(0.3)
+    try:
+        supervision = runs.Supervision(
+            lambda: [] if stray.poll() is not None else [row_of(stray)], unchanged
+        )
+        supervision.stopping.set()
+        started = time.monotonic()
+        supervision.wait(command, grace=0.5)
+        assert stray.wait(timeout=WAIT_SECONDS) == -signal.SIGKILL
+        assert time.monotonic() - started >= 0.5, "the grace was kept"
+    finally:
+        finish(command, stray)
+
+
+def test_a_command_that_ends_first_is_not_returned_while_a_descendant_runs() -> None:
+    """The command ends on ``SIGTERM`` at once, and a descendant that ignores it
+    keeps the supervisor until the grace ends and ``SIGKILL`` follows."""
+    command = sleeper(own_session=False)
+    stray = sleeper(ignore_term=True)
+    time.sleep(0.3)
+    try:
+        supervision = runs.Supervision(
+            lambda: [] if stray.poll() is not None else [row_of(stray)], unchanged
+        )
+        supervision.stopping.set()
+        started = time.monotonic()
+        assert supervision.wait(command, grace=0.6) == -signal.SIGTERM
+        assert time.monotonic() - started >= 0.6
+        assert stray.wait(timeout=WAIT_SECONDS) == -signal.SIGKILL
+    finally:
+        finish(command, stray)
+
+
+@pytest.mark.parametrize("changed", ["start", "parent", "gone"])
+def test_a_process_whose_identity_changed_since_the_walk_is_not_signalled(
+    changed: str,
+) -> None:
+    """Re-review of 4da3e0e. Between the walk and the signal the descendant can end
+    and its identifier go to a process that is not one. The stray here stands for that
+    process. Its start time or parent differs from the row, or ``ps`` cannot say, so it
+    is left running and is not counted among the descendants ended."""
+    command = sleeper(own_session=False)
+    stray = sleeper()
+    time.sleep(0.3)
+
+    def identity(pid: int) -> tuple[int, str] | None:
+        if changed == "gone":
+            return None
+        if changed == "start":
+            return 1, "Sun Nov  2 00:00:00 2026"
+        return 2, STARTED
+
+    try:
+        supervision = runs.Supervision(lambda: [row_of(stray)], identity)
+        supervision.stopping.set()
+        assert supervision.wait(command, grace=0.3) == -signal.SIGTERM
+        assert stray.poll() is None, "a process with another identity was signalled"
+        assert supervision.outside == set()
+        assert supervision.note() == ""
+    finally:
+        finish(command, stray)
+
+
+def test_the_identity_is_checked_before_the_group_is_signalled() -> None:
+    """The group signal ends the command, and a descendant it leaves has another parent
+    from then on, so a check made after it would find every orphan changed. The first
+    check of a stop must see the command still running."""
+    command = sleeper(own_session=False)
+    stray = sleeper()
+    time.sleep(0.3)
+    seen: list[int | None] = []
+
+    def identity(pid: int) -> tuple[int, str]:
+        seen.append(command.poll())
+        return 1, STARTED
+
+    try:
+        supervision = runs.Supervision(
+            lambda: [] if command.poll() is not None else [row_of(stray)], identity
+        )
+        supervision.stopping.set()
+        supervision.wait(command, grace=5.0)
+        assert seen and seen[0] is None
+        assert stray.wait(timeout=WAIT_SECONDS) == -signal.SIGTERM
+    finally:
+        finish(command, stray)
+
+
+def test_a_child_is_signalled_before_its_parent_so_it_is_not_orphaned_first() -> None:
+    """Round 15, re-review. With the real process table the parent of a descendant in a
+    session of its own is the command. A signal to the command first ended it, the
+    descendant's parent became the system's first process, and the check turned the
+    descendant away. The identity here changes once the parent has ended."""
+    parent = sleeper(own_session=False)
+    child = sleeper(ignore_term=True)
+    time.sleep(0.3)
+    parent_row = TreeRow(parent.pid, 1, parent.pid, "sleep", STARTED)
+    child_row = TreeRow(child.pid, parent.pid, child.pid, "sleep", STARTED)
+
+    checked: list[int] = []
+
+    def identity(pid: int) -> tuple[int, str] | None:
+        """The parent's check comes just before its signal, so a child checked after
+        it has been orphaned by that signal."""
+        checked.append(pid)
+        if pid == child.pid:
+            return (1 if parent.pid in checked else parent.pid), STARTED
+        return 1, STARTED
+
+    try:
+        supervision = runs.Supervision(lambda: [parent_row, child_row], identity)
+        supervision.stopping.set()
+        supervision._end(parent, parent.poll(), signal.SIGTERM)  # pyright: ignore[reportPrivateUsage]
+        assert parent.wait(timeout=WAIT_SECONDS) == -signal.SIGTERM
+        assert child_row.pid in supervision.outside
+    finally:
+        finish(parent, child)
+
+
+def test_a_signal_goes_only_to_what_the_latest_walk_found() -> None:
+    """The first walk names the stray, and the second names nothing, as when the stray
+    ended and its identifier was reused. The remembered identifier is not signalled."""
+    command = sleeper(own_session=False)
+    stray = sleeper(ignore_term=True)
+    time.sleep(0.3)
+    answers: list[list[TreeRow]] = [[row_of(stray)]]
+
+    def walk() -> list[TreeRow]:
+        return answers.pop(0) if answers else []
+
+    try:
+        supervision = runs.Supervision(walk, unchanged)
+        supervision.stopping.set()
+        assert supervision.wait(command, grace=0.3) == -signal.SIGTERM
+        assert stray.poll() is None, "a process the latest walk did not name was killed"
+    finally:
+        finish(command, stray)
+
+
+def test_a_process_the_walk_does_not_name_is_left_alone() -> None:
+    command = sleeper(own_session=False)
+    neighbour = sleeper()
+    try:
+        supervision = runs.Supervision(lambda: [])
+        supervision.stopping.set()
+        supervision.wait(command, grace=0.3)
+        assert neighbour.poll() is None
+        assert supervision.outside == set()
+        assert supervision.note() == ""
+    finally:
+        finish(command, neighbour)
+
+
+def test_an_unreadable_table_still_ends_the_group_and_the_receipt_says_so() -> None:
+    command = sleeper(own_session=False)
+    try:
+        supervision = runs.Supervision(lambda: None)
+        supervision.stopping.set()
+        assert supervision.wait(command, grace=0.3) == -signal.SIGTERM
+        assert supervision.unreadable
+        assert "could not be read" in supervision.note()
+    finally:
+        finish(command)
+
+
+def test_a_stop_that_never_comes_never_walks_the_table() -> None:
+    def walk() -> list[TreeRow]:
+        raise AssertionError("no stop was noted, so nothing may be walked")
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"], process_group=0)  # noqa: S603
+    assert runs.Supervision(walk, unchanged).wait(child) == 0
+
+
+def test_the_receipt_of_a_stopped_run_names_the_descendants_it_ended(
+    tmp_path: Path,
+) -> None:
+    stray = sleeper()
+    try:
+        supervision = runs.Supervision(
+            lambda: [] if stray.poll() is not None else [row_of(stray)], unchanged
+        )
+        stopper = threading.Timer(0.5, supervision.stopping.set)
+        stopper.start()
+        receipt = runs.supervise(
+            str(tmp_path), python_command("import time; time.sleep(60)"), supervision
+        )
+        assert receipt.status is RunStatus.STOPPED
+        assert receipt.note.startswith("stop_run asked its supervisor to end it, with")
+        assert len(receipt.note.encode()) <= MAX_RUN_NOTE_BYTES
+    finally:
+        finish(stray)
+
+
+@NEEDS_PS
+def test_a_real_stop_ends_a_command_child_that_called_setsid(tmp_path: Path) -> None:
+    """With the real process table. The command starts a child in a session of its
+    own, so the group kill alone misses it."""
+    stray_file = tmp_path / "work" / "stray.pid"
+    found, run = launched(
+        tmp_path,
+        python_command(
+            "import subprocess, sys, time;"
+            "p = subprocess.Popen("
+            "[sys.executable, '-c', 'import time; time.sleep(60)'],"
+            " start_new_session=True);"
+            f"open({str(stray_file)!r}, 'w').write(str(p.pid)); time.sleep(60)"
+        ),
+    )
+    runs.release(found)
+    wait_for_file(stray_file)
+    stray = int(stray_file.read_text())
+    try:
+        runs.signal_run(run, stand_in_start)
+        assert found.child.wait(timeout=WAIT_SECONDS) == 0
+        receipt = runs.read_receipt(tmp_path, run.run_id)
+        assert receipt is not None and receipt.status is RunStatus.STOPPED
+        assert "descendants outside its group" in receipt.note
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(stray, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("the child in a session of its own outlived the stop")
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(stray, 9)

@@ -130,11 +130,19 @@ message and leaving the old daemon running.
   finding P2. Only directories whose names begin `preflight-` are removed, never a
   link. **Assumption.** Two clients checking at once are rare. One whose check times
   out sweeps the other's copy too, which makes the other check fail, closed.
-- **The interpreter can differ.** The check runs on the interpreter `dromon` runs on,
-  and the successor on the one the old daemon runs on. When the two are different
-  environments, such as a client installed with pipx and a daemon in the project's
-  virtual environment, the check tests other installed code than the successor loads.
-  Run `dromon restart` from the environment the daemon was started from.
+- **The interpreter and the environment are the daemon's.** The successor runs on the
+  old daemon's interpreter with the old daemon's environment, which `client.start`
+  passes on. **Round 14, item 6.** The client therefore also asks the read-only
+  `start_context` request, served on the client socket only, for the daemon's
+  interpreter and its values of `DROMON_REGISTRY_DIR` and `SSH_AUTH_SOCK`, the
+  variables a start's checks read, and runs the check on that interpreter, with
+  the client's environment but those two variables as the daemon has them, a
+  variable the daemon lacks removed. An interpreter that is not an absolute path,
+  or an answer naming another variable, is not used. A daemon from before this
+  gives no `start_context`, and the check then runs on the client's interpreter and
+  environment, as before, which the client says. **Assumption.** No other variable
+  changes what a start's checks decide, since `HOME` is the same user's and the
+  runtime directory is passed on the command line.
 - **The reason.** The client prints the check's lines that begin `dromond:`, which are
   the reasons a real start prints, or else its last line, as for code that does not
   import.
@@ -161,9 +169,9 @@ message and leaving the old daemon running.
 | Recovery, the survivor scan and the process-table probe | They run in `serve`, or touch the process table, which the check does not |
 | Engines | No engine is built until a line's first turn, at a start as at a check |
 | What the drain records | The copy is taken before the request, so mail, lines or roles recorded during the drain are not checked. A line created during a drain can still make the successor refuse |
-| The daemon's environment | The check runs with the client's environment, and the successor with the old daemon's, so a refusal that depends on `SSH_AUTH_SOCK` or `DROMON_REGISTRY_DIR` can differ |
+| The rest of the daemon's environment | From round 14, item 6, the check takes the daemon's `SSH_AUTH_SOCK` and `DROMON_REGISTRY_DIR`, but any other variable is the client's, so a refusal that depended on one would differ. None is known to |
 | An installed checkout that moves after the check | The successor loads what is installed when it starts |
-| Another interpreter's installed code | The check runs on the client's interpreter, and the successor on the old daemon's |
+| Another interpreter's installed code, with an older daemon | From round 14, item 6, the check runs on the daemon's own interpreter. A daemon from before that does not name it, and the check then runs on the client's |
 
 **Compatibility.** A daemon from before 2026-10-31 gives no `options`, and the check
 then runs with none, which can differ from the successor's command line only in the
@@ -171,9 +179,13 @@ limits, operator, tick and held wakes, all of which the check validates the same
 
 ## `dromon restart`
 
-The command reads the daemon's `pid` and commit, runs the preflight, sends `restart`,
+The command reads the daemon's `pid` and commit, from round 14 asks `start_context`,
+runs the preflight, sends `restart`,
 and polls `status` four times a second until a daemon with another `pid` answers. It then prints the successor's commit and the commit before, and says when
-they are the same. It fails when the daemon refuses the request, when the restart is
+they are the same. From round 14 it also prints the commit the successor's checkout
+holds, and warns when that differs from the commit it loaded, which narrows the gap
+of a checkout that moves after the check, since the operator then sees that the
+daemon does not run the code checked out now. It fails when the daemon refuses the request, when the restart is
 abandoned, and when no successor answers within the wait and 70 seconds more, which
 covers the shutdown and the successor's start.
 

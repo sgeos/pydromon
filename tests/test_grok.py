@@ -5,12 +5,12 @@ script follows Grok Build 1.0.70's documentation and its ``initialize`` answer.
 """
 
 import asyncio
-import hashlib
 import dataclasses
 import json
 import os
 import re
 import shutil
+import subprocess
 import tomllib
 from collections import deque
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
@@ -90,6 +90,12 @@ async def _record(args: dict[str, Any]) -> dict[str, Any]:
 SEND: SdkMcpTool[Any] = SdkMcpTool(
     name="send_message", description="Send.", input_schema={}, handler=_record
 )
+
+
+def stored_digest(config: LineConfig, instructions: str) -> str:
+    return grok_module.session_digest(
+        config, instructions, frozenset({"dromon__send_message"})
+    )
 
 
 def write_profiles(home: Path, workspace: Path, *, writer_git: bool = True) -> None:
@@ -529,11 +535,12 @@ def test_a_prepared_home_is_owner_only_and_passes_its_own_checks(
         )
 
 
-def test_the_home_config_asks_and_loads_no_server_or_hook() -> None:
+def test_the_home_config_asks_and_loads_only_its_fixed_hook() -> None:
     document = tomllib.loads(HOME_CONFIG)
     assert document["ui"] == {"permission_mode": "default"}
     assert document["ui"]["permission_mode"] in grok_module.ASK_MODES
-    assert "mcp_servers" not in document and "hooks" not in document
+    assert "mcp_servers" not in document
+    assert list(document["hooks"]) == ["PreToolUse"]
     for vendor in ("claude", "cursor"):
         assert document["compat"][vendor] == {"mcps": False, "hooks": False}
 
@@ -636,6 +643,7 @@ def test_the_home_config_is_compared_by_its_contents(tmp_path: Path) -> None:
         "[compat.cursor]\nhooks = false\nmcps = false\n"
         '[ui]\npermission_mode = "default"\n'
         "[compat.claude]\nhooks = false\nmcps = false\n"
+        + HOME_CONFIG[HOME_CONFIG.index("[[hooks.PreToolUse]]") :]
     )
     check_home(grok_home, tmp_path / "etc")
     (grok_home / "config.toml").write_text("not toml [")
@@ -1042,8 +1050,8 @@ def test_an_existing_profile_gets_additive_advice_and_keeps_other_tables(
     assert "leave every other profile table and entry as it is" in message
     assert "creating either array if the profile has none" in message
     assert "Missing deny entries" in message
-    assert "missing read_only entries are []" in message
-    assert "missing read_only entries are []" in message
+    assert str(grok_module.HOOK_PROGRAM.parent.resolve()) in message
+    assert str(grok_module.HOOK_PROGRAM.parent.resolve()) in message
     assert "Remove unsupported keys" not in message
     assert "Set extends" not in message
     assert f"\n[profiles.{READER_PROFILE}]" not in message
@@ -1076,6 +1084,10 @@ def test_existing_profile_advice_lists_only_missing_deny_entries(
 
 
 def write_reader(home: Path, table: str) -> None:
+    if "read_only" not in table:
+        table += "\nread_only = " + json.dumps(
+            [str(grok_module.HOOK_PROGRAM.parent.resolve())]
+        )
     (home / HOME_DIR).mkdir(parents=True, exist_ok=True)
     (home / HOME_DIR / "sandbox.toml").write_text(
         f"[profiles.{READER_PROFILE}]\n{table}\n"
@@ -1103,7 +1115,8 @@ def test_grok_profile_must_hold_configured_paths_read_only(
         )
     write_reader(
         home,
-        f'extends = "read-only"\ndeny = [".dromon"]\nread_only = ["{readonly}"]',
+        'extends = "read-only"\ndeny = [".dromon"]\nread_only = '
+        + json.dumps([str(readonly), str(grok_module.HOOK_PROGRAM.parent.resolve())]),
     )
     assert (
         check_profile(
@@ -1187,7 +1200,10 @@ def test_writer_profile_holds_an_ordinary_git_directory_read_only(
     write_profiles(home, workspace)
     document = tomllib.loads((home / HOME_DIR / "sandbox.toml").read_text())
     writer = document["profiles"][WRITER_PROFILE]
-    assert writer["read_only"] == [str(git)]
+    assert set(writer["read_only"]) == {
+        str(git),
+        str(grok_module.HOOK_PROGRAM.parent.resolve()),
+    }
     assert (
         check_profile(
             LineConfig(builtin_tools=("Edit",)),
@@ -1221,7 +1237,11 @@ def test_writer_profile_holds_linked_worktree_and_common_git_directories(
     write_profiles(home, workspace)
     document = tomllib.loads((home / HOME_DIR / "sandbox.toml").read_text())
     writer = document["profiles"][WRITER_PROFILE]
-    assert set(writer["read_only"]) == {str(common), str(gitdir)}
+    assert set(writer["read_only"]) == {
+        str(common),
+        str(gitdir),
+        str(grok_module.HOOK_PROGRAM.parent.resolve()),
+    }
     assert str(workspace / ".git") not in writer["read_only"]
     assert str(gitdir / "commondir") not in writer["read_only"]
     assert (
@@ -1324,10 +1344,10 @@ def test_a_plain_turn_reports_text_credential_and_session(
     assert (report.subtype, report.text, report.session_id) == (
         "success",
         "hello there",
-        "s1:rules-" + hashlib.sha256(b"").hexdigest(),
+        "s1:rules-" + stored_digest(LineConfig(), ""),
     )
     assert report.credential is Credential.SUBSCRIPTION
-    assert target.session_id == "s1:rules-" + hashlib.sha256(b"").hexdigest()
+    assert target.session_id == "s1:rules-" + stored_digest(LineConfig(), "")
     assert "DAEMON_ONLY_SENTINEL" not in server.environment
     assert server.environment["GROK_SANDBOX"] == READER_PROFILE
     init = server.params("initialize")
@@ -1508,7 +1528,13 @@ def test_the_session_carries_dromons_tools_instructions_and_ask_mode(
 
 def test_the_next_turn_loads_the_session(project: tuple[Path, Path, Path]) -> None:
     server = FakeGrok()
-    run(line(server, project, session_id="s1:rules-" + hashlib.sha256(b"").hexdigest()))
+    run(
+        line(
+            server,
+            project,
+            session_id="s1:rules-" + stored_digest(LineConfig(), ""),
+        )
+    )
     assert server.params("session/load")["sessionId"] == "s1"
     assert "session/new" not in server.methods()
 
@@ -1541,7 +1567,7 @@ def test_an_engine_that_cannot_be_confirmed_is_refused_before_the_prompt(
 
 @pytest.mark.parametrize(
     "session_id",
-    [None, "s1:rules-" + hashlib.sha256(b"").hexdigest()],
+    [None, "s1:rules-" + stored_digest(LineConfig(), "")],
     ids=["new", "resumed"],
 )
 def test_another_reported_model_is_pinned_to_the_driver_model(
@@ -1688,8 +1714,10 @@ def test_permission_requests_follow_the_lines_tools(
     refused = FakeGrok(
         [
             permission("execute", request_id="p1", ident="a"),
+            call_update("a", status="failed", _meta={"toolNotRun": True}),
             permission("read", request_id="p2", ident="b"),
             permission("other", "gmail__send", request_id="p3", ident="c"),
+            call_update("c", status="failed", _meta={"toolNotRun": True}),
         ]
     )
     assert run(line(refused, project, config=reader)).tool_uses == ("Read",)
@@ -1982,7 +2010,13 @@ def test_a_title_never_names_one_of_dromons_tools(
     }
     asked = permission("other")
     asked["params"]["toolCall"] = titled
-    server = FakeGrok([asked, chunk("done")])
+    server = FakeGrok(
+        [
+            asked,
+            call_update("t", status="failed", _meta={"toolNotRun": True}),
+            chunk("done"),
+        ]
+    )
     assert run(line(server, project)).text == "done"
     assert "session/cancel" not in server.methods()
     answers = {a["id"]: a for a in server.answers()}
@@ -2000,7 +2034,12 @@ def test_no_kind_is_exempt_from_the_tool_check(
     server = FakeGrok([tool_call("think")])
     with pytest.raises(EngineRefused, match="not given: think"):
         run(line(server, project))
-    asked = FakeGrok([permission("think")])
+    asked = FakeGrok(
+        [
+            permission("think"),
+            call_update("t", status="failed", _meta={"toolNotRun": True}),
+        ]
+    )
     assert run(line(asked, project)).tool_uses == ()
     assert "session/cancel" not in asked.methods()
     assert asked.answers()[0]["result"]["outcome"]["optionId"] == "no"
@@ -3268,7 +3307,13 @@ def test_view_image_denies_a_permission_request_that_names_no_image(
     first = grok_call("read_file", raw_input=read_input("shot.png"))
     requests = (grok_permission(), grok_permission(rawInput=read_input("notes.txt")))
     for request in requests:
-        server = FakeGrok([first, request])
+        server = FakeGrok(
+            [
+                first,
+                request,
+                call_update("t", status="failed", _meta={"toolNotRun": True}),
+            ]
+        )
         run(line(server, project, config=VIEW))
         assert server.answers()[-1]["result"]["outcome"]["optionId"] == "no"
 
@@ -3499,7 +3544,7 @@ def test_unknown_or_changed_rules_replace_a_grok_session(
     assert "session/load" not in server.methods()
     assert "session/new" in server.methods()
     assert "Dromon replaced your Grok session" in str(server.params("session/prompt"))
-    assert report.session_id == "s1:rules-" + hashlib.sha256(b"").hexdigest()
+    assert report.session_id == "s1:rules-" + stored_digest(LineConfig(), "")
 
 
 def test_grok_changed_rules_file_starts_a_new_session(
@@ -3527,7 +3572,9 @@ def test_requested_model_must_be_listed(
     option["options"] = options
     server.extra["configOptions"] = [option]
     target = line(
-        server, project, session_id="s1:rules-" + hashlib.sha256(b"").hexdigest()
+        server,
+        project,
+        session_id="s1:rules-" + stored_digest(LineConfig(), ""),
     )
     with pytest.raises(
         EngineRefused, match="does not list requested model.*listed values"
@@ -3571,3 +3618,313 @@ def test_initialize_records_supported_protocol_version(
             run(target)
         assert "session/new" not in server.methods()
     assert target.protocol_version == version
+
+
+@pytest.mark.parametrize("fetch", [False, True])
+def test_launch_controls_advertised_tools_per_line(
+    project: tuple[Path, Path, Path], fetch: bool
+) -> None:
+    server = FakeGrok()
+    config = LineConfig(builtin_tools=("WebFetch",) if fetch else ())
+    inherited = {"GROK_SUBAGENTS": "1", "GROK_WEB_FETCH": "1" if not fetch else "0"}
+    run(line(server, project, config=config, environment=inherited))
+    assert server.environment["GROK_SUBAGENTS"] == "0"
+    assert server.environment["GROK_WEB_FETCH"] == ("1" if fetch else "0")
+
+
+def test_advertised_tool_change_replaces_resumed_session(
+    project: tuple[Path, Path, Path],
+) -> None:
+    old_config = LineConfig(builtin_tools=("WebFetch",))
+    stored = run(line(FakeGrok(), project, config=old_config)).session_id
+    server = FakeGrok()
+    run(line(server, project, session_id=stored))
+    assert "session/new" in server.methods()
+    assert "session/load" not in server.methods()
+    assert server.environment["GROK_WEB_FETCH"] == "0"
+
+
+@pytest.mark.parametrize("name", ["todo_write", "spawn_subagent", "web_fetch"])
+@pytest.mark.parametrize("not_run", [True, False])
+def test_unavailable_advertised_tool_is_denied_individually(
+    project: tuple[Path, Path, Path], name: str, not_run: bool
+) -> None:
+    blocked = grok_permission(_meta=grok_meta(name))
+    server = FakeGrok(
+        [
+            blocked,
+            call_update(
+                "t", status="failed", _meta={"toolNotRun": True} if not_run else {}
+            ),
+            permission(
+                "other", "dromon__send_message", ident="good", request_id="allow"
+            ),
+            chunk("continued"),
+        ]
+    )
+    if not_run:
+        report = run(line(server, project))
+        assert report.text == "continued"
+        assert report.tool_uses == ("dromon__send_message",)
+        assert "session/cancel" not in server.methods()
+    else:
+        with pytest.raises(
+            EngineRefused, match="did not confirm that a rejected tool call did not run"
+        ):
+            run(line(server, project))
+        assert "session/cancel" in server.methods()
+    rejected = next(
+        answer for answer in server.answers() if answer["id"] == blocked["id"]
+    )
+    expected = next(
+        option["optionId"]
+        for option in blocked["params"]["options"]
+        if option["kind"] == "reject_once"
+    )
+    assert rejected["result"]["outcome"]["optionId"] == expected
+
+
+@pytest.mark.parametrize("name", ["todo_write", "spawn_subagent", "web_fetch"])
+def test_rejection_without_later_update_holds_and_names_tool(
+    project: tuple[Path, Path, Path], name: str
+) -> None:
+    server = FakeGrok([grok_permission(_meta=grok_meta(name)), chunk("ended")])
+    with pytest.raises(EngineRefused, match="rejected tool call did not run: " + name):
+        run(line(server, project))
+    assert server.methods().count("session/cancel") == 1
+
+
+def test_confirmation_of_one_rejection_does_not_confirm_another(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok(
+        [
+            grok_permission(_meta=grok_meta("todo_write")),
+            call_update("t", status="failed", _meta={"toolNotRun": True}),
+            grok_permission(
+                ident="second", request_id="p2", _meta=grok_meta("web_fetch")
+            ),
+        ]
+    )
+    with pytest.raises(
+        EngineRefused, match="rejected tool call did not run: web_fetch"
+    ):
+        run(line(server, project))
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        LineConfig(builtin_tools=("Read",)),
+        LineConfig(allowed_tools=("dromon__extra",)),
+    ],
+)
+def test_each_changed_tool_grant_replaces_and_then_resumes(
+    project: tuple[Path, Path, Path], config: LineConfig
+) -> None:
+    stored = run(line(FakeGrok(), project)).session_id
+    server = FakeGrok()
+    target = line(server, project, config=config, session_id=stored)
+    run(target)
+    run(target)
+    assert server.methods().count("session/new") == 1
+    assert server.methods().count("session/load") == 1
+
+
+def test_changed_dromon_tool_set_replaces_session(
+    project: tuple[Path, Path, Path],
+) -> None:
+    stored = run(line(FakeGrok(), project)).session_id
+    server = FakeGrok()
+    target = line(server, project, session_id=stored)
+    target.own_tools = frozenset({"dromon__read_mail"})
+    run(target)
+    assert "session/new" in server.methods()
+    assert "session/load" not in server.methods()
+
+
+@pytest.mark.parametrize("preflight", [False, True])
+def test_refused_replacement_is_cached_before_a_successful_retry(
+    project: tuple[Path, Path, Path], preflight: bool
+) -> None:
+    server = FakeGrok(
+        [grok_call("todo_write")], servers=None if preflight else DROMON_ONLY
+    )
+    target = line(server, project, session_id="old:rules-incorrect")
+    with pytest.raises(EngineRefused):
+        run(target)
+    server.servers = DROMON_ONLY
+    server.turn = [chunk("retry")]
+    report = run(target)
+    assert report.text == "retry"
+    assert server.methods().count("session/new") == 1
+    assert server.methods().count("session/load") == 1
+    assert "Dromon replaced your Grok session" in str(server.params("session/prompt"))
+
+
+def test_replacement_without_a_valid_identifier_is_not_repeated(
+    project: tuple[Path, Path, Path],
+) -> None:
+    class NoSession(FakeGrok):
+        async def send(self, message: Mapping[str, object]) -> None:
+            await super().send(message)
+            if message.get("method") == "session/new":
+                self.queue[-1]["result"]["sessionId"] = ""
+
+    server = NoSession()
+    target = line(server, project, session_id="old:rules-incorrect")
+    with pytest.raises(EngineRefused, match="without an identifier"):
+        run(target)
+    with pytest.raises(EngineRefused, match="replacement already failed"):
+        run(target)
+    assert server.methods().count("session/new") == 1
+
+
+@pytest.mark.parametrize("rpc_failure", [False, True])
+def test_unconfirmed_rejection_is_named_when_prompt_fails(
+    project: tuple[Path, Path, Path], rpc_failure: bool
+) -> None:
+    class FailsAfterRejection(FakeGrok):
+        async def send(self, message: Mapping[str, object]) -> None:
+            await super().send(message)
+            if message.get("method") == "session/prompt":
+                self.queue.pop()
+                if rpc_failure:
+                    self.queue.append(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": self.prompt_id,
+                            "error": {"code": -32000, "message": "failed"},
+                        }
+                    )
+
+    server = FailsAfterRejection([grok_permission(_meta=grok_meta("todo_write"))])
+    with pytest.raises(
+        EngineRefused, match="rejected tool call did not run: todo_write"
+    ):
+        run(line(server, project))
+
+
+def test_tool_policy_is_part_of_the_session_digest() -> None:
+    from dromon.lineconfig import ToolPolicy
+
+    assert stored_digest(LineConfig(), "") != stored_digest(
+        LineConfig(tool_policy=ToolPolicy.ALLOW_ALL), ""
+    )
+
+
+def test_generated_hook_runs_a_fixed_system_program_without_shell_input(
+    project: tuple[Path, Path, Path],
+) -> None:
+    workspace, _, _ = project
+    parsed = tomllib.loads(HOME_CONFIG)
+    group = parsed["hooks"]["PreToolUse"][0]
+    assert group["matcher"].split("|") == ["todo_write", "spawn_subagent"]
+    handler = group["hooks"][0]
+    assert handler["command"] == str(grok_module.HOOK_PROGRAM)
+    assert Path(handler["command"]).is_absolute()
+    assert handler["timeout"] == 5
+    # Input and an untrusted working directory cannot select code or change output.
+    malicious = workspace / "printf"
+    malicious.write_text("exit 99\n")
+    malicious.chmod(0o700)
+    result = subprocess.run(  # noqa: S603, fixed generated command and arguments
+        [handler["command"], *handler["args"]],
+        input='{"toolName":"$(touch injected)"}',
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=5,
+        cwd=workspace,
+        env={"PATH": str(workspace)},
+    )
+    assert json.loads(result.stdout) == {
+        "decision": "deny",
+        "reason": "Dromon does not grant this tool",
+    }
+    assert not (workspace / "injected").exists()
+
+
+@pytest.mark.parametrize("fetch", [False, True])
+def test_no_deny_rule_is_passed_to_grok_agent(
+    project: tuple[Path, Path, Path], fetch: bool
+) -> None:
+    # Fact, 2026-11-01: Grok Build 1.0.70's agent command refuses --deny with
+    # "unexpected argument" and exits 2, which closed every Grok turn. WebFetch is
+    # withheld by GROK_WEB_FETCH and refused per call instead.
+    server = FakeGrok()
+    config = LineConfig(builtin_tools=("WebFetch",) if fetch else ())
+    run(line(server, project, config=config))
+    assert "--deny" not in server.arguments
+    assert server.arguments[-1] == "stdio"
+    assert "permission" not in tomllib.loads(HOME_CONFIG)
+
+
+def test_hook_program_cannot_be_placed_in_a_line_writable_directory(
+    project: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace, _, _ = project
+    program = workspace / "guard"
+    program.write_text("untrusted")
+    monkeypatch.setattr(grok_module, "HOOK_PROGRAM", program)
+    server = FakeGrok()
+    with pytest.raises(EngineRefused, match="within a line's writable paths"):
+        run(line(server, project))
+    assert server.methods() == []
+
+
+def test_profile_cannot_leave_the_hook_program_writable(
+    project: tuple[Path, Path, Path],
+) -> None:
+    workspace, home, _ = project
+    path = home / HOME_DIR / "sandbox.toml"
+    text = path.read_text().replace(
+        json.dumps(str(grok_module.HOOK_PROGRAM.parent.resolve())),
+        json.dumps(str(workspace / "unrelated")),
+    )
+    path.write_text(text)
+    server = FakeGrok()
+    with pytest.raises(EngineRefused, match="read-only") as raised:
+        run(line(server, project))
+    assert str(grok_module.HOOK_PROGRAM.parent.resolve()) in str(raised.value)
+    assert server.methods() == []
+
+
+def test_hook_configuration_cannot_be_changed_by_a_line(
+    tmp_path: Path,
+) -> None:
+    _, _, grok_home = prepared(tmp_path)
+    path = grok_home / "config.toml"
+    document = tomllib.loads(path.read_text())
+    assert document["hooks"]["PreToolUse"]
+    path.write_text(HOME_CONFIG.replace("spawn_subagent", "allowed_tool"))
+    with pytest.raises(EngineRefused, match="not the configuration Dromon wrote"):
+        check_home(grok_home, tmp_path / "etc")
+
+
+def test_saved_hook_disable_entries_refuse_before_launch(
+    project: tuple[Path, Path, Path],
+) -> None:
+    _, home, _ = project
+    (home / HOME_DIR / "disabled-hooks").write_text("disabled")
+    server = FakeGrok()
+    with pytest.raises(EngineRefused, match="disabled-hooks"):
+        run(line(server, project))
+    assert server.methods() == []
+
+
+def test_a_missing_hook_executable_refuses_before_launch(
+    project: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_access = os.access
+
+    def no_hook_access(path: str | Path, mode: int) -> bool:
+        if Path(path) == grok_module.HOOK_PROGRAM.resolve():
+            return False
+        return real_access(path, mode)
+
+    monkeypatch.setattr(os, "access", no_hook_access)
+    server = FakeGrok()
+    with pytest.raises(EngineRefused, match="denial hook program is not executable"):
+        run(line(server, project))
+    assert server.methods() == []

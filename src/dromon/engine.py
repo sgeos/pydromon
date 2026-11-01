@@ -107,6 +107,10 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     CLIJSONDecodeError,
+    HookContext,
+    HookInput,
+    HookJSONOutput,
+    HookMatcher,
     McpSdkServerConfig,
     McpServerConfig,
     Message,
@@ -141,6 +145,7 @@ from claude_agent_sdk.types import SystemPromptPreset
 
 from dromon import evidence, gitssh, launcher, redact
 from dromon.gitssh import GitSshAccess
+from dromon.hookpolicy import hook_policy_refusal
 from dromon.linetemp import CACHE_VARIABLE, TEMP_VARIABLE, LineTemp
 from dromon.imageaccess import claude_tools, image_refusal, view_only
 from dromon.capabilities import CLAUDE_CODE, version_refusal
@@ -294,6 +299,14 @@ NON_SUBSCRIPTION_ENVIRONMENT: Final = API_ENVIRONMENT + PROVIDER_ENVIRONMENT
 
 class EngineRefused(Exception):
     """The credential policy or the driver refused to run the turn."""
+
+
+class ConfinementBreach(EngineRefused):
+    """A call escaped the confinement Dromon gave the line, as a ``Read`` that
+    completed on a view-only line with no ViewImage hook call. **Round 15, review
+    of e9adf91.** The scheduler holds a line whose turn ends this way whether or not
+    the line mailed an operator, because the mail exemption covers a failed turn an
+    operator may have been told about and not a call that escaped its confinement."""
 
 
 class EnginePlanLimit(EngineRefused):
@@ -759,7 +772,9 @@ HALT_REASON: Final = (
 whose interrupt settled while the engine still ran work."""
 
 
-def flag_settings(settings: Mapping[str, object] | None) -> dict[str, object]:
+def flag_settings(
+    settings: Mapping[str, object] | None, ask: Sequence[str] = ()
+) -> dict[str, object]:
     """The settings Dromon passes Claude Code with ``--settings``, its flag
     settings, with the pinned tool search in their env block. **Review F9.**
 
@@ -779,7 +794,31 @@ def flag_settings(settings: Mapping[str, object] | None) -> dict[str, object]:
     )
     block[TOOL_SEARCH_VARIABLE] = TOOL_SEARCH_PINNED
     merged["env"] = block
+    if ask:
+        merged["permissions"] = _with_ask_rules(merged.get("permissions"), ask)
     return merged
+
+
+def _with_ask_rules(given: object, ask: Sequence[str]) -> dict[str, object]:
+    """``given``, a settings ``permissions`` block, with each of ``ask`` among its
+    ``ask`` rules once. **Round 14 review, item 1.** An ask rule makes the engine
+    consult the permission callback, so the gate runs for a ``Read`` that the engine
+    would allow inside its working directory without asking. **Hypothesis, to be
+    shown live.** An ask rule outranks the engine's allowance for reads in its
+    working directory. A block that is not a mapping is replaced, since it could not
+    have been valid."""
+    block: dict[str, object] = (
+        dict(cast(Mapping[str, object], given)) if isinstance(given, Mapping) else {}
+    )
+    rules = block.get("ask")
+    kept = (
+        [rule for rule in cast(list[object], rules) if isinstance(rule, str)]
+        if isinstance(rules, list)
+        else []
+    )
+    kept.extend(rule for rule in ask if rule not in kept)
+    block["ask"] = kept
+    return block
 
 
 HANDLED_SYSTEM_SUBTYPES: Final = frozenset(
@@ -1677,6 +1716,9 @@ class _Turn:
     tool_uses: list[str] = field(default_factory=list[str])
     interrupted_for: str | None = None
     refusal: str | None = None
+    breach: bool = False
+    """Whether the refusal is a confinement breach, which the scheduler holds a line
+    for unconditionally."""
     capabilities: Capabilities | None = None
     credential: Credential | None = None
     require_init: bool = True
@@ -1696,6 +1738,15 @@ class _Turn:
     compacted, from which the context is estimated."""
     billing: bool = False
     """Whether an assistant message of the turn carried ``BILLING_ERROR``."""
+    reads: set[str] = field(default_factory=set[str])
+    """The identifiers of the ``Read`` calls a view-only line made and whose results
+    have not arrived, which each must have had a call of the ViewImage hook."""
+
+
+def _refusal_error(turn: _Turn) -> EngineRefused:
+    """The error that ends a refused turn, a ``ConfinementBreach`` for a breach."""
+    text = turn.refusal if turn.refusal is not None else ""
+    return ConfinementBreach(text) if turn.breach else EngineRefused(text)
 
 
 type PermissionGate = Callable[
@@ -1765,6 +1816,73 @@ def permission_gate(
         )
 
     return gate
+
+
+VIEW_IMAGE_HOOK_MATCHER: Final = "Read"
+"""The tool the ``ViewImage`` hook runs before."""
+
+
+def view_image_hooks(
+    config: LineConfig,
+    workdir: Path,
+    record: Callable[[str], None] | None = None,
+) -> dict[str, list[HookMatcher]] | None:
+    """The hooks that hold a view-only line's ``Read`` to images, or ``None`` for any
+    other line.
+
+    **Round 14, item 5. The defect this closes.** A line with ``ViewImage`` and
+    without ``Read`` is offered ``Read``, and the permission callback allowed it only
+    for a path ``imageaccess.image_refusal`` accepts. The operator's live run of
+    2026-11-01 showed Claude Code viewing a 6,000,287 byte png over the limit, and
+    answering a renamed text file with the engine's own binary-file notice rather than
+    Dromon's refusal. **Inference, the cause.** Claude Code allows a ``Read`` inside
+    its working directory without calling the permission callback, so the rule ran
+    only for paths the engine would ask about. **Fix.** A ``PreToolUse`` hook runs
+    before every tool call, before the permission rules and the callback, whatever
+    they would decide, so the rule is applied there to every ``Read``, and a
+    refusal there is final, since a deny from a hook cannot be overridden by an allow.
+    The callback's check stays as a second guard. **Residual.** The check and the
+    engine's read are two steps, as ``imageaccess`` says.
+
+    **Review of a9995d8, item 1. Fail closed.** A callback that raises is answered by
+    the SDK with an error that Claude Code may treat as a hook that failed, which does
+    not block the tool, so the body is wrapped and any exception denies. ``record``
+    is called with the tool call's identifier before the decision, so the adapter can
+    tell a ``Read`` that completed without the hook having run. A ``record`` that
+    raises is also a deny."""
+    if not view_only(config.builtin_tools):
+        return None
+
+    def deny(why: str) -> HookJSONOutput:
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"Dromon's ViewImage rule refuses this Read: {why}"
+                ),
+            }
+        }
+
+    async def hook(
+        input_data: HookInput, tool_use_id: str | None, context: HookContext
+    ) -> HookJSONOutput:
+        del context
+        try:
+            data = cast(dict[str, Any], input_data)
+            identifier = (
+                tool_use_id if tool_use_id is not None else data.get("tool_use_id")
+            )
+            if record is not None and isinstance(identifier, str):
+                record(identifier)
+            given = data.get("tool_input")
+            arguments = cast(dict[str, Any], given) if isinstance(given, dict) else {}
+            why = image_refusal(arguments.get("file_path"), workdir)
+        except Exception as error:  # noqa: BLE001
+            return deny(f"the hook failed with {type(error).__name__}")
+        return {} if why is None else deny(why)
+
+    return {"PreToolUse": [HookMatcher(matcher=VIEW_IMAGE_HOOK_MATCHER, hooks=[hook])]}
 
 
 def _read_bounded(file: Path, what: str) -> bytes:
@@ -2158,6 +2276,14 @@ class ClaudeCodeLine:
         question, as ``dromon.ceiling`` describes."""
         self._surfaced: set[str] = set()
         """System message subtypes already surfaced, so each is surfaced once."""
+        self._hooked: set[str] = set()
+        """The tool call identifiers the ViewImage hook has seen and the adapter has
+        not yet matched with a completed ``Read``."""
+
+    def _hook_called(self, tool_use_id: str) -> None:
+        """Note that the ViewImage hook ran for ``tool_use_id``. Bounded by the
+        number of ``Read`` calls in one turn, which ``max_turns`` bounds."""
+        self._hooked.add(tool_use_id)
 
     @property
     def own_tools(self) -> frozenset[str]:
@@ -2204,6 +2330,16 @@ class ClaudeCodeLine:
             )
         if self.config.project_settings:
             check_project_settings(self.cwd)
+        if view_only(self.config.builtin_tools):
+            # Review of a9995d8, item 1. The hook is the confinement, so a line is not
+            # started where Dromon can see that hooks are switched off. The set is
+            # emptied in place, since a kept connection holds the hook that fills it.
+            switched_off = hook_policy_refusal(self.settings)
+            if switched_off is not None:
+                raise EngineRefused(
+                    f"a view-only line is held to images by a hook, and {switched_off}"
+                )
+            self._hooked.clear()
         plugins: list[SdkPluginConfig] = []
         for written in self.config.plugins:
             directory = resolve_plugin(written)
@@ -2214,6 +2350,7 @@ class ClaudeCodeLine:
             tools=claude_tools(self.config.builtin_tools),
             mcp_servers=cast(dict[str, McpServerConfig], servers),
             strict_mcp_config=not self.config.inherit_account_mcp,
+            hooks=cast(Any, view_image_hooks(self.config, self.cwd, self._hook_called)),
             can_use_tool=permission_gate(
                 self.config,
                 self.own_tools,
@@ -2228,7 +2365,14 @@ class ClaudeCodeLine:
             cwd=str(self.cwd),
             resume=self.session_id,
             sandbox=cast(SandboxSettings, self.sandbox),
-            settings=json.dumps(flag_settings(self.settings)),
+            settings=json.dumps(
+                flag_settings(
+                    self.settings,
+                    (VIEW_IMAGE_HOOK_MATCHER,)
+                    if view_only(self.config.builtin_tools)
+                    else (),
+                )
+            ),
             env=launch_environment(
                 self.mark,
                 self.config.stop_policy,
@@ -2307,7 +2451,7 @@ class ClaudeCodeLine:
                     )
                     prompt = f"{note}\n\n{prompt}"
                 if turn.refusal is not None:
-                    raise EngineRefused(turn.refusal)
+                    raise _refusal_error(turn)
                 answered = False
                 # Bounded by HANDOFF_RESENDS, past which _handed_off refuses.
                 for resends in range(HANDOFF_RESENDS + 1):
@@ -2336,7 +2480,7 @@ class ClaudeCodeLine:
             self._turn = None
         cost = None if result is None else self._measure(result)
         if turn.refusal is not None:
-            raise EngineRefused(turn.refusal)
+            raise _refusal_error(turn)
         self._check_limit(result, turn)
         return self._report(result, turn, cost)
 
@@ -2554,6 +2698,10 @@ class ClaudeCodeLine:
                     event = Event("text", "", len(block.text))
                 elif isinstance(block, ToolUseBlock):
                     turn.tool_uses.append(block.name)
+                    if block.name == VIEW_IMAGE_HOOK_MATCHER and view_only(
+                        self.config.builtin_tools
+                    ):
+                        turn.reads.add(block.id)
                     self._observe(ActivityKind.TOOL, block.name)
                     event = Event("tool_use", block.name)
                 elif isinstance(block, ThinkingBlock):
@@ -2568,7 +2716,32 @@ class ClaudeCodeLine:
             # takes, as ``dromon.priority`` describes.
             for block in message.content:
                 if isinstance(block, ToolResultBlock):
+                    await self._read_hooked(session, block.tool_use_id, turn)
                     await self._act(session, Event(TOOL_RESULT), turn)
+
+    async def _read_hooked(
+        self, session: AgentSession | KeptSession, tool_use_id: str, turn: _Turn
+    ) -> None:
+        """Refuse and interrupt a turn in which a view-only line's ``Read`` completed
+        without the ViewImage hook having run for it. **Review of a9995d8, item 1.**
+        The hook runs before the tool, so by the time its result arrives the hook has
+        been called. If it was not, the engine skipped it, as it would if hooks were
+        switched off, and the confinement did not apply to that call. The refusal
+        ends the turn and the scheduler holds a line whose turn is refused."""
+        if tool_use_id not in turn.reads:
+            return
+        turn.reads.discard(tool_use_id)
+        if tool_use_id in self._hooked:
+            self._hooked.discard(tool_use_id)
+            return
+        turn.breach = True
+        if turn.refusal is None:
+            turn.refusal = (
+                "a Read completed on a view-only line without the ViewImage hook"
+                " having run for it, so Dromon cannot show that the call was held to"
+                " an image"
+            )
+            await session.interrupt()
 
     async def _act(
         self, session: AgentSession | KeptSession, event: Event, turn: _Turn
@@ -3051,7 +3224,7 @@ class ClaudeCodeLine:
                     )
                 self._refuse_missing_sign_in(result.result, turn)
                 if turn.refusal is not None:
-                    raise EngineRefused(turn.refusal)
+                    raise _refusal_error(turn)
                 if turn.capabilities is None:
                     raise EngineRefused(
                         "the engine did not report its tools and credential before"
@@ -3348,7 +3521,7 @@ class ClaudeCodeLine:
                 inbox = asyncio.Queue()
                 connection.inbox = inbox
             if turn.refusal is not None:
-                raise EngineRefused(turn.refusal)
+                raise _refusal_error(turn)
             await connection.session.query(prompt)
             answered = False
             resends = 0
@@ -3404,14 +3577,14 @@ class ClaudeCodeLine:
             await self.close()
             self._notes.append(DIED_NOTE)
             if turn.refusal is not None:
-                raise EngineRefused(turn.refusal)
+                raise _refusal_error(turn)
             raise EngineRefused(
                 connection.ended_by or "the engine's process ended during the turn"
             )
         cost = self._measure(result)
         if turn.refusal is not None:
             await self.close()
-            raise EngineRefused(turn.refusal)
+            raise _refusal_error(turn)
         self._check_limit(result, turn)
         if turn.capabilities is not None:
             connection.capabilities = turn.capabilities

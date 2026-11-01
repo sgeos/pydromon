@@ -17,7 +17,7 @@ from typing import Final, cast
 
 from dromon.driver import ENGINE_OF, Driver, DriverError, Strategy
 from dromon.limits import DEFAULT_LIMITS, Limits
-from dromon.lineconfig import LineConfig
+from dromon.lineconfig import DEFAULT_CONTEXT_WARN_TOKENS, LineConfig
 from dromon.model import OperatorAddress
 from dromon.overrides import (
     SPECS,
@@ -267,6 +267,61 @@ def _driver_effort(model: str, strategy: str) -> str:
         return "unknown"
 
 
+COMPACTING_ENGINES: Final = ("claude-code", "codex")
+"""The engines whose lines can compact, as ``Scheduler._may_compact`` judges, repeated
+here because the view takes no scheduler. A test holds the two equal."""
+
+
+def sourced(key: str, summary: str, value: str, origin: str) -> dict[str, object]:
+    """An entry that is shown and changed only by configuration, with where its value
+    comes from, which ``info`` leaves empty."""
+    return {**info(key, summary, value), "source": origin}
+
+
+def _compaction_entries(facts: LineFacts) -> list[dict[str, object]]:
+    """``allow_compact`` and the thresholds it works with, each with its source.
+    **Round 14, item 1.** ``dromon settings`` showed none of them, so an operator could
+    not tell why a line had no ``compact_session``. A value the line's configuration
+    sets has the source ``line configuration``, and one it leaves unset is the
+    ``default``."""
+    config = facts.config
+    engine = ENGINE_OF.get(facts.model, "")
+    if not config.allow_compact:
+        allowed = "off, so the line has no compact_session and no automatic compaction"
+    elif engine in COMPACTING_ENGINES:
+        allowed = "on, so the line has compact_session and compacts at its warning"
+    else:
+        allowed = f"on, but {engine or 'its engine'} cannot compact"
+    automatic = config.auto_compact_tokens
+    return [
+        sourced(
+            "allow_compact",
+            "whether a Claude Code or Codex line has compact_session and compacts"
+            " automatically at its warning, changed only by configuration",
+            allowed,
+            CONFIGURED if config.allow_compact else DEFAULT,
+        ),
+        sourced(
+            "context_warn_tokens",
+            "the context size past which the line's prompt warns, changed only by"
+            " configuration",
+            str(config.context_warn_tokens),
+            CONFIGURED
+            if config.context_warn_tokens != DEFAULT_CONTEXT_WARN_TOKENS
+            else DEFAULT,
+        ),
+        sourced(
+            "auto_compact_tokens",
+            "an earlier context size at which a compactable line compacts, changed"
+            " only by configuration",
+            "none, so the warning is the threshold"
+            if automatic is None
+            else str(automatic),
+            DEFAULT if automatic is None else CONFIGURED,
+        ),
+    ]
+
+
 def line_entries(facts: LineFacts, project: Sequence[Layer]) -> list[dict[str, object]]:
     """A line's settings. ``project`` gives the sources of values the line takes from
     the project."""
@@ -320,6 +375,7 @@ def line_entries(facts: LineFacts, project: Sequence[Layer]) -> list[dict[str, o
             if facts.config.keep_session
             else "off",
         ),
+        *_compaction_entries(facts),
         info(
             "stop_policy",
             "whether stopping the engine ends what it started, changed only by"

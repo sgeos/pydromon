@@ -3,7 +3,7 @@
 > **Navigation**: [Protocol](./README.md) | [Documentation Root](../README.md)
 
 **Status.** Draft, written on 2026-10-25. Normative for Dromon's side. The Python module
-`dromon.codex` implements it against Codex 0.164.0. The app-server protocol is OpenAI's,
+`dromon.codex` implements it against Codex 0.164.0. **Fact, observed on 2026-11-01 with Codex 0.166.0.** That version refuses a configuration that defines a permissions profile without `default_permissions`, with "config defines `[permissions]` profiles but does not set `default_permissions`", so Dromon also passes `-c default_permissions="dromon-line"`. The app-server protocol is OpenAI's,
 documented as experimental, and Dromon also relies on its experimental dynamic tools.
 
 ## Purpose
@@ -173,8 +173,7 @@ observed live.
 Codex loads the operator's user configuration, which cannot be skipped by the
 app-server. Dromon starts it with these arguments.
 
-- `-c mcp_servers.NAME={enabled=false,command="/usr/bin/false",args=[]}` for every
-  server `codex mcp list --json` names.
+- `-c mcp_servers.NAME.enabled=false` for every server `codex mcp list --json` names.
   A name that is not a bare key is refused, because Codex rejects a quoted one.
 - `--disable` for `apps`, `browser_use`, `browser_use_external`, `computer_use`,
   `goals`, `hooks`, `image_generation`, `in_app_browser`, `memories`, `multi_agent`,
@@ -554,10 +553,19 @@ and field identified.
 This does not repair a failure inside Codex before its listing returns.
 
 
-**Fact.** Dromon supplies a complete disabled standard input and output transport
-for each named account server. An inert command and empty arguments provide the
-transport metadata even when the server has no local configuration. The enabled
-flag remains false and the post-start checks still require zero server tools.
+**Fact, observed by the operator on 2026-11-01 with Codex 0.166.0.** A round 14
+change supplied a complete disabled standard input and output transport,
+`{enabled=false,command="/usr/bin/false",args=[]}`, for each named server. Merged
+over a server the operator defines by `url`, it gave "url is not supported for stdio
+in `mcp_servers.slack`". Codex then used its defaults, refused the permission profile
+without `default_permissions`, and failed `account/read` with "failed to load
+workspace requirements: invalid data", so every Codex line failed. Dromon is back to
+the sparse `enabled=false` override, which a live `account/read` showed working with
+every server of the operator's listing. Dromon also passes `default_permissions` now,
+which is harmless with a valid configuration. A listed server absent from the local
+configuration, the case another project reported, is not handled, and its sparse
+override may give "invalid transport". The post-start checks still require zero
+server tools.
 
 **Fact.** The original reported account initialization failure was not reproduced
 here. The operator identified Codex but supplied no error text or missing field.
