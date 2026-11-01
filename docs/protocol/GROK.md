@@ -708,7 +708,8 @@ remaining unchanged. No live exchange independently verifies that report here.
 
 **Inference.** Passing current rules to `session/load` is insufficient evidence that
 they apply. Dromon stores the session identifier followed by `:rules-` and the full
-Secure Hash Algorithm 256 digest of the rendered instructions supplied at creation.
+Secure Hash Algorithm 256 digest of the rendered instructions and tool switches
+supplied at creation.
 It loads only when the current digest matches. A changed or absent digest creates a
 new session and explains the replacement in the first prompt. The mailbox, standing
 brief and files remain. Legacy sessions are replaced once because their rules cannot
@@ -727,24 +728,53 @@ necessary because paths and registered peers can change after preflight.
 
 ## Tool advertisement filtering
 
-**Fact.** The bundled guide `14-headless-mode.md` documents `--tools` and
-`--disallowed-tools` for terminal and headless invocations. It describes differences
-between shell and daemon routes, including entries that remove nothing and issue a
-warning. The agent options table in `15-agent-mode.md` does not document either flag
-for `agent stdio`, which is the transport Dromon uses.
+**Fact.** The following bundled Grok Build 1.0.70 guides were checked on 2026-11-01.
 
-**Inference.** These guides do not establish a supported way to filter the built-in
-tools advertised on Dromon's transport. Dromon does not pass an unverified filtering
-flag. This finding does not establish that Grok has no filtering capability.
+- `05-configuration.md` documents `GROK_CONFIG` for `agent stdio`, with a limited
+  overlay allowlist, and the direct `GROK_SUBAGENTS` and `GROK_WEB_FETCH` switches.
+- `16-subagents.md` explicitly says the subagent disable controls apply to
+  interactive, headless and `grok agent stdio` invocations. It documents
+  `GROK_SUBAGENTS=0` and `[subagents] enabled=false`.
+- `26-config-reference.md` documents `subagents.enabled` as the task tool master
+  switch and `features.web_fetch` with its `GROK_WEB_FETCH` equivalent.
+- `14-headless-mode.md` documents `--tools` and `--disallowed-tools` for terminal
+  and headless use, including the model name `spawn_subagent` for the task tool.
+- `15-agent-mode.md` does not list general tool filtering flags. Its agent profile
+  option does not load the file on the daemon route. The `tools` frontmatter example
+  in `16-subagents.md` describes custom agents and does not establish that this
+  option can filter the default main agent on Dromon's transport.
+- `18-sandbox.md` describes file and process restrictions rather than an advertised
+  tool allowlist. The reference and the guides contain no established `todo_write`
+  disable switch for `agent stdio`.
 
-**Fact.** Dromon rejects unavailable calls through its permission policy. It continues
-after a rejected call only when the subsequent report explicitly asserts Boolean
-`toolNotRun=true`. Otherwise it cancels the turn because non-execution is uncertain.
-This policy does not remove a tool from the model's advertised tools.
+**Fact.** Read-only inspection of Dromon's Grok home found only asking mode and
+compatibility settings in `config.toml`. The `dromon-reader` and `dromon-writer`
+sandbox profiles contain `extends`, `deny` and `read_only`. Policy and folder-trust
+files are present. Dromon's existing validation requires them to be empty and refuses
+custom agents, hooks and discovery entries. No credential file was read.
 
-**Unverified.** Filtering on `agent stdio` still requires transport-specific vendor
-documentation or an independent exchange showing that unavailable tools disappear
-from the advertised set. No live Grok turn was run for this investigation.
+**Fact.** Dromon now sets `GROK_SUBAGENTS=0` in every Grok process because it does
+not support granting `Agent` on this engine. It sets `GROK_WEB_FETCH=0` when the
+line lacks `WebFetch`, and `1` when granted. These documented process switches are
+selected from the line configuration and replace inherited values. They require no
+shared home edits and cannot change another line's process environment.
+
+**Fact.** The persisted rules digest now includes these tool switches. Old digests
+are replaced once. A change in `WebFetch` starts a fresh session so a loaded session
+cannot retain its earlier creation switches. Tests cover inherited value replacement,
+per-line web fetch grants, changed-switch replacement and matching-digest reuse.
+
+**Fact.** Dromon individually rejects permission requests for unavailable
+`todo_write`, `spawn_subagent` and `web_fetch`. Parameterized exchanges verify that
+the turn can continue to an allowed call when each later update explicitly reports
+Boolean `toolNotRun=true`. A missing report cancels the turn because non-execution
+is uncertain. Permission denial alone does not prove that a tool had no effects.
+
+**Unverified.** No live tool-definition snapshot verifies removal of `spawn_subagent`
+or `web_fetch` on Grok 1.0.70 here. That is the next operator verification. No
+supported advertisement control was established for `todo_write`. A transport-specific
+filter or an independently verified custom main-agent configuration is still needed
+to remove that tool from the advertised set. The current individual denial remains.
 
 
 ## Model selection after loading a session

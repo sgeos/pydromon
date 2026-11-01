@@ -299,6 +299,8 @@ DROMON_CONTROLLED: Final = (
     "GROK_SANDBOX",
     "GROK_CONFIG",
     "GROK_CONFIG_PATH",
+    "GROK_SUBAGENTS",
+    "GROK_WEB_FETCH",
     *HOME_VARIABLES,
 )
 """Variables Dromon sets or clears itself. An inherited ``GROK_HOME`` or ``HOME`` is
@@ -899,6 +901,29 @@ def engine_environment(
 # The sandbox profile.
 
 
+def tool_environment(config: LineConfig) -> dict[str, str]:
+    """Documented launch switches, selected by this line rather than inherited.
+
+    The bundled subagent guide explicitly includes agent stdio. The configuration
+    reference documents web_fetch as a feature switch. Agent is unsupported here.
+    """
+    return {
+        "GROK_SUBAGENTS": "0",
+        "GROK_WEB_FETCH": "1" if "WebFetch" in config.builtin_tools else "0",
+    }
+
+
+def session_digest(config: LineConfig, instructions: str) -> str:
+    """Bind a resumed session to its creation rules and advertised tool switches."""
+    settings = {
+        "instructions": instructions,
+        "tool_environment": tool_environment(config),
+    }
+    return hashlib.sha256(
+        json.dumps(settings, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 def profile_name(config: LineConfig) -> str:
     return (
         WRITER_PROFILE
@@ -1331,6 +1356,7 @@ class GrokLine:
         if claude_mode is not None:
             raise EngineRefused(claude_mode)
         check_user_home(user_home)
+        environment.update(tool_environment(self.config))
         environment["GROK_HOME"] = str(grok_home)
         environment["HOME"] = str(user_home)
         environment["GROK_SANDBOX"] = check_profile(
@@ -1961,7 +1987,7 @@ class GrokLine:
     async def _open_session(self, turn: _Turn) -> str:
         meta: dict[str, object] = {"yoloMode": False, "autoMode": False}
         instructions = read_instructions(self.config.instructions, self.cwd)
-        self._rules_digest = hashlib.sha256(instructions.encode("utf-8")).hexdigest()
+        self._rules_digest = session_digest(self.config, instructions)
         resumable: str | None = None
         if self.session_id is not None:
             candidate, separator, digest = self.session_id.rpartition(":rules-")
@@ -2100,8 +2126,9 @@ class GrokLine:
     async def _prompt(self, session_id: str, prompt: str, turn: _Turn) -> str:
         if self._rules_replaced:
             prompt = (
-                "Dromon replaced your Grok session because its stored rules differ"
-                " from the current instructions, or their digest was unavailable."
+                "Dromon replaced your Grok session because its stored rules or tool"
+                " switches differ from the current configuration, or their digest"
+                " was unavailable."
                 " Your mailbox, brief and files are retained. Earlier session"
                 " context is unavailable.\n\n" + prompt
             )

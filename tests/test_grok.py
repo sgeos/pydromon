@@ -5,7 +5,6 @@ script follows Grok Build 1.0.70's documentation and its ``initialize`` answer.
 """
 
 import asyncio
-import hashlib
 import dataclasses
 import json
 import os
@@ -1324,10 +1323,12 @@ def test_a_plain_turn_reports_text_credential_and_session(
     assert (report.subtype, report.text, report.session_id) == (
         "success",
         "hello there",
-        "s1:rules-" + hashlib.sha256(b"").hexdigest(),
+        "s1:rules-" + grok_module.session_digest(LineConfig(), ""),
     )
     assert report.credential is Credential.SUBSCRIPTION
-    assert target.session_id == "s1:rules-" + hashlib.sha256(b"").hexdigest()
+    assert target.session_id == "s1:rules-" + grok_module.session_digest(
+        LineConfig(), ""
+    )
     assert "DAEMON_ONLY_SENTINEL" not in server.environment
     assert server.environment["GROK_SANDBOX"] == READER_PROFILE
     init = server.params("initialize")
@@ -1508,7 +1509,13 @@ def test_the_session_carries_dromons_tools_instructions_and_ask_mode(
 
 def test_the_next_turn_loads_the_session(project: tuple[Path, Path, Path]) -> None:
     server = FakeGrok()
-    run(line(server, project, session_id="s1:rules-" + hashlib.sha256(b"").hexdigest()))
+    run(
+        line(
+            server,
+            project,
+            session_id="s1:rules-" + grok_module.session_digest(LineConfig(), ""),
+        )
+    )
     assert server.params("session/load")["sessionId"] == "s1"
     assert "session/new" not in server.methods()
 
@@ -1541,7 +1548,7 @@ def test_an_engine_that_cannot_be_confirmed_is_refused_before_the_prompt(
 
 @pytest.mark.parametrize(
     "session_id",
-    [None, "s1:rules-" + hashlib.sha256(b"").hexdigest()],
+    [None, "s1:rules-" + grok_module.session_digest(LineConfig(), "")],
     ids=["new", "resumed"],
 )
 def test_another_reported_model_is_pinned_to_the_driver_model(
@@ -3497,7 +3504,9 @@ def test_unknown_or_changed_rules_replace_a_grok_session(
     assert "session/load" not in server.methods()
     assert "session/new" in server.methods()
     assert "Dromon replaced your Grok session" in str(server.params("session/prompt"))
-    assert report.session_id == "s1:rules-" + hashlib.sha256(b"").hexdigest()
+    assert report.session_id == "s1:rules-" + grok_module.session_digest(
+        LineConfig(), ""
+    )
 
 
 def test_grok_changed_rules_file_starts_a_new_session(
@@ -3525,7 +3534,9 @@ def test_requested_model_must_be_listed(
     option["options"] = options
     server.extra["configOptions"] = [option]
     target = line(
-        server, project, session_id="s1:rules-" + hashlib.sha256(b"").hexdigest()
+        server,
+        project,
+        session_id="s1:rules-" + grok_module.session_digest(LineConfig(), ""),
     )
     with pytest.raises(
         EngineRefused, match="does not list requested model.*listed values"
@@ -3569,3 +3580,67 @@ def test_initialize_records_supported_protocol_version(
             run(target)
         assert "session/new" not in server.methods()
     assert target.protocol_version == version
+
+
+@pytest.mark.parametrize("fetch", [False, True])
+def test_launch_controls_advertised_tools_per_line(
+    project: tuple[Path, Path, Path], fetch: bool
+) -> None:
+    server = FakeGrok()
+    config = LineConfig(builtin_tools=("WebFetch",) if fetch else ())
+    inherited = {"GROK_SUBAGENTS": "1", "GROK_WEB_FETCH": "1" if not fetch else "0"}
+    run(line(server, project, config=config, environment=inherited))
+    assert server.environment["GROK_SUBAGENTS"] == "0"
+    assert server.environment["GROK_WEB_FETCH"] == ("1" if fetch else "0")
+
+
+def test_advertised_tool_change_replaces_resumed_session(
+    project: tuple[Path, Path, Path],
+) -> None:
+    old_config = LineConfig(builtin_tools=("WebFetch",))
+    stored = run(line(FakeGrok(), project, config=old_config)).session_id
+    server = FakeGrok()
+    run(line(server, project, session_id=stored))
+    assert "session/new" in server.methods()
+    assert "session/load" not in server.methods()
+    assert server.environment["GROK_WEB_FETCH"] == "0"
+
+
+@pytest.mark.parametrize("name", ["todo_write", "spawn_subagent", "web_fetch"])
+@pytest.mark.parametrize("not_run", [True, False])
+def test_unavailable_advertised_tool_is_denied_individually(
+    project: tuple[Path, Path, Path], name: str, not_run: bool
+) -> None:
+    blocked = grok_permission(_meta=grok_meta(name))
+    server = FakeGrok(
+        [
+            blocked,
+            call_update(
+                "t", status="failed", _meta={"toolNotRun": True} if not_run else {}
+            ),
+            permission(
+                "other", "dromon__send_message", ident="good", request_id="allow"
+            ),
+            chunk("continued"),
+        ]
+    )
+    if not_run:
+        report = run(line(server, project))
+        assert report.text == "continued"
+        assert report.tool_uses == ("dromon__send_message",)
+        assert "session/cancel" not in server.methods()
+    else:
+        with pytest.raises(
+            EngineRefused, match="did not confirm that a rejected tool call did not run"
+        ):
+            run(line(server, project))
+        assert "session/cancel" in server.methods()
+    rejected = next(
+        answer for answer in server.answers() if answer["id"] == blocked["id"]
+    )
+    expected = next(
+        option["optionId"]
+        for option in blocked["params"]["options"]
+        if option["kind"] == "reject_once"
+    )
+    assert rejected["result"]["outcome"]["optionId"] == expected
