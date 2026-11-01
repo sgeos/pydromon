@@ -342,6 +342,19 @@ since a turn running with access it no longer has is the more urgent to end.
   owner's turn cannot be in this position for a change the harness makes, since a
   handoff takes effect when the owner's turn ends and a take or a give is refused
   while the owner's turn is in flight.
+- **Residual, longer than one call. Round 14 review, O1, recorded at the operator's
+  request.** **Inference, from `dromon.priority`.** A safe point is reached only once
+  every tool use of the turn has its result. Parallel tool calls, and the calls of a
+  subagent inside a task, therefore keep the access the turn was built with until the
+  last of them returns, which may be far longer than one call. A long command run in
+  such a turn keeps that access for its whole length. A background task started in
+  the turn keeps the sandbox it was started with after the turn ends, as before round
+  14. Two writers are still not at work together, since the new owner's first turn
+  waits for the former writer's turn to end. Not shown by a run, since it needs a
+  live engine.
+- **Tested, from the round 14 review, G1.** A turn that ends before it reaches a safe
+  point clears its reason at its end, in both the ordinary and the self-started path,
+  so the next turn, already built with the new access, is not ended for it.
 
 **An engine that cannot confine a seat.** **Inference.** Not every adapter can make one
 directory read only. A seat on such an engine is not woken while another seat owns the

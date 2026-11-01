@@ -7,6 +7,7 @@ a line lists its unanswered mail with how long each has waited and closes one wi
 recorded reason. ``@operator`` names the project's default operator."""
 
 import asyncio
+from dataclasses import replace
 from collections.abc import Generator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -35,6 +36,7 @@ from dromon.model import (
     InvalidField,
     LineAddress,
     LineCreated,
+    Message,
     MessageAcknowledged,
     MessageDelivered,
     MessageKind,
@@ -185,8 +187,81 @@ def test_a_correction_asks_what_the_note_it_corrects_asked(world: World) -> None
     told = world.deliver(
         world.scheduler.send(ANA, ALPHA, "no reply needed", asking, asks_reply=False)
     )
-    assert world.unanswered() == 0
-    assert world.log.state.messages[told].asks_reply is False
+    # Round 14 review, M1. A correction never lowers the ask it stands in for.
+    assert world.unanswered() == 1
+    assert world.log.state.messages[told].asks_reply is True
+
+
+def test_a_correction_may_raise_an_ask(world: World) -> None:
+    quiet = world.deliver(
+        world.scheduler.send(ANA, ALPHA, "for the record", asks_reply=False)
+    )
+    raised = world.deliver(
+        world.scheduler.send(ANA, ALPHA, "now answer this", quiet, asks_reply=True)
+    )
+    assert world.unanswered() == 1
+    page, _ = listing(world.log.state, ALPHA, unanswered_only=True)
+    assert [message_id for message_id, _ in page] == [raised]
+
+
+# Round 14 review, M1. A line cannot hide its own ask from an operator.
+
+
+def test_a_lines_note_to_an_operator_asks_whatever_it_says(world: World) -> None:
+    world.deliver(world.scheduler.send(ALPHA, ANA, "ship or hold?", asks_reply=False))
+    assert world.unanswered(ANA) == 1
+    report = world.deliver(world.scheduler.send(BETA, ANA, "done"))
+    world.deliver(world.scheduler.send(ANA, BETA, "thanks", report))
+    world.deliver(
+        world.scheduler.send(BETA, ANA, "also done", report, asks_reply=False)
+    )
+    # A reply from the operator closes the report, and beta's correction of its
+    # report keeps the report's ask whatever it says.
+    assert world.unanswered(ANA) == 2
+
+
+def test_a_correction_to_an_operator_cannot_lower_the_ask(world: World) -> None:
+    ask = world.deliver(
+        world.scheduler.send(ALPHA, ANA, "ship or hold?", asks_reply=True)
+    )
+    assert world.unanswered(ANA) == 1
+    fixed = world.deliver(
+        world.scheduler.send(ALPHA, ANA, "never mind", ask, asks_reply=False)
+    )
+    state = world.log.state
+    assert state.messages[ask].corrected_by == fixed
+    assert world.unanswered(ANA) == 1
+    page, _ = listing(state, ANA, unanswered_only=True)
+    assert [message_id for message_id, _ in page] == [fixed]
+
+
+def test_a_reply_to_an_operator_still_asks_nothing_by_default(world: World) -> None:
+    task = world.deliver(world.scheduler.send(ANA, ALPHA, "do the task"))
+    world.deliver(world.scheduler.send(ALPHA, ANA, "done", task, asks_reply=False))
+    world.deliver(world.scheduler.send(ALPHA, ANA, "done too", task))
+    assert world.unanswered(ANA) == 0
+
+
+@pytest.mark.parametrize(
+    ("recipient", "given", "reply_to", "asks"),
+    [
+        (ALPHA, False, None, False),
+        (ALPHA, None, None, True),
+        (ALPHA, None, "m-0", False),
+        (ANA, False, None, True),
+        (ANA, False, "m-0", False),
+        (ANA, True, "m-0", True),
+        (ANA, None, None, True),
+    ],
+)
+def test_the_rule_honours_false_only_for_a_line(
+    recipient: LineAddress | OperatorAddress,
+    given: bool | None,
+    reply_to: str | None,
+    asks: bool,
+) -> None:
+    message = Message(BETA, recipient, MessageKind.NOTE, "x", (), reply_to)
+    assert asks_reply(replace(message, asks_reply=given)) is asks
 
 
 def test_a_line_may_correct_its_own_note(world: World) -> None:
@@ -290,8 +365,13 @@ def test_the_send_tool_checks_asks_reply(world: World) -> None:
         {"to": "@ana", "body": "x", "asks_reply": False, "issue": True},
     )
     assert "takes no asks_reply" in text
-    world.call("send_message", {"to": "@ana", "body": "fyi", "asks_reply": False})
-    assert world.unanswered(ANA) == 0
+    world.deliver(
+        world.call(
+            "send_message", {"to": "@ana", "body": "fyi", "asks_reply": False}
+        ).removeprefix("sent as ")
+    )
+    # Round 14 review, M1. To an operator, false is not honoured.
+    assert world.unanswered(ANA) == 1
 
 
 # Listing and closing.

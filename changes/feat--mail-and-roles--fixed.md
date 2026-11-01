@@ -17,3 +17,12 @@ Type: Fixed
 - `line_status` names the brief's stamp `workdir_commit_when_set` and
   `daemon_commit_when_set`, so a commit the brief was set under is not read as the
   running daemon's.
+- A line can no longer hide its own ask from an operator. `asks_reply` false is
+  honoured only for a note to a line, and a correction never asks less than the note
+  it corrects.
+- `list_leases` names a lease's note `holder_note_unverified`, and its caveat says the
+  note is the holder's unchecked claim.
+- Rollback floor. Once a log holds `message_sent.asks_reply`, a correction,
+  `message_acknowledged.reason`, `line_turn_ended.failed`, which every failed turn
+  writes, or `lease_acquired.note`, no daemon older than commit `4330502` can open it.
+  `EVENT_LOG.md` gives the floor of each.

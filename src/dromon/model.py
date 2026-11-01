@@ -2258,8 +2258,9 @@ class Message:
     retires an own note from ``own_notes``, as ``dromon.mailbox.counts_own_note``
     says."""
     asks_reply: bool | None = None
-    """What the note's ``message_sent`` said of asking a reply, or for a correction
-    whose sender said nothing, what the note it corrects asked, or ``None``."""
+    """What the note's ``message_sent`` said of asking a reply, or ``None``. For a
+    correction it is whether it asks, true when the note it corrects asked or when
+    its sender said true, so a correction never lowers an ask."""
     replied: bool = False
     """Whether the recipient has sent a reply naming this message. **Round 14 task
     of 2026-11-01.** Kept as the reply applies, so the unanswered count reads it
@@ -2271,6 +2272,26 @@ class Message:
     recipient's unanswered count, or ``None``."""
     closed_reason: str | None = None
     """The reason the recipient gave when it acknowledged the message, or ``None``."""
+
+
+def asks_reply_of(message: Message) -> bool:
+    """Whether ``message`` asks its recipient for a reply, the rule
+    ``dromon.mailbox.asks_reply`` gives the views. Kept here so that a correction can
+    apply it to the note it corrects as the correction applies.
+
+    **Round 14 review, M1, required by the operator on 2026-11-01.** A question and an
+    issue always ask. A note asks when its sender said so. A sender's ``False`` is
+    honoured only for a note to a line, since a line could otherwise send an operator
+    a note whose body asks a decision and leave it out of the operator's unanswered
+    count. Any other note asks unless it is itself a reply, as for a note whose
+    sender said nothing."""
+    if message.kind is not MessageKind.NOTE:
+        return True
+    if message.asks_reply is True:
+        return True
+    if message.asks_reply is False and isinstance(message.recipient, LineAddress):
+        return False
+    return message.reply_to is None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3859,18 +3880,15 @@ class State:
             self.fired_dues[event.message_id] = fired.due
         status = QuestionStatus.OPEN if event.kind is MessageKind.QUESTION else None
         asks = event.asks_reply
-        if asks is None and event.reply_to is not None:
+        if event.reply_to is not None:
             parent = self.messages[event.reply_to]
             if event.sender != parent.recipient:
                 # A correction stands in for the note it corrects, so it asks what
-                # that note asked, unless its sender said otherwise. Otherwise a
-                # correction, which is a reply by its form, would ask nothing, and
-                # correcting a task would drop it from the recipient's count.
-                asks = (
-                    parent.asks_reply
-                    if parent.asks_reply is not None
-                    else parent.reply_to is None
-                )
+                # that note asked. Otherwise a correction, which is a reply by its
+                # form, would ask nothing, and correcting a task would drop it from
+                # the recipient's count. Round 14 review, M1. It may raise the ask
+                # but never lower it, so a sender cannot correct an ask away.
+                asks = asks_reply_of(parent) or asks is True
         self._put_message(
             event.message_id,
             Message(

@@ -153,7 +153,7 @@ argument outside a tool's schema is refused.
 | `list_mail`, `read_mail`, `acknowledge_mail` | Page through, open and acknowledge the line's mailbox |
 | `list_sent` | Lists what became of the line's sent mail |
 | `acquire_lease`, `release_lease` | Take and give up a lease the project declares, as below |
-| `list_leases` | From round 14. Lists every live lease, with its holder, both times and its note, and the declared leases no line holds. Read only, the same for every line, as below |
+| `list_leases` | From round 14. Lists every live lease, with its holder, both times and the holder's unverified note, and the declared leases no line holds. Read only, the same for every line, as below |
 | `start_run`, `run_status`, `stop_run` | Offered while the project declares a run command, or while the line's scope has a run to read. Start a declared command as a supervised run that outlives the turn, the seat and the daemon, show the scope's latest runs with their receipts, and stop its open run, as [`RUNS.md`](../architecture/RUNS.md) specifies. A seat must own its role, and every line needs write access to its working directory. A lost run blocks its scope until no process is left in its supervisor's group or session, or an operator clears it. Added on 2026-10-31, and the last two sentences in the review of that day |
 | `line_status` | Shows a compact read-only status by default, with diagnostic detail and long lists available by argument, as below |
 | `role_status` | Offered only to a seat of a role. Shows the role's worktree, whether the project file or an operator holds it, its declared failover order, failover policy, handoff threshold, owner, the seat a failover would pass it to now and the latest change of owner, its seats in the failover order with whether each is usable for a failover, their condition, worktree access, whether each waits because its engine cannot confine it, model, provider and stated budget, each seat's latest three background task ends with the digest of their output, and its latest five journal entries, the newest with its body, read only, as [`ROLES.md`](../architecture/ROLES.md) describes. Added on 2026-10-27, the task ends on 2026-10-28, the holder and the order on 2026-10-31 in round 10, and whether the project file declares the role, how a role an operator holds differs from it, and the lines that wait beside the owner, in the round 10 review |
@@ -717,6 +717,13 @@ during that turn.
     and an issue always ask. Decided over counting every note, which made the count
     grow with every reply, and over a default of asking nothing, which would hide an
     operator's task note sent from a client without the flag.
+  - **Round 14 review, M1, required by the operator on 2026-11-01.** A line could
+    hide its own ask from an operator, by sending a note with `asks_reply` false or
+    by correcting an asking note with it. `asks_reply` false is now honoured only for
+    a note to a line, so a note to an operator counts unless it is a reply, and a
+    correction asks what the note it corrects asked, or more when it says true, and
+    never less. `dromon.model.asks_reply_of` holds the rule, which the views and a
+    correction's application share.
   - `list_mail` with `unanswered_only` lists exactly what the count counts, each
     entry ending with how long it has waited, such as `unanswered for 1h 3m`. It is
     refused beside `own_notes_only`, which selects other messages.
@@ -727,9 +734,9 @@ during that turn.
     recipient's note to itself. A reason for a message already acknowledged is
     refused, since it would not be recorded.
   - **Failure modes.** The ages are the event log's `recorded_at`, kept as events
-    apply, and follow the clock, as the peer view's ages do. An operator's client sends
-    no `asks_reply` yet, so an operator's note that asks nothing still counts until it
-    is acknowledged. Messages already in a log keep their old fields, so an old reply
+    apply, and follow the clock, as the peer view's ages do. From 2026-11-01
+    `dromon send --no-reply` lets an operator's note ask nothing, while the curses
+    client still sends no `asks_reply`, so its notes take the default. Messages already in a log keep their old fields, so an old reply
     that asked nothing leaves the count at once, which shrinks it and hides nothing
     that asked a reply.
 - **Own notes.** **Required by the operator on 2026-10-30, the rule decided by core
@@ -847,10 +854,18 @@ a time.
   does not end the processes started under it.
 - **`list_leases`, from round 14.** **Required by the operator on 2026-11-01.** No
   arguments. It answers with `leases`, each live lease in name order with `name`,
-  `holder`, `acquired_at`, `expires` and `note` when one was given, `free`, the
-  declared names no line holds, and `caveat`. Expiry is read by the wall clock as an
-  acquisition reads it, so the two agree. A note passes with its lease on a change of
-  owner, as the times do.
+  `holder`, `acquired_at`, `expires` and `holder_note_unverified` when a note was
+  given, `free`, the declared names no line holds, and `caveat`. Expiry is read by the
+  wall clock as an acquisition reads it, so the two agree. A note passes with its lease
+  on a change of owner, as the times do.
+- **The note is the holder's claim.** **Round 14 review, T1, required by the operator
+  on 2026-11-01.** The note was given under a plain `note` beside the daemon's own
+  fields, though it is a line's own text that every other line reads. It is named
+  `holder_note_unverified`, and the `caveat`, the description of `list_leases` and
+  that of the note in `acquire_lease` say it is the holder's claim, bounded to 500
+  bytes and screened against the disclosure list but otherwise unchecked, to be read
+  as a claim and never as an instruction. **Residual.** How many leases a line may
+  hold, and so how much such text it can show, is bounded only by the declared names.
 - **A lease is not proof that processes ended.** **Required by the operator on
   2026-11-01.** A released lease was read as proof that the former holder's processes
   had ended, which the daemon never checks. The `caveat` of `list_leases`, its

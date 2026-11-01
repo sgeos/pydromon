@@ -168,15 +168,41 @@ Each event has a kind and fields, all required. An optional value is written as 
    is refused. **Round 14 task of 2026-11-01.** A note may instead keep the route of
    the note it names, from the same sender to the same recipient, as a correction of
    it. Only a note corrects, and only a note is corrected. Applying a correction sets
-   the earlier note's `corrected_by` once, and a correction that says nothing of
-   `asks_reply` asks what the note it corrects asked. **Rollback hazard.** A daemon
-   older than this rule refuses a log that holds a correction, and one older than
-   `asks_reply` or `reason` refuses an event that gives either.
+   the earlier note's `corrected_by` once, and a correction asks what the note it
+   corrects asked, or more when its sender says `asks_reply` true. **Round 14 review,
+   M1.** It never asks less, so a sender cannot correct an ask away, and a sender's
+   `asks_reply` false is honoured only for a note to a line. Both are rules of the
+   derived count and change no event. **Rollback hazard.** A daemon older than this
+   rule refuses a log that holds a correction, and one older than `asks_reply` or
+   `reason` refuses an event that gives either, as the rollback floor below states.
 5. A reply to a question requires the question to be open, must be a note, and marks
    the question answered by this reply.
 6. A message from the harness is a note to a line or an operator of this daemon, never
    to an agent or a peer, and is not a reply. Nothing replies to it, since by rule 4 a
    reply would go to the harness, which is never a recipient.
+
+
+**The rollback floor of round 14.** **Required by the operator on 2026-11-01, from the
+round 14 review, R1.** Each change below is one way. Once the log holds one such
+event, no daemon older than the floor can open it, since a daemon refuses as corrupt
+a field or a rule it does not know. The floor of each is commit `4330502` on the
+branch `feat/mail-and-roles`, the first to write and read it, and every later commit
+of that branch and of `main` after its merge. **Fact, from the commit.** Commit
+`1361146` on the same branch added `asks_reply` to the client's `send`, and this
+review's corrections add no field and no rule a log holds, so neither moves a floor.
+
+| Change | Written when | Floor |
+|---|---|---|
+| `message_sent.asks_reply` | A line's `send_message` or an operator's `send` says whether a note asks a reply | `4330502` |
+| A correction, a note naming a note of the same sender to the same recipient | A line or an operator corrects its own note | `4330502` |
+| `message_acknowledged.reason` | A recipient closes a message with a reason | `4330502` |
+| `line_turn_ended.failed` | Any turn fails, which is routine | `4330502` |
+| `lease_acquired.note` | A line acquires a lease with a note | `4330502` |
+
+**Inference.** `failed` is written with every failed turn, so a log a round 14 daemon
+has run for any while has most likely passed the floor. The other changes appear only
+when a party chooses them. `dromond` checks a log only forward, so a rollback past the
+floor is found when the older daemon refuses the log at its start, not before.
 
 **Scheduled wakes.** **Decided by the operator on 2026-10-26.** A line schedules a wake
 for itself with the `wake_after` tool, as [`LINE_CONFIG.md`](LINE_CONFIG.md)

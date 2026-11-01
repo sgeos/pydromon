@@ -26,6 +26,7 @@ from dromon.model import (
     MessageKind,
     RemoteAddress,
     State,
+    asks_reply_of,
 )
 
 MAX_PAGE: Final = 50
@@ -147,12 +148,10 @@ def asks_reply(message: Message) -> bool:
     and an answer asks nothing by default. Decided over counting every note, which
     made the count grow with every report and every operator's reply, and over a
     default of asking nothing, which would hide an operator's task note that a
-    client sent without the flag."""
-    if message.kind is not MessageKind.NOTE:
-        return True
-    if message.asks_reply is not None:
-        return message.asks_reply
-    return message.reply_to is None
+    client sent without the flag. **Round 14 review, M1.** A sender's ``False`` is
+    honoured only for a note to a line, and a correction never lowers the ask of
+    the note it corrects, as ``dromon.model.asks_reply_of`` gives the rule."""
+    return asks_reply_of(message)
 
 
 def counts_unanswered(state: State, message: Message) -> bool:
