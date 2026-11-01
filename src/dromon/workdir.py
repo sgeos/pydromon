@@ -172,12 +172,23 @@ def git_write_guards(directory: Path) -> tuple[Path, ...]:
     These are the common git directory's ``hooks`` and ``config``, and the worktree's
     own ``config.worktree``. For a linked worktree, whose ``.git`` is a file, they also
     include that file and the worktree's ``commondir``. Raises ``SandboxError`` for a
-    pointer file that cannot be followed."""
+    pointer file that cannot be followed.
+
+    **Round 14, review of 1449c5c, C1.** They also include ``refs/remotes`` and
+    ``packed-refs``, where the files backend keeps the remote-tracking refs, so that
+    only the operator's fetch moves the refs a commit run may name. A line then
+    cannot pack or delete refs, which only the operator's sessions do."""
     found = _git_dirs(directory)
     if found is None:
         return ()
     gitdir, common, dot, linked = found
-    guards = {common / "hooks", common / "config", gitdir / "config.worktree"}
+    guards = {
+        common / "hooks",
+        common / "config",
+        common / "refs" / "remotes",
+        common / "packed-refs",
+        gitdir / "config.worktree",
+    }
     if linked:
         guards |= {dot, gitdir / "commondir"}
     return tuple(sorted(guards))

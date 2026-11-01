@@ -1326,6 +1326,35 @@ def test_the_summary_names_the_counts_and_each_skip_reason() -> None:
     )
 
 
+def test_only_the_last_summary_block_is_read() -> None:
+    """Audit of round 14. A green final line printed after pytest's own block is
+    not taken, and a mark with no final line after it gives no summary."""
+    failing = (
+        b"short test summary info\nFAILED tests/t.py::x - boom\n"
+        b"1 failed, 9 passed in 2.0s\n"
+    )
+    assert (
+        runs.gate_summary(failing + b"5000 passed in 1.00s\n") == "1 failed, 9 passed"
+    )
+    assert runs.gate_summary(failing + b"short test summary info\n") is None
+    # Without a mark the last final line is taken, with no reasons.
+    assert runs.gate_summary(b"SKIPPED [1] a.py:1: why\n3 passed in 1s\n") == (
+        "3 passed"
+    )
+
+
+def test_a_skip_reason_is_cut_after_its_place() -> None:
+    reason = "r" * (runs.MAX_REASON_CHARS + 20)
+    tail = (
+        f"short test summary info\nSKIPPED [1] a.py:7: {reason}\n"
+        "1 passed, 1 skipped in 1s\n"
+    )
+    summary = runs.gate_summary(tail.encode())
+    assert summary == (
+        f"1 passed, 1 skipped, skipped [1] a.py:7: {'r' * runs.MAX_REASON_CHARS}..."
+    )
+
+
 def test_the_summary_reads_the_last_final_line_with_or_without_its_rule() -> None:
     ruled = b"===== 3 failed, 1 passed in 0.5s =====\n"
     assert runs.gate_summary(ruled) == "3 failed, 1 passed"
@@ -1339,7 +1368,7 @@ def test_the_summary_reads_the_last_final_line_with_or_without_its_rule() -> Non
 
 def test_the_summary_is_bounded_and_printable() -> None:
     count = runs.MAX_SKIP_REASONS + 3
-    reasons = b"".join(
+    reasons = b"short test summary info\n" + b"".join(
         b"SKIPPED [1] tests/t.py:%d: reason\x1b\x07 " % n + b"x" * 400 + b"\n"
         for n in range(count)
     )
@@ -1349,14 +1378,15 @@ def test_the_summary_is_bounded_and_printable() -> None:
     assert summary.count("[1] tests/t.py:") == runs.MAX_SKIP_REASONS
     assert "\x1b" not in summary and "\x07" not in summary
     longest = max(len(part) for part in summary.split("; "))
-    assert longest <= runs.MAX_SUMMARY_LINE + len("1 passed, 11 skipped, skipped ")
+    assert longest <= runs.MAX_REASON_CHARS + len("1 passed, 11 skipped, skipped ") + 30
 
 
-def test_a_note_with_a_summary_fits_the_event() -> None:
+def test_a_note_with_a_summary_fits_the_event_and_is_labelled_unverified() -> None:
     assert runs.note_with_summary("as it was", None) == "as it was"
     assert runs.note_with_summary("", "1 passed") == (
-        "The output's test summary says 1 passed"
+        f'{runs.SUMMARY_LABEL} "1 passed"'
     )
+    assert runs.SUMMARY_LABEL.startswith("Unverified")
     long = runs.note_with_summary("é" * MAX_RUN_NOTE_BYTES, "1 passed")
     assert len(long.encode()) <= MAX_RUN_NOTE_BYTES
     RunEnded("r-1", RunStatus.EXITED, 0, None, None, long, LATER)
@@ -1389,6 +1419,19 @@ def test_a_receipt_carries_the_outputs_summary_into_the_finding(
     (finding,) = runs.reconcile([run], tmp_path, lambda pid: None)
     assert finding.output_digest == digest
     assert finding.summary == runs.gate_summary(QUIET_GATE)
+
+
+def test_a_lost_run_shows_no_summary_however_green_its_output(
+    tmp_path: Path,
+) -> None:
+    """Audit of round 14. A lost run has no exit code, so a green summary in its
+    output, which the line could have printed, is never shown as its result."""
+    run = run_in(tmp_path)
+    digest = write_output(tmp_path, run, QUIET_GATE)
+    (finding,) = runs.reconcile([run], tmp_path, lambda pid: None)
+    assert finding.status is RunStatus.LOST
+    assert finding.output_digest == digest
+    assert finding.summary is None
 
 
 def a_run(

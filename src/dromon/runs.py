@@ -229,6 +229,9 @@ MAX_SKIP_REASONS: Final = 8
 MAX_SUMMARY_LINE: Final = 200
 """The most characters of one line of output a summary keeps."""
 
+MAX_REASON_CHARS: Final = 80
+"""The most characters of one skip reason a summary keeps, after its place."""
+
 SUMMARY_PATTERN: Final = re.compile(
     r"=*\s*((?:\d+ (?:passed|failed|skipped|deselected|xfailed|xpassed|errors?"
     r"|warnings?)(?:, )?)+) in \d"
@@ -273,25 +276,46 @@ def _printable(raw: str) -> str:
     return "".join(c for c in raw if c.isprintable()).strip()[:MAX_SUMMARY_LINE]
 
 
+def _skip_reason(line: str) -> str:
+    """One skip line as its count and place and at most ``MAX_REASON_CHARS`` of its
+    reason, so a forged reason carries little text. **Audit of round 14.**"""
+    entry = line.removeprefix("SKIPPED ")
+    place, sep, reason = entry.partition(": ")
+    if not sep:
+        return entry[:MAX_REASON_CHARS]
+    cut = reason[:MAX_REASON_CHARS]
+    return f"{place}: {cut}{'...' if len(reason) > MAX_REASON_CHARS else ''}"
+
+
 def gate_summary(tail: bytes) -> str | None:
     """pytest's final line in ``tail`` and the skip reasons of the short summary
     before it, or ``None`` when ``tail`` holds no final line. **Round 14, item 2.**
     The daemon reads this from the output, which a writing line can edit, so it is
     what the output says, never what the daemon saw run. pytest does not name
-    deselected tests, so only their count is given, in the final line."""
+    deselected tests, so only their count is given, in the final line.
+
+    **Audit of round 14.** Only the last short summary block is read. Where the
+    tail holds pytest's ``short test summary info`` mark, the summary is the first
+    final line after the last mark, with the skip lines between, and is ``None``
+    when no final line follows it. Without a mark, the last final line is taken,
+    with no reasons, as pytest prints the mark whenever it has a reason to name. A
+    command can still print a forged block last, which is why the note labels the
+    summary unverified."""
+    lines = [_printable(raw) for raw in tail.decode("utf-8", "replace").splitlines()]
+    marks = [index for index, line in enumerate(lines) if SECTION_MARK in line]
+    if not marks:
+        finals = [found for line in lines if (found := SUMMARY_PATTERN.match(line))]
+        return finals[-1].group(1).rstrip(", ") if finals else None
     summary: str | None = None
     reasons: list[str] = []
-    section: list[str] = []
-    for raw in tail.decode("utf-8", "replace").splitlines():
-        line = _printable(raw)
-        if SECTION_MARK in line:
-            section = []
-        elif SKIP_PATTERN.match(line):
-            section.append(line.removeprefix("SKIPPED "))
-        else:
-            found = SUMMARY_PATTERN.match(line)
-            if found is not None:
-                summary, reasons, section = found.group(1).rstrip(", "), section, []
+    for line in lines[marks[-1] + 1 :]:
+        if SKIP_PATTERN.match(line):
+            reasons.append(_skip_reason(line))
+            continue
+        found = SUMMARY_PATTERN.match(line)
+        if found is not None:
+            summary = found.group(1).rstrip(", ")
+            break
     if summary is None:
         return None
     if not reasons:
@@ -302,13 +326,20 @@ def gate_summary(tail: bytes) -> str | None:
     return f"{summary}, skipped {shown}{rest}"
 
 
+SUMMARY_LABEL: Final = "Unverified, the run's own output ends with the test summary"
+"""How a note introduces the summary. **Audit of round 14.** The output is the
+line's to write, so the summary is labelled as its claim wherever the note is shown,
+in ``run_status``, the holder's ``Run ended`` note and ``dromon run status``."""
+
+
 def note_with_summary(note: str, summary: str | None) -> str:
-    """The run's note with its output's test summary after it, cut to
-    ``MAX_RUN_NOTE_BYTES`` at a character boundary, so ``run_ended`` holds it."""
+    """The run's note with its output's test summary after it, labelled unverified
+    and quoted, cut to ``MAX_RUN_NOTE_BYTES`` at a character boundary, so
+    ``run_ended`` holds it."""
     if summary is None:
         return note
     lead = f"{note}. " if note else ""
-    text = f"{lead}The output's test summary says {summary}"
+    text = f'{lead}{SUMMARY_LABEL} "{summary}"'
     return text.encode()[:MAX_RUN_NOTE_BYTES].decode("utf-8", "ignore")
 
 
@@ -682,15 +713,10 @@ def reconcile(
                     f" process, started {started}, so its supervisor is gone without"
                     " a receipt"
                 )
+                # Audit of round 14. A lost run has no result, so no summary its
+                # output gives is shown as one, however green it reads.
                 found.append(
-                    Finding(
-                        run.run_id,
-                        RunStatus.LOST,
-                        None,
-                        note,
-                        *_digest(run),
-                        _summary(run),
-                    )
+                    Finding(run.run_id, RunStatus.LOST, None, note, *_digest(run), None)
                 )
                 continue
         found.append(

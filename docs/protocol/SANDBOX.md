@@ -123,8 +123,12 @@ project settings.
    are the common git directory's `hooks` and `config`, and the git directory's
    `config.worktree`. For a linked worktree, whose `.git` is a file, they also include
    that file and its `commondir`, since rewriting either would hand git a directory of
-   the line's own making. Only writes are denied, so the line can still read them and
-   commit. A `.git` or `commondir` that cannot be read, or that is malformed, ends the
+   the line's own making. **Round 14, review of 1449c5c, C1.** They also include the
+   common directory's `refs/remotes` and `packed-refs`, where git's files backend
+   keeps the remote-tracking refs, so that only the operator's fetch moves the refs a
+   commit run may name, as [`RUNS.md`](../architecture/RUNS.md) gives. A line can then
+   neither pack refs nor delete a packed one, which only the operator's sessions do.
+   Only writes are denied, so the line can still read them and commit. A `.git` or `commondir` that cannot be read, or that is malformed, ends the
    turn before any command runs, and `dromond` refuses a project file with such a line.
    Git itself refuses such a checkout. **Fact, observed on 2026-10-26 with Claude
    Code 2.1.310 on macOS.** A deny entry wins over an allow entry. A Haiku line in a
@@ -165,7 +169,8 @@ succeeded and the one that wrote in the home directory was refused.
   process of another user, and a line runs as the operator's user. A project can require an enabled sandbox for every Claude Code line
   with `daemon.require_sandbox`, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies.
 - The git guard protects only the files of its set, the hooks directory, `config`,
-  `config.worktree` and a linked worktree's two pointers. Every other file under the
+  `config.worktree`, `refs/remotes`, `packed-refs` and a linked worktree's two
+  pointers. Every other file under the
   git directory stays as writable as the line's grants make it. Git runs no other file
   there as code unless configuration tells it to. A filter or merge driver, for
   example, is named in `.gitattributes` but defined in configuration, which is guarded.

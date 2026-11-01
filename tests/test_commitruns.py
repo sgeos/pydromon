@@ -12,8 +12,11 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +28,13 @@ from dromon.codec import decode, encode
 from dromon.driver import Strategy
 from dromon.eventlog import EventLog
 from dromon.lineconfig import LineConfig, WorkdirAccess
-from dromon.model import InvalidField, OperatorAddress, RunStarted, RunStatus
+from dromon.model import (
+    InvalidField,
+    OperatorAddress,
+    RunStarted,
+    RunStatus,
+    format_due,
+)
 from dromon.projectconfig import ConfigFileError, parse
 from dromon.scheduler import LineEngine, LineSpec, Scheduler
 
@@ -33,7 +42,7 @@ HAIKU = "claude-haiku-5-5"
 AT = "2026-10-31T09:00:00Z"
 ANA = OperatorAddress("ana")
 WAIT_SECONDS = 20
-MAIN = ("refs/heads/main",)
+MAIN = ("refs/remotes/origin/main",)
 
 
 def git_env(home: Path) -> dict[str, str]:
@@ -69,8 +78,9 @@ def git(repository: Path, *arguments: str) -> str:
 
 def repository_with_side_branch(tmp_path: Path) -> tuple[Path, str, str]:
     """A repository with a commit on ``main``, which holds ``gate.txt``, and a later
-    commit on ``side`` only, and an uncommitted file. Returns the repository, the
-    main commit and the side commit."""
+    commit on ``side`` only, and an uncommitted file. The remote-tracking refs
+    ``origin/main`` and ``origin/side`` point at them, as a fetch would leave them.
+    Returns the repository, the main commit and the side commit."""
     repository = tmp_path / "project"
     repository.mkdir()
     git(repository, "init", "--quiet", "-b", "main")
@@ -84,6 +94,8 @@ def repository_with_side_branch(tmp_path: Path) -> tuple[Path, str, str]:
     git(repository, "commit", "--quiet", "-m", "side")
     side = git(repository, "rev-parse", "HEAD")
     git(repository, "checkout", "--quiet", "main")
+    git(repository, "update-ref", "refs/remotes/origin/main", main)
+    git(repository, "update-ref", "refs/remotes/origin/side", side)
     (repository / "loose.txt").write_text("uncommitted\n")
     return repository, main, side
 
@@ -100,11 +112,15 @@ def test_the_runs_table_declares_commit_commands_and_their_refs() -> None:
     config = parse(
         "version = 1\n[runs.commands]\ngate = ['make']\n"
         "[runs.commit_commands]\nreview-gate = ['./scripts/check.sh']\n"
-        "[runs.commit_refs]\npatterns = ['refs/heads/main', 'refs/heads/feat/*']\n"
+        "[runs.commit_refs]\npatterns = ['refs/remotes/origin/main',"
+        " 'refs/remotes/origin/feat/*']\n"
     )
     assert config.run_commands == {"gate": ("make",)}
     assert config.run_commit_commands == {"review-gate": ("./scripts/check.sh",)}
-    assert config.run_commit_refs == ("refs/heads/main", "refs/heads/feat/*")
+    assert config.run_commit_refs == (
+        "refs/remotes/origin/main",
+        "refs/remotes/origin/feat/*",
+    )
     assert parse("version = 1\n").run_commit_commands == {}
 
 
@@ -114,11 +130,12 @@ def test_the_runs_table_declares_commit_commands_and_their_refs() -> None:
         ("[runs.commit_commands]\nreview = ['x']", "must name the refs"),
         (
             "[runs.commands]\nreview = ['x']\n[runs.commit_commands]\nreview = ['y']\n"
-            "[runs.commit_refs]\npatterns = ['refs/heads/main']",
+            "[runs.commit_refs]\npatterns = ['refs/remotes/origin/main']",
             "which runs.commands declares too",
         ),
         ("[runs.commit_refs]\npatterns = 'refs/heads/main'", "array of strings"),
-        ("[runs.commit_refs]\npatterns = ['heads/main']", "not a ref pattern"),
+        ("[runs.commit_refs]\npatterns = ['heads/main']", "not under refs/remotes/"),
+        ("[runs.commit_refs]\npatterns = ['refs/heads/main']", "not under"),
         ("[runs.commit_refs]\npatterns = ['refs/../x']", "not a ref pattern"),
         ("[runs.commit_refs]\npatterns = ['refs/a b']", "not a ref pattern"),
         ("[runs.commit_refs]\nwhere = []", "is not a known key"),
@@ -187,7 +204,7 @@ def test_a_commit_not_in_the_repository_is_refused(repo: tuple[Path, str, str]) 
         commitruns.check_commit(repository, "b" * 40, MAIN, environment)
 
 
-def test_a_commit_no_allowed_ref_contains_is_refused(
+def test_a_commit_no_allowed_ref_points_at_is_refused(
     repo: tuple[Path, str, str],
 ) -> None:
     repository, main, side = repo
@@ -195,7 +212,66 @@ def test_a_commit_no_allowed_ref_contains_is_refused(
     commitruns.check_commit(repository, main, MAIN, environment)
     with pytest.raises(commitruns.CommitRefused, match="no ref matching"):
         commitruns.check_commit(repository, side, MAIN, environment)
-    commitruns.check_commit(repository, side, ("refs/heads/*",), environment)
+    commitruns.check_commit(repository, side, ("refs/remotes/origin/*",), environment)
+
+
+def test_only_a_tip_runs_not_a_commit_a_ref_contains(
+    repo: tuple[Path, str, str],
+) -> None:
+    """Review of 1449c5c, C1. ``side`` contains ``main``, and a local branch points
+    at ``main`` still, but no allowed ref points at it, so it is refused."""
+    repository, main, side = repo
+    environment = git_env(repository.parent)
+    git(repository, "update-ref", "refs/remotes/origin/main", side)
+    assert git(repository, "merge-base", "--is-ancestor", main, side) == ""
+    assert git(repository, "rev-parse", "refs/heads/main") == main
+    with pytest.raises(commitruns.CommitRefused, match="Only the tip"):
+        commitruns.check_commit(repository, main, MAIN, environment)
+    commitruns.check_commit(repository, side, MAIN, environment)
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "refs/heads/main",
+        "refs/tags/*",
+        "refs/*",
+        "refs/remotes/*",
+        "refs/remotes/origin",
+        "refs/remotes/origin/",
+        "refs/remotes/o*/main",
+        "refs/notes/commits",
+        "refs/stash",
+    ],
+)
+def test_a_pattern_a_line_could_move_is_refused(pattern: str) -> None:
+    """Review of 1449c5c, C1. A line's sandbox may write every ref outside
+    ``refs/remotes``, so only a pattern naming a remote there is allowed."""
+    with pytest.raises(commitruns.CommitRefused, match="not under refs/remotes/"):
+        commitruns.check_patterns([pattern])
+    allowed = ("refs/remotes/origin/main", "refs/remotes/origin/feat/*")
+    assert commitruns.check_patterns(allowed) == allowed
+
+
+def test_a_repository_without_the_files_backend_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Review of 1449c5c, C1. The guards cover the files backend's places only, so
+    another ref storage is refused before any ref is read."""
+    asked: list[str] = []
+
+    def fake_git(
+        arguments: Sequence[str], cwd: Path, environment: Mapping[str, str]
+    ) -> subprocess.CompletedProcess[bytes]:
+        del cwd, environment
+        asked.append(arguments[0])
+        said = b"reftable\n" if arguments[0] == "config" else b""
+        return subprocess.CompletedProcess(list(arguments), 0, said, b"")
+
+    monkeypatch.setattr(commitruns, "_git", fake_git)
+    with pytest.raises(commitruns.CommitRefused, match="files backend"):
+        commitruns.check_commit(tmp_path, "a" * 40, MAIN, {})
+    assert asked == ["cat-file", "config"]
 
 
 # The checkout.
@@ -208,16 +284,16 @@ def test_a_checkout_holds_the_commit_and_nothing_uncommitted(
     base = tmp_path / "state" / "commit-runs"
     base.parent.mkdir()
     before = git(repository, "worktree", "list", "--porcelain")
-    checkout = commitruns.make_checkout(
-        base, "r-1", repository, main, git_env(tmp_path)
-    )
-    assert checkout == base / "r-1"
+    made = commitruns.make_checkout(base, "r-1", repository, main, git_env(tmp_path))
+    checkout = made.tree
+    assert made == commitruns.Checkout(base / "r-1" / "tree", base / "r-1" / "home")
     assert (checkout / "gate.txt").read_text() == "committed gate\n"
     assert not (checkout / "loose.txt").exists()
     assert not (checkout / "side.txt").exists()
     assert git(checkout, "rev-parse", "HEAD") == main
-    assert stat.S_IMODE(base.stat().st_mode) == 0o700
-    assert stat.S_IMODE(checkout.stat().st_mode) == 0o700
+    for private in (base, base / "r-1", made.home):
+        assert stat.S_IMODE(private.stat().st_mode) == 0o700
+    assert list(made.home.iterdir()) == []
     # The clone wrote no worktree into the project's repository.
     assert git(repository, "worktree", "list", "--porcelain") == before
 
@@ -286,6 +362,171 @@ def test_the_sweep_removes_what_no_run_keeps(tmp_path: Path) -> None:
     assert commitruns.sweep(tmp_path / "absent", set()) == []
 
 
+# What git may run before the command. Review of 1449c5c, C2 and G1.
+
+
+def test_git_runs_with_the_search_path_alone_and_no_global_configuration() -> None:
+    given = {
+        "PATH": "/opt/bin",
+        "HOME": "/home/operator",
+        "SSH_AUTH_SOCK": "/agent",
+        "GIT_DIR": "/elsewhere",
+        "XDG_CONFIG_HOME": "/config",
+    }
+    environment = commitruns.git_environment(given)
+    assert environment["PATH"] == given["PATH"]
+    assert not set(environment) & (set(given) - {"PATH"})
+    assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert environment["GIT_CONFIG_SYSTEM"] == os.devnull
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def filtered_repository(tmp_path: Path, driver: str) -> tuple[Path, str, Path, Path]:
+    """A repository whose commit names ``driver`` as the filter of every path and
+    carries a ``.lfsconfig`` naming an unroutable address, as a hostile commit
+    would, and a configuration file that defines ``driver`` to record each run in
+    a marker file. Returns the repository, the commit, the configuration file and
+    the marker."""
+    repository = tmp_path / f"filtered-{driver}"
+    repository.mkdir()
+    git(repository, "init", "--quiet", "-b", "main")
+    (repository / ".gitattributes").write_text(f"* filter={driver}\n")
+    (repository / ".lfsconfig").write_text("[lfs]\n\turl = http://198.51.100.7:9/x\n")
+    (repository / "data.txt").write_text("committed bytes\n")
+    git(repository, "add", ".gitattributes", ".lfsconfig", "data.txt")
+    git(repository, "commit", "--quiet", "-m", "filtered")
+    commit = git(repository, "rev-parse", "HEAD")
+    git(repository, "update-ref", "refs/remotes/origin/main", commit)
+    marker = tmp_path / f"{driver}-ran"
+    configuration = tmp_path / f"{driver}.gitconfig"
+    configuration.write_text(
+        f'[filter "{driver}"]\n'
+        f"\tsmudge = \"echo ran >> '{marker}'; cat\"\n"
+        f"\tprocess = \"sh -c 'echo ran >> {marker}; exit 1'\"\n"
+        "\trequired = true\n"
+    )
+    return repository, commit, configuration, marker
+
+
+def checkout_as_git_would(
+    repository: Path, commit: str, configuration: Path, target: Path
+) -> None:
+    """A clone and checkout with ``configuration`` as the global configuration and
+    nothing else turned off, as the operator's own git would make them."""
+    environment = {**git_env(target.parent), "GIT_CONFIG_GLOBAL": str(configuration)}
+    for arguments, cwd in (
+        (
+            [
+                "clone",
+                "--quiet",
+                "--no-checkout",
+                "--shared",
+                str(repository),
+                str(target),
+            ],
+            target.parent,
+        ),
+        (["checkout", "--quiet", "--detach", commit], target),
+    ):
+        subprocess.run(  # noqa: S603
+            ["git", *arguments],  # noqa: S607
+            cwd=cwd,
+            env=environment,
+            capture_output=True,
+            check=False,
+        )
+
+
+def test_a_filter_the_operator_configures_globally_never_runs(tmp_path: Path) -> None:
+    """The commit names the large file filter, which the operator's global
+    configuration defines here, as ``git lfs install`` would. The same checkout
+    with that configuration runs it, and a commit run's checkout does not."""
+    repository, commit, configuration, marker = filtered_repository(tmp_path, "lfs")
+    checkout_as_git_would(repository, commit, configuration, tmp_path / "control")
+    assert marker.exists(), "the filter must run without the protections"
+    marker.unlink()
+    home = tmp_path / "operator-home"
+    home.mkdir()
+    (home / ".gitconfig").write_text(configuration.read_text())
+    base = tmp_path / "commit-runs"
+    operator = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(home)}
+    made = commitruns.make_checkout(
+        base, "r-1", repository, commit, commitruns.git_environment(operator)
+    )
+    assert not marker.exists()
+    assert (made.tree / "data.txt").read_text() == "committed bytes\n"
+    assert (made.tree / ".lfsconfig").is_file()
+
+
+def test_no_path_names_a_filter_even_where_one_is_configured(tmp_path: Path) -> None:
+    """The clone's ``info/attributes`` outranks the commit's ``.gitattributes``, so
+    a filter defined in any configuration git reads is not run."""
+    repository, commit, configuration, marker = filtered_repository(tmp_path, "mark")
+    checkout_as_git_would(repository, commit, configuration, tmp_path / "control")
+    assert marker.exists(), "the filter must run without the protections"
+    marker.unlink()
+    environment = {
+        **commitruns.git_environment(os.environ),
+        "GIT_CONFIG_GLOBAL": str(configuration),
+    }
+    made = commitruns.make_checkout(
+        tmp_path / "commit-runs", "r-1", repository, commit, environment
+    )
+    assert not marker.exists()
+    assert (made.tree / "data.txt").read_text() == "committed bytes\n"
+
+
+def test_no_hook_runs_in_a_git_call_for_commit_runs(
+    repo: tuple[Path, str, str], tmp_path: Path
+) -> None:
+    """Review of 1449c5c, G1. A ``post-checkout`` hook runs for the same checkout
+    without the flags, and not for a git call of commit runs."""
+    repository, main, side = repo
+    marker = tmp_path / "hook-ran"
+    hook = repository / ".git" / "hooks" / "post-checkout"
+    hook.write_text(f"#!/bin/sh\necho ran >> '{marker}'\n")
+    hook.chmod(0o755)
+    git(repository, "checkout", "--quiet", "--detach", side)
+    assert marker.exists(), "the hook must run without the protections"
+    marker.unlink()
+    result = commitruns._git(  # pyright: ignore[reportPrivateUsage]
+        ["checkout", "--quiet", "--detach", main],
+        repository,
+        commitruns.git_environment(os.environ),
+    )
+    assert result.returncode == 0
+    assert git(repository, "rev-parse", "HEAD") == main
+    assert not marker.exists()
+
+
+def test_a_git_call_past_its_bound_is_killed_with_its_whole_group(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Review of 1449c5c, C3. A stand-in for git starts a child, as git starts a
+    filter, and waits. At the bound both are killed, not git alone."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    pid_file = tmp_path / "child.pid"
+    stand_in = bin_dir / "git"
+    stand_in.write_text(f"#!/bin/sh\nsleep 60 &\necho $! > '{pid_file}'\nwait\n")
+    stand_in.chmod(0o755)
+    monkeypatch.setattr(commitruns, "GIT_SECONDS", 1.0)
+    environment = {"PATH": f"{bin_dir}{os.pathsep}/bin{os.pathsep}/usr/bin"}
+    with pytest.raises(commitruns.CommitRefused, match="process group was killed"):
+        commitruns._git(  # pyright: ignore[reportPrivateUsage]
+            ["status"], tmp_path, environment
+        )
+    child = int(pid_file.read_text())
+    for _ in range(WAIT_SECONDS * 20):
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    os.kill(child, signal.SIGKILL)
+    raise AssertionError(f"the git call's child {child} outlived the kill")
+
+
 # The scheduler.
 
 
@@ -323,6 +564,7 @@ def commit_scheduler(
     tmp_path: Path,
     checkouts: bool = True,
     occupied: Callable[[int], bool] = stand_in_occupied,
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> Scheduler:
     """A scheduler for the project at ``repository``, whose line ``alpha`` may only
     read its working directory, with a commit command ``review`` and an ordinary
@@ -340,6 +582,7 @@ def commit_scheduler(
         run_start_of=stand_in_start,
         run_occupied=occupied,
         checkout_dir=(state / "commit-runs") if checkouts else None,
+        wall_clock=clock,
     )
     scheduler.set_runs(
         {"gate": (sys.executable, "-c", "print('gate')")},
@@ -371,7 +614,7 @@ def test_a_reading_line_runs_a_commit_command_and_its_checkout_is_removed(
             asyncio.run(scheduler.start_run("alpha", "gate", "none"))
         run = asyncio.run(scheduler.start_run("alpha", "review", "none", main))
         checkout = tmp_path / "state" / "commit-runs" / run.run_id
-        assert (run.commit, run.checkout) == (main, str(checkout))
+        assert (run.commit, run.checkout) == (main, str(checkout / "tree"))
         assert checkout.is_dir()
         assert f"on commit {main}" in scheduler.run_status("alpha")
         wait_for_supervisor(scheduler, run.run_id)
@@ -396,16 +639,19 @@ def test_a_commit_run_is_refused_before_anything_is_made(
             ("gate", main, "takes no commit"),
             ("other", main, "Commit commands: review"),
             ("review", "main", "is not a full commit"),
-            ("review", side, "no ref matching"),
         ]:
             with pytest.raises(runs.RunRefused, match=message):
                 asyncio.run(scheduler.start_run("alpha", command, "none", commit))
-        assert log.state.runs == {}
-        base = tmp_path / "state" / "commit-runs"
-        assert not base.exists() or list(base.iterdir()) == []
         without = commit_scheduler(log, repository, tmp_path, checkouts=False)
         with pytest.raises(runs.RunRefused, match="makes no checkouts"):
             asyncio.run(without.start_run("alpha", "review", "none", main))
+        # None of these held the commit worker, so none is recorded.
+        assert log.state.commit_refusals == {}
+        with pytest.raises(runs.RunRefused, match="no ref matching"):
+            asyncio.run(scheduler.start_run("alpha", "review", "none", side))
+        assert log.state.runs == {}
+        base = tmp_path / "state" / "commit-runs"
+        assert not base.exists() or list(base.iterdir()) == []
 
 
 def test_a_lost_commit_run_keeps_its_checkout_until_it_is_cleared(
@@ -491,3 +737,121 @@ def test_the_start_run_tool_takes_a_commit(
         assert "Commit commands, which take a commit: review" in scheduler.run_status(
             "alpha"
         )
+
+
+# Review of 1449c5c, C3 and C4. Starts are limited and isolated, and the command
+# finds a fresh home.
+
+
+@dataclass
+class Clock:
+    now: datetime = field(default_factory=lambda: datetime(2026, 11, 1, 9, tzinfo=UTC))
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+def test_a_refused_start_is_recorded_and_its_cooldown_outlives_a_restart(
+    repo: tuple[Path, str, str], tmp_path: Path
+) -> None:
+    repository, main, side = repo
+    clock = Clock()
+    with EventLog(tmp_path / "events.sqlite") as log:
+        scheduler = commit_scheduler(log, repository, tmp_path, clock=clock)
+        with pytest.raises(runs.RunRefused, match="This is recorded"):
+            asyncio.run(scheduler.start_run("alpha", "review", "none", side))
+        (refused,) = log.state.commit_refusals.values()
+        assert (refused.line_id, refused.role_id) == ("alpha", None)
+        assert (refused.command, refused.commit) == ("review", side)
+        assert "points at" in refused.reason
+        assert refused.refused_at == format_due(clock.now)
+    clock.now += timedelta(seconds=commitruns.REFUSED_COOLDOWN_SECONDS - 1)
+    with EventLog(tmp_path / "events.sqlite") as log:
+        scheduler = commit_scheduler(log, repository, tmp_path, clock=clock)
+        with pytest.raises(runs.RunRefused, match="was refused at"):
+            asyncio.run(scheduler.start_run("alpha", "review", "none", main))
+        assert log.state.runs == {}
+        clock.now += timedelta(seconds=1)
+        run = asyncio.run(scheduler.start_run("alpha", "review", "none", main))
+        wait_for_supervisor(scheduler, run.run_id)
+        check(scheduler)
+
+
+def test_a_second_start_of_a_scope_is_refused_while_one_is_in_progress(
+    repo: tuple[Path, str, str], tmp_path: Path
+) -> None:
+    repository, main, _ = repo
+    with EventLog(tmp_path / "events.sqlite") as log:
+        scheduler = commit_scheduler(log, repository, tmp_path)
+
+        async def both() -> tuple[RunStarted | BaseException, ...]:
+            return await asyncio.gather(
+                scheduler.start_run("alpha", "review", "none", main),
+                scheduler.start_run("alpha", "review", "none", main),
+                return_exceptions=True,
+            )
+
+        first, second = asyncio.run(both())
+        assert isinstance(first, RunStarted)
+        assert isinstance(second, runs.RunRefused)
+        assert "is starting" in str(second)
+        assert log.state.commit_refusals == {}
+        assert list(log.state.runs) == [first.run_id]
+        wait_for_supervisor(scheduler, first.run_id)
+        check(scheduler)
+
+
+def test_the_checkout_is_made_on_the_commit_worker(
+    repo: tuple[Path, str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The process worker, which serves stops and reconciliation, is never held by
+    a commit run's checkout."""
+    repository, main, _ = repo
+    seen: list[threading.Thread] = []
+    real = commitruns.make_checkout
+
+    def recorded(
+        base: Path,
+        run_id: str,
+        repository: Path,
+        commit: str,
+        environment: Mapping[str, str],
+    ) -> commitruns.Checkout:
+        seen.append(threading.current_thread())
+        return real(base, run_id, repository, commit, environment)
+
+    monkeypatch.setattr(commitruns, "make_checkout", recorded)
+    with EventLog(tmp_path / "events.sqlite") as log:
+        scheduler = commit_scheduler(log, repository, tmp_path)
+        run = asyncio.run(scheduler.start_run("alpha", "review", "none", main))
+        commit_worker = scheduler._commit_worker  # pyright: ignore[reportPrivateUsage]
+        process_worker = scheduler._process_worker  # pyright: ignore[reportPrivateUsage]
+        commit_thread = commit_worker._thread  # pyright: ignore[reportPrivateUsage]
+        process_thread = process_worker._thread  # pyright: ignore[reportPrivateUsage]
+        assert seen == [commit_thread]
+        assert process_thread is not None and process_thread is not commit_thread
+        wait_for_supervisor(scheduler, run.run_id)
+        check(scheduler)
+
+
+HOME_SOURCE = (
+    "import os, stat; home = os.environ['HOME'];"
+    " print(home, oct(stat.S_IMODE(os.stat(home).st_mode)), os.listdir(home))"
+)
+
+
+def test_a_commit_run_has_a_fresh_private_home_removed_with_its_checkout(
+    repo: tuple[Path, str, str], tmp_path: Path
+) -> None:
+    repository, main, _ = repo
+    with EventLog(tmp_path / "events.sqlite") as log:
+        scheduler = commit_scheduler(log, repository, tmp_path)
+        scheduler.set_runs({}, {"review": (sys.executable, "-c", HOME_SOURCE)}, MAIN)
+        run = asyncio.run(scheduler.start_run("alpha", "review", "none", main))
+        home = Path(str(run.checkout)).parent / commitruns.HOME
+        assert str(home) != os.environ.get("HOME")
+        wait_for_supervisor(scheduler, run.run_id)
+        check(scheduler)
+        output = (Path(run.workdir) / run.output_file).read_text()
+        assert output == f"{home} 0o700 []\n"
+        assert not home.exists()

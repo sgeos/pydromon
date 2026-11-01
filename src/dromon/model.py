@@ -1158,7 +1158,8 @@ class WakeWithdrawn:
     never fires. Its ``message_id`` is kept, and no later message, task note or
     scheduled wake may take it. Only the daemon records it, when the wake
     ``compact_session`` scheduled has lost its purpose because an earlier turn
-    already made the compaction it was for."""
+    already made the compaction it was for, when an operator's interrupt stops the
+    line's turn, and, from the audit of round 14, when an operator retires the line."""
 
     line_id: str
     message_id: str
@@ -2062,6 +2063,32 @@ class RunEnded:
         check_instant("ended_at", self.ended_at)
 
 
+@dataclass(frozen=True, slots=True)
+class CommitRunRefused:
+    """A commit run's start failed in its checks or its checkout, which ran on the
+    commit worker, so its scope starts no commit run for a cooldown after
+    ``refused_at``. **Round 14, review of 1449c5c, C3.** A failed start recorded
+    nothing before, so a line could repeat it without bound, each holding the
+    worker for minutes. ``commitruns.REFUSED_COOLDOWN_SECONDS`` gives the cooldown,
+    which is the reader's to apply, so the event holds the instant alone."""
+
+    line_id: str
+    role_id: str | None
+    command: str
+    commit: str
+    reason: str
+    refused_at: str
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        check_optional_id("role_id", self.role_id)
+        check_id("command", self.command)
+        if COMMIT_PATTERN.fullmatch(self.commit) is None:
+            raise InvalidField("commit must be a full hexadecimal commit")
+        check_text("reason", self.reason, MAX_RUN_NOTE_BYTES)
+        check_instant("refused_at", self.refused_at)
+
+
 class RunClearance(StrEnum):
     """Why a lost run no longer blocks its scope. ``empty`` means reconciliation
     found no process in its supervisor's process group or session, and ``operator``
@@ -2149,6 +2176,7 @@ type Event = (
     | RunStarted
     | RunEnded
     | RunCleared
+    | CommitRunRefused
     | PeerDeclared
     | PeerRemoved
     | PeerKeyed
@@ -2526,6 +2554,11 @@ class State:
     )
     """Every retired line, keyed by line, each of which also stays in ``lines``.
     Bounded by the lines ever created. **Round 14, item 4.**"""
+    commit_refusals: dict[tuple[str, str], CommitRunRefused] = field(
+        default_factory=dict[tuple[str, str], CommitRunRefused]
+    )
+    """Each scope's latest refused commit run start, by ``run_scope``, bounded by
+    the scopes. **Round 14, review of 1449c5c, C3.**"""
 
     def holder_of(self, role_id: str) -> RoleHolder:
         """What decides ``role_id``'s terms and seats now."""
@@ -2607,6 +2640,7 @@ class State:
             {line_id: dict(mail) for line_id, mail in self.unread_mail.items()},
             {line_id: dict(asked) for line_id, asked in self.open_asked.items()},
             dict(self.retired_lines),
+            dict(self.commit_refusals),
         )
 
     def line_mail(self, line_id: str) -> LineMail:
@@ -2845,6 +2879,13 @@ class State:
                     and event.operator_id not in self.operators
                 ):
                     raise EventRejected(f"no operator {event.operator_id}")
+            case CommitRunRefused():
+                self._live_line(event.line_id)
+                seat = self.seats.get(event.line_id)
+                if event.role_id != (None if seat is None else seat.role_id):
+                    raise EventRejected(
+                        f"line {event.line_id}'s refused start belongs to its own scope"
+                    )
             case PeerDeclared():
                 peer = self.peers.get(event.peer_id)
                 if (
@@ -3213,6 +3254,9 @@ class State:
             case RunCleared():
                 run = self.runs[event.run_id]
                 self.runs[event.run_id] = replace(run, cleared=event)
+            case CommitRunRefused():
+                scope = run_scope(event.line_id, event.role_id)
+                self.commit_refusals[scope] = event
             case PeerDeclared():
                 peer = self.peers.get(event.peer_id)
                 # A declared table replaces an open peer of its name whole, so its

@@ -92,6 +92,7 @@ from dromon.model import (
     RunEnded,
     RunStarted,
     RunStatus,
+    CommitRunRefused,
     PeerDeclared,
     PeerKeyed,
     PeerOpened,
@@ -276,6 +277,14 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "ended_at",
     ),
     "run_cleared": ("run_id", "cause", "operator_id", "cleared_at"),
+    "commit_run_refused": (
+        "line_id",
+        "role_id",
+        "command",
+        "commit",
+        "reason",
+        "refused_at",
+    ),
     "peer_declared": ("peer_id", "transport", "policy"),
     "peer_removed": ("peer_id",),
     "peer_keyed": ("peer_id", "token_sha256"),
@@ -751,6 +760,15 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "operator_id": event.operator_id,
                 "cleared_at": event.cleared_at,
             }
+        case CommitRunRefused():
+            return "commit_run_refused", {
+                "line_id": event.line_id,
+                "role_id": event.role_id,
+                "command": event.command,
+                "commit": event.commit,
+                "reason": event.reason,
+                "refused_at": event.refused_at,
+            }
         case PeerDeclared():
             return "peer_declared", {
                 "peer_id": event.peer_id,
@@ -1086,6 +1104,15 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _member(data, "cause", RunClearance),
                 _optional_str(data, "operator_id"),
                 _str(data, "cleared_at"),
+            )
+        case "commit_run_refused":
+            return CommitRunRefused(
+                _str(data, "line_id"),
+                _optional_str(data, "role_id"),
+                _str(data, "command"),
+                _str(data, "commit"),
+                _str(data, "reason"),
+                _str(data, "refused_at"),
             )
         case "peer_declared":
             return PeerDeclared(

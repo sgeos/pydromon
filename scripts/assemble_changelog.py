@@ -35,7 +35,9 @@ library.
 entry goes in a fragment. Two edits are allowed, because neither adds, removes or
 changes an entry. A *release* adds a version heading, leaves Unreleased empty, and
 keeps every entry that was in Unreleased and every released line, and either deletes a
-fragment or had entries in Unreleased. A *lossless regrouping* leaves Unreleased exactly
+fragment or had entries in Unreleased. Its new section holds exactly the Unreleased
+entries and the deleted fragments' lines, each under its own type, so no entry is
+dropped or moved to another type. A *lossless regrouping* leaves Unreleased exactly
 as ``collapse`` would write the base's, so a section with repeated headings can be
 tidied once, and a section already tidy has nothing left to regroup. The regrouping is
 the cleanest exception for the branch that introduced this rule, since it needs no
@@ -282,6 +284,45 @@ def is_regrouping(base: str, head: str) -> bool:
         return False
 
 
+def typed_entries(text: str, headings: set[str]) -> Counter[tuple[str, str]] | None:
+    """Each entry line of the sections ``headings`` name, with the type heading it
+    sits under, or ``None`` when such a section has text above its first type
+    heading or a heading that is not a type."""
+    found: Counter[tuple[str, str]] = Counter()
+    inside = False
+    kind: str | None = None
+    for line in text.split("\n"):
+        if line.startswith("## "):
+            inside, kind = line in headings, None
+            continue
+        if not inside:
+            continue
+        if line.startswith("### "):
+            kind = line[4:].strip()
+            if kind not in TYPES:
+                return None
+            continue
+        if line.strip():
+            if kind is None:
+                return None
+            found[(kind, line)] += 1
+    return found
+
+
+def released_entries(
+    unreleased: dict[str, str], removed: list[Fragment]
+) -> Counter[tuple[str, str]]:
+    """What a release of ``unreleased`` and ``removed`` must hold, each line with its
+    type."""
+    owed: Counter[tuple[str, str]] = Counter()
+    sources = [*unreleased.items(), *((f.type, f.body) for f in removed)]
+    for kind, body in sources:
+        for line in body.split("\n"):
+            if line.strip():
+                owed[(kind, line)] += 1
+    return owed
+
+
 def is_release(base: str, head: str, removed: list[Fragment]) -> bool:
     """Whether ``head`` is ``base`` released. A version heading is new, Unreleased is
     empty, every released line of ``base`` and every entry of its Unreleased is still
@@ -291,7 +332,12 @@ def is_release(base: str, head: str, removed: list[Fragment]) -> bool:
     from somewhere, the entries Unreleased held, the bodies of the fragments the
     branch deletes, or the new version headings, so that a release cannot slip in
     an entry no fragment held. Lines are compared as a multiset, ignoring blank
-    lines and type headings, which the release writes itself."""
+    lines and type headings, which the release writes itself.
+
+    Audit of round 14, T1 and T2. The new sections must also hold exactly what was
+    released, each line under its own type, the type of the Unreleased heading it
+    sat under or of the fragment that held it. A release can therefore neither drop
+    a deleted fragment's entry nor move an entry to another type heading."""
     try:
         before = split_changelog(base)
         after = split_changelog(head)
@@ -310,6 +356,9 @@ def is_release(base: str, head: str, removed: list[Fragment]) -> bool:
     for fragment in removed:
         sources += entry_lines(fragment.body)
     if (found - old) - sources:
+        return False
+    owed = released_entries(before.unreleased, removed)
+    if typed_entries(head, new_headings) != owed:
         return False
     return bool(removed) or bool(before.unreleased)
 

@@ -269,6 +269,7 @@ from dromon.lineconfig import (
     rooted_instructions,
 )
 from dromon.model import (
+    COMMIT_PATTERN,
     MAX_BRIEF_ARTIFACTS,
     MAX_BUDGET_NOTE_BYTES,
     BriefSet,
@@ -303,6 +304,7 @@ from dromon.model import (
     LeaseAcquired,
     LeaseEnd,
     LeaseReleased,
+    CommitRunRefused,
     Run,
     RunCleared,
     RunClearance,
@@ -564,6 +566,10 @@ WAKE_TOOL_SCHEMA: Final[dict[str, object]] = {
 }
 
 REPEAT_WINDOW: Final = timedelta(minutes=15)
+
+MAX_REFUSAL_REASON_CHARS: Final = 250
+"""The most characters of a refused commit run's reason recorded, at most four bytes
+each, within ``MAX_RUN_NOTE_BYTES``."""
 
 MIN_RATE_SECONDS: Final = 60
 """How long the daemon must have had its event log before a growth rate is given."""
@@ -1250,6 +1256,31 @@ class CompactingEngine(Protocol):
     def request_compaction(
         self, reason: str, context_line: Callable[[], str | None]
     ) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _RunStart:
+    """What ``start_run`` checked and chose for a run, which ``_launch_run`` uses."""
+
+    line_id: str
+    command: str
+    argv: tuple[str, ...]
+    latest_id: str | None
+    run_id: str
+    directory: Path
+    workdir: Path
+    environment: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class Retirement:
+    """What ``retire_line`` recorded. **Audit of round 14, R1 and R3.**"""
+
+    record: LineRetired
+    withdrawn_questions: tuple[str, ...]
+    """The line's open questions, withdrawn in the same batch, in identifier order."""
+    withdrawn_wake: str | None
+    """The message identifier of the scheduled wake withdrawn, if one was pending."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -2038,6 +2069,13 @@ class Scheduler:
         self._sweep_worker = ProcessWorker()
         """Separate queue so a sweep waiting on signalled children cannot occupy
         the worker that serves process inspections and stops."""
+        self._commit_worker = ProcessWorker()
+        """Round 14, review of 1449c5c, C3. A commit run's checks, checkout and
+        removal run here, so a reading line's start, which can take minutes, never
+        occupies the worker that serves stops and reconciliation."""
+        self._commit_starting: set[tuple[str, str]] = set()
+        """The scopes with a commit run's start in progress, by ``run_scope``. A
+        second start of the same scope is refused rather than queued."""
         self._workers_stopped = False
         self._workers_joined = True
         self._process_tasks: set[asyncio.Task[None]] = set()
@@ -2047,7 +2085,8 @@ class Scheduler:
         self._commit_commands: dict[str, tuple[str, ...]] = {}
         """Round 14, item 1. The commands a line may start on a commit it names."""
         self._commit_refs: tuple[str, ...] = ()
-        """The ref patterns one of which must contain a commit run's commit."""
+        """The ref patterns, under ``refs/remotes/``, one of which must point at a
+        commit run's commit."""
         self._checkout_dir = checkout_dir
         """Where commit runs' checkouts are made, or ``None``, which refuses them."""
         self._checkouts_starting: set[str] = set()
@@ -2881,12 +2920,19 @@ class Scheduler:
         self._work.set()
         return True
 
-    def retire_line(self, operator: OperatorAddress, line_id: str) -> LineRetired:
+    def retire_line(self, operator: OperatorAddress, line_id: str) -> Retirement:
         """``operator`` retires ``line_id``, hibernating it first where it is not, so
-        that every gate hibernation closes stays closed, and return the record.
-        **Round 14, item 4.** Both events are checked on a copy of the state before
-        either is appended, so a refusal records nothing. The daemon refuses a line
-        the project file declares before it calls this. Raises ``EventRejected``.
+        that every gate hibernation closes stays closed, and return the record with
+        what the retirement withdrew. **Round 14, item 4.** Every event is checked on
+        a copy of the state before any is appended, so a refusal records nothing. The
+        daemon refuses a line the project file declares before it calls this. Raises
+        ``EventRejected``.
+
+        **Audit of round 14, R1 and R3.** In the same checked batch the line's open
+        questions, its hold question among them, are withdrawn with
+        ``question_withdrawn``, since an answer is mail to the line, which a retired
+        line refuses, so nothing could close them afterwards. Its pending scheduled
+        wake is withdrawn with ``wake_withdrawn``, since it could never fire.
 
         **Residual.** A lease the line holds ends at its time to live, and a
         supervised run it started runs to its end, since neither needs a turn."""
@@ -2899,11 +2945,23 @@ class Scheduler:
         if line is None:
             raise EventRejected(f"no line {line_id}")
         retired = LineRetired(line_id, operator, format_due(self._wall_clock()))
+        asker = LineAddress(line_id)
+        questions = tuple(
+            sorted(
+                message_id
+                for message_id, message in state.messages.items()
+                if message.sender == asker and message.status is QuestionStatus.OPEN
+            )
+        )
+        pending = state.scheduled.get(line_id)
         events: list[Event] = []
         if operator.operator_id not in state.operators:
             events.append(OperatorRegistered(operator.operator_id))
         if not line.hibernated:
             events.append(LineHibernated(line_id))
+        events.extend(QuestionWithdrawn(message_id) for message_id in questions)
+        if pending is not None:
+            events.append(WakeWithdrawn(line_id, pending.message_id))
         events.append(retired)
         trial = state.copy()
         for event in events:
@@ -2912,10 +2970,17 @@ class Scheduler:
         for event in events:
             self._log.append(event)
         self._drop_engine(line_id)
+        self._context_compaction_wake_ids.pop(line_id, None)
+        self._context_compaction_wakes.discard(line_id)
+        self._compact_wake.pop(line_id, None)
         self.activity.record(
             line_id, ActivityKind.NOTICE, f"operator {operator} retired the line"
         )
-        return retired
+        return Retirement(
+            retired,
+            questions,
+            None if pending is None else pending.message_id,
+        )
 
     def retired_lines_view(self) -> list[dict[str, object]]:
         """Every retired line, by identifier, with who retired it and when."""
@@ -3794,11 +3859,63 @@ class Scheduler:
             **allowlisted(os.environ, BASE_ENVIRONMENT),
             RUN_ID_VARIABLE: run_id,
         }
+        start = _RunStart(
+            line_id, command, argv, latest_id, run_id, directory, workdir, environment
+        )
+        if commit is None:
+            return await self._launch_run(start, None)
+        if COMMIT_PATTERN.fullmatch(commit) is None:
+            raise runs.RunRefused(
+                f"{commit!r} is not a full commit, 40 or 64 lowercase hexadecimal"
+                " characters. Name a commit, never a branch, so it cannot move"
+            )
+        scope = run_scope(line_id, self._run_role(line_id))
+        self._check_commit_start(scope)
+        self._commit_starting.add(scope)
+        try:
+            return await self._launch_run(start, commit)
+        finally:
+            self._commit_starting.discard(scope)
+
+    def _check_commit_start(self, scope: tuple[str, str]) -> None:
+        """Refuse a commit run's start while another of ``scope``'s is in progress,
+        or within the cooldown after its latest refused start. Round 14, review of
+        1449c5c, C3. Raises ``runs.RunRefused``."""
+        if scope in self._commit_starting:
+            raise runs.RunRefused(
+                "a commit run of yours is starting, so no other starts until its"
+                " checkout is made or refused"
+            )
+        refused = self._log.state.commit_refusals.get(scope)
+        if refused is None:
+            return
+        until = parse_due(refused.refused_at) + timedelta(
+            seconds=commitruns.REFUSED_COOLDOWN_SECONDS
+        )
+        if self._wall_clock() < until:
+            raise runs.RunRefused(
+                f"a commit run of yours was refused at {refused.refused_at}, so none"
+                f" starts before {format_due(until)}. It was refused as"
+                f" {refused.reason}"
+            )
+
+    async def _launch_run(self, start: "_RunStart", commit: str | None) -> RunStarted:
+        """Make a commit run's checkout where ``commit`` is given, launch the run's
+        supervisor and record ``run_started``. Raises ``runs.RunRefused``."""
+        line_id, command, argv = start.line_id, start.command, start.argv
+        latest_id, run_id, directory = start.latest_id, start.run_id, start.directory
+        workdir, environment = start.workdir, start.environment
         checkout = (
             None
             if commit is None
-            else await self._make_checkout(run_id, commit, environment)
+            else await self._make_checkout(line_id, command, run_id, commit)
         )
+        command_dir = None if checkout is None else checkout.tree
+        if checkout is not None:
+            # A fresh private home, so the commit's code finds none of the
+            # operator's settings, credentials or caches by its home. It is not a
+            # confinement, since the command runs outside every sandbox.
+            environment = {**environment, "HOME": str(checkout.home)}
         try:
             launched = await self._process_worker.run(
                 lambda: runs.launch(
@@ -3808,7 +3925,7 @@ class Scheduler:
                     argv,
                     environment,
                     self._run_start_of,
-                    command_dir=checkout,
+                    command_dir=command_dir,
                 )
             )
             started = RunStarted(
@@ -3824,7 +3941,7 @@ class Scheduler:
                 launched.process_started,
                 format_due(self._wall_clock()),
                 commit,
-                None if checkout is None else str(checkout),
+                None if command_dir is None else str(command_dir),
             )
             try:
                 self._log.append(started)
@@ -3859,11 +3976,13 @@ class Scheduler:
         return started
 
     async def _make_checkout(
-        self, run_id: str, commit: str, environment: Mapping[str, str]
-    ) -> Path:
-        """Check ``commit`` and make its checkout for ``run_id`` on the process
+        self, line_id: str, command: str, run_id: str, commit: str
+    ) -> commitruns.Checkout:
+        """Check ``commit`` and make its checkout for ``run_id`` on the commit
         worker, as ``commitruns`` says. Round 14, item 1. A checkout left by a
-        failure or a cancellation is removed by the next tidy. Raises
+        failure or a cancellation is removed by the next tidy. **Round 14, review of
+        1449c5c, C3.** A refusal from the checks or the checkout is recorded as
+        ``commit_run_refused``, which starts the scope's cooldown. Raises
         ``runs.RunRefused``."""
         base, root = self._checkout_dir, self._root
         if base is None or root is None:
@@ -3874,16 +3993,23 @@ class Scheduler:
                 " commit runs are refused"
             )
         refs = self._commit_refs
-        git_environment = commitruns.git_environment(environment)
+        git_environment = commitruns.git_environment(os.environ)
 
-        def make() -> Path:
+        def make() -> commitruns.Checkout:
             commitruns.check_commit(root, commit, refs, git_environment)
             return commitruns.make_checkout(base, run_id, root, commit, git_environment)
 
         self._checkouts_starting.add(run_id)
         try:
-            return await self._process_worker.run(make)
+            return await self._commit_worker.run(make)
         except commitruns.CommitRefused as error:
+            self._checkouts_starting.discard(run_id)
+            self._record_commit_refusal(line_id, command, commit, str(error))
+            raise runs.RunRefused(
+                f"{error}. This is recorded, and no commit run of yours starts for"
+                f" {commitruns.REFUSED_COOLDOWN_SECONDS:g} seconds"
+            ) from error
+        except ProcessRefused as error:
             self._checkouts_starting.discard(run_id)
             raise runs.RunRefused(str(error)) from error
         except BaseException:
@@ -3891,12 +4017,31 @@ class Scheduler:
             self._tidy_pending = True
             raise
 
+    def _record_commit_refusal(
+        self, line_id: str, command: str, commit: str, reason: str
+    ) -> None:
+        """Record ``commit_run_refused`` for ``line_id``'s scope, with ``reason`` cut
+        to fit. A line retired or stopped meanwhile is left unrecorded, since no
+        start of its own follows."""
+        event = CommitRunRefused(
+            line_id,
+            self._run_role(line_id),
+            command,
+            commit,
+            reason[:MAX_REFUSAL_REASON_CHARS],
+            format_due(self._wall_clock()),
+        )
+        with contextlib.suppress(EventRejected):
+            self._log.append(event)
+
     async def tidy_checkouts(self) -> None:
         """Remove every commit run's checkout that no blocking run names and no
-        start is making, on the process worker. Round 14, item 1. A run that has
+        start is making, on the commit worker. Round 14, item 1. A run that has
         ended keeps its checkout only while it is lost and uncleared, since its
         command may still run there. A failure is said once on the daemon's standard
-        error and tried again at the next check."""
+        error and tried again at the next check. The worker runs its calls in the
+        order given, and a start names its run in ``_checkouts_starting`` before it
+        gives its own, so a sweep never removes a checkout a start is making."""
         base = self._checkout_dir
         if base is None or not self._tidy_pending:
             return
@@ -3905,7 +4050,7 @@ class Scheduler:
         } | set(self._checkouts_starting)
         self._tidy_pending = False
         try:
-            await self._process_worker.run(lambda: commitruns.sweep(base, keep))
+            await self._commit_worker.run(lambda: commitruns.sweep(base, keep))
         except (commitruns.CommitRefused, ProcessRefused) as error:
             self._tidy_pending = True
             if self._tidy_failure != str(error):
@@ -6833,10 +6978,13 @@ class Scheduler:
         gained an owner while such a line ran in its worktree, since every command
         that would place one is refused. **Cost.** It resolves the line's directory
         and each owned role's worktree on each call, which the tick makes for each
-        line, bounded by the roles."""
+        line, bounded by the roles. A retired line never runs again, so it writes
+        nothing and waits for nothing. **Audit of round 14, R4.**"""
         state = self._log.state
-        if line_id in state.seats or not any(
-            role.owner is not None for role in state.roles.values()
+        if (
+            line_id in state.seats
+            or line_id in state.retired_lines
+            or not any(role.owner is not None for role in state.roles.values())
         ):
             return None
         place = self.line_place(
@@ -7910,8 +8058,13 @@ class Scheduler:
         """Open a received message, or one ``owner`` sent. Opening one's own sent
         message marks nothing, since only its recipient reads it. Round 14, item 5.
         An operator may open what it sent to a line, as a line could already open
-        its own sent mail."""
-        message = self._log.state.messages.get(message_id)
+        its own sent mail.
+
+        **Audit of round 14, R2.** An operator may also open a message a retired line
+        received, marking nothing, since that line never runs again to read it and
+        its mail is documented as staying readable."""
+        state = self._log.state
+        message = state.messages.get(message_id)
         received = message is not None and message.recipient == owner
         # An external agent still opens only what it received, as tests/test_agents.py
         # pins, since it is outside the trust boundary.
@@ -7920,7 +8073,13 @@ class Scheduler:
             and isinstance(owner, (LineAddress, OperatorAddress))
             and message.sender == owner
         )
-        if message is None or not (received or sent_by_owner):
+        to_retired = (
+            message is not None
+            and isinstance(owner, OperatorAddress)
+            and isinstance(message.recipient, LineAddress)
+            and message.recipient.line_id in state.retired_lines
+        )
+        if message is None or not (received or sent_by_owner or to_retired):
             raise EventRejected(f"no message {message_id} in the mailbox of {owner}")
         if received:
             if not message.delivered:
@@ -8558,6 +8717,7 @@ class Scheduler:
         for worker_name, worker in (
             ("process inspection", self._process_worker),
             ("launch-record sweep", self._sweep_worker),
+            ("commit run", self._commit_worker),
         ):
             if not worker.close():
                 joined = False

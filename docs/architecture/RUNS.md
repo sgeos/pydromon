@@ -52,6 +52,19 @@ the point of it, since it must outlive the engine, and it is also its risk.
   its sandbox by editing the script and starting the run. **Inference.** This is the
   same exposure as the operator running the gate by hand in that worktree. An operator
   who does not accept it declares only commands whose code no line can write.
+- **Syncing a worktree runs the line's build.** `dromon sync-worktrees` runs
+  `uv sync --locked` as the operator, outside any sandbox and with the network, and uv
+  builds the project from the worktree's `pyproject.toml`, its local build backend and
+  `uv.lock`, all of which a writing line can change. A supervised run of the line's
+  gate already runs that line's code, but a sync runs it for every role at once, at
+  the operator's hand. **Round 14, audit finding S1.** The command therefore compares
+  each worktree's `pyproject.toml`, `uv.lock` and every `backend-path` directory with
+  `origin/main`, in the working tree and with untracked files, prints the difference,
+  and syncs a worktree that differs only on the operator's yes or with
+  `--accept-changes`. A worktree that matches is synced without a question, and one
+  whose difference cannot be read is not synced. **Residual.** A file git ignores
+  inside a backend path is not shown, and a build backend fetched from an index is
+  shown only as the `pyproject.toml` line that names it.
 - **Who may start or stop.** A seat may start or stop its role's runs only while it
   owns the role, so the one-writer rule holds for what a run writes. Every line, a
   seat that owns its role included, also needs `write` access to its working
@@ -148,13 +161,23 @@ scope's present holder, the role's owner or else the line that started it.
 of the output, opened as the digest is, and finds pytest's final line, such as `5162
 passed, 10 skipped, 48 deselected in 231.52s`, with the skip reasons of the short
 summary before it, which `-rfEs` in `pyproject.toml` makes pytest print. `run_ended`'s
-note then ends with `The output's test summary says` and that summary, at most eight
-reasons and the rest counted, each line cut to 200 printable characters and the whole
-note to 1,024 bytes. pytest names no deselected test, so only their count is given,
-and the run's command in the log says which marker expression deselected them.
-**Trust.** The output is under the line's working directory, which a writing line can
-edit, so the summary is what the output says, never what the daemon saw run, and the
-note says so in its wording. An output without a final line adds nothing.
+note then ends with `Unverified, the run's own output ends with the test summary` and
+that summary in quotation marks, at most eight reasons and the rest counted, each
+line cut to 200 printable characters, each reason to 80 characters after its place,
+and the whole note to 1,024 bytes. pytest names no deselected test, so only their
+count is given, and the run's command in the log says which marker expression
+deselected them. **Trust.** The output is under the line's working directory, which
+a writing line can edit, so the summary is what the output says, never what the
+daemon saw run. **Audit of round 14.** A command can print a forged summary last, and
+the note is shown by `run_status`, by the holder's `Run ended` note and by `dromon
+run status`, so the label travels inside the note to all three. Only the last short
+summary block is read, which is the first final line after the last `short test
+summary info` mark, or, with no mark, the last final line, and a mark with no final
+line after it gives nothing. A lost run records no summary at all, since it has no
+exit code and a green summary would read as its result. An output without a final
+line adds nothing. **Residual.** A command that prints a whole forged block last is
+still believed as far as the label allows, since only the exit code is the daemon's
+own observation.
 
 ## A lost run
 
@@ -352,11 +375,26 @@ that no existing command becomes startable by a reading line.
 review-gate = ["./scripts/check.sh"]
 
 [runs.commit_refs]
-patterns = ["refs/heads/*"]
+patterns = ["refs/remotes/origin/main", "refs/remotes/origin/feat/*"]
 ```
 
 A name may not be in both tables, and declaring a commit command requires at least one
-pattern, each beginning `refs/`, at most 16.
+pattern, at most 16. **Round 14, review of 1449c5c, C1.** Each pattern must begin
+`refs/remotes/REMOTE/`, with a remote named without wildcards, and anything else is
+refused at start and reload.
+
+**Who can move each allowed ref.** The following table is the operator's to check
+against the project's lines before declaring a pattern.
+
+| Ref | Who can move it |
+|---|---|
+| `refs/remotes/REMOTE/...` | The operator, by a fetch from that remote. A Claude Code line's enabled sandbox denies writing `refs/remotes` and `packed-refs` in the common git directory, as [`SANDBOX.md`](../protocol/SANDBOX.md) gives, and a Codex or Grok line keeps the whole `.git` read-only. Whoever can push to the remote moves it at the next fetch, so the remote's own access rules bound it too |
+| `refs/heads/...`, `refs/tags/...`, `refs/notes/...` and every other ref | Any line whose sandbox may write the common git directory, which a Claude Code line's may, so such patterns are refused |
+
+**Assumption.** The repository keeps its refs in git's files backend. A commit run is
+refused in a repository whose `extensions.refStorage` names another, since the guards
+name the files backend's places. A line whose sandbox is disabled is not confined at
+all, and could move any ref, as it could write any file.
 
 **How a line starts it.** `start_run` takes an optional argument `commit`, required for
 a commit command and refused for any other. It must be a full commit identifier of 40
@@ -365,23 +403,55 @@ move between the check and the checkout. The line needs only `read` access to it
 working directory, and a seat must still own its role, so the scope rule holds. A
 commit run is stopped with the same access it was started with.
 
-1. The daemon checks the commit with `git cat-file -e COMMIT^{commit}` and checks that
-   a ref matching one of `patterns` contains it, with `git for-each-ref --contains`,
-   in the project's repository, with arguments as an array and never a shell string.
-   Every git call turns hooks off, turns the credential prompt off, and is bounded to
-   60 seconds.
-2. It makes `commit-runs/RUN`, mode 0700, in the daemon's state directory, and fills
-   it with `git clone --no-checkout --shared` of the project's repository followed by
-   `git checkout --detach COMMIT`, then checks that `HEAD` is the commit. A clone
-   writes nothing into the project's own repository, as `git worktree add` would.
-   **Changed from the design.** The design put the checkout under `tmp` in the project
-   root. A line whose working directory is the project root could write there, so it
-   is in the state directory instead, which every line's sandbox denies. The start
-   makes or checks `commit-runs` with the other private directories.
-3. The run then starts as any run does, with the checkout as its command's working
-   directory, and its output file under `tmp/runs` in the reading line's working
-   directory, which the daemon writes, not the line, as it writes the output of any
-   run.
+1. The daemon refuses a start while another commit run of the same scope is starting,
+   and within 120 seconds after the scope's latest refused start, which
+   `commit_run_refused` records. It then checks the commit with `git cat-file -e
+   COMMIT^{commit}`, checks that the repository keeps its refs in the files backend,
+   and checks that a ref matching one of `patterns` points at it, with `git
+   for-each-ref --points-at`, in the project's repository, with arguments as an array
+   and never a shell string. **Round 14, review of 1449c5c, C1.** Only a tip
+   qualifies. Before, any commit a matching ref contained did, so a commit merged and
+   reverted since, or fixed since, could run.
+2. It makes `commit-runs/RUN`, mode 0700, in the daemon's state directory, holding
+   `home`, empty and mode 0700, and `tree`, filled with `git clone --no-checkout
+   --shared` of the project's repository, then an `info/attributes` of `* -filter` in
+   the clone, then `git checkout --detach COMMIT`, then a check that `HEAD` is the
+   commit. A clone writes nothing into the project's own repository, as `git worktree
+   add` would. **Changed from the design.** The design put the checkout under `tmp` in
+   the project root. A line whose working directory is the project root could write
+   there, so it is in the state directory instead, which every line's sandbox denies.
+   The start makes or checks `commit-runs` with the other private directories.
+3. The run then starts as any run does, with `tree` as its command's working
+   directory, `home` as its `HOME`, and its output file under `tmp/runs` in the
+   reading line's working directory, which the daemon writes, not the line, as it
+   writes the output of any run.
+
+**Every git call of a commit run.** **Round 14, review of 1449c5c, C2.** The review
+found that a commit's `.gitattributes` and `.lfsconfig` made the checkout start the
+large file filter the operator's global configuration defines, which read the
+commit's `.lfsconfig` and reached for the address it named before the command ran,
+with the operator's credential helper available. Each git call therefore runs with
+an environment of the daemon's `PATH` and fixed values alone, so no `HOME`, with
+`GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` set to `/dev/null` and
+`GIT_CONFIG_NOSYSTEM`, `GIT_ATTR_NOSYSTEM`, `GIT_NO_REPLACE_OBJECTS`,
+`GIT_LFS_SKIP_SMUDGE` and `GIT_TERMINAL_PROMPT=0`. It passes `core.hooksPath=/dev/null`,
+`core.fsmonitor=false`, an empty `credential.helper`, `submodule.recurse=false` and an
+empty large file filter that is not required. The clone's `info/attributes` outranks
+every `.gitattributes` the commit carries, so no path names a filter even where a
+configuration git still reads, the project repository's own, defines one. Each call
+runs in a session of its own and is bounded to 60 seconds, after which its whole
+process group is killed, so a filter or other child does not outlive it.
+
+**Starts are limited and isolated.** **Round 14, review of 1449c5c, C3.** The checks,
+the clone and the removal run on a worker of their own, so a slow checkout never
+delays the stops, launches and reconciliation the process worker serves. A scope has
+at most one commit run starting at a time, and a second start is refused, not queued.
+A start refused in the checks or the checkout costs the commit worker up to six git
+calls, so it is recorded as `commit_run_refused`, with the line, its role, the
+command, the commit, the reason and the time, and its scope starts no commit run for
+120 seconds after, a cooldown that outlives a restart since it is read from the log.
+A start refused before it reaches the worker, such as for a malformed commit, records
+nothing.
 4. `run_started` gains the optional fields `commit` and `checkout`, the directory the
    command ran in, so the record names what ran and where without reading the
    project's configuration. `workdir` then holds only the output.
@@ -393,44 +463,73 @@ commit run is stopped with the same access it was started with.
 
 **The trust argument.** It is written for the operator to accept or refuse.
 
-- **What runs.** The code at a commit that a ref matching `patterns` contains, which is
-  code a writer committed and the operator's repository holds. **Fact.** A reading line
-  can neither write that code nor change it after the check, since the identifier is a
-  digest of the tree and the checkout is made by the daemon in a directory no line can
-  write.
+- **What runs.** The code at the tip of a remote-tracking ref matching `patterns`,
+  which the operator's own fetch put there. **Fact.** A reading line can neither write
+  that code nor change it after the check, since the identifier is a digest of the
+  tree and the checkout is made by the daemon in a directory no line can write.
+  **Inference.** A writing line with an enabled sandbox cannot move such a ref either,
+  as the table above gives, so a line cannot choose what a commit run executes beyond
+  choosing among the tips the operator fetched.
 - **What a reading line gains.** It can make the daemon run any such commit's gate
   outside every sandbox, with the daemon's authority. **Inference.** This is no more
   than the exposure the trust section already accepts for a writing line that starts
   its own gate, since the code was committed by a line that could have started it
   itself. It is more where a commit's author could not start runs, such as a seat that
   does not own its role, since a reviewer can then run that author's code.
-  `patterns` is how the operator bounds it, such as to `refs/heads/main` alone.
+  `patterns` is how the operator bounds it, such as to `refs/remotes/origin/main`
+  alone.
 - **What the run can write.** A run is not sandboxed, so the commit's code may write
   anywhere the daemon may, other worktrees included. The checkout keeps the run's own
   writes out of every worktree, but a hostile commit is not contained. **Assumption.**
   The operator declares commit commands only where the committed gate is trusted as
   much as the gate a writing line runs.
+- **What a reading seat can read.** **Round 14, review of 1449c5c, C4.** The command
+  runs unsandboxed with the daemon's user, and its output file is written into the
+  reading line's working directory. So a commit's code can print anything the
+  operator's user can read, such as a credential, and a reading seat that could not
+  read it itself can then read it in the output. This is the exposure an ordinary run
+  gives a writing line, now given to a reader too. The fresh `home` only keeps the
+  operator's settings, credentials and caches from being found by `HOME`. It is not a
+  confinement, since the command can still name any path.
 - **What is not shared.** The checkout has no virtual environment, so the command makes
-  its own, with `uv sync --locked` in its first step, which needs uv's cache and the
-  network. Nothing of a line's uncommitted work reaches it.
+  its own, with `uv sync --locked` in its first step. Its `HOME` is the fresh `home`,
+  so uv starts with an empty cache, and a tool that keeps an interpreter or a download
+  under `HOME` fetches it again. **Hypothesis, not verified.** The project's gate then
+  still passes, given the network, more slowly, since the supervisor runs outside
+  every sandbox and uv and pyright fetch what they need. No commit run with the fresh
+  home has been run, since the daemon running when it was written held older code.
+  Nothing of a line's uncommitted work reaches it.
+
+**What a green commit run proves.** **Round 14, review of 1449c5c, C4.** Exit code 0
+means that the commit's own command, such as its own `scripts/check.sh`, exited 0 in
+a clean checkout of that commit, without any line's uncommitted files. It does not
+show that the project's current gate passed, since the commit carries its own gate,
+which can differ from the one on `main` now. It does not show that the commit is still
+a ref's tip, only that it was one at the start. The output's test summary is the
+commit's own output, which the commit's code writes, so it is labelled unverified as
+for any run. The receipt names the commit and the checkout, so a reader sees what ran.
 - **Scope and successor.** A commit run belongs to the reading line's scope as any run
   does, with the same `previous` rule, so a successor reads its record first.
 
-**Failure modes.** A commit that is not found or not contained is refused before
-anything is made. A clone or checkout that fails removes its directory and records
-nothing. A daemon that dies during a run leaves the checkout, which a later
+**Failure modes.** A commit that is not found or not a tip is refused before
+anything is made. A clone or checkout that fails removes its directory, and from round
+14 records `commit_run_refused`. A daemon that dies during a run leaves the checkout, which a later
 reconciliation removes once the run has ended or been cleared. A checkout left by a
 crash before the run was recorded has no run, and the first check after a start
 removes every entry of `commit-runs` that no open or lost run names, never following
 a link, reading at most 4,096 entries at a time. A removal that fails is said once on
 the daemon's standard error and tried again at the next check.
 
-**Residual.** The checks and the clone run on the process worker, which also serves
-stops and reconciliation, so a slow clone delays them, by at most the 60-second bound
-of each of its four git calls. **Inference.** A shared clone that checks out one tree
-is fast for a repository of this size, so the delay is short in practice. The
-checkout is also a full working tree for the duration of the run, so disk use grows
-with each open commit run, bounded by one open run per scope.
+**Residual.** A slow start delays other scopes' commit run starts, which share the
+commit worker, by at most the 60-second bound of each of its six git calls, and the
+worker's queue of eight refuses further starts when full. A git call killed at its
+bound is waited for 5 seconds, and a process that left its group by starting a
+session of its own is not killed. The cooldown follows a refused start only, so a
+scope may still repeat successful starts back to back, each a full gate. The checkout
+is also a full working tree for the duration of the run, so disk use grows with each
+open commit run, bounded by one open run per scope. **Rollback hazard.** A daemon from
+before this change cannot decode `commit_run_refused`, so once one is recorded the
+daemon cannot go back below it.
 
 **Tests.** `tests/test_commitruns.py` covers the declaration and its refusals, the
 event's fields together and its wire form without them, a refused name, short
@@ -440,8 +539,17 @@ worktree to the repository, a failed checkout that leaves nothing, a wide or lin
 base refused, a link in or at a checkout not followed, the sweep, a reading line
 refused an ordinary command and allowed a commit command whose checkout is removed
 after the end, the refusals before anything is made, a lost run's checkout kept until
-it is cleared, a start's sweep, and the tool's `commit` argument. **Coverage gap.**
-The real-process tests stand in for `ps` as the other run tests do.
+it is cleared, a start's sweep, and the tool's `commit` argument. From the review of
+1449c5c it also covers a commit a ref contains but does not point at, every pattern a
+line could move, a repository without the files backend, git's environment, a filter
+the operator's global configuration defines and one a configuration still read
+defines, each run without the protections first as a control, a hook likewise, a git
+call killed with its child at its bound, a refused start recorded with a cooldown
+that outlives a restart, a second start refused while one is in progress, the
+checkout made on the commit worker, and the fresh home. **Coverage gap.** The
+real-process tests stand in for `ps` as the other run tests do. No test reaches the
+network, so the large file filter's own behaviour is shown only by the review's
+experiment, and the filter test stands in for it with a filter that records its run.
 
 ## Not implemented
 

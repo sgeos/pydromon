@@ -5,20 +5,26 @@ normative, under "A gate run that a reading line may start".
 A review seat may only read its working directory, so it may not start an ordinary
 run, which writes there outside its sandbox. A commit run lets it start a gate
 without writing any worktree. The daemon checks that the commit is in the project's
-repository and that a ref the operator allows contains it, clones the repository
-with ``--no-checkout --shared`` into a private directory in the daemon's state
+repository and is the tip of a ref the operator allows, clones the repository with
+``--no-checkout --shared`` into a private directory in the daemon's state
 directory, which no line can reach, and checks out the commit detached. The run's
-command runs there, and the checkout is removed once the run no longer blocks its
-scope.
+command runs there, with a fresh private home beside it, and both are removed once
+the run no longer blocks its scope.
 
-Every function here blocks, so the scheduler runs each on its process worker.
+Every function here blocks, so the scheduler runs each on its own commit worker,
+not on the process worker that serves stops and reconciliation.
 
 Trust. Every git call takes its arguments as an array, never a shell string, with
-hooks turned off, without a terminal prompt and with a time bound. A commit is a
-full hexadecimal object name, never a ref, so it cannot move between the check and
-the checkout. The commit's own code runs with the daemon's authority and outside
-every sandbox, which the operator accepts by declaring a commit command, as
-``RUNS.md`` argues.
+hooks, filters, credential helpers and replace refs turned off, with neither the
+operator's global nor the system's git configuration, with an environment of the
+search path alone, without a terminal prompt, and with a time bound that kills its
+whole process group. A commit is a full hexadecimal object name, never a ref, so it
+cannot move between the check and the checkout. **Round 14, review of 1449c5c.** It
+must be the tip of a ref under ``refs/remotes/``, which a line's sandbox may not
+write, rather than any commit a ref contains, so a commit merged and reverted since,
+or one a line put under a branch, does not qualify. The commit's own code runs with
+the daemon's authority and outside every sandbox, which the operator accepts by
+declaring a commit command, as ``RUNS.md`` argues.
 
 Porting note. The removal relies on ``shutil.rmtree`` taking a directory descriptor
 and not following links, which ``avoids_symlink_attacks`` reports. A port uses
@@ -26,19 +32,44 @@ and not following links, which ``avoids_symlink_attacks`` reports. A port uses
 commit runs are refused rather than removed unsafely.
 """
 
+import contextlib
 import os
 import shutil
+import signal
 import stat
 import subprocess
 from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
 from dromon.model import COMMIT_PATTERN, ID_PATTERN
 
 GIT_SECONDS: Final = 60.0
-"""The bound on one git call. It also bounds how long a commit run's start holds the
-process worker, which serves stops and reconciliation, at about four times this."""
+"""The bound on one git call. A commit run's start makes at most six, so it holds
+the commit worker for at most about six times this."""
+
+REAP_SECONDS: Final = 5.0
+"""How long a git call killed at its bound is waited for once its group is sent
+``SIGKILL``. A call not reaped by then is left, and the start is refused all the
+same."""
+
+REFUSED_COOLDOWN_SECONDS: Final = 120.0
+"""How long a scope starts no commit run after a start of its own failed in the
+checks or the checkout, which ``commit_run_refused`` records. **Round 14, review of
+1449c5c, C3.** A failed start costs the commit worker up to six git calls and
+recorded nothing before, so a line could repeat it without bound."""
+
+REMOTE_REFS: Final = "refs/remotes/"
+"""The only refs a commit run's commit may be the tip of. A line's sandbox denies
+writing them, and the files backend keeps them under ``refs/remotes`` and in
+``packed-refs``, which ``workdir.git_write_guards`` guards, so they move only by
+the operator's own fetch."""
+
+TREE: Final = "tree"
+HOME: Final = "home"
+"""The two directories of a run's private directory, the checkout and the home the
+command is given."""
 
 MAX_REF_PATTERNS: Final = 16
 MAX_REF_PATTERN_BYTES: Final = 256
@@ -51,15 +82,43 @@ GIT_CONFIG: Final = (
     "-c",
     "core.hooksPath=/dev/null",
     "-c",
-    "protocol.file.allow=always",
+    "core.fsmonitor=false",
+    "-c",
+    "credential.helper=",
+    "-c",
+    "submodule.recurse=false",
+    "-c",
+    "filter.lfs.process=",
+    "-c",
+    "filter.lfs.smudge=",
+    "-c",
+    "filter.lfs.clean=",
+    "-c",
+    "filter.lfs.required=false",
 )
-"""Hooks are off, so neither a hook the operator configured globally nor one in the
-clone runs before the command does. ``protocol.file.allow`` lets the local clone read
-the project's repository whatever the global setting says."""
+"""Hooks are off, so neither a hook in the clone nor one the project's repository
+names runs before the command does. No file system monitor starts, no credential
+helper is asked, submodules are not followed, and the large file filter does
+nothing even where the project's repository configures it. The operator's global
+and the system configuration are not read at all, as ``git_environment`` gives.
+**Round 14, review of 1449c5c, C2.**"""
+
+NO_FILTERS: Final = "* -filter\n"
+"""The clone's ``info/attributes``, which outranks every ``.gitattributes`` a commit
+carries, so no path names a filter in the checkout."""
 
 
 class CommitRefused(ValueError):
     """A commit run cannot start, or its checkout cannot be made or removed."""
+
+
+@dataclass(frozen=True, slots=True)
+class Checkout:
+    """A commit run's checkout, ``tree``, and the empty private home its command is
+    given, ``home``, both in the run's own private directory."""
+
+    tree: Path
+    home: Path
 
 
 def supported() -> bool:
@@ -68,30 +127,71 @@ def supported() -> bool:
 
 
 def git_environment(base: Mapping[str, str]) -> dict[str, str]:
-    """``base`` with git's prompt for credentials turned off, since no one answers
-    it and the call would wait out its bound."""
-    return {**base, "GIT_TERMINAL_PROMPT": "0"}
+    """The environment of every git call for commit runs, which keeps only
+    ``base``'s search path. **Round 14, review of 1449c5c, C2.** Neither the
+    operator's global nor the system's configuration is read, so a filter or a
+    credential helper configured there is not reached, as a commit's
+    ``.gitattributes`` and ``.lfsconfig`` reached them before. No home is given, no
+    attribute file of the system is read, replace refs are ignored, the large file
+    filter skips its download, and git's prompt for credentials is off, since no one
+    answers it."""
+    return {
+        "PATH": base.get("PATH", os.defpath),
+        "LC_ALL": "C",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_LFS_SKIP_SMUDGE": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
 
 
 def _git(
     arguments: Sequence[str], cwd: Path, environment: Mapping[str, str]
 ) -> subprocess.CompletedProcess[bytes]:
+    """Run git in a session of its own, so that a call killed at its bound is killed
+    with every process it started, such as a filter, rather than the first alone.
+    Raises ``CommitRefused``."""
+    argv = ["git", *GIT_CONFIG, *arguments]
     try:
-        return subprocess.run(  # noqa: S603
-            ["git", *GIT_CONFIG, *arguments],  # noqa: S607
+        process = subprocess.Popen(  # noqa: S603
+            argv,
             cwd=cwd,
             env=dict(environment),
             stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=GIT_SECONDS,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired as error:
-        raise CommitRefused(
-            f"git {arguments[0]} took longer than {GIT_SECONDS:g} seconds"
-        ) from error
     except OSError as error:
         raise CommitRefused(f"git cannot run: {error}") from error
+    try:
+        stdout, stderr = process.communicate(timeout=GIT_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        _kill_group(process)
+        raise CommitRefused(
+            f"git {arguments[0]} took longer than {GIT_SECONDS:g} seconds, so its"
+            " process group was killed"
+        ) from error
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
+
+def _kill_group(process: subprocess.Popen[bytes]) -> None:
+    """Send ``SIGKILL`` to ``process``'s group, which ``start_new_session`` made it
+    the leader of, wait at most ``REAP_SECONDS`` for it, and close its pipes, which
+    a survivor outside the group may still hold. Never raises."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        with contextlib.suppress(OSError):
+            process.kill()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=REAP_SECONDS)
+    for pipe in (process.stdout, process.stderr):
+        if pipe is not None:
+            pipe.close()
 
 
 def _said(result: subprocess.CompletedProcess[bytes]) -> str:
@@ -102,19 +202,35 @@ def _said(result: subprocess.CompletedProcess[bytes]) -> str:
 
 def check_patterns(patterns: Sequence[str]) -> tuple[str, ...]:
     """``patterns`` as the project file may declare them, each a ref pattern under
-    ``refs/``. Raises ``CommitRefused`` naming the first that is not."""
+    ``refs/remotes/`` naming a remote. Raises ``CommitRefused`` naming the first that
+    is not. **Round 14, review of 1449c5c, C1.** A line's sandbox may write
+    ``refs/heads``, ``refs/tags`` and every other ref outside ``refs/remotes``, so a
+    pattern there would let a line choose the code a reading seat runs outside every
+    sandbox."""
     if not 0 < len(patterns) <= MAX_REF_PATTERNS:
         raise CommitRefused(f"declare 1 to {MAX_REF_PATTERNS} ref patterns")
     for pattern in patterns:
         if (
-            not pattern.startswith("refs/")
-            or len(pattern.encode()) > MAX_REF_PATTERN_BYTES
+            len(pattern.encode()) > MAX_REF_PATTERN_BYTES
             or any(ord(character) < 0x21 for character in pattern)
             or ".." in pattern
         ):
             raise CommitRefused(
-                f"{pattern!r} is not a ref pattern under refs/ of at most"
+                f"{pattern!r} is not a ref pattern of at most"
                 f" {MAX_REF_PATTERN_BYTES} bytes without spaces or '..'"
+            )
+        remote, _, rest = pattern.removeprefix(REMOTE_REFS).partition("/")
+        if (
+            not pattern.startswith(REMOTE_REFS)
+            or not remote
+            or not rest
+            or any(character in remote for character in "*?[\\")
+        ):
+            raise CommitRefused(
+                f"{pattern!r} is not under {REMOTE_REFS}REMOTE/, the only refs a"
+                " line's sandbox may not write. Refs under refs/heads, refs/tags or"
+                " elsewhere can be moved by a line, so they cannot choose what a"
+                " commit run executes"
             )
     return tuple(patterns)
 
@@ -126,8 +242,10 @@ def check_commit(
     environment: Mapping[str, str],
 ) -> None:
     """Refuse ``commit`` unless it is a full object name of a commit in
-    ``repository`` that a ref matching one of ``patterns`` contains. Raises
-    ``CommitRefused``."""
+    ``repository`` that a ref matching one of ``patterns`` points at now, in a
+    repository whose refs are kept by the files backend. Raises ``CommitRefused``.
+    **Round 14, review of 1449c5c, C1.** Only a tip qualifies, not every commit a
+    ref contains, so a commit since reverted or fixed does not run."""
     if COMMIT_PATTERN.fullmatch(commit) is None:
         raise CommitRefused(
             f"{commit!r} is not a full commit, 40 or 64 lowercase hexadecimal"
@@ -136,19 +254,26 @@ def check_commit(
     found = _git(["cat-file", "-e", f"{commit}^{{commit}}"], repository, environment)
     if found.returncode != 0:
         raise CommitRefused(f"{commit} is not a commit in the project's repository")
-    contained = _git(
-        ["for-each-ref", "--format=%(refname)", f"--contains={commit}", *patterns],
+    storage = _git(
+        ["config", "--get", "extensions.refStorage"], repository, environment
+    )
+    backend = storage.stdout.decode(errors="replace").strip().lower()
+    if storage.returncode not in (0, 1) or backend not in ("", "files"):
+        raise CommitRefused(
+            "the project's repository does not keep its refs in the files backend,"
+            " so a line's sandbox cannot be kept from moving refs/remotes"
+        )
+    tips = _git(
+        ["for-each-ref", "--format=%(refname)", f"--points-at={commit}", *patterns],
         repository,
         environment,
     )
-    if contained.returncode != 0:
+    if tips.returncode != 0:
+        raise CommitRefused(f"the refs at {commit} cannot be read: {_said(tips)}")
+    if not tips.stdout.strip():
         raise CommitRefused(
-            f"the refs containing {commit} cannot be read: {_said(contained)}"
-        )
-    if not contained.stdout.strip():
-        raise CommitRefused(
-            f"no ref matching {', '.join(patterns)} contains {commit}, so the project"
-            " does not let a run check it out"
+            f"no ref matching {', '.join(patterns)} points at {commit}. Only the tip"
+            " of an allowed ref runs, so name the commit such a ref holds now"
         )
 
 
@@ -182,47 +307,70 @@ def make_checkout(
     repository: Path,
     commit: str,
     environment: Mapping[str, str],
-) -> Path:
-    """A detached checkout of ``commit`` at ``base/run_id``, made with a clone that
-    writes nothing into ``repository``. Raises ``CommitRefused``, leaving nothing
-    behind, when any step fails, or when the checkout's ``HEAD`` is not the commit."""
+) -> Checkout:
+    """A detached checkout of ``commit`` at ``base/run_id/tree``, made with a clone
+    that writes nothing into ``repository``, and an empty home at
+    ``base/run_id/home``, each with mode 0700. Raises ``CommitRefused``, leaving
+    nothing behind, when any step fails, or when the checkout's ``HEAD`` is not the
+    commit. ``environment`` is given to git as it is, so the caller passes
+    ``git_environment``'s."""
     if ID_PATTERN.fullmatch(run_id) is None:
         raise CommitRefused(f"{run_id!r} is not a run identifier")
     _private_base(base)
-    target = base / run_id
+    run_dir = base / run_id
     try:
-        os.mkdir(target, 0o700)
+        os.mkdir(run_dir, 0o700)
     except OSError as error:
-        raise CommitRefused(f"{target} cannot be made: {error}") from error
+        raise CommitRefused(f"{run_dir} cannot be made: {error}") from error
+    found = Checkout(run_dir / TREE, run_dir / HOME)
     try:
-        steps: tuple[tuple[Sequence[str], Path], ...] = (
-            (
-                [
-                    "clone",
-                    "--quiet",
-                    "--no-checkout",
-                    "--shared",
-                    "--",
-                    str(repository),
-                    str(target),
-                ],
-                base,
-            ),
-            (["checkout", "--quiet", "--detach", commit], target),
+        try:
+            os.mkdir(found.home, 0o700)
+        except OSError as error:
+            raise CommitRefused(f"{found.home} cannot be made: {error}") from error
+        clone = [
+            "clone",
+            "--quiet",
+            "--no-checkout",
+            "--shared",
+            "--",
+            str(repository),
+            str(found.tree),
+        ]
+        _step(clone, run_dir, environment, commit)
+        _no_filters(found.tree)
+        _step(
+            ["checkout", "--quiet", "--detach", commit], found.tree, environment, commit
         )
-        for arguments, cwd in steps:
-            result = _git(arguments, cwd, environment)
-            if result.returncode != 0:
-                raise CommitRefused(
-                    f"git {arguments[0]} of {commit} failed: {_said(result)}"
-                )
-        head = _git(["rev-parse", "HEAD"], target, environment)
+        head = _git(["rev-parse", "HEAD"], found.tree, environment)
         if head.returncode != 0 or head.stdout.decode().strip() != commit:
             raise CommitRefused(f"the checkout of {commit} does not hold it")
     except CommitRefused:
         remove_checkout(base, run_id)
         raise
-    return target
+    return found
+
+
+def _step(
+    arguments: Sequence[str], cwd: Path, environment: Mapping[str, str], commit: str
+) -> None:
+    """Run one git step of a checkout. Raises ``CommitRefused`` when it fails."""
+    result = _git(arguments, cwd, environment)
+    if result.returncode != 0:
+        raise CommitRefused(f"git {arguments[0]} of {commit} failed: {_said(result)}")
+
+
+def _no_filters(tree: Path) -> None:
+    """Write ``NO_FILTERS`` as the new clone's ``info/attributes``, before anything
+    is checked out. Raises ``CommitRefused``."""
+    info = tree / ".git" / "info"
+    try:
+        info.mkdir(mode=0o700, exist_ok=True)
+        (info / "attributes").write_text(NO_FILTERS)
+    except OSError as error:
+        raise CommitRefused(
+            f"filters cannot be turned off in {tree}: {error}"
+        ) from error
 
 
 def remove_checkout(base: Path, run_id: str) -> None:

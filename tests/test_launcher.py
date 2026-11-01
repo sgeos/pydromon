@@ -20,8 +20,10 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -251,125 +253,236 @@ reaped within ``REAP_SECONDS``."""
 
 ATTEMPTS = 3
 """How many times a stop test runs its scenario when the launcher reports that one
-of its own bounds passed on a loaded machine."""
+of its own bounds passed and a measured delay explains it."""
+
+PROBE_SECONDS = 0.01
+"""The nominal sleep of the delay probe. An idle machine wakes it within a few
+milliseconds of this."""
+
+MAX_PROBES = 100_000
+"""The most sleeps one probe makes, so its loop is bounded, about 1,000 seconds at
+the nominal sleep, far past any attempt."""
+
+UNVERIFIED_SLACK = min(
+    launcher.WALK_DEADLINE_SECONDS - launcher.WALK_SECONDS,
+    launcher.KILL_CONFIRM_SECONDS,
+    launcher.REAP_SECONDS,
+)
+"""The least delay that could make the launcher exit ``UNVERIFIED``, its smallest
+margin, derived from its constants. The status does not say which bound passed, so
+the smallest is the delay a probe must have seen to explain it."""
 
 
-def loaded() -> str | None:
-    """The machine's load, described, when it runs more work than it has processors,
-    and otherwise ``None``. A load average that cannot be read counts as not loaded,
-    so the stop tests then fail rather than skip.
+@dataclass(frozen=True, slots=True)
+class Inconclusive:
+    """An attempt whose outcome only a delay explains, with the delay that would."""
 
-    **Assumption.** A one minute load average above the processor count is a loaded
-    machine. The gates that failed these tests in round 13 ran at load averages of 150
-    to 220, far above any processor count here."""
-    try:
-        one, _, _ = os.getloadavg()
-    except OSError:
-        return None
-    processors = os.cpu_count() or 1
-    if one <= processors:
-        return None
-    return f"a load average of {one:.0f} on {processors} processors"
+    bound: str
+    """What the launcher or the test reported passing."""
+    explained_by: float
+    """The seconds of delay that would explain it."""
 
 
-def until_conclusive(attempt: Callable[[int], str | None], what: str) -> None:
+class DelayProbe:
+    """Measures the scheduling delay this process sees while an attempt runs, by a
+    thread that sleeps ``PROBE_SECONDS`` again and again and records how far each
+    sleep overran. **Audit of round 14, L1.** The one-minute load average it
+    replaces lagged the attempt and excused a real regression on any machine whose
+    load passed its processor count. This measures the attempt's own time.
+
+    **Inference.** A loaded machine delays the launcher and this thread alike, since
+    both wait on the same scheduler, so a delay this thread did not see did not
+    delay the launcher either, up to the probe's granularity. **Residual.** A delay
+    confined to the launcher's process, such as a page-in, is not seen, and fails
+    the test, which is the failure mode chosen, since it fails safe."""
+
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._clock, self._sleep = clock, sleep
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self.most = 0.0
+        """The longest single overrun seen, in seconds."""
+        self.total = 0.0
+        """The sum of every overrun seen, in seconds."""
+
+    def _run(self) -> None:
+        for _ in range(MAX_PROBES):
+            if self._stop.is_set():
+                return
+            began = self._clock()
+            self._sleep(PROBE_SECONDS)
+            over = max(0.0, self._clock() - began - PROBE_SECONDS)
+            self.most = max(self.most, over)
+            self.total += over
+
+    def __enter__(self) -> "DelayProbe":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=RECORD_SECONDS)
+
+    def explains(self, needed: float) -> bool:
+        """Whether the delay seen could account for ``needed`` seconds: one stall of
+        at least half of it, or stalls that add up to all of it."""
+        return self.most >= needed / 2 or self.total >= needed
+
+    def described(self) -> str:
+        return (
+            f"a longest stall of {self.most * 1000:.0f} ms and"
+            f" {self.total * 1000:.0f} ms in all"
+        )
+
+
+def until_conclusive(
+    attempt: Callable[[int], Inconclusive | None],
+    what: str,
+    probe: Callable[[], DelayProbe] = DelayProbe,
+) -> None:
     """Run ``attempt`` until one run is conclusive, at most ``ATTEMPTS`` times.
 
     **Round 14, item 9.** The launcher's stop is bounded by its own constants, which
     the Agent SDK's window fixes, so a test cannot wait longer for it without changing
     what it checks. ``attempt`` asserts every outcome the bounds do not explain, and
-    returns ``None`` when its run was conclusive, or the bound the launcher reported
-    passing. Such a run counts as inconclusive only on a loaded machine, so the same
-    outcome on an idle one fails the test. When no run is conclusive, the test is
-    skipped with the load and the bounds named, so the skip is counted and seen, as
-    a test that needs ``ps`` is."""
+    returns ``None`` when its run was conclusive, or what passed with the delay that
+    would explain it. **Audit of round 14, L1.** Each attempt runs under a
+    ``DelayProbe``, and its outcome counts as inconclusive only when the delay the
+    probe measured during that attempt explains it, so the same outcome with no such
+    delay fails the test, however high the load average. When no run is conclusive,
+    the test is skipped with each bound and measured delay named, so the skip is
+    counted and seen, as a test that needs ``ps`` is."""
     passed: list[str] = []
     for number in range(ATTEMPTS):
-        bound = attempt(number)
-        if bound is None:
+        with probe() as seen:
+            outcome = attempt(number)
+        if outcome is None:
             return
-        load = loaded()
-        assert load is not None, f"{what}: {bound}, on a machine that is not loaded"
-        passed.append(f"{bound}, at {load}")
+        assert seen.explains(outcome.explained_by), (
+            f"{what}: {outcome.bound}, with {seen.described()}, too little to explain"
+            f" the {outcome.explained_by * 1000:.0f} ms it needs"
+        )
+        passed.append(f"{outcome.bound}, with {seen.described()}")
     pytest.skip(
         f"{what} was inconclusive in {ATTEMPTS} runs, since the launcher's own"
-        f" bounds passed under load: {'; '.join(passed)}"
+        f" bounds passed under a measured delay: {'; '.join(passed)}"
     )
 
 
-def test_load_is_read_against_the_processor_count(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    processors = 4
-    monkeypatch.setattr(os, "cpu_count", lambda: processors)
-    monkeypatch.setattr(os, "getloadavg", lambda: (float(processors), 0.0, 0.0))
-    assert loaded() is None
-    monkeypatch.setattr(os, "getloadavg", lambda: (processors * 50.0, 0.0, 0.0))
-    assert loaded() == f"a load average of {processors * 50} on {processors} processors"
+class Measured(DelayProbe):
+    """A probe that reports a fixed delay, for the tests of ``until_conclusive``."""
 
-    def unreadable() -> tuple[float, float, float]:
-        raise OSError("no load average")
+    def __init__(self, most: float, total: float) -> None:
+        super().__init__()
+        self._fixed = (most, total)
 
-    monkeypatch.setattr(os, "getloadavg", unreadable)
-    assert loaded() is None
+    def __enter__(self) -> "DelayProbe":
+        self.most, self.total = self._fixed
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
 
 
-def test_a_conclusive_run_ends_the_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sys.modules[__name__], "loaded", lambda: "heavy")
+def measured(most: float, total: float) -> Callable[[], DelayProbe]:
+    return lambda: Measured(most, total)
+
+
+STALLED = measured(UNVERIFIED_SLACK, UNVERIFIED_SLACK)
+IDLE = measured(0.002, 0.01)
+PASSED = Inconclusive("a bound passed", UNVERIFIED_SLACK)
+
+
+def test_the_probe_measures_overruns_of_its_sleep() -> None:
+    """A fake clock that loses 300 ms on the second sleep, and stops the probe on
+    the fourth, so the loop runs without real time."""
+    now = [0.0]
+    sleeps: list[float] = []
+    stalls = [0.0, 0.3, 0.001, 0.0]
+    probe = DelayProbe(clock=lambda: now[0])
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds + stalls[len(sleeps)]
+        sleeps.append(seconds)
+        if len(sleeps) == len(stalls):
+            probe._stop.set()  # pyright: ignore[reportPrivateUsage]
+
+    probe._sleep = sleep  # pyright: ignore[reportPrivateUsage]
+    probe._run()  # pyright: ignore[reportPrivateUsage]
+    assert sleeps == [PROBE_SECONDS] * len(stalls)
+    assert probe.most == pytest.approx(0.3)
+    assert probe.total == pytest.approx(0.301)
+    assert probe.explains(0.6) and probe.explains(0.3)
+    assert not probe.explains(0.61)
+    assert "a longest stall of 300 ms" in probe.described()
+
+
+def test_a_real_probe_starts_and_stops() -> None:
+    with DelayProbe() as probe:
+        time.sleep(PROBE_SECONDS * 3)
+    assert not probe._thread.is_alive()  # pyright: ignore[reportPrivateUsage]
+    assert probe.most >= 0.0 and probe.total >= probe.most
+
+
+def test_the_slack_is_the_launchers_smallest_margin() -> None:
+    assert 0 < UNVERIFIED_SLACK <= launcher.KILL_CONFIRM_SECONDS
+    assert UNVERIFIED_SLACK <= launcher.REAP_SECONDS
+
+
+def test_a_conclusive_run_ends_the_attempts() -> None:
     runs: list[int] = []
 
-    def attempt(number: int) -> str | None:
+    def attempt(number: int) -> Inconclusive | None:
         runs.append(number)
-        return "a bound passed" if number == 0 else None
+        return PASSED if number == 0 else None
 
-    until_conclusive(attempt, "a stop")
+    until_conclusive(attempt, "a stop", STALLED)
     assert runs == [0, 1]
 
 
-def test_a_passed_bound_on_an_idle_machine_fails(
+def test_a_passed_bound_without_a_measured_delay_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(sys.modules[__name__], "loaded", lambda: None)
+    """Audit of round 14, L1. A high load average no longer excuses it."""
+    monkeypatch.setattr(os, "getloadavg", lambda: (500.0, 500.0, 500.0))
     runs: list[int] = []
 
-    def attempt(number: int) -> str | None:
+    def attempt(number: int) -> Inconclusive | None:
         runs.append(number)
-        return "a bound passed"
+        return PASSED
 
-    with pytest.raises(AssertionError, match="a stop: a bound passed, on a machine"):
-        until_conclusive(attempt, "a stop")
+    with pytest.raises(AssertionError, match="a stop: a bound passed, with a longest"):
+        until_conclusive(attempt, "a stop", IDLE)
     assert runs == [0]
 
 
-def test_runs_inconclusive_under_load_skip_naming_each(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(sys.modules[__name__], "loaded", lambda: "heavy")
+def test_runs_inconclusive_under_a_measured_delay_skip_naming_each() -> None:
     runs: list[int] = []
 
-    def attempt(number: int) -> str | None:
+    def attempt(number: int) -> Inconclusive | None:
         runs.append(number)
-        return f"bound {number}"
+        return Inconclusive(f"bound {number}", UNVERIFIED_SLACK)
 
     with pytest.raises(pytest.skip.Exception) as skipped:
-        until_conclusive(attempt, "a stop")
+        until_conclusive(attempt, "a stop", STALLED)
     assert runs == list(range(ATTEMPTS))
     for number in range(ATTEMPTS):
-        assert f"bound {number}, at heavy" in str(skipped.value)
+        assert f"bound {number}, with a longest stall" in str(skipped.value)
 
 
-def test_a_failed_assertion_in_a_run_is_never_retried(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(sys.modules[__name__], "loaded", lambda: "heavy")
+def test_a_failed_assertion_in_a_run_is_never_retried() -> None:
     runs: list[int] = []
 
-    def attempt(number: int) -> str | None:
+    def attempt(number: int) -> Inconclusive | None:
         runs.append(number)
         raise AssertionError("the child survived")
 
     with pytest.raises(AssertionError, match="the child survived"):
-        until_conclusive(attempt, "a stop")
+        until_conclusive(attempt, "a stop", STALLED)
     assert runs == [0]
 
 
@@ -602,7 +715,7 @@ def test_the_filter_passes_the_lines_git_command_and_never_the_daemons(
 def test_a_stop_under_kill_all_ends_the_harness_and_its_group(
     tmp_path: Path, started: list[Launched]
 ) -> None:
-    def attempt(number: int) -> str | None:
+    def attempt(number: int) -> Inconclusive | None:
         del number
         launched = Launched(tmp_path, HARNESS + "time.sleep(60)\n", StopPolicy.KILL_ALL)
         started.append(launched)
@@ -614,7 +727,10 @@ def test_a_stop_under_kill_all_ends_the_harness_and_its_group(
         # it is gone either way.
         assert gone(stay)
         if status == UNVERIFIED:
-            return "the launcher could not confirm its stop within its bounds"
+            return Inconclusive(
+                "the launcher could not confirm its stop within its bounds",
+                UNVERIFIED_SLACK,
+            )
         assert status == 128 + signal.SIGTERM
         return None
 
@@ -983,7 +1099,7 @@ def test_a_harness_that_ignores_sigterm_is_killed_within_the_sdk_window(
     of the test, so a stop past the window counts as inconclusive only on a loaded
     machine, where the launcher's waits, each a count of short sleeps, take longer."""
 
-    def attempt(number: int) -> str | None:
+    def attempt(number: int) -> Inconclusive | None:
         del number
         launched = Launched(tmp_path, STUBBORN, StopPolicy.KILL_ALL)
         started.append(launched)
@@ -994,12 +1110,18 @@ def test_a_harness_that_ignores_sigterm_is_killed_within_the_sdk_window(
         took = time.monotonic() - began
         assert gone(stay)
         if status == UNVERIFIED:
-            return "the launcher could not confirm its stop within its bounds"
+            return Inconclusive(
+                "the launcher could not confirm its stop within its bounds",
+                UNVERIFIED_SLACK,
+            )
         assert status == 128 + signal.SIGKILL
         if took >= launcher.SDK_CLOSE_SECONDS:
-            return (
+            # The launcher plans its stop within STOP_BUDGET_SECONDS, so only a
+            # delay of the time beyond that explains it.
+            return Inconclusive(
                 f"the stop took {took:.1f} seconds, past the Agent SDK's"
-                f" {launcher.SDK_CLOSE_SECONDS:g}"
+                f" {launcher.SDK_CLOSE_SECONDS:g}",
+                took - launcher.STOP_BUDGET_SECONDS,
             )
         return None
 
@@ -1084,7 +1206,7 @@ session of its own, when its input closes, and echoes what it reads until then."
 def test_under_leave_background_a_closed_input_does_not_reach_the_harness(
     tmp_path: Path, started: list[Launched]
 ) -> None:
-    def attempt(number: int) -> str | None:
+    def attempt(number: int) -> Inconclusive | None:
         reports = tmp_path / f"left-{number}"
         reports.mkdir()
         launched = Launched(
@@ -1111,7 +1233,10 @@ def test_under_leave_background_a_closed_input_does_not_reach_the_harness(
         (report,) = collect_reports(reports)
         assert report.cause == "stopped"
         if status == UNVERIFIED or not report.listed:
-            return "the launcher could not list or reap within its bounds"
+            return Inconclusive(
+                "the launcher could not list or reap within its bounds",
+                UNVERIFIED_SLACK,
+            )
         assert status == 128 + signal.SIGKILL
         assert away in {pid for pid, _ in report.processes}
         return None

@@ -240,11 +240,11 @@ class Plan:
     """Where the branch left the remote base, from which every commit the push
     carries is screened, or ``None`` when the remote base is not known."""
     gate_changed: tuple[str, ...] = ()
+    """Paths under ``scripts/`` the branch changes against ``fork``, which hold the
+    gate and the hooks that land runs as the operator."""
     lock_changed: bool = False
     """Whether the branch changes ``uv.lock``, so that every other worktree's
     environment goes stale once it merges. Round 14, item 3."""
-    """Paths under ``scripts/`` the branch changes against ``fork``, which hold the
-    gate and the hooks that land runs as the operator."""
 
 
 @dataclass(frozen=True, slots=True)

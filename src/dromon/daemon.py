@@ -854,6 +854,7 @@ class Daemon:
                 | Operation.RETIRE_LINE
                 | Operation.RUN_CLEAR
                 | Operation.RUNS
+                | Operation.START_CONTEXT
                 | Operation.BUDGETS
                 | Operation.BUDGET_SET
                 | Operation.AGENT_ADD
@@ -995,6 +996,9 @@ class Daemon:
                     values = _text_args(request.args, names)
                     found = self.scheduler.runs_view(values[0] if values else None)
                     result = {"runs": cast(object, found)}
+                case Operation.START_CONTEXT:
+                    _text_args(request.args, ())
+                    result = start_context(os.environ)
                 case Operation.BUDGETS:
                     _text_args(request.args, ())
                     result = self.scheduler.budgets_view()
@@ -1232,7 +1236,13 @@ class Daemon:
             )
         lost = self.tasks_lost([line_id])
         retired = self.scheduler.retire_line(OperatorAddress(operator), line_id)
-        return {"line_id": line_id, "retired_at": retired.retired_at, **lost}
+        return {
+            "line_id": line_id,
+            "retired_at": retired.record.retired_at,
+            "withdrawn_questions": list(retired.withdrawn_questions),
+            "withdrawn_wake": retired.withdrawn_wake,
+            **lost,
+        }
 
     def _budget_set(self, args: dict[str, object]) -> dict[str, object]:
         """An operator's statement of a provider's budget, with ``provider`` and
@@ -2957,6 +2967,18 @@ def tls_serving(daemon: Daemon) -> TlsServing:
         return tls_peer_connection(daemon, reader, writer, context)
 
     return pinned_serving
+
+
+def start_context(environment: Mapping[str, str]) -> dict[str, object]:
+    """What a restart's successor starts with that a client cannot see, its
+    interpreter, which ``client.start`` runs, and ``restart.START_ENVIRONMENT`` as
+    ``environment`` holds it, each value ``None`` when unset. **Round 14, item 6.**"""
+    return {
+        "interpreter": sys.executable,
+        "environment": {
+            name: environment.get(name) for name in restart.START_ENVIRONMENT
+        },
+    }
 
 
 def successor_args(overrides: Overrides, hold_wakes: bool) -> list[str]:

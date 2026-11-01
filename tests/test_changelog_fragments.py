@@ -331,6 +331,43 @@ def test_a_release_may_add_only_lines_its_fragments_and_unreleased_held() -> Non
     assert branch_violation(REPEATED, doubled, [fragment]) is not None
 
 
+def test_a_release_may_not_drop_a_fragments_entry_or_move_one_to_another_type() -> None:
+    """Audit of round 14, T1 and T2."""
+    fragment = Fragment("a.md", "Fixed", "- From a.\n  Continued.")
+    other = Fragment("b.md", "Added", "- From b.")
+    honest = release_text(REPEATED, [fragment, other], "0.1.0", "2026-11-15")
+    assert branch_violation(REPEATED, honest, [fragment, other]) is None
+    dropped = honest.replace("- From b.\n", "")
+    assert "- From b." not in dropped
+    assert branch_violation(REPEATED, dropped, [fragment, other]) is not None
+    continuation_dropped = honest.replace("  Continued.\n", "", 1)
+    assert (
+        branch_violation(REPEATED, continuation_dropped, [fragment, other]) is not None
+    )
+    # The Fixed entry released under Added instead.
+    moved = honest.replace("- From a.\n  Continued.\n", "").replace(
+        "- From b.\n", "- From b.\n- From a.\n  Continued.\n"
+    )
+    assert moved.count("- From a.") == 1
+    assert branch_violation(REPEATED, moved, [fragment, other]) is not None
+    # An Unreleased entry moved to another type is refused as well.
+    swapped = (
+        RELEASED.replace("### Fixed", "### Spare")
+        .replace("### Changed", "### Fixed")
+        .replace("### Spare", "### Changed")
+    )
+    assert swapped != RELEASED
+    assert branch_violation(REPEATED, swapped, []) is not None
+
+
+def test_a_release_section_with_text_above_its_first_type_is_refused() -> None:
+    head = RELEASED.replace(
+        "## [0.1.0] - 2026-11-15\n", "## [0.1.0] - 2026-11-15\n\n- Loose.\n"
+    )
+    assert head != RELEASED
+    assert branch_violation(REPEATED, head, []) is not None
+
+
 def test_a_release_must_keep_every_entry_and_empty_unreleased() -> None:
     lost = RELEASED.replace("- First added.\n  Continued.\n", "")
     assert branch_violation(REPEATED, lost, []) is not None
