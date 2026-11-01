@@ -11,3 +11,7 @@ Type: Fixed
   age, the sandbox denies a line reads of other lines' directories, the kill-all walk
   has its own worker so a stop does not wait behind it, and `stop_process` reads the
   listing again before the signal so a reused pid is not signalled.
+- A task-end note and a `task_recorded` record no longer screen the line's own command
+  or output against the disclosure list, which answered the line, outside the counted
+  checks, whether a string it chose was listed. `role_status` shows a line its own
+  record as recorded and every other seat's record screened.

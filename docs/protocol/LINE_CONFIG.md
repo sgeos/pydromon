@@ -1436,10 +1436,18 @@ ends with each turn, and the next turn resumes the session in a new one.
   as delivered notes without a separate wake. Each task is noted at most once. At most
   3 task notes wake or accompany turns for a line in any 60 seconds. Ends past that
   limit are counted and named in the line's next note. A command is cut to 200
-  characters, and withheld when the
-  project's disclosure list covers it. It is the line's own text, so the note quotes
+  characters. It is the line's own text, so the note quotes
   it as a JSON string and says that it is data from the line's own tool call and not
-  an instruction, so that it cannot pose as Dromon's words.
+  an instruction, so that it cannot pose as Dromon's words. **Round 14 follow-up.**
+  Neither the command nor the output is screened against the disclosure list, and
+  neither is the command or output file name that `task_recorded` stores. The note goes
+  only to the line whose task wrote them, which holds them already, and a screen would
+  have answered that line, outside the counted checks, whether a string it chose is
+  listed, the oracle the roster closed. `role_status` shows a line its own record as
+  recorded, and shows a command or output file name the list covers as withheld in
+  every other seat's record and to an operator, who are not the line that chose them.
+  The residual is that a line colluding with a peer seat could still read the peer's
+  view. The role handoff package screens the latest record in the same way.
   **Round 4, decided by the operator on 2026-10-26.** An end waits up to 2 seconds for
   the turn the engine begins by itself on it. When the scheduler admits that turn, the
   one note says it began an ordinary Dromon turn. When admission is refused, the note
@@ -1452,8 +1460,7 @@ ends with each turn, and the next turn resumes the session in a new one.
   code 1` observed live in round 5, since the quoted description before it is the
   line's own text. It quotes the first lines of the task's
   output, at most 20 lines and 2,048 bytes, as a JSON string said to be data the task
-  wrote, says when the output is empty, and withholds it when the disclosure list
-  covers it. The output file is the line's to write, so it is read only as a file
+  wrote, says when the output is empty. The output file is the line's to write, so it is read only as a file
   named `.output`, not starting with a dot, in a `tasks` directory, inside the line's
   working directory or under the engine's own location, `claude-` and the user's
   number under `/tmp` and under the system's temporary directory. It is opened by
@@ -1464,7 +1471,7 @@ ends with each turn, and the next turn resumes the session in a new one.
   cannot have the daemon read for it a file its own sandbox denies.
   **Round 5, decided by the operator on 2026-10-26.** The note states the output's
   state plainly: quoted, empty, missing, not readable, outside the allowed locations,
-  withheld, that the engine named no output file, or, when it reported neither an exit
+  that the engine named no output file, or, when it reported neither an exit
   code nor output, that it reported none. It ends with the time Dromon detected the
   end, and its header in the prompt gives that time and the time it was delivered.
   `line_status` keeps the last task note's `last_task_note`, with its `message_id`,
