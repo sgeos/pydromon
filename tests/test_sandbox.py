@@ -391,7 +391,18 @@ def test_the_factory_merges_the_project_sandbox_under_each_line() -> None:
     )
     engine = build(spec, [])
     assert isinstance(engine, ClaudeCodeLine)
-    assert engine.sandbox == effective(merge([project, own]), ROOT, PROTECTED)
+    assert engine.temp is not None
+    grant = sandbox(
+        {
+            "filesystem": {
+                "allowWrite": engine.temp.writable(),
+                "denyRead": engine.temp.others_unreadable(),
+                "allowRead": engine.temp.readable(),
+            }
+        },
+        operator=True,
+    )
+    assert engine.sandbox == effective(merge([project, own, grant]), ROOT, PROTECTED)
     network = cast(dict[str, object], (engine.sandbox or {})["network"])
     assert network["allowedDomains"] == ["github.com", "pypi.org"]
 

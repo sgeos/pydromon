@@ -94,7 +94,8 @@ project whose default socket path is longer must set `DROMON_RUNTIME_DIR`.
 
 `status` also returns `tick`, the ticks run in this daemon's lifetime, and `lines`, one
 entry per line with `line_id`, `engine`, `strategy`, `state`, `condition`, as
-`line_status` gives it, `hibernated`, `pending`, the count of
+`line_status` gives it, `background_jobs`, the background jobs of a line that is not
+running, shown by `dromon status` as `idle with 2 background jobs`, `hibernated`, `pending`, the count of
 undelivered messages, `turns`, the turns run in this daemon's lifetime,
 `tool_policy`, `autonomous_turns`, the turns in a row without operator mail,
 `cost_estimate_usd`, a decimal string, or `null` when no turn since the line's release

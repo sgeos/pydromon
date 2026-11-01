@@ -259,9 +259,13 @@ def _peer_row(peer: Mapping[str, object]) -> str:
 def _line_row(line: Mapping[str, object]) -> str:
     """One line of ``dromon status`` for a session line, naming a hibernation and a
     hold, which each keep the line from waking."""
+    condition = str(line.get("condition", line.get("state")))
+    jobs = line.get("background_jobs")
+    if condition == "idle" and type(jobs) is int and jobs > 0:
+        condition = f"idle with {jobs} background {'job' if jobs == 1 else 'jobs'}"
     parts = [
         f"line {line.get('line_id')}",
-        str(line.get("condition", line.get("state"))),
+        condition,
         f"{line.get('pending')} pending",
     ]
     if line.get("hibernated") is True and line.get("condition") != "hibernated":

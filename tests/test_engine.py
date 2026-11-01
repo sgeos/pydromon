@@ -173,7 +173,10 @@ def run(target: ClaudeCodeLine, prompt: str = "hello") -> TurnReport:
     return asyncio.run(target.run_turn(prompt))
 
 
-def test_claude_bash_refuses_missing_shell_before_starting() -> None:
+def test_claude_bash_refuses_missing_shell_before_starting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("dromon.engine_environment.CLAUDE_FALLBACK_SHELLS", ())
     session = Scripted([])
     target = ClaudeCodeLine(
         Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
@@ -183,7 +186,7 @@ def test_claude_bash_refuses_missing_shell_before_starting() -> None:
         session_factory=session.factory,
     )
     with pytest.raises(
-        EngineRefused, match="Claude Code shell unavailable: SHELL is not set"
+        EngineRefused, match="Claude Code shell unavailable: no executable bash or zsh"
     ):
         run(target)
     assert session.options == []

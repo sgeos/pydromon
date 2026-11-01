@@ -24,6 +24,9 @@ SHELL_VARIABLE = "SHELL"
 CLAUDE_SHELL_VARIABLE = "CLAUDE_CODE_SHELL"
 """Claude Code's explicit shell override for Bash tool commands."""
 
+CLAUDE_FALLBACK_SHELLS = ("/bin/bash", "/bin/zsh", "/usr/bin/bash", "/usr/bin/zsh")
+"""Bounded system paths, independent of an inherited executable search path."""
+
 
 class ShellSelectionError(ValueError):
     """The daemon has no usable absolute shell executable for its engine lines."""
@@ -43,11 +46,24 @@ def selected_shell(environment: Mapping[str, str]) -> str:
 
 
 def selected_claude_shell(environment: Mapping[str, str]) -> str:
-    """Return Claude Code's supported Bash or Zsh executable."""
-    value = selected_shell(environment)
-    if Path(value).name not in {"bash", "zsh"}:
-        raise ShellSelectionError("Claude Code requires SHELL to name bash or zsh")
-    return value
+    """Prefer a supported daemon shell, then an existing system Bash or Zsh.
+
+    Fixed paths avoid executing an unrelated program found through PATH. The same
+    selector supplies the engine environment and the line's reported settings.
+    """
+    try:
+        value = selected_shell(environment)
+    except ShellSelectionError:
+        value = ""
+    if value and Path(value).name in {"bash", "zsh"}:
+        return value
+    for candidate in CLAUDE_FALLBACK_SHELLS:
+        path = Path(candidate)
+        if path.is_file() and os.access(path, os.X_OK):
+            return candidate
+    raise ShellSelectionError(
+        "no executable bash or zsh is available at a known system path"
+    )
 
 
 CLAUDE_ENGINE_ENVIRONMENT: tuple[str, ...] = (

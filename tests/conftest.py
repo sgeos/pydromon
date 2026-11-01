@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from typing import cast
 
-from dromon import priority
+from dromon import linetemp, priority
 from dromon import scheduler as scheduler_module
 from dromon.processes import ProcessInfo
 from dromon.fleet import HOSTS_FILE_ENV
@@ -400,6 +400,18 @@ def _no_real_process_table(
     node = cast(pytest.Item, request.node)  # pyright: ignore[reportUnknownMemberType]
     if node.get_closest_marker("real_processes") is None:
         monkeypatch.setattr(scheduler_module, "SystemProcesses", NoProcesses)
+
+
+@pytest.fixture(autouse=True)
+def _private_line_temp(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Give every test's lines temporary directories of its own, under the test's
+    own directory, since a line the factory builds with an enabled sandbox makes
+    them, and no test may write the machine's shared temporary directory. **Round 14,
+    item 6.**"""
+    base = tmp_path_factory.mktemp("linetemp")
+    monkeypatch.setattr(linetemp, "base_directory", lambda: base)
 
 
 @pytest.fixture(autouse=True)
