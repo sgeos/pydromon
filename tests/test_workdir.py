@@ -413,9 +413,13 @@ def test_project_read_only_paths_are_enforced_by_claude_codex_and_grok(
     )
     assert isinstance(codex, CodexLine)
     assert codex.write_protected == (readonly,)
-    profile = server_arguments(
-        [], codex.config, codex.protected, write_protected=codex.write_protected
-    )[-1]
+    profile = next(
+        argument
+        for argument in server_arguments(
+            [], codex.config, codex.protected, write_protected=codex.write_protected
+        )
+        if argument.startswith("permissions.")
+    )
     assert f'"{readonly}"="read"' in profile
 
     grok = build(
