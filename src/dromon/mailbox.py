@@ -139,6 +139,45 @@ def is_answered(message_id: str, message: Message, replied: set[str]) -> bool:
     return message_id in replied or message.acknowledged
 
 
+def asks_reply(message: Message) -> bool:
+    """Whether ``message`` asks its recipient for a reply. **Round 14 task of
+    2026-11-01, decided by core for review.** A question and an issue always do. A
+    note does when its sender said so with ``asks_reply``, and a note whose sender
+    said nothing does unless it is itself a reply, since a reply answers something
+    and an answer asks nothing by default. Decided over counting every note, which
+    made the count grow with every report and every operator's reply, and over a
+    default of asking nothing, which would hide an operator's task note that a
+    client sent without the flag."""
+    if message.kind is not MessageKind.NOTE:
+        return True
+    if message.asks_reply is not None:
+        return message.asks_reply
+    return message.reply_to is None
+
+
+def counts_unanswered(state: State, message: Message) -> bool:
+    """Whether ``message`` is counted in its recipient's ``unanswered``, the rule
+    ``summary`` counts by and ``listing`` filters by with ``unanswered_only``.
+
+    It reads the message and one set of the state, so the event log can keep the
+    time of each unanswered message as events apply. **Round 14 task of
+    2026-11-01.** A message leaves the count once its recipient replies to it or
+    acknowledges it, as before, and also once its own sender corrects it with a
+    later note naming it, since the correction is the one left to answer. A note
+    that asks nothing is never counted. As before, a reply to a question Dromon
+    asked when it held a line, a note from the owner to itself and a note from the
+    harness are not counted."""
+    return (
+        not message.replied
+        and not message.acknowledged
+        and message.corrected_by is None
+        and asks_reply(message)
+        and message.reply_to not in state.hold_questions
+        and not is_own_note(message, message.recipient)
+        and not isinstance(message.sender, HarnessAddress)
+    )
+
+
 def is_open_issue(message_id: str, message: Message, replied: set[str]) -> bool:
     """Whether ``message`` is an issue its recipient has not yet closed by a reply
     or an acknowledgement."""
@@ -236,14 +275,7 @@ def summary(state: State, owner: Address, new: int) -> MailSummary:
     return MailSummary(
         new=new,
         unread=sum(1 for _, message in held if counts_unread(message, owner)),
-        unanswered=sum(
-            1
-            for message_id, message in held
-            if not is_answered(message_id, message, replied)
-            and message.reply_to not in state.hold_questions
-            and not is_own_note(message, owner)
-            and not isinstance(message.sender, HarnessAddress)
-        ),
+        unanswered=sum(1 for _, message in held if counts_unanswered(state, message)),
         own_notes=sum(
             1
             for message_id, message in held
@@ -258,6 +290,7 @@ def listing(
     *,
     unread_only: bool = False,
     own_notes_only: bool = False,
+    unanswered_only: bool = False,
     sender: Address | None = None,
     issues_only: bool = False,
     offset: int = 0,
@@ -272,12 +305,19 @@ def listing(
     **Review r6, finding 1.** ``unread_only`` selects exactly what ``summary`` counts
     in ``unread``, and ``own_notes_only`` exactly what it counts in ``own_notes``, so
     a listing and the counts beside it agree. The two select disjoint messages, so
-    giving both is refused rather than answered with an empty page."""
+    giving both is refused rather than answered with an empty page. **Round 14 task
+    of 2026-11-01.** ``unanswered_only`` selects exactly what it counts in
+    ``unanswered``, which never holds an own note, so it is refused beside
+    ``own_notes_only`` for the same reason."""
     if offset < 0 or not 1 <= limit <= MAX_PAGE:
         raise ValueError(f"offset must be at least 0 and limit in [1, {MAX_PAGE}]")
     if unread_only and own_notes_only:
         raise ValueError(
             "unread_only and own_notes_only select different messages, so give one"
+        )
+    if unanswered_only and own_notes_only:
+        raise ValueError(
+            "unanswered_only and own_notes_only select different messages, so give one"
         )
     replied = replied_ids(state, owner) if own_notes_only or issues_only else set[str]()
     matches = [
@@ -288,6 +328,7 @@ def listing(
             not own_notes_only
             or counts_own_note(state, message_id, message, owner, replied)
         )
+        and (not unanswered_only or counts_unanswered(state, message))
         and (sender is None or message.sender == sender)
         and (not issues_only or is_open_issue(message_id, message, replied))
     ]
@@ -295,11 +336,15 @@ def listing(
 
 
 def outcome(message_id: str, message: Message, replied: set[str]) -> str:
-    """``replied``, ``acknowledged`` or ``unanswered``, from the recipient's side."""
+    """``replied``, ``acknowledged``, ``corrected`` or ``unanswered``, from the
+    recipient's side. ``corrected`` means the sender named it with a later note
+    before the recipient answered."""
     if message_id in replied:
         return "replied"
     if message.acknowledged:
         return "acknowledged"
+    if message.corrected_by is not None:
+        return "corrected"
     return "unanswered"
 
 
@@ -312,6 +357,8 @@ def header(message_id: str, message: Message, replied: set[str]) -> str:
     answered = outcome(message_id, message, replied)
     if answered != "unanswered":
         parts.append(answered)
+    if message.corrected_by is not None and answered != "corrected":
+        parts.append(f"corrected by {message.corrected_by}")
     return ", ".join(parts)
 
 
@@ -325,7 +372,7 @@ class SentStatus:
     delivered: bool
     read: bool
     outcome: str
-    """``replied``, ``acknowledged`` or ``unanswered``."""
+    """``replied``, ``acknowledged``, ``corrected`` or ``unanswered``."""
     delivery: str
     """``waiting``, ``delivered`` or ``read`` for local mail. Mail to a peer is
     ``waiting for peer``, ``delivered to peer``, ``returned`` with its code, or

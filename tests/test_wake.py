@@ -632,6 +632,7 @@ def test_every_line_has_the_tool_and_status_shows_the_pending_wake(
         WAKE_TOOL_NAME,
         "acquire_lease",
         "release_lease",
+        "list_leases",
         "line_status",
         "read_instructions",
         "write_scratch",
