@@ -25,6 +25,7 @@ from dromon.daemon import AlreadyRunning, Daemon, acquire_lock
 from dromon.driver import Strategy
 from dromon.eventlog import EventLog
 from dromon.model import (
+    HoldCause,
     LineAddress,
     LineCreated,
     MessageKind,
@@ -600,7 +601,9 @@ def test_release_resumes_a_held_line_and_status_shows_holds(
     with EventLog(paths.event_log) as log:
         scheduler = held_scheduler(log)
         scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
-        question_id = scheduler.hold("alpha", "was held by a test")
+        question_id = scheduler.hold(
+            "alpha", "was held by a test", cause=HoldCause.AUTONOMOUS_TURNS
+        )
     status = request(paths, "status", {})
     assert status.result is not None
     (line,) = cast(list[dict[str, object]], status.result["lines"])
@@ -1115,3 +1118,71 @@ def test_send_with_priority_refuses_and_records_nothing(
     with EventLog(paths.event_log) as log:
         assert log.state.messages == {}
         assert "ana" not in log.state.operators
+
+
+def test_create_limits_are_durable(paths: ProjectPaths) -> None:
+    args: dict[str, object] = {
+        "line_id": "beta",
+        "model": HAIKU,
+        "strategy": "api",
+        "limits": {
+            "max_autonomous_turns": 40,
+            "max_cost_usd": "30",
+            "cooldown_seconds": "2",
+        },
+    }
+    assert request(paths, "create_line", args).ok
+    with EventLog(paths.event_log) as log:
+        scheduler = held_scheduler(log)
+        limits = scheduler.limits_for("beta")
+        assert limits.max_autonomous_turns == 40
+        assert limits.max_cost_usd == 30
+        assert limits.cooldown_seconds == 2
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        {"max_cost_usd": "0"},
+        {"max_autonomous_turns": 0},
+        {"cooldown_seconds": "-1"},
+        {"unknown": 1},
+        [],
+    ],
+)
+def test_bad_create_limits_leave_no_line(paths: ProjectPaths, limits: object) -> None:
+    args: dict[str, object] = {
+        "line_id": "beta",
+        "model": HAIKU,
+        "strategy": "api",
+        "limits": limits,
+    }
+    assert not request(paths, "create_line", args).ok
+    with EventLog(paths.event_log) as log:
+        assert "beta" not in log.state.lines
+
+
+def test_create_override_encoding_failure_leaves_no_line(
+    paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dromon.overrides import OverrideError, Value
+    from collections.abc import Mapping
+
+    def refuse_encoding(document: Mapping[str, Value]) -> str:
+        raise OverrideError("cannot encode the initial limits")
+
+    monkeypatch.setattr(daemon_module, "encode_override", refuse_encoding)
+    response = request(
+        paths,
+        "create_line",
+        {
+            "line_id": "beta",
+            "model": HAIKU,
+            "strategy": "api",
+            "limits": {"max_cost_usd": "30"},
+        },
+    )
+    assert not response.ok
+    assert "cannot encode" in (response.error_message or "")
+    with EventLog(paths.event_log) as log:
+        assert "beta" not in log.state.lines

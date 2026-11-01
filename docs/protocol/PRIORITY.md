@@ -37,8 +37,8 @@ and no turn follows. An operator who wants the turn stopped as well sends `inter
 which also holds the line, as [`CLIENT.md`](CLIENT.md) specifies.
 
 **Status.** `line_status` gives `hibernated`, and `condition` is `hibernated` for a hibernated line
-that is not running, ahead of every condition but `running`. `other_lines` gives each
-line's `hibernated`. The daemon's `status` gives each line's `condition` and `hibernated`, and
+that is not running, ahead of every condition but `running`. `other_lines` gives
+`hibernated` for each hibernated line. The daemon's `status` gives each line's `condition` and `hibernated`, and
 `dromon status` prints one row per line naming either.
 
 **Restart.** Hibernation is in the event log, so it survives a restart, and a scheduled

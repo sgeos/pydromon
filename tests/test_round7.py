@@ -35,6 +35,7 @@ from dromon.eventlog import EventLog, read_entries
 from dromon.limits import Limits
 from dromon.lineconfig import config_from_document
 from dromon.model import (
+    HoldCause,
     EventRejected,
     InvalidField,
     LineAddress,
@@ -330,7 +331,7 @@ def test_only_one_compaction_wake_is_uncounted_per_warning_interval(
 
 
 def test_context_warning_does_not_queue_a_note_for_a_held_line(world: World) -> None:
-    world.scheduler.hold("alpha", "a test hold")
+    world.scheduler.hold("alpha", "a test hold", cause=HoldCause.AUTONOMOUS_TURNS)
     assert world.log.state.lines["alpha"].held_by is not None
     world.scheduler._context_reported(  # pyright: ignore[reportPrivateUsage]
         "alpha", 150_001, CONTEXT_FROM_CALL

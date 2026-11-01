@@ -23,6 +23,7 @@ from dromon.engine import BackgroundEnd, TurnReport
 from dromon.eventlog import EventLog, read_entries
 from dromon.limits import Limits
 from dromon.model import (
+    HoldCause,
     InvalidField,
     LineAddress,
     OperatorAddress,
@@ -258,7 +259,9 @@ def test_a_task_triggered_turn_is_refused_when_a_normal_turn_cannot_start(
 ) -> None:
     async def go() -> None:
         if blocker == "held":
-            world.scheduler.hold("alpha", "held for this test")
+            world.scheduler.hold(
+                "alpha", "held for this test", cause=HoldCause.AUTONOMOUS_TURNS
+            )
         elif blocker == "hibernated":
             world.scheduler.hibernate("alpha")
         elif blocker == "restart":

@@ -28,9 +28,60 @@ machine in a port.
 """
 
 import math
+import shutil
+import stat
+import time
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import Final
+
+CHECK_PREFIX: Final = "preflight-"
+"""The prefix of the private directory a preflight copies the event log into, under
+the runtime directory."""
+
+CHECK_SECONDS: Final = 120.0
+"""How long a preflight may take before ``dromon restart`` ends it. It replays the
+whole event log, as a start does. A preflight directory older than this is left over
+from a check that was killed."""
+
+MAX_SWEPT: Final = 1000
+"""The most runtime-directory entries one sweep looks at, so it is bounded."""
+
+
+def sweep_checks(runtime_dir: Path, older_than_seconds: float | None) -> int:
+    """Remove the preflight directories left in ``runtime_dir``, and say how many.
+
+    **Decided by the operator on 2026-10-31, after audit's finding P2.** A check
+    removes its own directory as it ends, but a check that is killed, as at the
+    client's timeout, cannot, and its copy holds message bodies. A sweep therefore
+    runs when a client's check times out, at each check, and at each start. A check
+    sweeps only directories older than ``older_than_seconds``, so two clients
+    checking at once do not remove each other's copy, and ``None`` sweeps them all,
+    as a start holding the lock, or a client whose own check it has just killed,
+    does. Only directories are removed, never a link, and a directory that cannot be
+    removed is left for the next sweep."""
+    now = time.time()
+    swept = 0
+    try:
+        entries = sorted(runtime_dir.iterdir())[:MAX_SWEPT]
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.name.startswith(CHECK_PREFIX):
+            continue
+        try:
+            found = entry.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISDIR(found.st_mode):
+            continue
+        if older_than_seconds is not None and now - found.st_mtime < older_than_seconds:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        swept += 0 if entry.exists() else 1
+    return swept
+
 
 DEFAULT_WAIT_SECONDS: Final = 600
 """How long a restart waits for running turns to end, unless the request says. Whole

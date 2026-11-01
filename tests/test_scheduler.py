@@ -20,12 +20,14 @@ from claude_agent_sdk import SdkMcpTool
 from dromon import scheduler as scheduler_module
 from dromon.activity import ActivityKind
 from dromon.driver import Driver, DriverError, Event, Strategy
-from dromon.engine import ClaudeCodeLine, EnginePlanLimit, TurnReport
+from dromon.engine import ClaudeCodeLine, EnginePlanLimit, EngineRefused, TurnReport
 from dromon.eventlog import EventLog, read_entries
 from dromon.gitssh import GitSshAccess
 from dromon.lineconfig import ConfigError, LineConfig, ToolPolicy, encode_config
 from dromon.overrides import OverrideError
 from dromon.model import (
+    HoldCause,
+    HARNESS,
     AgentAccess,
     AgentAddress,
     AgentRegistered,
@@ -79,6 +81,8 @@ class Scripted:
         self.gate: asyncio.Event | None = None
         self.fail = False
         self.plan_limit: str | None = None
+        self.refusal: str | None = None
+        self.interrupted_for: str | None = None
         self.cost: float | None = None
 
     async def run_turn(self, prompt: str) -> TurnReport:
@@ -87,6 +91,8 @@ class Scripted:
             await self.gate.wait()
         if self.fail:
             raise RuntimeError("the engine broke")
+        if self.refusal is not None:
+            raise EngineRefused(self.refusal)
         if self.plan_limit is not None:
             raise EnginePlanLimit(self.plan_limit)
         calls = self.turns.pop(0) if self.turns else []
@@ -101,7 +107,15 @@ class Scripted:
             self.results.append(await tool.handler(args))
         assert self.session_id is not None
         return TurnReport(
-            "success", 1, "ok", (), None, None, self.session_id, None, self.cost
+            "success",
+            1,
+            "ok",
+            (),
+            self.interrupted_for,
+            None,
+            self.session_id,
+            None,
+            self.cost,
         )
 
 
@@ -642,7 +656,9 @@ def test_answering_a_hold_question_releases_the_line(make_world: MakeWorld) -> N
 
 def test_release_resumes_a_held_line(make_world: MakeWorld) -> None:
     target = make_world({"alpha": [[] for _ in range(10)]})
-    target.scheduler.hold("alpha", "was held by a test")
+    target.scheduler.hold(
+        "alpha", "was held by a test", cause=HoldCause.AUTONOMOUS_TURNS
+    )
     run(target, send(target, "alpha", "waiting"))
     assert target.engines == {}
     target.scheduler.release("alpha")
@@ -687,7 +703,9 @@ def test_a_hold_asks_the_default_operator_when_none_messaged(
     make_world: MakeWorld,
 ) -> None:
     target = make_world({"alpha": []}, hold_wakes=True)
-    question_id = target.scheduler.hold("alpha", "was held by a test")
+    question_id = target.scheduler.hold(
+        "alpha", "was held by a test", cause=HoldCause.AUTONOMOUS_TURNS
+    )
     recipient = target.log.state.messages[question_id].recipient
     assert recipient == OperatorAddress("operator")
 
@@ -1822,3 +1840,162 @@ def test_dromon_status_prints_the_schedulers_fault_only_while_it_lasts() -> None
     assert row({"fault": "Faulty: x", "faults": 3}) == (
         "scheduler fault Faulty: x, 3 since the daemon started"
     )
+
+
+@pytest.mark.parametrize(
+    ("cause", "expected"),
+    [
+        (
+            "the engine reused a tool call identifier",
+            "the engine reused a tool call identifier",
+        ),
+        (
+            "the engine changed the kind of a tool call",
+            "the engine changed the identity of a tool call",
+        ),
+    ],
+)
+def test_engine_refusal_cause_reaches_the_next_prompt(
+    make_world: MakeWorld, cause: str, expected: str
+) -> None:
+    target = make_world({"alpha": [[], []]})
+    target.engine("alpha").refusal = cause
+    run(target, send(target, "alpha", "first"))
+    (question_id,) = questions_for(target)
+    assert len(target.engines["alpha"].prompts) == 1
+    target.engine("alpha").refusal = None
+    target.scheduler.send(ANA, LineAddress("alpha"), "continue", reply_to=question_id)
+    run(target, send(target, "alpha", "after"))
+    assert expected in target.engines["alpha"].prompts[1]
+    run(target, send(target, "alpha", "one more"))
+    assert (
+        "Dromon stopped the previous engine turn"
+        not in target.engines["alpha"].prompts[-1]
+    )
+
+
+def test_driver_budget_cause_is_owed_without_an_extra_wake(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": [[], []]})
+    target.engine("alpha").interrupted_for = "tool_budget"
+    run(target, send(target, "alpha", "first"))
+    assert len(target.engines["alpha"].prompts) == 1
+    target.engine("alpha").interrupted_for = None
+    run(target, send(target, "alpha", "next"))
+    assert "tool_budget" in target.engines["alpha"].prompts[-1]
+    run(target, send(target, "alpha", "one more"))
+    assert (
+        "Dromon stopped the previous engine turn"
+        not in target.engines["alpha"].prompts[-1]
+    )
+
+
+def test_stop_notice_survives_replay_without_engine_text(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": []})
+    hidden = "synthetic-protected-value"
+    # Replay a legacy note that contained engine evidence before this policy.
+    target.log.append(
+        MessageSent(
+            "m-legacy-stop",
+            HARNESS,
+            LineAddress("alpha"),
+            MessageKind.NOTE,
+            scheduler_module.ENGINE_STOP_NOTE
+            + "x" * scheduler_module.MAX_FAILURE_TEXT
+            + hidden,
+        )
+    )
+    target.log.append(MessageDelivered("m-legacy-stop"))
+    with EventLog(target.path) as replayed:
+        notices = Scheduler(replayed, World.build_nothing)
+        notice = notices._engine_stop_notice("alpha")  # pyright: ignore[reportPrivateUsage]
+        assert (
+            notice
+            == scheduler_module.ENGINE_STOP_NOTE + scheduler_module.STOP_CAUSE_UNKNOWN
+        )
+        assert hidden not in notice
+        notices.stop_workers()
+
+
+def test_stop_notice_is_unchanged_after_disclosure_reload(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": []})
+    target.scheduler._note_engine_stop(  # pyright: ignore[reportPrivateUsage]
+        "alpha", "the engine reused a tool call identifier"
+    )
+    before = target.scheduler._engine_stop_notice("alpha")  # pyright: ignore[reportPrivateUsage]
+    target.scheduler.set_disclosure_terms(["identifier", "engine", "dromon"])
+    notice = target.scheduler._engine_stop_notice("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert notice == before
+    assert (
+        notice
+        == scheduler_module.ENGINE_STOP_NOTE
+        + "the engine reused a tool call identifier"
+    )
+    assert not target.log.state.disclosure_checks.get("alpha")
+
+
+def test_stop_notices_leave_the_line_disclosure_allowance_untouched(
+    make_world: MakeWorld,
+) -> None:
+    target = make_world({"alpha": []})
+    target.scheduler.set_disclosure_terms(["identifier"])
+    # A matching line-originated refusal still consumes its ordinary check.
+    assert target.scheduler.refuse_disclosed("alpha", ("body", "identifier"))
+    before = target.log.state.disclosure_checks["alpha"]
+    for _ in range(scheduler_module.MAX_DISCLOSURE_CHECKS + 2):
+        target.scheduler._note_engine_stop(  # pyright: ignore[reportPrivateUsage]
+            "alpha", "the engine reused a tool call identifier"
+        )
+        notice = target.scheduler._engine_stop_notice("alpha")  # pyright: ignore[reportPrivateUsage]
+        assert (
+            notice
+            == scheduler_module.ENGINE_STOP_NOTE
+            + "the engine reused a tool call identifier"
+        )
+    assert target.log.state.disclosure_checks["alpha"] == before
+    assert target.log.state.lines["alpha"].held_by is None
+    assert "alpha" not in target.scheduler._disclosure_spent  # pyright: ignore[reportPrivateUsage]
+    assert target.scheduler.refuse_disclosed("alpha", ("body", "identifier"))
+    assert len(target.log.state.disclosure_checks["alpha"]) == len(before) + 1
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "the engine used a tool the line was not given: engine-chosen-label",
+        "the engine changed the title of its tool call engine-chosen-label",
+        "the engine refused a request: engine-chosen-label",
+        "The driver interrupted it for engine-chosen-label.",
+        "engine-chosen-label" * 1000,
+    ],
+)
+def test_stop_notes_use_only_closed_dromon_wording(
+    make_world: MakeWorld, evidence: str
+) -> None:
+    target = make_world({"alpha": []})
+    target.scheduler._note_engine_stop("alpha", evidence)  # pyright: ignore[reportPrivateUsage]
+    notice = target.scheduler._engine_stop_notice("alpha")  # pyright: ignore[reportPrivateUsage]
+    vocabulary = {text for _, text in scheduler_module.STOP_CAUSES}
+    vocabulary.add(scheduler_module.STOP_CAUSE_UNKNOWN)
+    assert notice in {scheduler_module.ENGINE_STOP_NOTE + text for text in vocabulary}
+    assert "engine-chosen-label" not in str(notice)
+    stored = list(target.log.state.messages.values())[-1].body
+    assert stored == notice
+
+
+@pytest.mark.parametrize(
+    "cause", [notice for _, notice in scheduler_module.STOP_CAUSES]
+)
+def test_canonical_stop_causes_keep_their_category_on_replay(
+    make_world: MakeWorld,
+    cause: str,
+) -> None:
+    target = make_world({"alpha": []})
+    target.scheduler._note_engine_stop("alpha", cause)  # pyright: ignore[reportPrivateUsage]
+    notice = target.scheduler._engine_stop_notice("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert notice == scheduler_module.ENGINE_STOP_NOTE + cause

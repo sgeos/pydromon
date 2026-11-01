@@ -23,6 +23,7 @@ from dromon.model import (
     AgentRegistered,
     AgentRevoked,
     Event,
+    HoldCause,
     InvalidField,
     LineConfigured,
     LineCreated,
@@ -119,7 +120,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "line_rebound": ("line_id", "engine", "strategy"),
     "line_overridden": ("line_id", "overrides"),
     "project_overridden": ("overrides",),
-    "line_held": ("line_id", "question_id"),
+    "line_held": ("line_id", "question_id", "cause"),
     "line_released": ("line_id",),
     "line_hibernated": ("line_id",),
     "line_awakened": ("line_id",),
@@ -382,12 +383,14 @@ OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
     "wake_scheduled": ("request",),
     "line_turn_ended": ("unreported",),
     "budget_stated": ("window",),
+    "line_held": ("cause",),
 }
 """The fields left out of the wire when they are null, which a log written before
 them never held, so decoding reads an absent one as null. **Task of 2026-10-29,
 round 5.** The request key of a keyed call is recorded in the event of its act, and
 an event of a call without a key is written as before it. The ``window`` field was
-added to ``budget_stated`` on 2026-10-31. **Porting hazard.** A port must omit these
+added to ``budget_stated`` on 2026-10-31, and ``cause`` to ``line_held`` the same
+day. **Porting hazard.** A port must omit these
 fields when null, not write them as null, so that its log stays readable by a daemon
 that predates them, and must read an absent one as null. A daemon predating ``window``
 does not read an event that names one."""
@@ -423,6 +426,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
             return "line_held", {
                 "line_id": event.line_id,
                 "question_id": event.question_id,
+                "cause": None if event.cause is None else event.cause.value,
             }
         case LineReleased():
             return "line_released", {"line_id": event.line_id}
@@ -769,7 +773,11 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
         case "line_configured":
             return LineConfigured(_str(data, "line_id"), _str(data, "config"))
         case "line_held":
-            return LineHeld(_str(data, "line_id"), _str(data, "question_id"))
+            return LineHeld(
+                _str(data, "line_id"),
+                _str(data, "question_id"),
+                None if data["cause"] is None else _member(data, "cause", HoldCause),
+            )
         case "line_released":
             return LineReleased(_str(data, "line_id"))
         case "line_hibernated":
@@ -1181,6 +1189,7 @@ def _remote_address(data: dict[str, object], name: str) -> RemoteAddress:
 def _member[
     T: (
         LineState,
+        HoldCause,
         MessageKind,
         AgentAccess,
         OwnershipCause,

@@ -163,7 +163,7 @@ argument outside a tool's schema is refused.
 | `propose_change` | Records a proposed patch, file list and message for operator review; it does not change project files |
 | `read_instructions` | Shows the instructions the line's next turn receives, as below |
 | `write_scratch` | Writes a file under the line's scratch in its working directory, `tmp/` or `tmp/lines/LINE`, as below |
-| `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term or the file that matched. Files are checked independently, so a match cannot span files. The combined content is at most 1 MiB. One call, including a list, spends one recorded check, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. Added on 2026-10-28 |
+| `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term, a file name or a line location. Files are checked independently, so a match cannot span files. The combined content is at most 1 MiB. One call, including a list, spends one recorded check, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. Added on 2026-10-28 |
 | `list_processes`, `stop_process` | List and stop the processes the line started, as below |
 
 **Issues.** **Round 11, item 3, decided by core for review on 2026-10-31.** A line
@@ -231,6 +231,71 @@ Detail mode keeps arrays summarized by counts. Set `lists` to true to receive th
 lists of leases, recent turns, other lines, kept-session tasks and left processes under
 a `lists` object. With both arguments true, the tool returns the full diagnostic object
 and those lists. No mode returns a configuration document or message body.
+
+**Other lines.** From 2026-10-31, asked by the operator after a line held back work it
+had planned for a peer, because its status gave it no reliable view of that peer. Each
+entry of `other_lines` is a read-only view of one other line of the daemon, never of
+the line asking, in the order of their identifiers. From 2026-11-01, decided by the
+operator on review r13, an entry is compact. It always gives `line_id`, `state` and
+`condition`, and gives every other field only when it says something, so a field left
+out reads as the value in the last column.
+
+| Field | Meaning | Left out |
+|---|---|---|
+| `line_id` | The other line | Never |
+| `state` | `idle`, `running` or `stopped`, as the event log records it | Never |
+| `condition` | One word for where the line stands, by the precedence `line_status` gives the line's own: `running`, `hibernated`, `held`, `failed`, `waiting` on a question it asked an operator, or `idle` | Never |
+| `hold_cause` | The short cause of the hold: `autonomous_turns`, `cost`, `disclosure_checks`, `git_ssh_changed`, `plan_limit`, `inferred_limit`, `turn_failed` or `stopped`. A hold recorded before causes were gives `unrecorded` | Not held |
+| `hibernated` | `true` when an operator hibernated the line | `false` |
+| `since` | When the line last was created, started or ended a turn, was held or released, or was hibernated or awakened, to the second in Coordinated Universal Time | The log's time does not parse |
+| `unread` | How many messages to the line it has not opened, its own notes left out | 0 |
+| `oldest_unread_age_seconds` | Whole seconds since the oldest of those was sent | No unread mail, or its time does not parse |
+| `workdir_commit` | The commit at `HEAD` of the line's working directory | Not allowed or not in a checkout |
+| `leases` | The names of the leases the line holds | None held |
+
+The entry gave `held` until 2026-11-01. It is no longer given, since `hold_cause` is
+given exactly when the line is held.
+
+- **The response bound.** **Decided by the operator on review r13, T1.** When the
+  whole response would pass the bound of 8,192 bytes, it keeps as many other lines as
+  fit, and `other_lines_omitted` beside `other_lines` counts the rest. It is 0 when
+  every line is shown, and `other_line_count` gives them all. **Decided by the
+  operator on the re-review of r13.** The lines kept are first those that are held,
+  whose turn failed or that hold unread mail, and then the rest, each part in the
+  order of their identifiers. A line that is only hibernated or waiting keeps its
+  place. The lines kept are given in the order of their identifiers, as the whole
+  view is, so a held line whose name sorts last is shown, and is shown last. When
+  the other lists alone pass the bound, the response is truncated as before, and
+  still carries `other_lines` and `other_lines_omitted` at its top. An entry whose
+  lease names alone would pass the bound gives `lease_count` in place of `leases`, so
+  at least one entry is given whenever another line exists. No argument pages past
+  the lines left out.
+- **The cost.** **Decided by the operator on review r13, C1.** The state keeps each
+  line's unread mail and its open questions to an operator as indexes, updated as
+  events apply and rebuilt by replay, so a line's `condition`, its `unread` and its
+  oldest unread mail are read without a scan of the messages. The view is built only
+  when `lists` is true. The caller's own counts are still found by a scan of its
+  mailbox, as before, and reading each other line's `workdir_commit` reads a file.
+
+- **Never the mail.** The view gives a count and an age, and never a message's body,
+  sender, identifier or subject. A hold gives its closed cause and never the hold
+  question, whose text is mail to an operator and may carry an engine's error.
+- **Mail still waiting.** **Decided by core, for review.** `unread` counts mail not yet
+  delivered with mail delivered and unopened, since a held or hibernated line's mail
+  waits undelivered, and leaving it out would show such a line with nothing waiting.
+  It therefore differs from the line's own `unread`, which counts delivered mail only.
+- **The cause is recorded.** The cause is written in the `line_held` event, as
+  [`EVENT_LOG.md`](EVENT_LOG.md) gives it, so it survives a restart.
+- **The times are the log's.** `since` and the age are read from the `recorded_at` of
+  the event log's entries, which the daemon keeps beside its state as it replays and
+  appends, so they also survive a restart and need no scan of the log. A message's
+  time is kept only while it is unread mail to a line, so the times grow with the
+  unread mail and not with the log. **Limits.**
+  `since` does not move when a line comes to wait on a question or when its turn
+  fails, since neither changes its state, hold or hibernation, so for `waiting` and
+  `failed` it names the latest change before. The times follow the daemon's clock, so
+  a clock that stepped gives a wrong age, and an age that would be negative is given
+  as 0.
 
 When Dromon refuses a tool call, the error names the permission layer or setting that
 refused it, such as the line's `tool_policy` or
@@ -739,9 +804,9 @@ to read the result.
   identifier its note will carry, as [`CLIENT.md`](CLIENT.md) specifies.
 
 **Disclosure guard.** When the project names a disclosure list, a refused tool call
-names the field that contains a listed term, such as `body` or `note`, without naming
-the term or its position. If several fields contain a listed term, all such field names
-are reported. The refusal records nothing and counts against the same hourly limit as
+names a field such as `body` or `note` only when the call offers text in that one
+field. Calls offering several text fields receive a generic refusal, even if only
+one matches. Neither answer names the term or its position. The refusal records a disclosure check and counts against the same hourly limit as
 `check_disclosure`, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. A wake note
 is checked again when it fires.
 
@@ -1898,3 +1963,16 @@ so it never enters the event log and no client or line can set it. Added on
 ## Not yet specified
 
 - References to secrets held in files or a keychain rather than the environment.
+
+## Runtime lifecycle options
+
+`dromon create` and `dromon configure` accept `--workdir-access read` or `write`,
+`--keep-session` and `--no-keep-session`, `--allow-compact` and `--no-allow-compact`,
+`--keep-session-idle-seconds`, `--keep-session-max-seconds`,
+`--keep-session-hard-seconds`, `--keep-session-at-max` and `--auto-compact-tokens`.
+Values use the same validation and engine restrictions as the corresponding project
+line keys. The at maximum policy is `close`, `ask` or `keep`.
+
+Accepted disclosure occurrences apply to files checked through `check_disclosure`.
+They do not exempt messages or text checks. The operator sets them as described in
+[`PROJECT_CONFIG.md`](PROJECT_CONFIG.md).

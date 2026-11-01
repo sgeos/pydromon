@@ -788,7 +788,7 @@ def test_a_held_line_says_how_to_release_it() -> None:
 
 
 def test_the_help_and_line_panels_list_what_they_offer() -> None:
-    text = frame_text(attached(overlay=Overlay.HELP, height=60))
+    text = frame_text(attached(overlay=Overlay.HELP, height=64))
     assert all(spec.usage in text for spec in SPECS)
     assert "Ctrl-O" in text and "Escape or Enter closes" in text
     listed = frame_text(attached(overlay=Overlay.LINES, lines=LINES))

@@ -24,7 +24,7 @@ from typing import Final, Protocol
 
 from dromon.ui.keys import Key, Named, from_text
 from dromon.ui.render import Frame, Style
-from dromon.ui.runtime import Daemon, Runtime, detached_status
+from dromon.ui.runtime import Daemon, Projects, Runtime, detached_status
 
 INPUT_TIMEOUT_MS: Final = 50
 ESCAPE_DELAY_MS: Final = 25
@@ -183,7 +183,14 @@ def loop(
     return 0
 
 
-def run(daemon: Daemon, line_id: str, operator: str, poll_seconds: float) -> int:
+def run(
+    daemon: Daemon,
+    line_id: str,
+    operator: str,
+    poll_seconds: float,
+    projects: Projects | None = None,
+    project: str | None = None,
+) -> int:
     """Attach in the terminal until the operator detaches, or until the daemon has
     been gone for the runtime's bound. Returns an exit status, ``exits.NOT_RUNNING``
     with a message on standard error in the second case."""
@@ -196,7 +203,9 @@ def run(daemon: Daemon, line_id: str, operator: str, poll_seconds: float) -> int
         curses.raw()
         curses.set_escdelay(ESCAPE_DELAY_MS)
         attributes = palette(curses.has_colors())
-        runtime = Runtime(daemon, line_id, operator, poll_seconds, curses.beep)
+        runtime = Runtime(
+            daemon, line_id, operator, poll_seconds, curses.beep, projects, project
+        )
         runtimes.append(runtime)
         return loop(window, runtime, attributes)
 

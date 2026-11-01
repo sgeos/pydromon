@@ -20,6 +20,7 @@ from dromon.engine import BackgroundEnd, TurnReport
 from dromon.eventlog import EventLog, read_entries
 from dromon.limits import Limits
 from dromon.model import (
+    HoldCause,
     MAX_WAKE_NOTE_BYTES,
     EventRejected,
     InvalidField,
@@ -547,7 +548,9 @@ def test_a_wake_fires_when_its_task_outlives_the_timeout(
 
 
 def test_a_held_lines_wake_fires_and_its_note_waits(world: World) -> None:
-    world.scheduler.hold("alpha", "was held for this test")
+    world.scheduler.hold(
+        "alpha", "was held for this test", cause=HoldCause.AUTONOMOUS_TURNS
+    )
     world.call({"seconds": 60, "note": "after the hold"})
     message_id = world.log.state.scheduled["alpha"].message_id
     world.clock.advance(60)

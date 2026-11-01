@@ -15,12 +15,13 @@ import re
 import subprocess
 import sys
 import time
+import tomllib
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from pathlib import Path
 from typing import Final, cast
 
 import dromon
-from dromon import __version__, exits, restart
+from dromon import __version__, exits, fleet, land, registry, restart, runs
 from dromon import proposals as proposal_store
 from dromon.client import (
     REQUEST_TIMEOUT_SECONDS,
@@ -33,7 +34,13 @@ from dromon.client import (
     start,
     stop,
 )
-from dromon.paths import PathError, ProjectPaths, ensure_private_dir, project_paths
+from dromon.paths import (
+    STATE_DIR_NAME,
+    PathError,
+    ProjectPaths,
+    ensure_private_dir,
+    project_paths,
+)
 from dromon.disclosure import DisclosureError, load_terms
 from dromon.driver import ENGINE_OF, MODELS, Credential, Driver, DriverError, Strategy
 from dromon import antigravity, capabilities, codex, cursor, evidence, grok, pi
@@ -95,6 +102,9 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     " this daemon's key",
     "mcp": "serve an external agent over MCP on standard input and output",
     "proposal": "list or show proposed changes from session lines",
+    "land": "stage, screen, commit, gate and push a line's worktree and open a pull"
+    " request for it",
+    "fleet": "list every daemon of this user on this machine, and reach each by name",
 }
 """Planned subcommands and their one-line help, in display order."""
 
@@ -306,20 +316,53 @@ def _stop(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
-PREFLIGHT_ARGV: Final = (sys.executable, "-m", "dromon.daemon", "--version")
-"""What ``dromon restart`` runs before it asks for the restart, which imports the
-installed daemon and every module it needs, and starts nothing."""
-
-PREFLIGHT_TIMEOUT_SECONDS: Final = 60.0
+PREFLIGHT_TIMEOUT_SECONDS: Final = restart.CHECK_SECONDS
+"""How long the installed daemon's start checks may take. They replay the whole
+event log, as a start does."""
 
 RESTART_POLL_SECONDS: Final = 0.25
 """How often ``dromon restart`` asks whether the successor answers."""
 
 
-def _preflight(argv: Sequence[str] = PREFLIGHT_ARGV) -> str | None:
+def _preflight_argv(paths: ProjectPaths, options: Sequence[str]) -> list[str]:
+    """What ``dromon restart`` runs before it asks for the restart. It is the
+    successor's own command, on the interpreter this client runs on, with the
+    running daemon's options, and ``--check``, so the installed code runs its start
+    checks against the project file and a copy of the event log, and starts
+    nothing."""
+    return [
+        sys.executable,
+        "-m",
+        "dromon.daemon",
+        "--project",
+        str(paths.root),
+        "--runtime-dir",
+        str(paths.runtime_dir),
+        *options,
+        "--check",
+    ]
+
+
+def _options_of(status: Mapping[str, object]) -> list[str]:
+    """The running daemon's command-line options from its status, or none when it
+    does not say them, as a daemon from before 2026-10-31 does not, or says them in
+    a form other than a list of strings."""
+    options = status.get("options")
+    if not isinstance(options, list):
+        return []
+    found = cast(list[object], options)
+    if not all(isinstance(option, str) for option in found):
+        return []
+    return [str(option) for option in found]
+
+
+def _preflight(argv: Sequence[str], runtime_dir: Path | None = None) -> str | None:
     """Why the installed daemon would not start, or ``None``. A restart whose
-    successor cannot import its code leaves no daemon running, so this is checked
-    before the old daemon is asked to stop."""
+    successor refuses to start leaves no daemon running, so this is checked before
+    the old daemon is asked to stop. The reason is the daemon's own, its lines that
+    begin ``dromond:``, or else its last line, as for code that does not import. A
+    check that times out is killed, which leaves its copy of the log, so the
+    preflight directories in ``runtime_dir`` are then swept."""
     try:
         done = subprocess.run(  # noqa: S603
             list(argv),
@@ -328,12 +371,18 @@ def _preflight(argv: Sequence[str] = PREFLIGHT_ARGV) -> str | None:
             timeout=PREFLIGHT_TIMEOUT_SECONDS,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except subprocess.TimeoutExpired as error:
+        if runtime_dir is not None:
+            restart.sweep_checks(runtime_dir, None)
         return str(error)
-    if done.returncode != 0:
-        lines = (done.stderr or done.stdout).strip().splitlines()
-        return f"status {done.returncode}: {lines[-1] if lines else 'no output'}"
-    return None
+    except OSError as error:
+        return str(error)
+    if done.returncode == 0:
+        return None
+    lines = (done.stderr or done.stdout).strip().splitlines()
+    own = [line for line in lines if line.startswith("dromond: ")]
+    reason = " ".join(own) if own else (lines[-1] if lines else "no output")
+    return f"status {done.returncode}: {reason}"
 
 
 def _installed_commit() -> str | None:
@@ -341,21 +390,41 @@ def _installed_commit() -> str | None:
     return read_head_commit(Path(dromon.__file__).parent)
 
 
-def _restart(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+def _restart(
+    paths: ProjectPaths,
+    arguments: argparse.Namespace,
+    entry: fleet.IndexEntry | None = None,
+) -> int:
     """Ask the daemon to restart, then wait until its successor answers and say
     which commit it runs. The daemon starts its successor itself, so a client that
-    leaves early does not stop the restart."""
-    problem = _preflight()
+    leaves early does not stop the restart. The installed code's start checks run
+    after the status, which gives the options they run with, and before the
+    request, so a successor that would refuse the project leaves the running daemon
+    serving, as ``docs/protocol/RESTART.md`` describes.
+
+    ``entry`` is given by ``dromon fleet restart``. **Review of 7ff033f, G1.** The
+    daemon's status is then checked against it once more before the restart is asked,
+    and the successor is the daemon the index then lists for the same root, under
+    another pid, live by its start time, and saying that pid and root, rather than
+    whichever process answers the socket under another pid."""
+    command = "restart" if entry is None else "fleet restart"
+    before = _call(paths, command, Operation.STATUS, {})
+    if isinstance(before, int):
+        return before
+    if entry is not None:
+        try:
+            fleet.verify(entry, before)
+        except fleet.FleetError as error:
+            print(f"dromon {command}: {error}", file=sys.stderr)
+            return exits.FAILURE
+    problem = _preflight(_preflight_argv(paths, _options_of(before)), paths.runtime_dir)
     if problem is not None:
         print(
-            "dromon restart: the installed daemon does not start, so the running one"
-            f" was not stopped: {problem}",
+            f"dromon {command}: the installed daemon refuses to start, so the running"
+            f" one was not stopped: {problem}",
             file=sys.stderr,
         )
         return exits.FAILURE
-    before = _call(paths, "restart", Operation.STATUS, {})
-    if isinstance(before, int):
-        return before
     wait: int = arguments.wait_seconds
     args: dict[str, object] = {
         "operator": arguments.operator,
@@ -366,37 +435,66 @@ def _restart(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     }
     if arguments.end_tasks:
         args["end_tasks"] = True
-    answer = _call(paths, "restart", Operation.RESTART, args)
+    answer = _call(paths, command, Operation.RESTART, args)
     if isinstance(answer, int):
         return answer
     warning = answer.get("warning")
     if isinstance(warning, str):
-        print(f"dromon restart: {warning}")
+        print(f"dromon {command}: {warning}")
     running = answer.get("running")
     count = len(cast(list[object], running)) if isinstance(running, list) else 0
     print(
-        f"dromon restart: draining, with {count} turns running, for at most"
+        f"dromon {command}: draining, with {count} turns running, for at most"
         f" {wait} seconds. The installed code is at commit"
         f" {_installed_commit() or 'unknown'}"
     )
-    return _await_successor(paths, before, wait)
+    if entry is None:
+        return _await_successor(paths, before, wait)
+    return _await_successor(
+        paths, before, wait, _fleet_successor(entry), FLEET_TIMEOUT_SECONDS
+    )
 
 
 def _await_successor(
-    paths: ProjectPaths, before: Mapping[str, object], wait: float
+    paths: ProjectPaths,
+    before: Mapping[str, object],
+    wait: float,
+    successor: Callable[[Mapping[str, object]], bool] | None = None,
+    request_seconds: float = REQUEST_TIMEOUT_SECONDS,
 ) -> int:
-    """Poll until a daemon with another process id answers, or the restart is
-    abandoned, or the bound passes. Bounded by its count of polls."""
+    """Poll until a daemon with another process id answers, and ``successor``, when
+    given, says that its status is the successor's, or the restart is abandoned, or
+    the bound passes.
+
+    **Review of 7ff033f, G2.** Bounded by its count of polls and by a deadline, and
+    each request waits at most ``request_seconds`` and never past the deadline. A
+    daemon that accepts and never answers made each poll wait out a whole request
+    before, so the count of polls alone let one hold the client for hours. It now
+    holds it for at most the drain wait, plus the shutdown and startup bounds of
+    ``SHUTDOWN_TIMEOUT_SECONDS`` and ``STARTUP_TIMEOUT_SECONDS``, plus one poll's
+    sleep."""
     bound = wait + SHUTDOWN_TIMEOUT_SECONDS + STARTUP_TIMEOUT_SECONDS
+    deadline = time.monotonic() + bound
     polls = math.ceil(bound / max(RESTART_POLL_SECONDS, 0.01)) + 1
     for _ in range(polls):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            response = call(paths.socket, Operation.STATUS)
+            response = call(
+                paths.socket,
+                Operation.STATUS,
+                timeout_seconds=min(request_seconds, remaining),
+            )
         except (DaemonNotRunning, ProtocolError, TimeoutError, OSError):
             time.sleep(RESTART_POLL_SECONDS)
             continue
         result = response.result or {}
-        if response.ok and result.get("pid") != before.get("pid"):
+        if (
+            response.ok
+            and result.get("pid") != before.get("pid")
+            and (successor is None or successor(result))
+        ):
             print(_restarted(before, result))
             return exits.OK
         state = result.get("restart")
@@ -410,9 +508,14 @@ def _await_successor(
                 )
                 return exits.FAILURE
         time.sleep(RESTART_POLL_SECONDS)
+    awaited = (
+        "no restarted daemon answered"
+        if successor is None
+        else "no restarted daemon that the fleet index lists for this root answered"
+    )
     print(
-        f"dromon restart: no restarted daemon answered within {bound:g} seconds."
-        f" See {paths.daemon_output}",
+        f"dromon restart: {awaited} within {bound:g} seconds. See"
+        f" {paths.daemon_output}",
         file=sys.stderr,
     )
     return exits.FAILURE
@@ -668,7 +771,21 @@ def _config_document(arguments: argparse.Namespace) -> dict[str, object] | None:
         instructions,
         prompt,
     )
-    if not any(given) and effort is None and workdir is None:
+    lifecycle = {
+        name: getattr(arguments, name, None)
+        for name in (
+            "workdir_access",
+            "keep_session",
+            "keep_session_idle_seconds",
+            "keep_session_max_seconds",
+            "keep_session_at_max",
+            "keep_session_hard_seconds",
+            "allow_compact",
+            "auto_compact_tokens",
+        )
+        if getattr(arguments, name, None) is not None
+    }
+    if not any(given) and effort is None and workdir is None and not lifecycle:
         return None
     document: dict[str, object] = {
         "builtin_tools": tools,
@@ -676,6 +793,7 @@ def _config_document(arguments: argparse.Namespace) -> dict[str, object] | None:
         "tool_policy": "allow_all" if allow_all else "allowlist",
         "inherit_account_mcp": inherit,
     }
+    document.update(lifecycle)
     if mcp_file is not None:
         document["mcp_servers"] = json.loads(mcp_file.read_text(encoding="utf-8"))
     if sandbox_file is not None:
@@ -721,6 +839,13 @@ def _create(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         args["config"] = config
     if arguments.session is not None:
         args["engine_session"] = arguments.session
+    limits = {
+        name: getattr(arguments, name)
+        for name in ("max_autonomous_turns", "max_cost_usd", "cooldown_seconds")
+        if getattr(arguments, name) is not None
+    }
+    if limits:
+        args["limits"] = limits
     return _request(paths, "create", Operation.CREATE_LINE, args)
 
 
@@ -1021,23 +1146,35 @@ def _sent(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 
 def _attach(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     """Wire a platform, the shared runtime and the daemon's socket together."""
-    from dromon.ui.link import SocketDaemon
+    from dromon.ui.link import FleetProjects, SocketDaemon
 
     if not arguments.poll_seconds > 0:
         print("dromon attach: --poll-seconds must be positive", file=sys.stderr)
         return exits.USAGE
     daemon = SocketDaemon(paths)
+    # The fleet index, through which /project moves to another project. Round 13,
+    # item 4. An override that is malformed leaves the client without it, and the
+    # client still attaches to this project.
+    try:
+        projects = FleetProjects(fleet.configured_index(os.environ), fleet_start_of)
+    except fleet.FleetError as error:
+        print(f"dromon attach: no fleet index, {error}", file=sys.stderr)
+        projects = None
+    given = (
+        daemon,
+        arguments.line_id,
+        arguments.operator,
+        arguments.poll_seconds,
+        projects,
+        paths.root.name,
+    )
     if arguments.gui:
         from dromon.ui import window
 
-        return window.run(
-            daemon, arguments.line_id, arguments.operator, arguments.poll_seconds
-        )
+        return window.run(*given)
     from dromon.ui import terminal
 
-    return terminal.run(
-        daemon, arguments.line_id, arguments.operator, arguments.poll_seconds
-    )
+    return terminal.run(*given)
 
 
 def _disclosure_summary(terms: str | None, root: Path) -> str:
@@ -1119,6 +1256,40 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             f" keep alive {teacher.keep_alive},"
             + (" autostart" if teacher.autostart else " started with dromon teacher up")
         )
+    print(
+        f"daemon: operator {config.operator}, tick_seconds {config.tick_seconds},"
+        f" require_sandbox {config.require_sandbox}"
+    )
+    print(
+        f"federation: local {config.federation.local},"
+        f" remote {config.federation.remote},"
+        f" listen {config.federation.listen}, tls_listen {config.federation.tls_listen}"
+    )
+    print(f"federation policy: {config.federation}")
+    raw_document = tomllib.loads(file.read_text(encoding="utf-8"))
+    for name in sorted(cast(dict[str, object], raw_document.get("profiles", {}))):
+        print(f"profile {name}: validated")
+    for name, hashes in sorted(config.disclosure_accepted.items()):
+        print(f"disclosure accepted {name}: {len(hashes)} exact line hashes")
+    print(f"agents: {config.agents}")
+    print(f"read_only_paths: {', '.join(config.read_only_paths) or 'none'}")
+    print(
+        f"leases: {', '.join(config.lease_names) or 'none'},"
+        f" ttl_seconds {config.lease_ttl_seconds}"
+    )
+    for name, command in sorted(config.run_commands.items()):
+        print(f"run {name}: {command}")
+    for name, relay in sorted(config.relays.relays.items()):
+        print(
+            f"relay {name}: {relay.kind}, path {relay.path}, command {relay.command},"
+            f" timeout_seconds {relay.timeout_seconds}"
+        )
+    for operator, relay in sorted(config.relays.routes.items()):
+        print(f"operator {operator}: relay {relay}")
+    for name, role in sorted(config.roles.items()):
+        print(f"role {name}: {role}")
+    for name, peer in sorted(config.federation.peers.items()):
+        print(f"peer {name}: {peer}")
     for line_id, line in sorted(config.lines.items()):
         line_settings = engine_settings.merge([config.settings, line.config.settings])
         line_sandbox = merge([config.sandbox, line.config.sandbox])
@@ -1983,6 +2154,393 @@ def _proposal(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
+def _land_arguments(command: argparse.ArgumentParser) -> None:
+    """The options of ``dromon land``, which ``dromon.land`` describes."""
+    command.add_argument("worktree", type=Path, help="the top of the line's worktree")
+    message = command.add_mutually_exclusive_group(required=True)
+    message.add_argument("-m", "--message", help="the commit message")
+    message.add_argument(
+        "--message-file", type=Path, metavar="PATH", help="read the commit message"
+    )
+    command.add_argument(
+        "--title", help="the pull request title, default the message's first line"
+    )
+    body = command.add_mutually_exclusive_group(required=True)
+    body.add_argument("--body", help="the pull request body")
+    body.add_argument(
+        "--body-file", type=Path, metavar="PATH", help="read the pull request body"
+    )
+    command.add_argument(
+        "--base", default=land.DEFAULT_BASE, help="the base, default %(default)s"
+    )
+    command.add_argument(
+        "--remote", default=land.DEFAULT_REMOTE, help="the remote, default %(default)s"
+    )
+    command.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show the plan and screen it, and change nothing",
+    )
+    command.add_argument(
+        "--yes", action="store_true", help="answer yes to every question"
+    )
+    command.add_argument(
+        "--terms",
+        type=Path,
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=f"a disclosure list, default {land.TERMS_FILE} under the project",
+    )
+    command.add_argument(
+        "--without-disclosure-list",
+        action="store_true",
+        help="land unscreened when no disclosure list is found",
+    )
+
+
+def _land_text(given: str | None, path: Path | None, what: str) -> str:
+    """The text an option gave, or the content of the file it named. Raises
+    ``ValueError`` naming the file only."""
+    if given is not None:
+        return given
+    if path is None:
+        raise ValueError(f"no {what} was given")
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ValueError(f"the {what} file {path} cannot be read") from error
+
+
+def _land(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Take a line's worktree to a pull request, as ``dromon.land`` describes. The
+    disclosure list and its accepted matches are the gate's, under the project root,
+    since a worktree holds no ``secret/``."""
+    try:
+        message = _land_text(arguments.message, arguments.message_file, "message")
+        body = _land_text(arguments.body, arguments.body_file, "body")
+    except ValueError as error:
+        print(f"dromon land: {error}", file=sys.stderr)
+        return exits.USAGE
+    title: str | None = arguments.title
+    if title is None:
+        stripped = message.strip()
+        title = stripped.splitlines()[0] if stripped else ""
+    given: list[Path] = arguments.terms
+    request = land.Request(
+        worktree=arguments.worktree,
+        message=message,
+        title=title,
+        body=body,
+        base=arguments.base,
+        remote=arguments.remote,
+        dry_run=arguments.dry_run,
+        yes=arguments.yes,
+        terms_files=tuple(given) or (paths.root / land.TERMS_FILE,),
+        accepted_file=paths.root / land.ACCEPTED_FILE,
+        without_list=arguments.without_disclosure_list,
+    )
+    return land.Lander(request).land()
+
+
+# The fleet, every daemon of this user on this machine. Round 13. Each command reads
+# the fleet index and sends the operation its single-project command sends, to the
+# daemon's own operator socket and nowhere else, so it adds no authority.
+
+FLEET_TIMEOUT_SECONDS: Final = 2.0
+"""How long a fleet command waits for each daemon, so one that hangs delays the rest by
+at most this, for each of its requests."""
+
+fleet_start_of: registry.StartOf = runs.process_start
+"""How the client reads a daemon's start time, which a test replaces, since a sandbox
+denies ``ps``."""
+
+
+class _NoAnswer(Exception):
+    """A daemon of the fleet did not answer, or refused, with the reason."""
+
+
+def _fleet_ask(
+    entry: fleet.IndexEntry, operation: Operation, args: dict[str, object]
+) -> dict[str, object]:
+    """One request to ``entry``'s own socket. Raises ``_NoAnswer``."""
+    try:
+        response = call(entry.socket, operation, FLEET_TIMEOUT_SECONDS, args)
+    except DaemonNotRunning as error:
+        raise _NoAnswer(f"not answering, {error}") from error
+    except (ProtocolError, TimeoutError, OSError) as error:
+        raise _NoAnswer(f"not answering, {error}") from error
+    if not response.ok or response.result is None:
+        raise _NoAnswer(f"refused {operation}, {response.error_message}")
+    return response.result
+
+
+def _fleet_verified(entry: fleet.IndexEntry) -> dict[str, object]:
+    """The status of ``entry``'s daemon, once it says the pid and root the index
+    names. Raises ``_NoAnswer``."""
+    status = _fleet_ask(entry, Operation.STATUS, {})
+    try:
+        fleet.verify(entry, status)
+    except fleet.FleetError as error:
+        raise _NoAnswer(str(error)) from error
+    return status
+
+
+def _fleet_successor(
+    entry: fleet.IndexEntry,
+) -> Callable[[Mapping[str, object]], bool]:
+    """Whether a status is that of ``entry``'s successor, the daemon the index now
+    lists for ``entry``'s root and socket under another pid, live by its start time,
+    whose status gives that pid and root. Review of 7ff033f, G1. A successor that
+    could not be listed is therefore never confirmed, and the wait reports that."""
+
+    def confirmed(status: Mapping[str, object]) -> bool:
+        try:
+            found = fleet.entry_of(fleet.configured_index(os.environ), entry.root)
+            if (
+                found is None
+                or found.pid == entry.pid
+                or found.root != entry.root
+                or found.socket != entry.socket
+                or fleet.liveness(found, fleet_start_of) is not fleet.Liveness.LIVE
+            ):
+                return False
+            fleet.verify(found, status)
+        except fleet.FleetError:
+            return False
+        return True
+
+    return confirmed
+
+
+def _fleet_survey(command: str) -> list[fleet.Indexed] | None:
+    try:
+        return fleet.survey(fleet.configured_index(os.environ), fleet_start_of)
+    except fleet.FleetError as error:
+        print(f"dromon fleet {command}: {error}", file=sys.stderr)
+        return None
+
+
+def _fleet_paths(entry: fleet.IndexEntry) -> ProjectPaths:
+    """The paths of ``entry``'s project, whose socket is the one the index names."""
+    return ProjectPaths(entry.root, entry.root / STATE_DIR_NAME, entry.socket.parent)
+
+
+def _fleet_mapping(value: object) -> Mapping[str, object]:
+    """``value`` as a mapping, or an empty one, since a daemon's answer is data."""
+    return cast(Mapping[str, object], value) if isinstance(value, dict) else {}
+
+
+def _fleet_count(value: object, key: str) -> object:
+    return _fleet_mapping(value).get(key)
+
+
+def _fleet_row(indexed: fleet.Indexed, operator: str) -> tuple[str, bool]:
+    """The row of ``fleet list`` for one daemon, and whether it answered. A stale or
+    unknown entry is shown and never asked."""
+    entry = indexed.entry
+    if indexed.liveness is not fleet.Liveness.LIVE:
+        return f"{entry.name}: {indexed.liveness}, pid {entry.pid}, not asked", True
+    try:
+        status = _fleet_verified(entry)
+        mail = _fleet_ask(
+            entry,
+            Operation.MAIL,
+            {"operator": operator, "issues_only": True, "limit": 1},
+        )
+    except _NoAnswer as error:
+        return f"{entry.name}: {error}", False
+    daemon = status.get("daemon")
+    stale = _fleet_count(daemon, "stale")
+    commit = _fleet_count(daemon, "commit")
+    behind = (
+        ", behind its checkout"
+        if stale is True
+        else ""
+        if stale is False
+        else ", whether behind its checkout is unknown"
+    )
+    log = status.get("event_log")
+    return (
+        f"{entry.name}: running, commit"
+        f" {str(commit)[:12] if isinstance(commit, str) else 'unknown'},"
+        f" {_fleet_count(log, 'lines')} lines,"
+        f" {_fleet_count(log, 'open_questions')} open questions,"
+        f" {mail.get('unread')} unread, {mail.get('total')} open issues{behind}"
+    ), True
+
+
+def _fleet_list(arguments: argparse.Namespace) -> int:
+    found = _fleet_survey("list")
+    if found is None:
+        return exits.FAILURE
+    if not found:
+        print("no daemon is in the fleet index")
+        return exits.OK
+    answered = True
+    for indexed in found:
+        row, ok = _fleet_row(indexed, arguments.operator)
+        answered = answered and ok
+        print(row)
+        print(f"    {indexed.entry.root}")
+    return exits.OK if answered else exits.FAILURE
+
+
+def _fleet_each(
+    command: str,
+    found: list[fleet.Indexed],
+    ask: Callable[[fleet.IndexEntry], None],
+) -> int:
+    """Run ``ask`` on each live daemon, reporting one that does not answer and going
+    on with the rest. A stale or unknown entry is reported and never asked."""
+    answered = True
+    for indexed in found:
+        entry = indexed.entry
+        if indexed.liveness is not fleet.Liveness.LIVE:
+            print(f"{entry.name}: {indexed.liveness}, not asked", file=sys.stderr)
+            continue
+        try:
+            _fleet_verified(entry)
+            ask(entry)
+        except _NoAnswer as error:
+            answered = False
+            print(f"dromon fleet {command}: {entry.name}: {error}", file=sys.stderr)
+    return exits.OK if answered else exits.FAILURE
+
+
+def _fleet_questions(arguments: argparse.Namespace) -> int:
+    found = _fleet_survey("questions")
+    if found is None:
+        return exits.FAILURE
+    args: dict[str, object] = {} if arguments.all else {"operator": arguments.operator}
+
+    def ask(entry: fleet.IndexEntry) -> None:
+        result = _fleet_ask(entry, Operation.QUESTIONS, args)
+        listed = result.get("questions")
+        for item in cast(list[object], listed) if isinstance(listed, list) else []:
+            question = _fleet_mapping(item)
+            print(
+                f"{entry.name}:{question.get('question_id')} from"
+                f" {question.get('line')} to {question.get('operator')}"
+            )
+            for text_line in str(question.get("text", "")).splitlines() or [""]:
+                print(f"    {text_line}")
+
+    return _fleet_each("questions", found, ask)
+
+
+def _fleet_mail(arguments: argparse.Namespace, issues: bool) -> int:
+    command = "issues" if issues else "mail"
+    found = _fleet_survey(command)
+    if found is None:
+        return exits.FAILURE
+    args: dict[str, object] = {"operator": arguments.operator, "limit": arguments.limit}
+    if issues:
+        args["issues_only"] = True
+    elif arguments.unread:
+        args["unread_only"] = True
+
+    def ask(entry: fleet.IndexEntry) -> None:
+        result = _fleet_ask(entry, Operation.MAIL, args)
+        listed = result.get("messages")
+        messages = cast(list[object], listed) if isinstance(listed, list) else []
+        if messages:
+            print(f"{entry.name}: {result.get('total')} matching")
+        for item in messages:
+            message = _fleet_mapping(item)
+            state = "read" if message.get("read") is True else "unread"
+            print(
+                f"{entry.name}:{message.get('message_id')} from"
+                f" {message.get('sender')}, {message.get('kind')}, {state}"
+            )
+
+    return _fleet_each(command, found, ask)
+
+
+def _fleet_target(command: str, project: str) -> fleet.IndexEntry | None:
+    """The live, verified daemon ``project`` names, or ``None`` once the reason is
+    printed."""
+    found = _fleet_survey(command)
+    if found is None:
+        return None
+    try:
+        entry = fleet.resolve(found, project)
+        _fleet_verified(entry)
+    except (fleet.FleetError, _NoAnswer) as error:
+        print(f"dromon fleet {command}: {error}", file=sys.stderr)
+        return None
+    return entry
+
+
+def _fleet_routed(
+    command: str, target: str, what: str
+) -> tuple[ProjectPaths, str] | None:
+    """The paths of the daemon ``target``, ``PROJECT:ITEM``, names, and the item."""
+    try:
+        project, item = fleet.split_target(target, what)
+    except fleet.FleetError as error:
+        print(f"dromon fleet {command}: {error}", file=sys.stderr)
+        return None
+    entry = _fleet_target(command, project)
+    return None if entry is None else (_fleet_paths(entry), item)
+
+
+def _fleet_hosts() -> int:
+    try:
+        hosts = fleet.read_hosts(fleet.configured_hosts_file(os.environ))
+    except fleet.FleetError as error:
+        print(f"dromon fleet hosts: {error}", file=sys.stderr)
+        return exits.FAILURE
+    if not hosts:
+        print("no host is configured")
+    for host in hosts.values():
+        print(f"{host.name}: ssh {host.destination}, {host.remote_dromon} there")
+    print(
+        "Reaching these hosts is designed and not implemented, as"
+        " docs/architecture/FLEET.md says"
+    )
+    return exits.OK
+
+
+def _fleet(arguments: argparse.Namespace) -> int:
+    """``dromon fleet``, which needs no project of its own."""
+    action: str = arguments.fleet_action
+    match action:
+        case "list":
+            return _fleet_list(arguments)
+        case "questions":
+            return _fleet_questions(arguments)
+        case "mail" | "issues":
+            return _fleet_mail(arguments, action == "issues")
+        case "hosts":
+            return _fleet_hosts()
+        case "status" | "restart":
+            entry = _fleet_target(action, arguments.project_name)
+            if entry is None:
+                return exits.FAILURE
+            if action == "status":
+                return _status(_fleet_paths(entry), arguments)
+            return _restart(_fleet_paths(entry), arguments, entry)
+        case "answer":
+            routed = _fleet_routed(action, arguments.target, "QUESTION")
+            if routed is None:
+                return exits.FAILURE
+            arguments.question_id = routed[1]
+            return _answer(routed[0], arguments)
+        case "send":
+            routed = _fleet_routed(action, arguments.target, "RECIPIENT")
+            if routed is None:
+                return exits.FAILURE
+            arguments.recipient = routed[1]
+            return _send(routed[0], arguments)
+        case _:
+            routed = _fleet_routed(action, arguments.target, "MESSAGE")
+            if routed is None:
+                return exits.FAILURE
+            arguments.message_id = routed[1]
+            return _read(routed[0], arguments)
+
+
 IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]] = {
     "start": _start,
     "status": _status,
@@ -2017,6 +2575,8 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "peer": _peer,
     "mcp": _mcp,
     "proposal": _proposal,
+    "land": _land,
+    "fleet": lambda _paths, arguments: _fleet(arguments),
 }
 
 
@@ -2160,6 +2720,21 @@ def _add_tool_options(command: argparse.ArgumentParser) -> None:
         help="the directory the line's engine runs in, relative to the project root,"
         " default the project root",
     )
+    command.add_argument("--workdir-access", choices=("read", "write"))
+    command.add_argument(
+        "--keep-session", action=argparse.BooleanOptionalAction, default=None
+    )
+    command.add_argument(
+        "--allow-compact", action=argparse.BooleanOptionalAction, default=None
+    )
+    for option in (
+        "keep-session-idle-seconds",
+        "keep-session-max-seconds",
+        "keep-session-hard-seconds",
+        "auto-compact-tokens",
+    ):
+        command.add_argument("--" + option, type=int)
+    command.add_argument("--keep-session-at-max", choices=("close", "keep", "ask"))
     command.add_argument(
         "--effort",
         choices=EFFORTS,
@@ -2183,6 +2758,84 @@ def _add_tool_options(command: argparse.ArgumentParser) -> None:
     )
 
 
+FLEET_COMMANDS: Final[dict[str, str]] = {
+    "list": "each daemon with its state, commit, lines, questions, mail and issues",
+    "questions": "the open questions of every daemon, each named PROJECT:QUESTION",
+    "mail": "an operator's mail in every daemon, each named PROJECT:MESSAGE",
+    "issues": "the open issues lines raised in every daemon",
+    "answer": "answer PROJECT:QUESTION",
+    "send": "send to PROJECT:LINE, or PROJECT:@OPERATOR",
+    "read": "open PROJECT:MESSAGE",
+    "status": "show one project's daemon, as dromon status does",
+    "restart": "restart one project's daemon, as dromon restart does",
+    "hosts": "list the hosts of other machines in the per-user hosts file",
+}
+
+
+def _add_fleet_commands(command: argparse.ArgumentParser) -> None:
+    """The subcommands of ``dromon fleet``, each taking the options of the command it
+    sends for one project."""
+    actions = command.add_subparsers(
+        dest="fleet_action", metavar="ACTION", required=True
+    )
+    for action, help_text in FLEET_COMMANDS.items():
+        sub = actions.add_parser(action, help=help_text, description=help_text)
+        if action != "hosts":
+            sub.add_argument(
+                "--operator",
+                default=default_operator(),
+                help="the operator, default %(default)s",
+            )
+        if action in ("status", "restart"):
+            sub.add_argument(
+                "project_name",
+                metavar="PROJECT",
+                help="the project, by its name or its root",
+            )
+        if action in ("answer", "send", "read"):
+            what = {"answer": "QUESTION", "send": "LINE", "read": "MESSAGE"}[action]
+            sub.add_argument(
+                "target", metavar=f"PROJECT:{what}", help="the project and the item"
+            )
+        if action in ("answer", "send"):
+            sub.add_argument("body", help="the text")
+        if action == "questions":
+            sub.add_argument(
+                "--all", action="store_true", help="list every operator's questions"
+            )
+        if action in ("mail", "issues"):
+            sub.add_argument(
+                "--limit",
+                type=int,
+                default=20,
+                help="at most this many from each daemon, default 20",
+            )
+        if action == "mail":
+            sub.add_argument("--unread", action="store_true", help="unread only")
+        if action == "send":
+            sub.add_argument("--reply-to", default=None, help="the message answered")
+            sub.add_argument(
+                "--priority",
+                action="store_true",
+                help="end the line's running turn at a safe point and lead its next",
+            )
+        if action == "status":
+            sub.add_argument(
+                "--correlation",
+                metavar="KEY",
+                help="also total the turns and cost recorded under this key",
+            )
+        if action == "restart":
+            sub.add_argument("--interrupt", action="store_true")
+            sub.add_argument(
+                "--wait-seconds",
+                type=int,
+                default=restart.DEFAULT_WAIT_SECONDS,
+                metavar="SECONDS",
+            )
+            sub.add_argument("--end-tasks", action="store_true")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Return the argument parser for ``dromon``."""
     parser = argparse.ArgumentParser(
@@ -2202,6 +2855,8 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     for name, help_text in SUBCOMMANDS.items():
         command = commands.add_parser(name, help=help_text, description=help_text)
+        if name == "fleet":
+            _add_fleet_commands(command)
         if name == "rebind":
             command.add_argument("line_id", help="the line to move")
             command.add_argument(
@@ -2251,6 +2906,8 @@ def build_parser() -> argparse.ArgumentParser:
                 default=default_operator(),
                 help="who asks for the restart, default %(default)s",
             )
+        if name == "land":
+            _land_arguments(command)
         if name == "awaken":
             command.add_argument("line_id", help="the hibernated line")
         if name == "start":
@@ -2301,6 +2958,9 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("line_id", help="the line's identifier")
             _add_tool_options(command)
         if name == "create":
+            command.add_argument("--max-autonomous-turns", type=int)
+            command.add_argument("--max-cost-usd")
+            command.add_argument("--cooldown-seconds")
             command.add_argument(
                 "--session",
                 default=None,
@@ -2656,6 +3316,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if handler is None:
         print(f"dromon {command}: not implemented in this version", file=sys.stderr)
         return exits.NOT_IMPLEMENTED
+    if command == "fleet":
+        # The fleet needs no project of its own, so a client run outside one works.
+        return _fleet(arguments)
     project: Path = arguments.project
     runtime_dir: Path | None = arguments.runtime_dir
     try:
