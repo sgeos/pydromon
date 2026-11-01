@@ -3398,7 +3398,7 @@ class Scheduler:
         """The lease held under ``name``, or ``None`` once its time has passed. An
         expired lease needs no event, since the next acquisition replaces it."""
         lease = self._log.state.leases.get(name)
-        if lease is not None and parse_due(lease.expires) <= self._wall_clock():
+        if lease is not None and not _lease_live(lease, self._wall_clock()):
             return None
         return lease
 
@@ -4393,17 +4393,15 @@ class Scheduler:
     ) -> dict[str, object]:
         """Build status for internal callers. The line tool explicitly chooses the
         compact default and only returns details or long lists when requested."""
-        full = self._detailed_line_status(line_id)
+        full = self._detailed_line_status(line_id, others=lists)
         if detail and lists:
             return full
         if detail:
             status = dict(full)
             leases = cast(list[dict[str, object]], status.pop("leases"))
             turns = cast(list[dict[str, object]], status.pop("recent_turns"))
-            others = cast(list[dict[str, object]], status.pop("other_lines"))
             status["lease_count"] = len(leases)
             status["recent_turn_count"] = len(turns)
-            status["other_line_count"] = len(others)
             kept = cast(dict[str, object], status["kept_session"])
             tasks = cast(list[dict[str, object]], kept.pop("tasks"))
             kept["background_task_count"] = len(tasks)
@@ -4433,9 +4431,7 @@ class Scheduler:
                 "background_tasks": kept["tasks"],
                 "left_processes": left_processes,
             }
-            if _status_size(compact) > MAX_LINE_STATUS_DEFAULT_BYTES:
-                return _truncated_line_status(full, lists_truncated=True)
-            return compact
+            return _bounded_with_lists(compact, full)
         if _status_size(compact) <= MAX_LINE_STATUS_DEFAULT_BYTES:
             return compact
         return _truncated_line_status(full, lists_truncated=False)
@@ -4465,8 +4461,13 @@ class Scheduler:
             if report.peer_id in peers and address in peers[report.peer_id].senders
         ]
 
-    def _detailed_line_status(self, line_id: str) -> dict[str, object]:
-        """The full status before the caller selects compact, detail or list fields."""
+    def _detailed_line_status(
+        self, line_id: str, *, others: bool = True
+    ) -> dict[str, object]:
+        """The full status before the caller selects compact, detail or list fields.
+        ``other_lines`` is built only when ``others`` is true, since only a request
+        for the lists returns it, and ``other_line_count`` is always given. **Task of
+        2026-11-01, answering review r13, C1.**"""
         state = self._log.state
         line = state.lines[line_id]
         limits = self.limits_for(line_id)
@@ -4476,27 +4477,7 @@ class Scheduler:
         except LineToolRefused:
             workdir = None
         pending = state.scheduled.get(line_id)
-        now = self._wall_clock()
-        unread = _unread_by_line(state, self._log.times.message_recorded)
-        others: list[dict[str, object]] = [
-            {
-                "line_id": other_id,
-                "state": other.state.value,
-                "condition": self.condition(other_id),
-                "held": other.held_by is not None,
-                "hold_cause": _hold_cause(other),
-                "hibernated": other.hibernated,
-                "since": _recorded_time_of(self._log.times.line_changed.get(other_id)),
-                "unread": unread.get(other_id, (0, None))[0],
-                "oldest_unread_age_seconds": _age_seconds(
-                    unread.get(other_id, (0, None))[1], now
-                ),
-                "workdir_commit": self._workdir_commit(other_id),
-                "leases": [str(lease["name"]) for lease in self.leases_of(other_id)],
-            }
-            for other_id, other in sorted(state.lines.items())
-            if other_id != line_id
-        ]
+        others_view = self._other_lines(state, line_id) if others else None
         self.collect_left()
         line = state.lines[line_id]
         return {
@@ -4550,8 +4531,62 @@ class Scheduler:
                 ),
                 "walk_limit": state.walk_limit or None,
             },
-            "other_lines": others,
+            "other_line_count": len(state.lines) - 1,
+            **({} if others_view is None else {"other_lines": others_view}),
         }
+
+    def _other_lines(self, state: State, line_id: str) -> list[dict[str, object]]:
+        """Every line but ``line_id`` as another line sees it, in the order of their
+        identifiers, from ``state`` taken once.
+
+        **Task of 2026-11-01, answering review r13.** Each entry is compact. It always
+        gives ``line_id``, ``state`` and ``condition``, and every other field only
+        when it says something, so an idle line with nothing waiting takes a few
+        fields. ``held`` is no longer given, since ``hold_cause`` is given exactly
+        when the line is held. The condition, the unread count and the oldest unread
+        message come from the indexes the state keeps, so no message is scanned.
+        Reading the working directory's commit is a file read for each line, as
+        before. Nothing of a message but its count and age leaves here, so no line
+        sees another line's mail."""
+        now = self._wall_clock()
+        leases = _live_leases_by_line(state, now)
+        recorded = self._log.times
+        entries: list[dict[str, object]] = []
+        for other_id, other in sorted(state.lines.items()):
+            if other_id == line_id:
+                continue
+            entry: dict[str, object] = {
+                "line_id": other_id,
+                "state": other.state.value,
+                "condition": self.condition(other_id),
+            }
+            cause = _hold_cause(other)
+            if cause is not None:
+                entry["hold_cause"] = cause
+            if other.hibernated:
+                entry["hibernated"] = True
+            since = _recorded_time_of(recorded.line_changed.get(other_id))
+            if since is not None:
+                entry["since"] = since
+            mail = state.line_mail(other_id)
+            if mail.unread:
+                entry["unread"] = mail.unread
+                oldest = (
+                    None
+                    if mail.oldest_unread is None
+                    else recorded.message_recorded.get(mail.oldest_unread)
+                )
+                age = _age_seconds(oldest, now)
+                if age is not None:
+                    entry["oldest_unread_age_seconds"] = age
+            commit = self._workdir_commit(other_id)
+            if commit is not None:
+                entry["workdir_commit"] = commit
+            held = leases.get(other_id)
+            if held:
+                entry["leases"] = held
+            entries.append(entry)
+        return entries
 
     def _shell_status(self, line_id: str, config: LineConfig) -> dict[str, object]:
         """Report the shell selection from the line adapter's environment."""
@@ -4701,9 +4736,13 @@ class Scheduler:
         keeps apart a line that is running, held for an operator, stopped by a failed
         turn, waiting on a question it asked an operator, and idle, in that order of
         precedence. A hibernated line that is not running is ``hibernated``, before all
-        but ``running``, since nothing else wakes it."""
-        state = self._log.state
-        line = state.lines[line_id]
+        but ``running``, since nothing else wakes it.
+
+        **Task of 2026-11-01, answering review r13, C1.** Whether the line is
+        waiting is read from the index of open questions the state keeps, and the line
+        from the log without copying its state, so the cost does not grow with the
+        messages the log holds, and another line's view may ask it of every line."""
+        line = self._log.line(line_id)
         if line_id in self._running or line.state is LineState.RUNNING:
             return "running"
         if line.hibernated:
@@ -4712,14 +4751,7 @@ class Scheduler:
             return "held"
         if line_id in self._failed:
             return "failed"
-        address = LineAddress(line_id)
-        asking = any(
-            message.sender == address
-            and message.status is QuestionStatus.OPEN
-            and isinstance(message.recipient, OperatorAddress)
-            for message in state.messages.values()
-        )
-        return "waiting" if asking else "idle"
+        return "waiting" if self._log.line_mail(line_id).asking else "idle"
 
     def event_log_status(self) -> dict[str, object]:
         """The event log's size and its growth since this daemon opened it. Row 14 of
@@ -5462,8 +5494,8 @@ class Scheduler:
             if type(lists) is not bool:
                 return _tool_error("lists must be true or false")
             status = self.line_status(line_id, detail=detail, lists=lists)
-            if lists and _status_size(status) > MAX_LINE_STATUS_DEFAULT_BYTES:
-                status = _truncated_line_status(status, lists_truncated=True)
+            if detail and lists:
+                status = _bounded_with_lists(status, status)
             return _tool_text(json.dumps(status, indent=2, sort_keys=True))
 
         return SdkMcpTool(
@@ -10307,32 +10339,20 @@ def _hold_cause(line: Line) -> str | None:
     return line.hold_cause.value
 
 
-def _unread_by_line(
-    state: State, recorded: dict[str, str]
-) -> dict[str, tuple[int, str | None]]:
-    """For each line, how many messages to it it has not opened and when the oldest
-    was recorded, by one pass over the messages in log order.
+def _lease_live(lease: LeaseAcquired, now: datetime) -> bool:
+    """Whether ``lease`` is still held at ``now``, by its expiry."""
+    return parse_due(lease.expires) > now
 
-    **Task of 2026-10-31, decided by core for review.** Mail still waiting for
-    delivery counts with mail delivered and unopened, since a held or hibernated
-    line's mail waits undelivered, and leaving it out would show such a line as
-    having nothing waiting. The line's own notes are left out, as its own unread
-    count leaves them out. Nothing of a message but its count and age leaves here,
-    so no line sees another line's mail."""
-    found: dict[str, tuple[int, str | None]] = {}
-    for message_id, message in state.messages.items():
-        recipient = message.recipient
-        if (
-            not isinstance(recipient, LineAddress)
-            or message.read
-            or message.sender == recipient
-        ):
-            continue
-        count, oldest = found.get(recipient.line_id, (0, None))
-        if count == 0:
-            oldest = recorded.get(message_id)
-        found[recipient.line_id] = (count + 1, oldest)
-    return found
+
+def _live_leases_by_line(state: State, now: datetime) -> dict[str, list[str]]:
+    """The names of the leases each line holds at ``now``, sorted, by one pass over
+    the leases. A line holding none has no entry."""
+    held: dict[str, list[str]] = {}
+    for name in sorted(state.leases):
+        lease = state.leases[name]
+        if _lease_live(lease, now):
+            held.setdefault(lease.line_id, []).append(name)
+    return held
 
 
 def _recorded_time_of(recorded_at: str | None) -> str | None:
@@ -10438,7 +10458,7 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         "background_task_count": len(cast(list[dict[str, object]], kept["tasks"])),
         "background_tasks_unknown": kept.get("background_tasks_unknown") is True,
         "recent_turn_count": len(cast(list[dict[str, object]], full["recent_turns"])),
-        "other_line_count": len(cast(list[dict[str, object]], full["other_lines"])),
+        "other_line_count": full["other_line_count"],
     }
 
 
@@ -10485,6 +10505,85 @@ def _commit_name(value: object) -> str | None:
 def _status_size(status: dict[str, object]) -> int:
     """The UTF-8 size of status as the line tool formats its JSON response."""
     return len(json.dumps(status, indent=2, sort_keys=True).encode("utf-8"))
+
+
+def _with_other_lines(
+    status: dict[str, object], entries: list[dict[str, object]], kept: int
+) -> dict[str, object]:
+    """``status`` with the first ``kept`` of ``entries`` as its other lines and the
+    count of the rest as ``other_lines_omitted``, under ``lists`` when ``status`` has
+    that object and at its top otherwise. ``status`` itself is not changed."""
+    fitted = dict(status)
+    holder = fitted
+    if isinstance(fitted.get("lists"), dict):
+        holder = dict(cast(dict[str, object], fitted["lists"]))
+        fitted["lists"] = holder
+    holder["other_lines"] = entries[:kept]
+    holder["other_lines_omitted"] = len(entries) - kept
+    return fitted
+
+
+def _fit_other_lines(
+    status: dict[str, object], entries: list[dict[str, object]]
+) -> dict[str, object] | None:
+    """``status`` with as many of ``entries`` as fit within
+    ``MAX_LINE_STATUS_DEFAULT_BYTES``, the first in order, or ``None`` when there are
+    entries and not even one fits. The size grows with the entries kept, so a
+    bisection finds the most, in at most the logarithm of their number of steps."""
+    whole = _with_other_lines(status, entries, len(entries))
+    if _status_size(whole) <= MAX_LINE_STATUS_DEFAULT_BYTES:
+        return whole
+    if _status_size(_with_other_lines(status, entries, 1)) > (
+        MAX_LINE_STATUS_DEFAULT_BYTES
+    ):
+        return None
+    low, high = 1, len(entries) - 1
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _status_size(_with_other_lines(status, entries, middle)) <= (
+            MAX_LINE_STATUS_DEFAULT_BYTES
+        ):
+            low = middle
+        else:
+            high = middle - 1
+    return _with_other_lines(status, entries, low)
+
+
+def _bare_other_line(entry: dict[str, object]) -> dict[str, object]:
+    """``entry`` with its lease names replaced by their count, whose size is bounded
+    by the identifier pattern and the fixed fields alone."""
+    bare = {key: value for key, value in entry.items() if key != "leases"}
+    leases = entry.get("leases")
+    if isinstance(leases, list):
+        bare["lease_count"] = len(cast(list[object], leases))
+    return bare
+
+
+def _bounded_with_lists(
+    status: dict[str, object], full: dict[str, object]
+) -> dict[str, object]:
+    """``status``, which carries the long lists, within
+    ``MAX_LINE_STATUS_DEFAULT_BYTES``.
+
+    **Task of 2026-11-01, decided by the operator on review r13, T1.** The view of
+    the other lines never vanishes as the lines grow. When the whole response would
+    pass the bound, it keeps as many other lines as fit, in the order of their
+    identifiers, with ``other_lines_omitted`` counting the rest. When not one fits
+    beside the other lists, the response is truncated as before, and still carries
+    as many other lines as fit beside the shortest status, then, should not one fit
+    with its lease names, entries with a lease count instead. Such an entry is at
+    most a few hundred bytes, since identifiers match ``ID_PATTERN``, so at least one
+    is always given while any other line exists."""
+    entries = cast(list[dict[str, object]], full["other_lines"])
+    fitted = _fit_other_lines(status, entries)
+    if fitted is not None:
+        return fitted
+    truncated = _truncated_line_status(full, lists_truncated=True)
+    for candidates in (entries, [_bare_other_line(entry) for entry in entries]):
+        fitted = _fit_other_lines(truncated, candidates)
+        if fitted is not None:
+            return fitted
+    return _with_other_lines(truncated, entries, 0)
 
 
 def _truncated_line_status(

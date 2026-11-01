@@ -235,21 +235,42 @@ and those lists. No mode returns a configuration document or message body.
 **Other lines.** From 2026-10-31, asked by the operator after a line held back work it
 had planned for a peer, because its status gave it no reliable view of that peer. Each
 entry of `other_lines` is a read-only view of one other line of the daemon, never of
-the line asking, with these fields.
+the line asking, in the order of their identifiers. From 2026-11-01, decided by the
+operator on review r13, an entry is compact. It always gives `line_id`, `state` and
+`condition`, and gives every other field only when it says something, so a field left
+out reads as the value in the last column.
 
-| Field | Meaning |
-|---|---|
-| `line_id` | The other line |
-| `state` | `idle`, `running` or `stopped`, as the event log records it |
-| `condition` | One word for where the line stands, by the precedence `line_status` gives the line's own: `running`, `hibernated`, `held`, `failed`, `waiting` on a question it asked an operator, or `idle` |
-| `held` | Whether the line is held |
-| `hold_cause` | The short cause of the hold, or `null` when it is not held: `autonomous_turns`, `cost`, `disclosure_checks`, `git_ssh_changed`, `plan_limit`, `inferred_limit`, `turn_failed` or `stopped`. A hold recorded before causes were gives `unrecorded` |
-| `hibernated` | Whether an operator hibernated the line |
-| `since` | When the line last was created, started or ended a turn, was held or released, or was hibernated or awakened, to the second in Coordinated Universal Time, or `null` when the log's time does not parse |
-| `unread` | How many messages to the line it has not opened, its own notes left out |
-| `oldest_unread_age_seconds` | Whole seconds since the oldest of those was sent, or `null` when there is none |
-| `workdir_commit` | The commit at `HEAD` of the line's working directory |
-| `leases` | The names of the leases the line holds |
+| Field | Meaning | Left out |
+|---|---|---|
+| `line_id` | The other line | Never |
+| `state` | `idle`, `running` or `stopped`, as the event log records it | Never |
+| `condition` | One word for where the line stands, by the precedence `line_status` gives the line's own: `running`, `hibernated`, `held`, `failed`, `waiting` on a question it asked an operator, or `idle` | Never |
+| `hold_cause` | The short cause of the hold: `autonomous_turns`, `cost`, `disclosure_checks`, `git_ssh_changed`, `plan_limit`, `inferred_limit`, `turn_failed` or `stopped`. A hold recorded before causes were gives `unrecorded` | Not held |
+| `hibernated` | `true` when an operator hibernated the line | `false` |
+| `since` | When the line last was created, started or ended a turn, was held or released, or was hibernated or awakened, to the second in Coordinated Universal Time | The log's time does not parse |
+| `unread` | How many messages to the line it has not opened, its own notes left out | 0 |
+| `oldest_unread_age_seconds` | Whole seconds since the oldest of those was sent | No unread mail, or its time does not parse |
+| `workdir_commit` | The commit at `HEAD` of the line's working directory | Not allowed or not in a checkout |
+| `leases` | The names of the leases the line holds | None held |
+
+The entry gave `held` until 2026-11-01. It is no longer given, since `hold_cause` is
+given exactly when the line is held.
+
+- **The response bound.** **Decided by the operator on review r13, T1.** When the
+  whole response would pass the bound of 8,192 bytes, it keeps as many other lines as
+  fit, the first in order, and `other_lines_omitted` beside `other_lines` counts the
+  rest. It is 0 when every line is shown, and `other_line_count` gives them all. When
+  the other lists alone pass the bound, the response is truncated as before, and
+  still carries `other_lines` and `other_lines_omitted` at its top. An entry whose
+  lease names alone would pass the bound gives `lease_count` in place of `leases`, so
+  at least one entry is given whenever another line exists. No argument pages past
+  the lines left out.
+- **The cost.** **Decided by the operator on review r13, C1.** The state keeps each
+  line's unread mail and its open questions to an operator as indexes, updated as
+  events apply and rebuilt by replay, so a line's `condition`, its `unread` and its
+  oldest unread mail are read without a scan of the messages. The view is built only
+  when `lists` is true. The caller's own counts are still found by a scan of its
+  mailbox, as before, and reading each other line's `workdir_commit` reads a file.
 
 - **Never the mail.** The view gives a count and an age, and never a message's body,
   sender, identifier or subject. A hold gives its closed cause and never the hold
@@ -262,7 +283,9 @@ the line asking, with these fields.
   [`EVENT_LOG.md`](EVENT_LOG.md) gives it, so it survives a restart.
 - **The times are the log's.** `since` and the age are read from the `recorded_at` of
   the event log's entries, which the daemon keeps beside its state as it replays and
-  appends, so they also survive a restart and need no scan of the log. **Limits.**
+  appends, so they also survive a restart and need no scan of the log. A message's
+  time is kept only while it is unread mail to a line, so the times grow with the
+  unread mail and not with the log. **Limits.**
   `since` does not move when a line comes to wait on a question or when its turn
   fails, since neither changes its state, hold or hibernation, so for `waiting` and
   `failed` it names the latest change before. The times follow the daemon's clock, so

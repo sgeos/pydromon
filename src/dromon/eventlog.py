@@ -37,12 +37,16 @@ from dromon.codec import DecodeError, decode, encode
 from dromon.model import (
     Event,
     EventRejected,
+    Line,
     LineAwakened,
     LineCreated,
     LineHeld,
     LineHibernated,
     LineReleased,
+    LineAddress,
+    LineMail,
     LineStateChanged,
+    MessageRead,
     MessageReceived,
     MessageSent,
     State,
@@ -148,6 +152,18 @@ class EventLog:
                 return None
         return total
 
+    def line(self, line_id: str) -> Line:
+        """The record of ``line_id``, read without the copy ``state`` makes, which
+        is safe since a record is frozen. Raises ``KeyError`` for a line the log does
+        not hold."""
+        return self._state.lines[line_id]
+
+    def line_mail(self, line_id: str) -> LineMail:
+        """What ``line_id``'s mail says of it, read without the copy ``state`` makes,
+        at a cost that does not grow with the messages the log holds. **Task of
+        2026-11-01.**"""
+        return self._state.line_mail(line_id)
+
     @property
     def times(self) -> "RecordedTimes":
         """When the events this log holds were recorded, as far as views need it.
@@ -185,7 +201,7 @@ class EventLog:
         self._state.apply(event)
         self._last_seq = expected
         entry = Entry(expected, recorded_at, event)
-        self._times.note(entry)
+        self._times.note(entry, self._state)
         return entry
 
 
@@ -203,15 +219,20 @@ time ``RecordedTimes.line_changed`` keeps."""
 
 class RecordedTimes:
     """The ``recorded_at`` of each line's latest ``LINE_CHANGES`` event and of each
-    message's first event, kept as the log is replayed and appended to.
+    unread message's first event, kept as the log is replayed and appended to.
 
     **Task of 2026-10-31.** Lines are shown how long another line has stood as it
     is and how old its oldest unread mail is, and reading the whole log for each
     ``line_status`` would cost a full scan each time. The times are the clock's
     text, never parsed here, and the model never reads them, so replay stays
     deterministic. They follow the clock, which may step backwards, so an age read
-    from them can be wrong by as much as the clock was. One entry is kept for every
-    message the log holds, as ``State.messages`` keeps the message itself.
+    from them can be wrong by as much as the clock was.
+
+    **Task of 2026-11-01, answering review r13.** A message's time is kept only
+    while it is in ``State.unread_mail``, the only messages whose age is shown, so
+    the map is bounded by the unread mail rather than by every message the log has
+    held. Mail enters that index only when it is sent or received, and leaves it
+    only when it is read, so these two events keep the map.
     **Porting note.** A port keeps the same two maps beside its state."""
 
     def __init__(self) -> None:
@@ -219,14 +240,23 @@ class RecordedTimes:
         """When each line last started or stopped running, was held or released,
         or was hibernated or awakened, or was created."""
         self.message_recorded: dict[str, str] = {}
-        """When each message was sent or received, by its identifier."""
+        """When each unread message to a line was sent or received, by its
+        identifier."""
 
-    def note(self, entry: Entry) -> None:
+    def note(self, entry: Entry, state: State) -> None:
+        """Note ``entry``'s time, with ``state`` as it stands once the entry is
+        applied."""
         event = entry.event
         if isinstance(event, LINE_CHANGES):
             self.line_changed[event.line_id] = entry.recorded_at
         elif isinstance(event, MessageSent | MessageReceived):
-            self.message_recorded.setdefault(event.message_id, entry.recorded_at)
+            recipient = event.recipient
+            if isinstance(recipient, LineAddress) and event.message_id in (
+                state.unread_mail.get(recipient.line_id, {})
+            ):
+                self.message_recorded.setdefault(event.message_id, entry.recorded_at)
+        elif isinstance(event, MessageRead):
+            self.message_recorded.pop(event.message_id, None)
 
 
 def replay(path: Path) -> State:
@@ -370,6 +400,6 @@ def _replay(
                     f"event {entry.seq} does not apply: {error}"
                 ) from error
             if times is not None:
-                times.note(entry)
+                times.note(entry, state)
             last_seq = entry.seq
     return state, last_seq

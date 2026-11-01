@@ -2305,6 +2305,19 @@ def role_terms(role: Role | RoleDeclared) -> RoleTerms:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class LineMail:
+    """What a line's mail says of it without its content, read from the indexes
+    ``State`` keeps as events apply. **Task of 2026-11-01.** ``asking`` is whether the
+    line has a question open to an operator, ``unread`` how many messages to it it has
+    not opened, its own notes left out and mail still waiting for delivery counted,
+    and ``oldest_unread`` the first of those in log order."""
+
+    asking: bool
+    unread: int
+    oldest_unread: str | None
+
+
 @dataclass(slots=True)
 class State:
     """Everything the event log records, keyed by identifier.
@@ -2456,6 +2469,21 @@ class State:
         default_factory=dict[tuple[str, str], str]
     )
     """Each scope's latest run, by ``run_scope``."""
+    unread_mail: dict[str, dict[str, None]] = field(
+        default_factory=dict[str, dict[str, None]]
+    )
+    """Each line's mail it has not opened, by the rule of ``LineMail.unread``, in log
+    order. A line with none has no entry. The inner maps are ordered sets.
+    **Task of 2026-11-01.** Another line's view of the line reads its count and its
+    oldest here, so that ``line_status`` scans no messages. Every write of
+    ``messages`` goes through ``_put_message``, which keeps it, so replay rebuilds it
+    from the events alone."""
+    open_asked: dict[str, dict[str, None]] = field(
+        default_factory=dict[str, dict[str, None]]
+    )
+    """Each line's questions to an operator still open, in the order asked, kept by
+    ``_put_message`` as ``unread_mail`` is. A line with none has no entry. The inner
+    maps are ordered sets. **Task of 2026-11-01.**"""
 
     def holder_of(self, role_id: str) -> RoleHolder:
         """What decides ``role_id``'s terms and seats now."""
@@ -2534,6 +2562,18 @@ class State:
             dict(self.leases),
             dict(self.runs),
             dict(self.latest_runs),
+            {line_id: dict(mail) for line_id, mail in self.unread_mail.items()},
+            {line_id: dict(asked) for line_id, asked in self.open_asked.items()},
+        )
+
+    def line_mail(self, line_id: str) -> LineMail:
+        """What ``line_id``'s mail says of it, from the indexes alone, so the cost
+        does not grow with the messages the log holds."""
+        unread = self.unread_mail.get(line_id, {})
+        return LineMail(
+            bool(self.open_asked.get(line_id)),
+            len(unread),
+            next(iter(unread), None),
         )
 
     def open_questions(self, operator_id: str) -> list[str]:
@@ -2873,8 +2913,9 @@ class State:
                     if isinstance(message.recipient, LineAddress)
                     else None
                 )
-                self.messages[event.message_id] = replace(
-                    message, delivered=True, reported_ends_at_delivery=ends
+                self._put_message(
+                    event.message_id,
+                    replace(message, delivered=True, reported_ends_at_delivery=ends),
                 )
                 if isinstance(message.sender, RemoteAddress) and not isinstance(
                     message.recipient, RemoteAddress
@@ -2884,7 +2925,9 @@ class State:
                 self._leave_outbox(event.message_id, message)
             case MessageReturned():
                 message = self.messages[event.message_id]
-                self.messages[event.message_id] = replace(message, returned=event.code)
+                self._put_message(
+                    event.message_id, replace(message, returned=event.code)
+                )
                 self._leave_outbox(event.message_id, message)
                 self._note_end(
                     message,
@@ -2893,7 +2936,7 @@ class State:
                 )
             case MessageUnconfirmed():
                 message = self.messages[event.message_id]
-                self.messages[event.message_id] = replace(message, unconfirmed=True)
+                self._put_message(event.message_id, replace(message, unconfirmed=True))
                 self._leave_outbox(event.message_id, message)
                 self._note_end(
                     message,
@@ -2902,17 +2945,17 @@ class State:
                 )
             case MessageRead():
                 message = self.messages[event.message_id]
-                self.messages[event.message_id] = replace(message, read=True)
+                self._put_message(event.message_id, replace(message, read=True))
             case MessageAcknowledged():
                 message = self.messages[event.message_id]
-                self.messages[event.message_id] = replace(message, acknowledged=True)
+                self._put_message(event.message_id, replace(message, acknowledged=True))
             case MessagePrioritized():
                 message = self.messages[event.message_id]
-                self.messages[event.message_id] = replace(message, priority=True)
+                self._put_message(event.message_id, replace(message, priority=True))
             case MessageCorrelated():
                 message = self.messages[event.message_id]
-                self.messages[event.message_id] = replace(
-                    message, correlation=event.key
+                self._put_message(
+                    event.message_id, replace(message, correlation=event.key)
                 )
             case TurnCorrelated():
                 self._total_correlated(event)
@@ -2980,24 +3023,30 @@ class State:
                     del self.scheduled[event.line_id]
                     self.withdrawn_wakes.add(pending.message_id)
                 address = LineAddress(event.line_id)
-                self.messages[event.message_id] = Message(
-                    address,
-                    address,
-                    MessageKind.NOTE,
-                    event.body,
-                    (),
-                    None,
+                self._put_message(
+                    event.message_id,
+                    Message(
+                        address,
+                        address,
+                        MessageKind.NOTE,
+                        event.body,
+                        (),
+                        None,
+                    ),
                 )
             case RestartNoted():
                 address = LineAddress(event.line_id)
-                self.messages[event.message_id] = Message(
-                    address,
-                    address,
-                    MessageKind.NOTE,
-                    event.body,
-                    (),
-                    None,
-                    restart_note=True,
+                self._put_message(
+                    event.message_id,
+                    Message(
+                        address,
+                        address,
+                        MessageKind.NOTE,
+                        event.body,
+                        (),
+                        None,
+                        restart_note=True,
+                    ),
                 )
             case QuestionWithdrawn():
                 self._close(event.message_id, QuestionStatus.WITHDRAWN)
@@ -3685,25 +3734,52 @@ class State:
 
     # Mutations.
 
+    def _put_message(self, message_id: str, message: Message) -> None:
+        """Store ``message`` under ``message_id``, keeping ``unread_mail`` and
+        ``open_asked``. The one write path of ``messages``. A message keeps its
+        place in an index while it stays in it, so each stays in log order."""
+        previous = self.messages.get(message_id)
+        _index_move(
+            self.unread_mail,
+            message_id,
+            None if previous is None else _unread_line(previous),
+            _unread_line(message),
+        )
+        _index_move(
+            self.open_asked,
+            message_id,
+            None if previous is None else _asking_line(previous),
+            _asking_line(message),
+        )
+        self.messages[message_id] = message
+
     def _apply_message_sent(self, event: MessageSent) -> None:
         if self._is_firing(event) and isinstance(event.sender, LineAddress):
             fired = self.scheduled.pop(event.sender.line_id)
             self.fired_dues[event.message_id] = fired.due
         status = QuestionStatus.OPEN if event.kind is MessageKind.QUESTION else None
-        self.messages[event.message_id] = Message(
-            event.sender,
-            event.recipient,
-            event.kind,
-            event.body,
-            event.choices,
-            event.reply_to,
-            status=status,
+        self._put_message(
+            event.message_id,
+            Message(
+                event.sender,
+                event.recipient,
+                event.kind,
+                event.body,
+                event.choices,
+                event.reply_to,
+                status=status,
+            ),
         )
         if event.reply_to is not None:
             parent = self.messages[event.reply_to]
             if parent.status is QuestionStatus.OPEN:
-                self.messages[event.reply_to] = replace(
-                    parent, status=QuestionStatus.ANSWERED, answered_by=event.message_id
+                self._put_message(
+                    event.reply_to,
+                    replace(
+                        parent,
+                        status=QuestionStatus.ANSWERED,
+                        answered_by=event.message_id,
+                    ),
                 )
         if isinstance(event.recipient, RemoteAddress):
             self.outbox.setdefault(event.recipient.peer_id, {})[event.message_id] = None
@@ -3724,8 +3800,9 @@ class State:
         undelivered, from the line to itself."""
         if note_id is None or not isinstance(message.sender, LineAddress):
             return
-        self.messages[note_id] = Message(
-            message.sender, message.sender, MessageKind.NOTE, body, (), None
+        self._put_message(
+            note_id,
+            Message(message.sender, message.sender, MessageKind.NOTE, body, (), None),
         )
 
     def _forget_old_keys(self, now: datetime) -> None:
@@ -3746,15 +3823,18 @@ class State:
         peer_id = event.sender.peer_id
         received_at = parse_due(event.received_at)
         self._forget_old_keys(received_at)
-        self.messages[event.message_id] = Message(
-            event.sender,
-            event.recipient,
-            MessageKind.NOTE,
-            event.body,
-            (),
-            event.reply_to,
-            origin_id=event.origin_id,
-            priority_asked=event.priority_asked,
+        self._put_message(
+            event.message_id,
+            Message(
+                event.sender,
+                event.recipient,
+                MessageKind.NOTE,
+                event.body,
+                (),
+                event.reply_to,
+                origin_id=event.origin_id,
+                priority_asked=event.priority_asked,
+            ),
         )
         self.received[(peer_id, event.origin_id)] = event.message_id
         self.received_times[(peer_id, event.origin_id)] = received_at
@@ -3769,8 +3849,8 @@ class State:
         superseded_by: str | None = None,
     ) -> None:
         question = self.messages[message_id]
-        self.messages[message_id] = replace(
-            question, status=status, superseded_by=superseded_by
+        self._put_message(
+            message_id, replace(question, status=status, superseded_by=superseded_by)
         )
 
 
@@ -3782,3 +3862,50 @@ def _decrement[K](counts: dict[K, int], key: K) -> None:
         counts[key] = left
     else:
         counts.pop(key, None)
+
+
+def _unread_line(message: Message) -> str | None:
+    """The line whose ``unread_mail`` holds ``message``, or ``None``. Mail to a line
+    it has not opened, from anyone but the line itself, delivered or not."""
+    recipient = message.recipient
+    if (
+        not isinstance(recipient, LineAddress)
+        or message.read
+        or message.sender == recipient
+    ):
+        return None
+    return recipient.line_id
+
+
+def _asking_line(message: Message) -> str | None:
+    """The line whose ``open_asked`` holds ``message``, or ``None``. A line's
+    question to an operator that is still open."""
+    sender = message.sender
+    if (
+        not isinstance(sender, LineAddress)
+        or not isinstance(message.recipient, OperatorAddress)
+        or message.status is not QuestionStatus.OPEN
+    ):
+        return None
+    return sender.line_id
+
+
+def _index_move(
+    index: dict[str, dict[str, None]],
+    message_id: str,
+    before: str | None,
+    after: str | None,
+) -> None:
+    """Move ``message_id`` in ``index`` from line ``before`` to line ``after``,
+    either ``None`` for no line, leaving it in place when both are the same, and
+    dropping a line's entry once it holds nothing."""
+    if before == after:
+        return
+    if before is not None:
+        held = index.get(before)
+        if held is not None:
+            held.pop(message_id, None)
+            if not held:
+                del index[before]
+    if after is not None:
+        index.setdefault(after, {})[message_id] = None
