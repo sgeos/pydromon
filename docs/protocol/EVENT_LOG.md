@@ -85,7 +85,7 @@ Each event has a kind and fields, all required. An optional value is written as 
 |---|---|---|
 | `line_created` | `line_id` and `strategy` identifiers, `engine` model name | The line does not exist. The new line is idle. The engine names the model, and the strategy names the driver's credential strategy. **Rollback hazard.** A daemon before 2026-10-31 refuses a log holding a model name with `:`, such as a Pi line's, as corrupt |
 | `line_state_changed` | `line_id`, `state` | The line exists and the change is in the transition table |
-| `line_configured` | `line_id`, `config` text of at most 262,144 bytes | The line exists. The text is the canonical JSON of [`LINE_CONFIG.md`](LINE_CONFIG.md), validated by the daemon before it appends, and replaces any earlier configuration |
+| `line_configured` | `line_id`, `config` text of at most 262,144 bytes, `sealed` an array of 1 to 4,096 sealed values, each an object of `at`, the steps of its location, and `digest`, a SHA-256 digest, or left out when there are none | The line exists. The text is the canonical JSON of [`LINE_CONFIG.md`](LINE_CONFIG.md), validated by the daemon before it appends, and replaces any earlier configuration. `sealed` names each value the daemon took out of the text, as sealed values below specify. A location is `mcp_servers`, a server, `env` or `headers`, and a key, or `settings`, `env` and a key, each step 1 to 4,096 bytes, and the locations are distinct and in order. **Rollback hazard.** A daemon older than `sealed` refuses an event that gives it. Added on 2026-11-01 |
 | `line_session` | `line_id`, `engine_session` text of 1 to 256 bytes | The line exists. Records the engine session the line's next turn resumes, so a restarted daemon continues the line's conversation. Appended after a turn, or right after `line_created` when the line adopts an existing session |
 | `line_session_cleared` | `line_id` | The line exists. Its next turn starts a new engine session, as an operator asked with `clear_session`, because the line's `workdir` changed, or at the start of each turn when `fresh_session_each_turn` is set, and from 2026-10-31 also when a configuration turns `fresh_session_each_turn` on for a line that has a recorded session, which from round 9's review, F1, includes a line in a turn, whose turn then records no `line_session` when it ends. The engine keeps the old session. The line is owed a context handoff for `cleared`, which configuration may opt out of. From 2026-10-31 it also ends every lease the line holds, as the lease rules below say. With `fresh_session_each_turn`, the event is appended after that turn's mail is delivered and before its engine starts, so replay and restart cannot resume the preceding session |
 | `line_rebound` | `line_id` and `strategy` identifiers, `engine` model name | The line exists and its current engine and strategy are not both these. The line now runs this model with this driver strategy, as an operator asked with `rebind_line`. Its identity, mailbox, configuration and overrides stay, and its next turn starts a new engine session. The project file's check compares with this binding. The line is owed a context handoff for `rebound`. From 2026-10-31 it also ends every lease the line holds |
@@ -227,13 +227,15 @@ branch's merge.
 | `budget_handoff_requested`, `budget_stated.window` | `1a1532d` | `33ac280` | `fix/grok-quota`, #109 |
 | `peer_opened` | `499bd55` | `f5f8da1` | `feat/federation-modes`, #114 |
 | `line_held.cause` and its hold causes | `f893e9a` | `f34a620` | `feat/peer-status`, #119 |
-| `message_sent.asks_reply`, written when a line's `send_message` or an operator's `send` says whether a note asks a reply | `4330502` | Pending | `feat/mail-and-roles` |
-| A correction, a note naming a note of the same sender to the same recipient | `4330502` | Pending | `feat/mail-and-roles` |
-| `message_acknowledged.reason` | `4330502` | Pending | `feat/mail-and-roles` |
-| `line_turn_ended.failed`, written with every failed turn | `4330502` | Pending | `feat/mail-and-roles` |
-| `lease_acquired.note` | `4330502` | Pending | `feat/mail-and-roles` |
-| `line_retired` | `625f3de` | Pending | `feat/operator-r14` |
-| A commit run, a `run_started` with `commit` and `checkout` | `1449c5c` | Pending | `feat/operator-r14` |
+| `message_sent.asks_reply`, written when a line's `send_message` or an operator's `send` says whether a note asks a reply | `4330502` | `ba90b4d` | `feat/mail-and-roles`, #125 |
+| A correction, a note naming a note of the same sender to the same recipient | `4330502` | `ba90b4d` | `feat/mail-and-roles`, #125 |
+| `message_acknowledged.reason` | `4330502` | `ba90b4d` | `feat/mail-and-roles`, #125 |
+| `line_turn_ended.failed`, written with every failed turn | `4330502` | `ba90b4d` | `feat/mail-and-roles`, #125 |
+| `lease_acquired.note` | `4330502` | `ba90b4d` | `feat/mail-and-roles`, #125 |
+| `line_retired` | `625f3de` | `8b2c508` | `feat/operator-r14`, #129 |
+| A commit run, a `run_started` with `commit` and `checkout` | `1449c5c` | `8b2c508` | `feat/operator-r14`, #129 |
+| `commit_run_refused` | `522c146` | `8b2c508` | `feat/operator-r14`, #129 |
+| `line_configured.sealed`, written when a configuration holds a literal value | `025149b` | Pending | `feat/eventlog-r14` |
 
 **Fact, from the history.** The table was built from the history of `HEAD` on
 `feat/mail-and-roles` at `5a1603f`. A kind's first commit is the oldest whose
@@ -246,7 +248,14 @@ value after it was added except `MessageKind`, which gained `issue`. Commit `136
 and `5a1603f` on `feat/mail-and-roles` add no kind, field or value, and `main` at
 `af316a0` changes neither `dromon.codec` nor `dromon.model` since `47c58d5`, so none of
 them moves a floor. The kinds of the first event log, merged in `4f0ee19`, are the
-format itself and are not listed.
+format itself and are not listed. **Updated on 2026-11-01 on `feat/eventlog-r14`.**
+`main` at `ba90b4d` merged `feat/mail-and-roles` in #125 and `feat/processes-r14` in
+#124, and `dromon.codec` and `dromon.model` are the same at `ba90b4d` as at `5a1603f`,
+so #124 moves no floor. **Updated again on 2026-11-01, in the merge of `main` at
+`8b2c508` into `feat/eventlog-r14`.** Of the merges on `main` after `ba90b4d`, only
+#129, `feat/operator-r14`, changes `dromon.codec` or `dromon.model`, so its rows now
+have their floor and the others move none. Its `commit_run_refused`, first written in
+`522c146`, is added, and no enumeration of `dromon.model` gained a value in it.
 
 **Inference.** The search reads the codec and the model, not every rule of the
 applying code. A rule that a newer daemon applies and an older one refuses, such as a
@@ -410,6 +419,192 @@ growth rate, and snapshots stay under "Not yet specified".
 immediate transaction that the newest `seq` is the one it last read, and refuses to
 append otherwise.
 
+## Sealed values
+
+**Required by the operator on 2026-11-01, the design decided by core for review.** A
+line's configuration may hold credentials in an MCP server's `env` or `headers` or in
+a settings document's `env`, and until this change `line_configured` stored them as
+written. The daemon now seals each such value before it appends the event, as
+`dromon.sealed` implements.
+
+- **What is sealed.** Every non-empty value of an MCP server's `env` or `headers` that
+  holds no `${NAME}` reference, and every non-empty value of a settings document's
+  `env`. A value that holds a reference is kept as written, since a reference is how
+  an operator already keeps a token in the daemon's environment, and its literal text,
+  such as `Bearer`, is not the secret. The project file's `secrets` list, which grants
+  each line the variables its references may name, is unchanged.
+- **What is not sealed.** A credential written into an MCP server's `command`, `args`
+  or `url` is not sealed and reaches the log as written, as does any value elsewhere in
+  the configuration. Those fields name a program or an address, and sealing them would
+  hide from every view what a line runs and where it connects. A credential belongs in
+  `env` or `headers`, or in the daemon's environment behind a `${NAME}` reference.
+  Audit's review of 2026-11-01 confirmed this residual, and it stays recorded rather
+  than closed.
+- **Errors.** A configuration refused before sealing names the location of the refused
+  value, such as `server search env TOKEN`, and a character position within it, and
+  never any part of the value, since the error reaches the client and, for a project
+  file, the daemon's output. Audit's finding V1 found a malformed reference echoing
+  the 16 characters after its `${`, which is no longer so. A reserved variable that a
+  reference names is not echoed either, since a reserved prefix matches names with
+  arbitrary text after it.
+- **The event.** The configuration text holds `<sealed>` at each sealed location, and
+  `sealed` names the location and the HMAC-SHA256 of the value under a random 32 byte
+  key drawn for that value. A configuration with no literal value is written exactly
+  as before, with no `sealed`.
+- **The store.** The values and their keys are kept in a JSON file beside the log,
+  named for it with `.sealed` added, such as `events.sqlite.sealed`. It is replaced
+  whole through an owner-only temporary file in the same directory, flushed, renamed
+  and its directory flushed, so a reader sees the old store or the new one. The store
+  is written before the event is appended, and after the append every value no line's
+  current configuration names is removed, so a crash between the two leaves values no
+  event names, which the next configuration removes.
+- **Replay.** Replay never reads the store. The state keeps each line's text and its
+  `sealed`, so a log builds the same state with or without its store, as every
+  client, check and port requires. The daemon reads the store only when it builds a
+  line's engine, and when it compares a stored configuration with the project file's
+  at start, so a sealed line is not configured again at every start.
+- **Failure modes.** A store that is missing, malformed, larger than 64 MiB, not a
+  regular file, or readable by anyone but its owner gives no value. A value whose
+  digest does not verify under its key is refused, so a store edited by hand is never
+  used in part. The engine is then not built, and the turn fails with the location of
+  each missing value, never a value, until an operator configures the line again. At
+  start, a line whose project file holds the values is sealed afresh, since its stored
+  configuration then differs from the file's. A line configured through a client
+  needs the operator. A store that is a symbolic link is not followed, and a named
+  pipe in its place is refused without waiting for a writer.
+- **The check.** `dromond --check` reads the live store and writes none, so what its
+  copy of the log seals is kept nowhere. This is load-bearing and not only tidy. The
+  copy may reconfigure a line, and a writing store would then keep the new value and
+  remove, as no configuration in the copy names it, the value the live log still
+  names, so the running daemon would fail that line's next turn. A test holds the
+  live store byte for byte across a check that reseals a line, after Audit's finding
+  G1c that nothing held it.
+- **No silent migration.** A `line_configured` appended before this change keeps its
+  literal values, since the log is append-only and no event is rewritten. A line whose
+  current configuration still holds literal values is named at every start, on the
+  daemon's standard error, and in the daemon status as `event_log.unsealed_lines`,
+  with how many values each holds. Nothing reseals it on its own. Configuring the line
+  again, through the project file or `dromon configure`, appends a sealed event, and
+  the earlier events still hold the old values. A line the log holds sealed is
+  therefore not a line whose history is clean. Removing the old values needs a new
+  log, which is not built here, so the remedy for a credential an older event holds is
+  to rotate it, after which the value the log keeps is no longer valid.
+- **Rollback.** A daemon older than `sealed` refuses as corrupt a log holding any
+  `line_configured` that gives it, and so cannot start on it, as the rollback floor
+  above records. A log whose every configuration has no literal value stays readable,
+  since its events carry no `sealed`. An older daemon also does not read the store, so
+  going back past the floor needs a log from before the first sealed configuration,
+  and the operator gives the values again in the older form.
+
+**Trust argument.** The log is owner only, but it is not the only copy of what it
+holds. `dromond --check` copies it, a backup copies it, and the operator's client shows
+and exports what it holds, so a credential in it is disclosed to every reader of any
+copy and of any view. The store narrows that set. Fact, from the code. It holds only the
+sealed values and their keys, it is created owner only and refused when its mode admits
+anyone else, no snapshot or check copies it, and no view or tool reads it. That holds
+for a copy of the log file and for the check's copy. A copy of the whole state
+directory, such as a backup of it, carries the store with the log, and gains nothing
+from sealing. The keyed digest gives integrity and not secrecy once the store is read,
+since each key and its value sit together in it, protected only by its mode. Inference.
+A line can never read it, since it lies beside the log in the daemon's state
+directory, which every line's sandbox denies as it denies the log. A line whose sandbox
+is disabled runs as the operator's user and could read both files, as it could read
+the log before this change, so the store does not protect against such a line. The
+keyed digest lets the event bind the store's value without revealing it, so a reader
+of the log alone cannot test a guess, which a plain hash of a short secret would
+allow. A reader of both files learns the values, as a reader of the log did before.
+The values still reach the engine's process at each turn, as before, so a line sees the
+values configured for it, as a settings `env` value is given to every command the line
+runs. Sealing keeps the values out of the log, its copies and the views, and not out of
+the line they are configured for. A credential written into a server's `command`,
+`args` or `url` is not sealed and still reaches the log, and older events keep their
+literals, both of which remain residuals as stated above.
+
+## Bounded start
+
+**Required by the operator on 2026-11-01, measured and designed by core for review.
+Not built.** A daemon opens its log by replaying every event into a state held in
+memory, so the time to start and the memory held both grow with the log.
+
+**Measurements. Fact, from runs on 2026-11-01 on the operator's macOS machine.** The
+script `tmp/r22/measure.py` in the core worktree, which is not tracked, wrote synthetic
+logs whose events all apply. Twelve lines take turns, and each turn records a state
+change to running, a note of 900 bytes to the operator or to the next line, its
+delivery and reading when sent to a line, a session, a turn end and a state change to
+idle. Each log was opened twice with `EventLog`, as `dromond` opens it, in a fresh
+process, after the import of `dromon.eventlog`, which took about 0.05 seconds and left
+a peak resident set of about 25.5 MiB.
+
+| Log | Events | Messages kept | Open, seconds | Peak resident set, MiB |
+|---|---|---|---|---|
+| 3.3 MiB, 3,506,176 bytes | 10,779 | 1,700 | 0.116 and 0.116 | 31.4 and 31.5 |
+| 33 MiB, 34,611,200 bytes | 106,729 | 16,850 | 1.136 and 1.152 | 56.1 and 55.9 |
+| 330 MiB, 346,071,040 bytes | 1,067,495 | 168,550 | 11.716 and 11.966 | 305.1 and 305.9 |
+
+**Inference.** Opening costs about 11 microseconds an event, and the state holds about
+0.85 MiB of memory for each MiB of log, mostly message bodies, since `State.messages`
+keeps every message's body for as long as the daemon runs. Both are linear, so a log a
+hundred times this project's is still opened in about 12 seconds. This project's own
+log, about 3.3 MiB, was not measured, since `.dromon/` is closed to lines. Its mix of
+events differs from the synthetic one, so its numbers may differ by a constant factor.
+The operator can measure it with `uv run python -I tmp/worktrees/core/tmp/r22/measure.py
+replay .dromon/events.sqlite` from the main checkout, which replays it read only and
+holds the log's read lock while it does, about a tenth of a second at that size, in
+which a running daemon's next commit waits. The
+start of `dromond` does more than open the log, such as applying the project file,
+which these numbers leave out.
+
+**Other whole reads. Fact, from the code.** Two paths read every entry of the log into
+a list after the start. `Daemon.forwarder` does so once when mail waits for a peer, and
+`Scheduler._recorded_time` does so once a line after a restart, for the time of the
+operator mail since its brief. Each costs about what the open costs, for each line, and
+holds the whole log in memory while it runs. They are debt that a bounded start must
+also remove, by a time index kept beside the state.
+
+**Design.** A snapshot of the state at a sequence number, from which replay resumes.
+
+1. **The file.** `events.sqlite.snapshot` beside the log, owner only, replaced whole as
+   the sealed store is. It holds a format version, the log's schema version, a state
+   version that the code raises whenever the shape of the state or the meaning of
+   applying an event changes, the sequence number `N` it was taken at, the SHA-256 of
+   the stored rows 1 and `N`, each its `recorded_at` and `payload`, the state and the
+   recorded times encoded as canonical JSON, and the SHA-256 of all of the above.
+2. **Taking one.** The daemon writes a snapshot between turns once the log has grown by
+   a set number of events since the last, and at a clean stop. It encodes the state it
+   holds, which costs about what the state's size costs, and it never blocks an append
+   for longer than the encoding takes.
+3. **Starting.** The daemon reads the snapshot, checks its own digest and versions,
+   reads rows 1 and `N` from the log and checks their digests, decodes the state, and
+   applies the events from `N + 1` as replay does today. The log is append only, its
+   triggers refuse a change, and a log whose first and `N`th rows match is the log the
+   snapshot was taken from, short of a writer with access to the file, whom the trust
+   section below already places outside the model.
+4. **Falling back.** A snapshot that is missing, unreadable, of another version, whose
+   digest does not verify, whose `N` lies past the log's end, or whose rows 1 and `N`
+   differ is ignored, and the daemon replays the whole log, as it does today. The
+   reason is named on standard error and in the daemon status. A snapshot is a cache
+   and never the record, so ignoring one loses nothing.
+5. **Checking.** `dromond --check` replays its copy of the log in full and compares the
+   encoded state with the snapshot's state at `N`. A difference means the code applies
+   events differently from the code that took the snapshot without raising the state
+   version, and fails the check.
+6. **What it does not bound.** Memory. A snapshot bounds the start time by the events
+   since `N`, but the state it restores is as large as the state replay builds.
+   Bounding memory needs the state to keep only the bodies of messages still open, and
+   to read the others from the log by sequence number when a view asks, which is a
+   separate change. The log itself is never compacted, since it is the record.
+7. **Rollback and porting.** The snapshot is a cache beside the log, so an older daemon
+   ignores the file and no floor moves. A port need not read the snapshot format and
+   may rebuild from the log, as replay always can.
+
+**Decision. Inference, by core.** Not built in this round. The design needs a canonical
+encoding of the whole state, every map and index of `dromon.model.State` and the
+recorded times, with a decoder as strict as the event codec and tests for each field,
+which is larger than the time left for this round. The measurements also show no
+present need, since this project's log opens in a fraction of a second by the
+synthetic numbers, and a hundredfold growth opens in about 12 seconds. The two whole
+reads above are the nearer cost, and a time index removes them without a snapshot.
+
 ## Trust
 
 The log records events and does not authenticate them. The daemon attributes each event
@@ -425,5 +620,6 @@ with write access to the file, so the file's permissions are the security bounda
   client are recorded by `line_overridden` and `project_overridden`.
 - How a line chooses which operator to ask, which belongs to per-project configuration.
 - Retiring an operator or a line.
-- Compaction or snapshots for long logs.
+- Compaction or snapshots for long logs. Bounded start above designs a snapshot, and
+  it is not built.
 - Migration between schema versions. Version 1 refuses every other version.

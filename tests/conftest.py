@@ -70,6 +70,7 @@ from dromon.model import (
     StopUnverified,
     WalkLimited,
     RoleDeclared,
+    SealedValue,
     SeatBound,
     SeatUnbound,
     RoleHeld,
@@ -123,6 +124,11 @@ SCENARIO: tuple[Event, ...] = (
         encode_config(
             LineConfig(builtin_tools=("Read",), allowed_tools=("mcp__docs__*",))
         ),
+    ),
+    LineConfigured(
+        "alpha",
+        '{"settings":{"env":{"T":"<sealed>"}}}',
+        (SealedValue(("settings", "env", "T"), "5" * 64),),
     ),
     LineSession("beta", "0b9f2c6e-session"),
     LineSessionCleared("beta"),

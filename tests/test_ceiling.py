@@ -290,8 +290,12 @@ def test_a_line_may_not_set_a_variable_dromon_sets() -> None:
 
 
 def test_a_server_may_not_refer_to_a_pinned_or_dromon_variable() -> None:
+    """The error names the place and not the variable, as it never echoes any part
+    of a value, Audit's finding V1."""
     for name in ("ENABLE_TOOL_SEARCH", "DROMON_STOP_POLICY"):
-        with pytest.raises(ConfigError, match=name):
+        with pytest.raises(
+            ConfigError, match="server s args: .*reserved variable, at character 1"
+        ) as raised:
             config_from_document(
                 {
                     "mcp_servers": {
@@ -299,6 +303,7 @@ def test_a_server_may_not_refer_to_a_pinned_or_dromon_variable() -> None:
                     }
                 }
             )
+        assert name not in str(raised.value)
 
 
 # Line tokens, row 12.

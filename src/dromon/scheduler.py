@@ -237,6 +237,15 @@ from dromon.workdir import (
     resolve_read_only_paths,
     resolve_workdir,
 )
+from dromon.sealed import (
+    SealedError,
+    SealedStore,
+    check_sealable,
+    literal_count,
+    seal,
+    store_path,
+    unseal,
+)
 from dromon.roles import (
     CONFINING_ENGINES,
     Plan,
@@ -2207,12 +2216,18 @@ class Scheduler:
         run_start_of: Callable[[int], str | None] = runs.process_start,
         run_occupied: Callable[[int], bool] = runs.session_occupied,
         checkout_dir: Path | None = None,
+        sealed_store: SealedStore | None = None,
     ) -> None:
         if not 1 <= wake_every_ticks <= MAX_WAKE_EVERY_TICKS:
             raise ValueError(f"wake_every_ticks must be in [1, {MAX_WAKE_EVERY_TICKS}]")
         if not 0 <= tick_seconds <= MAX_TICK_SECONDS:
             raise ValueError(f"tick_seconds must be in [0, {MAX_TICK_SECONDS}]")
         self._log = log
+        self._sealed = (
+            SealedStore(store_path(log.path)) if sealed_store is None else sealed_store
+        )
+        """The owner-only store of the values the log's configurations sealed, beside
+        the log, as ``dromon.sealed`` describes."""
         self._engine_factory = engine_factory
         self._wall_clock = wall_clock
         self._root = root
@@ -2701,6 +2716,9 @@ class Scheduler:
         _check_engine_supports(driver, config)
         if not placement_checked:
             self._check_placement(line_id, config, model)
+        # A configuration sealing would refuse is refused before the line exists,
+        # so no line is left created without it.
+        check_sealable(config)
         # Built first, so a malformed session refuses the line before it exists.
         adopted = (
             None if engine_session is None else LineSession(line_id, engine_session)
@@ -2752,7 +2770,14 @@ class Scheduler:
             if line.config is not None:
                 previous = decode_config(line.config).workdir
             fresh_before = self.effective_config(line_id).fresh_session_each_turn
-        self._log.append(LineConfigured(line_id, encode_config(config)))
+        sealing = seal(config)
+        # The values are kept before the event names them, so a crash between the
+        # two leaves only values no event names, which the prune below removes.
+        self._sealed.add(sealing.values)
+        self._log.append(
+            LineConfigured(line_id, encode_config(sealing.config), sealing.sealed)
+        )
+        self._retain_sealed()
         if not creating and line is not None and previous != config.workdir:
             self._log.append(LineSessionCleared(line_id))
             self._forget_context(line_id)
@@ -6173,6 +6198,7 @@ class Scheduler:
             if seconds >= MIN_RATE_SECONDS and size is not None and opened is not None
             else None,
             "compaction": "none",
+            "unsealed_lines": self.unsealed_lines(),
         }
 
     def _workdir_commit(self, line_id: str) -> str | None:
@@ -9639,6 +9665,47 @@ class Scheduler:
             return every
         return self._line_wake.get(line_id, self.wake_every_ticks)
 
+    def _retain_sealed(self) -> None:
+        """Forget the sealed values no line's current configuration names. A store
+        that cannot be written keeps them, and they are tried again at the next
+        configuration, since a value kept too long is no worse than the log was."""
+        names = {
+            value.digest
+            for line in self._state().lines.values()
+            for value in line.sealed
+        }
+        try:
+            self._sealed.retain(names)
+        except SealedError as error:
+            print(f"dromond: {error}", file=sys.stderr)
+
+    def unsealed_baseline(self, line_id: str) -> LineConfig | None:
+        """The line's configuration before its overrides with its sealed values put
+        back, to compare with a project file's, or ``None`` when the store cannot
+        give them."""
+        line = self._state().lines[line_id]
+        try:
+            return unseal(self.baseline_config(line_id), line.sealed, self._sealed)
+        except SealedError:
+            return None
+
+    def unsealed_lines(self) -> dict[str, int]:
+        """Each line whose current configuration still holds literal values the log
+        stores as written, because it was configured before sealing, and how many.
+        **Task of 2026-11-01.** Nothing reseals them on its own, so an operator who
+        is told of them chooses when to configure the line again."""
+        found: dict[str, int] = {}
+        for line_id, line in sorted(self._state().lines.items()):
+            if line.config is None:
+                continue
+            try:
+                count = literal_count(decode_config(line.config))
+            except ConfigError:
+                continue
+            if count:
+                found[line_id] = count
+        return found
+
     def baseline_config(self, line_id: str) -> LineConfig:
         """The line's configuration before its overrides, from the project file, its
         creation or ``dromon configure``."""
@@ -11999,11 +12066,15 @@ class Scheduler:
         engine = self._engines.get(line_id)
         if engine is None:
             line = self._state().lines[line_id]
+            try:
+                config = unseal(self.engine_config(line_id), line.sealed, self._sealed)
+            except SealedError as error:
+                raise EngineRefused(str(error)) from error
             spec = LineSpec(
                 line_id,
                 self.model_of(line_id),
                 Strategy(line.strategy),
-                self.engine_config(line_id),
+                config,
                 line.engine_session,
                 self.activity.observer(line_id),
                 self.line_mark(line_id),

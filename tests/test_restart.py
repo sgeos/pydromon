@@ -33,14 +33,18 @@ from dromon.daemon import Daemon, build_parser, start_successor, successor_args
 from dromon.driver import Strategy
 from dromon.engine import TurnReport
 from dromon.eventlog import EventLog, read_entries, replay
+from dromon.lineconfig import LineConfig, McpServer, encode_config
 from dromon.model import (
     LineAddress,
+    LineConfigured,
+    LineCreated,
     OperatorAddress,
     OperatorRegistered,
     RestartNoted,
 )
 from dromon.paths import ProjectPaths, ensure_private_dir, project_paths
 from dromon.projectconfig import config_path
+from dromon.sealed import SealedStore, store_path
 from dromon.protocol import (
     ErrorCode,
     Operation,
@@ -1329,6 +1333,70 @@ def test_the_check_passes_and_leaves_the_log_as_it_was(
     assert digest(paths.event_log) == before
     assert "gamma" not in replay(paths.event_log).lines
     assert leftovers(paths) == []
+
+
+LIVE_ENV_VALUE: Final = "live-token-value"
+ROTATED_ENV_VALUE: Final = "rotated-token-value"
+SEALED_PROJECT: Final = (
+    'version = 1\n[lines.alpha]\nmodel = "claude-haiku-5-5"\n'
+    "[lines.alpha.mcp_servers.search]\n"
+    f'command = "search-mcp"\nenv = {{ TOKEN = "{ROTATED_ENV_VALUE}" }}\n'
+)
+"""A project file that gives ``alpha`` another sealed value than the live log holds,
+so a check reconfigures ``alpha`` in its copy and seals the new value."""
+
+
+def search_config(token: str) -> LineConfig:
+    return LineConfig(
+        mcp_servers=(
+            (
+                "search",
+                McpServer("stdio", command="search-mcp", env=(("TOKEN", token),)),
+            ),
+        )
+    )
+
+
+def test_the_check_never_writes_the_live_sealed_store(
+    live: World, paths: ProjectPaths
+) -> None:
+    """Audit's finding G1c. The check's copy of the log reconfigures ``alpha``, which
+    in a writing store would keep the new value and prune the live one, which the
+    live log still names. The live store must stay as it was, byte for byte."""
+    live.scheduler.configure_line("alpha", search_config(LIVE_ENV_VALUE))
+    store = store_path(paths.event_log)
+    before = store.read_bytes()
+    config_path(paths.state_dir).write_text(SEALED_PROJECT)
+    assert daemon.run(paths, check_only=True) == exits.OK
+    assert store.read_bytes() == before
+    assert [
+        p.name for p in paths.state_dir.iterdir() if p.name.startswith(store.name)
+    ] == [store.name]
+    kept = {value for _, value in SealedStore(store).read().values()}
+    assert kept == {LIVE_ENV_VALUE}
+    assert leftovers(paths) == []
+
+
+def test_a_start_reports_each_line_configured_before_sealing(
+    paths: ProjectPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def no_serve(target: Daemon) -> None:
+        del target
+
+    monkeypatch.setattr(daemon, "serve", no_serve)
+    monkeypatch.setattr(daemon, "environment_reading_works", lambda: False)
+    ensure_private_dir(paths.state_dir)
+    with EventLog(paths.event_log) as log:
+        log.append(LineCreated("alpha", HAIKU, Strategy.SUBSCRIPTION.value))
+        log.append(
+            LineConfigured("alpha", encode_config(search_config(LIVE_ENV_VALUE)))
+        )
+    assert daemon.run(paths) == exits.OK
+    err = capsys.readouterr().err
+    assert "line alpha's configuration holds 1 literal" in err
+    assert LIVE_ENV_VALUE not in err
 
 
 def test_the_check_of_a_project_with_no_log_yet_passes(

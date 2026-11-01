@@ -101,6 +101,7 @@ from dromon.model import (
     OperatorAddress,
     RemoteAddress,
     ReturnCode,
+    SealedValue,
     Sender,
     parse_address,
     parse_any_address,
@@ -116,7 +117,7 @@ body and choices whose every character needs a six-byte escape, stays under it."
 KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "line_created": ("line_id", "engine", "strategy"),
     "line_state_changed": ("line_id", "state"),
-    "line_configured": ("line_id", "config"),
+    "line_configured": ("line_id", "config", "sealed"),
     "line_session": ("line_id", "engine_session"),
     "line_session_cleared": ("line_id",),
     "line_rebound": ("line_id", "engine", "strategy"),
@@ -401,6 +402,7 @@ OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
     "budget_stated": ("window",),
     "line_held": ("cause",),
     "run_started": ("commit", "checkout"),
+    "line_configured": ("sealed",),
 }
 """The fields left out of the wire when they are null, which a log written before
 them never held, so decoding reads an absent one as null. **Task of 2026-10-29,
@@ -410,10 +412,12 @@ added to ``budget_stated`` on 2026-10-31, and ``cause`` to ``line_held`` the sam
 day. ``commit`` and ``checkout`` were added to ``run_started`` in round 14, so a
 daemon that predates them still reads every run but a commit run. ``asks_reply`` was
 added to ``message_sent`` and ``reason`` to ``message_acknowledged`` in the round 14
-task of 2026-11-01. **Porting hazard.** A port must omit these fields when null, not
-write them as null, so that its log stays readable by a daemon that predates them,
-and must read an absent one as null. A daemon predating ``window`` does not read an
-event that names one."""
+task of 2026-11-01, and ``sealed`` to ``line_configured`` in a task of the same day,
+so a daemon that predates it still reads every configuration without a literal
+value. **Porting hazard.** A port must omit these fields when null, not write them
+as null, so that its log stays readable by a daemon that predates them, and must
+read an absent one as null. A daemon predating ``window`` does not read an event
+that names one."""
 
 
 def _without_nulls(kind: str, data: dict[str, object]) -> dict[str, object]:
@@ -441,7 +445,15 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "state": event.state.value,
             }
         case LineConfigured():
-            return "line_configured", {"line_id": event.line_id, "config": event.config}
+            return "line_configured", {
+                "line_id": event.line_id,
+                "config": event.config,
+                "sealed": [
+                    {"at": list(value.at), "digest": value.digest}
+                    for value in event.sealed
+                ]
+                or None,
+            }
         case LineHeld():
             return "line_held", {
                 "line_id": event.line_id,
@@ -814,7 +826,9 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "line_id"), _member(data, "state", LineState)
             )
         case "line_configured":
-            return LineConfigured(_str(data, "line_id"), _str(data, "config"))
+            return LineConfigured(
+                _str(data, "line_id"), _str(data, "config"), _sealed(data)
+            )
         case "line_held":
             return LineHeld(
                 _str(data, "line_id"),
@@ -1206,6 +1220,23 @@ def _optional_str(data: dict[str, object], name: str) -> str | None:
     if not isinstance(value, str):
         raise DecodeError(f"{name} is not a string or null")
     return value
+
+
+def _sealed(data: dict[str, object]) -> tuple[SealedValue, ...]:
+    """The sealed values in ``data``, or none when it names none. An empty array is
+    refused, since the encoding leaves the field out instead, so each event has one
+    encoding."""
+    value = data["sealed"]
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not value:
+        raise DecodeError("sealed is not a non-empty array")
+    items: list[object] = value  # pyright: ignore[reportUnknownVariableType]
+    found: list[SealedValue] = []
+    for item in items:
+        entry = _object(item, "a sealed value", ("at", "digest"))
+        found.append(SealedValue(tuple(_list(entry, "at", str)), _str(entry, "digest")))
+    return tuple(found)
 
 
 def _request_wire(request: RequestStamp | None) -> dict[str, object] | None:

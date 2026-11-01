@@ -2466,8 +2466,16 @@ unless the line's `workdir` changed.
 ## Trust
 
 A configuration is operator authority and arrives only through the client. Server
-`env` and `headers` may hold credentials. Literal values are stored in the event log,
-whose file is readable by its owner only, and references are stored as written. `allow_all` and `inherit_account_mcp` hand a line every
+`env` and `headers`, and a settings document's `env`, may hold credentials. **From
+2026-11-01** each literal value of them is sealed. It is kept in an owner-only store
+beside the event log, and the event holds `<sealed>` in its place with a keyed digest,
+as sealed values in [`EVENT_LOG.md`](EVENT_LOG.md) specify. A reference is stored as
+written. A configuration stored before then keeps its literal values in the log, and
+the daemon names such a line at each start rather than migrating it. A literal in a
+server's `command`, `args` or `url` is not sealed, so a credential there still
+reaches the log. A view of a sealed configuration shows `<sealed>`, and a
+configuration that gives `<sealed>` as a value is refused, naming the location, so one
+copied from a view cannot replace a credential with the placeholder. `allow_all` and `inherit_account_mcp` hand a line every
 tool they bring, including a claude.ai account's mail and file connectors, and suit
 only lines the operator trusts with them.
 

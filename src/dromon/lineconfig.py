@@ -46,10 +46,12 @@ The configuration is stored in the event log as canonical JSON, so it survives a
 restart and every change is on record. ``docs/protocol/LINE_CONFIG.md`` is normative.
 
 Security. The configuration is operator authority and arrives only through the client.
-An MCP server's ``env`` and ``headers`` may hold credentials, and they are stored in the
-event log, whose file is readable by its owner only. ``allow_all`` and
-``inherit_account_mcp`` hand a line every tool they bring, such as a claude.ai
-account's mail and file connectors, and are meant for lines the operator trusts.
+An MCP server's ``env`` and ``headers`` may hold credentials. From 2026-11-01 the
+scheduler seals each literal value into the store beside the event log before it
+stores a configuration, as ``dromon.sealed`` describes, so the log holds a
+placeholder. ``allow_all`` and ``inherit_account_mcp`` hand a line every tool they
+bring, such as a claude.ai account's mail and file connectors, and are meant for lines
+the operator trusts.
 """
 
 import json
@@ -119,15 +121,24 @@ class UnsetVariable(ConfigError):
 
 def references(text: str) -> tuple[str, ...]:
     """The variable names ``text`` refers to, or ``ConfigError`` for a ``${`` that does
-    not start a well-formed reference, or for a reserved variable."""
+    not start a well-formed reference, or for a reserved variable.
+
+    The errors give a character position and never any part of ``text``, because
+    ``text`` may be a credential that sealing would keep out of the log, and an error
+    reaches the client and, for a project file, the daemon's output. A reserved
+    name is not echoed either, since a reserved prefix matches names that carry
+    arbitrary text after it."""
     names: list[str] = []
     position = text.find("${")
     while position != -1:
         found = REFERENCE.match(text, position)
         if found is None:
-            _fail(f"malformed variable reference at {text[position : position + 16]!r}")
+            _fail(f"malformed variable reference at character {position + 1}")
         if reserved_variable(found.group(1)):
-            _fail(f"a server may not refer to the variable {found.group(1)}")
+            _fail(
+                "a server may not refer to a reserved variable,"
+                f" at character {position + 1}"
+            )
         names.append(found.group(1))
         position = text.find("${", found.end())
     return tuple(names)
@@ -640,9 +651,12 @@ def _pairs(value: object, what: str) -> tuple[tuple[str, str], ...]:
     document = _object(value, what)
     if len(document) > MAX_ENTRIES:
         _fail(f"{what} has more than {MAX_ENTRIES} entries")
-    return tuple(
-        sorted((_text(k, what), _server_text(v, what)) for k, v in document.items())
-    )
+    pairs: list[tuple[str, str]] = []
+    for key, item in document.items():
+        name = _text(key, what)
+        # The key names the location, as the value itself may never be echoed.
+        pairs.append((name, _server_text(item, f"{what} {name}")))
+    return tuple(sorted(pairs))
 
 
 def _server(name: str, value: object) -> McpServer:
