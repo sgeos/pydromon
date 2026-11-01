@@ -527,16 +527,12 @@ def test_the_arguments_disable_every_server_feature_and_the_shell() -> None:
     arguments = server_arguments(["slack", "gmail", "gmail"], LineConfig())
     assert arguments[0] == "app-server"
     entries = [value for value in arguments if value.startswith("mcp_servers.")]
-    assert len(entries) == 2
-    for entry in entries:
-        servers = tomllib.loads(entry)["mcp_servers"]
-        assert set(servers) <= {"gmail", "slack"}
-        for server in servers.values():
-            assert server == {
-                "enabled": False,
-                "command": "/usr/bin/false",
-                "args": [],
-            }
+    # Sparse overrides, since a whole table with a command broke a server the
+    # operator defines by url under Codex 0.166.0.
+    assert entries == [
+        "mcp_servers.gmail.enabled=false",
+        "mcp_servers.slack.enabled=false",
+    ]
     with pytest.raises(EngineRefused, match="cannot be disabled"):
         server_arguments(["mail.example"], LineConfig())
     for feature in (*DISABLED_FEATURES, "shell_tool", "unified_exec"):

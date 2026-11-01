@@ -598,13 +598,13 @@ def server_arguments(
                 f"the MCP server name {name!r} cannot be disabled by a Codex override,"
                 " so the line cannot be isolated"
             )
-        # Account listings can name servers absent from local configuration. A
-        # sparse enabled override then creates an entry without a transport.
-        # Supply a complete inert stdio transport even though it is disabled.
-        arguments += [
-            "-c",
-            f'mcp_servers.{name}={{enabled=false,command="/usr/bin/false",args=[]}}',
-        ]
+        # Fact, 2026-11-01, Codex 0.166.0: a whole inline table with a command,
+        # merged over a server the operator defines by url, gave "url is not
+        # supported for stdio", and Codex fell back to defaults and failed
+        # account/read, so every Codex line failed. The sparse override disables a
+        # configured server whatever its transport. A listed server absent from the
+        # local configuration, which another project reported, is not handled.
+        arguments += ["-c", f"mcp_servers.{name}.enabled=false"]
     for feature in DISABLED_FEATURES:
         arguments += ["--disable", feature]
     image = "enable" if VIEW_IMAGE in config.builtin_tools else "disable"
