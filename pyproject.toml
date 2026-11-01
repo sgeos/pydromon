@@ -83,5 +83,7 @@ select = ["E", "F", "B", "S", "ANN", "RET", "SIM"]
 
 [tool.pyright]
 include = ["src", "tests", "scripts/assemble_changelog.py"]
-extraPaths = ["scripts"]
+# Naming extraPaths drops pyright's automatic src entry, after which dromon resolves as
+# the installed library and every test import of a private name fails, so src is listed.
+extraPaths = ["src", "scripts"]
 typeCheckingMode = "strict"
