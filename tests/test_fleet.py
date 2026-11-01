@@ -625,12 +625,18 @@ def no_sleep(seconds: float) -> None:
     del seconds
 
 
+def preflight_passes(argv: object, runtime_dir: Path | None = None) -> None:
+    """A restart preflight that passes, since these tests start no installed
+    daemon. ``tests/test_restart.py`` covers the preflight itself."""
+    del argv, runtime_dir
+
+
 @pytest.fixture
 def restarting(
     two: tuple[Fleet, fleet.IndexEntry, fleet.IndexEntry],
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[Fleet, fleet.IndexEntry]:
-    monkeypatch.setattr(cli, "_preflight", lambda: None)
+    monkeypatch.setattr(cli, "_preflight", preflight_passes)
     monkeypatch.setattr(cli, "RESTART_POLL_SECONDS", 1000.0)
     monkeypatch.setattr(cli.time, "sleep", no_sleep)
     found, harbor, _ = two

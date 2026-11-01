@@ -7,6 +7,39 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- A restart preflight, round 13. `dromon restart` now reads `status`, then runs the
+  installed daemon's own start checks in a process of their own, `dromond --check`
+  with the running daemon's command-line options, against the project file and a copy
+  of the event log in a private directory under the
+  runtime directory, and refuses the restart with the new code's own message while
+  the old daemon keeps serving. The check never writes the live log, takes no lock,
+  makes and removes no socket, and starts nothing. `status` gives the new field
+  `options`. `docs/protocol/RESTART.md` tables what the check covers and what only a
+  real start reveals, which includes anything recorded during the drain. It replaces
+  the import check by `--version`. Prompted by the restart of 2026-10-31 that left no
+  daemon for about eight minutes. After audit's reviews, the copy is not a SQLite
+  backup, which starts again at every write to the source, but the exact schema and
+  the events up to the sequence number read when it begins, copied in ranges of at
+  most 2,000 events and about 1 MiB with a short pause and no lock between them, so
+  it finishes on a busy log and delays the daemon's commits by at most the reading
+  of one range. The live log is attached read-only, which a test pins. Preflight
+  directories that a killed check left are swept after a client's timeout, by each
+  check when older than its bound, and by each start.
+- `dromon land WORKTREE`, round 13, one operator command that takes a line's finished
+  worktree to a pull request. It shows the plan with every path to stage, refuses
+  protected paths under `docs/process`, `docs/roadmap`, `secret` and `.dromon`
+  except those a resolved merge carries unchanged from the incoming commit, screens
+  the diff, message, title and body against the disclosure list by file and line
+  only, then asks, stages, commits with the operator's message, runs the full gate,
+  asks, pushes without force, asks, and opens the pull request with `gh`. `--dry-run`
+  changes nothing, and `--yes` answers every question. It never merges and never adds
+  a `Co-Authored-By` trailer, and refuses a commit that a hook gave one. After
+  audit's review, it also screens every commit the push carries since the branch
+  left the remote base, their messages and the branch name, refuses an empty list or
+  a missing `--terms` file, lets only a merge of the published base carry a protected
+  path, re-screens the stored message after hooks, and asks before running a branch
+  that changes `scripts/`, even with `--yes`. A preflight writes nothing of the
+  operator's, so it neither makes the fleet index nor writes an entry in it.
 - The operator's fleet, round 13, as `docs/architecture/FLEET.md` specifies. Every
   daemon, whatever its federation mode, writes an entry in a per-user fleet index at
   start and removes it at stop. The entry holds the project root, its operator socket,

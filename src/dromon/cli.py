@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Final, cast
 
 import dromon
-from dromon import __version__, exits, fleet, registry, restart, runs
+from dromon import __version__, exits, fleet, land, registry, restart, runs
 from dromon import proposals as proposal_store
 from dromon.client import (
     REQUEST_TIMEOUT_SECONDS,
@@ -102,6 +102,8 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     " this daemon's key",
     "mcp": "serve an external agent over MCP on standard input and output",
     "proposal": "list or show proposed changes from session lines",
+    "land": "stage, screen, commit, gate and push a line's worktree and open a pull"
+    " request for it",
     "fleet": "list every daemon of this user on this machine, and reach each by name",
 }
 """Planned subcommands and their one-line help, in display order."""
@@ -314,20 +316,53 @@ def _stop(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
-PREFLIGHT_ARGV: Final = (sys.executable, "-m", "dromon.daemon", "--version")
-"""What ``dromon restart`` runs before it asks for the restart, which imports the
-installed daemon and every module it needs, and starts nothing."""
-
-PREFLIGHT_TIMEOUT_SECONDS: Final = 60.0
+PREFLIGHT_TIMEOUT_SECONDS: Final = restart.CHECK_SECONDS
+"""How long the installed daemon's start checks may take. They replay the whole
+event log, as a start does."""
 
 RESTART_POLL_SECONDS: Final = 0.25
 """How often ``dromon restart`` asks whether the successor answers."""
 
 
-def _preflight(argv: Sequence[str] = PREFLIGHT_ARGV) -> str | None:
+def _preflight_argv(paths: ProjectPaths, options: Sequence[str]) -> list[str]:
+    """What ``dromon restart`` runs before it asks for the restart. It is the
+    successor's own command, on the interpreter this client runs on, with the
+    running daemon's options, and ``--check``, so the installed code runs its start
+    checks against the project file and a copy of the event log, and starts
+    nothing."""
+    return [
+        sys.executable,
+        "-m",
+        "dromon.daemon",
+        "--project",
+        str(paths.root),
+        "--runtime-dir",
+        str(paths.runtime_dir),
+        *options,
+        "--check",
+    ]
+
+
+def _options_of(status: Mapping[str, object]) -> list[str]:
+    """The running daemon's command-line options from its status, or none when it
+    does not say them, as a daemon from before 2026-10-31 does not, or says them in
+    a form other than a list of strings."""
+    options = status.get("options")
+    if not isinstance(options, list):
+        return []
+    found = cast(list[object], options)
+    if not all(isinstance(option, str) for option in found):
+        return []
+    return [str(option) for option in found]
+
+
+def _preflight(argv: Sequence[str], runtime_dir: Path | None = None) -> str | None:
     """Why the installed daemon would not start, or ``None``. A restart whose
-    successor cannot import its code leaves no daemon running, so this is checked
-    before the old daemon is asked to stop."""
+    successor refuses to start leaves no daemon running, so this is checked before
+    the old daemon is asked to stop. The reason is the daemon's own, its lines that
+    begin ``dromond:``, or else its last line, as for code that does not import. A
+    check that times out is killed, which leaves its copy of the log, so the
+    preflight directories in ``runtime_dir`` are then swept."""
     try:
         done = subprocess.run(  # noqa: S603
             list(argv),
@@ -336,12 +371,18 @@ def _preflight(argv: Sequence[str] = PREFLIGHT_ARGV) -> str | None:
             timeout=PREFLIGHT_TIMEOUT_SECONDS,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except subprocess.TimeoutExpired as error:
+        if runtime_dir is not None:
+            restart.sweep_checks(runtime_dir, None)
         return str(error)
-    if done.returncode != 0:
-        lines = (done.stderr or done.stdout).strip().splitlines()
-        return f"status {done.returncode}: {lines[-1] if lines else 'no output'}"
-    return None
+    except OSError as error:
+        return str(error)
+    if done.returncode == 0:
+        return None
+    lines = (done.stderr or done.stdout).strip().splitlines()
+    own = [line for line in lines if line.startswith("dromond: ")]
+    reason = " ".join(own) if own else (lines[-1] if lines else "no output")
+    return f"status {done.returncode}: {reason}"
 
 
 def _installed_commit() -> str | None:
@@ -356,7 +397,10 @@ def _restart(
 ) -> int:
     """Ask the daemon to restart, then wait until its successor answers and say
     which commit it runs. The daemon starts its successor itself, so a client that
-    leaves early does not stop the restart.
+    leaves early does not stop the restart. The installed code's start checks run
+    after the status, which gives the options they run with, and before the
+    request, so a successor that would refuse the project leaves the running daemon
+    serving, as ``docs/protocol/RESTART.md`` describes.
 
     ``entry`` is given by ``dromon fleet restart``. **Review of 7ff033f, G1.** The
     daemon's status is then checked against it once more before the restart is asked,
@@ -364,14 +408,6 @@ def _restart(
     another pid, live by its start time, and saying that pid and root, rather than
     whichever process answers the socket under another pid."""
     command = "restart" if entry is None else "fleet restart"
-    problem = _preflight()
-    if problem is not None:
-        print(
-            f"dromon {command}: the installed daemon does not start, so the running"
-            f" one was not stopped: {problem}",
-            file=sys.stderr,
-        )
-        return exits.FAILURE
     before = _call(paths, command, Operation.STATUS, {})
     if isinstance(before, int):
         return before
@@ -381,6 +417,14 @@ def _restart(
         except fleet.FleetError as error:
             print(f"dromon {command}: {error}", file=sys.stderr)
             return exits.FAILURE
+    problem = _preflight(_preflight_argv(paths, _options_of(before)), paths.runtime_dir)
+    if problem is not None:
+        print(
+            f"dromon {command}: the installed daemon refuses to start, so the running"
+            f" one was not stopped: {problem}",
+            file=sys.stderr,
+        )
+        return exits.FAILURE
     wait: int = arguments.wait_seconds
     args: dict[str, object] = {
         "operator": arguments.operator,
@@ -2110,6 +2154,95 @@ def _proposal(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
+def _land_arguments(command: argparse.ArgumentParser) -> None:
+    """The options of ``dromon land``, which ``dromon.land`` describes."""
+    command.add_argument("worktree", type=Path, help="the top of the line's worktree")
+    message = command.add_mutually_exclusive_group(required=True)
+    message.add_argument("-m", "--message", help="the commit message")
+    message.add_argument(
+        "--message-file", type=Path, metavar="PATH", help="read the commit message"
+    )
+    command.add_argument(
+        "--title", help="the pull request title, default the message's first line"
+    )
+    body = command.add_mutually_exclusive_group(required=True)
+    body.add_argument("--body", help="the pull request body")
+    body.add_argument(
+        "--body-file", type=Path, metavar="PATH", help="read the pull request body"
+    )
+    command.add_argument(
+        "--base", default=land.DEFAULT_BASE, help="the base, default %(default)s"
+    )
+    command.add_argument(
+        "--remote", default=land.DEFAULT_REMOTE, help="the remote, default %(default)s"
+    )
+    command.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show the plan and screen it, and change nothing",
+    )
+    command.add_argument(
+        "--yes", action="store_true", help="answer yes to every question"
+    )
+    command.add_argument(
+        "--terms",
+        type=Path,
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=f"a disclosure list, default {land.TERMS_FILE} under the project",
+    )
+    command.add_argument(
+        "--without-disclosure-list",
+        action="store_true",
+        help="land unscreened when no disclosure list is found",
+    )
+
+
+def _land_text(given: str | None, path: Path | None, what: str) -> str:
+    """The text an option gave, or the content of the file it named. Raises
+    ``ValueError`` naming the file only."""
+    if given is not None:
+        return given
+    if path is None:
+        raise ValueError(f"no {what} was given")
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ValueError(f"the {what} file {path} cannot be read") from error
+
+
+def _land(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Take a line's worktree to a pull request, as ``dromon.land`` describes. The
+    disclosure list and its accepted matches are the gate's, under the project root,
+    since a worktree holds no ``secret/``."""
+    try:
+        message = _land_text(arguments.message, arguments.message_file, "message")
+        body = _land_text(arguments.body, arguments.body_file, "body")
+    except ValueError as error:
+        print(f"dromon land: {error}", file=sys.stderr)
+        return exits.USAGE
+    title: str | None = arguments.title
+    if title is None:
+        stripped = message.strip()
+        title = stripped.splitlines()[0] if stripped else ""
+    given: list[Path] = arguments.terms
+    request = land.Request(
+        worktree=arguments.worktree,
+        message=message,
+        title=title,
+        body=body,
+        base=arguments.base,
+        remote=arguments.remote,
+        dry_run=arguments.dry_run,
+        yes=arguments.yes,
+        terms_files=tuple(given) or (paths.root / land.TERMS_FILE,),
+        accepted_file=paths.root / land.ACCEPTED_FILE,
+        without_list=arguments.without_disclosure_list,
+    )
+    return land.Lander(request).land()
+
+
 # The fleet, every daemon of this user on this machine. Round 13. Each command reads
 # the fleet index and sends the operation its single-project command sends, to the
 # daemon's own operator socket and nowhere else, so it adds no authority.
@@ -2442,6 +2575,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "peer": _peer,
     "mcp": _mcp,
     "proposal": _proposal,
+    "land": _land,
     "fleet": lambda _paths, arguments: _fleet(arguments),
 }
 
@@ -2772,6 +2906,8 @@ def build_parser() -> argparse.ArgumentParser:
                 default=default_operator(),
                 help="who asks for the restart, default %(default)s",
             )
+        if name == "land":
+            _land_arguments(command)
         if name == "awaken":
             command.add_argument("line_id", help="the hibernated line")
         if name == "start":
