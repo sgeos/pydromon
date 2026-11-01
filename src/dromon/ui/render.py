@@ -332,16 +332,24 @@ def _cost(line: LineSummary) -> str:
     return f"${line.cost}{unknown}"
 
 
+def _where(model: Model) -> str:
+    """The attached line, after its project when the client was given one, as
+    ``PROJECT:LINE``, the form the fleet commands take."""
+    if model.project is None:
+        return model.line_id
+    return f"{model.project}:{model.line_id}"
+
+
 def _bar(model: Model, width: int) -> Row:
     view = model.view
     if view is None:
-        text = f" {model.line_id} | connecting | @{model.operator}"
+        text = f" {_where(model)} | connecting | @{model.operator}"
     else:
         line = view.line
         state = line.state + (f" {_spinner(model)}" if line.running else "")
         # The most urgent parts come first, because a narrow bar cuts the rest.
         parts = [
-            f" {line.line_id}",
+            f" {_where(model)}",
             state,
             "HELD, /release" if line.held_by else "",
             f"{len(view.questions)} open questions" if view.questions else "",
@@ -460,7 +468,7 @@ def frame(model: Model) -> Frame:
         model.height,
         rows,
         cursor if inside else None,
-        f"dromon {model.line_id}",
+        f"dromon {_where(model)}",
     )
 
 
