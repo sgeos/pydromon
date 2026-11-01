@@ -868,3 +868,75 @@ prompt. Tests cover the boundary and a multibyte identifier.
 read-only paths or profile requirements. It checks prospective declared configurations
 with operator overrides and existing client-created lines before mutating daemon
 state. Invalid profiles refuse the reload. Turn-time checks remain necessary.
+
+## Remaining tool surface on 2026-11-01
+
+**Fact.** The operator observed removal of `spawn_subagent` and `web_fetch` and a
+cancelled `todo_write` with no execution in Grok's log. The following controls are
+from the bundled guides. Their effects after this change require a live check.
+
+| Guide | Documented control | Dromon selection |
+|---|---|---|
+| `26-config-reference.md`, features | `features.backend_tools`, `GROK_BACKEND_SEARCH` | False in process overlay and `0` in environment |
+| `26-config-reference.md`, disable_web_search | `disable_web_search`, `--disable-web-search` | True in generated home configuration |
+| `05-configuration.md`, overlays | `GROK_CONFIG` allows `features` in `agent stdio` | Generated JSON replaces inherited overlay |
+| `26-config-reference.md`, features | `features.image_gen`, `features.video_gen` | Both false in process overlay |
+| `26-config-reference.md`, requirements | `features.image_edit` only in requirements | Fixed false in generated `requirements.toml` |
+| `05-configuration.md`, workflows | `workflows.enabled`, `GROK_WORKFLOWS` | Environment `0` |
+| `26-config-reference.md`, features | `GROK_WORKFLOW_CONVERSION` | Environment `0` |
+| `26-config-reference.md`, features | `GROK_ASK_USER_QUESTION`, `GROK_FEEDBACK_ENABLED` | Both environment `0` |
+
+**Fact.** The requirements file is compared against exactly the generated image-edit
+denial. Other home policy and system policy remain restricted to empty files.
+Existing configuration is never overwritten. The operator must remove the old home
+configuration and empty home requirements file to regenerate them before restart.
+No shared installed home was edited by this change.
+
+**Limitation.** The home web-search switch is shared and disables client search even
+for a line granted `WebSearch`. Backend search remains disabled on every line because
+its combined tool surface includes X search and page operations that Dromon cannot
+authorize separately. `WebFetch` retains its independent per-line switch. The guides
+do not establish an agent-transport command-line search flag, an overlay allowlist
+entry for the top-level `disable_web_search`, or separate switches for X search,
+`open_page` and `open_page_with_find`. Dromon does not pass another unverified flag.
+The combined backend switch is intended to withhold these server tools. This is an
+inference requiring the operator's live tool-list check.
+
+**Fact.** Searches across the bundled user guides found no scheduler or monitor
+feature switch. `20-background-tasks.md` describes scheduler state, timed prompts,
+monitor shell commands and their wakeups. `14-headless-mode.md` documents
+`--tools` and `--disallowed-tools` for headless and terminal use, including scheduler
+and monitor names on the shell route, but does not establish those flags for
+`agent stdio`. The agent guide does not document them. Media concurrency limits are
+limits rather than disable controls. A model's `supports_backend_search` describes
+endpoint capability and is not used to alter the built-in model definition.
+
+The table classifies the operator's remaining offered names. Local gating means
+Dromon judges permission requests and notices. It does not establish that every
+local tool asks before executing. Server execution can precede any notice, so a
+Dromon refusal cannot undo it. State classifications are inferences from guide
+purpose, with actual dispatch order unverified unless stated above.
+
+| Offered tool | Execution or state | Dromon decision |
+|---|---|---|
+| `web_search` | Server search or client fallback | WebSearch grant required by gate, startup disabled globally |
+| `open_page`, `open_page_with_find` | Server page operation inferred | Refused, intended withheld by backend switch |
+| `x_user_search`, `x_semantic_search`, `x_keyword_search`, `x_thread_fetch` | Server X search inferred | Refused, intended withheld by backend switch |
+| `search_replace`, `write` | Local file mutation | Edit or Write grant required |
+| `kill_command_or_subagent`, `get_command_or_subagent_output` | Local background task control | Bash grant required, target scoping beyond Grok session unverified |
+| `todo_write` | Grok task state | Refused, fixed hook denial observed by operator |
+| `scheduler_create`, `scheduler_delete`, `scheduler_list` | Grok scheduler state with later prompts | Refused, advertisement disable unavailable |
+| `monitor` | Local shell process with event wakeups | Refused, advertisement disable unavailable |
+| `workflow` | Host workflow execution with possible tool effects | Refused, startup disabled |
+| `enter_plan_mode`, `exit_plan_mode` | Grok session mode state | Refused |
+| `ask_user_question` | Grok interaction state | Refused, startup disabled |
+| `send_feedback` | Remote feedback inferred | Refused, startup disabled |
+| `image_gen`, `image_edit` | Remote media generation requested by host inferred | Refused, startup disabled through separate controls |
+| `image_to_video`, `reference_to_video` | Remote media generation requested by host inferred | Refused, startup disabled through video control |
+
+**Unverified.** No new live engine was run. Removal from the tool list, effective
+requirements pins and denial before effects require the operator's post-merge check.
+A missing or failing hook can still fail open inside Grok. Scheduler, monitor and
+plan-mode calls remain advertised unless Grok changes their filtering. Dromon's
+individual refusal requires explicit non-execution confirmation and cannot establish
+that an already running server operation had no effects.

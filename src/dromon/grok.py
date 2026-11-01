@@ -20,8 +20,8 @@ Grok's home. A Grok line runs with ``GROK_HOME`` set to Dromon's own Grok home,
 ``~/.grok/dromon-home``, never the operator's. Dromon writes its ``config.toml``, which
 sets the asking mode and one fixed denial hook without MCP servers, and its
 ``sandbox.toml`` when either is missing, and before every turn refuses any drift,
-any policy or trust file that sets something, and any agents, hooks, plugins, rules,
-skills or workflows there.
+policy beyond the fixed image-edit denial, any trust grant, and any agents, hooks,
+plugins, rules, skills or workflows there.
 Grok runs with ``HOME`` set to ``USER_HOME`` inside that home, so it cannot read the
 operator's Claude Code, Cursor or other harness files, and Dromon refuses a turn when
 that directory holds any or a Claude Code settings file there names another mode.
@@ -302,6 +302,11 @@ DROMON_CONTROLLED: Final = (
     "GROK_CONFIG_PATH",
     "GROK_SUBAGENTS",
     "GROK_WEB_FETCH",
+    "GROK_BACKEND_SEARCH",
+    "GROK_WORKFLOWS",
+    "GROK_WORKFLOW_CONVERSION",
+    "GROK_ASK_USER_QUESTION",
+    "GROK_FEEDBACK_ENABLED",
     *HOME_VARIABLES,
 )
 """Variables Dromon sets or clears itself. An inherited ``GROK_HOME`` or ``HOME`` is
@@ -410,6 +415,8 @@ HOME_CONFIG: Final = (
     "# Dromon's Grok home. Dromon wrote this file and refuses a Grok turn when it\n"
     "# changes. Delete it to have Dromon write it again.\n"
     "\n"
+    "disable_web_search = true\n"
+    "\n"
     "[ui]\n"
     'permission_mode = "default"\n'
     "\n"
@@ -434,10 +441,14 @@ MCP server, installs one fixed denial hook and turns off Claude Code's and Curso
 servers and hooks. Compared by its parsed contents before every turn, so any key Grok
 or anyone else adds is drift."""
 
+HOME_REQUIREMENTS: Final = "[features]\nimage_edit = false\n"
+"""Image editing has only a requirements-layer disable control in the guide."""
+
 POLICY_FILES: Final = ("managed_config.toml", "requirements.toml")
 """Policy files Grok reads from its home, which may add hooks, MCP servers or a pinned
 permission mode. **Observed on 2026-10-27, key names only.** Grok keeps both in the
-operator's home as empty files, so each must be absent or empty."""
+operator's home as empty files. Only the generated home image-edit denial is allowed
+here. Other policy files must be absent or empty."""
 
 TRUST_FILE: Final = "trusted_folders.toml"
 """Grok's record of trusted folders, which lets a project's hooks, MCP servers,
@@ -569,7 +580,7 @@ def prepare_home(
     daemon_home: Path | None = None,
 ) -> None:
     """Create Dromon's Grok home and the line's ``HOME`` inside it, owner-only, and
-    write the Grok home's ``config.toml`` and ``sandbox.toml`` when either is missing.
+    write the Grok home's configuration, fixed requirements and sandbox when missing.
     An existing file is never replaced, so drift is refused by ``check_home``,
     ``check_user_home`` and ``check_profile`` rather than repaired. Nothing here
     writes, reads or copies a credential.
@@ -578,6 +589,7 @@ def prepare_home(
     _own_directory(grok_home, "Dromon's Grok home")
     _own_directory(grok_home / USER_HOME, "a Grok line's home directory")
     _write_new(grok_home / "config.toml", HOME_CONFIG)
+    _write_new(grok_home / "requirements.toml", HOME_REQUIREMENTS)
     _write_new(
         grok_home / "sandbox.toml",
         profile_snippet(READER_PROFILE, workspace, protected, daemon_home)
@@ -589,7 +601,8 @@ def prepare_home(
 
 def check_home(grok_home: Path, system: Path = SYSTEM_POLICY_DIR) -> None:
     """Refuse Dromon's Grok home when its configuration has drifted from Dromon's,
-    when a policy or trust file sets anything, or when it holds an entry that would
+    when policy differs from the fixed image-edit denial, trust sets anything,
+    or when it holds an entry that would
     load something the line was not given. ``auth.json`` is never opened."""
     config = grok_home / "config.toml"
     document = _read_toml(config)
@@ -602,6 +615,12 @@ def check_home(grok_home: Path, system: Path = SYSTEM_POLICY_DIR) -> None:
         system / name for name in POLICY_FILES
     ]:
         policy = _read_toml(file)
+        if file == grok_home / "requirements.toml":
+            if policy != tomllib.loads(HOME_REQUIREMENTS):
+                raise EngineRefused(
+                    f"{file} must contain Dromon's image-edit denial only"
+                )
+            continue
         if policy is not None and not _is_empty(policy):
             raise EngineRefused(
                 f"{file} sets Grok policy, which may add hooks, MCP servers or a"
@@ -924,6 +943,21 @@ def tool_environment(config: LineConfig) -> dict[str, str]:
     reference documents web_fetch as a feature switch. Agent is unsupported here.
     """
     return {
+        "GROK_BACKEND_SEARCH": "0",
+        "GROK_WORKFLOWS": "0",
+        "GROK_WORKFLOW_CONVERSION": "0",
+        "GROK_ASK_USER_QUESTION": "0",
+        "GROK_FEEDBACK_ENABLED": "0",
+        "GROK_CONFIG": json.dumps(
+            {
+                "features": {
+                    "backend_tools": False,
+                    "image_gen": False,
+                    "video_gen": False,
+                }
+            },
+            sort_keys=True,
+        ),
         "GROK_SUBAGENTS": "0",
         "GROK_WEB_FETCH": "1" if "WebFetch" in config.builtin_tools else "0",
     }
@@ -941,6 +975,7 @@ def session_digest(
         "tool_policy": config.tool_policy.value,
         "own_tools": sorted(own_tools),
         "home_config": HOME_CONFIG,
+        "home_requirements": HOME_REQUIREMENTS,
     }
     return hashlib.sha256(
         json.dumps(settings, sort_keys=True).encode("utf-8")
