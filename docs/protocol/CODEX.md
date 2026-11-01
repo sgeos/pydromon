@@ -563,3 +563,11 @@ here. The operator identified Codex but supplied no error text or missing field.
 Tests verify the generated configuration as parsed TOML. Official configuration
 documentation could not be fetched because developers.openai.com did not resolve.
 Actual Codex configuration merging and account initialization remain unverified.
+
+
+**Fact.** A failed writer replacement retains the original stored session identifier
+in the cached adapter, so a later turn retries resume recovery. A replacement that
+returns the contested identifier is refused before prompting. Tests cover both
+paths. A disallowed dynamic tool completion without a matching denied request
+interrupts the turn, including when only the turn completion arrives. Notifications
+alone do not establish that execution required Dromon's response.

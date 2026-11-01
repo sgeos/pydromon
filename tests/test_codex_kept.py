@@ -89,7 +89,7 @@ class Server:
             return {"account": {"type": world.account}}
         if method in ("thread/start", "thread/resume"):
             return {
-                "thread": {"id": "th"},
+                "thread": {"id": getattr(world, "thread_id", "th")},
                 "model": LUNA,
                 "modelProvider": "openai",
                 "activePermissionProfile": {"id": world.profile},
@@ -143,6 +143,7 @@ def done() -> dict[str, Any]:
 
 class World:
     def __init__(self, script: list[list[dict[str, Any]]]) -> None:
+        self.thread_id = "th"
         self.script = script
         self.servers: list[Server] = []
         self.account = "chatgpt"
@@ -1192,6 +1193,7 @@ def test_kept_writer_conflict_replaces_thread_and_runs_the_turn(
             "code": -32600,
             "message": "thread th already has an active writer",
         }
+        world.thread_id = "replacement"
         report = await engine.run_turn("second")
         assert report.text == "recovered"
         await engine.close()

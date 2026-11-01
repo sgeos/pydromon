@@ -1021,6 +1021,8 @@ class _Turn:
     """Identifiers of refused items already counted, regardless of notice order."""
     tools_changed: bool = False
     """Whether this turn started a new thread because Dromon's tools changed."""
+    pending_dynamic: set[str] = field(default_factory=set[str])
+    denied_dynamic: set[str] = field(default_factory=set[str])
     writer_replaced: bool = False
     calls: list[dict[str, int]] = field(default_factory=list[dict[str, int]])
     """Each engine call's tokens, the latest ``MAX_CALLS``."""
@@ -1465,18 +1467,19 @@ class CodexLine:
             return
         params = cast(dict[str, Any], message.get("params") or {})
         if "id" in message:
-            await self._answer(message["id"], method, params)
+            await self._answer(message["id"], method, params, turn)
         else:
             await self._notice(method, params, turn)
 
     async def _answer(
-        self, request_id: object, method: str, params: dict[str, Any]
+        self, request_id: object, method: str, params: dict[str, Any], turn: _Turn
     ) -> None:
         """Answer a request from the engine. Only Dromon's own tools are served, and
         every approval is declined, since the line runs with approvals never asked."""
         if method == "item/tool/call":
             tool = self.mcp_tools.get(str(params.get("tool")))
             if tool is None:
+                turn.denied_dynamic.add(str(params.get("itemId") or ""))
                 result = tool_output(
                     {
                         "content": [
@@ -1541,7 +1544,7 @@ class CodexLine:
                 # as ``dromon.priority`` describes.
                 await self._act(Event(TOOL_RESULT), turn)
             elif str(item.get("type") or "") not in QUIET_ITEMS:
-                await self._refuse_item(item, turn)
+                await self._refuse_item(item, turn, completed=True)
         elif method == "model/rerouted":
             model = str(params.get("toModel") or "")
             verdict = self.driver.step(Event("init", model))
@@ -1557,6 +1560,10 @@ class CodexLine:
             if self._this_thread(params):
                 turn.turn_id = turn.turn_id or cast(str | None, started.get("id"))
         elif method == "turn/completed":
+            if turn.pending_dynamic - turn.denied_dynamic:
+                await self._interrupt(
+                    turn, "a disallowed dynamic tool completed without a request"
+                )
             completed = cast(dict[str, Any], params.get("turn") or {})
             turn.status = str(completed.get("status") or "")
             turn.limit = turn.limit or usage_limit(completed.get("error"))
@@ -1654,10 +1661,19 @@ class CodexLine:
         self._observe(ActivityKind.TOOL, name)
         await self._act(Event("tool_use", name), turn)
 
-    async def _refuse_item(self, item: Mapping[str, Any], turn: _Turn) -> None:
+    async def _refuse_item(
+        self, item: Mapping[str, Any], turn: _Turn, *, completed: bool = False
+    ) -> None:
         """Count and refuse an unavailable item once across start and completion."""
         kind = str(item.get("type") or "")
         identifier = item.get("id")
+        if kind == "dynamicToolCall":
+            key = str(identifier or "")
+            turn.pending_dynamic.add(key)
+            if completed and (not key or key not in turn.denied_dynamic):
+                await self._interrupt(
+                    turn, "a disallowed dynamic tool completed without a request"
+                )
         if isinstance(identifier, str) and identifier in turn.refused_items:
             return
         if isinstance(identifier, str):
@@ -1666,8 +1682,8 @@ class CodexLine:
         # item/completed. Identifiers deduplicate either notice order.
         await self._act(Event("tool_use", kind), turn)
         if kind == "dynamicToolCall":
-            # Execution requires our item/tool/call response. An unknown handler
-            # returns an error there without running code, so continuation is safe.
+            # Await the individual request. Completion without a matching denied
+            # request cannot establish non-execution and interrupts the turn.
             return
         reason = f"the engine used a tool the line was not given: {kind}"
         if kind == IMAGE_ITEM and VIEW_IMAGE in self.config.builtin_tools:
@@ -1766,6 +1782,7 @@ class CodexLine:
             # tools it was started with, and changed tools need a new thread.
             turn.tools_changed = True
             resumable = None
+        contested = resumable
         result: dict[str, Any] = {}
         if resumable is not None:
             for attempt in range(2):
@@ -1790,7 +1807,6 @@ class CodexLine:
                 result = await self._call("thread/start", settings, turn)
             except _RpcError as error:
                 if turn.writer_replaced:
-                    self.session_id = None
                     raise EngineRefused(
                         "the active writer persisted and a replacement thread could"
                         " not start. A resume will retry thread recovery and"
@@ -1802,6 +1818,10 @@ class CodexLine:
         thread_id = str(thread.get("id") or "")
         if not thread_id:
             raise EngineRefused("the engine started a thread without an identifier")
+        if turn.writer_replaced and thread_id == contested:
+            raise EngineRefused(
+                "the replacement reused the contested thread identifier"
+            )
         self._thread_id = thread_id
         provider = result.get("modelProvider")
         if provider != "openai":

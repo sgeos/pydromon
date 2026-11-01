@@ -202,7 +202,9 @@ def model_option(value: str) -> dict[str, object]:
         "category": "model",
         "type": "select",
         "currentValue": value,
-        "options": [{"value": value, "name": "Grok"}],
+        "options": [
+            {"value": item, "name": "Grok"} for item in dict.fromkeys((value, GROK))
+        ],
     }
 
 
@@ -247,6 +249,7 @@ class FakeGrok:
         }
         self.set_config_error: str | None = None
         self.auth = auth
+        self.protocol_version = 1
         self.model = model
         self.modes: object = (
             {"currentModeId": "default", "availableModes": [{"id": "default"}]}
@@ -303,7 +306,7 @@ class FakeGrok:
                 {
                     **reply,
                     "result": {
-                        "protocolVersion": 1,
+                        "protocolVersion": self.protocol_version,
                         "_meta": {"defaultAuthMethodId": self.auth},
                     },
                 }
@@ -1536,7 +1539,11 @@ def test_an_engine_that_cannot_be_confirmed_is_refused_before_the_prompt(
     assert "session/prompt" not in server.methods()
 
 
-@pytest.mark.parametrize("session_id", [None, "s1"], ids=["new", "resumed"])
+@pytest.mark.parametrize(
+    "session_id",
+    [None, "s1:rules-" + hashlib.sha256(b"").hexdigest()],
+    ids=["new", "resumed"],
+)
 def test_another_reported_model_is_pinned_to_the_driver_model(
     project: tuple[Path, Path, Path], session_id: str | None
 ) -> None:
@@ -1544,9 +1551,19 @@ def test_another_reported_model_is_pinned_to_the_driver_model(
     target = line(server, project, session_id=session_id)
     report = run(target)
     request = server.params("session/set_config_option")
-    assert request["sessionId"] == (session_id or "s1")
-    assert request["configId"] == "model"
-    assert request["value"] == {"value": target.driver.settings.model}
+    assert request == {
+        "sessionId": "s1",
+        "configId": "model",
+        "value": target.driver.settings.model,
+    }
+    opening = "session/load" if session_id else "session/new"
+    assert opening in server.methods()
+    assert ("session/new" if session_id else "session/load") not in server.methods()
+    assert (
+        server.methods().index(opening)
+        < server.methods().index("session/set_config_option")
+        < server.methods().index("session/prompt")
+    )
     assert report.text == "done"
     assert not server.methods().count("session/cancel")
 
@@ -1556,7 +1573,10 @@ def test_grok_refusing_the_driver_model_refuses_the_turn(
 ) -> None:
     server = FakeGrok(model="grok-4.6")
     server.set_config_error = "model is unavailable"
-    with pytest.raises(EngineRefused, match="Grok refused the driver's model"):
+    with pytest.raises(
+        EngineRefused,
+        match="Grok refused the driver's model.*after reporting 'grok-4.6'",
+    ):
         run(line(server, project))
     assert "session/prompt" not in server.methods()
 
@@ -2782,7 +2802,7 @@ def test_a_held_model_notice_is_superseded_by_a_successful_pin(
         notices=[grok_notice("models/update", {"currentModelId": "grok-other"})],
     )
     assert run(line(server, project)).text == "done"
-    assert server.params("session/set_config_option")["value"] == {"value": GROK}
+    assert server.params("session/set_config_option")["value"] == GROK
     assert "session/cancel" not in server.methods()
 
 
@@ -3494,3 +3514,58 @@ def test_grok_changed_rules_file_starts_a_new_session(
     run(line(server, project, config=config, session_id=stored))
     assert "session/load" not in server.methods()
     assert "New rules" in str(server.params("session/new"))
+
+
+@pytest.mark.parametrize("options", [[], [{"value": "grok-4.6", "name": "old"}]])
+def test_requested_model_must_be_listed(
+    project: tuple[Path, Path, Path], options: list[dict[str, str]]
+) -> None:
+    server = FakeGrok(model="grok-4.6")
+    option = model_option("grok-4.6")
+    option["options"] = options
+    server.extra["configOptions"] = [option]
+    target = line(
+        server, project, session_id="s1:rules-" + hashlib.sha256(b"").hexdigest()
+    )
+    with pytest.raises(
+        EngineRefused, match="does not list requested model.*listed values"
+    ):
+        run(target)
+    assert "session/load" in server.methods()
+    assert "session/set_config_option" not in server.methods()
+    assert "session/prompt" not in server.methods()
+
+
+@pytest.mark.parametrize("identifier", ["x" * 185, "x" * 186, "é" * 93])
+def test_session_identifier_digest_bound(
+    project: tuple[Path, Path, Path], identifier: str
+) -> None:
+    class LongSession(FakeGrok):
+        async def send(self, message: Mapping[str, object]) -> None:
+            await super().send(message)
+            if message.get("method") == "session/new":
+                self.queue[-1]["result"]["sessionId"] = identifier
+
+    server = LongSession()
+    if len(identifier.encode("utf-8")) <= 185:
+        assert len((run(line(server, project)).session_id or "").encode("utf-8")) == 256
+    else:
+        with pytest.raises(EngineRefused, match="identifier plus rules digest exceeds"):
+            run(line(server, project))
+        assert "session/prompt" not in server.methods()
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_initialize_records_supported_protocol_version(
+    project: tuple[Path, Path, Path], version: int
+) -> None:
+    server = FakeGrok()
+    server.protocol_version = version
+    target = line(server, project)
+    if version == 1:
+        run(target)
+    else:
+        with pytest.raises(EngineRefused, match="ACP version 2"):
+            run(target)
+        assert "session/new" not in server.methods()
+    assert target.protocol_version == version

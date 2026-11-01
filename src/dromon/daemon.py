@@ -1648,6 +1648,7 @@ class Daemon:
         routes = self.relay_routes(config)
         terms = project_terms(config, self.paths)
         check_lines_sandboxed(config, self.log, self.scheduler)
+        check_grok_profiles(config, self.paths, self.scheduler, self.registry_dir)
         for line_id in sorted(set(self.project.lines) - set(config.lines)):
             if line_id in self.log.state.lines:
                 self.scheduler.set_line_policy(line_id, None, None)
@@ -3339,10 +3340,22 @@ def check_grok_profiles(
     )
     home = Path.home()
     grok_home = home / grok.HOME_DIR
-    for line_id in sorted(scheduler.state.lines):
-        if ENGINE_OF[scheduler.model_of(line_id)] != grok.ENGINE_NAME:
+    from dromon.overrides import apply_config
+
+    for line_id in sorted(set(scheduler.state.lines) | set(config.lines)):
+        definition = config.lines.get(line_id)
+        existing = line_id in scheduler.state.lines
+        overrides = scheduler.line_overrides(line_id) if existing else {}
+        model = overrides.get("model") or (
+            definition.model if definition is not None else scheduler.model_of(line_id)
+        )
+        if ENGINE_OF[str(model)] != grok.ENGINE_NAME:
             continue
-        line = scheduler.effective_config(line_id)
+        line = (
+            apply_config(definition.config, overrides)
+            if definition is not None
+            else scheduler.effective_config(line_id)
+        )
         try:
             workspace = resolve_workdir(line.workdir, paths.root, protected)
             grok.check_profile(

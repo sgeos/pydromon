@@ -564,8 +564,9 @@ frame exchanged in order.
 
 **Fact.** Claude Code's permission gate returns a named denial and allows the turn to
 continue. Codex returns a named error for an unknown dynamic tool without invoking a
-handler. Dynamic tool execution requires Dromon's response. Other unexpected Codex
-items still interrupt because a notification does not establish that no work ran.
+handler. A disallowed dynamic call that completes without a matching request also
+interrupts because its notification alone does not establish non-execution. Other
+unexpected Codex items still interrupt for the same reason.
 
 **Fact.** Grok and Antigravity reject ACP permission requests for unavailable calls.
 They continue only when each subsequent report explicitly asserts `toolNotRun` as a

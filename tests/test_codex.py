@@ -604,7 +604,7 @@ def test_dromons_tools_are_served_and_counted() -> None:
             {
                 "id": "s2",
                 "method": "item/tool/call",
-                "params": {"tool": "missing", "arguments": {}},
+                "params": {"tool": "missing", "arguments": {}, "itemId": "i"},
             },
             message("ok"),
             completed(),
@@ -1869,6 +1869,12 @@ def test_active_writer_retries_once_then_replaces(
     monkeypatch.setattr(codex_module, "WRITER_RETRY_SECONDS", 0)
 
     class WriterServer(FakeServer):
+        def result(self, method: str) -> dict[str, Any]:
+            result = super().result(method)
+            if method == "thread/start":
+                result["thread"] = {"id": "replacement"}
+            return result
+
         remaining = failures
 
         async def send(self, message: Mapping[str, object]) -> None:
@@ -1930,7 +1936,7 @@ def test_unknown_dynamic_call_returns_named_error_and_continues() -> None:
             {
                 "id": "bad",
                 "method": "item/tool/call",
-                "params": {"tool": "missing", "arguments": {}},
+                "params": {"tool": "missing", "arguments": {}, "itemId": "i"},
             },
             message("recovered"),
             completed(),
@@ -1990,6 +1996,12 @@ def test_replacement_failure_explains_resume(monkeypatch: pytest.MonkeyPatch) ->
     assert server.methods().count("thread/resume") == 2
     assert server.methods().count("thread/start") == 1
     assert "turn/start" not in server.methods()
+    previous = target.session_id
+    assert previous is not None
+    with pytest.raises(EngineRefused, match="A resume will retry thread recovery"):
+        run(target)
+    assert target.session_id == previous
+    assert server.methods().count("thread/resume") == 4
 
 
 @pytest.mark.parametrize(
@@ -2034,3 +2046,47 @@ def test_profile_digest_keeps_the_launch_snapshot_when_a_path_appears(
     run(target)
     assert server.methods().count("thread/start") == 2
     assert "thread/resume" not in server.methods()
+
+
+@pytest.mark.parametrize("completed_notice", [True, False])
+def test_disallowed_dynamic_notice_without_request_stops(
+    completed_notice: bool,
+) -> None:
+    notice_item = item("dynamicToolCall", tool="missing")
+    if completed_notice:
+        notice_item["method"] = "item/completed"
+    server = FakeServer([notice_item, completed()])
+    with pytest.raises(
+        EngineRefused, match="disallowed dynamic tool completed without a request"
+    ):
+        run(line(server))
+    assert "turn/interrupt" in server.methods()
+
+
+def test_replacement_cannot_reuse_contested_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(codex_module, "WRITER_RETRY_SECONDS", 0)
+
+    class Held(FakeServer):
+        async def send(self, message: Mapping[str, object]) -> None:
+            if message.get("method") == "thread/resume":
+                self.sent.append(dict(message))
+                self.queue.append(
+                    {
+                        "id": message["id"],
+                        "error": {
+                            "code": -32600,
+                            "message": "thread th already has an active writer",
+                        },
+                    }
+                )
+            else:
+                await super().send(message)
+
+    server = Held()
+    target = line(server)
+    target.session_id = f"th:{target.tools_fingerprint()}"
+    previous = target.session_id
+    with pytest.raises(EngineRefused, match="reused the contested"):
+        run(target)
+    assert target.session_id == previous
+    assert "turn/start" not in server.methods()

@@ -745,3 +745,44 @@ This policy does not remove a tool from the model's advertised tools.
 **Unverified.** Filtering on `agent stdio` still requires transport-specific vendor
 documentation or an independent exchange showing that unavailable tools disappear
 from the advertised set. No live Grok turn was run for this investigation.
+
+
+## Model selection after loading a session
+
+**Fact.** Round 14 operator mail reports that Grok 1.0.70 returned a model other
+than `grok-4.7` after loading the grok-review session. The operator did not identify
+the returned model. Dromon can read it from the session response and checks that all
+reported model fields agree. A failed model selection now includes that reported
+model in its refusal message.
+
+**Fact.** Dromon now sends `session/set_config_option` with `configId` equal to
+`model` and a string `value` equal to the driver model. Previously it sent a nested
+object. The operator observed error code `-32602` naming `SessionConfigOptionValue`
+for that object. The bundled guides `15-agent-mode.md` and `17-sessions.md` show the
+nested form, which conflicts with this runtime report.
+
+**Fact.** The operator supplied schema examples fetched from
+[ACP version 1](https://agentclientprotocol.com/protocol/v1/session-config-options)
+and [ACP version 2](https://agentclientprotocol.com/protocol/v2/session-config-options).
+Both use bare select strings. Version 2 also requires `type` equal to `id` for a
+select. Version 1 permits the bare string without that field. Dromon requests
+version 1 at initialization, records the reported version on the adapter and
+refuses any other version before opening a session. No version 2 compatibility is
+claimed. Scripted replies report version 1. No new live initialization was captured
+for this follow-up.
+
+**Fact.** Before changing a mismatching model, Dromon requires the requested value
+in the reported model options, including grouped options. Otherwise it refuses
+before selection or prompting and reports the current model and listed values.
+Tests cover the exact request shape, a resumed session with a matching rules digest,
+missing requested values and version 2 refusal. Live acceptance remains unverified
+and the operator will verify it after merge.
+
+**Fact.** The persisted session identifier includes a 71 byte rules suffix. Dromon
+refuses an identifier whose encoded form would exceed 256 bytes before sending a
+prompt. Tests cover the boundary and a multibyte identifier.
+
+**Fact.** Project reload can introduce Grok lines or change their working directory,
+read-only paths or profile requirements. It checks prospective declared configurations
+with operator overrides and existing client-created lines before mutating daemon
+state. Invalid profiles refuse the reload. Turn-time checks remain necessary.
