@@ -141,6 +141,7 @@ from claude_agent_sdk.types import SystemPromptPreset
 
 from dromon import evidence, gitssh, launcher, redact
 from dromon.gitssh import GitSshAccess
+from dromon.linetemp import CACHE_VARIABLE, TEMP_VARIABLE, LineTemp
 from dromon.imageaccess import claude_tools, image_refusal, view_only
 from dromon.capabilities import CLAUDE_CODE, version_refusal
 from dromon.activity import ActivityKind, Observer, ignore
@@ -2002,6 +2003,7 @@ def launch_environment(
     stop_policy: launcher.StopPolicy,
     shell: str | None,
     git_ssh: GitSshAccess | None = None,
+    temp: LineTemp | None = None,
 ) -> dict[str, str]:
     """The variables a Claude Code line's engine starts with, beside the daemon's own:
     the pinned tool search, the line's process mark, what its launcher needs, and the
@@ -2009,7 +2011,13 @@ def launch_environment(
 
     Each relayed name is set, empty for a line without the option, so a value the
     daemon's own environment holds under that name, which the Agent SDK merges in
-    beneath these, never reaches the engine."""
+    beneath these, never reaches the engine.
+
+    **Round 14, item 6.** A line given ``temp`` has ``TMPDIR`` and ``UV_CACHE_DIR``
+    set to directories its sandbox may write, so that a here-document and the gate
+    need no workaround. ``TMPDIR`` is a base variable the launcher's filter keeps, and
+    ``UV_CACHE_DIR`` travels as a relayed variable, so only this value reaches the
+    engine and never the daemon's own."""
     environment = {TOOL_SEARCH_VARIABLE: TOOL_SEARCH_PINNED}
     if shell is not None:
         environment[SHELL_VARIABLE] = shell
@@ -2017,6 +2025,10 @@ def launch_environment(
     environment.update(launcher.launch_environment(claude_cli(), stop_policy))
     environment[launcher.FILTER_ENVIRONMENT_VARIABLE] = "1"
     given = gitssh.environment(git_ssh)
+    if temp is not None:
+        wanted = temp.environment()
+        environment[TEMP_VARIABLE] = wanted[TEMP_VARIABLE]
+        given[CACHE_VARIABLE] = wanted[CACHE_VARIABLE]
     if shell is not None:
         given[SHELL_VARIABLE] = shell
         given[CLAUDE_SHELL_VARIABLE] = shell
@@ -2034,6 +2046,11 @@ class ClaudeCodeLine:
     ``mcp_tools`` the in-process tools Dromon serves it. Both are empty by default, so
     a line does nothing but converse until its tools are configured deliberately.
     """
+
+    temp: LineTemp | None = None
+    """The directories the sandbox lets the shell write for temporary files and the
+    package cache, set by ``__init__``. A class default, so a subclass that does not
+    call it has none."""
 
     def __init__(
         self,
@@ -2065,6 +2082,7 @@ class ClaudeCodeLine:
         consent_asked: Callable[[str], object] = no_consent_question,
         secret_names: Callable[[], Sequence[str]] | Sequence[str] = (),
         git_ssh: GitSshAccess | None = None,
+        temp: LineTemp | None = None,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -2089,6 +2107,9 @@ class ClaudeCodeLine:
         self.git_ssh = git_ssh
         """The agent and pinned hosts of the project's ``[git_ssh]`` table, if the
         line was given them."""
+        self.temp = temp
+        """The temporary directory and package cache the sandbox lets the line's shell
+        write, if it has an enabled sandbox and they could be made."""
         self._kept_factory = kept_factory
         self._task_ended = task_ended
         self._begin_self_started_callback = begin_self_started
@@ -2213,6 +2234,7 @@ class ClaudeCodeLine:
                 self.config.stop_policy,
                 self._selected_shell(),
                 self.git_ssh,
+                self.temp,
             ),
             cli_path=self._launcher(),
             system_prompt=self._system_prompt(),

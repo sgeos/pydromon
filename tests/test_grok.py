@@ -2313,6 +2313,7 @@ def test_the_line_socket_serves_only_the_lines_own_tools(
             "propose_change",
             "list_processes",
             "stop_process",
+            "worktree_status",
             "list_mail",
             "read_mail",
             "acknowledge_mail",
