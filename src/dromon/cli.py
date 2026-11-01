@@ -17,11 +17,13 @@ import sys
 import time
 import tomllib
 from collections.abc import Callable, Coroutine, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, cast
 
 import dromon
-from dromon import __version__, exits, fleet, land, registry, restart, runs
+from dromon import __version__, buildinputs, exits, fleet, land, registry, restart, runs
+from dromon import syncenv
 from dromon import proposals as proposal_store
 from dromon.client import (
     REQUEST_TIMEOUT_SECONDS,
@@ -91,7 +93,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "set": "change a project or line setting, or return it to the layers below",
     "role": "show, create, update or delete roles, read their journals, or give,"
     " vacate or ask to hand over one",
-    "run": "clear a lost supervised run after inspecting what is left of it",
+    "run": "show supervised runs, or clear a lost one after inspecting what is left",
     "budget": "list the providers' stated budgets, or state one",
     "reload": "read the project file again and apply its lines, limits and wake policy",
     "config": "check the project file and show what it declares",
@@ -105,6 +107,11 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "land": "stage, screen, commit, gate and push a line's worktree and open a pull"
     " request for it",
     "fleet": "list every daemon of this user on this machine, and reach each by name",
+    "sync-worktrees": "run uv sync --locked in every role's worktree, asking first"
+    " where its build inputs differ from the base",
+    "renew": "start a line's next turn in a fresh engine session, keeping its mail,"
+    " brief and files",
+    "retire": "retire a line the project file does not declare, for good",
 }
 """Planned subcommands and their one-line help, in display order."""
 
@@ -258,7 +265,10 @@ def _peer_row(peer: Mapping[str, object]) -> str:
 
 def _line_row(line: Mapping[str, object]) -> str:
     """One line of ``dromon status`` for a session line, naming a hibernation and a
-    hold, which each keep the line from waking."""
+    hold, which each keep the line from waking, and a line the project file no
+    longer declares. **Round 14, item 4.** A daemon from before round 14 gives no
+    ``declared``, which is then not shown. A retired line is hibernated as well,
+    which is not named twice."""
     condition = str(line.get("condition", line.get("state")))
     jobs = line.get("background_jobs")
     if condition == "idle" and type(jobs) is int and jobs > 0:
@@ -268,8 +278,10 @@ def _line_row(line: Mapping[str, object]) -> str:
         condition,
         f"{line.get('pending')} pending",
     ]
-    if line.get("hibernated") is True and line.get("condition") != "hibernated":
+    if line.get("hibernated") is True and condition not in ("hibernated", "retired"):
         parts.append("hibernated")
+    if line.get("declared") is False and condition != "retired":
+        parts.append("not in the project file")
     if line.get("held_by") is not None and line.get("condition") != "held":
         parts.append(f"held by {line.get('held_by')}")
     return ", ".join(parts)
@@ -328,14 +340,16 @@ RESTART_POLL_SECONDS: Final = 0.25
 """How often ``dromon restart`` asks whether the successor answers."""
 
 
-def _preflight_argv(paths: ProjectPaths, options: Sequence[str]) -> list[str]:
+def _preflight_argv(
+    paths: ProjectPaths, options: Sequence[str], interpreter: str | None = None
+) -> list[str]:
     """What ``dromon restart`` runs before it asks for the restart. It is the
-    successor's own command, on the interpreter this client runs on, with the
-    running daemon's options, and ``--check``, so the installed code runs its start
-    checks against the project file and a copy of the event log, and starts
-    nothing."""
+    successor's own command, on the daemon's interpreter where the daemon names it
+    and else on the one this client runs on, with the running daemon's options, and
+    ``--check``, so the installed code runs its start checks against the project
+    file and a copy of the event log, and starts nothing."""
     return [
-        sys.executable,
+        interpreter or sys.executable,
         "-m",
         "dromon.daemon",
         "--project",
@@ -360,13 +374,62 @@ def _options_of(status: Mapping[str, object]) -> list[str]:
     return [str(option) for option in found]
 
 
-def _preflight(argv: Sequence[str], runtime_dir: Path | None = None) -> str | None:
+@dataclass(frozen=True, slots=True)
+class StartContext:
+    """What a restart's successor starts with, as the daemon's ``start_context``
+    gives it. **Round 14, item 6.**"""
+
+    interpreter: str
+    environment: dict[str, str | None]
+
+
+def _start_context(result: Mapping[str, object]) -> StartContext | None:
+    """The ``start_context`` answer, or ``None`` when it is not in the form the
+    daemon gives. The interpreter must be an absolute path, and each variable a
+    name of ``START_ENVIRONMENT`` with text or null, so nothing else of the
+    client's environment is replaced."""
+    interpreter, environment = result.get("interpreter"), result.get("environment")
+    if not isinstance(interpreter, str) or not os.path.isabs(interpreter):
+        return None
+    if not isinstance(environment, dict):
+        return None
+    found: dict[str, str | None] = {}
+    for name, value in cast(dict[object, object], environment).items():
+        if name not in restart.START_ENVIRONMENT:
+            return None
+        if value is not None and not isinstance(value, str):
+            return None
+        found[str(name)] = value
+    return StartContext(interpreter, found)
+
+
+def _preflight_environment(context: StartContext | None) -> dict[str, str]:
+    """This client's environment with the daemon's values of ``START_ENVIRONMENT``
+    in place of its own, a variable the daemon lacks removed."""
+    environment = dict(os.environ)
+    if context is None:
+        return environment
+    for name, value in context.environment.items():
+        if value is None:
+            environment.pop(name, None)
+        else:
+            environment[name] = value
+    return environment
+
+
+def _preflight(
+    argv: Sequence[str],
+    runtime_dir: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> str | None:
     """Why the installed daemon would not start, or ``None``. A restart whose
     successor refuses to start leaves no daemon running, so this is checked before
     the old daemon is asked to stop. The reason is the daemon's own, its lines that
     begin ``dromond:``, or else its last line, as for code that does not import. A
     check that times out is killed, which leaves its copy of the log, so the
-    preflight directories in ``runtime_dir`` are then swept."""
+    preflight directories in ``runtime_dir`` are then swept. ``environment``, when
+    given, is the one the check runs with, the daemon's start variables over the
+    client's own."""
     try:
         done = subprocess.run(  # noqa: S603
             list(argv),
@@ -374,6 +437,7 @@ def _preflight(argv: Sequence[str], runtime_dir: Path | None = None) -> str | No
             text=True,
             timeout=PREFLIGHT_TIMEOUT_SECONDS,
             check=False,
+            env=None if environment is None else dict(environment),
         )
     except subprocess.TimeoutExpired as error:
         if runtime_dir is not None:
@@ -387,6 +451,29 @@ def _preflight(argv: Sequence[str], runtime_dir: Path | None = None) -> str | No
     own = [line for line in lines if line.startswith("dromond: ")]
     reason = " ".join(own) if own else (lines[-1] if lines else "no output")
     return f"status {done.returncode}: {reason}"
+
+
+def _ask_start_context(paths: ProjectPaths, command: str) -> StartContext | None:
+    """The running daemon's interpreter and start variables, or ``None`` with a
+    note when it does not give them, as a daemon from before round 14, item 6 does
+    not, and the check then runs on this client's interpreter and environment, as
+    before."""
+    try:
+        response = call(paths.socket, Operation.START_CONTEXT)
+    except (DaemonNotRunning, ProtocolError, TimeoutError, OSError) as error:
+        print(f"dromon {command}: {error}", file=sys.stderr)
+        return None
+    context = (
+        _start_context(response.result)
+        if response.ok and response.result is not None
+        else None
+    )
+    if context is None:
+        print(
+            f"dromon {command}: the daemon does not say its interpreter and start"
+            " environment, so the check runs on this client's, which can differ"
+        )
+    return context
 
 
 def _installed_commit() -> str | None:
@@ -421,7 +508,14 @@ def _restart(
         except fleet.FleetError as error:
             print(f"dromon {command}: {error}", file=sys.stderr)
             return exits.FAILURE
-    problem = _preflight(_preflight_argv(paths, _options_of(before)), paths.runtime_dir)
+    context = _ask_start_context(paths, command)
+    problem = _preflight(
+        _preflight_argv(
+            paths, _options_of(before), None if context is None else context.interpreter
+        ),
+        paths.runtime_dir,
+        _preflight_environment(context),
+    )
     if problem is not None:
         print(
             f"dromon {command}: the installed daemon refuses to start, so the running"
@@ -530,15 +624,25 @@ def _restarted(before: Mapping[str, object], after: Mapping[str, object]) -> str
     was = _commit_of(before)
     now = _commit_of(after)
     text = f"dromon restart: restarted, pid {after.get('pid')}, at commit {now}"
-    if now == was:
-        return text + ", the same commit as before"
-    return text + f", which was {was}"
+    text += ", the same commit as before" if now == was else f", which was {was}"
+    # Round 14, item 6. The successor loads what is installed when it starts, which
+    # can differ from the checkout if the checkout moved during the start.
+    checkout = _commit_of(after, "checkout_commit")
+    text += f". Its checkout is at {checkout}"
+    if checkout not in {now, "unknown"} and now != "unknown":
+        text += (
+            ". Warning: the loaded commit differs from the checkout's, so the"
+            " daemon does not run the code checked out now"
+        )
+    return text
 
 
-def _commit_of(status: Mapping[str, object]) -> str:
+def _commit_of(status: Mapping[str, object], key: str = "commit") -> str:
+    """The daemon's ``commit``, the one it loaded, or another of its commit fields,
+    such as ``checkout_commit``, or ``unknown``."""
     daemon = status.get("daemon")
     if isinstance(daemon, dict):
-        commit = cast(Mapping[str, object], daemon).get("commit")
+        commit = cast(Mapping[str, object], daemon).get(key)
         if isinstance(commit, str):
             return commit
     return "unknown"
@@ -1285,6 +1389,10 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     )
     for name, command in sorted(config.run_commands.items()):
         print(f"run {name}: {command}")
+    for name, command in sorted(config.run_commit_commands.items()):
+        print(f"commit run {name}: {command}")
+    if config.run_commit_refs:
+        print(f"commit run refs: {', '.join(config.run_commit_refs)}")
     for name, relay in sorted(config.relays.relays.items()):
         print(
             f"relay {name}: {relay.kind}, path {relay.path}, command {relay.command},"
@@ -1787,7 +1895,9 @@ def _read(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         return response
     reply = response.get("reply_to")
     suffix = f", replying to {reply}" if reply is not None else ""
-    print(f"{response.get('message_id')} from {response.get('sender')}{suffix}")
+    recipient = response.get("recipient")
+    to = f" to {recipient}" if isinstance(recipient, str) else ""
+    print(f"{response.get('message_id')} from {response.get('sender')}{to}{suffix}")
     choices = response.get("choices")
     if isinstance(choices, list) and choices:
         print("choices: " + " | ".join(str(c) for c in cast(list[object], choices)))
@@ -1797,9 +1907,15 @@ def _read(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 
 
 def _run(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
-    """Clear a lost run, so its scope may start another. Its command may still run,
-    so the operator inspects what is left of it first."""
-    run_id: str = arguments.run_id
+    """Show supervised runs, or clear a lost run, so its scope may start another.
+    A lost run's command may still run, so the operator inspects what is left of it
+    first."""
+    run_id: str | None = arguments.run_id
+    if arguments.action == "status":
+        return _run_status(paths, run_id)
+    if run_id is None:
+        print("dromon run clear: name the run to clear", file=sys.stderr)
+        return exits.USAGE
     args: dict[str, object] = {"run_id": run_id, "operator": arguments.operator}
     result = _call(paths, "run clear", Operation.RUN_CLEAR, args)
     if isinstance(result, int):
@@ -1809,6 +1925,87 @@ def _run(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         f" {result['cleared_at']}"
     )
     return exits.OK
+
+
+def _run_status(paths: ProjectPaths, run_id: str | None) -> int:
+    """Print every scope's recent runs, or one run with its whole receipt. Round
+    14, item 11, since an operator otherwise read ``run_ended`` from the log."""
+    args: dict[str, object] = {} if run_id is None else {"run_id": run_id}
+    result = _call(paths, "run status", Operation.RUNS, args)
+    if isinstance(result, int):
+        return result
+    found = result.get("runs")
+    views = [
+        cast(dict[str, object], view)
+        for view in (cast(list[object], found) if isinstance(found, list) else [])
+        if isinstance(view, dict)
+    ]
+    if run_id is not None:
+        for view in views:
+            print(_run_row(view))
+            for detail in _run_details(view):
+                print(f"  {detail}")
+        return exits.OK
+    if not views:
+        print("no runs yet")
+        return exits.OK
+    scope: object = None
+    for view in views:
+        if view.get("scope") != scope:
+            scope = view.get("scope")
+            print(scope)
+        print(f"  {_run_row(view)}")
+    return exits.OK
+
+
+def _run_row(view: dict[str, object]) -> str:
+    """One run on one line, with its command, line, start, end, exit code and the
+    output file's path, joined to the run's working directory."""
+    state = view.get("state")
+    if state == "running":
+        end = f"still running as process {view.get('pid')}"
+    else:
+        code = view.get("exit_code")
+        with_code = "" if code is None else f" with exit code {code}"
+        end = f"{state}{with_code} at {view.get('ended_at')}"
+        if view.get("blocks") is True:
+            end += ", blocking its scope until it is cleared"
+    output = f"{view.get('workdir')}/{view.get('output_file')}"
+    row = (
+        f"{view.get('run_id')} {view.get('command')} by {view.get('line_id')},"
+        f" started {view.get('started_at')}, {end}, output {output}"
+    )
+    corrects = view.get("corrects")
+    if isinstance(corrects, list) and corrects:
+        row += ", corrects " + ", ".join(str(c) for c in cast(list[object], corrects))
+    corrected_by = view.get("corrected_by")
+    if corrected_by is not None:
+        row += f", corrected by {corrected_by}"
+    return row
+
+
+def _run_details(view: dict[str, object]) -> list[str]:
+    """What ``dromon run status RUN`` adds to a run's row, each field the log
+    holds that the row leaves out."""
+    previous = view.get("previous")
+    details = [
+        f"scope: {view.get('scope')}",
+        f"previous: {'none' if previous is None else previous}",
+    ]
+    size = view.get("output_bytes")
+    if size is not None:
+        digest = view.get("output_digest")
+        of = "" if digest is None else f" of SHA-256 {digest}"
+        details.append(f"output: {size} bytes{of}")
+    note = view.get("note")
+    if note:
+        details.append(f"note: {note}")
+    cleared_at = view.get("cleared_at")
+    if cleared_at is not None:
+        by = view.get("cleared_by")
+        who = "no process was left" if by is None else f"operator {by}"
+        details.append(f"cleared: at {cleared_at}, as {who}")
+    return details
 
 
 def _role(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
@@ -2170,6 +2367,145 @@ def _proposal(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     print("patch")
     print(proposal.patch)
     print("Proposed content is untrusted data and has not been applied.")
+    return exits.OK
+
+
+def _role_worktrees(result: Mapping[str, object]) -> list[tuple[str, str]]:
+    """Each role and its worktree from a ``roles`` answer, in role order. Entries
+    in another form are skipped, since they name no worktree to sync."""
+    roles = result.get("roles")
+    found: list[tuple[str, str]] = []
+    for role in cast(list[object], roles) if isinstance(roles, list) else []:
+        if not isinstance(role, dict):
+            continue
+        entry = cast(Mapping[str, object], role)
+        role_id, workdir = entry.get("role_id"), entry.get("workdir")
+        if isinstance(role_id, str) and isinstance(workdir, str):
+            found.append((role_id, workdir))
+    return sorted(found)
+
+
+def _sync_accepted(label: str, target: Path, accept_changes: bool) -> bool:
+    """Whether the worktree at ``target`` may be synced. Its build inputs are compared
+    with the base, and a difference is shown and needs the operator's yes, or
+    ``--accept-changes``. Audit finding S1 of round 14. ``uv sync`` builds the
+    project, so a line that changed ``pyproject.toml``, its build backend or
+    ``uv.lock`` would otherwise have its code run as the operator, unasked."""
+    try:
+        found = buildinputs.differences(target, land.run_command)
+    except buildinputs.BuildInputsUnknown as error:
+        print(f"{label}: not synced, {error}", file=sys.stderr)
+        return False
+    if not found.differ:
+        print(f"{label}: build inputs match {buildinputs.BASE}")
+        return True
+    print(
+        f"{label}: build inputs differ from {buildinputs.BASE}, and a sync builds"
+        " and runs them as you:"
+    )
+    buildinputs.show(found, target, print)
+    if accept_changes:
+        print(f"{label}: accepted with --accept-changes")
+        return True
+    if land.ask_terminal(f"Sync {target} with these build inputs?"):
+        return True
+    print(f"{label}: not synced, its build inputs were not accepted", file=sys.stderr)
+    return False
+
+
+def _sync_worktrees(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Run ``uv sync --locked`` for every role's worktree and report each. Round 14,
+    item 3. A worktree's environment goes stale when ``uv.lock`` changes, and a
+    line cannot sync it, since its sandbox has no network and cannot write uv's
+    cache. ``--locked`` never changes the lock file, but the branch it installs
+    from is written by a line, so a worktree whose build inputs differ from the
+    base is shown and synced only on the operator's yes or ``--accept-changes``.
+    **Final check of 951b9e7, item 1.** The environment is built outside the
+    worktree and moved into place, so uv never runs the interpreter in a ``.venv``
+    a line could write, as ``dromon.syncenv`` says.
+    A worktree outside the project, or with no ``uv.lock`` or no
+    ``pyproject.toml``, is reported and skipped. Exits 1 when any worktree failed,
+    lay outside the project or was left unsynced."""
+    accept_changes = bool(getattr(arguments, "accept_changes", False))
+    result = _call(paths, "sync-worktrees", Operation.ROLES, {})
+    if isinstance(result, int):
+        return result
+    root = paths.root.resolve()
+    failed = 0
+    seen: set[Path] = set()
+    for role_id, workdir in _role_worktrees(result):
+        target = (root / workdir).resolve()
+        label = f"dromon sync-worktrees: {role_id} {workdir}"
+        if target != root and root not in target.parents:
+            print(f"{label}: skipped, outside the project", file=sys.stderr)
+            failed += 1
+            continue
+        if target in seen:
+            print(f"{label}: already handled for another role")
+            continue
+        seen.add(target)
+        if not (target / land.LOCK_FILE).is_file():
+            print(f"{label}: skipped, no {land.LOCK_FILE}")
+            continue
+        if not (target / buildinputs.PROJECT_FILE).is_file():
+            # uv walks up to a parent's project, which this worktree does not hold.
+            print(f"{label}: skipped, no {buildinputs.PROJECT_FILE}")
+            continue
+        if not _sync_accepted(label, target, accept_changes):
+            failed += 1
+            continue
+        try:
+            synced = syncenv.sync(target, paths.sync_environments, land.run_command)
+        except syncenv.SyncFailed as error:
+            failed += 1
+            print(f"{label}: not synced, {error}", file=sys.stderr)
+            continue
+        print(f"{label}: synced, its {syncenv.ENVIRONMENT} built anew and moved in")
+        if synced.left is not None:
+            print(f"{label}: {synced.left}", file=sys.stderr)
+    return exits.FAILURE if failed else exits.OK
+
+
+def _renew(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Start a line's next turn in a fresh engine session, keeping its mail, brief,
+    files and identity. Round 14, item 4. It sends ``clear_session``, which the
+    attached client's ``/clear`` sends, so a fresh session no longer needs a rebind
+    away and back. Refused while the line is in a turn."""
+    line_id: str = arguments.line_id
+    result = _call(paths, "renew", Operation.CLEAR_SESSION, {"line_id": line_id})
+    if isinstance(result, int):
+        return result
+    warning = result.get("warning")
+    if isinstance(warning, str):
+        print(f"dromon renew: {warning}")
+    print(
+        f"dromon renew: line {line_id} starts its next turn in a fresh engine"
+        " session, with its mail, brief and files kept"
+    )
+    return exits.OK
+
+
+def _retire(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Retire a line, which then starts no turn again, keeps its mail readable, takes
+    no new mail and leaves the one-writer rule. Round 14, item 4. The daemon refuses a
+    line the project file declares, one in a turn and a seat of a role."""
+    line_id: str = arguments.line_id
+    args: dict[str, object] = {"line_id": line_id, "operator": arguments.operator}
+    result = _call(paths, "retire", Operation.RETIRE_LINE, args)
+    if isinstance(result, int):
+        return result
+    warning = result.get("warning")
+    if isinstance(warning, str):
+        print(f"dromon retire: {warning}")
+    print(f"dromon retire: line {line_id} retired at {result.get('retired_at')}")
+    # A daemon from before the audit of round 14 gives neither field.
+    questions = result.get("withdrawn_questions")
+    if isinstance(questions, list) and questions:
+        named = ", ".join(str(q) for q in cast(list[object], questions))
+        print(f"dromon retire: withdrew its open questions {named}")
+    wake = result.get("withdrawn_wake")
+    if isinstance(wake, str):
+        print(f"dromon retire: withdrew its scheduled wake {wake}")
     return exits.OK
 
 
@@ -2596,6 +2932,9 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "proposal": _proposal,
     "land": _land,
     "fleet": lambda _paths, arguments: _fleet(arguments),
+    "sync-worktrees": _sync_worktrees,
+    "renew": _renew,
+    "retire": _retire,
 }
 
 
@@ -2928,6 +3267,22 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if name == "land":
             _land_arguments(command)
+        if name == "sync-worktrees":
+            command.add_argument(
+                "--accept-changes",
+                action="store_true",
+                help="sync every worktree whose build inputs differ from"
+                f" {buildinputs.BASE} without asking, after showing each",
+            )
+        if name == "renew":
+            command.add_argument("line_id", help="the line to renew")
+        if name == "retire":
+            command.add_argument("line_id", help="the line to retire")
+            command.add_argument(
+                "--operator",
+                default=default_operator(),
+                help="who retires the line, default %(default)s",
+            )
         if name == "awaken":
             command.add_argument("line_id", help="the hibernated line")
         if name == "start":
@@ -3175,8 +3530,12 @@ def build_parser() -> argparse.ArgumentParser:
                 help="who makes the change or the request, default %(default)s",
             )
         if name == "run":
-            command.add_argument("action", choices=["clear"])
-            command.add_argument("run_id", help="the lost run to clear")
+            command.add_argument("action", choices=["status", "clear"])
+            command.add_argument(
+                "run_id",
+                nargs="?",
+                help="for status, one run to show, and for clear, the lost run",
+            )
             command.add_argument(
                 "--operator",
                 default=default_operator(),

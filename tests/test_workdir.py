@@ -209,7 +209,13 @@ def test_a_plain_checkout_guards_its_hooks_and_config(tmp_path: Path) -> None:
     (checkout / ".git").mkdir(parents=True)
     (checkout / "src" / "deep").mkdir(parents=True)
     git = checkout / ".git"
-    expected = (git / "config", git / "config.worktree", git / "hooks")
+    expected = (
+        git / "config",
+        git / "config.worktree",
+        git / "hooks",
+        git / "packed-refs",
+        git / "refs" / "remotes",
+    )
     assert git_write_guards(checkout) == expected
     assert git_write_guards(checkout / "src" / "deep") == expected
 
@@ -224,6 +230,8 @@ def test_a_linked_worktree_guards_the_common_directory_and_its_pointers(
             {
                 common / "hooks",
                 common / "config",
+                common / "refs" / "remotes",
+                common / "packed-refs",
                 gitdir / "config.worktree",
                 gitdir / "commondir",
                 tree / ".git",

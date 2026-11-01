@@ -116,6 +116,8 @@ relay = "tail"          # the route of operator ana's mail
 | `leases.names` | list of identifiers | none | The leases lines may acquire, each named once, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies |
 | `leases.ttl_seconds` | integer in [60, 86400] | 10800 | How long an acquired lease lasts unless released first |
 | `runs.commands` | table of names to arrays of text | none | The commands lines may start as supervised runs, at most 64, each name an identifier and each command its program and at most 63 arguments, never a shell string, as [`RUNS.md`](../architecture/RUNS.md) specifies. A declared command runs with the daemon's authority, outside any line's sandbox. Added on 2026-10-31 |
+| `runs.commit_commands` | table of names to arrays of text | none | Commands a line, a line that only reads its working directory included, may start on a commit it names, in a checkout the daemon makes in its state directory, as the commit run section of [`RUNS.md`](../architecture/RUNS.md) specifies. Each as in `runs.commands`, and no name may be in both tables. Declaring one requires `runs.commit_refs.patterns`. Added in round 14 |
+| `runs.commit_refs.patterns` | array of text | none | The ref patterns, 1 to 16, each beginning `refs/remotes/REMOTE/` with a remote named without wildcards, without spaces or `..`, as `git for-each-ref` reads them. A commit run's commit must be the tip of a ref matching one. A pattern under `refs/heads`, `refs/tags` or anywhere else outside `refs/remotes` is refused, since a line's sandbox may write those refs. Added in round 14, and narrowed to remote-tracking tips in its review of 1449c5c |
 | `limits.*` | as in `CLIENT.md` | 12, 2, 0 | The conversation limits of every line |
 | `wake.every_ticks` | integer in [1, 3600] | 1 | The wake policy of every line |
 | `profiles.NAME` | table | none | A reusable line template with every line key but `profile` and `session` |
@@ -250,7 +252,10 @@ relay = "tail"          # the route of operator ana's mail
   is refused and the daemon does not start. After `rebind_line`, the file is updated to
   the new binding, which it then matches.
   A client may still switch a line's model within its engine, as an override. Lines
-  created through the client and absent from the file are left as they are.
+  created through the client and absent from the file are left as they are, and
+  `dromon status` names each as not in the project file. From round 14 an operator
+  may retire such a line with `dromon retire`, and a file that declares a retired line
+  is refused, since a line identifier is never used again.
 - **Reload.** `reload_project` applies the file again without a restart, with the same
   rules, after checking all of it, so a refused reload applies nothing. It refuses a
   change to the sandbox, the engine settings, the teacher, the external agent policy,

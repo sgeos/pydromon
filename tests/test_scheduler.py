@@ -1456,6 +1456,22 @@ def test_a_line_can_read_its_own_sent_mail_but_not_another_lines_sent_mail(
     assert "no message" in tool_text(refused)
 
 
+def test_an_operator_can_open_what_it_sent_a_line_without_reading_it_for_the_line(
+    make_world: MakeWorld,
+) -> None:
+    """Round 14, item 5. ``dromon read`` once refused a message the operator itself
+    had sent, since only a line's own sent mail could be opened."""
+    target = make_world({"alpha": []}, hold_wakes=True)
+    target.scheduler.ensure_operator("ben")
+    sent = target.scheduler.send(ANA, LineAddress("alpha"), "from ana")
+    opened = target.scheduler.read(ANA, sent)
+    assert opened.body == "from ana"
+    assert not target.log.state.messages[sent].read
+    assert not target.log.state.messages[sent].delivered
+    with pytest.raises(EventRejected, match="no message"):
+        target.scheduler.read(BEN, sent)
+
+
 def test_mail_can_be_paged_and_filtered_by_sender(make_world: MakeWorld) -> None:
     target = make_world({"alpha": [[]], "beta": []}, hold_wakes=True)
     target.scheduler.ensure_operator("ben")

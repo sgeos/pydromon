@@ -25,7 +25,7 @@ from typing import Any, Final, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import cli, client, daemon, eventlog, exits, fleet, restart
+from dromon import cli, client, daemon, eventlog, exits, fleet, registry, restart
 from dromon.registry import REGISTRY_DIR_ENV
 from dromon.activity import ActivityKind
 from dromon.configview import Overrides
@@ -701,6 +701,22 @@ def status(
     return {"pid": pid, "daemon": {"commit": commit}, "restart": state}
 
 
+def test_the_restart_report_names_the_checkout_and_warns_when_it_differs() -> None:
+    """Round 14, item 6. The loaded commit and the checkout's, and a warning when
+    they differ, as when the checkout moved while the successor started."""
+    before = status(1, "a" * 40)
+    same = {"pid": 2, "daemon": {"commit": "b" * 40, "checkout_commit": "b" * 40}}
+    moved = {"pid": 2, "daemon": {"commit": "b" * 40, "checkout_commit": "c" * 40}}
+    said = cli._restarted(before, same)  # pyright: ignore[reportPrivateUsage]
+    assert f"Its checkout is at {'b' * 40}" in said
+    assert "Warning" not in said
+    said = cli._restarted(before, moved)  # pyright: ignore[reportPrivateUsage]
+    assert f"Its checkout is at {'c' * 40}" in said
+    assert "Warning: the loaded commit differs from the checkout's" in said
+    said = cli._restarted(before, status(2, "b" * 40))  # pyright: ignore[reportPrivateUsage]
+    assert "Its checkout is at unknown" in said and "Warning" not in said
+
+
 def no_sleep(seconds: float) -> None:
     del seconds
 
@@ -709,12 +725,22 @@ def no_sleep(seconds: float) -> None:
 def cli_paths(paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch) -> ProjectPaths:
     monkeypatch.setattr(cli, "RESTART_POLL_SECONDS", 0.0)
     monkeypatch.setattr(cli, "_preflight", passes)
+    monkeypatch.setattr(cli, "_ask_start_context", no_start_context)
     return paths
 
 
-def passes(argv: Sequence[str], runtime_dir: Path | None = None) -> None:
+def no_start_context(paths: ProjectPaths, command: str) -> None:
+    """A daemon that gives no start context, so these tests send what they did."""
+    del paths, command
+
+
+def passes(
+    argv: Sequence[str],
+    runtime_dir: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> None:
     """A preflight that passes, for the tests of what follows it."""
-    del argv, runtime_dir
+    del argv, runtime_dir, environment
 
 
 def test_dromon_restart_waits_for_a_new_pid_and_names_both_commits(
@@ -839,7 +865,12 @@ def test_dromon_restart_stops_nothing_when_the_installed_code_does_not_start(
         found["options"] = ["--hold-wakes"]
         return Response("r", ok=True, result=found)
 
-    def refuse(argv: Sequence[str], runtime_dir: Path | None = None) -> str:
+    def refuse(
+        argv: Sequence[str],
+        runtime_dir: Path | None = None,
+        environment: Mapping[str, str] | None = None,
+    ) -> str:
+        del environment
         assert runtime_dir == cli_paths.runtime_dir
         checked.append(list(argv))
         return "status 1: SyntaxError"
@@ -930,7 +961,7 @@ def test_dromon_restart_crosses_the_wire_to_a_daemon_whose_rates_are_known(
         return code
 
     assert asyncio.run(go()) == exits.OK
-    assert sent[:2] == [Operation.STATUS, Operation.RESTART]
+    assert sent[:3] == [Operation.STATUS, Operation.START_CONTEXT, Operation.RESTART]
     out = capsys.readouterr().out
     assert "for at most 600 seconds" in out
     assert "restarted, pid 4242" in out
@@ -1217,6 +1248,28 @@ def test_a_check_writes_nothing_in_the_operator_s_fleet_index(
     live.log = EventLog(paths.event_log)
 
 
+def test_a_daemon_given_a_registry_directory_registers_there_only(
+    paths: ProjectPaths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 14, item 7, decided by ops for the operator's review. A daemon given
+    ``DROMON_REGISTRY_DIR`` makes the index there and leaves the default one
+    untouched, since the override is an isolation boundary that every test relies
+    on. A client given the same override finds it."""
+    default = tmp_path / "home" / ".local" / "state" / "dromon" / "registry"
+    monkeypatch.setattr(registry, "default_directory", lambda: default)
+    given = tmp_path / "given"
+    monkeypatch.setenv(REGISTRY_DIR_ENV, str(given))
+
+    async def no_serve(target: Daemon) -> None:
+        assert target.registry_dir == given
+
+    monkeypatch.setattr(daemon, "serve", no_serve)
+    monkeypatch.setattr(daemon, "environment_reading_works", lambda: False)
+    assert daemon.run(paths) == exits.OK
+    assert fleet.index_directory(given).is_dir()
+    assert not default.exists()
+
+
 def test_a_start_sweeps_every_check_directory(
     paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1327,6 +1380,103 @@ def test_the_preflight_runs_the_daemon_s_check_with_the_running_options(
     assert cli._options_of({"options": ["--hold-wakes"]}) == ["--hold-wakes"]  # pyright: ignore[reportPrivateUsage]
 
 
+def test_the_daemon_gives_its_interpreter_and_start_variables_on_the_client_socket(
+    world: World, paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 14, item 6. The successor runs on the daemon's interpreter with the
+    daemon's environment, so the preflight asks for both."""
+    target = make_daemon(world, paths)
+    monkeypatch.setenv(REGISTRY_DIR_ENV, "/elsewhere/registry")
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    response = target.respond(encode_request(Request("c", Operation.START_CONTEXT, {})))
+    assert response.ok and response.result is not None
+    assert response.result == {
+        "interpreter": sys.executable,
+        "environment": {REGISTRY_DIR_ENV: "/elsewhere/registry", "SSH_AUTH_SOCK": None},
+    }
+    refused = target.respond(
+        encode_request(Request("d", Operation.START_CONTEXT, {"extra": "x"}))
+    )
+    assert not refused.ok
+    # Neither the status nor any agent tool carries it.
+    status = target.status()
+    assert "interpreter" not in status and "environment" not in status
+
+
+def test_the_preflight_takes_the_daemon_s_interpreter_and_variables(
+    paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = cli._start_context(  # pyright: ignore[reportPrivateUsage]
+        {
+            "interpreter": "/opt/daemon/bin/python",
+            "environment": {
+                REGISTRY_DIR_ENV: "/daemon/registry",
+                "SSH_AUTH_SOCK": None,
+            },
+        }
+    )
+    assert context is not None
+    argv = cli._preflight_argv(paths, [], context.interpreter)  # pyright: ignore[reportPrivateUsage]
+    assert argv[0] == "/opt/daemon/bin/python"
+    monkeypatch.setenv(REGISTRY_DIR_ENV, "/client/registry")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/client/agent.sock")
+    monkeypatch.setenv("KEPT", "yes")
+    environment = cli._preflight_environment(context)  # pyright: ignore[reportPrivateUsage]
+    assert environment[REGISTRY_DIR_ENV] == "/daemon/registry"
+    assert "SSH_AUTH_SOCK" not in environment
+    assert environment["KEPT"] == "yes"
+    assert cli._preflight_environment(None)["SSH_AUTH_SOCK"] == "/client/agent.sock"  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"interpreter": "python", "environment": {}},
+        {"interpreter": 3, "environment": {}},
+        {"interpreter": "/bin/python", "environment": []},
+        {"interpreter": "/bin/python", "environment": {"PATH": "/evil"}},
+        {"interpreter": "/bin/python", "environment": {REGISTRY_DIR_ENV: 3}},
+        {},
+    ],
+)
+def test_a_start_context_in_another_form_is_not_used(result: dict[str, object]) -> None:
+    assert cli._start_context(result) is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_the_preflight_runs_with_the_environment_given() -> None:
+    probe = (
+        sys.executable,
+        "-c",
+        "import os, sys; sys.exit(0 if os.environ.get('ONLY') == 'given' else 4)",
+    )
+    assert cli._preflight(probe, None, {"ONLY": "given"}) is None  # pyright: ignore[reportPrivateUsage]
+    assert cli._preflight(probe, None, {"ONLY": "other"}) == "status 4: no output"  # pyright: ignore[reportPrivateUsage]
+
+
+def test_an_older_daemon_without_start_context_leaves_the_client_s_own(
+    paths: ProjectPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def older(
+        socket: Path, operation: Operation, args: dict[str, object] | None = None
+    ) -> Response:
+        del socket, args
+        assert operation is Operation.START_CONTEXT
+        return Response(
+            "r",
+            ok=False,
+            error_code=ErrorCode.UNKNOWN_OPERATION,
+            error_message="unknown operation start_context",
+        )
+
+    monkeypatch.setattr(cli, "call", older)
+    assert cli._ask_start_context(paths, "restart") is None  # pyright: ignore[reportPrivateUsage]
+    assert "does not say its interpreter and start environment" in (
+        capsys.readouterr().out
+    )
+
+
 def test_the_preflight_quotes_the_daemon_s_own_refusal() -> None:
     noisy = (
         sys.executable,
@@ -1384,7 +1534,7 @@ def test_a_restart_the_preflight_refuses_leaves_the_old_daemon_serving(
     err = capsys.readouterr().err
     assert "the installed daemon refuses to start, so the running one was not" in err
     assert "dromond: line alpha runs claude-haiku-5-5" in err
-    assert sent == [Operation.STATUS]
+    assert sent == [Operation.STATUS, Operation.START_CONTEXT]
     assert live.scheduler.restart_status() is None
     assert not target.stop_requested.is_set()
     still = target.respond(encode_request(Request("again", Operation.STATUS, {})))
@@ -1416,6 +1566,6 @@ def test_a_restart_the_preflight_passes_goes_on_to_the_successor(
         return code
 
     assert asyncio.run(go()) == exits.OK
-    assert sent[:2] == [Operation.STATUS, Operation.RESTART]
+    assert sent[:3] == [Operation.STATUS, Operation.START_CONTEXT, Operation.RESTART]
     assert "restarted, pid 4242" in capsys.readouterr().out
     assert "gamma" not in replay(paths.event_log).lines

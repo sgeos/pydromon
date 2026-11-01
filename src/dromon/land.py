@@ -65,15 +65,20 @@ terminal, is answered no.
   pushed and no pull request.
 - Every command is run with an argument vector, never a shell. Paths are passed to
   git with ``--literal-pathspecs`` so a name with glob characters names only itself.
+- A command's start is bounded apart from its run, since a start once stalled for
+  five minutes on macOS, as ``CommandStart`` records. A stalled start fails the step
+  with status 125 and says so.
 
 Porting note. The command is a fixed sequence of external processes, each judged by
 its exit status and its output, so it maps onto a state machine over a process runner.
 The runner is injected, which is how the tests avoid a real remote.
 """
 
+import contextlib
 import re
 import subprocess
 import sys
+import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,6 +93,9 @@ after case folding."""
 
 DEFAULT_BASE: Final = "main"
 DEFAULT_REMOTE: Final = "origin"
+
+LOCK_FILE: Final = "uv.lock"
+"""The lock file whose change makes every other worktree's environment stale."""
 
 GATE: Final = ("./scripts/check.sh",)
 """The full gate, as continuous integration and the pre-push hook run it."""
@@ -163,6 +171,113 @@ class Runner(Protocol):
     ) -> Completed: ...
 
 
+START_SECONDS: Final = 30.0
+"""How long a command may take to start, before its program runs. A start takes
+milliseconds, so this is far above any start on a loaded host, and far below the five
+minutes after which pytest's faulthandler ends the whole test run."""
+
+STALLED: Final = 125
+"""The status ``run_command`` gives a command whose start did not end within its
+bound, apart from 124 for one that started and did not finish, and 127 for one that
+cannot be run."""
+
+_Started = subprocess.Popen[str] | Exception
+
+
+class CommandStart:
+    """Starts one command on a thread of its own, so that a start that stalls stalls
+    that thread and not its caller. **Found on 2026-11-01.** A land test hung for five
+    minutes in ``subprocess``'s ``_execute_child`` on macOS with Python 3.15 in
+    continuous integration, and passed on a re-run, as ``/bin/ps`` had on 2026-10-29.
+
+    **Facts.** A command given a working directory starts by fork on macOS, never by
+    ``posix_spawn``, and the parent then reads a pipe whose write end closes when the
+    child runs its program, with no bound, before the command's own timeout applies.
+    The read ends only once every copy of that write end is closed. Python 3.15 on
+    macOS has no ``pipe2``, so ``os.pipe`` marks the pipe close-on-exec in a second
+    step, after the call that made it, which releases the interpreter lock.
+
+    **Hypotheses, neither confirmed.** One, another thread's spawn that closes no
+    inherited descriptors, as ``os.posix_spawn`` in ``client.start_daemon`` does,
+    forked between those two steps, and its long-lived child kept the write end.
+    Two, the child stalled before its program ran, as in ``execve`` on a loaded
+    runner, which would fit ``/bin/ps`` too. A traceback of every thread at the hang
+    would tell the two apart, since the first needs a second thread that spawns.
+
+    **The bound.** The caller waits ``START_SECONDS`` for the start, and otherwise
+    returns ``STALLED`` naming the stall. The thread is a daemon thread, so it never
+    holds the interpreter open, and it kills and reaps the command itself should the
+    start end later, so nothing the caller gave up on runs on. The lock makes the
+    hand-over exact. Either the caller takes the started command, or it gives up
+    first and the thread then sees that. **Residual.** A start that never ends keeps
+    one blocked thread and its pipe until the process exits. **Porting note.** A
+    port that spawns with ``posix_spawn`` and a working-directory file action, or
+    reports exec failure another way, has no such read to bound."""
+
+    def __init__(
+        self,
+        argv: Sequence[str],
+        cwd: Path,
+        *,
+        piped_input: bool,
+        stream: bool,
+        env: Mapping[str, str] | None,
+    ) -> None:
+        self._argv = list(argv)
+        self._cwd = cwd
+        self._piped_input = piped_input
+        self._stream = stream
+        self._env = None if env is None else dict(env)
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._started: _Started | None = None
+        self._abandoned = False
+
+    def run(self) -> None:
+        """The thread's body. It never raises, so no exception escapes a thread."""
+        started: _Started
+        try:
+            started = subprocess.Popen(  # noqa: S603
+                self._argv,
+                cwd=self._cwd,
+                env=self._env,
+                stdin=subprocess.PIPE if self._piped_input else None,
+                stdout=None if self._stream else subprocess.PIPE,
+                stderr=None if self._stream else subprocess.PIPE,
+                text=True,
+                errors="surrogateescape",
+            )
+        except Exception as error:
+            started = error
+        with self._lock:
+            self._started = started
+            abandoned = self._abandoned
+        self._done.set()
+        if abandoned and isinstance(started, subprocess.Popen):
+            _reap(started)
+
+    def wait(self, seconds: float) -> _Started | None:
+        """The started command, or what its start raised, or ``None`` when the start
+        did not end within ``seconds``, after which the thread owns the command."""
+        self._done.wait(seconds)
+        with self._lock:
+            if self._started is None:
+                self._abandoned = True
+            return self._started
+
+
+def _reap(process: subprocess.Popen[str]) -> None:
+    """Kill and reap a command whose caller gave up on its start, and close its
+    pipes, without reading them, since a descendant could hold them open."""
+    with contextlib.suppress(OSError):
+        process.kill()
+    process.wait()
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            with contextlib.suppress(OSError):
+                stream.close()
+
+
 def run_command(
     argv: Sequence[str],
     cwd: Path,
@@ -170,25 +285,44 @@ def run_command(
     *,
     stream: bool = False,
     timeout: float = GIT_SECONDS,
+    env: Mapping[str, str] | None = None,
+    start_seconds: float = START_SECONDS,
 ) -> Completed:
-    """The real runner. A timeout or a command that cannot start is reported as a
-    failed command, so every step judges one ``Completed``."""
-    try:
-        done = subprocess.run(  # noqa: S603
-            list(argv),
-            cwd=cwd,
-            input=stdin,
-            capture_output=not stream,
-            text=True,
-            errors="surrogateescape",
-            timeout=timeout,
-            check=False,
+    """The real runner. A timeout, a start that stalls, as ``CommandStart`` says, and a
+    command that cannot start are each reported as a failed command, so every step
+    judges one ``Completed``. ``env``, when given, is the command's whole
+    environment, which ``dromon sync-worktrees`` sets. It does what
+    ``subprocess.run`` does, with the start bounded apart. Raises ``ValueError`` for
+    a start bound that is not above 0."""
+    if not start_seconds > 0:
+        raise ValueError(f"the start bound must be above 0, not {start_seconds:g}")
+    start = CommandStart(
+        argv, cwd, piped_input=stdin is not None, stream=stream, env=env
+    )
+    threading.Thread(target=start.run, name="dromon command start", daemon=True).start()
+    started = start.wait(start_seconds)
+    if started is None:
+        return Completed(
+            STALLED,
+            "",
+            f"{argv[0]} did not start within {start_seconds:g}s, as its start"
+            " stalled before the command ran. It is killed if it starts later.",
         )
-    except subprocess.TimeoutExpired:
-        return Completed(124, "", f"{argv[0]} did not finish within {timeout:g}s")
-    except OSError as error:
-        return Completed(127, "", f"{argv[0]} cannot be run: {error}")
-    return Completed(done.returncode, done.stdout or "", done.stderr or "")
+    if isinstance(started, OSError):
+        return Completed(127, "", f"{argv[0]} cannot be run: {started}")
+    if isinstance(started, Exception):
+        raise started
+    with started as process:
+        try:
+            stdout, stderr = process.communicate(stdin, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            return Completed(124, "", f"{argv[0]} did not finish within {timeout:g}s")
+        except BaseException:
+            process.kill()
+            raise
+    return Completed(process.returncode, stdout or "", stderr or "")
 
 
 def ask_terminal(question: str) -> bool:
@@ -239,6 +373,9 @@ class Plan:
     gate_changed: tuple[str, ...] = ()
     """Paths under ``scripts/`` the branch changes against ``fork``, which hold the
     gate and the hooks that land runs as the operator."""
+    lock_changed: bool = False
+    """Whether the branch changes ``uv.lock``, so that every other worktree's
+    environment goes stale once it merges. Round 14, item 3."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,6 +530,7 @@ class Lander:
             frozenset(carried),
             fork,
             () if fork is None else self._gate_changes(fork, changes),
+            fork is not None and LOCK_FILE in self._changed(fork, changes),
         )
 
     def _fork(self, remote_base: str) -> str | None:
@@ -410,12 +548,18 @@ class Lander:
         )
         return done.code == 0
 
-    def _gate_changes(self, fork: str, changes: Sequence[Change]) -> tuple[str, ...]:
-        """The paths under ``scripts/`` that differ from ``fork`` in the commits or
-        the working tree, or that are new. Audit's finding L5."""
+    def _changed(self, fork: str, changes: Sequence[Change]) -> frozenset[str]:
+        """The paths that differ from ``fork`` in the commits or the working tree,
+        or that are new."""
         listed = self.git("diff", "--name-only", "-z", "--no-renames", fork)
         names = {name for name in listed.split("\0") if name}
         names |= {change.path for change in changes}
+        return frozenset(names)
+
+    def _gate_changes(self, fork: str, changes: Sequence[Change]) -> tuple[str, ...]:
+        """The paths under ``scripts/`` that differ from ``fork``. Audit's finding
+        L5."""
+        names = self._changed(fork, changes)
         return tuple(sorted(n for n in names if n.casefold().startswith("scripts/")))
 
     def load_lists(self) -> None:
@@ -768,6 +912,12 @@ def describe(plan: Plan, request: Request) -> str:
         " sandbox, which is all of the branch's code they reach: scripts/check.sh,"
         " the tests, conftest.py, pyproject.toml and uv.lock"
     )
+    if plan.lock_changed:
+        lines.append(
+            "  warning: the branch changes uv.lock, so once it merges every role's"
+            " worktree needs dromon sync-worktrees, since lines cannot sync without"
+            " the network"
+        )
     if plan.gate_changed:
         lines.append(
             f"  the branch changes {len(plan.gate_changed)} paths under scripts/,"

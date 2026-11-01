@@ -448,6 +448,23 @@ def test_a_change_to_the_gate_is_asked_about_even_with_yes(
     assert staged(repo) == ""
 
 
+def test_a_branch_that_changes_the_lock_file_is_warned_about(
+    repo: Path, terms: Path
+) -> None:
+    """Round 14, item 3. A line cannot sync its environment without the network,
+    so a merged change to ``uv.lock`` leaves every other worktree stale."""
+    write(repo, "uv.lock", "version = 1\n")
+    said = Said()
+    assert lander(repo, said, terms_files=(terms,), dry_run=True).land() == exits.OK
+    assert "warning: the branch changes uv.lock" in "\n".join(said.out)
+    write(repo, "src/a.py", "changed\n")
+    (repo / "uv.lock").unlink()
+    said = Said()
+    assert lander(repo, said, terms_files=(terms,), dry_run=True).land() == exits.OK
+    plan = "\n".join(said.out).replace("pyproject.toml and uv.lock", "")
+    assert "warning: the branch changes uv.lock" not in plan
+
+
 def test_the_plan_always_says_whose_gate_runs(repo: Path, terms: Path) -> None:
     write(repo, "src/a.py", "changed\n")
     said = Said()
