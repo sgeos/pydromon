@@ -15,3 +15,6 @@ Type: Fixed
   or output against the disclosure list, which answered the line, outside the counted
   checks, whether a string it chose was listed. `role_status` shows a line its own
   record as recorded and every other seat's record screened.
+- `stop_process` reads the line's mark a second time after its second listing, so a
+  pid reused by a process with the same parent and command, which no listing tells
+  apart, is refused unless it carries the mark.

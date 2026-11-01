@@ -301,6 +301,33 @@ def test_a_pid_given_to_another_process_after_the_mark_was_read_is_not_signalled
     assert reusing.sent == []
 
 
+class _Unmarked(FakeTable):
+    """A table whose pid 2001 is given, with the same parent and command and a later
+    elapsed time, to a process that carries no mark, once the second listing is read."""
+
+    def __init__(self, base: FakeTable) -> None:
+        super().__init__(base.rows, base.envs)
+        self.listings = 0
+
+    def own_processes(self) -> Sequence[ProcessInfo]:
+        self.listings += 1
+        return self.rows
+
+    def has_variable(self, pid: int, assignment: str) -> bool:
+        if self.listings >= 2:
+            return False
+        return super().has_variable(pid, assignment)
+
+
+def test_a_process_without_the_mark_at_the_second_check_is_not_signalled(
+    table: FakeTable,
+) -> None:
+    unmarked = _Unmarked(table)
+    with pytest.raises(ProcessRefused, match="no longer carries the line's mark"):
+        stop_line_process(unmarked, MARK, DAEMON, 2001, False)
+    assert unmarked.listings == 2 and unmarked.sent == []
+
+
 def test_a_process_that_only_grew_older_is_still_signalled(table: FakeTable) -> None:
     older = ProcessInfo(2001, 1001, "02:03", "uv run pytest " + "x" * 300)
     reusing = _Reusing(table, older)

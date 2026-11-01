@@ -698,12 +698,13 @@ def stop_line_process(
     signal follows, so a process that ended between the two could have its pid given
     to another, which the signal would then reach. The listing is therefore read
     again after the mark, and the signal is sent only if the process is still the one
-    first seen, by parent, command and an elapsed time that has not gone back.
-    **Residual.** The two reads and the signal are not one step, and no process
-    handle exists on this platform, so a pid reused within the same second by a
-    process with the same parent and command is not told apart, and one reused after
-    the second listing and before the signal is not seen at all. The window that
-    remains is the time between the second listing and the signal, which is
+    first seen, by parent, command and an elapsed time that has not gone back. The
+    mark is then read a second time, so a pid reused within the same second by a
+    process with the same parent and command is still refused unless it carries the
+    line's mark, which no other process has. **Residual.** The reads and the signal
+    are not one step, and no process handle exists on this platform, so a pid reused
+    after the second read of the mark and before the signal is not seen at all. The
+    window that remains is the time between that read and the signal, which is
     microseconds and not the listing's seconds."""
     if type(pid) is not int or pid <= 1:
         raise ProcessRefused("pid must be a whole number above 1")
@@ -719,6 +720,10 @@ def stop_line_process(
     if not _same_process(process, next((p for p in again if p.pid == pid), None)):
         raise ProcessRefused(
             f"process {pid} changed while it was checked, so it was not signalled"
+        )
+    if not table.has_variable(pid, f"{MARK_VARIABLE}={mark}"):
+        raise ProcessRefused(
+            f"process {pid} no longer carries the line's mark, so it was not signalled"
         )
     chosen = signal.SIGKILL if force else signal.SIGTERM
     try:

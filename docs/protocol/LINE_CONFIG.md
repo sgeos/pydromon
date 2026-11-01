@@ -556,10 +556,12 @@ tools do the same for a line.
   **Reuse of a pid, review of 2026-11-01.** The listing is read again after the mark,
   and the signal is sent only if the process is still the one first seen, by parent,
   command and an elapsed time that has not gone back. Otherwise the stop is refused as
-  `changed while it was checked`. **Residual.** No process handle exists on this
-  platform, so a pid reused within the same second by a process with the same parent
-  and command is not told apart, and the window between the second listing and the
-  signal remains, which is microseconds and not the listing's seconds.
+  `changed while it was checked`. The line's mark is then read a second time, so a
+  pid reused within the same second by a process with the same parent and command is
+  still refused unless it carries the mark, which only the line's own processes have.
+  **Residual.** No process handle exists on this platform, so the window between that
+  second read and the signal remains, which is microseconds and not the listing's
+  seconds.
 - **Process workers.** Process inspections, launch-record sweeps, worktree status and
   the kill-all pre-turn walk use separate worker threads, each with at most eight queued calls behind its active call. Sweeps wait for
   signalled processes, so isolating them keeps a long sweep from occupying the inspection
