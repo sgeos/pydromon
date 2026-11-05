@@ -67,6 +67,7 @@ from dromon.processes import TreeRow, attached, deepest_first, signal_if_same
 from dromon.model import (
     MAX_EXIT_CODE,
     MAX_RUN_NOTE_BYTES,
+    MAX_RUN_TAIL_BYTES,
     ID_PATTERN,
     Run,
     RunStarted,
@@ -142,6 +143,9 @@ class Finding:
     summary: str | None = None
     """The test summary the output ends with, as ``gate_summary`` reads it, or
     ``None`` when it holds none. Round 14, item 2."""
+    tail: str | None = None
+    """The last lines of a failed run's output, as ``failure_tail`` cuts them, or
+    ``None`` for a run that passed or was lost. Task of 2026-11-05, item 2."""
 
 
 @dataclass(slots=True)
@@ -345,6 +349,77 @@ def note_with_summary(note: str, summary: str | None) -> str:
     lead = f"{note}. " if note else ""
     text = f'{lead}{SUMMARY_LABEL} "{summary}"'
     return text.encode()[:MAX_RUN_NOTE_BYTES].decode("utf-8", "ignore")
+
+
+OUTPUT_WITHHELD: Final = (
+    "The output's test summary and last lines are withheld from this record, since"
+    " they hold a term from the project's disclosure list. The output file is"
+    " unchanged"
+)
+"""What a run's end says in place of its summary and tail when either holds a listed
+term. **Round 15 review, R1.** Both come from the command's output and would enter
+the event log and every copy of it in clear, so they are screened before the end is
+recorded, as a line's own text is, and dropped whole when either matches."""
+
+OUTPUT_WITHHELD_SPENT: Final = (
+    "The output's test summary and last lines are withheld from this record, since"
+    " the line that started it has spent its disclosure checks. The output file is"
+    " unchanged"
+)
+"""What a run's end says in place of its summary and tail, whatever they hold, when
+the line that started it has no failing disclosure check left. **Round 15 review,
+R1.** Whether a tail was withheld says whether the output held a term, which is the
+answer the check limits, so a line that has spent them learns nothing from it."""
+
+
+def note_withheld(note: str, reason: str) -> str:
+    """The run's note with the reason its summary and tail are withheld after it."""
+    lead = f"{note}. " if note else ""
+    return f"{lead}{reason}".encode()[:MAX_RUN_NOTE_BYTES].decode("utf-8", "ignore")
+
+
+MAX_TAIL_LINES: Final = 20
+"""The most lines of a failed run's output its end keeps. **Task of 2026-11-05, item
+2.**"""
+
+TAIL_LABEL: Final = (
+    "Untrusted, the last lines of the run's own output, which the command wrote"
+)
+"""How a failed run's tail is introduced wherever it is shown, since the output is
+the line's to write and may say anything, an instruction included."""
+
+
+def _tail_line(raw: str) -> str:
+    """One line of output without characters that are not printable and without
+    trailing space, cut to ``MAX_SUMMARY_LINE``. Leading space is kept, so a
+    traceback keeps its shape."""
+    return "".join(c for c in raw if c.isprintable()).rstrip()[:MAX_SUMMARY_LINE]
+
+
+def failure_tail(tail: bytes) -> str | None:
+    """The last ``MAX_TAIL_LINES`` lines of ``tail`` that are not blank, each as
+    ``_tail_line`` cuts it, joined by newlines and cut from the front to at most
+    ``MAX_RUN_TAIL_BYTES`` at a line boundary, or ``None`` when no line is left.
+    **Task of 2026-11-05, item 2.** A failed run keeps its reason in its end, so a
+    line or an operator can see why it failed after its output file is gone or
+    rewritten. The bound is on lines and on bytes, since one long line could fill
+    either."""
+    lines = [
+        line
+        for raw in tail.decode("utf-8", "replace").splitlines()
+        if (line := _tail_line(raw))
+    ][-MAX_TAIL_LINES:]
+    # Each step drops one line, so the loop ends within MAX_TAIL_LINES steps.
+    for _ in range(MAX_TAIL_LINES):
+        if not lines or len("\n".join(lines).encode()) <= MAX_RUN_TAIL_BYTES:
+            break
+        lines = lines[1:]
+    if not lines:
+        return None
+    text = "\n".join(lines)
+    # A single line over the bound cannot happen, since MAX_SUMMARY_LINE characters
+    # of at most four bytes each are within it, but the cut keeps the bound total.
+    return text.encode()[-MAX_RUN_TAIL_BYTES:].decode("utf-8", "ignore") or None
 
 
 def failed(run: Run) -> bool:
@@ -723,6 +798,7 @@ def reconcile(
                     Finding(run.run_id, RunStatus.LOST, None, note, *_digest(run), None)
                 )
                 continue
+        passed = receipt.status is RunStatus.EXITED and receipt.exit_code == 0
         found.append(
             Finding(
                 run.run_id,
@@ -730,7 +806,7 @@ def reconcile(
                 receipt.exit_code,
                 receipt.note,
                 *_digest(run),
-                _summary(run),
+                *_results(run, passed),
             )
         )
     return found
@@ -740,9 +816,13 @@ def _digest(run: RunStarted) -> tuple[str | None, int | None]:
     return output_digest(Path(run.workdir), run.output_file)
 
 
-def _summary(run: RunStarted) -> str | None:
+def _results(run: RunStarted, passed: bool) -> tuple[str | None, str | None]:
+    """The test summary the run's output ends with, and, for a run that did not
+    pass, its output's tail, from one read of the output's end."""
     tail = output_tail(Path(run.workdir), run.output_file)
-    return None if tail is None else gate_summary(tail)
+    if tail is None:
+        return None, None
+    return gate_summary(tail), None if passed else failure_tail(tail)
 
 
 def signal_run(

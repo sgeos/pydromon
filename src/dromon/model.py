@@ -949,14 +949,47 @@ class LineTurnEnded:
 
 
 MAX_DISCLOSURE_CHECKS: Final = 10
-"""The most ``check_disclosure`` calls one line may make within
-``DISCLOSURE_CHECK_WINDOW_SECONDS``, and the most check times the state keeps for a
-line. **Proposed for item B2 of 2026-10-28.** Each pass or fail answer says whether a
+"""The most failing ``check_disclosure`` calls and disclosure refusals one line may
+have within ``DISCLOSURE_CHECK_WINDOW_SECONDS``, and the most failure times the state
+keeps for a line. **Proposed for item B2 of 2026-10-28.** Each answer says whether a
 text holds a listed term, so an unbounded tool would let a line test candidate words
-one by one and recover the list."""
+one by one and recover the list. **Task of 2026-11-05, item 1, the operator's
+decision.** A check that passes spends nothing of this limit, which so bounds the
+terms a line can confirm an hour. **Round 15 review, D1, the operator's decision.**
+Passes alone were then free, which let a line try candidates without bound, so
+``MAX_DISCLOSURE_PASSES`` and ``MAX_DISCLOSURE_BYTES`` bound them. The disclosure
+guard is against accidents and not against a line that tries to evade it, as
+``dromon.disclosure`` says."""
+
+MAX_DISCLOSURE_PASSES: Final = 60
+"""The most passing ``check_disclosure`` calls one line may have within
+``DISCLOSURE_CHECK_WINDOW_SECONDS``, and the most pass times the state keeps for a
+line. **Round 15 review, D1, the operator's decision.** The audit measured about 1,300
+free passes of 16 MiB an hour on one daemon, about 130 times the candidates ten
+counted checks allowed, which put a short term within reach of a few failures. This
+limit bounds the candidate texts a line may try an hour. It counts the
+``check_disclosure`` tool and, since the round 15 re-review, each ``write_scratch``
+whose text the list screens, since the audit screened 100 texts of 256 KiB in two
+seconds through it for nothing. Another tool's text that passes the screen is still
+free, as it always was, and each such text is at most what that tool accepts, which
+for a note or a brief is far less than a scratch file."""
+
+MAX_DISCLOSURE_BYTES: Final = 64 * 1024 * 1024
+"""The most bytes one line's ``check_disclosure`` calls and screened ``write_scratch``
+texts may read and match within ``DISCLOSURE_CHECK_WINDOW_SECONDS``, passes and
+failures together. **Round 15 review,
+D1.** It bounds the candidate bytes a line may test an hour, at less than the 160 MiB
+that ten counted checks of 16 MiB allowed before passes were free, and the daemon's
+time spent matching for one line. A check whose content would cross it is refused by
+its size before it is read."""
+
+MAX_DISCLOSURE_SIZES: Final = MAX_DISCLOSURE_CHECKS + MAX_DISCLOSURE_PASSES
+"""The most checked sizes the state keeps for a line. A window holds at most this many
+checks, since any further one is refused, so the byte total of the window is exact."""
 
 DISCLOSURE_CHECK_WINDOW_SECONDS: Final = 3600
-"""The window ``MAX_DISCLOSURE_CHECKS`` applies to."""
+"""The window ``MAX_DISCLOSURE_CHECKS``, ``MAX_DISCLOSURE_PASSES`` and
+``MAX_DISCLOSURE_BYTES`` apply to."""
 
 MAX_DISCLOSURE_MATCHES: Final = 1_000_000
 """The largest count of matching lines one ``disclosure_checked`` records."""
@@ -970,11 +1003,20 @@ class DisclosureChecked:
     counts as a check. Neither the text, its name nor any term is recorded.
     **Item B2 of 2026-10-28.** The
     record makes the rate limit survive a restart of the daemon, and shows an
-    operator how often each line asked."""
+    operator how often each line asked.
+
+    **Round 15 review, D1.** ``checked_bytes`` is how many bytes a
+    ``check_disclosure`` call read and matched, so the hourly ceiling on bytes survives
+    a restart too. It is null for a tool's refusal and in a record from before the
+    field, which count as no bytes. **Round 15 re-review.** A ``write_scratch``
+    screening records its bytes too, both when the text passes and when it is
+    refused. **Rollback hazard.** A daemon from before the field
+    refuses a log that holds it, as ``docs/protocol/EVENT_LOG.md`` records."""
 
     line_id: str
     checked_at: str
     matched_lines: int
+    checked_bytes: int | None = None
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
@@ -984,6 +1026,14 @@ class DisclosureChecked:
             raise InvalidField(
                 f"matched_lines must be a whole number from 0 to"
                 f" {MAX_DISCLOSURE_MATCHES}"
+            )
+        size = self.checked_bytes
+        if size is not None and (
+            type(size) is not int or not 0 <= size <= MAX_DISCLOSURE_BYTES
+        ):
+            raise InvalidField(
+                f"checked_bytes must be null or a whole number from 0 to"
+                f" {MAX_DISCLOSURE_BYTES}"
             )
 
 
@@ -2202,6 +2252,11 @@ MAX_RUN_ARGUMENTS: Final = 64
 MAX_RUN_ARGUMENT_BYTES: Final = 1024
 MAX_RUN_NOTE_BYTES: Final = 1024
 
+MAX_RUN_TAIL_BYTES: Final = 2048
+"""The most bytes of a failed run's output tail that ``run_ended`` keeps. **Task of
+2026-11-05, item 2.** Enough for a traceback's last frames or a gate's failing step,
+and small enough that a run that fails often does not swell the log."""
+
 
 class RunStatus(StrEnum):
     """How a supervised run ended. ``exited`` and ``stopped`` come from the receipt
@@ -2288,7 +2343,13 @@ class RunStarted:
 class RunEnded:
     """A supervised run ended, with its supervisor's receipt where one was found,
     the SHA-256 digest and size of its output file where the daemon could read it,
-    and a note on what was found. **Task of 2026-10-31.**"""
+    and a note on what was found. **Task of 2026-10-31.**
+
+    **Task of 2026-11-05, item 2.** ``output_tail`` is the last lines of a failed
+    run's output, as ``runs.failure_tail`` cuts them, so a failure keeps its reason
+    once the output file is gone or rewritten. It is the command's own output, which
+    a writing line can shape, so it is untrusted data wherever it is shown. Null for
+    a run that passed, for a lost run, and where the output could not be read."""
 
     run_id: str
     status: RunStatus
@@ -2297,9 +2358,19 @@ class RunEnded:
     output_bytes: int | None
     note: str
     ended_at: str
+    output_tail: str | None = None
 
     def __post_init__(self) -> None:
         check_id("run_id", self.run_id)
+        if self.output_tail is not None:
+            check_text("output_tail", self.output_tail, MAX_RUN_TAIL_BYTES)
+            if any(
+                not character.isprintable() and character != "\n"
+                for character in self.output_tail
+            ):
+                raise InvalidField(
+                    "output_tail holds only printable characters and newlines"
+                )
         check_member("status", self.status, RunStatus)
         code = self.exit_code
         if code is not None and (
@@ -2816,8 +2887,20 @@ class State:
     disclosure_checks: dict[str, tuple[str, ...]] = field(
         default_factory=dict[str, tuple[str, ...]]
     )
-    """When each line last checked a text against the disclosure list, oldest first,
-    at most ``MAX_DISCLOSURE_CHECKS`` times per line, for the rate limit."""
+    """When each line's checks against the disclosure list failed, or a tool refused
+    its text, oldest first, at most ``MAX_DISCLOSURE_CHECKS`` times per line, for the
+    rate limit."""
+    disclosure_passes: dict[str, tuple[str, ...]] = field(
+        default_factory=dict[str, tuple[str, ...]]
+    )
+    """When each line's ``check_disclosure`` calls passed, oldest first, at most
+    ``MAX_DISCLOSURE_PASSES`` times per line. **Round 15 review, D1.**"""
+    disclosure_sizes: dict[str, tuple[tuple[str, int], ...]] = field(
+        default_factory=dict[str, tuple[tuple[str, int], ...]]
+    )
+    """When each line's ``check_disclosure`` calls ran and how many bytes each read,
+    oldest first, at most ``MAX_DISCLOSURE_SIZES`` per line. **Round 15 review,
+    D1.**"""
     task_records: dict[str, tuple[TaskRecorded, ...]] = field(
         default_factory=dict[str, tuple[TaskRecorded, ...]]
     )
@@ -2981,6 +3064,8 @@ class State:
             dict(self.waiting_for),
             dict(self.correlations),
             dict(self.disclosure_checks),
+            dict(self.disclosure_passes),
+            dict(self.disclosure_sizes),
             dict(self.task_records),
             dict(self.last_turn_commits),
             dict(self.turn_start_counts),
@@ -3453,10 +3538,31 @@ class State:
                 records = self.task_records.get(event.line_id, ())
                 self.task_records[event.line_id] = (*records, event)[-MAX_TASK_RECORDS:]
             case DisclosureChecked():
-                times = self.disclosure_checks.get(event.line_id, ())
-                self.disclosure_checks[event.line_id] = (*times, event.checked_at)[
-                    -MAX_DISCLOSURE_CHECKS:
-                ]
+                # Task of 2026-11-05, item 1. Only a failure counts against the
+                # limit, so a check that passed is recorded and keeps no time here. A
+                # log from before that task replays with its passes no longer
+                # counted, which only widens the window. Round 15 review, D1. A pass
+                # now keeps its time under its own limit, and a check that read bytes
+                # keeps their count. A log from before the field has no sizes, which
+                # only widens the byte window.
+                if event.matched_lines > 0:
+                    times = self.disclosure_checks.get(event.line_id, ())
+                    self.disclosure_checks[event.line_id] = (
+                        *times,
+                        event.checked_at,
+                    )[-MAX_DISCLOSURE_CHECKS:]
+                else:
+                    passes = self.disclosure_passes.get(event.line_id, ())
+                    self.disclosure_passes[event.line_id] = (
+                        *passes,
+                        event.checked_at,
+                    )[-MAX_DISCLOSURE_PASSES:]
+                if event.checked_bytes is not None:
+                    sizes = self.disclosure_sizes.get(event.line_id, ())
+                    self.disclosure_sizes[event.line_id] = (
+                        *sizes,
+                        (event.checked_at, event.checked_bytes),
+                    )[-MAX_DISCLOSURE_SIZES:]
             case WakeRequested():
                 self.wakes[event.wake_id] = Wake(
                     event.line_id, event.message_id, issued=False

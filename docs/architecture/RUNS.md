@@ -23,10 +23,83 @@ device = ["./scripts/device-run.sh"]
 ```
 
 Each command is an array, its program and its arguments, never a shell string. A line
-passes no arguments, so a name runs exactly what the operator wrote. **Decided.** Free
-arguments, a working directory of the line's choosing and an environment of the line's
-choosing are left out, because each widens what a line can make the daemon run, and no
-case needs them yet.
+passes no arguments, except the parameters the next section describes, so a name runs
+exactly what the operator wrote. **Decided.** Free arguments, a working directory of
+the line's choosing and an environment of the line's choosing are left out, because
+each widens what a line can make the daemon run.
+
+### Parameters a line supplies
+
+**Task of 2026-11-05, item 3.** A line sometimes needs to rerun one suspect test
+outside its sandbox, such as one that needs `ps` or a socket. A declared command may
+therefore name parameters, each with a pattern the operator writes.
+
+```toml
+[runs.commands]
+one_test = ["uv", "run", "pytest", "{test}", "-q"]
+
+[runs.parameters.one_test.test]
+pattern = 'tests/[a-z0-9_]+\.py'
+description = "one test file under tests"
+```
+
+An argument that is exactly `{NAME}`, a lowercase name of at most 32 characters, is a
+placeholder. Each placeholder must be declared under `[runs.parameters.COMMAND.NAME]`
+and each declaration must have its placeholder, so a literal `{name}` is never left to
+chance, the program itself may not be one, a placeholder appears at most once, and a
+command has at most eight. `start_run` then takes `arguments`, an object giving a text
+value for every parameter of the command and for no other, and a command without
+parameters refuses any. `run_status` lists each parameter with its pattern.
+
+**The trust argument.** A run executes with the daemon's authority outside every
+sandbox, so a parameter is a channel from a line into an unsandboxed command. It is
+kept narrow by these rules, each of which a test checks.
+
+- **The operator chooses the place.** A value replaces exactly one whole argument the
+  operator placed. It is never joined to other text, split, expanded, globbed or given
+  to a shell, so it cannot add an argument, change the program or reach a shell.
+- **The operator chooses the shape.** The value must match the declared pattern in
+  full, with Python's `re.fullmatch`. A pattern of `tests/[a-z0-9_]+\.py` admits no
+  `..`, no slash outside `tests/`, no space and no other suffix.
+- **Rules the operator cannot widen.** A value is 1 to 256 bytes, holds only printable
+  characters, and never begins with `-`, so it is never read as an option, such as
+  `--rootdir` or `-p` for pytest, whatever the pattern admits. **Round 15 review,
+  P2.** Nor may it begin with `/` or hold a `..` step between slashes, so a value
+  never names a path outside the working directory by itself. The audit's
+  `tests/[A-Za-z0-9_./]+` admitted `tests/../../etc/passwd`, which is now refused
+  before the pattern is matched. A name such as `a..b` is no step and is accepted.
+- **A pattern cannot hold the daemon.** **Round 15 review, P1.** Python's `re`
+  backtracks, and the audit measured `([a-z]+)+` holding the daemon's event loop for
+  59 seconds on a value of 30 characters. A pattern that repeats a group with `*`, `+`
+  or `{` is refused when it is declared, which a linear engine in a port would accept
+  and which removes the usual exponential forms. That alone is not enough, since a run
+  of optional items such as `a?a?a?aaa`, or of alternatives such as `(a|a)(a|a)`,
+  still backtracks exponentially. So the values are matched by a child Python process,
+  run with `-I`, under a deadline of two seconds, and a match that does not end in
+  time refuses the start and its child is killed and reaped. `re` holds the
+  interpreter lock while it matches, so a worker thread would not have freed the loop,
+  and a process does. A child that fails or answers anything but one result for each
+  value refuses the start, so a broken matcher lets nothing through.
+- **The record.** `run_started` records `argv` with the values in place, so the log
+  and `run_status` show exactly what ran.
+- **Refused before anything else.** A value that is refused stops the start before the
+  scope's checks, the checkout or the supervisor, so a refused value starts nothing and
+  records nothing.
+
+**What it does not bound.** The program runs the value as it reads it. A test file
+named by a valid value runs with the daemon's authority, and a writing line can write
+that file, as it can write every script a declared command runs, which the trust
+section below already accepts for every command. The pattern only bounds which file.
+A commit command may declare parameters too, and then the file is the commit's, which
+no line can change after the ref has moved. A value with no `..` step can still reach
+outside the worktree through a link the line planted in it, which the program
+follows, so a command that must stay in the worktree must refuse links itself.
+**Porting hazard.** A pattern may not use `(?`, a backslash before a digit or a
+possessive quantifier, which a port's regular expressions may lack, so patterns stay
+portable. A port with a linear engine needs neither the child nor the deadline, but
+must keep the refusal of a repeated group so the same declarations load. **Residual.**
+A start whose values match waits for the child, about 50 milliseconds on the machine
+the tests ran on, while other work on the loop goes on.
 
 The command runs in the line's working directory, resolved to its real path, with the
 daemon's `PATH`, `HOME`, `LANG`, `TERM` and `TMPDIR` and with `DROMON_RUN_ID`, the
@@ -172,6 +245,22 @@ identifier space to wrap within a second, which this design takes as negligible.
 The daemon reconciles every run that has not ended whenever it collects launcher
 reports, which is at each rest of the scheduler, at most a minute apart, after each
 turn and at start. It runs on the scheduler's process worker, never on the event loop.
+
+**At the end of the output, task of 2026-11-05, item 2.** A run's end could wait up
+to a minute after its output was complete, or until a turn ended, and `run_status`
+showed it as still running meanwhile. Two changes close that.
+
+- **A watcher.** The daemon waits for each supervisor it started on a thread of its
+  own, and reconciles once the supervisor exits. The supervisor writes its receipt
+  and then exits, so its exit is the moment the output is complete. A reconciliation
+  asked for while one is under way, which may have read the receipts before the
+  latest was written, is followed by one more. A supervisor started before a restart
+  is not the daemon's child, so its end still waits for the next rest.
+- **A fresh read.** `run_status`, while its scope has an open run, reconciles first
+  and waits for it, a second time when one was already under way, so it never shows
+  an output its receipt already ended as running. A process table that cannot be read
+  still ends nothing, so the answer then shows the run open, as before.
+
 For each open run, in order:
 
 1. A supervisor this daemon started is reaped first, so one that has exited is not seen
@@ -215,6 +304,37 @@ exit code and a green summary would read as its result. An output without a fina
 line adds nothing. **Residual.** A command that prints a whole forged block last is
 still believed as far as the label allows, since only the exit code is the daemon's
 own observation.
+
+**The tail of a failed run, task of 2026-11-05, item 2.** A run that exited other than
+with code 0, or was stopped, keeps the last lines of its output in `run_ended`'s
+`output_tail`, so its failure keeps its reason after the output file is gone or
+rewritten. The tail is read from the same 64 KiB as the summary. Blank lines are
+dropped, every character that is not printable is removed, trailing space is cut and
+leading space kept, so a traceback keeps its shape, each line is cut to 200
+characters, and at most the last 20 lines and 2,048 bytes are kept, whole lines only.
+A lost run keeps none, as it keeps no summary. **Trust.** The tail is the command's own
+text, which a writing line can shape to say anything, an instruction included. It is
+therefore shown only under `Untrusted, the last lines of the run's own output, which
+the command wrote`, and each line is quoted with `| `, in the holder's `Run ended`
+note, in `run_status` for the scope's latest run, and in `dromon run status RUN`. The
+`runs` request gives it as `output_tail`. It discloses nothing a reader of the output
+file could not already read, since the file is in the scope's working directory.
+
+**Screening, round 15 review, R1, the operator's decision.** The tail and the test
+summary enter the event log and every copy of it, such as the one `dromond --check`
+makes, where a term of the disclosure list, a token in a URL or a value a traceback
+printed would stay in clear. So both are screened against the disclosure list before
+the end is recorded, and when either holds a term both are withheld, and the note says
+`The output's test summary and last lines are withheld from this record, since they
+hold a term from the project's disclosure list`. The output file is unchanged. A
+withholding is the same answer a check gives, so it counts as a failing check of the
+line that started the run, which a line printing candidates in its output could
+otherwise use to test them outside the check's limit. A line that has spent its failing
+checks has both withheld whatever they hold, with a note naming that reason, so the
+withholding tells it nothing. **Residual.** A tail that passes is not counted against
+the pass limit, as a tool's passing text is not, so a line can test a tail of up to
+2,048 bytes for each run it can start, at most one at a time in its scope. Text that is
+no listed term, such as a credential the list does not name, is kept as before.
 
 ## A lost run
 
@@ -267,9 +387,10 @@ tree changed for another reason, since the daemon cannot tell why a run passed.
 
 | Tool | Effect |
 |---|---|
-| `start_run` | Arguments `command` and `previous`, and `commit` for a commit command only. Starts the declared command, and answers with the run's identifier and output file |
-| `run_status` | No arguments. The scope's latest ten runs, newest first, with what `previous` must be and the declared commands |
+| `start_run` | Arguments `command` and `previous`, `commit` for a commit command only, and `arguments` for a command with parameters only. Starts the declared command, and answers with the run's identifier and output file |
+| `run_status` | No arguments. The scope's latest ten runs, newest first, with what `previous` must be and the declared commands. Since the task of 2026-11-05 it reconciles an open run first, and gives the latest run's tail where it failed |
 | `stop_run` | Argument `run_id`, the scope's open run. Signals its supervisor after checking its start time again |
+| `wake_after` | **Task of 2026-11-05, item 2.** Its `task_id` may name an open run of the line's scope. The run's end withdraws the wake, and its `Run ended` note, with the exit, wakes the line and names the wake it cancelled. A run of another scope, or one that has ended, is refused, the latter with its receipt. A run that outlives the timeout lets the wake fire as usual |
 
 They are offered while the project declares a run command, or while the line's scope
 has a run to read. The operator's `dromon run clear RUN` is the only way to clear a
@@ -292,7 +413,12 @@ A supervisor started by a newer daemon also keeps running under an older one, wh
 does not know of it, and its receipt waits unread in the report directory. A daemon
 of 09003fa, before the review, reads no `run_cleared` and lets a lost run's scope
 start another run. The rollback floor in [`EVENT_LOG.md`](../protocol/EVENT_LOG.md)
-names the commits of these and every other one-way change.
+names the commits of these and every other one-way change. **Task of 2026-11-05, item
+2.** `run_ended` gained `output_tail`, left out when null, so a daemon from before it
+reads every end without a tail and refuses the log once a failed run's tail is
+recorded. **Round 15 review.** `disclosure_checked` gained `checked_bytes` the same
+way, so a daemon from before it refuses the log once a `check_disclosure` call is
+recorded.
 
 ## Descendants in a session of their own
 
@@ -722,13 +848,42 @@ real-process tests stand in for `ps` as the other run tests do. No test reaches 
 network, so the large file filter's own behaviour is shown only by the review's
 experiment, and the filter test stands in for it with a filter that records its run.
 
+### The review line's flow
+
+**Task of 2026-11-05, item 5.** The project now declares its commit command as
+`review-gate`. A review line, the one seat of the review role, owning it and reading
+only its worktree, uses it in this order, which
+`test_a_review_line_runs_review_gate_end_to_end` follows in a real repository with a
+worktree of its own.
+
+1. `run_status` gives `previous` and lists `review-gate` among the commit commands.
+2. `start_run` with `command` `review-gate`, `previous` and the full commit, which must
+   be the tip of a ref matching `[runs.commit_refs] patterns`. Without a commit it is
+   refused, naming the need for one. To review a branch, the patterns must cover it,
+   such as `refs/remotes/origin/*`, and the branch must be fetched, which only the
+   operator can do.
+3. `wake_after` with the run's identifier as `task_id`, and the line ends its turn.
+4. The run's end withdraws the wake, and the `Run ended` note, sent to the role's
+   owner, gives the exit, the output's digest, a failed run's tail and the wake it
+   cancelled. The output is `tmp/runs/RUN.out` in the review worktree, which the line
+   reads, and the checkout is removed.
+5. After a failure, a start on the corrected tip names the failed run as `previous`,
+   and `run_status` links the two.
+
+**What the flow found, fact.** Before this task the line could not wait for its run,
+since `wake_after` named only engine tasks and processes, and `run_status` could show a
+run whose output was complete as still running for up to a minute. Item 2 fixed both.
+The flow found nothing else to fix. **Not covered.** The test runs a stand-in gate, not
+`scripts/check.sh`, whose `uv sync` in the checkout needs the network and a fresh
+home's cache, so the cost of the real gate in a commit run is not measured here.
+
 ## Not implemented
 
 **Deferred.** These are left out of the smallest feature, and named so they are not
 mistaken for oversights.
 
-- Arguments from the line, per-command environments and per-command working
-  directories.
+- Free arguments from the line, beyond the declared parameters of the task of
+  2026-11-05, per-command environments and per-command working directories.
 - A time limit on a run. A lease's expiry bounds the resource, not the process.
 - Showing runs in `line_status`, `role_status` and the client's status. Only
   `run_status` shows them, and the end note reaches the holder.

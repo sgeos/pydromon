@@ -756,8 +756,12 @@ def commit_scheduler(
 
 
 def wait_for_supervisor(scheduler: Scheduler, run_id: str) -> None:
+    """Wait for the run's supervisor, unless its end is recorded already, which the
+    watcher of the task of 2026-11-05, item 2, does once the supervisor exits."""
     children = scheduler._run_children  # pyright: ignore[reportPrivateUsage]
-    children[run_id].wait(timeout=WAIT_SECONDS)
+    child = children.get(run_id)
+    if child is not None:
+        child.wait(timeout=WAIT_SECONDS)
 
 
 def check(scheduler: Scheduler) -> None:
@@ -1065,3 +1069,166 @@ def test_a_commit_run_has_a_fresh_private_home_removed_with_its_checkout(
         output = (Path(run.workdir) / run.output_file).read_text()
         assert output == f"{home} 0o700 []\n"
         assert not home.exists()
+
+
+# Task of 2026-11-05, item 5. The flow a review line uses, end to end. The project
+# declares the commit command review-gate, and the review role's seat reads a
+# worktree of its own. It reads run_status, starts the gate on a branch's tip, waits
+# for the run with wake_after, reads the end, the tail and the output, and starts the
+# gate again on the corrected tip.
+
+REVIEW_GATE_SOURCE = (
+    "import os, sys; text = open('gate.txt').read().strip();"
+    " print('checking', text, os.environ['DROMON_RUN_ID']);"
+    " sys.exit(0 if text == 'committed gate' else 1)"
+)
+
+
+def review_project(source: str) -> str:
+    """A project file declaring ``review-gate`` as the operator does, on every
+    branch of ``origin``."""
+    argv = ", ".join(f"{part!r}".replace("'", '"') for part in (sys.executable, "-c"))
+    return (
+        "version = 1\n"
+        "[runs.commit_commands]\n"
+        f"review-gate = [{argv}, {source!r}]\n"
+        "[runs.commit_refs]\n"
+        'patterns = ["refs/remotes/origin/*"]\n'
+    )
+
+
+def review_scheduler(log: EventLog, repository: Path, tmp_path: Path) -> Scheduler:
+    """A daemon's scheduler for ``repository`` with the review role, whose one seat
+    ``review`` owns it and only reads its worktree ``tmp/worktrees/review``."""
+    from dromon.model import (
+        OperatorRegistered,
+        OwnershipCause,
+        OwnershipChanged,
+        RoleDeclared,
+        SeatBound,
+    )
+
+    config = parse(review_project(REVIEW_GATE_SOURCE))
+    scheduler = commit_scheduler(log, repository, tmp_path)
+    scheduler.set_runs(
+        config.run_commands,
+        config.run_commit_commands,
+        config.run_commit_refs,
+        config.run_parameters,
+    )
+    worktree = "tmp/worktrees/review"
+    scheduler.create_line("review", HAIKU, Strategy.SUBSCRIPTION)
+    scheduler.configure_line(
+        "review", LineConfig(workdir=worktree, workdir_access=WorkdirAccess.READ)
+    )
+    for event in (
+        OperatorRegistered("ana"),
+        RoleDeclared("review", worktree),
+        SeatBound("review", "review", True),
+        OwnershipChanged(
+            "review", "review", None, OwnershipCause.DECLARED, ANA, None, AT
+        ),
+    ):
+        log.append(event)
+    return scheduler
+
+
+def test_a_review_line_runs_review_gate_end_to_end(tmp_path: Path) -> None:
+    from dromon.model import HARNESS, LineAddress
+    from dromon.scheduler import (
+        RUN_STATUS_TOOL_NAME,
+        START_RUN_TOOL_NAME,
+        WAKE_TOOL_NAME,
+    )
+
+    repository, main, _ = repository_with_side_branch(tmp_path)
+    # A branch whose tip breaks the gate, as a branch under review might.
+    git(repository, "checkout", "--quiet", "-b", "broken", main)
+    (repository / "gate.txt").write_text("broken gate\n")
+    git(repository, "commit", "--quiet", "-am", "break the gate")
+    broken = git(repository, "rev-parse", "HEAD")
+    git(repository, "checkout", "--quiet", "main")
+    git(repository, "update-ref", "refs/remotes/origin/broken", broken)
+    git(repository, "worktree", "add", "--quiet", "--detach", "tmp/worktrees/review")
+    with EventLog(tmp_path / "events.sqlite") as log:
+        scheduler = review_scheduler(log, repository, tmp_path)
+        tools = {tool.name: tool for tool in scheduler.own_tools("review")}
+
+        async def call(name: str, args: dict[str, object]) -> tuple[str, bool]:
+            result = await tools[name].handler(args)
+            return str(result["content"][0]["text"]), result.get("is_error") is True
+
+        def finish(run_id: str) -> None:
+            wait_for_supervisor(scheduler, run_id)
+            check(scheduler)
+
+        def notes() -> list[str]:
+            return [
+                message.body
+                for message in log.state.messages.values()
+                if message.sender == HARNESS
+                and message.recipient == LineAddress("review")
+            ]
+
+        text, error = asyncio.run(call(RUN_STATUS_TOOL_NAME, {}))
+        assert not error and "no runs yet, so previous is none" in text
+        assert "Commit commands, which take a commit: review-gate" in text
+        text, error = asyncio.run(
+            call(START_RUN_TOOL_NAME, {"command": "review-gate", "previous": "none"})
+        )
+        assert error and "is a commit command, so name the full commit" in text
+        start: dict[str, object] = {
+            "command": "review-gate",
+            "previous": "none",
+            "commit": broken,
+        }
+        text, error = asyncio.run(call(START_RUN_TOOL_NAME, start))
+        assert not error, text
+        (first_id,) = log.state.runs
+        first = log.state.runs[first_id].started
+        assert (first.commit, first.role_id) == (broken, "review")
+        assert Path(first.workdir) == (repository / "tmp/worktrees/review").resolve()
+        wait: dict[str, object] = {
+            "seconds": 900,
+            "note": "read the gate",
+            "task_id": first_id,
+        }
+        text, error = asyncio.run(call(WAKE_TOOL_NAME, wait))
+        assert not error, text
+        wake_id = log.state.scheduled["review"].message_id
+        finish(first_id)
+        ended = log.state.runs[first_id].ended
+        assert ended is not None and (ended.status, ended.exit_code) == (
+            RunStatus.EXITED,
+            1,
+        )
+        assert ended.output_tail == f"checking broken gate {first_id}"
+        assert "review" not in log.state.scheduled
+        (note,) = notes()
+        assert "exited with exit code 1" in note
+        assert f"| checking broken gate {first_id}" in note
+        assert f"This end cancels your wake {wake_id}" in note
+        # The output is in the review worktree, which the line reads, and the
+        # checkout is gone.
+        output = Path(first.workdir) / first.output_file
+        assert output.read_text() == f"checking broken gate {first_id}\n"
+        assert first.checkout is not None and not Path(first.checkout).exists()
+        text, error = asyncio.run(call(RUN_STATUS_TOOL_NAME, {}))
+        assert not error and f"previous is {first_id}" in text
+        assert runs.TAIL_LABEL in text
+        again: dict[str, object] = {
+            "command": "review-gate",
+            "previous": first_id,
+            "commit": main,
+        }
+        text, error = asyncio.run(call(START_RUN_TOOL_NAME, again))
+        assert not error, text
+        second_id = next(run for run in log.state.runs if run != first_id)
+        finish(second_id)
+        second = log.state.runs[second_id].ended
+        assert second is not None and second.exit_code == 0
+        assert second.output_tail is None
+        text, error = asyncio.run(call(RUN_STATUS_TOOL_NAME, {}))
+        assert f"Corrected by run {second_id}" in text
+        # The latest run passed, so no tail is shown with it.
+        assert runs.TAIL_LABEL not in text

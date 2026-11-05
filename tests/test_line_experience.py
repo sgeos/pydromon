@@ -43,7 +43,9 @@ from dromon.model import (
     HoldCause,
     HARNESS,
     DISCLOSURE_CHECK_WINDOW_SECONDS,
+    MAX_DISCLOSURE_BYTES,
     MAX_DISCLOSURE_CHECKS,
+    MAX_DISCLOSURE_PASSES,
     AgentAddress,
     DisclosureChecked,
     RestartNoted,
@@ -72,6 +74,7 @@ from dromon.scheduler import (
     UNREPORTED_ENGINE_NOTE,
     WHOLE_COST_SINCE,
     UNRELEASED_NOTE,
+    CheckAnswer,
     LineSpec,
     LineToolRefused,
     Scheduler,
@@ -1099,17 +1102,31 @@ def test_check_disclosure_answers_pass_or_fail_with_a_count(
     listed(world, tmp_path)
     text, error = world.call("check_disclosure", {"text": "clean\nlines"})
     assert not error and text.startswith("pass, 0 lines hold a term")
+    assert "This pass counts against its limit." in text
+    assert f"you have {MAX_DISCLOSURE_CHECKS} of" in text
+    assert f"{MAX_DISCLOSURE_PASSES - 1} of {MAX_DISCLOSURE_PASSES} passing" in text
     body = "the CODENAME\nclean\nCodename and a Second Term\n"
     text, error = world.call("check_disclosure", {"text": body})
     assert not error and text.startswith("fail, 2 lines hold a term")
+    assert "This failure counts against its limit." in text
     (world.root / "notes.md").write_text("one codename line\nclean\n")
     text, error = world.call("check_disclosure", {"path": "notes.md"})
     assert not error and text.startswith("fail, 1 line holds a term")
-    left = MAX_DISCLOSURE_CHECKS - 3
-    assert f"You have {left} of {MAX_DISCLOSURE_CHECKS} checks left" in text
+    # Task of 2026-11-05, item 1. The two failures spent the failure limit, and
+    # the round 15 review, D1, the one pass spent the pass limit.
+    left = MAX_DISCLOSURE_CHECKS - 2
+    assert f"you have {left} of {MAX_DISCLOSURE_CHECKS} failing checks," in text
+    assert f"{MAX_DISCLOSURE_PASSES - 1} of {MAX_DISCLOSURE_PASSES} passing" in text
+    read = len("clean\nlines") + len(body) + len("one codename line\nclean\n")
+    assert f"{MAX_DISCLOSURE_BYTES - read} of {MAX_DISCLOSURE_BYTES} bytes" in text
     assert "codename" not in text.casefold() and "second term" not in text.casefold()
     recorded = checks(world)
     assert [event.matched_lines for event in recorded] == [0, 2, 1]
+    assert [event.checked_bytes for event in recorded] == [
+        len("clean\nlines"),
+        len(body),
+        len("one codename line\nclean\n"),
+    ]
     assert {event.checked_at for event in recorded} == {"2026-10-26T09:00:00Z"}
 
 
@@ -1127,7 +1144,7 @@ def test_check_disclosure_checks_multiple_files_as_one_call(
     assert not error and text.startswith("fail, 3 lines hold a term")
     assert len(checks(world)) == 1
     assert checks(world)[0].matched_lines == 3
-    assert f"You have {MAX_DISCLOSURE_CHECKS - 1} of" in text
+    assert f"you have {MAX_DISCLOSURE_CHECKS - 1} of" in text
     assert "readme-a.md" not in text and "readme-b.md" not in text
     assert "review-a.md" not in text
     assert "codename" not in text.casefold()
@@ -1148,17 +1165,245 @@ def test_check_disclosure_multi_file_call_spends_one_limit_entry(
     world: World, tmp_path: Path
 ) -> None:
     listed(world, tmp_path)
-    (world.root / "one.md").write_text("clean\n")
-    (world.root / "two.md").write_text("also clean\n")
+    (world.root / "one.md").write_text("codename\n")
+    (world.root / "two.md").write_text("codename too\n")
     for _ in range(MAX_DISCLOSURE_CHECKS - 1):
-        _, error = world.call("check_disclosure", {"text": "clean"})
+        _, error = world.call("check_disclosure", {"text": "codename"})
         assert not error
     text, error = world.call("check_disclosure", {"paths": ["one.md", "two.md"]})
-    assert not error and f"You have 0 of {MAX_DISCLOSURE_CHECKS}" in text
+    assert not error and f"you have 0 of {MAX_DISCLOSURE_CHECKS}" in text
     assert len(checks(world)) == MAX_DISCLOSURE_CHECKS
+    # Once the failures reach the limit, a text that would pass is refused unread
+    # too, since answering only passes would say which texts fail.
     text, error = world.call("check_disclosure", {"text": "clean"})
-    assert error and "limit of 10 checks" in text
+    assert error and "limit of 10 failing checks and refusals" in text
     assert len(checks(world)) == MAX_DISCLOSURE_CHECKS
+
+
+def test_passes_count_against_their_own_larger_limit(
+    world: World, tmp_path: Path
+) -> None:
+    """Round 15 review, D1, the operator's decision. A pass spends nothing of the
+    failure limit, and counts against the pass limit, which once spent refuses
+    every check unread, a would-be failure too."""
+    listed(world, tmp_path)
+    for index in range(MAX_DISCLOSURE_PASSES):
+        text, error = world.call("check_disclosure", {"text": "clean"})
+        assert not error and f"you have {MAX_DISCLOSURE_CHECKS} of" in text
+        left = MAX_DISCLOSURE_PASSES - index - 1
+        assert f"{left} of {MAX_DISCLOSURE_PASSES} passing checks" in text
+    assert len(checks(world)) == MAX_DISCLOSURE_PASSES
+    for probe in ("clean", "codename"):
+        text, error = world.call("check_disclosure", {"text": probe})
+        assert error and f"limit of {MAX_DISCLOSURE_PASSES} passing checks" in text
+        assert "next check is allowed at 2026-10-26T10:00:00Z" in text
+    assert len(checks(world)) == MAX_DISCLOSURE_PASSES
+    # A send that passes after the passes are spent is still not refused or held,
+    # since another tool's passing text is not a check.
+    text, error = world.call("send_message", {"to": "@ana", "body": "clean"})
+    assert not error and text.startswith("sent as")
+    assert world.log.state.lines["alpha"].held_by is None
+    world.clock.now += timedelta(seconds=DISCLOSURE_CHECK_WINDOW_SECONDS)
+    text, error = world.call("check_disclosure", {"text": "codename"})
+    assert not error and text.startswith("fail, 1 line holds")
+    assert f"{MAX_DISCLOSURE_PASSES} of {MAX_DISCLOSURE_PASSES} passing" in text
+
+
+def test_the_bytes_checked_an_hour_are_bounded(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 15 review, D1. Content that would pass the bytes left is refused by
+    its size before it is read, records nothing, and spends nothing, and the
+    ceiling survives a restart, since each check records its bytes."""
+    ceiling = 100
+    monkeypatch.setattr(scheduler_module, "MAX_DISCLOSURE_BYTES", ceiling)
+    listed(world, tmp_path)
+    text, error = world.call("check_disclosure", {"text": "a" * 60})
+    assert not error and f"{ceiling - 60} of {ceiling} bytes left" in text
+    (world.root / "big.md").write_text("b" * 41)
+    text, error = world.call("check_disclosure", {"path": "big.md"})
+    assert error and f"the ceiling of {ceiling} bytes" in text
+    assert "with 40 bytes left" in text and "before it was read" in text
+    text, error = world.call("check_disclosure", {"text": "c" * 41})
+    assert error and "with 40 bytes left" in text
+    assert len(checks(world)) == 1
+    (world.root / "fits.md").write_text("d" * 40)
+    text, error = world.call("check_disclosure", {"path": "fits.md"})
+    assert not error and f"0 of {ceiling} bytes left" in text
+    world.log.close()
+    world.log = EventLog(world.log_path)
+    world.start()
+    listed(world, tmp_path)
+    text, error = world.call("check_disclosure", {"text": "e"})
+    assert error and "with 0 bytes left" in text
+    world.clock.now += timedelta(seconds=DISCLOSURE_CHECK_WINDOW_SECONDS)
+    text, error = world.call("check_disclosure", {"text": "e"})
+    assert not error and f"{ceiling - 1} of {ceiling} bytes left" in text
+
+
+def test_a_file_past_the_ceiling_is_refused_unread(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 15 review, D1. The size is read before the content, so a file past
+    the bytes left is never read, which a handle that records its reads shows."""
+    import io
+
+    from dromon import disclosurecheck
+
+    monkeypatch.setattr(scheduler_module, "MAX_DISCLOSURE_BYTES", 10)
+    listed(world, tmp_path)
+    (world.root / "big.md").write_text("codename\n" * 4)
+    (world.root / "small.md").write_text("codename\n")
+    reads: list[int] = []
+    real_fdopen = os.fdopen
+
+    class Recording(io.BufferedReader):
+        def read(self, size: int | None = -1, /) -> bytes:
+            reads.append(-1 if size is None else size)
+            return super().read(size)
+
+    def fdopen(descriptor: int, mode: str, closefd: bool = True) -> io.BufferedReader:
+        assert mode == "rb"
+        return Recording(real_fdopen(descriptor, "rb", buffering=0, closefd=closefd))
+
+    monkeypatch.setattr(disclosurecheck.os, "fdopen", fdopen)
+    text, error = world.call("check_disclosure", {"path": "big.md"})
+    assert error and "refused by its size before it was read" in text
+    assert reads == [] and checks(world) == []
+    text, error = world.call("check_disclosure", {"path": "small.md"})
+    assert not error and text.startswith("fail, 1 line holds")
+    assert reads == [11]
+
+
+def test_a_check_reads_off_the_loop_one_at_a_time_per_line(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 15 review, D3. A check reads on a worker thread, so the loop runs
+    other work meanwhile, and a second check of the same line while the first runs
+    is refused, so two cannot both pass the budget before either is recorded."""
+    import threading
+
+    from dromon import disclosurecheck
+
+    listed(world, tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    real_count = disclosurecheck.count
+    workers: list[bool] = []
+
+    def slow(
+        plan: disclosurecheck.CheckPlan, ceiling: int, window: int
+    ) -> disclosurecheck.CheckResult:
+        workers.append(threading.current_thread() is threading.main_thread())
+        started.set()
+        release.wait(10)
+        return real_count(plan, ceiling, window)
+
+    monkeypatch.setattr(disclosurecheck, "count", slow)
+
+    async def scenario() -> tuple[CheckAnswer, str]:
+        first = asyncio.create_task(
+            world.scheduler.check_disclosure_off_loop("alpha", "codename", None)
+        )
+        # The loop is free while the first check waits on its worker.
+        await asyncio.to_thread(started.wait, 10)
+        try:
+            await world.scheduler.check_disclosure_off_loop("alpha", "clean", None)
+            second = "answered"
+        except LineToolRefused as error:
+            second = str(error)
+        release.set()
+        return await first, second
+
+    answer, second = asyncio.run(scenario())
+    assert workers == [False]
+    assert "still running" in second
+    assert answer.matched == 1 and len(checks(world)) == 1
+    # Once the first has answered, the line may check again.
+    monkeypatch.setattr(disclosurecheck, "count", real_count)
+    assert world.scheduler.check_disclosure("alpha", "clean", None).matched == 0
+
+
+def test_memory_taken_before_the_list_changed_is_not_used_or_extended(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 15, item 4, merged with review D3. A check carries the memory of passes
+    to its worker, so the list may be replaced while it runs. An answer from that
+    memory is then refused, and a pass made under the old list is answered but not
+    remembered, since neither tells what the new list holds."""
+    from dromon import disclosurecheck
+
+    as_writer(world)
+    listed(world, tmp_path)
+    world.call("write_scratch", {"path": "kept.md", "text": "kept\n"})
+    # The write's own screening is one passing check.
+    written = checks(world)
+    assert len(written) == 1
+    (world.root / "fresh.md").write_text("fresh\n")
+    real_count = disclosurecheck.count
+    replacements = iter(["other\n", "another\n"])
+
+    def replaced(
+        plan: disclosurecheck.CheckPlan, ceiling: int, window: int
+    ) -> disclosurecheck.CheckResult:
+        result = real_count(plan, ceiling, window)
+        (tmp_path / "terms").write_text(next(replacements))
+        world.scheduler.set_disclosure_terms(load_terms(tmp_path / "terms"))
+        return result
+
+    monkeypatch.setattr(disclosurecheck, "count", replaced)
+    with pytest.raises(LineToolRefused, match="changed while the check ran"):
+        world.scheduler.check_disclosure("alpha", None, "tmp/kept.md")
+    assert checks(world) == written
+    answer = world.scheduler.check_disclosure("alpha", None, "fresh.md")
+    assert answer.matched == 0 and not answer.cached
+    assert len(checks(world)) == len(written) + 1
+    monkeypatch.setattr(disclosurecheck, "count", real_count)
+    again = world.scheduler.check_disclosure("alpha", None, "fresh.md")
+    assert not again.cached, "a pass under the old list was remembered"
+
+
+def test_a_refusal_during_a_check_withholds_its_answer(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 15 review, D3. A tool's refusal on the loop may spend the last failure
+    while a check reads, so the budget is read again before the check is recorded,
+    and the check is then refused and records nothing."""
+    from dromon import disclosurecheck
+
+    listed(world, tmp_path)
+    for _ in range(MAX_DISCLOSURE_CHECKS - 1):
+        assert world.scheduler.check_disclosure("alpha", "codename", None).matched
+    planned: list[int] = []
+    real_count = disclosurecheck.count
+
+    def count(
+        plan: disclosurecheck.CheckPlan, ceiling: int, window: int
+    ) -> disclosurecheck.CheckResult:
+        planned.append(len(checks(world)))
+        return real_count(plan, ceiling, window)
+
+    monkeypatch.setattr(disclosurecheck, "count", count)
+
+    async def scenario() -> str:
+        check = asyncio.create_task(
+            world.scheduler.check_disclosure_off_loop("alpha", "clean", None)
+        )
+        # The task plans and hands its read to the worker at its first await.
+        await asyncio.sleep(0)
+        assert world.scheduler.refuse_disclosed("alpha", ("body", "codename"))
+        try:
+            await check
+        except LineToolRefused as error:
+            return str(error)
+        return "answered"
+
+    refusal = asyncio.run(scenario())
+    assert len(planned) == 1
+    assert f"limit of {MAX_DISCLOSURE_CHECKS} failing checks" in refusal
+    assert [event.matched_lines > 0 for event in checks(world)] == [True] * (
+        MAX_DISCLOSURE_CHECKS
+    )
 
 
 def test_check_disclosure_is_limited_per_line_across_a_restart(
@@ -1166,23 +1411,23 @@ def test_check_disclosure_is_limited_per_line_across_a_restart(
 ) -> None:
     listed(world, tmp_path)
     for _ in range(MAX_DISCLOSURE_CHECKS):
-        _, error = world.call("check_disclosure", {"text": "clean"})
+        _, error = world.call("check_disclosure", {"text": "codename"})
         assert not error
     world.clock.now += timedelta(seconds=DISCLOSURE_CHECK_WINDOW_SECONDS - 1)
     world.log.close()
     world.log = EventLog(world.log_path)
     world.start()
     listed(world, tmp_path)
-    text, error = world.call("check_disclosure", {"text": "codename"})
-    assert error and "next is allowed at 2026-10-26T10:00:00Z" in text
+    text, error = world.call("check_disclosure", {"text": "clean"})
+    assert error and "next check is allowed at 2026-10-26T10:00:00Z" in text
     assert len(checks(world)) == MAX_DISCLOSURE_CHECKS
-    # The window slides, so each check made an hour ago frees one place.
+    # The window slides, so each failure made an hour ago frees one place, and a
+    # pass spends none of it.
     world.clock.now += timedelta(seconds=1)
     text, error = world.call("check_disclosure", {"text": "clean"})
-    assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 1} of" in text
-    world.clock.now += timedelta(seconds=1)
-    text, error = world.call("check_disclosure", {"text": "clean"})
-    assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 2} of" in text
+    assert not error and f"you have {MAX_DISCLOSURE_CHECKS} of" in text
+    text, error = world.call("check_disclosure", {"text": "codename"})
+    assert not error and f"you have {MAX_DISCLOSURE_CHECKS - 1} of" in text
 
 
 def test_check_disclosure_refuses_without_a_list_or_one_input(
@@ -1317,8 +1562,15 @@ def test_a_refusal_for_disclosure_spends_a_check(
         else f"the {field} field contains a term from the project's disclosure list"
     )
     assert [event.matched_lines for event in checks(world)] == [1]
+    # A refusal of another tool records no bytes. Since the round 15 re-review a
+    # write_scratch screening is a check and spends the bytes of its text and path.
+    screened = (
+        len(str(args["text"])) + len(str(args["path"])) if field is None else None
+    )
+    assert [event.checked_bytes for event in checks(world)] == [screened]
     text, error = world.call("check_disclosure", {"text": "clean"})
-    assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 2} of" in text
+    assert not error and f"you have {MAX_DISCLOSURE_CHECKS - 1} of" in text
+    assert f"{MAX_DISCLOSURE_BYTES - len('clean') - (screened or 0)} of" in text
 
 
 def test_the_role_and_proposal_tools_spend_a_check_too(
@@ -1336,6 +1588,56 @@ def test_the_role_and_proposal_tools_spend_a_check_too(
         with pytest.raises(LineToolRefused, match="contains a term"):
             call()
     assert len(checks(world)) == len(calls)
+
+
+@pytest.mark.parametrize(
+    ("field", "values"),
+    [
+        ("task", ("a codename task", "", (), "")),
+        ("decisions", ("task", "a Codename call", (), "")),
+        ("next_action", ("task", "", (), "say codename")),
+        ("artifacts", ("task", "", ("docs/a.md", "codename.md"), "")),
+    ],
+)
+def test_a_refused_brief_names_the_one_field_that_matched(
+    world: World,
+    tmp_path: Path,
+    field: str,
+    values: tuple[str, str, tuple[str, ...], str],
+) -> None:
+    """Task of 2026-11-05, item 1, the operator's decision. A refused ``set_brief``
+    names the
+    one field that matched among its four, and never the term."""
+    listed(world, tmp_path)
+    task, decisions, artifacts, next_action = values
+    with pytest.raises(LineToolRefused) as refused:
+        world.scheduler.set_brief("alpha", task, decisions, artifacts, next_action)
+    assert str(refused.value) == disclosure.field_refusal((field,))
+    assert "codename" not in str(refused.value).casefold()
+    assert [event.matched_lines for event in checks(world)] == [1]
+
+
+def test_a_brief_matching_in_two_fields_names_neither(
+    world: World, tmp_path: Path
+) -> None:
+    """At most one field is ever named, so two matching fields get the generic
+    refusal."""
+    listed(world, tmp_path)
+    with pytest.raises(LineToolRefused) as refused:
+        world.scheduler.set_brief("alpha", "codename", "second term", (), "clean")
+    assert str(refused.value) == disclosure.REFUSAL
+
+
+def test_only_a_brief_names_one_field_among_several() -> None:
+    """Other tools that offer several fields keep the generic refusal."""
+    assert disclosure.refusal(("question",), 2) == disclosure.REFUSAL
+    assert disclosure.refusal(("question",), 2, name_single_match=True) == (
+        disclosure.field_refusal(("question",))
+    )
+    assert disclosure.refusal(("a", "b"), 2, name_single_match=True) == (
+        disclosure.REFUSAL
+    )
+    assert disclosure.refusal(("body",), 1) == disclosure.field_refusal(("body",))
 
 
 def test_a_text_that_passes_spends_no_check(world: World, tmp_path: Path) -> None:
@@ -2573,26 +2875,31 @@ def test_a_draft_checked_as_text_then_written_is_not_checked_again(
     assert not error and text.startswith("pass")
     assert spent(world) == 1
     written, error = world.call("write_scratch", {"path": "r.md", "text": draft})
-    assert not error
+    assert not error and spent(world) == 2
     absolute = written.removeprefix("wrote ").split(" bytes to ", 1)[1]
     text, error = world.call("check_disclosure", {"path": absolute})
     assert not error and text.startswith("pass, 0 lines")
     assert "spent no check" in text
-    assert f"You have {MAX_DISCLOSURE_CHECKS - 1} of" in text
-    assert spent(world) == 1, "the unchanged file spent a second check"
+    # The text's check and the write's screening each spent one pass and their
+    # bytes, and the file spent nothing.
+    assert f"{MAX_DISCLOSURE_PASSES - 2} of {MAX_DISCLOSURE_PASSES} passing" in text
+    left = MAX_DISCLOSURE_BYTES - 2 * len(draft) - len("r.md")
+    assert f"{left} of {MAX_DISCLOSURE_BYTES}" in text
+    assert spent(world) == 2, "the unchanged file spent a third check"
 
 
 def test_a_file_the_tool_wrote_is_checked_clean_without_a_prior_check(
     world: World, tmp_path: Path
 ) -> None:
-    """write_scratch checks the text against the list, so its own pass is remembered
-    for the file it wrote."""
+    """write_scratch checks the text against the list, which spends one pass, and
+    that pass is remembered for the file it wrote."""
     as_writer(world)
     listed(world, tmp_path)
     world.call("write_scratch", {"path": "w.md", "text": "clean\n"})
+    assert spent(world) == 1
     text, error = world.call("check_disclosure", {"path": "tmp/w.md"})
     assert not error and "spent no check" in text
-    assert spent(world) == 0
+    assert spent(world) == 1
 
 
 def test_an_edited_file_is_checked_and_counted_again(
@@ -2601,20 +2908,21 @@ def test_an_edited_file_is_checked_and_counted_again(
     as_writer(world)
     listed(world, tmp_path)
     world.call("write_scratch", {"path": "e.md", "text": "clean\n"})
+    # The write's screening spent the first.
     (world.root / "tmp" / "e.md").write_text("clean\nand the codename\n")
     text, error = world.call("check_disclosure", {"path": "tmp/e.md"})
     assert not error and text.startswith("fail, 1 line holds")
-    assert "spent no check" not in text and spent(world) == 1
+    assert "spent no check" not in text and spent(world) == 2
     # A failed file is never remembered as clean.
     text, error = world.call("check_disclosure", {"path": "tmp/e.md"})
-    assert text.startswith("fail") and spent(world) == 2
+    assert text.startswith("fail") and spent(world) == 3
     # One byte of difference is a different digest.
     (world.root / "tmp" / "e.md").write_text("clean\n ")
     text, error = world.call("check_disclosure", {"path": "tmp/e.md"})
     assert text.startswith("pass") and "spent no check" not in text
-    assert spent(world) == 3
+    assert spent(world) == 4
     text, error = world.call("check_disclosure", {"path": "tmp/e.md"})
-    assert "spent no check" in text and spent(world) == 3
+    assert "spent no check" in text and spent(world) == 4
 
 
 def test_a_text_check_is_never_answered_from_memory(
@@ -2627,21 +2935,69 @@ def test_a_text_check_is_never_answered_from_memory(
         assert spent(world) == expected
 
 
+@pytest.mark.parametrize(
+    ("filler", "limit", "left"),
+    [
+        ("codename {number}", MAX_DISCLOSURE_CHECKS, "you have 0 of"),
+        (
+            "filler {number}",
+            MAX_DISCLOSURE_PASSES,
+            f"0 of {MAX_DISCLOSURE_PASSES} pass",
+        ),
+    ],
+    ids=["failures", "passes"],
+)
 def test_a_remembered_file_is_answered_at_the_limit_and_an_edited_one_is_not(
-    world: World, tmp_path: Path
+    world: World,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filler: str,
+    limit: int,
+    left: str,
 ) -> None:
+    """Merged with review D1. A remembered file is answered once either count is
+    spent. Another file is refused unread unless its size is a remembered one, and
+    one of that size but other bytes is read to compare and still never matched or
+    recorded."""
+    import io
+
+    from dromon import disclosurecheck
+
     as_writer(world)
     listed(world, tmp_path)
     world.call("write_scratch", {"path": "k.md", "text": "kept\n"})
-    for number in range(MAX_DISCLOSURE_CHECKS):
-        world.call("check_disclosure", {"text": f"filler {number}"})
-    assert spent(world) == MAX_DISCLOSURE_CHECKS
+    # The write spent one pass, so the pass limit is reached one filler sooner and
+    # the last filler is refused unrecorded.
+    for number in range(limit):
+        world.call("check_disclosure", {"text": filler.format(number=number)})
+    filled = spent(world)
+    assert filled == (limit + 1 if limit == MAX_DISCLOSURE_CHECKS else limit)
+    reads: list[int] = []
+    real_fdopen = os.fdopen
+
+    class Recording(io.BufferedReader):
+        def read(self, size: int | None = -1, /) -> bytes:
+            reads.append(-1 if size is None else size)
+            return super().read(size)
+
+    def fdopen(descriptor: int, mode: str, closefd: bool = True) -> io.BufferedReader:
+        assert mode == "rb"
+        return Recording(real_fdopen(descriptor, "rb", buffering=0, closefd=closefd))
+
+    monkeypatch.setattr(disclosurecheck.os, "fdopen", fdopen)
     text, error = world.call("check_disclosure", {"path": "tmp/k.md"})
-    assert not error and "spent no check" in text and "You have 0 of" in text
-    assert spent(world) == MAX_DISCLOSURE_CHECKS
-    (world.root / "tmp" / "k.md").write_text("changed\n")
+    assert not error and "spent no check" in text and left in text
+    assert spent(world) == filled and reads == [len("kept\n") + 1]
+    reads.clear()
+    # Of a size no remembered pass has, neither the file nor any filler text.
+    (world.root / "tmp" / "k.md").write_text("a changed file\n")
     text, error = world.call("check_disclosure", {"path": "tmp/k.md"})
     assert error and "limit of" in text
+    assert reads == [], "a file of no remembered size was read"
+    (world.root / "tmp" / "k.md").write_text("kapt\n")
+    text, error = world.call("check_disclosure", {"path": "tmp/k.md"})
+    assert error and "limit of" in text
+    assert reads == [len("kept\n") + 1] and spent(world) == filled
 
 
 def test_a_list_of_files_spends_nothing_only_when_every_file_is_remembered(
@@ -2651,18 +3007,19 @@ def test_a_list_of_files_spends_nothing_only_when_every_file_is_remembered(
     listed(world, tmp_path)
     world.call("write_scratch", {"path": "a.md", "text": "one\n"})
     world.call("write_scratch", {"path": "b.md", "text": "two\n"})
+    # Each write's screening spent one.
     text, error = world.call("check_disclosure", {"paths": ["tmp/a.md", "tmp/b.md"]})
-    assert not error and "spent no check" in text and spent(world) == 0
+    assert not error and "spent no check" in text and spent(world) == 2
     (world.root / "tmp" / "c.md").write_text("three\n")
     text, error = world.call(
         "check_disclosure", {"paths": ["tmp/a.md", "tmp/b.md", "tmp/c.md"]}
     )
-    assert not error and "spent no check" not in text and spent(world) == 1
+    assert not error and "spent no check" not in text and spent(world) == 3
     # The whole call passed, so each file is remembered now.
     text, error = world.call(
         "check_disclosure", {"paths": ["tmp/a.md", "tmp/b.md", "tmp/c.md"]}
     )
-    assert "spent no check" in text and spent(world) == 1
+    assert "spent no check" in text and spent(world) == 3
 
 
 def test_replacing_the_list_forgets_what_passed(world: World, tmp_path: Path) -> None:
@@ -2672,7 +3029,8 @@ def test_replacing_the_list_forgets_what_passed(world: World, tmp_path: Path) ->
     (tmp_path / "terms").write_text("plain\n")
     world.scheduler.set_disclosure_terms(load_terms(tmp_path / "terms"))
     text, _ = world.call("check_disclosure", {"path": "tmp/f.md"})
-    assert text.startswith("fail") and spent(world) == 1
+    # The write's screening, then the check.
+    assert text.startswith("fail") and spent(world) == 2
 
 
 def test_a_change_of_working_directory_forgets_what_passed(
@@ -2687,12 +3045,13 @@ def test_a_change_of_working_directory_forgets_what_passed(
     world.scheduler.configure_line("alpha", one)
     listed(world, tmp_path)
     world.call("write_scratch", {"path": "same.md", "text": "plain\n"})
+    # The write's screening spent one.
     text, error = world.call("check_disclosure", {"path": "tmp/same.md"})
-    assert not error and "spent no check" in text and spent(world) == 0
+    assert not error and "spent no check" in text and spent(world) == 1
     # The same configuration again keeps the memory.
     world.scheduler.configure_line("alpha", one)
     text, _ = world.call("check_disclosure", {"path": "tmp/same.md"})
-    assert "spent no check" in text and spent(world) == 0
+    assert "spent no check" in text and spent(world) == 1
     # Another directory holding a file of the same name and bytes is checked.
     world.scheduler.configure_line(
         "alpha", LineConfig(workdir="two", builtin_tools=WRITING.builtin_tools)
@@ -2701,9 +3060,9 @@ def test_a_change_of_working_directory_forgets_what_passed(
     (world.root / "two" / "tmp" / "same.md").write_text("plain\n")
     text, error = world.call("check_disclosure", {"path": "tmp/same.md"})
     assert not error and text.startswith("pass")
-    assert "spent no check" not in text and spent(world) == 1
+    assert "spent no check" not in text and spent(world) == 2
     text, _ = world.call("check_disclosure", {"path": "tmp/same.md"})
-    assert "spent no check" in text and spent(world) == 1
+    assert "spent no check" in text and spent(world) == 2
 
 
 def test_an_override_of_the_line_forgets_what_passed(
@@ -2721,7 +3080,8 @@ def test_an_override_of_the_line_forgets_what_passed(
         LineConfig(builtin_tools=WRITING.builtin_tools, instructions=("changed.md",)),
     )
     text, _ = world.call("check_disclosure", {"path": "tmp/o.md"})
-    assert "spent no check" not in text and spent(world) == 1
+    # The write's screening, then the check.
+    assert "spent no check" not in text and spent(world) == 2
 
 
 def test_nothing_is_remembered_while_no_list_is_configured(world: World) -> None:
@@ -2736,13 +3096,22 @@ def test_the_memory_of_passes_is_bounded(world: World, tmp_path: Path) -> None:
 
     as_writer(world)
     listed(world, tmp_path)
+    # Each write spends a pass, and the memory holds more than an hour's passes, so
+    # the writes are spread over two windows.
+    half = MAX_CLEAN_CHECKED // 2
     for number in range(MAX_CLEAN_CHECKED + 1):
-        world.call("write_scratch", {"path": f"m{number}.md", "text": f"t{number}\n"})
+        if number == half:
+            world.clock.now += timedelta(seconds=DISCLOSURE_CHECK_WINDOW_SECONDS)
+        _, error = world.call(
+            "write_scratch", {"path": f"m{number}.md", "text": f"t{number}\n"}
+        )
+        assert not error
+    assert spent(world) == MAX_CLEAN_CHECKED + 1
     text, _ = world.call("check_disclosure", {"path": f"tmp/m{MAX_CLEAN_CHECKED}.md"})
     assert "spent no check" in text
     text, _ = world.call("check_disclosure", {"path": "tmp/m0.md"})
     assert text.startswith("pass") and "spent no check" not in text
-    assert spent(world) == 1
+    assert spent(world) == MAX_CLEAN_CHECKED + 2
 
 
 def test_a_held_line_gets_no_remembered_answer(world: World, tmp_path: Path) -> None:
@@ -2752,6 +3121,103 @@ def test_a_held_line_gets_no_remembered_answer(world: World, tmp_path: Path) -> 
     world.scheduler._disclosure_spent.add("alpha")  # pyright: ignore[reportPrivateUsage]
     text, error = world.call("check_disclosure", {"path": "tmp/h.md"})
     assert error and text == DISCLOSURE_HELD
+
+
+# Round 15 re-review. write_scratch's screening was a free oracle on the list, so it
+# spends the same budgets as check_disclosure.
+
+
+def test_a_screened_write_spends_a_pass_and_the_bytes_of_its_text_and_path(
+    world: World, tmp_path: Path
+) -> None:
+    as_writer(world)
+    listed(world, tmp_path)
+    path, text = "screened.md", "a clean text\n"
+    _, error = world.call("write_scratch", {"path": path, "text": text})
+    assert not error
+    [recorded] = checks(world)
+    assert recorded == DisclosureChecked(
+        "alpha", recorded.checked_at, 0, len(text) + len(path)
+    )
+    answer, _ = world.call("check_disclosure", {"text": "x"})
+    assert f"{MAX_DISCLOSURE_PASSES - 2} of {MAX_DISCLOSURE_PASSES} passing" in answer
+    assert f"{MAX_DISCLOSURE_BYTES - len(text) - len(path) - 1} of" in answer
+    # A write without a list screens nothing and spends nothing.
+    world.scheduler.set_disclosure_terms(())
+    _, error = world.call("write_scratch", {"path": "free.md", "text": text})
+    assert not error and len(checks(world)) == 2
+
+
+@pytest.mark.parametrize(
+    ("filler", "limit", "reason"),
+    [
+        ("codename {number}", MAX_DISCLOSURE_CHECKS, "failing checks"),
+        ("filler {number}", MAX_DISCLOSURE_PASSES, "passing checks"),
+    ],
+    ids=["failures", "passes"],
+)
+def test_a_write_is_refused_unscreened_once_a_count_is_spent(
+    world: World, tmp_path: Path, filler: str, limit: int, reason: str
+) -> None:
+    """The audit's 100 clean writes in two seconds now stop at the pass limit. A
+    spent failure limit refuses a clean write too, since answering only the clean
+    ones would tell the line which texts fail. Neither holds the line, writes the
+    file or records a check, as a spent check_disclosure does not."""
+    as_writer(world)
+    listed(world, tmp_path)
+    for number in range(limit):
+        world.call("check_disclosure", {"text": filler.format(number=number)})
+    filled = len(checks(world))
+    assert filled == limit
+    for text in ("clean\n", "the codename\n"):
+        refusal, error = world.call("write_scratch", {"path": "late.md", "text": text})
+        assert error and refusal.startswith(
+            "write_scratch refused by the disclosure budget rule: the limit of"
+        )
+        assert reason in refusal
+    assert not (world.root / "tmp" / "late.md").exists()
+    assert len(checks(world)) == filled and held(world) == []
+    # The window passing opens the writes again.
+    world.clock.now += timedelta(seconds=DISCLOSURE_CHECK_WINDOW_SECONDS)
+    _, error = world.call("write_scratch", {"path": "late.md", "text": "clean\n"})
+    assert not error and len(checks(world)) == filled + 1
+
+
+def test_a_write_past_the_byte_ceiling_is_refused_unscreened(
+    world: World, tmp_path: Path
+) -> None:
+    as_writer(world)
+    listed(world, tmp_path)
+    left = 10
+    world.log.append(
+        DisclosureChecked(
+            "alpha",
+            world.clock.now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            0,
+            MAX_DISCLOSURE_BYTES - left,
+        )
+    )
+    # The text and the path together are one byte over what is left.
+    path, text = "b.md", "x" * (left - len("b.md") + 1)
+    refusal, error = world.call("write_scratch", {"path": path, "text": text})
+    assert error and "disclosure budget rule" in refusal
+    assert f"with {left} bytes left" in refusal
+    assert len(checks(world)) == 1 and not (world.root / "tmp" / path).exists()
+    _, error = world.call("write_scratch", {"path": path, "text": text[:-1]})
+    assert not error and checks(world)[-1].checked_bytes == left
+
+
+def test_a_refused_write_spends_a_failure_and_its_bytes(
+    world: World, tmp_path: Path
+) -> None:
+    as_writer(world)
+    listed(world, tmp_path)
+    path, text = "f.md", "the codename\n"
+    refusal, error = world.call("write_scratch", {"path": path, "text": text})
+    assert error and "disclosure list rule" in refusal
+    assert [(event.matched_lines, event.checked_bytes) for event in checks(world)] == [
+        (1, len(text) + len(path))
+    ]
 
 
 # Round 15, item 5. A turn that would only repeat an answer already given.

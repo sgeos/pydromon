@@ -247,12 +247,12 @@ argument outside a tool's schema is refused.
 |---|---|
 | `send_message` | Sends a note to a line, an operator or the line itself, delivered in a later tick. With `priority` true, a note to another line is priority mail, rate limited, as [`PRIORITY.md`](PRIORITY.md) specifies. With `issue` true, from 2026-10-31, it raises an issue with an operator, as below. From round 14, `asks_reply` says whether a note asks a reply, and `reply_to` may also name a note the line sent the same recipient, to correct it, as the unanswered rule below says. `@operator` names the project's default operator, as below |
 | `ask_operator` | Asks an operator a question, which never pauses the line |
-| `wake_after` | Schedules one wake for the line, optionally tied to a running background task or to a process of its own that `list_processes` shows, as below |
+| `wake_after` | Schedules one wake for the line, optionally tied to a running background task, to a process of its own that `list_processes` shows, or to an open run of its scope, as below |
 | `list_mail`, `read_mail`, `acknowledge_mail` | Page through, open and acknowledge the line's mailbox |
 | `list_sent` | Lists what became of the line's sent mail |
 | `acquire_lease`, `release_lease` | Take and give up a lease the project declares, as below |
 | `list_leases` | From round 14. Lists every live lease, with its holder, both times and the holder's unverified note, and the declared leases no line holds. Read only, the same for every line, as below |
-| `start_run`, `run_status`, `stop_run` | Offered while the project declares a run command, or while the line's scope has a run to read. Start a declared command as a supervised run that outlives the turn, the seat and the daemon, show the scope's latest runs with their receipts, and stop its open run, as [`RUNS.md`](../architecture/RUNS.md) specifies. A seat must own its role, and every line needs write access to its working directory. A lost run blocks its scope until no process is left in its supervisor's group or session, or an operator clears it. Added on 2026-10-31, and the last two sentences in the review of that day. From round 14 they are also offered while the project declares a commit command, and `start_run` takes `commit`, the full commit a commit command runs on in a checkout the daemon makes, which a line that only reads its working directory may start and stop |
+| `start_run`, `run_status`, `stop_run` | Offered while the project declares a run command, or while the line's scope has a run to read. Start a declared command as a supervised run that outlives the turn, the seat and the daemon, show the scope's latest runs with their receipts, and stop its open run, as [`RUNS.md`](../architecture/RUNS.md) specifies. A seat must own its role, and every line needs write access to its working directory. A lost run blocks its scope until no process is left in its supervisor's group or session, or an operator clears it. Added on 2026-10-31, and the last two sentences in the review of that day. From round 14 they are also offered while the project declares a commit command, and `start_run` takes `commit`, the full commit a commit command runs on in a checkout the daemon makes, which a line that only reads its working directory may start and stop. From the task of 2026-11-05 `start_run` takes `arguments`, a value for each parameter a command declares, each matching its pattern, `run_status` reconciles an open run before it answers and shows a failed latest run's untrusted output tail, and `wake_after` may wait for an open run |
 | `line_status` | Shows a compact read-only status by default, with diagnostic detail and long lists available by argument, as below |
 | `role_status` | Offered only to a seat of a role. Shows the role's worktree, whether the project file or an operator holds it, its declared failover order, failover policy, handoff threshold, owner, the seat a failover would pass it to now and the latest change of owner, its seats in the failover order with whether each is usable for a failover, their condition, worktree access, whether each waits because its engine cannot confine it, model, provider and stated budget, each seat's latest three background task ends with the digest of their output, and its latest five journal entries, the newest with its body, read only, as [`ROLES.md`](../architecture/ROLES.md) describes. Added on 2026-10-27, the task ends on 2026-10-28, the holder and the order on 2026-10-31 in round 10, and whether the project file declares the role, how a role an operator holds differs from it, and the lines that wait beside the owner, in the round 10 review. **Round 15, item 5.** It also gives `reviews`, the roles this role reviews, `reviewed_by`, the roles that review it, and `review_diversity`, each pair of a reviewing role and a role it reviews, this role being either, whose owners run the same engine and model, with `reviewer`, `reviewer_owner`, `author`, `author_owner`, `model`, `provider` and `text`, a sentence that says so. A pair either role of which is vacant is left out. Nothing is refused for a pair |
 | `record_role_note` | Offered only to a seat. Records a journal entry of `kind` `note`, by any seat, or `recovery`, by the owner, which the daemon stamps with the role worktree's commit, its own commit and the time. A handoff entry is written only by `relinquish_ownership`. Added on 2026-10-27 |
@@ -262,7 +262,7 @@ argument outside a tool's schema is refused.
 | `propose_change` | Records a proposed patch, file list and message for operator review; it does not change project files |
 | `read_instructions` | Shows the instructions the line's next turn receives, as below |
 | `write_scratch` | Writes a file under the line's scratch in its working directory, `tmp/` or `tmp/lines/LINE`, as below. Its result gives the absolute path written and the bytes written |
-| `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term, a file name or a line location. Files are checked independently, so a match cannot span files. A file is read in parts of at most 1 MiB cut after a newline and the counts are summed, a line may not exceed 1 MiB, and the combined content is at most 16 MiB. A path may be the absolute path `write_scratch` reported. One call, including a list, spends one recorded check, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. A file whose bytes already passed, as a checked text or as written by `write_scratch`, is answered as a pass and spends no check. Added on 2026-10-28, changed in round 15 |
+| `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term, a file name or a line location. Files are checked independently, so a match cannot span files. A file is read in parts of at most 1 MiB cut after a newline and the counts are summed, a line may not exceed 1 MiB, and the combined content is at most 16 MiB. A path may be the absolute path `write_scratch` reported. One call, including a list, is one recorded check. In any 3,600 seconds a line has 10 failing checks, which bound the terms it can confirm, 60 passing checks, which bound the candidate texts it can try, and 64 MiB read by its checks in all, which bounds the candidate bytes it can test and the daemon's time spent matching for it, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies since the round 15 review. Once either count is spent every check is refused, content past the bytes left is refused unread, and the answer says what is left of each. The check reads on a worker thread, off the daemon's event loop, and one runs at a time for each line. A file check whose files' bytes all already passed, as a checked text, as a checked file of the same path or as written by `write_scratch`, is answered as a pass from memory and spends nothing of any budget, even once a budget is spent, since it tells the line nothing it did not learn when the bytes passed. A file the daemon wrote without screening, as `scratch_place` writes an operator's CI log, is never remembered as passed. Once a budget is spent, a file is read for that comparison only when its size equals that of a remembered pass, and is never matched. Added on 2026-10-28, changed in round 15 |
 | `list_processes`, `stop_process` | List and stop the processes the line started, as below. Where the daemon cannot attribute processes to the line, `list_processes` says it is unavailable and why, and never returns an empty list. Changed in round 14 |
 | `worktree_status` | Gives the state of the line's own working directory, computed by the daemon outside the line's sandbox, as the processes section below specifies. Added in round 14, item 7 |
 
@@ -808,7 +808,7 @@ area, since `tmp/reports` is the owner's. **Interpretation.** The task named "th
 scratch path is already tmp/reports", which this reads as these two cases. The operator
 can narrow it to one. **Every refusal names its rule.** A refusal reads `write_scratch
 refused by the RULE rule: DETAIL`, with RULE one of `area`, `relative path`, `no parent
-component`, `size`, `disclosure list`, `read_only_paths`, `working directory`, `path
+component`, `size`, `disclosure budget`, `disclosure list`, `read_only_paths`, `working directory`, `path
 walk`, `reserved report directory`, `no overwrite of a link`, `file target`,
 `operating system`, `reports area is for the owner` and `reports area is declared`.
 The one exception is a line held for its disclosure limit, which every tool answers in
@@ -1366,8 +1366,11 @@ to read the result.
 - **Arguments.** `seconds`, a whole number from 60 to 86,400, and `note`, text of at
   most 2,000 bytes. Optional `task_id` names one of the line's currently running
   background tasks, or, from round 14, one of its own processes that `list_processes`
-  shows, written `pid:NUMBER` as that listing gives it. Naming a task that is not
-  running, or a process that is not the line's own, is refused. Where processes cannot
+  shows, written `pid:NUMBER` as that listing gives it, or, from the task of
+  2026-11-05, an open supervised run of the line's scope by the identifier
+  `run_status` gives. Naming a task that is not running, a process that is not the
+  line's own, a run of another scope, or a run that has ended, is refused, the last
+  with the run's receipt. Where processes cannot
   be attributed, a `pid:` identifier is refused as unavailable with the reason. A number with a
   fraction, a boolean or text is refused.
 - **Effect.** The daemon appends `wake_scheduled` with the due time, the wall clock in
@@ -1380,7 +1383,10 @@ to read the result.
   end wakes the line with a note that names the cancelled wake. This note is emitted
   even when the ordinary task-note limit has been reached. If the task outlives the
   timeout, the wake fires instead. If the wake has fired already, its message cannot
-  be withdrawn, and it has already provided the fallback turn. An unbound wake behaves
+  be withdrawn, and it has already provided the fallback turn. A run's end is recorded
+  as `run_ended` rather than a task note, and withdraws the wake with `wake_withdrawn`,
+  and its `Run ended` note, with the exit and a failed run's untrusted tail, names the
+  cancelled wake, as [`RUNS.md`](../architecture/RUNS.md) specifies. An unbound wake behaves
   as before.
 - **For review.** The wait uses a scheduled wake and ends the turn. It does not block
   inside a tool call, because a blocked turn would hold the line open while preventing
@@ -1402,8 +1408,14 @@ to read the result.
 **Disclosure guard.** When the project names a disclosure list, a refused tool call
 names a field such as `body` or `note` only when the call offers text in that one
 field. Calls offering several text fields receive a generic refusal, even if only
-one matches. Neither answer names the term or its position. The refusal records a disclosure check and counts against the same hourly limit as
-`check_disclosure`, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. A wake note
+one matches, except `set_brief`, which since the task of 2026-11-05 names the one field that
+matched and gives the generic refusal when two or more did. No answer names the term
+or its position. The refusal records a disclosure check and counts against the same hourly limit as
+`check_disclosure`'s failing checks. A text that passes is not counted, unlike a
+passing `check_disclosure`, which since the round 15 review counts against its own
+limit of 60, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. `write_scratch`
+is the exception since the round 15 re-review. Its screening spends a pass or a
+failure and its bytes as a check does, and is refused once either count is spent. A wake note
 is checked again when it fires.
 
 **Request keys.** **Row 11 of the T3 Code review, 2026-10-27.** `send_message`,
