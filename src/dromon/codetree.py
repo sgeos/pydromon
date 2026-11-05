@@ -31,13 +31,15 @@ line is denied that file, as ``dromon.workdir`` describes.
 
 Failure modes. Every failure, a missing git, a timeout, a commit the repository does not
 hold, and a question still queued, answers ``None``, which callers report as unknown,
-never as a difference. The worker is a daemon thread, so it never holds the daemon's
-exit. A git it is running when the daemon exits is left to end by itself, which a
-command that only reads does without harm.
+never as a difference. **Round 15.** The start of a git is bounded too, through
+``dromon.spawn``, so one stalled start cannot hold the worker for good. The worker is
+a daemon thread, so it never holds the daemon's exit. A git it is running when the
+daemon exits is left to end by itself, which a command that only reads does without
+harm.
 
 Porting note. The worker is a thread with a lock, which maps onto a ``std::thread``
 with a channel in the Rust port, and onto an external effect of a bounded stream
-processor in Keleusma. The process is started with ``subprocess.run``, which maps onto
+processor in Keleusma. The process is started with ``spawn.run``, which maps onto
 ``std::process::Command`` with a timeout.
 """
 
@@ -51,6 +53,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal
+
+from dromon import spawn
 
 GIT_SECONDS: Final = 5.0
 """How long one git command may take before its answer counts as unknown."""
@@ -92,21 +96,22 @@ class _Answer:
 
 def _git(directory: Path, *arguments: str) -> subprocess.CompletedProcess[str] | None:
     """Run git in ``directory``, or ``None`` when it cannot be started. Raises
-    ``_Timeout`` when it runs past ``GIT_SECONDS``."""
+    ``_Timeout`` when it runs past ``GIT_SECONDS``, or does not start within
+    ``dromon.spawn.START_SECONDS``, or when earlier starts are still stuck, as
+    ``dromon.spawn`` describes."""
     environment = {
         name: value for name, value in os.environ.items() if not name.startswith("GIT_")
     }
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     try:
-        return subprocess.run(  # noqa: S603
-            ["git", "-C", str(directory), *arguments],  # noqa: S607
+        return spawn.run(
+            ["git", "-C", str(directory), *arguments],
             capture_output=True,
             text=True,
             timeout=GIT_SECONDS,
-            check=False,
             env=environment,
         )
-    except subprocess.TimeoutExpired as error:
+    except (subprocess.TimeoutExpired, spawn.StartStalled) as error:
         raise _Timeout from error
     except OSError:
         return None

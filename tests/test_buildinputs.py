@@ -4,12 +4,11 @@ S1b. The comparisons run real git on a temporary repository, with no remote, who
 ``origin/main`` is set by hand."""
 
 import os
-import subprocess
 from pathlib import Path
 
 import pytest
 
-from dromon import buildinputs
+from dromon import buildinputs, spawn
 from dromon.buildinputs import WHOLE_TREE, BuildInputsUnknown
 
 PROJECT = """\
@@ -57,13 +56,14 @@ def git(repository: Path, *args: str) -> str:
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
     }
-    return subprocess.run(  # noqa: S603
-        ["git", "-c", "core.hooksPath=/dev/null", *args],  # noqa: S607
+    return spawn.run(
+        ["git", "-c", "core.hooksPath=/dev/null", *args],
         cwd=repository,
         env=environment,
         capture_output=True,
         text=True,
         check=True,
+        timeout=60,
     ).stdout
 
 

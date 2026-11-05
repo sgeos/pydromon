@@ -3,7 +3,6 @@ paths together. **Round 14 task of 2026-11-01.**"""
 
 import asyncio
 import os
-import subprocess
 from collections.abc import Generator, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -12,7 +11,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import readiness
+from dromon import readiness, spawn
 from dromon.driver import Strategy
 from dromon.lineconfig import DEFAULT_CONFIG
 from dromon.eventlog import EventLog
@@ -83,8 +82,8 @@ def git(directory: Path, *arguments: str) -> None:
     environment = {
         name: value for name, value in os.environ.items() if not name.startswith("GIT_")
     }
-    subprocess.run(  # noqa: S603
-        [  # noqa: S607
+    spawn.run(
+        [
             "git",
             "-C",
             str(directory),
@@ -99,6 +98,7 @@ def git(directory: Path, *arguments: str) -> None:
         check=True,
         capture_output=True,
         env=environment,
+        timeout=60,
     )
 
 
@@ -238,10 +238,11 @@ def test_the_tool_is_offered_to_seats_and_takes_no_arguments(role: Role) -> None
 
 
 def readiness_head(worktree: Path) -> str:
-    done = subprocess.run(  # noqa: S603
-        ["git", "-C", str(worktree), "rev-parse", "HEAD"],  # noqa: S607
+    done = spawn.run(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
         check=True,
         capture_output=True,
         text=True,
+        timeout=60,
     )
     return done.stdout.strip()

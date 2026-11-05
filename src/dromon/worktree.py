@@ -48,6 +48,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from dromon import spawn
+
 GIT_SECONDS: Final = 30.0
 """How long one git command may take. ``status`` reads every file of a large tree."""
 
@@ -97,23 +99,25 @@ def git_environment() -> dict[str, str]:
 
 
 def run_git(directory: Path, arguments: Sequence[str]) -> Ran:
-    """The real runner. It never raises for a failed command."""
+    """The real runner. It never raises for a failed command. A git that overruns
+    ``GIT_SECONDS`` gives 124, and one that does not start within
+    ``dromon.spawn.START_SECONDS``, or cannot be run, or is not started because earlier
+    starts are still stuck, gives 127 with the reason, as ``dromon.spawn`` describes."""
     command = ["git", "-C", str(directory), "-c", "core.fsmonitor=false", *arguments]
     try:
-        done = subprocess.run(  # noqa: S603
+        result = spawn.run(
             command,
             capture_output=True,
             text=True,
             errors="surrogateescape",
             timeout=GIT_SECONDS,
-            check=False,
             env=git_environment(),
         )
     except subprocess.TimeoutExpired:
         return Ran(124, "", f"git did not finish within {GIT_SECONDS:g} seconds")
     except OSError as error:
         return Ran(127, "", f"git cannot be run: {error}")
-    return Ran(done.returncode, done.stdout, done.stderr)
+    return Ran(result.returncode, result.stdout, result.stderr)
 
 
 def _cut(text: str, limit: int) -> str:

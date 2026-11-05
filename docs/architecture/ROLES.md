@@ -503,6 +503,28 @@ records no budget, and grounds neither a failover nor a seat's own take, so the
 operator moves the role, if at all. A turn that fails in any other way holds the line
 as before, and is not a ground.
 
+### The former holder's processes
+
+**Round 15, item 4.** After ownership passes, the successor wants to know whether the
+former holder left processes running. `role_status` and the operator's role view carry
+`former_holder` for the seat named as `previous` in the latest change of owner, with
+`state`, `count`, `observed_at` and `basis`.
+
+- `running` when the seat has a turn in flight, or the last observation found a process
+  carrying one of the seat's marks, of this run or an earlier one.
+- `ended` when the last observation read the process table and found none. **It means
+  none was found among the environments that could be read at `observed_at`.** A
+  process that removed its mark, or whose environment cannot be read, is not seen, and a
+  turn that began after the observation is not in it.
+- `unknown` when the platform cannot attribute processes, when the table could not be
+  read, and for a change not yet observed. A failed read is never `ended`.
+
+The `role_status` tool reads the table before it answers. The operator's view shows the
+last observation and starts a new one in the background, so a second view is fresher. An
+observation belongs to one change of owner, by its journal entry, and a later change
+shows `unknown` until it is observed. It does not say that an engine session ended, only
+what the process table showed, and `list_processes` remains the line's own tool.
+
 ## Recovery
 
 A seat takes ownership with `take_ownership` and a reason, or the operator gives it with

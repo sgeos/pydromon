@@ -63,6 +63,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final, cast
 
+from dromon import spawn
 from dromon.processes import TreeRow, attached, deepest_first, signal_if_same
 from dromon.model import (
     MAX_EXIT_CODE,
@@ -497,13 +498,14 @@ def process_start(pid: int) -> str | None:
     it. Raises ``TableUnreadable`` when ``ps`` cannot answer, which is never taken
     for an absent process."""
     try:
-        found = subprocess.run(  # noqa: S603
+        found = spawn.run(
             ["/bin/ps", "-o", "lstart=", "-p", str(pid)],
             capture_output=True,
             text=True,
             env=PS_ENVIRONMENT,
             timeout=PS_TIMEOUT_SECONDS,
             check=False,
+            essential=True,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise TableUnreadable(f"ps cannot be run: {error}") from error
@@ -544,13 +546,14 @@ def process_groups() -> list[tuple[int, int]]:
     """Every process with its group, by the process table. Raises
     ``TableUnreadable`` when ``ps`` cannot answer."""
     try:
-        found = subprocess.run(  # noqa: S603
+        found = spawn.run(
             ["/bin/ps", "-A", "-o", "pid=,pgid="],
             capture_output=True,
             text=True,
             env=PS_ENVIRONMENT,
             timeout=PS_TIMEOUT_SECONDS,
             check=False,
+            essential=True,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise TableUnreadable(f"ps cannot be run: {error}") from error
@@ -672,7 +675,7 @@ def launch(
     runs_in = workdir if command_dir is None else command_dir
     ready_read, ready_write = os.pipe()
     try:
-        child = subprocess.Popen(  # noqa: S603
+        child = spawn.start(
             [
                 sys.executable,
                 "-I",
@@ -692,13 +695,13 @@ def launch(
             cwd="/",
             env=dict(environment),
             start_new_session=True,
+            # Closed by spawn once the start has ended, even a start that stalled, so
+            # that a late start never sees a descriptor another thread reused.
+            close_after=(output, ready_write),
         )
     except OSError as error:
         os.close(ready_read)
         raise RunRefused(f"the run's supervisor cannot start: {error}") from error
-    finally:
-        os.close(output)
-        os.close(ready_write)
     try:
         readable, _, _ = select.select([ready_read], [], [], READY_SECONDS)
         ready = bool(readable) and os.read(ready_read, len(READY)) == READY
@@ -1006,7 +1009,7 @@ def supervise(
     if supervision.stopping.is_set():
         return Receipt(RunStatus.STOPPED, None, "stopped before its command started")
     try:
-        child = subprocess.Popen(  # noqa: S603
+        child = spawn.start(
             list(command), cwd=workdir, stdin=subprocess.DEVNULL, process_group=0
         )
     except OSError as error:

@@ -114,7 +114,14 @@ import sys
 import traceback
 from datetime import UTC, datetime, timedelta
 from collections import deque
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    Awaitable,
+    Callable,
+    Generator,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import (
@@ -129,6 +136,7 @@ from typing import (
 
 from claude_agent_sdk import SdkMcpTool
 
+from dromon import spawn
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon import disclosure, disclosurecheck
 from dromon.overrides import (
@@ -152,7 +160,14 @@ from dromon.forwarder import PeerReport, check_outbound, outage_text
 from dromon.peering import PeerPriority, PeerTurns, Received, TurnCause, turn_cause
 from dromon import acp, antigravity, codex, cursor, grok, pi
 from dromon.agents import LineTokens
-from dromon import capabilities, launcher, linetemp, redact
+from dromon import (
+    capabilities,
+    credentials,
+    launcher,
+    linetemp,
+    redact,
+    sandboxprobe,
+)
 from dromon.linetemp import LineTemp
 from dromon.security_paths import project_secret_paths
 from dromon.handoff import Handoff
@@ -211,6 +226,8 @@ from dromon import codetree
 from dromon.gitssh import GitSshAccess, sandbox_layer, unreadable
 from dromon.settings import SettingsConfig
 from dromon.processes import (
+    ChildLedger,
+    LaunchedHarness,
     ProcessRefused,
     ProcessTable,
     ProcessWorker,
@@ -219,12 +236,19 @@ from dromon.processes import (
     unavailable,
     SystemProcesses,
     TreeRow,
+    below,
+    former_holder_reading,
+    identity_of,
+    ledger_listing,
     line_process_ended,
     line_processes,
     marked_processes,
     pid_of_task,
     pid_task_id,
+    root_is_harness,
+    stop_ledgered,
     stop_line_process,
+    tree_or_reason,
 )
 from dromon.projectconfig import ProjectConfig
 from dromon.worktree import (
@@ -861,6 +885,11 @@ CHECK_DISCLOSURE_SCHEMA: Final[dict[str, object]] = {
 
 FIRST_FAULT_PAUSE_SECONDS: Final = 1.0
 MAX_FAULT_PAUSE_SECONDS: Final = 60.0
+SECRETS_RETRY_SECONDS: Final = 1.0
+"""**Review of 7744806.** How long the loop rests after a tick in which the log refused
+an event for want of its secret values, as ``SecretsUnavailable`` says. It is fixed
+and not doubled, and it is not a fault, so the other work of the tick has been done
+and nothing else is held."""
 """The scheduler's pause after a fault doubles from 1 second to 1 minute. Shorter than
 the forwarder's backoff, since every line waits on the scheduler."""
 
@@ -1011,6 +1040,19 @@ READ_INSTRUCTIONS_TOOL_NAME: Final = "read_instructions"
 NO_ARGUMENTS_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
     "properties": {},
+    "additionalProperties": False,
+}
+
+SANDBOX_PROBE_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "operation": {"type": "string", "enum": ["read", "write"]},
+        "path": {
+            "type": "string",
+            "description": "a path in your scratch directory, or relative to it",
+        },
+    },
+    "required": ["operation", "path"],
     "additionalProperties": False,
 }
 
@@ -1264,6 +1306,7 @@ PID_WATCH_SECONDS: Final = 5.0
 is one ``ps`` call on macOS, so it is not made oftener. **Round 14, item 5.**"""
 
 WORKTREE_STATUS_TOOL_NAME: Final = "worktree_status"
+SANDBOX_PROBE_TOOL_NAME: Final = "sandbox_probe"
 
 LIST_PROCESSES_TOOL_NAME: Final = "list_processes"
 STOP_PROCESS_TOOL_NAME: Final = "stop_process"
@@ -2542,6 +2585,9 @@ class Scheduler:
         log once after a restart."""
         self._processes: ProcessTable = processes or SystemProcesses()
         self._process_worker = ProcessWorker()
+        self._former_observed: dict[str, tuple[str | None, dict[str, object]]] = {}
+        """By role, the change of owner an observation of the former holder's processes
+        answers, by its entry identifier, and the observation. Round 15, item 4."""
         self._sweep_worker = ProcessWorker()
         self._git_worker = ProcessWorker()
         self._walk_worker = ProcessWorker()
@@ -2632,6 +2678,25 @@ class Scheduler:
         self._sweep_failure: str | None = None
         """Why the last sweep could not read the process table, said once."""
         self._detached: dict[str, tuple[int, ...]] = {}
+        self._stuck_noted = False
+        """Whether the operator was told of the stuck starts now at the bound."""
+        self.secret_refusals = 0
+        """How many actions of a tick the log refused for want of its secret values."""
+        self._secrets_noted = False
+        """Whether the present episode of such refusals was said on the error stream."""
+        self._tick_refused = False
+        """Whether the tick now running had such a refusal."""
+        self._children = ChildLedger()
+        """Round 15, item 3. The children seen below each line's engine."""
+        self._tree_read: Callable[[], list[TreeRow] | TreeReadFailure] = lambda: (
+            tree_or_reason(os.getuid(), with_start=True)
+        )
+        """Reads every process of the daemon's user with start times. A test replaces
+        it with a fake table."""
+        self._identity_read: Callable[[int], tuple[int, str] | None] = identity_of
+        self._harness_read: Callable[[str], LaunchedHarness | None] = (
+            self._launched_harness
+        )
         """The pids each line was last reported to have left outside its engine's
         tree, so the same set is not recorded again at every turn."""
         self._processes_identifiable = processes_identifiable
@@ -2809,6 +2874,21 @@ class Scheduler:
         self._withdraw_stale_ceilings()
         self._work.set()
 
+    async def _trim_line_temp(self, engine: LineEngine) -> str | None:
+        """Keep the line's temporary directory and cache within their byte bounds
+        before its turn, as ``linetemp.trim`` says, off the event loop, and give the
+        sentence the prompt carries when something was removed. **Round 15, item 5.**
+        A failure is written to standard error and does not stop the turn."""
+        temp = getattr(engine, "temp", None)
+        if not isinstance(temp, LineTemp):
+            return None
+        try:
+            found = await asyncio.to_thread(linetemp.trim_line, temp)
+        except OSError as error:
+            print(f"dromond: line temporary trim failed: {error}", file=sys.stderr)
+            return None
+        return linetemp.trim_notice(found)
+
     def _sweep_line_temps(self) -> None:
         """Remove the temporary directories that no line owns, and stale entries in
         those that do, as ``linetemp.sweep`` says, before any engine of this run
@@ -2833,7 +2913,80 @@ class Scheduler:
         line. **Review F1.**"""
         text = note or ""
         if self._state().walk_limit != text:
-            self._log.append(WalkLimited(text))
+            self._append_or_say(WalkLimited(text), "the walk gap")
+
+    @contextlib.contextmanager
+    def _refusing_on_secrets(self, what: str) -> Generator[None]:
+        """The one place where a refused append ends an action of the tick, and no
+        more. **Review of 7744806.** About seventy appends in this module can meet
+        ``credentials.SecretsUnavailable`` when the source of literal secret values
+        fails, and an exception from any of them would reach ``_fault_found``, which
+        pauses the whole scheduler and doubles the pause while the source fails. The
+        tick therefore runs each of its actions inside this guard. The action that
+        met the refusal ends, its event was never stored, so its state is as it was
+        and it is tried again at the next tick, and the other actions of the tick go
+        on. The standard error says so once for each episode, naming the action and
+        never any text, and ``secret_refusals`` counts them. The loop rests
+        ``SECRETS_RETRY_SECONDS`` before the next tick, which is not a fault.
+
+        Not covered, by design. A tool or an operator request calls the log from its
+        own task, and the refusal reaches its caller as an ``EventRejected``, which
+        every such caller already turns into an error. Only a refusal that is raised
+        outside the tick's actions, as from a turn task, still reaches the fault
+        handler."""
+        try:
+            yield
+        except credentials.SecretsUnavailable:
+            self.secret_refusals += 1
+            self._tick_refused = True
+            if not self._secrets_noted:
+                self._secrets_noted = True
+                print(
+                    f"dromond: {what} was refused, because the literal secret values"
+                    " could not be read, and is tried again",
+                    file=sys.stderr,
+                )
+
+    def _append_or_say(self, event: Event, what: str) -> bool:
+        """Append an event the daemon makes for itself, and say so on the standard error
+        and return ``False`` when the log refuses it because the literal secret values
+        could not be read, as ``credentials.SecretsUnavailable`` says. **Review of
+        151cbcd.** The daemon cannot ask anyone to try again, and an exception here
+        would cut a turn's end or the daemon's start short, so the event is dropped,
+        nothing unmasked is stored, and the message names what was lost and never its
+        text. A caller that has state to undo undoes it when this returns ``False``."""
+        try:
+            self._log.append(event)
+        except credentials.SecretsUnavailable:
+            print(
+                f"dromond: {what} was not recorded, because the literal secret values"
+                " could not be read",
+                file=sys.stderr,
+            )
+            return False
+        return True
+
+    def note_stuck_starts(self) -> None:
+        """Tell the default operator, once for each time the count of stuck starts
+        reaches ``spawn.MAX_STRANDED``, in a note from the harness that holds no line.
+        **Review of 151cbcd.** No further child is started at the bound except the
+        reads a stop depends on, and a start that never returns frees its slot only
+        when the daemon restarts, so the operator is told. The count is read at each
+        rest of the loop. A note that cannot be recorded is tried again at the next."""
+        stuck = spawn.stranded_count()
+        if stuck < spawn.MAX_STRANDED:
+            self._stuck_noted = False
+            return
+        if self._stuck_noted:
+            return
+        operator = self._default_operator
+        try:
+            self.ensure_operator(operator.operator_id)
+            self.send(HARNESS, operator, spawn.stuck_text(stuck))
+        except EventRejected as error:
+            print(f"dromond: stuck starts were not reported: {error}", file=sys.stderr)
+            return
+        self._stuck_noted = True
 
     def _schedule_survivor_scan(self) -> None:
         if not self._processes_identifiable:
@@ -3749,7 +3902,10 @@ class Scheduler:
         template = restart.NOTE if self._restart is not None else restart.ABANDONED_NOTE
         body = template.format(operator=self._restart_by)
         message_id = new_id("m")
-        self._log.append(RestartNoted(line_id, message_id, body))
+        if not self._append_or_say(
+            RestartNoted(line_id, message_id, body), f"the restart note of {line_id}"
+        ):
+            return
         self._sent.append(message_id)
         self._failed.discard(line_id)
         self._work.set()
@@ -4092,37 +4248,43 @@ class Scheduler:
         the note goes no further."""
         fired: list[str] = []
         for line_id in self._due_wakes():
-            pending = self._state().scheduled[line_id]
-            # Task of 2026-10-30, and R1 of its review. A context known below the
-            # threshold needs no compaction. Under the automatic hold the last
-            # compaction did not bring the context below the threshold, or its effect
-            # is unknown, so another would not help, and the wake would cost a turn
-            # only to say so.
-            if self._context_compaction_wake_ids.get(
-                line_id
-            ) == pending.message_id and (
-                self._context_below_compaction_threshold(line_id)
-                or line_id in self._auto_held
-            ):
-                self._log.append(WakeWithdrawn(line_id, pending.message_id))
-                self._context_compaction_wake_ids.pop(line_id, None)
-                self._context_compaction_wakes.discard(line_id)
-                continue
-            address = LineAddress(line_id)
-            body = WITHHELD_WAKE_NOTE if self.discloses(pending.note) else pending.note
-            self._log.append(
-                MessageSent(
-                    pending.message_id,
-                    address,
-                    address,
-                    MessageKind.NOTE,
-                    body,
-                )
-            )
-            self._sent.append(pending.message_id)
-            self._failed.discard(line_id)
-            fired.append(pending.message_id)
+            with self._refusing_on_secrets(f"the wake of line {line_id}"):
+                woken = self._fire_wake(line_id)
+                if woken is not None:
+                    fired.append(woken)
         return fired
+
+    def _fire_wake(self, line_id: str) -> str | None:
+        """Fire the due wake of ``line_id``, and return its message identifier, or
+        ``None`` when the wake was withdrawn instead."""
+        pending = self._state().scheduled[line_id]
+        # Task of 2026-10-30, and R1 of its review. A context known below the
+        # threshold needs no compaction. Under the automatic hold the last
+        # compaction did not bring the context below the threshold, or its effect
+        # is unknown, so another would not help, and the wake would cost a turn
+        # only to say so.
+        if self._context_compaction_wake_ids.get(line_id) == pending.message_id and (
+            self._context_below_compaction_threshold(line_id)
+            or line_id in self._auto_held
+        ):
+            self._log.append(WakeWithdrawn(line_id, pending.message_id))
+            self._context_compaction_wake_ids.pop(line_id, None)
+            self._context_compaction_wakes.discard(line_id)
+            return None
+        address = LineAddress(line_id)
+        body = WITHHELD_WAKE_NOTE if self.discloses(pending.note) else pending.note
+        self._log.append(
+            MessageSent(
+                pending.message_id,
+                address,
+                address,
+                MessageKind.NOTE,
+                body,
+            )
+        )
+        self._sent.append(pending.message_id)
+        self._failed.discard(line_id)
+        return pending.message_id
 
     def _context_below_compaction_threshold(self, line_id: str) -> bool:
         """Whether a known context estimate is below its effective trigger."""
@@ -5206,7 +5368,23 @@ class Scheduler:
         holder = self._note_run_holder(ended, text, waiting.get)
         for line_id, wake_id in sorted(waiting.items()):
             if line_id != holder:
-                self._harness_note(LineAddress(line_id), text + _run_wake_text(wake_id))
+                self._note_or_say(line_id, text + _run_wake_text(wake_id))
+
+    def _note_or_say(self, line_id: str, text: str) -> None:
+        """Send ``text`` from the harness to ``line_id``, and when the literal
+        secret values cannot be read say so on the standard error, naming the line
+        and never the text. Review of 151cbcd. The run's end is already recorded
+        and the note is the only thing lost, so the sweep goes on. The wake the note
+        names was withdrawn, so a line that waited for the run is not woken by it
+        and finds the run with ``run_status``."""
+        try:
+            self._harness_note(LineAddress(line_id), text)
+        except credentials.SecretsUnavailable:
+            print(
+                f"dromond: the note of a run to {line_id} was not recorded,"
+                " because the literal secret values could not be read",
+                file=sys.stderr,
+            )
 
     def _screened_output(
         self, line_id: str, finding: runs.Finding
@@ -5277,7 +5455,7 @@ class Scheduler:
             return None
         wake_id = waited(recipient)
         suffix = "" if wake_id is None else _run_wake_text(wake_id)
-        self._harness_note(LineAddress(recipient), text + suffix)
+        self._note_or_say(recipient, text + suffix)
         return recipient
 
     def _run_tools(self, line_id: str) -> list[SdkMcpTool[Any]]:
@@ -5758,9 +5936,12 @@ class Scheduler:
         if self.discloses(note):
             note = WITHHELD_WAKE_NOTE
         message_id = new_id("m")
-        self._log.append(
-            WakeScheduled(line_id, message_id, format_due(self._wall_clock()), note)
-        )
+        if not self._append_or_say(
+            WakeScheduled(line_id, message_id, format_due(self._wall_clock()), note),
+            f"the compaction wake of {line_id}",
+        ):
+            self._context_compaction_wakes.discard(line_id)
+            return
         self._context_compaction_wake_ids[line_id] = message_id
         self._work.set()
 
@@ -6448,6 +6629,11 @@ class Scheduler:
                 else {
                     "tmpdir": str(temp.temp),
                     "uv_cache_dir": str(temp.cache),
+                    "shell_tmpdir": linetemp.claude_shell_tmpdir(os.getuid()),
+                    "shell_tmpdir_basis": (
+                        "observed under Claude Code on 2026-11-01, shared by every"
+                        " Claude Code line of the user, not a contract"
+                    ),
                     "shell_may_write": all(
                         writable(Path(path)) for path in temp.writable()
                     ),
@@ -6520,10 +6706,14 @@ class Scheduler:
             lines.append("Your shell keeps the temporary directory the engine gave it.")
         else:
             lines.append(
-                f"TMPDIR is {temporary['tmpdir']} and UV_CACHE_DIR is"
+                f"Claude Code sets TMPDIR in your shell to its own directory, observed"
+                f" as {temporary['shell_tmpdir']}, which every Claude Code line of"
+                " this user shares, so do not treat it as private. Dromon's directory"
+                f" for you is {temporary['tmpdir']} and UV_CACHE_DIR is"
                 f" {temporary['uv_cache_dir']}, which your shell may"
                 + ("" if temporary["shell_may_write"] else " not")
-                + " write."
+                + " write. Name that directory in full for a file other lines must"
+                " not read."
             )
         return " ".join(lines)
 
@@ -7716,6 +7906,102 @@ class Scheduler:
             handler=handler,
         )
 
+    def sandbox_probe_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``sandbox_probe`` tool, which checks one read or write of a path inside
+        the line's own scratch directory against the line's effective sandbox document,
+        as ``dromon.sandboxprobe`` says. **Round 15, item 6.** It reads and writes
+        nothing of the path, so it cannot widen what the line may do, and it says that
+        it checks configuration and does not probe the operating system."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, SANDBOX_PROBE_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            operation, text = args.get("operation"), args.get("path")
+            if not isinstance(operation, str) or not isinstance(text, str):
+                return _tool_error("operation and path must be text")
+            engine = self._engines.get(line_id)
+            if not isinstance(engine, ClaudeCodeLine):
+                return _tool_error(
+                    unavailable(
+                        SANDBOX_PROBE_TOOL_NAME,
+                        "only a Claude Code line has a sandbox document Dromon holds",
+                    )
+                )
+            scratch = engine.cwd.joinpath(*self.scratch_parts(line_id))
+            try:
+                found = sandboxprobe.probe(
+                    engine.sandbox, engine.cwd, scratch, operation, text
+                )
+            except sandboxprobe.ProbeRefused as error:
+                return _tool_error(unavailable(SANDBOX_PROBE_TOOL_NAME, str(error)))
+            return _tool_text(json.dumps(found, indent=2, sort_keys=True))
+
+        return SdkMcpTool(
+            name=SANDBOX_PROBE_TOOL_NAME,
+            description=(
+                "Check whether your sandbox allows a read or a write of a path inside"
+                " your own scratch directory, and which rule decides it. This checks"
+                " the sandbox document the engine was given and is not a probe by the"
+                " operating system, which the answer says. It reads and writes"
+                " nothing, and a path outside your scratch directory is refused."
+            ),
+            input_schema=SANDBOX_PROBE_SCHEMA,
+            handler=handler,
+        )
+
+    def _launched_harness(self, line_id: str) -> LaunchedHarness | None:
+        """The engine process the newest launch record of ``line_id`` names, when its
+        launcher has not finished, or ``None``. It is only a claim until
+        ``root_is_harness`` has compared it with the process table. Blocking file
+        reads, so a caller on the event loop runs it on the process worker.
+        **Round 15, item 3.**"""
+        records = [
+            record
+            for record in launcher.read_launches(self._report_dir)
+            if record.line_id == line_id and not record.done
+        ]
+        if not records:
+            return None
+        newest = max(records, key=lambda record: record.launched_ns or 0)
+        return LaunchedHarness(newest.harness, newest.command, newest.launched_ns)
+
+    async def _see_children(self, line_id: str) -> list[TreeRow] | TreeReadFailure:
+        """Read the process table once with start times, keep the line's children seen
+        below its engine in the ledger, and return the table. A line with no running
+        engine adds nothing, and its earlier entries are checked against the table by
+        the caller. Raises ``ProcessRefused`` when the worker's queue is full."""
+
+        known = bool(self._children.entries(line_id))
+
+        def look() -> tuple[LaunchedHarness | None, list[TreeRow] | TreeReadFailure]:
+            harness = self._harness_read(line_id)
+            if harness is None and not known:
+                # Nothing to record and nothing to check, so no process is run.
+                return None, []
+            return harness, self._tree_read()
+
+        harness, rows = await self._process_worker.run(look)
+        if (
+            harness is not None
+            and not isinstance(rows, TreeReadFailure)
+            and root_is_harness(rows, harness)
+        ):
+            # A root that is not the harness the record names is a reused pid, and its
+            # children are not the line's. Round 15, re-review of 03ccbf3.
+            self._children.record(line_id, below(rows, harness.pid, os.getpid()))
+        return rows
+
+    async def children_listing(self, line_id: str) -> list[dict[str, object]] | str:
+        """The line's ledgered children that still run as the same process, or the
+        reason the table could not be read. Used when the mark cannot be read, and to
+        add what the mark does not show. **Round 15, item 3.**"""
+        rows = await self._see_children(line_id)
+        if isinstance(rows, TreeReadFailure):
+            return str(rows)
+        me = os.getpid()
+        return ledger_listing(self._children, line_id, rows, lambda pid: pid == me)
+
     def list_processes_tool(self, line_id: str) -> SdkMcpTool[Any]:
         """The ``list_processes`` tool for ``line_id``, which sees only its own."""
 
@@ -7724,9 +8010,23 @@ class Scheduler:
             if unexpected:
                 return _tool_error(unexpected)
             if not self._processes_identifiable:
-                return _tool_error(
-                    unavailable(LIST_PROCESSES_TOOL_NAME, UNIDENTIFIABLE)
-                )
+                # Round 15, item 3. The mark cannot be read here, so what the daemon
+                # saw below the engine is all there is. An empty ledger says nothing
+                # about the line's processes, so it is the same answer as before.
+                try:
+                    ledgered = await self.children_listing(line_id)
+                except ProcessRefused as error:
+                    return _tool_error(
+                        unavailable(LIST_PROCESSES_TOOL_NAME, str(error))
+                    )
+                if isinstance(ledgered, str):
+                    # A table that could not be read is not an empty ledger.
+                    return _tool_error(unavailable(LIST_PROCESSES_TOOL_NAME, ledgered))
+                if not ledgered:
+                    return _tool_error(
+                        unavailable(LIST_PROCESSES_TOOL_NAME, UNIDENTIFIABLE)
+                    )
+                return _tool_text(json.dumps(ledgered, indent=2))
             mark = self.line_mark(line_id)
             try:
                 found = await self._process_worker.run(
@@ -7736,6 +8036,15 @@ class Scheduler:
                 # A failed inspection is never an empty list, which would say that
                 # the line has no process.
                 return _tool_error(unavailable(LIST_PROCESSES_TOOL_NAME, str(error)))
+            # The ledger adds the children the mark does not show, such as one that
+            # cleared its environment. A failure to read it never fails the listing.
+            try:
+                ledgered = await self.children_listing(line_id)
+            except ProcessRefused:
+                ledgered = []
+            if not isinstance(ledgered, str):
+                shown = {entry["pid"] for entry in found}
+                found = [*found, *(e for e in ledgered if e["pid"] not in shown)]
             return _tool_text(json.dumps(found, indent=2))
 
         return SdkMcpTool(
@@ -7752,6 +8061,29 @@ class Scheduler:
             handler=handler,
         )
 
+    async def _stop_ledgered(
+        self, line_id: str, pid: int, force: bool
+    ) -> dict[str, Any]:
+        """Stop a ledgered child by pid after checking its start time and command
+        against a fresh reading, on the process worker. **Round 15, item 3.**"""
+        me = os.getpid()
+        try:
+            done = await self._process_worker.run(
+                lambda: stop_ledgered(
+                    self._children,
+                    line_id,
+                    pid,
+                    force,
+                    read_rows=self._tree_read,
+                    identity=self._identity_read,
+                    send=self._processes.send,
+                    forbidden=lambda candidate: candidate == me,
+                )
+            )
+        except ProcessRefused as error:
+            return _tool_error(str(error))
+        return _tool_text(done)
+
     def stop_process_tool(self, line_id: str) -> SdkMcpTool[Any]:
         """The ``stop_process`` tool for ``line_id``, which stops only its own."""
 
@@ -7765,8 +8097,13 @@ class Scheduler:
                 return _tool_error("pid must be a whole number")
             if type(force) is not bool:
                 return _tool_error("force must be true or false")
-            if not self._processes_identifiable:
+            ledgered = self._children.find(line_id, pid) is not None
+            if not self._processes_identifiable and not ledgered:
                 return _tool_error(unavailable(STOP_PROCESS_TOOL_NAME, UNIDENTIFIABLE))
+            if ledgered:
+                # Round 15, item 3. A child the daemon saw below the engine is stopped
+                # by its pid and start time, without reading any environment.
+                return await self._stop_ledgered(line_id, pid, force)
             mark = self.line_mark(line_id)
             try:
                 done = await self._process_worker.run(
@@ -7999,6 +8336,7 @@ class Scheduler:
             "in_project_file": definition is not None,
             "file_differences": list(differences),
             "beside_owner": self._beside_owner_of(role_id),
+            "former_holder": self._former_holder_view(role_id),
             "order": list(role.seats),
             "handoff_seconds": role.handoff_seconds,
             "failover": role.failover.value,
@@ -8200,14 +8538,138 @@ class Scheduler:
             handler=handler,
         )
 
+    def _former_holder_view(self, role_id: str) -> dict[str, object] | None:
+        """What Dromon can say of the processes of the seat that held the role before
+        its latest change of owner, or ``None`` when the role has never changed owner
+        or the change had no former holder. **Round 15, item 4.**
+
+        ``state`` is ``running`` when the seat has a turn in flight or the last
+        observation found a process carrying its mark, ``ended`` when the last
+        observation read the process table and found none, and ``unknown`` otherwise,
+        which includes a platform that cannot attribute processes, a table that could
+        not be read and a change not yet observed. ``ended`` is
+        answered only when every process of the daemon's user was read at
+        ``observed_at``, the daemon's own launchers and their engines included, and none
+        carried the mark. A process whose environment cannot be read makes the answer
+        ``unknown``, with their number in ``unseen``. **Residual.** A process that
+        removed its mark from its own environment, or one begun after the observation,
+        is not seen, and ``ended`` says what the table showed and nothing of an engine
+        session."""
+        role = self._state().roles.get(role_id)
+        change = None if role is None else role.changed
+        if change is None or change.previous is None:
+            return None
+        former = change.previous
+        kept = self._former_observed.get(role_id)
+        observation = (
+            kept[1]
+            if kept is not None and kept[0] == change.entry_id
+            else {
+                "state": "unknown",
+                "count": None,
+                "unseen": None,
+                "observed_at": None,
+                "basis": "not observed since this change of owner",
+            }
+        )
+        view: dict[str, object] = {"line_id": former, **observation}
+        if former in self._running:
+            view.update(
+                state="running",
+                basis="a turn of the former holder is in flight",
+            )
+        return view
+
+    async def observe_former_holder(self, role_id: str) -> None:
+        """Read the process table for the former holder of ``role_id`` and keep the
+        observation for ``role_view``. A failure is kept as ``unknown`` with its
+        reason, and is never read as ``ended``."""
+        role = self._state().roles.get(role_id)
+        change = None if role is None else role.changed
+        if change is None or change.previous is None:
+            return
+        former = change.previous
+        stamp = format_due(self._wall_clock())
+        if not self._processes_identifiable:
+            observation: dict[str, object] = {
+                "state": "unknown",
+                "count": None,
+                "unseen": None,
+                "observed_at": stamp,
+                "basis": UNIDENTIFIABLE,
+            }
+        else:
+            try:
+                reading = await self._process_worker.run(
+                    lambda: former_holder_reading(self._processes, former, os.getpid())
+                )
+            except (ProcessRefused, OSError) as error:
+                observation = {
+                    "state": "unknown",
+                    "count": None,
+                    "unseen": None,
+                    "observed_at": stamp,
+                    "basis": f"the process table could not be read: {error}",
+                }
+            else:
+                count = reading.marked
+                if count:
+                    state, basis = (
+                        "running",
+                        "processes carrying the former holder's mark were found",
+                    )
+                elif reading.unseen:
+                    state, basis = (
+                        "unknown",
+                        f"none carrying the former holder's mark was found, but"
+                        f" {reading.unseen} processes of the daemon's user could not"
+                        " be read, and one of them might be the former holder's",
+                    )
+                else:
+                    state, basis = (
+                        "ended",
+                        "no process carrying the former holder's mark was found, and"
+                        " every process of the daemon's user was read, the daemon's"
+                        " own launchers and their engines included",
+                    )
+                observation = {
+                    "state": state,
+                    "count": count,
+                    "unseen": reading.unseen,
+                    "observed_at": stamp,
+                    "basis": basis,
+                }
+        self._former_observed[role_id] = (change.entry_id, observation)
+
     def role_status_tool(self, line_id: str) -> SdkMcpTool[Any]:
-        """The ``role_status`` tool for ``line_id``, offered only to a seat."""
-        return self._view_tool(
-            ROLE_STATUS_TOOL_NAME,
-            "Show your role: its worktree, its owner and the latest change of owner,"
-            " each seat with its condition, model and its provider's stated budget,"
-            " and the latest journal entries, the newest with its text, read only.",
-            lambda: json.dumps(self.role_status(line_id), indent=2, sort_keys=True),
+        """The ``role_status`` tool for ``line_id``, offered only to a seat. It reads
+        the former holder's processes first, so its answer is as fresh as the call."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, NO_ARGUMENTS_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            try:
+                seat = self._state().seats.get(line_id)
+                if seat is not None:
+                    await self.observe_former_holder(seat.role_id)
+                return _tool_text(
+                    json.dumps(self.role_status(line_id), indent=2, sort_keys=True)
+                )
+            except LineToolRefused as error:
+                return _tool_error(str(error))
+
+        return SdkMcpTool(
+            name=ROLE_STATUS_TOOL_NAME,
+            description=(
+                "Show your role: its worktree, its owner and the latest change of"
+                " owner, whether the former holder's processes are shown to have"
+                " ended, unknown or still running, each seat with its condition,"
+                " model and its provider's stated budget, and the latest journal"
+                " entries, the newest with its text, read only."
+            ),
+            input_schema=NO_ARGUMENTS_SCHEMA,
+            handler=handler,
         )
 
     # Ownership, roles step 2 of ``docs/architecture/ROLES.md``.
@@ -8771,7 +9233,7 @@ class Scheduler:
                 resets_at = None
         # Four bytes is the most one character takes in UTF-8.
         note = str(error)[: MAX_BUDGET_NOTE_BYTES // 4]
-        self._log.append(
+        self._append_or_say(
             BudgetStated(
                 provider,
                 0,
@@ -8780,7 +9242,8 @@ class Scheduler:
                 note,
                 format_due(self._wall_clock()),
                 error.window,
-            )
+            ),
+            f"the budget of {provider}",
         )
 
     def credits_spent(self, line_id: str, note: str) -> None:
@@ -8805,7 +9268,8 @@ class Scheduler:
             note[: MAX_BUDGET_NOTE_BYTES // 4],
             format_due(now),
         )
-        self._log.append(budget)
+        if not self._append_or_say(budget, f"the budget of {provider}"):
+            return
         self.activity.record(line_id, ActivityKind.NOTICE, note)
         self._budget_followed(budget)
 
@@ -8856,7 +9320,8 @@ class Scheduler:
             format_due(now),
             window,
         )
-        self._log.append(budget)
+        if not self._append_or_say(budget, f"the budget of {provider}"):
+            return
         effective = self._state().effective_budget(provider, now)
         if effective is not None:
             self._budget_followed(effective)
@@ -8866,9 +9331,25 @@ class Scheduler:
     def roles_view(self, role_id: str | None) -> list[dict[str, object]]:
         """Every role as ``role_view`` gives it, by identifier, or only ``role_id``.
         Raises ``EventRejected`` for an unknown role."""
-        if role_id is not None:
-            return [self.role_view(role_id)]
-        return [self.role_view(found) for found in sorted(self._state().roles)]
+        found_roles = [role_id] if role_id is not None else sorted(self._state().roles)
+        views = [self.role_view(found) for found in found_roles]
+        for found in found_roles:
+            self._observe_former_in_background(found)
+        return views
+
+    def _observe_former_in_background(self, role_id: str) -> None:
+        """Start an observation of the former holder's processes that the next view
+        shows, since an operator's view is built without waiting. Nothing starts
+        outside a running loop or when the platform cannot attribute processes."""
+        if not self._processes_identifiable:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self.observe_former_holder(role_id))
+        self._process_tasks.add(task)
+        task.add_done_callback(self._process_tasks.discard)
 
     def _seat_task_view(self, record: TaskRecorded, own: bool) -> dict[str, object]:
         """``record`` as ``role_view`` shows it. ``own`` is true for the viewing
@@ -10087,6 +10568,7 @@ class Scheduler:
             self.list_processes_tool(line_id),
             self.stop_process_tool(line_id),
             self.worktree_status_tool(line_id),
+            self.sandbox_probe_tool(line_id),
             self.list_mail_tool(line_id),
             self.read_mail_tool(line_id),
             self.acknowledge_mail_tool(line_id),
@@ -10940,23 +11422,33 @@ class Scheduler:
     def step(self) -> None:
         """Run one tick: update every line once, then move the sent queue to the post
         office. Turns the tick starts run on after it, as tasks. Scheduled wakes that
-        have fallen due fire first, into the sent queue."""
+        have fallen due fire first, into the sent queue. **Review of 7744806.** Each
+        wake and each line is one action, and an action the log refuses for want of
+        its secret values ends alone, as ``_refusing_on_secrets`` says."""
         self.tick += 1
+        self._tick_refused = False
         self.fire_due_wakes()
         for line_id in sorted(self._state().lines):
-            if not self._can_start(line_id):
-                continue
-            messages = self.deliverable(line_id)
-            if not messages or not self.peer_turns.may_wake(
-                line_id, (message for _, message in messages)
-            ):
-                continue
-            if self._nothing_new(line_id, messages):
-                self._deliver_without_turn(messages)
-                continue
-            self._begin_turn(line_id, messages)
+            with self._refusing_on_secrets(f"the update of line {line_id}"):
+                self._update_line(line_id)
         self._post_office.update(self._sent)
         self._sent.clear()
+        if not self._tick_refused:
+            self._secrets_noted = False
+
+    def _update_line(self, line_id: str) -> None:
+        """One line's part of a tick: begin its turn or deliver its mail, if any."""
+        if not self._can_start(line_id):
+            return
+        messages = self.deliverable(line_id)
+        if not messages or not self.peer_turns.may_wake(
+            line_id, (message for _, message in messages)
+        ):
+            return
+        if self._nothing_new(line_id, messages):
+            self._deliver_without_turn(messages)
+            return
+        self._begin_turn(line_id, messages)
 
     async def run(self, stop: asyncio.Event) -> None:
         """Run ticks while there is work, until ``stop`` is set. A tick or a sweep
@@ -10972,7 +11464,13 @@ class Scheduler:
                         continue
                     self._fault_pause = 0.0
                     self.fault = None
-                    if self._tick_seconds:
+                    if self._tick_refused:
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(
+                                stop.wait(),
+                                max(SECRETS_RETRY_SECONDS, self._tick_seconds),
+                            )
+                    elif self._tick_seconds:
                         with contextlib.suppress(TimeoutError):
                             await asyncio.wait_for(stop.wait(), self._tick_seconds)
                     else:
@@ -10982,7 +11480,9 @@ class Scheduler:
                 # Each rest, at most MAX_REST_SECONDS apart, also sweeps the launch
                 # records of launchers that exited between turns. Review N1.
                 try:
-                    self.collect_left()
+                    with self._refusing_on_secrets("the sweep of left processes"):
+                        self.collect_left()
+                    self.note_stuck_starts()
                 except Exception as error:  # noqa: BLE001
                     await self._fault_found(error, stop)
                     continue
@@ -11296,6 +11796,9 @@ class Scheduler:
             await self._check_walk(line_id)
             self._check_git_ssh(line_id)
             engine = self.engine_for(line_id)
+            trimmed = await self._trim_line_temp(engine)
+            if trimmed is not None:
+                prompt = f"{trimmed}\n\n{prompt}"
             facts = self._sandbox_facts_text(line_id)
             if facts is not None and self._facts_due(
                 line_id, facts, fresh=compaction is not None
@@ -11541,15 +12044,17 @@ class Scheduler:
         Delivery after the turn end keeps it owed until a later engine report,
         including across a restart or a failure before the next prompt arrives."""
         message_id = new_id("m")
-        self._log.append(
+        if not self._append_or_say(
             MessageSent(
                 message_id,
                 HARNESS,
                 LineAddress(line_id),
                 MessageKind.NOTE,
                 self._safe_stop_notice(cause),
-            )
-        )
+            ),
+            f"the engine stop note of {line_id}",
+        ):
+            return
         self._log.append(MessageDelivered(message_id))
 
     def _engine_stop_notice(self, line_id: str) -> str | None:
@@ -12180,6 +12685,21 @@ class Scheduler:
         task = loop.create_task(self.report_detached(line_id))
         self._halting.add(task)
         task.add_done_callback(self._halting.discard)
+        seen = loop.create_task(self._note_children(line_id))
+        self._halting.add(seen)
+        seen.add_done_callback(self._halting.discard)
+
+    async def _note_children(self, line_id: str) -> None:
+        """Record the children below the line's engine at a turn's end, while a kept
+        engine still stands. An engine that has ended leaves nothing to read, and
+        what earlier looks recorded stays. A failure is dropped, since the ledger is a
+        help and no turn depends on it. **Round 15, item 3.**"""
+        if line_id not in self._state().lines:
+            return
+        try:
+            await self._see_children(line_id)
+        except (ProcessRefused, OSError):
+            return
 
     def _correlate(
         self, line_id: str, keys: tuple[str, ...], report: TurnReport | None
@@ -12615,15 +13135,23 @@ class Scheduler:
                 " the limit on such notes."
             )
         message_id = new_id("m")
-        self._log.append(
+        if not self._append_or_say(
             TaskNoted(
                 line_id,
                 message_id,
                 _cut(end.task_id, MAX_TASK_ID_BYTES),
                 _cut(end.status, MAX_TASK_STATUS_BYTES),
                 _cut(body, MAX_TASK_NOTE_BYTES),
-            )
-        )
+            ),
+            f"the task note of {line_id}",
+        ):
+            # Review of 151cbcd. The end is not noted, so a later report of it is
+            # noted, and the count of ends left unnoted is given back.
+            if end.task_id in noted:
+                noted.remove(end.task_id)
+            if unnoted:
+                self._unnoted_tasks[line_id] = unnoted
+            return None
         _bounded_put(self._task_detected, message_id, detected)
         if record_only:
             self._log.append(MessageDelivered(message_id))
@@ -14127,7 +14655,7 @@ def _git_snapshot_command(arguments: list[str]) -> tuple[str, tuple[str, ...]]:
     """Run one fixed, read-only Git query with a short bound and bounded output, and
     return it with the paths its warnings say it could not read."""
     try:
-        result = subprocess.run(  # noqa: S603
+        result = spawn.run(
             arguments,
             stdin=subprocess.DEVNULL,
             capture_output=True,

@@ -38,7 +38,7 @@ from dromon.model import (
     State,
 )
 from dromon.paths import ProjectPaths, project_paths
-from dromon import processes as processes_module
+from dromon import processes as processes_module, spawn
 from dromon.processes import TreeRow
 from dromon.projectconfig import ConfigFileError, ProjectConfig, config_path, parse
 import dromon.relay as relay_module
@@ -438,7 +438,7 @@ def test_a_hung_command_times_out_and_its_group_is_killed(tmp_path: Path) -> Non
 
 def _ps_runs() -> bool:
     try:
-        found = subprocess.run(  # noqa: S603
+        found = spawn.run(
             ["/bin/ps", "-o", "pid=", "-p", str(os.getpid())],
             capture_output=True,
             timeout=10,

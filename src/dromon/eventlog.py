@@ -35,7 +35,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Final, Self, cast
 
-from dromon import statesnapshot
+from dromon import credentials, statesnapshot
 from dromon.codec import DecodeError, decode, encode
 from dromon.mailbox import counts_unanswered
 from dromon.model import (
@@ -170,6 +170,10 @@ class EventLog:
         """The newest sequence number when this process opened the log."""
         self.opened_bytes = self.size_bytes()
         """The log's size when this process opened it, or ``None`` if unknown."""
+        self.secrets: credentials.SecretSource | None = None
+        """Where the literal secret values come from, which the daemon sets, so that
+        ``append`` masks them as ``credentials`` says. ``None`` masks by pattern
+        only."""
 
     def __enter__(self) -> Self:
         return self
@@ -341,13 +345,33 @@ class EventLog:
         """The sequence number of the newest event, or 0 for an empty log."""
         return self._last_seq
 
+    def _secret_values(self) -> tuple[str, ...]:
+        """The literal secret values to mask. Raises ``credentials.SecretsUnavailable``
+        when the source raises, so that the event is refused and not stored masked by
+        pattern alone, which would leave a literal value in the log with no sign that
+        it was missed. **Review of 03ccbf3.** The error's text names the kind of the
+        failure and never its message, which could hold a value."""
+        if self.secrets is None:
+            return ()
+        try:
+            return tuple(self.secrets())
+        except Exception as error:  # noqa: BLE001
+            raise credentials.SecretsUnavailable(
+                "the literal secret values could not be read"
+                f" ({type(error).__name__}), so this event was not stored. Try again"
+            ) from None
+
     def append(self, event: Event) -> Entry:
-        """Check ``event`` against the current state, store it, then apply it.
+        """Check ``event`` against the current state, store it, then apply it. Its
+        free text is first masked by ``credentials.scrub_event``, so the stored event
+        and the state hold the masked text.
 
         Raises ``EventRejected`` if the event does not apply, and ``LogConflict`` if
         another writer appended first. In both cases nothing is stored and the state is
         unchanged.
         """
+        values = self._secret_values() if credentials.has_text(event) else ()
+        event = credentials.scrub_event(event, values)
         self._state.check(event)
         payload = encode(event)
         recorded_at = _timestamp(self._clock)

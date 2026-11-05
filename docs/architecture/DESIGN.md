@@ -49,6 +49,46 @@ a client written against one version keeps working after a port.
 mature parts are later ported to the lasting `dromon` repository. See
 [`../decisions/NAMING_AND_PORTS.md`](../decisions/NAMING_AND_PORTS.md).
 
+### Starting a child process
+
+**Implemented 2026-11-05, round 15.** Every child the daemon or its commands start goes
+through `dromon.spawn`, which bounds the start as well as the run. `subprocess.run` and
+`subprocess.Popen` wait for the child to reach `exec` with no bound, and on macOS that
+wait stalled for five minutes in several tests and in continuous integration, which
+caused most of the flaky runs. **Fact.** That read was where the stalled threads sat.
+**Not found.** Why the child did not start, and it does not reproduce in isolation. Two
+hypotheses are recorded in the module, and a traceback of every thread at the next hang
+would tell them apart.
+
+The start bound, `START_SECONDS`, is named once. A start past it fails at once with
+`StartStalled`, a `TimeoutError` and so an `OSError`, whose message names the program and
+the bound. The child is killed and reaped should it start later, and at most four stuck
+starts are tolerated before no further child is started. The run keeps the semantics of
+`subprocess.run`, with a required timeout. **Known residual.** The `asyncio` starts of
+the engine drivers run `Popen` on the event loop's own thread and are not covered, so a
+stall there stops the daemon's loop, and the launcher's start is exempt because a parent
+death signal on Linux belongs to the thread that forked. A test pins both lists. See
+`src/dromon/spawn.py`.
+
+**Review of 151cbcd.** The count of stuck starts frees a slot as soon as the thread of
+its start ends, and the scheduler tells the default operator once, in a note that holds
+no line, when the count reaches the bound. A start that never returns holds its slot
+until the daemon restarts, and the note says so. The reads of the process table that a
+stop or a hold depends on are started as `essential`, which the bound does not refuse,
+up to a ceiling of 32 stuck starts that keeps the threads bounded. A late child is
+killed with its process group when it leads one, never the daemon's own group, and its
+reap waits at most ten seconds. The group kill covers only a child that leads its own
+group, as one started with a new session or its own process group does. A child that
+shares the daemon's group is killed alone, and its descendants are not reached, since
+signalling the group would kill the daemon. **Past the ceiling.** At 32 stuck starts
+the `essential` reads are refused too, so the process table cannot be read and a stop
+by pid, which needs it, is refused with the reason. The operator's note at the bound of
+four is the warning, and a restart is the only recovery. A command past its timeout
+keeps the last 64 KiB of what it wrote on the `TimeoutExpired`. **Exempt and unbounded.** `client.start_daemon`
+starts the daemon with `os.posix_spawn`, which has no pipe to wait on, and it is the
+call the module's first hypothesis names, so that candidate is neither bounded nor
+excluded.
+
 ## Session lines and engines
 
 **Proposed.** Coordinate existing harnesses rather than replace them, so that each model
