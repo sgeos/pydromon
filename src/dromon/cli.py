@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Final, cast
 
 import dromon
+from dromon import spawn
 from dromon import __version__, buildinputs, exits, fleet, land, registry, restart, runs
 from dromon import syncenv
 from dromon import proposals as proposal_store
@@ -431,7 +432,7 @@ def _preflight(
     given, is the one the check runs with, the daemon's start variables over the
     client's own."""
     try:
-        done = subprocess.run(  # noqa: S603
+        done = spawn.run(
             list(argv),
             capture_output=True,
             text=True,

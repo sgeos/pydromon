@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from dromon import spawn
+
 GIT_STATUS_SECONDS: Final = 20.0
 """How long ``git status`` may run before the report is refused."""
 
@@ -84,8 +86,8 @@ def dirty_paths(worktree: Path) -> Dirty:
     }
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     try:
-        done = subprocess.run(  # noqa: S603
-            [  # noqa: S607
+        done = spawn.run(
+            [
                 "git",
                 "-C",
                 str(worktree),

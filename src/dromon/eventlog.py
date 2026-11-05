@@ -184,14 +184,20 @@ class EventLog:
         return self._last_seq
 
     def _secret_values(self) -> tuple[str, ...]:
-        """The literal secret values to mask. A source that raises gives none, so the
-        patterns still apply and the append is not refused for it."""
+        """The literal secret values to mask. Raises ``credentials.SecretsUnavailable``
+        when the source raises, so that the event is refused and not stored masked by
+        pattern alone, which would leave a literal value in the log with no sign that
+        it was missed. **Review of 03ccbf3.** The error's text names the kind of the
+        failure and never its message, which could hold a value."""
         if self.secrets is None:
             return ()
         try:
             return tuple(self.secrets())
-        except Exception:  # noqa: BLE001
-            return ()
+        except Exception as error:  # noqa: BLE001
+            raise credentials.SecretsUnavailable(
+                "the literal secret values could not be read"
+                f" ({type(error).__name__}), so this event was not stored. Try again"
+            ) from None
 
     def append(self, event: Event) -> Entry:
         """Check ``event`` against the current state, store it, then apply it. Its
@@ -202,7 +208,8 @@ class EventLog:
         another writer appended first. In both cases nothing is stored and the state is
         unchanged.
         """
-        event = credentials.scrub_event(event, self._secret_values())
+        values = self._secret_values() if credentials.has_text(event) else ()
+        event = credentials.scrub_event(event, values)
         self._state.check(event)
         payload = encode(event)
         recorded_at = _timestamp(self._clock)

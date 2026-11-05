@@ -38,6 +38,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Final, Protocol, cast
 
+from dromon import spawn
 from dromon.eventlog import EventLog
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 from dromon.processes import TreeRow, attached, deepest_first, signal_if_same
@@ -191,7 +192,7 @@ class CommandRelay:
         try:
             # The argument vector is operator configuration, and no shell is involved,
             # so notice text cannot change what runs.
-            completed = subprocess.run(  # noqa: S603
+            completed = spawn.run(
                 self._argv,
                 input=payload.encode("utf-8"),
                 capture_output=True,

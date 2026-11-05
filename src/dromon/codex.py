@@ -60,7 +60,6 @@ import sys
 import tempfile
 import re
 import shutil
-import subprocess
 import time
 from collections.abc import (
     AsyncGenerator,
@@ -78,6 +77,7 @@ from typing import Any, Final, Protocol, cast
 
 from claude_agent_sdk import SdkMcpTool
 
+from dromon import spawn
 from dromon import __version__
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import TOOL_RESULT, ActionTag, Credential, Driver, Event, Strategy
@@ -733,7 +733,7 @@ async def _app_server(
 
 def list_servers(environment: Mapping[str, str]) -> Sequence[str]:
     """The names of every MCP server Codex would load, from ``codex mcp list``."""
-    completed = subprocess.run(  # noqa: S603
+    completed = spawn.run(
         [codex_path(), "mcp", "list", "--json"],
         capture_output=True,
         text=True,

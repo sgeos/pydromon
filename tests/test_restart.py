@@ -25,7 +25,7 @@ from typing import Any, Final, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import cli, client, daemon, eventlog, exits, fleet, registry, restart
+from dromon import cli, client, daemon, eventlog, exits, fleet, registry, restart, spawn
 from dromon.registry import REGISTRY_DIR_ENV
 from dromon.activity import ActivityKind
 from dromon.configview import Overrides
@@ -1297,7 +1297,7 @@ def test_a_preflight_that_times_out_sweeps_its_copy(
     def slow(*args: object, **kwargs: object) -> object:
         raise subprocess.TimeoutExpired("dromond", restart.CHECK_SECONDS)
 
-    monkeypatch.setattr(cli.subprocess, "run", slow)
+    monkeypatch.setattr(spawn, "run", slow)
     found = cli._preflight(["dromond"], paths.runtime_dir)  # pyright: ignore[reportPrivateUsage]
     assert found is not None and "timed out" in found
     assert not left.exists()

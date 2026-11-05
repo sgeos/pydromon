@@ -128,6 +128,7 @@ from typing import (
 
 from claude_agent_sdk import SdkMcpTool
 
+from dromon import spawn
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon import disclosure
 from dromon.overrides import (
@@ -209,6 +210,7 @@ from dromon.gitssh import GitSshAccess, sandbox_layer, unreadable
 from dromon.settings import SettingsConfig
 from dromon.processes import (
     ChildLedger,
+    LaunchedHarness,
     ProcessRefused,
     ProcessTable,
     ProcessWorker,
@@ -226,6 +228,7 @@ from dromon.processes import (
     marked_processes,
     pid_of_task,
     pid_task_id,
+    root_is_harness,
     stop_ledgered,
     stop_line_process,
     tree_or_reason,
@@ -2474,7 +2477,9 @@ class Scheduler:
         """Reads every process of the daemon's user with start times. A test replaces
         it with a fake table."""
         self._identity_read: Callable[[int], tuple[int, str] | None] = identity_of
-        self._harness_read: Callable[[str], int | None] = self._launched_harness
+        self._harness_read: Callable[[str], LaunchedHarness | None] = (
+            self._launched_harness
+        )
         """The pids each line was last reported to have left outside its engine's
         tree, so the same set is not recorded again at every turn."""
         self._processes_identifiable = processes_identifiable
@@ -7011,10 +7016,12 @@ class Scheduler:
             handler=handler,
         )
 
-    def _launched_harness(self, line_id: str) -> int | None:
-        """The pid of the engine process the newest launch record of ``line_id`` names,
-        when its launcher has not finished, or ``None``. Blocking file reads, so a
-        caller on the event loop runs it on the process worker. **Round 15, item 3.**"""
+    def _launched_harness(self, line_id: str) -> LaunchedHarness | None:
+        """The engine process the newest launch record of ``line_id`` names, when its
+        launcher has not finished, or ``None``. It is only a claim until
+        ``root_is_harness`` has compared it with the process table. Blocking file
+        reads, so a caller on the event loop runs it on the process worker.
+        **Round 15, item 3.**"""
         records = [
             record
             for record in launcher.read_launches(self._report_dir)
@@ -7022,7 +7029,8 @@ class Scheduler:
         ]
         if not records:
             return None
-        return max(records, key=lambda record: record.launched_ns or 0).harness
+        newest = max(records, key=lambda record: record.launched_ns or 0)
+        return LaunchedHarness(newest.harness, newest.command, newest.launched_ns)
 
     async def _see_children(self, line_id: str) -> list[TreeRow] | TreeReadFailure:
         """Read the process table once with start times, keep the line's children seen
@@ -7032,7 +7040,7 @@ class Scheduler:
 
         known = bool(self._children.entries(line_id))
 
-        def look() -> tuple[int | None, list[TreeRow] | TreeReadFailure]:
+        def look() -> tuple[LaunchedHarness | None, list[TreeRow] | TreeReadFailure]:
             harness = self._harness_read(line_id)
             if harness is None and not known:
                 # Nothing to record and nothing to check, so no process is run.
@@ -7040,8 +7048,14 @@ class Scheduler:
             return harness, self._tree_read()
 
         harness, rows = await self._process_worker.run(look)
-        if harness is not None and not isinstance(rows, TreeReadFailure):
-            self._children.record(line_id, below(rows, harness, os.getpid()))
+        if (
+            harness is not None
+            and not isinstance(rows, TreeReadFailure)
+            and root_is_harness(rows, harness)
+        ):
+            # A root that is not the harness the record names is a reused pid, and its
+            # children are not the line's. Round 15, re-review of 03ccbf3.
+            self._children.record(line_id, below(rows, harness.pid, os.getpid()))
         return rows
 
     async def children_listing(self, line_id: str) -> list[dict[str, object]] | str:
@@ -13310,7 +13324,7 @@ def _git_snapshot_command(arguments: list[str]) -> tuple[str, tuple[str, ...]]:
     """Run one fixed, read-only Git query with a short bound and bounded output, and
     return it with the paths its warnings say it could not read."""
     try:
-        result = subprocess.run(  # noqa: S603
+        result = spawn.run(
             arguments,
             stdin=subprocess.DEVNULL,
             capture_output=True,

@@ -49,6 +49,27 @@ a client written against one version keeps working after a port.
 mature parts are later ported to the lasting `dromon` repository. See
 [`../decisions/NAMING_AND_PORTS.md`](../decisions/NAMING_AND_PORTS.md).
 
+### Starting a child process
+
+**Implemented 2026-11-05, round 15.** Every child the daemon or its commands start goes
+through `dromon.spawn`, which bounds the start as well as the run. `subprocess.run` and
+`subprocess.Popen` wait for the child to reach `exec` with no bound, and on macOS that
+wait stalled for five minutes in several tests and in continuous integration, which
+caused most of the flaky runs. **Fact.** That read was where the stalled threads sat.
+**Not found.** Why the child did not start, and it does not reproduce in isolation. Two
+hypotheses are recorded in the module, and a traceback of every thread at the next hang
+would tell them apart.
+
+The start bound, `START_SECONDS`, is named once. A start past it fails at once with
+`StartStalled`, a `TimeoutError` and so an `OSError`, whose message names the program and
+the bound. The child is killed and reaped should it start later, and at most four stuck
+starts are tolerated before no further child is started. The run keeps the semantics of
+`subprocess.run`, with a required timeout. **Known residual.** The `asyncio` starts of
+the engine drivers run `Popen` on the event loop's own thread and are not covered, so a
+stall there stops the daemon's loop, and the launcher's start is exempt because a parent
+death signal on Linux belongs to the thread that forked. A test pins both lists. See
+`src/dromon/spawn.py`.
+
 ## Session lines and engines
 
 **Proposed.** Coordinate existing harnesses rather than replace them, so that each model

@@ -20,7 +20,7 @@ import pytest
 from claude_agent_sdk import SdkMcpTool
 from imagesamples import png
 
-from dromon import codex as codex_module
+from dromon import codex as codex_module, spawn
 from dromon import evidence
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon.codex import (
@@ -1965,7 +1965,7 @@ def test_disabled_connector_does_not_need_a_name(
     def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(returncode=0, stdout=json.dumps([{"enabled": enabled}]))
 
-    monkeypatch.setattr(codex_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(spawn, "run", fake_run)
     if enabled is False:
         assert codex_module.list_servers({}) == []
     else:

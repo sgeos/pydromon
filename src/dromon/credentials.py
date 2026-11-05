@@ -13,7 +13,10 @@ What is masked, in a text, each by pattern.
   SendGrid, npm, PyPI, Hugging Face, DigitalOcean, Google and Anthropic or OpenAI keys,
   Amazon access key identifiers and the session token an Amazon temporary credential
   carries, JSON web tokens, and the body of a private key block.
-- The credential after ``Bearer`` or ``Basic``, and the user and password of a URL.
+- The credential after ``Bearer`` or ``Basic``, and the user and password of a URL,
+  or of ``user:password@host`` with no scheme. A password with ``@`` is masked whole.
+  One with ``/`` is masked in a URL and not without a scheme, where it cannot be told
+  from a path.
 - The value of an upper case ``NAME=value`` pair whose name says token, secret,
   password, credential, access key, private key, API key or session, as an environment
   dump prints it.
@@ -36,10 +39,15 @@ False positives. The patterns need a prefix and a length, or an upper case name,
 a commit name, a digest, a UUID and prose do not match. A text that really holds such a
 value as an example is masked too, which fails safe.
 
-Failure modes. A secret source that raises is treated as empty, so the patterns still
-apply and the append is not refused for it. Masking changes the stored text and never
-the request digest of a keyed call, which is taken over the arguments as given, so a
-retry is unaffected.
+Failure modes. **Review of 03ccbf3.** A secret source that raises fails closed. An
+event that has a covered text field is refused with ``SecretsUnavailable``, which is an
+``EventRejected``, and nothing is stored, because storing it masked by pattern alone
+would record a literal value the patterns do not know, with nothing to say so. The
+source is asked only for an event that has a covered field, so every other event is
+stored as before. The source reads a dictionary and the environment, so it fails only
+when a reload changes the dictionary as it is read, and the next append succeeds.
+Masking changes the stored text and never the request digest of a keyed call, which is
+taken over the arguments as given, so a retry is unaffected.
 
 Porting note. The patterns are plain regular expressions, which a port carries across
 unchanged, and ``scrub_event`` is a table of event classes and their text fields.
@@ -108,15 +116,27 @@ _PATTERNS: Final = (
     (re.compile(rf"(?<![A-Za-z0-9_-])(?:{_PREFIXED})(?![A-Za-z0-9])"), MASK),
     (re.compile(r"(?i)\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]{8,}"), rf"\1\2{MASK}"),
     (
-        re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@"),
+        # The user and password of a URL. The password runs to the last ``@`` of the
+        # word, so one that holds ``/`` or ``@`` is masked whole, at the price of also
+        # masking what lies between the host and a later ``@`` of the same word. A
+        # password that begins with up to five digits and a ``/`` reads as a port and
+        # a path, as in ``host:8080/pkg@1.0``, and is not matched. **Review of
+        # 03ccbf3.**
+        re.compile(
+            r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@:]+:(?!\d{1,5}/)\S+@"
+            r"(?!sha\d+:)(?=[A-Za-z0-9\[])"
+        ),
         rf"\1{MASK}@",
     ),
     (
         # A user and password before a host with no scheme, as a connection string
         # or a remote shorthand prints it. An image reference with a digest is kept.
+        # The password may hold ``@`` and runs to the last one of the word. One that
+        # holds ``/`` is not matched, since ``host:dir/file@name`` is ordinary text.
+        # **Review of 03ccbf3.**
         re.compile(
-            r"(?<![\w/:@.*-])[^\s/@:'\"<>*]{1,64}:[^\s/@:'\"<>*]{3,128}"
-            r"@(?!sha256:)(?=[A-Za-z0-9])"
+            r"(?<![\w/:@.*-])[^\s/@:'\"<>*]{1,64}:[^\s/:'\"<>*]{3,128}"
+            r"@(?!sha\d+:)(?=[A-Za-z0-9])"
         ),
         f"{MASK}@",
     ),
@@ -140,6 +160,17 @@ _PATTERNS: Final = (
         rf"\1{MASK}\2",
     ),
 )
+
+
+class SecretsUnavailable(model.EventRejected):
+    """The literal secret values could not be read, so an event with text was not
+    stored. Retrying later may succeed. The message never names a value."""
+
+
+def has_text(event: Event) -> bool:
+    """Whether ``scrub_event`` looks at any field of ``event``."""
+    return type(event) in COVERED
+
 
 type SecretSource = Callable[[], Iterable[str]]
 """Where the literal secret values come from, asked at each scrub."""

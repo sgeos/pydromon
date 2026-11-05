@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import commitruns, runs
+from dromon import commitruns, runs, spawn
 from dromon.codec import decode, encode
 from dromon.driver import Strategy
 from dromon.eventlog import EventLog
@@ -56,8 +56,8 @@ def git_env(home: Path) -> dict[str, str]:
 
 
 def git(repository: Path, *arguments: str) -> str:
-    result = subprocess.run(  # noqa: S603
-        [  # noqa: S607
+    result = spawn.run(
+        [
             "git",
             "-c",
             "user.name=Test",
@@ -72,6 +72,7 @@ def git(repository: Path, *arguments: str) -> str:
         capture_output=True,
         check=True,
         text=True,
+        timeout=60,
     )
     return result.stdout.strip()
 
@@ -588,12 +589,13 @@ def checkout_as_git_would(
         ),
         (["checkout", "--quiet", "--detach", commit], target),
     ):
-        subprocess.run(  # noqa: S603
-            ["git", *arguments],  # noqa: S607
+        spawn.run(
+            ["git", *arguments],
             cwd=cwd,
             env=environment,
             capture_output=True,
             check=False,
+            timeout=60,
         )
 
 

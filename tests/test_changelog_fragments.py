@@ -26,6 +26,7 @@ from assemble_changelog import (
     split_changelog,
     unreleased_text,
 )
+from dromon import spawn
 
 SKIPPED_STATUS = 3
 REPOSITORY = Path(__file__).parents[1]
@@ -405,12 +406,13 @@ def test_a_release_with_nothing_released_is_not_one() -> None:
 
 
 def git(root: Path, *arguments: str) -> str:
-    done = subprocess.run(  # noqa: S603
-        ["git", *arguments],  # noqa: S607
+    done = spawn.run(
+        ["git", *arguments],
         cwd=root,
         capture_output=True,
         text=True,
         check=True,
+        timeout=60,
     )
     return done.stdout
 

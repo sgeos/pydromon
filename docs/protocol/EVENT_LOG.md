@@ -573,9 +573,13 @@ unaffected.
   value. The operator settings in `line_overridden` and `project_overridden`, and an
   operator's own free text in a client, which is masked like any message body. A text
   that really holds such a value as an example is masked too, which fails safe.
-- **Failure modes.** A secret source that raises is treated as empty, so the patterns
-  still apply and the append is not refused. Masking is by pattern and is not the
-  disclosure scan.
+- **Failure modes.** A secret source that raises fails closed. An event with a covered
+  text field is refused as rejected, naming the kind of failure and no value, and
+  nothing is stored, because pattern masking alone would record a literal value it
+  cannot know. An event with no covered field does not ask the source. A password with
+  `@` is masked whole, and in a URL one with `/`, and a scheme-less password with `/`
+  is not masked, since it cannot be told from a path. Masking is by pattern and is not
+  the disclosure scan.
 
 ## Bounded start
 

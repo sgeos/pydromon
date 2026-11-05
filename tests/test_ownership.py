@@ -5,7 +5,6 @@ turn. Roles step 2, ``docs/architecture/ROLES.md``."""
 
 import asyncio
 import os
-import subprocess
 from collections.abc import Callable, Coroutine, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,7 +13,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import scheduler as scheduler_module
+from dromon import scheduler as scheduler_module, spawn
 from dromon.capabilities import Known, TABLES
 from dromon.driver import Strategy
 from dromon.engine import EnginePlanLimit, TurnReport
@@ -1821,10 +1820,10 @@ def test_a_real_unreadable_directory_is_reported_unreadable(tmp_path: Path) -> N
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     git = ["git", "-C", str(checkout), "-c", "user.email=a@b", "-c", "user.name=a"]
-    subprocess.run([*git, "init", "-q"], check=True)  # noqa: S603
+    spawn.run([*git, "init", "-q"], check=True, timeout=60)  # noqa: S603
     (checkout / "a").write_text("a\n")
-    subprocess.run([*git, "add", "a"], check=True)  # noqa: S603
-    subprocess.run([*git, "commit", "-qm", "a"], check=True)  # noqa: S603
+    spawn.run([*git, "add", "a"], check=True, timeout=60)  # noqa: S603
+    spawn.run([*git, "commit", "-qm", "a"], check=True, timeout=60)  # noqa: S603
     closed = checkout / "closed"
     closed.mkdir()
     (closed / "b").write_text("b\n")

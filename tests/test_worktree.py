@@ -7,7 +7,6 @@ import json
 import os
 import shutil
 import subprocess
-import threading
 from collections.abc import Generator, Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -15,7 +14,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import worktree
+from dromon import spawn, worktree
 from dromon.driver import Strategy
 from dromon.eventlog import EventLog
 from dromon.scheduler import LineEngine, LineSpec, Scheduler
@@ -47,12 +46,13 @@ def git(directory: Path, *arguments: str) -> str:
         "GIT_COMMITTER_NAME": "t",
         "GIT_COMMITTER_EMAIL": "t@example.com",
     }
-    done = subprocess.run(  # noqa: S603
-        ["git", "-C", str(directory), *arguments],  # noqa: S607
+    done = spawn.run(
+        ["git", "-C", str(directory), *arguments],
         capture_output=True,
         text=True,
         check=True,
         env=environment,
+        timeout=60,
     )
     return done.stdout
 
@@ -315,14 +315,14 @@ def test_the_real_runner_reports_a_missing_git_and_a_timeout(
     def cannot(command: list[str], **_: object) -> object:
         raise FileNotFoundError("git")
 
-    monkeypatch.setattr(subprocess, "run", cannot)
+    monkeypatch.setattr(spawn, "run", cannot)
     found = run_git(tmp_path, ["status"])
     assert found.code == 127 and "git cannot be run" in found.stderr
 
     def slow(command: list[str], **_: object) -> object:
         raise subprocess.TimeoutExpired(command, 1)
 
-    monkeypatch.setattr(subprocess, "run", slow)
+    monkeypatch.setattr(spawn, "run", slow)
     found = run_git(tmp_path, ["status"])
     assert found.code == 124 and "did not finish" in found.stderr
 
@@ -332,15 +332,16 @@ def test_the_real_runner_turns_the_file_system_monitor_off(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     seen: list[list[str]] = []
-    real = subprocess.run
+    real = spawn.run
 
     def spy(
-        command: list[str], **keywords: object
+        command: list[str],
+        **keywords: Any,  # noqa: ANN401
     ) -> "subprocess.CompletedProcess[str]":
         seen.append(command)
-        return real(command, **keywords)  # type: ignore[call-overload,no-any-return]
+        return cast("subprocess.CompletedProcess[str]", real(command, **keywords))
 
-    monkeypatch.setattr(subprocess, "run", spy)
+    monkeypatch.setattr(spawn, "run", spy)
     run_git(tmp_path, ["--version"])
     assert seen[0][:5] == ["git", "-C", str(tmp_path), "-c", "core.fsmonitor=false"]
 
@@ -417,41 +418,15 @@ def test_the_tool_is_unavailable_where_the_directory_does_not_resolve(
 def test_a_git_whose_start_never_completes_is_reported_and_does_not_hold_the_caller(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Round 15. subprocess.run waits for the child to reach exec without a bound.
-    release = threading.Event()
+    # Round 15. The start of a git is bounded by dromon.spawn, which tests/test_spawn.py
+    # covers in full. Here the runner shows what a stalled start becomes: a failure
+    # to run with the reason, not a hang and not a clean tree.
+    def stalled(command: list[str], **_: object) -> object:
+        raise spawn.StartStalled("git did not start within 0.2s")
 
-    def stalled(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        release.wait(60)
-        raise OSError("released")
-
-    monkeypatch.setattr(worktree.subprocess, "run", stalled)
-    monkeypatch.setattr(worktree, "GIT_SECONDS", 0.2)
-    monkeypatch.setattr(worktree, "START_GRACE_SECONDS", 0.2)
-    monkeypatch.setattr(worktree, "_stranded", [])
-    try:
-        ran = worktree.run_git(tmp_path, ["status"])
-        assert ran.code == 124 and "did not finish" in ran.stderr
-        assert len(worktree._stranded) == 1  # pyright: ignore[reportPrivateUsage]
-    finally:
-        release.set()
-
-
-def test_starts_stranded_to_the_cap_stop_further_starts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    release = threading.Event()
-    blockers = [
-        threading.Thread(target=release.wait, args=(60,), daemon=True)
-        for _ in range(worktree.MAX_STRANDED)
-    ]
-    for blocker in blockers:
-        blocker.start()
-    monkeypatch.setattr(worktree, "_stranded", list(blockers))
-    try:
-        ran = worktree.run_git(tmp_path, ["status"])
-        assert ran.code == 127 and "still stuck" in ran.stderr
-    finally:
-        release.set()
+    monkeypatch.setattr(spawn, "run", stalled)
+    ran = run_git(tmp_path, ["status"])
+    assert ran.code == 127 and "did not start within" in ran.stderr
 
 
 def test_a_git_that_cannot_be_started_and_one_that_overruns_are_reported(
@@ -460,11 +435,11 @@ def test_a_git_that_cannot_be_started_and_one_that_overruns_are_reported(
     def missing(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         raise FileNotFoundError("no git")
 
-    monkeypatch.setattr(worktree.subprocess, "run", missing)
+    monkeypatch.setattr(spawn, "run", missing)
     assert worktree.run_git(tmp_path, ["status"]).code == 127
 
     def slow(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         raise subprocess.TimeoutExpired("git", 1.0)
 
-    monkeypatch.setattr(worktree.subprocess, "run", slow)
+    monkeypatch.setattr(spawn, "run", slow)
     assert worktree.run_git(tmp_path, ["status"]).code == 124

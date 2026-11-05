@@ -137,6 +137,39 @@ def test_lower_case_names_and_a_user_and_password_without_a_scheme_are_masked() 
         assert scrub_text(kept) == kept, kept
 
 
+def test_a_password_with_a_slash_or_an_at_sign_is_masked_whole() -> None:
+    # Review of 03ccbf3. The classes of the first patterns stopped at both, so the rest
+    # of the password was recorded.
+    cases = {
+        "https://user:p@ss@host/x": f"https://{MASK}@host/x",
+        "https://user:pa/ss@host/x?y=1": f"https://{MASK}@host/x?y=1",
+        "https://user:a/b@c@host.example": f"https://{MASK}@host.example",
+        "ssh://git:/tmp/key@host": f"ssh://{MASK}@host",
+        "psql admin:p@ss@db.internal/x": f"psql {MASK}@db.internal/x",
+        "psql admin:@pass@db.internal": f"psql {MASK}@db.internal",
+    }
+    for text, expected in cases.items():
+        found = scrub_text(text)
+        assert found == expected, text
+        assert scrub_text(found) == found, "idempotent"
+
+
+def test_text_with_a_port_a_path_a_digest_or_an_address_is_left_alone() -> None:
+    for kept in (
+        "https://host:8080/pkg@1.0.0",
+        "https://example.com:8443/@scope/name",
+        "https://example.com/a@b",
+        "docker://registry:5000/img@sha256:" + "ab" * 32,
+        "ssh://git@github.com/org/repo",
+        "git@github.com:org/repo.git",
+        "rsync host:dir/file@name now",
+        "python:3.12@sha256:" + "ab" * 32,
+        "mail ana@example.org and bob@example.org",
+        "at 12:30@home",
+    ):
+        assert scrub_text(kept) == kept, kept
+
+
 def test_masking_is_idempotent_and_never_lengthens_a_text_past_a_mask() -> None:
     text = f"a {FAKES['github']} b AWS_SECRET_ACCESS_KEY=abcdefgh12345678 c"
     once = scrub_text(text)
@@ -349,11 +382,8 @@ def test_the_log_stores_and_applies_the_masked_text(tmp_path: Path) -> None:
     assert any(MASK in payload for payload in stored)
 
 
-def test_named_secrets_are_masked_in_the_log_and_a_failing_source_still_masks_patterns(
-    tmp_path: Path,
-) -> None:
+def test_named_secrets_are_masked_in_the_log(tmp_path: Path) -> None:
     value = "plain-words-secret-value"
-    token = FAKES["github"]
     with EventLog(tmp_path / "events.sqlite") as log:
         log.append(OperatorRegistered("ana"))
         log.append(LineCreated("alpha", ENGINE, "subscription"))
@@ -361,14 +391,52 @@ def test_named_secrets_are_masked_in_the_log_and_a_failing_source_still_masks_pa
         log.append(MessageSent("m1", ANA, ALPHA, MessageKind.NOTE, f"is {value}"))
         assert log.state.messages["m1"].body == f"is {MASK}"
 
+
+def test_a_failing_secret_source_refuses_an_event_with_text_and_stores_nothing(
+    tmp_path: Path,
+) -> None:
+    # Review of 03ccbf3. The patterns alone would store a literal value they cannot
+    # know, so the event is refused, and the refusal does not echo the failure.
+    value = "plain-words-secret-value"
+    with EventLog(tmp_path / "events.sqlite") as log:
+        log.append(OperatorRegistered("ana"))
+        log.append(LineCreated("alpha", ENGINE, "subscription"))
+        before = log.last_seq
+
         def broken() -> list[str]:
-            raise RuntimeError("no source")
+            raise RuntimeError(f"cannot read {value}")
 
         log.secrets = broken
-        log.append(
-            MessageSent("m2", ANA, ALPHA, MessageKind.NOTE, f"{value} and {token}")
-        )
-        assert log.state.messages["m2"].body == f"{value} and {MASK}"
+        with pytest.raises(credentials.SecretsUnavailable) as caught:
+            log.append(MessageSent("m2", ANA, ALPHA, MessageKind.NOTE, f"is {value}"))
+        assert isinstance(caught.value, model.EventRejected)
+        assert "RuntimeError" in str(caught.value)
+        assert value not in str(caught.value)
+        assert log.last_seq == before
+        assert "m2" not in log.state.messages
+        # An event with no text field is stored as before, and the source recovers.
+        log.append(LineCreated("beta", ENGINE, "subscription"))
+        log.secrets = lambda: [value]
+        log.append(MessageSent("m2", ANA, ALPHA, MessageKind.NOTE, f"is {value}"))
+        assert log.state.messages["m2"].body == f"is {MASK}"
+
+
+def test_the_secret_source_is_asked_only_for_an_event_with_text(
+    tmp_path: Path,
+) -> None:
+    asked: list[int] = []
+
+    def source() -> list[str]:
+        asked.append(1)
+        return []
+
+    with EventLog(tmp_path / "events.sqlite") as log:
+        log.secrets = source
+        log.append(OperatorRegistered("ana"))
+        log.append(LineCreated("alpha", ENGINE, "subscription"))
+        assert asked == []
+        log.append(MessageSent("m1", ANA, ALPHA, MessageKind.NOTE, "hello"))
+        assert asked == [1]
 
 
 def test_each_kind_of_note_and_summary_is_masked_by_its_field() -> None:

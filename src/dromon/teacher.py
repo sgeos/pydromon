@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, cast
 
+from dromon import spawn
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 
 DEFAULT_ENDPOINT: Final = "http://127.0.0.1:11434"
@@ -145,7 +146,7 @@ def available_memory() -> int | None:
                     return int(fields[1]) * 1024
         return None
     try:
-        completed = subprocess.run(  # noqa: S603
+        completed = spawn.run(
             ["/usr/sbin/sysctl", "-n", "kern.memorystatus_level", "hw.memsize"],
             capture_output=True,
             text=True,
@@ -229,7 +230,7 @@ def _start_detached(
     command: list[str], environment: Mapping[str, str], log: Path
 ) -> int:
     with log.open("ab") as output:
-        process = subprocess.Popen(  # noqa: S603
+        process = spawn.start(
             command,
             stdin=subprocess.DEVNULL,
             stdout=output,
@@ -242,7 +243,7 @@ def _start_detached(
 
 def _command_name(pid: int) -> str | None:
     """The executable name of process ``pid``, or ``None`` if there is none."""
-    completed = subprocess.run(  # noqa: S603
+    completed = spawn.run(
         ["/bin/ps", "-p", str(pid), "-o", "comm="],
         capture_output=True,
         text=True,

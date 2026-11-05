@@ -23,12 +23,15 @@ from dromon.processes import (
     MAX_LEDGER_LINES,
     MAX_LEDGER_PER_LINE,
     ChildLedger,
+    LaunchedHarness,
     ProcessInfo,
     ProcessRefused,
     TreeReadFailure,
     TreeRow,
     below,
     ledger_listing,
+    lstart_epoch,
+    root_is_harness,
     stop_ledgered,
 )
 from dromon.scheduler import LineEngine, LineSpec, Scheduler
@@ -38,6 +41,21 @@ HARNESS = 1001
 FIRST = "Sat Nov  1 07:23:05 2026"
 SECOND = "Sat Nov  1 09:41:17 2026"
 THIRD = "Sun Nov  2 00:00:01 2026"
+
+
+def launched(
+    pid: int | None,
+    command: str = "claude",
+    after: str = FIRST,
+    minutes: float = 1.0,
+) -> LaunchedHarness | None:
+    """The launch record for the engine at ``pid``, written ``minutes`` after ``after``,
+    which is when a launcher writes it, a little after the engine began."""
+    if pid is None:
+        return None
+    moment = lstart_epoch(after)
+    assert moment is not None
+    return LaunchedHarness(pid, command, int((moment + 60 * minutes) * 1e9))
 
 
 def row(
@@ -342,7 +360,7 @@ def world(
         found._tree_read = machine.read  # pyright: ignore[reportPrivateUsage]
         found._identity_read = machine.identity  # pyright: ignore[reportPrivateUsage]
         found._harness_read = lambda line_id: (  # pyright: ignore[reportPrivateUsage]
-            machine.harness if line_id == "alpha" else None
+            launched(machine.harness) if line_id == "alpha" else None
         )
         yield found
 
@@ -519,3 +537,65 @@ def test_a_failed_reading_at_a_turns_end_is_dropped_and_a_gone_line_is_skipped(
     asyncio.run(scheduler._note_children("alpha"))  # pyright: ignore[reportPrivateUsage]
     asyncio.run(scheduler._note_children("nobody"))  # pyright: ignore[reportPrivateUsage]
     assert scheduler._children.entries("alpha") == []  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_root_is_the_harness_with_its_command_and_a_start_before_the_record() -> None:
+    table = [row(HARNESS, 1, "/usr/bin/claude --print", FIRST)]
+    record = launched(HARNESS)
+    assert record is not None
+    assert root_is_harness(table, record)
+    # The same second as the record is accepted, whole seconds being all lstart has.
+    same = launched(HARNESS, minutes=0)
+    assert same is not None and root_is_harness(table, same)
+    # Another executable at the pid.
+    assert not root_is_harness([row(HARNESS, 1, "vim notes.txt", FIRST)], record)
+    # A process that began long after the record was written took the pid since.
+    assert not root_is_harness([row(HARNESS, 1, "claude", SECOND)], record)
+    # Not there, exited and not reaped, or a start that cannot be read.
+    assert not root_is_harness([row(2001, 1, "claude", FIRST)], record)
+    assert not root_is_harness([row(HARNESS, 1, "<defunct>", FIRST)], record)
+    assert not root_is_harness([row(HARNESS, 1, "claude", "not a time")], record)
+    assert not root_is_harness([row(HARNESS, 1, "claude", "")], record)
+    # A record that carries no time, or no command, proves nothing.
+    assert not root_is_harness(table, LaunchedHarness(HARNESS, "claude", None))
+    assert not root_is_harness(table, LaunchedHarness(HARNESS, "", 10**18))
+
+
+def test_a_stale_record_does_not_root_the_ledger_at_a_reused_pid(
+    blind: tuple[Scheduler, Machine],
+) -> None:
+    scheduler, machine = blind
+    # The engine ended and its pid went to an unrelated process that has children. The
+    # launch record is still not done, so it still names the pid.
+    machine.rows = [
+        row(HARNESS, 1, "vim notes.txt", SECOND),
+        row(3001, HARNESS, "sleep 5000", SECOND),
+    ]
+    text, error = call(scheduler, "alpha", "list_processes", {})
+    assert error and processes.UNIDENTIFIABLE in text
+    done, error = call(scheduler, "alpha", "stop_process", {"pid": 3001})
+    assert error and processes.UNIDENTIFIABLE in done
+    assert machine.sent == []
+    assert not scheduler._children.entries("alpha")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_root_with_the_recorded_command_but_a_later_start_is_not_taken(
+    blind: tuple[Scheduler, Machine],
+) -> None:
+    scheduler, machine = blind
+    # The same executable name, as when the engine was started again by someone else.
+    machine.rows = [
+        row(HARNESS, 1, "claude", SECOND),
+        row(3001, HARNESS, "sleep 5000", SECOND),
+    ]
+    text, error = call(scheduler, "alpha", "list_processes", {})
+    assert error and processes.UNIDENTIFIABLE in text
+    assert not scheduler._children.entries("alpha")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_the_lstart_of_ps_reads_as_local_time() -> None:
+    assert lstart_epoch("Sat Nov  1 07:23:05 2026") is not None
+    first, second = lstart_epoch(FIRST), lstart_epoch(THIRD)
+    assert first is not None and second is not None and first < second
+    assert lstart_epoch("") is None
+    assert lstart_epoch("Sat Foo 99 07:23:05 2026") is None

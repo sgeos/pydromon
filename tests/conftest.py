@@ -2,14 +2,17 @@
 
 import gc
 import shutil
+import subprocess
 import tempfile
+import threading
+import time
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 import pytest
-from typing import cast
+from typing import Any, cast
 
-from dromon import hookpolicy, linetemp, priority
+from dromon import hookpolicy, linetemp, priority, spawn
 from dromon import scheduler as scheduler_module
 from dromon.processes import ProcessInfo
 from dromon.fleet import HOSTS_FILE_ENV
@@ -414,6 +417,63 @@ def _no_real_process_table(
     node = cast(pytest.Item, request.node)  # pyright: ignore[reportUnknownMemberType]
     if node.get_closest_marker("real_processes") is None:
         monkeypatch.setattr(scheduler_module, "SystemProcesses", NoProcesses)
+
+
+class StalledStart:
+    """Stands in for a start that stalls before the program runs, which no test can
+    make the operating system do on demand. While ``stall`` is true, every
+    ``subprocess.Popen`` waits for ``gate``, at most a minute, as the read of the exec
+    pipe waits in a real stall, and then starts the real program. ``calls`` counts the
+    starts attempted, and ``started`` holds each child that did start. **Round 15.**
+    See ``dromon.spawn``."""
+
+    def __init__(self) -> None:
+        self.gate = threading.Event()
+        self.stall = True
+        self.calls = 0
+        self.started: list[subprocess.Popen[Any]] = []
+
+    def until_ended(self, seconds: float = 10.0) -> None:
+        """Wait until no start is stuck, within ``seconds``."""
+        deadline = time.monotonic() + seconds
+        while spawn.stranded_count() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    def until_reaped(self, seconds: float = 10.0) -> subprocess.Popen[Any]:
+        """The one child started, once its pipes are closed, which the late-start reap
+        does last. Fails the test when that takes longer than ``seconds``."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self.started:
+                child = self.started[0]
+                pipes = [child.stdin, child.stdout, child.stderr]
+                if all(pipe is None or pipe.closed for pipe in pipes):
+                    return child
+            time.sleep(0.01)
+        pytest.fail("the late child was not reaped in time")
+
+
+@pytest.fixture
+def stalled_start(monkeypatch: pytest.MonkeyPatch) -> Iterator[StalledStart]:
+    fake = StalledStart()
+
+    class Gated(subprocess.Popen[Any]):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:  # noqa: ANN401
+            fake.calls += 1
+            if fake.stall:
+                fake.gate.wait(60)
+            super().__init__(*args, **kwargs)
+            fake.started.append(self)
+
+    monkeypatch.setattr(subprocess, "Popen", Gated)
+    yield fake
+    fake.stall = False
+    fake.gate.set()
+    fake.until_ended()
+    for child in fake.started:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
 
 
 @pytest.fixture(autouse=True)

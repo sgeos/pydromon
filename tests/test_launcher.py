@@ -31,7 +31,7 @@ import pytest
 from claude_agent_sdk import ClaudeAgentOptions
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
-from dromon import launcher, processes
+from dromon import launcher, processes, spawn
 from dromon.launcher import (
     LAUNCH_MARK_VARIABLE,
     LAUNCH_VARIABLES,
@@ -104,12 +104,15 @@ their pids and the Dromon variables it sees, and then waits or exits."""
 
 def ps_runs() -> bool:
     try:
-        found = subprocess.run(  # noqa: S603
-            ["ps", "-o", "pid=", "-p", str(os.getpid())],  # noqa: S607
+        found = spawn.run(
+            ["ps", "-o", "pid=", "-p", str(os.getpid())],
             capture_output=True,
             timeout=10,
             check=False,
         )
+    except spawn.StartStalled:
+        # A stalled start is a failure to report, never a ps that is absent.
+        raise
     except OSError:
         return False
     return found.returncode == 0
@@ -135,8 +138,8 @@ def alive(pid: int) -> bool:
         return True
     try:
         # A zombie still answers, so ask ps's view where it can be had.
-        state = subprocess.run(  # noqa: S603
-            ["ps", "-o", "stat=", "-p", str(pid)],  # noqa: S607
+        state = spawn.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
             capture_output=True,
             text=True,
             timeout=10,
@@ -1077,7 +1080,7 @@ def test_ps_failing_is_a_reason_and_not_a_tree(monkeypatch: pytest.MonkeyPatch) 
     def missing(*_: object, **__: object) -> object:
         raise FileNotFoundError("no ps")
 
-    monkeypatch.setattr(processes.subprocess, "run", missing)
+    monkeypatch.setattr(spawn, "run", missing)
     assert processes.read_tree(os.getuid()) is None
     reason = processes.tree_or_reason(os.getuid())
     assert isinstance(reason, TreeReadFailure) and "no ps" in reason.reason
@@ -1085,7 +1088,7 @@ def test_ps_failing_is_a_reason_and_not_a_tree(monkeypatch: pytest.MonkeyPatch) 
     def refused(*_: object, **__: object) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(["ps"], 1, "", "ps: not permitted\n")
 
-    monkeypatch.setattr(processes.subprocess, "run", refused)
+    monkeypatch.setattr(spawn, "run", refused)
     reason = processes.tree_or_reason(os.getuid())
     assert isinstance(reason, TreeReadFailure)
     assert reason.reason == "ps failed with status 1 and said ps: not permitted"

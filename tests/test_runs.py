@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import runs
+from dromon import runs, spawn
 from dromon.driver import Strategy
 from dromon.eventlog import EventLog
 from dromon.model import (
@@ -410,12 +410,15 @@ def test_an_output_replaced_by_a_link_has_no_digest(tmp_path: Path) -> None:
 
 def ps_runs() -> bool:
     try:
-        found = subprocess.run(  # noqa: S603
+        found = spawn.run(
             ["/bin/ps", "-o", "pid=", "-p", str(os.getpid())],
             capture_output=True,
             timeout=10,
             check=False,
         )
+    except spawn.StartStalled:
+        # A stalled start is a failure to report, never a ps that is absent.
+        raise
     except OSError:
         return False
     return found.returncode == 0
@@ -1218,7 +1221,7 @@ def test_ps_with_no_output_is_absent_only_when_it_says_nothing(
     def fake(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(["/bin/ps"], code, "", stderr)
 
-    monkeypatch.setattr(runs.subprocess, "run", fake)
+    monkeypatch.setattr(spawn, "run", fake)
     if absent:
         assert runs.process_start(4321) is None
     else:
@@ -1232,7 +1235,7 @@ def test_a_denied_table_ends_no_live_run(
     def denied(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(["/bin/ps"], 1, "", "ps: not permitted\n")
 
-    monkeypatch.setattr(runs.subprocess, "run", denied)
+    monkeypatch.setattr(spawn, "run", denied)
     with pytest.raises(runs.TableUnreadable):
         runs.reconcile([run_in(tmp_path)], tmp_path)
     with pytest.raises(runs.TableUnreadable):

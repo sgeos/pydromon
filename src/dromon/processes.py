@@ -51,6 +51,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Generic, Protocol, TypeVar, cast
 
+from dromon import spawn
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 
 MARK_VARIABLE: Final = "DROMON_LINE_MARK"
@@ -305,8 +306,8 @@ def read_environments(uid: int, *, strict: bool = False) -> dict[int, list[str]]
     that merely timed out under load."""
     if sys.platform == "darwin":
         try:
-            found = subprocess.run(  # noqa: S603
-                [  # noqa: S607
+            found = spawn.run(
+                [
                     "/bin/ps",
                     "-wwE",
                     "-U",
@@ -380,8 +381,8 @@ def read_environment(pid: int) -> list[str] | None:
         return raw.decode("utf-8", "replace").split("\x00")
     if sys.platform == "darwin":
         try:
-            found = subprocess.run(  # noqa: S603
-                ["/bin/ps", "-wwE", "-o", "command=", "-p", str(pid)],  # noqa: S607
+            found = spawn.run(
+                ["/bin/ps", "-wwE", "-o", "command=", "-p", str(pid)],
                 capture_output=True,
                 text=True,
                 timeout=PS_TIMEOUT_SECONDS,
@@ -400,8 +401,8 @@ class SystemProcesses:
 
     def own_processes(self) -> Sequence[ProcessInfo]:
         try:
-            found = subprocess.run(  # noqa: S603
-                [  # noqa: S607
+            found = spawn.run(
+                [
                     "ps",
                     "-ww",
                     "-U",
@@ -439,8 +440,8 @@ def environment_reading_works() -> bool:
     token = secrets.token_hex(16)
     assignment = f"{PROBE_VARIABLE}={token}"
     try:
-        child = subprocess.Popen(  # noqa: S603
-            ["/bin/sleep", "5"],  # noqa: S607
+        child = spawn.start(
+            ["/bin/sleep", "5"],
             env={**allowlisted(os.environ, BASE_ENVIRONMENT), PROBE_VARIABLE: token},
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -551,8 +552,8 @@ def tree_or_reason(
     """Every process of ``uid`` with its parent and group, or why ``ps`` could not
     list them. ``ps`` takes these fields alike on macOS and Linux."""
     try:
-        found = subprocess.run(  # noqa: S603
-            [  # noqa: S607
+        found = spawn.run(
+            [
                 "ps",
                 "-ww",
                 "-U",
@@ -633,6 +634,66 @@ def attached(root: int, timeout: float = ATTACHED_SECONDS) -> list[TreeRow] | No
     if rows is None:
         return None
     return below(rows, root, os.getpid())
+
+
+LSTART_FORMAT: Final = "%a %b %d %H:%M:%S %Y"
+"""``lstart`` in the C locale, as ``START_TOKENS`` describes."""
+
+ROOT_SLACK_SECONDS: Final = 2.0
+"""How much later than a launch record's time a process may have started and still be
+the harness the record names. ``lstart`` has whole seconds, so a process started in the
+second the record was written reads as up to one second later than the record."""
+
+
+@dataclass(frozen=True, slots=True)
+class LaunchedHarness:
+    """The engine process a launch record names, with what is needed to tell it from
+    another process that holds its pid later. **Round 15, re-review of 03ccbf3.**"""
+
+    pid: int
+    command: str
+    """The harness's executable, as the launcher recorded it."""
+    launched_ns: int | None
+    """When the launcher wrote the record, in nanoseconds of the wall clock, or ``None``
+    when the record's name does not carry it."""
+
+
+def lstart_epoch(text: str) -> float | None:
+    """``lstart`` in the C locale and in local time, as seconds since the epoch, or
+    ``None`` when it is not one. **Assumption.** In the hour a clock is set back the
+    local time names two instants and the first is taken, so a process may read up to
+    an hour earlier than it began, which only ever accepts a harness that began then."""
+    try:
+        moment = time.strptime(" ".join(text.split()), LSTART_FORMAT)
+        return time.mktime(moment)
+    except (ValueError, OverflowError):
+        return None
+
+
+def root_is_harness(rows: Sequence[TreeRow], harness: LaunchedHarness) -> bool:
+    """Whether the process holding ``harness.pid`` in ``rows`` is the harness the launch
+    record names, and not a process that was given its pid after the harness ended.
+
+    **Round 15, re-review of 03ccbf3.** A record whose launcher died before it finished
+    stays not done until the sweep removes it, and in that time its pid may be reused.
+    The ledger takes the children of its root as the line's, so a reused root would
+    enter another process's children. The process must be there, not exited, with the
+    recorded executable in its command, and must have started no later than the
+    record was written, since the harness began before its launcher wrote the record
+    and a process that took the pid began after the harness ended. A record with no
+    time, or a start that cannot be read, is not accepted, since not knowing is not a
+    match."""
+    row = next((row for row in rows if row.pid == harness.pid), None)
+    if row is None or "<defunct>" in row.command:
+        return False
+    if not harness.command or harness.command not in row.command:
+        return False
+    if harness.launched_ns is None:
+        return False
+    started = lstart_epoch(row.started)
+    if started is None:
+        return False
+    return started <= harness.launched_ns / 1e9 + ROOT_SLACK_SECONDS
 
 
 def below(rows: Sequence[TreeRow], root: int, me: int) -> list[TreeRow]:
@@ -888,8 +949,8 @@ def identity_of(pid: int, timeout: float = IDENTITY_SECONDS) -> tuple[int, str] 
     Not knowing is never the same as knowing, so a caller that signals only a process
     it can show to be unchanged treats ``None`` as changed."""
     try:
-        found = subprocess.run(  # noqa: S603
-            [  # noqa: S607
+        found = spawn.run(
+            [
                 "ps",
                 "-ww",
                 "-p",

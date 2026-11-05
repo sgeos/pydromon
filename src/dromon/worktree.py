@@ -43,22 +43,14 @@ stream processor in Keleusma.
 import os
 import re
 import subprocess
-import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from dromon import spawn
+
 GIT_SECONDS: Final = 30.0
-START_GRACE_SECONDS: Final = 5.0
-"""How long past ``GIT_SECONDS`` a git may take to start before the wait for it ends.
-``subprocess.run`` bounds a process only once it exists and waits for the child to reach
-``exec`` with no bound, in a read of the pipe that reports a failed start. **Fact,
-observed 2026-11-05.** A gate on macOS was stopped by its five minute limit with its
-test thread in that read, in a staleness test and again in a worktree test that
-reached it through ``run_git``. **Not found.** Why the child did not start."""
-MAX_STRANDED: Final = 4
-"""The most git starts left stuck at once. At the bound no further git is started."""
 """How long one git command may take. ``status`` reads every file of a large tree."""
 
 MAX_DIRTY: Final = 200
@@ -106,56 +98,25 @@ def git_environment() -> dict[str, str]:
     return kept
 
 
-_stranded: list[threading.Thread] = []
-_stranded_lock = threading.Lock()
-
-
 def run_git(directory: Path, arguments: Sequence[str]) -> Ran:
-    """The real runner. It never raises for a failed command, and it returns after at
-    most ``GIT_SECONDS`` plus ``START_GRACE_SECONDS`` even if the start stalls. The
-    command runs in a daemon thread of its own, which is left behind when it overruns,
-    and at most ``MAX_STRANDED`` such threads are tolerated, so a host that cannot start
-    processes is not given more of them."""
+    """The real runner. It never raises for a failed command. A git that overruns
+    ``GIT_SECONDS`` gives 124, and one that does not start within
+    ``dromon.spawn.START_SECONDS``, or cannot be run, or is not started because earlier
+    starts are still stuck, gives 127 with the reason, as ``dromon.spawn`` describes."""
     command = ["git", "-C", str(directory), "-c", "core.fsmonitor=false", *arguments]
-    with _stranded_lock:
-        _stranded[:] = [thread for thread in _stranded if thread.is_alive()]
-        if len(_stranded) >= MAX_STRANDED:
-            return Ran(127, "", "git cannot be run: earlier starts are still stuck")
-    done = threading.Event()
-    outcome: list[subprocess.CompletedProcess[str] | BaseException] = []
-
-    def target() -> None:
-        try:
-            outcome.append(
-                subprocess.run(  # noqa: S603
-                    command,
-                    capture_output=True,
-                    text=True,
-                    errors="surrogateescape",
-                    timeout=GIT_SECONDS,
-                    check=False,
-                    env=git_environment(),
-                )
-            )
-        except BaseException as error:  # noqa: BLE001
-            # Carried to the waiting thread, which decides what it means.
-            outcome.append(error)
-        finally:
-            done.set()
-
-    thread = threading.Thread(target=target, name="dromon-worktree-git", daemon=True)
-    thread.start()
-    if not done.wait(GIT_SECONDS + START_GRACE_SECONDS):
-        with _stranded_lock:
-            _stranded.append(thread)
+    try:
+        result = spawn.run(
+            command,
+            capture_output=True,
+            text=True,
+            errors="surrogateescape",
+            timeout=GIT_SECONDS,
+            env=git_environment(),
+        )
+    except subprocess.TimeoutExpired:
         return Ran(124, "", f"git did not finish within {GIT_SECONDS:g} seconds")
-    result = outcome[0]
-    if isinstance(result, subprocess.TimeoutExpired):
-        return Ran(124, "", f"git did not finish within {GIT_SECONDS:g} seconds")
-    if isinstance(result, OSError):
-        return Ran(127, "", f"git cannot be run: {result}")
-    if isinstance(result, BaseException):
-        raise result
+    except OSError as error:
+        return Ran(127, "", f"git cannot be run: {error}")
     return Ran(result.returncode, result.stdout, result.stderr)
 
 
