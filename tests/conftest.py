@@ -442,6 +442,20 @@ def _no_real_process_table(
         monkeypatch.setattr(scheduler_module, "SystemProcesses", NoProcesses)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_spawn_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test starts with no stranded start, and the real list is put back when it
+    ends. **Round 15.** ``dromon.spawn`` counts the starts that stalled past its bound
+    in one list for the whole process. Under load a real ``git`` start can stall past
+    the bound of 30 seconds in any test, and that one stall left the count raised, so
+    later tests that count stranded starts or start a child past the cap failed for a
+    cause that was not theirs. The bound is not raised, and a test that meets a real
+    stall still fails by itself. A test that checks the counts sets its own, through
+    ``stalled_start`` or by patching ``MAX_STRANDED``. The list is replaced by name, as
+    ``spawn`` reads it at each call, and ``monkeypatch`` puts the original back."""
+    monkeypatch.setattr(spawn, "_stranded", [])
+
+
 class StalledStart:
     """Stands in for a start that stalls before the program runs, which no test can
     make the operating system do on demand. While ``stall`` is true, every
