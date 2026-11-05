@@ -1581,8 +1581,20 @@ the intent itself, in the line's own words, set with `set_brief` and recorded as
     commit move, the changed uncommitted state with the count of dirty paths, or both,
     until the line sets the brief again. A turn whose lead already says the commit
     moved is told only of the uncommitted state. A line with a fresh session each turn
-    is never led with its brief and is not told. A side that cannot be read is not
+    is never led with its brief and is not told. A commit that cannot be read is not
     compared, and a brief recorded before the field compares the commit alone.
+  - **A failed read, from the operator's task of 2026-11-05.** A failed `git status`
+    had been skipped with no reason kept, so the turn said nothing and the brief read
+    as current. Where the brief names a digest and the read fails, the turn now opens
+    with `BRIEF CURRENCY UNKNOWN.`, which says the daemon could not read `git status`
+    and gives the reason in one fixed word, `timed_out`, `not_started`, `failed`,
+    `malformed`, `not_text` or `no_workdir`. Where the commit also moved, the
+    `STALE BRIEF.` notice carries the same sentence instead. The word is chosen from
+    where the read stopped and never taken from git's text, which names paths. When
+    the read fails as `set_brief` records the brief, the brief names no digest, and
+    the tool's answer says with the same word that later turns compare the commit
+    alone. **Residual.** Such a brief is not told of the failure again on later
+    turns, since a brief recorded before the field cannot be told apart from it.
   - **Decided by core, for review.** The digest covers which paths are dirty and how,
     not their contents, so edits inside a file already dirty do not flag the brief,
     while a new dirty path, a path made clean, or discarded work does. A line's own

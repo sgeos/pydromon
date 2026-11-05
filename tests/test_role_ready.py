@@ -25,6 +25,7 @@ from dromon.model import (
 from dromon.readiness import (
     MAX_READY_PATH_CHARACTERS,
     MAX_READY_PATHS,
+    ReadFailure,
     ReadinessUnknown,
     parse_porcelain,
 )
@@ -61,8 +62,9 @@ def test_clean_output_has_no_paths() -> None:
 
 @pytest.mark.parametrize("output", ["XY\0", "MX_x\0", "R  b.py\0"])
 def test_output_not_in_the_form_is_refused(output: str) -> None:
-    with pytest.raises(ReadinessUnknown):
+    with pytest.raises(ReadinessUnknown) as raised:
         parse_porcelain(output)
+    assert raised.value.cause is ReadFailure.MALFORMED
 
 
 def test_paths_are_bounded_in_count_and_length() -> None:
@@ -195,7 +197,9 @@ def test_a_worktree_git_cannot_read_is_refused(
     role.scheduler.give_ownership(ANA, "core", "beta")
 
     def fail(worktree: Path) -> readiness.Dirty:
-        raise ReadinessUnknown(f"git status failed in {worktree.name}")
+        raise ReadinessUnknown(
+            f"git status failed in {worktree.name}", ReadFailure.FAILED
+        )
 
     monkeypatch.setattr(readiness, "dirty_paths", fail)
     with pytest.raises(LineToolRefused, match="no readiness is reported"):

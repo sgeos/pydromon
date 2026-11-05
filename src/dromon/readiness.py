@@ -18,6 +18,7 @@ import hashlib
 import os
 import subprocess
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Final
 
@@ -31,8 +32,35 @@ MAX_READY_PATH_CHARACTERS: Final = 300
 """The longest path a report names whole. A longer one is cut and marked."""
 
 
+class ReadFailure(StrEnum):
+    """Why the worktree's ``git status`` could not be read, in one fixed word.
+    **Operator task of 2026-11-05.** A failed read had left a stale brief unflagged
+    with no reason given, which read as a current brief. The word is chosen by the
+    daemon from where the read stopped, never from git's own text, which names paths
+    and may carry anything.
+
+    ``TIMED_OUT``, git ran past ``GIT_STATUS_SECONDS``. ``NOT_STARTED``, git could not
+    be started. ``FAILED``, git exited with an error, as outside a repository.
+    ``MALFORMED``, git's output was not in the porcelain form. ``NOT_TEXT``, git's
+    output could not be decoded. ``NO_WORKDIR``, the line's working directory is not
+    known or not allowed, so git was not run."""
+
+    TIMED_OUT = "timed_out"
+    NOT_STARTED = "not_started"
+    FAILED = "failed"
+    MALFORMED = "malformed"
+    NOT_TEXT = "not_text"
+    NO_WORKDIR = "no_workdir"
+
+
 class ReadinessUnknown(RuntimeError):
-    """The worktree's state could not be read, so no readiness is reported."""
+    """The worktree's state could not be read, so no readiness is reported.
+    ``cause`` says why in a fixed word, apart from the message, which may name a
+    path."""
+
+    def __init__(self, message: str, cause: ReadFailure) -> None:
+        super().__init__(message)
+        self.cause = cause
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,11 +89,16 @@ def parse_porcelain(output: str) -> Dirty:
         field = fields[index]
         index += 1
         if len(field) < 4 or field[2] != " ":
-            raise ReadinessUnknown(f"git status gave an entry it should not: {field!r}")
+            raise ReadinessUnknown(
+                f"git status gave an entry it should not: {field!r}",
+                ReadFailure.MALFORMED,
+            )
         status, path = field[:2], field[3:]
         if status[0] in "RC" or status[1] in "RC":
             if index >= len(fields):
-                raise ReadinessUnknown("git status gave a rename with no origin")
+                raise ReadinessUnknown(
+                    "git status gave a rename with no origin", ReadFailure.MALFORMED
+                )
             path = f"{fields[index]} -> {path}"
             index += 1
         total += 1
@@ -78,8 +111,9 @@ def parse_porcelain(output: str) -> Dirty:
 
 def dirty_paths(worktree: Path) -> Dirty:
     """The dirty paths of ``worktree``. Raises ``ReadinessUnknown`` when git cannot
-    start, runs too long or fails, since a report must not claim a clean tree it did
-    not read. Blocking, so the scheduler runs it off its event loop."""
+    start, runs too long, fails or gives output that is not text, since a report must
+    not claim a clean tree it did not read. Blocking, so the scheduler runs it off its
+    event loop."""
     return parse_porcelain(_status(worktree))
 
 
@@ -123,10 +157,20 @@ def _status(worktree: Path) -> str:
         )
     except subprocess.TimeoutExpired as error:
         raise ReadinessUnknown(
-            f"git status ran past {GIT_STATUS_SECONDS:g} seconds"
+            f"git status ran past {GIT_STATUS_SECONDS:g} seconds",
+            ReadFailure.TIMED_OUT,
         ) from error
     except OSError as error:
-        raise ReadinessUnknown(f"git could not start: {error}") from error
+        raise ReadinessUnknown(
+            f"git could not start: {error}", ReadFailure.NOT_STARTED
+        ) from error
+    except UnicodeError as error:
+        # Paths may hold any byte git allows, and the output is decoded as text.
+        raise ReadinessUnknown(
+            "git status gave output that is not text", ReadFailure.NOT_TEXT
+        ) from error
     if done.returncode != 0:
-        raise ReadinessUnknown(f"git status failed with exit code {done.returncode}")
+        raise ReadinessUnknown(
+            f"git status failed with exit code {done.returncode}", ReadFailure.FAILED
+        )
     return done.stdout

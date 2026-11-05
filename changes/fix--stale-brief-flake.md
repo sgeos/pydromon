@@ -1,0 +1,3 @@
+Type: Changed
+
+- The kept-session test of the stale brief notice, which failed once in continuous integration on Linux with Python 3.15, now records every read of the worktree's uncommitted state and puts the record in each assertion message. It also checks that the brief kept a digest when it was set. Nothing is put in front of the notice in that test, so the notice was absent, and a failed read is turned into no comparison without a reason. The next failure therefore names which read failed or what it returned. The cause is still unknown, since the failed log was not read, and this is a test change only. The test of discarded work is given the same record.
