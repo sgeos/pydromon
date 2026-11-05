@@ -55,7 +55,7 @@ from OpenSSL.SSL import Context as OpenSSLContext
 
 from dromon.scheduler import StartCheckEngine
 from dromon import __version__, exits, fleet, grok, peercred, registry, restart, runs
-from dromon import credentials, evidence
+from dromon import credentials, evidence, spawn
 from dromon import proposals as proposal_store
 from dromon.federation import (
     MAX_OPEN_REMOTE_PEERS,
@@ -2950,12 +2950,16 @@ async def serve(daemon: Daemon) -> None:
     scheduling.add_done_callback(watch_task("scheduler", daemon.stop_requested))
     forwarding.add_done_callback(watch_task("forwarder", daemon.stop_requested))
     relaying.add_done_callback(watch_task("relayer", daemon.stop_requested))
+    # A start stuck past its bound dumps every thread's traceback here, from a timer
+    # that does not need the interpreter lock. See ``spawn.watch_starts``.
+    spawn.watch_starts(sys.stderr)
     try:
         # The umask already gives 0600, and this states it rather than relying on it.
         socket_path.chmod(0o600)
         print(f"dromond: serving {daemon.paths.root} on {socket_path}", file=sys.stderr)
         await daemon.stop_requested.wait()
     finally:
+        spawn.watch_starts(None)
         daemon.stop_requested.set()
         await scheduling
         try:

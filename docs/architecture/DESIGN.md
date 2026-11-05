@@ -60,6 +60,75 @@ caused most of the flaky runs. **Fact.** That read was where the stalled threads
 hypotheses are recorded in the module, and a traceback of every thread at the next hang
 would tell them apart.
 
+**Stall diagnostics, 2026-11-05.** The stall also occurred on a Linux runner, so it is
+not peculiar to one macOS host. A start that stalls now raises `StartStalled` with a
+report, which is written to the daemon's standard error as well. It gives where the
+start's thread is in Python, how many starts were in flight together, the number of
+threads, and each child of the daemon with its state, its program name, whether it has
+executed and what it waits on, from `/proc` on Linux and from `ps` elsewhere. It names
+no argument. **Inference.** A child that is stuck before its program runs holds a copy of
+the exec-failure pipe of every start that overlaps it, so the report's overlap and
+children tell a stuck child from a missing fork. The module records the full reading and
+three further hypotheses. No cause is fixed.
+
+**Watchdog and worker threads, 2026-11-05.** The faulthandler dump of a hung Linux run
+shows 100 threads, its limit, of which 99 are idle process workers that tests never
+stopped, so the main thread is missing. The waiting thread had already returned from its
+timed wait, so it was waiting for the interpreter lock. **Hypothesis.** A thread in
+`fork_exec` holds the lock while a child stalls before its program, which freezes every
+Python thread, the stall report included. `spawn.watch_starts`, which the daemon turns
+on while it serves, sets `faulthandler`'s timer, which needs no lock, to dump every
+thread a margin past a start's bound. The tests now stop each scheduler's process
+workers, and fail if one outlives its test.
+
+**Fork lock, 2026-11-05.** Main failed three pushes running with the stall. **Inference.**
+Starting children from more threads at once made it frequent. Every fork in the daemon
+process is now made under one lock, `spawn.forking`, which `spawn.install_fork_lock`
+puts around `subprocess._fork_exec`, `os.posix_spawn` and `os.posix_spawnp` when the
+module is imported, so it covers the engine drivers and the launcher as well as
+`spawn.start`. A start that waits 30 seconds for it is refused with `StartStalled`.
+Whether this ends the stall is not known, and the watchdog, which times each fork, shows
+a stall that remains. A port holds one mutex around its spawn call.
+
+**A stall with the lock in place.** A sandbox gate on macOS stalled a real `git` start at
+the exec-pipe read with one start in flight and two threads alive, so overlapping forks
+did not cause that one. **Inference.** The child was stuck before its program ran, or the
+system was slow to execute it. The report reads children from `libproc` on macOS, which
+needs no process, and shows a child still being created as state `I`.
+
+**A second stall with the lock in place, and one hypothesis tested.** A full gate on macOS
+stalled again with one start in flight, two threads alive, and the child in state `R`
+with the daemon's own program name, not yet executed. **Fact.** The child was running,
+not blocked. A hypothesis was that the child closes every descriptor up to the soft limit
+`RLIMIT_NOFILE`, which is 1,048,576 here with an unlimited hard limit, and that a million
+closes pass 30 seconds under load. **Measured, and not supported.** A start took about 20
+milliseconds with the soft limit at 1,048,576 and at 256, for plain starts, with pipes,
+with `start_new_session` and `cwd`, with `preexec_fn` and with `pass_fds`, idle and with
+twice as many busy processes as cores and thirty idle threads. A million closes of
+unused descriptors take 0.34 seconds when called directly. So CPython's child lists the
+open descriptors here and does not close each number, and even the worst case is far
+below 30 seconds. **Not read.** The `_posixsubprocess` source, which is not on this
+machine. The stall report now gives the soft limit, so a stall that does show a large
+limit, or a small one, settles it. No limit was lowered, since nothing showed it helps.
+
+**A Linux hang inside the report, and an experiment.** The second CI run on Linux with
+Python 3.12 hung five minutes with two threads left, so the thread leak is fixed. **Fact.**
+The main thread was inside the stall report itself, in the read of a `/proc` file in
+`_proc_children`, called from a start of `git` that had stalled. **Inference.** A read
+of a child's `/proc` file waited for ever while the child was in the middle of `vfork`
+or `exec`, and Linux CPython starts children with `vfork`. This is the same stall seen
+from the parent, and the first evidence of where the child is. **Not known.** Which file
+it was, since the dump names only the line that read `stat` of some process. The report
+now reads `/proc` on a thread of its own and gives up after three seconds, naming the
+file it was reading and the children it had already found, reads only `stat`, `exe` and
+`wchan`, never `cmdline`, `environ` or `maps`, and the daemon goes on. **Experiment.**
+`spawn.disable_vfork` turns off `subprocess._USE_VFORK` and, since Python 3.15 and
+`glibc` make the same kind of child through `posix_spawn`, `subprocess._USE_POSIX_SPAWN`,
+on Linux only, so every start of the `subprocess` module forks. If Linux CI then stops
+stalling, `vfork` is the cause. If it does not, the change is taken out, since a fork
+copies the daemon's page tables and is slower. Direct calls of `os.posix_spawn` in this
+repository are not changed, and the fork lock still covers them.
+
 The start bound, `START_SECONDS`, is named once. A start past it fails at once with
 `StartStalled`, a `TimeoutError` and so an `OSError`, whose message names the program and
 the bound. The child is killed and reaped should it start later, and at most four stuck

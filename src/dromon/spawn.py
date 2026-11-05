@@ -21,6 +21,110 @@ child kept the write end. Two, the child stalled before its program ran, as in
 them apart, since the first needs a second thread that spawns. **Not found.** The
 cause. It does not reproduce in isolation.
 
+**Reading of 2026-11-05, after a stall on a Linux runner.** In pull request 142 a start
+stalled for 30 seconds on a GitHub Linux runner, so the stall is not peculiar to one
+macOS host or to its load. **Facts, read from this repository.** Every start in the
+daemon goes through this module, apart from the asyncio starts of the engine drivers and
+the relay, which run ``Popen`` on the event loop's thread, and ``client.start_daemon``,
+which calls ``os.posix_spawn``. None of them sets ``preexec_fn``, ``close_fds`` or
+``restore_signals``, so ``Popen`` closes every descriptor but those it was told to pass.
+``start_new_session`` is set by four starts, ``process_group`` by one, ``pass_fds`` by
+one, the run supervisor's, and ``cwd`` by several. The only ``preexec_fn`` in ``src`` is
+the launcher's, which runs in the launcher's own single-threaded process and so cannot
+hold up a start in the daemon. Starts run concurrently from the process worker, the code
+tree's worker, the engine drivers on the event loop and the scheduler's tick, and
+``spawn`` now counts how many were in flight together.
+
+**Facts, read from ``subprocess.py`` of Python 3.15.1.** A start with a working
+directory, a bare program name such as ``git``, a descriptor to pass or a new session
+takes the ``_fork_exec`` path, which creates a pipe with ``os.pipe``, forks, and reads
+the pipe until every copy of its write end is closed. Only a start with an absolute
+program path and none of those options can take ``posix_spawn``, which has no such pipe.
+The macOS interpreter's executable imports ``opendir``, ``readdir`` and
+``proc_pidinfo``, so its child may call them before the program runs. **Not read in this
+review.** The C code of ``_posixsubprocess``. From its documentation and memory, the
+child sets the session or group, duplicates the standard descriptors, changes directory,
+closes the other descriptors and restores signals before the program runs, and Python
+3.10 and later use ``vfork`` on Linux where permitted, which suspends the starting
+thread until the child executes. Linux makes the pipe close-on-exec in one call, so the
+macOS window between two steps does not apply there.
+
+**Inferences.** A copy of the pipe's write end is held by every child forked while the
+pipe exists, until that child executes, so a child that is slow or stuck before its
+program runs holds up every other start in the process, not only its own. **Hypotheses,
+none confirmed.** Three, beside the two above. A child forked from a process with
+several threads waits on a lock that another thread held at the fork, in code the child
+must run before it executes. A start's thread never reaches ``Popen`` because another
+thread holds the interpreter lock in a call that does not release it, so there is no
+child at all. Many children are forked at once and the program's executable is slow to
+load.
+
+The stall report below tells these apart. A thread at ``os.read`` in ``_execute_child``
+with a child of the daemon that has not executed means the child is stuck before its
+program. A thread at ``os.read`` with no such child means another copy of the pipe is
+held, and the overlap says whether another start was in flight. A thread in
+``_fork_exec`` means the fork has not returned. A thread still in ``target`` means no
+fork was made.
+
+**The dump of 2026-11-05, read in full.** The faulthandler dump of that run lists 100
+threads and then ``...``, because ``faulthandler`` shows at most 100. **Facts.** Ninety
+nine of them are idle ``dromon-processes`` workers of earlier tests' schedulers, which
+tests never stopped, and one is the ``asyncio_0`` thread of the stale-brief test, so the
+main thread and every older thread are not in the dump. The ``asyncio_0`` thread is at
+``threading.py`` line 370 and 665, which are the ``return`` statements after the
+blocking acquire, in the layout that matches Python 3.15.1's, so its timed wait had
+already returned and it was not sleeping in it. No ``dromon-spawn`` thread is in the
+dump, which would be listed before it. Every path of ``target`` sets the event.
+**Inference.** The thread that wakes and does not run waits for the interpreter lock,
+which another thread holds. **Hypothesis, not confirmed.** That holder is a thread in
+``fork_exec``, which as the author recalls holds the lock across ``vfork`` or ``fork``,
+so a child that stalls before its program freezes every Python thread, the waiter, the
+report and the bound with them. No Python timer can report that. **Two changes follow.**
+``watch_starts`` sets ``faulthandler``'s timer, which runs on a thread of its own
+without the lock, to dump every thread ``WATCHDOG_MARGIN_SECONDS`` past a start's bound,
+and the daemon turns it on. And the tests stop every scheduler's workers, so a dump is
+not filled with idle threads and every start copies fewer of them. The timer is one per
+process and replaces pytest's, so the tests leave it off, and it is aimed at the oldest
+start in flight that has not been dumped, so a second stuck start is shown by the same
+dump only if it is stuck by then.
+
+**The fork lock, 2026-11-05.** Main failed three pushes running with the stall, on Linux
+and once on macOS, after two changes that start children from more threads.
+**Inference.** More threads forking together made the stall frequent. So every fork in
+the process is now made one at a time. ``install_fork_lock``, run when this module is
+imported, puts one lock, ``forking``, around ``subprocess._fork_exec``,
+``os.posix_spawn`` and ``os.posix_spawnp``, which every start reaches, whoever makes it,
+asyncio's and the engine drivers' included. Nothing else is held across the fork, and a
+start that waits ``FORK_LOCK_SECONDS`` for the lock is refused with ``StartStalled`` and
+holds no thread. The lock is held while the starting thread is in the call, which with
+``vfork`` is until the child has executed, and not while it waits on the exec pipe, so
+the bound still covers that wait. **Not known.** Whether this ends the stall. It removes
+forks that overlap, which the inference names, and does not touch a single child that
+stalls alone, which the watchdog's dump would show. **Porting hazard.** It replaces
+names in the standard library, which only Python allows, and a Rust port holds a mutex
+around ``Command::spawn``. The watchdog times each fork as well as each start.
+
+**A stall observed with the fork lock in place.** In a sandbox gate on macOS a real
+``git`` start stalled at the read of the exec pipe, with one start in flight and two
+threads alive in the whole process, and ``ps`` could not be started to show the child.
+**Facts.** No other thread of the process was forking, so a child of another start
+holding a copy of the pipe cannot explain it, and the fork had returned, so the thread
+was not frozen in it. **Inference.** The child was stuck before its program ran, or the
+operating system was slow to execute it, in which case the fork lock does not help. The
+report now reads children from ``libproc`` on macOS, which needs no process, and says
+whether a child is still being created, state ``I``, or has executed.
+
+**The stall report.** A start that stalls raises ``StartStalled`` with a report, and
+writes the same to the daemon's standard error. It gives where the start's thread is in
+Python, how many starts were in flight now and at most during this one, how many threads
+are alive, and each child of the daemon, up to eight, with its process state, its
+program name, whether it has executed, and what it waits on. The children come from
+``/proc`` on Linux and from ``libproc`` on macOS, which start no process, and from
+``ps`` otherwise, on a thread of its own that is left behind after three seconds. It
+names no argument, shows only printable ASCII, and is at most 1200 characters. The stuck
+child is not killed by searching for it, since a search by parent and program could end
+an unrelated child that is about to execute.
+
 **The bound.** ``START_SECONDS`` is the one place the start bound is named. Every
 ``subprocess.run`` and ``subprocess.Popen`` in ``src`` goes through ``run`` or
 ``start`` here, and ``tests/test_spawn.py`` fails when a module outside this one calls
@@ -76,11 +180,18 @@ another way, has no such read to bound, and the module reduces to its signatures
 """
 
 import contextlib
+import faulthandler
 import os
+import resource
 import signal
 import subprocess
+import sys
 import threading
-from collections.abc import Mapping, Sequence
+import time
+import traceback
+from collections.abc import Callable, Generator, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from typing import IO, Any, Final, Literal, cast, overload
 
 START_SECONDS: Final = 30.0
@@ -108,6 +219,37 @@ holds a pipe open would otherwise hold the read."""
 TAIL_LIMIT: Final = 65536
 """The most of a timed-out command's output kept for the caller, from its end, in bytes
 or characters."""
+
+DIAGNOSE_SECONDS: Final = 3.0
+"""How long the report of a stalled start waits for the process table. The table is read
+on a thread of its own, since the start that stalled may have left the process unable to
+start another, and a read that does not end is left behind."""
+
+MAX_REPORT_CHARS: Final = 1200
+"""The most of a stall report put in the error and the daemon's log, in characters."""
+
+MAX_CHILDREN_REPORTED: Final = 8
+"""The most children of the daemon the report describes."""
+
+MAX_PROC_ENTRIES: Final = 4096
+"""The most entries of ``/proc`` the report reads, so a host with a very long process
+list does not lengthen a stall."""
+
+FORK_LOCK_SECONDS: Final = 30.0
+"""How long a start waits for the lock that serializes forks. A start that waits this
+long is refused with ``StartStalled``, so that one stuck fork does not hold every other
+thread of the daemon, the event loop's among them."""
+
+WATCHDOG_MARGIN_SECONDS: Final = 5.0
+"""How long past a start's own bound the watchdog waits before it dumps the traceback
+of every thread. It is after the bound, so a start that stalls is already reported by
+``StartStalled`` when the dump is written, and the dump is of the state the report
+describes."""
+
+_REAL_POPEN: Final = subprocess.Popen
+"""``subprocess.Popen`` as it was when this module was loaded. The report of a stalled
+start reads the process table with it, so that a test which replaces ``Popen`` to stall
+a start does not stall the report as well."""
 
 EXEMPT: Final = {
     "launcher.py": "a parent death signal on Linux belongs to the thread that forked",
@@ -157,13 +299,530 @@ def stuck_text(count: int) -> str:
 class _Handoff:
     """The place a start's outcome goes, for the thread that made it and the caller that
     waits. Under ``lock`` the outcome is set once, and ``abandoned`` is set once, and
-    never both."""
+    never both. ``overlap`` is the most starts that were in flight at once while this
+    one was, itself included, and is read and written under ``_active_lock``."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.done = threading.Event()
         self.outcome: subprocess.Popen[Any] | BaseException | None = None
         self.abandoned = False
+        self.overlap = 1
+        self.began = time.monotonic()
+        self.deadline = 0.0
+        self.dumped = False
+
+
+_active: set[_Handoff] = set()
+_watched: set[_Handoff] = set()
+"""The starts the watchdog times. Every start in ``_active`` is in it, and so is each
+fork, from any thread, that ``_serialized`` makes."""
+_active_lock = threading.Lock()
+
+
+_watch_file: IO[str] | None = None
+_armed: _Handoff | None = None
+
+
+def watch_starts(file: IO[str] | None) -> bool:
+    """Write the traceback of every thread to ``file`` when a start is still stuck
+    ``WATCHDOG_MARGIN_SECONDS`` past its bound, or stop doing so with ``None``. The
+    daemon turns it on, and tests and other callers leave it off. **Round 15.** It is
+    ``faulthandler``'s timer, which runs on a thread of its own and does not need the
+    interpreter lock, so it fires when a start holds that lock and every Python
+    thread, the waiter and the stall report with them, is frozen. Nothing in Python
+    can report that, and a hang seen on 2026-11-05 had exactly that shape. A dump from
+    it shows the thread that is stuck, and the main thread. ``faulthandler`` keeps one
+    timer for the process, so this replaces and is replaced by pytest's own, which is
+    why the tests leave it off. Returns whether it is now on, and ``False`` where
+    ``file`` has no descriptor."""
+    global _watch_file  # noqa: PLW0603
+    with _active_lock:
+        if file is not None:
+            try:
+                file.fileno()
+            except (OSError, ValueError):
+                file = None
+        _watch_file = file
+        _rearm_locked()
+        return _watch_file is not None
+
+
+def _rearm_locked() -> None:
+    """Point the timer at the oldest start in flight that has not been dumped, or
+    cancel it. A start already past its deadline is taken to have been dumped, since
+    its timer was set for that, and is not dumped again. Held under ``_active_lock``.
+    Bounded by the number of starts in flight."""
+    global _armed  # noqa: PLW0603
+    if _watch_file is None:
+        if _armed is not None:
+            faulthandler.cancel_dump_traceback_later()
+        _armed = None
+        return
+    now = time.monotonic()
+    for each in _watched:
+        if each.deadline and each.deadline <= now:
+            each.dumped = True
+    waiting = [each for each in _watched if each.deadline and not each.dumped]
+    if not waiting:
+        if _armed is not None:
+            faulthandler.cancel_dump_traceback_later()
+        _armed = None
+        return
+    first = min(waiting, key=lambda each: each.deadline)
+    if first is _armed:
+        return
+    faulthandler.dump_traceback_later(
+        max(first.deadline - now, 0.001), repeat=False, file=_watch_file, exit=False
+    )
+    _armed = first
+
+
+def _enter(handoff: _Handoff) -> None:
+    """Note that ``handoff``'s start has begun, and raise the overlap of every start in
+    flight, itself included, to the number in flight now."""
+    with _active_lock:
+        _active.add(handoff)
+        _watched.add(handoff)
+        now = len(_active)
+        for other in _active:
+            other.overlap = max(other.overlap, now)
+        _rearm_locked()
+
+
+def _leave(handoff: _Handoff) -> None:
+    global _armed  # noqa: PLW0603
+    with _active_lock:
+        _active.discard(handoff)
+        _unwatch_locked(handoff)
+
+
+def _unwatch_locked(handoff: _Handoff) -> None:
+    global _armed  # noqa: PLW0603
+    _watched.discard(handoff)
+    if _armed is handoff:
+        _armed = None
+        if _watch_file is not None:
+            faulthandler.cancel_dump_traceback_later()
+    _rearm_locked()
+
+
+def _watch(handoff: _Handoff) -> None:
+    """Time ``handoff`` for the watchdog without counting it among the starts."""
+    with _active_lock:
+        _watched.add(handoff)
+        _rearm_locked()
+
+
+def _unwatch(handoff: _Handoff) -> None:
+    with _active_lock:
+        _unwatch_locked(handoff)
+
+
+_fork_lock = threading.Lock()
+_FORK_INSTALLED: list[bool] = [False]
+
+
+@contextlib.contextmanager
+def forking() -> Generator[None]:
+    """Hold the one lock every child start in this process takes, for the call that
+    forks. **Round 15.** Two threads that fork at the same moment each hand the other
+    a copy of every descriptor open at the time, and a lock or an allocator held by a
+    thread that is not the forking one is held for ever in the child. A stall seen on
+    Linux and on macOS only appeared once several threads started children together, so
+    the starts are made one at a time. Nothing else is held across the fork, and a
+    start that waits ``FORK_LOCK_SECONDS`` for the lock raises ``StartStalled`` instead
+    of waiting for a start that is stuck. It is also timed by the watchdog."""
+    watched = _Handoff()
+    if not _fork_lock.acquire(timeout=FORK_LOCK_SECONDS):
+        raise StartStalled(
+            f"a child was not started: another start held the fork lock for"
+            f" {FORK_LOCK_SECONDS:g}s"
+        )
+    # Timed from here, since a wait for the lock is not a stall in the fork.
+    watched.began = time.monotonic()
+    watched.deadline = watched.began + FORK_LOCK_SECONDS + WATCHDOG_MARGIN_SECONDS
+    _watch(watched)
+    try:
+        yield
+    finally:
+        _unwatch(watched)
+        _fork_lock.release()
+
+
+def _serialized(call: Callable[..., Any]) -> Callable[..., Any]:
+    def serialized(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+        with forking():
+            return call(*args, **kwargs)
+
+    setattr(serialized, "__wrapped__", call)  # noqa: B010
+    return serialized
+
+
+def install_fork_lock() -> bool:
+    """Put ``forking`` around ``subprocess``'s call that forks, ``_fork_exec``, and
+    around ``os.posix_spawn`` and ``os.posix_spawnp``, which ``subprocess`` and
+    ``asyncio`` and the engine drivers reach, so that no two threads start a child at
+    once, whoever starts it. Idempotent. Returns whether the lock is in place. It is
+    done at import of this module, which the daemon and ``subprocess`` users here
+    load. **Porting hazard.** It replaces names in the standard library, which only
+    Python allows, and relies on ``subprocess._fork_exec``, which is private and
+    present in Python 3.12 to 3.15. Where it is absent the lock covers ``spawn.start``
+    alone, which is what ``test_every_fork_is_serialized`` checks for. A Rust port
+    holds one mutex around ``Command::spawn``."""
+    if _FORK_INSTALLED[0]:
+        return True
+    installed = False
+    inner = getattr(subprocess, "_fork_exec", None)
+    if callable(inner):
+        setattr(subprocess, "_fork_exec", _serialized(inner))  # noqa: B010
+        installed = True
+    for name in ("posix_spawn", "posix_spawnp"):
+        spawner = getattr(os, name, None)
+        if callable(spawner):
+            setattr(os, name, _serialized(spawner))
+    _FORK_INSTALLED[0] = installed
+    return installed
+
+
+def disable_vfork(platform: str = sys.platform) -> bool:
+    """On Linux, stop ``subprocess`` from starting children with ``vfork`` or
+    ``posix_spawn``, so that every start forks. **Round 15, an experiment.** A CI run on
+    Linux stalled a start of ``git``, and reading ``/proc`` for the report then blocked
+    for the rest of five minutes, which fits a child that is in the middle of ``vfork``,
+    where the parent thread is suspended and the child shares its memory until it runs
+    its program. CPython on Linux uses ``vfork`` since 3.10 through
+    ``subprocess._USE_VFORK``, and ``glibc``'s ``posix_spawn``, which Python 3.15 uses
+    when it can, makes the same kind of child, so both are turned off. If Linux CI
+    then stops stalling, ``vfork`` is the cause and this is the fix. If it does not, it
+    is not, and it should be taken out, since a fork copies the page tables of the
+    whole daemon and is slower. **Not known.** Whether it helps. It is not applied
+    elsewhere. ``os.posix_spawn`` calls made directly by this repository are not
+    changed. Returns whether it changed anything. **Porting hazard.** It sets private
+    names in the standard library, which only Python allows."""
+    if not platform.startswith("linux"):
+        return False
+    changed = False
+    for name in ("_USE_VFORK", "_USE_POSIX_SPAWN"):
+        if hasattr(subprocess, name):
+            setattr(subprocess, name, False)
+            changed = True
+    return changed
+
+
+@dataclass(frozen=True)
+class _Child:
+    """A child of this process, as the process table shows it. ``execed`` is whether
+    it runs a program other than this process's own, which a child forked and not yet
+    executed does not, and ``None`` where that cannot be told."""
+
+    pid: int
+    state: str
+    program: str
+    execed: bool | None
+    waiting: str | None
+
+
+def _clean(text: str, limit: int) -> str:
+    """``text`` cut to ``limit`` characters, with anything but printable ASCII shown as
+    a question mark, since process names are not trusted."""
+    return "".join(c if " " <= c <= "~" else "?" for c in text[:limit])
+
+
+def _where(thread: threading.Thread) -> str:
+    """Where the start's thread is now in Python, the last four frames, innermost
+    first. A thread in ``os.read`` inside ``subprocess`` waits for the child to execute
+    its program, one in ``_fork_exec`` has not been given the child's pid, and one in
+    ``target`` has not reached ``Popen``, as when the interpreter lock is held
+    elsewhere."""
+    if not thread.is_alive():
+        return "has ended"
+    frame = sys._current_frames().get(thread.ident or 0)  # pyright: ignore[reportPrivateUsage]
+    if frame is None:
+        return "has no frame"
+    steps = traceback.extract_stack(frame, limit=4)
+    return " <- ".join(
+        f"{Path(step.filename).name}:{step.lineno} {step.name}"
+        for step in reversed(steps)
+    )
+
+
+def _proc_children(
+    root: Path,
+    parent: int,
+    at: list[str] | None = None,
+    found: list[_Child] | None = None,
+) -> list[_Child]:
+    """The children of ``parent`` read from a Linux ``/proc`` at ``root``, without
+    starting a process, which is what a stalled start may no longer be able to do. A
+    child's program is its ``comm``, and it has executed when its ``exe`` differs from
+    this process's own. Reads at most ``MAX_PROC_ENTRIES`` entries. Only ``stat``,
+    ``exe`` and ``wchan`` are read, never ``cmdline``, ``environ`` or ``maps``, which
+    need the memory of a process that may be in the middle of ``vfork``. **Round 15.**
+    A CI run on Linux hung five minutes inside the read of one of these files, so
+    ``at`` is set to the path about to be read and a child is added to ``found`` as
+    soon as its ``stat`` is read, for ``_proc_children_bounded`` to report when the
+    read does not return."""
+    seen = [] if found is None else found
+    here = [""] if at is None else at
+    here[0] = str(root / "self" / "exe")
+    own = _read_link(root / "self" / "exe")
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return seen
+    for name in names[:MAX_PROC_ENTRIES]:
+        if not name.isdigit():
+            continue
+        try:
+            here[0] = str(root / name / "stat")
+            stat = (root / name / "stat").read_text(errors="replace")
+        except OSError:
+            continue
+        close = stat.rfind(")")
+        open_ = stat.find("(")
+        fields = stat[close + 2 :].split()
+        if close < 0 or open_ < 0 or len(fields) < 2 or not fields[1].isdigit():
+            continue
+        if int(fields[1]) != parent:
+            continue
+        program = stat[open_ + 1 : close]
+        seen.append(_Child(int(name), fields[0], program, None, None))
+        here[0] = str(root / name / "exe")
+        exe = _read_link(root / name / "exe")
+        here[0] = str(root / name / "wchan")
+        wait = _read_text(root / name / "wchan")
+        seen[-1] = _Child(
+            int(name),
+            fields[0],
+            program,
+            None if own is None or exe is None else exe != own,
+            None if wait in (None, "", "0") else wait,
+        )
+        if len(seen) >= MAX_CHILDREN_REPORTED:
+            break
+    return seen
+
+
+def _proc_children_bounded(root: Path, parent: int) -> list[_Child] | str:
+    """``_proc_children`` on a thread of its own, left behind after
+    ``DIAGNOSE_SECONDS`` where a read does not return, so the report never blocks. A
+    read can wait for ever on a child in the middle of ``vfork`` or ``exec``, and it
+    cannot be interrupted, so the thread is abandoned and is a daemon. The text then
+    names the file it was reading and the children found before it, which is itself
+    evidence of where the child is."""
+    at = [""]
+    found: list[_Child] = []
+    ended = threading.Event()
+
+    def read() -> None:
+        try:
+            _proc_children(root, parent, at, found)
+        except Exception:  # noqa: BLE001, S110
+            pass
+        finally:
+            ended.set()
+
+    reader = threading.Thread(target=read, name="dromon-spawn-report", daemon=True)
+    reader.start()
+    if ended.wait(DIAGNOSE_SECONDS):
+        return list(found)
+    where = Path(at[0])
+    shown = "/".join(where.parts[-2:]) if where.parts[-2:] else at[0]
+    return (
+        f"reading /proc/{_clean(shown, 40)} did not return within"
+        f" {DIAGNOSE_SECONDS:g}s, {_children_text(list(found))}"
+    )
+
+
+def _read_link(path: Path) -> str | None:
+    try:
+        return os.readlink(path)
+    except OSError:
+        return None
+
+
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(errors="replace").strip()
+    except OSError:
+        return None
+
+
+def _parse_ps(text: str, parent: int, own: int) -> list[_Child]:
+    """The children of ``parent`` from ``ps -A -o pid=,ppid=,stat=,wchan=,comm=``. A
+    child has executed when its program differs from the row of ``own``, this
+    process. Rows that do not parse are skipped, and at most
+    ``MAX_CHILDREN_REPORTED`` are returned."""
+    rows: list[tuple[int, int, str, str, str]] = []
+    for line in text.splitlines():
+        fields = line.split(None, 4)
+        if len(fields) == 5 and fields[0].isdigit() and fields[1].isdigit():
+            rows.append(
+                (int(fields[0]), int(fields[1]), fields[2], fields[3], fields[4])
+            )
+    mine = next((row[4] for row in rows if row[0] == own), None)
+    found = [
+        _Child(
+            pid,
+            state,
+            Path(program).name,
+            None if mine is None else program != mine,
+            None if wait in ("-", "") else wait,
+        )
+        for pid, ppid, state, wait, program in rows
+        if ppid == parent
+    ]
+    return found[:MAX_CHILDREN_REPORTED]
+
+
+def _ps_table(parent: int, own: int) -> list[_Child] | str:
+    """The children of this process from ``ps``, or the reason it cannot be read. It
+    runs on a thread of its own and is left behind after ``DIAGNOSE_SECONDS``, since
+    the process that stalled may be unable to start ``ps`` as well."""
+    result: list[list[_Child] | str] = []
+
+    def read() -> None:
+        try:
+            done = _REAL_POPEN(  # noqa: S603
+                ["/bin/ps", "-A", "-o", "pid=,ppid=,stat=,wchan=,comm="],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            out, _ = done.communicate(timeout=DIAGNOSE_SECONDS)
+        except (OSError, subprocess.SubprocessError) as error:
+            result.append(f"unavailable, {type(error).__name__}")
+            return
+        result.append(_parse_ps(out, parent, own))
+
+    reader = threading.Thread(target=read, name="dromon-spawn-report", daemon=True)
+    reader.start()
+    reader.join(DIAGNOSE_SECONDS + 1)
+    return result[0] if result else "unavailable, the read did not end"
+
+
+_PROC_PIDTBSDINFO: Final = 3
+_PROC_STATES: Final = {1: "I", 2: "R", 3: "S", 4: "T", 5: "Z"}
+"""``pbi_status`` of macOS's ``proc_bsdinfo`` as the letters ``ps`` uses. ``I`` is a
+process being created, one forked and not yet running a program."""
+
+
+def _libproc_children(parent: int) -> list[_Child] | str:
+    """The children of ``parent`` on macOS from ``libproc``, which reads the process
+    table through the kernel and starts no process, so it works where ``ps`` cannot be
+    started, as in an agent's sandbox, and where the stall has left the process
+    unable to start one. A child has executed when its path differs from this
+    process's own. At most ``MAX_CHILDREN_REPORTED`` are read. Gives the reason as text
+    where it cannot read."""
+    if sys.platform != "darwin":
+        return "unavailable, not macOS"
+    try:
+        import ctypes  # noqa: PLC0415
+
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        ids = (ctypes.c_int * MAX_CHILDREN_REPORTED)()
+        count = int(lib.proc_listchildpids(parent, ids, ctypes.sizeof(ids)))
+        if count < 0:
+            return "unavailable, proc_listchildpids failed"
+        path = ctypes.create_string_buffer(4096)
+        own = lib.proc_pidpath(os.getpid(), path, len(path)) > 0 and path.value
+        found: list[_Child] = []
+        for pid in list(ids)[: min(count, MAX_CHILDREN_REPORTED)]:
+            if pid <= 0:
+                continue
+            info = (ctypes.c_uint32 * 34)()
+            if (
+                lib.proc_pidinfo(pid, _PROC_PIDTBSDINFO, 0, info, ctypes.sizeof(info))
+                <= 0
+            ):
+                continue
+            status = int(info[1])
+            name = bytes(ctypes.string_at(ctypes.addressof(info) + 48, 16)).split(
+                b"\0"
+            )[0]
+            has_path = lib.proc_pidpath(pid, path, len(path)) > 0
+            found.append(
+                _Child(
+                    pid,
+                    _PROC_STATES.get(status, "?"),
+                    name.decode(errors="replace"),
+                    None if not own or not has_path else path.value != own,
+                    None,
+                )
+            )
+        return found
+    except (OSError, AttributeError, ValueError) as error:
+        return f"unavailable, {type(error).__name__}"
+
+
+def _children_text(table: list[_Child] | str) -> str:
+    if isinstance(table, str):
+        return f"children of the daemon {table}"
+    if not table:
+        return "no child of the daemon in the process table"
+    shown = ", ".join(
+        f"pid {child.pid} state {_clean(child.state, 8)}"
+        f" program {_clean(child.program, 40)}"
+        + {None: "", True: " executed", False: " NOT executed"}[child.execed]
+        + ("" if child.waiting is None else f" waiting {_clean(child.waiting, 24)}")
+        for child in table
+    )
+    return f"children of the daemon {shown}"
+
+
+def _descriptor_limit_text() -> str:
+    """The soft limit on open descriptors, since a child that closes every descriptor
+    up to it before its program runs takes time in proportion to it. **Round 15.**
+    Timed on macOS with the soft limit at 1,048,576 and at 256, idle and with twice
+    as many busy processes as cores, a start took about 20 milliseconds either way, so
+    that is not the cause there, and the report shows the limit to rule it in or out
+    where a stall is seen."""
+    try:
+        soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    except (OSError, ValueError):
+        return "descriptor limit unknown"
+    if soft < 0 or soft == resource.RLIM_INFINITY:
+        return "descriptor limit unlimited"
+    return f"descriptor limit {soft}"
+
+
+def stall_report(
+    thread: threading.Thread,
+    handoff: _Handoff,
+    *,
+    proc: Path = Path("/proc"),
+    table: Callable[[int, int], list[_Child] | str] = _ps_table,
+    libproc: Callable[[int], list[_Child] | str] = _libproc_children,
+) -> str:
+    """What is known of a start that has stalled, bounded to ``MAX_REPORT_CHARS``, for
+    the error and the daemon's log. **Round 15, stall diagnostics.** It says where the
+    start's thread is in Python, how many starts were in flight with it, how many
+    threads are alive, and what the daemon's children are doing, from ``/proc`` where
+    that exists, from ``libproc`` on macOS and from ``ps`` otherwise. Together they
+    tell the hypotheses in the module's note apart. It names no argument, since a
+    command line may carry a secret, and it never raises."""
+    try:
+        with _active_lock:
+            now, most = len(_active), handoff.overlap
+        if (proc / "self" / "stat").exists():
+            children: list[_Child] | str = _proc_children_bounded(proc, os.getpid())
+        else:
+            children = libproc(os.getpid())
+            if isinstance(children, str):
+                children = table(os.getpid(), os.getpid())
+        parts = [
+            f"the start thread is at {_where(thread)}",
+            f"{now} starts in flight now and {most} at most during this one",
+            f"{threading.active_count()} threads alive",
+            _descriptor_limit_text(),
+            _children_text(children),
+        ]
+        return _clean("; ".join(parts), MAX_REPORT_CHARS)
+    except Exception as error:  # noqa: BLE001
+        # A report must not hide the stall it describes.
+        return f"the report failed, {type(error).__name__}"
 
 
 def _kill(process: subprocess.Popen[Any]) -> None:
@@ -220,14 +879,18 @@ def _begin(
             " stuck start ends only when its thread does or the daemon restarts"
         )
     handoff = _Handoff()
+    handoff.deadline = handoff.began + bound + WATCHDOG_MARGIN_SECONDS
 
     def target() -> None:
         outcome: subprocess.Popen[Any] | BaseException
+        _enter(handoff)
         try:
             outcome = subprocess.Popen(argv, **options)  # noqa: S603
         except BaseException as error:  # noqa: BLE001
             # Carried to the caller, which decides what it means.
             outcome = error
+        finally:
+            _leave(handoff)
         # The descriptors are closed here, once the start has ended, not by a caller
         # that was told the start stalled, who would close them under a late start.
         _close_all(close_after)
@@ -248,11 +911,15 @@ def _begin(
     if outcome is None:
         with _stranded_lock:
             _stranded.append(thread)
-        raise StartStalled(
+        report = stall_report(thread, handoff)
+        message = (
             f"{name} did not start within {bound:g}s, as its start stalled before the"
-            " program ran, a known intermittent stall in subprocess on macOS that"
+            " program ran, a known intermittent stall in subprocess that"
             " dromon.spawn describes. It is killed if it starts later."
+            f" Report, {report}"
         )
+        print(f"dromond: {message}", file=sys.stderr)
+        raise StartStalled(message)
     if isinstance(outcome, BaseException):
         raise outcome
     return outcome
@@ -517,3 +1184,7 @@ def run(
     if check and code != 0:
         raise subprocess.CalledProcessError(code, shown, out, err)
     return subprocess.CompletedProcess(shown, code, out, err)
+
+
+install_fork_lock()
+disable_vfork()
