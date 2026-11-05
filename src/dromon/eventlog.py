@@ -34,6 +34,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Final, Self, cast
 
+from dromon import credentials
 from dromon.codec import DecodeError, decode, encode
 from dromon.mailbox import counts_unanswered
 from dromon.model import (
@@ -121,6 +122,10 @@ class EventLog:
         """The newest sequence number when this process opened the log."""
         self.opened_bytes = self.size_bytes()
         """The log's size when this process opened it, or ``None`` if unknown."""
+        self.secrets: credentials.SecretSource | None = None
+        """Where the literal secret values come from, which the daemon sets, so that
+        ``append`` masks them as ``credentials`` says. ``None`` masks by pattern
+        only."""
 
     def __enter__(self) -> Self:
         return self
@@ -178,13 +183,26 @@ class EventLog:
         """The sequence number of the newest event, or 0 for an empty log."""
         return self._last_seq
 
+    def _secret_values(self) -> tuple[str, ...]:
+        """The literal secret values to mask. A source that raises gives none, so the
+        patterns still apply and the append is not refused for it."""
+        if self.secrets is None:
+            return ()
+        try:
+            return tuple(self.secrets())
+        except Exception:  # noqa: BLE001
+            return ()
+
     def append(self, event: Event) -> Entry:
-        """Check ``event`` against the current state, store it, then apply it.
+        """Check ``event`` against the current state, store it, then apply it. Its
+        free text is first masked by ``credentials.scrub_event``, so the stored event
+        and the state hold the masked text.
 
         Raises ``EventRejected`` if the event does not apply, and ``LogConflict`` if
         another writer appended first. In both cases nothing is stored and the state is
         unchanged.
         """
+        event = credentials.scrub_event(event, self._secret_values())
         self._state.check(event)
         payload = encode(event)
         recorded_at = _timestamp(self._clock)

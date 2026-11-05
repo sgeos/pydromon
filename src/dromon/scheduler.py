@@ -151,7 +151,7 @@ from dromon.forwarder import PeerReport, check_outbound, outage_text
 from dromon.peering import PeerPriority, PeerTurns, Received, TurnCause, turn_cause
 from dromon import acp, antigravity, codex, cursor, grok, pi
 from dromon.agents import LineTokens
-from dromon import capabilities, launcher, linetemp, redact
+from dromon import capabilities, launcher, linetemp, redact, sandboxprobe
 from dromon.linetemp import LineTemp
 from dromon.security_paths import project_secret_paths
 from dromon.handoff import Handoff
@@ -216,6 +216,7 @@ from dromon.processes import (
     unavailable,
     SystemProcesses,
     TreeRow,
+    former_holder_processes,
     line_process_ended,
     line_processes,
     marked_processes,
@@ -938,6 +939,19 @@ NO_ARGUMENTS_SCHEMA: Final[dict[str, object]] = {
     "additionalProperties": False,
 }
 
+SANDBOX_PROBE_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "operation": {"type": "string", "enum": ["read", "write"]},
+        "path": {
+            "type": "string",
+            "description": "a path in your scratch directory, or relative to it",
+        },
+    },
+    "required": ["operation", "path"],
+    "additionalProperties": False,
+}
+
 READ_INSTRUCTIONS_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
     "properties": {
@@ -1115,6 +1129,7 @@ PID_WATCH_SECONDS: Final = 5.0
 is one ``ps`` call on macOS, so it is not made oftener. **Round 14, item 5.**"""
 
 WORKTREE_STATUS_TOOL_NAME: Final = "worktree_status"
+SANDBOX_PROBE_TOOL_NAME: Final = "sandbox_probe"
 
 LIST_PROCESSES_TOOL_NAME: Final = "list_processes"
 STOP_PROCESS_TOOL_NAME: Final = "stop_process"
@@ -2358,6 +2373,9 @@ class Scheduler:
         log once after a restart."""
         self._processes: ProcessTable = processes or SystemProcesses()
         self._process_worker = ProcessWorker()
+        self._former_observed: dict[str, tuple[str | None, dict[str, object]]] = {}
+        """By role, the change of owner an observation of the former holder's processes
+        answers, by its entry identifier, and the observation. Round 15, item 4."""
         self._sweep_worker = ProcessWorker()
         self._git_worker = ProcessWorker()
         self._walk_worker = ProcessWorker()
@@ -2615,6 +2633,21 @@ class Scheduler:
         self._schedule_survivor_scan()
         self._withdraw_stale_ceilings()
         self._work.set()
+
+    async def _trim_line_temp(self, engine: LineEngine) -> str | None:
+        """Keep the line's temporary directory and cache within their byte bounds
+        before its turn, as ``linetemp.trim`` says, off the event loop, and give the
+        sentence the prompt carries when something was removed. **Round 15, item 5.**
+        A failure is written to standard error and does not stop the turn."""
+        temp = getattr(engine, "temp", None)
+        if not isinstance(temp, LineTemp):
+            return None
+        try:
+            found = await asyncio.to_thread(linetemp.trim_line, temp)
+        except OSError as error:
+            print(f"dromond: line temporary trim failed: {error}", file=sys.stderr)
+            return None
+        return linetemp.trim_notice(found)
 
     def _sweep_line_temps(self) -> None:
         """Remove the temporary directories that no line owns, and stale entries in
@@ -5941,6 +5974,11 @@ class Scheduler:
                 else {
                     "tmpdir": str(temp.temp),
                     "uv_cache_dir": str(temp.cache),
+                    "shell_tmpdir": linetemp.claude_shell_tmpdir(os.getuid()),
+                    "shell_tmpdir_basis": (
+                        "observed under Claude Code on 2026-11-01, shared by every"
+                        " Claude Code line of the user, not a contract"
+                    ),
                     "shell_may_write": all(
                         writable(Path(path)) for path in temp.writable()
                     ),
@@ -6013,10 +6051,14 @@ class Scheduler:
             lines.append("Your shell keeps the temporary directory the engine gave it.")
         else:
             lines.append(
-                f"TMPDIR is {temporary['tmpdir']} and UV_CACHE_DIR is"
+                f"Claude Code sets TMPDIR in your shell to its own directory, observed"
+                f" as {temporary['shell_tmpdir']}, which every Claude Code line of"
+                " this user shares, so do not treat it as private. Dromon's directory"
+                f" for you is {temporary['tmpdir']} and UV_CACHE_DIR is"
                 f" {temporary['uv_cache_dir']}, which your shell may"
                 + ("" if temporary["shell_may_write"] else " not")
-                + " write."
+                + " write. Name that directory in full for a file other lines must"
+                " not read."
             )
         return " ".join(lines)
 
@@ -6910,6 +6952,50 @@ class Scheduler:
             handler=handler,
         )
 
+    def sandbox_probe_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``sandbox_probe`` tool, which checks one read or write of a path inside
+        the line's own scratch directory against the line's effective sandbox document,
+        as ``dromon.sandboxprobe`` says. **Round 15, item 6.** It reads and writes
+        nothing of the path, so it cannot widen what the line may do, and it says that
+        it checks configuration and does not probe the operating system."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, SANDBOX_PROBE_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            operation, text = args.get("operation"), args.get("path")
+            if not isinstance(operation, str) or not isinstance(text, str):
+                return _tool_error("operation and path must be text")
+            engine = self._engines.get(line_id)
+            if not isinstance(engine, ClaudeCodeLine):
+                return _tool_error(
+                    unavailable(
+                        SANDBOX_PROBE_TOOL_NAME,
+                        "only a Claude Code line has a sandbox document Dromon holds",
+                    )
+                )
+            scratch = engine.cwd.joinpath(*self.scratch_parts(line_id))
+            try:
+                found = sandboxprobe.probe(
+                    engine.sandbox, engine.cwd, scratch, operation, text
+                )
+            except sandboxprobe.ProbeRefused as error:
+                return _tool_error(unavailable(SANDBOX_PROBE_TOOL_NAME, str(error)))
+            return _tool_text(json.dumps(found, indent=2, sort_keys=True))
+
+        return SdkMcpTool(
+            name=SANDBOX_PROBE_TOOL_NAME,
+            description=(
+                "Check whether your sandbox allows a read or a write of a path inside"
+                " your own scratch directory, and which rule decides it. This checks"
+                " the sandbox document the engine was given and is not a probe by the"
+                " operating system, which the answer says. It reads and writes"
+                " nothing, and a path outside your scratch directory is refused."
+            ),
+            input_schema=SANDBOX_PROBE_SCHEMA,
+            handler=handler,
+        )
+
     def list_processes_tool(self, line_id: str) -> SdkMcpTool[Any]:
         """The ``list_processes`` tool for ``line_id``, which sees only its own."""
 
@@ -7192,6 +7278,7 @@ class Scheduler:
             "in_project_file": definition is not None,
             "file_differences": list(differences),
             "beside_owner": self._beside_owner_of(role_id),
+            "former_holder": self._former_holder_view(role_id),
             "order": list(role.seats),
             "handoff_seconds": role.handoff_seconds,
             "failover": role.failover.value,
@@ -7309,14 +7396,117 @@ class Scheduler:
             handler=handler,
         )
 
+    def _former_holder_view(self, role_id: str) -> dict[str, object] | None:
+        """What Dromon can say of the processes of the seat that held the role before
+        its latest change of owner, or ``None`` when the role has never changed owner
+        or the change had no former holder. **Round 15, item 4.**
+
+        ``state`` is ``running`` when the seat has a turn in flight or the last
+        observation found a process carrying its mark, ``ended`` when the last
+        observation read the process table and found none, and ``unknown`` otherwise,
+        which includes a platform that cannot attribute processes, a table that could
+        not be read and a change not yet observed. ``ended`` means none was found among
+        the environments that could be read at ``observed_at``, so a process that
+        removed its mark or whose environment is unreadable is not seen. It does not
+        say a process of an engine session ended, only what the table showed."""
+        role = self._state().roles.get(role_id)
+        change = None if role is None else role.changed
+        if change is None or change.previous is None:
+            return None
+        former = change.previous
+        kept = self._former_observed.get(role_id)
+        observation = (
+            kept[1]
+            if kept is not None and kept[0] == change.entry_id
+            else {
+                "state": "unknown",
+                "count": None,
+                "observed_at": None,
+                "basis": "not observed since this change of owner",
+            }
+        )
+        view: dict[str, object] = {"line_id": former, **observation}
+        if former in self._running:
+            view.update(
+                state="running",
+                basis="a turn of the former holder is in flight",
+            )
+        return view
+
+    async def observe_former_holder(self, role_id: str) -> None:
+        """Read the process table for the former holder of ``role_id`` and keep the
+        observation for ``role_view``. A failure is kept as ``unknown`` with its
+        reason, and is never read as ``ended``."""
+        role = self._state().roles.get(role_id)
+        change = None if role is None else role.changed
+        if change is None or change.previous is None:
+            return
+        former = change.previous
+        stamp = format_due(self._wall_clock())
+        if not self._processes_identifiable:
+            observation: dict[str, object] = {
+                "state": "unknown",
+                "count": None,
+                "observed_at": stamp,
+                "basis": UNIDENTIFIABLE,
+            }
+        else:
+            try:
+                count = await self._process_worker.run(
+                    lambda: former_holder_processes(
+                        self._processes, former, os.getpid()
+                    )
+                )
+            except (ProcessRefused, OSError) as error:
+                observation = {
+                    "state": "unknown",
+                    "count": None,
+                    "observed_at": stamp,
+                    "basis": f"the process table could not be read: {error}",
+                }
+            else:
+                observation = {
+                    "state": "running" if count else "ended",
+                    "count": count,
+                    "observed_at": stamp,
+                    "basis": (
+                        "processes carrying the former holder's mark were found"
+                        if count
+                        else "no process carrying the former holder's mark was found"
+                        " among the environments that could be read"
+                    ),
+                }
+        self._former_observed[role_id] = (change.entry_id, observation)
+
     def role_status_tool(self, line_id: str) -> SdkMcpTool[Any]:
-        """The ``role_status`` tool for ``line_id``, offered only to a seat."""
-        return self._view_tool(
-            ROLE_STATUS_TOOL_NAME,
-            "Show your role: its worktree, its owner and the latest change of owner,"
-            " each seat with its condition, model and its provider's stated budget,"
-            " and the latest journal entries, the newest with its text, read only.",
-            lambda: json.dumps(self.role_status(line_id), indent=2, sort_keys=True),
+        """The ``role_status`` tool for ``line_id``, offered only to a seat. It reads
+        the former holder's processes first, so its answer is as fresh as the call."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, NO_ARGUMENTS_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            try:
+                seat = self._state().seats.get(line_id)
+                if seat is not None:
+                    await self.observe_former_holder(seat.role_id)
+                return _tool_text(
+                    json.dumps(self.role_status(line_id), indent=2, sort_keys=True)
+                )
+            except LineToolRefused as error:
+                return _tool_error(str(error))
+
+        return SdkMcpTool(
+            name=ROLE_STATUS_TOOL_NAME,
+            description=(
+                "Show your role: its worktree, its owner and the latest change of"
+                " owner, whether the former holder's processes are shown to have"
+                " ended, unknown or still running, each seat with its condition,"
+                " model and its provider's stated budget, and the latest journal"
+                " entries, the newest with its text, read only."
+            ),
+            input_schema=NO_ARGUMENTS_SCHEMA,
+            handler=handler,
         )
 
     # Ownership, roles step 2 of ``docs/architecture/ROLES.md``.
@@ -7956,9 +8146,25 @@ class Scheduler:
     def roles_view(self, role_id: str | None) -> list[dict[str, object]]:
         """Every role as ``role_view`` gives it, by identifier, or only ``role_id``.
         Raises ``EventRejected`` for an unknown role."""
-        if role_id is not None:
-            return [self.role_view(role_id)]
-        return [self.role_view(found) for found in sorted(self._state().roles)]
+        found_roles = [role_id] if role_id is not None else sorted(self._state().roles)
+        views = [self.role_view(found) for found in found_roles]
+        for found in found_roles:
+            self._observe_former_in_background(found)
+        return views
+
+    def _observe_former_in_background(self, role_id: str) -> None:
+        """Start an observation of the former holder's processes that the next view
+        shows, since an operator's view is built without waiting. Nothing starts
+        outside a running loop or when the platform cannot attribute processes."""
+        if not self._processes_identifiable:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self.observe_former_holder(role_id))
+        self._process_tasks.add(task)
+        task.add_done_callback(self._process_tasks.discard)
 
     def _seat_task_view(self, record: TaskRecorded, own: bool) -> dict[str, object]:
         """``record`` as ``role_view`` shows it. ``own`` is true for the viewing
@@ -9163,6 +9369,7 @@ class Scheduler:
             self.list_processes_tool(line_id),
             self.stop_process_tool(line_id),
             self.worktree_status_tool(line_id),
+            self.sandbox_probe_tool(line_id),
             self.list_mail_tool(line_id),
             self.read_mail_tool(line_id),
             self.acknowledge_mail_tool(line_id),
@@ -10325,6 +10532,9 @@ class Scheduler:
             await self._check_walk(line_id)
             self._check_git_ssh(line_id)
             engine = self.engine_for(line_id)
+            trimmed = await self._trim_line_temp(engine)
+            if trimmed is not None:
+                prompt = f"{trimmed}\n\n{prompt}"
             facts = self._sandbox_facts_text(line_id)
             if facts is not None and self._facts_due(
                 line_id, facts, fresh=compaction is not None

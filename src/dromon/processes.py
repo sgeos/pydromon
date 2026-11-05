@@ -715,6 +715,14 @@ def marked_processes(
     return found
 
 
+def former_holder_processes(table: ProcessTable, line_id: str, daemon_pid: int) -> int:
+    """How many processes of the daemon's user carry a mark of ``line_id``, of this run
+    or an earlier one. Zero says none was found among the environments that could be
+    read, not that none exists. Raises ``ProcessRefused`` when the table could not be
+    read, which is not an answer of zero. **Round 15, item 4.**"""
+    return len(marked_processes(table, daemon_pid).get(line_id, []))
+
+
 def line_process_ended(
     table: ProcessTable, mark: str, daemon_pid: int, pid: int
 ) -> bool:

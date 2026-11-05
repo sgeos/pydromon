@@ -54,7 +54,7 @@ from claude_agent_sdk import SdkMcpTool
 from OpenSSL.SSL import Context as OpenSSLContext
 
 from dromon import __version__, exits, fleet, grok, peercred, registry, restart, runs
-from dromon import evidence
+from dromon import credentials, evidence
 from dromon import proposals as proposal_store
 from dromon.federation import (
     MAX_OPEN_REMOTE_PEERS,
@@ -3771,6 +3771,10 @@ def run(
             log_path = scratch / paths.event_log.name
             snapshot(paths.event_log, log_path)
         with EventLog(log_path) as log:
+            # The dictionary is the daemon's own, which a reload updates in place.
+            log.secrets = lambda: credentials.environment_values(
+                line_secrets, os.environ
+            )
             scheduler = Scheduler(
                 log,
                 engine_factory(

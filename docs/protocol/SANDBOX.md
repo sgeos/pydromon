@@ -103,6 +103,40 @@ worked. `UV_CACHE_DIR` stays Dromon's. **Inference.** That directory is shared b
 Claude Code line of the user, so such lines may read one another's temporary files
 there, which Dromon does not control.
 
+**The shell's `TMPDIR`, stated per engine, round 15, item 2.** The turn-start note names
+both directories and says which one the shell has. Under Claude Code the shell's
+`TMPDIR` is Claude Code's own, observed as `/tmp/claude-UID` and shared, and Dromon's
+directory for the line is named in full beside it, with `UV_CACHE_DIR`, so a line that
+needs a file other lines must not read writes to the directory the note names. The path
+`dromon.linetemp.claude_shell_tmpdir` gives is an observation of Claude Code's behaviour
+and not a contract, and the note and `line_status` say so. Other engines do not receive a
+directory from Dromon and so have no such note. **Hypothesis.** A Claude Code release
+that changes its directory makes the note wrong until `claude_shell_tmpdir` is updated.
+
+**A byte bound on the directories, round 15, item 5.** The sandbox has no quota, so the
+daemon applies one between turns. Before a line's turn starts it measures the line's
+`tmp` and its package cache, in allocated bytes with no link followed and at most
+100,000 entries. A directory over its bound, one gibibyte for `tmp` and four for the
+cache, or one that holds more entries than the walk limit, loses whole top-level entries,
+oldest change first, until it holds at most half of the bound. A link is unlinked and its
+target is kept, and an entry another user owns is left and reported. The turn's prompt
+then says how many entries and bytes were removed, naming no file. **Residuals.** The
+bound holds between turns only, so a line can exceed it within a turn as far as the disk
+allows. A file in use by a command that outlives the turn can be removed. Hard links count
+once for each name. The bounds are constants and not a project setting. The sweep at
+start still removes what has gone unchanged for a week.
+
+**A check of one rule, round 15, item 6.** The tool `sandbox_probe` takes `read` or
+`write` and a path inside the line's own scratch directory, and answers `allowed` or
+`denied` with the entry of the effective sandbox document that decides it. **It checks
+the document the engine was given and is not a probe by the operating system**, which
+every answer says, because the daemon cannot run a process under Claude Code's
+confinement. It reads and writes nothing of the path, resolves links only to name the
+deciding rule, and refuses a path that leaves the scratch directory without looking at
+it, so it cannot widen what the line may do. A rule that the engine applies differently
+from the document is not seen. It is offered to every line and refuses a line whose
+engine holds no sandbox document Dromon reads.
+
 The sandbox also denies the line reads of the directory that holds every line's
 directory, and lifts the denial for its own, so one line cannot read what another's
 commands wrote. **Fact, observed live on 2026-11-01** on the same line and daemon.

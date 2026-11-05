@@ -641,6 +641,7 @@ def test_every_line_has_the_tool_and_status_shows_the_pending_wake(
         "list_processes",
         "stop_process",
         "worktree_status",
+        "sandbox_probe",
         "list_mail",
         "read_mail",
         "acknowledge_mail",

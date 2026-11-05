@@ -1,0 +1,7 @@
+Type: Added
+
+- Credential-shaped values are masked in the free text of the event log. Known token prefixes, the credential after `Bearer` or `Basic`, URL passwords, upper case `NAME=value` secrets, JSON members that name a token, secret or password, private key blocks, and the values of the environment variables a project grants a line in `secrets` are replaced before an event is stored, so every view of the log holds the masked text. The engine's own context, the raw output files of runs and credentials with no known shape are not covered, and `EVENT_LOG.md` lists both.
+- The turn-start sandbox note states the `TMPDIR` the line's shell has, which Claude Code replaces with its own shared directory, and names Dromon's per-line directory beside it.
+- A line's temporary directory and package cache have byte bounds, one and four gibibytes. Before a turn the daemon removes the oldest top-level entries of a directory over its bound down to half of it, and tells the line how many. The bound holds between turns only.
+- `role_status` and the operator's role view say whether the former holder's processes are shown to have ended, are unknown or are running, with the time and the basis. A table that cannot be read is unknown and never ended.
+- A `sandbox_probe` tool answers `allowed` or `denied`, with the deciding rule, for a read or write of a path inside a line's own scratch directory. It checks the sandbox document and is not an operating-system probe, and it touches nothing.

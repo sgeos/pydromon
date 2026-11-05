@@ -385,3 +385,119 @@ def test_a_failed_sweep_does_not_stop_the_start(
         found.recover()
         found.stop_workers()
     assert "line temporary sweep failed: disk gone" in capsys.readouterr().err
+
+
+# Round 15, item 5. A byte bound, applied between turns.
+
+
+def stuff(directory: Path, name: str, size: int, age: float = 0.0) -> Path:
+    """A file of about ``size`` bytes, changed ``age`` seconds ago."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_bytes(b"x" * size)
+    moment = path.stat().st_mtime - age
+    os.utime(path, (moment, moment))
+    return path
+
+
+def test_a_measure_counts_allocated_bytes_and_does_not_follow_links(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    stuff(outside, "big", 200_000)
+    inside = tmp_path / "inside"
+    stuff(inside / "sub", "a", 50_000)
+    (inside / "link").symlink_to(outside)
+    total, complete = linetemp.measure(inside)
+    assert complete and 50_000 <= total < 100_000
+    assert linetemp.measure(tmp_path / "missing") == (0, True)
+
+
+def test_a_measure_stops_at_its_walk_limit_and_says_so(tmp_path: Path) -> None:
+    for index in range(10):
+        stuff(tmp_path, f"f{index}", 10)
+    _, complete = linetemp.measure(tmp_path, limit=5)
+    assert not complete
+    assert linetemp.measure(tmp_path, limit=10)[1]
+
+
+def test_a_directory_within_its_bound_loses_nothing(tmp_path: Path) -> None:
+    stuff(tmp_path, "a", 10_000)
+    done = linetemp.trim(tmp_path, 10**9)
+    assert done.removed == () and done.freed == 0 and not done.incomplete
+    assert (tmp_path / "a").exists()
+
+
+def test_a_directory_over_its_bound_loses_its_oldest_entries_down_to_half(
+    tmp_path: Path,
+) -> None:
+    for index, age in enumerate((400.0, 300.0, 200.0, 100.0)):
+        stuff(tmp_path, f"old{index}", 100_000, age)
+    inner = tmp_path / "newest"
+    stuff(inner, "deep", 100_000, 0.0)
+    done = linetemp.trim(tmp_path, 300_000)
+    # Five files of 100 kB are over 300 kB, and half of the bound is 150 kB, so the
+    # oldest four go and the newest, which alone is under it, stays.
+    assert done.removed == ("old0", "old1", "old2", "old3")
+    assert not (tmp_path / "old3").exists() and (inner / "deep").exists()
+    assert done.freed >= 400_000 and not done.incomplete and done.failed == ()
+    again = linetemp.trim(tmp_path, 300_000)
+    assert again.removed == ()
+
+
+def test_a_tree_and_a_link_are_removed_whole_and_the_link_target_is_kept(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    stuff(target, "keep", 10)
+    place = tmp_path / "place"
+    stuff(place / "tree" / "deeper", "f", 200_000, 500.0)
+    link = place / "link"
+    link.symlink_to(target)
+    os.utime(link, (1.0, 1.0), follow_symlinks=False)
+    done = linetemp.trim(place, 100_000)
+    assert "tree" in done.removed and "link" in done.removed
+    assert (target / "keep").exists() and not link.is_symlink()
+
+
+def test_a_directory_with_too_many_entries_is_treated_as_over_its_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(linetemp, "MAX_WALK_ENTRIES", 3)
+    for index in range(8):
+        stuff(tmp_path, f"f{index}", 10, float(100 - index))
+    done = linetemp.trim(tmp_path, 10**9)
+    assert done.removed and not (tmp_path / "f0").exists()
+
+
+def test_an_entry_another_user_owns_is_left_and_reported(tmp_path: Path) -> None:
+    stuff(tmp_path, "mine", 200_000, 100.0)
+    done = linetemp.trim(tmp_path, 100_000, user=os.getuid() + 1)
+    assert done.removed == () and (tmp_path / "mine").exists()
+    assert done.failed and "another user" in done.failed[0]
+
+
+def test_an_unreadable_place_is_reported_and_missing_one_is_not(tmp_path: Path) -> None:
+    assert linetemp.trim(tmp_path / "missing", 10).removed == ()
+    place = tmp_path / "place"
+    stuff(place, "a", 200_000)
+    place.chmod(0o000)
+    try:
+        done = linetemp.trim(place, 100_000)
+    finally:
+        place.chmod(0o700)
+    if os.getuid() != 0:
+        assert done.removed == ()
+
+
+def test_the_notice_names_sizes_and_never_a_file_name() -> None:
+    assert linetemp.trim_notice(()) is None
+    quiet = linetemp.Trimmed("tmp", 10, (), 0, False, ())
+    assert linetemp.trim_notice((quiet,)) is None
+    taken = linetemp.Trimmed("tmp", 10, ("secret-name",), 99, False, ())
+    said = linetemp.trim_notice((taken,))
+    assert said is not None and "1 oldest entries of tmp (99 bytes)" in said
+    assert "secret-name" not in said
+    stuck = linetemp.Trimmed("uv-cache", 10, (), 0, True, ("x: busy",))
+    assert "over its bound" in (linetemp.trim_notice((stuck,)) or "")
+    assert "x: busy" not in (linetemp.trim_notice((stuck,)) or "")

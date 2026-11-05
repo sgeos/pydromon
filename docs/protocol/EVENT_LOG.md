@@ -520,6 +520,50 @@ the line they are configured for. A credential written into a server's `command`
 `args` or `url` is not sealed and still reaches the log, and older events keep their
 literals, both of which remain residuals as stated above.
 
+## Credential masking
+
+**Round 15, item 1.** Another project saw a temporary credential from a hosting service
+printed in tool output. Command lines were already masked by `dromon.redact`. The free
+text that enters the log is now masked as well, by `dromon.credentials`, in
+`EventLog.append`, which every event passes through. The text is masked before the
+model checks the event and before it is stored, so the stored event, the state and every
+view, status, export and backup built from either hold the masked text. A keyed call's
+request digest is taken over the arguments as given and is unchanged, so a retry is
+unaffected.
+
+- **Covered fields.** `body` of `message_sent`, `message_received`, `task_noted`,
+  `restart_noted` and `role_noted`, and `choices` of `message_sent`. `reason` of
+  `message_acknowledged` and `commit_run_refused`. `note` of `wake_scheduled`,
+  `stop_unverified`, `walk_limited`, `budget_stated`, `lease_acquired` and `run_ended`.
+  `task`, `decisions`, `artifacts` and `next_action` of `brief_set`. `command` of
+  `task_recorded` and `commands` of `processes_left`. A test fails when an event class is
+  neither covered nor listed as holding no free text, so a new event is classified when
+  it is added.
+- **What is masked, by pattern.** Values with a known prefix and length, namely GitHub,
+  GitLab, Slack, Stripe, SendGrid, npm, PyPI, Hugging Face, DigitalOcean, Google and
+  Anthropic or OpenAI keys, Amazon access key identifiers and the session token of an
+  Amazon temporary credential, JSON web tokens, and a private key block. The credential
+  after `Bearer` or `Basic`. The user and password of a URL. The value of an upper case
+  `NAME=value` whose name says token, secret, password, credential, access key, private
+  key, API key or session. The value of a JSON member whose name says the same.
+- **What is masked, by name.** The literal value of every environment variable that the
+  project grants a line in a `secrets` list, wherever it appears, when it has at least
+  eight characters. The daemon reads the values from its own environment at each append,
+  so a reload of the project file takes effect at once.
+- **Not covered, stated plainly.** The engine's own context, which Dromon does not hold,
+  so a line that reads a credential in its own tool output still holds it and may write
+  it into a file or a mail, where only the patterns above stand between it and the log.
+  The raw output file of a supervised run, files a line writes, the launcher's report
+  file and the engine's transcript, since Dromon does not author them and the log holds
+  only a digest of the first. A credential with no known prefix, no `NAME=value` shape and
+  no listed name. A listed secret shorter than eight characters. A value split across two
+  texts. The operator settings in `line_overridden` and `project_overridden`, and an
+  operator's own free text in a client, which is masked like any message body. A text
+  that really holds such a value as an example is masked too, which fails safe.
+- **Failure modes.** A secret source that raises is treated as empty, so the patterns
+  still apply and the append is not refused. Masking is by pattern and is not the
+  disclosure scan.
+
 ## Bounded start
 
 **Required by the operator on 2026-11-01, measured and designed by core for review.
